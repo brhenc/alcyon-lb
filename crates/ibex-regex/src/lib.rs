@@ -14,6 +14,12 @@
 //! [`BACKTRACK_LIMIT`]: a match that exceeds it is a non-match, silently, as `HAProxy`'s
 //! PCRE2 match limit makes it (measured: `^/(a+)+$` against `/aaaa...ab` answers "no match"
 //! at once). Nothing is logged per request.
+//!
+//! `fancy-regex` counts its backtracks per call of its matcher: one `captures`/`is_match`
+//! is one count, shared by every start position it tries (0.19.2, `vm::run`), and the limit
+//! is fixed when the regex is compiled. A loop that searches again after each match
+//! (`replace_all`) would pay the whole limit at every match, so it runs under one
+//! [`LOOP_BUDGET`] for the whole loop instead (T316); see [`Ladder`].
 
 #![forbid(unsafe_code)]
 
@@ -517,6 +523,68 @@ pub fn compiles_on_this_thread() -> u64 {
 /// one is configuration text; the bound only stops other text from growing the cache.
 const REGEX_CACHE_MAX: usize = 4096;
 
+/// The backtracking steps all the searches of one `replace`/`replace_all` may take together:
+/// the first search can still use the whole [`BACKTRACK_LIMIT`] (the steps spent on the
+/// smaller attempts that precede it, at most a third of it, are charged too), the later ones
+/// share the rest. When it runs out the text is left unchanged, as a non-match leaves it.
+/// Measured (release, one core) on `(a*)*\1c|a` over 8 KB: 6.7 s before; the fuzz artifact
+/// `timeout-f1aa0b4d`, 180 bytes: 0.53 s before.
+pub const LOOP_BUDGET: usize = 2 * BACKTRACK_LIMIT;
+
+/// The limits of the compiled copies of a backtracking pattern, ascending, each 4 times the
+/// one before and the last [`BACKTRACK_LIMIT`]. `fancy-regex` does not say how many steps a
+/// search took, only whether it stayed under the limit it was compiled with; a search in a
+/// loop therefore tries the copies in turn and is charged the limit of each it tried, which
+/// overcharges by at most 4 and keeps a search that needs a few steps cheap.
+const RUNGS: [usize; 8] = [64, 256, 1_024, 4_096, 16_384, 65_536, 262_144, BACKTRACK_LIMIT];
+
+/// The copies of one backtracking pattern with a lower limit, compiled when first needed
+/// (a pattern that is never used in a loop never pays for them).
+pub struct Ladder {
+    pattern: String,
+    case_insensitive: bool,
+    rungs: [std::sync::OnceLock<Option<fancy_regex::Regex>>; RUNGS.len()],
+}
+
+impl Ladder {
+    fn new(pattern: &str, case_insensitive: bool) -> Self {
+        Ladder { pattern: pattern.to_owned(), case_insensitive, rungs: Default::default() }
+    }
+
+    fn rung(&self, i: usize) -> Option<&fancy_regex::Regex> {
+        self.rungs[i]
+            .get_or_init(|| {
+                fancy_regex::RegexBuilder::new(&self.pattern)
+                    .case_insensitive(self.case_insensitive)
+                    .backtrack_limit(RUNGS[i])
+                    .build()
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    /// The match of `text` from `pos` on, charging `budget`; `Err` when the budget cannot pay
+    /// for another attempt or the last permitted one went over its limit.
+    fn captures_from_pos<'h>(
+        &self,
+        text: &'h str,
+        pos: usize,
+        budget: &mut usize,
+    ) -> Result<Option<fancy_regex::Captures<'h, str>>, ()> {
+        for (i, &limit) in RUNGS.iter().enumerate() {
+            if limit > *budget {
+                break;
+            }
+            let Some(re) = self.rung(i) else { break };
+            *budget -= limit;
+            if let Ok(found) = re.captures_from_pos(text, pos) {
+                return Ok(found);
+            }
+        }
+        Err(())
+    }
+}
+
 type RegexCache = std::collections::HashMap<Box<str>, Result<std::rc::Rc<UserRegex>, Error>>;
 
 thread_local! {
@@ -530,7 +598,7 @@ pub enum UserRegex {
     Linear(regex::Regex),
     /// Compiled by `fancy-regex`: the pattern uses a PCRE-only feature, and a match is
     /// bounded by [`BACKTRACK_LIMIT`].
-    Backtracking(fancy_regex::Regex),
+    Backtracking(fancy_regex::Regex, std::sync::Arc<Ladder>),
 }
 
 impl fmt::Debug for UserRegex {
@@ -746,7 +814,7 @@ impl UserRegex {
             // is not supported, of a pattern that fails for another reason).
             .map_err(|e| Error::from_fancy(&e))?;
         check_conditions(pattern, re.captures_len())?;
-        Ok(UserRegex::Backtracking(re))
+        Ok(UserRegex::Backtracking(re, std::sync::Arc::new(Ladder::new(pattern, case_insensitive))))
     }
 
     /// [`UserRegex::new`] as `HAProxy` compiles the regex of an ACL, of `map_reg` and of a
@@ -785,14 +853,14 @@ impl UserRegex {
     pub fn as_str(&self) -> &str {
         match self {
             UserRegex::Linear(r) => r.as_str(),
-            UserRegex::Backtracking(r) => r.as_str(),
+            UserRegex::Backtracking(r, _) => r.as_str(),
         }
     }
 
     /// Whether this pattern needed `fancy-regex`.
     #[must_use]
     pub fn is_backtracking(&self) -> bool {
-        matches!(self, UserRegex::Backtracking(_))
+        matches!(self, UserRegex::Backtracking(..))
     }
 
     /// Whether `text` matches. A match that exceeds [`BACKTRACK_LIMIT`] does not.
@@ -802,7 +870,7 @@ impl UserRegex {
         let text = text.as_ref();
         match self {
             UserRegex::Linear(r) => r.is_match(text),
-            UserRegex::Backtracking(r) => r.is_match(text).unwrap_or(false),
+            UserRegex::Backtracking(r, _) => r.is_match(text).unwrap_or(false),
         }
     }
 
@@ -818,7 +886,7 @@ impl UserRegex {
                     let c = r.captures(mapped)?;
                     ((0..c.len()).map(|i| c.get(i).map(|m| unbytewise(m.as_str()))).collect(), r.capture_names().map(|n| n.map(str::to_owned)).collect())
                 }
-                UserRegex::Backtracking(r) => {
+                UserRegex::Backtracking(r, _) => {
                     let c = r.captures(mapped).ok().flatten()?;
                     ((0..c.len()).map(|i| c.get(i).map(|m| unbytewise(m.as_str()))).collect(), r.capture_names().map(|n| n.map(str::to_owned)).collect())
                 }
@@ -827,7 +895,7 @@ impl UserRegex {
         }
         match self {
             UserRegex::Linear(r) => r.captures(text).map(Captures::Linear),
-            UserRegex::Backtracking(r) => r.captures(text).ok().flatten().map(Captures::Backtracking),
+            UserRegex::Backtracking(r, _) => r.captures(text).ok().flatten().map(Captures::Backtracking),
         }
     }
 
@@ -865,13 +933,19 @@ impl UserRegex {
                     r.replace_all(text, replacement)
                 }
             }
-            UserRegex::Backtracking(r) => {
+            UserRegex::Backtracking(_, ladder) => {
+                let mut budget = LOOP_BUDGET;
                 let mut out = String::new();
                 let mut last = 0;
                 let mut pos = 0;
                 let mut n = 0;
                 while n < limit && pos <= text.len() {
-                    let Ok(Some(caps)) = r.captures_from_pos(text, pos) else { break };
+                    let caps = match ladder.captures_from_pos(text, pos, &mut budget) {
+                        Ok(Some(caps)) => caps,
+                        Ok(None) => break,
+                        // Out of budget: a non-match, whatever was replaced so far is dropped.
+                        Err(()) => return Cow::Borrowed(text),
+                    };
                     let Some(m) = caps.get(0) else { break };
                     out.push_str(&text[last..m.start()]);
                     caps.expand(replacement, &mut out);
