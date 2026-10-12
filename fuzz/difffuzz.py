@@ -230,6 +230,26 @@ def confirm(pair, k, raw, first):
     return sh
 
 
+# Baseline `task` values that name an accepted class, not a tracked defect: any DIFF with the
+# shape of such an entry is known, whatever its input (T315). `note:ibex-stricter` is
+# "HAProxy closes without a status, Ibex answers 400, nothing reaches the server".
+ACCEPTED_CLASSES = ('note:ibex-stricter',)
+
+
+def accepted_shapes(base):
+    """The shapes of the baseline's accepted classes, as a list of shape dicts."""
+    out = []
+    for v in base.values():
+        if v.get('task') in ACCEPTED_CLASSES and v['shape'] not in out:
+            out.append(v['shape'])
+    return out
+
+
+def is_accepted(sh, base):
+    """Whether the DIFF shape `sh` is the shape of an accepted class of the baseline."""
+    return sh in accepted_shapes(base)
+
+
 def load_baseline(path):
     try:
         return json.load(open(path))
@@ -301,7 +321,7 @@ def cmd_gate(a):
                                      f'raw={raw[:120]!r}')
             elif not same(sh):
                 sh2 = confirm(pairs[0], k, raw, sh)
-                if not same(sh2):
+                if not same(sh2) and not is_accepted(sh2, base):
                     fails.append(f'NEW DIFF {k}: ha={sh2["haproxy"]} ibex={sh2["ibex"]} raw={raw[:160]!r}')
         if not all(p.alive() for p in pairs):
             fails.append('a proxy died during the run')
@@ -354,6 +374,7 @@ def cmd_soak(a):
     new = {}
     total = 0
     rnd = 0
+    accepted = 0  # DIFFs of an accepted class (ACCEPTED_CLASSES) on inputs not in the baseline
     try:
         self_test(pairs[0])
         while time.time() < end:
@@ -368,8 +389,11 @@ def cmd_soak(a):
                     continue
                 if k in base and base[k]['shape'] == sh:
                     continue
+                if k not in base and is_accepted(sh, base):
+                    accepted += 1
+                    continue
                 sh2 = pairs[0].shape(raw)[0]
-                if not same(sh2) and not (k in base and base[k]['shape'] == sh2):
+                if not same(sh2) and not (k in base and base[k]['shape'] == sh2) and not (k not in base and is_accepted(sh2, base)):
                     new[k] = (sh2, raw, seed, k in base)
             if not all(p.alive() for p in pairs):
                 print('difffuzz: a proxy died')
@@ -387,7 +411,7 @@ def cmd_soak(a):
                             f'- haproxy: {sh.get("haproxy")}\n- ibex: {sh.get("ibex")}\n- raw: `{raw[:300]!r}`\n'
                             f'- input_b64: `{base64.b64encode(raw).decode()}`\n\n')
         print(f'difffuzz-soak: {total} cases in {secs:.0f}s, {rnd} rounds (seeds {a.seed}..{a.seed + rnd - 1}), '
-              f'{len(new)} new DIFFs, ibex {sha}' + (f', report {a.out}' if a.out and new else ''))
+              f'{len(new)} new DIFFs, ibex {sha}' + (f' ({accepted} more of an accepted class)' if accepted else '') + (f', report {a.out}' if a.out and new else ''))
         return 1 if new else 0
     finally:
         killall()

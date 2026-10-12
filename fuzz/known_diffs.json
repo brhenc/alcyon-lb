@@ -94,6 +94,25 @@
   },
   "task": "note:ibex-stricter"
  },
+ "b05bd55da7b15cbe": {
+  "input_b64": "UE9TVCAvY29tbWEtY2wgSFRUUC8xLjENCkhvc3Q6IGV4YW1wbGUuY29tDQpDb250ZW50LUxlbmd0aDogNSwgNQ0KIApoZWxsbw==",
+  "note": "POST /comma-cl HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5, 5\r\n \nhello",
+  "shape": {
+   "haproxy": {
+    "fwd": "e3b0c44298fc",
+    "fwd_len": 0,
+    "status": []
+   },
+   "ibex": {
+    "fwd": "e3b0c44298fc",
+    "fwd_len": 0,
+    "status": [
+     "408"
+    ]
+   }
+  },
+  "task": "T315"
+ },
  "d940a5d2d1b0978c": {
   "input_b64": "UE9TVCAvZHVwLWNsIEhUVFAvMS4xDQpIb3N0OiBleGFtcGxlLmNvbQ0KQ29udGVudC1MZW5ndGg6IDUNCkNvAHRlbnQtTGVuZ3RoOiA1DQoNCmhlbGxv",
   "note": "POST /dup-cl HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nCo\u0000tent-Length: 5\r\n",
