@@ -283,7 +283,10 @@ fn trim_idle_returns_the_pages_of_freed_buffers() {
     let after = rss();
     println!("rss: base {base} peak {peak} after {after}");
     assert!(peak - base > 10_000_000, "the burst did not grow the heap");
-    assert!(after - base < (peak - base) / 4, "freed buffers still resident");
+    // Without the trim nothing comes back (T318: peak 59.4 MB, after 59.4 MB). Run alone, the
+    // trim leaves 25-35% resident (base 8.0, peak 36.8, after 17.0 MB): the pool's cached
+    // buffers, the neighbours and glibc's top pad.
+    assert!(after - base < (peak - base) / 2, "freed buffers still resident");
     drop(keep);
 }
 
