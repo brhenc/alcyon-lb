@@ -67,7 +67,7 @@ CFG = """global
     stats socket {run}/stats.sock mode 666 level admin
 defaults
     mode http
-    timeout connect 5s
+{capture}    timeout connect 5s
     timeout client 30s
     timeout server 30s
     timeout http-request 5s
@@ -145,8 +145,12 @@ def parse_haload(text):
 
 
 def haterm_cli(run, cmd):
+    return cli(f"{run}/haterm.sock", cmd)
+
+
+def cli(path, cmd):
     import socket as so
-    c = so.socket(so.AF_UNIX); c.settimeout(2); c.connect(f"{run}/haterm.sock"); c.sendall(cmd + b"\n")
+    c = so.socket(so.AF_UNIX); c.settimeout(2); c.connect(path); c.sendall(cmd + b"\n")
     buf = b""
     while True:
         d = c.recv(65536)
@@ -192,7 +196,21 @@ def run_one(binary, label, outdir, secs, name):
     run = f"/tmp/battery-{label}-{name}"
     subprocess.run(["rm", "-rf", run]); os.makedirs(run)
     tlsbind = f"    bind 127.0.0.1:{TLS} ssl crt {CRT} alpn h2,http/1.1\n" if os.path.exists(CRT) else ""
-    open(f"{run}/proxy.cfg", "w").write(CFG.format(run=run, h1=H1, h2=H2, tlsbind=tlsbind))
+    # CAPTURE=1 (MY-8 watch): httplog to a UDP sink here, histogram of status + termination flags,
+    # and a per-second `show info` CurrConns/Maxsock poll on the proxy's stats socket.
+    capture = bool(os.environ.get("CAPTURE")); caplines = []; capinfo = []; capsock = None
+    if capture:
+        import socket as so
+        capsock = so.socket(so.AF_INET, so.SOCK_DGRAM); capsock.bind(("127.0.0.1", 0)); capsock.settimeout(0.5)
+        logport = capsock.getsockname()[1]
+        def capsink():
+            while not capstop:
+                try: d, _ = capsock.recvfrom(65536)
+                except OSError: continue
+                caplines.append(d.decode(errors="replace").strip())
+        capstop = []; threading.Thread(target=capsink, daemon=True).start()
+    capcfg = f"    log 127.0.0.1:{logport} local0\n    option httplog\n" if capture else ""
+    open(f"{run}/proxy.cfg", "w").write(CFG.format(run=run, h1=H1, h2=H2, tlsbind=tlsbind, capture=capcfg))
     procs = []
     try:
         procs.append(spawn([HATERM, "-L", "127.0.0.1:8888", "-G", "nbthread 8", "-G", f"stats socket {run}/haterm.sock mode 666"],
@@ -212,6 +230,11 @@ def run_one(binary, label, outdir, secs, name):
                 time.sleep(1); s = stat(pid)
                 if s is None: samples.append(None); return
                 samples.append((s[0], (s[1] - last[1]) * 100, s[2])); last = s
+                if capture:
+                    try:
+                        info = dict(l.split(": ", 1) for l in cli(f"{run}/stats.sock", b"show info").splitlines() if ": " in l)
+                        capinfo.append((int(info.get("CurrConns", -1)), int(info.get("Maxsock", -1)), int(info.get("ConnRate", -1))))
+                    except (OSError, ValueError): capinfo.append(None)
         th = threading.Thread(target=sampler); th.start()
         attacks, proto = SCEN[name]
         lport, lopt, lscheme = LEGIT[proto]
@@ -271,6 +294,21 @@ def run_one(binary, label, outdir, secs, name):
                    cpu_series=[round(s[1]) for s in live], fds_series=[s[2] for s in live], rss_series=[s[0] // 1024 for s in live],
                    exit=proxy.returncode)
         res["panics"] = len(re.findall(r"panic|SIGSEGV|abort", open(f"{run}/proxy.log").read(), re.I))
+        if capture:
+            capstop.append(1); capsock.close()
+            open(f"{run}/httplog.txt", "w").write("\n".join(caplines) + "\n")
+            from collections import Counter
+            hist = Counter()
+            for l in caplines:
+                m = re.search(r" -?\d+/-?\d+/-?\d+/-?\d+/-?\d+ (\d{3}|-1) -?\d+ \S+ \S+ ([A-Za-z-]{4}) ", l)
+                hist[(m.group(1), m.group(2)) if m else ("?", "?")] += 1
+            res["cap_log_lines"] = len(caplines)
+            res["cap_top"] = [[st, fl, n] for (st, fl), n in hist.most_common(12)]
+            res["cap_503"] = sum(n for (st, fl), n in hist.items() if st == "503")
+            ci = [c for c in capinfo if c]
+            res["cap_currconns_series"] = [c[0] for c in capinfo] if capinfo else []
+            res["cap_maxsock"] = ci[0][1] if ci else None
+            res["cap_connrate_series"] = [c[2] for c in capinfo] if capinfo else []
         json.dump(res, open(f"{outdir}/{label}-{name}.json", "w"))
         print(json.dumps(res), flush=True)
         stop(proxy)
