@@ -219,6 +219,8 @@ pub struct GlobalSection {
     pub h2_max_concurrent_streams: Option<u32>,
     /// `tune.h2.fe.max-concurrent-streams`: the same for frontends, over the global one when not 0.
     pub h2_fe_max_concurrent_streams: Option<u32>,
+    /// `tune.h2.fe.rxbuf`: the bytes a frontend HTTP/2 connection may hold for its streams (default: one 16 KB buffer per allowed stream).
+    pub h2_fe_rxbuf: Option<usize>,
     /// Maximum total streams per HTTP/2 connection (`tune.h2.fe.max-total-streams`). Default: 0 (unlimited).
     pub h2_max_total_streams: Option<usize>,
     /// Glitches threshold before graceful GOAWAY and hard close (`tune.h2.fe.glitches-threshold`). Default: 0 (disabled).

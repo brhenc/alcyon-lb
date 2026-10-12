@@ -4151,6 +4151,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     .as_ref()
                     .and_then(|g| g.h2_glitches_threshold)
                     .unwrap_or(0),
+                rxbuf: config.global.as_ref().and_then(|g| g.h2_fe_rxbuf).unwrap_or(0),
             },
             idle_backend_pool: IdlePool::default(),
             next_stick_purge: None,

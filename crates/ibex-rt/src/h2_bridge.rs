@@ -362,6 +362,10 @@ pub(crate) fn pump_h2_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, r
                 }
                 // A chunk's size line takes at most 8 bytes, with its two CRLFs.
                 let framing = if st.chunked { 12 } else { 0 };
+                // The head went into a small buffer (T312); a body takes a full one, else
+                // it goes to the server a kilobyte at a time (4 uploads of 256 KB: 256
+                // writes each, ~35 ms a round where `HAProxy` takes 7).
+                req.promote_to_standard();
                 let room = req.writable();
                 if room.len() <= framing {
                     break;

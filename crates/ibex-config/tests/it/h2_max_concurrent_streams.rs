@@ -79,3 +79,17 @@ fn the_backend_keyword_is_refused_with_its_reason() {
     let e = global("tune.h2.be.max-concurrent-streams 3").unwrap_err();
     assert!(e.contains("'tune.h2.be.max-concurrent-streams' is not supported") && e.contains("HTTP/1.1"), "{e}");
 }
+
+/// `tune.h2.fe.rxbuf` as `h2_parse_rxbuf` reads it (`haproxy -c` 3.5-dev8-885761-29): a size
+/// with an optional k, m or g, one argument; `abc` is "unexpected character 'a' in size
+/// argument 'abc'". It reaches the data path as the connection's receive budget
+/// (`H2MuxContext::rx_budget`, `ibex-proto`).
+#[test]
+fn the_frontend_rxbuf_is_a_size() {
+    let rxbuf = |line: &str| parse_str(&format!("global\n\t{line}\n")).map(|c| c.global.expect("global").h2_fe_rxbuf).map_err(|e| e.message);
+    assert_eq!(rxbuf("tune.h2.fe.rxbuf 8m"), Ok(Some(8 << 20)));
+    assert_eq!(rxbuf("tune.h2.fe.rxbuf 1048576"), Ok(Some(1 << 20)));
+    assert_eq!(rxbuf("tune.h2.fe.rxbuf 2k"), Ok(Some(2048)));
+    assert_eq!(rxbuf("tune.h2.fe.rxbuf abc"), Err("'tune.h2.fe.rxbuf': unexpected character 'a' in size argument 'abc'.".to_string()));
+    assert_eq!(rxbuf("tune.h2.fe.rxbuf 5 6"), Err("'tune.h2.fe.rxbuf' cannot handle unexpected argument '6'.".to_string()));
+}

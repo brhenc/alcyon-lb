@@ -340,6 +340,26 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        // `h2_parse_rxbuf` (mux_h2.c): a size. The budget of what a frontend connection holds
+        // for its streams (`engine.rs` `global_h2_flood_config.rxbuf`, `H2MuxContext::rx_budget`).
+        "tune.h2.fe.rxbuf" => {
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'tune.h2.fe.rxbuf' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            let Some(arg) = tokens.get(1) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.h2.fe.rxbuf' expects an argument."));
+            };
+            // `parse_size_err`: digits, then one of k, m, g; the first other character is named.
+            let t = arg.text.as_str();
+            let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+            let rest = &t[digits..];
+            if !matches!(rest.to_ascii_lowercase().as_str(), "" | "k" | "m" | "g") {
+                let bad = if digits < t.len() && rest.len() > 1 && matches!(rest.as_bytes()[0] | 0x20, b'k' | b'm' | b'g') { &rest[1..] } else { rest };
+                return Err(ConfigError::new(arg.line, arg.col, format!("'tune.h2.fe.rxbuf': unexpected character '{}' in size argument '{t}'.", bad.chars().next().unwrap_or('\0'))));
+            }
+            global.h2_fe_rxbuf = Some(super::scalars::parse_size(arg).unwrap_or(0));
+            Ok(())
+        }
         // HAProxy accepts it; Ibex opens no HTTP/2 connection to a server (`server ... proto h2`
         // is refused, requests go out as HTTP/1.1), so there is no stream to limit.
         "tune.h2.be.max-concurrent-streams" => Err(ConfigError::new(

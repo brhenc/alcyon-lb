@@ -109,6 +109,7 @@ mod h2_buffering;
 mod h2_early_response_rst;
 mod h2_backend_reuse;
 mod h2_concurrent_streams;
+mod h2_rx_budget;
 mod h2_connection_end_log;
 mod h2_flood_knobs;
 mod h2_frame_flags;
