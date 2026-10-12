@@ -222,6 +222,71 @@ fn a_slow_client_holds_no_buffer_for_a_forwarded_request() {
     }
 }
 
+/// T318: a burst of slow clients makes the heap hold hundreds of buffers at once; they go
+/// back to the pool or the allocator, but the allocator keeps the pages. Once the engine has
+/// been quiet for a while it must give them back (`buf::trim_idle`, `malloc_trim`), as
+/// HAProxy's pool garbage collector does; otherwise RSS stays at the burst's peak.
+#[test]
+fn the_engine_gives_the_heap_back_after_a_burst_of_slow_clients() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    const N: usize = 200;
+    let running = Arc::new(AtomicBool::new(true));
+    let srv = endless_backend(Arc::clone(&running));
+    let fe = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+    let mut engine = engine(srv, fe);
+    let before = ibex_rt::buf::heap_trims();
+    let mut clients = Vec::new();
+    for _ in 0..N {
+        let mut c = slow_client(fe);
+        c.write_all(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+        clients.push(c);
+        let _ = engine.run_once();
+    }
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        let _ = engine.run_once();
+    }
+    let trims = ibex_rt::buf::heap_trims() - before;
+    println!("heap trims after a burst of {N} slow clients: {trims}");
+    assert!(trims >= 1, "the heap was never given back");
+    running.store(false, Ordering::Relaxed);
+    drop(clients);
+    for _ in 0..20 {
+        let _ = engine.run_once();
+    }
+}
+
+/// `trim_idle` itself: buffers allocated and freed in a burst leave their pages resident
+/// until the idle hook runs.
+#[test]
+fn trim_idle_returns_the_pages_of_freed_buffers() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let rss = || -> usize {
+        let s = std::fs::read_to_string("/proc/self/statm").expect("statm");
+        s.split_whitespace().nth(1).and_then(|v| v.parse::<usize>().ok()).expect("rss") * 4096
+    };
+    // a live neighbour per buffer keeps the freed chunks from being the top of the heap
+    let mut keep = Vec::new();
+    let mut bufs = Vec::new();
+    let base = rss();
+    for _ in 0..1500 {
+        let mut b = ibex_rt::buf::Buf::standard();
+        b.writable().fill(1);
+        bufs.push(b);
+        keep.push(vec![1u8; 64]);
+    }
+    let peak = rss();
+    drop(bufs);
+    let t0 = Instant::now();
+    ibex_rt::buf::trim_idle(t0);
+    ibex_rt::buf::trim_idle(t0 + Duration::from_secs(2));
+    let after = rss();
+    println!("rss: base {base} peak {peak} after {after}");
+    assert!(peak - base > 10_000_000, "the burst did not grow the heap");
+    assert!(after - base < (peak - base) / 4, "freed buffers still resident");
+    drop(keep);
+}
+
 /// HAProxy keeps ~1 KB of RSS per idle client, request or not; T183's target is at most
 /// twice that. The session itself (its arena slot is preallocated here) is not counted:
 /// what is held is what the connection allocated -- its buffers above all.

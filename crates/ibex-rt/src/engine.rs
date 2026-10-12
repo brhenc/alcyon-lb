@@ -4663,6 +4663,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             proxies.get(be).and_then(|p| p.server_actconn.get(s)).map_or(0, |a| a.load(Ordering::Relaxed))
         });
         self.idle_backend_pool.sweep(now_inst);
+        crate::buf::trim_idle(now_inst);
         self.purge_stick_tables(now_inst);
         let poll_timeout = self
             .idle_backend_pool

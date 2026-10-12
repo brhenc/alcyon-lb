@@ -170,6 +170,59 @@ pub enum BufClass {
 
 const MAX_CACHED_PER_THREAD: usize = 64;
 
+/// Number of times the idle hook gave free heap memory back to the system.
+static HEAP_TRIMS: AtomicUsize = AtomicUsize::new(0);
+
+/// Fresh heap buffers it takes since the last trim for another one to be worth it.
+const TRIM_MIN_FRESH: usize = 64;
+/// How long no buffer has had to come from the heap before the pages are given back.
+const TRIM_QUIET: std::time::Duration = std::time::Duration::from_millis(500);
+
+struct TrimState {
+    seen: usize,
+    changed: Option<std::time::Instant>,
+    trimmed_at: usize,
+}
+
+thread_local! {
+    static TRIM: RefCell<TrimState> = const { RefCell::new(TrimState { seen: 0, changed: None, trimmed_at: 0 }) };
+}
+
+/// Number of times the idle hook gave free heap memory back to the system.
+#[must_use]
+pub fn heap_trims() -> usize {
+    HEAP_TRIMS.load(Ordering::Relaxed)
+}
+
+/// Gives the allocator's free pages back once a burst is over (T318). A burst of
+/// connections in flight needs a buffer each, hundreds at once; they are freed afterwards
+/// (the pool caches only `MAX_CACHED_PER_THREAD`), but glibc keeps the pages in its free
+/// lists and RSS stays at the peak -- 9 KB per connection after 1000 slow clients, where
+/// `HAProxy` is at 4.5 KB. `HAProxy` has the same `malloc_trim` in its pool garbage
+/// collector. Called on every pass of the engine loop (at most every 100 ms): when at
+/// least `TRIM_MIN_FRESH` buffers had to be allocated from the heap since the last trim and
+/// none has been for `TRIM_QUIET`, the trim is done.
+pub fn trim_idle(now: std::time::Instant) {
+    let allocated = BUF_STD_ALLOCATED.load(Ordering::Relaxed);
+    let due = TRIM.with(|t| {
+        let mut t = t.borrow_mut();
+        if allocated != t.seen || t.changed.is_none() {
+            t.seen = allocated;
+            t.changed = Some(now);
+            return false;
+        }
+        let quiet = t.changed.is_some_and(|c| now.saturating_duration_since(c) >= TRIM_QUIET);
+        if quiet && allocated.wrapping_sub(t.trimmed_at) >= TRIM_MIN_FRESH {
+            t.trimmed_at = allocated;
+            return true;
+        }
+        false
+    });
+    if due && ibex_alloc::trim_heap() {
+        HEAP_TRIMS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 struct ThreadPools {
     small: Vec<Box<[u8]>>,
     standard: Vec<Box<[u8]>>,
