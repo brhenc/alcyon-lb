@@ -433,3 +433,26 @@ mod tests {
         assert!(dump.contains("Total: 1 pools, 1097728 bytes allocated, 1097728 used"));
     }
 }
+
+/// Gives the free pages of the allocator's heap back to the system (glibc `malloc_trim`).
+/// Returns whether anything was done: false where the allocator has no such call.
+#[must_use]
+#[allow(unsafe_code)]
+pub fn trim_heap() -> bool {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: `malloc_trim` takes no pointer, is thread-safe in glibc, and only
+        // releases memory the allocator has already freed.
+        unsafe {
+            malloc_trim(0);
+        }
+        true
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
+    }
+}
