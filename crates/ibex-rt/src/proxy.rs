@@ -2238,6 +2238,20 @@ impl TcpSession {
                 // that byte, not a 408 later (T291).
                 self.fail_request(400);
                 return Ok(true);
+            } else if let early @ (ibex_proto::h1::ClEarly::Bad | ibex_proto::h1::ClEarly::Conflict) = match ibex_proto::h1::scan_request_line(self.req.readable(), self.accept_unsafe_request) {
+                ibex_proto::h1::ReqLineScan::Complete(l) => ibex_proto::h1::content_length_early(self.req.readable(), l.eol + l.eol_len),
+                _ => ibex_proto::h1::ClEarly::Fine,
+            } {
+                // A head not yet whole with a bad `Content-Length` line, refused when the
+                // line completes as HAProxy does: a 400, or for a value that differs from an
+                // earlier line's a close with nothing written (T315).
+                self.fail_request(400);
+                if early == ibex_proto::h1::ClEarly::Conflict {
+                    if let Some(t) = self.txn.as_mut() {
+                        t.quiet = true;
+                    }
+                }
+                return Ok(true);
             } else if self.req.readable().len() + 56 >= self.bufsize {
                 // No end of head and the buffer is full: 431 as well. Measured on 3.5-dev8,
                 // a partial head draws it from `bufsize - 56` bytes on (the 40 of `struct

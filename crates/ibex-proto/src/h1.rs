@@ -1065,6 +1065,63 @@ pub fn header_lines_invalid(buf: &[u8], mut at: usize, accept_unsafe: bool) -> b
     false
 }
 
+/// What the `Content-Length` lines of a head not yet whole already settle
+/// ([`content_length_early`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClEarly {
+    /// Nothing wrong yet: wait for the rest of the head.
+    Fine,
+    /// A value that is not a number, or a list of different values in the first line: 400.
+    Bad,
+    /// A value that differs from an earlier line's: the connection closes, nothing written
+    /// (`HAProxy` logs a 400; [`Refusal::quiet`]).
+    Conflict,
+}
+
+/// The `Content-Length` lines of a request head not yet whole, from `at` in `buf`, read as
+/// `HAProxy` reads them as each line completes (`h1_headers_to_hdr_list`,
+/// `h1_parse_cont_len_header`, T315). A line counts once it ends with LF and a byte of the
+/// next is in. A value is a list of decimal numbers that fit 64 bits; the list of the first
+/// line holds one number; a number that differs from an earlier line's is a [`ClEarly::Conflict`].
+/// It stops at the end of the head, which the full parse judges. One pass, no allocation.
+#[must_use]
+pub fn content_length_early(buf: &[u8], mut at: usize) -> ClEarly {
+    let mut seen: Option<u64> = None;
+    while at < buf.len() {
+        let Some(nl) = buf[at..].iter().position(|&b| b == b'\n') else { break };
+        let end = at + nl;
+        // The next line's first byte decides nothing but whether this one is folded; a line
+        // is judged once it is there.
+        if end + 1 >= buf.len() {
+            break;
+        }
+        let line = &buf[at..end];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        at = end + 1;
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
+        if !line[..colon].eq_ignore_ascii_case(b"content-length") {
+            continue;
+        }
+        let value = line[colon + 1..].trim_ascii();
+        let first_line = seen.is_none();
+        for (i, item) in value.split(|&b| b == b',').enumerate() {
+            let item = item.trim_ascii();
+            if item.is_empty() || !item.iter().all(u8::is_ascii_digit) {
+                return ClEarly::Bad;
+            }
+            let Some(n) = std::str::from_utf8(item).ok().and_then(|s| s.parse::<u64>().ok()) else { return ClEarly::Bad };
+            match seen {
+                Some(prev) if prev != n => return if first_line && i > 0 { ClEarly::Bad } else { ClEarly::Conflict },
+                _ => seen = Some(n),
+            }
+        }
+    }
+    ClEarly::Fine
+}
+
 #[cfg(test)]
 fn parse_request_line_borrowed(line: &str) -> io::Result<(&str, &str, &str)> {
     let mut parts = line.split_whitespace();
