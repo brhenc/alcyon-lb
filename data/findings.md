@@ -34,7 +34,7 @@ vv-battery             1.8  never            6
 vv-soak                7.0  2026-10-12 14:38 2
 vv-probe               0.2  2026-10-11 21:34 3
 vv-recheck             0.1  never            2
-redteam                0.2  2026-10-12 12:31 1
+redteam                1.0  2026-10-12 12:31 2
 fuzz-libfuzzer         3.0  2026-10-10 22:18 4
 fuzz-differential      0.0  2026-10-11 11:30 0
 review                 0.0  2026-10-11 11:00 0
