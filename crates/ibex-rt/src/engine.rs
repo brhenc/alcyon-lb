@@ -11411,7 +11411,8 @@ impl EngineDispatcher<'_> {
             let low = s_idx.map_or(0, |i| proxies[be_idx].ids.server_pool(i).low_conn);
             let steal = key.as_ref().is_none_or(|k| idle_pool.may_steal(k.srv, low));
             let srv = key.as_ref().map(|k| k.srv);
-            if let Some((conn, safe)) = key.and_then(|k| idle_pool.take(&k, entry.sess.is_first_req, proxies[be_idx].http_reuse, steal)) {
+            // Every stream of an HTTP/2 frontend is "not the first request" (`SE_FL_NOT_FIRST`, `mux_h2.c`).
+            if let Some((conn, safe)) = key.and_then(|k| idle_pool.take(&k, entry.sess.is_first_req && !entry.sess.is_h2_child(), proxies[be_idx].http_reuse, steal)) {
                 entry.srv_served = if safe { 2 } else { 1 };
                 reused = Some(conn);
             }
