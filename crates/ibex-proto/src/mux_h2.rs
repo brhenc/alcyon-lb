@@ -1182,6 +1182,26 @@ impl MuxH2 {
                 ));
             }
 
+            // RFC 9113 5.3.1: a stream cannot depend on itself, a connection error here
+            // (`h2c_handle_priority`, measured: GOAWAY PROTOCOL_ERROR). Otherwise a client
+            // could use it, with a request before it in the same read, as a reset trigger
+            // (MadeYouReset, T309).
+            Frame::Priority {
+                stream_id,
+                stream_dependency,
+                ..
+            } if stream_dependency == stream_id => {
+                ctx.send_goaway(
+                    ctx.last_client_stream_id,
+                    H2Error::ProtocolError,
+                    b"PRIORITY depends on itself",
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PRIORITY depends on itself",
+                ));
+            }
+
             Frame::Priority { .. }
             | Frame::PushPromise { .. }
             | Frame::Unknown { .. } => {}
