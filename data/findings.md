@@ -15,24 +15,24 @@ needs `fixed_on`; `fixed` (time) feeds the mean time to fix. Check with
 never an open finding. Then `python3 tools/findings.py --md` and commit the CSVs and this file.
 
 ```
-== (a) open findings: 19 of 66
+== (a) open findings: 20 of 67
 severity        dos      leak    parity      perf     flaky  total
 critical          0         0         0         0         0      0
 high              0         0         0         0         0      0
-medium            1         0         0         0         0      1
+medium            1         0         1         0         0      2
 low               4         1        11         1         1     18
 
 == (b) new findings per method per day
-day                 vv-probe           redteam    fuzz-libfuzzer fuzz-differential            review              gate
-2026-10-10                 4                 0                 1                 0                31                 1
-2026-10-11                 6                 6                 0                 7                 5                 2
-2026-10-12                 0                 3                 0                 0                 0                 0
+day                  vv-soak          vv-probe           redteam    fuzz-libfuzzer fuzz-differential            review              gate
+2026-10-10                 0                 4                 0                 1                 0                31                 1
+2026-10-11                 0                 6                 6                 0                 7                 5                 2
+2026-10-12                 1                 0                 3                 0                 0                 0                 0
 
 == (c) clean hours since the method's last new finding (runs on the main lineage)
 method               hours  last finding     runs
 vv-battery             1.8  never            6
-vv-soak               15.4  never            11
-vv-probe               0.1  2026-10-11 21:34 2
+vv-soak                0.0  2026-10-12 14:38 0
+vv-probe               0.2  2026-10-11 21:34 3
 vv-recheck             0.1  never            2
 redteam                0.2  2026-10-12 12:31 1
 fuzz-libfuzzer         3.0  2026-10-10 22:18 4
