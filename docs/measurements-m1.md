@@ -1,4 +1,109 @@
-# M1 resource measurements (T180)
+# M1 resource measurements (T180, re-measured T294)
+
+(`docs/tradeoff.md` does not exist, so the table is here; `docs/milestones.md` "Resource
+parameters" is the source of the targets.)
+
+- Date: 2026-10-12, 08:14-10:00. Commit: 29cdff64 (Ibex built with
+  `CARGO_TARGET_DIR=/home/bhenc/ibex-targets/T294 CARGO_INCREMENTAL=0 cargo build --release --bin ibex`).
+- HAProxy: `/home/bhenc/reference/haproxy/haproxy` 3.5-dev8-885761-29, also the origin server
+  (4 threads, `http-request return`).
+- Machine: 64 CPUs, quiet. Peers paused, no `wwm.exe`/`wineserver` before or after any run
+  (checked with `ps`). `uptime` load average (1/5/15) at script start: 0.8-3.5 / 2.0-3.3 / 2.7-5.8
+  (the 15 min figure still decaying from earlier work at the start); highest 1-min value at
+  the start or end of a run 4.95. Every script ran under `flock -o -x /tmp/ibex-load.lock`.
+- Each row: 3 runs of the script (each script itself takes the median of 3 internal runs
+  where it has a loop), median of those. Both proxies on the same generated config
+  (`tools/measure/m1lib.py` `proxy_cfg`), `nbthread 1`, frontend `maxconn` explicit.
+  Exceptions: reload `single` ran 3 times at full host and once (3 internal runs) at 16 cores;
+  reload `soak` (100 reloads, 1k backends only) and `m1_uneven_load.py` ran once per
+  configuration (3 internal runs for uneven).
+- **Two configurations.** "Full" = whole host. "16 cores" = the whole script (proxies,
+  origin and Python/wrk2 clients; the scripts cannot pin proxy and client apart) under
+  `taskset -c 0-15`. This is not 8 cores; no 8-core run was made. All numbers on a machine
+  with 16 cores or more are therefore these; fewer cores are untested.
+- Ports: the scripts pick ephemeral ports (`free_port()` binds port 0); `m1_reload.py` and
+  `m1_uneven_load.py` use 27001-27099. None takes a port argument, so 18600-18999 was not used.
+- **Tools substituted** (unchanged from the previous run). `wrk`, `h2load` and `ab` are not
+  installed. Throughput and latency use the Python client in `m1lib.load()` (epoll, up to 12
+  processes), h2 uses `curl --http2 --parallel`, TLS handshakes `openssl s_time -new -tls1_3`,
+  reload/uneven use `~/.local/bin/wrk2`. A Python client tops out near 30-35k rps, so the
+  50-conn small-body rows are probably partly client-limited.
+- `m1_reload.py` and `m1_uneven_load.py` are not executable; run as `python3 tools/measure/...`.
+
+Commands, from the repo root with `CARGO_TARGET_DIR=/home/bhenc/ibex-targets/T294`, wrapped as
+`flock -o -x /tmp/ibex-load.lock [taskset -c 0-15] <command>`.
+
+| Parameter | Ibex full | HAProxy full | Ratio | Ibex 16 cores | HAProxy 16 cores | Ratio | M1 target | Result | Command |
+|---|---:|---:|---:|---:|---:|---:|---|---|---|
+| RSS per idle keep-alive conn (10k) | 1 674 B | 1 062 B | 1.58x | 1 691 B | 1 062 B | 1.59x | <= 2x | PASS | `tools/measure/m1_idle_conn_rss.py` |
+| RSS per active conn, 1 MB body in flight (1k) | 10 449 B | 4 514 B | 2.31x | 11 022 B | 4 514 B | 2.44x | <= 2x | **MISS (T318)** | `tools/measure/m1_active_conn_rss.py` |
+| Throughput 1 conn, small | 4 897 rps | 4 696 rps | 1.04 | 5 108 | 5 061 | 1.01 | >= 0.8x | PASS | `tools/measure/m1_throughput.py` |
+| Throughput 50 conns, small | 27 587 rps | 31 808 rps | 0.87 | 29 712 | 35 220 | 0.84 | >= 0.8x | PASS (client-limited?) | same |
+| Throughput 1 conn, 64 KB | 2 750 rps | 2 082 rps | 1.32 | 2 781 | 2 193 | 1.27 | >= 0.8x | PASS | same |
+| Throughput 50 conns, 64 KB | 10 336 rps | 11 434 rps | 0.90 | 10 814 | 11 802 | 0.92 | >= 0.8x | PASS | same |
+| Added latency p50 at 50% of max (15 105 rps full, 17 023 rps 16 cores) | +45 us | +79 us | 0.57 | +28 us | +50 us | 0.55 | - | info | `tools/measure/m1_latency.py` |
+| Latency p99 at the same rate (absolute; added: +75 vs +166 us full, +42 vs +125 us 16 cores) | 1 310 us | 1 401 us | 0.93 | 1 274 us | 1 357 us | 0.94 | p99 <= 1.5x | PASS | same |
+| CPU per request, h2 (TLS, ALPN h2) | 37.3 us | 39.0 us | 0.96 | 36.6 us | 37.8 us | 0.97 | <= 1.5x | PASS | `tools/measure/m1_h2_tls.py` |
+| TLS handshakes per CPU-second (ECDSA P-256, TLS 1.3) | 4 650 (215 us) | 2 811 (356 us) | CPU 0.60 | 4 811 (208 us) | 2 857 (350 us) | CPU 0.59 | <= 1.5x CPU | PASS | same |
+| File descriptors per connection | 1.01 | 1.01 | 1.00 | 1.01 | 1.01 | 1.00 | equal | PASS | `tools/measure/m1_fds.py` |
+| Startup, 10k backends, to first accepted conn | 0.106 s | 0.169 s | 0.63 | 0.10 s | 0.166 s | 0.60 | <= 2x | PASS | `tools/measure/m1_startup_10k.py` |
+
+Run-to-run ranges (3 runs): idle RSS Ibex 1 665-1 679 B; active RSS Ibex 9 019-11 534 B (full),
+10 924-11 031 B (16 cores); 50-conn small throughput Ibex 26 218-27 662 rps vs HAProxy 31 187-32 023.
+
+Reload and uneven load (T214 rows, same scripts, same method as the section below):
+
+| Parameter | Ibex full | HAProxy full | Ratio | Ibex 16 cores | HAProxy 16 cores | Ratio | Target | Result | Command |
+|---|---:|---:|---:|---:|---:|---:|---|---|---|
+| Reload, 1k backends, SIGUSR2 -> new worker accepting, `-W` | 53 ms | 125 ms | 0.42 | 113 ms | 185 ms | 0.61 | <= 2x | PASS | `python3 tools/measure/m1_reload.py single` |
+| same, Ibex `-W -S` | 124 ms | 125 ms | 0.99 | 131 ms | 185 ms | 0.71 | <= 2x | PASS | same |
+| Reload, 10k backends, `-W` | 179 ms | 209 ms | 0.86 | 222 ms | 204 ms | 1.09 | <= 2x | PASS | same |
+| same, Ibex `-W -S` | 164 ms | 209 ms | 0.78 | 160 ms | 204 ms | 0.78 | <= 2x | PASS | same |
+| Peak RSS old+new, 1k, `-W` (baseline 15.5 vs 53.3 MB) | 30.7 MB | 85.4 MB | 0.36 | 30.7 MB | 85.3 MB | 0.36 | <= 2x | PASS | same |
+| same, Ibex `-W -S` (baseline 25.3 MB) | 40.5 MB | 85.4 MB | 0.47 | 40.3 MB | 85.3 MB | 0.47 | <= 2x | PASS | same |
+| Peak RSS old+new, 10k, `-W` (baseline 72 vs 131.9 MB) | 144.1 MB | 242.6 MB | 0.59 | 143.9 MB | 242.6 MB | 0.59 | <= 2x | PASS | same |
+| same, Ibex `-W -S` (baseline 112.5 MB) | 184.5 MB | 242.6 MB | 0.76 | 183.9 MB | 242.6 MB | 0.76 | <= 2x | PASS | same |
+| Failed requests (py client with one legal retry of an idle close), all reloads | 0 | 0 | - | 0 | 0 | - | 0 | PASS | same |
+| 100 reloads under load, 1k, `-W`: worker RSS before/after, fds net of conns | 15 440 / 14 976 kB, 8 / 7 | 32 236 / 32 212 kB, 10 / 10 | - | 15 368 / 15 340 kB, 8 / 8 | 32 268 / 32 252 kB, 10 / 10 | - | flat | PASS | `python3 tools/measure/m1_reload.py soak --sizes 1000` |
+| same, Ibex `-W -S`: worker RSS, fds; master RSS, fds | 15 884 / 15 320 kB, 9 / 9; master 9 840 / 10 112 kB, 5 / 5 | master 20 848 / 20 952 kB, 7 / 7 | - | 15 504 / 15 248 kB, 9 / 9; master 9 856 / 10 000 kB, 5 / 5 | master 20 876 / 20 972 kB, 7 / 7 | - | flat | PASS | same |
+| Backend conns accepted per 10 s, wrk2 -c100 -R1000 `Connection: close` /slow, nbthread 4 | 66 | 70 | 0.94 | 55 | 59 | 0.93 | within 10% | PASS (fewer) | `python3 tools/measure/m1_uneven_load.py` |
+| same, nbthread 16 | 96 | 91 | 1.05 | 94 | 85 | 1.11 | within 10% | PASS (1.11 is within the 91-100 run spread of HAProxy at 16 cores) | same |
+| Backend conns, T159 B burst cycles, nbthread 4 | 28 | 31 | 0.90 | 25 | 27 | 0.93 | within 10% | PASS (fewer) | same |
+| same, nbthread 16 | 31 | 31 | 1.00 | 30 | 30 | 1.00 | within 10% | PASS | same |
+
+Reload notes
+
+- Reload times are medians of per-invocation medians (full: 3 invocations x 3 runs; 16 cores:
+  1 x 3). Ibex `-W` 1k reload "new worker accepting" ranged 43-139 ms (full), HAProxy 123-127 ms.
+  In one full-host 1k run per `-W`/`-W -S` the RSS peak equalled the baseline (the sampler
+  missed the second process), so those RSS peaks are medians that exclude it.
+- **wrk2 timeouts now occur on Ibex too.** The 2026-10-05 table recorded 0 wrk2 errors for Ibex.
+  Now wrk2 reports timeouts on both proxies in 1k reloads (Ibex `-W` 54/50/215 per 3 runs,
+  `-W -S` 26/40/28, HAProxy 172/180/168) and in the 100-reload soak (about 4 300-4 400 for
+  all three layouts). The py client had 0 failed requests in every run, with 570-800 of its
+  idle connections closed during the soak by all three layouts and retried. So Ibex now
+  closes idle keep-alive connections of the old worker like HAProxy does; wrk2 neither retries
+  nor notices. Not a regression against HAProxy, but a change from the previous table.
+- Soak at 10k backends was started once and abandoned (about 25 min per invocation); not measured.
+- Old worker gone (median full, 1k / 10k): Ibex `-W` 70 / 201 ms, HAProxy 90 / 307 ms.
+
+Notes (carried over)
+
+- Latency run: direct-to-origin baseline p50 / p99 subtracted; max throughput at 50 conns
+  32 475 (Ibex) and 30 212 (HAProxy) rps full, 34 047 / 34 441 at 16 cores.
+- Idle RSS: HAProxy reuses one idle server connection for successive clients, Ibex now measures
+  10 006 fds at 10k clients vs HAProxy 10 007 (previously 20 005).
+- Active RSS: slow-client case only (4 KB receive buffer, never reads).
+- Not redone here: startup RSS (T175), CPU per request h1 and allocations (`tools/measure/run.sh`).
+- Discarded runs: none because of the game or load. Two attempts were not measurements:
+  the first launch of `m1_reload.py`/`m1_uneven_load.py` failed with "Permission denied"
+  (script not executable, nothing ran), and a 10k soak was killed by me to save time.
+
+Raw `RESULT` lines of the runs are printed by each script; re-run any row with its command.
+
+## Previous run (2026-10-05, 4d2cc6f, loaded host)
+
+(Original title: M1 resource measurements (T180).)
 
 (`docs/tradeoff.md` does not exist, so the table is here; `docs/milestones.md` "Resource
 parameters" is the source of the targets.)
@@ -57,7 +162,7 @@ Notes on individual rows
 
 Raw `RESULT` lines of the runs are printed by each script; re-run any row with its command.
 
-## Reload and uneven load (T214)
+## Previous run: reload and uneven load (T214, 2026-10-05, 863f5a8)
 
 - Date: 2026-10-05. Commit: 863f5a8 (no `crates/` change; Ibex built with
   `CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t214 CARGO_INCREMENTAL=0 cargo build --release --bin ibex`).
