@@ -31,7 +31,7 @@ day                  vv-soak          vv-probe           redteam    fuzz-libfuzz
 == (c) clean hours since the method's last new finding (runs on the main lineage)
 method               hours  last finding     runs
 vv-battery             1.8  never            6
-vv-soak                0.0  2026-10-12 14:38 0
+vv-soak                7.0  2026-10-12 14:38 2
 vv-probe               0.2  2026-10-11 21:34 3
 vv-recheck             0.1  never            2
 redteam                0.2  2026-10-12 12:31 1
