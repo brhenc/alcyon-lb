@@ -35,6 +35,9 @@ use std::io;
 /// nothing can make the connection queue in replies (RST_STREAM, PING and SETTINGS ACKs).
 pub const TX_ROOM: usize = 65536;
 
+/// The size of one receive buffer of the connection's budget (`tune.bufsize`, 16 KB).
+const RX_BUF: usize = 16384;
+
 static H2_OPS: MuxOps = MuxOps {
     name: "h2",
     alpn: Some(b"h2"),
@@ -56,6 +59,11 @@ pub struct H2StreamCtx {
     /// A stream holds at most its receive window of them: the next DATA frame waits in
     /// `rx_buf`, and the connection's demux with it, until they drain (T235).
     pub rx_buffered: usize,
+    /// The receive window the stream has been granted beyond the initial one, as a size: 0
+    /// until a body that needs more starts to flow ([`H2MuxContext::grow_rx_window`]). The
+    /// stream holds at most this much (or the initial window) of DATA the data path has not
+    /// taken ([`MuxH2::demux_blocked`]).
+    pub rx_limit: usize,
     /// `scheme://authority` of a request that carried both pseudo-headers: what `HAProxy`
     /// puts before the path in the start line it logs and counts (`GET http://x/g HTTP/2.0`).
     pub abs_prefix: Option<String>,
@@ -74,6 +82,7 @@ impl H2StreamCtx {
             is_shut: false,
             dispatched: false,
             rx_buffered: 0,
+            rx_limit: 0,
             abs_prefix: None,
         }
     }
@@ -90,6 +99,9 @@ pub struct H2FloodConfig {
     /// (`tune.h2.{,fe.}max-concurrent-streams`); `None` is the default, 100. 0 advertises
     /// nothing and refuses every stream.
     pub max_concurrent_streams: Option<u32>,
+    /// The connection's receive budget in bytes (`tune.h2.fe.rxbuf`); 0 is the default, one
+    /// buffer per allowed stream ([`H2MuxContext::rx_budget`]).
+    pub rxbuf: usize,
 }
 
 /// HTTP/2 Connection Context.
@@ -103,6 +115,8 @@ pub struct H2MuxContext {
     pub streams: BTreeMap<u32, H2StreamCtx>,
     pub conn_send_window: i32,
     pub conn_recv_window: i32,
+    /// The connection window has been opened wide ([`Self::rx_taken`]).
+    pub rx_window_opened: bool,
     pub remote_initial_window: i32,
     pub local_initial_window: i32,
     /// How many streams may be open at once: on a server connection the client's, as
@@ -154,6 +168,7 @@ impl H2MuxContext {
             streams: BTreeMap::new(),
             conn_send_window: DEFAULT_INITIAL_WINDOW_SIZE,
             conn_recv_window: DEFAULT_INITIAL_WINDOW_SIZE,
+            rx_window_opened: false,
             remote_initial_window: DEFAULT_INITIAL_WINDOW_SIZE,
             local_initial_window: DEFAULT_INITIAL_WINDOW_SIZE,
             max_concurrent_streams: 100,
@@ -254,6 +269,58 @@ impl H2MuxContext {
     pub fn rx_taken(&mut self, stream_id: u32, n: usize) {
         if let Some(s) = self.streams.get_mut(&stream_id) {
             s.rx_buffered = s.rx_buffered.saturating_sub(n);
+        }
+        // The first update of the connection window opens it wide (`h2c_send_conn_wu`,
+        // `H2_CF_WINDOW_OPENED`): what the connection can be sent is bounded by the streams'
+        // windows and the budget, not by this one.
+        if !self.rx_window_opened && n > 0 {
+            self.rx_window_opened = true;
+            let inc = i32::MAX.saturating_sub(self.conn_recv_window);
+            self.send_window_update(0, inc.max(0) as u32);
+        }
+    }
+
+    /// The most DATA the connection holds for streams the data path has not taken from: one
+    /// buffer of [`RX_BUF`] per stream it allows, at least `tune.h2.fe.rxbuf` bytes, and one
+    /// more (`bl_init(h2c->shared_rx_bufs, nb_rxbufs + 1)`, `mux_h2.c`). The fuzz target
+    /// `h2_mux` holds the connection to 2 MiB with this.
+    #[must_use]
+    pub fn rx_budget(&self) -> usize {
+        let forced = self.flood_config.rxbuf.div_ceil(RX_BUF - 9);
+        (forced.max(self.max_concurrent_streams as usize) + 1) * RX_BUF
+    }
+
+    /// Grows the receive window of stream `stream_id`, which is receiving a body, to its
+    /// share of the budget (`h2c_update_strm_rx_win`): every existing stream is given one
+    /// buffer, a stream that is not receiving keeps just that, an eighth of the streams the
+    /// connection allows is kept for new ones, and the rest is shared among the streams
+    /// that receive, rounded up to a buffer. Only ever grows; what was granted stays, and
+    /// the budget itself is enforced by the demux ([`MuxH2::demux_blocked`]).
+    fn grow_rx_window(&mut self, stream_id: u32) {
+        let initial = usize::try_from(self.local_initial_window).unwrap_or(0);
+        let Some(st) = self.streams.get(&stream_id) else { return };
+        if st.state != H2StreamState::Open {
+            return;
+        }
+        // A body that fits the window already is not worth more (`H2_SF_DATA_CLEN`).
+        if st.rx_htx.get_header("content-length").and_then(|v| v.trim().parse::<usize>().ok()).is_some_and(|l| l <= initial) {
+            return;
+        }
+        let open = |s: &&H2StreamCtx| !matches!(s.state, H2StreamState::Closed | H2StreamState::Reset(_));
+        let nb_sc = self.streams.values().filter(open).count();
+        let receiving = self.streams.values().filter(|s| s.state == H2StreamState::Open).count().max(1);
+        let bufs = self.rx_budget() / RX_BUF;
+        let allocatable = bufs.saturating_sub(nb_sc.saturating_sub(receiving));
+        let reserved = (self.max_concurrent_streams as usize).saturating_sub(nb_sc).div_ceil(8);
+        let to_share = allocatable.saturating_sub(reserved);
+        let win = (RX_BUF * to_share).div_ceil(receiving).div_ceil(RX_BUF) * RX_BUF;
+        let cur = st.rx_limit.max(initial);
+        if win > cur {
+            let inc = u32::try_from(win - cur).unwrap_or(u32::MAX).min(i32::MAX as u32);
+            if let Some(st) = self.streams.get_mut(&stream_id) {
+                st.rx_limit = win;
+            }
+            self.send_window_update(stream_id, inc);
         }
     }
 
@@ -720,9 +787,13 @@ impl MuxH2 {
             return false;
         }
         let limit = usize::try_from(ctx.local_initial_window).unwrap_or(0).max(DEFAULT_MAX_FRAME_SIZE as usize);
-        ctx.streams.get(&header.stream_id).is_some_and(|s| {
-            s.state == H2StreamState::Open && s.rx_buffered > 0 && s.rx_buffered + header.length as usize > limit
-        })
+        let Some(s) = ctx.streams.get(&header.stream_id) else { return false };
+        if s.state != H2StreamState::Open || s.rx_buffered == 0 {
+            return false;
+        }
+        let len = header.length as usize;
+        s.rx_buffered + len > limit.max(s.rx_limit)
+            || ctx.streams.values().map(|s| s.rx_buffered).sum::<usize>() + len > ctx.rx_budget()
     }
 
     fn process_headers_block(
@@ -1065,9 +1136,15 @@ impl MuxH2 {
                     }
                 }
 
-                // Automatic window replenishment if receive window falls below 32KB
-                if ctx.conn_recv_window < 32768 {
-                    let replenish = (DEFAULT_INITIAL_WINDOW_SIZE - ctx.conn_recv_window) as u32;
+                if (flags & frame_flags::END_STREAM) == 0 {
+                    ctx.grow_rx_window(stream_id);
+                }
+
+                // Automatic window replenishment: once opened wide, when a billion bytes
+                // went; before, when the window falls below 32 KB.
+                let (low, full) = if ctx.rx_window_opened { (1 << 30, i32::MAX) } else { (32768, DEFAULT_INITIAL_WINDOW_SIZE) };
+                if ctx.conn_recv_window < low {
+                    let replenish = (full - ctx.conn_recv_window) as u32;
                     ctx.send_window_update(0, replenish);
                 }
             }
@@ -1485,26 +1562,127 @@ mod tests {
     }
 
     /// A stream holds at most its receive window of DATA: the frame past it waits in
-    /// `rx_buf` (the connection stops asking for input) until the data path takes some (T235).
+    /// `rx_buf` (the connection stops asking for input) until the data path takes some
+    /// (T235). The window of a stream that receives a body grows at its first DATA to its
+    /// share of the budget (T313: 88 buffers of 16 KB for the only stream of a default
+    /// connection, as `HAProxy` measured), so that is what it holds.
     #[test]
     fn data_past_the_stream_window_waits_until_the_stream_drains() {
         let (mux, mut ctx) = open_conn();
         mux.parse(&mut ctx, &post_headers(1)).expect("open");
         let mut wire = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..90 {
             wire.extend(data(1, 16384, 0));
         }
         mux.parse(&mut ctx, &wire).expect("data");
-        // Three frames fit the 65535-byte window, the fourth does not.
-        assert_eq!(ctx.streams.get(&1).map(|s| s.rx_buffered), Some(3 * 16384));
+        // 88 frames fit the grown window, the 89th does not.
+        assert_eq!(ctx.streams.get(&1).map(|s| s.rx_buffered), Some(88 * 16384));
         assert!(!ctx.wants_input(), "two frames wait: no more input");
         ctx.rx_taken(1, 16384);
         ctx.resume();
-        assert_eq!(ctx.streams.get(&1).map(|s| s.rx_buffered), Some(3 * 16384));
-        ctx.rx_taken(1, 3 * 16384);
+        assert_eq!(ctx.streams.get(&1).map(|s| s.rx_buffered), Some(88 * 16384));
+        ctx.rx_taken(1, 88 * 16384);
         ctx.resume();
         assert_eq!(ctx.streams.get(&1).map(|s| s.rx_buffered), Some(16384));
         assert!(ctx.rx_buf.is_empty() && ctx.wants_input());
+    }
+
+    /// The window increments sent on `stream` (0: the connection) since `from` of `tx_buf`.
+    fn wu_sent(ctx: &H2MuxContext, from: usize, stream: u32) -> Vec<u64> {
+        let (mut out, mut i) = (Vec::new(), from);
+        while i + 9 <= ctx.tx_buf.len() {
+            let len = (usize::from(ctx.tx_buf[i]) << 16) | (usize::from(ctx.tx_buf[i + 1]) << 8) | usize::from(ctx.tx_buf[i + 2]);
+            let sid = u32::from_be_bytes([ctx.tx_buf[i + 5], ctx.tx_buf[i + 6], ctx.tx_buf[i + 7], ctx.tx_buf[i + 8]]);
+            if ctx.tx_buf[i + 3] == 8 && sid == stream {
+                let p = &ctx.tx_buf[i + 9..i + 13];
+                out.push(u64::from(u32::from_be_bytes([p[0], p[1], p[2], p[3]])));
+            }
+            i += 9 + len;
+        }
+        out
+    }
+
+    /// `HAProxy` 3.5-dev8 (measured, one POST and 64 KB of DATA): the stream's window grows
+    /// by 1409024 at the first DATA, and the connection's opens by 2147434496 at the first
+    /// update. Ibex's initial stream window is 65535, not 16384: the grown window is the
+    /// same 88 buffers, so the stream is granted 88 x 16384 - 65535.
+    #[test]
+    fn a_receiving_stream_is_granted_its_share_and_the_connection_window_opens_wide() {
+        let (mux, mut ctx) = open_conn();
+        mux.parse(&mut ctx, &post_headers(1)).expect("open");
+        let before = ctx.tx_buf.len();
+        mux.parse(&mut ctx, &data(1, 16384, 0)).expect("data");
+        assert_eq!(wu_sent(&ctx, before, 1), vec![88 * 16384 - 65535]);
+        assert!(wu_sent(&ctx, before, 0).iter().sum::<u64>() < 65536, "the connection window is not opened before a byte is taken");
+        let before = ctx.tx_buf.len();
+        let open_from = ctx.conn_recv_window;
+        ctx.rx_taken(1, 16384);
+        assert_eq!(wu_sent(&ctx, before, 0), vec![i64::from(i32::MAX).saturating_sub(i64::from(open_from)) as u64]);
+        assert_eq!(ctx.conn_recv_window, i32::MAX);
+        // A body that fits the initial window gets no growth.
+        let small = Frame::Headers {
+            flags: frame_flags::END_HEADERS,
+            stream_id: 3,
+            header_block: {
+                HpackEncoder::new().encode(&[
+                    HeaderField { name: ":method".into(), value: "POST".into() },
+                    HeaderField { name: ":path".into(), value: "/".into() },
+                    HeaderField { name: "content-length".into(), value: "100".into() },
+                ])
+            },
+        }
+        .encode();
+        mux.parse(&mut ctx, &small).expect("open 3");
+        let before = ctx.tx_buf.len();
+        mux.parse(&mut ctx, &data(3, 100, 0)).expect("data 3");
+        assert!(wu_sent(&ctx, before, 3).is_empty(), "{:?}", wu_sent(&ctx, before, 3));
+    }
+
+    /// The budget: with no stream consumed, 100 streams send DATA until the connection holds
+    /// its budget (101 buffers of 16 KB), and not a frame more; the rest waits. The fuzz
+    /// target `h2_mux` holds the connection under 2 MiB with the same.
+    #[test]
+    fn the_connection_holds_no_more_than_its_budget_of_unconsumed_data() {
+        let (mux, mut ctx) = open_conn();
+        for k in 0..100 {
+            mux.parse(&mut ctx, &post_headers(1 + 2 * k)).expect("open");
+        }
+        let budget = ctx.rx_budget();
+        assert_eq!(budget, 101 * 16384);
+        let mut wire = Vec::new();
+        for _ in 0..40 {
+            for k in 0..100 {
+                wire.extend(data(1 + 2 * k, 16384, 0));
+            }
+        }
+        // The transport reads only while the connection wants input.
+        for chunk in wire.chunks(16393) {
+            if !ctx.wants_input() {
+                break;
+            }
+            let _ = mux.parse(&mut ctx, chunk);
+        }
+        let held: usize = ctx.streams.values().map(|s| s.rx_buffered).sum();
+        assert!(held <= budget, "held {held} > budget {budget}");
+        assert!(held > budget - 16384 * 3, "held {held}: the budget is not used");
+        assert!(ctx.rx_buf.len() < 3 * 16393, "only the frames waiting are kept: {}", ctx.rx_buf.len());
+        // Taking a stream's data makes room for the frames waiting.
+        let taken = ctx.streams.get(&1).map_or(0, |s| s.rx_buffered);
+        ctx.rx_taken(1, taken);
+        ctx.resume();
+        let held2: usize = ctx.streams.values().map(|s| s.rx_buffered).sum();
+        assert!(held2 > held - taken, "held {held2} after taking {taken} of {held}");
+    }
+
+    /// `tune.h2.fe.rxbuf` raises the budget (`nb_rxbufs = max(rxbuf / (bufsize - 9), streams)`).
+    #[test]
+    fn the_rxbuf_setting_raises_the_budget() {
+        let (_, mut ctx) = open_conn();
+        assert_eq!(ctx.rx_budget(), 101 * 16384);
+        ctx.flood_config.rxbuf = 8 << 20;
+        assert_eq!(ctx.rx_budget(), (8usize << 20).div_ceil(16375).max(100) * 16384 + 16384);
+        ctx.flood_config.rxbuf = 1 << 20;
+        assert_eq!(ctx.rx_budget(), 101 * 16384, "under the per-stream floor");
     }
 
     /// DATA after the client's END_STREAM is a stream error STREAM_CLOSED (HAProxy measured:
@@ -1615,7 +1793,8 @@ mod tests {
         let mut raw = vec![0, 0, 8, 0, frame_flags::PADDED, 0, 0, 0, 1, 4, b'a', b'b', b'c', 0, 0, 0, 0];
         mux.parse(&mut ctx, &raw).expect("padded data");
         assert_eq!(ctx.conn_recv_window, DEFAULT_INITIAL_WINDOW_SIZE - 8);
-        assert_eq!(ctx.streams.get(&1).map(|s| s.recv_window), Some(DEFAULT_INITIAL_WINDOW_SIZE - 8));
+        // The stream's window was grown to its share of the budget (T313): 88 buffers.
+        assert_eq!(ctx.streams.get(&1).map(|s| s.recv_window), Some(88 * 16384 - 8));
         // A pad length that does not fit is a connection error, PROTOCOL_ERROR.
         raw = vec![0, 0, 2, 0, frame_flags::PADDED, 0, 0, 0, 1, 9, b'a'];
         assert!(mux.parse(&mut ctx, &raw).is_err());
