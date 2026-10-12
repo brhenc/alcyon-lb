@@ -91,5 +91,7 @@ fn the_frontend_rxbuf_is_a_size() {
     assert_eq!(rxbuf("tune.h2.fe.rxbuf 1048576"), Ok(Some(1 << 20)));
     assert_eq!(rxbuf("tune.h2.fe.rxbuf 2k"), Ok(Some(2048)));
     assert_eq!(rxbuf("tune.h2.fe.rxbuf abc"), Err("'tune.h2.fe.rxbuf': unexpected character 'a' in size argument 'abc'.".to_string()));
+    // No argument: `parse_size_err("")` stops at the NUL, which ends the message.
+    assert_eq!(rxbuf("tune.h2.fe.rxbuf"), Err("'tune.h2.fe.rxbuf': unexpected character '".to_string()));
     assert_eq!(rxbuf("tune.h2.fe.rxbuf 5 6"), Err("'tune.h2.fe.rxbuf' cannot handle unexpected argument '6'.".to_string()));
 }

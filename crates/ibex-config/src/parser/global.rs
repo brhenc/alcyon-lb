@@ -347,7 +347,8 @@ pub(crate) fn parse_global_directive(
                 return Err(ConfigError::new(extra.line, extra.col, format!("'tune.h2.fe.rxbuf' cannot handle unexpected argument '{}'.", extra.text)));
             }
             let Some(arg) = tokens.get(1) else {
-                return Err(ConfigError::new(kw.line, kw.col, "'tune.h2.fe.rxbuf' expects an argument."));
+                // `parse_size_err("")` stops at the NUL, which ends HAProxy's message there.
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.h2.fe.rxbuf': unexpected character '"));
             };
             // `parse_size_err`: digits, then one of k, m, g; the first other character is named.
             let t = arg.text.as_str();
