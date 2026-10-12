@@ -15,12 +15,12 @@ needs `fixed_on`; `fixed` (time) feeds the mean time to fix. Check with
 never an open finding. Then `python3 tools/findings.py --md` and commit the CSVs and this file.
 
 ```
-== (a) open findings: 21 of 66
+== (a) open findings: 19 of 66
 severity        dos      leak    parity      perf     flaky  total
 critical          0         0         0         0         0      0
 high              0         0         0         0         0      0
-medium            1         0         1         0         0      2
-low               4         1        11         2         1     19
+medium            1         0         0         0         0      1
+low               4         1        11         1         1     18
 
 == (b) new findings per method per day
 day                 vv-probe           redteam    fuzz-libfuzzer fuzz-differential            review              gate
@@ -41,5 +41,5 @@ review                 0.0  2026-10-11 11:00 0
 gate                   0.0  2026-10-11 08:20 0
 
 == (d) mean time found -> fixed
-4.4 h over 17 findings with both timestamps (44 fixed in all)
+5.0 h over 19 findings with both timestamps (46 fixed in all)
 ```
