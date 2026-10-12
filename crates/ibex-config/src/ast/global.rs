@@ -274,6 +274,8 @@ pub struct GlobalSection {
     pub ssl_server_verify: Option<crate::SslVerify>,
     /// Global log tag (`log-tag`). Defaults to "haproxy".
     pub log_tag: Option<std::sync::Arc<str>>,
+    /// `no-memory-trimming`: never call the allocator's `malloc_trim`.
+    pub no_memory_trimming: bool,
 }
 
 /// Global variable initialized at startup via `set-var` or `set-var-fmt`.

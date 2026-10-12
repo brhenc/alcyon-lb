@@ -64,7 +64,12 @@ fn backend(running: Arc<AtomicBool>) -> SocketAddr {
 }
 
 fn engine(srv: SocketAddr, fe: SocketAddr) -> Engine {
+    engine_with(srv, fe, false)
+}
+
+fn engine_with(srv: SocketAddr, fe: SocketAddr, no_memory_trimming: bool) -> Engine {
     let config = Config {
+        global: no_memory_trimming.then(|| ibex_config::ast::GlobalSection { no_memory_trimming: true, ..Default::default() }),
         frontends: vec![FrontendSection {
             name: "fe".into(),
             bind: Some(fe),
@@ -256,11 +261,62 @@ fn the_engine_gives_the_heap_back_after_a_burst_of_slow_clients() {
     }
 }
 
+/// T319: `global no-memory-trimming` turns the trim of T318 off, as it does HAProxy's.
+#[test]
+fn no_memory_trimming_keeps_the_engine_from_trimming() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    const N: usize = 200;
+    let running = Arc::new(AtomicBool::new(true));
+    let srv = endless_backend(Arc::clone(&running));
+    let fe = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+    let mut engine = engine_with(srv, fe, true);
+    let before = ibex_rt::buf::heap_trims();
+    let mut clients = Vec::new();
+    for _ in 0..N {
+        let mut c = slow_client(fe);
+        c.write_all(b"GET /big HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+        clients.push(c);
+        let _ = engine.run_once();
+    }
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        let _ = engine.run_once();
+    }
+    let trims = ibex_rt::buf::heap_trims() - before;
+    println!("heap trims after a burst of {N} slow clients: {trims}");
+    assert_eq!(trims, 0, "the heap was trimmed despite no-memory-trimming");
+    running.store(false, Ordering::Relaxed);
+    drop(clients);
+    for _ in 0..20 {
+        let _ = engine.run_once();
+    }
+    // leave the process as the other tests expect it: switch off, heap given back
+    drop(engine);
+    ibex_alloc::set_trim_disabled(false);
+    let _ = ibex_alloc::trim_heap();
+}
+
+/// A reload to a configuration without the keyword turns the trim back on.
+#[test]
+fn a_new_engine_without_the_keyword_trims_again() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let running = Arc::new(AtomicBool::new(true));
+    let srv = endless_backend(Arc::clone(&running));
+    let fe = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+    let off = engine_with(srv, fe, true);
+    drop(off);
+    let _on = engine(srv, fe);
+    assert!(ibex_alloc::trim_heap(), "the switch stayed off after an engine without the keyword");
+    running.store(false, Ordering::Relaxed);
+}
+
 /// `trim_idle` itself: buffers allocated and freed in a burst leave their pages resident
 /// until the idle hook runs.
 #[test]
 fn trim_idle_returns_the_pages_of_freed_buffers() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // the switch is process-wide and an earlier test may have left `no-memory-trimming` on
+    ibex_alloc::set_trim_disabled(false);
     let rss = || -> usize {
         let s = std::fs::read_to_string("/proc/self/statm").expect("statm");
         s.split_whitespace().nth(1).and_then(|v| v.parse::<usize>().ok()).expect("rss") * 4096

@@ -647,6 +647,15 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        // `mem_parse_global_no_mem_trim` (`src/pool.c`): no argument. Read by `Engine::new`,
+        // which hands it to `ibex_alloc::set_trim_disabled`.
+        "no-memory-trimming" => {
+            if let Some(extra) = tokens.get(1).filter(|t| !t.text.is_empty()) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'no-memory-trimming' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            global.no_memory_trimming = true;
+            Ok(())
+        }
         "ssl-server-verify" => {
             // `ssl_parse_global_ssl_server_verify` (`src/cfgparse-ssl.c`): the messages of a
             // missing argument and of a wrong one are HAProxy's, odd as the first is.
