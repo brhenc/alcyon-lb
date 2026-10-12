@@ -1436,6 +1436,36 @@ mod request_target_tests {
         assert!(!header_lines_invalid(b"GET / HTTP/1.1\r\nX\0: y\0\r\n", 16, true));
     }
 
+    /// No prefix of a valid head, repeated equal `Content-Length` lines included, is settled
+    /// early; a bad value or a list of different values is a 400, a later different value a
+    /// quiet close (T315).
+    #[test]
+    fn content_length_early_settles_only_bad_lines() {
+        use super::{content_length_early, ClEarly};
+        let heads: [&[u8]; 3] = [
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 5, 5\r\nX: y\r\n\r\nhello",
+            b"POST / HTTP/1.1\nContent-Length: 0\nnocolon\n\n",
+            b"GET / HTTP/1.1\r\n\r\nContent-Length: x\r\n\r\n",
+        ];
+        for head in heads {
+            for n in 1..=head.len() {
+                assert_eq!(content_length_early(&head[..n], 0), ClEarly::Fine, "{:?}", &head[..n]);
+            }
+        }
+        let cases: [(&[u8], ClEarly); 6] = [
+            (b"P / HTTP/1.1\r\nContent-Length: +5\r\nX", ClEarly::Bad),
+            (b"P / HTTP/1.1\r\nContent-Length: 5,\r\nX", ClEarly::Bad),
+            (b"P / HTTP/1.1\r\nContent-Length: 5, 6\r\nX", ClEarly::Bad),
+            (b"P / HTTP/1.1\r\nContent-Length: 99999999999999999999\r\nX", ClEarly::Bad),
+            (b"P / HTTP/1.1\r\nContent-Length: 5\r\ncontent-length: 10\r\nX", ClEarly::Conflict),
+            (b"P / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5, 6\r\nX", ClEarly::Conflict),
+        ];
+        for (buf, want) in cases {
+            assert_eq!(content_length_early(buf, 0), want, "{buf:?}");
+            assert_eq!(content_length_early(&buf[..buf.len() - 1], 0), ClEarly::Fine, "{buf:?} without the next line's byte");
+        }
+    }
+
     /// A request line not yet whole is waited on: nothing is consumed, nothing refused (T291).
     #[test]
     fn a_partial_request_line_is_waited_on() {
