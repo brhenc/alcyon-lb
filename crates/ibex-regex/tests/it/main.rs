@@ -10,5 +10,6 @@
 //! own `[[test]]` in Cargo.toml and says why in its header. `harness/test_layout.py` fails on
 //! a test file no target compiles.
 
+mod budget;
 mod bytewise;
 mod group_refs;
