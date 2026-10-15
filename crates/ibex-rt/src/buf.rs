@@ -184,9 +184,9 @@ struct TrimState {
     trimmed_at: usize,
 }
 
-thread_local! {
-    static TRIM: RefCell<TrimState> = const { RefCell::new(TrimState { seen: 0, changed: None, trimmed_at: 0 }) };
-}
+/// Process-wide trim state so only one thread claims a quiet period (T321).
+static TRIM_STATE: std::sync::Mutex<TrimState> =
+    std::sync::Mutex::new(TrimState { seen: 0, changed: None, trimmed_at: 0 });
 
 /// Number of times the idle hook gave free heap memory back to the system.
 #[must_use]
@@ -204,21 +204,22 @@ pub fn heap_trims() -> usize {
 /// none has been for `TRIM_QUIET`, the trim is done.
 pub fn trim_idle(now: std::time::Instant) {
     let allocated = BUF_STD_ALLOCATED.load(Ordering::Relaxed);
-    let due = TRIM.with(|t| {
-        let mut t = t.borrow_mut();
-        if allocated != t.seen || t.changed.is_none() {
-            t.seen = allocated;
-            t.changed = Some(now);
-            return false;
-        }
-        let quiet = t.changed.is_some_and(|c| now.saturating_duration_since(c) >= TRIM_QUIET);
-        if quiet && allocated.wrapping_sub(t.trimmed_at) >= TRIM_MIN_FRESH {
-            t.trimmed_at = allocated;
-            return true;
-        }
-        false
-    });
-    if due && ibex_alloc::trim_heap() {
+    let mut state = TRIM_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if allocated != state.seen || state.changed.is_none() {
+        state.seen = allocated;
+        state.changed = Some(now);
+        return;
+    }
+    let quiet = state.changed.is_some_and(|c| now.saturating_duration_since(c) >= TRIM_QUIET);
+    let mut claimed = false;
+    if quiet && allocated.wrapping_sub(state.trimmed_at) >= TRIM_MIN_FRESH {
+        state.trimmed_at = allocated;
+        claimed = true;
+    }
+    drop(state);
+    if claimed && ibex_alloc::trim_heap() {
         HEAP_TRIMS.fetch_add(1, Ordering::Relaxed);
     }
 }

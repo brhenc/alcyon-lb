@@ -358,3 +358,49 @@ fn an_idle_client_connection_holds_no_buffer() {
     assert!(fresh <= 2048, "an idle client that sent nothing holds {fresh} B of heap");
     assert!(after_one <= 2048, "an idle keep-alive client holds {after_one} B of heap after its request");
 }
+
+/// T321: only one trim per quiet period, not one per thread.
+/// With 4 threads all calling `trim_idle`, the heap should be trimmed exactly once,
+/// not four times (once per thread).
+#[test]
+fn one_trim_per_quiet_period_not_one_per_thread() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    ibex_alloc::set_trim_disabled(false);
+
+    // Allocate a burst of buffers and drop them so the allocator has free pages to trim.
+    let mut bufs = Vec::new();
+    for _ in 0..200 {
+        bufs.push(ibex_rt::buf::Buf::standard());
+    }
+    let t0 = std::time::Instant::now();
+    drop(bufs);
+
+    let before = ibex_rt::buf::heap_trims();
+
+    // Start 4 threads that each call trim_idle(t0) first, then after a barrier
+    // call trim_idle(t0 + 600ms) a few times.
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let bar = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            // First call: no quiet yet, should not trim.
+            ibex_rt::buf::trim_idle(t0);
+            // Wait for all threads to be ready.
+            bar.wait();
+            // Now 600ms have passed since t0, and no new allocations occurred,
+            // so the quiet period is met. Only one thread will claim the trim.
+            for _ in 0..3 {
+                ibex_rt::buf::trim_idle(t0 + Duration::from_millis(600));
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let after = ibex_rt::buf::heap_trims();
+    let delta = after.wrapping_sub(before);
+    // With the bug, delta == 4 (one per thread). After fix, delta == 1.
+    assert_eq!(delta, 1, "expected exactly 1 trim, got {delta}");
+}
