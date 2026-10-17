@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
+#![allow(clippy::disallowed_macros)] // tests print with eprintln!; see /clippy.toml
+
 //! ibex-tls's integration tests, one binary (T260). Each former `tests/<name>.rs` is the
 //! module `<name>` here: run one file's tests with `cargo test -p ibex-tls --test it <name>::`.
 //!

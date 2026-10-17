@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
+#![allow(clippy::disallowed_macros)] // tests print with eprintln!; see /clippy.toml
+
 //! ibex-rt's integration tests, one binary (T260). Each former `tests/<name>.rs` is the
 //! module `<name>` here: run one file's tests with `cargo test -p ibex-rt --test it <name>::`.
 //!
@@ -192,6 +194,7 @@ mod log_forward;
 mod log_format_sd;
 mod log_parity;
 mod log_rc_redispatch;
+mod log_stderr_signal;
 mod log_stdout_full_pipe;
 mod log_tag_sample;
 mod logfmt;

@@ -26,7 +26,7 @@ pub fn abort_on_panic() {
     let report = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         report(info);
-        eprintln!("[ALERT] ibex: a thread panicked; this is a bug in Ibex, aborting the process");
+        crate::stderr_line!("[ALERT] ibex: a thread panicked; this is a bug in Ibex, aborting the process");
         die();
     }));
 }

@@ -73,7 +73,7 @@ fn apply_tuning(fd: &OwnedFd, tuning: &ibex_config::ast::SocketTuning) {
 /// The one place a refused socket option is reported (HAProxy: a warning, the listener is kept).
 fn warn_if_refused<E: std::fmt::Display>(what: &str, r: Result<(), E>) {
     if let Err(e) = r {
-        eprintln!("[WARNING] bind: cannot set {what}: {e}");
+        crate::stderr_line!("[WARNING] bind: cannot set {what}: {e}");
     }
 }
 

@@ -20,7 +20,7 @@ fn check_hash(hash: &str, user: &str) -> Result<(), String> {
             let _ = h.verify(b"");
             let ms = t.elapsed().as_millis();
             if ms >= 10 {
-                eprintln!(
+                crate::stderr_line!(
                     "[ibex] warning: the hash algorithm used for this password takes {ms} milliseconds to verify, which can have devastating performance and stability impacts. Please hash this password using a lighter algorithm (one that is compatible with web usage)."
                 );
             }

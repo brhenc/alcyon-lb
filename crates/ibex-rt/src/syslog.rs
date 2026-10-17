@@ -72,6 +72,41 @@ pub(crate) fn write_fd_nonblocking(fd: i32, line: &[u8]) -> bool {
     res.is_ok_and(|n| n > 0)
 }
 
+/// Writes one runtime diagnostic line to fd 2 and never panics, whatever state fd 2 is in.
+///
+/// `log stderr` makes fd 2 `O_NONBLOCK` (see [`write_fd_nonblocking`]); `eprintln!` then
+/// panics on `EAGAIN` ("failed printing to stderr") and the crash hook aborts the process.
+/// `HAProxy` simply loses a message it cannot write. A message that does not fit is dropped
+/// and counted in `DroppedLogs`, as a log line is; `EPIPE` and the like are the reader's
+/// choice and drop it silently. Does not change the descriptor's flags.
+pub fn eprint_line(args: std::fmt::Arguments<'_>) {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    let _ = text.write_fmt(args);
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let mut rest = text.as_bytes();
+    while !rest.is_empty() {
+        match rustix::io::write(std::io::stderr().as_fd(), rest) {
+            Ok(0) => return,
+            Ok(n) => rest = &rest[n..],
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => {
+                DROPPED_LOGS.fetch_add(u64::from(e == rustix::io::Errno::AGAIN), Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+}
+
+/// `eprintln!` for anything that can run once `log stderr` has made fd 2 non-blocking:
+/// writes through [`eprint_line`], so a full stderr drops the message instead of panicking.
+#[macro_export]
+macro_rules! stderr_line {
+    ($($arg:tt)*) => { $crate::syslog::eprint_line(format_args!($($arg)*)) };
+}
+
 /// Sends `line` to the unix datagram socket at `path` (`@name`: the abstract namespace).
 fn send_unix(sock: &UnixDatagram, path: &str, line: &[u8]) -> bool {
     use std::os::linux::net::SocketAddrExt;
@@ -214,14 +249,14 @@ impl SyslogTarget {
             LogTarget::Ring(name) => match crate::ring::find(name) {
                 Some(r) => Sink::Ring(r),
                 None => {
-                    eprintln!("[ibex] warning: log target ring@{name} names no ring section; these lines are dropped");
+                    crate::stderr_line!("[ibex] warning: log target ring@{name} names no ring section; these lines are dropped");
                     Sink::Discard
                 }
             },
             LogTarget::Fd(1) => Sink::Stdout,
             LogTarget::Fd(2) => Sink::Stderr,
             LogTarget::Fd(other) => {
-                eprintln!(
+                crate::stderr_line!(
                     "[ibex] warning: log target fd@{other} is not supported; only \
                      stdout (fd@1), stderr (fd@2) and a syslog address are written"
                 );
