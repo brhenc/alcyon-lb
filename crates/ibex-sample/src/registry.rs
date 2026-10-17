@@ -1202,6 +1202,15 @@ impl Registry {
         self.multi_fetches.insert(name, func);
     }
 
+    /// T337: registers `names` as a fetch that gives one sample (`one`, used where a sample is
+    /// evaluated) and, in an ACL, every value it can iterate on (`all`: `SMP_OPT_ITERATE`).
+    fn register_iterating(&mut self, names: &[&'static str], out_type: SampleType, one: FetchFn, all: MultiFetchFn) {
+        for &name in names {
+            self.register_fetch(FetchDesc { name, out_type, func: one });
+            self.register_multi_fetch(name, all);
+        }
+    }
+
     /// Registers a sample fetch. Panics if `desc.name` is already registered.
     ///
     /// This used to be a bare `HashMap::insert`, so a second registration of the same
@@ -1690,35 +1699,20 @@ impl Registry {
             },
         });
 
-        let url_param_fetch: FetchFn = |ctx, args| {
-            let param = args.first()?;
-            let uri = get_context_uri(ctx)?;
-            let (_, _, query) = split_uri(uri);
-            extract_url_param(query, param).map(Sample::Str)
-        };
-        self.register_fetch(FetchDesc {
-            name: "url_param",
-            out_type: SampleType::Str,
-            func: url_param_fetch,
-        });
-        self.register_fetch(FetchDesc {
-            name: "urlp",
-            out_type: SampleType::Str,
-            func: url_param_fetch,
-        });
-
-        self.register_fetch(FetchDesc {
-            name: "urlp_val",
-            out_type: SampleType::Sint,
-            func: |ctx, args| {
-                let param = args.first()?;
-                let uri = get_context_uri(ctx)?;
-                let (_, _, query) = split_uri(uri);
-                // T327: `smp_fetch_url_param_val` is `strl2ic` over the raw value, not decoded.
-                let raw = extract_url_param(query, param)?;
-                Some(Sample::Sint(i64::from(strl2ic(raw.as_bytes()))))
-            },
-        });
+        // T337: `url_param`/`urlp` give the first parameter as a sample; an ACL tries each one.
+        self.register_iterating(
+            &["url_param", "urlp"],
+            SampleType::Str,
+            |ctx, args| url_param_fetch(ctx, args, false).pop(),
+            |ctx, args| url_param_fetch(ctx, args, true),
+        );
+        // T327: `smp_fetch_url_param_val` is `strl2ic` over the raw value, not decoded.
+        self.register_iterating(
+            &["urlp_val"],
+            SampleType::Sint,
+            |ctx, args| url_param_fetch(ctx, args, false).pop().map(to_strl2ic),
+            |ctx, args| url_param_fetch(ctx, args, true).into_iter().map(to_strl2ic).collect(),
+        );
 
         // `meth(<name>)`: the constant method `<name>` (`smp_fetch_meth` is `method`; this one
         // is the constant `meth` of src/sample.c). A name outside the known methods is kept as
@@ -1948,46 +1942,20 @@ impl Registry {
         });
 
         // --- 4. HTTP Headers Fetches ---
-        let request_header_fetch: FetchFn = |ctx, args| {
-            let name = args.first()?;
-            let occ: Option<i64> = args.get(1).and_then(|s| s.parse().ok());
-            let hdrs = get_all_req_headers(ctx, name);
-            if hdrs.is_empty() {
-                return None;
-            }
-            if let Some(idx) = occ {
-                // HAProxy counts occurrences from 1, and from the end when negative, so
-                // -1 is the last header. Both conversions are fallible rather than `as`:
-                // the index comes from the config as an i64, and a truncating cast would
-                // turn an out-of-range occurrence into a valid index for a *different*
-                // header instead of no match at all.
-                if idx > 0 {
-                    let uidx = usize::try_from(idx - 1).ok()?;
-                    return hdrs.get(uidx).map(|s| Sample::Str((*s).clone()));
-                } else if idx < 0 {
-                    let back = usize::try_from(idx.unsigned_abs()).ok()?;
-                    let uidx = hdrs.len().checked_sub(back)?;
-                    return hdrs.get(uidx).map(|s| Sample::Str((*s).clone()));
-                }
-                return None;
-            }
-            Some(Sample::Str(hdrs.join(", ")))
-        };
-        self.register_fetch(FetchDesc {
-            name: "req.hdr",
-            out_type: SampleType::Str,
-            func: request_header_fetch,
-        });
-        self.register_fetch(FetchDesc {
-            name: "hdr",
-            out_type: SampleType::Str,
-            func: request_header_fetch,
-        });
-        self.register_fetch(FetchDesc {
-            name: "req.fhdr",
-            out_type: SampleType::Str,
-            func: request_header_fetch,
-        });
+        // T337: `smp_fetch_hdr` (comma values) and `smp_fetch_fhdr` (lines): the last one as a
+        // sample, every one in an ACL, the `<occ>`th one (from the end when negative) either way.
+        self.register_iterating(
+            &["req.hdr", "hdr"],
+            SampleType::Str,
+            |ctx, args| header_fetch(ctx, args, false, false, false).pop(),
+            |ctx, args| header_fetch(ctx, args, false, false, true),
+        );
+        self.register_iterating(
+            &["req.fhdr"],
+            SampleType::Str,
+            |ctx, args| header_fetch(ctx, args, false, true, false).pop(),
+            |ctx, args| header_fetch(ctx, args, false, true, true),
+        );
 
         // `http_auth_bearer([<header>])` (`smp_fetch_http_auth_bearer`): the token of a
         // `Bearer` credential in the first `<header>` (default `Authorization`). The scheme is
@@ -2010,47 +1978,18 @@ impl Registry {
             },
         });
 
-        let response_header_fetch: FetchFn = |ctx, args| {
-            let name = args.first()?;
-            let occ: Option<i64> = args.get(1).and_then(|s| s.parse().ok());
-            let hdrs = get_all_res_headers(ctx, name);
-            if hdrs.is_empty() {
-                return None;
-            }
-            if let Some(idx) = occ {
-                // HAProxy counts occurrences from 1, and from the end when negative, so
-                // -1 is the last header. Both conversions are fallible rather than `as`:
-                // the index comes from the config as an i64, and a truncating cast would
-                // turn an out-of-range occurrence into a valid index for a *different*
-                // header instead of no match at all.
-                if idx > 0 {
-                    let uidx = usize::try_from(idx - 1).ok()?;
-                    return hdrs.get(uidx).map(|s| Sample::Str((*s).clone()));
-                } else if idx < 0 {
-                    let back = usize::try_from(idx.unsigned_abs()).ok()?;
-                    let uidx = hdrs.len().checked_sub(back)?;
-                    return hdrs.get(uidx).map(|s| Sample::Str((*s).clone()));
-                }
-                return None;
-            }
-            Some(Sample::Str(hdrs.join(", ")))
-        };
-        self.register_fetch(FetchDesc {
-            name: "res.hdr",
-            out_type: SampleType::Str,
-            func: response_header_fetch,
-        });
-        // T326: deprecated alias of res.hdr (shdr)
-        self.register_fetch(FetchDesc {
-            name: "shdr",
-            out_type: SampleType::Str,
-            func: response_header_fetch,
-        });
-        self.register_fetch(FetchDesc {
-            name: "res.fhdr",
-            out_type: SampleType::Str,
-            func: response_header_fetch,
-        });
+        self.register_iterating(
+            &["res.hdr", "shdr"],
+            SampleType::Str,
+            |ctx, args| header_fetch(ctx, args, true, false, false).pop(),
+            |ctx, args| header_fetch(ctx, args, true, false, true),
+        );
+        self.register_iterating(
+            &["res.fhdr"],
+            SampleType::Str,
+            |ctx, args| header_fetch(ctx, args, true, true, false).pop(),
+            |ctx, args| header_fetch(ctx, args, true, true, true),
+        );
 
         // T327: req.fhdr_cnt counts lines and req.hdr_cnt values, with or without a name, on
         // the headers as the oracle's H1 parser leaves them (`h1_cleaned_headers`).
@@ -2188,38 +2127,20 @@ impl Registry {
             },
         });
 
-        let req_hdr_val_fetch: FetchFn = |ctx, args| {
-            let name = args.first()?;
-            let val = get_req_header(ctx, name)?;
-            val.trim().parse::<i64>().ok().map(Sample::Sint)
-        };
-        self.register_fetch(FetchDesc {
-            name: "req.hdr_val",
-            out_type: SampleType::Sint,
-            func: req_hdr_val_fetch,
-        });
-        self.register_fetch(FetchDesc {
-            name: "hdr_val",
-            out_type: SampleType::Sint,
-            func: req_hdr_val_fetch,
-        });
-
-        let res_hdr_val_f: FetchFn = |ctx, args| {
-            let name = args.first()?;
-            let val = get_res_header(ctx, name)?;
-            val.trim().parse::<i64>().ok().map(Sample::Sint)
-        };
-        // T326: res.hdr_val registered once with a named FetchFn so the deprecated alias shdr_val below shares it
-        self.register_fetch(FetchDesc {
-            name: "res.hdr_val",
-            out_type: SampleType::Sint,
-            func: res_hdr_val_f,
-        });
-        self.register_fetch(FetchDesc {
-            name: "shdr_val",
-            out_type: SampleType::Sint,
-            func: res_hdr_val_f,
-        });
+        // T337: `smp_fetch_hdr_val`: `strl2ic` over the value `smp_fetch_hdr` gives.
+        self.register_iterating(
+            &["req.hdr_val", "hdr_val"],
+            SampleType::Sint,
+            |ctx, args| header_fetch(ctx, args, false, false, false).pop().map(to_strl2ic),
+            |ctx, args| header_fetch(ctx, args, false, false, true).into_iter().map(to_strl2ic).collect(),
+        );
+        // T326: shdr_val is the deprecated alias of res.hdr_val.
+        self.register_iterating(
+            &["res.hdr_val", "shdr_val"],
+            SampleType::Sint,
+            |ctx, args| header_fetch(ctx, args, true, false, false).pop().map(to_strl2ic),
+            |ctx, args| header_fetch(ctx, args, true, false, true).into_iter().map(to_strl2ic).collect(),
+        );
 
         let hdr_ip_fetch: FetchFn = |ctx, args| {
             let name = args.first()?;
@@ -2254,63 +2175,23 @@ impl Registry {
             func: res_hdr_ip_fetch,
         });
 
-        self.register_fetch(FetchDesc {
-            name: "req.cook",
-            out_type: SampleType::Str,
-            func: fetch_req_cook,
-        });
-        self.register_fetch(FetchDesc {
-            name: "cook",
-            out_type: SampleType::Str,
-            func: fetch_req_cook,
-        });
-        self.register_fetch(FetchDesc {
-            name: "cookie",
-            out_type: SampleType::Str,
-            func: fetch_req_cook,
-        });
+        // T337: `smp_fetch_cookie`: the last cookie of that name (the first cookie when no name
+        // is given) as a sample, every one in an ACL.
+        self.register_iterating(
+            &["req.cook", "cook", "cookie"],
+            SampleType::Str,
+            |ctx, args| cookie_fetch(ctx, args, false, false).pop(),
+            |ctx, args| cookie_fetch(ctx, args, false, true),
+        );
+        self.register_iterating(
+            &["res.cook", "scook"],
+            SampleType::Str,
+            |ctx, args| cookie_fetch(ctx, args, true, false).pop(),
+            |ctx, args| cookie_fetch(ctx, args, true, true),
+        );
 
-        let res_cook_fetch: FetchFn = |ctx, args| {
-            let name = args.first()?;
-            let set_cookies = get_all_res_headers(ctx, "set-cookie");
-            for hdr in set_cookies {
-                for (k, v) in extract_cookies(&hdr) {
-                    if k == name {
-                        return Some(Sample::Str(v.to_string()));
-                    }
-                }
-            }
-            None
-        };
-        // T326: res.cook registered once with a named FetchFn so the deprecated alias scook below shares it
-        self.register_fetch(FetchDesc {
-            name: "res.cook",
-            out_type: SampleType::Str,
-            func: res_cook_fetch,
-        });
-        self.register_fetch(FetchDesc {
-            name: "scook",
-            out_type: SampleType::Str,
-            func: res_cook_fetch,
-        });
-
-        let cook_cnt_fetch: FetchFn = |ctx, args| {
-            let name = args.first();
-            let cookie_hdrs = get_all_req_headers(ctx, "cookie");
-            let mut count = 0;
-            for hdr in cookie_hdrs {
-                for (k, _) in extract_cookies(&hdr) {
-                    if let Some(target) = name {
-                        if k == target {
-                            count += 1;
-                        }
-                    } else {
-                        count += 1;
-                    }
-                }
-            }
-            Some(Sample::Sint(count))
-        };
+        // T337: `smp_fetch_cookie_cnt` on a request: every cookie `smp_fetch_cookie` would try.
+        let cook_cnt_fetch: FetchFn = |ctx, args| Some(Sample::Sint(len_to_sint(cookie_fetch(ctx, args, false, true).len())));
         self.register_fetch(FetchDesc {
             name: "req.cook_cnt",
             out_type: SampleType::Sint,
@@ -2376,45 +2257,19 @@ impl Registry {
             },
         });
 
-        let cook_val_fetch: FetchFn = |ctx, args| {
-            let smp = fetch_req_cook(ctx, args)?;
-            let Sample::Str(s) = smp else { return None };
-            s.parse::<i64>().ok().map(Sample::Sint)
-        };
-        self.register_fetch(FetchDesc {
-            name: "req.cook_val",
-            out_type: SampleType::Sint,
-            func: cook_val_fetch,
-        });
-        self.register_fetch(FetchDesc {
-            name: "cook_val",
-            out_type: SampleType::Sint,
-            func: cook_val_fetch,
-        });
-
-        let res_cook_val_fetch: FetchFn = |ctx, args| {
-            let name = args.first()?;
-            let set_cookies = get_all_res_headers(ctx, "set-cookie");
-            for hdr in set_cookies {
-                for (k, v) in extract_cookies(&hdr) {
-                    if k == name {
-                        return v.parse::<i64>().ok().map(Sample::Sint);
-                    }
-                }
-            }
-            None
-        };
-        // T326: res.cook_val registered once with a named FetchFn so the deprecated alias scook_val below shares it
-        self.register_fetch(FetchDesc {
-            name: "res.cook_val",
-            out_type: SampleType::Sint,
-            func: res_cook_val_fetch,
-        });
-        self.register_fetch(FetchDesc {
-            name: "scook_val",
-            out_type: SampleType::Sint,
-            func: res_cook_val_fetch,
-        });
+        // T337: `smp_fetch_cookie_val`: `strl2ic` over the value `smp_fetch_cookie` gives.
+        self.register_iterating(
+            &["req.cook_val", "cook_val"],
+            SampleType::Sint,
+            |ctx, args| cookie_fetch(ctx, args, false, false).pop().map(to_strl2ic),
+            |ctx, args| cookie_fetch(ctx, args, false, true).into_iter().map(to_strl2ic).collect(),
+        );
+        self.register_iterating(
+            &["res.cook_val", "scook_val"],
+            SampleType::Sint,
+            |ctx, args| cookie_fetch(ctx, args, true, false).pop().map(to_strl2ic),
+            |ctx, args| cookie_fetch(ctx, args, true, true).into_iter().map(to_strl2ic).collect(),
+        );
 
         // --- 6. Body & Length Fetches ---
         self.register_fetch(FetchDesc {
@@ -2446,7 +2301,8 @@ impl Registry {
                 let name = args.first().map_or(&b""[..], |s| s.as_bytes());
                 // HAProxy looks only at the flag's first character (`*area == 'i'`).
                 let insensitive = args.get(1).is_some_and(|s| s.starts_with('i'));
-                find_body_param(body, name, insensitive).map(|v| Sample::Bin(v.to_vec()))
+                // `smp_fetch_body_param` is `smp_fetch_param` with `&` as the delimiter (T337).
+                url_param_values(body, name, b'&', insensitive).first().map(|v| Sample::Bin(v.to_vec()))
             },
         });
 
@@ -6289,6 +6145,12 @@ impl Registry {
         converters: &[(&str, Vec<String>)],
         ctx: &SampleContext,
     ) -> Option<Sample> {
+        // T337: a fetch that iterates in an ACL gives its own single sample here (the last
+        // header value, the last cookie), not the first of the ACL's list.
+        if let Some(f_desc) = self.get_fetch(fetch_name) {
+            let smp = (f_desc.func)(ctx, fetch_args)?;
+            return self.apply_converters_in(ctx, smp, converters);
+        }
         self.eval_all(fetch_name, fetch_args, converters, ctx).into_iter().next()
     }
 }
@@ -6383,19 +6245,6 @@ fn base32_hash(ctx: &SampleContext) -> Option<u32> {
         input.extend_from_slice(path.as_bytes());
     }
     Some(full_hash(hash_sdbm(&input)))
-}
-
-fn fetch_req_cook(ctx: &SampleContext, args: &[String]) -> Option<Sample> {
-    let name = args.first()?;
-    let cookie_hdrs = get_all_req_headers(ctx, "cookie");
-    for hdr in cookie_hdrs {
-        for (k, v) in extract_cookies(&hdr) {
-            if k == name {
-                return Some(Sample::Str(v.to_string()));
-            }
-        }
-    }
-    None
 }
 
 /// `tune.bufsize`: the size of the trash chunks converters write into.
@@ -6701,6 +6550,138 @@ fn hdr_values(v: &str) -> Vec<&str> {
     }
 }
 
+/// T337: `MAX_HDR_HISTORY`, how far back from the last one a negative occurrence reaches.
+const MAX_HDR_HISTORY: u64 = 10;
+
+/// T337: the values of header `name` (`args[0]`) as `smp_fetch_hdr` (comma values) or, with
+/// `full`, `smp_fetch_fhdr` (lines) gives them. With no `<occ>` (`args[1]`, 0 the same), every
+/// value when `iterate` (an ACL: `SMP_OPT_ITERATE`) and the last one otherwise; else the
+/// `<occ>`th one, counted from the end when negative, no further back than
+/// [`MAX_HDR_HISTORY`] (`http_get_htx_hdr`).
+fn header_fetch(ctx: &SampleContext, args: &[String], res: bool, full: bool, iterate: bool) -> Vec<Sample> {
+    let Some(name) = args.first() else { return Vec::new() };
+    let lines = if res { get_all_res_headers(ctx, name) } else { get_all_req_headers(ctx, name) };
+    let mut values = if full { lines } else { lines.iter().flat_map(|l| hdr_values(l)).map(str::to_string).collect() };
+    let occ: i64 = args.get(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    if occ == 0 && iterate {
+        return values.into_iter().map(Sample::Str).collect();
+    }
+    let occ = if occ == 0 { -1 } else { occ };
+    let idx = if occ > 0 {
+        usize::try_from(occ - 1).ok()
+    } else {
+        let back = occ.unsigned_abs();
+        if back > MAX_HDR_HISTORY { None } else { usize::try_from(back).ok().and_then(|b| values.len().checked_sub(b)) }
+    };
+    idx.filter(|&i| i < values.len()).map(|i| Sample::Str(values.swap_remove(i))).into_iter().collect()
+}
+
+/// T337: the cookie values `smp_fetch_cookie` gives for `args[0]` (any cookie when absent or
+/// empty), from `Cookie` or, with `res`, `Set-Cookie`. Each header is walked value by value
+/// (`http_find_header(full=0)`), a value shorter than the name and `=` is skipped, and
+/// [`crate::cookie_names::values`] reads the cookies of each. Every one when `iterate` (an
+/// ACL), otherwise the last one, or the first one when no name is given.
+fn cookie_fetch(ctx: &SampleContext, args: &[String], res: bool, iterate: bool) -> Vec<Sample> {
+    let name = args.first().map_or("", String::as_str);
+    let lines = if res { get_all_res_headers(ctx, "set-cookie") } else { get_all_req_headers(ctx, "cookie") };
+    let mut vals: Vec<Sample> = Vec::new();
+    for line in &lines {
+        for elem in hdr_values(line).into_iter().filter(|e| e.len() > name.len()) {
+            let found = crate::cookie_names::values(elem, name, !res);
+            vals.extend(found.into_iter().map(|v| Sample::Str(v.to_string())));
+            if !iterate && name.is_empty() && !vals.is_empty() {
+                vals.truncate(1);
+                return vals;
+            }
+        }
+    }
+    if !iterate && vals.len() > 1 {
+        vals.drain(..vals.len() - 1);
+    }
+    vals
+}
+
+/// T337: the parameters `smp_fetch_url_param` gives: `url_param([<name>[,<delim>[,i]]])`
+/// reads the URI after its first `<delim>` (default `?`) with [`url_param_values`]. The first
+/// one as a sample, every one when `iterate` (an ACL). Raw, not URL-decoded.
+fn url_param_fetch(ctx: &SampleContext, args: &[String], iterate: bool) -> Vec<Sample> {
+    let Some(uri) = get_context_uri(ctx) else { return Vec::new() };
+    let name = args.first().map_or(&b""[..], |s| s.as_bytes());
+    let delim = args.get(1).and_then(|s| s.bytes().next()).unwrap_or(b'?');
+    // HAProxy looks only at the flag's first character (`*area == 'i'`).
+    let insensitive = args.get(2).is_some_and(|s| s.starts_with('i'));
+    let Some(start) = uri.bytes().position(|c| c == delim) else { return Vec::new() };
+    let mut vals = url_param_values(&uri.as_bytes()[start + 1..], name, delim, insensitive);
+    if !iterate {
+        vals.truncate(1);
+    }
+    vals.into_iter().map(|v| Sample::Str(String::from_utf8_lossy(v).into_owned())).collect()
+}
+
+/// T337: every value `http_find_next_url_param` (`src/http.c`) finds in the parameter list
+/// `qs`, in order, each search starting where the last value ended. `&`, `;` and `delim` end a
+/// parameter (`http_is_param_delimiter`); a name matches only at the start of a parameter and
+/// only when `=` follows it (`http_find_url_param_pos`, case aside with `insensitive`); with
+/// no name the value after the next `=` is taken, wherever it is.
+fn url_param_values<'a>(qs: &'a [u8], name: &[u8], delim: u8, insensitive: bool) -> Vec<&'a [u8]> {
+    let is_delim = |c: u8| c == b'&' || c == b';' || c == delim;
+    let end = qs.len();
+    let find_name = |mut pos: usize| -> Option<usize> {
+        while pos < end {
+            let equal = pos + name.len();
+            if equal >= end {
+                return None;
+            }
+            if qs[equal] == b'=' {
+                let k = &qs[pos..equal];
+                if if insensitive { k.eq_ignore_ascii_case(name) } else { k == name } {
+                    return Some(equal + 1);
+                }
+                pos = equal + 1;
+            }
+            while pos < end && !is_delim(qs[pos]) {
+                pos += 1;
+            }
+            if pos >= end {
+                return None;
+            }
+            pos += 1;
+        }
+        None
+    };
+    let mut out = Vec::new();
+    let mut from = 0;
+    loop {
+        let start = if name.is_empty() {
+            match qs.get(from..).and_then(|r| r.iter().position(|&c| c == b'=')) {
+                Some(p) => from + p + 1,
+                None => break,
+            }
+        } else {
+            match find_name(from) {
+                Some(s) => s,
+                None => break,
+            }
+        };
+        let stop = qs[start..].iter().position(|&c| is_delim(c)).map_or(end, |p| start + p);
+        out.push(&qs[start..stop]);
+        // `smp_fetch_param` sets `SMP_F_NOT_LAST` only while the list goes on.
+        if stop >= end {
+            break;
+        }
+        from = stop;
+    }
+    out
+}
+
+/// T337: `strl2ic` over a string sample, as the `_val` fetches convert what they read.
+fn to_strl2ic(s: Sample) -> Sample {
+    match s {
+        Sample::Str(v) => Sample::Sint(i64::from(strl2ic(v.as_bytes()))),
+        other => other,
+    }
+}
+
 /// T327: `hdrs` as the oracle's H1 parser leaves them in HTX, for the header-count fetches:
 /// [`crate::h1_clean::h1_clean_headers`] (the one implementation of that cleaning, shared
 /// with `req.hdrs`/`res.hdrs` and the `*.hdr_names` fetches).
@@ -6914,57 +6895,6 @@ fn cookie_value_end(b: &[u8], s: usize) -> usize {
         }
     }
     b.len()
-}
-
-fn extract_cookies(cookie_header: &str) -> Vec<(&str, &str)> {
-    let mut list = Vec::new();
-    for part in cookie_header.split(';') {
-        let trimmed = part.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = trimmed.split_once('=') {
-            list.push((k.trim(), v.trim().trim_matches('"')));
-        }
-    }
-    list
-}
-
-fn extract_url_param(query: &str, param: &str) -> Option<String> {
-    for pair in query.split('&') {
-        // T327: only `name=` matches (`http_find_url_param_pos`): a bare `name` is not found.
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == param {
-                return Some(v.to_string()); // T327
-            }
-        }
-    }
-    None
-}
-
-/// T326: `http_find_next_url_param` over a request body: `&` and `;` end a parameter
-/// (`http_is_param_delimiter`), a name matches only at the start of a parameter and only when
-/// `=` follows it, and with no name the value after the first `=` anywhere in the body is
-/// returned. No URL decoding.
-fn find_body_param<'a>(body: &'a [u8], name: &[u8], insensitive: bool) -> Option<&'a [u8]> {
-    let is_delim = |c: &u8| *c == b'&' || *c == b';';
-    let start = if name.is_empty() {
-        body.iter().position(|&c| c == b'=')? + 1
-    } else {
-        let mut pos = 0;
-        loop {
-            let end = pos + name.len();
-            if body.get(end) == Some(&b'=') {
-                let k = body.get(pos..end)?;
-                if if insensitive { k.eq_ignore_ascii_case(name) } else { k == name } {
-                    break end + 1;
-                }
-            }
-            pos += body.get(pos..)?.iter().position(is_delim)? + 1;
-        }
-    };
-    let v = body.get(start..)?;
-    Some(&v[..v.iter().position(is_delim).unwrap_or(v.len())])
 }
 
 /// `strl2ic` (`src/tools.c`): an optional '-', then the decimal digits up to the first other

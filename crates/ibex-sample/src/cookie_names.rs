@@ -7,6 +7,8 @@
 //! by element (split on `,`), each `;`-separated pair gives its name; a response
 //! `Set-Cookie` value gives one name, its first pair's. `$` attributes and pairs without
 //! `=` are skipped, quoted values are honoured.
+//!
+//! [`values`] reads the cookie values `req.cook`/`res.cook` give the same way (T337).
 
 fn is_spht(b: u8) -> bool {
     b == b' ' || b == b'\t'
@@ -97,6 +99,60 @@ fn next_name(v: &[u8], from: usize, is_req: bool) -> Option<(usize, usize, usize
     None
 }
 
+/// T337: the values of the cookies named `name` (every cookie when `name` is empty) in one
+/// header element, in order, as `smp_fetch_cookie` finds them by calling
+/// `http_extract_cookie_value` (`src/http.c`) again from where the last one ended. `list` is
+/// the request direction: a `,` also ends a name, and every pair is a cookie; otherwise a
+/// search looks only at its first pair that is not a `$` attribute and has a `=` (but the
+/// next search starts after a value found, so `a=1; a=2` gives both). Values keep their
+/// quotes, end at a `;` or `,` outside them, and are trimmed of blanks.
+pub fn values<'a>(elem: &'a str, name: &str, list: bool) -> Vec<&'a str> {
+    let (v, name) = (elem.as_bytes(), name.as_bytes());
+    let end = v.len();
+    let mut out = Vec::new();
+    let mut att_beg = 0;
+    while att_beg + name.len() + 1 < end {
+        while att_beg < end && is_spht(v[att_beg]) {
+            att_beg += 1;
+        }
+        let (mut equal, mut att_end) = (att_beg, att_beg);
+        while equal < end {
+            let c = v[equal];
+            if c == b'=' || c == b';' || (list && c == b',') {
+                break;
+            }
+            equal += 1;
+            if !is_spht(c) {
+                att_end = equal;
+            }
+        }
+        let (val_beg, val_end, next) = if equal < end && v[equal] == b'=' {
+            let mut val_beg = equal + 1;
+            while val_beg < end && is_spht(v[val_beg]) {
+                val_beg += 1;
+            }
+            let next = cookie_value_end(v, val_beg);
+            let mut val_end = next;
+            while val_end > val_beg && is_spht(v[val_end - 1]) {
+                val_end -= 1;
+            }
+            (val_beg, val_end, next)
+        } else {
+            (equal, equal, equal)
+        };
+        if v.get(att_beg) != Some(&b'$') && equal != next {
+            if name.is_empty() || v.get(att_beg..att_end) == Some(name) {
+                // The bounds border ASCII delimiters or the ends: char boundaries.
+                out.push(elem.get(val_beg..val_end).unwrap_or(""));
+            } else if !list {
+                break;
+            }
+        }
+        att_beg = next + 1;
+    }
+    out
+}
+
 /// Appends the names of one `value` to `out` the way `smp_fetch_cookie_names` does: `delim`
 /// goes in front of a name only when `out` is not empty, so an empty name vanishes at the
 /// start and keeps its slot after that. `is_req` reads a `Cookie` value, else a
@@ -161,6 +217,19 @@ mod tests {
         assert_eq!(names(&["a=\"p\\\"q;r=1\"; b=2"], true), "a,b");
         assert_eq!(names(&["a=\"p\\\"q,r=1\", b=2"], true), "a,b");
         assert_eq!(names(&["a=\"p\\\"q,r=1\"; b=2"], true), "a,b");
+    }
+
+    #[test]
+    fn values_measured() {
+        // T337: as HAProxy 3.5-dev8 gives them with res.cook/cook (ACL rows: every value).
+        assert_eq!(values("a=1; a=2", "a", false), ["1", "2"]);
+        assert_eq!(values("s=1; Path=/", "", false), ["1", "/"]);
+        assert_eq!(values(r#"a="x\"y;z"; b=2"#, "a", false), [r#""x\"y;z""#]);
+        assert!(values(r#"a="x\"y;z"; b=2"#, "b", false).is_empty());
+        assert_eq!(values("$v=1; a=4; b=5", "a", false), ["4"]);
+        assert_eq!(values(r#"a="x;y"; b=2"#, "", true), [r#""x;y""#, "2"]);
+        assert_eq!(values("a = 7 ; b=1", "a", true), ["7"]);
+        assert_eq!(values("$a=9; a=5", "a", true), ["5"]);
     }
 
     #[test]
