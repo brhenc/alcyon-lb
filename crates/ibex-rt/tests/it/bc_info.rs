@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T331: bc_* backend conn fetches
+//! T331: the backend connection's fetches, `bc_err`, `bc_err_str`, `bc_reused`, `bc_dst`
+//! and `bc_dst_port`. Every expected value was measured on `HAProxy` 3.5-dev8-885761-29 with
+//! the same configuration.
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::os::unix::net::UnixStream;
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Ibex(Child, std::path::PathBuf);
 
@@ -21,118 +21,145 @@ impl Drop for Ibex {
     }
 }
 
-/// Starts ibex on `cfg` (`{sock}` is replaced by the stats socket path), waits for `addrs` and the
-/// socket, then lets the readiness probes slide out of the one-second windows and clears the maxima.
-fn start(tag: &str, cfg: &str, addrs: &[SocketAddr]) -> (Ibex, String) {
-    let dir = std::env::temp_dir().join(format!("qh-{tag}-{}", std::process::id()));
+fn start(tag: &str, cfg: &str, addrs: &[SocketAddr]) -> Ibex {
+    let dir = std::env::temp_dir().join(format!("bc-info-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("cli.sock").display().to_string();
     let path = dir.join("c.cfg");
-    std::fs::write(&path, cfg.replace("{sock}", &sock).replace("{dir}", &dir.display().to_string())).unwrap();
+    let full = format!("defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{cfg}");
+    std::fs::write(&path, full).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     let ibex = Ibex(child, dir);
     for a in addrs {
         assert!(common::wait_listening(*a), "ibex did not listen on {a}");
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !std::path::Path::new(&sock).exists() {
-        assert!(Instant::now() < deadline, "no stats socket");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(2200));
-    cli(&sock, "clear counters");
-    (ibex, sock)
+    ibex
 }
 
-fn cli(sock: &str, cmd: &str) -> String {
-    let mut s = UnixStream::connect(sock).expect("cli");
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(format!("{cmd}\n").as_bytes()).unwrap();
-    let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    out
-}
-
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
-/// One request on a new connection; the whole raw answer.
-fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(req).unwrap();
-    let mut out = Vec::new();
-    let _ = s.read_to_end(&mut out);
-    out
-}
-
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+/// A keep-alive server on `bind`: answers every request of every connection with a 2-byte 200.
+fn backend(bind: &str) -> SocketAddr {
+    let l = TcpListener::bind(bind).unwrap();
     let addr = l.local_addr().unwrap();
     std::thread::spawn(move || {
         for c in l.incoming() {
             let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
+            std::thread::spawn(move || {
+                let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
+                let (mut pending, mut b) = (Vec::new(), [0u8; 4096]);
+                loop {
+                    while let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                        pending.drain(..end + 4);
+                        if c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err() {
+                            return;
+                        }
+                    }
+                    match c.read(&mut b) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => pending.extend_from_slice(&b[..n]),
+                    }
                 }
-            }
-            let _ = c.write_all(resp);
+            });
         }
     });
     addr
 }
 
-/// The body of the answer to `req` (what follows the first empty line).
-fn body(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
+/// A port nothing listens on.
+fn closed_port() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
 }
 
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
+/// Sends one keep-alive request on `c` and returns the `x-out` header of its 2-byte answer.
+fn xout(c: &mut TcpStream) -> String {
+    c.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+    let (mut got, mut b) = (Vec::new(), [0u8; 4096]);
+    let head = loop {
+        if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+            if got.len() >= end + 4 + 2 {
+                break String::from_utf8_lossy(&got[..end]).into_owned();
+            }
+        }
+        let n = c.read(&mut b).unwrap_or(0);
+        assert!(n > 0, "the answer stopped short: {:?}", String::from_utf8_lossy(&got));
+        got.extend_from_slice(&b[..n]);
+    };
     head.lines()
         .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
+        .unwrap_or_else(|| panic!("no x-out header in the answer: {head:?}"))
 }
 
+fn connect(a: SocketAddr) -> TcpStream {
+    let c = TcpStream::connect_timeout(&a, Duration::from_secs(2)).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c
+}
+
+const XOUT: &str = "http-response set-header x-out \"%[bc_err]|[%[bc_err_str]]|%[bc_reused]|%[bc_dst]|%[bc_dst_port]|%[dst]\"";
+
+/// `http-reuse always`, three requests on one client connection: the second and third run
+/// on the server connection the first opened (oracle: 0, then 1, then 1).
 #[test]
-fn bc_info() {
-    const RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-    let be = backend(RESP);
+fn bc_reused_is_set_on_a_reused_server_connection() {
+    let be = backend("127.0.0.1:0");
     let a = common::reserve_addr();
+    let cfg = format!("frontend fe\n  bind {a}\n  default_backend b\n  {XOUT}\nbackend b\n  http-reuse always\n  server s {be}\n");
+    let _ibex = start("reuse", &cfg, &[a]);
+    let mut c = connect(a);
+    let p = be.port();
+    assert_eq!(xout(&mut c), format!("0|[Success]|0|127.0.0.1|{p}|127.0.0.1"));
+    assert_eq!(xout(&mut c), format!("0|[Success]|1|127.0.0.1|{p}|127.0.0.1"));
+    assert_eq!(xout(&mut c), format!("0|[Success]|1|127.0.0.1|{p}|127.0.0.1"));
+}
+
+/// A server on `::1` behind a frontend on 127.0.0.1: `bc_dst` is the server's address, an
+/// IPv6 one, and `dst` the frontend's (oracle: `0|[Success]|0|::1|<port>|127.0.0.1`).
+#[test]
+fn bc_dst_is_the_server_address_not_the_frontend_one() {
+    let be = backend("[::1]:0");
+    let a = common::reserve_addr();
+    let cfg = format!("frontend fe\n  bind {a}\n  default_backend b\n  {XOUT}\nbackend b\n  http-reuse never\n  server s {be}\n");
+    let _ibex = start("v6", &cfg, &[a]);
+    let mut c = connect(a);
+    assert_eq!(xout(&mut c), format!("0|[Success]|0|::1|{}|127.0.0.1", be.port()));
+}
+
+/// The log line of a connect the server refused (`retries 0`) carries `CO_ER_EREFUSED`; one
+/// with no server to connect to has no backend connection, so no `bc_err` nor `bc_dst`, and
+/// `bc_reused` 0 (oracle, in this order: 200 ok, 503 refused, 503 no server).
+#[test]
+fn bc_err_logs_the_server_connect_error() {
+    let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+    collector.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (be, dead) = (backend("127.0.0.1:0"), closed_port());
+    let (ok, refused, none) = (common::reserve_addr(), common::reserve_addr(), common::reserve_addr());
+    // The readiness probes send nothing: `dontlognull` keeps them out of the log.
+    let fmt = "LOG %ST %[bc_err]|[%[bc_err_str]]|%[bc_reused]|%[bc_dst]|%[bc_dst_port]";
+    let log = collector.local_addr().unwrap();
     let cfg = format!(
-        "frontend fe\n  bind {a}\n  default_backend b\n  http-response set-header x-out \"%[bc_err]|[%[bc_err_str]]|%[bc_reused]|%[bc_dst]\"\nbackend b\n  http-reuse never\n  server s {be}"
+        "frontend f1\n  bind {ok}\n  log {log} local0\n  option dontlognull\n  log-format \"{fmt}\"\n  default_backend good\n\
+         frontend f2\n  bind {refused}\n  log {log} local0\n  option dontlognull\n  log-format \"{fmt}\"\n  default_backend refused\n\
+         frontend f3\n  bind {none}\n  log {log} local0\n  option dontlognull\n  log-format \"{fmt}\"\n  default_backend none\n\
+         backend good\n  server s {be}\n\
+         backend refused\n  retries 0\n  server s {dead}\n\
+         backend none\n"
     );
-    let global = "";
-    let body = cfg;
-    let cfg_full = http_cfg(global, &body);
-    let (ibex, _sock) = start("bc_info", &cfg_full, &[a]);
-    // first request
-    let v = xout(a, GET);
-    assert_eq!(v, "0|[Success]|0|127.0.0.1");
-    // second request
-    let v2 = xout(a, GET);
-    assert_eq!(v2, "0|[Success]|0|127.0.0.1");
+    let _ibex = start("err", &cfg, &[ok, refused, none]);
+    let mut lines = Vec::new();
+    for a in [ok, refused, none] {
+        let mut c = connect(a);
+        c.write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n").unwrap();
+        let _ = c.read_to_end(&mut Vec::new());
+        let mut buf = [0u8; 2048];
+        let n = collector.recv(&mut buf).expect("a log line");
+        let line = String::from_utf8_lossy(&buf[..n]).into_owned();
+        lines.push(line[line.find("LOG ").expect("the log-format line")..].trim_end().to_string());
+    }
+    assert_eq!(
+        lines,
+        [
+            format!("LOG 200 0|[Success]|0|127.0.0.1|{}", be.port()),
+            format!("LOG 503 47|[ECONNREFUSED returned by OS]|0|127.0.0.1|{}", dead.port()),
+            "LOG 503 -|[-]|0|-|-".to_string(),
+        ]
+    );
 }
