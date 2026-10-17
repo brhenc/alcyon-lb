@@ -3,7 +3,8 @@
 //! The RFC 7239 `Forwarded` helpers behind `option forwarded` and the `rfc7239_*`
 //! converters. Every expected value was measured on the reference binary,
 //! `HAProxy 3.5-dev8-885761-29`, on 2026-10-04, through `rfc7239_is_valid` and
-//! `rfc7239_field(<name>)` on a request header, and through `option forwarded`.
+//! `rfc7239_field(<name>)` fed by `req.hdr(<name>)` (which hands them the last comma-separated
+//! value; `rfc7239::last_value` stands in for that split), and through `option forwarded`.
 
 use ibex_sample::rfc7239::{field, is_valid, n2nn, n2np, node_from_sample, nn, np, port_from_sample, valid_host};
 use ibex_sample::Sample;
