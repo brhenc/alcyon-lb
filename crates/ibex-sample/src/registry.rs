@@ -2572,6 +2572,24 @@ impl Registry {
                 Some(Sample::Sint(r))
             },
         });
+        // T331: process id fetches
+        self.register_fetch(FetchDesc {
+            name: "tgroup",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(0)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "master_id",
+            out_type: SampleType::Str,
+            func: |_ctx, _args| std::env::var("HAPROXY_MASTER_ID").ok().map(Sample::Str),
+        });
+        self.register_fetch(FetchDesc {
+            name: "quic_enabled",
+            out_type: SampleType::Bool,
+            func: |_ctx, _args| Some(Sample::Bool(false)),
+        });
+
+
     }
 
     #[allow(clippy::too_many_lines)]
