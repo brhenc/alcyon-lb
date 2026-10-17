@@ -1049,6 +1049,35 @@ impl Registry {
             out_type: SampleType::Str,
             func: request_version_fetch,
         });
+        // T329: `fc_http_major` / `bc_http_major` are the major version numbers of the
+        // front (client) and back (server) connections. `req_proto_http` is true when
+        // the request was parsed as HTTP.
+        self.register_fetch(FetchDesc {
+            name: "fc_http_major",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| {
+                let v = get_context_req_version(ctx)
+                    .or_else(|| ctx.htx.and_then(|h| h.req_line()).map(|l| l.version.as_str()))?;
+                Some(Sample::Sint(v.strip_prefix("HTTP/").unwrap_or(v).split('.').next()?.parse().unwrap_or(i64::MAX)))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_http_major",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| {
+                let v = get_context_res_version(ctx)
+                    .or_else(|| ctx.htx.and_then(|h| h.res_line()).map(|l| l.version.as_str()))?;
+                Some(Sample::Sint(v.strip_prefix("HTTP/").unwrap_or(v).split('.').next()?.parse().unwrap_or(i64::MAX)))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "req_proto_http",
+            out_type: SampleType::Bool,
+            func: |ctx, _args| {
+                get_context_req_version(ctx).map(|_| Sample::Bool(true))
+            },
+        });
+
 
         // `smp_fetch_rqver` / `smp_fetch_stver` (src/http_fetch.c): the version without
         // its "HTTP/" ("1.1"), and nothing when there is no message to read it from.
@@ -1067,6 +1096,13 @@ impl Registry {
             out_type: SampleType::Str,
             func: response_version_fetch,
         });
+        // T329: `resp_ver` is an alias of `res.ver`
+        self.register_fetch(FetchDesc {
+            name: "resp_ver",
+            out_type: SampleType::Str,
+            func: response_version_fetch,
+        });
+
 
         let status_fetch: FetchFn = |ctx, _args| {
             if let Some(h) = ctx.htx_slice {
@@ -1099,6 +1135,13 @@ impl Registry {
             out_type: SampleType::Sint,
             func: status_fetch,
         });
+        // T329: `server_status` is the same as `status`
+        self.register_fetch(FetchDesc {
+            name: "server_status",
+            out_type: SampleType::Sint,
+            func: status_fetch,
+        });
+
         // `txn.conn_retries` and `txn.redispatched` (`smp_fetch_conn_retries`,
         // `smp_fetch_redispatched`): what the stream has spent on reaching a server.
         self.register_fetch(FetchDesc {
