@@ -284,6 +284,7 @@ mod soft_stop;
 mod soft_stop_h2;
 mod soft_stop_h3;
 mod spawned_ibex_stopped_on_panic;
+mod srv_weights;
 mod ssl_bases;
 mod ssl_fetches;
 mod startup_scaling;
