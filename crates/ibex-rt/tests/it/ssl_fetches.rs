@@ -221,7 +221,7 @@ fn global_ssl_server_verify_none_makes_the_server_connection_unverified() {
     let cfg = format!(
         "global\n  ssl-server-verify none\n\
          defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
-         frontend up\n  bind {up} ssl crt {}\n  http-request return status 200 string up\n\
+         frontend up\n  bind {up} ssl crt {}\n  http-request return status 200 content-type text/plain string up\n\
          frontend f\n  bind {front}\n  default_backend b\n\
          backend b\n  server s {up} ssl\n",
         crt.path().display()

@@ -22,6 +22,7 @@ mod proptest_expr;
 mod proptest_rawpayload;
 mod registry_cover;
 mod rfc7239;
+mod sample_arg_tokens;
 mod str_to_int_cast;
 mod t136_edges;
 mod tcp_converters_non_binary;

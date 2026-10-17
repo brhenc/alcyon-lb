@@ -104,7 +104,7 @@ fn jwt_verify_refused_algs() {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("c.cfg");
         let a = common::reserve_addr();
-        std::fs::write(&path, format!("defaults\n  mode http\n  timeout client 5s\nfrontend fe\n  bind {a}\n  http-request return status 200 lf-string \"%[str(abc),jwt_verify({alg},/nonexistent/key.pem)]\"\n")).unwrap();
+        std::fs::write(&path, format!("defaults\n  mode http\n  timeout client 5s\nfrontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"%[str(abc),jwt_verify({alg},/nonexistent/key.pem)]\"\n")).unwrap();
         let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(&path).output().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!out.status.success(), "{alg} was accepted");
@@ -127,4 +127,19 @@ fn jwt_verify_hmac_oracle_edges() {
     );
     let (_ibex, _sock) = start("jwt_verify_edges", &cfg, &[a]);
     assert_eq!(body(a, GET), "a|b-3|c-5|d|e1|f1|g0");
+}
+
+/// T341: an unquoted argument keeps its blanks too (`make_arg_list`): `jwt_verify(HS256, secret)`
+/// checks the key ` secret`. Oracle (3.5-dev8, 2026-10-17): 1 for a token signed with ` secret`, 0
+/// for one signed with `secret`; Ibex on 945ae6be trimmed the key and answered 0 and 1.
+#[test]
+fn jwt_verify_unquoted_key_keeps_its_blanks() {
+    const T1: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0.UUtsUaeO3koQylSZ3wxP4lqVvgFw6mGsVzGNBNF_1sQ"; // key "secret"
+    const TA: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0.EmYX0-a77cRyRKolXx96yiQ9s0ehY_x2VRQKtK1Mz68"; // key " secret"
+    let a = common::reserve_addr();
+    let cfg = format!(
+        "global\n  stats socket {{sock}} level admin\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"a%[str({TA}),jwt_verify(HS256, secret)]|b%[str({T1}),jwt_verify(HS256, secret)]\"\n",
+    );
+    let (_ibex, _sock) = start("jwt_verify_blank", &cfg, &[a]);
+    assert_eq!(body(a, GET), "a1|b0");
 }

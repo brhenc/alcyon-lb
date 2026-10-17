@@ -104,3 +104,97 @@ fn ibex_c_resolves_the_arguments_of_the_counter_fetches_as_haproxy_does() {
     }
     assert!(wrong.is_empty(), "{} of {} cases differ from HAProxy:\n{}", wrong.len(), ARG_REFUSED.len() + ACCEPTED.len(), wrong.join("\n"));
 }
+
+/// T341: a fetch that names one backend, server, frontend or table takes nothing after it, and
+/// `srv_id`/`srv_name` take nothing at all. `make_arg_list` stops at the last argument the
+/// fetch has and refuses what follows. Measured on 3.5-dev8-885761-29, 2026-10-17, `haproxy -c`
+/// with `http-request set-var(txn.r) <expr>` in frontend `fe`; all accepted by Ibex before.
+#[test]
+fn a_fetch_given_more_arguments_than_it_has_is_refused() {
+    let refused: &[(&str, &str)] = &[
+        ("srv_uweight(be/s1,x)", "fetch method 'srv_uweight' : expected ')' before ',x)'."),
+        ("srv_iweight(be/s1,x)", "fetch method 'srv_iweight' : expected ')' before ',x)'."),
+        ("srv_weight(be/s1,x)", "fetch method 'srv_weight' : expected ')' before ',x)'."),
+        ("srv_conn(be/s1,x)", "fetch method 'srv_conn' : expected ')' before ',x)'."),
+        ("srv_conn(be/s1,x,y)", "fetch method 'srv_conn' : expected ')' before ',x,y)'."),
+        ("srv_conn(be/s1,)", "fetch method 'srv_conn' : expected ')' before ',)'."),
+        ("srv_conn_free(be/s1,x)", "fetch method 'srv_conn_free' : expected ')' before ',x)'."),
+        ("srv_is_up(be/s1,x)", "fetch method 'srv_is_up' : expected ')' before ',x)'."),
+        ("srv_sess_rate(be/s1,x)", "fetch method 'srv_sess_rate' : expected ')' before ',x)'."),
+        ("srv_id(be/s1)", "fetch method 'srv_id' : expected ')' before 'be/s1)'."),
+        ("srv_name(be/s1,x)", "fetch method 'srv_name' : expected ')' before 'be/s1,x)'."),
+        ("nbsrv(be,x)", "fetch method 'nbsrv' : expected ')' before ',x)'."),
+        ("nbsrv(be,)", "fetch method 'nbsrv' : expected ')' before ',)'."),
+        ("be_sess_rate(be,x)", "fetch method 'be_sess_rate' : expected ')' before ',x)'."),
+        ("be_conn_free(be,x)", "fetch method 'be_conn_free' : expected ')' before ',x)'."),
+        ("fe_conn(fe,x)", "fetch method 'fe_conn' : expected ')' before ',x)'."),
+        ("fe_sess_rate(fe,x)", "fetch method 'fe_sess_rate' : expected ')' before ',x)'."),
+        ("fe_req_rate(fe,x)", "fetch method 'fe_req_rate' : expected ')' before ',x)'."),
+        ("table_cnt(fe,x)", "fetch method 'table_cnt' : expected ')' before ',x)'."),
+        ("table_avl(fe,x)", "fetch method 'table_avl' : expected ')' before ',x)'."),
+    ];
+    for (i, (expr, text)) in refused.iter().enumerate() {
+        let (code, out) = check(900 + i, &config(&format!("http-request set-var(txn.r) {expr}"), ""));
+        assert_eq!(code, Some(1), "`{expr}` must be refused: {out}");
+        assert!(out.contains(text), "`{expr}`: expected {text:?} in: {out}");
+    }
+    for (i, expr) in ["srv_conn(be/s1)", "srv_uweight(be/s1)", "nbsrv(be)", "fe_conn"].iter().enumerate() {
+        let (code, out) = check(950 + i, &config(&format!("http-request set-var(txn.r) {expr}"), ""));
+        assert_eq!(code, Some(0), "`{expr}` must load: {out}");
+    }
+}
+
+/// T341: a request rule has no server yet. `HAProxy` refuses there the fetches of the server
+/// (`SMP_USE_SERVR`: `srv_id`, `srv_name`), of its address (`SMP_USE_L4SRV`: `bc_dst`,
+/// `bc_reused`, `txn.conn_retries`, ...) and of its connection (`SMP_USE_L5SRV`: `ssl_bc*`,
+/// `bc_nb_streams`, `bs.*`), in rules, `return ... lf-string` and `unique-id-format` both, and
+/// takes them in response rules and log lines. Measured on 3.5-dev8-885761-29, 2026-10-17,
+/// `haproxy -c`; Ibex loaded every refused one and read nothing (or the last stream's server).
+#[test]
+fn a_request_rule_may_not_read_the_server_or_its_connection() {
+    let set_var = |part: &str| format!("fetch method 'set-var(txn.r)' extracts information from '{part}', none of which is available here");
+    let lf = |f: &str, part: &str| format!("sample fetch <{f}> may not be reliably used here because it needs '{part}' which is not available here.");
+    let mut refused: Vec<(String, String, String)> = Vec::new();
+    for (f, part) in [
+        ("bc_dst", "server address"),
+        ("bc_dst_port", "server address"),
+        ("bc_reused", "server address"),
+        ("bc_err", "server address"),
+        ("bc_err_str", "server address"),
+        ("txn.conn_retries", "server address"),
+        ("txn.redispatched", "server address"),
+        ("ssl_bc", "server-side connection"),
+        ("ssl_bc_protocol", "server-side connection"),
+        ("srv_id", "server"),
+        ("srv_name", "server"),
+    ] {
+        refused.push((format!("http-request set-var(txn.r) {f}"), String::new(), format!("error detected in frontend 'fe' while parsing 'http-request set-var(txn.r)' rule : {}.", set_var(part))));
+        refused.push((String::new(), format!("http-request set-var(txn.r) {f}"), format!("error detected in backend 'be' while parsing 'http-request set-var(txn.r)' rule : {}.", set_var(part))));
+        refused.push((format!("http-request set-header x %[{f}]"), String::new(), format!("error detected in frontend 'fe' while parsing 'http-request set-header' rule : {}", lf(f, part))));
+        refused.push((format!("tcp-request content set-var(txn.r) {f}"), String::new(), set_var(part)));
+        refused.push((format!("http-request return status 200 content-type t lf-string %[{f}]"), String::new(), format!("error detected in frontend 'fe' while parsing 'http-request return' rule : {}", lf(f, part))));
+        refused.push((format!("unique-id-format %[{f}]"), String::new(), format!("failed to parse unique-id : {}", lf(f, part))));
+    }
+    let mut wrong = Vec::new();
+    for (i, (fe, be, text)) in refused.iter().enumerate() {
+        let (code, out) = check(1000 + i, &config(fe, be));
+        if code != Some(1) || !out.contains(text.as_str()) {
+            wrong.push(format!("[{fe}][{be}]: exit {code:?}, expected {text:?}: {}", out.trim()));
+        }
+    }
+    for (i, (fe, be)) in [
+        ("", "http-response set-var(txn.r) bc_dst"),
+        ("", "http-response set-var(txn.r) srv_id"),
+        ("", "http-after-response set-header x %[ssl_bc]"),
+        ("log-format %[srv_name]/%[bc_reused]", ""),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (code, out) = check(1200 + i, &config(fe, be));
+        if code != Some(0) {
+            wrong.push(format!("[{fe}][{be}] must load: {}", out.trim()));
+        }
+    }
+    assert!(wrong.is_empty(), "{} cases differ from HAProxy:\n{}", wrong.len(), wrong.join("\n"));
+}

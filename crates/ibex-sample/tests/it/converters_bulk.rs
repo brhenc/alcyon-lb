@@ -1050,11 +1050,8 @@ fn test_conv_strcmp() {
     );
     // 3. Missing arg -> None
     assert_eq!(eval_conv("strcmp", Sample::Str("alpha".into()), &[]), None);
-    // 4. Literal string comparison fallback
-    assert_eq!(
-        eval_conv("strcmp", Sample::Str("foo".into()), &["foo"]),
-        Some(Sample::Sint(0))
-    );
+    // 4. A literal is no variable: refused at load in HAProxy (T341), no value here
+    assert_eq!(eval_conv("strcmp", Sample::Str("foo".into()), &["foo"]), None);
     // 5. Refused types
     assert_eq!(eval_conv("strcmp", Sample::Sint(42), &["foo"]), None);
 }
