@@ -2439,7 +2439,6 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         accept_date: Some(s.log.date),
         last_rule: last_rule_at(s.log.last_rule),
         prio: (s.log.prio_class, s.log.prio_offset),
-        thread_id: Some(crate::engine::worker_id() as u64),
         ..Default::default()
     }
 }
@@ -3944,6 +3943,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
     pub fn new_worker(config: &Config, capacity: usize, worker_id: usize, proxies: Proxies) -> io::Result<Self> {
         WORKER_ID.with(|id| id.set(worker_id));
+        ibex_sample::THREAD_ID.with(|t| t.set(worker_id));
         let poller = Poller::new(capacity)?;
         let mut scheduler = Scheduler::with_capacity(capacity);
         let mut fdtab = FdTab::with_capacity(capacity * 2);
@@ -5122,7 +5122,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 fc_src: Some(peer_addr),
                 fc_dst: Some(local_addr),
                 act_conn: self.proxies[proxy_idx].counters().act_conn.load(Ordering::Relaxed),
-                thread_id: Some(crate::engine::worker_id() as u64),
                 ..Default::default()
             };
 
@@ -10549,7 +10548,6 @@ impl EngineDispatcher<'_> {
                         acls: Some(acls),
                         act_conn,
                         stick: Some(&stick),
-                        thread_id: Some(crate::engine::worker_id() as u64),
                         ..Default::default()
                     }
                 };

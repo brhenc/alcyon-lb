@@ -144,3 +144,62 @@ fn process_fetches() {
     let _ = sock;
     let _ = ibex;
 }
+
+/// `thread` on the response side (the oracle: "0" with nbthread 1). The candidate set the thread
+/// only in three of the sample contexts, so http-response rules saw no sample.
+#[test]
+fn thread_in_http_response() {
+    let a = common::reserve_addr();
+    let be = backend(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+    let cfg = http_cfg(
+        "nbthread 1\n",
+        &format!(
+            "frontend fe\n  bind {a}\n  http-response set-header x-out \"%[thread]\"\n  default_backend be\n\
+             backend be\n  server s {be}\n"
+        ),
+    );
+    let (_ibex, _sock) = start("t326-res", &cfg, &[a]);
+    assert_eq!(xout(a, GET), "0", "thread in an http-response rule");
+}
+
+/// `thread` in a tcp-request content rule (the oracle accepts: the variable is 0).
+#[test]
+fn thread_in_tcp_request_content() {
+    let a = common::reserve_addr();
+    let be = backend(b"ok\n");
+    let cfg = format!(
+        "global\n  stats socket {{sock}} level admin\n  nbthread 1\n\
+         defaults\n  mode tcp\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind {a}\n  tcp-request content set-var(sess.t) thread\n  \
+         tcp-request content reject unless {{ var(sess.t) -m int 0 }}\n  default_backend be\n\
+         backend be\n  server s {be}\n"
+    );
+    let (_ibex, _sock) = start("t326-tcp", &cfg, &[a]);
+    let out = get(a, b"hello\r\n\r\n");
+    assert_eq!(String::from_utf8_lossy(&out), "ok\n", "tcp-request content saw no thread and rejected");
+}
+
+/// `stopping` during a soft stop: a request whose head is still incomplete when SIGUSR1 arrives
+/// is answered with stopping = 1 on the oracle. The candidate hard-coded false.
+#[test]
+fn stopping_during_soft_stop() {
+    let a = common::reserve_addr();
+    let cfg = http_cfg(
+        "nbthread 1\n",
+        &format!("frontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"[%[stopping]]\"\n"),
+    );
+    let (ibex, _sock) = start("t326-stop", &cfg, &[a]);
+    let mut s = TcpStream::connect_timeout(&a, Duration::from_secs(2)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let pid = rustix::process::Pid::from_raw(i32::try_from(ibex.0.id()).unwrap()).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::Usr1).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    s.write_all(b"Connection: close\r\n\r\n").unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let out = String::from_utf8_lossy(&out).into_owned();
+    let body = out.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {out:?}"), |(_, b)| b.to_string());
+    assert_eq!(body, "[1]", "stopping after SIGUSR1");
+}
