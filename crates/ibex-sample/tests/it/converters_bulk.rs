@@ -522,8 +522,9 @@ fn test_conv_add() {
     // 1. Documented behaviour
     assert_eq!(eval_conv("add", Sample::Sint(10), &["5"]), Some(Sample::Sint(15)));
     assert_eq!(eval_conv("add", Sample::Sint(-10), &["5"]), Some(Sample::Sint(-5)));
-    // 2. Empty / missing arg
-    assert_eq!(eval_conv("add", Sample::Sint(10), &[]), None);
+    // 2. Empty / missing arg: `read_int64` of nothing is 0 (`check_operator`); HAProxy
+    // 3.5-dev8 answers 5 for `int(5),add` (T343).
+    assert_eq!(eval_conv("add", Sample::Sint(10), &[]), Some(Sample::Sint(10)));
     // 3. Boundaries / saturation
     assert_eq!(
         eval_conv("add", Sample::Sint(i64::MAX - 5), &["10"]),
@@ -545,7 +546,7 @@ fn test_conv_sub() {
     assert_eq!(eval_conv("sub", Sample::Sint(10), &["3"]), Some(Sample::Sint(7)));
     assert_eq!(eval_conv("sub", Sample::Sint(5), &["10"]), Some(Sample::Sint(-5)));
     // 2. Empty / missing arg
-    assert_eq!(eval_conv("sub", Sample::Sint(10), &[]), None);
+    assert_eq!(eval_conv("sub", Sample::Sint(10), &[]), Some(Sample::Sint(10))); // T343: HAProxy 3.5-dev8 reads no argument as 0
     // 3. Boundaries / saturation
     assert_eq!(
         eval_conv("sub", Sample::Sint(i64::MIN + 5), &["10"]),
@@ -579,7 +580,7 @@ fn test_conv_mul() {
         Some(Sample::Sint(i64::MIN))
     );
     // 4. Missing arg
-    assert_eq!(eval_conv("mul", Sample::Sint(10), &[]), None);
+    assert_eq!(eval_conv("mul", Sample::Sint(10), &[]), Some(Sample::Sint(0))); // T343: HAProxy 3.5-dev8 reads no argument as 0
     // 5. Refused types
     assert_eq!(eval_conv("mul", Sample::Str("6".into()), &["7"]), None);
 }
@@ -598,7 +599,7 @@ fn test_conv_div() {
         Some(Sample::Sint(i64::MAX))
     );
     // 4. Missing arg
-    assert_eq!(eval_conv("div", Sample::Sint(10), &[]), None);
+    assert_eq!(eval_conv("div", Sample::Sint(10), &[]), Some(Sample::Sint(i64::MAX))); // T343: HAProxy 3.5-dev8 reads no argument as 0
     // 5. Refused types
     assert_eq!(eval_conv("div", Sample::Str("10".into()), &["2"]), None);
 }
@@ -617,7 +618,7 @@ fn test_conv_mod() {
         Some(Sample::Sint(0))
     );
     // 4. Missing arg
-    assert_eq!(eval_conv("mod", Sample::Sint(10), &[]), None);
+    assert_eq!(eval_conv("mod", Sample::Sint(10), &[]), Some(Sample::Sint(0))); // T343: HAProxy 3.5-dev8 reads no argument as 0
     // 5. Refused types
     assert_eq!(eval_conv("mod", Sample::Str("10".into()), &["3"]), None);
 }
@@ -652,8 +653,9 @@ fn test_conv_and() {
     assert_eq!(eval_conv("and", Sample::Sint(15), &["0"]), Some(Sample::Sint(0)));
     // 3. Mask with -1
     assert_eq!(eval_conv("and", Sample::Sint(15), &["-1"]), Some(Sample::Sint(15)));
-    // 4. Missing arg
-    assert_eq!(eval_conv("and", Sample::Sint(15), &[]), None);
+    // 4. Missing arg: 0, as `check_operator` reads it; HAProxy 3.5-dev8 answers 0 for
+    // `int(5),and(-)` (T343).
+    assert_eq!(eval_conv("and", Sample::Sint(15), &[]), Some(Sample::Sint(0)));
     // 5. Refused types
     assert_eq!(eval_conv("and", Sample::Str("15".into()), &["6"]), None);
 }
@@ -667,7 +669,7 @@ fn test_conv_or() {
     // 3. Mask with -1
     assert_eq!(eval_conv("or", Sample::Sint(15), &["-1"]), Some(Sample::Sint(-1)));
     // 4. Missing arg
-    assert_eq!(eval_conv("or", Sample::Sint(15), &[]), None);
+    assert_eq!(eval_conv("or", Sample::Sint(15), &[]), Some(Sample::Sint(15))); // T343: HAProxy 3.5-dev8 reads no argument as 0
     // 5. Refused types
     assert_eq!(eval_conv("or", Sample::Str("15".into()), &["16"]), None);
 }
@@ -681,7 +683,7 @@ fn test_conv_xor() {
     // 3. XOR with 0 -> unchanged
     assert_eq!(eval_conv("xor", Sample::Sint(42), &["0"]), Some(Sample::Sint(42)));
     // 4. Missing arg
-    assert_eq!(eval_conv("xor", Sample::Sint(15), &[]), None);
+    assert_eq!(eval_conv("xor", Sample::Sint(15), &[]), Some(Sample::Sint(15))); // T343: HAProxy 3.5-dev8 reads no argument as 0
     // 5. Refused types
     assert_eq!(eval_conv("xor", Sample::Str("15".into()), &["6"]), None);
 }

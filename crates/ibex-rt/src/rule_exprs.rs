@@ -15,9 +15,8 @@
 //! [`crate::engine::Engine::build_shared_state`] and from the binary before `-c` reports
 //! a configuration valid.
 //!
-//! Only action expressions are checked. Log-format arguments (`set-header`,
-//! `set-var-fmt`, `return lf-string`, ...), ACL conditions and `stick on/match/store`
-//! expressions are not.
+//! Action expressions, `stick on/match/store` and the `%[...]` of rule arguments are checked
+//! here; ACLs and the log-format family in [`crate::proxy_state::check_sample_refs`] (T343).
 
 use ibex_config::{
     Config, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
@@ -92,6 +91,10 @@ pub fn check_sample_expr(expr: &str, registry: &Registry) -> Result<(), String> 
             return Err(format!("unknown converter '{conv}'"));
         }
     }
+    // T343: every argument against the type `HAProxy` declares for it, each converter's input
+    // type, and the `val_args` checks (`sample_parse_expr`): a typed argument that does not
+    // parse would give no sample on every request.
+    ibex_sample::check_typed_expr(word, false).map_err(|e| format!("{e}."))?;
     // An expression that does not parse would answer nothing on every request (T341:
     // `hmac(sha256,var(txn.k))`, an unclosed argument, text after one).
     let parsed = ibex_sample::Expr::parse(word)?;

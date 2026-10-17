@@ -141,34 +141,12 @@ impl Expr {
             {
                 return Err(format!("Invalid converter name '{c_name}'"));
             }
-            if matches!(
-                c_name.as_str(),
-                "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "xor"
-            ) {
-                if let Some(arg) = c_args.first() {
-                    let trimmed = arg.trim().trim_matches('"').trim_matches('\'');
-                    let is_int = trimmed.parse::<i64>().is_ok()
-                        || trimmed
-                            .strip_prefix("0x")
-                            .or_else(|| trimmed.strip_prefix("0X"))
-                            .is_some_and(|hex| i64::from_str_radix(hex, 16).is_ok());
-                    let var_name = if trimmed.starts_with("var(") && trimmed.ends_with(')') {
-                        &trimmed[4..trimmed.len() - 1]
-                    } else {
-                        trimmed
-                    };
-                    let is_var = var_name.starts_with("proc.")
-                        || var_name.starts_with("sess.")
-                        || var_name.starts_with("req.")
-                        || var_name.starts_with("txn.")
-                        || var_name.starts_with("res.");
-                    if !is_int && !is_var {
-                        return Err(format!(
-                            "invalid args in converter '{c_name}' : expects an integer or a variable name."
-                        ));
-                    }
-                } else {
-                    return Err(format!("missing argument for converter '{c_name}'"));
+            // `check_operator`: a variable, or an integer `read_int64` takes whole; `-`, `+`
+            // and nothing are 0 (T343: `HAProxy` accepts `and(-)` and a bare `add`).
+            if matches!(c_name.as_str(), "add" | "sub" | "mul" | "div" | "mod" | "and" | "or" | "xor") {
+                let arg = c_args.first().map_or("", String::as_str);
+                if crate::argspec::read_int64_whole(arg).is_none() && !crate::argspec::is_variable(arg) {
+                    return Err(format!("invalid args in converter '{c_name}' : expects an integer or a variable name."));
                 }
             }
             converters.push((c_name, c_args));

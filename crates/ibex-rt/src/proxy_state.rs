@@ -679,6 +679,10 @@ pub fn check_expr(config: &Config, registry: &Registry, at: Where<'_>, expr: &st
         if let Some(msg) = not_implemented_message(c) {
             return Err(msg);
         }
+        // T343: an unknown converter in an ACL loaded and the ACL never matched.
+        if acl && !registry.has_converter(c) {
+            return Err(format!("unknown converter '{c}' in ACL expression '{word}'."));
+        }
     }
     // `request_date()` is one empty unit to `HAProxy` (`make_arg_list`), which it refuses;
     // `Expr::parse` sees no argument there, as in a bare `request_date`.
@@ -727,18 +731,25 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
     for r in &config.sample_refs {
         let in_line = |e: String| format!("parsing [line {}]: {e}", r.line);
         // The patterns of an anonymous ACL, which a named one has checked since `validate_acls`.
+        // What `HAProxy` names the condition an ACL is written in.
+        let condition = || match r.directive.as_str() {
+            "acl" => format!("ACL '{}'", r.action),
+            "http-request" | "http-response" | "http-after-response" => format!("an '{} {}' condition", r.directive, r.action),
+            "use_backend" | "use-server" => "switching rule".to_string(),
+            "force-persist" | "ignore-persist" => format!("a '{}' rule", r.directive),
+            "stick" => "sticking condition".to_string(),
+            d => format!("an '{d}' condition"),
+        };
+        // T343: an ACL's arguments against their declared types, as `parse_acl_expr` checks them;
+        // a bad one gives no sample, and the ACL never matches.
+        if r.acl {
+            if let Err(e) = ibex_sample::check_typed_expr(&r.expr, true) {
+                return Err(in_line(format!("error detected while parsing {} : {e}.", condition())));
+            }
+        }
         if let (true, Some(full)) = (r.acl, r.full.as_deref()) {
             if let Err(e) = Expr::parse(full) {
-                let what = match r.directive.as_str() {
-                    "http-request" | "http-response" | "http-after-response" => {
-                        format!("an '{} {}' condition", r.directive, r.action)
-                    }
-                    "use_backend" | "use-server" => "switching rule".to_string(),
-                    "force-persist" | "ignore-persist" => format!("a '{}' rule", r.directive),
-                    "stick" => "sticking condition".to_string(),
-                    d => format!("an '{d}' condition"),
-                };
-                return Err(in_line(format!("error detected while parsing {what} : {e}.")));
+                return Err(in_line(format!("error detected while parsing {} : {e}.", condition())));
             }
         }
         // A fetch or converter that does not exist would load and yield an empty value on
