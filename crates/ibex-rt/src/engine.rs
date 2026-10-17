@@ -3983,6 +3983,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
     pub fn new_worker(config: &Config, capacity: usize, worker_id: usize, proxies: Proxies) -> io::Result<Self> {
         WORKER_ID.with(|id| id.set(worker_id));
+        ibex_sample::THREAD_ID.with(|t| t.set(worker_id));
         let poller = Poller::new(capacity)?;
         let mut scheduler = Scheduler::with_capacity(capacity);
         let mut fdtab = FdTab::with_capacity(capacity * 2);

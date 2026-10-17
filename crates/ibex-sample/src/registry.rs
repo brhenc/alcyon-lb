@@ -162,6 +162,15 @@ fn len_to_sint(len: usize) -> i64 {
 /// Set once the process is stopping (`when(stopping)`).
 pub static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+thread_local! {
+    /// T326: the engine thread this code runs on (0..nbthread-1), for `thread`; set by
+    /// `Engine::new_worker`, so every sample context on that thread reads the same value.
+    pub static THREAD_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// T326: the host name, read once (`HAProxy` reads it at startup), for `hostname`.
+static HOSTNAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
 /// The stream state `when()` conditions read (`sample_conv_when`, src/sample.c).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamFacts {
@@ -1931,6 +1940,43 @@ impl Registry {
             name: "nbsrv",
             out_type: SampleType::Sint,
             func: |ctx, args| ctx.proxies?.usable_servers(backend_arg(ctx, args)?).map(Sample::Sint),
+        });
+        // T326: process-wide fetches
+        self.register_fetch(FetchDesc {
+            name: "pid",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(i64::from(std::process::id()))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "hostname",
+            out_type: SampleType::Str,
+            func: |_ctx, _args| {
+                HOSTNAME
+                    .get_or_init(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok().map(|s| s.trim().to_string()))
+                    .clone()
+                    .map(Sample::Str)
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "nbproc",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(1)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "proc",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(1)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "thread",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(THREAD_ID.with(|t| i64::try_from(t.get()).unwrap_or(i64::MAX)))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "stopping",
+            out_type: SampleType::Bool,
+            // Set by `Engine::begin_soft_stop`, the flag `when stopping` reads.
+            func: |_ctx, _args| Some(Sample::Bool(STOPPING.load(std::sync::atomic::Ordering::Relaxed))),
         });
         self.register_fetch(FetchDesc {
             name: "srv_conn",

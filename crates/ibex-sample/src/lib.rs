@@ -36,7 +36,7 @@ pub use matcher::{IntOp, IntRange, Matcher};
 pub use registry::{set_debug_sink, take_debug_destinations, DebugSinkFn, 
     check_converter_args, check_dump_all_vars_args, get_proc_var, not_implemented, not_implemented_message, sample_registry, set_proc_var, unset_proc_var, var_conds_hold, ConvDesc,
     ConvFn, CtxConvDesc, CtxConvFn, FetchDesc, FetchFn, FrontendCounter, ProxyState, Registry,
-    ServerState, SampleContext, ConnErr, SslFacts, StickData, StickGpc, StickOp, StickState, StreamFacts, StreamTimeouts, TimeoutKind, CURRENT_VARS, STOPPING, GLOBAL_PROC_VARS, SAMPLE_REGISTRY,
+    ServerState, SampleContext, ConnErr, SslFacts, StickData, StickGpc, StickOp, StickState, StreamFacts, StreamTimeouts, TimeoutKind, CURRENT_VARS, STOPPING, THREAD_ID, GLOBAL_PROC_VARS, SAMPLE_REGISTRY,
 };
 pub use rawpayload::{check_args as check_raw_fetch_args, raw_may_change};
 pub use sample::{Sample, SampleType, TypeSpec, SAMPLE_TYPES_COUNT};
