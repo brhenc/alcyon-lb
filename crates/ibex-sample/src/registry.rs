@@ -1444,7 +1444,9 @@ impl Registry {
                 let set_cookies = get_all_res_headers(ctx, "set-cookie");
                 let mut count = 0;
                 for hdr in set_cookies {
-                    for (k, _) in extract_cookies(&hdr) {
+                    // T327: for Set-Cookie headers, only the first name=value pair is the cookie,
+                    // the rest are attributes (Path, HttpOnly, Secure, ...).
+                    if let Some((k, _)) = extract_cookies(&hdr).first() {
                         if let Some(target) = name {
                             if k == target {
                                 count += 1;
