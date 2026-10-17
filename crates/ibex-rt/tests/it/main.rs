@@ -226,6 +226,7 @@ mod request_line_validation;
 mod request_rule_actions;
 mod res_hdrs;
 mod req_hdr_names;
+mod req_cook_names;
 mod response_fetch_in_request;
 mod response_head_validation;
 mod response_te;

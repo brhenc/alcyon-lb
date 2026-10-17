@@ -1451,6 +1451,21 @@ impl Registry {
             func: cook_cnt_fetch,
         });
 
+        let cook_names_fetch: FetchFn = |ctx, args| {
+            // T326
+            let delim = args.first().and_then(|s| s.chars().next()).unwrap_or(',');
+            let mut names = String::new();
+            for hdr in get_all_req_headers(ctx, "cookie") {
+                crate::cookie_names::append(&mut names, &hdr, true, delim);
+            }
+            Some(Sample::Str(names))
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.cook_names",
+            out_type: SampleType::Str,
+            func: cook_names_fetch,
+        });
+
         self.register_fetch(FetchDesc {
             name: "res.cook_cnt",
             out_type: SampleType::Sint,
