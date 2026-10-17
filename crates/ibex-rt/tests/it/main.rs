@@ -283,6 +283,7 @@ mod tcp_frontend_backend;
 mod tcp_raw_fetches;
 mod tcp_request_rules;
 mod tcp_request_tracking;
+mod tcp_converters;
 mod tcp_response_rules;
 mod timeout_tunnel_queue;
 mod timer_waits;
