@@ -291,6 +291,7 @@ mod show_info_total_bytes_out;
 mod show_info_listeners_maxconn;
 mod show_info_ssl;
 mod show_table;
+mod smtp_check_eof;
 mod smtp_check_partial_lines;
 mod soft_stop;
 mod soft_stop_h2;
