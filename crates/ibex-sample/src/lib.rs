@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod acls;
+pub mod argspec;
 pub mod aes;
 pub mod auth;
 pub mod capture_write;
@@ -29,6 +30,7 @@ pub mod registry;
 pub mod sample;
 
 pub use acls::Acls;
+pub use argspec::check_typed_expr;
 pub use auth::{set_userlists, AuthUser, AuthUserlist};
 pub use ibex_crypt::CryptHash;
 pub use cast::{can_cast, cast};

@@ -2150,12 +2150,18 @@ class VtcExecutor:
                 elif block is not None:
                     conf_type = "-conf"
                     start_imm = False
+                    expect_exit = None
                     idx = 0
                     while idx < len(opts):
                         if opts[idx] in ("-conf", "-conf-OK", "-conf-BAD"):
                             conf_type = opts[idx]
                         elif opts[idx] == "-start":
                             start_imm = True
+                        elif opts[idx] == "-expectexit" and idx + 1 < len(opts):
+                            # `haproxy h1 -conf {...} -start -expectexit 1`: the proxy is
+                            # expected to refuse its configuration (converter/bytes.vtc).
+                            expect_exit = int(opts[idx + 1])
+                            idx += 1
                         idx += 1
 
                     rewritten_cfg, alloc_ports = preprocess_haproxy_config(
@@ -2228,7 +2234,10 @@ class VtcExecutor:
                                 print(f"     {Color.DIM}[haproxy {haproxy_id}] started (pid {proc.pid}) ports={list(alloc_ports.values())}{Color.RESET}")
 
                             await asyncio.sleep(0.06)
-                            if proc.poll() is not None:
+                            if proc.poll() is not None and proc.returncode == expect_exit:
+                                proc.communicate()
+                                _note_assertion()
+                            elif proc.poll() is not None:
                                 out, err = proc.communicate()
                                 raise RuntimeError(
                                     f"Proxy {haproxy_id} exited prematurely with code {proc.returncode}:\n"

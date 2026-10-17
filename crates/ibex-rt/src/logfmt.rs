@@ -564,6 +564,8 @@ impl LogFormat {
                 if let Some((c, _)) = expr.converters.iter().find(|(c, _)| !registry.has_converter(c)) {
                     return Err(format!("failed to parse sample expression <{src}> : unknown converter '{c}'"));
                 }
+                // T343: each argument against its declared type, each converter's input type.
+                ibex_sample::check_typed_expr(src, false).map_err(|e| format!("failed to parse sample expression <{src}> : {e}."))?;
                 // T341: the same load-time argument checks as a rule's expression
                 // (`val_args`, run by `sample_parse_expr` wherever the `%[...]` is).
                 if let Some(e) = registry.check_converters(&expr.converters) {

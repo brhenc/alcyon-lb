@@ -605,6 +605,9 @@ fn test_bare_non_numeric_converter_args_rejected() {
         // T341: parentheses do not nest in an argument; HAProxy 3.5-dev8: "invalid args in
         // converter 'add' : expects an integer or a variable name."
         "int(100),add(var(req.offset))",
+        // T343: `read_int64` reads no hexadecimal; HAProxy 3.5-dev8 refuses `add(0x10)` ("expects
+        // an integer or a variable name").
+        "int(100),add(0x10)",
     ];
 
     for expr_str in invalid_expressions {
@@ -619,7 +622,6 @@ fn test_bare_non_numeric_converter_args_rejected() {
     let valid_expressions = [
         "int(100),add(10)",
         "int(100),add(-5)",
-        "int(100),add(0x10)",
         "int(100),add(proc.delta)",
         "int(100),mul(3)",
     ];
