@@ -201,6 +201,7 @@ mod maxsock_limit;
 mod monitor_uri;
 mod mqtt;
 mod multithread;
+mod multi_value_occurrence;
 mod no_log;
 mod node_description;
 mod nofile_limit;
