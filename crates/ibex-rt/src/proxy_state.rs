@@ -665,6 +665,9 @@ pub fn check_expr(config: &Config, registry: &Registry, at: Where<'_>, expr: &st
     if let Some(msg) = ibex_sample::check_raw_fetch_args(&e.fetch_name, &e.fetch_args) {
         return Err(msg);
     }
+    if let Some(msg) = ibex_sample::check_dump_all_vars_args(&e.fetch_name, &e.fetch_args) {
+        return Err(msg);
+    }
     if let Some(msg) = array_arity(&e.fetch_name, e.fetch_args.len(), false) {
         return Err(msg);
     }
