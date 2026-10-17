@@ -13,6 +13,7 @@ use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Outcome of a transport read or write.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -96,11 +97,50 @@ pub fn recv(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Io> {
     }
 }
 
-/// Writes from `buf`.
+/// `show info` `TotalBytesOut`, in shards so the threads that write do not share one
+/// cache line: `HAProxy` keeps it per thread (`th_ctx->out_bytes`) and sums on read.
+#[repr(align(128))]
+struct OutShard(AtomicU64);
+
+const OUT_SHARDS: usize = 64;
+static OUT_BYTES: [OutShard; OUT_SHARDS] = [const { OutShard(AtomicU64::new(0)) }; OUT_SHARDS];
+static OUT_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static OUT_SHARD: usize = OUT_NEXT.fetch_add(1, Ordering::Relaxed) % OUT_SHARDS;
+}
+
+/// Counts `n` bytes written to a socket by a path that does not go through [`send`]
+/// (the CLI applet's `std` stream).
+pub fn count_out(n: usize) {
+    OUT_SHARD.with(|&i| OUT_BYTES[i].0.fetch_add(n as u64, Ordering::Relaxed));
+}
+
+/// Every byte written to a client, server, health-check or CLI socket since start
+/// (`raw_sock_from_buf` -> `increment_send_rate`): on TLS, the records on the wire.
+#[must_use]
+pub fn bytes_out() -> u64 {
+    OUT_BYTES.iter().map(|s| s.0.load(Ordering::Relaxed)).sum()
+}
+
+/// Writes from `buf`, counting what was written in [`bytes_out`].
 ///
 /// # Errors
 /// Propagates genuinely unexpected failures.
 pub fn send(fd: BorrowedFd<'_>, buf: &[u8]) -> io::Result<Io> {
+    let r = send_uncounted(fd, buf);
+    if let Ok(Io::Done(n)) = r {
+        count_out(n);
+    }
+    r
+}
+
+/// [`send`] for a hop inside Ibex that `HAProxy` does not have (the QUIC listener feeding
+/// an HTTP/3 request to its engine): not in [`bytes_out`].
+///
+/// # Errors
+/// Propagates genuinely unexpected failures.
+pub fn send_uncounted(fd: BorrowedFd<'_>, buf: &[u8]) -> io::Result<Io> {
     if buf.is_empty() {
         return Ok(Io::Done(0));
     }

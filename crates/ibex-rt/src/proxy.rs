@@ -1979,7 +1979,6 @@ impl TcpSession {
                         // Room for replies again: a demux held on a full output goes on.
                         h2.resume();
                         self.bytes_out += n as u64;
-                        crate::stats::BYTES_OUT.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                         changed = true;
                     }
                     Io::Closed => {
@@ -2304,7 +2303,6 @@ impl TcpSession {
                         }
                     }
                     self.rep.consume(n);
-                    crate::stats::BYTES_OUT.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                     self.bytes_out += n as u64;
                     changed = true;
                 }
@@ -2705,7 +2703,6 @@ impl TcpSession {
                         // a GOAWAY more queued each time (T288, MY-3).
                         h2.send_goaway(last, ibex_proto::h2::H2Error::NoError, &[]);
                         if let Ok(Io::Done(n)) = self.cli.send(&mut self.cli_xprt, &h2.tx_buf[h2.tx_consumed..]) {
-                            crate::stats::BYTES_OUT.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                             MuxH2.consume_output(h2, n);
                             self.bytes_out += n as u64;
                         }

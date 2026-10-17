@@ -909,7 +909,7 @@ impl QuicListener {
                 continue;
             }
             while !r.to_engine.is_empty() {
-                match crate::raw::send(r.fd.as_fd(), &r.to_engine) {
+                match crate::raw::send_uncounted(r.fd.as_fd(), &r.to_engine) {
                     Ok(crate::raw::Io::Done(n)) if n > 0 => {
                         r.to_engine.drain(..n);
                     }

@@ -339,9 +339,6 @@ pub fn description() -> Option<String> {
 
 pub static NBTHREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-/// T320: process-wide bytes written to clients and stats socket.
-pub static BYTES_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 pub fn format_show_info(start_time: Instant, pid: u32, total_tasks: usize, run_queue_len: usize, active_conns: u32, max_conns: u32) -> String {
     format_show_info_counts(start_time, pid, total_tasks, run_queue_len, active_conns, max_conns, 0, 0)
 }
@@ -484,7 +481,7 @@ fn show_info_pairs(
         ("DroppedLogs", crate::syslog::dropped_logs().to_string()),
         ("BusyPolling", zero()),
         ("FailedResolutions", zero()),
-        ("TotalBytesOut", BYTES_OUT.load(std::sync::atomic::Ordering::Relaxed).to_string()),
+        ("TotalBytesOut", crate::raw::bytes_out().to_string()),
         ("TotalSplicedBytesOut", zero()),
         ("BytesOutRate", zero()),
         ("DebugCommandsIssued", zero()),
