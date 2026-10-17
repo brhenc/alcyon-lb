@@ -522,10 +522,11 @@ pub struct TcpSession {
     pub retry_conn: bool,
     /// The stream was redispatched (`SF_REDISP`): what `txn.redispatched` reads.
     pub redispatched: bool,
-    /// Where the server connection was made, or is being made, to: `bc_dst`. Set with
-    /// the engine's `target_addr`, cleared when the server is released.
-    /// Boxed: one is held per client connection (`struct_sizes::session_entry_stays_small`).
-    pub bc_dst: Option<Box<SocketAddr>>,
+    /// The configured address of the server the stream is connected, or connecting, to
+    /// (`%si` and the stats read it); `None` while it has none. Set when a connect is
+    /// made, cleared when the server is released, and moved with the server connection.
+    /// The socket's own destination, `bc_dst`, is derived from it: [`Self::bc_dst`].
+    pub target_addr: Option<SocketAddr>,
     /// The server connection's `conn->err_code`: [`BC_CONNECTED`] once connected, the
     /// failure of a connect, `None` while there is none or it is connecting: `bc_err`.
     pub bc_err: Option<&'static ibex_sample::ConnErr<'static>>,
@@ -686,6 +687,20 @@ impl TcpSession {
     #[must_use]
     pub fn bc_http_major(&self) -> Option<u8> {
         (self.mode == Mode::Http && self.srv.is_some()).then_some(1)
+    }
+
+    /// `bc_dst`: where the server connection was made, or is being made, to -- the
+    /// server's address with the destination filling in what it leaves unset
+    /// (`connect_addr`, as the connect computed it). Derived rather than stored, which
+    /// would cost a `SessionEntry` 32 bytes or a box per connect. It reads `server_addr`
+    /// as it is now, which is the value the connect used: `set-dst` runs before the
+    /// connect, and a server that takes the destination's address or port is never
+    /// reused for a later request (its kept connection is replaced, `set_target` again).
+    /// Only that later request's own rules, before its connect, could see the old
+    /// connection with the new destination.
+    #[must_use]
+    pub fn bc_dst(&self) -> Option<SocketAddr> {
+        self.target_addr.map(|t| crate::engine::connect_addr(t, self.server_addr))
     }
 
     /// Whether the session is a stream of an HTTP/2 connection (T280).
@@ -1010,7 +1025,7 @@ impl TcpSession {
             srv_park_exp: Tick::ETERNITY,
             retry_conn: true,
             redispatched: false,
-            bc_dst: None,
+            target_addr: None,
             bc_err: None,
             lb_picked: false,
             cli_exp: Tick::ETERNITY,

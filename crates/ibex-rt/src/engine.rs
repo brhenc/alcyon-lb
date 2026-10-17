@@ -1869,7 +1869,6 @@ pub struct SessionEntry {
     /// transactions outlives the routing of the one that opened it.
     pub srv_backend_idx: usize,
     pub target_server_idx: Option<usize>,
-    pub target_addr: Option<SocketAddr>,
     pub cli_raw_fd: RawFd,
     pub srv_raw_fd: Option<RawFd>,
     pub cli_interest: Interest,
@@ -2489,7 +2488,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         prio: (s.log.prio_class, s.log.prio_offset),
         bc_err: s.bc_err.copied(),
         bc_reused: Some(s.txn.as_ref().is_some_and(|t| t.srv_reused)),
-        bc_dst: s.bc_dst.as_deref().copied(),
+        bc_dst: s.bc_dst(),
         ..Default::default()
     }
 }
@@ -2506,7 +2505,7 @@ fn stream_log_data<'a>(entry: &'a SessionEntry, proxies: &'a [Proxy], proxy_idx:
     let fe = &proxies[proxy_idx];
     let be = proxies.get(entry.backend_idx).filter(|_| proxies.len() > 1).unwrap_or(fe);
     crate::logfmt::LogData {
-        server_addr: entry.target_addr.map(|t| connect_addr(t, entry.sess.server_addr)),
+        server_addr: entry.sess.bc_dst(),
         server: entry.target_server_idx.and_then(|i| proxies.get(entry.srv_backend_idx)?.server_ids.get(i)).map(String::as_str),
         term_state: term_state(entry),
         // The stream has let go of its backend when the line is made: only the others count.
@@ -4931,7 +4930,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 backend_idx: owner.proxy_idx,
                 srv_backend_idx: owner.proxy_idx,
                 target_server_idx: None,
-                target_addr: None,
                 // The connection's, which `show sess` shows; never polled through this entry.
                 cli_raw_fd: owner.cli_raw_fd,
                 srv_raw_fd: None,
@@ -6350,7 +6348,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         captures_res_hdr: Some(&sess.log.res_captures),
         bc_err: sess.bc_err.copied(),
         bc_reused: Some(sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
-        bc_dst: sess.bc_dst.as_deref().copied(),
+        bc_dst: sess.bc_dst(),
         ..Default::default()
     };
     for rule in &proxy.tcp_res_content_rules {
@@ -6650,7 +6648,6 @@ fn register_new_session(
         backend_idx: proxy_idx,
         srv_backend_idx: proxy_idx,
         target_server_idx,
-        target_addr,
         cli_raw_fd,
         srv_raw_fd,
         cli_interest,
@@ -6762,7 +6759,7 @@ fn maps_destination(server: SocketAddr) -> bool {
 /// the destination port -- which `set-dst-port` may have rewritten. The server keeps its
 /// configured address as its identity (selection, `actconn`, stats); only the socket
 /// sees this one.
-fn connect_addr(server: SocketAddr, dst: Option<SocketAddr>) -> SocketAddr {
+pub(crate) fn connect_addr(server: SocketAddr, dst: Option<SocketAddr>) -> SocketAddr {
     let Some(dst) = dst else { return server };
     let ip = if server.ip().is_unspecified() { dst.ip() } else { server.ip() };
     let port = if server.port() == 0 { dst.port() } else { server.port() };
@@ -6772,8 +6769,7 @@ fn connect_addr(server: SocketAddr, dst: Option<SocketAddr>) -> SocketAddr {
 /// The stream connects to `target` now: `%si` and the stats read the configured address,
 /// `bc_dst` the one the socket connects to.
 fn set_target(entry: &mut SessionEntry, target: SocketAddr) {
-    entry.target_addr = Some(target);
-    entry.sess.bc_dst = Some(Box::new(connect_addr(target, entry.sess.server_addr)));
+    entry.sess.target_addr = Some(target);
 }
 
 fn maybe_prepend_send_proxy(fe: &Proxy, proxy: &Proxy, proxies: &[Proxy], sess: &mut TcpSession, target_addr: SocketAddr) {
@@ -7013,7 +7009,7 @@ fn init_client_session(
             arm_res_inspect(proxy, &mut sess);
             sess.set_backend_timeouts(proxy);
 
-            sess.bc_dst = Some(Box::new(connect_addr(target, sess.server_addr)));
+            sess.target_addr = Some(target);
             let connected = raw::connect_opts(connect_addr(target, sess.server_addr), proxy.server_tfo_of(target))
                 .inspect_err(|e| sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)));
             if let Ok((srv_fd, immediate)) = connected {
@@ -7340,6 +7336,7 @@ fn release_server(
         let xprt = std::mem::replace(&mut entry.sess.srv_xprt, crate::xprt::ServerXprt::Plain);
         // Only a server's connections are pooled (`srv_add_to_idle_list` needs one).
         let key = entry
+            .sess
             .target_addr
             .filter(|&a| reusable && !maps_destination(a))
             .and_then(|addr| idle_key(addr, entry.srv_backend_idx, entry.target_server_idx, xprt.sni().map(str::to_string)));
@@ -7367,8 +7364,7 @@ fn release_server(
         release_server_actconn(entry, proxies, parked);
     }
     entry.target_server_idx = None;
-    entry.target_addr = None;
-    entry.sess.bc_dst = None;
+    entry.sess.target_addr = None;
     entry.sess.bc_err = None;
     entry.srv_served = 0;
     entry.sess.srv_state = ScState::Init;
@@ -7406,13 +7402,12 @@ fn move_server(from: &mut SessionEntry, to: &mut SessionEntry, fdtab: &mut FdTab
     t.srv_cant_recv = f.srv_cant_recv;
     t.send_proxy_prepended = std::mem::take(&mut f.send_proxy_prepended);
     t.send_proxy_header = std::mem::take(&mut f.send_proxy_header);
-    t.bc_dst = f.bc_dst.take();
+    t.target_addr = f.target_addr.take();
     t.bc_err = f.bc_err.take();
     to.srv_raw_fd = from.srv_raw_fd.take();
     to.srv_interest = std::mem::replace(&mut from.srv_interest, Interest::NONE);
     to.srv_backend_idx = from.srv_backend_idx;
     to.target_server_idx = from.target_server_idx.take();
-    to.target_addr = from.target_addr.take();
     to.srv_served = std::mem::take(&mut from.srv_served);
     if let Some(sfd) = to.srv_raw_fd {
         fdtab.set_task(sfd, to.task);
@@ -7702,7 +7697,7 @@ fn retry_server_connect(
         )
     };
     let target = if resuming {
-        entry.target_addr
+        entry.sess.target_addr
     } else if redispatch {
         // A consistent ring walks past the server to avoid; a map-based hash cannot.
         let hash = matches!(proxies[be_idx].balance, BalanceAlgorithm::Source | BalanceAlgorithm::Uri)
@@ -7718,12 +7713,13 @@ fn retry_server_connect(
         })
     } else {
         entry
+            .sess
             .target_addr
             .or_else(|| proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref()))
     };
     // A different server is a redispatch (`wredis`), the same one a retry (`wretr`); the
     // client's persistence cookie no longer holds (`SF_DIRECT` cleared, `TX_CK_DOWN`).
-    let moved = target.is_some() && entry.target_addr.is_some() && target != entry.target_addr;
+    let moved = target.is_some() && entry.sess.target_addr.is_some() && target != entry.sess.target_addr;
     let stats = &proxies[be_idx].counters();
     let count_on_server = |redispatch: bool| {
         let mut m = proxies[be_idx].server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7767,7 +7763,7 @@ fn retry_server_connect(
     // The same server again after an asynchronous connect error: wait `MIN(1s, timeout
     // connect)` first (`SC_ST_TAR`, `src/backend.c`). `check_timeouts_and_retry` resumes the
     // connect when it is over. A connect refused at once is retried at once.
-    if wait && !resuming && entry.target_addr == Some(target_addr) {
+    if wait && !resuming && entry.sess.target_addr == Some(target_addr) {
         entry.sess.retry_after = now.add(entry.sess.retry_delay_ms());
         return false;
     }
@@ -9314,7 +9310,7 @@ impl EngineDispatcher<'_> {
                 // A retry waiting out its turnaround connects in step 2 when it is over.
                 && !entry.sess.retry_after.is_set()
             {
-                if entry.target_addr.is_some() {
+                if entry.sess.target_addr.is_some() {
                     // The connect made at accept was refused at once, retries remain: this
                     // is the retry (`wretr`, or `wredis` redispatched), at once.
                     retry_now(entry, self.proxies, self.fdtab, self.poller, now);
@@ -9907,7 +9903,7 @@ impl EngineDispatcher<'_> {
             stream: Some(stream_facts(&entry.sess, Some(status))),
             bc_err: entry.sess.bc_err.copied(),
             bc_reused: Some(entry.sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
-            bc_dst: entry.sess.bc_dst.as_deref().copied(),
+            bc_dst: entry.sess.bc_dst(),
             last_rule: last_rule_at(entry.sess.log.last_rule),
             prio: (entry.sess.log.prio_class, entry.sess.log.prio_offset),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
@@ -11373,7 +11369,7 @@ impl EngineDispatcher<'_> {
 
         let xot_excepts: Vec<&str> = fe_be.iter().filter_map(|&i| proxies[i].stats_config.originalto.as_deref()).collect();
         if !xot_excepts.is_empty() {
-            let dst_ip = entry.sess.server_addr.or(entry.target_addr).map(|a| a.ip());
+            let dst_ip = entry.sess.server_addr.or(entry.sess.target_addr).map(|a| a.ip());
             if let Some(ip) = dst_ip {
                 let in_except = xot_excepts.iter().any(|e| !e.is_empty() && ip_in_cidr(ip, e));
                 if !in_except {
@@ -11466,7 +11462,7 @@ impl EngineDispatcher<'_> {
             // A server that maps the destination may have been reached at another
             // address than this request's destination names; it is not kept.
             let same = entry.srv_backend_idx == be_idx
-                && entry.target_addr == Some(target_addr)
+                && entry.sess.target_addr == Some(target_addr)
                 && !maps_destination(target_addr)
                 // A TLS connection carries the name it was opened with; a request whose
                 // SNI differs (another Host, under the automatic SNI) needs its own.
@@ -13712,7 +13708,7 @@ fn after_res_on_reply<'r>(
             captures_res_hdr: Some(&res_caps_in),
             bc_err: sess.bc_err.copied(),
             bc_reused: Some(sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
-            bc_dst: sess.bc_dst.as_deref().copied(),
+            bc_dst: sess.bc_dst(),
             ..Default::default()
         };
         eval_after_res_rules(

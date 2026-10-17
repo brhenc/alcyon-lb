@@ -206,7 +206,10 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
     // 2026-09-23 (Nudge 7): HTX buffer pooling & zero-alloc fast path: measured 6 allocs, 186 bytes
     // (allocprofile: 5 allocs, 124 bytes). Zero allocs in HtxBuffer::with_capacity and to_h1_wire.
     // Bound lowered from 25 to <= 10, bytes from 2000 to <= 500.
-    let max_allowed_allocs: usize = 10;
+    // 2026-10-17: 6 allocs, 202 bytes, one of them a 32-byte `Box<SocketAddr>` for `bc_dst`
+    // made on every server connect (853f2b94; measuring gate 4 -> 5 allocs/req). `bc_dst`
+    // is derived from the stream's target now: 5 allocs, 170 bytes. Pinned there.
+    let max_allowed_allocs: usize = 5;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
         "a steady state HTTP request allocated {} times (> {}); diff: {:?}",
@@ -214,7 +217,7 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
         max_allowed_allocs,
         diff
     );
-    let max_allowed_bytes: usize = 500;
+    let max_allowed_bytes: usize = 170;
     assert!(
         diff.bytes_allocated <= max_allowed_bytes,
         "a steady state HTTP request allocated {} bytes (> {}); diff: {:?}",
@@ -310,7 +313,9 @@ fn a_steady_state_tcp_connection_allocates_no_more_than_n_times() {
     // Bound lowered from 35 to <= 30.
     // 2026-09-23 (Nudge 6): Measured 0 allocs, 0 bytes. Buffer reuse and poller event buffer reuse.
     // Bound lowered from 30 to <= 5.
-    let max_allowed_allocs: usize = 5;
+    // 2026-10-17: 2 allocs, 40 bytes, one of them the 32-byte `Box<SocketAddr>` the TCP-mode
+    // connect made for `bc_dst` (853f2b94). Without it: 1 alloc, 8 bytes. Pinned there.
+    let max_allowed_allocs: usize = 1;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
         "a steady state TCP connection allocated {} times (> {}); diff: {:?}",
@@ -318,7 +323,7 @@ fn a_steady_state_tcp_connection_allocates_no_more_than_n_times() {
         max_allowed_allocs,
         diff
     );
-    let max_allowed_bytes: usize = 500;
+    let max_allowed_bytes: usize = 8;
     assert!(
         diff.bytes_allocated <= max_allowed_bytes,
         "a steady state TCP connection allocated {} bytes (> {}); diff: {:?}",

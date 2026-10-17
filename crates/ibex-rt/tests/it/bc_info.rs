@@ -163,3 +163,38 @@ fn bc_err_logs_the_server_connect_error() {
         ]
     );
 }
+
+/// A server written without a port connects to the destination port, which
+/// `set-dst-port` sets per request: `bc_dst_port` is the port each request's server
+/// connection went to, on one client connection, the second request to another port than
+/// the first (oracle, `http-reuse always`: `127.0.0.1|<p1>|<p1>`, then `<p2>`, `<p2>`, `<p1>`).
+/// `bc_dst` is derived from the stream's server and destination (not stored): this pins
+/// that the derivation follows each new connection.
+#[test]
+fn bc_dst_port_follows_the_destination_a_portless_server_maps() {
+    let (be1, be2) = (backend("127.0.0.1:0"), backend("127.0.0.1:0"));
+    let a = common::reserve_addr();
+    let cfg = format!(
+        "frontend fe\n  bind {a}\n  http-request set-dst-port req.hdr(x-port)\n  default_backend b\n  \
+         http-response set-header x-out \"%[bc_dst]|%[bc_dst_port]|%[dst_port]\"\n\
+         backend b\n  http-reuse always\n  server s 127.0.0.1\n"
+    );
+    let _ibex = start("mapports", &cfg, &[a]);
+    let mut c = connect(a);
+    for p in [be1.port(), be2.port(), be2.port(), be1.port()] {
+        c.write_all(format!("GET / HTTP/1.1\r\nHost: a\r\nx-port: {p}\r\n\r\n").as_bytes()).unwrap();
+        let (mut got, mut b) = (Vec::new(), [0u8; 4096]);
+        let head = loop {
+            if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                if got.len() >= end + 4 + 2 {
+                    break String::from_utf8_lossy(&got[..end]).into_owned();
+                }
+            }
+            let n = c.read(&mut b).unwrap_or(0);
+            assert!(n > 0, "the answer stopped short: {:?}", String::from_utf8_lossy(&got));
+            got.extend_from_slice(&b[..n]);
+        };
+        let out = head.lines().find_map(|l| l.strip_prefix("x-out: ")).unwrap_or_else(|| panic!("no x-out: {head:?}"));
+        assert_eq!(out, format!("127.0.0.1|{p}|{p}"));
+    }
+}
