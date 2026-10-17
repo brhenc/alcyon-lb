@@ -82,9 +82,9 @@ fn http_cfg(global: &str, body: &str) -> String {
     )
 }
 
-fn cert() -> (std::path::PathBuf, rustls::pki_types::CertificateDer<'static>) {
+fn cert(tag: &str) -> (std::path::PathBuf, rustls::pki_types::CertificateDer<'static>) {
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
-    let path = std::env::temp_dir().join(format!("qh-ssl-{}.pem", std::process::id()));
+    let path = std::env::temp_dir().join(format!("qh-ssl-{tag}-{}.pem", std::process::id()));
     std::fs::write(&path, format!("{}{}", ck.cert.pem(), ck.key_pair.serialize_pem())).expect("write pem");
     (path, ck.cert.der().clone())
 }
@@ -118,21 +118,32 @@ fn tls_request(tls: &mut Tls, close: bool) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn four(sock: &str) -> [u64; 4] {
+/// `CurrSslConns`, `CumSslConns` less `base`, `SslRate`, `MaxSslRate`.
+fn four(sock: &str, base: u64) -> [u64; 4] {
     let i = info(sock);
-    ["CurrSslConns", "CumSslConns", "SslRate", "MaxSslRate"].map(|k| num(&i, k))
+    let mut f = ["CurrSslConns", "CumSslConns", "SslRate", "MaxSslRate"].map(|k| num(&i, k));
+    f[1] -= base;
+    f
+}
+
+/// `CumSslConns` once `start` is done: its readiness probes of a TLS port are TLS connections
+/// that never handshake, which `HAProxy` counts too (`ssl_sock_init`), and `clear counters`
+/// leaves the total alone.
+fn cum_at_start(sock: &str) -> u64 {
+    four(sock, 0)[1]
 }
 
 #[test]
 fn show_info_ssl_counters() {
-    let (pem, der) = cert();
+    let (pem, der) = cert("counters");
     let (a, b) = (common::reserve_addr(), common::reserve_addr());
     let cfg = http_cfg(
         "  nbthread 4\n",
         &format!("frontend fe\n  bind {a}\n  bind {b} ssl crt {}\n  http-request return status 200 content-type text/plain string ok\n", pem.display()),
     );
     let (_ibex, sock) = start("ssl", &cfg, &[a, b]);
-    assert_eq!(four(&sock), [0, 0, 0, 0], "at start");
+    let base = cum_at_start(&sock);
+    assert_eq!(four(&sock, base), [0, 0, 0, 0], "at start");
 
     for _ in 0..10 {
         let mut t = tls_connect(b, &der);
@@ -140,22 +151,80 @@ fn show_info_ssl_counters() {
     }
     let mut kept = tls_connect(b, &der);
     assert!(tls_request(&mut kept, false).starts_with("HTTP/1.1 200"));
-    assert_eq!(four(&sock), [1, 11, 11, 11], "after 10 TLS requests + 1 kept open");
+    assert_eq!(four(&sock, base), [1, 11, 11, 11], "after 10 TLS requests + 1 kept open");
 
     for _ in 0..5 {
         assert!(get(a, GET).starts_with(b"HTTP/1.1 200"));
     }
-    assert_eq!(four(&sock), [1, 11, 11, 11], "plain requests are no TLS connection");
+    assert_eq!(four(&sock, base), [1, 11, 11, 11], "plain requests are no TLS connection");
 
     drop(kept);
     let deadline = Instant::now() + Duration::from_secs(3);
-    while four(&sock)[0] != 0 {
-        assert!(Instant::now() < deadline, "CurrSslConns stays {}", four(&sock)[0]);
+    while four(&sock, base)[0] != 0 {
+        assert!(Instant::now() < deadline, "CurrSslConns stays {}", four(&sock, base)[0]);
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(four(&sock)[1], 11, "CumSslConns after close");
+    assert_eq!(four(&sock, base)[1], 11, "CumSslConns after close");
     cli(&sock, "clear counters");
-    let f = four(&sock);
+    let f = four(&sock, base);
     assert_eq!((f[1], f[3]), (11, 0), "clear counters resets only MaxSslRate");
+    let _ = std::fs::remove_file(&pem);
+}
+
+/// Waits up to 3 s for `CurrSslConns` and `CumSslConns` to read `want`; the last reading of
+/// those two and `MaxSslRate` (`SslRate` is left out: it decays while this waits).
+fn settle(sock: &str, base: u64, want: [u64; 2]) -> [u64; 3] {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let f = four(sock, base);
+        if [f[0], f[1]] == want || Instant::now() >= deadline {
+            return [f[0], f[1], f[3]];
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `HAProxy` counts a TLS connection in `CumSslConns` when its TLS layer is set up
+/// (`ssl_sock_init`), not when the handshake completes: a client that speaks plaintext to a
+/// TLS port, or connects and closes, is one (3.5-dev8: 1 then 2).
+#[test]
+fn cum_ssl_conns_counts_failed_handshakes() {
+    let (pem, _der) = cert("fail");
+    let b = common::reserve_addr();
+    let cfg = http_cfg(
+        "",
+        &format!("frontend fe\n  bind {b} ssl crt {}\n  http-request return status 200 content-type text/plain string ok\n", pem.display()),
+    );
+    let (_ibex, sock) = start("sslfail", &cfg, &[b]);
+    let base = cum_at_start(&sock);
+    assert_eq!(four(&sock, base), [0, 0, 0, 0], "at start");
+    let _ = get(b, GET);
+    assert_eq!(settle(&sock, base, [0, 1]), [0, 1, 1], "after a plaintext request to the TLS port");
+    drop(TcpStream::connect(b).expect("connect"));
+    assert_eq!(settle(&sock, base, [0, 2]), [0, 2, 2], "after a connect and close");
+    let _ = std::fs::remove_file(&pem);
+}
+
+/// A TLS connection to a server is an SSL connection too (`ssl_sock_init` on the server
+/// side): one request from a plaintext frontend to a `server ... ssl` that is a TLS frontend
+/// of the same process counts two in `CumSslConns` and one in `MaxSslRate` (3.5-dev8: 0 2 1 1).
+#[test]
+fn backend_tls_connections_are_ssl_conns() {
+    let (pem, _der) = cert("be");
+    let (a, inner) = (common::reserve_addr(), common::reserve_addr());
+    let cfg = http_cfg(
+        "",
+        &format!(
+            "frontend fe\n  bind {a}\n  default_backend be\n\
+             backend be\n  http-reuse never\n  server s {inner} ssl verify none\n\
+             frontend inner\n  bind {inner} ssl crt {}\n  http-request return status 200 content-type text/plain string ok\n",
+            pem.display()
+        ),
+    );
+    let (_ibex, sock) = start("sslbe", &cfg, &[a, inner]);
+    let base = cum_at_start(&sock);
+    assert_eq!(four(&sock, base), [0, 0, 0, 0], "at start");
+    assert!(get(a, GET).starts_with(b"HTTP/1.1 200"));
+    assert_eq!(settle(&sock, base, [0, 2]), [0, 2, 1], "after one request through a TLS server");
     let _ = std::fs::remove_file(&pem);
 }

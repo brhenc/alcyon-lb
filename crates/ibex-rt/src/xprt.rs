@@ -183,6 +183,8 @@ impl Write for Sock<'_> {
 #[allow(clippy::struct_excessive_bools)] // independent facts about the stream, not a state machine
 pub struct TlsConn {
     ctx: RustlsContext,
+    /// T320: this connection in `CurrSslConns` and `CumSslConns` while it exists.
+    _counted: crate::stats::SslConnCount,
     /// The peer sent `close_notify`: the stream ended where it said it would.
     peer_closed: bool,
     /// The socket hit EOF while the TLS stream was still open.
@@ -239,6 +241,7 @@ impl TlsConn {
     pub fn new(ctx: RustlsContext) -> Self {
         Self {
             ctx,
+            _counted: crate::stats::SslConnCount::new(),
             peer_closed: false,
             truncated: false,
             failed: false,

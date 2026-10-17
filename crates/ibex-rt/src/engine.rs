@@ -1857,8 +1857,6 @@ pub struct SessionEntry {
     /// The frontend's `rate_max` is still to be raised for this session: it is, once the TLS
     /// handshake is behind it (a connection whose handshake fails is no session).
     pub rate_max_due: bool,
-    /// T320: the TLS handshake of this client connection is still to be counted in `CumSslConns`.
-    pub ssl_cum_due: bool,
     /// Requests the server connection has carried (saturating at 2): from the second it is
     /// kept in the server's safe list (`http-reuse`).
     pub srv_served: u8,
@@ -4892,7 +4890,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 be_counted: std::cell::Cell::new(NO_BACKEND),
                 connect_log_due: false,
                 rate_max_due: false,
-                ssl_cum_due: false,
                 srv_served: 0,
                 log_line: None,
                 log_err: false,
@@ -6592,7 +6589,6 @@ fn register_new_session(
         be_counted: std::cell::Cell::new(NO_BACKEND),
         connect_log_due: proxy.log_format.is_none() && !proxy.log_target_idx.is_empty(),
         rate_max_due: true,
-        ssl_cum_due: true,
         srv_served: 0,
         log_line: None,
         log_err: false,
@@ -6837,7 +6833,7 @@ fn init_client_session(
         match sess.cli_fd().map_or_else(|| Err(io::Error::from(io::ErrorKind::NotConnected)), |fd| crate::xprt::accept_tls(&fd, Arc::clone(cfg))) {
             Ok(xprt) => {
                 sess.cli_xprt = xprt;
-                // T320: counted open from the accept; `cleanup_done` (or a return below) takes it back.
+                // T320: `SslRate`; `CurrSslConns` and `CumSslConns` are the transport's own.
                 crate::stats::ssl_conn_accepted();
             }
             Err(e) => {
@@ -6873,18 +6869,12 @@ fn init_client_session(
         SessionEvalOutcome::Reject => {
             sess.abort_client();
             proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
-            if sess.cli_is_tls() {
-                crate::stats::ssl_conn_closed(); // T320
-            }
             return None;
         }
         SessionEvalOutcome::SilentDrop(ttl) => {
             let is_ipv6 = peer_addr.is_ipv6();
             sess.silent_drop_client(is_ipv6, ttl);
             proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
-            if sess.cli_is_tls() {
-                crate::stats::ssl_conn_closed(); // T320
-            }
             return None;
         }
     }
@@ -7841,17 +7831,6 @@ fn update_interests(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &mut Po
     }
 }
 
-/// T320: counts a client TLS handshake once, when it is complete (plaintext connections and
-/// failed handshakes do not count: `CumSslConns`).
-fn count_ssl_handshake(entry: &mut SessionEntry) {
-    if entry.ssl_cum_due && entry.sess.cli_xprt.is_ready() {
-        entry.ssl_cum_due = false;
-        if entry.sess.cli_is_tls() {
-            crate::stats::SSL_CUM.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
 fn cleanup_done(
     entry: &SessionEntry,
     proxies: &[Proxy],
@@ -7879,13 +7858,6 @@ fn cleanup_done(
     };
     let _ = poller.delete(cfd);
     fdtab.remove(entry.cli_raw_fd);
-    if entry.sess.cli_is_tls() {
-        // T320: a connection that finished before the loop saw its handshake complete counts here.
-        if entry.ssl_cum_due && entry.sess.cli_xprt.is_ready() {
-            crate::stats::SSL_CUM.fetch_add(1, Ordering::Relaxed);
-        }
-        crate::stats::ssl_conn_closed();
-    }
     let proxy_idx = entry.proxy_idx;
     proxies[proxy_idx].counters().bytes_in.fetch_add(entry.sess.bytes_in, Ordering::Relaxed);
     proxies[proxy_idx].counters().bytes_out.fetch_add(entry.sess.bytes_out, Ordering::Relaxed);
@@ -9052,7 +9024,6 @@ impl EngineDispatcher<'_> {
                 connect_line = Some((entry.proxy_idx, line));
             }
 
-            count_ssl_handshake(entry);
             if entry.rate_max_due && entry.sess.cli_xprt.is_ready() {
                 entry.rate_max_due = false;
                 let rate = self.proxies[entry.proxy_idx].counters().fe_sess_rate.rate();
@@ -9102,8 +9073,6 @@ impl EngineDispatcher<'_> {
             if !entry.sess.is_done() {
                 entry.sess.advance(now);
             }
-            // T320: the pass may have completed the handshake of a connection that is done by the next one.
-            count_ssl_handshake(entry);
         }
         // Step 3.05: an HTTP/2 connection's streams, each served by an entry of its own: the
         // next ones dispatched, their request bodies and responses moved (T280).

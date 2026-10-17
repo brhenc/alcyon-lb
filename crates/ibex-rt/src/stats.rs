@@ -339,18 +339,18 @@ pub fn description() -> Option<String> {
 
 pub static NBTHREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-/// T320: TLS client connections open now (`CurrSslConns`).
+/// T320: TLS connections open now, client and server side (`CurrSslConns`).
 pub static SSL_CURR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// T320: TLS handshakes completed on client connections (`CumSslConns`).
+/// T320: TLS connections set up since start, client and server side (`CumSslConns`).
 pub static SSL_CUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// T320: highest `SslRate` seen (`MaxSslRate`); reset by `clear counters`.
 pub static SSL_MAX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// T320: TLS client connections accepted over the last second (`SslRate`).
+/// T320: connections accepted on `ssl` binds over the last second (`SslRate`).
 pub static SSL_RATE: std::sync::Mutex<crate::engine::RateCtr> = std::sync::Mutex::new(crate::engine::RateCtr::new());
 
-/// T320: a TLS client connection was accepted: counts it open and in the rate, raising the maximum.
+/// T320: a connection was accepted on an `ssl` bind: counts it in the rate, raising the
+/// maximum (`listener_accept`).
 pub fn ssl_conn_accepted() {
-    SSL_CURR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let rate = {
         let r = SSL_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         r.tick();
@@ -359,9 +359,32 @@ pub fn ssl_conn_accepted() {
     SSL_MAX.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// T320: a TLS client connection is gone.
-pub fn ssl_conn_closed() {
-    let _ = SSL_CURR.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |v| v.checked_sub(1));
+/// T320: one TLS connection, client or server side, in `CurrSslConns` from the moment its TLS
+/// layer is set up until it is dropped, and in `CumSslConns` from that moment on, whether or not
+/// its handshake completes: `HAProxy` counts both in `ssl_sock_init` and takes `CurrSslConns`
+/// back when the connection is freed. Owned by the transport, so every path that drops one
+/// settles it.
+pub struct SslConnCount(());
+
+impl SslConnCount {
+    #[must_use]
+    pub fn new() -> Self {
+        SSL_CURR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SSL_CUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Default for SslConnCount {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SslConnCount {
+    fn drop(&mut self) {
+        SSL_CURR.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 pub fn format_show_info(start_time: Instant, pid: u32, total_tasks: usize, run_queue_len: usize, active_conns: u32, max_conns: u32) -> String {
