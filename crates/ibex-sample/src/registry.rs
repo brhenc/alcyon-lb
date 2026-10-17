@@ -2062,9 +2062,7 @@ impl Registry {
             func: req_hdr_cnt_fetch,
         });
         let req_hdr_names_fetch: FetchFn = |ctx, args| {
-            let delim = args.first().and_then(|s| s.chars().next()).unwrap_or(',');
-            let names = req_header_names(ctx);
-            Some(Sample::Str(names.join(&delim.to_string())))
+            Some(Sample::Str(req_header_names(ctx).join(&names_delim(args))))
         };
         self.register_fetch(FetchDesc {
             name: "req.hdr_names",
@@ -2118,11 +2116,7 @@ impl Registry {
             name: "res.hdr_names",
             out_type: SampleType::Str,
             func: |ctx, args| {
-                let names = get_all_res_header_names(ctx);
-                let delim = args.first().map_or(",", |s| s.as_str());
-                let delim_char = delim.chars().next()?;
-                let s = names.join(&delim_char.to_string());
-                Some(Sample::Str(s))
+                Some(Sample::Str(get_all_res_header_names(ctx).join(&names_delim(args))))
             },
         });
 
@@ -2218,10 +2212,10 @@ impl Registry {
 
         let cook_names_fetch: FetchFn = |ctx, args| {
             // T326
-            let delim = args.first().and_then(|s| s.chars().next()).unwrap_or(',');
+            let delim = names_delim(args);
             let mut names = String::new();
             for hdr in get_all_req_headers(ctx, "cookie") {
-                crate::cookie_names::append(&mut names, &hdr, true, delim);
+                crate::cookie_names::append(&mut names, &hdr, true, &delim);
             }
             Some(Sample::Str(names))
         };
@@ -2260,11 +2254,11 @@ impl Registry {
             name: "res.cook_names",
             out_type: SampleType::Str,
             func: |ctx, args| {
-                let delim = args.first().and_then(|s| s.chars().next()).unwrap_or(',');
+                let delim = names_delim(args);
                 // A Set-Cookie holds one cookie: the first pair `cookie_names` accepts.
                 let mut names = String::new();
                 for hdr in get_all_res_headers(ctx, "set-cookie") {
-                    crate::cookie_names::append(&mut names, &hdr, false, delim);
+                    crate::cookie_names::append(&mut names, &hdr, false, &delim);
                 }
                 Some(Sample::Str(names))
             },
@@ -6812,6 +6806,19 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
 }
 /// T326: the names of the request headers, lowercased, in order, from the first source that
 /// has any, without those `HAProxy`'s H1 parser leaves out of HTX ([`crate::h1_clean`]).
+/// The delimiter of the `*.hdr_names` and `*.cook_names` fetches (T340): the first byte of the
+/// argument (`args[0].data.str.area[0]` in HAProxy), `,` without an argument and NUL for an
+/// empty one. A byte of 0x80 or more is a byte of text that is not UTF-8, so it goes in as
+/// its bytetext character, as the names it separates carry theirs.
+fn names_delim(args: &[String]) -> String {
+    let Some(arg) = args.first() else { return ",".to_string() };
+    match ibex_regex::bytetext::text_to_bytes(arg).first() {
+        None => "\0".to_string(),
+        Some(&b) if b >= 0x80 => ibex_regex::bytetext::escape_byte(b).to_string(),
+        Some(&b) => char::from(b).to_string(),
+    }
+}
+
 fn req_header_names(ctx: &SampleContext) -> Vec<String> {
     let mut hdrs: Vec<(&str, &str)> = Vec::new();
     if let Some(htx) = ctx.htx_slice {

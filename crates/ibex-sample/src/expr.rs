@@ -551,7 +551,9 @@ fn parse_chain(expr_part: &str) -> Result<Vec<(String, Vec<String>)>, String> {
                 }
             }
             // `f()` has no argument; `f(,)` has two empty ones.
-            if args.len() == 1 && args[0].is_empty() {
+            // The names fetches read an empty argument as the delimiter NUL, `()` too (T340).
+            let names_fetch = calls.is_empty() && matches!(name.as_str(), "req.hdr_names" | "res.hdr_names" | "req.cook_names" | "res.cook_names");
+            if args.len() == 1 && args[0].is_empty() && !names_fetch {
                 args.clear();
             }
         }
