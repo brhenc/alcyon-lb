@@ -2487,9 +2487,9 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         request_date: Some(request_date(&s.log)),
         last_rule: last_rule_at(s.log.last_rule),
         prio: (s.log.prio_class, s.log.prio_offset),
-        bc_err: s.bc_err,
+        bc_err: s.bc_err.copied(),
         bc_reused: Some(s.txn.as_ref().is_some_and(|t| t.srv_reused)),
-        bc_dst: s.bc_dst,
+        bc_dst: s.bc_dst.as_deref().copied(),
         ..Default::default()
     }
 }
@@ -6348,9 +6348,9 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         accept_date: Some(sess.log.date),
         captures_req_hdr: Some(&sess.log.req_captures),
         captures_res_hdr: Some(&sess.log.res_captures),
-        bc_err: sess.bc_err,
+        bc_err: sess.bc_err.copied(),
         bc_reused: Some(sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
-        bc_dst: sess.bc_dst,
+        bc_dst: sess.bc_dst.as_deref().copied(),
         ..Default::default()
     };
     for rule in &proxy.tcp_res_content_rules {
@@ -6773,7 +6773,7 @@ fn connect_addr(server: SocketAddr, dst: Option<SocketAddr>) -> SocketAddr {
 /// `bc_dst` the one the socket connects to.
 fn set_target(entry: &mut SessionEntry, target: SocketAddr) {
     entry.target_addr = Some(target);
-    entry.sess.bc_dst = Some(connect_addr(target, entry.sess.server_addr));
+    entry.sess.bc_dst = Some(Box::new(connect_addr(target, entry.sess.server_addr)));
 }
 
 fn maybe_prepend_send_proxy(fe: &Proxy, proxy: &Proxy, proxies: &[Proxy], sess: &mut TcpSession, target_addr: SocketAddr) {
@@ -7013,7 +7013,7 @@ fn init_client_session(
             arm_res_inspect(proxy, &mut sess);
             sess.set_backend_timeouts(proxy);
 
-            sess.bc_dst = Some(connect_addr(target, sess.server_addr));
+            sess.bc_dst = Some(Box::new(connect_addr(target, sess.server_addr)));
             let connected = raw::connect_opts(connect_addr(target, sess.server_addr), proxy.server_tfo_of(target))
                 .inspect_err(|e| sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)));
             if let Ok((srv_fd, immediate)) = connected {
@@ -9905,9 +9905,9 @@ impl EngineDispatcher<'_> {
             unique_id: entry.sess.log.unique_id.as_deref(),
             accept_date: Some(entry.sess.log.date),
             stream: Some(stream_facts(&entry.sess, Some(status))),
-            bc_err: entry.sess.bc_err,
+            bc_err: entry.sess.bc_err.copied(),
             bc_reused: Some(entry.sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
-            bc_dst: entry.sess.bc_dst,
+            bc_dst: entry.sess.bc_dst.as_deref().copied(),
             last_rule: last_rule_at(entry.sess.log.last_rule),
             prio: (entry.sess.log.prio_class, entry.sess.log.prio_offset),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
@@ -13710,9 +13710,9 @@ fn after_res_on_reply<'r>(
             stream: Some(stream_facts(sess, Some(status))),
             captures_req_hdr: Some(&sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
-            bc_err: sess.bc_err,
+            bc_err: sess.bc_err.copied(),
             bc_reused: Some(sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
-            bc_dst: sess.bc_dst,
+            bc_dst: sess.bc_dst.as_deref().copied(),
             ..Default::default()
         };
         eval_after_res_rules(
