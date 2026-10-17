@@ -892,6 +892,25 @@ mod tests {
         assert_eq!(openssl_cipher_name("TLS_FUTURE_SUITE"), "TLS_FUTURE_SUITE");
     }
 
+    /// Every suite the small table maps agrees with the generated id table
+    /// (`ibex_tls::cipher_names`), by the suite's IANA id.
+    #[test]
+    fn cipher_names_agree_with_the_id_table() {
+        for (iana, id) in [
+            ("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", 0xc02b_u16),
+            ("TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", 0xc02c),
+            ("TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", 0xcca9),
+            ("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", 0xc02f),
+            ("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", 0xc030),
+            ("TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", 0xcca8),
+            ("TLS13_AES_128_GCM_SHA256", 0x1301),
+            ("TLS13_AES_256_GCM_SHA384", 0x1302),
+            ("TLS13_CHACHA20_POLY1305_SHA256", 0x1303),
+        ] {
+            assert_eq!(Some(openssl_cipher_name(iana)), ibex_tls::cipher_names::openssl_cipher_name_by_id(id), "{iana}");
+        }
+    }
+
     /// A plaintext client has no handshake to fail: a read error on it is an ordinary
     /// close, never the TLS-handshake-failure path in `proxy.rs`.
     #[test]

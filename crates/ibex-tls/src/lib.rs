@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod arena;
+pub mod cipher_names;
 pub mod config;
 pub mod resolver;
 pub mod transport;
