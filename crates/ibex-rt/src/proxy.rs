@@ -3531,8 +3531,9 @@ mod tests {
             let srv_write_wanted = s.interests().1.write;
             let woken = moved || srv_write_wanted || s.wants_rerun();
             assert!(woken, "run {run}: {} body bytes moved on, the rest held with nothing to run the session again", s.h2_active().expect("served").body.consumed);
-            if !moved && !s.wants_rerun() {
-                // Only the socket event will run it: wait for it, as the poller does.
+            if srv_write_wanted {
+                // The socket event runs it: wait for it, as the poller does (at once when the
+                // socket can take bytes).
                 use rustix::event::{poll, PollFd, PollFlags};
                 let fd = s.srv.as_ref().expect("the server's socket");
                 let mut fds = [PollFd::new(fd, PollFlags::OUT)];
