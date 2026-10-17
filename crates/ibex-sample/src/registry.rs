@@ -2944,6 +2944,45 @@ impl Registry {
         });
     }
 
+    /// T330: the TCP header length in bytes when `b` holds a complete TCP header (at least 20
+    /// bytes, and as many as its data offset says), otherwise `None` (`tcp_fullhdr_length()`
+    /// in `src/net_helper.c` returning 0, which makes every tcp.options converter give no sample).
+    fn tcp_fullhdr_length(b: &[u8]) -> Option<usize> {
+        if b.len() < 20 {
+            return None;
+        }
+        let len = usize::from(b[12] >> 4) * 4;
+        (len >= 20 && b.len() >= len).then_some(len)
+    }
+
+    /// T330: the offset in the TCP header `b` where option kind `opt` is first seen, if any
+    /// (`tcp_fullhdr_find_opt()` in `src/net_helper.c`). The walk stops at END, at an option whose length
+    /// byte is missing or under 2; an option counts only when its declared length fits the header.
+    fn tcp_fullhdr_find_opt(b: &[u8], opt: u8) -> Option<usize> {
+        let len = Self::tcp_fullhdr_length(b)?;
+        let mut next = 20;
+        while next < len {
+            let curr = next;
+            match b[curr] {
+                0 => break,
+                1 => next += 1,
+                _ if next + 1 < len && b[next + 1] > 1 => next += usize::from(b[next + 1]),
+                _ => break,
+            }
+            if b[curr] == opt && next <= len {
+                return Some(curr);
+            }
+        }
+        None
+    }
+
+    /// T330: the big-endian value of the `n` bytes at `ofs` in `b`. The reference reads them whatever the
+    /// option's declared length; past the end of the input it would read out of bounds, here it
+    /// gives 0.
+    fn tcp_read_be(b: &[u8], ofs: usize, n: usize) -> i64 {
+        b.get(ofs..ofs + n).map_or(0, |d| d.iter().fold(0i64, |v, &x| v << 8 | i64::from(x)))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn register_builtin_converters(&mut self) {
                 
@@ -4925,6 +4964,118 @@ impl Registry {
             },
         });
 
+        // T330: tcp.options.* (src/net_helper.c). An incomplete TCP header gives no sample.
+        self.register_converter(ConvDesc {
+            name: "tcp.options.mss",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    Self::tcp_fullhdr_length(&b)?;
+                    let v = Self::tcp_fullhdr_find_opt(&b, 2).map_or(0, |ofs| Self::tcp_read_be(&b, ofs + 2, 2));
+                    Some(Sample::Sint(v))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "tcp.options.sack",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    Self::tcp_fullhdr_length(&b)?;
+                    Some(Sample::Sint(i64::from(Self::tcp_fullhdr_find_opt(&b, 4).is_some())))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "tcp.options.tsopt",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    Self::tcp_fullhdr_length(&b)?;
+                    Some(Sample::Sint(i64::from(Self::tcp_fullhdr_find_opt(&b, 8).is_some())))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "tcp.options.tsval",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    Self::tcp_fullhdr_length(&b)?;
+                    let v = Self::tcp_fullhdr_find_opt(&b, 8).map_or(0, |ofs| Self::tcp_read_be(&b, ofs + 2, 4));
+                    Some(Sample::Sint(v))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "tcp.options.wscale",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    Self::tcp_fullhdr_length(&b)?;
+                    let v = Self::tcp_fullhdr_find_opt(&b, 3).map_or(0, |ofs| Self::tcp_read_be(&b, ofs + 2, 1));
+                    Some(Sample::Sint(v))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "tcp.options.wsopt",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    Self::tcp_fullhdr_length(&b)?;
+                    Some(Sample::Sint(i64::from(Self::tcp_fullhdr_find_opt(&b, 3).is_some())))
+                }
+                _ => None,
+            },
+        });
+
+        // One byte per option kind, a truncated or overrunning last option included
+        // (sample_conv_tcp_options_list pushes the kind before it checks the length byte).
+        self.register_converter(ConvDesc {
+            name: "tcp.options_list",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let len = Self::tcp_fullhdr_length(&b)?;
+                    let mut out = Vec::new();
+                    let mut ofs = 20;
+                    while ofs < len {
+                        let kind = b[ofs];
+                        if kind == 0 {
+                            break;
+                        }
+                        out.push(kind);
+                        if kind == 1 {
+                            ofs += 1;
+                        } else if ofs + 1 < len && b[ofs + 1] > 1 {
+                            ofs += usize::from(b[ofs + 1]);
+                        } else {
+                            break;
+                        }
+                    }
+                    Some(Sample::Bin(out))
+                }
+                _ => None,
+            },
+        });
         self.register_converter(ConvDesc {
             name: "ip.tos",
             in_type: TypeSpec::Exact(SampleType::Bin),
