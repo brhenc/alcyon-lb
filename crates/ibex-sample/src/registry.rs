@@ -3694,7 +3694,7 @@ impl Registry {
                 let count_str = args.get(2);
 
                 let idx: i64 = idx_str.parse().ok()?;
-                let count: usize = count_str.and_then(|c| c.parse().ok()).unwrap_or(1);
+                let count: usize = count_str.map_or(1, |c| parse_count(c));
 
                 let Sample::Str(s) = smp else { return None };
                 let fields: Vec<&str> = s.split(delim_char).collect();
@@ -3719,7 +3719,7 @@ impl Registry {
                 let end_idx = if count == 0 {
                     len
                 } else {
-                    (start_idx + count).min(len)
+                    start_idx.saturating_add(count).min(len)
                 };
                 let joined = fields[start_idx..end_idx].join(&delim_char.to_string());
                 Some(Sample::Str(joined))
@@ -3739,7 +3739,7 @@ impl Registry {
                 if idx == 0 {
                     return None;
                 }
-                let count: usize = count_str.and_then(|c| c.parse().ok()).unwrap_or(1);
+                let count: usize = count_str.map_or(1, |c| parse_count(c));
 
                 let Sample::Str(s) = smp else { return None };
                 let mut words: Vec<(usize, usize)> = Vec::new();
@@ -3787,7 +3787,7 @@ impl Registry {
                 let end_word_idx = if count == 0 {
                     len - 1
                 } else {
-                    (start_idx + count - 1).min(len - 1)
+                    start_idx.saturating_add(count - 1).min(len - 1)
                 };
 
                 let slice = &s[words[start_idx].0..words[end_word_idx].1];
@@ -9097,5 +9097,16 @@ mod ip_header_length_tests {
         v6[0] = 0x60;
         v6[6] = 6;
         assert_eq!(Registry::ip_header_length(&v6), Some(40));
+    }
+}
+
+/// The count argument of `field` and `word`: a number too large for `usize` is the largest
+/// one (`HAProxy` clamps it, measured with 2^64 and 10^20 on 3.5-dev8), and anything that is
+/// not a number is 1, as before.
+fn parse_count(arg: &str) -> usize {
+    match arg.parse::<usize>() {
+        Ok(n) => n,
+        Err(_) if !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_digit()) => usize::MAX,
+        Err(_) => 1,
     }
 }

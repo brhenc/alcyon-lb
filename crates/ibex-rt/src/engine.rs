@@ -11118,8 +11118,11 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::NormalizeUri { normalizer, full, strict } => {
                         let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                         if let Ok(new_uri) = apply_normalize_uri(current_uri, normalizer, *full, *strict) {
-                            sess.req_uri = Some(new_uri);
-                            rebuild_req_buffer(sess);
+                            // Through the HTX message, as `set-uri` does: setting only
+                            // `req_uri` left the request that went out unchanged.
+                            if !req_set_uri(sess, new_uri) && STRICT_MODE.get() {
+                                return Err(500);
+                            }
                         } else {
                             return Err(400);
                         }
@@ -12428,64 +12431,45 @@ fn apply_normalize_uri(
             let new_query = pairs.join("&");
             Ok(rebuild_uri(prefix, path, &new_query))
         }
-        "percent-to-uppercase" => {
-            let mut res = String::with_capacity(uri.len());
+        // Both work on bytes and copy every byte they do not rewrite, so a multibyte
+        // character after a `%` stays whole (T358 #1: slicing the `str` at `i + 1..i + 3`
+        // panicked off a char boundary). `HAProxy` leaves a `%` that is not followed by two
+        // hex digits as it is (measured, 3.5-dev8), or refuses it with `strict`.
+        "percent-to-uppercase" | "percent-decode-unreserved" => {
+            let decode = normalizer == "percent-decode-unreserved";
+            let mut res: Vec<u8> = Vec::with_capacity(uri.len());
             let bytes = uri.as_bytes();
             let mut i = 0;
             while i < bytes.len() {
-                if bytes[i] == b'%' {
-                    if i + 2 < bytes.len() {
-                        let h1 = bytes[i + 1] as char;
-                        let h2 = bytes[i + 2] as char;
-                        if h1.is_ascii_hexdigit() && h2.is_ascii_hexdigit() {
-                            res.push('%');
-                            res.push(h1.to_ascii_uppercase());
-                            res.push(h2.to_ascii_uppercase());
-                            i += 3;
-                            continue;
-                        }
-                    }
+                if bytes[i] != b'%' {
+                    res.push(bytes[i]);
+                    i += 1;
+                    continue;
+                }
+                let hex = bytes.get(i + 1..i + 3).filter(|h| h.iter().all(u8::is_ascii_hexdigit));
+                let Some(hex) = hex else {
                     if strict {
                         return Err(());
                     }
-                    res.push('%');
+                    res.push(b'%');
                     i += 1;
+                    continue;
+                };
+                let nib = |c: u8| u8::try_from(char::from(c).to_digit(16).unwrap_or(0)).unwrap_or(0);
+                let value = nib(hex[0]) << 4 | nib(hex[1]);
+                if decode && (value.is_ascii_alphanumeric() || matches!(value, b'-' | b'.' | b'_' | b'~')) {
+                    res.push(value);
+                } else if decode {
+                    res.extend_from_slice(&bytes[i..i + 3]);
                 } else {
-                    res.push(bytes[i] as char);
-                    i += 1;
+                    res.push(b'%');
+                    res.push(hex[0].to_ascii_uppercase());
+                    res.push(hex[1].to_ascii_uppercase());
                 }
+                i += 3;
             }
-            Ok(res)
-        }
-        "percent-decode-unreserved" => {
-            let mut res = String::with_capacity(uri.len());
-            let bytes = uri.as_bytes();
-            let mut i = 0;
-            while i < bytes.len() {
-                if bytes[i] == b'%' {
-                    if i + 2 < bytes.len() {
-                        if let Ok(b) = u8::from_str_radix(&uri[i + 1..i + 3], 16) {
-                            if b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_' || b == b'~' {
-                                res.push(b as char);
-                                i += 3;
-                                continue;
-                            }
-                            res.push_str(&uri[i..i + 3]);
-                            i += 3;
-                            continue;
-                        }
-                    }
-                    if strict {
-                        return Err(());
-                    }
-                    res.push('%');
-                    i += 1;
-                } else {
-                    res.push(bytes[i] as char);
-                    i += 1;
-                }
-            }
-            Ok(res)
+            // Only ASCII bytes were replaced by ASCII bytes: still valid UTF-8.
+            String::from_utf8(res).map_err(|_| ())
         }
         "fragment-strip" => {
             let cleaned = uri.split_once('#').map_or(uri, |(u, _)| u);
