@@ -1610,19 +1610,14 @@ impl Registry {
 
         let res_cook_cnt_fetch: FetchFn = |ctx, args| {
             let name = args.first();
-            let set_cookies = get_all_res_headers(ctx, "set-cookie");
-            let mut count = 0;
-            for hdr in set_cookies {
-                for (k, _) in extract_cookies(&hdr) {
-                    if let Some(target) = name {
-                        if k == target {
-                            count += 1;
-                        }
-                    } else {
-                        count += 1;
-                    }
-                }
-            }
+            // T327: as the oracle's smp_fetch_cookie_cnt: each Set-Cookie value (split at
+            // commas outside quotes, the Expires date included) holds one cookie.
+            let count = get_all_res_headers(ctx, "set-cookie")
+                .iter()
+                .flat_map(|hdr| hdr_values(hdr))
+                .filter(|seg| set_cookie_is(seg.as_bytes(), name.map_or(&b""[..], |n| n.as_bytes())))
+                .count();
+            let count = len_to_sint(count);
             Some(Sample::Sint(count))
         };
         // T326: res.cook_cnt registered once with a named FetchFn so the deprecated alias scook_cnt below shares it
@@ -5542,6 +5537,69 @@ fn get_all_res_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
         CURRENT_RES_HEADERS.with(|hdrs| all.extend(hdrs.borrow().iter().cloned()));
     }
     h1_cleaned_headers(all, false)
+}
+
+/// T327: whether the Set-Cookie value `seg` holds a cookie named `name` (any cookie when
+/// `name` is empty). A port of the oracle's `http_extract_cookie_value` with `list` = 0:
+/// attributes starting with `$` or without `=` are skipped, and the first other one is the
+/// cookie, whether or not it matches. Its bounds checks are kept, so `s=` (empty value) is not
+/// a cookie named `s`.
+fn set_cookie_is(seg: &[u8], name: &[u8]) -> bool {
+    let spht = |c: u8| c == b' ' || c == b'\t';
+    let end = seg.len();
+    if end < name.len() + 1 {
+        return false;
+    }
+    let mut att = 0;
+    while att + name.len() + 1 < end {
+        while att < end && spht(seg[att]) {
+            att += 1;
+        }
+        let (mut equal, mut att_end) = (att, att);
+        while equal < end && seg[equal] != b'=' && seg[equal] != b';' {
+            equal += 1;
+            if !spht(seg[equal - 1]) {
+                att_end = equal;
+            }
+        }
+        let next = if equal < end && seg[equal] == b'=' {
+            let mut val = equal + 1;
+            while val < end && spht(seg[val]) {
+                val += 1;
+            }
+            cookie_value_end(seg, val)
+        } else {
+            equal
+        };
+        if seg.get(att) == Some(&b'$') || equal == next {
+            att = next + 1;
+            continue;
+        }
+        return name.is_empty() || &seg[att..att_end] == name;
+    }
+    false
+}
+
+/// T327: the end of the cookie value starting at `s`: the next `,` or `;` outside a quoted
+/// string, or the end (the oracle's `http_find_cookie_value_end`).
+fn cookie_value_end(b: &[u8], s: usize) -> usize {
+    let (mut quoted, mut qdpair) = (false, false);
+    for (i, &c) in b.iter().enumerate().skip(s) {
+        if qdpair {
+            qdpair = false;
+        } else if quoted {
+            match c {
+                b'\\' => qdpair = true,
+                b'"' => quoted = false,
+                _ => {}
+            }
+        } else if c == b'"' {
+            quoted = true;
+        } else if c == b',' || c == b';' {
+            return i;
+        }
+    }
+    b.len()
 }
 
 fn extract_cookies(cookie_header: &str) -> Vec<(&str, &str)> {
