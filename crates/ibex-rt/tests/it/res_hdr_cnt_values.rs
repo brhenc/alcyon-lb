@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T327: res.hdr_cnt counts values
+//! T327: `res.hdr_cnt` counts values, `res.fhdr_cnt` lines, on the headers as the H1 parser
+//! leaves them.
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +54,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -72,17 +64,9 @@ fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     out
 }
 
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
+/// A server on a free port that reads each request head and answers `GET /<i>` with
+/// `resps[i]`, then closes the connection.
+fn backend(resps: &'static [&'static [u8]]) -> SocketAddr {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -96,16 +80,12 @@ fn backend(resp: &'static [u8]) -> SocketAddr {
                     Ok(n) => head.extend_from_slice(&b[..n]),
                 }
             }
-            let _ = c.write_all(resp);
+            let head = String::from_utf8_lossy(&head);
+            let i: usize = head.split(' ').nth(1).and_then(|p| p.trim_start_matches('/').parse().ok()).unwrap_or(0);
+            let _ = c.write_all(resps[i]);
         }
     });
     addr
-}
-
-/// The body of the answer to `req` (what follows the first empty line).
-fn body(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
 }
 
 /// The value of the `x-out` header in the answer to `req`.
@@ -119,7 +99,30 @@ fn xout(addr: SocketAddr, req: &[u8]) -> String {
 
 #[test]
 fn res_hdr_cnt_values() {
-    const RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-B: 1\r\nX-B: 2, 3\r\nSet-Cookie: s=abc; Path=/\r\nSet-Cookie: n=7\r\n\r\nok";
+    // Each row: the backend's response, and the x-out HAProxy 3.5-dev8 gives for it.
+    const ROWS: &[(&[u8], &str)] = &[
+        // The task's row: X-B "1" + "2, 3" is 3 values on 2 lines; 6 values on 5 lines in all.
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-B: 1\r\nX-B: 2, 3\r\nSet-Cookie: s=abc; Path=/\r\nSet-Cookie: n=7\r\n\r\nok",
+            "[3|2|6|5|2|0|0|0|0]",
+        ),
+        // A comma inside quotes does not split ("3,4" is one value); the Expires comma does,
+        // as on the oracle; `Connection: close` is removed by the H1 parser.
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-B: 1\r\nX-B: 2, \"3,4\"\r\nX-E:\r\nSet-Cookie: s=abc; Expires=Thu, 01 Jan 2030 00:00:00 GMT\r\nSet-Cookie: n=7\r\nConnection: close\r\n\r\nok",
+            "[3|2|8|6|3|0|0|0|0]",
+        ),
+        // Only `close` is cut out of Connection; `Upgrade` stays.
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close, Upgrade\r\n\r\nok", "[0|0|2|2|0|1|1|0|0]"),
+        // `Connection: keep-alive` is removed; an escaped quote inside quotes does not end them.
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\nX-C: \"a,b,c\"\r\nX-B: \"a\\\",b\", c\r\n\r\nok",
+            "[2|1|4|3|0|0|0|1|0]",
+        ),
+        // `Upgrade: h2c` is removed; `Keep-Alive` is cut out of Connection, `foo` stays.
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nUpgrade: h2c\r\nX-B: 1\r\nConnection: Keep-Alive, foo\r\n\r\nok", "[1|1|3|3|0|1|1|0|0]"),
+    ];
+    const RESPS: &[&[u8]] = &[ROWS[0].0, ROWS[1].0, ROWS[2].0, ROWS[3].0, ROWS[4].0];
     const CFG: &str = r#"
 global
   stats socket {sock} level admin
@@ -131,22 +134,22 @@ defaults
 frontend fe
   bind {A}
   default_backend b
-  http-response set-header x-out "[%[res.hdr_cnt(x-b)]|%[res.fhdr_cnt(x-b)]|%[res.hdr_cnt]|%[res.fhdr_cnt]]"
+  http-response set-header x-out "[%[res.hdr_cnt(x-b)]|%[res.fhdr_cnt(x-b)]|%[res.hdr_cnt]|%[res.fhdr_cnt]|%[res.hdr_cnt(set-cookie)]|%[res.hdr_cnt(connection)]|%[res.fhdr_cnt(connection)]|%[res.hdr_cnt(x-c)]|%[res.hdr_cnt(upgrade)]]"
 backend b
   server s {BE}
 "#;
 
     let a = common::reserve_addr();
-    let be = backend(RESP);
+    let be = backend(RESPS);
     let cfg = CFG.replace("{A}", &a.to_string()).replace("{BE}", &be.to_string());
-    let (ibex, sock) = start("t327-res-hdr-cnt", &cfg, &[a]);
-    let _ = sock; // used for cli
+    let (_ibex, _sock) = start("t327-res-hdr-cnt", &cfg, &[a]);
 
-    let out = xout(a, GET);
-    // HAProxy 3.5-dev8:
-    //   res.hdr_cnt(x-b)   = 3  (values: "1", "2", "3" from comma-split)
-    //   res.fhdr_cnt(x-b)  = 2  (header lines)
-    //   res.hdr_cnt        = 6  (all values: CL=1, X-B=1, X-B=2,3=2, SC=1, SC=1)
-    //   res.fhdr_cnt       = 5  (all header lines)
-    assert_eq!(out, "[3|2|6|5]", "x-out header value: {out}");
+    let mut bad = Vec::new();
+    for (i, (_, want)) in ROWS.iter().enumerate() {
+        let got = xout(a, format!("GET /{i} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n").as_bytes());
+        if got != *want {
+            bad.push(format!("row {i}: got {got}, want {want}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
