@@ -123,6 +123,16 @@ pub fn response_part(fetch: &str) -> Option<&'static str> {
     }
 }
 
+/// T326: what a request-side rule cannot read of the server connection, which is not made
+/// yet: `SMP_USE_L4SRV` (`src/connection.c`). A response rule and a log line may read it.
+#[must_use]
+pub fn server_part(fetch: &str) -> Option<&'static str> {
+    match fetch {
+        "bc_http_major" => Some("server address"),
+        _ => None,
+    }
+}
+
 const REQUEST_HEADER_FETCHES: &[&str] = &[
     "base",
     "base32",
@@ -383,7 +393,7 @@ impl Section<'_> {
                 let fetch = leading_fetch(expr);
                 let part = match *kw {
                     "http-request" | "tcp-request content" | "tcp-request session" | "tcp-request connection" => {
-                        response_part(fetch)
+                        response_part(fetch).or_else(|| server_part(fetch))
                     }
                     "http-response" | "http-after-response" => request_part(fetch, false),
                     _ => request_part(fetch, true), // "tcp-response content", the last of the seven

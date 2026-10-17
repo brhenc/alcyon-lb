@@ -736,7 +736,7 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
             _ if in_log => crate::rule_exprs::request_part(fetch, false)
                 .filter(|p| p.ends_with("headers"))
                 .or_else(|| crate::rule_exprs::response_part(fetch)),
-            _ => crate::rule_exprs::response_part(fetch),
+            _ => crate::rule_exprs::response_part(fetch).or_else(|| crate::rule_exprs::server_part(fetch)),
         };
         if let Some(part) = (!r.acl).then(|| part_missing(crate::rule_exprs::leading_fetch(&r.expr))).flatten() {
             let fetch = crate::rule_exprs::leading_fetch(&r.expr);
