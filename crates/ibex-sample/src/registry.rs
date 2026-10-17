@@ -993,7 +993,7 @@ impl Registry {
                 let param = args.first()?;
                 let uri = get_context_uri(ctx)?;
                 let (_, _, query) = split_uri(uri);
-                let val_str = extract_url_param(query, param)?;
+                let val_str = url_decode(&extract_url_param(query, param)?, true); // T327
                 val_str.parse::<i64>().ok().map(Sample::Sint)
             },
         });
@@ -4938,7 +4938,7 @@ fn extract_url_param(query: &str, param: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == param {
-                return Some(url_decode(v, true));
+                return Some(v.to_string()); // T327
             }
         } else if pair == param {
             return Some(String::new());
