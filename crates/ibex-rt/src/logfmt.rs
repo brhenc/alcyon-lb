@@ -561,7 +561,7 @@ impl LogFormat {
                 }
                 // T341: the same load-time argument checks as a rule's expression
                 // (`val_args`, run by `sample_parse_expr` wherever the `%[...]` is).
-                if let Some(e) = expr.converters.iter().find_map(|(c, a)| ibex_sample::check_converter_args(c, a)) {
+                if let Some(e) = registry.check_converters(&expr.converters) {
                     return Err(format!("failed to parse sample expression <{src}> : {e}"));
                 }
                 flush(&mut text, &mut nodes);

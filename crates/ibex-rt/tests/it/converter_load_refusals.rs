@@ -128,3 +128,41 @@ fn strcmp_and_secure_memcmp_need_a_variable() {
         }
     }
 }
+
+/// T341: `ip.fp(<mode>)` takes one integer (`ARG1(0,SINT)`), and a converter whose input the
+/// previous converter's output cannot be cast to is refused (`sample_casts[prev][in]` is
+/// NULL: a `bin` is no integer for `bool`). Measured with `haproxy -c` on
+/// 3.5-dev8-885761-29, 2026-10-17; Ibex loaded each and the expression gave no sample. An
+/// `ANY` output (`set-var`, `when`) leaves any converter applicable after it.
+#[test]
+fn ip_fp_arguments_and_converter_input_types_are_checked_at_load() {
+    let refused = [
+        ("src,ip.fp(abc)", "invalid arg 1 in converter 'ip.fp' : failed to parse 'abc' as type 'integer' at position 1."),
+        ("src,ip.fp(1a)", "invalid arg 1 in converter 'ip.fp' : failed to parse '1a' as type 'integer' at position 1."),
+        ("src,ip.fp(1,2)", "invalid arg 2 in converter 'ip.fp' : expected ')' before ',2)'."),
+        ("req.body,ip.data,bool", "converter 'bool' cannot be applied."),
+        ("src,ip.data,bool", "converter 'bool' cannot be applied."),
+        ("bin(00),ip.data,debug,bool", "converter 'bool' cannot be applied."),
+        ("bin(00),ip.data,add(1)", "converter 'add' cannot be applied."),
+        ("bin(00),ip.data,ipmask(24)", "converter 'ipmask' cannot be applied."),
+        ("bin(00),ip.data,bool(x)", "converter 'bool' cannot be applied."),
+    ];
+    let accepted = [
+        "src,ip.fp", "src,ip.fp()", "src,ip.fp(1)", "src,ip.fp(-1)", "req.body,ip.data", "req.body,ip.data,hex",
+        "bin(00),ip.data,hex,bool", "bin(00),ip.data,set-var(txn.y),bool", "bin(00),ip.data,when(normal),bool", "str(a),length,ipmask(24)",
+    ];
+    let mut wrong = Vec::new();
+    for (expr, text) in refused {
+        let (code, out) = check(expr);
+        if code != Some(1) || !out.contains(text) {
+            wrong.push(format!("`{expr}`: exit {code:?}, expected {text:?}: {}", out.trim()));
+        }
+    }
+    for expr in accepted {
+        let (code, out) = check(expr);
+        if code != Some(0) {
+            wrong.push(format!("`{expr}` must load: {}", out.trim()));
+        }
+    }
+    assert!(wrong.is_empty(), "{} cases differ from HAProxy:\n{}", wrong.len(), wrong.join("\n"));
+}

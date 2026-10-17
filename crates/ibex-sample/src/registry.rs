@@ -1317,6 +1317,44 @@ impl Registry {
         names
     }
 
+    /// T341: what `sample_parse_expr` checks of a converter chain at load, in its order: each
+    /// converter's input must be castable from what the one before it gives
+    /// (`sample_casts[prev][in]`, "converter 'bool' cannot be applied" after `ip.data`), then
+    /// its arguments ([`check_converter_args`]). The fetch's own type is not used: not every
+    /// fetch here declares the one `HAProxy` gives it (`fc_pp_tlv` is `str` there), so the
+    /// first converter is not checked, nor one after a converter whose output is `ANY`.
+    #[must_use]
+    pub fn check_converters(&self, converters: &[(String, Vec<String>)]) -> Option<String> {
+        let mut prev: Option<SampleType> = None;
+        for (name, args) in converters {
+            let types = self
+                .get_converter(name)
+                .map(|d| (d.in_type, d.out_type))
+                .or_else(|| self.get_ctx_converter(name).map(|d| (d.in_type, d.out_type)));
+            let Some((in_type, out_type)) = types else {
+                prev = None;
+                continue;
+            };
+            let applies = |p: SampleType| match in_type {
+                TypeSpec::Exact(t) => crate::cast::can_cast(p, t),
+                TypeSpec::Addr => crate::cast::can_cast(p, SampleType::Ipv4) || crate::cast::can_cast(p, SampleType::Ipv6),
+                TypeSpec::Any | TypeSpec::Same => true,
+            };
+            if prev.is_some_and(|p| !applies(p)) {
+                return Some(format!("converter '{name}' cannot be applied."));
+            }
+            if let Some(e) = check_converter_args(name, args) {
+                return Some(e);
+            }
+            prev = match (out_type, in_type) {
+                (TypeSpec::Exact(t), _) | (TypeSpec::Same, TypeSpec::Exact(t)) => Some(t),
+                (TypeSpec::Same, _) => prev,
+                _ => None,
+            };
+        }
+        None
+    }
+
     /// T330: the total IP header length of `b` (v4 or v6, IPv6 extension headers included), the
     /// offset of the TCP or UDP header, or `None` when data are missing or unparsable
     /// (`ip_header_length()` in `src/net_helper.c` returning 0).
@@ -4317,7 +4355,7 @@ impl Registry {
         self.register_ctx_converter(CtxConvDesc {
             name: "when",
             in_type: TypeSpec::Any,
-            out_type: TypeSpec::Same,
+            out_type: TypeSpec::Any, // SMP_T_ANY in HAProxy: what follows takes any type (T341)
             func: |ctx, smp, args| {
                 let (neg, cond) = parse_when_cond(args)?;
                 let facts = ctx.stream.unwrap_or_default();
@@ -5428,7 +5466,7 @@ impl Registry {
         self.register_converter(ConvDesc {
             name: "set-var",
             in_type: TypeSpec::Any,
-            out_type: TypeSpec::Same,
+            out_type: TypeSpec::Any, // SMP_T_ANY in HAProxy: what follows takes any type (T341)
             func: |smp, args| {
                 { // `set-var` always has its variable name: the load refuses `set-var()`
                     let spec = args.join(",");
@@ -5460,7 +5498,7 @@ impl Registry {
         self.register_converter(ConvDesc {
             name: "unset-var",
             in_type: TypeSpec::Any,
-            out_type: TypeSpec::Same,
+            out_type: TypeSpec::Any, // SMP_T_ANY in HAProxy: what follows takes any type (T341)
             func: |smp, args| {
                 // A `proc.` variable is the process's, not the stream's (T156).
                 if let Some(var_name) = args.first() {
@@ -7802,6 +7840,12 @@ fn check_protobuf_args(name: &str, args: &[String]) -> Option<String> {
 #[must_use]
 pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
     match name {
+        // `ARG1(0,SINT)`, and nothing after it.
+        "ip.fp" if args.len() > 1 => Some(format!("invalid arg 2 in converter 'ip.fp' : expected ')' before ',{})'.", args[1..].join(","))),
+        "ip.fp" => args
+            .first()
+            .filter(|a| crate::cast::parse_sint_arg(a).is_none())
+            .map(|a| format!("invalid arg 1 in converter 'ip.fp' : failed to parse '{a}' as type 'integer' at position 1.")),
         // `ARG1(0,SINT)`: a seed that is no integer is refused, not hashed with as 0.
         "xxh32" | "xxh64" => args
             .first()
