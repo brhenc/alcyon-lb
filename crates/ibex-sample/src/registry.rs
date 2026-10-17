@@ -1302,6 +1302,39 @@ impl Registry {
             out_type: SampleType::Sint,
             func: req_hdr_cnt_fetch,
         });
+
+        // T329: req.hdrs_bin - binary request headers
+        let req_hdrs_bin_fetch: FetchFn = |ctx, _args| {
+            let mut buf: Vec<u8> = Vec::new();
+            if let Some(htx) = ctx.htx_slice {
+                for (name, value) in htx.headers() {
+                    if is_hop_by_hop(name) { continue; }
+                    let name_lower = name.to_ascii_lowercase();
+                    encode_varint(&mut buf, name_lower.len() as u64);
+                    buf.extend_from_slice(name_lower.as_bytes());
+                    encode_varint(&mut buf, value.len() as u64);
+                    buf.extend_from_slice(value.as_bytes());
+                }
+            } else if let Some(htx) = ctx.htx {
+                for hf in htx.headers() {
+                    if is_hop_by_hop(&hf.name) { continue; }
+                    let name_lower = hf.name.to_ascii_lowercase();
+                    encode_varint(&mut buf, name_lower.len() as u64);
+                    buf.extend_from_slice(name_lower.as_bytes());
+                    encode_varint(&mut buf, hf.value.len() as u64);
+                    buf.extend_from_slice(hf.value.as_bytes());
+                }
+            }
+            // End marker: two zero bytes (empty name and empty value)
+            buf.push(0);
+            buf.push(0);
+            Some(Sample::Bin(buf))
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.hdrs_bin",
+            out_type: SampleType::Bin,
+            func: req_hdrs_bin_fetch,
+        });
         self.register_fetch(FetchDesc {
             name: "hdr_cnt",
             out_type: SampleType::Sint,
@@ -6335,4 +6368,43 @@ mod date_tests {
 /// multi-byte character (captures are bytes, as in `HAProxy`).
 fn capture_sample(bytes: Vec<u8>) -> Sample {
     String::from_utf8(bytes).map_or_else(|e| Sample::Bin(e.into_bytes()), Sample::Str)
+}
+
+/// T329: Encode a value as `HAProxy`'s `varint` (used in SPOE / `req.hdrs_bin`).
+///
+/// Values 0-239 are stored in one byte. Larger values use continuation bytes:
+/// - 240-1759: 2 bytes (first byte = 240 + val/256, second byte = val%256)
+/// - 1760-131_071: 3 bytes (first byte = 264 + val/65536, etc.)
+/// - 131_072-16_777_215: 4 bytes
+#[allow(clippy::cast_possible_truncation)]
+pub fn encode_varint(out: &mut Vec<u8>, val: u64) {
+    if val < 240 {
+        out.push(val as u8);
+    } else if val < 1760 {
+        out.push((240 + val / 256) as u8);
+        out.push((val % 256) as u8);
+    } else if val < 131_072 {
+        out.push((264 + val / 65536) as u8);
+        out.push(((val / 256) % 256) as u8);
+        out.push((val % 256) as u8);
+    } else {
+        out.push((276 + val / 16_777_216) as u8);
+        out.push(((val / 65536) % 256) as u8);
+        out.push(((val / 256) % 256) as u8);
+        out.push((val % 256) as u8);
+    }
+}
+
+/// T329: Check if a header name is a hop-by-hop header that should be excluded from
+/// `req.hdrs_bin`. The standard hop-by-hop headers are: Connection, Keep-Alive,
+/// Proxy-Connection, Transfer-Encoding, and Upgrade.
+fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name,
+        "Connection"
+            | "Keep-Alive"
+            | "Proxy-Connection"
+            | "Transfer-Encoding"
+            | "Upgrade"
+    )
 }
