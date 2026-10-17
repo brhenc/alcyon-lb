@@ -129,3 +129,14 @@ fn a_socket_taken_over_keeps_its_backlog() {
     let _ = std::fs::remove_file(&sock);
     assert!(!got.is_empty() && got.iter().all(|&b| b == 50), "after the reload: {got:?}");
 }
+
+#[test]
+fn a_backlog_without_a_number_is_refused_as_haproxy_does() {
+    // `haproxy -c` on 3.5-dev8: "'backlog' expects an integer argument.", exit 1.
+    let cfg = "defaults\n  mode http\n  timeout client 1s\n  timeout server 1s\n  timeout connect 1s\nfrontend f\n  bind 127.0.0.1:1\n  backlog\n";
+    let f = NamedTempFile::new().expect("tmp");
+    std::fs::write(f.path(), cfg).expect("write cfg");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(f.path()).output().expect("ibex -c");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("'backlog' expects an integer argument."), "{}", String::from_utf8_lossy(&out.stderr));
+}
