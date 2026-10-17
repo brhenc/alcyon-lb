@@ -255,8 +255,7 @@ fn c_str2sint(smp: Sample) -> Option<Sample> {
 /// Whatever follows them is ignored, nothing is skipped before them (so `"abc"` and
 /// `" 12"` are 0, `"12abc"` is 12), and a value out of range saturates at `i64::MAX` /
 /// `i64::MIN`.
-#[must_use]
-pub fn read_int64(s: &[u8]) -> i64 {
+fn read_int64(s: &[u8]) -> i64 {
     let (neg, digits) = match s.first() {
         Some(b'-') => (true, &s[1..]),
         Some(b'+') => (false, &s[1..]),

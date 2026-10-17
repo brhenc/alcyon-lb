@@ -28,7 +28,7 @@ pub mod sample;
 pub use acls::Acls;
 pub use auth::{set_userlists, AuthUser, AuthUserlist};
 pub use ibex_crypt::CryptHash;
-pub use cast::{can_cast, cast, read_int64};
+pub use cast::{can_cast, cast};
 pub use expr::Expr;
 pub use matcher::{IntOp, IntRange, Matcher};
 pub use registry::{set_debug_sink, take_debug_destinations, DebugSinkFn, 

@@ -535,10 +535,8 @@ fn test_conv_add() {
     );
     // 4. Negative arg
     assert_eq!(eval_conv("add", Sample::Sint(10), &["-3"]), Some(Sample::Sint(7)));
-    // 5. String inputs are converted using read_int64
-    assert_eq!(eval_conv("add", Sample::Str("10".into()), &["5"]), Some(Sample::Sint(15)));
-    // Empty strings are refused
-    assert_eq!(eval_conv("add", Sample::Str("".into()), &["5"]), None);
+    // 5. Refused types
+    assert_eq!(eval_conv("add", Sample::Str("10".into()), &["5"]), None);
 }
 
 #[test]

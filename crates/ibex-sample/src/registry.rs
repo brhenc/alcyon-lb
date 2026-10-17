@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::cast::{cast, read_int64};
+use crate::cast::cast;
 use crate::hash::{
     full_hash, hash_crc32, hash_crc32c, hash_djb2, hash_sdbm, hash_wt6, hash_xxh3, hash_xxh32,
     hash_xxh64, md5_digest, sha1_digest, sha224_digest, sha256_digest, sha384_digest,
@@ -3001,15 +3001,12 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "add",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let n = resolve_int_arg(args.first()?)?;
                 match smp {
                     Sample::Sint(val) => Some(Sample::Sint(val.saturating_add(n))),
-                    Sample::Str(s) if !s.is_empty() => {
-                        Some(Sample::Sint(read_int64(s.as_bytes()).saturating_add(n)))
-                    }
                     _ => None,
                 }
             },
@@ -3017,7 +3014,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "sub",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let n = resolve_int_arg(args.first()?)?;
@@ -3030,7 +3027,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "mul",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let factor = resolve_int_arg(args.first()?)?;
@@ -3043,7 +3040,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "div",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let divisor = resolve_int_arg(args.first()?)?;
@@ -3059,7 +3056,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "mod",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let divisor = resolve_int_arg(args.first()?)?;
@@ -3075,7 +3072,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "neg",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Sint(n.saturating_neg())),
@@ -3085,7 +3082,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "and",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let mask = resolve_int_arg(args.first()?)?;
@@ -3098,7 +3095,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "or",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let mask = resolve_int_arg(args.first()?)?;
@@ -3111,7 +3108,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "xor",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let mask = resolve_int_arg(args.first()?)?;
@@ -3124,7 +3121,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "cpl",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Sint(!n)),
@@ -3134,7 +3131,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "bool",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Bool),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Bool(n != 0)),
@@ -3145,7 +3142,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "not",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Bool),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Bool(n == 0)),
@@ -3156,7 +3153,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "odd",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Bool),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Bool((n & 1) != 0)),
@@ -3166,7 +3163,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "even",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Bool),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Bool((n & 1) == 0)),
@@ -3537,7 +3534,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "htonl",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Bin(n.to_be_bytes()[4..8].to_vec())),
@@ -3931,7 +3928,7 @@ impl Registry {
         // --- 7. Time & Date Converters ---
         self.register_converter(ConvDesc {
             name: "http_date",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, args| {
                 // `http_date([<offset>[,<unit>]])`: the unit (s, ms or us) is the input's and
@@ -3993,7 +3990,7 @@ impl Registry {
             };
             self.register_converter(ConvDesc {
                 name,
-                in_type: TypeSpec::Any,
+                in_type: TypeSpec::Exact(SampleType::Sint),
                 out_type: TypeSpec::Exact(SampleType::Str),
                 func,
             });
@@ -4502,20 +4499,20 @@ impl Registry {
             },
         });
 
-        // `x509_v_err_str`: convert an X.509 verification error code to its name (T328).
+        // `x509_v_err_str`: an X.509 verification error code to its name (T328). The input is
+        // cast to an integer first (SMP_T_SINT in HAProxy), and HAProxy's
+        // `x509_v_err_int_to_str(int)` takes its low 32 bits; an unknown code prints as the
+        // full 64-bit value, unsigned (`%llu`).
         self.register_converter(ConvDesc {
             name: "x509_v_err_str",
-            in_type: TypeSpec::Any,
+            in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, _args| match smp {
-                Sample::Sint(code) => {
-                    if let Some(name) = x509_v_err_name(code) {
-                        Some(Sample::Str(name.to_string()))
-                    } else {
-                        Some(Sample::Str(code.cast_unsigned().to_string()))
-                    }
-                }
-                _ => Some(Sample::Str("X509_V_OK".to_string())),
+            func: |smp, _args| {
+                let Sample::Sint(code) = smp else { return None };
+                let low = i32::from_le_bytes(code.to_le_bytes()[..4].try_into().ok()?);
+                Some(Sample::Str(
+                    x509_v_err_name(i64::from(low)).map_or_else(|| code.cast_unsigned().to_string(), str::to_string),
+                ))
             },
         });
     }

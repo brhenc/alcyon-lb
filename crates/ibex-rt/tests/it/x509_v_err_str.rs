@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T328: x509_v_err_str converter
+//! T328: `x509_v_err_str` converter
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +53,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -72,7 +63,8 @@ fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     out
 }
 
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+/// The request every case answers; `x-c` feeds the `hdr(x-c)` cases.
+const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nx-c: 20\r\nConnection: close\r\n\r\n";
 
 fn http_cfg(global: &str, body: &str) -> String {
     format!(
@@ -81,40 +73,10 @@ fn http_cfg(global: &str, body: &str) -> String {
     )
 }
 
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
-        }
-    });
-    addr
-}
-
 /// The body of the answer to `req` (what follows the first empty line).
 fn body(addr: SocketAddr, req: &[u8]) -> String {
     let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
-}
-
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
+    s.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {s:?}"), |(_, b)| b.to_string())
 }
 
 #[test]
@@ -123,13 +85,20 @@ fn x509_v_err_str_converter() {
     let cfg = http_cfg(
         "",
         &format!(
-            "frontend fe\n  bind {A}\n\
+            "frontend fe\n  bind {a}\n\
              http-request return status 200 content-type text/plain lf-string \
-             \"[%[int(0),x509_v_err_str]|%[int(10),x509_v_err_str]|%[int(20),x509_v_err_str]|%[int(94),x509_v_err_str]|%[int(95),x509_v_err_str]|%[int(-1),x509_v_err_str]|%[str(abc),x509_v_err_str]]\"",
-            A = a
+             \"[%[int(0),x509_v_err_str]|%[int(10),x509_v_err_str]|%[int(20),x509_v_err_str]|%[int(94),x509_v_err_str]|%[int(95),x509_v_err_str]|%[int(-1),x509_v_err_str]|%[str(abc),x509_v_err_str]\
+             |%[str(10),x509_v_err_str]|%[hdr(x-c),x509_v_err_str]|%[str(),x509_v_err_str]|%[int(4294967306),x509_v_err_str]|%[hdr(x-none),x509_v_err_str]]\
+             {{%[str(10),sub(3)]|%[str(10),mul(2)]|%[hdr(x-c),add(1)]|%[str(7),neg]|%[str(1),bool]|%[str(3),odd]|%[str(1),htonl,hex]|%[str(5),div(2)]\
+             |%[str(10),add(5)]|%[bool(1),add(1)]|%[str(abc),add(5)]}}\""
         ),
     );
-    let (ibex, _sock) = start("x509_v_err_str", &cfg, &[a]);
-    let expected = "[X509_V_OK|X509_V_ERR_CERT_HAS_EXPIRED|X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY|X509_V_ERR_EC_KEY_EXPLICIT_PARAMS|95|18446744073709551615|X509_V_OK]";
+    let (_ibex, _sock) = start("x509_v_err_str", &cfg, &[a]);
+    // Measured on HAProxy 3.5-dev8 with `x-c: 20`. The input is cast to an integer first, as for
+    // every integer converter: str(10) is 10, an empty string or a missing header gives no
+    // sample, and the code is read as a 32-bit int (4294967306 is 10).
+    let expected = "[X509_V_OK|X509_V_ERR_CERT_HAS_EXPIRED|X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY|X509_V_ERR_EC_KEY_EXPLICIT_PARAMS|95|18446744073709551615|X509_V_OK\
+                    |X509_V_ERR_CERT_HAS_EXPIRED|X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY||X509_V_ERR_CERT_HAS_EXPIRED|]\
+                    {7|20|21|-7|1|1|00000001|2|15|2|5}";
     assert_eq!(body(a, GET), expected);
 }
