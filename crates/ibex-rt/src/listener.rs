@@ -77,6 +77,17 @@ fn warn_if_refused<E: std::fmt::Display>(what: &str, r: Result<(), E>) {
     }
 }
 
+/// The `listen()` backlog of a bind, `listener_backlog()` of `HAProxy` (src/listener.c): the
+/// bind's `backlog`, else the proxy's `backlog`, else the bind's `maxconn` (the `bind`
+/// keyword is refused here), else the proxy's `maxconn` -- the global one when the proxy sets
+/// none, measured -- else 1024. 0 is unset. The kernel caps it at `net.core.somaxconn`.
+#[must_use]
+pub fn listener_backlog(bind_backlog: Option<u32>, proxy_backlog: u32, proxy_maxconn: u32) -> i32 {
+    let proxy_maxconn = if proxy_maxconn == 0 { crate::globalconn::hard() } else { proxy_maxconn };
+    let v = [bind_backlog.unwrap_or(0), proxy_backlog, proxy_maxconn].into_iter().find(|&v| v != 0).unwrap_or(1024);
+    i32::try_from(v).unwrap_or(i32::MAX)
+}
+
 impl Listener {
     /// Binds a listening socket with `SO_REUSEPORT` and `SO_REUSEADDR`.
     ///
@@ -114,7 +125,7 @@ impl Listener {
 
         let any = to_any(addr);
         net::bind_any(&fd, &any)?;
-        net::listen(&fd, tuning.backlog.map_or(backlog, |b| i32::try_from(b).unwrap_or(i32::MAX)))?;
+        net::listen(&fd, backlog)?;
 
         let bound_addr = if addr.port() == 0 {
             net::getsockname(&fd)
@@ -156,15 +167,15 @@ impl Listener {
     /// completed for the old process -- from being reset when that process exits.
     ///
     /// The descriptor is checked before it is trusted: it must be a listening TCP socket
-    /// bound to `addr`. It is set non-blocking and re-`listen`ed with this config's
-    /// backlog, which is how Linux changes the backlog of a listening socket.
+    /// bound to `addr`. It is set non-blocking and keeps the backlog it was bound with: the
+    /// oracle's reloaded worker does not `listen()` again either (T360, measured: a socket
+    /// bound with `backlog 50` still shows 50 after a reload whose config says 70).
     ///
     /// # Errors
     /// Refuses a descriptor that is not a listening TCP socket on `addr`.
     pub fn adopt(
         fd: OwnedFd,
         addr: SocketAddr,
-        backlog: i32,
         proxy: u32,
         tuning: &ibex_config::ast::SocketTuning,
     ) -> io::Result<Self> {
@@ -190,7 +201,6 @@ impl Listener {
         }
         rustix::io::ioctl_fionbio(&fd, true)?;
         apply_tuning(&fd, tuning);
-        net::listen(&fd, tuning.backlog.map_or(backlog, |b| i32::try_from(b).unwrap_or(i32::MAX)))?;
         Ok(Listener {
             fd,
             addr,
@@ -330,7 +340,7 @@ mod tests {
         let orig = Listener::bind(loopback0(), 16, 0).expect("bind");
         let addr = orig.addr();
         let fd = orig.borrowed_fd().try_clone_to_owned().expect("dup");
-        let adopted = Listener::adopt(fd, addr, 16, 7, &ibex_config::ast::SocketTuning::default()).expect("adopt");
+        let adopted = Listener::adopt(fd, addr, 7, &ibex_config::ast::SocketTuning::default()).expect("adopt");
         assert_eq!(adopted.addr(), addr);
         assert_eq!(adopted.proxy, 7);
         let _c = std::net::TcpStream::connect(addr).expect("connect");
@@ -350,7 +360,7 @@ mod tests {
         let orig = Listener::bind(loopback0(), 16, 0).expect("bind");
         let other = Listener::bind(loopback0(), 16, 0).expect("bind other");
         let fd = orig.borrowed_fd().try_clone_to_owned().expect("dup");
-        let err = Listener::adopt(fd, other.addr(), 16, 0, &ibex_config::ast::SocketTuning::default()).err().expect("must refuse");
+        let err = Listener::adopt(fd, other.addr(), 0, &ibex_config::ast::SocketTuning::default()).err().expect("must refuse");
         assert!(err.to_string().contains("bound to"), "{err}");
     }
 
@@ -358,7 +368,7 @@ mod tests {
     fn adopt_refuses_a_socket_that_is_not_listening() {
         let fd = net::socket_with(AddressFamily::INET, SocketType::STREAM, SocketFlags::CLOEXEC, None)
             .expect("socket");
-        let err = Listener::adopt(fd, loopback0(), 16, 0, &ibex_config::ast::SocketTuning::default()).err().expect("must refuse");
+        let err = Listener::adopt(fd, loopback0(), 0, &ibex_config::ast::SocketTuning::default()).err().expect("must refuse");
         assert!(err.to_string().contains("not listening"), "{err}");
     }
 
@@ -366,7 +376,7 @@ mod tests {
     fn adopt_refuses_a_datagram_socket() {
         let fd = net::socket_with(AddressFamily::INET, SocketType::DGRAM, SocketFlags::CLOEXEC, None)
             .expect("socket");
-        let err = Listener::adopt(fd, loopback0(), 16, 0, &ibex_config::ast::SocketTuning::default()).err().expect("must refuse");
+        let err = Listener::adopt(fd, loopback0(), 0, &ibex_config::ast::SocketTuning::default()).err().expect("must refuse");
         assert!(err.to_string().contains("not a stream socket"), "{err}");
     }
 
@@ -377,7 +387,7 @@ mod tests {
         };
         let addr = orig.addr();
         let fd = orig.borrowed_fd().try_clone_to_owned().expect("dup");
-        let adopted = Listener::adopt(fd, addr, 16, 0, &ibex_config::ast::SocketTuning::default()).expect("adopt v6");
+        let adopted = Listener::adopt(fd, addr, 0, &ibex_config::ast::SocketTuning::default()).expect("adopt v6");
         assert_eq!(adopted.addr(), addr);
     }
 }

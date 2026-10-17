@@ -36,6 +36,8 @@ pub struct DefaultsSection {
     pub redisp_after: i32,
     /// Default maxconn.
     pub maxconn: Option<u32>,
+    /// Default `backlog` (the proxy `backlog` keyword).
+    pub backlog: Option<u32>,
     /// `default_backend`, inherited by the frontends and listens that name none.
     pub default_backend: Option<String>,
     /// Default load balancing algorithm.
@@ -256,6 +258,8 @@ pub struct ListenSection {
     pub redisp_after: i32,
     /// Maximum concurrent connections for this proxy; 0 when not set, which is the global `maxconn`.
     pub maxconn: u32,
+    /// `backlog <n>`: the `listen()` backlog of its binds that set none; 0 when not set.
+    pub backlog: u32,
     /// Default dispatch address to connect to.
     pub dispatch: Option<SocketAddr>,
     /// Known backend servers.
@@ -439,6 +443,7 @@ impl Default for ListenSection {
             redisp: false,
             redisp_after: -1,
             maxconn: 0,
+            backlog: 0,
             dispatch: None,
             default_server: None,
             use_servers: Vec::new(),
@@ -528,6 +533,8 @@ pub struct FrontendSection {
     pub timeouts: TimeoutConfig,
     /// Maximum concurrent connections for this proxy; 0 when not set, which is the global `maxconn`.
     pub maxconn: u32,
+    /// `backlog <n>`: the `listen()` backlog of its binds that set none; 0 when not set.
+    pub backlog: u32,
     /// Default backend name to forward traffic to.
     pub default_backend: Option<String>,
     /// Dynamic switching rules (`use_backend <name> [if|unless <acl_cond>]`).
@@ -631,6 +638,7 @@ impl Default for FrontendSection {
             clitimeout: None,
             timeouts: TimeoutConfig::default(),
             maxconn: 0,
+            backlog: 0,
             default_backend: None,
             use_backends: Vec::new(),
             force_be_switch: Vec::new(),

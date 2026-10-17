@@ -1220,6 +1220,15 @@ pub(crate) fn parse_retry_on(retry_on: &mut u32, tokens: &[Token], kw: &Token) -
     Ok(())
 }
 
+/// `backlog <n>` of a proxy (HAProxy `cfg_parse_listen`: `"backlog"` -> `curproxy->backlog`).
+pub(crate) fn parse_backlog(backlog: &mut u32, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    if tokens.len() < 2 || tokens[1].text.is_empty() {
+        return Err(ConfigError::new(kw.line, kw.col, "'backlog' expects an integer argument."));
+    }
+    *backlog = parse_u32(&tokens[1], "backlog")?;
+    Ok(())
+}
+
 pub(crate) fn parse_maxconn(maxconn: &mut u32, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
     if tokens.len() < 2 || tokens[1].text.is_empty() {
         return Err(ConfigError::new(
