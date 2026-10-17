@@ -3689,40 +3689,76 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, args| {
+                // T359
                 let idx_str = args.first()?;
-                let delim_char = args.get(1).and_then(|d| d.chars().next()).unwrap_or(' ');
-                let count_str = args.get(2);
-
+                let seps_str = args.get(1).map_or(" ", |s| s.as_str());
                 let idx: i64 = idx_str.parse().ok()?;
-                let count: usize = count_str.map_or(1, |c| parse_count(c));
-
-                let Sample::Str(s) = smp else { return None };
-                let fields: Vec<&str> = s.split(delim_char).collect();
-                let len = fields.len();
-                // A field past either end is "no sample", not an empty one.
-                let start_idx = match idx.cmp(&0) {
-                    std::cmp::Ordering::Greater => {
-                        usize::try_from(idx).unwrap_or(usize::MAX).saturating_sub(1)
-                    }
-                    std::cmp::Ordering::Less => {
-                        let neg_idx = usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX);
-                        if neg_idx > len {
-                            return None;
-                        }
-                        len - neg_idx
-                    }
-                    std::cmp::Ordering::Equal => return None,
-                };
-                if start_idx >= len {
+                if idx == 0 {
                     return None;
                 }
-                let end_idx = if count == 0 {
-                    len
+                let count = args.get(2).map_or(1i32, |c| parse_count(c));
+                let Sample::Str(s) = smp else { return None };
+                let bytes = s.as_bytes();
+                let len = bytes.len();
+                let seps = seps_str.as_bytes();
+                if idx < 0 {
+                    let mut field = -1i64;
+                    let mut start = len;
+                    let mut end = len;
+                    let mut cnt = count;
+                    let mut found = false;
+                    while start > 0 {
+                        let pos = start - 1;
+                        let Some(&b) = bytes.get(pos) else { break };
+                        if seps.contains(&b) {
+                            if field == idx {
+                                if cnt == 1 {
+                                    found = true;
+                                    break;
+                                } else if cnt > 1 {
+                                    cnt -= 1;
+                                }
+                            } else {
+                                end = pos;
+                                field -= 1;
+                            }
+                        }
+                        start -= 1;
+                    }
+                    if !found && field != idx {
+                        return None;
+                    }
+                    let slice = s.get(start..end)?;
+                    Some(Sample::Str(slice.to_string()))
                 } else {
-                    start_idx.saturating_add(count).min(len)
-                };
-                let joined = fields[start_idx..end_idx].join(&delim_char.to_string());
-                Some(Sample::Str(joined))
+                    let mut field = 1i64;
+                    let mut start = 0usize;
+                    let mut end = 0usize;
+                    let mut cnt = count;
+                    let mut found = false;
+                    while end < len {
+                        let Some(&b) = bytes.get(end) else { break };
+                        if seps.contains(&b) {
+                            if field == idx {
+                                if cnt == 1 {
+                                    found = true;
+                                    break;
+                                } else if cnt > 1 {
+                                    cnt -= 1;
+                                }
+                            } else {
+                                start = end + 1;
+                                field += 1;
+                            }
+                        }
+                        end += 1;
+                    }
+                    if !found && field != idx {
+                        return None;
+                    }
+                    let slice = s.get(start..end)?;
+                    Some(Sample::Str(slice.to_string()))
+                }
             },
         });
 
@@ -3731,67 +3767,92 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, args| {
+                // T359
                 let idx_str = args.first()?;
-                let delims = args.get(1).map_or(" ", String::as_str);
-                let count_str = args.get(2);
-
+                let seps_str = args.get(1).map_or(" ", |s| s.as_str());
                 let idx: i64 = idx_str.parse().ok()?;
                 if idx == 0 {
                     return None;
                 }
-                let count: usize = count_str.map_or(1, |c| parse_count(c));
-
+                let count = args.get(2).map_or(1i32, |c| parse_count(c));
                 let Sample::Str(s) = smp else { return None };
-                let mut words: Vec<(usize, usize)> = Vec::new();
-                let mut in_word = false;
-                let mut word_start = 0;
-                for (char_idx, ch) in s.char_indices() {
-                    let is_delim = delims.contains(ch);
-                    if in_word {
-                        if is_delim {
-                            words.push((word_start, char_idx));
+                let bytes = s.as_bytes();
+                let len = bytes.len();
+                let seps = seps_str.as_bytes();
+                if idx < 0 {
+                    let mut word_num = 0i64;
+                    let mut in_word = false;
+                    let mut start = len;
+                    let mut end = len;
+                    let mut cnt = count;
+                    let mut found = false;
+                    while start > 0 {
+                        let pos = start - 1;
+                        let Some(&b) = bytes.get(pos) else { break };
+                        let is_sep = seps.contains(&b);
+                        if !in_word {
+                            if !is_sep {
+                                if word_num != idx {
+                                    word_num -= 1;
+                                    end = start;
+                                }
+                                in_word = true;
+                            }
+                        } else if is_sep {
+                            if word_num == idx {
+                                if cnt == 1 {
+                                    found = true;
+                                    break;
+                                } else if cnt > 1 {
+                                    cnt -= 1;
+                                }
+                            }
                             in_word = false;
                         }
-                    } else if !is_delim {
-                        word_start = char_idx;
-                        in_word = true;
+                        start -= 1;
                     }
-                }
-                if in_word {
-                    words.push((word_start, s.len()));
-                }
-
-                let len = words.len();
-                if len == 0 {
-                    return None;
-                }
-
-                let start_idx = match idx.cmp(&0) {
-                    std::cmp::Ordering::Greater => {
-                        usize::try_from(idx).unwrap_or(usize::MAX).saturating_sub(1)
+                    if !found && word_num != idx {
+                        return None;
                     }
-                    std::cmp::Ordering::Less => {
-                        let neg_idx = usize::try_from(idx.saturating_neg()).unwrap_or(usize::MAX);
-                        if neg_idx > len {
-                            return None;
-                        }
-                        len - neg_idx
-                    }
-                    std::cmp::Ordering::Equal => return None,
-                };
-
-                if start_idx >= len {
-                    return None;
-                }
-
-                let end_word_idx = if count == 0 {
-                    len - 1
+                    let slice = s.get(start..end)?;
+                    Some(Sample::Str(slice.to_string()))
                 } else {
-                    start_idx.saturating_add(count - 1).min(len - 1)
-                };
-
-                let slice = &s[words[start_idx].0..words[end_word_idx].1];
-                Some(Sample::Str(slice.to_string()))
+                    let mut word_num = 0i64;
+                    let mut in_word = false;
+                    let mut start = 0usize;
+                    let mut end = 0usize;
+                    let mut cnt = count;
+                    let mut found = false;
+                    while end < len {
+                        let Some(&b) = bytes.get(end) else { break };
+                        let is_sep = seps.contains(&b);
+                        if !in_word {
+                            if !is_sep {
+                                if word_num != idx {
+                                    word_num += 1;
+                                    start = end;
+                                }
+                                in_word = true;
+                            }
+                        } else if is_sep {
+                            if word_num == idx {
+                                if cnt == 1 {
+                                    found = true;
+                                    break;
+                                } else if cnt > 1 {
+                                    cnt -= 1;
+                                }
+                            }
+                            in_word = false;
+                        }
+                        end += 1;
+                    }
+                    if !found && word_num != idx {
+                        return None;
+                    }
+                    let slice = s.get(start..end)?;
+                    Some(Sample::Str(slice.to_string()))
+                }
             },
         });
 
@@ -9100,11 +9161,12 @@ mod ip_header_length_tests {
     }
 }
 
-/// The count argument of `field` and `word` (an integer; anything else is refused at load):
-/// a number too large for `usize` is the largest one (`HAProxy` clamps it, measured with 2^64
-/// and 10^20 on 3.5-dev8), and a count below 1 is 0, "to the end" (`field(2,:,-1)` of
-/// `a:b:c:d` is `b:c:d` on 3.5-dev8, as `field(2,:,0)`).
-fn parse_count(arg: &str) -> usize {
-    let n = arg.parse::<i128>().unwrap_or(i128::MAX);
-    if n < 1 { 0 } else { usize::try_from(n).unwrap_or(usize::MAX) }
+/// The count argument of `field` and `word` (an integer; anything else is refused at load).
+/// T359: parse as i64 and keep low 32 bits as C `int` does.
+fn parse_count(arg: &str) -> i32 {
+    let n = arg.parse::<i64>().unwrap_or_else(|_| if arg.starts_with('-') { i64::MIN } else { i64::MAX });
+    // The low 32 bits, as C's `int` assignment keeps them: the truncation is the point.
+    #[allow(clippy::cast_possible_truncation)]
+    let v = n as i32;
+    v
 }
