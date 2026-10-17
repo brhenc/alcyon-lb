@@ -33,7 +33,12 @@ pub(crate) fn parse_stats_directive(
                     "<stats refresh> expects <interval>.",
                 ));
             }
-            stats.refresh = Some(parse_timeout(&tokens[2], "stats refresh")?);
+            // The unit is seconds when none is given (`stats refresh 5` is 5s on HAProxy).
+            let mut interval = tokens[2].clone();
+            if interval.text.bytes().all(|b| b.is_ascii_digit()) {
+                interval.text.push('s');
+            }
+            stats.refresh = Some(parse_timeout(&interval, "stats refresh")?);
             Ok(())
         }
         "admin" => {

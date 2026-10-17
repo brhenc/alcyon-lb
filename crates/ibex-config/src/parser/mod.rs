@@ -49,31 +49,12 @@ const IGNORED_GLOBAL_KEYWORDS: &[(&str, &str)] = &[
     ),
 ];
 
-/// `HAProxy` keywords in `defaults` section that are deliberately inert or accepted.
-const IGNORED_DEFAULTS_KEYWORDS: &[(&str, &str)] = &[
-    (
-        "resolvers",
-        "Default resolvers directive; inert when dynamic DNS resolution is inactive",
-    ),
-];
-
-/// `HAProxy` keywords in `resolvers` section that are deliberately inert.
-const IGNORED_RESOLVERS_KEYWORDS: &[(&str, &str)] = &[
-    ("nameserver", "DNS nameserver definition"),
-    ("timeout", "DNS resolver timeout"),
-    ("resolve_retries", "DNS resolver retry count"),
-    ("hold", "DNS cache hold timers"),
-    ("accepted_payload_size", "DNS UDP payload size"),
-    ("parse-resolv-conf", "System resolv.conf parser flag"),
-];
-
 pub(crate) enum CurrentSection {
     Global(GlobalSection),
     Defaults(DefaultsSection),
     Listen(ListenSection),
     Frontend(FrontendSection),
     Backend(BackendSection),
-    Resolvers,
     /// `userlist <name>`.
     Userlist(Userlist),
     /// `http-errors <name>`: a named, independent set of `errorfile` entries referenced by
@@ -367,18 +348,11 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                 cur_section = Some(CurrentSection::LogForward(ring::parse_log_forward_header(tokens, kw, &log_forwards)?));
             }
             "resolvers" => {
-                flush_current_section(
-                    &mut cur_section,
-                    &mut global,
-                    &mut defaults,
-                    &mut named_defaults,
-                    &mut listens,
-                    &mut frontends,
-                    &mut backends,
-                    &mut rings,
-                    &mut log_forwards,
-                );
-                cur_section = Some(CurrentSection::Resolvers);
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    "'resolvers' sections are not supported: Ibex does no DNS resolution at run time (out of M1 scope)",
+                ));
             }
             "userlist" => {
                 flush_current_section(
@@ -789,7 +763,6 @@ pub(crate) fn flush_current_section(
             CurrentSection::Listen(l) => listens.push(l),
             CurrentSection::Frontend(f) => frontends.push(f),
             CurrentSection::Backend(b) => backends.push(b),
-            CurrentSection::Resolvers => {}
             CurrentSection::Userlist(u) => register_userlist(u),
             CurrentSection::HttpErrors(name, table) => register_http_errors_section(name, table),
             CurrentSection::Ring(r) => rings.push(r),
@@ -812,7 +785,6 @@ pub(crate) fn parse_section_directive(
         CurrentSection::Listen(l) => parse_listen_directive(l, tokens, kw),
         CurrentSection::Frontend(f) => parse_frontend_directive(f, tokens, kw),
         CurrentSection::Backend(b) => parse_backend_directive(b, tokens, kw),
-        CurrentSection::Resolvers => parse_resolvers_directive(tokens, kw),
         CurrentSection::Userlist(u) => parse_userlist_directive(u, tokens, kw),
         CurrentSection::Ring(r) => ring::parse_ring_directive(r, tokens, kw),
         CurrentSection::LogForward(l) => ring::parse_log_forward_directive(l, tokens, kw),
@@ -827,17 +799,6 @@ pub(crate) fn parse_section_directive(
     }
 }
 
-pub(crate) fn parse_resolvers_directive(tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
-    let _ = tokens;
-    match kw.text.as_str() {
-        other if IGNORED_RESOLVERS_KEYWORDS.iter().any(|(k, _)| *k == other) => Ok(()),
-        other => Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            format!("unknown keyword '{other}' in 'resolvers' section"),
-        )),
-    }
-}
 
 
 
@@ -892,12 +853,14 @@ const OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[(&str, &str)] = &[
 
 
 
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn parse_no_directive(tokens: &[Token], _kw: &Token) -> Result<(), ConfigError> {
-    if tokens.len() >= 2 {
-        crate::stderr_line!("[ibex] warning: ignored 'no {}'", tokens[1].text);
-    }
-    Ok(())
+pub(crate) fn parse_no_directive(_tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    // `no option` and `no log` are handled by the callers; HAProxy (`cfgparse-listen.c`)
+    // refuses every other `no <keyword>`, and a bare `no`, with this one message.
+    Err(ConfigError::new(
+        kw.line,
+        kw.col,
+        "negation/default currently supported only for options, log, busy-polling, set-dumpable, strict-limits, insecure-fork-wanted and numa-cpu-mapping.".to_string(),
+    ))
 }
 
 /// Where a `declare` line is, for the sections `HAProxy` refuses it in.
@@ -1602,7 +1565,6 @@ mod tests {
 
     #[test]
     fn only_a_proxy_section_gives_an_explicit_id() {
-        assert!(CurrentSection::Resolvers.explicit_id().is_none());
         let mut be = BackendSection { name: "b".into(), ..Default::default() };
         assert!(CurrentSection::Backend(be.clone()).explicit_id().is_none());
         be.id = Some(4);

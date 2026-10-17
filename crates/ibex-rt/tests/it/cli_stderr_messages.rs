@@ -62,13 +62,12 @@ fn bad_command_lines_say_why_and_exit_1() {
 
 #[test]
 fn debug_flags_announce_themselves() {
-    let (code, err) = run(&["-dr", "-de", "-dp", "-dM", "-f", "CFG", "-c"]);
+    let (code, err) = run(&["-dr", "-de", "-dp", "-f", "CFG", "-c"]);
     assert_eq!(code, Some(0), "{err}");
     for want in [
         "[DIAG] Flag -dr: ignoring server address resolution failures.",
         "[DIAG] Flag -de: disabling epoll poller (falling back to standard poll).",
         "[DIAG] Flag -dp: disabling poll poller.",
-        "[DIAG] Flag -dM: memory pool debugging active.",
     ] {
         assert!(err.contains(want), "{want:?} missing from {err:?}");
     }
@@ -125,20 +124,6 @@ fn daemon_mode_failures_are_reported() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("Failed to daemonize:"), "{err:?}");
     assert_eq!(out.status.code(), Some(1));
-}
-
-/// `no <keyword>` that is neither `no log` nor `no option`: ibex warns and ignores it.
-/// `HAProxy` (3.5-dev8-885761-29) refuses an unknown one ("unknown keyword") -- a known
-/// gap, pinned here so that the warning, now written through `stderr_line!`, is executed.
-#[test]
-fn an_ignored_no_directive_is_announced() {
-    let dir = std::path::PathBuf::from(format!("/tmp/t342b-no-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let cfg = dir.join("c.cfg");
-    std::fs::write(&cfg, CFG.replace("http-request", "no foo\n  http-request")).unwrap();
-    let (code, err) = run(&["-c", "-f", &cfg.display().to_string()]);
-    assert!(err.contains("[ibex] warning: ignored 'no foo'"), "{err:?}");
-    assert_eq!(code, Some(0));
 }
 
 fn start_w(args: &[&str], envs: &[(&str, &str)], exe: &std::path::Path, addr: std::net::SocketAddr) -> (common::Ibex, std::process::ChildStderr) {
@@ -213,4 +198,15 @@ fn a_failed_socket_handover_is_reported() {
     let mut text = String::new();
     err.read_to_string(&mut text).unwrap();
     assert!(text.contains("[ALERT] could not hand the listening sockets over:"), "{text:?}");
+}
+
+/// T351: `-dM` (HAProxy: poison pool memory) has no Ibex equivalent, so every form is refused
+/// with a message naming the option instead of printing a banner and doing nothing.
+#[test]
+fn dm_is_refused_in_every_form() {
+    for flag in ["-dM", "-dMhelp", "-dM0x55", "-dMfail", "-dMno-cache"] {
+        let (code, err) = run(&[flag, "-f", "CFG", "-c"]);
+        assert_eq!(code, Some(1), "{flag}: {err:?}");
+        assert!(err.contains("-dM") && err.contains("not supported"), "{flag}: {err:?}");
+    }
 }

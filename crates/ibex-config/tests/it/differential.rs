@@ -914,9 +914,6 @@ global
     thread-groups 1
     expose-experimental-directives
     insecure-fork-wanted
-
-defaults
-    resolvers mydns
 ";
     assert!(
         parse_config(inert_cfg).is_ok(),

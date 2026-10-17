@@ -532,6 +532,11 @@ pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("fc_retrans", "Ibex does not read TCP_INFO"),
     ("fc_fackets", "Ibex does not read TCP_INFO"),
     ("fc_reordering", "Ibex does not read TCP_INFO"),
+    // T351: registered, and always 0.
+    ("fc_rtt", "Ibex does not read TCP_INFO"),
+    ("fc_rttvar", "Ibex does not read TCP_INFO"),
+    ("bc_rtt", "Ibex does not read TCP_INFO"),
+    ("bc_rttvar", "Ibex does not read TCP_INFO"),
     ("queue", "Ibex has no server queues"),
     ("avg_queue", "Ibex has no server queues"),
     ("srv_queue", "Ibex has no server queues"),
@@ -1595,28 +1600,8 @@ impl Registry {
             func: fc_dst_is_local_fetch,
         });
 
-        self.register_fetch(FetchDesc {
-            name: "fc_rtt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.fc_rtt.unwrap_or(0)))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "fc_rttvar",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.fc_rttvar.unwrap_or(0)))),
-        });
         // T331: `fc_nb_streams`, `fc_settings_streams_limit` and `fc_glitches` are refused
         // instead ([`NOT_IMPLEMENTED`]): they were registered here as the constants 1, 1, 0.
-        self.register_fetch(FetchDesc {
-            name: "bc_rtt",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.bc_rtt.unwrap_or(0)))),
-        });
-        self.register_fetch(FetchDesc {
-            name: "bc_rttvar",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.bc_rttvar.unwrap_or(0)))),
-        });
         // T331: the backend connection (`SMP_USE_L4SRV`). Without one, none has a value;
         // `bc_reused` is 0 on any stream (`smp_fetch_reused`).
         self.register_fetch(FetchDesc {
