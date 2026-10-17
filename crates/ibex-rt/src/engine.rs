@@ -2552,6 +2552,8 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
         return;
     }
     entry.stats_done = true;
+    // T320: count every finished stream (HTTP transaction or TCP session).
+    crate::stats::CUM_STREAMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let http = entry.sess.mode == Mode::Http;
     // Only what the counters need of the log line's data: the whole `LogData` costs a
     // measurable share of a request (T172).
@@ -4932,6 +4934,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             match listener.accept() {
                 Ok(stream) => {
                     let mut applet = CliApplet::new(stream, self.now);
+                    // T320: count each CLI connection.
+                    crate::stats::CUM_STREAMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     applet.timeout_ms = self.cli_timeout_ms;
                     applet.level = level;
                     applet.socket_name = name.cloned();

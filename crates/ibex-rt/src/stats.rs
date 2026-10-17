@@ -339,6 +339,9 @@ pub fn description() -> Option<String> {
 
 pub static NBTHREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
+// T320: process-wide count of streams (HTTP transactions, TCP sessions, CLI connections).
+pub static CUM_STREAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn format_show_info(start_time: Instant, pid: u32, total_tasks: usize, run_queue_len: usize, active_conns: u32, max_conns: u32) -> String {
     format_show_info_counts(start_time, pid, total_tasks, run_queue_len, active_conns, max_conns, 0, 0)
 }
@@ -497,7 +500,7 @@ fn show_info_pairs(
         ("BootTime_ms", zero()),
         ("Niced_tasks", zero()),
         ("CurrStreams", zero()),
-        ("CumStreams", zero()),
+        ("CumStreams", crate::stats::CUM_STREAMS.load(std::sync::atomic::Ordering::Relaxed).to_string()),
         ("BlockedTrafficWarnings", zero()),
         ("PatternsAdded", zero()),
         ("PatternsFreed", zero()),

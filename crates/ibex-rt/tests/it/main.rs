@@ -242,6 +242,7 @@ mod set_status_reason;
 mod silent_drop_ttl;
 mod shared_counters;
 mod show_info_counters;
+mod show_info_cum_streams;
 mod show_table;
 mod smtp_check_partial_lines;
 mod soft_stop;
