@@ -783,7 +783,9 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
                     Some(format!("error detected in {what} while parsing '{} {}' rule : {why}", r.directive, r.action))
                 }
                 "log-format" | "error-log-format" | "log-format-sd" if headers => Some(format!("failed to parse {} : {why}", r.directive)),
-                "unique-id-format" if headers => Some(format!("failed to parse unique-id : {why}")),
+                // The unique id is made from the request: neither the response nor the server
+                // is there yet (T341).
+                "unique-id-format" => Some(format!("failed to parse unique-id : {why}")),
                 _ => None,
             };
             if let Some(e) = refused {

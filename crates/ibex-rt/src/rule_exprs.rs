@@ -124,12 +124,24 @@ pub fn response_part(fetch: &str) -> Option<&'static str> {
     }
 }
 
-/// T326: what a request-side rule cannot read of the server connection, which is not made
-/// yet: `SMP_USE_L4SRV` (`src/connection.c`). A response rule and a log line may read it.
+/// T326, T341: what a request-side rule cannot read of the server, which is not chosen yet,
+/// in `HAProxy`'s words (`fetch_src_names`, `src/sample.c`): the server itself
+/// (`SMP_USE_SERVR`), its address (`SMP_USE_L4SRV`) and its connection (`SMP_USE_L5SRV`), from
+/// the keyword lists of `backend.c`, `connection.c`, `sample.c`, `stream.c`, `tcp_sample.c`,
+/// `ssl_sample.c` and `stconn.c`. A response rule and a log line may read them.
 #[must_use]
 pub fn server_part(fetch: &str) -> Option<&'static str> {
     match fetch {
-        "bc_http_major" => Some("server address"),
+        "srv_id" | "srv_name" => Some("server"),
+        "bc_err" | "bc_err_name" | "bc_err_str" | "bc_glitches" | "bc_http_major" | "bc_be_queue" | "bc_srv_queue"
+        | "bc.timer.connect" | "req.timer.queue" | "txn.conn_retries" | "txn.redispatched" | "bc_dst" | "bc_dst_port"
+        | "bc_reused" | "bc_src" | "bc_src_port" => Some("server address"),
+        // Not the `ssl_bc_*_secret` keylog fetches: `HAProxy` files those under `SMP_USE_L5CLI`.
+        "bc_nb_streams" | "bc_settings_streams_limit" | "bs.aborted" | "bs.debug_str" | "bs.id" | "bs.rst_code"
+        | "ssl_bc" | "ssl_bc_alg_keysize" | "ssl_bc_alpn" | "ssl_bc_cipher" | "ssl_bc_client_random" | "ssl_bc_curve"
+        | "ssl_bc_err" | "ssl_bc_err_str" | "ssl_bc_is_resumed" | "ssl_bc_npn" | "ssl_bc_protocol"
+        | "ssl_bc_server_random" | "ssl_bc_session_id" | "ssl_bc_session_key" | "ssl_bc_sni" | "ssl_bc_unique_id"
+        | "ssl_bc_use_keysize" => Some("server-side connection"),
         _ => None,
     }
 }
