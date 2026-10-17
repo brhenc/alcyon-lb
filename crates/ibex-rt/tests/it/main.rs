@@ -170,6 +170,7 @@ mod idle_pool_shared;
 mod jwt_query;
 mod is_local;
 mod ip_converters;
+mod ip_v6_fp;
 mod keepalive_abort_accounting;
 mod keepalive_binary;
 mod large_response_latency;
