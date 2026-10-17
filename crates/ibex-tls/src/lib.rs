@@ -28,6 +28,6 @@ pub use config::{
     install_default_crypto_provider, load_ca_file, load_cert_file, load_server_ca, load_system_ca_roots,
     parse_server_name, versions_between, BackendTlsOptions, NoServerAuth, ServerVerifier, TlsConfig, TlsEngineKind,
 };
-pub use capture::{HelloTap, SslCapture};
+pub use capture::{exclude_tls_grease, HelloTap, SslCapture};
 pub use resolver::IbexCertResolver;
 pub use transport::{RustlsContext, RustlsTlsInfo, RustlsTransport};

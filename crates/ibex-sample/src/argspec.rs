@@ -479,19 +479,6 @@ const TLV_NAMES: &[&str] = &[
 /// `when_cond_kw[]`, in `HAProxy`'s order.
 const WHEN_KEYWORDS: &[&str] = &["stopping", "normal", "error", "forwarded", "toapplet", "processed", "acl"];
 
-/// An argument `HAProxy` takes and Ibex does not implement yet: refused at load, so that it
-/// cannot be accepted and then ignored (AGENTS.md rule 5).
-fn ibex_refusal(fetch: &str, args: &[Arg]) -> Option<&'static str> {
-    match fetch {
-        // T344: `(1)` filters the GREASE values out (`exclude_tls_grease`); `(0)` is the
-        // unfiltered list, which is what Ibex gives.
-        "ssl_fc_cipherlist_bin" if args.first().is_some_and(|a| a.sint() != 0) => {
-            Some("the GREASE filter argument is not implemented in Ibex yet (T344, next slice); use no argument or 0")
-        }
-        _ => None,
-    }
-}
-
 /// A fetch's `val_args`, by `HAProxy`'s function name. Functions not ported accept, and so do
 /// those of fetches Ibex does not register, whose names are refused first (`val_distcc`,
 /// `val_blk_arg`).
@@ -750,15 +737,11 @@ pub fn check_typed_expr(expr: &str, acl: bool) -> Result<(), String> {
         Some(_) => format!("ACL keyword '{fname}' : {m}"),
         None => in_acl(format!("fetch method '{fname}' : {m}")),
     })?;
-    let mut args = args;
-    if let (Some(args), Some(val)) = (args.as_mut(), spec.val) {
-        val_fetch(val, args).map_err(|m| match aclkw {
+    if let (Some(mut args), Some(val)) = (args, spec.val) {
+        val_fetch(val, &mut args).map_err(|m| match aclkw {
             Some(_) => format!("in argument to '{fname}', {m}"),
             None => in_acl(format!("invalid args in fetch method '{fname}' : {m}")),
         })?;
-    }
-    if let Some(m) = args.as_deref().and_then(|a| ibex_refusal(aclkw.unwrap_or(fname), a)) {
-        return Err(in_acl(format!("invalid args in fetch method '{fname}' : {m}")));
     }
     let conv_err = |m: String| match aclkw {
         Some(_) => format!("ACL keyword '{fname}' : {m}"),

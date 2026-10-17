@@ -73,6 +73,34 @@ impl SslCapture {
     }
 }
 
+/// `exclude_tls_grease` (`ssl_utils.c`): `input` without its `GREASE` (RFC 8701) pairs -- two
+/// equal bytes whose low nibble is 0xa -- in a buffer of `size` bytes (`HAProxy` writes into a
+/// trash chunk, `tune.bufsize` long): the walk stops when the next pair no longer fits, and an
+/// odd trailing byte is kept if there is room. Used by the `(1)` argument of the list fetches.
+#[must_use]
+pub fn exclude_tls_grease(input: &[u8], size: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut ptr = 0;
+    while ptr + 1 < input.len() {
+        let (a, b) = (input.get(ptr).copied().unwrap_or(0), input.get(ptr + 1).copied().unwrap_or(0));
+        if a != b || (a & 0x0f) != 0x0a {
+            if out.len() + 2 <= size {
+                out.push(a);
+                out.push(b);
+            } else {
+                break;
+            }
+        }
+        ptr += 2;
+    }
+    if size > out.len() {
+        if let Some(&last) = input.get(ptr) {
+            out.push(last);
+        }
+    }
+    out
+}
+
 fn be16(b: &[u8], at: usize) -> Option<usize> {
     let s = b.get(at..at.checked_add(2)?)?;
     Some(usize::from(u16::from_be_bytes([*s.first()?, *s.get(1)?])))
@@ -413,6 +441,71 @@ mod tests {
         assert_eq!(hex(c.ec()), "001D");
         assert!(c.ec_formats().is_empty());
         assert_eq!(c.ec_formats, 30..30, "the offset is set even with no room");
+    }
+
+    #[test]
+    fn grease_rows() {
+        let g = |v: &str| hex(&exclude_tls_grease(&unhex(v), 16384));
+        assert_eq!(g(""), "");
+        assert_eq!(g("0a0a 1301 1303"), "13011303");
+        assert_eq!(g("1301 0a0a"), "1301");
+        assert_eq!(g("1301 0a0b"), "13010A0B", "bytes differ: not GREASE");
+        assert_eq!(g("0b0a"), "0B0A");
+        assert_eq!(g("2a2a 3a3a"), "");
+        assert_eq!(g("fafa 1301 dada"), "1301");
+        assert_eq!(g("1301 1b1b"), "13011B1B", "low nibble must be a");
+        assert_eq!(g("1301 aa"), "1301AA", "odd trailing byte kept");
+        assert_eq!(g("0a0a 0a"), "0A", "odd trailing byte kept after a GREASE pair");
+        // A full output stops the walk; the C then copies the byte at `ptr` only with room left.
+        assert_eq!(hex(&exclude_tls_grease(&unhex("1301 1303 1304"), 4)), "13011303");
+        assert_eq!(hex(&exclude_tls_grease(&unhex("1301 1303 1304"), 5)), "1301130313");
+    }
+
+    fn client_hello(ciphers: &[u8], exts: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x03, 0x03];
+        b.extend([7u8; 32]);
+        b.push(0);
+        b.extend((ciphers.len() as u16).to_be_bytes());
+        b.extend(ciphers);
+        b.extend([1, 0]);
+        b.extend((exts.len() as u16).to_be_bytes());
+        b.extend(exts);
+        let mut m = vec![1, 0, (b.len() >> 8) as u8, b.len() as u8];
+        m.extend(b);
+        m
+    }
+
+    /// Two hand-built `ClientHello`s with `GREASE` in every list. Not measured on `HAProxy`
+    /// (a client that sends `GREASE` is a browser, and the oracle host has none to hand): the
+    /// expected values are computed from the C (`ssl_sock_parse_clienthello` keeps every id
+    /// and list as sent, except that the loop `msg + 4 < extensions_end` never reads a last
+    /// extension of 4 bytes (the empty `4a4a` and `3a3a` below); `exclude_tls_grease` then drops the pairs).
+    #[test]
+    fn grease_hellos_filter_per_the_c() {
+        let exts = unhex(
+            "0a0a 0000 000a 000a 0008 3a3a 001d 0017 1a1a  \
+             000b 0002 0100  002b 0007 06 2a2a 0304 0303  000d 0006 0004 0403 5a5a  4a4a 0000",
+        );
+        let m = client_hello(&unhex("6a6a 1301 1302 c02b"), &exts);
+        let c = parse(&m, 1024).unwrap();
+        assert_eq!(hex(c.ciphersuite()), "6A6A13011302C02B");
+        assert_eq!(hex(&exclude_tls_grease(c.ciphersuite(), 16384)), "13011302C02B");
+        assert_eq!(hex(c.extensions()), "0A0A000A000B002B000D");
+        assert_eq!(hex(&exclude_tls_grease(c.extensions(), 16384)), "000A000B002B000D");
+        assert_eq!(hex(c.ec()), "3A3A001D00171A1A");
+        assert_eq!(hex(&exclude_tls_grease(c.ec(), 16384)), "001D0017");
+        assert_eq!(hex(c.ec_formats()), "00");
+        assert_eq!(hex(c.supver()), "2A2A03040303");
+        assert_eq!(hex(&exclude_tls_grease(c.supver(), 16384)), "03040303");
+        assert_eq!(hex(c.sigalgs()), "04035A5A");
+        assert_eq!(hex(&exclude_tls_grease(c.sigalgs(), 16384)), "0403");
+
+        let m = client_hello(&unhex("0a0a fafa"), &unhex("2a2a 0000 3a3a 0000"));
+        let c = parse(&m, 64).unwrap();
+        assert_eq!(hex(c.ciphersuite()), "0A0AFAFA");
+        assert!(exclude_tls_grease(c.ciphersuite(), 16384).is_empty());
+        assert_eq!(hex(c.extensions()), "2A2A");
+        assert!(exclude_tls_grease(c.extensions(), 16384).is_empty());
     }
 
     /// No input may panic: every prefix of the hello, and every prefix with each byte flipped.

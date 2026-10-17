@@ -3052,19 +3052,58 @@ impl Registry {
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.ssl_fc.sni.map(|v| Sample::Str(v.to_string())),
         });
-        // The ClientHello capture (`tune.ssl.capture-buffer-size`, `smp_fetch_ssl_fc_cl_bin`
-        // and `smp_fetch_ssl_fc_protocol_hello_id`, src/ssl_sample.c): no sample without one.
-        // The GREASE filter argument of `ssl_fc_cipherlist_bin` is refused at load
-        // (`argspec::ibex_refusal`) until it is implemented, so only the unfiltered list is here.
+        // The ClientHello capture (`tune.ssl.capture-buffer-size`, `smp_fetch_ssl_fc_*_bin` and
+        // friends, src/ssl_sample.c): no sample without one. The `(1)` argument runs the list
+        // through `exclude_tls_grease` into a trash chunk (`tune.bufsize`, 16384).
         self.register_fetch(FetchDesc {
             name: "ssl_fc_cipherlist_bin",
             out_type: SampleType::Bin,
-            func: |ctx, _args| ctx.ssl_fc.capture.map(|c| Sample::Bin(c.ciphersuite().to_vec())),
+            func: |ctx, args| capture_list(ctx, args, ibex_tls::SslCapture::ciphersuite),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_cipherlist_hex",
+            out_type: SampleType::Bin,
+            // `dump_binary`: upper-case hex (`hextab`), declared BIN, so `,hex` doubles it.
+            func: |ctx, args| match capture_list(ctx, args, ibex_tls::SslCapture::ciphersuite)? {
+                Sample::Bin(b) => Some(Sample::Bin(hex_encode(&b).into_bytes())),
+                _ => None,
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_cipherlist_xxh",
+            out_type: SampleType::Sint,
+            // `smp->data.u.sint = capture->xxh64`: the unsigned 64-bit hash as a signed value.
+            func: |ctx, _args| ctx.ssl_fc.capture.map(|c| Sample::Sint(c.xxh64.cast_signed())),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_protocol_hello_id",
             out_type: SampleType::Sint,
             func: |ctx, _args| ctx.ssl_fc.capture.map(|c| Sample::Sint(i64::from(c.protocol_version))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_extlist_bin",
+            out_type: SampleType::Bin,
+            func: |ctx, args| capture_list(ctx, args, ibex_tls::SslCapture::extensions),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_eclist_bin",
+            out_type: SampleType::Bin,
+            func: |ctx, args| capture_list(ctx, args, ibex_tls::SslCapture::ec),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_ecformats_bin",
+            out_type: SampleType::Bin,
+            func: |ctx, _args| ctx.ssl_fc.capture.map(|c| Sample::Bin(c.ec_formats().to_vec())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_supported_versions_bin",
+            out_type: SampleType::Bin,
+            func: |ctx, args| capture_list(ctx, args, ibex_tls::SslCapture::supver),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_sigalgs_bin",
+            out_type: SampleType::Bin,
+            func: |ctx, args| capture_list(ctx, args, ibex_tls::SslCapture::sigalgs),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_alpn",
@@ -7397,6 +7436,15 @@ fn format_time_ns(epoch: i64, nanos: u32, format: &str, local: bool) -> String {
 }
 
 // --- Encoding Internals ---
+
+/// One captured list for the `ssl_fc_*list_bin` fetches: the bytes as captured, or with
+/// `GREASE` removed when the integer argument is not 0; no sample without a capture.
+fn capture_list(ctx: &SampleContext, args: &[String], list: fn(&ibex_tls::SslCapture) -> &[u8]) -> Option<Sample> {
+    let c = ctx.ssl_fc.capture?;
+    let bytes = list(c);
+    let filter = args.first().and_then(|a| a.parse::<i64>().ok()).unwrap_or(0) != 0;
+    Some(Sample::Bin(if filter { ibex_tls::exclude_tls_grease(bytes, 16384) } else { bytes.to_vec() }))
+}
 
 fn hex_encode(data: &[u8]) -> String {
     let mut s = String::with_capacity(data.len() * 2);
