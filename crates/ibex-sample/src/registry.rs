@@ -993,8 +993,9 @@ impl Registry {
                 let param = args.first()?;
                 let uri = get_context_uri(ctx)?;
                 let (_, _, query) = split_uri(uri);
-                let val_str = url_decode(&extract_url_param(query, param)?, true); // T327
-                val_str.parse::<i64>().ok().map(Sample::Sint)
+                // T327: `smp_fetch_url_param_val` is `strl2ic` over the raw value, not decoded.
+                let raw = extract_url_param(query, param)?;
+                Some(Sample::Sint(i64::from(strl2ic(raw.as_bytes()))))
             },
         });
 
@@ -4936,15 +4937,27 @@ fn extract_cookies(cookie_header: &str) -> Vec<(&str, &str)> {
 
 fn extract_url_param(query: &str, param: &str) -> Option<String> {
     for pair in query.split('&') {
+        // T327: only `name=` matches (`http_find_url_param_pos`): a bare `name` is not found.
         if let Some((k, v)) = pair.split_once('=') {
             if k == param {
                 return Some(v.to_string()); // T327
             }
-        } else if pair == param {
-            return Some(String::new());
         }
     }
     None
+}
+
+/// `strl2ic` (`src/tools.c`): an optional '-', then the decimal digits up to the first other
+/// byte, wrapping as a C `int` does; 0 where there are none ('+' is not a sign).
+fn strl2ic(s: &[u8]) -> i32 {
+    let (neg, digits) = match s.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, s),
+    };
+    digits.iter().take_while(|c| c.is_ascii_digit()).fold(0i32, |i, &c| {
+        let j = i32::from(c - b'0');
+        if neg { i.wrapping_mul(10).wrapping_sub(j) } else { i.wrapping_mul(10).wrapping_add(j) }
+    })
 }
 
 /// The address and port `url_ip` and `url_port` read from an absolute-form target

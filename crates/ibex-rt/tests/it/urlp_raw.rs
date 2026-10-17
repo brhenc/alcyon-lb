@@ -5,7 +5,6 @@
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +53,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -72,49 +63,10 @@ fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     out
 }
 
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
-        }
-    });
-    addr
-}
-
 /// The body of the answer to `req` (what follows the first empty line).
 fn body(addr: SocketAddr, req: &[u8]) -> String {
     let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
-}
-
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
+    s.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {s:?}"), |(_, b)| b.to_string())
 }
 
 #[test]
@@ -123,7 +75,7 @@ fn urlp_raw() {
     let cfg = format!(
         "global\n  stats socket {{sock}} level admin\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"[%[urlp(y)]|%[url_param(y)]|%[urlp(y),url_dec]|%[urlp(z)]]\""
     );
-    let (ibex, _sock) = start("urlp_raw", &cfg, &[a]);
+    let (_ibex, _sock) = start("urlp_raw", &cfg, &[a]);
     // Row 1
     let req1 = b"GET /a/b.html?x=1&y=%41b&x=2 HTTP/1.1\r\nHost: a\r\nX-Foo: 1\r\nX-Foo: 2, 3\r\nCookie: a=1; b=2\r\nCookie: a=3\r\nX-L: a, b\r\nUser-Agent: Mozilla/5.0 (X11)\r\nConnection: close\r\n\r\n";
     assert_eq!(body(a, req1), "[%41b|%41b|Ab|]");
@@ -133,4 +85,34 @@ fn urlp_raw() {
     // Row 3
     let req3 = b"GET /?y=%zz HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
     assert_eq!(body(a, req3), "[%zz|%zz||]");
+}
+
+/// Review U1: `urlp_val` is `strl2ic` over the raw value (no percent-decoding, stops at the
+/// first non-digit, wraps as a C int), and a parameter matches only as `name=`, so a bare
+/// `n` is not found. Values measured on `HAProxy` 3.5-dev8.
+#[test]
+fn urlp_val_raw() {
+    let a = common::reserve_addr();
+    let cfg = format!(
+        "global\n  stats socket {{sock}} level admin\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"found:%[urlp(n)]:%[urlp_val(n)]\" if {{ urlp(n) -m found }}\n  http-request return status 200 content-type text/plain lf-string \"none\"\n"
+    );
+    let (_ibex, _sock) = start("urlp_val_raw", &cfg, &[a]);
+    for (q, want) in [
+        ("n=%31", "found:%31:0"),
+        ("n=%2D5", "found:%2D5:0"),
+        ("n=%2B3", "found:%2B3:0"),
+        ("n=12abc", "found:12abc:12"),
+        ("n=", "found::0"),
+        ("n=99999999999", "found:99999999999:1215752191"),
+        ("n=-99999999999", "found:-99999999999:-1215752191"),
+        ("n=-12", "found:-12:-12"),
+        ("n=+3", "found:+3:0"),
+        ("n=-", "found:-:0"),
+        ("n", "none"),
+        ("n&n=5", "found:5:5"),
+        ("nn=3&n=4", "found:4:4"),
+    ] {
+        let req = format!("GET /?{q} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        assert_eq!(body(a, req.as_bytes()), want, "?{q}");
+    }
 }
