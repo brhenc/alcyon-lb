@@ -552,6 +552,11 @@ impl LogFormat {
             if b.get(i) == Some(&b'[') {
                 let end = find_expr_end(&fmt[i + 1..]).ok_or_else(|| format!("missing ']' after '{}'", &fmt[i + 1..]))?;
                 let src = &fmt[i + 1..i + 1 + end];
+                // A rule's expression may end in commas, a `%[...]` may not: the converter
+                // `sample_parse_expr` finds after them is the `]`, an empty name (T341).
+                if src.ends_with(',') {
+                    return Err(format!("failed to parse sample expression <{src}> : unknown converter ''"));
+                }
                 let expr = Expr::parse(src).map_err(|e| format!("failed to parse sample expression <{src}> : {e}"))?;
                 if registry.get_fetch(&expr.fetch_name).is_none() {
                     return Err(format!("failed to parse sample expression <{src}> : unknown fetch method '{}'", expr.fetch_name));

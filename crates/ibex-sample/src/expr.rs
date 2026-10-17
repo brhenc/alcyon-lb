@@ -581,7 +581,16 @@ fn parse_chain(expr_part: &str) -> Result<Vec<(String, Vec<String>)>, String> {
         calls.push((name, args));
         match b.get(pos) {
             None => return Ok(calls),
-            Some(b',') => pos += 1,
+            // `sample_parse_expr` skips a run of commas (`str(a),,lower`), trailing ones too
+            // (T341). In a `%[...]` the `]` follows them: the log-format parser refuses that.
+            Some(b',') => {
+                while b.get(pos) == Some(&b',') {
+                    pos += 1;
+                }
+                if pos == b.len() {
+                    return Ok(calls);
+                }
+            }
             Some(_) if first => return Err("missing comma after fetch keyword".to_string()),
             Some(_) => {
                 // HAProxy checks a converter's arguments (`val_args`) before it looks for the

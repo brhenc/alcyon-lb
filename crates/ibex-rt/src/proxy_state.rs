@@ -747,7 +747,11 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
         // `log-format`, `unique-id-format`, `error-log-format` and `log-format-sd` are compiled, and refused
         // in `HAProxy`'s "failed to parse log-format" words, by `validate_formats`.
         if !r.acl && !matches!(r.directive.as_str(), "log-format" | "unique-id-format" | "error-log-format" | "log-format-sd") {
-            crate::rule_exprs::check_sample_expr(&r.expr, registry)
+            // A `%[...]` may not end in commas, unlike a rule's expression: the converter
+            // `sample_parse_expr` finds after them is the `]`, an empty name (T341).
+            let trailing = r.expr.ends_with(',').then(|| Err("unknown converter ''".to_string()));
+            trailing
+                .unwrap_or_else(|| crate::rule_exprs::check_sample_expr(&r.expr, registry))
                 .map_err(|e| in_line(format!("failed to parse sample expression <{}> : {e}", r.expr)))?;
         }
         // A fetch of the response where the stream has none would read the response of
