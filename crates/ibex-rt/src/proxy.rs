@@ -3328,6 +3328,18 @@ fn h3_log_line(line: &str, host: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
 
+    /// `bc_err` builds the `bc_err`/`bc_err_str` pair the oracle prints for a plain
+    /// (non-TLS) connection. Runtime call: the table in `proxy.rs` evaluates it at compile
+    /// time, where no coverage is counted. No oracle value: the arguments are made up here (the real
+    /// table is pinned by the bc_err tests of the integration suite).
+    #[test]
+    fn bc_err_builds_a_plain_connection_error() {
+        let e = super::bc_err(47, "EREFUSED", "ECONNREFUSED returned by OS");
+        assert_eq!((e.code, e.name, e.text), (47, "EREFUSED", "ECONNREFUSED returned by OS"));
+        assert!(!e.tls && e.ssl_code == 0 && e.ssl_text.is_none());
+        assert_eq!(super::BC_CONNECTED.text, "Success");
+    }
+
     /// A stream of an HTTP/2 connection has no socket of its own (T280): reads and writes
     /// on its client side find nothing to do, its owner moves its bytes.
     #[test]

@@ -14097,6 +14097,17 @@ mod quic_fd_reuse_tests {
 mod rate_ctr_tests {
     use super::RateCtr;
 
+    /// `RateCtr::new()` is a zeroed counter that counts as the default one does. The statics
+    /// that use it evaluate it at compile time (no coverage), so call it at run time. No
+    /// oracle value: a fresh counter's rate is 0 by construction.
+    #[test]
+    fn a_new_rate_counter_is_zero_and_counts() {
+        let r = RateCtr::new();
+        assert_eq!(r.rate_at(100), 0);
+        r.tick_at(1000);
+        assert_eq!(r.rate_at(1000), 1);
+    }
+
     /// `read_freq_ctr` over a period of one second: the window starts at the first event
     /// after a quiet spell, and the part of the previous window that has not slid out counts.
     #[test]

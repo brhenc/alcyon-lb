@@ -202,3 +202,12 @@ fn option_forwarded_writes_the_values_haproxy_writes() {
         assert_eq!(valid_host(h), ok, "{h}");
     }
 }
+
+#[test]
+fn truncated_or_unknown_nodes_are_invalid() {
+    // Measured on the reference binary, 3.5-dev8, through `req.hdr(x-a),rfc7239_is_valid` on
+    // 2026-10-17: a quote or colon with nothing after it, and an `u` that is not `unknown`.
+    for v in [r#"host=""#, r#"for=""#, "for=uxx", r#"by="1.2.3.4:"#, "for="] {
+        assert!(!is_valid(v), "{v}");
+    }
+}

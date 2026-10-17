@@ -171,6 +171,14 @@ mod tests {
     }
 
     #[test]
+    fn quoted_backslash_pairs_do_not_end_quotes() {
+        // Measured through req.hdrs on 3.5-dev8 (Connection: `"a\",close", close, x` and
+        // `"a\\",close, x`): an escaped quote keeps the string open, an escaped backslash does not.
+        assert_eq!(drop_items(r#""a\",close", close, x"#, ka), r#""a\",close",x"#);
+        assert_eq!(drop_items(r#""a\\",close, x"#, ka), r#""a\\",x"#);
+    }
+
+    #[test]
     fn rewrite_follows_haproxy() {
         assert_eq!(drop_items("Keep-Alive, Close", ka), "");
         assert_eq!(drop_items("close, x-y", ka), "x-y");

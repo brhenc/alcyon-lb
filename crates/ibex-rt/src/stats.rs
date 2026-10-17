@@ -952,6 +952,20 @@ pub fn format_show_stat_as(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SslConnCount::default()` counts a TLS connection as `new()` does. No oracle value:
+    /// the type is a private RAII guard; the observable counters (`CurrSslConns`,
+    /// `CumSslConns`) are tested through show info. Deltas are `>=` because the statics
+    /// are shared with every test of this binary.
+    #[test]
+    fn ssl_conn_count_default_counts_like_new() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let cum = SSL_CUM.load(Relaxed);
+        let guard = SslConnCount::default();
+        assert!(SSL_CUM.load(Relaxed) > cum);
+        assert!(SSL_CURR.load(Relaxed) >= 1);
+        drop(guard);
+    }
     use crate::proxy::Timeouts;
     use ibex_config::Mode;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};

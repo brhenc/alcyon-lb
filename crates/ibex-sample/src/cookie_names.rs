@@ -155,6 +155,15 @@ mod tests {
     }
 
     #[test]
+    fn quoted_backslash_pairs_do_not_end_quotes() {
+        // As HAProxy 3.5-dev8 lists them with req.cook_names: a backslash inside a quoted
+        // string escapes the next byte, in the value (`;`) and in the element (`,`) scans.
+        assert_eq!(names(&["a=\"p\\\"q;r=1\"; b=2"], true), "a,b");
+        assert_eq!(names(&["a=\"p\\\"q,r=1\", b=2"], true), "a,b");
+        assert_eq!(names(&["a=\"p\\\"q,r=1\"; b=2"], true), "a,b");
+    }
+
+    #[test]
     fn response_names_measured() {
         // As HAProxy 3.5-dev8 lists them with res.cook_names.
         assert_eq!(names(&["s=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT", " u = 2", "nov", "$d=1", "w="], false), "s,u,w");
