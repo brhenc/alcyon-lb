@@ -1405,12 +1405,19 @@ impl Registry {
             func: req_hdr_names_fetch,
         });
 
+        // T327: res.hdr_cnt counts values and res.fhdr_cnt lines, with or without a name, on the
+        // headers as the oracle's H1 parser leaves them (`h1_cleaned_headers`). shdr_cnt is the
+        // same fetch as res.hdr_cnt on the oracle (`smp_fetch_hdr_cnt`): T326 registers it with
+        // `res_hdr_cnt_f` too.
         let res_hdr_cnt_f: FetchFn = |ctx, args| {
-            let name = args.first()?;
-            let count = get_all_res_headers(ctx, name).len();
-            Some(Sample::Sint(len_to_sint(count)))
+            let all = get_all_res_headers_all(ctx);
+            let total: usize = all
+                .iter()
+                .filter(|(n, _)| args.first().is_none_or(|name| n.eq_ignore_ascii_case(name)))
+                .map(|(_, v)| hdr_values(v).len())
+                .sum();
+            Some(Sample::Sint(len_to_sint(total)))
         };
-        // T326: res.hdr_cnt registered once with a named FetchFn so the deprecated alias shdr_cnt below shares it
         self.register_fetch(FetchDesc {
             name: "res.hdr_cnt",
             out_type: SampleType::Sint,
@@ -1420,6 +1427,18 @@ impl Registry {
             name: "shdr_cnt",
             out_type: SampleType::Sint,
             func: res_hdr_cnt_f,
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.fhdr_cnt",
+            out_type: SampleType::Sint,
+            func: |ctx, args| {
+                let all = get_all_res_headers_all(ctx);
+                let count = match args.first() {
+                    Some(name) => all.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name)).count(),
+                    None => all.len(),
+                };
+                Some(Sample::Sint(len_to_sint(count)))
+            },
         });
 
         self.register_fetch(FetchDesc {
@@ -5585,6 +5604,17 @@ fn get_all_res_header_names(ctx: &SampleContext) -> Vec<String> {
         return names(&headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
     }
     CURRENT_RES_HEADERS.with(|hdrs| names(&hdrs.borrow().iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>()))
+}
+
+
+/// T327: all response header `(name, value)` pairs, in order, from the same sources as
+/// `get_all_res_headers`, as the oracle's H1 parser leaves them (`h1_cleaned_headers`).
+fn get_all_res_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
+    let mut all: Vec<(String, String)> = ctx.res_headers.map(<[_]>::to_vec).unwrap_or_default();
+    if all.is_empty() {
+        CURRENT_RES_HEADERS.with(|hdrs| all.extend(hdrs.borrow().iter().cloned()));
+    }
+    h1_cleaned_headers(all, false)
 }
 
 fn extract_cookies(cookie_header: &str) -> Vec<(&str, &str)> {
