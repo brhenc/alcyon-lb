@@ -4898,58 +4898,20 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     matches
 }
 
-/// T302: Build the request header block as one string: each header as `name: value\r\n`,
-/// the name lowercased, the value trimmed, in arrival order (repeated headers kept),
-/// without the `Connection` header (`HAProxy` removes it when parsing), then the empty line `\r\n`.
+/// T302: `req.hdrs` (`smp_fetch_hdrs`): the request's headers as the H1 parser stores them
+/// ([`crate::h1_clean::h1_clean_headers`]), each `name: value\r\n`, then the `\r\n` that ends
+/// them, there even when no header is. Read from the first request source present; `None`
+/// when there is no request.
 fn req_header_block(ctx: &SampleContext) -> Option<String> {
-    let mut result = String::new();
-    let mut found = false;
-    if let Some(htx) = ctx.htx_slice {
-        for (hn, hv) in htx.headers() {
-            if !hn.eq_ignore_ascii_case("connection") {
-                found = true;
-                result.push_str(&hn.to_ascii_lowercase());
-                result.push_str(": ");
-                result.push_str(hv.trim());
-                result.push_str("\r\n");
-            }
-        }
-        if found {
-            result.push_str("\r\n");
-            return Some(result);
-        }
-    }
-    if let Some(htx) = ctx.htx {
-        for hf in htx.headers() {
-            if !hf.name.eq_ignore_ascii_case("connection") {
-                found = true;
-                result.push_str(&hf.name.to_ascii_lowercase());
-                result.push_str(": ");
-                result.push_str(hf.value.trim());
-                result.push_str("\r\n");
-            }
-        }
-        if found {
-            result.push_str("\r\n");
-            return Some(result);
-        }
-    }
-    if let Some(headers) = ctx.req_headers {
-        for (k, v) in headers {
-            if !k.eq_ignore_ascii_case("connection") {
-                found = true;
-                result.push_str(&k.to_ascii_lowercase());
-                result.push_str(": ");
-                result.push_str(v.trim());
-                result.push_str("\r\n");
-            }
-        }
-        if found {
-            result.push_str("\r\n");
-            return Some(result);
-        }
-    }
-    None
+    use crate::h1_clean::{h1_clean_headers, header_block};
+    let hdrs = if let Some(htx) = ctx.htx_slice {
+        h1_clean_headers(htx.headers(), true)
+    } else if let Some(htx) = ctx.htx {
+        h1_clean_headers(htx.headers().map(|hf| (hf.name.as_str(), hf.value.as_str())), true)
+    } else {
+        h1_clean_headers(ctx.req_headers?.iter().map(|(k, v)| (k.as_str(), v.as_str())), true)
+    };
+    Some(header_block(&hdrs))
 }
 
 /// The response's header `name`. Only the response is read: `ctx.htx_slice` holds the
