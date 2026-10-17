@@ -2574,6 +2574,44 @@ impl Registry {
         });
     }
 
+/// T330: parse TCP options from a TCP segment binary.
+/// Returns list of (kind, data) pairs.
+fn tcp_options(b: &[u8]) -> Vec<(u8, &[u8])> {
+    if b.len() < 13 {
+        return Vec::new();
+    }
+    let data_offset = (b[12] >> 4) as usize;
+    let header_len = data_offset * 4;
+    if header_len < 20 || header_len > b.len() {
+        return Vec::new();
+    }
+    let opts = &b[20..header_len];
+    let mut i = 0usize;
+    let mut out = Vec::new();
+    while i < opts.len() {
+        let kind = opts[i];
+        if kind == 0 {
+            break;
+        }
+        if kind == 1 {
+            out.push((kind, &[] as &[u8]));
+            i += 1;
+            continue;
+        }
+        if i + 1 >= opts.len() {
+            break;
+        }
+        let len = opts[i + 1] as usize;
+        if len < 2 || i + len > opts.len() {
+            break;
+        }
+        let data = &opts[i + 2..i + len];
+        out.push((kind, data));
+        i += len;
+    }
+    out
+}
+
     #[allow(clippy::too_many_lines)]
     fn register_builtin_converters(&mut self) {
                 
@@ -4345,6 +4383,121 @@ impl Registry {
             },
         });
 
+        self.register_converter(ConvDesc {
+
+            name: "tcp.options.mss",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let opts = Self::tcp_options(&b);
+                    for (kind, data) in opts {
+                        if kind == 2 && data.len() >= 2 {
+                            let val = i64::from(u16::from_be_bytes([data[0], data[1]]));
+                            return Some(Sample::Sint(val));
+                        }
+                    }
+                    Some(Sample::Sint(0))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "tcp.options.sack",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let opts = Self::tcp_options(&b);
+                    let present = opts.iter().any(|(k, _)| *k == 4);
+                    Some(Sample::Sint(i64::from(u8::from(present))))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "tcp.options.tsopt",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let opts = Self::tcp_options(&b);
+                    let present = opts.iter().any(|(k, _)| *k == 8);
+                    Some(Sample::Sint(i64::from(u8::from(present))))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "tcp.options.tsval",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let opts = Self::tcp_options(&b);
+                    for (kind, data) in opts {
+                        if kind == 8 && data.len() >= 4 {
+                            let val = i64::from(u32::from_be_bytes([data[0], data[1], data[2], data[3]]));
+                            return Some(Sample::Sint(val));
+                        }
+                    }
+                    Some(Sample::Sint(0))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "tcp.options.wscale",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let opts = Self::tcp_options(&b);
+                    for (kind, data) in opts {
+                        if kind == 3 && !data.is_empty() {
+                            return Some(Sample::Sint(i64::from(data[0])));
+                        }
+                    }
+                    Some(Sample::Sint(0))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "tcp.options.wsopt",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let opts = Self::tcp_options(&b);
+                    let present = opts.iter().any(|(k, _)| *k == 3);
+                    Some(Sample::Sint(i64::from(u8::from(present))))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "tcp.options_list",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let opts = Self::tcp_options(&b);
+                    let mut out = Vec::with_capacity(opts.len());
+                    for (kind, _) in opts {
+                        out.push(kind);
+                    }
+                    Some(Sample::Bin(out))
+                }
+                _ => None,
+            },
+        });
         self.register_converter(ConvDesc {
             name: "ip.tos",
             in_type: TypeSpec::Exact(SampleType::Bin),
