@@ -1160,7 +1160,7 @@ impl Registry {
             func: |ctx, _args| {
                 // `http_parse_path`: a target that is neither an absolute path nor an
                 // absolute URI (`*`, `host:port`, what `replace-path a Y` leaves) has none.
-                let path = http_parse_path(get_context_uri(ctx)?)?;
+                let path = http_parse_path(get_context_uri(ctx)?, get_context_method(ctx) == Some("OPTIONS"))?;
                 Some(Sample::Str(path.split('?').next().unwrap_or_default().to_string()))
             },
         });
@@ -1169,7 +1169,7 @@ impl Registry {
             name: "pathq",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                let path = http_parse_path(get_context_uri(ctx)?)?;
+                let path = http_parse_path(get_context_uri(ctx)?, get_context_method(ctx) == Some("OPTIONS"))?;
                 Some(Sample::Str(path.to_string()))
             },
         });
@@ -2209,7 +2209,7 @@ impl Registry {
             name: "capture.req.uri",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                let path = http_parse_path(get_context_uri(ctx)?)?;
+                let path = http_parse_path(get_context_uri(ctx)?, get_context_method(ctx) == Some("OPTIONS"))?;
                 Some(Sample::Str(path.to_string()))
             },
         });
@@ -5745,7 +5745,7 @@ fn fetch_base(ctx: &SampleContext, _args: &[String]) -> Option<Sample> {
 /// `?` (or with its query for `baseq`) when it starts with `/`. Without a Host header, or with
 /// an empty one, it is what `path` (or `pathq`) gives.
 fn fetch_base_path(ctx: &SampleContext, with_query: bool) -> Option<Sample> {
-    let path = http_parse_path(get_context_uri(ctx)?);
+    let path = http_parse_path(get_context_uri(ctx)?, get_context_method(ctx) == Some("OPTIONS"));
     let cut = |p: &'_ str| -> usize {
         if with_query {
             p.len()
@@ -5765,9 +5765,11 @@ fn fetch_base_path(ctx: &SampleContext, with_query: bool) -> Option<Sample> {
 
 /// T327: the path of the request target `uri` as the oracle's `http_parse_path` finds it:
 /// all of an absolute path; for an absolute URI (any scheme, any case) what follows the
-/// authority, which may start with `?` or `#`; nothing for `*`, an authority (CONNECT) or an
-/// absolute URI that ends with its authority.
-fn http_parse_path(uri: &str) -> Option<&str> {
+/// authority, which may start with `?` or `#`; nothing for `*` or an authority (CONNECT).
+/// An absolute URI that ends with its authority reads `/` (T326: the oracle's
+/// `http_scheme_based_normalize`, `src/http_htx.c`, adds it on the way in), except for an
+/// OPTIONS request (`options`), where it has no path.
+fn http_parse_path(uri: &str, options: bool) -> Option<&str> {
     let b = uri.as_bytes();
     match b.first()? {
         b'*' => return None,
@@ -5777,8 +5779,11 @@ fn http_parse_path(uri: &str) -> Option<&str> {
     }
     let scheme = 1 + b[1..].iter().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.')).count();
     let rest = uri[scheme..].strip_prefix("://")?;
-    let path = &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..];
-    (!path.is_empty()).then_some(path)
+    match rest.find(['/', '?', '#']) {
+        Some(i) => Some(&rest[i..]),
+        None if options => None,
+        None => Some("/"),
+    }
 }
 
 /// `HAProxy`'s `smp_fetch_base32`: SDBM from 0 over the Host header's value, when there is
@@ -6435,32 +6440,11 @@ fn url_ipv4_authority(uri: &str) -> Option<(Ipv4Addr, u16)> {
 fn url32_hash(ctx: &SampleContext) -> u32 {
     let mut data = get_req_header(ctx, "host").unwrap_or_default().into_bytes();
     let uri = get_context_uri(ctx).unwrap_or("");
-    let path = http_parse_path(uri, get_context_method(ctx) == Some("OPTIONS"));
+    let path = http_parse_path(uri, get_context_method(ctx) == Some("OPTIONS")).unwrap_or("");
     if path.starts_with('/') {
         data.extend_from_slice(path.as_bytes());
     }
     full_hash(hash_sdbm(&data))
-}
-
-/// `http_parse_path` (`src/http.c`) on a request URI: an origin-form URI is the path; after an
-/// RFC 3986 scheme and "://", the path is what follows the authority (which ends at '/', '?' or
-/// '#'); an authority-form or '*' URI has none. An empty absolute-URI path reads "/" except for
-/// OPTIONS, as `http_scheme_based_normalize` (`src/http_htx.c`) rewrites it on the way in.
-fn http_parse_path(uri: &str, options: bool) -> &str {
-    if uri.starts_with('/') {
-        return uri;
-    }
-    let b = uri.as_bytes();
-    if !b.first().is_some_and(u8::is_ascii_alphabetic) {
-        return "";
-    }
-    let n = b.iter().skip(1).take_while(|&&c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.')).count() + 1;
-    let Some(rest) = uri[n..].strip_prefix("://") else { return "" };
-    match rest.find(['/', '?', '#']) {
-        Some(i) => &rest[i..],
-        None if options => "",
-        None => "/",
-    }
 }
 
 fn split_uri(uri: &str) -> (&str, &str, &str) {
