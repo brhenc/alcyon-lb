@@ -262,6 +262,8 @@ pub(crate) fn parse_error_body_args(
     let mut lf_string = None;
     let mut custom_headers: Vec<(String, String)> = Vec::new();
     let mut error_page = None;
+    // The last body given: (its keyword, whether it is a log-format, whether it is non-empty).
+    let mut body: Option<(&Token, bool, bool)> = None;
     let mut i = start;
     while i < limit {
         match tokens[i].text.as_str() {
@@ -273,23 +275,28 @@ pub(crate) fn parse_error_body_args(
                 i += 2;
             }
             "lf-string" if i + 1 < limit => {
+                body = Some((&tokens[i], true, true));
                 lf_string = Some(tokens[i + 1].text.clone());
                 i += 2;
             }
             // `string` and `file` are literal in HAProxy: only the `lf-` forms are log-formats.
             // The body is kept as a format, so a literal one has its `%` doubled.
             "string" if i + 1 < limit => {
+                body = Some((&tokens[i], false, !tokens[i + 1].text.is_empty()));
                 lf_string = Some(tokens[i + 1].text.replace('%', "%%"));
                 i += 2;
             }
             "lf-file" if i + 1 < limit => {
                 let path = &tokens[i + 1].text;
+                body = Some((&tokens[i], true, true));
                 lf_string = Some(std::fs::read_to_string(path).unwrap_or_default());
                 i += 2;
             }
             "file" if i + 1 < limit => {
                 let path = &tokens[i + 1].text;
-                lf_string = Some(std::fs::read_to_string(path).unwrap_or_default().replace('%', "%%"));
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                body = Some((&tokens[i], false, !text.is_empty()));
+                lf_string = Some(text.replace('%', "%%"));
                 i += 2;
             }
             "hdr" if i + 2 < limit => {
@@ -335,6 +342,19 @@ pub(crate) fn parse_error_body_args(
                     format!("unknown or incomplete argument '{other}'"),
                 ));
             }
+        }
+    }
+
+    // `HAProxy` (`http_parse_http_reply`) will not send a body of unknown type: a log-format
+    // one needs `content-type` even when it is empty, a literal one when it is not (T341).
+    if content_type.is_none() {
+        let why = match body {
+            Some((_, true, _)) => Some("a content type must be defined with a log-format payload"),
+            Some((_, false, true)) => Some("a content type must be defined when non-empty payload is configured"),
+            _ => None,
+        };
+        if let (Some((kw, ..)), Some(why)) = (body, why) {
+            return Err(ConfigError::new(kw.line, kw.col, why));
         }
     }
 

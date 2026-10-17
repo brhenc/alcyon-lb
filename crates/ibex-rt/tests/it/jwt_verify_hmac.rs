@@ -104,7 +104,7 @@ fn jwt_verify_refused_algs() {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("c.cfg");
         let a = common::reserve_addr();
-        std::fs::write(&path, format!("defaults\n  mode http\n  timeout client 5s\nfrontend fe\n  bind {a}\n  http-request return status 200 lf-string \"%[str(abc),jwt_verify({alg},/nonexistent/key.pem)]\"\n")).unwrap();
+        std::fs::write(&path, format!("defaults\n  mode http\n  timeout client 5s\nfrontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"%[str(abc),jwt_verify({alg},/nonexistent/key.pem)]\"\n")).unwrap();
         let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(&path).output().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!out.status.success(), "{alg} was accepted");
