@@ -892,12 +892,14 @@ const OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[(&str, &str)] = &[
 
 
 
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn parse_no_directive(tokens: &[Token], _kw: &Token) -> Result<(), ConfigError> {
-    if tokens.len() >= 2 {
-        crate::stderr_line!("[ibex] warning: ignored 'no {}'", tokens[1].text);
-    }
-    Ok(())
+pub(crate) fn parse_no_directive(_tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    // `no option` and `no log` are handled by the callers; HAProxy (`cfgparse-listen.c`)
+    // refuses every other `no <keyword>`, and a bare `no`, with this one message.
+    Err(ConfigError::new(
+        kw.line,
+        kw.col,
+        "negation/default currently supported only for options, log, busy-polling, set-dumpable, strict-limits, insecure-fork-wanted and numa-cpu-mapping.".to_string(),
+    ))
 }
 
 /// Where a `declare` line is, for the sections `HAProxy` refuses it in.
