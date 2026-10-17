@@ -27,6 +27,7 @@ mod acl_pattern_tokens;
 mod action_fetch_names;
 mod after_response_generated;
 mod anonymous_acl_patterns;
+mod bc_info;
 mod backend_reuse_dead_idle;
 mod backend_tls;
 mod backup_servers;

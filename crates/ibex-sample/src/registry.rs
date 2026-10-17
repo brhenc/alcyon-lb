@@ -237,6 +237,9 @@ pub struct SampleContext<'a> {
     pub fc_rttvar: Option<u32>,
     pub bc_rtt: Option<u32>,
     pub bc_rttvar: Option<u32>,
+    pub bc_err: Option<i64>,
+    pub bc_err_str: Option<&'a str>,
+    pub bc_reused: Option<bool>,
     /// Capture slots: `None` where nothing was captured (a header that was absent).
     pub captures_req_hdr: Option<&'a [Option<Vec<u8>>]>,
     pub captures_res_hdr: Option<&'a [Option<Vec<u8>>]>,
@@ -892,6 +895,32 @@ impl Registry {
             name: "bc_rttvar",
             out_type: SampleType::Sint,
             func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.bc_rttvar.unwrap_or(0)))),
+        });
+        // T331
+        self.register_fetch(FetchDesc {
+            name: "bc_err",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(ctx.bc_err.unwrap_or(0))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_err_str",
+            out_type: SampleType::Str,
+            func: |ctx, _args| Some(Sample::Str(ctx.bc_err_str.unwrap_or("Success").to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_reused",
+            out_type: SampleType::Bool,
+            func: |ctx, _args| Some(Sample::Bool(ctx.bc_reused.unwrap_or(false))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_dst",
+            out_type: SampleType::Ipv4,
+            func: |ctx, _args| {
+                ctx.server_addr.map(|sa| match sa.ip() {
+                    std::net::IpAddr::V4(v4) => Sample::Ipv4(v4),
+                    std::net::IpAddr::V6(v6) => Sample::Ipv6(v6),
+                })
+            },
         });
 
         // --- 2. HTTP Request Line & URL Fetches ---
