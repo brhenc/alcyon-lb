@@ -72,7 +72,7 @@ pub(crate) fn write_fd_nonblocking(fd: i32, line: &[u8]) -> bool {
     res.is_ok_and(|n| n > 0)
 }
 
-/// Writes one runtime diagnostic line to fd 2 and never panics, whatever state fd 2 is in.
+/// Writes one runtime diagnostic line (`eprintln!`'s bytes: the message and one line feed) to fd 2 and never panics, whatever state fd 2 is in.
 ///
 /// `log stderr` makes fd 2 `O_NONBLOCK` (see [`write_fd_nonblocking`]); `eprintln!` then
 /// panics on `EAGAIN` ("failed printing to stderr") and the crash hook aborts the process.
@@ -83,17 +83,14 @@ pub fn eprint_line(args: std::fmt::Arguments<'_>) {
     use std::fmt::Write as _;
     let mut text = String::new();
     let _ = text.write_fmt(args);
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
+    text.push('\n'); // exactly one, as eprintln! does: a message ending in "\n" keeps its blank line
     let mut rest = text.as_bytes();
+    let fd = std::io::stderr();
     while !rest.is_empty() {
-        match rustix::io::write(std::io::stderr().as_fd(), rest) {
-            Ok(0) => return,
-            Ok(n) => rest = &rest[n..],
-            Err(rustix::io::Errno::INTR) => {}
-            Err(e) => {
-                DROPPED_LOGS.fetch_add(u64::from(e == rustix::io::Errno::AGAIN), Ordering::Relaxed);
+        match rustix::io::retry_on_intr(|| rustix::io::write(fd.as_fd(), rest)) {
+            Ok(n) if n > 0 => rest = &rest[n..],
+            res => {
+                DROPPED_LOGS.fetch_add(u64::from(res == Err(rustix::io::Errno::AGAIN)), Ordering::Relaxed);
                 return;
             }
         }

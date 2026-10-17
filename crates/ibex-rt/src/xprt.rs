@@ -867,17 +867,13 @@ impl std::fmt::Debug for ClientXprt {
     }
 }
 
-/// Builds a server-side TLS transport for an accepted connection.
-///
-/// # Errors
-/// Propagates rustls session setup failure.
-pub fn accept_tls(
-    fd: &impl AsRawFd,
-    config: std::sync::Arc<rustls::ServerConfig>,
-) -> io::Result<ClientXprt> {
+/// Builds a server-side TLS transport for an accepted connection. Nothing can fail here:
+/// the handshake runs later, on the connection's first reads.
+#[must_use]
+pub fn accept_tls(fd: &impl AsRawFd, config: std::sync::Arc<rustls::ServerConfig>) -> ClientXprt {
     let mut tls = TlsConn::new(RustlsContext::new_server_pending(fd.as_raw_fd()));
     tls.gate = Some(Box::new(Gate { acceptor: rustls::server::Acceptor::default(), config }));
-    Ok(ClientXprt::Tls(Box::new(tls)))
+    ClientXprt::Tls(Box::new(tls))
 }
 
 #[cfg(test)]
