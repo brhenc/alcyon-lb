@@ -1464,17 +1464,12 @@ impl Registry {
             out_type: SampleType::Str,
             func: |ctx, args| {
                 let delim = args.first().and_then(|s| s.chars().next()).unwrap_or(',');
-                let set_cookies = get_all_res_headers(ctx, "set-cookie");
-                let mut names = Vec::new();
-                for hdr in set_cookies {
-                    // Only the first name=value pair is the cookie name; attributes follow.
-                    // Simpler: take first part before ';'
-                    let first = hdr.split(';').next().unwrap_or("");
-                    if let Some((k, _)) = first.split_once('=') {
-                        names.push(k.trim().to_string());
-                    }
+                // A Set-Cookie holds one cookie: the first pair `cookie_names` accepts.
+                let mut names = String::new();
+                for hdr in get_all_res_headers(ctx, "set-cookie") {
+                    crate::cookie_names::append(&mut names, &hdr, false, delim);
                 }
-                Some(Sample::Str(names.join(&delim.to_string())))
+                Some(Sample::Str(names))
             },
         });
 
