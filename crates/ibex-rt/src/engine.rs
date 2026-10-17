@@ -2587,6 +2587,12 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     }
     entry.stats_done = true;
     let http = entry.sess.mode == Mode::Http;
+    // `show info` `CumStreams`: `HAProxy` makes a stream for a TCP session at once, and for
+    // HTTP only once a request was parsed (`stream_new`); a probe, an unparsable request,
+    // a 408 or garbage to an h2 bind never had one.
+    if !http || entry.sess.log.request.is_some() {
+        crate::stats::CUM_STREAMS.fetch_add(1, Ordering::Relaxed);
+    }
     // Only what the counters need of the log line's data: the whole `LogData` costs a
     // measurable share of a request (T172).
     let s = &entry.sess;
@@ -4966,6 +4972,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             match listener.accept() {
                 Ok(stream) => {
                     let mut applet = CliApplet::new(stream, self.now);
+                    // T320: count each CLI connection.
+                    crate::stats::CUM_STREAMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     applet.timeout_ms = self.cli_timeout_ms;
                     applet.level = level;
                     applet.socket_name = name.cloned();
