@@ -5,7 +5,7 @@
 //!
 //! They are written through `stderr_line!` (a full non-blocking stderr drops a message
 //! instead of aborting the process), so each one is pinned here: the text and the exit
-//! status. The texts are Ibex's own: HAProxy (3.5-dev8-885761-29) words most of these
+//! status. The texts are Ibex's own: `HAProxy` (3.5-dev8-885761-29) words most of these
 //! differently (`-f` with no argument is "failed to copy argv.", an unknown option prints
 //! the usage on stdout, `-n abc` is accepted), but it too exits 1 for a missing argument,
 //! an unknown option and an unreachable `-C` directory.
