@@ -443,6 +443,11 @@ impl QuicListener {
                     // connection we have no layer for, and pretending otherwise would send
                     // a client frames it never asked for.
                     if alpn.as_deref() == Some(b"h3".as_slice()) {
+                        // `HAProxy` accepts a QUIC connection once, after its handshake
+                        // (`quic_accept_push_qc` -> `listener_accept`): one connection and
+                        // one session however many request streams it carries.
+                        crate::engine::count_global_conn();
+                        crate::engine::count_global_sess();
                         self.open_control_stream(conn_id);
                     }
                 }

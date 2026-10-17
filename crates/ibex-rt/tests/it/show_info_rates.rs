@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T320: `show info` ConnRate, SessRate, MaxConnRate, MaxSessRate.
+//! T320: `show info` `ConnRate`, `SessRate`, `MaxConnRate`, `MaxSessRate`.
 //!
-//! Measured on HAProxy with two HTTP frontends and a stats socket:
+//! Measured on `HAProxy` with two HTTP frontends and a stats socket:
 //!
 //! | moment                                         | ConnRate | MaxConnRate | SessRate | MaxSessRate |
 //! |------------------------------------------------|----------|-------------|----------|-------------|
@@ -21,7 +21,7 @@ use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Daemon(Child, std::path::PathBuf, std::path::PathBuf);
 
@@ -150,4 +150,104 @@ fn show_info_rates_track_connections_and_clear_counters_resets_maxima() {
     assert_eq!(get_rate(&info, "MaxConnRate"), 0, "MaxConnRate after clear counters all");
     assert_eq!(get_rate(&info, "SessRate"), 5, "SessRate after clear counters all");
     assert_eq!(get_rate(&info, "MaxSessRate"), 0, "MaxSessRate after clear counters all");
+}
+
+/// Starts ibex on `cfg`, waits for `tcp` to accept, then lets the probe connections age
+/// out of the rate window and clears the maxima, so every counter starts at 0.
+fn start_quiet(name: &str, cfg: &str, tcp: &[std::net::SocketAddr], sock: &std::path::Path) -> Daemon {
+    let path = std::env::temp_dir().join(format!("ibex_t320_{name}_{}.cfg", std::process::id()));
+    std::fs::write(&path, cfg).expect("write config");
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ibex");
+    let d = Daemon(child, path, sock.to_path_buf());
+    for a in tcp {
+        assert!(common::wait_listening(*a), "ibex never listened on {a}");
+    }
+    thread::sleep(Duration::from_millis(2200));
+    assert_eq!(cli(sock, "clear counters"), "\n");
+    let info = show_info(sock);
+    for k in ["ConnRate", "MaxConnRate", "SessRate", "MaxSessRate"] {
+        assert_eq!(get_rate(&info, k), 0, "{k} at start");
+    }
+    d
+}
+
+/// Measured on `HAProxy` 3.5-dev8: 5 connections to a frontend with `tcp-request connection
+/// reject` and 2 requests to an accepting one give `ConnRate: 7 MaxConnRate: 7 SessRate: 2
+/// MaxSessRate: 2`, and reading `show info` again does not move them (the CLI listener is
+/// unlimited and not counted). `listener_accept` ticks `conn_per_sec` before the rules run;
+/// `sess_per_sec` only once `accept()` kept the connection.
+#[test]
+fn rejected_connections_count_in_conn_rate_not_sess_rate() {
+    let rej = common::reserve_addr();
+    let ok = common::reserve_addr();
+    let sock = std::env::temp_dir().join(format!("ibex_t320_rej_{}.sock", std::process::id()));
+    let cfg = format!(
+        "global\n  nbthread 2\n  stats socket {} level admin\n\
+         defaults\n  mode http\n  timeout connect 1s\n  timeout client 10s\n  timeout server 10s\n\
+         frontend rej\n  bind {rej}\n  tcp-request connection reject\n\
+         frontend ok\n  bind {ok}\n  http-request return status 200\n",
+        sock.display()
+    );
+    let _d = start_quiet("rej", &cfg, &[rej, ok], &sock);
+
+    for _ in 0..5 {
+        let mut s = TcpStream::connect(rej).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let _ = s.read_to_end(&mut Vec::new());
+    }
+    for _ in 0..2 {
+        assert_eq!(get_status(ok.port(), "/"), "200");
+    }
+    for round in 0..2 {
+        let info = show_info(&sock);
+        assert_eq!(get_rate(&info, "ConnRate"), 7, "ConnRate (show info read {round})");
+        assert_eq!(get_rate(&info, "MaxConnRate"), 7, "MaxConnRate (show info read {round})");
+        assert_eq!(get_rate(&info, "SessRate"), 2, "SessRate (show info read {round})");
+        assert_eq!(get_rate(&info, "MaxSessRate"), 2, "MaxSessRate (show info read {round})");
+    }
+}
+
+/// Three HTTP/3 requests over one QUIC connection are one connection and one session.
+/// Not measured: the reference binary is built without QUIC. From its source, a QUIC
+/// connection reaches `listener_accept` once (`quic_accept_push_qc` -> `quic_accept_run`,
+/// `src/quic_sock.c`), which ticks `conn_per_sec` and `sess_per_sec` once each; request
+/// streams are not accepted connections.
+#[test]
+fn h3_requests_on_one_quic_connection_count_once() {
+    let has_h3 = Command::new("curl")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("HTTP3"));
+    assert!(has_h3, "this test needs a curl with HTTP/3; it fails rather than skips");
+    let tcp = common::reserve_addr();
+    let quic = common::reserve_addr();
+    let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
+    let sock = std::env::temp_dir().join(format!("ibex_t320_h3_{}.sock", std::process::id()));
+    let cfg = format!(
+        "global\n  nbthread 2\n  stats socket {} level admin\n\
+         defaults\n  mode http\n  timeout connect 1s\n  timeout client 10s\n  timeout server 10s\n\
+         frontend fe\n  bind {tcp}\n  bind quic4@{quic} ssl crt {crt} alpn h3\n  http-request return status 200\n",
+        sock.display()
+    );
+    let _d = start_quiet("h3", &cfg, &[tcp], &sock);
+
+    let url = format!("https://localhost:{}/", quic.port());
+    let out = Command::new("curl")
+        .args(["-sS", "-o", "/dev/null", "-w", "%{http_code} ", "--http3-only", "-k", "--max-time", "8", "--resolve"])
+        .arg(format!("localhost:{}:127.0.0.1", quic.port()))
+        .args([&url, &url, &url])
+        .output()
+        .expect("curl");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "200 200 200 ", "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let info = show_info(&sock);
+    assert_eq!(get_rate(&info, "ConnRate"), 1, "ConnRate");
+    assert_eq!(get_rate(&info, "MaxConnRate"), 1, "MaxConnRate");
+    assert_eq!(get_rate(&info, "SessRate"), 1, "SessRate");
+    assert_eq!(get_rate(&info, "MaxSessRate"), 1, "MaxSessRate");
 }
