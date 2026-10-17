@@ -39,6 +39,7 @@ mod body_after_head_rewrite;
 mod bufsize_h2_alpn;
 mod canonical_haproxy_35_e2e;
 mod capture_slots;
+mod capture_ver;
 mod check_condition;
 mod check_malformed_replies;
 mod check_reply_buffer_bound;

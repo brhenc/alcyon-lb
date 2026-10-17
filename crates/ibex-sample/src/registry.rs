@@ -1738,18 +1738,26 @@ impl Registry {
             },
         });
 
+        // T327: capture.req/res.ver return the version WITH the "HTTP/" prefix (unlike req/res.ver)
         self.register_fetch(FetchDesc {
             name: "capture.req.ver",
             out_type: SampleType::Str,
-            func: request_version_fetch,
+            func: |ctx, _args| {
+                let v = get_context_req_version(ctx).map(str::to_string)
+                    .or_else(|| ctx.htx.and_then(|h| h.req_line()).map(|l| l.version.as_str().to_string()))?;
+                Some(Sample::Str(v))
+            },
         });
 
         self.register_fetch(FetchDesc {
             name: "capture.res.ver",
             out_type: SampleType::Str,
-            func: response_version_fetch,
+            func: |ctx, _args| {
+                let v = get_context_res_version(ctx).map(str::to_string)
+                    .or_else(|| ctx.htx.and_then(|h| h.res_line()).map(|l| l.version.as_str().to_string()))?;
+                Some(Sample::Str(v))
+            },
         });
-
         // --- 8. Frontend / Backend / Server Fetches ---
         self.register_fetch(FetchDesc {
             name: "fe_id",
