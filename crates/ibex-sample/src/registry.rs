@@ -2572,6 +2572,46 @@ impl Registry {
                 Some(Sample::Sint(r))
             },
         });
+        // `dump_all_vars([<scope>][,<prefix>][,<delimiter>])`: the variables of <scope> as `name=value`
+        // joined by <delimiter> (default ", "), only those whose name after the scope starts with <prefix>.
+        // Without <scope> it visits sess, txn, req, res and proc in that order, as configuration.txt says;
+        // HAProxy 3.5-dev8's binary dumps only the current context's scope (txn in a stream) instead, which
+        // has been reported upstream: Ibex follows the documentation here. Ibex keeps variable values as
+        // strings, so a value that reads as an integer is printed unquoted and any other is quoted (HAProxy
+        // prints by the stored type). Within a scope the names are sorted; HAProxy's order is its hash tree's.
+        // T329
+        self.register_fetch(FetchDesc {
+            name: "dump_all_vars",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let scopes: &[&str] = match args.first().map(String::as_str).filter(|s| !s.is_empty()) {
+                    None => &DUMP_VAR_SCOPES,
+                    Some(s) => std::slice::from_ref(DUMP_VAR_SCOPES.iter().find(|&&k| k == s)?),
+                };
+                let prefix = args.get(1).map_or("", String::as_str);
+                let delimiter = args.get(2).map_or(", ", String::as_str);
+                let mut stream: Vec<(String, String)> = ctx.vars.map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
+                CURRENT_VARS.with(|v| {
+                    for (k, val) in v.borrow().iter() {
+                        if !stream.iter().any(|(n, _)| n == k) {
+                            stream.push((k.clone(), val.clone()));
+                        }
+                    }
+                });
+                let process: Vec<(String, String)> = GLOBAL_PROC_VARS.read().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
+                let mut out = Vec::new();
+                for scope in scopes {
+                    let vars = if *scope == "proc" { &process } else { &stream };
+                    let mut found: Vec<&(String, String)> = vars
+                        .iter()
+                        .filter(|(k, _)| k.strip_prefix(scope).and_then(|r| r.strip_prefix('.')).is_some_and(|r| r.starts_with(prefix)))
+                        .collect();
+                    found.sort();
+                    out.extend(found.into_iter().map(|(k, v)| format!("{k}={}", dump_var_value(v))));
+                }
+                Some(Sample::Str(out.join(delimiter)))
+            },
+        });
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4817,6 +4857,49 @@ fn regsub_eval(input: &str, pattern: &str, repl: &str, flags: &str) -> Option<St
 }
 
 // --- HTTP and String Parsing Helpers ---
+
+/// The scopes `dump_all_vars` knows, in the order it visits them when given none. T329
+const DUMP_VAR_SCOPES: [&str; 5] = ["sess", "txn", "req", "res", "proc"];
+
+/// The configuration-time check of `dump_all_vars`'s arguments: an unknown <scope> is refused with
+/// `HAProxy`'s message (an empty one means every scope). `None` for any other fetch or valid arguments. T329
+#[must_use]
+pub fn check_dump_all_vars_args(fetch: &str, args: &[String]) -> Option<String> {
+    if fetch != "dump_all_vars" {
+        return None;
+    }
+    let scope = args.first().map(String::as_str).filter(|s| !s.is_empty())?;
+    if DUMP_VAR_SCOPES.contains(&scope) {
+        return None;
+    }
+    Some(format!(
+        "invalid args in fetch method 'dump_all_vars' : invalid scope '{scope}', must be one of: {}.",
+        DUMP_VAR_SCOPES.join(", ")
+    ))
+}
+
+/// A variable's value as `dump_all_vars` prints it: an integer bare, anything else quoted with `"`, `\\`,
+/// CR, LF, backspace and NUL escaped (as `chunk_escape_string` does in `HAProxy`). T329
+fn dump_var_value(val: &str) -> String {
+    if let Ok(n) = val.parse::<i64>() {
+        return n.to_string();
+    }
+    let mut out = String::with_capacity(val.len() + 2);
+    out.push('"');
+    for c in val.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            '\x08' => out.push_str("\\b"),
+            '\0' => out.push_str("\\0"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
 
 #[must_use]
 pub fn sample_to_string(smp: &Sample) -> String {
