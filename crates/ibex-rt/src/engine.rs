@@ -10282,6 +10282,15 @@ impl EngineDispatcher<'_> {
         entry.sess.log.applet = true;
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
 
+        // `stats refresh`: HAProxy sends `Refresh: <seconds, rounded up>` unless the URI carries
+        // `;norefresh` (stats-html.c, uri->refresh).
+        let refresh = match proxies[serving].stats_config.refresh {
+            Some(d) if !d.is_zero() && !req_uri.contains(";norefresh") => {
+                format!("Refresh: {}\r\n", d.as_millis().div_ceil(1000))
+            }
+            _ => String::new(),
+        };
+
         // 1. CSV telemetry
         if req_uri.contains(";csv") || req_uri.ends_with("/csv") {
             let csv = crate::stats::format_show_stat(proxies, checks, pid);
@@ -10290,6 +10299,7 @@ impl EngineDispatcher<'_> {
                  Content-Type: text/plain; charset=utf-8\r\n\
                  Content-Length: {}\r\n\
                  Cache-Control: no-cache, no-store, must-revalidate\r\n\
+                 {refresh}\
                  Connection: close\r\n\
                  \r\n\
                  {}",
@@ -10308,6 +10318,7 @@ impl EngineDispatcher<'_> {
                  Content-Type: application/json; charset=utf-8\r\n\
                  Content-Length: {}\r\n\
                  Cache-Control: no-cache, no-store, must-revalidate\r\n\
+                 {refresh}\
                  Connection: close\r\n\
                  \r\n\
                  {}",
@@ -10420,6 +10431,7 @@ impl EngineDispatcher<'_> {
                      Content-Type: application/json; charset=utf-8\r\n\
                      Content-Length: {}\r\n\
                      Cache-Control: no-cache, no-store, must-revalidate\r\n\
+                     {refresh}\
                      Connection: close\r\n\
                      \r\n\
                      {}",
@@ -10436,6 +10448,7 @@ impl EngineDispatcher<'_> {
                  Content-Type: text/html; charset=utf-8\r\n\
                  Content-Length: {}\r\n\
                  Cache-Control: no-cache, no-store, must-revalidate\r\n\
+                 {refresh}\
                  Connection: close\r\n\
                  \r\n\
                  {}",
@@ -10453,6 +10466,7 @@ impl EngineDispatcher<'_> {
              Content-Type: text/html; charset=utf-8\r\n\
              Content-Length: {}\r\n\
              Cache-Control: no-cache, no-store, must-revalidate\r\n\
+             {refresh}\
              Connection: close\r\n\
              \r\n\
              {}",

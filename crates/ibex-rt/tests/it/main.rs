@@ -316,6 +316,7 @@ mod stat_wretr_wredis;
 mod stats_admin_sessions;
 mod stats_csv_schema;
 mod stats_global_keywords;
+mod stats_refresh;
 mod stats_parity;
 mod stats_pid_column;
 mod stats_show_desc_node;
