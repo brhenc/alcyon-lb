@@ -10,6 +10,9 @@
 //! req.fhdr(x-a),field(2,',',18446744073709551615)  [b,,c]     field(2,',',2)  [b,]
 //! req.fhdr(x-a),word(3,',',18446744073709551615)   [c]
 //! ```
+//!
+//! A count below 1 is "to the end", as 0 (measured with `a: a:b:c:d`):
+//! `field(2,:,-1)` and `field(2,:,-7)` `[b:c:d]`, `word(2,:,-1)` `[b:c:d]`.
 
 use ibex_sample::registry::Registry;
 use ibex_sample::sample::Sample;
@@ -36,5 +39,13 @@ fn word_with_a_huge_count_takes_the_rest() {
     for count in HUGE {
         assert_eq!(eval("word", "a,b,,c", &["3", ",", count]), Some(Sample::Str("c".into())), "{count}");
         assert_eq!(eval("word", "a,b,,c", &["2", ",", count]), Some(Sample::Str("b,,c".into())), "{count}");
+    }
+}
+
+#[test]
+fn a_count_below_one_takes_the_rest() {
+    for count in ["-1", "-7", "0"] {
+        assert_eq!(eval("field", "a:b:c:d", &["2", ":", count]), Some(Sample::Str("b:c:d".into())), "field {count}");
+        assert_eq!(eval("word", "a:b:c:d", &["2", ":", count]), Some(Sample::Str("b:c:d".into())), "word {count}");
     }
 }

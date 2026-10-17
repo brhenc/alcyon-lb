@@ -141,3 +141,56 @@ fn percent_decode_unreserved_survives_and_matches_haproxy() {
 fn percent_to_uppercase_matches_haproxy() {
     check("percent-to-uppercase", 2);
 }
+
+/// A `normalize-uri` that grows the URI past the room the buffer has fails like any rewrite:
+/// 500 in strict mode, and the URI left as received with `strict-mode off`. Measured on
+/// `HAProxy` 3.5-dev8-885761-29: `fragment-encode` of `/` + 600 `#` (+1200 bytes) with an
+/// `x` header of 14000 bytes gives 200 and the 600 `%23`; of 14550 bytes, 500, and with
+/// `strict-mode off` 200 and the 600 `#` unchanged. (The exact edge differs: the largest `x`
+/// that still gives 200 is 14473 bytes on `HAProxy`, 14450 on Ibex; T359.)
+#[test]
+fn a_normalizer_that_does_not_fit_fails_the_request_in_strict_mode() {
+    let addr = common::reserve_addr();
+    for strict in [true, false] {
+        let cfg = format!(
+            "global\n  expose-experimental-directives\n\
+             defaults\n  mode http\n  timeout client 2s\n  timeout server 2s\n  timeout connect 2s\n\
+             listen f\n  bind {addr}\n  option accept-unsafe-violations-in-http-request\n{}\
+             \x20 http-request normalize-uri fragment-encode\n\
+             \x20 http-request return status 200 content-type text/plain lf-string \"[%[url]]\"\n",
+            if strict { "" } else { "  http-request strict-mode off\n" }
+        );
+        let path = std::env::temp_dir().join(format!("ibex-nup-fit-{}-{}.cfg", std::process::id(), addr.port()));
+        std::fs::write(&path, cfg).unwrap();
+        let mut ibex = common::Ibex(
+            Command::new(env!("CARGO_BIN_EXE_ibex"))
+                .arg("-db")
+                .arg("-f")
+                .arg(&path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn ibex"),
+        );
+        assert!(common::wait_listening(addr));
+        let ask = |n: usize| {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let req = format!("GET /{} HTTP/1.1\r\nHost: a\r\nx: {}\r\nConnection: close\r\n\r\n", "#".repeat(600), "A".repeat(n));
+            s.write_all(req.as_bytes()).unwrap();
+            String::from_utf8_lossy(&read_all(&mut s)).into_owned()
+        };
+        let small = ask(14000);
+        assert!(small.starts_with("HTTP/1.1 200 "), "strict={strict} 14000: {}", &small[..small.len().min(80)]);
+        assert_eq!(small.matches("%23").count(), 600, "strict={strict}: fragment-encode applied");
+        let big = ask(14550);
+        if strict {
+            assert!(big.starts_with("HTTP/1.1 500 "), "14550 strict: {}", &big[..big.len().min(80)]);
+        } else {
+            assert!(big.starts_with("HTTP/1.1 200 "), "14550 strict-mode off: {}", &big[..big.len().min(80)]);
+            assert_eq!((big.matches("%23").count(), big.matches('#').count()), (0, 600), "the URI as received");
+        }
+        common::stop(&mut ibex);
+        let _ = std::fs::remove_file(&path);
+    }
+}

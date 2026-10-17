@@ -9100,13 +9100,11 @@ mod ip_header_length_tests {
     }
 }
 
-/// The count argument of `field` and `word`: a number too large for `usize` is the largest
-/// one (`HAProxy` clamps it, measured with 2^64 and 10^20 on 3.5-dev8), and anything that is
-/// not a number is 1, as before.
+/// The count argument of `field` and `word` (an integer; anything else is refused at load):
+/// a number too large for `usize` is the largest one (`HAProxy` clamps it, measured with 2^64
+/// and 10^20 on 3.5-dev8), and a count below 1 is 0, "to the end" (`field(2,:,-1)` of
+/// `a:b:c:d` is `b:c:d` on 3.5-dev8, as `field(2,:,0)`).
 fn parse_count(arg: &str) -> usize {
-    match arg.parse::<usize>() {
-        Ok(n) => n,
-        Err(_) if !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_digit()) => usize::MAX,
-        Err(_) => 1,
-    }
+    let n = arg.parse::<i128>().unwrap_or(i128::MAX);
+    if n < 1 { 0 } else { usize::try_from(n).unwrap_or(usize::MAX) }
 }
