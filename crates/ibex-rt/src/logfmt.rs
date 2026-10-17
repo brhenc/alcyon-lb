@@ -559,6 +559,11 @@ impl LogFormat {
                 if let Some((c, _)) = expr.converters.iter().find(|(c, _)| !registry.has_converter(c)) {
                     return Err(format!("failed to parse sample expression <{src}> : unknown converter '{c}'"));
                 }
+                // T341: the same load-time argument checks as a rule's expression
+                // (`val_args`, run by `sample_parse_expr` wherever the `%[...]` is).
+                if let Some(e) = expr.converters.iter().find_map(|(c, a)| ibex_sample::check_converter_args(c, a)) {
+                    return Err(format!("failed to parse sample expression <{src}> : {e}"));
+                }
                 flush(&mut text, &mut nodes);
                 nodes.push(Node::Expr(Box::new(expr), opts, named.name.is_some().then(|| Box::new(named))));
                 i += end + 2;

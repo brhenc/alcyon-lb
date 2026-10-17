@@ -164,7 +164,7 @@ impl Expr {
                         || var_name.starts_with("res.");
                     if !is_int && !is_var {
                         return Err(format!(
-                            "invalid integer argument '{arg}' for converter '{c_name}'"
+                            "invalid args in converter '{c_name}' : expects an integer or a variable name."
                         ));
                     }
                 } else {
