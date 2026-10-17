@@ -883,6 +883,22 @@ impl Registry {
             out_type: SampleType::Sint,
             func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.fc_rttvar.unwrap_or(0)))),
         });
+        // T331: fc_nb_streams, fc_settings_streams_limit, fc_glitches
+        self.register_fetch(FetchDesc {
+            name: "fc_nb_streams",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(1)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_settings_streams_limit",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(1)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_glitches",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(0)),
+        });
         self.register_fetch(FetchDesc {
             name: "bc_rtt",
             out_type: SampleType::Sint,

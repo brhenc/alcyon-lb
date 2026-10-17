@@ -92,6 +92,7 @@ mod error_reply_header_case;
 mod expect_proxy;
 mod expr_compile_once;
 mod fd_hygiene;
+mod fc_stream_info;
 mod fetch_arg_refusals;
 mod fetch_availability_by_rule;
 mod fetch_counters;
