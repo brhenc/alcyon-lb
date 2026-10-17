@@ -654,6 +654,481 @@ impl Default for Registry {
     }
 }
 
+/// T330: the `mqtt_is_valid` and `mqtt_field_value` converters, ported from
+/// `HAProxy`'s `src/mqtt.c` (`mqtt_validate_message`, `mqtt_field_value`) and
+/// `include/haproxy/mqtt.h` (`mqtt_typeid`, `mqtt_check_type_fieldname`). Only CONNECT and
+/// CONNACK are parsed, as in `HAProxy`; every read is bounds-checked.
+mod mqtt {
+    const CPT_CONNECT: u8 = 1;
+    const CPT_CONNACK: u8 = 2;
+    const CPT_ENTRIES: u32 = 16;
+    const VERSION_3_1: u8 = 3;
+    const VERSION_3_1_1: u8 = 4;
+    const VERSION_5_0: u8 = 5;
+    const FL_RESERVED: u8 = 0x01;
+    const FL_WILL: u8 = 0x04;
+    const FL_WILL_QOS: u8 = 0x18;
+    const FL_WILL_RETAIN: u8 = 0x20;
+    const FL_PASSWORD: u8 = 0x40;
+    const FL_USERNAME: u8 = 0x80;
+
+    /// The field names (`mqtt_fields_string`); the numeric ones are MQTT 5.0 property ids.
+    const FIELDS: &[&str] = &[
+        "flags", "reason_code", "protocol_name", "protocol_version", "client_identifier", "will_topic",
+        "will_payload", "username", "password", "keepalive", "1", "2", "3", "8", "9", "11", "17", "18", "19",
+        "21", "22", "23", "24", "25", "26", "28", "31", "33", "34", "35", "36", "37", "38", "39", "40", "41",
+        "42",
+    ];
+
+    /// The property ids each packet type may be asked for (`mqtt_fields_per_packet`), the
+    /// named fields apart. Indexed by packet type; only CONNECT and CONNACK are parsed.
+    const CONNECT_FIELDS: &[&str] = &[
+        "flags", "protocol_name", "protocol_version", "client_identifier", "will_topic", "will_payload",
+        "username", "password", "keepalive", "1", "2", "3", "8", "9", "17", "21", "22", "23", "24",
+        "25", "33", "34", "38", "39",
+    ];
+    const CONNACK_FIELDS: &[&str] = &[
+        "flags", "protocol_version", "reason_code", "17", "18", "19", "21", "22", "26", "28", "31", "33",
+        "34", "36", "37", "38", "39", "40", "41", "42",
+    ];
+    const PUBLISH_FIELDS: &[&str] = &["1", "2", "3", "8", "9", "11", "35", "38"];
+    const ACK_FIELDS: &[&str] = &["reason_code", "31", "38"];
+    const NO_FIELDS: &[&str] = &[];
+    const TYPE_NAMES: [&str; 15] = [
+        "CONNECT", "CONNACK", "PUBLISH", "PUBACK", "PUBREC", "PUBREL", "PUBCOMP", "SUBSCRIBE", "SUBACK",
+        "UNSUBSCRIBE", "UNSUBACK", "PINGREQ", "PINGRESP", "DISCONNECT", "AUTH",
+    ];
+
+    /// `mqtt_typeid`: a packet type from its number or name. The number is `HAProxy`'s
+    /// unchecked `strl2ui` (each byte adds its value minus `'0'`, wrapping), so a stray
+    /// character still maps to a type exactly as it does there.
+    #[must_use]
+    pub(super) fn type_id(s: &str) -> Option<u8> {
+        let n = s.bytes().fold(0u32, |i, b| i.wrapping_mul(10).wrapping_sub(u32::from(b'0')).wrapping_add(u32::from(b)));
+        if (u32::from(CPT_CONNECT)..CPT_ENTRIES).contains(&n) {
+            return u8::try_from(n).ok();
+        }
+        let pos = TYPE_NAMES.iter().position(|n| n.eq_ignore_ascii_case(s))?;
+        u8::try_from(pos + 1).ok()
+    }
+
+    /// `mqtt_check_type_fieldname`: the field `name` when packet type `ty` has it.
+    #[must_use]
+    pub(super) fn field_id(ty: u8, name: &str) -> Option<&'static str> {
+        let known = FIELDS.iter().copied().find(|f| f.eq_ignore_ascii_case(name))?;
+        let allowed = match ty {
+            CPT_CONNECT => CONNECT_FIELDS,
+            CPT_CONNACK => CONNACK_FIELDS,
+            3 => PUBLISH_FIELDS,
+            4..=7 => ACK_FIELDS,
+            8 => &["11", "38"],
+            9 | 11 => &["31", "38"],
+            10 => &["38"],
+            14 => &["reason_code", "17", "28", "31", "38"],
+            15 => &["21", "22", "31", "38"],
+            _ => NO_FIELDS,
+        };
+        allowed.contains(&known).then_some(known)
+    }
+
+    /// A read cursor over the bytes not yet consumed (an `ist` in `HAProxy`).
+    #[derive(Clone, Copy)]
+    struct Cur<'a>(&'a [u8]);
+
+    impl<'a> Cur<'a> {
+        fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+            let head = self.0.get(..n)?;
+            self.0 = self.0.get(n..)?;
+            Some(head)
+        }
+
+        fn u8(&mut self) -> Option<u8> {
+            self.take(1)?.first().copied()
+        }
+
+        fn u16(&mut self) -> Option<u16> {
+            let b = self.take(2)?;
+            Some(u16::from_be_bytes([*b.first()?, *b.get(1)?]))
+        }
+
+        fn u32(&mut self) -> Option<u32> {
+            let b = self.take(4)?;
+            Some(u32::from_be_bytes([*b.first()?, *b.get(1)?, *b.get(2)?, *b.get(3)?]))
+        }
+
+        /// A string prefixed by its 16-bit length.
+        fn string(&mut self) -> Option<&'a [u8]> {
+            let len = usize::from(self.u16()?);
+            self.take(len)
+        }
+
+        /// `mqtt_read_varint`: up to four bytes; running out of bytes is not an error here
+        /// (the caller compares lengths), a fourth continuation byte is.
+        fn varint(&mut self) -> Option<u32> {
+            let (mut value, mut shift, mut off) = (0u32, 0u32, 0u8);
+            while off < 4 {
+                let Some(b) = self.u8() else { break };
+                value = value.checked_add(u32::from(b & 0x7f) << shift)?;
+                shift += 7;
+                if b <= 0x7f {
+                    break;
+                }
+                off += 1;
+            }
+            (off < 4).then_some(value)
+        }
+    }
+
+    /// Which property set a block is parsed against.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Ctx {
+        Connect,
+        Will,
+        Connack,
+    }
+
+    /// The MQTT 5.0 properties of a block; absent ones stay 0 / empty, as in `HAProxy`.
+    #[derive(Default)]
+    struct Props<'a> {
+        session_expiry_interval: u32,
+        receive_maximum: u16,
+        maximum_packet_size: u32,
+        topic_alias_maximum: u16,
+        request_response_information: u8,
+        request_problem_information: u8,
+        maximum_qos: u8,
+        retain_available: u8,
+        wildcard_subscription_available: u8,
+        subscription_identifiers_available: u8,
+        shared_subscription_available: u8,
+        server_keepalive: u16,
+        delay_interval: u32,
+        payload_format_indicator: u8,
+        message_expiry_interval: u32,
+        authentication_method: &'a [u8],
+        authentication_data: &'a [u8],
+        assigned_client_identifier: &'a [u8],
+        reason_string: &'a [u8],
+        response_information: &'a [u8],
+        server_reference: &'a [u8],
+        content_type: &'a [u8],
+        response_topic: &'a [u8],
+        correlation_data: &'a [u8],
+    }
+
+    /// Reads a property block (its length, then the properties) from `cur`.
+    fn props<'a>(cur: &mut Cur<'a>, ctx: Ctx) -> Option<Props<'a>> {
+        let plen = usize::try_from(cur.varint()?).ok()?;
+        let mut block = Cur(cur.take(plen)?);
+        let mut p = Props::default();
+        let mut seen = 0u64;
+        while let Some(id) = block.u8() {
+            if id != 0x26 {
+                // a property may appear once (only user properties repeat)
+                let bit = 1u64.checked_shl(u32::from(id))?;
+                if seen & bit != 0 {
+                    return None;
+                }
+                seen |= bit;
+            }
+            let flag = |v: u8| (v <= 1).then_some(v);
+            match (ctx, id) {
+                (Ctx::Connect | Ctx::Connack, 0x11) => p.session_expiry_interval = block.u32()?,
+                (Ctx::Connect | Ctx::Connack, 0x21) => {
+                    p.receive_maximum = block.u16().filter(|v| *v != 0)?;
+                }
+                (Ctx::Connect | Ctx::Connack, 0x27) => {
+                    p.maximum_packet_size = block.u32().filter(|v| *v != 0)?;
+                }
+                (Ctx::Connect | Ctx::Connack, 0x22) => p.topic_alias_maximum = block.u16()?,
+                (Ctx::Connect, 0x19) => p.request_response_information = block.u8().and_then(flag)?,
+                (Ctx::Connect, 0x17) => p.request_problem_information = block.u8().and_then(flag)?,
+                (Ctx::Connect | Ctx::Connack, 0x15) => p.authentication_method = block.string()?,
+                (Ctx::Connect | Ctx::Connack, 0x16) => p.authentication_data = block.string()?,
+                (Ctx::Will, 0x18) => p.delay_interval = block.u32()?,
+                (Ctx::Will, 0x01) => p.payload_format_indicator = block.u8().and_then(flag)?,
+                (Ctx::Will, 0x02) => p.message_expiry_interval = block.u32()?,
+                (Ctx::Will, 0x03) => p.content_type = block.string()?,
+                (Ctx::Will, 0x08) => p.response_topic = block.string()?,
+                (Ctx::Will, 0x09) => p.correlation_data = block.string()?,
+                (Ctx::Connack, 0x24) => p.maximum_qos = block.u8().and_then(flag)?,
+                (Ctx::Connack, 0x25) => p.retain_available = block.u8().and_then(flag)?,
+                (Ctx::Connack, 0x12) => {
+                    p.assigned_client_identifier = block.string().filter(|s| !s.is_empty())?;
+                }
+                (Ctx::Connack, 0x1f) => p.reason_string = block.string()?,
+                (Ctx::Connack, 0x28) => p.wildcard_subscription_available = block.u8().and_then(flag)?,
+                (Ctx::Connack, 0x29) => p.subscription_identifiers_available = block.u8().and_then(flag)?,
+                (Ctx::Connack, 0x2a) => p.shared_subscription_available = block.u8().and_then(flag)?,
+                (Ctx::Connack, 0x13) => p.server_keepalive = block.u16()?,
+                (Ctx::Connack, 0x1a) => p.response_information = block.string()?,
+                (Ctx::Connack, 0x1c) => p.server_reference = block.string()?,
+                (_, 0x26) => {
+                    block.string()?;
+                    block.string()?;
+                }
+                _ => return None,
+            }
+        }
+        Some(p)
+    }
+
+    #[derive(Default)]
+    pub(super) struct Connect<'a> {
+        protocol_name: &'a [u8],
+        protocol_version: u8,
+        flags: u8,
+        keepalive: u16,
+        props: Props<'a>,
+        client_identifier: &'a [u8],
+        will_props: Props<'a>,
+        will_topic: &'a [u8],
+        will_payload: &'a [u8],
+        username: &'a [u8],
+        password: &'a [u8],
+    }
+
+    /// `mqtt_parse_connect`; `cur` follows the fixed header. `None` is an invalid message.
+    fn parse_connect<'a>(cur: &mut Cur<'a>) -> Option<Connect<'a>> {
+        let mut c = Connect { protocol_name: cur.string()?, ..Connect::default() };
+        if !(c.protocol_name.eq_ignore_ascii_case(b"MQTT") || c.protocol_name.eq_ignore_ascii_case(b"MQIsdp")) {
+            return None;
+        }
+        c.protocol_version = cur.u8()?;
+        if ![VERSION_3_1, VERSION_3_1_1, VERSION_5_0].contains(&c.protocol_version) {
+            return None;
+        }
+        c.flags = cur.u8()?;
+        if c.flags & FL_RESERVED != 0 {
+            return None;
+        }
+        // as in HAProxy: refused only when both QoS bits are set without will nor retain
+        if c.flags & (FL_WILL | FL_WILL_QOS | FL_WILL_RETAIN) == FL_WILL_QOS {
+            return None;
+        }
+        c.keepalive = cur.u16()?;
+        let v5 = c.protocol_version == VERSION_5_0;
+        if v5 {
+            c.props = props(cur, Ctx::Connect)?;
+        }
+        if c.props.authentication_method.is_empty() && !c.props.authentication_data.is_empty() {
+            return None;
+        }
+        c.client_identifier = cur.string()?;
+        if v5 && c.flags & FL_WILL != 0 {
+            c.will_props = props(cur, Ctx::Will)?;
+        }
+        if c.flags & FL_WILL != 0 {
+            c.will_topic = cur.string()?;
+            c.will_payload = cur.string()?;
+        }
+        if c.flags & FL_USERNAME != 0 {
+            c.username = cur.string()?;
+        }
+        if c.flags & FL_PASSWORD != 0 {
+            c.password = cur.string()?;
+        }
+        Some(c)
+    }
+
+    #[derive(Default)]
+    pub(super) struct Connack<'a> {
+        protocol_version: u8,
+        flags: u8,
+        reason_code: u8,
+        props: Props<'a>,
+    }
+
+    /// `mqtt_parse_connack`; `cur` follows the fixed header. As in `HAProxy`, the version
+    /// is told from everything that follows the header, not from the remaining length.
+    fn parse_connack<'a>(cur: &mut Cur<'a>) -> Option<Connack<'a>> {
+        let mut c = Connack::default();
+        match cur.0.len() {
+            0 | 1 => return None,
+            2 => c.protocol_version = VERSION_3_1_1,
+            _ => c.protocol_version = VERSION_5_0,
+        }
+        c.flags = cur.u8()?;
+        if c.flags & 0xfe != 0 {
+            return None;
+        }
+        c.reason_code = cur.u8()?;
+        if c.protocol_version == VERSION_5_0 {
+            c.props = props(cur, Ctx::Connack)?;
+        }
+        Some(c)
+    }
+
+    /// A message that passed `mqtt_validate_message`.
+    pub(super) enum Packet<'a> {
+        Connect(Box<Connect<'a>>),
+        Connack(Box<Connack<'a>>),
+    }
+
+    /// The outcome of `mqtt_validate_message`.
+    pub(super) enum Parsed<'a> {
+        Invalid,
+        NeedMoreData,
+        Valid(Packet<'a>),
+    }
+
+    /// `mqtt_validate_message`: the fixed header, the remaining length, then the packet.
+    #[must_use]
+    pub(super) fn validate(msg: &[u8]) -> Parsed<'_> {
+        let mut cur = Cur(msg);
+        if msg.len() < 2 {
+            return Parsed::NeedMoreData;
+        }
+        let Some(first) = cur.u8() else { return Parsed::Invalid };
+        let (ty, flags) = (first >> 4, first & 0x0f);
+        let wanted_flags = match ty {
+            0 => return Parsed::Invalid,
+            3 => flags,
+            6 | 8 | 10 => 0x02,
+            _ => 0,
+        };
+        if flags != wanted_flags {
+            return Parsed::Invalid;
+        }
+        let Some(remaining) = cur.varint().and_then(|r| usize::try_from(r).ok()) else {
+            return Parsed::Invalid;
+        };
+        if cur.0.len() < remaining {
+            return Parsed::NeedMoreData;
+        }
+        let before = cur.0.len();
+        let packet = match ty {
+            CPT_CONNECT => parse_connect(&mut cur).map(|c| Packet::Connect(Box::new(c))),
+            CPT_CONNACK => parse_connack(&mut cur).map(|c| Packet::Connack(Box::new(c))),
+            _ => None,
+        };
+        match packet {
+            Some(p) if before - cur.0.len() == remaining => Parsed::Valid(p),
+            _ => Parsed::Invalid,
+        }
+    }
+
+    /// A field value: a number (printed in decimal) or bytes.
+    pub(super) enum Value<'a> {
+        Num(u32),
+        Bytes(&'a [u8]),
+    }
+
+    fn bytes(b: &[u8]) -> Option<Value<'_>> {
+        (!b.is_empty()).then_some(Value::Bytes(b))
+    }
+
+    /// `mqtt_field_value` for a CONNECT: `field` comes from [`field_id`].
+    fn connect_field<'a>(c: &Connect<'a>, field: &str) -> Option<Value<'a>> {
+        let v5 = c.protocol_version == VERSION_5_0;
+        let will5 = v5 && c.flags & FL_WILL != 0;
+        match field {
+            "flags" => Some(Value::Num(u32::from(c.flags))),
+            "protocol_name" => bytes(c.protocol_name),
+            "protocol_version" => Some(Value::Num(u32::from(c.protocol_version))),
+            "client_identifier" => bytes(c.client_identifier),
+            "will_topic" => bytes(c.will_topic),
+            "will_payload" => bytes(c.will_payload),
+            "username" => bytes(c.username),
+            "password" => bytes(c.password),
+            "keepalive" => Some(Value::Num(u32::from(c.keepalive))),
+            "1" if will5 => Some(Value::Num(u32::from(c.will_props.payload_format_indicator))),
+            "2" if will5 => Some(Value::Num(c.will_props.message_expiry_interval)),
+            "3" if will5 => bytes(c.will_props.content_type),
+            "8" if will5 => bytes(c.will_props.response_topic),
+            "9" if will5 => bytes(c.will_props.correlation_data),
+            "24" if will5 => Some(Value::Num(c.will_props.delay_interval)),
+            "17" if v5 => Some(Value::Num(c.props.session_expiry_interval)),
+            "21" if v5 => bytes(c.props.authentication_method),
+            "22" if v5 => bytes(c.props.authentication_data),
+            "23" if v5 => Some(Value::Num(u32::from(c.props.request_problem_information))),
+            "25" if v5 => Some(Value::Num(u32::from(c.props.request_response_information))),
+            "33" if v5 => Some(Value::Num(u32::from(c.props.receive_maximum))),
+            "34" if v5 => Some(Value::Num(u32::from(c.props.topic_alias_maximum))),
+            "39" if v5 => Some(Value::Num(c.props.maximum_packet_size)),
+            _ => None,
+        }
+    }
+
+    /// `mqtt_field_value` for a CONNACK.
+    fn connack_field<'a>(c: &Connack<'a>, field: &str) -> Option<Value<'a>> {
+        let v5 = c.protocol_version == VERSION_5_0;
+        let p = &c.props;
+        match field {
+            "flags" => Some(Value::Num(u32::from(c.flags))),
+            "reason_code" => Some(Value::Num(u32::from(c.reason_code))),
+            "protocol_version" => Some(Value::Num(u32::from(c.protocol_version))),
+            "17" if v5 => Some(Value::Num(p.session_expiry_interval)),
+            "18" if v5 => bytes(p.assigned_client_identifier),
+            "19" if v5 => Some(Value::Num(u32::from(p.server_keepalive))),
+            "21" if v5 => bytes(p.authentication_method),
+            "22" if v5 => bytes(p.authentication_data),
+            "26" if v5 => bytes(p.response_information),
+            "28" if v5 => bytes(p.server_reference),
+            "31" if v5 => bytes(p.reason_string),
+            "33" if v5 => Some(Value::Num(u32::from(p.receive_maximum))),
+            "34" if v5 => Some(Value::Num(u32::from(p.topic_alias_maximum))),
+            "36" if v5 => Some(Value::Num(u32::from(p.maximum_qos))),
+            "37" if v5 => Some(Value::Num(u32::from(p.retain_available))),
+            "39" if v5 => Some(Value::Num(p.maximum_packet_size)),
+            "40" if v5 => Some(Value::Num(u32::from(p.wildcard_subscription_available))),
+            "41" if v5 => Some(Value::Num(u32::from(p.subscription_identifiers_available))),
+            "42" if v5 => Some(Value::Num(u32::from(p.shared_subscription_available))),
+            _ => None,
+        }
+    }
+
+    /// `mqtt_field_value`: `None` when the field is absent, the message invalid or still
+    /// incomplete. `ty` and `field` come from [`type_id`] and [`field_id`].
+    #[must_use]
+    pub(super) fn field_value<'a>(msg: &'a [u8], ty: u8, field: &str) -> Option<Value<'a>> {
+        match (validate(msg), ty) {
+            (Parsed::Valid(Packet::Connect(c)), CPT_CONNECT) => connect_field(&c, field),
+            (Parsed::Valid(Packet::Connack(c)), CPT_CONNACK) => connack_field(&c, field),
+            _ => None,
+        }
+    }
+}
+
+/// T330: the converter `mqtt_is_valid`: 1 or 0, and no sample while the message is
+/// incomplete (`SMP_F_MAY_CHANGE` in `HAProxy`).
+fn mqtt_is_valid(msg: &[u8]) -> Option<Sample> {
+    match mqtt::validate(msg) {
+        mqtt::Parsed::Valid(_) => Some(Sample::Bool(true)),
+        mqtt::Parsed::Invalid => Some(Sample::Bool(false)),
+        mqtt::Parsed::NeedMoreData => None,
+    }
+}
+
+/// T330: the converter `mqtt_field_value(<packettype>,<fieldname>)`.
+fn mqtt_field_value(msg: &[u8], args: &[String]) -> Option<Sample> {
+    let ty = mqtt::type_id(args.first()?)?;
+    let field = mqtt::field_id(ty, args.get(1)?)?;
+    Some(match mqtt::field_value(msg, ty, field)? {
+        mqtt::Value::Num(n) => Sample::Str(n.to_string()),
+        mqtt::Value::Bytes(b) => match std::str::from_utf8(b) {
+            Ok(s) => Sample::Str(s.to_string()),
+            Err(_) => Sample::Bin(b.to_vec()),
+        },
+    })
+}
+
+/// T330: load-time check of `mqtt_field_value`'s arguments (`sample_conv_mqtt_field_value_check`).
+fn mqtt_field_value_args_error(args: &[String]) -> Option<String> {
+    let (Some(ty), Some(field)) = (args.first(), args.get(1)) else {
+        return Some("invalid arg 2 in converter 'mqtt_field_value' : missing arguments (got 1/2), type 'string' expected.".to_string());
+    };
+    if args.len() > 2 {
+        return Some(format!("invalid arg 2 in converter 'mqtt_field_value' : expected ')' before ',{})'.", args[2..].join(",")));
+    }
+    let Some(id) = mqtt::type_id(ty) else {
+        return Some(format!("invalid args in converter 'mqtt_field_value' : Unknown MQTT type '{ty}'."));
+    };
+    mqtt::field_id(id, field).is_none().then(|| {
+        format!("invalid args in converter 'mqtt_field_value' : Unknown MQTT field name '{field}' for packet type '{ty}'.")
+    })
+}
+
 impl Registry {
     #[must_use]
     pub fn new() -> Self {
@@ -3533,6 +4008,26 @@ impl Registry {
         });
 
         self.register_converter(ConvDesc {
+            name: "mqtt_is_valid",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bool),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => mqtt_is_valid(&b),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "mqtt_field_value",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Any,
+            func: |smp, args| match smp {
+                Sample::Bin(b) => mqtt_field_value(&b, args),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
             name: "htonl",
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Bin),
@@ -5745,6 +6240,11 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
             let path = args.first()?.trim_matches(['"', '\'']);
             crate::patref::map_file_error(path, keys, vals).map(|e| format!("invalid args in converter '{name}' : {e}"))
         }
+        "mqtt_field_value" => mqtt_field_value_args_error(args),
+        "mqtt_is_valid" if !args.iter().all(String::is_empty) => Some(format!(
+            "invalid arg 1 in converter 'mqtt_is_valid' : expected ')' before '{})'.",
+            args.join(",")
+        )),
         "has_ctl" if has_ctl_mask(args.first().map_or("", String::as_str)).is_none() => {
             Some("invalid args in converter 'has_ctl' : expects 'any', 'http' or a mask of at most 33 bits".to_string())
         }
