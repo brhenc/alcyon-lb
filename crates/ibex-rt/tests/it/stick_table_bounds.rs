@@ -182,3 +182,22 @@ fn a_client_that_leaves_mid_show_table_ends_the_dump() {
     let all = String::from_utf8_lossy(&all);
     assert_eq!(all.lines().filter(|l| l.contains("key=")).count(), 20_000, "entries");
 }
+
+/// T342: `expire 0` means the entries never expire (HAProxy 3.5-dev8 shows `exp=0` and keeps
+/// the entry), and it must not hang the worker: two requests on one connection, both
+/// answered, the tracked entry listed by `show table`.
+#[test]
+fn expire_0_never_expires_and_does_not_hang() {
+    let (ibex, fe) = start("stick-table type string size 10 expire 0");
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+    for _ in 0..2 {
+        write!(c, "GET / HTTP/1.1\r\nHost: x\r\nx-k: kk\r\n\r\n").expect("send");
+        let mut buf = [0u8; 1024];
+        let n = c.read(&mut buf).expect("a reply within 3s");
+        assert!(buf[..n].starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&buf[..n]));
+        thread::sleep(Duration::from_millis(600));
+    }
+    let out = show_table(&ibex);
+    assert!(out.contains("used:1") && out.contains("key=kk "), "{out}");
+}
