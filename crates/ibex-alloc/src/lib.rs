@@ -459,6 +459,23 @@ mod tests {
         assert!(dump.contains("- Pool buffer (16384 bytes) : 67 allocated (1097728 bytes), 67 used"));
         assert!(dump.contains("Total: 1 pools, 1097728 bytes allocated, 1097728 used"));
     }
+
+    // A provider whose pool is gone; the signature is fixed by `register_provider`.
+    #[allow(clippy::unnecessary_wraps)]
+    fn absent_stats() -> Option<PoolHead> {
+        None
+    }
+
+    /// A provider that reports nothing is skipped by `totals`, neither counted as zero nor a reason to
+    /// drop the providers after it.
+    #[test]
+    fn test_totals_skips_provider_reporting_nothing() {
+        let reg = PoolRegistry::new();
+        reg.register_provider("absent", absent_stats);
+        assert_eq!(reg.totals(), (0, 0));
+        reg.register_provider("buffer", sample_buffer_stats);
+        assert_eq!(reg.totals(), (1_097_728, 67 * 16384));
+    }
 }
 
 static TRIM_DISABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

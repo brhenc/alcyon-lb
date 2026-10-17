@@ -133,3 +133,20 @@ fn tcp_converters() {
     assert_eq!(b, "40000|443|16909060|64240|2");
     drop(ibex);
 }
+
+// Inputs under 20 bytes (19 bytes for every converter, 2 bytes, and a string that is not a TCP segment)
+// answer nothing, exactly as HAProxy 3.5-dev8 does: each field is empty. The 20-byte case is above.
+const CFG_SHORT: &str = r#"
+frontend fe
+  bind {A}
+  http-request return status 200 content-type text/plain lf-string "[%[bin(9c4001bb0102030400000000a002faf0000000),tcp.src]|%[bin(9c4001bb0102030400000000a002faf0000000),tcp.dst]|%[bin(9c4001bb0102030400000000a002faf0000000),tcp.seq]|%[bin(9c4001bb0102030400000000a002faf0000000),tcp.win]|%[bin(9c4001bb0102030400000000a002faf0000000),tcp.flags]|%[bin(9c40),tcp.src]|%[str(abc),tcp.src]]"
+"#;
+
+#[test]
+fn tcp_converters_short_or_non_binary_input_yields_nothing() {
+    let addr = common::reserve_addr();
+    let cfg = http_cfg("", CFG_SHORT.replace("{A}", &addr.to_string()).as_str());
+    let (ibex, _sock) = start("tcp_converters_short", &cfg, &[addr]);
+    assert_eq!(body(addr, GET), "[||||||]");
+    drop(ibex);
+}

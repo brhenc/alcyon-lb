@@ -141,3 +141,19 @@ fn jwt_query() {
     // jwt_header_query('\$.alg') on non-JWT -> "" (empty)
     assert_eq!(body(addr, GET), r#"[HS256|5|John Doe|1516239022||{"alg":"HS256","typ":"JWT","n":5}|]"#);
 }
+
+// The payload without a path, a token with no second part, and a part that decodes to bytes which are not
+// UTF-8 (`AP8` is 00 ff), with and without a path. Every value measured on HAProxy 3.5-dev8.
+const CFG_EDGE: &str = r#"
+frontend fe
+  bind {A}
+  http-request return status 200 content-type text/plain lf-string "[%[str({JWT}),jwt_payload_query]|%[str(abc.),jwt_payload_query]|%[str(abc),jwt_payload_query]|%[str(a.eyJhIjoxfQ.c),jwt_payload_query]|%[str(a.eyJhIjoxfQ.c),jwt_payload_query('\$.a')]|%[str(a.AP8.c),jwt_payload_query]|%[str(a.AP8.c),jwt_payload_query('\$.a')]|%[str(a.AP8.c),jwt_header_query]]"
+"#;
+
+#[test]
+fn jwt_query_payload_without_path_and_malformed_parts() {
+    let addr = common::reserve_addr();
+    let cfg = http_cfg("", &CFG_EDGE.replace("{A}", &addr.to_string()).replace("{JWT}", JWT));
+    let _ibex = start("jwt_query_edge", &cfg, &[addr]);
+    assert_eq!(body(addr, GET), r#"[{"sub":"1234567890","name":"John Doe","iat":1516239022,"o":{"a":1}}|||{"a":1}|1|||]"#);
+}
