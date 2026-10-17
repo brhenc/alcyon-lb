@@ -1286,6 +1286,7 @@ impl Registry {
             out_type: SampleType::Str,
             func: response_header_fetch,
         });
+        // T326: deprecated alias of res.hdr (shdr)
         self.register_fetch(FetchDesc {
             name: "shdr",
             out_type: SampleType::Str,
@@ -1323,7 +1324,7 @@ impl Registry {
             let count = get_all_res_headers(ctx, name).len();
             Some(Sample::Sint(len_to_sint(count)))
         };
-        // T326
+        // T326: res.hdr_cnt registered once with a named FetchFn so the deprecated alias shdr_cnt below shares it
         self.register_fetch(FetchDesc {
             name: "res.hdr_cnt",
             out_type: SampleType::Sint,
@@ -1356,7 +1357,7 @@ impl Registry {
             let val = get_res_header(ctx, name)?;
             val.trim().parse::<i64>().ok().map(Sample::Sint)
         };
-        // T326
+        // T326: res.hdr_val registered once with a named FetchFn so the deprecated alias shdr_val below shares it
         self.register_fetch(FetchDesc {
             name: "res.hdr_val",
             out_type: SampleType::Sint,
@@ -1389,7 +1390,7 @@ impl Registry {
             let val = get_res_header(ctx, name)?;
             parse_ip_str(&val)
         };
-        // T326
+        // T326: res.hdr_ip registered once with a named FetchFn so the deprecated alias shdr_ip below shares it
         self.register_fetch(FetchDesc {
             name: "res.hdr_ip",
             out_type: SampleType::Ipv4,
@@ -1429,7 +1430,7 @@ impl Registry {
             }
             None
         };
-        // T326
+        // T326: res.cook registered once with a named FetchFn so the deprecated alias scook below shares it
         self.register_fetch(FetchDesc {
             name: "res.cook",
             out_type: SampleType::Str,
@@ -1440,6 +1441,7 @@ impl Registry {
             out_type: SampleType::Str,
             func: res_cook_fetch,
         });
+
         let cook_cnt_fetch: FetchFn = |ctx, args| {
             let name = args.first();
             let cookie_hdrs = get_all_req_headers(ctx, "cookie");
@@ -1485,7 +1487,7 @@ impl Registry {
             }
             Some(Sample::Sint(count))
         };
-        // T326
+        // T326: res.cook_cnt registered once with a named FetchFn so the deprecated alias scook_cnt below shares it
         self.register_fetch(FetchDesc {
             name: "res.cook_cnt",
             out_type: SampleType::Sint,
@@ -1524,7 +1526,7 @@ impl Registry {
             }
             None
         };
-        // T326
+        // T326: res.cook_val registered once with a named FetchFn so the deprecated alias scook_val below shares it
         self.register_fetch(FetchDesc {
             name: "res.cook_val",
             out_type: SampleType::Sint,
@@ -1535,6 +1537,7 @@ impl Registry {
             out_type: SampleType::Sint,
             func: res_cook_val_fetch,
         });
+
         // --- 6. Body & Length Fetches ---
         self.register_fetch(FetchDesc {
             name: "req.body",
