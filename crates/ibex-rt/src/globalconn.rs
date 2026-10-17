@@ -22,7 +22,8 @@ static MAXSOCK: AtomicU64 = AtomicU64::new(0);
 static ULIMIT_N: AtomicU64 = AtomicU64::new(0);
 /// Number of listening sockets (T320): one per `bind` address plus one per `stats socket`.
 static LISTENERS: AtomicUsize = AtomicUsize::new(0);
-/// Times an accepted connection took the last free slot of `global maxconn` (T320).
+/// Accepts made while `actconn + 1 >= global maxconn` (T320), the last two slots: client
+/// connections refused afterwards and stats-socket accepts included, as in listener.c.
 static REACHED: AtomicU64 = AtomicU64::new(0);
 
 /// Raises the soft limit on open files to `maxsock` when it is lower, as `HAProxy` does at
@@ -175,14 +176,17 @@ pub fn acquire() {
 /// Takes a slot if there is one, atomically: false when `global maxconn` is reached.
 pub fn try_acquire() -> bool {
     let max = MAX.load(Ordering::Relaxed);
-    match CURR.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| (max == 0 || c < max).then_some(c + 1)) {
-        Ok(prev) => {
-            if max != 0 && prev + 1 == max {
-                REACHED.fetch_add(1, Ordering::Relaxed);
-            }
-            true
-        }
-        Err(_) => false,
+    CURR.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| (max == 0 || c < max).then_some(c + 1)).is_ok()
+}
+
+/// An accepted connection, limited or not (T320): `HAProxy` counts `MaxconnReached` when
+/// `actconn + 1 >= maxconn` after the accept (listener.c), outside its `BC_O_UNLIMITED` guard,
+/// so the stats socket counts too. Called right after `accept()`, before any rule can refuse
+/// the connection; a client connection's own slot is already in `CURR` there.
+pub fn note_accept() {
+    let max = MAX.load(Ordering::Relaxed);
+    if max != 0 && CURR.load(Ordering::Relaxed).saturating_add(1) >= max {
+        REACHED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -237,8 +241,8 @@ pub fn listeners() -> usize {
     LISTENERS.load(Ordering::Relaxed)
 }
 
-/// Times an accepted connection took the last free slot of `global maxconn`
-/// (`show info` `MaxconnReached`). Never reset by `clear counters`.
+/// Accepts made while `actconn + 1 >= global maxconn` ([`note_accept`]; `show info`
+/// `MaxconnReached`). Never reset by `clear counters`.
 #[must_use]
 pub fn reached() -> u64 {
     REACHED.load(Ordering::Relaxed)

@@ -4931,6 +4931,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             };
             match listener.accept() {
                 Ok(stream) => {
+                    crate::globalconn::note_accept();
                     let mut applet = CliApplet::new(stream, self.now);
                     applet.timeout_ms = self.cli_timeout_ms;
                     applet.level = level;
@@ -5043,6 +5044,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 self.backlog_waits &= self.fe_paused || self.global_paused;
                 break;
             };
+            crate::globalconn::note_accept();
             let local_addr = self.listeners[l_idx].addr();
             self.admit_connection(proxy_idx, Some(l_idx), cli_fd, peer_addr, local_addr);
         }

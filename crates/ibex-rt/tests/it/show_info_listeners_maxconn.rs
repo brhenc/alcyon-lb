@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T320: show info Listeners, MaxconnReached
+//! T320: `show info` `Listeners` and `MaxconnReached`.
 
 use crate::common;
 
@@ -62,18 +62,6 @@ fn num(i: &HashMap<String, String>, k: &str) -> u64 {
     i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
 }
 
-/// One request on a new connection; the whole raw answer.
-fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(req).unwrap();
-    let mut out = Vec::new();
-    let _ = s.read_to_end(&mut out);
-    out
-}
-
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
 fn http_cfg(global: &str, body: &str) -> String {
     format!(
         "global\n  stats socket {{sock}} level admin\n{global}\
@@ -82,41 +70,58 @@ fn http_cfg(global: &str, body: &str) -> String {
 }
 
 #[test]
-fn show_info_listeners_maxconn_reached() {
-    let a: SocketAddr = "127.0.0.1:18001".parse().unwrap();
-    let b: SocketAddr = "127.0.0.1:18002".parse().unwrap();
-    let c: SocketAddr = "127.0.0.1:18003".parse().unwrap();
+fn show_info_listeners() {
+    let (a, b, c) = (common::reserve_addr(), common::reserve_addr(), common::reserve_addr());
     let cfg = http_cfg("  nbthread 4\n  maxconn 8\n", &format!("frontend fe\n  bind {a}\n  bind {b}\n  http-request return status 200\nfrontend fe2\n  bind {c}\n  http-request return status 200\n"));
-    let (_ibex, sock) = start("lmc", &cfg, &[a, b, c]);
+    let (_ibex, sock) = start("lst", &cfg, &[a, b, c]);
+    // 3 bind lines + 1 stats socket, as the oracle gives with `nbthread 4` (one thread group).
+    assert_eq!(num(&info(&sock), "Listeners"), 4);
+}
 
-    let info_map = info(&sock);
+fn connect(addr: SocketAddr) -> TcpStream {
+    let s = TcpStream::connect(addr).expect("connect");
+    std::thread::sleep(Duration::from_millis(50));
+    s
+}
 
-    // Listeners: 2 frontends with 3 bind lines total + 1 stats socket = 4
-    assert_eq!(num(&info_map, "Listeners"), 4, "Listeners should be 4 (3 binds + 1 stats socket)");
+/// `MaxconnReached` counts every accept, refused ones and stats-socket ones included, made
+/// while `actconn + 1 >= maxconn` (listener.c): the last two slots. Every number below was
+/// measured on the oracle (3.5-dev8) with this exact sequence; each `show info` is itself a
+/// counted accept once 7 or more connections are held.
+#[test]
+fn show_info_maxconn_reached() {
+    let (a, r) = (common::reserve_addr(), common::reserve_addr());
+    let cfg = http_cfg(
+        "  nbthread 1\n  maxconn 8\n",
+        &format!("frontend fe\n  bind {a}\n  http-request return status 200\nfrontend rej\n  bind {r}\n  tcp-request connection reject\n"),
+    );
+    let (_ibex, sock) = start("mcr", &cfg, &[a, r]);
+    let reached = || num(&info(&sock), "MaxconnReached");
+    assert_eq!(reached(), 0, "at start");
 
-    // MaxconnReached should be 0 at start
-    assert_eq!(num(&info_map, "MaxconnReached"), 0, "MaxconnReached should be 0 at start");
+    let mut held: Vec<TcpStream> = (0..6).map(|_| connect(a)).collect();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(reached(), 0, "6 held of 8: 6 + 1 < 8");
 
-    // Open 8 connections (maxconn 8) and keep them open
-    let mut streams: Vec<TcpStream> = Vec::with_capacity(8);
-    for _ in 0..8 {
-        let s = TcpStream::connect(a).expect("connect");
-        streams.push(s);
+    for _ in 0..3 {
+        let mut s = connect(r);
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let _ = s.read(&mut [0u8; 16]);
     }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(reached(), 3, "3 connections refused by tcp-request connection reject at 6 held");
 
+    held.push(connect(a));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(reached(), 5, "7th connection + this show info");
+    assert_eq!(reached(), 6, "one more show info at 7 held");
+    held.push(connect(a));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(reached(), 8, "8th connection + this show info");
+
+    drop(held);
     std::thread::sleep(Duration::from_millis(300));
-
-    let info_map = info(&sock);
-    let reached = num(&info_map, "MaxconnReached");
-    assert!(reached >= 1, "MaxconnReached should be >= 1 after 8 connections with maxconn 8, got {reached}");
-    assert!(reached <= 8, "MaxconnReached should be <= 8, got {reached}");
-
-    // Drop the connections
-    drop(streams);
-
-    // clear counters all should NOT reset MaxconnReached
+    assert_eq!(reached(), 8, "not counted once the connections closed");
     cli(&sock, "clear counters all");
-    let info_map = info(&sock);
-    let reached = num(&info_map, "MaxconnReached");
-    assert!(reached >= 1, "MaxconnReached should still be >= 1 after clear counters all, got {reached}");
+    assert_eq!(reached(), 8, "clear counters all does not reset it");
 }
