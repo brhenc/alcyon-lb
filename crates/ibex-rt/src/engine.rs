@@ -6909,7 +6909,11 @@ fn init_client_session(
         // one connection at a time instead of all at once. Closing is visible; serving
         // cleartext is not.
         match sess.cli_fd().map_or_else(|| Err(io::Error::from(io::ErrorKind::NotConnected)), |fd| crate::xprt::accept_tls(&fd, Arc::clone(cfg))) {
-            Ok(xprt) => sess.cli_xprt = xprt,
+            Ok(xprt) => {
+                sess.cli_xprt = xprt;
+                // T320: `SslRate`; `CurrSslConns` and `CumSslConns` are the transport's own.
+                crate::stats::ssl_conn_accepted();
+            }
             Err(e) => {
                 eprintln!(
                     "[ibex] {}: dropping connection from {peer_addr}, TLS setup failed: {e}",

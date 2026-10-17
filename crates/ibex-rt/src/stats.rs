@@ -342,6 +342,54 @@ pub static NBTHREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 // T320: process-wide count of streams (HTTP transactions, TCP sessions, CLI connections).
 pub static CUM_STREAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// T320: TLS connections open now, client and server side (`CurrSslConns`).
+pub static SSL_CURR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// T320: TLS connections set up since start, client and server side (`CumSslConns`).
+pub static SSL_CUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// T320: highest `SslRate` seen (`MaxSslRate`); reset by `clear counters`.
+pub static SSL_MAX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// T320: connections accepted on `ssl` binds over the last second (`SslRate`).
+pub static SSL_RATE: std::sync::Mutex<crate::engine::RateCtr> = std::sync::Mutex::new(crate::engine::RateCtr::new());
+
+/// T320: a connection was accepted on an `ssl` bind: counts it in the rate, raising the
+/// maximum (`listener_accept`).
+pub fn ssl_conn_accepted() {
+    let rate = {
+        let r = SSL_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        r.tick();
+        r.rate()
+    };
+    SSL_MAX.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// T320: one TLS connection, client or server side, in `CurrSslConns` from the moment its TLS
+/// layer is set up until it is dropped, and in `CumSslConns` from that moment on, whether or not
+/// its handshake completes: `HAProxy` counts both in `ssl_sock_init` and takes `CurrSslConns`
+/// back when the connection is freed. Owned by the transport, so every path that drops one
+/// settles it.
+pub struct SslConnCount(());
+
+impl SslConnCount {
+    #[must_use]
+    pub fn new() -> Self {
+        SSL_CURR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SSL_CUM.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Default for SslConnCount {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SslConnCount {
+    fn drop(&mut self) {
+        SSL_CURR.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub fn format_show_info(start_time: Instant, pid: u32, total_tasks: usize, run_queue_len: usize, active_conns: u32, max_conns: u32) -> String {
     format_show_info_counts(start_time, pid, total_tasks, run_queue_len, active_conns, max_conns, 0, 0)
 }
@@ -446,8 +494,8 @@ fn show_info_pairs(
         ("CumConns", cum_conns.to_string()),
         ("CumReq", cum_reqs.to_string()),
         ("MaxSslConns", zero()),
-        ("CurrSslConns", zero()),
-        ("CumSslConns", zero()),
+        ("CurrSslConns", SSL_CURR.load(std::sync::atomic::Ordering::Relaxed).to_string()),
+        ("CumSslConns", SSL_CUM.load(std::sync::atomic::Ordering::Relaxed).to_string()),
         ("Maxpipes", zero()),
         ("PipesUsed", zero()),
         ("PipesFree", zero()),
@@ -457,9 +505,9 @@ fn show_info_pairs(
         ("SessRate", crate::engine::GLOBAL_SESS_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).rate().to_string()),
         ("SessRateLimit", zero()),
         ("MaxSessRate", crate::engine::MAX_SESS_RATE.load(std::sync::atomic::Ordering::Relaxed).to_string()),
-        ("SslRate", zero()),
+        ("SslRate", SSL_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).rate().to_string()),
         ("SslRateLimit", zero()),
-        ("MaxSslRate", zero()),
+        ("MaxSslRate", SSL_MAX.load(std::sync::atomic::Ordering::Relaxed).to_string()),
         ("SslFrontendKeyRate", zero()),
         ("SslFrontendMaxKeyRate", zero()),
         ("SslFrontendSessionReuse_pct", zero()),
