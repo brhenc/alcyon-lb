@@ -100,10 +100,16 @@ pub enum SmtpGreeting {
 /// The SMTP greeting: `expect rstring ^[0-9]{3}[ \r] min-recv 4` (L7RSP, info = the reply
 /// up to the line end), then `^2[0-9]{2}[ \r] min-recv 4` (L7STS). Four bytes decide, a CRLF
 /// is not needed, and a multi-line greeting (`220-x`) is "invalid response". Under four bytes
-/// nothing is judged, even after the close.
-pub fn smtp_greeting(b: &[u8]) -> Option<SmtpGreeting> {
+/// nothing is judged while more may come; once the server has closed (`eof`) the short reply
+/// is "invalid response" (measured on the reference binary for a close with no data and for
+/// `22` then close: `L7RSP`), so the check ends instead of polling the closed socket.
+pub fn smtp_greeting(b: &[u8], eof: bool) -> Option<SmtpGreeting> {
     if b.len() < 4 {
-        return None;
+        if !eof {
+            return None;
+        }
+        let line = cut_crlf(b);
+        return Some(SmtpGreeting::Invalid((!line.is_empty()).then(|| ascii_encode(line))));
     }
     if !(b[..3].iter().all(u8::is_ascii_digit) && matches!(b[3], b' ' | b'\r')) {
         let line = cut_crlf(b);

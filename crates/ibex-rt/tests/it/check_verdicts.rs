@@ -330,7 +330,11 @@ fn smtp_greeting_verdicts() {
             "Health check for server b/s failed, reason: Layer7 wrong status, code: 450",
             false,
         );
-        // Under 4 bytes nothing is judged, even after the close.
-        expect(SMTP, b"45", b"", close, TIMEOUT, true);
+        // Under 4 bytes nothing is judged while the server may still send. This fake reads the
+        // client's request before it closes, which SMTP never sends, so it cannot show the close:
+        // `smtp_check_eof` does (reference binary: `45` then close is L7RSP at once, not a timeout).
+        if !close {
+            expect(SMTP, b"45", b"", close, TIMEOUT, true);
+        }
     }
 }
