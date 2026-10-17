@@ -4345,6 +4345,121 @@ impl Registry {
             },
         });
 
+        // T330: eth.* converters for Ethernet frame analysis (input: binary Ethernet frame)
+        // Frame layout: dst_mac(6) + src_mac(6) + [vlan_tag(4)] + ether_type(2) + payload
+        // vlan_tag: 0x8100 (2 bytes) + TCI (2 bytes, VLAN ID = lower 12 bits)
+
+        self.register_converter(ConvDesc {
+            name: "eth.data",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    if b.len() < 12 {
+                        return None;
+                    }
+                    // Determine offset: 12 if no VLAN, 14 if VLAN tag present
+                    let offset = if b.len() >= 18 && &b[12..14] == b"\x81\x00" {
+                        18usize
+                    } else {
+                        14usize
+                    };
+                    Some(Sample::Bin(b[offset..].to_vec()))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "eth.dst",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    if b.len() < 6 {
+                        return None;
+                    }
+                    Some(Sample::Bin(b[..6].to_vec()))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "eth.hdr",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    if b.len() < 12 {
+                        return None;
+                    }
+                    // Determine header length: 12 if no VLAN, 14 if VLAN tag present
+                    let hdr_len = if b.len() >= 18 && &b[12..14] == b"\x81\x00" {
+                        18usize
+                    } else {
+                        14usize
+                    };
+                    Some(Sample::Bin(b[..hdr_len].to_vec()))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "eth.proto",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    if b.len() < 12 {
+                        return None;
+                    }
+                    // EtherType is at offset 12 (no VLAN) or 14 (with VLAN)
+                    let offset = if b.len() >= 18 && &b[12..14] == b"\x81\x00" {
+                        16usize
+                    } else {
+                        12usize
+                    };
+                    let proto = u16::from_be_bytes([*b.get(offset)?, *b.get(offset + 1)?]);
+                    Some(Sample::Sint(i64::from(proto)))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "eth.src",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    if b.len() < 12 {
+                        return None;
+                    }
+                    Some(Sample::Bin(b[6..12].to_vec()))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "eth.vlan",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    // VLAN tag: 0x8100 at offset 12, TCI at offset 13-14
+                    if b.len() < 18 || &b[12..14] != b"\x81\x00" {
+                        return None;
+                    }
+                    let tci = u16::from_be_bytes([*b.get(14)?, *b.get(15)?]);
+                    Some(Sample::Sint(i64::from(tci & 0x0FFF)))
+                }
+                _ => None,
+            },
+        });
+
         self.register_converter(ConvDesc {
             name: "ip.tos",
             in_type: TypeSpec::Exact(SampleType::Bin),
