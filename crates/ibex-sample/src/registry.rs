@@ -1617,6 +1617,28 @@ impl Registry {
             },
         });
 
+        // T326: req.body_param, `smp_fetch_body_param`: a raw (not URL-decoded) parameter of the
+        // request body, binary like HAProxy's (SMP_T_BIN), so a non-UTF-8 value keeps its bytes.
+        self.register_fetch(FetchDesc {
+            name: "req.body_param",
+            out_type: SampleType::Bin,
+            func: |ctx, args| {
+                let owned;
+                let body: &[u8] = match (ctx.req_body, ctx.htx_slice) {
+                    (Some(b), _) => b,
+                    (_, Some(h)) => {
+                        owned = h.body_bytes();
+                        &owned
+                    }
+                    _ => return None,
+                };
+                let name = args.first().map_or(&b""[..], |s| s.as_bytes());
+                // HAProxy looks only at the flag's first character (`*area == 'i'`).
+                let insensitive = args.get(1).is_some_and(|s| s.starts_with('i'));
+                find_body_param(body, name, insensitive).map(|v| Sample::Bin(v.to_vec()))
+            },
+        });
+
         self.register_fetch(FetchDesc {
             name: "res.body",
             out_type: SampleType::Bin,
@@ -5384,6 +5406,31 @@ fn extract_url_param(query: &str, param: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// T326: `http_find_next_url_param` over a request body: `&` and `;` end a parameter
+/// (`http_is_param_delimiter`), a name matches only at the start of a parameter and only when
+/// `=` follows it, and with no name the value after the first `=` anywhere in the body is
+/// returned. No URL decoding.
+fn find_body_param<'a>(body: &'a [u8], name: &[u8], insensitive: bool) -> Option<&'a [u8]> {
+    let is_delim = |c: &u8| *c == b'&' || *c == b';';
+    let start = if name.is_empty() {
+        body.iter().position(|&c| c == b'=')? + 1
+    } else {
+        let mut pos = 0;
+        loop {
+            let end = pos + name.len();
+            if body.get(end) == Some(&b'=') {
+                let k = body.get(pos..end)?;
+                if if insensitive { k.eq_ignore_ascii_case(name) } else { k == name } {
+                    break end + 1;
+                }
+            }
+            pos += body.get(pos..)?.iter().position(is_delim)? + 1;
+        }
+    };
+    let v = body.get(start..)?;
+    Some(&v[..v.iter().position(is_delim).unwrap_or(v.len())])
 }
 
 /// The address and port `url_ip` and `url_port` read from an absolute-form target
