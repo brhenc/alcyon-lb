@@ -159,23 +159,6 @@ fn len_to_sint(len: usize) -> i64 {
     i64::try_from(len).unwrap_or(i64::MAX)
 }
 
-/// Encode an integer as `HAProxy`'s varint (SPOE encoding, T329).
-/// Values 0-239 are one byte, 240-65535 are two bytes, 65536+ are three bytes.
-#[allow(clippy::cast_possible_truncation)]
-fn encode_varint(n: u32) -> Vec<u8> {
-    if n < 240 {
-        vec![n as u8]
-    } else if n < 65536 {
-        vec![240 + (n >> 8) as u8, n as u8]
-    } else {
-        vec![
-            255 + ((n >> 16) & 0x0F) as u8,
-            (n >> 8) as u8,
-            n as u8,
-        ]
-    }
-}
-
 /// Set once the process is stopping (`when(stopping)`).
 pub static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1360,24 +1343,14 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "res.hdrs_bin",
             out_type: SampleType::Bin,
+            // T329: `smp_fetch_hdrs_bin` on the response, through the same H1 cleanup and
+            // varint as req.hdrs_bin.
             func: |ctx, _args| {
-                let mut out = Vec::new();
-                let hdrs = if let Some(headers) = ctx.res_headers {
-                    headers.to_vec()
-                } else {
-                    CURRENT_RES_HEADERS.with(|h| h.borrow().clone())
-                };
-                for (k, v) in hdrs {
-                    let k_lower = k.to_ascii_lowercase();
-                    let k_len = u32::try_from(k_lower.len()).ok()?;
-                    out.extend_from_slice(&encode_varint(k_len));
-                    out.extend_from_slice(k_lower.as_bytes());
-                    let v_len = u32::try_from(v.len()).ok()?;
-                    out.extend_from_slice(&encode_varint(v_len));
-                    out.extend_from_slice(v.as_bytes());
+                let pairs = |h: &[(String, String)]| hdrs_bin(h.iter().map(|(k, v)| (k.as_str(), v.as_str())), false);
+                if let Some(headers) = ctx.res_headers {
+                    return Some(pairs(headers));
                 }
-                out.extend_from_slice(&[0, 0]);
-                Some(Sample::Bin(out))
+                Some(CURRENT_RES_HEADERS.with(|h| pairs(&h.borrow())))
             },
         });
 
