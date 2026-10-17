@@ -4385,14 +4385,14 @@ impl Registry {
                     let ver = b.first()? >> 4;
                     match ver {
                         4 => {
-                            if b.len() < 24 {
+                            if b.len() < 20 {
                                 return None;
                             }
                             let octets: [u8; 4] = b[16..20].try_into().ok()?;
                             Some(Sample::Ipv4(Ipv4Addr::from(octets)))
                         }
                         6 => {
-                            if b.len() < 56 {
+                            if b.len() < 40 {
                                 return None;
                             }
                             let octets: [u8; 16] = b[24..40].try_into().ok()?;
@@ -4411,86 +4411,18 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, _args| match smp {
-                Sample::Bin(b) => {
-                    let ver = b.first()? >> 4;
-                    match ver {
-                        4 => {
-                            if b.len() < 20 {
-                                return None;
-                            }
-                            let ihl = usize::from(b[0] & 0x0f) * 4;
-                            if ihl < 20 || ihl > b.len() {
-                                return None;
-                            }
-                            Some(Sample::Bin(b[..ihl].to_vec()))
-                        }
-                        6 => {
-                            if b.len() < 40 {
-                                return None;
-                            }
-                            let mut next = *b.get(6)?;
-                            let mut len = 40usize;
-                            while next != 6 && next != 17 {
-                                if b.len() < len + 2 {
-                                    return None;
-                                }
-                                let ext_len = usize::from(*b.get(len + 1)?) * 8 + 8;
-                                next = *b.get(len)?;
-                                len += ext_len;
-                            }
-                            if len > b.len() {
-                                return None;
-                            }
-                            Some(Sample::Bin(b[..len].to_vec()))
-                        }
-                        _ => None,
-                    }
-                }
+                Sample::Bin(b) => Some(Sample::Bin(b.get(..ip_header_length(&b)?)?.to_vec())),
                 _ => None,
             },
         });
 
-        // T330: ip.data - payload after IP header
+        // T330: ip.data - payload after IP header (empty for a header-only packet)
         self.register_converter(ConvDesc {
             name: "ip.data",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, _args| match smp {
-                Sample::Bin(b) => {
-                    let ver = b.first()? >> 4;
-                    match ver {
-                        4 => {
-                            if b.len() < 20 {
-                                return None;
-                            }
-                            let ihl = usize::from(b[0] & 0x0f) * 4;
-                            if ihl < 20 || ihl >= b.len() {
-                                return None;
-                            }
-                            Some(Sample::Bin(b[ihl..].to_vec()))
-                        }
-                        6 => {
-                            if b.len() < 40 {
-                                return None;
-                            }
-                            let mut next = *b.get(6)?;
-                            let mut len = 40usize;
-                            while next != 6 && next != 17 {
-                                if b.len() < len + 2 {
-                                    return None;
-                                }
-                                let ext_len = usize::from(*b.get(len + 1)?) * 8 + 8;
-                                next = *b.get(len)?;
-                                len += ext_len;
-                            }
-                            if len >= b.len() {
-                                return None;
-                            }
-                            Some(Sample::Bin(b[len..].to_vec()))
-                        }
-                        _ => None,
-                    }
-                }
+                Sample::Bin(b) => Some(Sample::Bin(b.get(ip_header_length(&b)?..)?.to_vec())),
                 _ => None,
             },
         });
@@ -5959,6 +5891,28 @@ fn url_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// T330: the length of an IPv4 or IPv6 header including every IPv6 extension header, or None
+/// when the packet is shorter or the length is 0 (`ip_header_length` in `net_helper.c`).
+fn ip_header_length(b: &[u8]) -> Option<usize> {
+    let len = match b.first()? >> 4 {
+        4 => usize::from(b[0] & 0x0f) * 4,
+        6 => {
+            if b.len() < 40 {
+                return None;
+            }
+            let mut next = *b.get(6)?;
+            let mut len = 40usize;
+            while next != 6 && next != 17 {
+                next = *b.get(len)?;
+                len += usize::from(*b.get(len + 1)?) * 8 + 8;
+            }
+            len
+        }
+        _ => return None,
+    };
+    (len != 0 && len <= b.len()).then_some(len)
 }
 
 #[cfg(test)]

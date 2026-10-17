@@ -5,7 +5,6 @@
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +53,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -81,40 +72,10 @@ fn http_cfg(global: &str, body: &str) -> String {
     )
 }
 
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
-        }
-    });
-    addr
-}
-
 /// The body of the answer to `req` (what follows the first empty line).
 fn body(addr: SocketAddr, req: &[u8]) -> String {
     let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
-}
-
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
+    s.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {s:?}"), |(_, b)| b.to_string())
 }
 
 const CFG: &str = r#"
@@ -126,12 +87,8 @@ frontend fe
 #[test]
 fn ip_converters_extract_ipv4_and_ipv6_fields() {
     let addr = common::reserve_addr();
-    let be = backend(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n");
-    let cfg = http_cfg("", &format!(
-        "backend be\n  server s1 {be}\n{CFG}",
-    ).replace("{A}", &addr.to_string()));
-    let (ibex, _sock) = start("ip-converters", &cfg, &[addr]);
-    let _ = ibex;
+    let cfg = http_cfg("", &CFG.replace("{A}", &addr.to_string()));
+    let (_ibex, _sock) = start("ip-converters", &cfg, &[addr]);
 
     // Expected output for IPv4 packet:
     // ip.src: 192.0.2.1
@@ -146,4 +103,31 @@ fn ip_converters_extract_ipv4_and_ipv6_fields() {
 
     let expected = "192.0.2.1|198.51.100.2|4510003C1C46400040060000C0000201C6336402|9C4001BB0102030400000000A002FAF000000000020405B40402080A112233440000000001030307|2001:db8::1|2001:db8::2|600000000028064020010DB800000000000000000000000120010DB8000000000000000000000002|9C4001BB0102030400000000A002FAF000000000020405B40402080A112233440000000001030307";
     assert_eq!(body(addr, GET), expected);
+}
+
+/// T330 review B1-B3: a bare 20-byte v4 or 40-byte v6 header is enough for `ip.dst` (also on the
+/// output of `ip.hdr`) and gives an empty `ip.data`; an IHL below 5 still splits the packet, and an
+/// IHL of 0 gives no sample. Expected values from `HAProxy` 3.5-dev8.
+#[test]
+fn ip_converters_bare_headers_and_short_ihl() {
+    const V4: &str = "4510003c1c46400040060000c0000201c6336402";
+    const V6: &str = "600000000014064020010db800000000000000000000000120010db8000000000000000000000002";
+    let line = |k: &str, h: &str| {
+        format!("{k}=[%[bin({h}),ip.src]|%[bin({h}),ip.dst]|%[bin({h}),ip.hdr,ip.dst]|%[bin({h}),ip.data,length]]")
+    };
+    let lf = format!(
+        "{}\\n{}\\nI1=[%[bin(41000000aabb),ip.hdr,hex]|%[bin(41000000aabb),ip.data,hex]]\\nI0=[%[bin(40000000aabb),ip.hdr,hex]|%[bin(40000000aabb),ip.data,hex]]",
+        line("V4", V4),
+        line("V6", V6)
+    );
+    let addr = common::reserve_addr();
+    let fe = format!("frontend fe\n  bind {addr}\n  http-request return status 200 content-type text/plain lf-string \"{lf}\"\n");
+    let (_ibex, _sock) = start("ip-bare", &http_cfg("", &fe), &[addr]);
+    assert_eq!(
+        body(addr, GET),
+        "V4=[192.0.2.1|198.51.100.2|198.51.100.2|0]\n\
+         V6=[2001:db8::1|2001:db8::2|2001:db8::2|0]\n\
+         I1=[41000000|AABB]\n\
+         I0=[|]"
+    );
 }
