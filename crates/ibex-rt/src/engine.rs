@@ -2411,6 +2411,18 @@ fn stream_facts(sess: &TcpSession, status: Option<u16>) -> ibex_sample::StreamFa
 
 /// The sample context a log line's `%[...]` reads.
 fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>) -> SampleContext<'a> {
+    // T331: compute request_date from first_byte
+    let request_date = s.log.first_byte.map(|fb| {
+        let delta = fb.duration_since(s.log.start);
+        let (secs, ms) = s.log.date;
+        let delta_secs = delta.as_secs().cast_signed();
+        let delta_ms = delta.subsec_millis();
+        let total_ms = ms + delta_ms;
+        let carry = total_ms / 1000;
+        let new_secs = secs + delta_secs + i64::from(carry);
+        let new_ms = total_ms % 1000;
+        (new_secs, new_ms)
+    }).or(Some(s.log.date));
     SampleContext {
         proxies: Some(view),
         stick: Some(stick),
@@ -2437,6 +2449,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         captures_res_hdr: Some(&s.log.res_captures),
         unique_id: s.log.unique_id.as_deref(),
         accept_date: Some(s.log.date),
+        request_date,
         last_rule: last_rule_at(s.log.last_rule),
         prio: (s.log.prio_class, s.log.prio_offset),
         ..Default::default()
@@ -10540,6 +10553,7 @@ impl EngineDispatcher<'_> {
                         captures_req_hdr: Some(&$s.log.req_captures),
                         unique_id: $s.log.unique_id.as_deref(),
                         accept_date: Some($s.log.date),
+                        request_date: Some($s.log.date),
                         last_rule: last_rule_at($s.log.last_rule),
                         prio: ($s.log.prio_class, $s.log.prio_offset),
                         be_max_retries: Some(be_retries),
