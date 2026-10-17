@@ -188,6 +188,7 @@ mod no_log;
 mod node_description;
 mod nofile_limit;
 mod nul_in_text_output;
+mod ocsp_check_err_str;
 mod ops_patref_cli;
 mod ops_t171;
 mod option_persist;

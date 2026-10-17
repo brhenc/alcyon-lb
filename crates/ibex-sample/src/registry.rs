@@ -4498,6 +4498,33 @@ impl Registry {
                 _ => None,
             },
         });
+        // T328: ocsp_check_err_str converter
+        self.register_converter(ConvDesc {
+            name: "ocsp_check_err_str",
+            in_type: TypeSpec::Exact(SampleType::Sint),
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, _args| match smp {
+                Sample::Sint(n) => {
+                    let s = match n {
+                        1 => "OCSP verification failed",
+                        2 => "OCSP unknown cert",
+                        3 => "OCSP response(s) invalid",
+                        4 => "OCSP response signature verification failure",
+                        5 => "OCSP response not yet valid (contains a date in the future)",
+                        6 => "OCSP response has expired",
+                        7 => "no OCSP response available for certificate or responder unreachable",
+                        8 => "unable to get issuer certificate",
+                        9 => "CID mismatch",
+                        10 => "Memory allocation failed",
+                        11 => "Timeout",
+                        _ => "",
+                    };
+                    Some(Sample::Str(s.to_string()))
+                },
+                _ => None,
+            },
+        });
+
     }
 
     /// Applies a chain of converters to a sample value, with the runtime state the context
