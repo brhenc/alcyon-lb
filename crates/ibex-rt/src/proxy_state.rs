@@ -441,7 +441,10 @@ fn fetch_arg(name: &str) -> Option<ArgSpec> {
     let at = |kind, pos| Some(ArgSpec { kind, pos, optional: false });
     match name {
         "nbsrv" | "be_conn_free" | "be_sess_rate" => at(ArgKind::Backend, 0),
-        "srv_is_up" | "srv_conn" | "srv_conn_free" | "srv_sess_rate" => at(ArgKind::Server, 0),
+        // T331: the weight fetches name their server as `srv_conn` does.
+        "srv_is_up" | "srv_conn" | "srv_conn_free" | "srv_sess_rate" | "srv_weight" | "srv_iweight" | "srv_uweight" => {
+            at(ArgKind::Server, 0)
+        }
         "fe_conn" | "fe_sess_rate" | "fe_req_rate" => at(ArgKind::Frontend, 0),
         "http_auth" | "http_auth_group" => at(ArgKind::Userlist, 0),
         "table_cnt" | "table_avl" => at(ArgKind::Table, 0),

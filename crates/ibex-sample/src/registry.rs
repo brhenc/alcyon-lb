@@ -309,8 +309,12 @@ pub struct ServerState {
     pub maxconn: Option<u32>,
     /// The streams assigned to the server over the last second (`srv_sess_rate`).
     pub sess_rate: i64,
+    /// T331: `srv_weight`: the effective weight (`srv->cur_eweight` scaled by `wmult`/`wdiv`).
+    /// The user weight while Ibex has no `slowstart` or other effective-weight scaling.
     pub weight: u32,
+    /// T331: `srv_iweight`: the configured weight (`srv->iweight`).
     pub iweight: u32,
+    /// T331: `srv_uweight`: the user weight as `set server weight` leaves it (`srv->uweight`).
     pub uweight: u32,
 }
 
@@ -1832,6 +1836,7 @@ impl Registry {
             out_type: SampleType::Sint,
             func: |ctx, args| server_fetch(ctx, args, conn_free),
         });
+        // T331: `srv_weight`, `srv_iweight`, `srv_uweight` ([`ServerState`]'s weights).
         self.register_fetch(FetchDesc {
             name: "srv_weight",
             out_type: SampleType::Sint,
