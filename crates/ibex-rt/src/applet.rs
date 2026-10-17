@@ -1347,10 +1347,14 @@ impl CliApplet {
             return;
         } else if first == Some("all") {
             crate::engine::clear_proxy_counters(ctx.proxies, None);
+            crate::engine::MAX_CONN_RATE.store(0, std::sync::atomic::Ordering::Relaxed);
+            crate::engine::MAX_SESS_RATE.store(0, std::sync::atomic::Ordering::Relaxed);
             self.finish_msg("");
             return;
         } else {
             crate::engine::clear_proxy_maxima(ctx.proxies);
+            crate::engine::MAX_CONN_RATE.store(0, std::sync::atomic::Ordering::Relaxed);
+            crate::engine::MAX_SESS_RATE.store(0, std::sync::atomic::Ordering::Relaxed);
             self.finish_msg("");
             return;
         }

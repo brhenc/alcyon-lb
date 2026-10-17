@@ -1223,6 +1223,26 @@ pub struct RateCtr {
     prev: AtomicU32,
 }
 
+
+impl RateCtr {
+    /// Create a new zeroed rate counter, suitable for a `static`.
+    pub const fn new() -> Self {
+        Self {
+            head: AtomicU64::new(0),
+            prev: AtomicU32::new(0),
+        }
+    }
+}
+
+/// Process-wide connection rate counter (`ConnRate` / `MaxConnRate`).
+/// Ticked once per accepted client connection by any engine thread.
+pub static GLOBAL_CONN_RATE: std::sync::Mutex<RateCtr> = std::sync::Mutex::new(RateCtr::new());
+/// Process-wide session rate counter (`SessRate` / `MaxSessRate`).
+pub static GLOBAL_SESS_RATE: std::sync::Mutex<RateCtr> = std::sync::Mutex::new(RateCtr::new());
+/// Maximum connection rate ever recorded (`MaxConnRate`).
+pub static MAX_CONN_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Maximum session rate ever recorded (`MaxSessRate`).
+pub static MAX_SESS_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 #[allow(clippy::cast_possible_truncation)]
 impl RateCtr {
     const PERIOD_MS: u32 = 1000;
@@ -5257,6 +5277,19 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             proxy.counters().cum_conn.fetch_add(1, Ordering::Relaxed);
             proxy.counters().fe_sess_rate.tick();
             proxy.counters().fe_conn_rate.tick();
+            // Global process-wide rate counters (ConnRate / SessRate).
+            {
+                let g_conn = crate::engine::GLOBAL_CONN_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                g_conn.tick();
+                let rate = g_conn.rate();
+                crate::engine::MAX_CONN_RATE.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), Ordering::Relaxed);
+            }
+            {
+                let g_sess = crate::engine::GLOBAL_SESS_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                g_sess.tick();
+                let rate = g_sess.rate();
+                crate::engine::MAX_SESS_RATE.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), Ordering::Relaxed);
+            }
             // `rate_max` counts sessions: it is raised once the TLS handshake is done, not here.
             let conn_rate = proxy.counters().fe_conn_rate.rate();
             proxy.txn_counters().fe.conn_rate_max.fetch_max(u32::try_from(conn_rate).unwrap_or(u32::MAX), Ordering::Relaxed);
