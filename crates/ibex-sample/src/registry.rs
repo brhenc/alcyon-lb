@@ -1317,8 +1317,26 @@ impl Registry {
             name: "res.hdr_cnt",
             out_type: SampleType::Sint,
             func: |ctx, args| {
-                let name = args.first()?;
-                let count = get_all_res_headers(ctx, name).len();
+                let name = args.first().cloned();
+                let count: usize = if let Some(ref n) = name {
+                    get_all_res_headers(ctx, n).iter().map(|v| v.split(',').count()).sum()
+                } else {
+                    get_all_res_headers_all(ctx).iter().map(|(_k, v)| v.split(',').count()).sum()
+                };
+                Some(Sample::Sint(len_to_sint(count)))
+            },
+        });
+        // T327: count header lines (full values), like res.hdr_cnt but counts lines not values
+        self.register_fetch(FetchDesc {
+            name: "res.fhdr_cnt",
+            out_type: SampleType::Sint,
+            func: |ctx, args| {
+                let name = args.first().cloned();
+                let count = if let Some(ref n) = name {
+                    get_all_res_headers(ctx, n).len()
+                } else {
+                    get_all_res_headers_all(ctx).len()
+                };
                 Some(Sample::Sint(len_to_sint(count)))
             },
         });
@@ -4920,6 +4938,24 @@ fn get_all_res_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     matches
 }
 
+
+/// Get all response headers without filtering by name. T327 helper for `res.hdr_cnt/fhdr_cnt` without a name.
+fn get_all_res_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
+    let mut all = Vec::new();
+    if let Some(headers) = ctx.res_headers {
+        for (k, v) in headers {
+            all.push((k.clone(), v.clone()));
+        }
+    }
+    if all.is_empty() {
+        CURRENT_RES_HEADERS.with(|hdrs| {
+            for (k, v) in hdrs.borrow().iter() {
+                all.push((k.clone(), v.clone()));
+            }
+        });
+    }
+    all
+}
 fn extract_cookies(cookie_header: &str) -> Vec<(&str, &str)> {
     let mut list = Vec::new();
     for part in cookie_header.split(';') {

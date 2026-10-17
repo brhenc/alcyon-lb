@@ -204,6 +204,7 @@ mod proxy_protocol;
 mod proxy_v2_unique_id;
 mod reads_per_request;
 mod redispatch;
+mod res_hdr_cnt_values;
 mod regex_bytes;
 mod regex_group_refs;
 mod regex_nocapture;
