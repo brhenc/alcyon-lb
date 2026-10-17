@@ -899,14 +899,10 @@ impl Registry {
             name: "path",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                let uri = get_context_uri(ctx)?;
-                let (prefix, path, _) = split_uri(uri);
                 // `http_parse_path`: a target that is neither an absolute path nor an
                 // absolute URI (`*`, `host:port`, what `replace-path a Y` leaves) has none.
-                if prefix.is_empty() && !uri.starts_with('/') {
-                    return None;
-                }
-                Some(Sample::Str(path.to_string()))
+                let path = http_parse_path(get_context_uri(ctx)?)?;
+                Some(Sample::Str(path.split('?').next().unwrap_or_default().to_string()))
             },
         });
 
@@ -914,16 +910,8 @@ impl Registry {
             name: "pathq",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                let uri = get_context_uri(ctx)?;
-                let (prefix, path, query) = split_uri(uri);
-                if prefix.is_empty() && !uri.starts_with('/') {
-                    return None;
-                }
-                if query.is_empty() {
-                    Some(Sample::Str(path.to_string()))
-                } else {
-                    Some(Sample::Str(format!("{path}?{query}")))
-                }
+                let path = http_parse_path(get_context_uri(ctx)?)?;
+                Some(Sample::Str(path.to_string()))
             },
         });
 
@@ -1180,16 +1168,8 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "baseq",
             out_type: SampleType::Str,
-            func: |ctx, args| {
-                let base_smp = fetch_base(ctx, args)?;
-                let Sample::Str(b) = base_smp else { return None };
-                let uri = get_context_uri(ctx)?;
-                let (_, _, query) = split_uri(uri);
-                if query.is_empty() {
-                    Some(Sample::Str(b))
-                } else {
-                    Some(Sample::Str(format!("{b}?{query}")))
-                }
+            func: |ctx, _args| {
+                fetch_base_path(ctx, true)
             },
         });
 
@@ -1729,18 +1709,15 @@ impl Registry {
             },
         });
 
-        // T327: capture.req.uri returns path+query only, without scheme/authority.
+        // T327: capture.req.uri is the path of the request target with its query, as the
+        // oracle's `http_parse_path` finds it: no sample for `*`, an authority or an absolute
+        // URI without a path.
         self.register_fetch(FetchDesc {
             name: "capture.req.uri",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                let uri = get_context_uri(ctx)?;
-                let (_prefix, path, query) = split_uri(uri);
-                if query.is_empty() {
-                    Some(Sample::Str(path.to_string()))
-                } else {
-                    Some(Sample::Str(format!("{path}?{query}")))
-                }
+                let path = http_parse_path(get_context_uri(ctx)?)?;
+                Some(Sample::Str(path.to_string()))
             },
         });
 
@@ -4621,11 +4598,48 @@ fn get_context_res_version<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
 }
 
 fn fetch_base(ctx: &SampleContext, _args: &[String]) -> Option<Sample> {
-    // T327: always use the Host header for the host part, even for absolute-form URIs.
-    let uri = get_context_uri(ctx)?;
-    let (_prefix, path, _) = split_uri(uri);
-    let host: String = get_req_header(ctx, "host").unwrap_or_default().clone();
-    Some(Sample::Str(format!("{host}{path}")))
+    fetch_base_path(ctx, false)
+}
+
+/// T327: `base` (`with_query` false) and `baseq`, as the oracle's `smp_fetch_base`: the Host
+/// header, even for an absolute-form target, then the target's path (`http_parse_path`) up to
+/// `?` (or with its query for `baseq`) when it starts with `/`. Without a Host header, or with
+/// an empty one, it is what `path` (or `pathq`) gives.
+fn fetch_base_path(ctx: &SampleContext, with_query: bool) -> Option<Sample> {
+    let path = http_parse_path(get_context_uri(ctx)?);
+    let cut = |p: &'_ str| -> usize {
+        if with_query {
+            p.len()
+        } else {
+            p.find('?').unwrap_or(p.len())
+        }
+    };
+    let Some(mut out) = get_req_header(ctx, "host").filter(|h| !h.is_empty()) else {
+        let p = path?;
+        return Some(Sample::Str(p[..cut(p)].to_string()));
+    };
+    if let Some(p) = path.filter(|p| p.starts_with('/')) {
+        out.push_str(&p[..cut(p)]);
+    }
+    Some(Sample::Str(out))
+}
+
+/// T327: the path of the request target `uri` as the oracle's `http_parse_path` finds it:
+/// all of an absolute path; for an absolute URI (any scheme, any case) what follows the
+/// authority, which may start with `?` or `#`; nothing for `*`, an authority (CONNECT) or an
+/// absolute URI that ends with its authority.
+fn http_parse_path(uri: &str) -> Option<&str> {
+    let b = uri.as_bytes();
+    match b.first()? {
+        b'*' => return None,
+        b'/' => return Some(uri),
+        c if !c.is_ascii_alphabetic() => return None,
+        _ => {}
+    }
+    let scheme = 1 + b[1..].iter().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.')).count();
+    let rest = uri[scheme..].strip_prefix("://")?;
+    let path = &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..];
+    (!path.is_empty()).then_some(path)
 }
 
 fn fetch_req_cook(ctx: &SampleContext, args: &[String]) -> Option<Sample> {

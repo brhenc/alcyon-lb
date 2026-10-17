@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T327: absolute-form URI fetches
+//! T327: `base`, `baseq`, `capture.req.uri`, `path` and `pathq` on absolute-form and other
+//! request targets, as the oracle's `http_parse_path` and `smp_fetch_base` give them.
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +54,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -72,80 +64,63 @@ fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     out
 }
 
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
-        }
-    });
-    addr
-}
-
 /// The body of the answer to `req` (what follows the first empty line).
 fn body(addr: SocketAddr, req: &[u8]) -> String {
     let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
+    s.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {s:?}"), |(_, b)| b.to_string())
 }
-
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
-}
-
-// T327: tests for absolute-form URI handling in base, baseq, capture.req.uri, path, url
 
 #[test]
 fn test_absolute_uri_fetches() {
-    let a = common::reserve_addr();
-    let be = backend(b"HTTP/1.0 204\r\n\r\n");
+    // No backend: `http-request return` answers every request.
     const CFG: &str = r#"
+global
+  stats socket {sock} level admin
+defaults
+  mode http
+  timeout connect 1s
+  timeout client 5s
+  timeout server 5s
 frontend fe
   bind {A}
-  http-request return status 200 content-type text/plain lf-string "[%[base]|%[baseq]|%[capture.req.uri]|%[path]|%[url]]"
-default_backend be
-backend be
-  server s1 {A}
+  http-request return status 200 content-type text/plain lf-string "[%[base]|%[baseq]|%[capture.req.uri]|%[path]|%[url]|%[pathq]]"
 "#;
-    let cfg = http_cfg("", &CFG.replace("{A}", &a.to_string()));
-    let (ibex, _sock) = start("t327", &cfg, &[a]);
+    let a = common::reserve_addr();
+    let (_ibex, _sock) = start("t327-absolute-uri", &CFG.replace("{A}", &a.to_string()), &[a]);
 
-    // Test 1: relative URI (path-only), should work same as before
-    let req1 = b"GET /a/b.html?x=1&y=%41b&x=2 HTTP/1.1\r\nHost: a\r\nX-Foo: 1\r\nX-Foo: 2, 3\r\nCookie: a=1; b=2\r\nCookie: a=3\r\nX-L: a, b\r\nUser-Agent: Mozilla/5.0 (X11)\r\nConnection: close\r\n\r\n";
-    let expected1 = "[a/a/b.html|a/a/b.html?x=1&y=%41b&x=2|/a/b.html?x=1&y=%41b&x=2|/a/b.html|/a/b.html?x=1&y=%41b&x=2]";
-    assert_eq!(body(a, req1), expected1, "relative URI fetches mismatch");
-
-    // Test 2: absolute-form URI with different-case authority, should use Host header
-    let req2 = b"POST http://Example.com:8080/p;m?q HTTP/1.0\r\nHost: example.com:8080\r\nContent-Length: 3\r\n\r\nabc";
-    let expected2 = "[example.com:8080/p;m|example.com:8080/p;m?q|/p;m?q|/p;m|http://Example.com:8080/p;m?q]";
-    assert_eq!(body(a, req2), expected2, "absolute-form URI fetches mismatch (test 2)");
-
-    // Test 3: absolute-form URI with different-case authority, Host header case preserved
-    let req3 = b"GET http://h.example/ HTTP/1.1\r\nHost: H.example\r\nConnection: close\r\n\r\n";
-    let expected3 = "[H.example/|H.example/|/|/|http://h.example/]";
-    assert_eq!(body(a, req3), expected3, "absolute-form URI fetches mismatch (test 3)");
+    // Each row: the request, and the answer HAProxy 3.5-dev8 gives for it.
+    let rows: &[(&[u8], &str)] = &[
+        // An absolute path.
+        (
+            b"GET /a/b.html?x=1&y=%41b&x=2 HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+            "[a/a/b.html|a/a/b.html?x=1&y=%41b&x=2|/a/b.html?x=1&y=%41b&x=2|/a/b.html|/a/b.html?x=1&y=%41b&x=2|/a/b.html?x=1&y=%41b&x=2]",
+        ),
+        // Absolute form: the host comes from the Host header, not the authority.
+        (
+            b"POST http://Example.com:8080/p;m?q HTTP/1.0\r\nHost: example.com:8080\r\nContent-Length: 3\r\n\r\nabc",
+            "[example.com:8080/p;m|example.com:8080/p;m?q|/p;m?q|/p;m|http://Example.com:8080/p;m?q|/p;m?q]",
+        ),
+        (b"GET http://h.example/ HTTP/1.1\r\nHost: H.example\r\nConnection: close\r\n\r\n", "[H.example/|H.example/|/|/|http://h.example/|/]"),
+        // `*` has no path: no capture.req.uri, and base is the host alone.
+        (b"OPTIONS * HTTP/1.1\r\nHost: h.example\r\nConnection: close\r\n\r\n", "[h.example|h.example|||*|]"),
+        // Any scheme, in any case.
+        (b"GET HTTP://h.example/x?y HTTP/1.1\r\nHost: h.example\r\nConnection: close\r\n\r\n", "[h.example/x|h.example/x?y|/x?y|/x|HTTP://h.example/x?y|/x?y]"),
+        (b"GET ftp://h.example/x?y HTTP/1.1\r\nHost: h.example\r\nConnection: close\r\n\r\n", "[h.example/x|h.example/x?y|/x?y|/x|ftp://h.example/x?y|/x?y]"),
+        // The path of an absolute URI with only a query is `?q=1`: base appends nothing.
+        (b"GET http://h.example?q=1 HTTP/1.1\r\nHost: h.example\r\nConnection: close\r\n\r\n", "[h.example|h.example|?q=1||http://h.example?q=1|?q=1]"),
+        // No Host header, or an empty one: base is what path gives, baseq what pathq gives.
+        (b"GET /x?y HTTP/1.0\r\n\r\n", "[/x|/x?y|/x?y|/x|/x?y|/x?y]"),
+        (b"GET /x?y HTTP/1.0\r\nHost:\r\n\r\n", "[/x|/x?y|/x?y|/x|/x?y|/x?y]"),
+        (b"GET http://h.example?q=1 HTTP/1.0\r\n\r\n", "[|?q=1|?q=1||http://h.example?q=1|?q=1]"),
+        // The H1 parser gives an absolute URI without a path the path `/`.
+        (b"GET http://h.example HTTP/1.1\r\nHost: h.example\r\nConnection: close\r\n\r\n", "[h.example/|h.example/|/|/|http://h.example/|/]"),
+    ];
+    let mut bad = Vec::new();
+    for (i, (req, want)) in rows.iter().enumerate() {
+        let got = body(a, req);
+        if got != *want {
+            bad.push(format!("row {i}: got {got}, want {want}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
