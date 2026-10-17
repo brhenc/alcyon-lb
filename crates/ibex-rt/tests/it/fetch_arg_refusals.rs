@@ -104,3 +104,42 @@ fn ibex_c_resolves_the_arguments_of_the_counter_fetches_as_haproxy_does() {
     }
     assert!(wrong.is_empty(), "{} of {} cases differ from HAProxy:\n{}", wrong.len(), ARG_REFUSED.len() + ACCEPTED.len(), wrong.join("\n"));
 }
+
+/// T341: a fetch that names one backend, server, frontend or table takes nothing after it, and
+/// `srv_id`/`srv_name` take nothing at all. `make_arg_list` stops at the last argument the
+/// fetch has and refuses what follows. Measured on 3.5-dev8-885761-29, 2026-10-17, `haproxy -c`
+/// with `http-request set-var(txn.r) <expr>` in frontend `fe`; all accepted by Ibex before.
+#[test]
+fn a_fetch_given_more_arguments_than_it_has_is_refused() {
+    let refused: &[(&str, &str)] = &[
+        ("srv_uweight(be/s1,x)", "fetch method 'srv_uweight' : expected ')' before ',x)'."),
+        ("srv_iweight(be/s1,x)", "fetch method 'srv_iweight' : expected ')' before ',x)'."),
+        ("srv_weight(be/s1,x)", "fetch method 'srv_weight' : expected ')' before ',x)'."),
+        ("srv_conn(be/s1,x)", "fetch method 'srv_conn' : expected ')' before ',x)'."),
+        ("srv_conn(be/s1,x,y)", "fetch method 'srv_conn' : expected ')' before ',x,y)'."),
+        ("srv_conn(be/s1,)", "fetch method 'srv_conn' : expected ')' before ',)'."),
+        ("srv_conn_free(be/s1,x)", "fetch method 'srv_conn_free' : expected ')' before ',x)'."),
+        ("srv_is_up(be/s1,x)", "fetch method 'srv_is_up' : expected ')' before ',x)'."),
+        ("srv_sess_rate(be/s1,x)", "fetch method 'srv_sess_rate' : expected ')' before ',x)'."),
+        ("srv_id(be/s1)", "fetch method 'srv_id' : expected ')' before 'be/s1)'."),
+        ("srv_name(be/s1,x)", "fetch method 'srv_name' : expected ')' before 'be/s1,x)'."),
+        ("nbsrv(be,x)", "fetch method 'nbsrv' : expected ')' before ',x)'."),
+        ("nbsrv(be,)", "fetch method 'nbsrv' : expected ')' before ',)'."),
+        ("be_sess_rate(be,x)", "fetch method 'be_sess_rate' : expected ')' before ',x)'."),
+        ("be_conn_free(be,x)", "fetch method 'be_conn_free' : expected ')' before ',x)'."),
+        ("fe_conn(fe,x)", "fetch method 'fe_conn' : expected ')' before ',x)'."),
+        ("fe_sess_rate(fe,x)", "fetch method 'fe_sess_rate' : expected ')' before ',x)'."),
+        ("fe_req_rate(fe,x)", "fetch method 'fe_req_rate' : expected ')' before ',x)'."),
+        ("table_cnt(fe,x)", "fetch method 'table_cnt' : expected ')' before ',x)'."),
+        ("table_avl(fe,x)", "fetch method 'table_avl' : expected ')' before ',x)'."),
+    ];
+    for (i, (expr, text)) in refused.iter().enumerate() {
+        let (code, out) = check(900 + i, &config(&format!("http-request set-var(txn.r) {expr}"), ""));
+        assert_eq!(code, Some(1), "`{expr}` must be refused: {out}");
+        assert!(out.contains(text), "`{expr}`: expected {text:?} in: {out}");
+    }
+    for (i, expr) in ["srv_conn(be/s1)", "srv_uweight(be/s1)", "nbsrv(be)", "fe_conn"].iter().enumerate() {
+        let (code, out) = check(950 + i, &config(&format!("http-request set-var(txn.r) {expr}"), ""));
+        assert_eq!(code, Some(0), "`{expr}` must load: {out}");
+    }
+}

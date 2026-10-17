@@ -503,6 +503,18 @@ fn converter_arg(name: &str) -> Option<ArgSpec> {
     (name == "in_table" || TABLE_CONVERTERS.contains(&name)).then_some(ArgSpec { kind: ArgKind::Table, pos: 0, optional: false })
 }
 
+/// T341: how many arguments a fetch that names one proxy, server or table has (`ARG1`), or
+/// none (`srv_id`, `srv_name`): `make_arg_list` refuses what follows the last one.
+fn fetch_max_args(name: &str) -> Option<usize> {
+    match name {
+        "srv_id" | "srv_name" => Some(0),
+        "nbsrv" | "be_conn_free" | "be_sess_rate" | "srv_is_up" | "srv_conn" | "srv_conn_free" | "srv_sess_rate"
+        | "srv_weight" | "srv_iweight" | "srv_uweight" | "fe_conn" | "fe_sess_rate" | "fe_req_rate" | "table_cnt"
+        | "table_avl" => Some(1),
+        _ => None,
+    }
+}
+
 /// The array forms take the element and the counter or table both: `sc_get_gpc(<idx>,<ctr>)`,
 /// `src_get_gpc(<idx>,<table>)`, `table_gpc(<idx>,<table>)`. `HAProxy` refuses one written with
 /// less (a table may be left empty, not left out): "missing arguments (got 1/2), type 'table'
@@ -687,6 +699,11 @@ pub fn check_expr(config: &Config, registry: &Registry, at: Where<'_>, expr: &st
         if let Some(msg) = array_arity(c, args.len(), true) {
             return Err(msg);
         }
+    }
+    if let Some(max) = fetch_max_args(&e.fetch_name).filter(|m| e.fetch_args.len() > *m) {
+        let rest = e.fetch_args[max..].join(",");
+        let rest = if max == 0 { rest } else { format!(",{rest}") };
+        return Err(format!("fetch method '{}' : expected ')' before '{rest})'.", e.fetch_name));
     }
     if let Some(spec) = fetch_arg(&e.fetch_name) {
         let what = format!("{} '{}'{in_proxy}", if acl { "ACL keyword" } else { "sample fetch keyword" }, e.fetch_name);
