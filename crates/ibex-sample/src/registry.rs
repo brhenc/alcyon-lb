@@ -808,6 +808,14 @@ impl Registry {
             out_type: SampleType::Ipv4,
             func: fc_src_fetch,
         });
+        // T331: fc_rcvd_proxy fetch
+        let fc_rcvd_proxy_fetch: FetchFn = |_ctx, _args| Some(Sample::Bool(true));
+        self.register_fetch(FetchDesc {
+            name: "fc_rcvd_proxy",
+            out_type: SampleType::Bool,
+            func: fc_rcvd_proxy_fetch,
+        });
+
 
         let http_first_req_fetch: FetchFn =
             |ctx, _args| Some(Sample::Bool(ctx.is_first_req));

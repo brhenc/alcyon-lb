@@ -96,6 +96,7 @@ mod fetch_arg_refusals;
 mod fetch_availability_by_rule;
 mod fetch_counters;
 mod fetch_edge_cases;
+mod fc_rcvd_proxy;
 mod forwardfor_no_room;
 mod getsocks_blocking;
 mod global_maxconn;
