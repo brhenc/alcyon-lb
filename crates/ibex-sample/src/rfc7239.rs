@@ -7,7 +7,7 @@
 //! formatting `option forwarded` uses. Each rule here was measured on `HAProxy`
 //! 3.5-dev8-885761-29 (see `tests/rfc7239.rs`).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 use crate::registry::Registry;
@@ -21,10 +21,6 @@ fn is_obf_char(c: char) -> bool {
 /// `_` and at least one more character of `[A-Za-z0-9._-]`.
 fn is_obf(s: &str) -> bool {
     s.len() >= 2 && s.starts_with('_') && s[1..].chars().all(is_obf_char)
-}
-
-fn is_tchar(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
 }
 
 /// The inside of an IPv6 literal: hexadecimal groups only, no embedded IPv4, no zone.
@@ -114,98 +110,274 @@ pub fn valid_host(s: &str) -> bool {
     port.is_none_or(is_port)
 }
 
-type Pair<'a> = (&'a str, String);
+// `http_validate_7239_header()` and the `http_7239_extract_*()` helpers of src/http_ext.c,
+// ported as they are: one forwarded-element, parameters separated by ';' with no whitespace,
+// each of for/by/host/proto at most once, and the scan stops as soon as all four are
+// validated, whatever follows. Every helper consumes from `b` at `*i`; only ASCII is consumed,
+// so every position is a char boundary of the `&str` the bytes come from.
 
-fn split_outside_quotes(s: &str, sep: char) -> Option<Vec<&str>> {
-    let mut parts = Vec::new();
-    let (mut start, mut quoted) = (0, false);
-    for (i, c) in s.char_indices() {
-        if c == '"' {
-            quoted = !quoted;
-        } else if c == sep && !quoted {
-            parts.push(&s[start..i]);
-            start = i + 1;
-        }
-    }
-    if quoted {
-        return None;
-    }
-    parts.push(&s[start..]);
-    Some(parts)
+const FWD_FOR: u8 = 1;
+const FWD_BY: u8 = 2;
+const FWD_HOST: u8 = 4;
+const FWD_PROTO: u8 = 8;
+const FWD_ALL: u8 = FWD_FOR | FWD_BY | FWD_HOST | FWD_PROTO;
+
+/// The parameters `http_validate_7239_header()` validated, and their raw values.
+#[derive(Default)]
+struct Forwarded<'a> {
+    steps: u8,
+    nfor: &'a str,
+    nby: &'a str,
+    host: &'a str,
+    proto: &'static str,
 }
 
-fn parse_pair(pair: &str) -> Option<Pair<'_>> {
-    let (name, value) = pair.split_once('=')?;
-    let (content, quoted) = if let Some(inner) = value.strip_prefix('"') {
-        let inner = inner.strip_suffix('"')?;
-        if inner.contains(['"', '\\']) {
-            return None;
+/// `http_7239_extract_port()`: 1 to 65535, in digits.
+fn extract_port(b: &[u8], i: &mut usize) -> bool {
+    let mut port = 0u32;
+    let mut it = *i;
+    while it < b.len() && b[it].is_ascii_digit() {
+        port = port * 10 + u32::from(b[it] - b'0');
+        if port > 65535 {
+            return false;
         }
-        (inner, true)
+        it += 1;
+    }
+    if port == 0 {
+        return false;
+    }
+    *i = it;
+    true
+}
+
+/// `http_7239_extract_obfs()`: at least one of `[A-Za-z0-9._-]`.
+fn extract_obfs(b: &[u8], i: &mut usize) -> bool {
+    let start = *i;
+    while *i < b.len() && b[*i] != b';' && (b[*i].is_ascii_alphanumeric() || matches!(b[*i], b'.' | b'-' | b'_')) {
+        *i += 1;
+    }
+    *i > start
+}
+
+/// The longest run of `ok` bytes from `*i`, at most `max` long, as text.
+fn take_run(b: &[u8], i: usize, max: usize, ok: impl Fn(u8) -> bool) -> &str {
+    let n = b[i..].iter().take(max).take_while(|&&c| ok(c)).count();
+    std::str::from_utf8(&b[i..i + n]).unwrap_or("")
+}
+
+/// `http_7239_extract_ipv4()`: up to 15 digits and dots that `inet_pton()` takes.
+fn extract_ipv4(b: &[u8], i: &mut usize) -> bool {
+    let ip4 = take_run(b, *i, 15, |c| c.is_ascii_digit() || c == b'.');
+    if Ipv4Addr::from_str(ip4).is_err() {
+        return false;
+    }
+    *i += ip4.len();
+    true
+}
+
+/// `http_7239_extract_ipv6()`, at a `[`: up to 45 alphanumerics and colons, a `]`, and an
+/// address `inet_pton()` takes.
+fn extract_ipv6(b: &[u8], i: &mut usize) -> bool {
+    let at = *i + 1;
+    let ip6 = take_run(b, at, 45, |c| c.is_ascii_alphanumeric() || c == b':');
+    let end = at + ip6.len();
+    if b.get(end) != Some(&b']') || Ipv6Addr::from_str(ip6).is_err() {
+        return false;
+    }
+    *i = end + 1;
+    true
+}
+
+/// `http_7239_extract_host()`: a name of alphanumerics and dots (possibly empty), or a
+/// bracketed IPv6 address when quoted; a port only when quoted.
+fn extract_host(b: &[u8], i: &mut usize, quoted: bool) -> bool {
+    if *i >= b.len() {
+        return false;
+    }
+    if quoted && b[*i] == b'[' {
+        if !extract_ipv6(b, i) {
+            return false;
+        }
     } else {
-        if value.is_empty() || !value.chars().all(is_tchar) {
-            return None;
+        while *i < b.len() && (b[*i].is_ascii_alphanumeric() || b[*i] == b'.') {
+            *i += 1;
         }
-        (value, false)
-    };
-    let ok = match name {
-        "for" | "by" => split_node(content).is_some(),
-        "host" => valid_host(content),
-        "proto" => !quoted && matches!(content, "http" | "https"),
-        _ => false,
-    };
-    ok.then(|| (name, content.to_string()))
-}
-
-fn parse_element(element: &str) -> Option<Vec<Pair<'_>>> {
-    let mut pairs: Vec<Pair<'_>> = Vec::new();
-    for part in split_outside_quotes(element, ';')? {
-        let pair = parse_pair(part)?;
-        if pairs.iter().any(|(n, _)| *n == pair.0) {
-            return None;
-        }
-        pairs.push(pair);
     }
-    Some(pairs)
+    if *i >= b.len() || b[*i] != b':' {
+        return true;
+    }
+    if !quoted {
+        return false;
+    }
+    *i += 1;
+    extract_port(b, i)
 }
 
-/// The elements of a `Forwarded` value; empty ones are skipped, except as the last.
-fn parse(s: &str) -> Option<Vec<Vec<Pair<'_>>>> {
-    let parts = split_outside_quotes(s, ',')?;
-    let last = parts.len() - 1;
-    let mut out: Vec<Vec<_>> = Vec::new();
-    for (i, part) in parts.into_iter().enumerate() {
-        let part = part.trim_matches([' ', '\t']);
-        if part.is_empty() {
-            if i == last {
+/// `http_7239_extract_nodename()`: `_obfs`, `unknown`, a bracketed IPv6 address when quoted, or
+/// an IPv4 address.
+fn extract_nodename(b: &[u8], i: &mut usize, quoted: bool) -> bool {
+    match b.get(*i) {
+        None | Some(0) => false,
+        Some(b'_') => {
+            *i += 1;
+            extract_obfs(b, i)
+        }
+        Some(b'u') => {
+            if !b[*i..].starts_with(b"unknown") {
+                return false;
+            }
+            *i += 7;
+            true
+        }
+        Some(b'[') if quoted => extract_ipv6(b, i),
+        Some(_) => extract_ipv4(b, i),
+    }
+}
+
+/// `http_7239_extract_node()`: a node name, then `:` and a port (digits or `_obfs`) only when
+/// quoted.
+fn extract_node(b: &[u8], i: &mut usize, quoted: bool) -> bool {
+    if !extract_nodename(b, i, quoted) {
+        return false;
+    }
+    if *i >= b.len() || b[*i] != b':' {
+        return true;
+    }
+    if !quoted {
+        return false;
+    }
+    *i += 1;
+    match b.get(*i) {
+        None => false,
+        Some(b'_') => {
+            *i += 1;
+            extract_obfs(b, i)
+        }
+        Some(_) => extract_port(b, i),
+    }
+}
+
+/// `http_validate_7239_header(hdr, FORWARDED_HEADER_ALL, ctx)`; `None` where it returns 0.
+fn validate(hdr: &str) -> Option<Forwarded<'_>> {
+    let b = hdr.as_bytes();
+    let mut f = Forwarded::default();
+    let mut i = 0;
+    let mut first = true;
+    while i < b.len() && f.steps != FWD_ALL {
+        if first {
+            first = false;
+        } else if b[i] == b';' {
+            i += 1;
+        } else {
+            return None;
+        }
+        let rest = &b[i..];
+        let has = |step: u8, name: &[u8]| f.steps & step == 0 && rest.len() > name.len() && rest.starts_with(name);
+        // a quote opens the value of for, by and host; it must close right after it
+        let quote = |i: &mut usize| {
+            let q = b.get(*i) == Some(&b'"');
+            *i += usize::from(q);
+            q
+        };
+        let (step, quoted) = if has(FWD_FOR, b"for=") || has(FWD_BY, b"by=") {
+            let step = if rest[0] == b'f' { FWD_FOR } else { FWD_BY };
+            i += if step == FWD_FOR { 4 } else { 3 };
+            let quoted = quote(&mut i);
+            let start = i;
+            if !extract_node(b, &mut i, quoted) {
                 return None;
             }
-            continue;
-        }
-        let elem = parse_element(part)?;
-        out.push(elem);
-    }
-    // HAProxy requires that if any element contains `for`, the first element must contain it.
-    if out.len() > 1 {
-        let any_for = out.iter().any(|e| e.iter().any(|(n,_)| *n == "for"));
-        if any_for && !out[0].iter().any(|(n,_)| *n == "for") {
+            if step == FWD_FOR {
+                f.nfor = &hdr[start..i];
+            } else {
+                f.nby = &hdr[start..i];
+            }
+            (step, quoted)
+        } else if has(FWD_HOST, b"host=") {
+            i += 5;
+            let quoted = quote(&mut i);
+            let start = i;
+            if !extract_host(b, &mut i, quoted) {
+                return None;
+            }
+            f.host = &hdr[start..i];
+            (FWD_HOST, quoted)
+        } else if has(FWD_PROTO, b"proto=") {
+            // only http and https, never quoted
+            i += 6;
+            if !b[i..].starts_with(b"http") {
+                return None;
+            }
+            i += 4;
+            f.proto = if b.get(i) == Some(&b's') {
+                i += 1;
+                "https"
+            } else {
+                "http"
+            };
+            (FWD_PROTO, false)
+        } else {
             return None;
+        };
+        if quoted {
+            if b.get(i) != Some(&b'"') {
+                return None;
+            }
+            i += 1;
+        }
+        f.steps |= step;
+    }
+    (f.steps != 0).then_some(f)
+}
+
+/// What `HAProxy`'s `req.hdr()` would hand the converter for the value `s`: the last
+/// comma-separated value (`http_find_hdr_value_end()`: commas inside a quoted string, with
+/// its backslash pairs, do not count), without its surrounding whitespace. A value without a
+/// comma is left as it is.
+///
+/// Ibex's `req.hdr()` returns the whole line, so the converters pick the last value here to
+/// keep `req.hdr(forwarded),rfc7239_field(for)` answering as on `HAProxy`. The cost is
+/// `req.fhdr()`: `HAProxy` validates the whole line there, and any comma before the fourth
+/// parameter makes it invalid. Remove this once `req.hdr()` splits values itself.
+fn last_value(s: &str) -> &str {
+    let (mut quoted, mut qdpair, mut last) = (false, false, None);
+    for (at, c) in s.bytes().enumerate() {
+        if qdpair {
+            qdpair = false;
+        } else if quoted {
+            match c {
+                b'\\' => qdpair = true,
+                b'"' => quoted = false,
+                _ => {}
+            }
+        } else if c == b'"' {
+            quoted = true;
+        } else if c == b',' {
+            last = Some(at);
         }
     }
-    Some(out)
+    last.map_or(s, |at| s[at + 1..].trim_matches([' ', '\t']))
 }
 
 /// `rfc7239_is_valid`: whether `s` is a well formed `Forwarded` value.
 #[must_use]
 pub fn is_valid(s: &str) -> bool {
-    parse(s).is_some()
+    validate(last_value(s)).is_some()
 }
 
-/// `rfc7239_field(<name>)`: the value of `name` in the last element, unquoted.
+/// `rfc7239_field(<name>)`: the raw value of `name` (for, by, host or proto), unquoted, when it
+/// was validated.
 #[must_use]
 pub fn field(s: &str, name: &str) -> Option<String> {
-    let elements = parse(s)?;
-    elements.last()?.iter().find(|(n, _)| *n == name).map(|(_, v)| v.clone())
+    let f = validate(last_value(s))?;
+    let (step, value) = match name {
+        "for" => (FWD_FOR, f.nfor),
+        "by" => (FWD_BY, f.nby),
+        "host" => (FWD_HOST, f.host),
+        "proto" => (FWD_PROTO, f.proto),
+        _ => return None,
+    };
+    (f.steps & step != 0).then(|| value.to_string())
 }
 
 /// `rfc7239_n2nn`: the node name of a node, an IPv6 address without its brackets.

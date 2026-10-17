@@ -1,16 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T331: rfc7239 validation
+//! T331: `rfc7239_is_valid` and `rfc7239_field` on `Forwarded` values delivered in request
+//! headers, through `req.fhdr()` (the whole line) and `req.hdr()` (on the reference, the last
+//! comma-separated value). Every expected value was measured on the reference (3.5-dev8) with
+//! the same configuration and request.
+//!
+//! Ibex's `req.hdr()` returns the whole line too, so the converters take the last value
+//! themselves (`rfc7239::last_value`). That matches the reference on `req.hdr()` everywhere and
+//! on `req.fhdr()` for a value without a comma; with a comma, `req.fhdr()` differs until
+//! `req.hdr()` splits values (those rows carry the reference's answer in a comment).
 
 use crate::common;
 
-use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::os::unix::net::UnixStream;
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Ibex(Child, std::path::PathBuf);
 
@@ -21,113 +28,104 @@ impl Drop for Ibex {
     }
 }
 
-fn start(tag: &str, cfg: &str, addrs: &[SocketAddr]) -> (Ibex, String) {
-    let dir = std::env::temp_dir().join(format!("qh-{tag}-{}", std::process::id()));
+#[test]
+fn rfc7239_converters_on_request_headers() {
+    // (header value, through req.fhdr, through req.hdr), each as
+    // rfc7239_is_valid|rfc7239_field(for)|(proto)|(by)|(host)
+    let rows: [(&str, Option<&str>, &str); 36] = [
+        ("for=192.0.2.43, for=198.51.100.17", None, "1|198.51.100.17|||"), // the reference on req.fhdr: 0||||
+        ("for=192.0.2.43,for=198.51.100.17", None, "1|198.51.100.17|||"), // the reference on req.fhdr: 0||||
+        ("proto=https, host=example.com", None, "1||||example.com"), // the reference on req.fhdr: 0||||
+        ("for=192.0.2.43;proto=https, by=10.0.0.1", None, "1|||10.0.0.1|"), // the reference on req.fhdr: 0||||
+        (",for=1.2.3.4", None, "1|1.2.3.4|||"), // the reference on req.fhdr: 0||||
+        ("for=1.2.3.4;by=5.6.7.8;host=a.b;proto=http,garbage", None, "0||||"), // the reference on req.fhdr: 1|1.2.3.4|http|5.6.7.8|a.b
+        ("proto=https, for=198.51.100.17", None, "1|198.51.100.17|||"), // the reference on req.fhdr: 0||||
+        ("for=a, for=b", None, "0||||"), // the reference on req.fhdr: 0||||
+        ("for=1.2.3.4;by=5.6.7.8;host=a.b;proto=http,", None, "0||||"), // the reference on req.fhdr: 1|1.2.3.4|http|5.6.7.8|a.b
+        ("for=1.2.3.4; by=5.6.7.8", Some("0||||"), "0||||"),
+        ("proto=httpx", Some("0||||"), "0||||"),
+        ("for=1.2.3.4;by=5.6.7.8;host=a.b;proto=httpx", Some("1|1.2.3.4|http|5.6.7.8|a.b"), "1|1.2.3.4|http|5.6.7.8|a.b"),
+        (r#"for="[2001:db8::1]:8080""#, Some("1|[2001:db8::1]:8080|||"), "1|[2001:db8::1]:8080|||"),
+        ("for=[2001:db8::1]", Some("0||||"), "0||||"),
+        (r#"for="_hidden:_port";by=unknown"#, Some("1|_hidden:_port||unknown|"), "1|_hidden:_port||unknown|"),
+        (r#"host="example.com:8080""#, Some("1||||example.com:8080"), "1||||example.com:8080"),
+        ("host=example.com:8080", Some("0||||"), "0||||"),
+        ("for=1.2.3.4;for=5.6.7.8", Some("0||||"), "0||||"),
+        ("FOR=1.2.3.4", Some("0||||"), "0||||"),
+        ("for=1.2.3.4x", Some("0||||"), "0||||"),
+        (r#"for="1.2.3.4"#, Some("0||||"), "0||||"),
+        (r#"for=1.2.3.4;proto="https""#, Some("0||||"), "0||||"),
+        ("for=unknownfoo", Some("0||||"), "0||||"),
+        ("host=a_b", Some("0||||"), "0||||"),
+        ("garbage, for=1.2.3.4", None, "1|1.2.3.4|||"), // the reference on req.fhdr: 0||||
+        (r#"for=1.2.3.4, host="x,y""#, None, "0||||"), // the reference on req.fhdr: 0||||
+        ("for=1.2.3.4;host=", Some("0||||"), "0||||"),
+        ("for=192.0.2.1:80", Some("0||||"), "0||||"),
+        (r#"for="192.0.2.1:80""#, Some("1|192.0.2.1:80|||"), "1|192.0.2.1:80|||"),
+        (r#"by="[::1]:_x";for=_y"#, Some("1|_y||[::1]:_x|"), "1|_y||[::1]:_x|"),
+        ("for=1.2.3.4;by=5.6.7.8;host=a.b;proto=https;junk", Some("1|1.2.3.4|https|5.6.7.8|a.b"), "1|1.2.3.4|https|5.6.7.8|a.b"),
+        ("for=001.2.3.4", Some("0||||"), "0||||"),
+        (r#"for="[::ffff:1.2.3.4]""#, Some("0||||"), "0||||"),
+        (r#"host="[::1]:443";proto=http"#, Some("1||http||[::1]:443"), "1||http||[::1]:443"),
+        ("for=1.2.3.4 , for=5.6.7.8", None, "1|5.6.7.8|||"), // the reference on req.fhdr: 0||||
+        (r#"for="_x", by="5.6.7.8:0""#, None, "0||||"), // the reference on req.fhdr: 0||||
+    ];
+    let lf = (0..rows.len())
+        .map(|i| {
+            ["req.fhdr", "req.hdr"]
+                .iter()
+                .map(|f| {
+                    let mut s = format!("%[{f}(x{i}),rfc7239_is_valid]");
+                    for k in ["for", "proto", "by", "host"] {
+                        let _ = write!(s, "|%[{f}(x{i}),rfc7239_field({k})]");
+                    }
+                    s
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect::<Vec<_>>()
+        .join("~");
+
+    let a = common::reserve_addr();
+    let dir = std::env::temp_dir().join(format!("ibex-rfc7239-field-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("cli.sock").display().to_string();
     let path = dir.join("c.cfg");
-    std::fs::write(&path, cfg.replace("{sock}", &sock).replace("{dir}", &dir.display().to_string())).unwrap();
+    let cfg = format!(
+        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"{lf}\"\n"
+    );
+    std::fs::write(&path, cfg).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let ibex = Ibex(child, dir);
-    for a in addrs {
-        assert!(common::wait_listening(*a), "ibex did not listen on {a}");
+    let _ibex = Ibex(child, dir);
+    assert!(common::wait_listening(a), "ibex did not listen on {a}");
+
+    let mut req = String::from("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n");
+    for (i, (v, _, _)) in rows.iter().enumerate() {
+        let _ = write!(req, "x{i}: {v}\r\n");
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !std::path::Path::new(&sock).exists() {
-        assert!(Instant::now() < deadline, "no stats socket");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(2200));
-    cli(&sock, "clear counters");
-    (ibex, sock)
-}
-
-fn cli(sock: &str, cmd: &str) -> String {
-    let mut s = UnixStream::connect(sock).expect("cli");
+    req.push_str("\r\n");
+    let mut s = TcpStream::connect_timeout(&a, Duration::from_secs(2)).expect("connect");
     s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(format!("{cmd}\n").as_bytes()).unwrap();
-    let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    out
-}
-
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
-fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(req).unwrap();
+    s.write_all(req.as_bytes()).unwrap();
     let mut out = Vec::new();
     let _ = s.read_to_end(&mut out);
-    out
-}
+    let out = String::from_utf8_lossy(&out).into_owned();
+    let body = out.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {out:?}"), |(_, b)| b.to_string());
 
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!("global\n  stats socket {{sock}} level admin\n{global}\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}")
-}
-
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
+    let got: Vec<&str> = body.split('~').collect();
+    assert_eq!(got.len(), rows.len(), "body: {body:?}");
+    let mut bad = Vec::new();
+    for ((v, fhdr, hdr), got) in rows.iter().zip(got) {
+        let p: Vec<&str> = got.split('|').collect();
+        let (got_f, got_h) = (p[..5.min(p.len())].join("|"), p.get(5..).map(|h| h.join("|")).unwrap_or_default());
+        if fhdr.is_some_and(|f| f != got_f) {
+            bad.push(format!("req.fhdr {v:?}: got {got_f:?}, want {fhdr:?}"));
         }
-    });
-    addr
-}
-
-fn body(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
-}
-
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines().find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string())).unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
-}
-
-#[test]
-fn rfc7239_is_valid_and_field() {
-    const CFG: &str = r#"global
-  stats socket {sock} level admin
-defaults
-  mode http
-  timeout connect 1s
-  timeout client 5s
-  timeout server 5s
-frontend fe
-  bind {A}
-  http-request return status 200 content-type text/plain lf-string "%[req.fhdr(forwarded),rfc7239_is_valid]|%[req.fhdr(forwarded),rfc7239_field(for)]|%[req.fhdr(forwarded),rfc7239_field(proto)]|%[req.fhdr(forwarded),rfc7239_field(by)]|%[req.fhdr(forwarded),rfc7239_field(host)]"
-"#;
-    let a = common::reserve_addr();
-    let cfg = CFG.replace("{A}", &a.to_string());
-    let (_ibex, _sock) = start("rfc7239", &cfg, &[a]);
-    let req1 = b"GET / HTTP/1.1\r\nHost: a\r\nForwarded: for=192.0.2.60;proto=http;by=203.0.113.43\r\nConnection: close\r\n\r\n";
-    assert_eq!(body(a, req1), "1|192.0.2.60|http|203.0.113.43|");
-    let req2 = b"GET / HTTP/1.1\r\nHost: a\r\nForwarded: for=\"[2001:db8:cafe::17]:4711\";host=example.com\r\nConnection: close\r\n\r\n";
-    assert_eq!(body(a, req2), "1|[2001:db8:cafe::17]:4711|||example.com");
-    let req3 = b"GET / HTTP/1.1\r\nHost: a\r\nForwarded: for=192.0.2.60;;proto\r\nConnection: close\r\n\r\n";
-    assert_eq!(body(a, req3), "0||||");
-    let req4 = b"GET / HTTP/1.1\r\nHost: a\r\nForwarded: proto=https, for=198.51.100.17\r\nConnection: close\r\n\r\n";
-    assert_eq!(body(a, req4), "0||||");
+        if *hdr != got_h {
+            bad.push(format!("req.hdr {v:?}: got {got_h:?}, want {hdr:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "rows differing from the reference:\n{}", bad.join("\n"));
 }
