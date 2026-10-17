@@ -153,3 +153,49 @@ backend b
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+#[test]
+fn shdr_cnt_is_res_hdr_cnt() {
+    // `shdr_cnt` is `smp_fetch_hdr_cnt` like `res.hdr_cnt`: it counts values, with or without a
+    // name. x-out as HAProxy 3.5-dev8-885761-29 gives it (measured at the batch/1011 merge of
+    // t326e and t327b). The oracle refuses `shdr_cnt` in a frontend `log-format` ("needs 'HTTP
+    // response headers' which is not available here"), so set-header is where it is checked.
+    const ROWS: &[(&[u8], &str)] = &[
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-B: 1\r\nX-B: 2, 3\r\nSet-Cookie: s=abc; Path=/\r\nSet-Cookie: n=7\r\n\r\nok", "[3|6|2|0|3|6]"),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-B: 1\r\nX-B: 2, \"3,4\"\r\nX-E:\r\nSet-Cookie: s=abc; Expires=Thu, 01 Jan 2030 00:00:00 GMT\r\nSet-Cookie: n=7\r\nConnection: close\r\n\r\nok",
+            "[3|8|3|0|3|8]",
+        ),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close, Upgrade\r\n\r\nok", "[0|2|0|1|0|2]"),
+    ];
+    const RESPS: &[&[u8]] = &[ROWS[0].0, ROWS[1].0, ROWS[2].0];
+    const CFG: &str = r#"
+global
+  stats socket {sock} level admin
+defaults
+  mode http
+  timeout connect 1s
+  timeout client 5s
+  timeout server 5s
+frontend fe
+  bind {A}
+  default_backend b
+  http-response set-header x-out "[%[shdr_cnt(x-b)]|%[shdr_cnt]|%[shdr_cnt(set-cookie)]|%[shdr_cnt(connection)]|%[res.hdr_cnt(x-b)]|%[res.hdr_cnt]]"
+backend b
+  server s {BE}
+"#;
+
+    let a = common::reserve_addr();
+    let be = backend(RESPS);
+    let cfg = CFG.replace("{A}", &a.to_string()).replace("{BE}", &be.to_string());
+    let (_ibex, _sock) = start("t326e-shdr-cnt", &cfg, &[a]);
+
+    let mut bad = Vec::new();
+    for (i, (_, want)) in ROWS.iter().enumerate() {
+        let got = xout(a, format!("GET /{i} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n").as_bytes());
+        if got != *want {
+            bad.push(format!("row {i}: got {got}, want {want}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
