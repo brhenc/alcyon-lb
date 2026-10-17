@@ -1311,6 +1311,16 @@ impl Registry {
             out_type: SampleType::Sint,
             func: req_hdr_cnt_fetch,
         });
+        let req_hdr_names_fetch: FetchFn = |ctx, args| {
+            let delim = args.first().and_then(|s| s.chars().next()).unwrap_or(',');
+            let names = req_header_names(ctx);
+            Some(Sample::Str(names.join(&delim.to_string())))
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.hdr_names",
+            out_type: SampleType::Str,
+            func: req_hdr_names_fetch,
+        });
 
         self.register_fetch(FetchDesc {
             name: "res.hdr_cnt",
@@ -5124,6 +5134,22 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
         }
     }
     matches
+}
+/// T326: the names of the request headers, lowercased, in order, from the first source that
+/// has any, without those `HAProxy`'s H1 parser leaves out of HTX ([`crate::h1_clean`]).
+fn req_header_names(ctx: &SampleContext) -> Vec<String> {
+    let mut hdrs: Vec<(&str, &str)> = Vec::new();
+    if let Some(htx) = ctx.htx_slice {
+        hdrs.extend(htx.headers());
+    }
+    if let (true, Some(htx)) = (hdrs.is_empty(), ctx.htx) {
+        hdrs.extend(htx.headers().map(|hf| (hf.name.as_str(), hf.value.as_str())));
+    }
+    if let (true, Some(headers)) = (hdrs.is_empty(), ctx.req_headers) {
+        hdrs.extend(headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    }
+    let kept = crate::h1_clean::kept_headers(&hdrs, true);
+    hdrs.iter().zip(kept).filter(|(_, k)| *k).map(|((n, _), _)| n.to_ascii_lowercase()).collect()
 }
 
 /// T302: `req.hdrs` (`smp_fetch_hdrs`): the request's headers as the H1 parser stores them
