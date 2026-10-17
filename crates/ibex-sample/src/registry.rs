@@ -1178,6 +1178,56 @@ impl Registry {
         });
 
         self.register_fetch(FetchDesc {
+            name: "url32",
+            out_type: SampleType::Sint,
+            // T326
+            func: |ctx, _args| {
+                let host = get_req_header(ctx, "host").unwrap_or_default();
+                let uri = get_context_uri(ctx).unwrap_or("");
+                let (_, path, query) = split_uri(uri);
+                let mut data = host.into_bytes();
+                if path.starts_with('/') {
+                    data.extend_from_slice(path.as_bytes());
+                    if !query.is_empty() {
+                        data.push(b'?');
+                        data.extend_from_slice(query.as_bytes());
+                    }
+                }
+                let h = full_hash(hash_sdbm(&data));
+                Some(Sample::Sint(i64::from(h)))
+            },
+        });
+
+        self.register_fetch(FetchDesc {
+            name: "url32+src",
+            out_type: SampleType::Bin,
+            // T326
+            func: |ctx, _args| {
+                let host = get_req_header(ctx, "host").unwrap_or_default();
+                let uri = get_context_uri(ctx).unwrap_or("");
+                let (_, path, query) = split_uri(uri);
+                let mut data = host.into_bytes();
+                if path.starts_with('/') {
+                    data.extend_from_slice(path.as_bytes());
+                    if !query.is_empty() {
+                        data.push(b'?');
+                        data.extend_from_slice(query.as_bytes());
+                    }
+                }
+                let h = full_hash(hash_sdbm(&data));
+                let mut out = Vec::with_capacity(20);
+                out.extend_from_slice(&h.to_be_bytes());
+                if let Some(sa) = ctx.client_addr {
+                    match sa.ip() {
+                        IpAddr::V4(v4) => out.extend_from_slice(&v4.octets()),
+                        IpAddr::V6(v6) => out.extend_from_slice(&v6.octets()),
+                    }
+                }
+                Some(Sample::Bin(out))
+            },
+        });
+
+        self.register_fetch(FetchDesc {
             name: "baseq",
             out_type: SampleType::Str,
             func: |ctx, args| {
