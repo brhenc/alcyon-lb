@@ -234,3 +234,61 @@ fn base32_src_without_a_client_address() {
         other => panic!("base32+src: {other:?}"),
     }
 }
+
+/// T337: `hdr`/`fhdr`/`hdr_val` and their `res.` forms, as a sample (`Registry::eval`) and as
+/// an ACL sees them (`eval_all`), from every source of the context. `x: 1, 2, 3, 4, 5, 6` +
+/// `x: 7, 8, 9, 10, 11, 12` on `HAProxy` 3.5-dev8: `hdr(x)` 12, `hdr(x,3)` 3, `hdr(x,-10)` 3,
+/// `fhdr(x,-10)` empty (two lines). `hdr(x,-11)` is refused by the oracle's parser ("header
+/// occurrence must be >= -10"); called directly it gives no sample.
+#[test]
+fn header_occurrences_from_every_source_of_the_context() {
+    let reg = Registry::new();
+    let hdrs = pairs(&[("Host", "h"), ("X", "1, 2, 3, 4, 5, 6"), ("x", "7, 8, 9, 10, 11, 12")]);
+    let check = |ctx: &SampleContext, p: &str, what: &str| {
+        let one = |f: &str, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            match reg.eval(&format!("{p}{f}"), &args, &[], ctx) {
+                Some(Sample::Str(v)) => v,
+                Some(Sample::Sint(n)) => n.to_string(),
+                None => "-".into(),
+                other => format!("{other:?}"),
+            }
+        };
+        let got = [
+            one("hdr", &["x"]),
+            one("hdr", &["x", "3"]),
+            one("hdr", &["x", "-10"]),
+            one("hdr", &["x", "-11"]),
+            one("fhdr", &["x", "-10"]),
+            one("fhdr", &["x"]),
+            one("hdr_val", &["x", "-1"]),
+            one("hdr", &["y"]),
+        ]
+        .join("|");
+        assert_eq!(got, "12|3|3|-|-|7, 8, 9, 10, 11, 12|12|-", "{what}");
+        let all = reg.eval_all(&format!("{p}hdr"), &["x".to_string()], &[], ctx);
+        assert_eq!(all.len(), 12, "{what}: every value in an ACL");
+        let all = reg.eval_all(&format!("{p}hdr_val"), &["x".to_string()], &[], ctx);
+        assert_eq!(all.last(), Some(&Sample::Sint(12)), "{what}: hdr_val in an ACL");
+        let occ = reg.eval_all(&format!("{p}hdr"), &["x".to_string(), "2".to_string()], &[], ctx);
+        assert_eq!(occ, [Sample::Str("2".into())], "{what}: an occurrence in an ACL");
+    };
+
+    let htx = htx_of(&hdrs);
+    check(&SampleContext { htx: Some(&htx), ..Default::default() }, "req.", "htx");
+    check(&SampleContext { req_headers: Some(&hdrs), ..Default::default() }, "req.", "req_headers");
+    let mut buf = vec![0u8; 4096];
+    let mut slice = HtxSlice::new(&mut buf);
+    slice.push_req_line("GET", "/", "HTTP/1.1").unwrap();
+    for (k, v) in &hdrs {
+        slice.push_header(k, v).unwrap();
+    }
+    slice.push_eoh().unwrap();
+    slice.push_eom().unwrap();
+    check(&SampleContext { htx_slice: Some(slice.as_ref()), ..Default::default() }, "req.", "htx_slice");
+
+    check(&SampleContext { res_headers: Some(&hdrs), ..Default::default() }, "res.", "res_headers");
+    ibex_sample::registry::set_current_res_headers(hdrs.clone());
+    check(&SampleContext::default(), "res.", "the response being processed");
+    ibex_sample::registry::set_current_res_headers(Vec::new());
+}
