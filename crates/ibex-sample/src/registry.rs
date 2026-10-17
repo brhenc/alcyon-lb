@@ -1327,14 +1327,13 @@ impl Registry {
     pub fn check_converters(&self, converters: &[(String, Vec<String>)]) -> Option<String> {
         let mut prev: Option<SampleType> = None;
         for (name, args) in converters {
-            let types = self
+            // Every caller has refused an unknown converter already; one would take and give
+            // any type here.
+            let (in_type, out_type) = self
                 .get_converter(name)
                 .map(|d| (d.in_type, d.out_type))
-                .or_else(|| self.get_ctx_converter(name).map(|d| (d.in_type, d.out_type)));
-            let Some((in_type, out_type)) = types else {
-                prev = None;
-                continue;
-            };
+                .or_else(|| self.get_ctx_converter(name).map(|d| (d.in_type, d.out_type)))
+                .unwrap_or((TypeSpec::Any, TypeSpec::Any));
             let applies = |p: SampleType| match in_type {
                 TypeSpec::Exact(t) => crate::cast::can_cast(p, t),
                 TypeSpec::Addr => crate::cast::can_cast(p, SampleType::Ipv4) || crate::cast::can_cast(p, SampleType::Ipv6),
