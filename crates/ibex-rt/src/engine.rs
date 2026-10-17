@@ -2134,7 +2134,7 @@ fn listeners_for(
     for fd in crate::handover::take_inherited(worker_id, addr) {
         match Listener::adopt(fd, addr, 128, proxy, tuning) {
             Ok(l) => out.push(l),
-            Err(e) => eprintln!("[WARNING] {e}; binding a fresh socket instead"),
+            Err(e) => crate::stderr_line!("[WARNING] {e}; binding a fresh socket instead"),
         }
     }
     if out.is_empty() {
@@ -6911,7 +6911,7 @@ fn init_client_session(
                 crate::stats::ssl_conn_accepted();
             }
             Err(e) => {
-                eprintln!(
+                crate::stderr_line!(
                     "[ibex] {}: dropping connection from {peer_addr}, TLS setup failed: {e}",
                     proxies[proxy_idx].name
                 );

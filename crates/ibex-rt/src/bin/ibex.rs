@@ -1012,7 +1012,7 @@ fn main() {
             let mut engine = match started {
                 Ok(eng) => eng,
                 Err(err) => {
-                    eprintln!("Failed to initialize Ibex engine (worker {}): {}", worker_id, err);
+                    ibex_rt::stderr_line!("Failed to initialize Ibex engine (worker {}): {}", worker_id, err);
                     process::exit(1);
                 }
             };
@@ -1029,10 +1029,10 @@ fn main() {
                     engine.set_cli_level(level);
                 }
                 // Only an epoll_ctl failure on a fresh descriptor can fail here.
-                engine.adopt_cli(listener, name, file).unwrap_or_else(|e| { eprintln!("Failed to serve a CLI / stats socket: {e}"); process::exit(1) });
+                engine.adopt_cli(listener, name, file).unwrap_or_else(|e| { ibex_rt::stderr_line!("Failed to serve a CLI / stats socket: {e}"); process::exit(1) });
             }
             for (listener, name, file, level) in extra_pre.into_iter().flatten() {
-                engine.adopt_extra_cli(listener, name, file, level).unwrap_or_else(|e| { eprintln!("Failed to serve a CLI / stats socket: {e}"); process::exit(1) });
+                engine.adopt_extra_cli(listener, name, file, level).unwrap_or_else(|e| { ibex_rt::stderr_line!("Failed to serve a CLI / stats socket: {e}"); process::exit(1) });
             }
             engine.set_lifecycle(lifecycle_clone);
             let _ = ready_tx.send(());
@@ -1044,7 +1044,7 @@ fn main() {
             }
             drop(released);
             if let Err(err) = engine.run_loop() {
-                eprintln!("Engine error (worker {}): {}", worker_id, err);
+                ibex_rt::stderr_line!("Engine error (worker {}): {}", worker_id, err);
                 process::exit(1);
             }
         });
@@ -1065,7 +1065,7 @@ fn main() {
     }
     let unused = ibex_rt::handover::drop_unused_inherited();
     if unused > 0 && !opts.quiet {
-        eprintln!("[NOTICE] closed {unused} inherited socket(s) that no bind in this configuration uses");
+        ibex_rt::stderr_line!("[NOTICE] closed {unused} inherited socket(s) that no bind in this configuration uses");
     }
     // `HAProxy`'s order (src/haproxy.c `main`): the pidfile is written before the chroot,
     // the old processes are signalled before the user changes (it may no longer be allowed
@@ -1092,7 +1092,7 @@ fn main() {
     }
     if master_dir.is_some() {
         // To the master, on the stderr pipe it reads: loaded (see master.rs).
-        eprintln!("{}", master::READY_MARK);
+        ibex_rt::stderr_line!("{}", master::READY_MARK);
     }
     // A reload child does not announce itself: it is not systemd's main PID yet, and under
     // the default `NotifyAccess=main` systemd would drop the message. The process it
@@ -1102,7 +1102,7 @@ fn main() {
         // abstract socket systemd hands out as `@name`, and the module sends the full
         // READY=1/MAINPID/STATUS message HAProxy does (src/cli.c:3087).
         if let Err(e) = ibex_rt::systemd::notify_ready() {
-            eprintln!("[WARNING] systemd notify failed: {e}");
+            ibex_rt::stderr_line!("[WARNING] systemd notify failed: {e}");
         }
     }
 
@@ -1218,7 +1218,7 @@ impl Reload {
             return;
         }
         if let Err(e) = ibex_rt::handover::serve_getsocks(&stream) {
-            eprintln!("[ALERT] could not hand the listening sockets over: {e}");
+            ibex_rt::stderr_line!("[ALERT] could not hand the listening sockets over: {e}");
         }
     }
 }
@@ -1264,7 +1264,7 @@ fn supervise(
         if lifecycle.take_reload_request() {
             if !reloadable {
                 if !quiet {
-                    eprintln!("[NOTICE] SIGUSR2 ignored: reloading on SIGUSR2 needs -W or -Ws");
+                    ibex_rt::stderr_line!("[NOTICE] SIGUSR2 ignored: reloading on SIGUSR2 needs -W or -Ws");
                 }
             } else if reload.is_none() && !lifecycle.soft_stop_requested() {
                 ibex_rt::systemd::notify_reloading();
@@ -1272,7 +1272,7 @@ fn supervise(
                 match Reload::start(respawn) {
                     Ok(r) => reload = Some(r),
                     Err(e) => {
-                        eprintln!("[ALERT] reload failed to start a new process: {e}");
+                        ibex_rt::stderr_line!("[ALERT] reload failed to start a new process: {e}");
                         ibex_rt::systemd::set_handing_over(false);
                         let _ = ibex_rt::systemd::notify_reload_failed();
                     }
@@ -1284,7 +1284,7 @@ fn supervise(
             r.serve_pending();
             if !handed_over {
                 if let Ok(Some(st)) = r.child.try_wait() {
-                    eprintln!(
+                    ibex_rt::stderr_line!(
                         "[ALERT] reload failed: the new process exited ({st}) before taking over; \
                          still serving on the previous configuration"
                     );
