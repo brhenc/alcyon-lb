@@ -17,7 +17,7 @@ fuzz_target!(|data: &[u8]| {
         }
         1 => {
             // The greeting, the EHLO reply and the QUIT reply (T273 A replaced smtp_status_line).
-            let _ = cr::smtp_greeting(rest);
+            let _ = cr::smtp_greeting(rest, eof);
             let _ = cr::smtp_reply(rest, eof);
             let _ = cr::smtp_quit(rest, eof);
             let _ = cr::smtp_codeless_info(rest);
