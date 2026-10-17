@@ -307,3 +307,4 @@ mod wait_for_body;
 mod websocket_handshake;
 mod when_applet;
 mod when_error_retries;
+mod xxh32_xxh64;
