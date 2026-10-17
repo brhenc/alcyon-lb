@@ -241,11 +241,17 @@ connection counts; it must keep `tools/allocprofile` at 4 allocations per reques
 shared state behind a `Box` in `ProxyIdInfo` (`Proxy` is bounded in `struct_sizes.rs`).
 **Gave up:** C's lock-free fast path. **Revisit if** B's lock shows in a profile.
 
-### 6.4 No watchdog
+### 6.4 Watchdog — **implemented 2026-10-17 (T361 slice 1); CPU-time like HAProxy, so a blocked (deadlocked) thread is still not caught**
 
 `src/wdt.c` panics a thread that stops making progress. With hard affinity and no
-stealing, a wedged thread silently strands every connection assigned to it. **Needed
-before this is run anywhere real.**
+stealing, a wedged thread silently strands every connection assigned to it.
+
+| | |
+|---|---|
+| **Matches HAProxy** | A worker that spins is reported every tick (`WARNING! thread N has stopped processing traffic for M milliseconds ...`, from ~200 ms) and the process aborts about 1.2 s of that thread's CPU time into the stall (`PANIC! Thread N is about to kill the process (pid P).`, exit status 134; measured on both: HAProxy 11 warnings then the panic, Ibex 10). The thresholds are HAProxy's (warn from one tick, `stuck` past 1 s, abort at the next tick), measured on thread CPU time, so a starved or off-CPU thread is never killed. `warn-blocked-traffic-after` (1-1000 ms, HAProxy's texts) sets the tick. `show info` `BlockedTrafficWarnings` counts the warnings. CLI `expert-mode [on\|off]` and `debug dev loop <ms> [warn]` as HAProxy's (levels and answers measured). |
+| **Differs** | No thread dump: HAProxy prints the stuck thread's backtrace, current task and lock history; Ibex prints neither (the core file has the stacks). The "M milliseconds" is counted from the monitor's first look, not from leaving the poller, so it is a lower bound by up to one tick. "S streams" counts the worker's sessions, not its CLI applets (HAProxy said 1 for a CLI loop, Ibex 0). `debug dev loop ... isolated` is refused (no thread isolation). |
+| **Cost** | One relaxed store per loop pass, per task run and per CLI command, plus two around `epoll_wait`: no syscall, no lock, no allocation on the request path. A monitor thread wakes every tick and reads `/proc/thread-self/schedstat` (opened by each worker before the chroot) only for a worker whose counter did not move. |
+| **Not caught (as in HAProxy)** | A thread blocked off-CPU: a deadlocked mutex, a blocking syscall (`debug dev delay 3000` is not reported by HAProxy either). Catching it needs a wall-clock check, which can kill a process the host starved: a decision for the user (tasks/T361-watchdog.md, decision 2). |
 
 ### 6.5 `struct server` and 60k-backend memory — **measured and verified**
 

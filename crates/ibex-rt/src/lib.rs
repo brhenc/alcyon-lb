@@ -55,6 +55,7 @@ pub mod stats_typed;
 pub mod systemd;
 pub mod lifecycle;
 pub mod handover;
+pub mod watchdog;
 
 pub use quic_listener::QuicListener;
 
