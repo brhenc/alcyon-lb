@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T326: res.hdr_names fetch
+//! T326: the `res.hdr_names` fetch
 
 use crate::common;
 
-use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +54,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -73,13 +65,6 @@ fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
 }
 
 const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
 
 /// A server on a free port that reads each request head, answers `resp` and closes the connection.
 fn backend(resp: &'static [u8]) -> SocketAddr {
@@ -100,12 +85,6 @@ fn backend(resp: &'static [u8]) -> SocketAddr {
         }
     });
     addr
-}
-
-/// The body of the answer to `req` (what follows the first empty line).
-fn body(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
 }
 
 /// The value of the `x-out` header in the answer to `req`.
@@ -131,14 +110,12 @@ defaults
   timeout client 5s
   timeout server 5s
 frontend fe
-  bind {A}
+  bind {a}
   default_backend b
   http-response set-header x-out "[%[res.hdr_names]][%[res.hdr_names(;)]]"
 backend b
-  server s {BE}
-"#,
-        A = a,
-        BE = be,
+  server s {be}
+"#
     );
     let (ibex, _sock) = start("res_hdr_names", &cfg, &[a]);
     let _ = ibex;
@@ -146,4 +123,36 @@ backend b
     // The response headers are: Content-Length, X-B, x-b, Set-Cookie
     // Default delimiter is comma
     assert_eq!(xout(a, GET), "[content-length,x-b,x-b,set-cookie][content-length;x-b;x-b;set-cookie]");
+}
+
+/// `HAProxy`'s H1 parser takes `close` and `keep-alive` out of a server's `Connection` value
+/// and drops the header when nothing is left, and `h2c`/`h2` out of `Upgrade`, so
+/// `res.hdr_names` does not list them (measured on `HAProxy` 3.5-dev8).
+#[test]
+fn res_hdr_names_after_connection_cleaning() {
+    const CASES: [(&[u8], &str); 7] = [
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-B: 1\r\nx-b: 2\r\nConnection: close\r\nKeep-Alive: timeout=5\r\nSet-Cookie: s=1\r\n\r\nok", "[content-length,x-b,x-b,keep-alive,set-cookie]"),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: Keep-Alive\r\nX-A: 1\r\n\r\nok", "[content-length,x-a]"),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close, close\r\nX-A: 1\r\n\r\nok", "[content-length,x-a]"),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive, x-z\r\nX-Z: 1\r\n\r\nok", "[content-length,connection,x-z]"),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nUpgrade: h2c\r\nX-A: 1\r\n\r\nok", "[content-length,x-a]"),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nUpgrade: websocket\r\nX-A: 1\r\n\r\nok", "[content-length,upgrade,x-a]"),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: upgrade\r\nX-A: 1\r\n\r\nok", "[content-length,connection,x-a]"),
+    ];
+    let a = common::reserve_addr();
+    let mut cfg = format!(
+        "global\n  stats socket {{sock}} level admin\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind {a}\n  http-response set-header x-out \"[%[res.hdr_names]]\"\n"
+    );
+    for i in 0..CASES.len() {
+        let _ = writeln!(cfg, "  use_backend b{i} if {{ path /{i} }}");
+    }
+    for (i, (resp, _)) in CASES.iter().enumerate() {
+        let _ = writeln!(cfg, "backend b{i}\n  server s {}", backend(resp));
+    }
+    let (_ibex, _sock) = start("res_hdr_names_conn", &cfg, &[a]);
+    for (i, (resp, want)) in CASES.iter().enumerate() {
+        let req = format!("GET /{i} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+        assert_eq!(xout(a, req.as_bytes()), *want, "for {:?}", String::from_utf8_lossy(resp));
+    }
 }

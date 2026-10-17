@@ -4932,22 +4932,18 @@ fn get_all_res_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     matches
 }
 
-/// T326: The response header names (not values), as a `Vec<String>`.
+/// T326: the response header names, lowercased, in order (from where
+/// [`get_all_res_headers`] reads them), without those `HAProxy`'s H1 parser leaves out of
+/// HTX ([`crate::h1_clean`]).
 fn get_all_res_header_names(ctx: &SampleContext) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Some(headers) = ctx.res_headers {
-        for (k, _v) in headers {
-            names.push(k.to_ascii_lowercase());
-        }
+    let names = |hdrs: &[(&str, &str)]| -> Vec<String> {
+        let kept = crate::h1_clean::kept_headers(hdrs, false);
+        hdrs.iter().zip(kept).filter(|(_, k)| *k).map(|((n, _), _)| n.to_ascii_lowercase()).collect()
+    };
+    if let Some(headers) = ctx.res_headers.filter(|h| !h.is_empty()) {
+        return names(&headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
     }
-    if names.is_empty() {
-        CURRENT_RES_HEADERS.with(|hdrs| {
-            for (k, _v) in hdrs.borrow().iter() {
-                names.push(k.to_ascii_lowercase());
-            }
-        });
-    }
-    names
+    CURRENT_RES_HEADERS.with(|hdrs| names(&hdrs.borrow().iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>()))
 }
 
 fn extract_cookies(cookie_header: &str) -> Vec<(&str, &str)> {
