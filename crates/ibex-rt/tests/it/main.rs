@@ -30,6 +30,7 @@ mod anonymous_acl_patterns;
 mod backend_reuse_dead_idle;
 mod backend_tls;
 mod backup_servers;
+mod cmp_unset_var;
 mod balance_roundrobin_changes;
 mod balance_roundrobin_weights;
 mod balance_source_consistent;
