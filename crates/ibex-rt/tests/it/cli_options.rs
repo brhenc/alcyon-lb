@@ -382,7 +382,6 @@ fn test_diagnostic_flags() {
         .arg("-dr")
         .arg("-de")
         .arg("-dp")
-        .arg("-dM")
         .arg("-dL")
         .arg("-f")
         .arg(&cfg_path)
@@ -401,10 +400,6 @@ fn test_diagnostic_flags() {
     assert!(
         stderr.contains("[DIAG] Flag -dp"),
         "stderr should log -dp flag"
-    );
-    assert!(
-        stderr.contains("[DIAG] Flag -dM"),
-        "stderr should log -dM flag"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(

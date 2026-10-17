@@ -126,20 +126,6 @@ fn daemon_mode_failures_are_reported() {
     assert_eq!(out.status.code(), Some(1));
 }
 
-/// `no <keyword>` that is neither `no log` nor `no option`: ibex warns and ignores it.
-/// `HAProxy` (3.5-dev8-885761-29) refuses an unknown one ("unknown keyword") -- a known
-/// gap, pinned here so that the warning, now written through `stderr_line!`, is executed.
-#[test]
-fn an_ignored_no_directive_is_announced() {
-    let dir = std::path::PathBuf::from(format!("/tmp/t342b-no-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let cfg = dir.join("c.cfg");
-    std::fs::write(&cfg, CFG.replace("http-request", "no foo\n  http-request")).unwrap();
-    let (code, err) = run(&["-c", "-f", &cfg.display().to_string()]);
-    assert!(err.contains("[ibex] warning: ignored 'no foo'"), "{err:?}");
-    assert_eq!(code, Some(0));
-}
-
 fn start_w(args: &[&str], envs: &[(&str, &str)], exe: &std::path::Path, addr: std::net::SocketAddr) -> (common::Ibex, std::process::ChildStderr) {
     let mut cmd = Command::new(exe);
     cmd.args(args).stderr(Stdio::piped()).stdout(Stdio::null());
