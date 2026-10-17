@@ -71,6 +71,7 @@ mod cli_show_typed_json;
 mod cli_socket_prebind;
 mod client_gone_while_blocked;
 mod client_keepalive;
+mod cmp_unset_var;
 mod config_conditional_edges;
 mod config_conditional_errors;
 mod config_message_directives;

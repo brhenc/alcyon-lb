@@ -2953,9 +2953,14 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let target_arg = args.first()?;
-                let target_val = CURRENT_VARS
-                    .with(|v| v.borrow().get(target_arg).cloned())
-                    .unwrap_or_else(|| target_arg.clone());
+                // T327: when the variable is not set, return no sample (empty field in log-format).
+                let target_val = if hmac_key_is_var(target_arg) {
+                    CURRENT_VARS
+                        .with(|v| v.borrow().get(target_arg).cloned())
+                        .or_else(|| get_proc_var(target_arg))?
+                } else {
+                    target_arg.clone()
+                };
                 let Sample::Str(s) = smp else { return None };
                 let cmp = s.cmp(&target_val);
                 let res = match cmp {
@@ -4893,9 +4898,15 @@ impl Registry {
             func: |smp, args| match smp {
                 Sample::Bin(b) => {
                     let arg = args.first()?;
-                    let target_bytes = CURRENT_VARS.with(|v| v.borrow().get(arg).cloned())
-                        .or_else(|| get_proc_var(arg))
-                        .map_or_else(|| arg.as_bytes().to_vec(), String::into_bytes);
+                    // T327: when the variable is not set, return no sample (empty field in log-format).
+                    let target_bytes: Vec<u8> = if hmac_key_is_var(arg) {
+                        CURRENT_VARS
+                            .with(|v| v.borrow().get(arg).cloned())
+                            .or_else(|| get_proc_var(arg))?
+                            .into_bytes()
+                    } else {
+                        arg.as_bytes().to_vec()
+                    };
 
                     if b.len() != target_bytes.len() {
                         return Some(Sample::Bool(false));
