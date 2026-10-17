@@ -4346,6 +4346,152 @@ impl Registry {
         });
 
         self.register_converter(ConvDesc {
+            name: "ip.fp",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, args| {
+                // T330
+                let mode = args.first().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                match smp {
+                    Sample::Bin(b) => {
+                        if b.is_empty() { return None; }
+                        let ver = b[0] >> 4;
+                        if ver == 4 {
+                            if b.len() < 20 { return None; }
+                            let ihl = ((b[0] & 0x0F) as usize) * 4;
+                            if b.len() < ihl || ihl < 20 { return None; }
+                            let tos = b[1];
+                            let df = (b[6] & 0x40) != 0;
+                            let ttl = b[8];
+                            let options_present = ihl > 20;
+                            let ip_total = u16::from_be_bytes([b[2], b[3]]) as usize;
+                            let tcp_start = ihl;
+                            let tcp_hdr_len_words = ((b[tcp_start + 12] >> 4) & 0x0F) as usize;
+                            if tcp_hdr_len_words == 0 { return None; }
+                            let tcp_hdr_len = tcp_hdr_len_words * 4;
+                            if b.len() < tcp_start + tcp_hdr_len { return None; }
+                            let tcp_flags = b[tcp_start + 13];
+                            let cwr = (tcp_flags & 0x80) != 0;
+                            let ece = (tcp_flags & 0x40) != 0;
+                            let data_present = ip_total > ihl + tcp_hdr_len;
+                            let tcp_win = u16::from_be_bytes([b[tcp_start + 14], b[tcp_start + 15]]);
+                            let mut mss = 0u16;
+                            let mut win_scaling = 0u8;
+                            let mut option_bits = 0u8;
+                            let mut any_opt_ge9 = false;
+                            let mut options_list = Vec::new();
+                            let mut pos = tcp_start + 20;
+                            let end = tcp_start + tcp_hdr_len;
+                            while pos < end {
+                                let kind = b[pos];
+                                if kind == 0 { break; }
+                                if kind == 1 { options_list.push(kind); pos += 1; continue; }
+                                if pos + 1 >= end { break; }
+                                let len = b[pos + 1] as usize;
+                                if len < 2 || pos + len > end { break; }
+                                if (2..=8).contains(&kind) { option_bits |= 1 << (kind - 2); }
+                                if kind >= 9 { any_opt_ge9 = true; }
+                                options_list.push(kind);
+                                if kind == 2 && len >= 4 { mss = u16::from_be_bytes([b[pos + 2], b[pos + 3]]); }
+                                if kind == 3 && len >= 3 { win_scaling = b[pos + 2]; }
+                                pos += len;
+                            }
+                            if any_opt_ge9 { option_bits |= 0x80; }
+                            let mut out = Vec::with_capacity(8);
+                            out.push(tos);
+                            let mut byte1 = 0u8;
+                            byte1 |= u8::from(df) << 6;
+                            let ttl_bits = if ttl <= 32 { 0 } else if ttl <= 64 { 1 } else if ttl <= 128 { 2 } else { 3 };
+                            byte1 |= (ttl_bits & 0x03) << 4;
+                            byte1 |= u8::from(options_present) << 3;
+                            byte1 |= u8::from(data_present) << 2;
+                            byte1 |= u8::from(cwr) << 1;
+                            byte1 |= u8::from(ece);
+                            out.push(byte1);
+                            let mut byte2 = (u8::try_from(tcp_hdr_len_words & 0x0F).unwrap_or(0)) << 4;
+                            let ws = if win_scaling > 0 { win_scaling + 1 } else { 0 };
+                            byte2 |= ws & 0x0F;
+                            out.push(byte2);
+                            out.extend_from_slice(&tcp_win.to_be_bytes());
+                            out.extend_from_slice(&mss.to_be_bytes());
+                            out.push(option_bits);
+                            if mode & 1 != 0 { out.push(ttl); }
+                            if mode & 2 != 0 { out.extend(&options_list); }
+                            if mode & 4 != 0 { out.extend_from_slice(&b[12..16]); }
+                            Some(Sample::Bin(out))
+                        } else if ver == 6 {
+                            if b.len() < 40 { return None; }
+                            let tc = ((b[0] & 0x0F) << 4) | (b[1] >> 4);
+                            let tos = tc;
+                            let df = true;
+                            let ttl = b[7];
+                            let options_present = false;
+                            let next_header = b[6];
+                            let tcp_start = 40usize;
+                            if next_header != 6 { return None; }
+                            let tcp_hdr_len_words = ((b[tcp_start + 12] >> 4) & 0x0F) as usize;
+                            if tcp_hdr_len_words == 0 { return None; }
+                            let tcp_hdr_len = tcp_hdr_len_words * 4;
+                            if b.len() < tcp_start + tcp_hdr_len { return None; }
+                            let tcp_flags = b[tcp_start + 13];
+                            let cwr = (tcp_flags & 0x80) != 0;
+                            let ece = (tcp_flags & 0x40) != 0;
+                            let payload_len = u16::from_be_bytes([b[4], b[5]]) as usize;
+                            let data_present = payload_len > tcp_hdr_len;
+                            let tcp_win = u16::from_be_bytes([b[tcp_start + 14], b[tcp_start + 15]]);
+                            let mut mss = 0u16;
+                            let mut win_scaling = 0u8;
+                            let mut option_bits = 0u8;
+                            let mut any_opt_ge9 = false;
+                            let mut options_list = Vec::new();
+                            let mut pos = tcp_start + 20;
+                            let end = tcp_start + tcp_hdr_len;
+                            while pos < end {
+                                let kind = b[pos];
+                                if kind == 0 { break; }
+                                if kind == 1 { options_list.push(kind); pos += 1; continue; }
+                                if pos + 1 >= end { break; }
+                                let len = b[pos + 1] as usize;
+                                if len < 2 || pos + len > end { break; }
+                                if (2..=8).contains(&kind) { option_bits |= 1 << (kind - 2); }
+                                if kind >= 9 { any_opt_ge9 = true; }
+                                options_list.push(kind);
+                                if kind == 2 && len >= 4 { mss = u16::from_be_bytes([b[pos + 2], b[pos + 3]]); }
+                                if kind == 3 && len >= 3 { win_scaling = b[pos + 2]; }
+                                pos += len;
+                            }
+                            if any_opt_ge9 { option_bits |= 0x80; }
+                            let mut out = Vec::with_capacity(8);
+                            out.push(tos);
+                            let mut byte1 = 0x80u8;
+                            byte1 |= u8::from(df) << 6;
+                            let ttl_bits = if ttl <= 32 { 0 } else if ttl <= 64 { 1 } else if ttl <= 128 { 2 } else { 3 };
+                            byte1 |= (ttl_bits & 0x03) << 4;
+                            byte1 |= u8::from(options_present) << 3;
+                            byte1 |= u8::from(data_present) << 2;
+                            byte1 |= u8::from(cwr) << 1;
+                            byte1 |= u8::from(ece);
+                            out.push(byte1);
+                            let mut byte2 = (u8::try_from(tcp_hdr_len_words & 0x0F).unwrap_or(0)) << 4;
+                            let ws = if win_scaling > 0 { win_scaling + 1 } else { 0 };
+                            byte2 |= ws & 0x0F;
+                            out.push(byte2);
+                            out.extend_from_slice(&tcp_win.to_be_bytes());
+                            out.extend_from_slice(&mss.to_be_bytes());
+                            out.push(option_bits);
+                            if mode & 1 != 0 { out.push(ttl); }
+                            if mode & 2 != 0 { out.extend(&options_list); }
+                            if mode & 4 != 0 { out.extend_from_slice(&b[8..24]); }
+                            Some(Sample::Bin(out))
+                        } else { None }
+                    }
+                    _ => None,
+                }
+            },
+        });
+
+
+        self.register_converter(ConvDesc {
             name: "ip.tos",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Sint),
