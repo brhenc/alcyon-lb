@@ -5,7 +5,6 @@
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +53,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -72,49 +63,10 @@ fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     out
 }
 
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
-        }
-    });
-    addr
-}
-
 /// The body of the answer to `req` (what follows the first empty line).
 fn body(addr: SocketAddr, req: &[u8]) -> String {
     let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
-}
-
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
+    s.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {s:?}"), |(_, b)| b.to_string())
 }
 
 #[test]
@@ -123,7 +75,7 @@ fn url32_fetches() {
     let cfg = format!(
         "global\n  stats socket {{sock}} level admin\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"[%[url32]][%[url32+src,hex]]\""
     );
-    let (ibex, _sock) = start("url32", &cfg, &[a]);
+    let (_ibex, _sock) = start("url32", &cfg, &[a]);
     // Test cases from the issue
     let req1 = b"GET /p?q=1 HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
     let req2 = b"GET http://example.com/x?y HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
@@ -131,4 +83,27 @@ fn url32_fetches() {
     assert_eq!(body(a, req1), "[526637239][1F63D8B77F000001]");
     assert_eq!(body(a, req2), "[255589819][0F3BFDBB7F000001]");
     assert_eq!(body(a, req3), "[877786378][3451F50A7F000001]");
+    // Review F1/F2 (values measured on HAProxy 3.5-dev8): the raw path tail is hashed as sent,
+    // trailing '?' included, after any RFC 3986 scheme and the authority (which ends at '/', '?'
+    // or '#'); a tail that does not start with '/' is not hashed; an empty path is "/" except
+    // for OPTIONS (http_scheme_based_normalize).
+    let cases: &[(&str, &str, &str)] = &[
+        ("GET /p? HTTP/1.1", "a", "[4174073112][F8CB4D187F000001]"),
+        ("GET http://a/p? HTTP/1.1", "a", "[4174073112][F8CB4D187F000001]"),
+        ("GET http://a/? HTTP/1.1", "a", "[1034210362][3DA4CC3A7F000001]"),
+        ("GET http://a?x HTTP/1.1", "a", "[1830748055][6D1EFF977F000001]"),
+        ("GET https://a HTTP/1.1", "a", "[877786378][3451F50A7F000001]"),
+        ("OPTIONS https://a HTTP/1.1", "a", "[1830748055][6D1EFF977F000001]"),
+        ("OPTIONS https://a?q HTTP/1.1", "a", "[1830748055][6D1EFF977F000001]"),
+        ("OPTIONS * HTTP/1.1", "a", "[1830748055][6D1EFF977F000001]"),
+        ("GET HTTP://example.com/x?y HTTP/1.1", "example.com", "[255589819][0F3BFDBB7F000001]"),
+        ("GET ftp://example.com/x?y HTTP/1.1", "example.com", "[255589819][0F3BFDBB7F000001]"),
+        ("GET a1+.b://a/y HTTP/1.1", "a", "[2193154996][82B8E3B47F000001]"),
+        ("GET /x://y HTTP/1.1", "a", "[2182710902][821986767F000001]"),
+    ];
+    for (line, host, want) in cases {
+        let req = format!("{line}\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        assert_eq!(body(a, req.as_bytes()), *want, "{line}");
+    }
+    assert_eq!(body(a, b"GET /x HTTP/1.0\r\n\r\n"), "[2340802059][8B85CE0B7F000001]", "no Host");
 }

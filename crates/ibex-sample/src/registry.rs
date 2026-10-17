@@ -1182,18 +1182,7 @@ impl Registry {
             out_type: SampleType::Sint,
             // T326
             func: |ctx, _args| {
-                let host = get_req_header(ctx, "host").unwrap_or_default();
-                let uri = get_context_uri(ctx).unwrap_or("");
-                let (_, path, query) = split_uri(uri);
-                let mut data = host.into_bytes();
-                if path.starts_with('/') {
-                    data.extend_from_slice(path.as_bytes());
-                    if !query.is_empty() {
-                        data.push(b'?');
-                        data.extend_from_slice(query.as_bytes());
-                    }
-                }
-                let h = full_hash(hash_sdbm(&data));
+                let h = url32_hash(ctx);
                 Some(Sample::Sint(i64::from(h)))
             },
         });
@@ -1203,18 +1192,7 @@ impl Registry {
             out_type: SampleType::Bin,
             // T326
             func: |ctx, _args| {
-                let host = get_req_header(ctx, "host").unwrap_or_default();
-                let uri = get_context_uri(ctx).unwrap_or("");
-                let (_, path, query) = split_uri(uri);
-                let mut data = host.into_bytes();
-                if path.starts_with('/') {
-                    data.extend_from_slice(path.as_bytes());
-                    if !query.is_empty() {
-                        data.push(b'?');
-                        data.extend_from_slice(query.as_bytes());
-                    }
-                }
-                let h = full_hash(hash_sdbm(&data));
+                let h = url32_hash(ctx);
                 let mut out = Vec::with_capacity(20);
                 out.extend_from_slice(&h.to_be_bytes());
                 if let Some(sa) = ctx.client_addr {
@@ -5036,6 +5014,39 @@ fn url_ipv4_authority(uri: &str) -> Option<(Ipv4Addr, u16)> {
         }
     };
     Some((Ipv4Addr::from(octets), port))
+}
+
+/// T326: `smp_fetch_url32` (`src/http_fetch.c`): SDBM over the first Host value, then over the
+/// request path (query included, as sent) when it starts with '/', then `full_hash`.
+fn url32_hash(ctx: &SampleContext) -> u32 {
+    let mut data = get_req_header(ctx, "host").unwrap_or_default().into_bytes();
+    let uri = get_context_uri(ctx).unwrap_or("");
+    let path = http_parse_path(uri, get_context_method(ctx) == Some("OPTIONS"));
+    if path.starts_with('/') {
+        data.extend_from_slice(path.as_bytes());
+    }
+    full_hash(hash_sdbm(&data))
+}
+
+/// `http_parse_path` (`src/http.c`) on a request URI: an origin-form URI is the path; after an
+/// RFC 3986 scheme and "://", the path is what follows the authority (which ends at '/', '?' or
+/// '#'); an authority-form or '*' URI has none. An empty absolute-URI path reads "/" except for
+/// OPTIONS, as `http_scheme_based_normalize` (`src/http_htx.c`) rewrites it on the way in.
+fn http_parse_path(uri: &str, options: bool) -> &str {
+    if uri.starts_with('/') {
+        return uri;
+    }
+    let b = uri.as_bytes();
+    if !b.first().is_some_and(u8::is_ascii_alphabetic) {
+        return "";
+    }
+    let n = b.iter().skip(1).take_while(|&&c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.')).count() + 1;
+    let Some(rest) = uri[n..].strip_prefix("://") else { return "" };
+    match rest.find(['/', '?', '#']) {
+        Some(i) => &rest[i..],
+        None if options => "",
+        None => "/",
+    }
 }
 
 fn split_uri(uri: &str) -> (&str, &str, &str) {
