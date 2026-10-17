@@ -1512,6 +1512,15 @@
     "line": 2962
   },
   {
+    "keyword": "ocsp_check_err_str",
+    "process": "sample_conv_ocsp_check_err_str",
+    "arg_mask": "0",
+    "in_type": "SMP_T_SINT",
+    "out_type": "SMP_T_STR",
+    "file": "src/ssl_ocsp.c",
+    "line": 2872
+  },
+  {
     "keyword": "digest",
     "process": "sample_conv_crypto_digest",
     "arg_mask": "ARG1(1,STR)",
