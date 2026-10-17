@@ -13,6 +13,7 @@ pub mod acls;
 pub mod aes;
 pub mod auth;
 pub mod cast;
+mod cookie_names;
 pub mod expr;
 pub mod fix;
 pub mod hash;

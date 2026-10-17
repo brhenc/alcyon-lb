@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T326: req.cook_names fetch
+//! T326: the `req.cook_names` fetch
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +53,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -72,49 +63,10 @@ fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     out
 }
 
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
-        }
-    });
-    addr
-}
-
 /// The body of the answer to `req` (what follows the first empty line).
 fn body(addr: SocketAddr, req: &[u8]) -> String {
     let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
-}
-
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
+    s.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {s:?}"), |(_, b)| b.to_string())
 }
 
 #[test]
@@ -123,14 +75,33 @@ fn req_cook_names_fetch() {
     let cfg = format!(
         "global\n  stats socket {{sock}} level admin\n\
          defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
-         frontend fe\n  bind {}\n  http-request return status 200 content-type text/plain lf-string \"[%[req.cook_names]][%[req.cook_names(;)]]\"",
-        a
+         frontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"[%[req.cook_names]][%[req.cook_names(;)]]\""
     );
-    let (ibex, _sock) = start("req_cook_names", &cfg, &[a]);
+    let (_ibex, _sock) = start("req_cook_names", &cfg, &[a]);
     let req1 = b"GET / HTTP/1.1\r\nHost: a\r\nCookie: a=1; b=2\r\nConnection: close\r\n\r\n";
     let req2 = b"GET / HTTP/1.1\r\nHost: a\r\nCookie: a=1\r\nCookie: c=3; d\r\nConnection: close\r\n\r\n";
     let req3 = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
     assert_eq!(body(a, req1), "[a,b][a;b]");
     assert_eq!(body(a, req2), "[a,c][a;c]");
     assert_eq!(body(a, req3), "[][]");
+    // The names as `http_extract_next_cookie_name` finds them: a Cookie value is split on
+    // `,` too, `$` attributes and pairs without `=` are skipped, quotes are honoured, and a
+    // delimiter goes in only behind a non-empty output, so a leading empty name vanishes
+    // while a later one keeps its slot (measured on HAProxy 3.5-dev8).
+    for (cookie, want) in [
+        ("$Version=1; a=1; $Path=/; b=2", "[a,b][a;b]"),
+        ("a=1, b=2", "[a,b][a;b]"),
+        ("=1; b=2; c=", "[b,c][b;c]"),
+        ("a=1; =2; b=3", "[a,,b][a;;b]"),
+        ("a=\"x;y\"; b=2", "[a,b][a;b]"),
+        ("a=\"1,2\", b=3", "[a,b][a;b]"),
+        ("a=1; nov; b=2", "[a,b][a;b]"),
+        ("  a = 1 ;  b  =2", "[a,b][a;b]"),
+        ("a=1;b", "[a][a]"),
+        ("a b=1", "[a b][a b]"),
+        ("x", "[][]"),
+    ] {
+        let req = format!("GET / HTTP/1.1\r\nHost: a\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n");
+        assert_eq!(body(a, req.as_bytes()), want, "for Cookie: {cookie}");
+    }
 }
