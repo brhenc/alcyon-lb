@@ -5,7 +5,6 @@
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +53,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -71,8 +62,6 @@ fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let _ = s.read_to_end(&mut out);
     out
 }
-
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
 
 fn http_cfg(global: &str, body: &str) -> String {
     format!(
@@ -108,15 +97,6 @@ fn body(addr: SocketAddr, req: &[u8]) -> String {
     s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
 }
 
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
-}
-
 #[test]
 fn req_hdrs_bin_basic() {
     let addr = common::reserve_addr();
@@ -133,7 +113,7 @@ backend be
             A = addr,
         ),
     );
-    let (ibex, _sock) = start("req_hdrs_bin_basic", &cfg, &[addr]);
+    let (_ibex, _sock) = start("req_hdrs_bin_basic", &cfg, &[addr]);
     let a = addr;
 
     // Test 1: single header Host: a
@@ -163,4 +143,51 @@ fn hex_encode(data: &[u8]) -> String {
         let _ = write!(s, "{b:02X}");
     }
     s
+}
+
+/// Lengths of 240 and more take `HAProxy`'s varint (`include/haproxy/intops.h`), and the
+/// `Connection` / `Upgrade` headers are what `HAProxy`'s H1 parser leaves of them
+/// (`h1_parse_connection_header`, `h1_parse_upgrade_header`, `h1_postparse_req_hdrs`).
+/// Every expected value was measured on `HAProxy` 3.5-dev8.
+#[test]
+fn req_hdrs_bin_matches_haproxy() {
+    const HOST: &str = "04686F73740161";
+    let addr = common::reserve_addr();
+    let cfg = http_cfg(
+        "",
+        &format!(
+            r#"frontend fe
+  bind {addr}
+  http-request return status 200 content-type text/plain lf-string "[%[req.hdrs_bin,hex]]""#
+        ),
+    );
+    let (_ibex, _sock) = start("req_hdrs_bin_oracle", &cfg, &[addr]);
+
+    // Varint boundaries: (value length, its varint as HAProxy writes it).
+    for (n, varint) in [(239, "EF"), (240, "F000"), (300, "FC03"), (2287, "FF7F"), (2288, "F08000"), (5000, "F8A901")] {
+        let v = "v".repeat(n);
+        let req = format!("GET / HTTP/1.1\r\nHost: a\r\nX-L: {v}\r\nConnection: close\r\n\r\n");
+        assert_eq!(body(addr, req.as_bytes()), format!("[{HOST}03782D6C{varint}{}0000]", hex_encode(v.as_bytes())), "X-L of {n} bytes");
+    }
+
+    // (headers after `Host: a`, the whole sample as HAProxy encodes it).
+    let cases = [
+        ("connection: close\r\n", "04686F737401610000"),
+        ("Connection: close, foo\r\n", "04686F737401610A636F6E6E656374696F6E03666F6F0000"),
+        ("Connection: foo , close\r\n", "04686F737401610A636F6E6E656374696F6E04666F6F200000"),
+        ("Connection: close, Foo,  bar\r\n", "04686F737401610A636F6E6E656374696F6E07466F6F2C6261720000"),
+        ("Connection: upgrade, foo\r\n", "04686F737401610A636F6E6E656374696F6E03666F6F0000"),
+        ("Connection: upgrade\r\nUpgrade: h2c\r\n", "04686F737401610000"),
+        ("Connection: upgrade, close\r\nUpgrade: x\r\n", "04686F737401610A636F6E6E656374696F6E0775706772616465077570677261646501780000"),
+        ("Connection: Upgrade\r\nUpgrade: h2c, Foo\r\n", "04686F737401610A636F6E6E656374696F6E0755706772616465077570677261646503466F6F0000"),
+        ("Upgrade: x\r\nKeep-Alive: 5\r\nConnection: close\r\n", "04686F737401610A6B6565702D616C69766501350000"),
+        ("Proxy-Connection: x\r\nConnection: close\r\n", "04686F737401611070726F78792D636F6E6E656374696F6E01780000"),
+        ("X-A: 1\r\n", "04686F7374016103782D6101310000"),
+    ];
+    for (hdrs, want) in cases {
+        let req = format!("GET / HTTP/1.1\r\nHost: a\r\n{hdrs}\r\n");
+        assert_eq!(body(addr, req.as_bytes()), format!("[{want}]"), "headers {hdrs:?}");
+    }
+    let te = b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n";
+    assert_eq!(body(addr, te), "[04686F73740161117472616E736665722D656E636F64696E67076368756E6B65640000]");
 }
