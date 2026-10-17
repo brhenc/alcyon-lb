@@ -62,13 +62,12 @@ fn bad_command_lines_say_why_and_exit_1() {
 
 #[test]
 fn debug_flags_announce_themselves() {
-    let (code, err) = run(&["-dr", "-de", "-dp", "-dM", "-f", "CFG", "-c"]);
+    let (code, err) = run(&["-dr", "-de", "-dp", "-f", "CFG", "-c"]);
     assert_eq!(code, Some(0), "{err}");
     for want in [
         "[DIAG] Flag -dr: ignoring server address resolution failures.",
         "[DIAG] Flag -de: disabling epoll poller (falling back to standard poll).",
         "[DIAG] Flag -dp: disabling poll poller.",
-        "[DIAG] Flag -dM: memory pool debugging active.",
     ] {
         assert!(err.contains(want), "{want:?} missing from {err:?}");
     }
@@ -213,4 +212,15 @@ fn a_failed_socket_handover_is_reported() {
     let mut text = String::new();
     err.read_to_string(&mut text).unwrap();
     assert!(text.contains("[ALERT] could not hand the listening sockets over:"), "{text:?}");
+}
+
+/// T351: `-dM` (HAProxy: poison pool memory) has no Ibex equivalent, so every form is refused
+/// with a message naming the option instead of printing a banner and doing nothing.
+#[test]
+fn dm_is_refused_in_every_form() {
+    for flag in ["-dM", "-dMhelp", "-dM0x55", "-dMfail", "-dMno-cache"] {
+        let (code, err) = run(&[flag, "-f", "CFG", "-c"]);
+        assert_eq!(code, Some(1), "{flag}: {err:?}");
+        assert!(err.contains("-dM") && err.contains("not supported"), "{flag}: {err:?}");
+    }
 }

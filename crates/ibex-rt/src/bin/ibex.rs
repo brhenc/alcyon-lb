@@ -56,7 +56,6 @@ struct CliOptions {
     ignore_resolve_fail: bool,
     disable_epoll: bool,
     disable_poll: bool,
-    dump_memory_pools: bool,
     dump_libs: bool,
     overrides: Vec<String>,
 }
@@ -68,7 +67,6 @@ fn print_help(program: &str) {
     println!("        -v displays version ; -vv shows known build options.");
     println!("        -vq/-vqs/-vqb only displays version, short version, branch.");
     println!("        -d enters debug mode ; -db only disables background mode.");
-    println!("        -dM[<byte>,help,...] debug memory pools");
     println!("        -V enters verbose mode (disables quiet mode)");
     println!("        -D goes daemon ; -C changes to <dir> before loading files.");
     println!("        -W reload on SIGUSR2, handing listening sockets to the new process.");
@@ -410,9 +408,6 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
             "-dL" => {
                 opts.dump_libs = true;
             }
-            "-dM" => {
-                opts.dump_memory_pools = true;
-            }
             "-e" => {
                 i += 1;
                 if i < args.len() {
@@ -438,7 +433,10 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
                 opts.memory_limit_mb = Some(parse_arg_u64(&other[2..], "-m"));
             }
             other if other.starts_with("-dM") => {
-                opts.dump_memory_pools = true;
+                ibex_rt::stderr_line!(
+                    "{other}: -dM (memory pool debugging) is not supported: Ibex has no memory pools to poison"
+                );
+                process::exit(1);
             }
             unknown => {
                 ibex_rt::stderr_line!("Unknown option: {unknown}");
@@ -522,9 +520,6 @@ fn report_diagnostics(opts: &CliOptions) {
     }
     if opts.disable_poll && !opts.quiet {
         ibex_rt::stderr_line!("[DIAG] Flag -dp: disabling poll poller.");
-    }
-    if opts.dump_memory_pools && !opts.quiet {
-        ibex_rt::stderr_line!("[DIAG] Flag -dM: memory pool debugging active.");
     }
     if opts.dump_libs {
         dump_loaded_libraries();
