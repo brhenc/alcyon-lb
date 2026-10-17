@@ -3531,15 +3531,11 @@ mod tests {
             let srv_write_wanted = s.interests().1.write;
             let woken = moved || srv_write_wanted || s.wants_rerun();
             assert!(woken, "run {run}: {} body bytes moved on, the rest held with nothing to run the session again", s.h2_active().expect("served").body.consumed);
-            if srv_write_wanted {
-                // The socket event runs it: wait for it, as the poller does (at once when the
-                // socket can take bytes).
-                use rustix::event::{poll, PollFd, PollFlags};
-                let fd = s.srv.as_ref().expect("the server's socket");
-                let mut fds = [PollFd::new(fd, PollFlags::OUT)];
-                let n = poll(&mut fds, 10_000).expect("poll");
-                assert_eq!(n, 1, "run {run}: the server's socket never became writable");
-            }
+            // The socket event runs it: wait for the server's socket to take bytes, as the
+            // poller does (at once when it can; the reader thread drains it).
+            use rustix::event::{poll, PollFd, PollFlags};
+            let mut fds = [PollFd::new(s.srv.as_ref().expect("the server's socket"), PollFlags::OUT)];
+            assert_eq!(poll(&mut fds, 10_000).expect("poll"), 1, "run {run}: the server's socket never became writable");
         }
         assert!(done(&s), "the body was moved on whole");
         drop(s);
