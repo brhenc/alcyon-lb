@@ -420,6 +420,7 @@ fn show_info_pairs(
     let idle_pct = cpu::get_idle_pct();
     let node = node_name();
     let zero = || "0".to_string();
+    let (pool_alloc, pool_used) = ibex_alloc::global_pool_registry().totals();
     let mut pairs = vec![
         ("Name", "Ibex".to_string()),
         ("Version", "0.1.0".to_string()),
@@ -431,8 +432,8 @@ fn show_info_pairs(
         ("Uptime", format!("{days}d {hours}h{mins:02}m{secs:02}s")),
         ("Uptime_sec", total_secs.to_string()),
         ("Memmax_MB", zero()),
-        ("PoolAlloc_MB", zero()),
-        ("PoolUsed_MB", zero()),
+        ("PoolAlloc_MB", (pool_alloc / 1_048_576).to_string()),
+        ("PoolUsed_MB", (pool_used / 1_048_576).to_string()),
         ("PoolFailed", zero()),
         ("Ulimit-n", ulimit_n.to_string()),
         ("Maxsock", maxsock.to_string()),
@@ -488,8 +489,8 @@ fn show_info_pairs(
         ("CumRecvLogs", zero()),
         ("Build info", "0.1.0".to_string()),
         ("Memmax_bytes", zero()),
-        ("PoolAlloc_bytes", zero()),
-        ("PoolUsed_bytes", zero()),
+        ("PoolAlloc_bytes", pool_alloc.to_string()),
+        ("PoolUsed_bytes", pool_used.to_string()),
         ("Start_time_sec", start_sec.to_string()),
         ("Tainted", zero()),
         ("TotalWarnings", zero()),

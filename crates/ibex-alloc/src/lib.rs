@@ -365,6 +365,33 @@ impl PoolRegistry {
 
         out
     }
+
+    /// Returns the total allocated and used bytes across all pools.
+    ///
+    /// T320: Matches the arithmetic used in [`Self::dump_pools_info`]'s `Total:` line.
+    #[must_use]
+    pub fn totals(&self) -> (u64, u64) {
+        let providers: Vec<PoolStatsFn> = self
+            .providers
+            .read()
+            .map(|list| list.iter().map(|(_, f)| *f).collect())
+            .unwrap_or_default();
+
+        let mut total_alloc_bytes: u64 = 0;
+        let mut total_used_bytes: u64 = 0;
+
+        for provider in providers {
+            let Some(p) = provider() else {
+                continue;
+            };
+            let alloc_bytes = p.alloc_bytes as u64;
+            let used_bytes = (p.used * p.size) as u64;
+            total_alloc_bytes += alloc_bytes;
+            total_used_bytes += used_bytes;
+        }
+
+        (total_alloc_bytes, total_used_bytes)
+    }
 }
 
 static GLOBAL_REGISTRY: PoolRegistry = PoolRegistry::new();
