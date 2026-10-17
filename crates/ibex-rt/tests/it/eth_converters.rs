@@ -5,7 +5,6 @@
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +53,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -81,40 +72,10 @@ fn http_cfg(global: &str, body: &str) -> String {
     )
 }
 
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
-        }
-    });
-    addr
-}
-
 /// The body of the answer to `req` (what follows the first empty line).
 fn body(addr: SocketAddr, req: &[u8]) -> String {
     let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
-}
-
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
+    s.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {s:?}"), |(_, b)| b.to_string())
 }
 
 const CFG: &str = r#"
@@ -124,12 +85,12 @@ frontend fe
 "#;
 
 #[test]
-fn eth_converters_without_vlan() {
+fn eth_converters_table() {
     // Frame without VLAN: 02:00:00:00:00:01 (dst) 02:00:00:00:00:02 (src) 0x0800 (EtherType)
     // Frame with VLAN:    02:00:00:00:00:01 (dst) 02:00:00:00:00:02 (src) 0x8100 (VLAN) 0x002A (TCI, VLAN ID=42) 0x0800 (EtherType)
     let a = common::reserve_addr();
     let cfg = http_cfg("", &CFG.replace("{A}", &a.to_string()));
-    let (ibex, _sock) = start("eth", &cfg, &[a]);
+    let (_ibex, _sock) = start("eth", &cfg, &[a]);
     // First 6 values: without VLAN
     // eth.data: IP header after eth header (12 bytes = 6 dst + 6 src)
     assert_eq!(
@@ -146,5 +107,76 @@ fn eth_converters_without_vlan() {
          |2048\
          |020000000002\
          |42"
+    );
+}
+
+/// One line per frame, `K=[data|hdr|proto|vlan|src|dst]`, each converter applied to `bin(<frame>)`.
+fn eth_lf(frames: &[(&str, &str)]) -> String {
+    frames
+        .iter()
+        .map(|(k, f)| {
+            format!(
+                "{k}=[%[bin({f}),eth.data,hex]|%[bin({f}),eth.hdr,hex]|%[bin({f}),eth.proto]|%[bin({f}),eth.vlan]|%[bin({f}),eth.src,hex]|%[bin({f}),eth.dst,hex]]"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\\n")
+}
+
+fn eth_body(tag: &str, frames: &[(&str, &str)]) -> String {
+    let a = common::reserve_addr();
+    let fe = format!(
+        "frontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"{}\"\n",
+        eth_lf(frames)
+    );
+    let (_ibex, _sock) = start(tag, &http_cfg("", &fe), &[a]);
+    body(a, GET)
+}
+
+/// T330 review A1/A3: frames too short for an `EtherType` give no sample (and must not panic);
+/// the 12- and 13-byte frames used to abort the process. Expected values from `HAProxy` 3.5-dev8.
+#[test]
+fn eth_converters_short_frames() {
+    let got = eth_body(
+        "eth-short",
+        &[
+            ("F5", "0200000000"),
+            ("F11", "0200000000010200000000"),
+            ("F12", "020000000001020000000002"),
+            ("F13", "02000000000102000000000208"),
+            ("F14", "0200000000010200000000020800"),
+            ("F16", "0200000000010200000000028100002a"),
+            ("F18", "0200000000010200000000028100002a0800"),
+        ],
+    );
+    assert_eq!(
+        got,
+        "F5=[|||||]\n\
+         F11=[|||||020000000001]\n\
+         F12=[||||020000000002|020000000001]\n\
+         F13=[||||020000000002|020000000001]\n\
+         F14=[||||020000000002|020000000001]\n\
+         F16=[||||020000000002|020000000001]\n\
+         F18=[||||020000000002|020000000001]"
+    );
+}
+
+/// T330 review A2/A3: every 802.1Q tag is skipped (`QinQ`), `eth.vlan` is the last id and id 0 is no
+/// VLAN, and one byte past the `EtherType` is enough. Expected values from `HAProxy` 3.5-dev8.
+#[test]
+fn eth_converters_vlan_walk() {
+    let got = eth_body(
+        "eth-vlan",
+        &[
+            ("F15", "020000000001020000000002080045"),
+            ("FQ", "0200000000010200000000028100000a8100002b08004500"),
+            ("F0", "0200000000010200000000028100000008004500"),
+        ],
+    );
+    assert_eq!(
+        got,
+        "F15=[45|0200000000010200000000020800|2048||020000000002|020000000001]\n\
+         FQ=[4500|0200000000010200000000028100000A8100002B0800|2048|43|020000000002|020000000001]\n\
+         F0=[4500|020000000001020000000002810000000800|2048||020000000002|020000000001]"
     );
 }

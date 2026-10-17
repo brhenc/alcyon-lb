@@ -4345,27 +4345,15 @@ impl Registry {
             },
         });
 
-        // T330: eth.* converters for Ethernet frame analysis (input: binary Ethernet frame)
-        // Frame layout: dst_mac(6) + src_mac(6) + [vlan_tag(4)] + ether_type(2) + payload
-        // vlan_tag: 0x8100 (2 bytes) + TCI (2 bytes, VLAN ID = lower 12 bits)
+        // T330: eth.* converters on a binary Ethernet frame (net_helper.c). Layout: dst MAC (6),
+        // src MAC (6), any number of 802.1Q tags (0x8100 + TCI), EtherType (2), payload.
 
         self.register_converter(ConvDesc {
             name: "eth.data",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, _args| match smp {
-                Sample::Bin(b) => {
-                    if b.len() < 12 {
-                        return None;
-                    }
-                    // Determine offset: 12 if no VLAN, 14 if VLAN tag present
-                    let offset = if b.len() >= 18 && &b[12..14] == b"\x81\x00" {
-                        18usize
-                    } else {
-                        14usize
-                    };
-                    Some(Sample::Bin(b[offset..].to_vec()))
-                }
+                Sample::Bin(b) => Some(Sample::Bin(b.get(eth_hdr_len(&b)?..)?.to_vec())),
                 _ => None,
             },
         });
@@ -4375,12 +4363,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, _args| match smp {
-                Sample::Bin(b) => {
-                    if b.len() < 6 {
-                        return None;
-                    }
-                    Some(Sample::Bin(b[..6].to_vec()))
-                }
+                Sample::Bin(b) => Some(Sample::Bin(b.get(..6)?.to_vec())),
                 _ => None,
             },
         });
@@ -4390,18 +4373,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, _args| match smp {
-                Sample::Bin(b) => {
-                    if b.len() < 12 {
-                        return None;
-                    }
-                    // Determine header length: 12 if no VLAN, 14 if VLAN tag present
-                    let hdr_len = if b.len() >= 18 && &b[12..14] == b"\x81\x00" {
-                        18usize
-                    } else {
-                        14usize
-                    };
-                    Some(Sample::Bin(b[..hdr_len].to_vec()))
-                }
+                Sample::Bin(b) => Some(Sample::Bin(b.get(..eth_hdr_len(&b)?)?.to_vec())),
                 _ => None,
             },
         });
@@ -4412,17 +4384,8 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Bin(b) => {
-                    if b.len() < 12 {
-                        return None;
-                    }
-                    // EtherType is at offset 12 (no VLAN) or 14 (with VLAN)
-                    let offset = if b.len() >= 18 && &b[12..14] == b"\x81\x00" {
-                        16usize
-                    } else {
-                        12usize
-                    };
-                    let proto = u16::from_be_bytes([*b.get(offset)?, *b.get(offset + 1)?]);
-                    Some(Sample::Sint(i64::from(proto)))
+                    let o = eth_hdr_len(&b)?;
+                    Some(Sample::Sint(i64::from(u16::from_be_bytes([*b.get(o - 2)?, *b.get(o - 1)?]))))
                 }
                 _ => None,
             },
@@ -4433,12 +4396,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, _args| match smp {
-                Sample::Bin(b) => {
-                    if b.len() < 12 {
-                        return None;
-                    }
-                    Some(Sample::Bin(b[6..12].to_vec()))
-                }
+                Sample::Bin(b) => Some(Sample::Bin(b.get(6..12)?.to_vec())),
                 _ => None,
             },
         });
@@ -4448,13 +4406,21 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
+                // The last VLAN id seen; id 0 is no VLAN (sample_conv_eth_vlan's `return !!vlan`).
                 Sample::Bin(b) => {
-                    // VLAN tag: 0x8100 at offset 12, TCI at offset 13-14
-                    if b.len() < 18 || &b[12..14] != b"\x81\x00" {
-                        return None;
+                    let mut vlan = 0u16;
+                    let mut idx = 12usize;
+                    while idx + 2 < b.len() {
+                        if b.get(idx..idx + 2)? != [0x81, 0x00] {
+                            return (vlan != 0).then_some(Sample::Sint(i64::from(vlan)));
+                        }
+                        if idx + 4 > b.len() {
+                            break;
+                        }
+                        vlan = u16::from_be_bytes([*b.get(idx + 2)?, *b.get(idx + 3)?]) & 0x0fff;
+                        idx += 4;
                     }
-                    let tci = u16::from_be_bytes([*b.get(14)?, *b.get(15)?]);
-                    Some(Sample::Sint(i64::from(tci & 0x0FFF)))
+                    None
                 }
                 _ => None,
             },
@@ -5924,6 +5890,19 @@ fn url_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// T330: the length of an Ethernet header up to and including the `EtherType`, skipping every
+/// 802.1Q tag, or None when the frame ends first (the loop in `net_helper.c`'s `sample_conv_eth_*`).
+fn eth_hdr_len(b: &[u8]) -> Option<usize> {
+    let mut idx = 12usize;
+    while idx + 2 < b.len() {
+        if b.get(idx..idx + 2)? != [0x81, 0x00] {
+            return Some(idx + 2);
+        }
+        idx += 4;
+    }
+    None
 }
 
 #[cfg(test)]
