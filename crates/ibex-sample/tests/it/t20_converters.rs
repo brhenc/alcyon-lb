@@ -16,7 +16,7 @@ fn test_div() {
     assert_eq!(eval_conv("div", Sample::Sint(10), &["2"]), Some(Sample::Sint(5)));
     assert_eq!(eval_conv("div", Sample::Sint(10), &["0"]), Some(Sample::Sint(i64::MAX)));
     assert_eq!(eval_conv("div", Sample::Str("10".into()), &["2"]), None);
-    assert_eq!(eval_conv("div", Sample::Sint(10), &[]), None); // missing arg
+    assert_eq!(eval_conv("div", Sample::Sint(10), &[]), Some(Sample::Sint(i64::MAX))); // T343: HAProxy 3.5-dev8 reads no argument as 0
 }
 
 #[test]

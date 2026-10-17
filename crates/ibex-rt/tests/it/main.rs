@@ -350,6 +350,7 @@ mod trailer_case;
 mod tune_maxaccept;
 mod transport_edges;
 mod txn_variables_race;
+mod typed_sample_args;
 mod url32;
 mod url_ip_port;
 mod urlp_raw;

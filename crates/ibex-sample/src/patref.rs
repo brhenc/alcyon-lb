@@ -396,12 +396,22 @@ fn map_key_error(keys: MapKeys, key: &str, resolve: bool) -> Option<String> {
 
 /// The first key of map file `path` that a converter of kind `keys` refuses, as `HAProxy`
 /// words it when it loads the file: `<why> at line <n> of file '<path>'.` `None` when every
-/// key is fine, or the file cannot be read (reported elsewhere). A key of a regex map is
+/// key is fine; for a file that cannot be read, `HAProxy`'s message (T343). A key of a regex map is
 /// otherwise compiled only when a lookup first reaches it, and one that does not compile
 /// then never matches (T277).
 #[must_use]
 pub fn map_file_error(path: &str, keys: MapKeys, vals: MapVals) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    // T343: a map file that cannot be read is refused (`pat_ref_read_from_file`), but for a
+    // virtual (`virt@`) or optional (`opt@`) one, which `HAProxy` loads without a file.
+    if path.starts_with("virt@") || path.starts_with("opt@") {
+        return None;
+    }
+    if std::path::Path::new(path).is_dir() {
+        return Some(format!("error encountered while reading  <{path}> : Is a directory."));
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Some(format!("failed to open pattern file <{path}>."));
+    };
     text.lines().enumerate().find_map(|(n, l)| {
         let l = l.trim();
         if l.is_empty() || l.starts_with('#') {
@@ -750,10 +760,15 @@ mod tests {
     }
 
     #[test]
-    fn converters_that_read_no_key_file_check_nothing() {
+    fn a_map_file_that_cannot_be_read_is_refused_unless_virtual_or_optional() {
+        // T343, measured on HAProxy 3.5-dev8: "failed to open pattern file </nonexistent>.";
+        // `virt@` and `opt@` maps load without a file.
         let args = ["/nonexistent".to_string()];
-        assert_eq!(crate::registry::check_converter_args("map_str_int", &args), None);
-        assert_eq!(crate::registry::check_converter_args("map_int", &args), None);
+        let refused = Some("invalid args in converter 'map_str_int' : failed to open pattern file </nonexistent>.".to_string());
+        assert_eq!(crate::registry::check_converter_args("map_str_int", &args), refused);
+        assert!(crate::registry::check_converter_args("map", &args).is_some());
+        assert_eq!(crate::registry::check_converter_args("map", &["virt@x".to_string()]), None);
+        assert_eq!(crate::registry::check_converter_args("map_int", &["opt@/nonexistent".to_string()]), None);
     }
 
     #[test]

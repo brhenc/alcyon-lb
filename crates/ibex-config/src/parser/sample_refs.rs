@@ -49,7 +49,12 @@ pub fn log_format_exprs(fmt: &str) -> Vec<&str> {
             pos += 1;
             continue;
         }
-        let Some(close) = expr_end(bytes, open + 1) else { break };
+        // T343: with no `]` (`%[int(` where an unquoted blank ended the word), `HAProxy` parses the
+        // expression to the end of the text and refuses what it finds there.
+        let Some(close) = expr_end(bytes, open + 1) else {
+            found.push(&fmt[open + 1..]);
+            break;
+        };
         found.push(&fmt[open + 1..close]);
         pos = close + 1;
     }
@@ -149,7 +154,9 @@ mod tests {
         assert_eq!(log_format_exprs("a%[nbsrv(be)]-%[srv_is_up(s),iif(up,down)]"), ["nbsrv(be)", "srv_is_up(s),iif(up,down)"]);
         assert_eq!(log_format_exprs("%{+Q}[req.hdr(x)] %%[not] %ci"), ["req.hdr(x)"]);
         assert_eq!(log_format_exprs("%[str(a]b)]"), ["str(a]b)"]);
-        assert!(log_format_exprs("%[unterminated").is_empty());
+        // T343: the rest of the text, which `HAProxy` parses as the expression and refuses
+        // (`%[int(` "expected type 'integer' at position 1, but got nothing").
+        assert_eq!(log_format_exprs("%[unterminated"), ["unterminated"]);
         assert!(log_format_exprs("%{+Q").is_empty());
         assert_eq!(log_format_exprs(r#"%[str("a]b")] %[str(a\]b)]"#), [r#"str("a]b")"#, r"str(a\]b)"]);
     }

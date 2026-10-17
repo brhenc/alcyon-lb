@@ -661,6 +661,11 @@ pub struct Registry {
 }
 
 fn resolve_int_arg(arg: &str) -> Option<i64> {
+    // T343: what `check_operator` made of it at load: an integer `read_int64` takes whole (an
+    // empty argument, a lone sign: 0), or a variable.
+    if let Some(n) = crate::argspec::read_int64_whole(arg) {
+        return Some(n);
+    }
     let trimmed = arg.trim().trim_matches('"').trim_matches('\'');
     if let Ok(n) = trimmed.parse::<i64>() {
         return Some(n);
@@ -1326,41 +1331,12 @@ impl Registry {
         names
     }
 
-    /// T341: what `sample_parse_expr` checks of a converter chain at load, in its order: each
-    /// converter's input must be castable from what the one before it gives
-    /// (`sample_casts[prev][in]`, "converter 'bool' cannot be applied" after `ip.data`), then
-    /// its arguments ([`check_converter_args`]). The fetch's own type is not used: not every
-    /// fetch here declares the one `HAProxy` gives it (`fc_pp_tlv` is `str` there), so the
-    /// first converter is not checked, nor one after a converter whose output is `ANY`.
+    /// T341: the arguments of each converter of a chain ([`check_converter_args`]). Whether
+    /// each converter applies to what precedes it is checked with `HAProxy`'s declared types
+    /// since T343 ([`crate::argspec::check_typed_expr`]), the fetch's included.
     #[must_use]
     pub fn check_converters(&self, converters: &[(String, Vec<String>)]) -> Option<String> {
-        let mut prev: Option<SampleType> = None;
-        for (name, args) in converters {
-            // Every caller has refused an unknown converter already; one would take and give
-            // any type here.
-            let (in_type, out_type) = self
-                .get_converter(name)
-                .map(|d| (d.in_type, d.out_type))
-                .or_else(|| self.get_ctx_converter(name).map(|d| (d.in_type, d.out_type)))
-                .unwrap_or((TypeSpec::Any, TypeSpec::Any));
-            let applies = |p: SampleType| match in_type {
-                TypeSpec::Exact(t) => crate::cast::can_cast(p, t),
-                TypeSpec::Addr => crate::cast::can_cast(p, SampleType::Ipv4) || crate::cast::can_cast(p, SampleType::Ipv6),
-                TypeSpec::Any | TypeSpec::Same => true,
-            };
-            if prev.is_some_and(|p| !applies(p)) {
-                return Some(format!("converter '{name}' cannot be applied."));
-            }
-            if let Some(e) = check_converter_args(name, args) {
-                return Some(e);
-            }
-            prev = match (out_type, in_type) {
-                (TypeSpec::Exact(t), _) | (TypeSpec::Same, TypeSpec::Exact(t)) => Some(t),
-                (TypeSpec::Same, _) => prev,
-                _ => None,
-            };
-        }
-        None
+        converters.iter().find_map(|(name, args)| check_converter_args(name, args))
     }
 
     /// T330: the total IP header length of `b` (v4 or v6, IPv6 extension headers included), the
@@ -4023,7 +3999,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let n = resolve_int_arg(args.first()?)?;
+                let n = resolve_int_arg(args.first().map_or("", String::as_str))?;
                 match smp {
                     Sample::Sint(val) => Some(Sample::Sint(val.saturating_add(n))),
                     _ => None,
@@ -4036,7 +4012,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let n = resolve_int_arg(args.first()?)?;
+                let n = resolve_int_arg(args.first().map_or("", String::as_str))?;
                 match smp {
                     Sample::Sint(val) => Some(Sample::Sint(val.saturating_sub(n))),
                     _ => None,
@@ -4049,7 +4025,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let factor = resolve_int_arg(args.first()?)?;
+                let factor = resolve_int_arg(args.first().map_or("", String::as_str))?;
                 match smp {
                     Sample::Sint(n) => Some(Sample::Sint(n.saturating_mul(factor))),
                     _ => None,
@@ -4062,7 +4038,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let divisor = resolve_int_arg(args.first()?)?;
+                let divisor = resolve_int_arg(args.first().map_or("", String::as_str))?;
                 if divisor == 0 {
                     return Some(Sample::Sint(i64::MAX));
                 }
@@ -4078,7 +4054,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let divisor = resolve_int_arg(args.first()?)?;
+                let divisor = resolve_int_arg(args.first().map_or("", String::as_str))?;
                 if divisor == 0 {
                     return Some(Sample::Sint(0));
                 }
@@ -4104,7 +4080,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let mask = resolve_int_arg(args.first()?)?;
+                let mask = resolve_int_arg(args.first().map_or("", String::as_str))?;
                 match smp {
                     Sample::Sint(n) => Some(Sample::Sint(n & mask)),
                     _ => None,
@@ -4117,7 +4093,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let mask = resolve_int_arg(args.first()?)?;
+                let mask = resolve_int_arg(args.first().map_or("", String::as_str))?;
                 match smp {
                     Sample::Sint(n) => Some(Sample::Sint(n | mask)),
                     _ => None,
@@ -4130,7 +4106,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let mask = resolve_int_arg(args.first()?)?;
+                let mask = resolve_int_arg(args.first().map_or("", String::as_str))?;
                 match smp {
                     Sample::Sint(n) => Some(Sample::Sint(n ^ mask)),
                     _ => None,
@@ -4604,7 +4580,9 @@ impl Registry {
         self.register_converter(ConvDesc {
             name: "ipmask",
             in_type: TypeSpec::Addr,
-            out_type: TypeSpec::Same,
+            // T343: `SMP_T_ADDR`, as `HAProxy` declares it; an ACL on it matches networks by
+            // default (it took the string match of a string input when this was `Same`).
+            out_type: TypeSpec::Addr,
             func: |smp, args| {
                 let mask1_str = args.first()?;
                 let mask2_str = args.get(1);
@@ -4808,22 +4786,11 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, args| {
-                let algo = args.first().map_or("sha256", String::as_str);
+                // T343: the algorithm is checked at load (`check_crypto_digest`); a name
+                // `OpenSSL` knows by an alias (`SHA-1`, `sha2-256`) is that digest, not sha256.
+                let f = digest_by_name(args.first()?)?;
                 let Sample::Bin(b) = smp else { return None };
-                let out = match algo.to_lowercase().as_str() {
-                    "sha1" => sha1_digest(&b).to_vec(),
-                    "sha224" => sha224_digest(&b).to_vec(),
-                    "sha384" => sha384_digest(&b).to_vec(),
-                    "sha512" => sha512_digest(&b).to_vec(),
-                    "md5" => md5_digest(&b).to_vec(),
-                    "crc32" => hash_crc32(&b).to_be_bytes().to_vec(),
-                    "crc32c" => hash_crc32c(&b).to_be_bytes().to_vec(),
-                    "djb2" => hash_djb2(&b).to_be_bytes().to_vec(),
-                    "sdbm" => hash_sdbm(&b).to_be_bytes().to_vec(),
-                    "wt6" => hash_wt6(&b).to_be_bytes().to_vec(),
-                    _ => sha256_digest(&b).to_vec(),
-                };
-                Some(Sample::Bin(out))
+                Some(Sample::Bin(f(&b)))
             },
         });
 
@@ -7602,6 +7569,17 @@ fn hmac_digest(alg: &str) -> Option<(fn(&[u8]) -> Vec<u8>, usize)> {
     })
 }
 
+/// T343: the digest `digest(<alg>)` computes, by `OpenSSL` name (`EVP_get_digestbyname`), as
+/// `hmac` takes it; `None` for a name it does not know.
+pub(crate) fn digest_by_name(alg: &str) -> Option<fn(&[u8]) -> Vec<u8>> {
+    hmac_digest(alg).map(|(f, _)| f)
+}
+
+/// T343: whether `alg` is an `OpenSSL` digest Ibex does not compute.
+pub(crate) fn digest_unimplemented(alg: &str) -> bool {
+    HMAC_UNIMPLEMENTED.contains(&alg.to_ascii_lowercase().as_str())
+}
+
 /// Digests `OpenSSL` has that `hmac` does not compute here; `HAProxy` loads them, so
 /// refusing is the honest answer to a name that is valid but would never give a sample.
 const HMAC_UNIMPLEMENTED: &[&str] = &[
@@ -7861,7 +7839,8 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
             .first()
             .filter(|a| crate::cast::parse_sint_arg(a).is_none())
             .map(|a| format!("invalid arg 1 in converter '{name}' : failed to parse '{a}' as type 'integer' at position 1.")),
-        _ if name.starts_with("map_") && crate::patref::converter_map(name).is_some() => {
+        // T343: `map` itself too, not only the `map_*` forms.
+        _ if (name == "map" || name.starts_with("map_")) && crate::patref::converter_map(name).is_some() => {
             let (keys, vals) = crate::patref::converter_map(name)?;
             let path = args.first()?.trim_matches(['"', '\'']);
             crate::patref::map_file_error(path, keys, vals).map(|e| format!("invalid args in converter '{name}' : {e}"))
