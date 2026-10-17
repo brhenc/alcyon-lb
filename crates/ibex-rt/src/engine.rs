@@ -12394,47 +12394,74 @@ fn apply_normalize_uri(
             }
             Ok(rebuild_uri(prefix, &merged_path, query))
         }
-        "path-strip-dotdot" => {
-            let segments: Vec<&str> = path.split('/').collect();
-            let mut stack: Vec<&str> = Vec::new();
-            for seg in segments {
-                if seg == ".." {
-                    if stack.is_empty() {
-                        // A ".." with nothing to pop would escape the root. The `full`
-                        // variant discards it; the plain variant preserves it verbatim
-                        // so the path is not silently altered.
-                        //
-                        // Both branches previously called stack.pop(), which is a no-op
-                        // on an empty Vec -- so the `full` flag had no effect at all.
-                        if !full {
-                            stack.push(seg);
+        // T359: ports of `uri_normalizer_path_dot` and `uri_normalizer_path_dotdot`
+        // (src/uri_normalizer.c). They keep empty segments (`//`) and the trailing slash, and
+        // dot-dot walks the path from the end as the C does; the rest of the target (`?` and the
+        // query, even an empty one) is kept as `http_replace_req_path` keeps it.
+        "path-strip-dotdot" | "path-strip-dot" => {
+            let p = path.as_bytes();
+            let mut out: Vec<u8> = Vec::with_capacity(p.len());
+            if normalizer == "path-strip-dot" {
+                let mut rest = p;
+                while !rest.is_empty() {
+                    let (seg, more, slash) = match rest.iter().position(|&c| c == b'/') {
+                        Some(i) => (rest.get(..i).unwrap_or(&[]), rest.get(i + 1..).unwrap_or(&[]), true),
+                        None => (rest, &[][..], false),
+                    };
+                    if seg != b"." {
+                        out.extend_from_slice(seg);
+                        if slash {
+                            out.push(b'/');
+                        }
+                    }
+                    rest = more;
+                }
+            } else {
+                let at = |i: isize| usize::try_from(i).ok().and_then(|i| p.get(i).copied());
+                let is = |i: isize, pat: &[u8]| usize::try_from(i).ok().and_then(|i| p.get(i..i + pat.len())) == Some(pat);
+                let mut off = isize::try_from(p.len()).unwrap_or(0) - 1;
+                let mut up = 0;
+                if off >= 2 && is(off - 2, b"/..") {
+                    up += 1;
+                    off -= 2;
+                }
+                while off >= 0 {
+                    if off >= 3 && is(off - 3, b"/../") {
+                        up += 1;
+                        off -= 3;
+                        continue;
+                    }
+                    if up > 0 {
+                        off -= 1;
+                        if off >= 0 {
+                            up -= 1;
+                            while off >= 0 && at(off) != Some(b'/') {
+                                off -= 1;
+                            }
                         }
                     } else {
-                        stack.pop();
+                        out.extend(at(off));
+                        off -= 1;
+                        while off >= 0 && at(off) != Some(b'/') {
+                            out.extend(at(off));
+                            off -= 1;
+                        }
                     }
-                } else if seg != "." && !seg.is_empty() {
-                    stack.push(seg);
                 }
-            }
-            let mut new_path = format!("/{}", stack.join("/"));
-            if path.ends_with('/') && !new_path.ends_with('/') {
-                new_path.push('/');
-            }
-            Ok(rebuild_uri(prefix, &new_path, query))
-        }
-        "path-strip-dot" => {
-            let segments: Vec<&str> = path.split('/').collect();
-            let mut stack: Vec<&str> = Vec::new();
-            for seg in segments {
-                if seg != "." && !seg.is_empty() {
-                    stack.push(seg);
+                if up > 0 {
+                    out.push(b'/');
+                    if !full {
+                        while up > 0 {
+                            out.extend_from_slice(b"../");
+                            up -= 1;
+                        }
+                    }
                 }
+                out.reverse();
             }
-            let mut new_path = format!("/{}", stack.join("/"));
-            if path.ends_with('/') && !new_path.ends_with('/') {
-                new_path.push('/');
-            }
-            Ok(rebuild_uri(prefix, &new_path, query))
+            let new_path = String::from_utf8(out).map_err(|_| ())?;
+            let tail = uri.get(prefix.len() + path.len()..).unwrap_or("");
+            Ok(format!("{prefix}{new_path}{tail}"))
         }
         "query-sort-by-name" => {
             if query.is_empty() {

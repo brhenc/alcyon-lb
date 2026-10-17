@@ -2,22 +2,24 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! `http-request normalize-uri` keywords (T358, T359).
 //!
-//! `path-strip-dot` and `path-strip-dotdot` (with and without `full`) rewrite the forwarded
-//! path differently from `HAProxy` (`tasks/T359-normalize-uri-path-normalizers.md` has the
-//! measured outputs): a wrong rewrite can bypass a path ACL or a routing rule, so `ibex -c`
-//! refuses them until they are ported (`haproxy -c` accepts them, measured on
-//! 3.5-dev8-885761-29). An unknown normalizer is refused by `HAProxy` too (`unknown normalizer
-//! 'bogus'`) and was accepted and ignored by Ibex. The other six keywords give the same
-//! answers as `HAProxy` (measured on 15 paths each) and are accepted.
+//! Each normalizer takes only the option `HAProxy` gives it (`full` for `path-strip-dotdot`,
+//! `strict` for the percent ones); another word before the condition is refused with
+//! `HAProxy`'s message (measured with `haproxy -c` on 3.5-dev8-885761-29).
+//! An unknown normalizer is refused by `HAProxy` too (`unknown normalizer 'bogus'`) and was accepted
+//! and ignored by Ibex. All eight are accepted.
 
 use std::process::Command;
+
+// One file per call: tests run in parallel and rules of the same length used to share a name.
+static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 fn check(rule: &str) -> (bool, String) {
     let cfg = format!(
         "global\n  expose-experimental-directives\ndefaults\n  mode http\n  timeout client 1s\n  timeout server 1s\n  timeout connect 1s\n\
          listen f\n  bind 127.0.0.1:1\n  http-request normalize-uri {rule}\n  server s 127.0.0.1:1\n"
     );
-    let path = std::env::temp_dir().join(format!("ibex-nur-{}-{}.cfg", std::process::id(), rule.len()));
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("ibex-nur-{}-{n}.cfg", std::process::id()));
     std::fs::write(&path, cfg).expect("write cfg");
     let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(&path).output().expect("ibex -c");
     let _ = std::fs::remove_file(&path);
@@ -25,11 +27,18 @@ fn check(rule: &str) -> (bool, String) {
 }
 
 #[test]
-fn the_path_strip_normalizers_are_refused_until_they_match_haproxy() {
-    for rule in ["path-strip-dot", "path-strip-dotdot", "path-strip-dotdot full", "path-strip-dot strict"] {
+fn an_option_a_normalizer_does_not_take_is_refused_as_haproxy_does() {
+    // Messages measured with `haproxy -c` on 3.5-dev8-885761-29.
+    for (rule, msg) in [
+        ("path-strip-dot strict", "expects either 'if' or 'unless' followed by a condition but found 'strict'"),
+        ("fragment-strip strict", "expects either 'if' or 'unless' followed by a condition but found 'strict'"),
+        ("percent-decode-unreserved strict x", "expects either 'if' or 'unless' followed by a condition but found 'x'"),
+        ("path-strip-dotdot strict", "unknown argument 'strict' for 'path-strip-dotdot' normalizer"),
+        ("percent-to-uppercase full", "unknown argument 'full' for 'percent-to-uppercase' normalizer"),
+    ] {
         let (ok, err) = check(rule);
         assert!(!ok, "{rule} was accepted");
-        assert!(err.contains("is not implemented as HAProxy does it in Ibex yet (T359)"), "{rule}: {err}");
+        assert!(err.contains(msg), "{rule}: {err}");
     }
 }
 
@@ -50,6 +59,10 @@ fn the_normalizers_that_match_haproxy_are_accepted() {
         "percent-decode-unreserved",
         "fragment-strip",
         "fragment-encode",
+        "path-strip-dot",
+        "path-strip-dotdot",
+        "path-strip-dotdot full",
+        "path-strip-dotdot full if TRUE",
     ] {
         let (ok, err) = check(rule);
         assert!(ok, "{rule} refused: {err}");
