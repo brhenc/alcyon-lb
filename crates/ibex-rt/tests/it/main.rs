@@ -160,6 +160,7 @@ mod http_txn;
 mod htx_byte_counts;
 mod idle_pool_fd_ratio;
 mod idle_pool_shared;
+mod jwt_query;
 mod keepalive_abort_accounting;
 mod keepalive_binary;
 mod large_response_latency;

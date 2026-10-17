@@ -3933,6 +3933,48 @@ impl Registry {
             func: json_query_conv,
         });
 
+        // --- T328: JWT Query Converters ---
+        // jwt_header_query([<json_path>[,<output_type>]])
+        // Decodes the JWT header (first base64url part) and optionally applies json_query.
+        self.register_converter(ConvDesc {
+            name: "jwt_header_query",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Any,
+            func: |smp, args| {
+                let Sample::Str(s) = smp else { return None };
+                let parts: Vec<&str> = s.splitn(3, '.').collect();
+                let header_b64 = parts.first()?;
+                let decoded = base64_decode(header_b64, true, false)?;
+                let decoded_str = std::str::from_utf8(&decoded).ok()?;
+                if let Some(path) = args.first() {
+                    json_extract(decoded_str, path).map(Sample::Str)
+                } else {
+                    Some(Sample::Str(decoded_str.to_string()))
+                }
+            },
+        });
+
+        // jwt_payload_query([<json_path>[,<output_type>]])
+        // Decodes the JWT payload (second base64url part) and optionally applies json_query.
+        self.register_converter(ConvDesc {
+            name: "jwt_payload_query",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Any,
+            func: |smp, args| {
+                let Sample::Str(s) = smp else { return None };
+                let parts: Vec<&str> = s.splitn(3, '.').collect();
+                let payload_b64 = parts.get(1)?;
+                let decoded = base64_decode(payload_b64, true, false)?;
+                let decoded_str = std::str::from_utf8(&decoded).ok()?;
+                if let Some(path) = args.first() {
+                    json_extract(decoded_str, path).map(Sample::Str)
+                } else {
+                    Some(Sample::Str(decoded_str.to_string()))
+                }
+            },
+        });
+
+
         // --- 7. Time & Date Converters ---
         self.register_converter(ConvDesc {
             name: "http_date",
