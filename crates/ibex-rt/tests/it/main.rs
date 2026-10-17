@@ -252,6 +252,7 @@ mod set_src_dst;
 mod set_status_reason;
 mod silent_drop_ttl;
 mod shared_counters;
+mod shdr_scook_aliases;
 mod show_info_counters;
 mod show_info_pools;
 mod show_info_rates;
