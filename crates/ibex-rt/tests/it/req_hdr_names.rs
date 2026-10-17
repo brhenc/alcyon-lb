@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T326: req.hdr_names fetch
+//! T326: the `req.hdr_names` fetch
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +53,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -72,63 +63,42 @@ fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     out
 }
 
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
-        }
-    });
-    addr
-}
-
 /// The body of the answer to `req` (what follows the first empty line).
 fn body(addr: SocketAddr, req: &[u8]) -> String {
     let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
-}
-
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
+    s.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {s:?}"), |(_, b)| b.to_string())
 }
 
 #[test]
 fn req_hdr_names() {
     let a = common::reserve_addr();
     let cfg = format!(
-        "global\n  stats socket {{sock}} level admin\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {}\n  http-request return status 200 content-type text/plain lf-string \"[%[req.hdr_names]][%[req.hdr_names(;)]]\"",
-        a
+        "global\n  stats socket {{sock}} level admin\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"[%[req.hdr_names]][%[req.hdr_names(;)]]\""
     );
-    let (ibex, _sock) = start("req_hdr_names", &cfg, &[a]);
+    let (_ibex, _sock) = start("req_hdr_names", &cfg, &[a]);
     let req1 = b"GET / HTTP/1.1\r\nHost: a\r\nX-Foo: 1\r\nx-foo: 2\r\nUser-Agent: T\r\nConnection: close\r\n\r\n";
     assert_eq!(body(a, req1), "[host,x-foo,x-foo,user-agent][host;x-foo;x-foo;user-agent]");
     let req2 = b"GET / HTTP/1.0\r\n\r\n";
     assert_eq!(body(a, req2), "[][]");
     let req3 = b"GET / HTTP/1.1\r\nHost: a\r\nA-B: c, d\r\nConnection: close\r\n\r\n";
     assert_eq!(body(a, req3), "[host,a-b][host;a-b]");
+    // The H1 parser takes `close` and `keep-alive` out of a Connection value and drops the
+    // header when nothing is left; `h2c`/`h2` out of Upgrade; and, in a request, an Upgrade
+    // without `Connection: upgrade` and an `upgrade` token without an Upgrade header
+    // (measured on HAProxy 3.5-dev8; the trailing `Connection: close` goes too).
+    for (hdrs, want) in [
+        ("Connection: upgrade\r\nUpgrade: foo", "[host,connection,upgrade]"),
+        ("Connection: close, x-y\r\nX-Y: 1", "[host,connection,x-y]"),
+        ("Connection: x-y, upgrade\r\nX-Y: 1", "[host,connection,x-y]"),
+        ("Connection: upgrade\r\nUpgrade: h2c", "[host]"),
+        ("Connection: upgrade\r\nUpgrade: h2c, foo", "[host,connection,upgrade]"),
+        ("Upgrade: websocket", "[host]"),
+        ("Connection: upgrade", "[host]"),
+        ("Connection: Keep-Alive, Close", "[host]"),
+        ("Connection: ,  , close", "[host,connection]"),
+    ] {
+        let req = format!("GET / HTTP/1.1\r\nHost: a\r\n{hdrs}\r\nConnection: close\r\n\r\n");
+        let got = body(a, req.as_bytes());
+        assert_eq!(got.split(']').next().map(|s| format!("{s}]")), Some(want.to_string()), "for {hdrs:?}: {got}");
+    }
 }

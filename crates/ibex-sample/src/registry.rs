@@ -1323,7 +1323,6 @@ impl Registry {
             func: req_hdr_names_fetch,
         });
 
-
         self.register_fetch(FetchDesc {
             name: "res.hdr_cnt",
             out_type: SampleType::Sint,
@@ -4902,45 +4901,22 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     }
     matches
 }
-/// Returns the names of request headers, in order, from the first source that has any.
-/// T326
+/// T326: the names of the request headers, lowercased, in order, from the first source that
+/// has any, without those `HAProxy`'s H1 parser leaves out of HTX ([`crate::h1_clean`]).
 fn req_header_names(ctx: &SampleContext) -> Vec<String> {
+    let mut hdrs: Vec<(&str, &str)> = Vec::new();
     if let Some(htx) = ctx.htx_slice {
-        let mut names = Vec::new();
-        for (hn, _hv) in htx.headers() {
-            let n_low = hn.to_ascii_lowercase();
-            if n_low == "connection" { continue; }
-            names.push(n_low);
-        }
-        if !names.is_empty() {
-            return names;
-        }
+        hdrs.extend(htx.headers());
     }
-    if let Some(htx) = ctx.htx {
-        let mut names = Vec::new();
-        for hf in htx.headers() {
-            let n_low = hf.name.to_ascii_lowercase();
-            if n_low == "connection" { continue; }
-            names.push(n_low);
-        }
-        if !names.is_empty() {
-            return names;
-        }
+    if let (true, Some(htx)) = (hdrs.is_empty(), ctx.htx) {
+        hdrs.extend(htx.headers().map(|hf| (hf.name.as_str(), hf.value.as_str())));
     }
-    if let Some(headers) = ctx.req_headers {
-        let mut names = Vec::new();
-        for (k, _v) in headers {
-            let n_low = k.to_ascii_lowercase();
-            if n_low == "connection" { continue; }
-            names.push(n_low);
-        }
-        if !names.is_empty() {
-            return names;
-        }
+    if let (true, Some(headers)) = (hdrs.is_empty(), ctx.req_headers) {
+        hdrs.extend(headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     }
-    Vec::new()
+    let kept = crate::h1_clean::kept_headers(&hdrs, true);
+    hdrs.iter().zip(kept).filter(|(_, k)| *k).map(|((n, _), _)| n.to_ascii_lowercase()).collect()
 }
-
 
 /// The response's header `name`. Only the response is read: `ctx.htx_slice` holds the
 /// *request* while a response rule runs, so a `shdr(x-n)` that fell back to it answered
