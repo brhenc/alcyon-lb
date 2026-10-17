@@ -1458,6 +1458,26 @@ impl Registry {
             },
         });
 
+        // T326: res.cook_names
+        self.register_fetch(FetchDesc {
+            name: "res.cook_names",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let delim = args.first().and_then(|s| s.chars().next()).unwrap_or(',');
+                let set_cookies = get_all_res_headers(ctx, "set-cookie");
+                let mut names = Vec::new();
+                for hdr in set_cookies {
+                    // Only the first name=value pair is the cookie name; attributes follow.
+                    // Simpler: take first part before ';'
+                    let first = hdr.split(';').next().unwrap_or("");
+                    if let Some((k, _)) = first.split_once('=') {
+                        names.push(k.trim().to_string());
+                    }
+                }
+                Some(Sample::Str(names.join(&delim.to_string())))
+            },
+        });
+
         let cook_val_fetch: FetchFn = |ctx, args| {
             let smp = fetch_req_cook(ctx, args)?;
             let Sample::Str(s) = smp else { return None };
