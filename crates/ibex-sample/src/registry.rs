@@ -1500,6 +1500,21 @@ impl Registry {
             },
         });
 
+        // T326: res.cook_names
+        self.register_fetch(FetchDesc {
+            name: "res.cook_names",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let delim = args.first().and_then(|s| s.chars().next()).unwrap_or(',');
+                // A Set-Cookie holds one cookie: the first pair `cookie_names` accepts.
+                let mut names = String::new();
+                for hdr in get_all_res_headers(ctx, "set-cookie") {
+                    crate::cookie_names::append(&mut names, &hdr, false, delim);
+                }
+                Some(Sample::Str(names))
+            },
+        });
+
         let cook_val_fetch: FetchFn = |ctx, args| {
             let smp = fetch_req_cook(ctx, args)?;
             let Sample::Str(s) = smp else { return None };
