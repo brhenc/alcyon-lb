@@ -4426,6 +4426,67 @@ impl Registry {
                 Some(Sample::Bin(digest(&outer)))
             },
         });
+        // `jwt_verify(<alg>,<key>)`: T331. Only the HMAC algorithms are verified. As in HAProxy the
+        // <alg> argument alone selects the algorithm (the token's own "alg" is not compared), names
+        // are case sensitive, and the result is 1, 0 or a negative code (-1 unknown algorithm,
+        // -2 unmanaged algorithm, -3 invalid token).
+        self.register_converter(ConvDesc {
+            name: "jwt_verify",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, args| {
+                let token = match smp {
+                    Sample::Str(v) => v,
+                    Sample::Bin(b) => String::from_utf8_lossy(&b).into_owned(),
+                    _ => return None,
+                };
+                let resolve = |arg: &str| -> Option<String> {
+                    let arg = arg.trim();
+                    if hmac_key_is_var(arg) {
+                        if arg.starts_with("proc.") { get_proc_var(arg) } else { CURRENT_VARS.with(|v| v.borrow().get(arg).cloned()) }
+                    } else {
+                        Some(arg.to_string())
+                    }
+                };
+                let alg = resolve(args.first()?)?;
+                let key = resolve(args.get(1)?)?;
+                let digest_name = match alg.as_str() {
+                    "HS256" => "sha256",
+                    "HS384" => "sha384",
+                    "HS512" => "sha512",
+                    // Public keys are never loaded (the load-time check refuses these), so none is known.
+                    "RS256" | "RS384" | "RS512" | "ES256" | "ES384" | "ES512" | "PS256" | "PS384" | "PS512" => return Some(Sample::Sint(-5)),
+                    "none" => return Some(Sample::Sint(-2)),
+                    _ => return Some(Sample::Sint(-1)),
+                };
+                let mut parts = token.split('.');
+                let (Some(jose), Some(claims), Some(sig), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {
+                    return Some(Sample::Sint(-3));
+                };
+                // HAProxy's base64url table maps '=' to the same value as '_', and nothing else is skipped.
+                let sig = sig.replace('=', "_");
+                let sig_ok = !sig.is_empty() && sig.len() % 4 != 1 && sig.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
+                let Some(sig_bytes) = base64_decode(&sig, true, false).filter(|_| sig_ok) else {
+                    return Some(Sample::Sint(-3));
+                };
+                let (digest, block) = hmac_digest(digest_name)?;
+                let mut key = key.into_bytes();
+                if key.len() > block {
+                    key = digest(&key);
+                }
+                key.resize(block, 0);
+                let mut inner: Vec<u8> = key.iter().map(|b| b ^ 0x36).collect();
+                inner.extend_from_slice(jose.as_bytes());
+                inner.push(b'.');
+                inner.extend_from_slice(claims.as_bytes());
+                let mut outer: Vec<u8> = key.iter().map(|b| b ^ 0x5c).collect();
+                outer.extend_from_slice(&digest(&inner));
+                let expected = digest(&outer);
+                // Constant-time comparison of the signature.
+                let same = expected.len() == sig_bytes.len() && expected.iter().zip(&sig_bytes).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0;
+                Some(Sample::Sint(i64::from(same)))
+            },
+        });
 
         // `aes_cbc_enc(<bits>,<nonce>,<key>[,<aad>])`, `aes_cbc_dec` (same arguments),
         // `aes_gcm_enc(<bits>,<nonce>,<key>,<tag var>[,<aad>])` and
@@ -5767,6 +5828,19 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
                 return Some("invalid args in converter 'hmac' : failed to parse key : argument needs to be base64 encoded, and can either be a string or a variable.".to_string());
             }
             None
+        }
+        // T331: a literal <alg> is checked at load time as in HAProxy; the public-key algorithms need
+        // a key file that Ibex does not load, so they are refused rather than silently answering.
+        "jwt_verify" => {
+            let alg = args.first()?.trim();
+            if hmac_key_is_var(alg) || matches!(alg, "HS256" | "HS384" | "HS512") {
+                return None;
+            }
+            Some(if matches!(alg, "RS256" | "RS384" | "RS512" | "ES256" | "ES384" | "ES512" | "PS256" | "PS384" | "PS512" | "none") {
+                format!("invalid args in converter 'jwt_verify' : algorithm {alg} is not implemented by Ibex (only HS256, HS384 and HS512)")
+            } else {
+                format!("invalid args in converter 'jwt_verify' : unknown JWT algorithm: {alg}.")
+            })
         }
         "set-var" if args.first().is_none_or(String::is_empty) => {
             Some("invalid args in converter 'set-var' : Empty variable name cannot be accepted.".to_string())
