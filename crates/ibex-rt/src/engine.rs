@@ -2384,8 +2384,6 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &[Proxy], fe_idx: usize,
     // that never parsed.
     entry.sess.log.res_captures = vec![None; fe.res_capture_slots.len()];
     // T331: what the `capture-req` and `capture-res` converters cut at.
-    entry.sess.log.req_capture_lens = fe.req_capture_slots.clone();
-    entry.sess.log.res_capture_lens = fe.res_capture_slots.clone();
     // The run that parsed the request has started already, with no slots to give.
     ibex_sample::capture_write::enter(fe.req_capture_slots.clone(), fe.res_capture_slots.clone());
     // `HAProxy` builds the ID on first use (`stream_generate_unique_id`); built here, once,
@@ -6502,15 +6500,15 @@ fn store_var_smp(
 /// the thread's map is the one every write lands in (`store_var` writes both; the
 /// `set-var` converter, which has no session, writes only it). What it holds after `f` is
 /// what the session keeps. No allocation, whatever the number of variables.
-fn with_stream_vars<R>(sess: &mut TcpSession, f: impl FnOnce(&mut TcpSession) -> R) -> R {
-    stream_vars_enter(sess);
+fn with_stream_vars<R>(sess: &mut TcpSession, fe: &Proxy, f: impl FnOnce(&mut TcpSession) -> R) -> R {
+    stream_vars_enter(sess, fe);
     let out = f(sess);
     stream_vars_leave(Some(sess));
     out
 }
 
 /// The start of [`with_stream_vars`].
-fn stream_vars_enter(sess: &mut TcpSession) {
+fn stream_vars_enter(sess: &mut TcpSession, fe: &Proxy) {
     CURRENT_VARS.with(|v| {
         let mut map = v.borrow_mut();
         map.clear();
@@ -6518,7 +6516,7 @@ fn stream_vars_enter(sess: &mut TcpSession) {
         map.extend(sess.req_vars.drain());
     });
     // T331: the slots' lengths, for the converters that write them.
-    ibex_sample::capture_write::enter(sess.log.req_capture_lens.clone(), sess.log.res_capture_lens.clone());
+    ibex_sample::capture_write::enter(fe.req_capture_slots.clone(), fe.res_capture_slots.clone());
 }
 
 /// The end of [`with_stream_vars`]: what the thread's map holds goes back to the scope it
@@ -6939,7 +6937,7 @@ fn init_client_session(
         SessionEvalOutcome::Accept
     } else {
         stream_timeouts_enter(proxies, proxy_idx, proxy_idx, &sess);
-        let out = with_stream_vars(&mut sess, |sess| eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, sess));
+        let out = with_stream_vars(&mut sess, &proxies[proxy_idx], |sess| eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, sess));
         CURRENT_TIMEOUTS.set(None);
         out
     };
@@ -9083,7 +9081,7 @@ impl EngineDispatcher<'_> {
     /// run never waits -- a stream that waits ends its run and is woken for another.
     fn step_stream(&mut self, session_idx: u32) -> Outcome {
         if let Some(entry) = self.sessions.get_mut(session_idx) {
-            stream_vars_enter(&mut entry.sess);
+            stream_vars_enter(&mut entry.sess, &self.proxies[entry.proxy_idx]);
             stream_timeouts_enter(self.proxies, entry.proxy_idx, entry.backend_idx, &entry.sess);
         }
         let out = self.step_stream_run(session_idx);

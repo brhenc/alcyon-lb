@@ -7866,12 +7866,6 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
             let path = args.first()?.trim_matches(['"', '\'']);
             crate::patref::map_file_error(path, keys, vals).map(|e| format!("invalid args in converter '{name}' : {e}"))
         }
-        // T331: `ARG1(1,SINT)`.
-        "capture-req" | "capture-res" if args.len() > 1 => Some(format!("invalid arg 2 in converter '{name}' : expected ')' before ',{})'.", args[1..].join(","))),
-        "capture-req" | "capture-res" => match args.first().map(String::as_str) {
-            None | Some("") => Some(format!("invalid arg 1 in converter '{name}' : expected type 'integer' at position 1, but got nothing.")),
-            Some(a) => crate::cast::parse_sint_arg(a).is_none().then(|| format!("invalid arg 1 in converter '{name}' : failed to parse '{a}' as type 'integer' at position 1.")),
-        },
         "mqtt_field_value" => mqtt_field_value_args_error(args),
         "mqtt_is_valid" if !args.iter().all(String::is_empty) => Some(format!(
             "invalid arg 1 in converter 'mqtt_is_valid' : expected ')' before '{})'.",
@@ -8887,10 +8881,8 @@ fn pb_convert(buf: &[u8], args: &[String], grpc: bool) -> Option<Sample> {
 /// and passed on. A negative or absent id is a slot that does not exist.
 fn capture_conv(res: bool, smp: Sample, args: &[String]) -> Option<Sample> {
     if let Some(id) = args.first().and_then(|a| a.trim().parse::<usize>().ok()) {
-        match &smp {
-            Sample::Bin(b) => crate::capture_write::store(res, id, b),
-            other => crate::capture_write::store(res, id, &ibex_regex::bytetext::text_to_bytes(&sample_to_string(other))),
-        }
+        // The input was cast to a string before the converter ran.
+        crate::capture_write::store(res, id, &ibex_regex::bytetext::text_to_bytes(&sample_to_string(&smp)));
     }
     Some(smp)
 }
