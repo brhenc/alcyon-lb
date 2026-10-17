@@ -237,3 +237,39 @@ the extension and blanks dropped, the size in upper-case hex without leading zer
 goes out as `5`, `a` as `A`). HAProxy also merges the chunks it holds in its buffer at once
 into one (`A` and `3` received in one read go out as `D`); Ibex keeps the chunks as received.
 Which chunks HAProxy merges depends on how the bytes arrive, and the payload is the same.
+
+## Slow clients (slowloris) and timeouts (T349)
+
+Measured live on 2026-10-17 (main 603c48a2 vs HAProxy 3.5-dev8, timeouts of 1-3 s, raw-socket
+clients; scripts in T349). Open items are tracked in `tasks/T349-slow-client-defences.md`.
+
+**The same on both:**
+- HTTP/1: `timeout http-request` (408 and close, counted from the first byte of each
+  request), the fall-back to `timeout client` when it is unset, and `timeout http-keep-alive`.
+- `http-request tarpit` with `timeout tarpit` and `deny_status`.
+- `tcp-request connection reject`.
+- `http-request wait-for-body` and `option http-buffer-request`: same timing.
+- Global and frontend `maxconn`.
+- Stick-table per-source limits (`track-sc0 src` with `sc_conn_cur`, `sc_conn_rate`,
+  `sc_http_req_rate`, `sc_http_err_rate`, `src_conn_cur`).
+- `timeout queue`, `tune.h2.fe.max-concurrent-streams`, `option http-ignore-probes` and
+  `option dontlognull`.
+- A slow reader is cut by `timeout client`.
+
+**A request body sent slowly is not cut by `timeout http-request` on either proxy.** That
+timeout ends with the request head. To close a client that trickles its body, use
+`http-request wait-for-body time <t>` or `option http-buffer-request` (both work in Ibex, as
+in HAProxy).
+
+| | HAProxy | Ibex | what to do |
+|---|---|---|---|
+| `maxconnrate`, `maxsessrate` (global), `rate-limit sessions` (frontend) | accepted | **refused at load** (unknown keyword) | limit per source with a stick table (`sc_conn_rate`) until implemented (T349) |
+| `timeout client-fin` | accepted | **refused at load** | remove it; half-closed clients wait for `timeout client` (T349) |
+| Idle HTTP/2 connection after a request | GOAWAY after `timeout http-keep-alive` (else `http-request`, else `client`) | GOAWAY after `timeout client` only: an idle h2 connection lives longer (5.7 s vs 1.7 s with client 6s, http-request 4s, keep-alive 2s) | set `timeout client` close to the keep-alive you want for h2 until fixed (T349) |
+| `tcp-request inspect-delay` + `tcp-request content accept if { req.proto_http }` (or `req.len`, `req.payload`) when the first segment is short | waits for more data up to the inspect delay | **decides on the partial data and resets at once** | avoid content rules that need the whole head on slow links until fixed (T349) |
+| A content `reject` after the inspect delay | FIN after the inspect delay | RST at once | (T349) |
+| h2 HEADERS without END_HEADERS at `timeout http-request` | GOAWAY, then close | close without GOAWAY | none needed |
+| After a `wait-for-body` 408 | keeps the connection | closes it | none needed |
+| Stalled HTTP/1 upload | 400 at 2x `timeout client` | 400 at 1x `timeout client` (stricter) (VV-9) | none needed |
+| TLS handshake that stalls | `timeout client` only | also `timeout http-request` (stricter) | none needed |
+| h2 connection that never sends a request | GOAWAY at `timeout http-request` | close at `timeout http-request` without GOAWAY | none needed |

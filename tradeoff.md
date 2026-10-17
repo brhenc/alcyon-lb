@@ -438,3 +438,13 @@ Status: **resolved and measured** — cached lookups verified in `crates/ibex-sa
 | **Why it matters** | The user's requirement (2026-10-17): a request must not need a malloc. Every allocation a client can cause is one an attacker can make fail. In Rust a failed allocation does not return NULL to unchecked code (that C cascade cannot happen): the global allocator calls `handle_alloc_error`, which **aborts the worker** — every connection on it is lost, a denial of service instead of one failed request. HAProxy instead takes from a pool sized in advance and, when a pool is empty, fails only that stream (`tune.buffers.reserve` keeps buffers back for streams already running). |
 | **Status** | **measured** 2026-10-17 (`~/ibex-worktrees/review/pools-haproxy-vs-ibex-2026-10-17.md`). Planning of the pools (which objects, per-thread caches, a bounded and fallible take on the request path, what to do when a pool is empty, how to count and test "0 allocations per request" on the real binary) is set for the 2026-10-17 21:00 planning session (Fable), with T344. |
 | **Revisit if** | Done when the request path makes 0 allocations per request on the shipped binary (counted, pinned in a test), and an empty pool fails one stream, not the process. |
+
+### 6.14 Slow-client defences not implemented yet — **not a decision to leave out; tracked in T349 for M1**
+
+| | |
+|---|---|
+| **Gained** | Nothing; these were missed, not traded. Everything else a blog uses against slow clients matches HAProxy (docs/differences.md "Slow clients"). |
+| **Gave up** | `maxconnrate`, `maxsessrate`, `rate-limit sessions` and `timeout client-fin` are refused at load. Idle HTTP/2 connections ignore `timeout http-keep-alive` and `timeout http-request` (only `timeout client` closes them, about 3x later in the audit). `tcp-request content` rules decide on a partial first segment instead of waiting for the inspect delay (false rejects of slow clients). |
+| **Status** | **measured** 2026-10-17 live against HAProxy 3.5-dev8 (T349 audit). |
+| **Revisit if** | Done when each is implemented with an oracle test, or deliberately refused with a reason recorded here. |
+

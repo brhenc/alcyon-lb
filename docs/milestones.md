@@ -28,7 +28,9 @@ produced it.
 - Persistence: `cookie` (insert/rewrite/prefix), stick tables with `stick on` / `track-sc`.
 - ACLs, `http-request` / `http-response` / `tcp-request` rules, redirects, header and path
   rewrites, `use_backend`, maps, `errorfile` / `http-error`.
-- Timeouts (client, server, connect, http-request, http-keep-alive, queue, tunnel),
+- Timeouts (client, server, connect, http-request, http-keep-alive, queue, tunnel; for h2
+  connections too), slow-client defences as HAProxy (T349: `maxconnrate`, `maxsessrate`,
+  `rate-limit sessions`, `timeout client-fin`, h2 idle timers, `tcp-request content` waiting),
   WebSocket and `Upgrade` tunnelling, Server-Sent Events / long responses.
 - `option forwardfor`, `option forwarded`, PROXY protocol v1/v2 (send and receive).
 - Idle server connection pools (T159 A+B).
