@@ -47,11 +47,11 @@ impl Identity {
 }
 
 fn alert(text: &str) {
-    eprintln!("[ALERT]    ({}) : {text}", process::id());
+    ibex_rt::stderr_line!("[ALERT]    ({}) : {text}", process::id());
 }
 
 fn warning(text: &str) {
-    eprintln!("[WARNING]  ({}) : {text}", process::id());
+    ibex_rt::stderr_line!("[WARNING]  ({}) : {text}", process::id());
 }
 
 /// `do_chroot`. Exits 1 when it fails.

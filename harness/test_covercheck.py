@@ -507,5 +507,42 @@ class OneRunOfTheTests(unittest.TestCase):
         self.assertTrue(path.startswith("/x/llvm-cov-target/"))
 
 
+class ReportObjects(unittest.TestCase):
+    """2026-10-17: the report read debug/ibex-fuzz, the differential harness's binary that
+    the diff-fuzz stage builds *after* covercheck, so it was always the previous gate's,
+    built from older sources. Its zero counts sat on the line numbers of the old
+    `mux_h2.rs` and covercheck called two doc-comment lines of the new one unexecuted.
+    Only executables this run of the suite built are read."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.debug = os.path.join(self.tmp.name, "debug")
+        for sub in ("deps", "examples"):
+            os.makedirs(os.path.join(self.debug, sub))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def exe(self, rel: str) -> str:
+        path = os.path.join(self.debug, rel)
+        with open(path, "w") as f:
+            f.write("x")
+        os.chmod(path, 0o755)
+        return path
+
+    def test_an_executable_the_suite_did_not_build_is_not_read(self):
+        test_bin = self.exe("deps/it-0123")
+        self.exe("ibex-fuzz")
+        self.exe("examples/old")
+        self.exe("deps/it-stale")
+        self.assertEqual(covercheck.report_objects(self.debug, {test_bin}), [test_bin])
+
+    def test_a_hard_link_of_a_built_executable_is_read_once(self):
+        built = self.exe("deps/ibex-0123")
+        os.link(built, os.path.join(self.debug, "ibex"))
+        self.assertEqual(covercheck.report_objects(self.debug, {os.path.join(self.debug, "ibex")}),
+                         [built])
+
+
 if __name__ == "__main__":
     unittest.main()

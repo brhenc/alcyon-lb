@@ -691,7 +691,7 @@ impl TlsConfig {
             .into_iter()
             .partition(|p| p == "h3" || p == "h2" || p == "http/1.1" || p == "http/1.0");
         for p in &unsupported {
-            eprintln!(
+            ibex_config::stderr_line!(
                 "[ibex] warning: bind {}: ALPN '{p}' is not served by this build and was \
                  not advertised",
                 bind.addr

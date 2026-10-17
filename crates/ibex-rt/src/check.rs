@@ -2597,9 +2597,9 @@ fn progress_smtp_check(
         let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
 
         // True once nothing more is coming: the server closed, or one buffer is full.
-        let _eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
+        let eof = recv_check_reply(&mut check.xprt, sock.as_fd(), &mut recv_buf);
 
-        let Some(greeting) = check_reply::smtp_greeting(&recv_buf) else {
+        let Some(greeting) = check_reply::smtp_greeting(&recv_buf, eof) else {
             fdtab.clear_ready(raw_fd, true, false);
             check.run.sub_state = CheckSubState::SmtpRunning {
                 phase,

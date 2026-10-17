@@ -258,7 +258,7 @@ pub fn start(section: &RingSection) {
         let (connect, write) = (section.timeout_connect, section.timeout_server);
         let name = format!("ring-{}", section.name);
         let spawned = std::thread::Builder::new().name(name.clone()).spawn(move || forward(&ring, &server, connect, write));
-        spawned.map(|_| ()).unwrap_or_else(|e| eprintln!("[ibex] {name}: cannot start the forwarder: {e}"));
+        spawned.map(|_| ()).unwrap_or_else(|e| crate::stderr_line!("[ibex] {name}: cannot start the forwarder: {e}"));
     }
 }
 

@@ -102,6 +102,15 @@ pub struct StickTableConfig {
     pub extra: StickExtra,
 }
 
+impl StickTableConfig {
+    /// Whether an entry last updated at `last_updated` has expired at `now`. An `expire` of
+    /// zero means the entries never expire (`HAProxy` shows `exp=0` and keeps them).
+    #[must_use]
+    pub fn is_expired(&self, now: Instant, last_updated: Instant) -> bool {
+        !self.expire.is_zero() && now.duration_since(last_updated) >= self.expire
+    }
+}
+
 impl Default for StickTableConfig {
     fn default() -> Self {
         Self {
@@ -305,11 +314,8 @@ impl StickTable {
         // Capacity check and O(1) eviction
         if inner.len >= self.config.max_size {
             let now = Instant::now();
-            let expire_dur = self.config.expire;
             if let Some(head) = inner.head_lru {
-                let is_expired = inner.slots[head as usize]
-                    .as_ref()
-                    .is_none_or(|s| now.duration_since(s.data.last_updated) >= expire_dur);
+                let is_expired = inner.slots[head as usize].as_ref().is_none_or(|s| self.config.is_expired(now, s.data.last_updated));
                 if is_expired || inner.len >= self.config.max_size {
                     inner.evict_slot(head);
                 }
@@ -360,7 +366,7 @@ impl StickTable {
         if let Some(node_idx) = inner.tree.lookup_node(&enc_key) {
             let slot_idx = inner.tree.data_of(node_idx);
             if let Some(ref slot) = inner.slots[slot_idx as usize] {
-                if slot.data.last_updated.elapsed() < self.config.expire {
+                if !self.config.is_expired(Instant::now(), slot.data.last_updated) {
                     return Ok(Some(slot.data.clone()));
                 }
             }
@@ -380,12 +386,18 @@ impl StickTable {
             .map_err(|e| StickTableError::LockPoisoned(e.to_string()))?;
 
         let now = Instant::now();
-        let expire_dur = self.config.expire;
         let mut purged = 0;
+        // Bounded by the entries present now: a renewed (tracked) entry moves to the tail and
+        // is never expired again within this call, but the walk must end whatever happens.
+        let mut budget = inner.len;
         while let Some(head) = inner.head_lru {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
             // The LRU list links occupied slots only: `evict_slot` unlinks before it frees.
             let Some(slot) = inner.slots[head as usize].as_mut() else { break };
-            if now.duration_since(slot.data.last_updated) < expire_dur {
+            if !self.config.is_expired(now, slot.data.last_updated) {
                 break;
             }
             if slot.data.trackers > 0 {
@@ -463,12 +475,11 @@ impl StickTable {
             .map_err(|e| StickTableError::LockPoisoned(e.to_string()))?;
 
         let now = Instant::now();
-        let expire_dur = self.config.expire;
         let mut result = Vec::new();
         let mut cur = inner.head_lru;
         while let Some(idx) = cur {
             if let Some(ref slot) = inner.slots[idx as usize] {
-                if now.duration_since(slot.data.last_updated) < expire_dur {
+                if !self.config.is_expired(now, slot.data.last_updated) {
                     // The key is kept once, in the tree.
                     if let Some(key) = StickKey::decode_bytes(inner.tree.key_of(slot.node_idx)) {
                         result.push((key, slot.data.clone()));
@@ -492,7 +503,7 @@ impl StickTable {
         let mut i = from;
         while i < inner.slots.len() && out.len() < max {
             if let Some(slot) = &inner.slots[i] {
-                if now.duration_since(slot.data.last_updated) < self.config.expire {
+                if !self.config.is_expired(now, slot.data.last_updated) {
                     if let Some(key) = StickKey::decode_bytes(inner.tree.key_of(slot.node_idx)) {
                         out.push((key, slot.data.clone()));
                     }
@@ -817,6 +828,40 @@ mod tests {
         assert_eq!(dump.len(), 1);
         assert_eq!(dump[0].0, StickKey::Binary(vec![1, 2]));
         assert_eq!(dump[0].1.conn_cnt, 2);
+    }
+
+    /// T342: a renewed (tracked) entry must not make `purge_expired` loop for ever, and
+    /// `expire 0` means no expiry (HAProxy shows `exp=0` and keeps the entry).
+    #[test]
+    fn purge_terminates_with_tracked_entries() {
+        for (n, expire) in [(1, Duration::from_millis(1)), (3, Duration::from_millis(1)), (1, Duration::ZERO), (3, Duration::ZERO)] {
+            let config = StickTableConfig { key_type: KeyType::Integer, expire, ..Default::default() };
+            let table = std::sync::Arc::new(StickTable::new(config));
+            for k in 0..n {
+                table.update_entry(&StickKey::Integer(k), |e| e.track(false)).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            let t = table.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(t.purge_expired().unwrap());
+            });
+            let purged = rx.recv_timeout(Duration::from_secs(2)).expect("purge_expired must terminate");
+            assert_eq!(purged, 0);
+            assert_eq!(table.len(), n as usize);
+        }
+    }
+
+    #[test]
+    fn expire_zero_never_expires() {
+        let config = StickTableConfig { key_type: KeyType::Integer, expire: Duration::ZERO, ..Default::default() };
+        let table = StickTable::new(config);
+        table.update_entry(&StickKey::Integer(1), |e| e.conn_cnt = 1).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(table.get_entry(&StickKey::Integer(1)).unwrap().is_some());
+        assert_eq!(table.dump_entries().unwrap().len(), 1);
+        assert_eq!(table.purge_expired().unwrap(), 0);
+        assert_eq!(table.len(), 1);
     }
 
     #[test]

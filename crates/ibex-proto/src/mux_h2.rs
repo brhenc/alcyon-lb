@@ -426,13 +426,17 @@ impl H2MuxContext {
         true
     }
 
-    /// How many DATA bytes the connection and stream send windows allow now. A stream
-    /// that is gone takes anything (it is discarded), so its budget is unbounded.
+    /// How many DATA bytes the connection and stream send windows allow now, and the
+    /// room left in the output buffer ([`TX_ROOM`]): a client that opens its windows wide
+    /// and reads nothing stops the response copy, hence the server read, as `HAProxy`'s
+    /// one-buffer mux does (T342). A stream that is gone takes anything (it is
+    /// discarded), so its budget is unbounded.
     #[must_use]
     pub fn data_budget(&self, stream_id: u32) -> usize {
         match self.streams.get(&stream_id) {
             Some(st) if !matches!(st.state, H2StreamState::Reset(_) | H2StreamState::Closed) => {
-                usize::try_from(self.conn_send_window.min(st.send_window)).unwrap_or(0)
+                let room = TX_ROOM.saturating_sub(self.tx_buf.len() - self.tx_consumed);
+                usize::try_from(self.conn_send_window.min(st.send_window)).unwrap_or(0).min(room)
             }
             _ => usize::MAX,
         }

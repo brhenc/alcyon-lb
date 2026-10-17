@@ -272,7 +272,7 @@ def run_pooled() -> bool:
         print("covercheck: llvm-profdata merge wrote no profile")
         return False
     t1 = time.monotonic()
-    objects = report_objects(os.path.join(tdir, "debug"))
+    objects = report_objects(os.path.join(tdir, "debug"), suite.built_executables)
     sources = sorted(os.path.join(REPO, p) for p in _wanted
                      if not IGNORED.match(p) and os.path.exists(os.path.join(REPO, p)))
     try:
@@ -324,9 +324,19 @@ def drop_corrupt_profiles(tdir: str, env: dict, out: str = os.devnull) -> list[s
     return sorted(bad)
 
 
-def report_objects(debug: str) -> list[str]:
-    """The executables `cargo llvm-cov report` reads: those in debug/deps, debug/ and
-    debug/examples. Each once: debug/ibex is a hard link of a file in deps/."""
+def report_objects(debug: str, built: set[str]) -> list[str]:
+    """The executables the report reads: those in debug/deps, debug/ and debug/examples
+    that this run of the suite built (`built`, cargo's `executable` paths), each once:
+    debug/ibex is a hard link of a file in deps/. Anything else there is another build's
+    (debug/ibex-fuzz is built by the diff-fuzz stage after this one), and its counts sit
+    on the line numbers of older sources."""
+    wanted = set()
+    for b in built:
+        try:
+            st = os.stat(b)
+        except OSError:
+            continue
+        wanted.add((st.st_dev, st.st_ino))
     seen, objects = set(), []
     for sub in ("deps", "", "examples"):
         d = os.path.join(debug, sub)
@@ -335,8 +345,9 @@ def report_objects(debug: str) -> list[str]:
             if "." in f or not os.path.isfile(path) or not os.access(path, os.X_OK):
                 continue
             st = os.stat(path)
-            if (st.st_dev, st.st_ino) not in seen:
-                seen.add((st.st_dev, st.st_ino))
+            key = (st.st_dev, st.st_ino)
+            if key in wanted and key not in seen:
+                seen.add(key)
                 objects.append(path)
     return objects
 

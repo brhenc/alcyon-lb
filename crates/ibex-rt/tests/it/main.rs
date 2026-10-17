@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
+#![allow(clippy::disallowed_macros)] // tests print with eprintln!; see /clippy.toml
+
 //! ibex-rt's integration tests, one binary (T260). Each former `tests/<name>.rs` is the
 //! module `<name>` here: run one file's tests with `cargo test -p ibex-rt --test it <name>::`.
 //!
@@ -117,6 +119,7 @@ mod h1_case_adjust;
 mod h2_alpn_settings;
 mod h2_buffering;
 mod h2_early_response_rst;
+mod h2_backend_dies_under_streams;
 mod h2_backend_reuse;
 mod h2_concurrent_streams;
 mod h2_rx_budget;
@@ -138,6 +141,7 @@ mod h2_response_body;
 mod h2_stream_entries;
 mod h2_stream_timers;
 mod h2_unread_output_timeout;
+mod h2_unread_response_memory;
 mod h3_end_to_end;
 mod h3_many_threads;
 mod h3_proxy_path;
@@ -191,6 +195,8 @@ mod log_forward;
 mod log_format_sd;
 mod log_parity;
 mod log_rc_redispatch;
+mod cli_stderr_messages;
+mod log_stderr_signal;
 mod log_stdout_full_pipe;
 mod log_tag_sample;
 mod logfmt;
@@ -290,6 +296,7 @@ mod show_info_total_bytes_out;
 mod show_info_listeners_maxconn;
 mod show_info_ssl;
 mod show_table;
+mod smtp_check_eof;
 mod smtp_check_partial_lines;
 mod soft_stop;
 mod soft_stop_h2;

@@ -2134,7 +2134,7 @@ fn listeners_for(
     for fd in crate::handover::take_inherited(worker_id, addr) {
         match Listener::adopt(fd, addr, 128, proxy, tuning) {
             Ok(l) => out.push(l),
-            Err(e) => eprintln!("[WARNING] {e}; binding a fresh socket instead"),
+            Err(e) => crate::stderr_line!("[WARNING] {e}; binding a fresh socket instead"),
         }
     }
     if out.is_empty() {
@@ -6865,6 +6865,9 @@ fn init_client_session(
     let retries = proxies[proxy_idx].retries;
     let cliexp = proxies[proxy_idx].cliexp.clone();
     let srvexp = proxies[proxy_idx].srvexp.clone();
+    // The TLS transport is built on the accepted socket before the session owns it, so
+    // there is no session without a client socket to account for (T342).
+    let tls_xprt = tls.map(|cfg| crate::xprt::accept_tls(&cli_fd, Arc::clone(cfg)));
 
     let mut sess = TcpSession::new_with_mode(
         crate::proxy::ClientSide::Fd(cli_fd),
@@ -6898,26 +6901,12 @@ fn init_client_session(
         .maxrewrite
         .unwrap_or(global_maxrewrite);
 
-    if let Some(cfg) = tls {
-        // The connection is dropped rather than continued in the clear. Falling back to
-        // plaintext here would hand an unencrypted session to a client that opened :443
-        // expecting TLS -- the same downgrade `bind_tls` refuses to start with, arriving
-        // one connection at a time instead of all at once. Closing is visible; serving
-        // cleartext is not.
-        match sess.cli_fd().map_or_else(|| Err(io::Error::from(io::ErrorKind::NotConnected)), |fd| crate::xprt::accept_tls(&fd, Arc::clone(cfg))) {
-            Ok(xprt) => {
-                sess.cli_xprt = xprt;
-                // T320: `SslRate`; `CurrSslConns` and `CumSslConns` are the transport's own.
-                crate::stats::ssl_conn_accepted();
-            }
-            Err(e) => {
-                eprintln!(
-                    "[ibex] {}: dropping connection from {peer_addr}, TLS setup failed: {e}",
-                    proxies[proxy_idx].name
-                );
-                return None;
-            }
-        }
+    // A TLS bind's connection is TLS from its first byte and never falls back to cleartext
+    // (the downgrade `bind_tls` refuses to start with); a failed handshake closes it.
+    if let Some(xprt) = tls_xprt {
+        sess.cli_xprt = xprt;
+        // T320: `SslRate`; `CurrSslConns` and `CumSslConns` are the transport's own.
+        crate::stats::ssl_conn_accepted();
     }
     // `accept-proxy` belongs to the bind that accepted, not to the frontend.
     if bind_proxy.0 {
@@ -8777,6 +8766,15 @@ impl EngineDispatcher<'_> {
                     txn.close_after = true;
                     txn.aborted = true;
                     txn.keepalive_lost = true;
+                    // On HTTP/2 that is the stream alone, reset `REFUSED_STREAM` (the
+                    // client may retry it), and the connection and its other streams go
+                    // on: measured on `HAProxy` 3.5-dev8 (T324). Its client side is done,
+                    // so the close that follows sends no FIN for the whole connection.
+                    if let Some(c) = entry.sess.h2_child_mut() {
+                        c.rst = Some(ibex_proto::h2::H2Error::RefusedStream);
+                        c.finished = true;
+                        entry.sess.cli_state = ScState::Closed;
+                    }
                     return;
                 }
                 if status == 502 {
@@ -14228,4 +14226,22 @@ pub fn bind_unix_listener(path: &Path) -> io::Result<(UnixListener, PathBuf)> {
     let listener = UnixListener::bind(&path_buf)?;
     listener.set_nonblocking(true)?;
     Ok((listener, path_buf))
+}
+
+#[cfg(test)]
+mod inherited_socket_tests {
+    use super::*;
+
+    /// T342: an inherited descriptor that is not a listening stream socket for its address
+    /// is reported on stderr (through `stderr_line!`) and a fresh socket is bound instead.
+    #[test]
+    fn a_mismatched_inherited_socket_falls_back_to_a_fresh_bind() {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp");
+        let addr = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).expect("free port");
+        let fd = rustix::io::dup(&udp).expect("dup");
+        crate::handover::distribute(vec![(crate::handover::Kind::Tcp, addr, fd)], 1);
+        let got = listeners_for(0, addr, 3, &ibex_config::ast::SocketTuning::default()).expect("listeners");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].addr(), addr);
+    }
 }
