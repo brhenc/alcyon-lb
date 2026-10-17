@@ -262,6 +262,8 @@ pub struct SampleContext<'a> {
     /// The stream's retry budget, for `cur_max_retries`: what `set-retries` changes.
     pub cur_max_retries: Option<u16>,
     pub act_conn: u32,
+    /// The engine thread running the rule, for `thread`; `None` where the caller has none.
+    pub thread_id: Option<u64>,
     /// The client connection's TLS session, for `ssl_fc*` and `ssl_c_used`; the default
     /// (`used` false, nothing else) for a plaintext one.
     pub ssl_fc: SslFacts<'a>,
@@ -1818,6 +1820,41 @@ impl Registry {
             name: "nbsrv",
             out_type: SampleType::Sint,
             func: |ctx, args| ctx.proxies?.usable_servers(backend_arg(ctx, args)?).map(Sample::Sint),
+        });
+        // T326: process-wide fetches
+        self.register_fetch(FetchDesc {
+            name: "pid",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(i64::from(std::process::id()))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "hostname",
+            out_type: SampleType::Str,
+            func: |_ctx, _args| {
+                std::fs::read_to_string("/proc/sys/kernel/hostname")
+                    .ok()
+                    .map(|s| Sample::Str(s.trim().to_string()))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "nbproc",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(1)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "proc",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(1)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "thread",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.thread_id.and_then(|t| i64::try_from(t).ok().map(Sample::Sint)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "stopping",
+            out_type: SampleType::Bool,
+            func: |_ctx, _args| Some(Sample::Bool(false)),
         });
         self.register_fetch(FetchDesc {
             name: "srv_conn",
