@@ -194,7 +194,7 @@ fn a_header_slot_is_overwritten_only_by_its_header() {
 /// Every input type is converted to a string first.
 #[test]
 fn non_string_input() {
-    for (smp, want) in [("int(1234567)", "[1234567][1234]"), ("src", "[127.0.0.1][127.]"), ("bool(1)", "[1][1]"), ("str()", "[][]")] {
+    for (smp, want) in [("int(1234567)", "[1234567][1234]"), ("src", "[127.0.0.1][127.]"), ("bool(1)", "[1][1]"), ("bin(616263646566)", "[abcdef][abcd]"), ("str()", "[][]")] {
         let c = cfg(&format!("  http-request set-var(txn.c) {smp},capture-req(0)\n"), "[%[var(txn.c)]][%[capture.req.hdr(0)]]");
         let (_i, a) = start("types", &c);
         assert_eq!(xout(a, &req("")), want, "{smp}");
