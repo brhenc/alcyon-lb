@@ -149,6 +149,11 @@ fn is_local_behind_a_proxy_header() {
         ("TCP4 0.0.0.0 8.8.8.8 1234 80", "[1|0|1|1]"),
         ("TCP6 2001:db8::1 ::1 1234 80", "[0|1|1|1]"),
         ("TCP6 ::1 2001:db8::1 1234 80", "[1|0|1|1]"),
+        // A link-local address cannot be bound without a scope (EINVAL, neither "not available"
+        // nor connectable): `addr_is_local` fails and the fetch has no value.
+        ("TCP6 fe80::1 fe80::2 1234 80", "[||1|1]"),
+        ("TCP6 fe80::1 ::1 1234 80", "[|1|1|1]"),
+        ("TCP6 ::1 fe80::2 1234 80", "[1||1|1]"),
     ] {
         let mut req = format!("PROXY {proxy}\r\n").into_bytes();
         req.extend_from_slice(GET);

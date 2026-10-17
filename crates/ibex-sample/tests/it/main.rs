@@ -20,6 +20,7 @@ mod proptest_cidr;
 mod proptest_converters;
 mod proptest_expr;
 mod proptest_rawpayload;
+mod registry_cover;
 mod rfc7239;
 mod str_to_int_cast;
 mod t136_edges;

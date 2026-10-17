@@ -9007,3 +9007,27 @@ fn clean_header_list(value: &str, mut drop: impl FnMut(&str) -> bool) -> std::bo
     }
     rewritten.map_or(std::borrow::Cow::Borrowed(&value[..kept]), std::borrow::Cow::Owned)
 }
+
+#[cfg(test)]
+mod ip_header_length_tests {
+    use super::Registry;
+
+    /// `ip.fp` checks the packet is a whole IPv4 or IPv6 header before it asks for the length,
+    /// so the arms of `Registry::ip_header_length` for a short IPv6 packet and for another IP
+    /// version are never reached through a configuration (no oracle value exists for them); they
+    /// are the same answers as the `ip.hdr` helper gives for the same bytes.
+    #[test]
+    fn short_ipv6_and_other_versions_have_no_length() {
+        assert_eq!(Registry::ip_header_length(&[0x60, 0, 0, 0]), None);
+        assert_eq!(Registry::ip_header_length(&[0x70; 40]), None);
+        assert_eq!(Registry::ip_header_length(&[]), None);
+        // a complete IPv4 header and an IPv6 one with TCP next
+        let mut v4 = vec![0u8; 20];
+        v4[0] = 0x45;
+        assert_eq!(Registry::ip_header_length(&v4), Some(20));
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x60;
+        v6[6] = 6;
+        assert_eq!(Registry::ip_header_length(&v6), Some(40));
+    }
+}
