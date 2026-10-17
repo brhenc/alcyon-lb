@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T329: *_is_local fetches
+//! T329: `*_is_local` fetches
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +53,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -108,15 +99,6 @@ fn body(addr: SocketAddr, req: &[u8]) -> String {
     s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
 }
 
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
-}
-
 #[test]
 fn test_is_local_fetches() {
     // T329: src_is_local, dst_is_local, fc_src_is_local, fc_dst_is_local
@@ -133,8 +115,43 @@ backend be
   server s1 {b}"#,
         ),
     );
-    let (ibex, _sock) = start("is_local", &cfg, &[a]);
+    let (_ibex, _sock) = start("is_local", &cfg, &[a]);
     let expected = body(a, GET);
     // All should be 1 when connecting locally (localhost)
     assert_eq!(expected, "[1|1|1|1]", "is_local fetches returned unexpected: {expected:?}");
+}
+
+/// The four fetches on addresses a PROXY header sets: `src` and `dst` are judged apart,
+/// `fc_*` stay the real (loopback) socket, and a broadcast address is not local (`HAProxy`'s
+/// `addr_is_local` binds, then connects, and a broadcast address binds but does not
+/// connect). Every expected value was measured on `HAProxy` 3.5-dev8.
+#[test]
+fn is_local_behind_a_proxy_header() {
+    let a = common::reserve_addr();
+    let p = common::reserve_addr();
+    let cfg = http_cfg(
+        "",
+        &format!(
+            r#"frontend fe
+  bind {a}
+  bind {p} accept-proxy
+  http-request return status 200 content-type text/plain lf-string "[%[src_is_local]|%[dst_is_local]|%[fc_src_is_local]|%[fc_dst_is_local]]""#
+        ),
+    );
+    let (_ibex, _sock) = start("is_local_proxy", &cfg, &[a, p]);
+    assert_eq!(body(a, GET), "[1|1|1|1]");
+    for (proxy, want) in [
+        ("TCP4 192.0.2.1 8.8.8.8 1234 80", "[0|0|1|1]"),
+        ("TCP4 192.0.2.1 127.0.0.1 1234 80", "[0|1|1|1]"),
+        ("TCP4 127.0.0.1 8.8.8.8 1234 80", "[1|0|1|1]"),
+        ("TCP4 255.255.255.255 8.8.8.8 1234 80", "[0|0|1|1]"),
+        ("TCP4 127.255.255.255 8.8.8.8 1234 80", "[0|0|1|1]"),
+        ("TCP4 0.0.0.0 8.8.8.8 1234 80", "[1|0|1|1]"),
+        ("TCP6 2001:db8::1 ::1 1234 80", "[0|1|1|1]"),
+        ("TCP6 ::1 2001:db8::1 1234 80", "[1|0|1|1]"),
+    ] {
+        let mut req = format!("PROXY {proxy}\r\n").into_bytes();
+        req.extend_from_slice(GET);
+        assert_eq!(body(p, &req), want, "PROXY {proxy}");
+    }
 }

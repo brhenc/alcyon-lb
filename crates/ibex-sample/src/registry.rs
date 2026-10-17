@@ -159,6 +159,23 @@ fn len_to_sint(len: usize) -> i64 {
     i64::try_from(len).unwrap_or(i64::MAX)
 }
 
+/// T329: Whether `ip` is an address of this host (`addr_is_local`, src/tools.c): a UDP
+/// socket binds to it and then connects to it. A broadcast address binds but does not
+/// connect: not local. `EADDRNOTAVAIL` on the bind: not local. Any other failure: `None`,
+/// no sample.
+fn addr_is_local(ip: IpAddr) -> Option<bool> {
+    match UdpSocket::bind((ip, 0)) {
+        Ok(s) => Some(s.connect((ip, 0)).is_ok()),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => Some(false),
+        Err(_) => None,
+    }
+}
+
+/// A `*_is_local` sample of `addr`: none without an address, or when the test fails.
+fn is_local_sample(addr: Option<SocketAddr>) -> Option<Sample> {
+    addr.and_then(|a| addr_is_local(a.ip())).map(Sample::Bool)
+}
+
 /// Set once the process is stopping (`when(stopping)`).
 pub static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -787,12 +804,6 @@ impl Registry {
         names
     }
 
-    /// T329: Returns true if the IP address is local to this system (i.e. we can bind
-    /// a UDP socket to it), false otherwise. No address means no sample.
-    fn addr_is_local(ip: IpAddr) -> bool {
-        UdpSocket::bind((ip, 0)).is_ok()
-    }
-
     #[allow(clippy::too_many_lines)]
     fn register_builtin_fetches(&mut self) {
         // --- 1. Client & Destination Network Fetches ---
@@ -840,10 +851,10 @@ impl Registry {
 
         // T329: src_is_local, fc_src_is_local
         let src_is_local_fetch: FetchFn = |ctx, _args| {
-            ctx.client_addr.map(|addr| Sample::Bool(Self::addr_is_local(addr.ip())))
+            is_local_sample(ctx.client_addr)
         };
         let fc_src_is_local_fetch: FetchFn = |ctx, _args| {
-            ctx.fc_src.or(ctx.client_addr).map(|addr| Sample::Bool(Self::addr_is_local(addr.ip())))
+            is_local_sample(ctx.fc_src.or(ctx.client_addr))
         };
         self.register_fetch(FetchDesc {
             name: "src_is_local",
@@ -899,10 +910,10 @@ impl Registry {
 
         // T329: dst_is_local, fc_dst_is_local
         let dst_is_local_fetch: FetchFn = |ctx, _args| {
-            ctx.server_addr.map(|addr| Sample::Bool(Self::addr_is_local(addr.ip())))
+            is_local_sample(ctx.server_addr)
         };
         let fc_dst_is_local_fetch: FetchFn = |ctx, _args| {
-            ctx.fc_dst.or(ctx.server_addr).map(|addr| Sample::Bool(Self::addr_is_local(addr.ip())))
+            is_local_sample(ctx.fc_dst.or(ctx.server_addr))
         };
         self.register_fetch(FetchDesc {
             name: "dst_is_local",
