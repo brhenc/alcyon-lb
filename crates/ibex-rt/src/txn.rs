@@ -615,7 +615,8 @@ impl MsgState {
                 let b = data[i];
                 match c.scan(&[b], &mut 0, false) {
                     (1, Ok(next)) => {
-                        data[w] = b;
+                        // T302: HAProxy writes trailer names lowercased.
+                        data[w] = if matches!(next, Some(Chunk::TrailerName { .. })) { b.to_ascii_lowercase() } else { b };
                         i += 1;
                         w += 1;
                         match next {
@@ -2075,7 +2076,7 @@ mod tests {
         let chunked = MsgState::head(Framing::Chunked);
         let head = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
         let msg = [&head[..], b"0005;a=b\r\nhello\r\na ; x=\"y;z\"\r\n0123456789\r\n00;e\r\nT: 1\r\n\r\nGET / HTTP/1.1\r\n\r\n"].concat();
-        let want = [&head[..], b"5\r\nhello\r\nA\r\n0123456789\r\n0\r\nT: 1\r\n\r\nGET / HTTP/1.1\r\n\r\n"].concat();
+        let want = [&head[..], b"5\r\nhello\r\nA\r\n0123456789\r\n0\r\nt: 1\r\n\r\nGET / HTTP/1.1\r\n\r\n"].concat();
         assert_eq!(canonical(chunked, &msg), want);
         // The head measured already.
         let mut measured = chunked;
@@ -2095,6 +2096,16 @@ mod tests {
         let mut line = [0u8; 18];
         let n = chunk_size_line((1 << 52) - 1, &mut line);
         assert_eq!(&line[..n], b"FFFFFFFFFFFFF\r\n");
+    }
+
+    /// T302: trailer names are lowercased.
+    #[test]
+    fn trailer_names_are_lowercased_in_chunked_lines() {
+        let chunked = MsgState::head(Framing::Chunked);
+        let head = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let msg = [&head[..], b"3\r\nabc\r\n0\r\nX-T: V\r\n\r\nNEXT"].concat();
+        let want = [&head[..], b"3\r\nabc\r\n0\r\nx-t: V\r\n\r\nNEXT"].concat();
+        assert_eq!(canonical(chunked, &msg), want);
     }
 
     #[test]

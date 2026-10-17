@@ -394,7 +394,8 @@ fn endless_trailers_are_not_relayed() {
     let seen = get(fe, Duration::from_secs(6), |b| b.starts_with(b"HTTP/1.1 502 ") && b.ends_with(b"</html>\n"));
     assert!(seen.total < 64 * 1024, "{} bytes relayed", seen.total);
     if seen.bytes.starts_with(b"HTTP/1.1 502 ") {
-        assert!(!seen.bytes.windows(3).any(|w| w == b"T: "), "{:?}", String::from_utf8_lossy(&seen.bytes));
+        // Ibex writes trailer names lowercased (T302): match either case, or this passes vacuously.
+        assert!(!seen.bytes.windows(3).any(|w| w.eq_ignore_ascii_case(b"t: ")), "{:?}", String::from_utf8_lossy(&seen.bytes));
         return;
     }
     assert!(seen.closed, "the client connection is still open after {:?}", seen.elapsed);
@@ -416,14 +417,14 @@ fn trailer_lines(c: &mut TcpStream, n: usize) {
 fn a_hundred_trailer_fields_pass_and_a_hundred_and_one_do_not() {
     let be = backend(|c| trailer_lines(c, 100));
     let (px, fe) = start("", be, "10s");
-    let seen = get(fe, Duration::from_secs(3), |b| b.ends_with(b"T: v\r\n\r\n"));
-    assert!(seen.bytes.ends_with(b"T: v\r\n\r\n") && !seen.closed, "{:?}", String::from_utf8_lossy(&seen.bytes));
-    assert_eq!(count(&seen.bytes, b"T: v\r\n"), 100);
+    let seen = get(fe, Duration::from_secs(3), |b| b.ends_with(b"t: v\r\n\r\n"));
+    assert!(seen.bytes.ends_with(b"t: v\r\n\r\n") && !seen.closed, "{:?}", String::from_utf8_lossy(&seen.bytes));
+    assert_eq!(count(&seen.bytes, b"t: v\r\n"), 100);
     drop(px);
 
     let be = backend(|c| trailer_lines(c, 101));
     let (_px, fe) = start("", be, "10s");
     let seen = get(fe, Duration::from_secs(3), |b| b.ends_with(b"</html>\n"));
     assert!(seen.bytes.starts_with(b"HTTP/1.1 502 "), "{:?}", String::from_utf8_lossy(&seen.bytes));
-    assert_eq!(count(&seen.bytes, b"T: v\r\n"), 0, "{:?}", String::from_utf8_lossy(&seen.bytes));
+    assert_eq!(count(&seen.bytes, b"t: v\r\n"), 0, "{:?}", String::from_utf8_lossy(&seen.bytes));
 }
