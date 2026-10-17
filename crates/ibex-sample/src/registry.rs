@@ -787,6 +787,131 @@ impl Registry {
         names
     }
 
+    /// T330: the total IP header length of `b` (v4 or v6, IPv6 extension headers included), the
+    /// offset of the TCP or UDP header, or `None` when data are missing or unparsable
+    /// (`ip_header_length()` in `src/net_helper.c` returning 0).
+    fn ip_header_length(b: &[u8]) -> Option<usize> {
+        let len = match b.first()? >> 4 {
+            4 => usize::from(b[0] & 0xF) * 4,
+            6 => {
+                if b.len() < 40 {
+                    return None;
+                }
+                let mut len = 40;
+                let mut next = b[6];
+                while next != 6 && next != 17 {
+                    let h = b.get(len..len + 2)?;
+                    next = h[0];
+                    len += usize::from(h[1]) * 8 + 8;
+                }
+                len
+            }
+            _ => return None,
+        };
+        (len != 0 && b.len() >= len).then_some(len)
+    }
+
+    /// T330: the `ip.fp` fingerprint of the IP+TCP packet `b` (`sample_conv_ip_fp()` in
+    /// `src/net_helper.c`): TOS, then flags, header length and wscale, window, MSS and the option
+    /// mask, then by `<mode>` bit the TTL (1), the option kinds (2) and the source address (4).
+    fn ip_fp(b: &[u8], args: &[String]) -> Option<Vec<u8>> {
+        // ARG1(0,SINT): the argument is an integer; only its low bits matter.
+        let mode = args.first().map_or(Some(0), |s| s.trim().parse::<i64>().ok())?;
+        let ipver = b.first()? >> 4;
+        let (iptos, pktlen, ipdf, ipttl, ipext, ipsrc) = match ipver {
+            4 => {
+                // The reference reads these fields whatever the header length says; a packet
+                // too short for them cannot hold a TCP header either, so give no sample.
+                let h = b.get(..20)?;
+                if b.len() < usize::from(h[0] & 0xF) * 4 {
+                    return None;
+                }
+                let pktlen = usize::from(u16::from_be_bytes([h[2], h[3]]));
+                (h[1], pktlen, h[6] & 0x40 != 0, h[8], h[0] & 0xF != 5, &h[12..16])
+            }
+            6 => {
+                let h = b.get(..40)?;
+                let pktlen = 40 + usize::from(u16::from_be_bytes([h[4], h[5]]));
+                // read_n16() >> 4 stored in a byte: the traffic class, across bytes 0 and 1
+                let iptos = h[0] << 4 | h[1] >> 4;
+                (iptos, pktlen, true, h[7], h[6] != 6 && h[6] != 17, &h[8..24])
+            }
+            _ => return None,
+        };
+
+        let mut out = vec![0u8; 8];
+        out[0] = iptos;
+        if mode & 1 != 0 {
+            out.push(ipttl);
+        }
+        // two bits of TTL: <=32, <=64, <=128, <=255
+        let ttl2: u8 = if ipttl > 64 { if ipttl > 128 { 3 } else { 2 } } else { u8::from(ipttl > 32) };
+
+        let iplen = Self::ip_header_length(b)?;
+        if iplen > pktlen {
+            return None;
+        }
+        let tcp = &b[iplen..];
+        let pktlen = pktlen - iplen;
+        // the TCP header must be complete (tcp_fullhdr_length()) and fit the packet length
+        if tcp.len() < 20 {
+            return None;
+        }
+        let tcplen = usize::from(tcp[12] >> 4) * 4;
+        if tcplen < 20 || tcp.len() < tcplen || tcplen > pktlen {
+            return None;
+        }
+        let data_present = pktlen - tcplen > 0;
+        let tcpflags = tcp[13];
+        let tcpwin = u16::from_be_bytes([tcp[14], tcp[15]]);
+
+        out[1] = u8::from(ipver == 6) << 7
+            | u8::from(ipdf) << 6
+            | ttl2 << 4
+            | u8::from(ipext) << 3
+            | u8::from(data_present) << 2
+            | tcpflags >> 6;
+
+        let (mut tcpmss, mut tcpws, mut opts) = (0u16, 0u8, 0u8);
+        let mut ofs = 20;
+        while ofs < tcplen {
+            let opt = tcp[ofs];
+            let next = match opt {
+                0 => break,
+                1 => ofs + 1,
+                _ if ofs + 1 < tcplen && tcp[ofs + 1] > 1 => ofs + usize::from(tcp[ofs + 1]),
+                _ => break,
+            };
+            if next > tcplen {
+                break;
+            }
+            if mode & 2 != 0 {
+                out.push(opt);
+            }
+            if opt == 2 && ofs + 3 < tcplen {
+                tcpmss = u16::from_be_bytes([tcp[ofs + 2], tcp[ofs + 3]]);
+            } else if opt == 3 && ofs + 2 < tcplen {
+                // 1 to 15, 0 meaning absent
+                let ws = tcp[ofs + 2];
+                tcpws = if ws > 14 { 15 } else { ws + 1 };
+            }
+            if opt >= 2 {
+                opts |= 1 << (if opt < 9 { opt - 2 } else { 7 });
+            }
+            ofs = next;
+        }
+
+        // tcplen << 2 in a byte: the data offset in words, in the high nibble
+        out[2] = tcp[12] & 0xF0 | tcpws;
+        out[3..5].copy_from_slice(&tcpwin.to_be_bytes());
+        out[5..7].copy_from_slice(&tcpmss.to_be_bytes());
+        out[7] = opts;
+        if mode & 4 != 0 {
+            out.extend_from_slice(ipsrc);
+        }
+        Some(out)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn register_builtin_fetches(&mut self) {
         // --- 1. Client & Destination Network Fetches ---
@@ -4345,151 +4470,17 @@ impl Registry {
             },
         });
 
+        // T330: ip.fp(<mode>), a port of sample_conv_ip_fp() in src/net_helper.c. Every field is
+        // read through a bounds check: what is missing gives no sample, never an index panic.
         self.register_converter(ConvDesc {
             name: "ip.fp",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Bin),
-            func: |smp, args| {
-                // T330
-                let mode = args.first().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-                match smp {
-                    Sample::Bin(b) => {
-                        if b.is_empty() { return None; }
-                        let ver = b[0] >> 4;
-                        if ver == 4 {
-                            if b.len() < 20 { return None; }
-                            let ihl = ((b[0] & 0x0F) as usize) * 4;
-                            if b.len() < ihl || ihl < 20 { return None; }
-                            let tos = b[1];
-                            let df = (b[6] & 0x40) != 0;
-                            let ttl = b[8];
-                            let options_present = ihl > 20;
-                            let ip_total = u16::from_be_bytes([b[2], b[3]]) as usize;
-                            let tcp_start = ihl;
-                            let tcp_hdr_len_words = ((b[tcp_start + 12] >> 4) & 0x0F) as usize;
-                            if tcp_hdr_len_words == 0 { return None; }
-                            let tcp_hdr_len = tcp_hdr_len_words * 4;
-                            if b.len() < tcp_start + tcp_hdr_len { return None; }
-                            let tcp_flags = b[tcp_start + 13];
-                            let cwr = (tcp_flags & 0x80) != 0;
-                            let ece = (tcp_flags & 0x40) != 0;
-                            let data_present = ip_total > ihl + tcp_hdr_len;
-                            let tcp_win = u16::from_be_bytes([b[tcp_start + 14], b[tcp_start + 15]]);
-                            let mut mss = 0u16;
-                            let mut win_scaling = 0u8;
-                            let mut option_bits = 0u8;
-                            let mut any_opt_ge9 = false;
-                            let mut options_list = Vec::new();
-                            let mut pos = tcp_start + 20;
-                            let end = tcp_start + tcp_hdr_len;
-                            while pos < end {
-                                let kind = b[pos];
-                                if kind == 0 { break; }
-                                if kind == 1 { options_list.push(kind); pos += 1; continue; }
-                                if pos + 1 >= end { break; }
-                                let len = b[pos + 1] as usize;
-                                if len < 2 || pos + len > end { break; }
-                                if (2..=8).contains(&kind) { option_bits |= 1 << (kind - 2); }
-                                if kind >= 9 { any_opt_ge9 = true; }
-                                options_list.push(kind);
-                                if kind == 2 && len >= 4 { mss = u16::from_be_bytes([b[pos + 2], b[pos + 3]]); }
-                                if kind == 3 && len >= 3 { win_scaling = b[pos + 2]; }
-                                pos += len;
-                            }
-                            if any_opt_ge9 { option_bits |= 0x80; }
-                            let mut out = Vec::with_capacity(8);
-                            out.push(tos);
-                            let mut byte1 = 0u8;
-                            byte1 |= u8::from(df) << 6;
-                            let ttl_bits = if ttl <= 32 { 0 } else if ttl <= 64 { 1 } else if ttl <= 128 { 2 } else { 3 };
-                            byte1 |= (ttl_bits & 0x03) << 4;
-                            byte1 |= u8::from(options_present) << 3;
-                            byte1 |= u8::from(data_present) << 2;
-                            byte1 |= u8::from(cwr) << 1;
-                            byte1 |= u8::from(ece);
-                            out.push(byte1);
-                            let mut byte2 = (u8::try_from(tcp_hdr_len_words & 0x0F).unwrap_or(0)) << 4;
-                            let ws = if win_scaling > 0 { win_scaling + 1 } else { 0 };
-                            byte2 |= ws & 0x0F;
-                            out.push(byte2);
-                            out.extend_from_slice(&tcp_win.to_be_bytes());
-                            out.extend_from_slice(&mss.to_be_bytes());
-                            out.push(option_bits);
-                            if mode & 1 != 0 { out.push(ttl); }
-                            if mode & 2 != 0 { out.extend(&options_list); }
-                            if mode & 4 != 0 { out.extend_from_slice(&b[12..16]); }
-                            Some(Sample::Bin(out))
-                        } else if ver == 6 {
-                            if b.len() < 40 { return None; }
-                            let tc = ((b[0] & 0x0F) << 4) | (b[1] >> 4);
-                            let tos = tc;
-                            let df = true;
-                            let ttl = b[7];
-                            let options_present = false;
-                            let next_header = b[6];
-                            let tcp_start = 40usize;
-                            if next_header != 6 { return None; }
-                            let tcp_hdr_len_words = ((b[tcp_start + 12] >> 4) & 0x0F) as usize;
-                            if tcp_hdr_len_words == 0 { return None; }
-                            let tcp_hdr_len = tcp_hdr_len_words * 4;
-                            if b.len() < tcp_start + tcp_hdr_len { return None; }
-                            let tcp_flags = b[tcp_start + 13];
-                            let cwr = (tcp_flags & 0x80) != 0;
-                            let ece = (tcp_flags & 0x40) != 0;
-                            let payload_len = u16::from_be_bytes([b[4], b[5]]) as usize;
-                            let data_present = payload_len > tcp_hdr_len;
-                            let tcp_win = u16::from_be_bytes([b[tcp_start + 14], b[tcp_start + 15]]);
-                            let mut mss = 0u16;
-                            let mut win_scaling = 0u8;
-                            let mut option_bits = 0u8;
-                            let mut any_opt_ge9 = false;
-                            let mut options_list = Vec::new();
-                            let mut pos = tcp_start + 20;
-                            let end = tcp_start + tcp_hdr_len;
-                            while pos < end {
-                                let kind = b[pos];
-                                if kind == 0 { break; }
-                                if kind == 1 { options_list.push(kind); pos += 1; continue; }
-                                if pos + 1 >= end { break; }
-                                let len = b[pos + 1] as usize;
-                                if len < 2 || pos + len > end { break; }
-                                if (2..=8).contains(&kind) { option_bits |= 1 << (kind - 2); }
-                                if kind >= 9 { any_opt_ge9 = true; }
-                                options_list.push(kind);
-                                if kind == 2 && len >= 4 { mss = u16::from_be_bytes([b[pos + 2], b[pos + 3]]); }
-                                if kind == 3 && len >= 3 { win_scaling = b[pos + 2]; }
-                                pos += len;
-                            }
-                            if any_opt_ge9 { option_bits |= 0x80; }
-                            let mut out = Vec::with_capacity(8);
-                            out.push(tos);
-                            let mut byte1 = 0x80u8;
-                            byte1 |= u8::from(df) << 6;
-                            let ttl_bits = if ttl <= 32 { 0 } else if ttl <= 64 { 1 } else if ttl <= 128 { 2 } else { 3 };
-                            byte1 |= (ttl_bits & 0x03) << 4;
-                            byte1 |= u8::from(options_present) << 3;
-                            byte1 |= u8::from(data_present) << 2;
-                            byte1 |= u8::from(cwr) << 1;
-                            byte1 |= u8::from(ece);
-                            out.push(byte1);
-                            let mut byte2 = (u8::try_from(tcp_hdr_len_words & 0x0F).unwrap_or(0)) << 4;
-                            let ws = if win_scaling > 0 { win_scaling + 1 } else { 0 };
-                            byte2 |= ws & 0x0F;
-                            out.push(byte2);
-                            out.extend_from_slice(&tcp_win.to_be_bytes());
-                            out.extend_from_slice(&mss.to_be_bytes());
-                            out.push(option_bits);
-                            if mode & 1 != 0 { out.push(ttl); }
-                            if mode & 2 != 0 { out.extend(&options_list); }
-                            if mode & 4 != 0 { out.extend_from_slice(&b[8..24]); }
-                            Some(Sample::Bin(out))
-                        } else { None }
-                    }
-                    _ => None,
-                }
+            func: |smp, args| match smp {
+                Sample::Bin(b) => Self::ip_fp(&b, args).map(Sample::Bin),
+                _ => None,
             },
         });
-
 
         self.register_converter(ConvDesc {
             name: "ip.tos",
