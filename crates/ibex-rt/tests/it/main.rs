@@ -203,6 +203,7 @@ mod proxy_line_reuse;
 mod proxy_protocol;
 mod proxy_v2_unique_id;
 mod reads_per_request;
+mod req_body_param;
 mod redispatch;
 mod regex_bytes;
 mod regex_group_refs;

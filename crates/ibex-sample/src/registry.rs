@@ -1503,6 +1503,24 @@ impl Registry {
             },
         });
 
+        // T326: req.body_param — extract first URL-encoded body parameter
+        self.register_fetch(FetchDesc {
+            name: "req.body_param",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let body = match (ctx.req_body, ctx.htx_slice) {
+                    (Some(b), _) => b,
+                    (_, Some(h)) => &h.body_bytes(),
+                    _ => return None,
+                };
+                let body_str = std::str::from_utf8(body).ok()?;
+                let param = args.first().cloned().unwrap_or_default();
+                let case_insensitive = args.get(1).is_some_and(|s| *s == "i");
+                extract_body_param(body_str, &param, case_insensitive).map(Sample::Str)
+            },
+        });
+
+
         self.register_fetch(FetchDesc {
             name: "res.body",
             out_type: SampleType::Bin,
@@ -4941,6 +4959,33 @@ fn extract_url_param(query: &str, param: &str) -> Option<String> {
                 return Some(url_decode(v, true));
             }
         } else if pair == param {
+            return Some(String::new());
+        }
+    }
+    None
+}
+
+/// Extracts the first occurrence of parameter `param` from a url-encoded body string.
+/// If `case_insensitive` is true, the parameter name matching is case-insensitive.
+/// If `param` is empty, returns the first parameter's value.
+/// No URL decoding is performed (matching `HAProxy`'s `req.body_param` behavior).
+fn extract_body_param(body: &str, param: &str, case_insensitive: bool) -> Option<String> {
+    for pair in body.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if param.is_empty() {
+                // No name given: return first parameter's value
+                return Some(v.to_string());
+            }
+            let key_matches = if case_insensitive {
+                k.eq_ignore_ascii_case(param)
+            } else {
+                k == param
+            };
+            if key_matches {
+                return Some(v.to_string());
+            }
+        } else if param.is_empty() {
+            // No name given: return empty string for parameter without value
             return Some(String::new());
         }
     }
