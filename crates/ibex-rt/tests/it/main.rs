@@ -224,6 +224,7 @@ mod request_line_414;
 mod content_length_early_reject;
 mod request_line_validation;
 mod request_rule_actions;
+mod res_hdrs;
 mod response_fetch_in_request;
 mod response_head_validation;
 mod response_te;

@@ -1322,6 +1322,12 @@ impl Registry {
             },
         });
 
+        self.register_fetch(FetchDesc {
+            name: "res.hdrs",
+            out_type: SampleType::Str,
+            func: |ctx, _| Some(Sample::Str(res_header_block(ctx))),
+        });
+
         let req_hdr_val_fetch: FetchFn = |ctx, args| {
             let name = args.first()?;
             let val = get_req_header(ctx, name)?;
@@ -5141,6 +5147,19 @@ fn req_header_block(ctx: &SampleContext) -> Option<String> {
 /// with the request's `X-N` (T132).
 fn get_res_header(ctx: &SampleContext, name: &str) -> Option<String> {
     get_all_res_headers(ctx, name).into_iter().next()
+}
+
+/// T329: `res.hdrs` (`smp_fetch_hdrs`): the response's headers as the H1 parser stores them
+/// ([`crate::h1_clean::h1_clean_headers`]), each `name: value\r\n`, then the `\r\n` that ends
+/// them. Raw: a header action that writes it has its own `%XX` encoding (`http_encode_map`).
+/// Read from `ctx.res_headers`, else from the response being processed.
+fn res_header_block(ctx: &SampleContext) -> String {
+    use crate::h1_clean::{h1_clean_headers, header_block};
+    let hdrs = match ctx.res_headers {
+        Some(h) => h1_clean_headers(h.iter().map(|(k, v)| (k.as_str(), v.as_str())), false),
+        None => CURRENT_RES_HEADERS.with(|h| h1_clean_headers(h.borrow().iter().map(|(k, v)| (k.as_str(), v.as_str())), false)),
+    };
+    header_block(&hdrs)
 }
 
 fn get_all_res_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
