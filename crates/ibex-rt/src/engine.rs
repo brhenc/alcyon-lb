@@ -1227,6 +1227,12 @@ pub struct RateCtr {
 impl RateCtr {
     const PERIOD_MS: u32 = 1000;
 
+    /// A zeroed counter, for a `static`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { head: AtomicU64::new(0), prev: AtomicU32::new(0) }
+    }
+
     /// Milliseconds since the first call; never 0, which marks a counter nothing was counted in.
     fn now() -> u32 {
         // Wraps after 49 days, as `HAProxy`'s ticks do; every comparison is a wrapping difference.
@@ -1290,6 +1296,34 @@ impl RateCtr {
             cur + u64::from(self.prev.load(Ordering::Relaxed)) * (period - elapsed) / period
         }
     }
+}
+
+/// Process-wide connection rate (`show info` `ConnRate`), ticked by every engine thread
+/// and by the QUIC listener: the per-thread `RateCtr` writes are not atomic as a whole.
+pub static GLOBAL_CONN_RATE: std::sync::Mutex<RateCtr> = std::sync::Mutex::new(RateCtr::new());
+/// Process-wide session rate (`show info` `SessRate`).
+pub static GLOBAL_SESS_RATE: std::sync::Mutex<RateCtr> = std::sync::Mutex::new(RateCtr::new());
+/// Highest `ConnRate` seen since start or the last `clear counters` (`MaxConnRate`).
+pub static MAX_CONN_RATE: AtomicU32 = AtomicU32::new(0);
+/// Highest `SessRate` seen since start or the last `clear counters` (`MaxSessRate`).
+pub static MAX_SESS_RATE: AtomicU32 = AtomicU32::new(0);
+
+fn tick_global(ctr: &std::sync::Mutex<RateCtr>, max: &AtomicU32) {
+    let ctr = ctr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    ctr.tick();
+    max.fetch_max(u32::try_from(ctr.rate()).unwrap_or(u32::MAX), Ordering::Relaxed);
+}
+
+/// One accepted client connection, counted before `tcp-request connection` rules run
+/// (`listener_accept`: rejected and silently dropped connections are in `ConnRate`).
+/// Not for the CLI, which `HAProxy` binds unlimited (`BC_O_UNLIMITED`).
+pub(crate) fn count_global_conn() {
+    tick_global(&GLOBAL_CONN_RATE, &MAX_CONN_RATE);
+}
+
+/// One session, counted once the connection survived the `tcp-request connection` rules.
+pub(crate) fn count_global_sess() {
+    tick_global(&GLOBAL_SESS_RATE, &MAX_SESS_RATE);
 }
 
 /// Accumulated statistics per proxy.
@@ -5111,6 +5145,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
     ) {
+        if l_idx.is_some() {
+            count_global_conn();
+        }
         {
             let mut tracked_sc: [Option<(usize, StickKey)>; 3] = [None, None, None];
 
@@ -5257,6 +5294,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             proxy.counters().cum_conn.fetch_add(1, Ordering::Relaxed);
             proxy.counters().fe_sess_rate.tick();
             proxy.counters().fe_conn_rate.tick();
+            // Once per TCP connection; a QUIC connection is counted by the QUIC listener,
+            // not per HTTP/3 request stream (`l_idx` is `None` for those).
+            if l_idx.is_some() {
+                count_global_sess();
+            }
             // `rate_max` counts sessions: it is raised once the TLS handshake is done, not here.
             let conn_rate = proxy.counters().fe_conn_rate.rate();
             proxy.txn_counters().fe.conn_rate_max.fetch_max(u32::try_from(conn_rate).unwrap_or(u32::MAX), Ordering::Relaxed);
