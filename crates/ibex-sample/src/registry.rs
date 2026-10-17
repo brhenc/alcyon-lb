@@ -2544,6 +2544,10 @@ impl Registry {
             func: |ctx, args| {
                 let idx_str = args.first()?;
                 let idx: usize = idx_str.parse().ok()?;
+                // T331: what a `capture-req` converter wrote since, which the slots do not hold yet.
+                if let Some(v) = crate::capture_write::pending(false, idx) {
+                    return Some(capture_sample(v));
+                }
                 let caps = ctx.captures_req_hdr?;
                 caps.get(idx)?.clone().map(capture_sample)
             },
@@ -2555,6 +2559,10 @@ impl Registry {
             func: |ctx, args| {
                 let idx_str = args.first()?;
                 let idx: usize = idx_str.parse().ok()?;
+                // T331: what a `capture-res` converter wrote since, which the slots do not hold yet.
+                if let Some(v) = crate::capture_write::pending(true, idx) {
+                    return Some(capture_sample(v));
+                }
                 let caps = ctx.captures_res_hdr?;
                 caps.get(idx)?.clone().map(capture_sample)
             },
@@ -4230,6 +4238,19 @@ impl Registry {
                 neg.then_some(smp)
             },
         });
+
+        // T331: `capture-req(<id>)` and `capture-res(<id>)` store their input, as a string, in the
+        // request's or response's capture slot <id> (cut at its length) and return it as it is.
+        // A slot that does not exist captures nothing (`sample_conv_req_capture`). The write
+        // is the engine's to put in the slot (`capture_write`).
+        for (name, res) in [("capture-req", false), ("capture-res", true)] {
+            self.register_ctx_converter(CtxConvDesc {
+                name,
+                in_type: TypeSpec::Exact(SampleType::Str),
+                out_type: TypeSpec::Exact(SampleType::Str),
+                func: if res { |_, smp, args| capture_conv(true, smp, args) } else { |_, smp, args| capture_conv(false, smp, args) },
+            });
+        }
 
         // --- 3. Encoding & Binary Converters ---
         // FIX (src/fix.c). A message that needs more data yields nothing; the
@@ -7866,6 +7887,12 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
             let path = args.first()?.trim_matches(['"', '\'']);
             crate::patref::map_file_error(path, keys, vals).map(|e| format!("invalid args in converter '{name}' : {e}"))
         }
+        // T331: `ARG1(1,SINT)`.
+        "capture-req" | "capture-res" if args.len() > 1 => Some(format!("invalid arg 2 in converter '{name}' : expected ')' before ',{})'.", args[1..].join(","))),
+        "capture-req" | "capture-res" => match args.first().map(String::as_str) {
+            None | Some("") => Some(format!("invalid arg 1 in converter '{name}' : expected type 'integer' at position 1, but got nothing.")),
+            Some(a) => crate::cast::parse_sint_arg(a).is_none().then(|| format!("invalid arg 1 in converter '{name}' : failed to parse '{a}' as type 'integer' at position 1.")),
+        },
         "mqtt_field_value" => mqtt_field_value_args_error(args),
         "mqtt_is_valid" if !args.iter().all(String::is_empty) => Some(format!(
             "invalid arg 1 in converter 'mqtt_is_valid' : expected ')' before '{})'.",
@@ -8875,6 +8902,18 @@ fn pb_convert(buf: &[u8], args: &[String], grpc: bool) -> Option<Sample> {
         left -= msg_len;
     }
     None
+}
+
+/// T331: the body of `capture-req` and `capture-res`: the sample is stored in slot `args[0]`
+/// and passed on. A negative or absent id is a slot that does not exist.
+fn capture_conv(res: bool, smp: Sample, args: &[String]) -> Option<Sample> {
+    if let Some(id) = args.first().and_then(|a| a.trim().parse::<usize>().ok()) {
+        match &smp {
+            Sample::Bin(b) => crate::capture_write::store(res, id, b),
+            other => crate::capture_write::store(res, id, &ibex_regex::bytetext::text_to_bytes(&sample_to_string(other))),
+        }
+    }
+    Some(smp)
 }
 
 /// A header capture as a sample: a string, or the bytes when a capture length cut a

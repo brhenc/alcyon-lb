@@ -2383,6 +2383,11 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &[Proxy], fe_idx: usize,
     // is `{}` for a transaction the server never answered, and nothing for a request
     // that never parsed.
     entry.sess.log.res_captures = vec![None; fe.res_capture_slots.len()];
+    // T331: what the `capture-req` and `capture-res` converters cut at.
+    entry.sess.log.req_capture_lens = fe.req_capture_slots.clone();
+    entry.sess.log.res_capture_lens = fe.res_capture_slots.clone();
+    // The run that parsed the request has started already, with no slots to give.
+    ibex_sample::capture_write::enter(fe.req_capture_slots.clone(), fe.res_capture_slots.clone());
     // `HAProxy` builds the ID on first use (`stream_generate_unique_id`); built here, once,
     // it is the same value for every reader, from the request as received.
     if let Some(fmt) = fe.unique_id_format.as_ref() {
@@ -6512,11 +6517,16 @@ fn stream_vars_enter(sess: &mut TcpSession) {
         map.extend(sess.sess_vars.drain());
         map.extend(sess.req_vars.drain());
     });
+    // T331: the slots' lengths, for the converters that write them.
+    ibex_sample::capture_write::enter(sess.log.req_capture_lens.clone(), sess.log.res_capture_lens.clone());
 }
 
 /// The end of [`with_stream_vars`]: what the thread's map holds goes back to the scope it
 /// belongs to in `sess`, or is dropped with a stream that is gone.
 fn stream_vars_leave(sess: Option<&mut TcpSession>) {
+    // T331: what `capture-req` and `capture-res` wrote goes into the slots; a stream that is
+    // gone has none to take it.
+    let writes = ibex_sample::capture_write::leave();
     CURRENT_VARS.with(|v| {
         let mut map = v.borrow_mut();
         let Some(sess) = sess else {
@@ -6528,6 +6538,12 @@ fn stream_vars_leave(sess: Option<&mut TcpSession>) {
         for (k, val) in map.drain() {
             let scope = if k.starts_with("sess.") { &mut sess.sess_vars } else { &mut sess.req_vars };
             scope.insert(k, val);
+        }
+        for (res, id, val) in writes {
+            let slots = if res { &mut sess.log.res_captures } else { &mut sess.log.req_captures };
+            if let Some(slot) = slots.get_mut(id) {
+                *slot = Some(val);
+            }
         }
     });
 }
@@ -9672,7 +9688,13 @@ impl EngineDispatcher<'_> {
                     Some((&l[..colon], l[colon + 1..].strip_suffix(b"\r").unwrap_or(&l[colon + 1..])))
                 })
                 .collect();
-            entry.sess.log.res_captures = capture_values(fe_caps.iter().map(|(n, l)| (n.as_str(), *l)), &headers);
+            // T331: a slot whose header the response lacks keeps what a converter wrote to it.
+            let found = capture_values(fe_caps.iter().map(|(n, l)| (n.as_str(), *l)), &headers);
+            for (slot, new) in entry.sess.log.res_captures.iter_mut().zip(found) {
+                if new.is_some() {
+                    *slot = new;
+                }
+            }
         }
         txn.status = status;
         txn.srv_reusable = !srv_has_close
@@ -11177,6 +11199,7 @@ impl EngineDispatcher<'_> {
                             // With `id`, the length is the declared slot's.
                             let max = len.or_else(|| proxies[proxy_idx].req_capture_slots.get(*target_id).map(|(_, l)| *l));
                             if let Some(slot) = sess.log.req_captures.get_mut(*target_id) {
+                                ibex_sample::capture_write::discard(false, *target_id);
                                 *slot = Some(cut_at(&val, max.unwrap_or(usize::MAX)).into_owned());
                             }
                         }
@@ -13397,6 +13420,7 @@ fn run_res_rules<'a>(
                 let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, ctx)).map(|smp| sample_to_string(&smp));
                 if let (Some(val), Some((slots, lens))) = (val, caps.as_mut()) {
                     if let (Some(slot), Some((_, len))) = (slots.get_mut(id), lens.get(id)) {
+                        ibex_sample::capture_write::discard(true, id);
                         *slot = Some(cut_at(&val, *len).into_owned());
                     }
                 }

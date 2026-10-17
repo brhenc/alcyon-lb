@@ -43,6 +43,7 @@ mod bind_options_per_bind;
 mod body_after_head_rewrite;
 mod bufsize_h2_alpn;
 mod canonical_haproxy_35_e2e;
+mod capture_converters;
 mod capture_slots;
 mod capture_ver;
 mod check_condition;
