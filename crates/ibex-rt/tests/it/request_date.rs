@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T331: request_date fetch
+//! T331: `request_date([<unit>])`, the date of the request's first byte: `accept_date`
+//! plus the idle time before it (`tcp_sample.c`). Every expected value was measured on
+//! `HAProxy` 3.5-dev8-885761-29 with the same configuration.
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::os::unix::net::UnixStream;
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Ibex(Child, std::path::PathBuf);
 
@@ -21,114 +21,122 @@ impl Drop for Ibex {
     }
 }
 
-/// Starts ibex on `cfg` (`{sock}` is replaced by the stats socket path), waits for `addrs` and the
-/// socket, then lets the readiness probes slide out of the one-second windows and clears the maxima.
-fn start(tag: &str, cfg: &str, addrs: &[SocketAddr]) -> (Ibex, String) {
-    let dir = std::env::temp_dir().join(format!("qh-{tag}-{}", std::process::id()));
+fn write_cfg(tag: &str, cfg: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("request-date-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("cli.sock").display().to_string();
     let path = dir.join("c.cfg");
-    std::fs::write(&path, cfg.replace("{sock}", &sock).replace("{dir}", &dir.display().to_string())).unwrap();
+    let full = format!("defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{cfg}");
+    std::fs::write(&path, full).unwrap();
+    (dir, path)
+}
+
+fn start(tag: &str, cfg: &str, a: SocketAddr) -> Ibex {
+    let (dir, path) = write_cfg(tag, cfg);
     let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     let ibex = Ibex(child, dir);
-    for a in addrs {
-        assert!(common::wait_listening(*a), "ibex did not listen on {a}");
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !std::path::Path::new(&sock).exists() {
-        assert!(Instant::now() < deadline, "no stats socket");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(2200));
-    cli(&sock, "clear counters");
-    (ibex, sock)
+    assert!(common::wait_listening(a), "ibex did not listen on {a}");
+    ibex
 }
 
-fn cli(sock: &str, cmd: &str) -> String {
-    let mut s = UnixStream::connect(sock).expect("cli");
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(format!("{cmd}\n").as_bytes()).unwrap();
-    let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    out
-}
-
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
-/// One request on a new connection; the whole raw answer.
-fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(req).unwrap();
-    let mut out = Vec::new();
-    let _ = s.read_to_end(&mut out);
-    out
-}
-
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
+/// Sends one keep-alive request on `c` and returns the body of the answer.
+fn ask(c: &mut TcpStream) -> String {
+    c.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+    let (mut got, mut b) = (Vec::new(), [0u8; 4096]);
+    loop {
+        if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .map_or(0, |v| v.trim().parse().unwrap());
+            if got.len() >= end + 4 + len {
+                return String::from_utf8_lossy(&got[end + 4..end + 4 + len]).into_owned();
             }
-            let _ = c.write_all(resp);
         }
-    });
-    addr
+        let n = c.read(&mut b).unwrap_or(0);
+        assert!(n > 0, "the answer stopped short: {:?}", String::from_utf8_lossy(&got));
+        got.extend_from_slice(&b[..n]);
+    }
 }
 
-/// The body of the answer to `req` (what follows the first empty line).
-fn body(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
+/// `<request_date(ms)>-<accept_date(ms)>`, the leading field of `s`, as the difference.
+fn idle(s: &str) -> i64 {
+    let (r, a) = s.split('|').next().unwrap().split_once('-').unwrap_or_else(|| panic!("not a pair: {s:?}"));
+    r.parse::<i64>().unwrap() - a.parse::<i64>().unwrap()
 }
 
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
-}
-
+/// A client that waits 1 s before its request, then 0.7 s before a second one on the same
+/// connection, then a new client that asks at once (oracle: 1000, 700 and 0, both in an
+/// `http-request return` and in the log line). Here within 150 ms either way: the accept
+/// of a loaded or just started process can come late, and the idle time is counted from it.
 #[test]
-fn request_date_fetch() {
+fn request_date_adds_the_idle_time_before_the_request() {
+    let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+    collector.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let a = common::reserve_addr();
     let cfg = format!(
-        "global\n  stats socket {{sock}} level admin\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"%[request_date,utime(%Y)]|%[request_date(ms),ms_utime(%Y)]|%[request_date(us),us_utime(%Y)]|%[date,utime(%Y)]\""
+        "frontend fe\n  bind {a}\n  log {} local0\n  option dontlognull\n  \
+         log-format \"LOG %[request_date(ms)]-%[accept_date(ms)]\"\n  \
+         http-request return status 200 content-type text/plain lf-string \"%[request_date(ms)]-%[accept_date(ms)]|%[request_date(us)]|%[request_date]\"\n",
+        collector.local_addr().unwrap()
     );
-    let (ibex, _sock) = start("request_date", &cfg, &[a]);
-    let b = body(a, GET);
-    // All four values should be the same year (2026 in the test environment)
-    let parts: Vec<&str> = b.split('|').collect();
-    assert_eq!(parts.len(), 4);
-    for p in &parts {
-        assert_eq!(*p, "2026");
+    let _ibex = start("idle", &cfg, a);
+    let connect = || {
+        let c = TcpStream::connect_timeout(&a, Duration::from_secs(2)).expect("connect");
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let mut c = connect();
+    std::thread::sleep(Duration::from_millis(1000));
+    let first = ask(&mut c);
+    std::thread::sleep(Duration::from_millis(700));
+    let second = ask(&mut c);
+    drop(c);
+    let third = ask(&mut connect());
+    let mut logs = Vec::new();
+    for _ in 0..3 {
+        let mut buf = [0u8; 2048];
+        let n = collector.recv(&mut buf).expect("a log line");
+        let line = String::from_utf8_lossy(&buf[..n]).into_owned();
+        logs.push(line[line.find("LOG ").expect("the log-format line") + 4..].trim_end().to_string());
+    }
+    for (what, got) in [("rule", [&first, &second, &third].map(|s| idle(s))), ("log", [&logs[0], &logs[1], &logs[2]].map(|s| idle(s)))] {
+        for (want, got) in [1000, 700, 0].into_iter().zip(got) {
+            assert!((want - 150..want + 150).contains(&got) && got >= 0, "{what}: request_date - accept_date is {got} ms, not {want}: {first:?} {second:?} {third:?} {logs:?}");
+        }
+    }
+    // The units are of one date: microseconds, milliseconds, seconds.
+    for b in [&first, &second, &third] {
+        let f: Vec<&str> = b.split('|').collect();
+        let ms: i64 = f[0].split('-').next().unwrap().parse().unwrap();
+        assert_eq!((f[1].parse::<i64>().unwrap() / 1000, f[2].parse::<i64>().unwrap()), (ms, ms / 1000), "{b:?}");
+    }
+}
+
+/// `HAProxy` refuses a unit other than `s`, `ms` or `us`, an empty one and a second argument
+/// at load, for `request_date` and `accept_date` alike; it takes no argument, or one of the three.
+#[test]
+fn request_date_and_accept_date_refuse_a_bad_unit_at_load() {
+    for f in ["request_date", "accept_date"] {
+        for (arg, why) in [
+            ("(min)", Some(format!("invalid args in fetch method '{f}' : expects 's', 'ms' or 'us', got 'min'"))),
+            ("()", Some(format!("invalid args in fetch method '{f}' : expects 's', 'ms' or 'us', got ''"))),
+            ("(ms,1)", Some(format!("fetch method '{f}' : expected ')' before ',1)'"))),
+            ("", None),
+            ("(s)", None),
+            ("(ms)", None),
+            ("(us)", None),
+        ] {
+            let cfg = format!("frontend fe\n  bind 127.0.0.1:0\n  http-request return status 200 content-type text/plain lf-string \"%[{f}{arg}]\"\n");
+            let (dir, path) = write_cfg("load", &cfg);
+            let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(&path).output().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            let err = String::from_utf8_lossy(&out.stderr);
+            match why {
+                Some(why) => assert!(!out.status.success() && err.contains(&why), "{f}{arg}: want {why:?}, got {err:?}"),
+                None => assert!(out.status.success(), "{f}{arg} is refused: {err:?}"),
+            }
+        }
     }
 }
