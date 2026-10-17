@@ -668,7 +668,13 @@ pub fn check_expr(config: &Config, registry: &Registry, at: Where<'_>, expr: &st
             return Err(msg);
         }
     }
-    if let Some(msg) = ibex_sample::check_raw_fetch_args(&e.fetch_name, &e.fetch_args) {
+    // `request_date()` is one empty unit to `HAProxy` (`make_arg_list`), which it refuses;
+    // `Expr::parse` sees no argument there, as in a bare `request_date`.
+    let empty_unit = matches!(e.fetch_name.as_str(), "accept_date" | "request_date")
+        && e.fetch_args.is_empty()
+        && word.split(',').next().is_some_and(|f| f.trim_end().ends_with("()"));
+    let fetch_args = if empty_unit { vec![String::new()] } else { e.fetch_args.clone() };
+    if let Some(msg) = ibex_sample::check_raw_fetch_args(&e.fetch_name, &fetch_args) {
         return Err(msg);
     }
     if let Some(msg) = ibex_sample::check_dump_all_vars_args(&e.fetch_name, &e.fetch_args) {

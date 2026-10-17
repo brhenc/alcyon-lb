@@ -286,6 +286,8 @@ pub struct SampleContext<'a> {
     pub prio: (i32, i32),
     /// When the stream was accepted, as unix seconds and milliseconds: `accept_date`.
     pub accept_date: Option<(i64, u32)>,
+    /// When the first byte of the request was received, as unix seconds and milliseconds: `request_date`.
+    pub request_date: Option<(i64, u32)>,
     /// What `when()` reads of the stream; `None` is a stream that has done nothing yet.
     pub stream: Option<StreamFacts>,
     /// The proxy's ACLs, for `when(acl,<name>)`; `None` where the caller has none, and the
@@ -3063,7 +3065,22 @@ impl Registry {
             func: |ctx, args| {
                 let (secs, ms) = ctx.accept_date?;
                 match args.first().map_or("s", String::as_str) {
-                    "s" | "" => Some(Sample::Sint(secs)),
+                    "s" => Some(Sample::Sint(secs)),
+                    "ms" => Some(Sample::Sint(secs * 1000 + i64::from(ms))),
+                    "us" => Some(Sample::Sint((secs * 1000 + i64::from(ms)) * 1000)),
+                    _ => None,
+                }
+            },
+        });
+        // T331: `request_date[(<unit>)]`: when the first byte of the HTTP request was received.
+        // Millisecond resolution, as `accept_date`: `us` is the milliseconds times 1000.
+        self.register_fetch(FetchDesc {
+            name: "request_date",
+            out_type: SampleType::Sint,
+            func: |ctx, args| {
+                let (secs, ms) = ctx.request_date?;
+                match args.first().map_or("s", String::as_str) {
+                    "s" => Some(Sample::Sint(secs)),
                     "ms" => Some(Sample::Sint(secs * 1000 + i64::from(ms))),
                     "us" => Some(Sample::Sint((secs * 1000 + i64::from(ms)) * 1000)),
                     _ => None,

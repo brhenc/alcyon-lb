@@ -235,6 +235,7 @@ mod reload_under_load;
 mod replace_path_targets;
 mod req_body_param;
 mod req_hdrs_bin;
+mod request_date;
 mod request_framing_smuggling;
 mod request_head_limit;
 mod request_line_414;

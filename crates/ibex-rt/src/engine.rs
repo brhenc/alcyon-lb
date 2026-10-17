@@ -2443,6 +2443,17 @@ fn stream_facts(sess: &TcpSession, status: Option<u16>) -> ibex_sample::StreamFa
     }
 }
 
+/// `request_date`: the accept date plus the idle time before the request's first byte
+/// (`accept_date + t_idle + t_handshake`, `tcp_sample.c`), as unix seconds and
+/// milliseconds; the accept date while no byte has come.
+fn request_date(log: &crate::txnlog::StreamLog) -> (i64, u32) {
+    let Some(fb) = log.first_byte else { return log.date };
+    let d = fb.saturating_duration_since(log.start);
+    let ms = log.date.1 + d.subsec_millis();
+    let secs = log.date.0.saturating_add(i64::try_from(d.as_secs()).unwrap_or(i64::MAX)).saturating_add(i64::from(ms / 1000));
+    (secs, ms % 1000)
+}
+
 /// The sample context a log line's `%[...]` reads.
 fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>) -> SampleContext<'a> {
     SampleContext {
@@ -2473,6 +2484,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         captures_res_hdr: Some(&s.log.res_captures),
         unique_id: s.log.unique_id.as_deref(),
         accept_date: Some(s.log.date),
+        request_date: Some(request_date(&s.log)),
         last_rule: last_rule_at(s.log.last_rule),
         prio: (s.log.prio_class, s.log.prio_offset),
         bc_err: s.bc_err,
@@ -10638,6 +10650,7 @@ impl EngineDispatcher<'_> {
                         captures_req_hdr: Some(&$s.log.req_captures),
                         unique_id: $s.log.unique_id.as_deref(),
                         accept_date: Some($s.log.date),
+                        request_date: Some(request_date(&$s.log)),
                         last_rule: last_rule_at($s.log.last_rule),
                         prio: ($s.log.prio_class, $s.log.prio_offset),
                         be_max_retries: Some(be_retries),

@@ -627,11 +627,23 @@ pub(crate) fn register(r: &mut Registry) {
     });
 }
 
-/// The load-time check of the arguments of these fetches, worded as `HAProxy` words it
-/// (`make_arg_list` and `val_payload_lv`), or `None` when `fetch` is not one of them or its
+/// The load-time check of the arguments of these fetches and of `accept_date` and
+/// `request_date`, worded as `HAProxy` words it (`make_arg_list`, `val_payload_lv`,
+/// `smp_check_date_unit`), or `None` when `fetch` is not one of them or its
 /// arguments are fine.
 #[must_use]
 pub fn check_args(fetch: &str, args: &[String]) -> Option<String> {
+    // `accept_date` and `request_date` take one optional unit (`smp_check_date_unit`); an
+    // empty one, `()`, is refused like a wrong one.
+    if matches!(fetch, "accept_date" | "request_date") {
+        if let Some(extra) = args.get(1..).filter(|e| !e.is_empty()) {
+            return Some(format!("fetch method '{fetch}' : expected ')' before ',{})'", extra.join(",")));
+        }
+        return args
+            .first()
+            .filter(|u| !matches!(u.as_str(), "s" | "ms" | "us"))
+            .map(|u| format!("invalid args in fetch method '{fetch}' : expects 's', 'ms' or 'us', got '{u}'"));
+    }
     let none = matches!(
         fetch,
         "req.ssl_hello_type" | "req_ssl_hello_type" | "res.ssl_hello_type" | "rep_ssl_hello_type" | "req.ssl_ver" | "req_ssl_ver"
