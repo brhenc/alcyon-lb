@@ -622,6 +622,22 @@ impl TcpSession {
         self.h2_ctx.is_some() || self.is_h2_child()
     }
 
+    /// T326: `fc_http_major` (`smp_fetch_fc_http_major`, `src/connection.c`): the client
+    /// connection's mux, 2 for HTTP/2 (TLS ALPN, `proto h2` or a detected preface), 1 for
+    /// HTTP/1, none in TCP mode, whose mux is raw.
+    #[must_use]
+    pub fn fc_http_major(&self) -> Option<u8> {
+        (self.mode == Mode::Http).then(|| if self.is_h2() { 2 } else { 1 })
+    }
+
+    /// T326: `bc_http_major`: 1 on an HTTP server connection, the only one Ibex makes (it has
+    /// no HTTP/2 mux towards servers and refuses `server ... proto h2`); none before there is
+    /// a server connection, or in TCP mode.
+    #[must_use]
+    pub fn bc_http_major(&self) -> Option<u8> {
+        (self.mode == Mode::Http && self.srv.is_some()).then_some(1)
+    }
+
     /// Whether the session is a stream of an HTTP/2 connection (T280).
     #[must_use]
     #[inline]

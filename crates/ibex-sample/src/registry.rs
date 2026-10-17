@@ -262,6 +262,12 @@ pub struct SampleContext<'a> {
     /// The stream's retry budget, for `cur_max_retries`: what `set-retries` changes.
     pub cur_max_retries: Option<u16>,
     pub act_conn: u32,
+    /// T326: the major HTTP version of the client connection's mux (`fc_http_major`): 2 for
+    /// HTTP/2, 1 for HTTP/1; `None` where it has no HTTP mux (TCP mode, not set up yet).
+    pub fc_http_major: Option<u8>,
+    /// T326: the same for the server connection (`bc_http_major`); `None` where there is none
+    /// yet or it is not HTTP.
+    pub bc_http_major: Option<u8>,
     /// The client connection's TLS session, for `ssl_fc*` and `ssl_c_used`; the default
     /// (`used` false, nothing else) for a plaintext one.
     pub ssl_fc: SslFacts<'a>,
@@ -1032,7 +1038,8 @@ impl Registry {
             },
         });
 
-        // `smp_fetch_rqver`
+        // `smp_fetch_rqver` / `smp_fetch_stver` (src/http_fetch.c): the version without
+        // its "HTTP/" ("1.1"), and nothing when there is no message to read it from.
         let request_version_fetch: FetchFn = |ctx, _args| {
             let v = get_context_req_version(ctx).map(str::to_string)
                 .or_else(|| ctx.htx.and_then(|h| h.req_line()).map(|l| l.version.as_str().to_string()))?;
@@ -1049,46 +1056,23 @@ impl Registry {
             func: request_version_fetch,
         });
 
-        // `smp_fetch_rqver`
-        // T326: req_proto_http fetch
-        let req_proto_http_fetch: FetchFn = |_ctx, _args| {
-            // For the purposes of this test, assume HTTP requests are present.
-            // In a full implementation, check that the request buffer parses as HTTP.
-            Some(Sample::Sint(1))
-        };
-        self.register_fetch(FetchDesc {
-            name: "req_proto_http",
-            out_type: SampleType::Sint,
-            func: req_proto_http_fetch,
-        });
-
-        // T326: fc_http_major fetch
-        let fc_http_major_fetch: FetchFn = |ctx, _args| {
-            // Determine HTTP major version of front connection; default to 1 for HTTP/1.x
-            // when no explicit protocol information is available. In practice, HTTP/2 is
-            // signaled via ALPN "h2" on the TLS front connection.
-            let major = if ctx.ssl_fc.alpn == Some(b"h2") { 2 } else { 1 };
-            Some(Sample::Sint(i64::from(major)))
-        };
+        // T326: `smp_fetch_fc_http_major` (`src/connection.c`), `fc_http_major` and
+        // `bc_http_major`: the major version of the client's or the server's connection by its
+        // mux (2 for H2, 1 for H1), and nothing where it has no HTTP mux (TCP mode, before the
+        // mux is set up, no server connection yet). The runtime gives both in the context.
         self.register_fetch(FetchDesc {
             name: "fc_http_major",
             out_type: SampleType::Sint,
-            func: fc_http_major_fetch,
+            func: |ctx, _args| ctx.fc_http_major.map(|m| Sample::Sint(i64::from(m))),
         });
-
-        // T326: bc_http_major fetch
-        let bc_http_major_fetch: FetchFn = |_ctx, _args| {
-            // Backend connection protocol is not tracked in SampleContext; assume HTTP/1
-            // for HTTP mode when no information is available.
-            let major = 1;
-            Some(Sample::Sint(i64::from(major)))
-        };
         self.register_fetch(FetchDesc {
             name: "bc_http_major",
             out_type: SampleType::Sint,
-            func: bc_http_major_fetch,
+            func: |ctx, _args| ctx.bc_http_major.map(|m| Sample::Sint(i64::from(m))),
         });
 
+        // `smp_fetch_rqver` / `smp_fetch_stver` (src/http_fetch.c): the version without
+        // its "HTTP/" ("1.1"), and nothing when there is no message to read it from.
         let response_version_fetch: FetchFn = |ctx, _args| {
             let v = get_context_res_version(ctx).map(str::to_string)
                 .or_else(|| ctx.htx.and_then(|h| h.res_line()).map(|l| l.version.as_str().to_string()))?;
@@ -1155,15 +1139,13 @@ impl Registry {
             func: status_fetch,
         });
 
-        self.register_fetch(FetchDesc {
-            name: "req.proto_http",
-            out_type: SampleType::Bool,
-            func: |ctx, _args| {
-                Some(Sample::Bool(
-                    ctx.htx_slice.is_some() || ctx.htx.is_some() || ctx.req_uri.is_some(),
-                ))
-            },
-        });
+        // `smp_fetch_proto_http` (`src/http_fetch.c`), registered as `req.proto_http` and, T326,
+        // as its alias `req_proto_http`.
+        let proto_http_fetch: FetchFn = |ctx, _args| {
+            Some(Sample::Bool(ctx.htx_slice.is_some() || ctx.htx.is_some() || ctx.req_uri.is_some()))
+        };
+        self.register_fetch(FetchDesc { name: "req.proto_http", out_type: SampleType::Bool, func: proto_http_fetch });
+        self.register_fetch(FetchDesc { name: "req_proto_http", out_type: SampleType::Bool, func: proto_http_fetch });
         self.register_fetch(FetchDesc {
             name: "res.proto_http",
             out_type: SampleType::Bool,
