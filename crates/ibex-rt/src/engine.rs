@@ -2098,6 +2098,24 @@ struct ExtraCli {
     level: crate::applet::CliLevel,
 }
 
+impl Engine {
+    /// The lines of `show cli sockets`: every CLI socket, in configuration order, with the
+    /// level it was bound at (T354).
+    fn cli_sockets_text(&self) -> String {
+        let mut out = String::new();
+        if let Some(n) = &self.cli_socket_name {
+            out.push_str(&format!("{n} {} all", self.cli_level.name()));
+        }
+        for x in &self.extra_cli {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("{} {} all", x.name, x.level.name()));
+        }
+        out
+    }
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
         // Whatever the other workers still ask of this one is answered empty.
@@ -4997,6 +5015,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     applet.timeout_ms = self.cli_timeout_ms;
                     applet.level = level;
                     applet.socket_name = name.cloned();
+                    applet.socket_list = self.cli_sockets_text();
                     let raw_fd = applet.raw_fd;
 
                     let Some(applet_idx) = self.applets.alloc(applet) else {

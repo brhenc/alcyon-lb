@@ -306,3 +306,31 @@ fn x_hands_the_tcp_stats_socket_over() {
     let _ = new.stderr.take().expect("stderr").read_to_string(&mut err);
     assert!(err.contains("took over 1 listening socket(s)"), "the TCP CLI was not handed over: {err}");
 }
+
+/// T354. `HAProxy` 3.5-dev8-885761-29 (`stats socket` on a unix path at admin, another at
+/// operator, a TCP one at user, abnsz@ prints as abns@; asked on each, and after `user;`): every socket is listed,
+/// in configuration order, each with the level it was bound at -- not the level the
+/// asking session has dropped to, and not only the socket asked on.
+#[test]
+fn show_cli_sockets_lists_every_socket_with_its_own_level() {
+    let p4 = common::reserve_port();
+    let p6 = common::reserve_port();
+    let abns = format!("ibex-t354-{}", std::process::id());
+    let lines = format!(
+        "\tstats socket 127.0.0.1:{p4} level admin mode 600\n\
+         \tstats socket ipv6@[::1]:{p6}\n\
+         \tstats socket abns@{abns} level user\n\
+         \tstats socket abnsz@{abns}z"
+    );
+    let (mut child, _f) = start(&lines, &[]);
+    let v4: SocketAddr = format!("127.0.0.1:{p4}").parse().expect("addr");
+    let want = format!(
+        "# socket lvl processes\nipv4@127.0.0.1:{p4} admin all\nipv6@[::1]:{p6} operator all\n\
+         abns@{abns} user all\nabns@{abns}z operator all\n\n"
+    );
+    assert_eq!(ask(tcp(v4), "show cli sockets"), want, "asked on the first socket");
+    let s = wait("abns@", || abstract_stream(&abns, true));
+    assert_eq!(ask(s, "show cli sockets"), want, "asked on another one");
+    assert_eq!(ask(tcp(v4), "operator;show cli sockets"), format!("\n{want}"), "after the session dropped its level");
+    common::stop(&mut child);
+}

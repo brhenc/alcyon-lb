@@ -199,6 +199,9 @@ pub struct CliApplet {
     /// The name of the socket the connection came in on (`unix@/p`, `ipv4@a:p`, `abns@n`),
     /// for `show cli sockets`.
     pub socket_name: Option<String>,
+    /// Every CLI socket of the process with the level it was bound at, one line each, for
+    /// `show cli sockets`; empty when the engine did not say (then `socket_name` is used).
+    pub socket_list: String,
     pub stream: Option<CliStream>,
     pub raw_fd: RawFd,
     pub task: TaskRef,
@@ -251,6 +254,7 @@ impl CliApplet {
         CliApplet {
             level: CliLevel::Admin,
             socket_name: None,
+            socket_list: String::new(),
             stream: Some(stream),
             raw_fd,
             task: TaskRef::NONE,
@@ -477,8 +481,12 @@ impl CliApplet {
         } else if cmd == "show cli level" {
             self.finish_msg(self.level.name());
         } else if cmd == "show cli sockets" {
-            let sock = self.socket_name.clone().unwrap_or_default();
-            let msg = format!("# socket lvl processes\n{sock} {} all", self.level.name());
+            let list = if self.socket_list.is_empty() {
+                format!("{} {} all", self.socket_name.clone().unwrap_or_default(), self.level.name())
+            } else {
+                self.socket_list.clone()
+            };
+            let msg = format!("# socket lvl processes\n{list}");
             self.finish_msg(&msg);
         } else if cmd == "show version" {
             self.finish_msg(env!("CARGO_PKG_VERSION"));
