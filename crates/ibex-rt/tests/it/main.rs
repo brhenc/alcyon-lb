@@ -197,6 +197,7 @@ mod poll_accept;
 mod privilege_drop;
 mod proc_var_converters;
 mod protocol_checks;
+mod proto_major;
 mod proxy_header_log;
 mod proxy_ids;
 mod proxy_line_reuse;
