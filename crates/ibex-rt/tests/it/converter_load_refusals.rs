@@ -186,4 +186,8 @@ fn repeated_commas_between_converters_are_skipped() {
         let (code, out) = check(&format!("str(b)\n  http-request set-header x %[{expr}]"));
         assert!(code == Some(1) && out.contains("unknown converter ''"), "`%[{expr}]`: exit {code:?}: {out}");
     }
+    for line in ["log-format %[str(a),]", "log-format %[str(a),lower,]", "unique-id-format %[str(a),,]"] {
+        let (code, out) = check(&format!("str(b)\n  {line}"));
+        assert!(code == Some(1) && out.contains("unknown converter ''"), "`{line}`: exit {code:?}: {out}");
+    }
 }
