@@ -134,3 +134,48 @@ fn xxh32_xxh64_match_the_reference_library() {
     assert_eq!(body(a, b"GET /0123456789abcdef0123456789abcdef0123456789 HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"), "[852579327|4952883123889572249|46947589|2856167679|1052971786|7687958087540669822|8845622410792476331]");
     assert_eq!(body(a, b"GET /xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"), "[852579327|4952883123889572249|46947589|2856167679|73530813|-6618268220350324068|-6737632001074821097]");
 }
+
+/// The seed is a SINT argument (`ARG1(0,SINT)`, `read_int64`, saturating), converted as C does:
+/// `xxh32` keeps its low 32 bits, `xxh64` its 64 bits as unsigned. A negative or oversized
+/// seed is a seed, not 0 (3.5-dev8).
+const SEED_CFG: &str = r#"frontend fe
+  bind {A}
+  http-request return status 200 content-type text/plain lf-string "[%[str(abc),xxh32(-1)]|%[str(abc),xxh32(4294967297)]|%[str(abc),xxh32(99999999999999999999)]|%[str(abc),xxh32(+5)]|%[str(abc),xxh32(-)]|%[str(abc),xxh64(-1)]|%[str(abc),xxh64(99999999999999999999)]|%[str(abc),xxh64(-99999999999999999999)]|%[str(abc),xxh64(+5)]]"
+"#;
+
+#[test]
+fn xxh32_xxh64_seed_is_a_haproxy_sint() {
+    let a = common::reserve_addr();
+    let cfg = http_cfg("  nbthread 1\n", &SEED_CFG.replace("{A}", &a.to_string()));
+    let (_ibex, _sock) = start("xxhseed", &cfg, &[a]);
+    assert_eq!(
+        body(a, GET),
+        "[2989167648|2856167679|2989167648|1562728233|852579327|2895935887265243510|-6843889581911917747|-2991377997648133420|-1753195980308443340]"
+    );
+}
+
+/// A seed that is not an integer is a configuration error, not a seed of 0 (3.5-dev8 refuses
+/// each of these: "invalid arg 1 in converter 'xxh32' : failed to parse 'abc' as type 'integer'").
+#[test]
+fn xxh32_xxh64_refuse_a_seed_that_is_no_integer() {
+    let dir = std::env::temp_dir().join(format!("qh-xxhbad-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = common::reserve_addr();
+    for (i, arg) in ["xxh32(abc)", "xxh32(0x10)", "xxh32(1k)", "xxh64(abc)", "xxh64(5x)", "xxh64(--1)"].iter().enumerate() {
+        let path = dir.join(format!("c{i}.cfg"));
+        std::fs::write(
+            &path,
+            format!(
+                "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+                 frontend fe\n  bind {a}\n  http-request set-var(txn.x) str(abc),{arg}\n"
+            ),
+        )
+        .unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(&path).output().unwrap();
+        assert!(!out.status.success(), "{arg} was accepted: {}", String::from_utf8_lossy(&out.stdout));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("invalid arg 1 in converter 'xxh"), "{arg}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

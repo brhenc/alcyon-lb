@@ -251,6 +251,16 @@ fn c_str2sint(smp: Sample) -> Option<Sample> {
     }
 }
 
+/// A `SINT` argument of a sample keyword (`make_arg_list`, `src/arg.c`): `read_int64` must
+/// consume the whole text (an optional sign and decimal digits, saturating), or the
+/// configuration is refused. `"-"` alone is 0, as in `HAProxy`.
+#[must_use]
+pub fn parse_sint_arg(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let digits = b.strip_prefix(b"-").or_else(|| b.strip_prefix(b"+")).unwrap_or(b);
+    digits.iter().all(u8::is_ascii_digit).then(|| read_int64(b))
+}
+
 /// `read_int64` (`src/tools.c`): an optional `-` or `+`, then the leading decimal digits.
 /// Whatever follows them is ignored, nothing is skipped before them (so `"abc"` and
 /// `" 12"` are 0, `"12abc"` is 12), and a value out of range saturates at `i64::MAX` /
