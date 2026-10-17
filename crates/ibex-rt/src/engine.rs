@@ -6865,6 +6865,9 @@ fn init_client_session(
     let retries = proxies[proxy_idx].retries;
     let cliexp = proxies[proxy_idx].cliexp.clone();
     let srvexp = proxies[proxy_idx].srvexp.clone();
+    // The TLS transport is built on the accepted socket before the session owns it, so
+    // there is no session without a client socket to account for (T342).
+    let tls_xprt = tls.map(|cfg| crate::xprt::accept_tls(&cli_fd, Arc::clone(cfg)));
 
     let mut sess = TcpSession::new_with_mode(
         crate::proxy::ClientSide::Fd(cli_fd),
@@ -6898,26 +6901,12 @@ fn init_client_session(
         .maxrewrite
         .unwrap_or(global_maxrewrite);
 
-    if let Some(cfg) = tls {
-        // The connection is dropped rather than continued in the clear. Falling back to
-        // plaintext here would hand an unencrypted session to a client that opened :443
-        // expecting TLS -- the same downgrade `bind_tls` refuses to start with, arriving
-        // one connection at a time instead of all at once. Closing is visible; serving
-        // cleartext is not.
-        match sess.cli_fd().map_or_else(|| Err(io::Error::from(io::ErrorKind::NotConnected)), |fd| crate::xprt::accept_tls(&fd, Arc::clone(cfg))) {
-            Ok(xprt) => {
-                sess.cli_xprt = xprt;
-                // T320: `SslRate`; `CurrSslConns` and `CumSslConns` are the transport's own.
-                crate::stats::ssl_conn_accepted();
-            }
-            Err(e) => {
-                crate::stderr_line!(
-                    "[ibex] {}: dropping connection from {peer_addr}, TLS setup failed: {e}",
-                    proxies[proxy_idx].name
-                );
-                return None;
-            }
-        }
+    // A TLS bind's connection is TLS from its first byte and never falls back to cleartext
+    // (the downgrade `bind_tls` refuses to start with); a failed handshake closes it.
+    if let Some(xprt) = tls_xprt {
+        sess.cli_xprt = xprt;
+        // T320: `SslRate`; `CurrSslConns` and `CumSslConns` are the transport's own.
+        crate::stats::ssl_conn_accepted();
     }
     // `accept-proxy` belongs to the bind that accepted, not to the frontend.
     if bind_proxy.0 {

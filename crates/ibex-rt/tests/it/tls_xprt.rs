@@ -94,8 +94,7 @@ fn pump_client(conn: &mut ClientConnection, sock: &mut TcpStream) {
 fn handshake_completes_and_data_flows_both_ways() {
     let (cert, key) = test_certs();
     let (mut cli_sock, srv_sock) = socket_pair();
-    let mut xprt = ibex_rt::accept_tls(&srv_sock, server_config(cert.clone(), key))
-        .expect("accept_tls");
+    let mut xprt = ibex_rt::accept_tls(&srv_sock, server_config(cert.clone(), key));
 
     let name = ServerName::try_from("localhost").expect("name");
     let mut client = ClientConnection::new(client_config(&cert), name).expect("client conn");
@@ -157,7 +156,7 @@ fn an_eof_without_close_notify_is_reported_as_truncation() {
     let (cert, key) = test_certs();
     let (mut cli_sock, srv_sock) = socket_pair();
     let mut xprt =
-        ibex_rt::accept_tls(&srv_sock, server_config(cert.clone(), key)).expect("accept_tls");
+        ibex_rt::accept_tls(&srv_sock, server_config(cert.clone(), key));
     let name = ServerName::try_from("localhost").expect("name");
     let mut client = ClientConnection::new(client_config(&cert), name).expect("client conn");
 
@@ -210,7 +209,7 @@ fn close_notify_is_a_clean_eof() {
     let (cert, key) = test_certs();
     let (mut cli_sock, srv_sock) = socket_pair();
     let mut xprt =
-        ibex_rt::accept_tls(&srv_sock, server_config(cert.clone(), key)).expect("accept_tls");
+        ibex_rt::accept_tls(&srv_sock, server_config(cert.clone(), key));
     let name = ServerName::try_from("localhost").expect("name");
     let mut client = ClientConnection::new(client_config(&cert), name).expect("client conn");
 
@@ -285,7 +284,7 @@ fn tls_asks_for_writability_during_the_handshake() {
     let (mut cli_sock, srv_sock) = socket_pair();
     let (cert, key) = test_certs();
     let mut xprt =
-        ibex_rt::accept_tls(&srv_sock, server_config(cert.clone(), key)).expect("accept_tls");
+        ibex_rt::accept_tls(&srv_sock, server_config(cert.clone(), key));
     let name = ServerName::try_from("localhost").expect("name");
     let mut client = ClientConnection::new(client_config(&cert), name).expect("client conn");
 
