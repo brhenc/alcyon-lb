@@ -199,6 +199,7 @@ mod master_cli;
 mod maxconn_client_left;
 mod maxsock_limit;
 mod monitor_uri;
+mod mqtt;
 mod multithread;
 mod no_log;
 mod node_description;
