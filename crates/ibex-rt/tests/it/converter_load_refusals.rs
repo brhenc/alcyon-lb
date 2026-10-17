@@ -166,3 +166,24 @@ fn ip_fp_arguments_and_converter_input_types_are_checked_at_load() {
     }
     assert!(wrong.is_empty(), "{} cases differ from HAProxy:\n{}", wrong.len(), wrong.join("\n"));
 }
+
+/// T341: `sample_parse_expr` skips a run of commas between converters (`while (*endt == ',')`),
+/// and at the end of a rule's expression; in a `%[...]` the `]` is left, and the converter
+/// after a trailing comma is the empty name. Measured with `haproxy -c` on
+/// 3.5-dev8-885761-29, 2026-10-17: Ibex refused `str(a),,lower` everywhere ("Invalid
+/// converter name ''") once expressions were parsed at load (2ea14cbe).
+#[test]
+fn repeated_commas_between_converters_are_skipped() {
+    for expr in ["str(a),,lower", "str(a),,,lower", "str(a),lower,,upper", "str(a),", "str(a),lower,"] {
+        let (code, out) = check(expr);
+        assert_eq!(code, Some(0), "`{expr}` must load: {out}");
+    }
+    for expr in ["str(a),,lower", "str(a),lower,,upper"] {
+        let (code, out) = check(&format!("str(b)\n  http-request set-header x %[{expr}]\n  log-format %[{expr}]"));
+        assert_eq!(code, Some(0), "`%[{expr}]` must load: {out}");
+    }
+    for expr in ["str(a),", "str(a),lower,", "str(a),,"] {
+        let (code, out) = check(&format!("str(b)\n  http-request set-header x %[{expr}]"));
+        assert!(code == Some(1) && out.contains("unknown converter ''"), "`%[{expr}]`: exit {code:?}: {out}");
+    }
+}
