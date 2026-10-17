@@ -240,6 +240,7 @@ mod req_cook_names;
 mod res_cook_names;
 mod response_aliases;
 mod res_cook_cnt;
+mod res_hdrs_bin;
 mod response_fetch_in_request;
 mod response_head_validation;
 mod response_te;

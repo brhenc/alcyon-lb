@@ -1456,6 +1456,20 @@ impl Registry {
             },
         });
 
+        self.register_fetch(FetchDesc {
+            name: "res.hdrs_bin",
+            out_type: SampleType::Bin,
+            // T329: `smp_fetch_hdrs_bin` on the response, through the same H1 cleanup and
+            // varint as req.hdrs_bin.
+            func: |ctx, _args| {
+                let pairs = |h: &[(String, String)]| hdrs_bin(h.iter().map(|(k, v)| (k.as_str(), v.as_str())), false);
+                if let Some(headers) = ctx.res_headers {
+                    return Some(pairs(headers));
+                }
+                Some(CURRENT_RES_HEADERS.with(|h| pairs(&h.borrow())))
+            },
+        });
+
         let req_hdr_val_fetch: FetchFn = |ctx, args| {
             let name = args.first()?;
             let val = get_req_header(ctx, name)?;
