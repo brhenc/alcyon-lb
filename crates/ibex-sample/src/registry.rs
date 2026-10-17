@@ -1292,26 +1292,23 @@ impl Registry {
             func: response_header_fetch,
         });
 
+        // T327: req.fhdr_cnt counts lines and req.hdr_cnt values, with or without a name, on
+        // the headers as the oracle's H1 parser leaves them (`h1_cleaned_headers`).
         let req_hdr_cnt_fetch: FetchFn = |ctx, args| {
-            let count = if let Some(name) = args.first() {
-                get_all_req_headers(ctx, name).len()
-            } else {
-                // Count all request header lines (excluding Connection)
-                get_all_req_headers_all(ctx).len()
+            let all = get_all_req_headers_all(ctx);
+            let count = match args.first() {
+                Some(name) => all.iter().filter(|(n, _)| n.eq_ignore_ascii_case(name)).count(),
+                None => all.len(),
             };
             Some(Sample::Sint(len_to_sint(count)))
         };
-        // T327: req.hdr_cnt and hdr_cnt count comma-separated values, not lines
         let req_hdr_val_cnt_fetch: FetchFn = |ctx, args| {
-            let total = if let Some(name) = args.first() {
-                // Count values for a specific header name
-                let vals = get_all_req_headers(ctx, name);
-                vals.iter().map(|v| v.split(',').count()).sum::<usize>()
-            } else {
-                // Count values across all request headers (excluding Connection)
-                let all = get_all_req_headers_all(ctx);
-                all.iter().map(|(_, v)| v.split(',').count()).sum::<usize>()
-            };
+            let all = get_all_req_headers_all(ctx);
+            let total: usize = all
+                .iter()
+                .filter(|(n, _)| args.first().is_none_or(|name| n.eq_ignore_ascii_case(name)))
+                .map(|(_, v)| hdr_values(v).len())
+                .sum();
             Some(Sample::Sint(len_to_sint(total)))
         };
         self.register_fetch(FetchDesc {
@@ -4880,6 +4877,126 @@ fn get_req_header(ctx: &SampleContext, name: &str) -> Option<String> {
     None
 }
 
+/// T327: the end of the header value starting at `s` in `b`: the next comma outside a quoted
+/// string, or the end. A port of `http_find_hdr_value_end` in the oracle (a backslash inside
+/// quotes escapes the next byte).
+fn hdr_value_end(b: &[u8], s: usize) -> usize {
+    let (mut quoted, mut qdpair) = (false, false);
+    for (i, &c) in b.iter().enumerate().skip(s) {
+        if qdpair {
+            qdpair = false;
+        } else if quoted {
+            match c {
+                b'\\' => qdpair = true,
+                b'"' => quoted = false,
+                _ => {}
+            }
+        } else if c == b'"' {
+            quoted = true;
+        } else if c == b',' {
+            return i;
+        }
+    }
+    b.len()
+}
+
+/// T327: the comma-separated values of one header line as `http_find_header(full=0)` walks
+/// them: split at commas outside quoted strings, each trimmed of blanks. An empty line or an
+/// empty element is one (empty) value, so `"a,,b,"` gives four.
+fn hdr_values(v: &str) -> Vec<&str> {
+    let b = v.as_bytes();
+    let mut out = Vec::new();
+    let mut s = 0;
+    loop {
+        let n = hdr_value_end(b, s);
+        out.push(v[s..n].trim_matches([' ', '\t']));
+        if n >= b.len() {
+            return out;
+        }
+        s = n + 1;
+    }
+}
+
+/// T327: `value` without the elements equal (ignoring case) to one of `drop`, rewritten as the
+/// oracle's `h1_parse_connection_header` / `h1_parse_upgrade_header` rewrite it in place:
+/// the value is kept verbatim up to the first dropped element, and what follows is rejoined
+/// with bare commas (so "x,,y, close,,z" becomes "x,,y,,z").
+fn h1_drop_tokens(value: &str, drop: &[&str]) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    // `prev`: where the previous element ended; `out` is still the verbatim prefix of the
+    // value while its length equals `prev` ("no rewrite done till now").
+    let (mut prev, mut at) = (0usize, 0usize);
+    while at < bytes.len() {
+        if matches!(bytes[at], b' ' | b'\t' | b'\r' | b'\n') {
+            at += 1;
+            continue;
+        }
+        let end = hdr_value_end(bytes, at);
+        let mut len = end - at;
+        while len > 0 && matches!(bytes[at + len - 1], b' ' | b'\t' | b'\r' | b'\n') {
+            len -= 1;
+        }
+        let word = &bytes[at..at + len];
+        if !drop.iter().any(|d| word.eq_ignore_ascii_case(d.as_bytes())) {
+            if out.len() == prev {
+                out = bytes[..end].to_vec();
+            } else {
+                if !out.is_empty() {
+                    out.push(b',');
+                }
+                out.extend_from_slice(word);
+            }
+        }
+        prev = end;
+        at = end + 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// T327: `hdrs` as the oracle's H1 parser leaves them in HTX (`H1_MF_CLEAN_CONN_HDR`): `close` and
+/// `keep-alive` are cut out of Connection, `h2c` and `h2` out of Upgrade, and a line left empty
+/// is removed. For a request (`h1_postparse_req_hdrs`) an Upgrade without `Connection: upgrade`
+/// is removed, and `upgrade` is cut out of Connection when no Upgrade header is left. Ibex
+/// keeps these headers as received, so the header-count fetches apply this view; the other
+/// header fetches do not yet (follow-up: clean them once, when the message is parsed).
+fn h1_cleaned_headers(hdrs: Vec<(String, String)>, is_req: bool) -> Vec<(String, String)> {
+    let (mut conn_upg, mut upg_hdr) = (false, false);
+    let mut out: Vec<(String, String)> = Vec::with_capacity(hdrs.len());
+    for (n, v) in hdrs {
+        if n.eq_ignore_ascii_case("connection") {
+            conn_upg |= hdr_values(&v).iter().any(|w| w.eq_ignore_ascii_case("upgrade"));
+            let v = h1_drop_tokens(&v, &["close", "keep-alive"]);
+            if !v.is_empty() {
+                out.push((n, v));
+            }
+        } else if n.eq_ignore_ascii_case("upgrade") {
+            let v = h1_drop_tokens(&v, &["h2c", "h2"]);
+            if !v.is_empty() {
+                upg_hdr = true;
+                out.push((n, v));
+            }
+        } else {
+            out.push((n, v));
+        }
+    }
+    if is_req && upg_hdr && !conn_upg {
+        out.retain(|(n, _)| !n.eq_ignore_ascii_case("upgrade"));
+    } else if is_req && conn_upg && !upg_hdr {
+        out = out
+            .into_iter()
+            .filter_map(|(n, v)| {
+                if !n.eq_ignore_ascii_case("connection") {
+                    return Some((n, v));
+                }
+                let v = h1_drop_tokens(&v, &["upgrade"]);
+                (!v.is_empty()).then_some((n, v))
+            })
+            .collect();
+    }
+    out
+}
+
 fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     let mut matches = Vec::new();
     if let Some(htx) = ctx.htx_slice {
@@ -4909,35 +5026,22 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     matches
 }
 
-/// Returns all request header `(name, value)` pairs, excluding `Connection`.
-/// Used by `req.hdr_cnt` without a name argument (T327).
+/// T327: all request header `(name, value)` pairs, in order, from the same sources as
+/// `get_all_req_headers`, as the oracle's H1 parser leaves them (`h1_cleaned_headers`).
 fn get_all_req_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
     let mut all = Vec::new();
     if let Some(htx) = ctx.htx_slice {
-        for (hn, hv) in htx.headers() {
-            if !hn.eq_ignore_ascii_case("connection") {
-                all.push((hn.to_string(), hv.to_string()));
-            }
+        all.extend(htx.headers().map(|(n, v)| (n.to_string(), v.to_string())));
+    }
+    if all.is_empty() {
+        if let Some(htx) = ctx.htx {
+            all.extend(htx.headers().map(|hf| (hf.name.clone(), hf.value.clone())));
         }
-        if !all.is_empty() {
-            return all;
+        if let Some(headers) = ctx.req_headers {
+            all.extend(headers.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
     }
-    if let Some(htx) = ctx.htx {
-        for hf in htx.headers() {
-            if !hf.name.eq_ignore_ascii_case("connection") {
-                all.push((hf.name.clone(), hf.value.clone()));
-            }
-        }
-    }
-    if let Some(headers) = ctx.req_headers {
-        for (k, v) in headers {
-            if !k.eq_ignore_ascii_case("connection") {
-                all.push((k.clone(), v.clone()));
-            }
-        }
-    }
-    all
+    h1_cleaned_headers(all, true)
 }
 
 /// The response's header `name`. Only the response is read: `ctx.htx_slice` holds the
