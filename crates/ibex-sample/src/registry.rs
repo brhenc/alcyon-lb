@@ -1441,21 +1441,14 @@ impl Registry {
             out_type: SampleType::Sint,
             func: |ctx, args| {
                 let name = args.first();
-                let set_cookies = get_all_res_headers(ctx, "set-cookie");
-                let mut count = 0;
-                for hdr in set_cookies {
-                    // T327: for Set-Cookie headers, only the first name=value pair is the cookie,
-                    // the rest are attributes (Path, HttpOnly, Secure, ...).
-                    if let Some((k, _)) = extract_cookies(&hdr).first() {
-                        if let Some(target) = name {
-                            if k == target {
-                                count += 1;
-                            }
-                        } else {
-                            count += 1;
-                        }
-                    }
-                }
+                // T327: as the oracle's smp_fetch_cookie_cnt: each Set-Cookie value (split at
+                // commas outside quotes, the Expires date included) holds one cookie.
+                let count = get_all_res_headers(ctx, "set-cookie")
+                    .iter()
+                    .flat_map(|hdr| hdr_values(hdr))
+                    .filter(|seg| set_cookie_is(seg.as_bytes(), name.map_or(&b""[..], |n| n.as_bytes())))
+                    .count();
+                let count = len_to_sint(count);
                 Some(Sample::Sint(count))
             },
         });
@@ -4865,6 +4858,46 @@ fn get_req_header(ctx: &SampleContext, name: &str) -> Option<String> {
     None
 }
 
+/// T327: the end of the header value starting at `s` in `b`: the next comma outside a quoted
+/// string, or the end. A port of `http_find_hdr_value_end` in the oracle (a backslash inside
+/// quotes escapes the next byte).
+fn hdr_value_end(b: &[u8], s: usize) -> usize {
+    let (mut quoted, mut qdpair) = (false, false);
+    for (i, &c) in b.iter().enumerate().skip(s) {
+        if qdpair {
+            qdpair = false;
+        } else if quoted {
+            match c {
+                b'\\' => qdpair = true,
+                b'"' => quoted = false,
+                _ => {}
+            }
+        } else if c == b'"' {
+            quoted = true;
+        } else if c == b',' {
+            return i;
+        }
+    }
+    b.len()
+}
+
+/// T327: the comma-separated values of one header line as `http_find_header(full=0)` walks
+/// them: split at commas outside quoted strings, each trimmed of blanks. An empty line or an
+/// empty element is one (empty) value, so `"a,,b,"` gives four.
+fn hdr_values(v: &str) -> Vec<&str> {
+    let b = v.as_bytes();
+    let mut out = Vec::new();
+    let mut s = 0;
+    loop {
+        let n = hdr_value_end(b, s);
+        out.push(v[s..n].trim_matches([' ', '\t']));
+        if n >= b.len() {
+            return out;
+        }
+        s = n + 1;
+    }
+}
+
 fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     let mut matches = Vec::new();
     if let Some(htx) = ctx.htx_slice {
@@ -4920,6 +4953,69 @@ fn get_all_res_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
         });
     }
     matches
+}
+
+/// T327: whether the Set-Cookie value `seg` holds a cookie named `name` (any cookie when
+/// `name` is empty). A port of the oracle's `http_extract_cookie_value` with `list` = 0:
+/// attributes starting with `$` or without `=` are skipped, and the first other one is the
+/// cookie, whether or not it matches. Its bounds checks are kept, so `s=` (empty value) is not
+/// a cookie named `s`.
+fn set_cookie_is(seg: &[u8], name: &[u8]) -> bool {
+    let spht = |c: u8| c == b' ' || c == b'\t';
+    let end = seg.len();
+    if end < name.len() + 1 {
+        return false;
+    }
+    let mut att = 0;
+    while att + name.len() + 1 < end {
+        while att < end && spht(seg[att]) {
+            att += 1;
+        }
+        let (mut equal, mut att_end) = (att, att);
+        while equal < end && seg[equal] != b'=' && seg[equal] != b';' {
+            equal += 1;
+            if !spht(seg[equal - 1]) {
+                att_end = equal;
+            }
+        }
+        let next = if equal < end && seg[equal] == b'=' {
+            let mut val = equal + 1;
+            while val < end && spht(seg[val]) {
+                val += 1;
+            }
+            cookie_value_end(seg, val)
+        } else {
+            equal
+        };
+        if seg.get(att) == Some(&b'$') || equal == next {
+            att = next + 1;
+            continue;
+        }
+        return name.is_empty() || &seg[att..att_end] == name;
+    }
+    false
+}
+
+/// T327: the end of the cookie value starting at `s`: the next `,` or `;` outside a quoted
+/// string, or the end (the oracle's `http_find_cookie_value_end`).
+fn cookie_value_end(b: &[u8], s: usize) -> usize {
+    let (mut quoted, mut qdpair) = (false, false);
+    for (i, &c) in b.iter().enumerate().skip(s) {
+        if qdpair {
+            qdpair = false;
+        } else if quoted {
+            match c {
+                b'\\' => qdpair = true,
+                b'"' => quoted = false,
+                _ => {}
+            }
+        } else if c == b'"' {
+            quoted = true;
+        } else if c == b',' || c == b';' {
+            return i;
+        }
+    }
+    b.len()
 }
 
 fn extract_cookies(cookie_header: &str) -> Vec<(&str, &str)> {

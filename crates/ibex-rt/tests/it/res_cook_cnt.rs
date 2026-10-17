@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T327: res.cook_cnt attributes
+//! T327: `res.cook_cnt` counts one cookie per Set-Cookie value, as the oracle's
+//! `smp_fetch_cookie_cnt` does.
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +54,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -72,17 +64,9 @@ fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     out
 }
 
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
+/// A server on a free port that reads each request head and answers `GET /<i>` with
+/// `resps[i]`, then closes the connection.
+fn backend(resps: &'static [&'static [u8]]) -> SocketAddr {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -96,16 +80,12 @@ fn backend(resp: &'static [u8]) -> SocketAddr {
                     Ok(n) => head.extend_from_slice(&b[..n]),
                 }
             }
-            let _ = c.write_all(resp);
+            let head = String::from_utf8_lossy(&head);
+            let i: usize = head.split(' ').nth(1).and_then(|p| p.trim_start_matches('/').parse().ok()).unwrap_or(0);
+            let _ = c.write_all(resps[i]);
         }
     });
     addr
-}
-
-/// The body of the answer to `req` (what follows the first empty line).
-fn body(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
 }
 
 /// The value of the `x-out` header in the answer to `req`.
@@ -119,25 +99,61 @@ fn xout(addr: SocketAddr, req: &[u8]) -> String {
 
 #[test]
 fn res_cook_cnt_attributes() {
-    const RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-B: 1\r\nX-B: 2, 3\r\nSet-Cookie: s=abc; Path=/\r\nSet-Cookie: n=7\r\n\r\nok";
+    // Each row: the backend's response, and the x-out HAProxy 3.5-dev8 gives for it. The oracle
+    // walks Set-Cookie with http_find_header(full=0), so a header is first split at commas
+    // outside quotes (the Expires date too: `Path=/` after it becomes a cookie of its own),
+    // and each piece has one cookie: its first attribute with `=` not starting with `$`.
+    const ROWS: &[(&[u8], &str)] = &[
+        // The task's row.
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-B: 1\r\nX-B: 2, 3\r\nSet-Cookie: s=abc; Path=/\r\nSet-Cookie: n=7\r\n\r\nok",
+            "[2|1|0|0|0|0|0|0]",
+        ),
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: s=abc; Expires=Thu, 01 Jan 2030 00:00:00 GMT; Path=/\r\nSet-Cookie: t=1; Expires=Thu, 01 Jan 2030 00:00:00 GMT; HttpOnly\r\n\r\nok",
+            "[3|1|1|0|1|0|0|0]",
+        ),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: a=1, b=2\r\n\r\nok", "[2|0|0|0|0|1|1|0]"),
+        // A comma inside quotes does not split.
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: q=\"x,y\"; Path=/\r\n\r\nok", "[1|0|0|0|0|0|0|1]"),
+        // `s=` has an empty value and is not `s` for cook_cnt(s); `$v` is skipped.
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: s=\r\nSet-Cookie: $v=1; s=2\r\n\r\nok", "[2|1|0|0|0|0|0|0]"),
+        // An attribute with no `=` is skipped; an empty name is a cookie; blanks around `=`.
+        (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: flag; s=3\r\nSet-Cookie: =v; s=4\r\nSet-Cookie: s = 5 ; Path=/\r\n\r\nok",
+            "[3|2|0|0|0|0|0|0]",
+        ),
+        // No `=` at all, an empty header, and empty pieces around a cookie.
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: s\r\nSet-Cookie:\r\nSet-Cookie: ,s=6,\r\n\r\nok", "[1|1|0|0|0|0|0|0]"),
+    ];
+    const RESPS: &[&[u8]] = &[ROWS[0].0, ROWS[1].0, ROWS[2].0, ROWS[3].0, ROWS[4].0, ROWS[5].0, ROWS[6].0];
     const CFG: &str = r#"
+global
+  stats socket {sock} level admin
+defaults
+  mode http
+  timeout connect 1s
+  timeout client 5s
+  timeout server 5s
 frontend fe
   bind {A}
   default_backend b
-  http-response set-header x-out "[%[res.cook_cnt]|%[res.cook_cnt(s)]|%[res.cook_cnt(Path)]]"
+  http-response set-header x-out "[%[res.cook_cnt]|%[res.cook_cnt(s)]|%[res.cook_cnt(Path)]|%[res.cook_cnt(Expires)]|%[res.cook_cnt(t)]|%[res.cook_cnt(a)]|%[res.cook_cnt(b)]|%[res.cook_cnt(q)]]"
 backend b
   server s {BE}
 "#;
 
     let a = common::reserve_addr();
-    let be = backend(RESP);
-    let cfg = http_cfg("", &CFG.replace("{A}", &a.to_string()).replace("{BE}", &be.to_string()));
-    let (ibex, _sock) = start("t327", &cfg, &[a]);
-    let req = GET;
+    let be = backend(RESPS);
+    let cfg = CFG.replace("{A}", &a.to_string()).replace("{BE}", &be.to_string());
+    let (_ibex, _sock) = start("t327-res-cook-cnt", &cfg, &[a]);
 
-    // HAProxy expected: [2|1|0]
-    // 2 cookies (s=abc, n=7), 1 cookie named s, 0 cookies named Path
-    let x = xout(a, req);
-    assert_eq!(x, "[2|1|0]", "x-out header mismatch");
-    let _ = ibex;
+    let mut bad = Vec::new();
+    for (i, (_, want)) in ROWS.iter().enumerate() {
+        let got = xout(a, format!("GET /{i} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n").as_bytes());
+        if got != *want {
+            bad.push(format!("row {i}: got {got}, want {want}"));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
