@@ -10,6 +10,9 @@
 
 use std::process::Command;
 
+const LF: &str = "a content type must be defined with a log-format payload";
+const RAW: &str = "a content type must be defined when non-empty payload is configured";
+
 fn check(i: usize, rule: &str) -> (Option<i32>, String) {
     let p = std::env::temp_dir().join(format!("ibex_reply_ct_{}_{i}.cfg", std::process::id()));
     let cfg = format!(
@@ -31,8 +34,6 @@ fn a_reply_with_a_body_needs_a_content_type() {
     std::fs::write(&empty, "").expect("write");
     std::fs::write(&full, "hello\n").expect("write");
     let (empty, full) = (empty.display(), full.display());
-    const LF: &str = "a content type must be defined with a log-format payload";
-    const RAW: &str = "a content type must be defined when non-empty payload is configured";
     let refused = [
         ("http-request return status 200 lf-string %[str(a)]".to_string(), LF),
         ("http-request return lf-string x".to_string(), LF),
