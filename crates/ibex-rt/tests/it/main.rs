@@ -94,6 +94,7 @@ mod empty_conditions;
 mod error_log_format;
 mod error_pages;
 mod error_reply_header_case;
+mod eth_converters;
 mod expect_proxy;
 mod expr_compile_once;
 mod fd_hygiene;

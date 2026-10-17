@@ -4762,6 +4762,87 @@ impl Registry {
             },
         });
 
+        // T330: eth.* converters on a binary Ethernet frame (net_helper.c). Layout: dst MAC (6),
+        // src MAC (6), any number of 802.1Q tags (0x8100 + TCI), EtherType (2), payload.
+
+        self.register_converter(ConvDesc {
+            name: "eth.data",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => Some(Sample::Bin(b.get(eth_hdr_len(&b)?..)?.to_vec())),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "eth.dst",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => Some(Sample::Bin(b.get(..6)?.to_vec())),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "eth.hdr",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => Some(Sample::Bin(b.get(..eth_hdr_len(&b)?)?.to_vec())),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "eth.proto",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let o = eth_hdr_len(&b)?;
+                    Some(Sample::Sint(i64::from(u16::from_be_bytes([*b.get(o - 2)?, *b.get(o - 1)?]))))
+                }
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "eth.src",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => Some(Sample::Bin(b.get(6..12)?.to_vec())),
+                _ => None,
+            },
+        });
+
+        self.register_converter(ConvDesc {
+            name: "eth.vlan",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                // The last VLAN id seen; id 0 is no VLAN (sample_conv_eth_vlan's `return !!vlan`).
+                Sample::Bin(b) => {
+                    let mut vlan = 0u16;
+                    let mut idx = 12usize;
+                    while idx + 2 < b.len() {
+                        if b.get(idx..idx + 2)? != [0x81, 0x00] {
+                            return (vlan != 0).then_some(Sample::Sint(i64::from(vlan)));
+                        }
+                        if idx + 4 > b.len() {
+                            break;
+                        }
+                        vlan = u16::from_be_bytes([*b.get(idx + 2)?, *b.get(idx + 3)?]) & 0x0fff;
+                        idx += 4;
+                    }
+                    None
+                }
+                _ => None,
+            },
+        });
+
         self.register_converter(ConvDesc {
             name: "ip.tos",
             in_type: TypeSpec::Exact(SampleType::Bin),
@@ -6714,6 +6795,19 @@ fn url_encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// T330: the length of an Ethernet header up to and including the `EtherType`, skipping every
+/// 802.1Q tag, or None when the frame ends first (the loop in `net_helper.c`'s `sample_conv_eth_*`).
+fn eth_hdr_len(b: &[u8]) -> Option<usize> {
+    let mut idx = 12usize;
+    while idx + 2 < b.len() {
+        if b.get(idx..idx + 2)? != [0x81, 0x00] {
+            return Some(idx + 2);
+        }
+        idx += 4;
+    }
+    None
 }
 
 #[cfg(test)]
