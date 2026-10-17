@@ -284,3 +284,16 @@ HAProxy (for example `/a//b/../x` and a trailing `.`), which can bypass a path A
 other six normalizers give HAProxy's answers on the paths measured. An unknown normalizer
 is refused, as HAProxy does. Ibex does not yet require `expose-experimental-directives` for
 `normalize-uri` (HAProxy 3.5 does).
+
+## `-m <megs>` is a connection budget, not an rlimit (both)
+
+On HAProxy and on Ibex, `-m` sets no system limit: HAProxy never calls `setrlimit` for it
+(src/limits.c), it shows the value as `Memmax_MB` / `Memmax_bytes` and sizes `maxconn` from
+it (`STREAM_MAX_COST + 2 * tune.bufsize` per connection, 97% of the budget, TLS costs when a
+`bind` or `server` uses `ssl`; a configured `maxconn` that leaves no room for TLS is refused,
+exit 1). Ibex does the same. An `RLIMIT_AS` would be wrong for Ibex: past it `malloc`
+returns NULL and Rust aborts the whole worker (exit 134), where HAProxy only refuses
+connections. Differences left: Ibex's per-connection cost is a constant calibrated on
+HAProxy's results (`sizeof(struct stream)` has no Ibex counterpart), `maxsslconn` and
+`tune.ssl.cachesize` are not configurable, so `MaxSslConns` stays 0 and the
+`Automatically setting global.maxconn ...` notice is not printed.

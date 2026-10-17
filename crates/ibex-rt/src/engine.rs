@@ -3235,6 +3235,29 @@ pub fn prebind_quic(config: &Config, workers: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// `-m <megs>` as `HAProxy` applies it (`compute_ideal_maxconn`, src/limits.c): the budget
+/// is recorded for `show info` and `/metrics`, and sizes `global maxconn` when the
+/// configuration has none; a configured one that leaves no room for TLS is refused.
+/// Nothing is limited at the system level: past the budget `malloc` would fail and Rust
+/// aborts the process, where `HAProxy` just refuses connections (docs/differences.md).
+///
+/// # Errors
+/// The alert text `HAProxy` exits 1 with.
+pub fn apply_memmax(config: &mut Config) -> Result<(), String> {
+    let Some(g) = config.global.as_mut() else { return Ok(()) };
+    let Some(megs) = g.memmax_mb else { return Ok(()) };
+    crate::globalconn::set_memmax_mb(megs);
+    let bind_ssl = config.listens.iter().any(|l| l.binds.iter().any(|b| b.ssl))
+        || config.frontends.iter().any(|f| frontend_binds(f).iter().any(|b| b.ssl));
+    let server_ssl = config.backends.iter().flat_map(|b| &b.servers).chain(config.listens.iter().flat_map(|l| &l.servers)).any(|s| s.ssl.as_ref().is_some_and(|x| x.ssl));
+    let sides = u64::from(bind_ssl) + u64::from(server_ssl);
+    let bufsize = g.bufsize.map_or(16384, |b| b as u64);
+    // `tune.ssl.cachesize` is not configurable in Ibex: SSLCACHESIZE (defaults.h:515).
+    let maxconn = crate::globalconn::memmax_maxconn(megs, g.maxconn, sides, bufsize, 20000)?;
+    g.maxconn = Some(maxconn);
+    Ok(())
+}
+
 /// Settles `global maxconn` for `config` ([`crate::globalconn::configure`]), leaving room for
 /// its listeners. Startup calls it before [`config_maxsock`] raises the file descriptor
 /// limit, which `build_shared_state` now follows (it binds the `log-forward` sockets after

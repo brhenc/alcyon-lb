@@ -227,6 +227,9 @@ pub struct GlobalSection {
     pub h2_glitches_threshold: Option<usize>,
     /// Global maximum connection limit.
     pub maxconn: Option<u32>,
+    /// The memory budget in megabytes, `-m` on the command line (`global.rlimit_memmax`): it
+    /// sizes `maxconn` and is what `Memmax_MB` shows; it is not a limit on the process.
+    pub memmax_mb: Option<u32>,
     /// Background daemon mode.
     pub daemon: bool,
     /// Master-worker mode.
