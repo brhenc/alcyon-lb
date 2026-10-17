@@ -173,7 +173,7 @@ fn parse_element(element: &str) -> Option<Vec<Pair<'_>>> {
 fn parse(s: &str) -> Option<Vec<Vec<Pair<'_>>>> {
     let parts = split_outside_quotes(s, ',')?;
     let last = parts.len() - 1;
-    let mut out = Vec::new();
+    let mut out: Vec<Vec<_>> = Vec::new();
     for (i, part) in parts.into_iter().enumerate() {
         let part = part.trim_matches([' ', '\t']);
         if part.is_empty() {
@@ -182,7 +182,15 @@ fn parse(s: &str) -> Option<Vec<Vec<Pair<'_>>>> {
             }
             continue;
         }
-        out.push(parse_element(part)?);
+        let elem = parse_element(part)?;
+        out.push(elem);
+    }
+    // HAProxy requires that if any element contains `for`, the first element must contain it.
+    if out.len() > 1 {
+        let any_for = out.iter().any(|e| e.iter().any(|(n,_)| *n == "for"));
+        if any_for && !out[0].iter().any(|(n,_)| *n == "for") {
+            return None;
+        }
     }
     Some(out)
 }
