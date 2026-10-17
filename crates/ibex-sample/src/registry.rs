@@ -18,7 +18,7 @@ use ibex_proto::htx::{Htx, HtxSliceRef};
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, LazyLock, RwLock};
 
 thread_local! {
@@ -787,6 +787,12 @@ impl Registry {
         names
     }
 
+    /// T329: Returns true if the IP address is local to this system (i.e. we can bind
+    /// a UDP socket to it), false otherwise. No address means no sample.
+    fn addr_is_local(ip: IpAddr) -> bool {
+        UdpSocket::bind((ip, 0)).is_ok()
+    }
+
     #[allow(clippy::too_many_lines)]
     fn register_builtin_fetches(&mut self) {
         // --- 1. Client & Destination Network Fetches ---
@@ -832,6 +838,24 @@ impl Registry {
             func: fc_src_port_fetch,
         });
 
+        // T329: src_is_local, fc_src_is_local
+        let src_is_local_fetch: FetchFn = |ctx, _args| {
+            ctx.client_addr.map(|addr| Sample::Bool(Self::addr_is_local(addr.ip())))
+        };
+        let fc_src_is_local_fetch: FetchFn = |ctx, _args| {
+            ctx.fc_src.or(ctx.client_addr).map(|addr| Sample::Bool(Self::addr_is_local(addr.ip())))
+        };
+        self.register_fetch(FetchDesc {
+            name: "src_is_local",
+            out_type: SampleType::Bool,
+            func: src_is_local_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_src_is_local",
+            out_type: SampleType::Bool,
+            func: fc_src_is_local_fetch,
+        });
+
         let dst_fetch: FetchFn = |ctx, _args| match ctx.server_addr?.ip() {
             IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
             IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
@@ -871,6 +895,24 @@ impl Registry {
             name: "fc_dst_port",
             out_type: SampleType::Sint,
             func: fc_dst_port_fetch,
+        });
+
+        // T329: dst_is_local, fc_dst_is_local
+        let dst_is_local_fetch: FetchFn = |ctx, _args| {
+            ctx.server_addr.map(|addr| Sample::Bool(Self::addr_is_local(addr.ip())))
+        };
+        let fc_dst_is_local_fetch: FetchFn = |ctx, _args| {
+            ctx.fc_dst.or(ctx.server_addr).map(|addr| Sample::Bool(Self::addr_is_local(addr.ip())))
+        };
+        self.register_fetch(FetchDesc {
+            name: "dst_is_local",
+            out_type: SampleType::Bool,
+            func: dst_is_local_fetch,
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_dst_is_local",
+            out_type: SampleType::Bool,
+            func: fc_dst_is_local_fetch,
         });
 
         self.register_fetch(FetchDesc {
