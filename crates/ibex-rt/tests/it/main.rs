@@ -324,6 +324,7 @@ mod transport_edges;
 mod txn_variables_race;
 mod url32;
 mod url_ip_port;
+mod urlp_raw;
 mod userlist_hashes;
 mod var_size_cap;
 mod version_fetches;
