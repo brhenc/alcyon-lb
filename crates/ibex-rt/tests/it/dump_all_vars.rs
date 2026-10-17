@@ -94,3 +94,28 @@ fn dump_all_vars_escapes_quote_and_backslash() {
     let body = answer.split_once("\r\n\r\n").map_or("", |(_, b)| b);
     assert_eq!(body, r#"[txn.q="a\"b\\c"|req.q="a\"b\\c"]"#);
 }
+
+/// CR, LF and backspace in a value are printed as `\r`, `\n`, `\b` in the explicit-scope column; measured on
+/// HAProxy 3.5-dev8 with `set-var(txn.a) req.hdr(x-a),url_dec` and `x-a: a%0db%0ac%08d`. NUL has no oracle
+/// column: HAProxy drops the variable when `url_dec` meets `%00`, so that arm is a unit test in ibex-sample.
+#[test]
+fn dump_all_vars_escapes_cr_lf_backspace() {
+    let cfg = "defaults\n  mode http\nfrontend fe\n  bind {A}\n  http-request set-var(txn.a) req.hdr(x-a),url_dec\n  http-request return status 200 content-type text/plain lf-string \"[%[dump_all_vars(txn)]]\"\n";
+    let a = common::reserve_addr();
+    let dir = std::env::temp_dir().join(format!("ibex-dump-all-vars-ctl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.cfg");
+    std::fs::write(&path, cfg.replace("{A}", &a.to_string())).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let _ibex = common::Ibex(child);
+    assert!(common::wait_listening(a), "ibex did not listen on {a}");
+
+    let mut s = TcpStream::connect_timeout(&a, Duration::from_secs(2)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\nx-a: a%0db%0ac%08d\r\nConnection: close\r\n\r\n").unwrap();
+    let mut answer = String::new();
+    let _ = s.read_to_string(&mut answer);
+    let _ = std::fs::remove_dir_all(&dir);
+    let body = answer.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+    assert_eq!(body, r#"[txn.a="a\rb\nc\bd"]"#);
+}
