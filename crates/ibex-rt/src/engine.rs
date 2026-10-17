@@ -2475,6 +2475,9 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         accept_date: Some(s.log.date),
         last_rule: last_rule_at(s.log.last_rule),
         prio: (s.log.prio_class, s.log.prio_offset),
+        bc_err: s.bc_err,
+        bc_reused: Some(s.txn.as_ref().is_some_and(|t| t.srv_reused)),
+        bc_dst: s.bc_dst,
         ..Default::default()
     }
 }
@@ -6333,6 +6336,9 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         accept_date: Some(sess.log.date),
         captures_req_hdr: Some(&sess.log.req_captures),
         captures_res_hdr: Some(&sess.log.res_captures),
+        bc_err: sess.bc_err,
+        bc_reused: Some(sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
+        bc_dst: sess.bc_dst,
         ..Default::default()
     };
     for rule in &proxy.tcp_res_content_rules {
@@ -6751,6 +6757,13 @@ fn connect_addr(server: SocketAddr, dst: Option<SocketAddr>) -> SocketAddr {
     SocketAddr::new(ip, port)
 }
 
+/// The stream connects to `target` now: `%si` and the stats read the configured address,
+/// `bc_dst` the one the socket connects to.
+fn set_target(entry: &mut SessionEntry, target: SocketAddr) {
+    entry.target_addr = Some(target);
+    entry.sess.bc_dst = Some(connect_addr(target, entry.sess.server_addr));
+}
+
 fn maybe_prepend_send_proxy(fe: &Proxy, proxy: &Proxy, proxies: &[Proxy], sess: &mut TcpSession, target_addr: SocketAddr) {
     if sess.send_proxy_prepended {
         return;
@@ -6984,7 +6997,10 @@ fn init_client_session(
             arm_res_inspect(proxy, &mut sess);
             sess.set_backend_timeouts(proxy);
 
-            if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target, sess.server_addr), proxy.server_tfo_of(target)) {
+            sess.bc_dst = Some(connect_addr(target, sess.server_addr));
+            let connected = raw::connect_opts(connect_addr(target, sess.server_addr), proxy.server_tfo_of(target))
+                .inspect_err(|e| sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)));
+            if let Ok((srv_fd, immediate)) = connected {
                 let sfd = srv_fd.as_raw_fd();
                 let s_idx = proxy.servers.iter().position(|s| s == target);
                 attach_server_to(&mut sess, proxies, proxy_idx, proxy_idx, s_idx, srv_fd, now);
@@ -7336,6 +7352,8 @@ fn release_server(
     }
     entry.target_server_idx = None;
     entry.target_addr = None;
+    entry.sess.bc_dst = None;
+    entry.sess.bc_err = None;
     entry.srv_served = 0;
     entry.sess.srv_state = ScState::Init;
     // The next server connection is a new one and gets its own PROXY header.
@@ -7372,6 +7390,8 @@ fn move_server(from: &mut SessionEntry, to: &mut SessionEntry, fdtab: &mut FdTab
     t.srv_cant_recv = f.srv_cant_recv;
     t.send_proxy_prepended = std::mem::take(&mut f.send_proxy_prepended);
     t.send_proxy_header = std::mem::take(&mut f.send_proxy_header);
+    t.bc_dst = f.bc_dst.take();
+    t.bc_err = f.bc_err.take();
     to.srv_raw_fd = from.srv_raw_fd.take();
     to.srv_interest = std::mem::replace(&mut from.srv_interest, Interest::NONE);
     to.srv_backend_idx = from.srv_backend_idx;
@@ -7751,8 +7771,10 @@ fn retry_server_connect(
 
     maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
-    entry.target_addr = Some(target_addr);
-    if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr)) {
+    set_target(entry, target_addr);
+    if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr))
+        .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
+    {
         let sfd = srv_fd.as_raw_fd();
         attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
         entry.srv_raw_fd = Some(sfd);
@@ -7835,6 +7857,9 @@ fn check_srv_connect(
                         entry.srv_interest = new_interest;
                     }
                 } else {
+                    if let Ok(Some(e)) = &conn_err {
+                        entry.sess.bc_err = Some(crate::proxy::bc_connect_errno(e));
+                    }
                     server_connect_failed(entry, proxies, fdtab, poller, now, true);
                 }
             }
@@ -9162,6 +9187,9 @@ impl EngineDispatcher<'_> {
                 }
                 entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
                 entry.sess.ending = None;
+                // `HAProxy` records a `CO_ER_SSL_*` code here, which Ibex does not tell
+                // apart yet: no `bc_err` rather than the 0 of the TCP connect.
+                entry.sess.bc_err = None;
                 server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, true);
             }
 
@@ -9861,6 +9889,9 @@ impl EngineDispatcher<'_> {
             unique_id: entry.sess.log.unique_id.as_deref(),
             accept_date: Some(entry.sess.log.date),
             stream: Some(stream_facts(&entry.sess, Some(status))),
+            bc_err: entry.sess.bc_err,
+            bc_reused: Some(entry.sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
+            bc_dst: entry.sess.bc_dst,
             last_rule: last_rule_at(entry.sess.log.last_rule),
             prio: (entry.sess.log.prio_class, entry.sess.log.prio_offset),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
@@ -11469,7 +11500,7 @@ impl EngineDispatcher<'_> {
 
         maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
-        entry.target_addr = Some(target_addr);
+        set_target(entry, target_addr);
 
         let mut reused = None;
         entry.srv_served = 0;
@@ -11533,7 +11564,9 @@ impl EngineDispatcher<'_> {
                     new_interest.writable,
                 );
             }
-        } else if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr)) {
+        } else if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr))
+        .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
+    {
             let sfd = srv_fd.as_raw_fd();
             attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
             entry.srv_raw_fd = Some(sfd);
@@ -11706,13 +11739,15 @@ impl EngineDispatcher<'_> {
 
         maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
-        entry.target_addr = Some(target_addr);
+        set_target(entry, target_addr);
         // A connect that completed at once (`connect()` returning 0, which a TCP socket on
         // Linux never does: it is EINPROGRESS even on loopback) takes the same path: the
         // socket is reported writable on the next poll and completes there. Only INET
         // servers exist (`unix@` is refused at parse time), so no test could reach a
         // separate branch for it.
-        if let Ok((srv_fd, _immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr)) {
+        if let Ok((srv_fd, _immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr))
+        .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
+    {
             let sfd = srv_fd.as_raw_fd();
             attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
             entry.srv_raw_fd = Some(sfd);
@@ -13658,6 +13693,9 @@ fn after_res_on_reply<'r>(
             stream: Some(stream_facts(sess, Some(status))),
             captures_req_hdr: Some(&sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
+            bc_err: sess.bc_err,
+            bc_reused: Some(sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
+            bc_dst: sess.bc_dst,
             ..Default::default()
         };
         eval_after_res_rules(

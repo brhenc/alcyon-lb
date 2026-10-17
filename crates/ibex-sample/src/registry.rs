@@ -263,6 +263,17 @@ pub struct SampleContext<'a> {
     pub fc_rttvar: Option<u32>,
     pub bc_rtt: Option<u32>,
     pub bc_rttvar: Option<u32>,
+    /// The backend connection's error (`conn->err_code` of the stream's `scb`): `CO_ER_NONE`
+    /// once it is connected, the code of a connect that failed, `None` while there is no
+    /// connection or it is still connecting. What `bc_err` and `bc_err_str` read.
+    pub bc_err: Option<ConnErr<'a>>,
+    /// The stream's server connection was taken over from an earlier one (`SF_SRV_REUSED`);
+    /// `None` where there is no stream. What `bc_reused` reads.
+    pub bc_reused: Option<bool>,
+    /// The address the backend connection was made to (`conn_dst` of the stream's `scb`),
+    /// `None` without one. What `bc_dst` and `bc_dst_port` read; `server_addr` is the
+    /// frontend's.
+    pub bc_dst: Option<SocketAddr>,
     /// Capture slots: `None` where nothing was captured (a header that was absent).
     pub captures_req_hdr: Option<&'a [Option<Vec<u8>>]>,
     pub captures_res_hdr: Option<&'a [Option<Vec<u8>>]>,
@@ -1107,6 +1118,37 @@ impl Registry {
             name: "bc_rttvar",
             out_type: SampleType::Sint,
             func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.bc_rttvar.unwrap_or(0)))),
+        });
+        // T331: the backend connection (`SMP_USE_L4SRV`). Without one, none has a value;
+        // `bc_reused` is 0 on any stream (`smp_fetch_reused`).
+        self.register_fetch(FetchDesc {
+            name: "bc_err",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.bc_err.map(|e| Sample::Sint(e.code)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_err_str",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.bc_err.map(|e| Sample::Str(e.text.to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_reused",
+            out_type: SampleType::Bool,
+            func: |ctx, _args| ctx.bc_reused.map(Sample::Bool),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_dst",
+            // An address, IPv4 or IPv6 (`SMP_T_ADDR`), typed as `dst` is.
+            out_type: SampleType::Ipv4,
+            func: |ctx, _args| match ctx.bc_dst?.ip() {
+                IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
+                IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_dst_port",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.bc_dst.map(|sa| Sample::Sint(i64::from(sa.port()))),
         });
 
         // --- 2. HTTP Request Line & URL Fetches ---

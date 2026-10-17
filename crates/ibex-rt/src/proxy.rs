@@ -384,6 +384,49 @@ pub fn ssl_fc<'a>(xprt: &'a ClientXprt, role: Option<&'a H2Role>) -> ibex_sample
     }
 }
 
+/// A backend connection's `conn->err_code` (`CO_ER_*`, numbered as in
+/// `include/haproxy/connection-t.h`), named and worded as `conn_err_code_name` and
+/// `conn_err_code_str` do: what `bc_err` and `bc_err_str` read.
+const fn bc_err(code: i64, name: &'static str, text: &'static str) -> ibex_sample::ConnErr<'static> {
+    ibex_sample::ConnErr { code, text, name, tls: false, ssl_code: 0, ssl_text: None }
+}
+
+/// `CO_ER_NONE`: the connection is established.
+pub const BC_CONNECTED: ibex_sample::ConnErr<'static> = bc_err(0, "", "Success");
+
+/// The error of a server connect the kernel refused once under way, as `sock_conn_check`
+/// records it (`conn_set_errno`).
+#[must_use]
+pub fn bc_connect_errno(e: &io::Error) -> ibex_sample::ConnErr<'static> {
+    use rustix::io::Errno;
+    let errno = e.raw_os_error().map(Errno::from_raw_os_error);
+    match errno {
+        Some(Errno::CONNREFUSED) => bc_err(47, "EREFUSED", "ECONNREFUSED returned by OS"),
+        Some(Errno::CONNRESET) => bc_err(48, "ERESET", "ECONNRESET returned by OS"),
+        Some(Errno::HOSTUNREACH | Errno::NETUNREACH) => bc_err(49, "EUNREACH", "ENETUNREACH returned by OS"),
+        Some(Errno::NOMEM) => bc_err(50, "ENOMEM", "ENOMEM returned by OS"),
+        Some(Errno::BADF) => bc_err(51, "EBADF", "EBADF returned by OS"),
+        Some(Errno::FAULT) => bc_err(52, "EFAULT", "EFAULT returned by OS"),
+        Some(Errno::INVAL) => bc_err(53, "EINVAL", "EINVAL returned by OS"),
+        Some(Errno::NOTCONN) => bc_err(54, "ENCONN", "ENCONN returned by OS"),
+        Some(Errno::NOTSOCK) => bc_err(55, "ENSOCK", "ENSOCK returned by OS"),
+        Some(Errno::NOBUFS) => bc_err(56, "ENOBUFS", "ENOBUFS returned by OS"),
+        Some(Errno::PIPE) => bc_err(57, "EPIPE", "EPIPE returned by OS"),
+        _ => bc_err(6, "SOCK_ERR", "General socket error"),
+    }
+}
+
+/// The error of a server `connect()` that failed at once, as `tcp_connect_server` records it.
+#[must_use]
+pub fn bc_connect_now_errno(e: &io::Error) -> ibex_sample::ConnErr<'static> {
+    use rustix::io::Errno;
+    match e.raw_os_error().map(Errno::from_raw_os_error) {
+        Some(Errno::AGAIN | Errno::ADDRNOTAVAIL) => bc_err(9, "FREE_PORTS", "Out of local source ports on the system"),
+        Some(Errno::ADDRINUSE) => bc_err(10, "ADDR_INUSE", "Local source address already in use"),
+        _ => bc_err(6, "SOCK_ERR", "General socket error"),
+    }
+}
+
 /// One TCP / HTTP session: two connections, two buffers, two state machines.
 #[allow(clippy::struct_excessive_bools)]
 pub struct TcpSession {
@@ -479,6 +522,12 @@ pub struct TcpSession {
     pub retry_conn: bool,
     /// The stream was redispatched (`SF_REDISP`): what `txn.redispatched` reads.
     pub redispatched: bool,
+    /// Where the server connection was made, or is being made, to: `bc_dst`. Set with
+    /// the engine's `target_addr`, cleared when the server is released.
+    pub bc_dst: Option<SocketAddr>,
+    /// The server connection's `conn->err_code`: [`BC_CONNECTED`] once connected, the
+    /// failure of a connect, `None` while there is none or it is connecting: `bc_err`.
+    pub bc_err: Option<ibex_sample::ConnErr<'static>>,
     /// The load balancer picked the stream's server (`assign_server`'s balancing branch),
     /// where `use-server`, a persistence cookie or `stick match` did not (`SF_DIRECT`):
     /// only a pick counts in `lbtot` (T225).
@@ -960,6 +1009,8 @@ impl TcpSession {
             srv_park_exp: Tick::ETERNITY,
             retry_conn: true,
             redispatched: false,
+            bc_dst: None,
+            bc_err: None,
             lb_picked: false,
             cli_exp: Tick::ETERNITY,
             http_request_ms: 0,
@@ -1263,6 +1314,7 @@ impl TcpSession {
         self.srv_xprt = xprt;
         self.srv_cant_recv = false;
         self.srv_state = ScState::Connecting;
+        self.bc_err = None;
         self.conn_exp = if self.timeouts.connect == 0 {
             Tick::ETERNITY
         } else {
@@ -1272,6 +1324,7 @@ impl TcpSession {
 
     /// The server connection completed.
     pub fn server_connected(&mut self, now: Tick) {
+        self.bc_err = Some(BC_CONNECTED);
         self.srv_state = if self.mode == Mode::Http {
             ScState::Ready
         } else {

@@ -32,6 +32,7 @@ mod backend_reuse_dead_idle;
 mod backend_tls;
 mod backup_servers;
 mod base32_sdbm;
+mod bc_info;
 mod balance_roundrobin_changes;
 mod balance_roundrobin_weights;
 mod balance_source_consistent;
