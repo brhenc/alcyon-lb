@@ -1,154 +1,105 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T329: res.hdrs fetch
+//! T329: `res.hdrs`, the response's header block as `HAProxy`'s H1 parser leaves it (names
+//! lowercased, `close`/`keep-alive` out of `Connection`, `h2c` out of `Upgrade`), each
+//! `name: value\r\n`, then `\r\n`. The sample itself is raw: the `%0D%0A` in an
+//! `http-response set-header` comes from the header's log-format encoding
+//! (`http_encode_map`), so `res.hdrs,length` and `res.hdrs,hex` see the CR LFs. Every
+//! expectation is what 3.5-dev8-885761-29 answered on 2026-10-17.
 
 use crate::common;
 
-use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
-struct Ibex(Child, std::path::PathBuf);
-
-impl Drop for Ibex {
-    fn drop(&mut self) {
-        common::stop(&mut self.0);
-        let _ = std::fs::remove_dir_all(&self.1);
-    }
-}
-
-/// Starts ibex on `cfg` (`{sock}` is replaced by the stats socket path), waits for `addrs` and the
-/// socket, then lets the readiness probes slide out of the one-second windows and clears the maxima.
-fn start(tag: &str, cfg: &str, addrs: &[SocketAddr]) -> (Ibex, String) {
-    let dir = std::env::temp_dir().join(format!("qh-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("cli.sock").display().to_string();
-    let path = dir.join("c.cfg");
-    std::fs::write(&path, cfg.replace("{sock}", &sock).replace("{dir}", &dir.display().to_string())).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let ibex = Ibex(child, dir);
-    for a in addrs {
-        assert!(common::wait_listening(*a), "ibex did not listen on {a}");
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !std::path::Path::new(&sock).exists() {
-        assert!(Instant::now() < deadline, "no stats socket");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(2200));
-    cli(&sock, "clear counters");
-    (ibex, sock)
-}
-
-fn cli(sock: &str, cmd: &str) -> String {
-    let mut s = UnixStream::connect(sock).expect("cli");
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(format!("{cmd}\n").as_bytes()).unwrap();
-    let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    out
-}
-
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
-/// One request on a new connection; the whole raw answer.
-fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(req).unwrap();
-    let mut out = Vec::new();
-    let _ = s.read_to_end(&mut out);
-    out
-}
-
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
+/// A server that reads each request head, answers `resp` and closes the connection.
 fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
+    let addr = common::reserve_addr();
+    let listener = TcpListener::bind(addr).unwrap();
     std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+            let (mut head, mut buf) = (Vec::new(), [0u8; 4096]);
             while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
+                match conn.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
+                    Ok(got) => head.extend_from_slice(&buf[..got]),
                 }
             }
-            let _ = c.write_all(resp);
+            let _ = conn.write_all(resp);
         }
     });
     addr
 }
 
-/// The body of the answer to `req` (what follows the first empty line).
-fn body(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
+/// The value of header `name` in the answer to `GET path`, if any.
+fn header(addr: SocketAddr, path: &str, name: &str) -> Option<Vec<u8>> {
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(out.len());
+    let prefix = format!("{name}: ");
+    out[..end].split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l)).find_map(|l| l.strip_prefix(prefix.as_bytes())).map(<[u8]>::to_vec)
 }
 
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
-}
+const RESPS: [&[u8]; 5] = [
+    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-B: 1\r\nX-B: 2, 3\r\nSet-Cookie: s=abc\r\n\r\nok",
+    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok",
+    b"HTTP/1.1 200 OK\r\nConnection: keep-alive, foo\r\nContent-Length: 2\r\n\r\nok",
+    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-U: caf\xc3\xa9\r\nX-T: a\tb\r\nUpgrade: h2c, x\r\n\r\nok",
+];
 
-// The backend response: exactly these bytes.
-const RESP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-B: 1\r\nX-B: 2, 3\r\nSet-Cookie: s=abc\r\n\r\nok";
-
-// The expected res.hdrs value (headers + final empty line, CR LF encoded as %0D%0A).
-const EXPECTED_HDRS: &str = "[content-length: 2%0D%0Ax-b: 1%0D%0Ax-b: 2, 3%0D%0Aset-cookie: s=abc%0D%0A%0D%0A]";
-
-// T329: configuration using res.hdrs
-const CFG: &str = r#"
-global
-  stats socket {sock} level admin
-  nbthread 1
-defaults
-  mode http
-  timeout connect 1s
-  timeout client 5s
-  timeout server 5s
-frontend fe
-  bind {A}
-  default_backend b
-  http-response set-header x-out "[%[res.hdrs]]"
-backend b
-  server s {BE}
-"#;
+/// `x-out` for each of [`RESPS`]: the block as set-header writes it, its length, its hex.
+const WANT: [&[u8]; 5] = [
+    b"[content-length: 2%0D%0Ax-b: 1%0D%0Ax-b: 2, 3%0D%0Aset-cookie: s=abc%0D%0A%0D%0A]|59|636F6E74656E742D6C656E6774683A20320D0A782D623A20310D0A782D623A20322C20330D0A7365742D636F6F6B69653A20733D6162630D0A0D0A",
+    b"[content-length: 2%0D%0A%0D%0A]|21|636F6E74656E742D6C656E6774683A20320D0A0D0A",
+    b"[content-length: 2%0D%0A%0D%0A]|21|636F6E74656E742D6C656E6774683A20320D0A0D0A",
+    b"[connection: foo%0D%0Acontent-length: 2%0D%0A%0D%0A]|38|636F6E6E656374696F6E3A20666F6F0D0A636F6E74656E742D6C656E6774683A20320D0A0D0A",
+    b"[content-length: 2%0D%0Ax-u: caf\xc3\xa9%0D%0Ax-t: a\tb%0D%0Aupgrade: x%0D%0A%0D%0A]|55|636F6E74656E742D6C656E6774683A20320D0A782D753A20636166C3A90D0A782D743A206109620D0A757067726164653A20780D0A0D0A",
+];
 
 #[test]
 fn test_res_hdrs() {
     let a = common::reserve_addr();
-    let be = backend(RESP);
-    let cfg = CFG
-        .replace("{A}", &a.to_string())
-        .replace("{BE}", &be.to_string());
-    let (ibex, _sock) = start("res_hdrs", &cfg, &[a]);
-    // The response should have x-out set to the expected header block.
-    assert_eq!(xout(a, GET), EXPECTED_HDRS);
+    let mut cfg = format!("defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {a}\n");
+    for i in 0..RESPS.len() {
+        let _ = writeln!(cfg, "  use_backend b{i} if {{ path /{i} }}");
+    }
+    for (i, resp) in RESPS.iter().enumerate() {
+        let be = backend(resp);
+        let _ = write!(
+            cfg,
+            "backend b{i}\n  http-response set-header x-out \"[%[res.hdrs]]|%[res.hdrs,length]|%[res.hdrs,hex]\"\n\
+             \x20 http-response set-header x-m yes if {{ res.hdrs,hex -m sub 0D0A0D0A }}\n  server s {be}\n"
+        );
+    }
+    let dir = std::env::temp_dir().join(format!("res-hdrs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.cfg");
+    std::fs::write(&path, cfg).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let _ibex = common::Ibex(child);
+    assert!(common::wait_listening(a), "ibex did not listen on {a}");
+
+    let mut wrong = Vec::new();
+    for (i, want) in WANT.iter().enumerate() {
+        let got = header(a, &format!("/{i}"), "x-out").unwrap_or_default();
+        if got != *want {
+            wrong.push(format!("/{i}: got {:?}, want {:?}", String::from_utf8_lossy(&got), String::from_utf8_lossy(want)));
+        }
+        // The raw block ends with an empty line, so the documented truncated-block check works.
+        if header(a, &format!("/{i}"), "x-m").as_deref() != Some(b"yes") {
+            wrong.push(format!("/{i}: res.hdrs,hex -m sub 0D0A0D0A did not match"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

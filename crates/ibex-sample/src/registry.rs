@@ -1323,45 +1323,10 @@ impl Registry {
             },
         });
 
-        // T329: res.hdrs - returns the full response header block as URL-encoded string
-        let res_hdrs_fetch: FetchFn = |ctx, _args| {
-            let mut result = String::new();
-            if let Some(headers) = ctx.res_headers {
-                for (k, v) in headers {
-                    // Lowercase the header name as HAProxy does
-                    let name_lower: String = k.to_ascii_lowercase();
-                    result.push_str(&name_lower);
-                    result.push_str(": ");
-                    result.push_str(v);
-                    result.push_str("\r\n");
-                }
-            } else {
-                CURRENT_RES_HEADERS.with(|hdrs| {
-                    for (k, v) in hdrs.borrow().iter() {
-                        let name_lower: String = k.to_ascii_lowercase();
-                        result.push_str(&name_lower);
-                        result.push_str(": ");
-                        result.push_str(v);
-                        result.push_str("\r\n");
-                    }
-                });
-            }
-            // Append the final empty line separating headers from body
-            result.push_str("\r\n");
-            // URL-encode control characters and DEL as %XX
-            let encoded: String = result.bytes().map(|b| {
-                if (32..127).contains(&b) {
-                    (b as char).to_string()
-                } else {
-                    format!("%{b:02X}")
-                }
-            }).collect();
-            Some(Sample::Str(encoded))
-        };
         self.register_fetch(FetchDesc {
             name: "res.hdrs",
             out_type: SampleType::Str,
-            func: res_hdrs_fetch,
+            func: |ctx, _| Some(Sample::Str(res_header_block(ctx))),
         });
 
         let req_hdr_val_fetch: FetchFn = |ctx, args| {
@@ -4938,6 +4903,19 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
 /// with the request's `X-N` (T132).
 fn get_res_header(ctx: &SampleContext, name: &str) -> Option<String> {
     get_all_res_headers(ctx, name).into_iter().next()
+}
+
+/// T329: `res.hdrs` (`smp_fetch_hdrs`): the response's headers as the H1 parser stores them
+/// ([`crate::h1_clean::h1_clean_headers`]), each `name: value\r\n`, then the `\r\n` that ends
+/// them. Raw: a header action that writes it has its own `%XX` encoding (`http_encode_map`).
+/// Read from `ctx.res_headers`, else from the response being processed.
+fn res_header_block(ctx: &SampleContext) -> String {
+    use crate::h1_clean::{h1_clean_headers, header_block};
+    let hdrs = match ctx.res_headers {
+        Some(h) => h1_clean_headers(h.iter().map(|(k, v)| (k.as_str(), v.as_str())), false),
+        None => CURRENT_RES_HEADERS.with(|h| h1_clean_headers(h.borrow().iter().map(|(k, v)| (k.as_str(), v.as_str())), false)),
+    };
+    header_block(&hdrs)
 }
 
 fn get_all_res_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
