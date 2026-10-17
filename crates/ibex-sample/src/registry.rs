@@ -4440,22 +4440,27 @@ impl Registry {
                     Sample::Bin(b) => String::from_utf8_lossy(&b).into_owned(),
                     _ => return None,
                 };
+                // As `chunk_printf("%.*s")` makes them in HAProxy: cut at the first NUL, and an
+                // empty one is no sample. The argument is taken as written, spaces included.
                 let resolve = |arg: &str| -> Option<String> {
-                    let arg = arg.trim();
-                    if hmac_key_is_var(arg) {
+                    let mut v = if hmac_key_is_var(arg) {
                         if arg.starts_with("proc.") { get_proc_var(arg) } else { CURRENT_VARS.with(|v| v.borrow().get(arg).cloned()) }
                     } else {
                         Some(arg.to_string())
-                    }
+                    }?;
+                    v.truncate(v.find('\0').unwrap_or(v.len()));
+                    (!v.is_empty()).then_some(v)
                 };
                 let alg = resolve(args.first()?)?;
                 let key = resolve(args.get(1)?)?;
+                // jwt_verify(): the algorithm first (-1 unknown, -2 "none" without
+                // jwt.allow_none_alg), then the token (-3), and only then the key (-5 for a public
+                // key, which Ibex never loads).
                 let digest_name = match alg.as_str() {
-                    "HS256" => "sha256",
-                    "HS384" => "sha384",
-                    "HS512" => "sha512",
-                    // Public keys are never loaded (the load-time check refuses these), so none is known.
-                    "RS256" | "RS384" | "RS512" | "ES256" | "ES384" | "ES512" | "PS256" | "PS384" | "PS512" => return Some(Sample::Sint(-5)),
+                    "HS256" => Some("sha256"),
+                    "HS384" => Some("sha384"),
+                    "HS512" => Some("sha512"),
+                    "RS256" | "RS384" | "RS512" | "ES256" | "ES384" | "ES512" | "PS256" | "PS384" | "PS512" => None,
                     "none" => return Some(Sample::Sint(-2)),
                     _ => return Some(Sample::Sint(-1)),
                 };
@@ -4468,6 +4473,9 @@ impl Registry {
                 let sig_ok = !sig.is_empty() && sig.len() % 4 != 1 && sig.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
                 let Some(sig_bytes) = base64_decode(&sig, true, false).filter(|_| sig_ok) else {
                     return Some(Sample::Sint(-3));
+                };
+                let Some(digest_name) = digest_name else {
+                    return Some(Sample::Sint(-5));
                 };
                 let (digest, block) = hmac_digest(digest_name)?;
                 let mut key = key.into_bytes();
@@ -5832,7 +5840,7 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
         // T331: a literal <alg> is checked at load time as in HAProxy; the public-key algorithms need
         // a key file that Ibex does not load, so they are refused rather than silently answering.
         "jwt_verify" => {
-            let alg = args.first()?.trim();
+            let alg = args.first()?.as_str();
             if hmac_key_is_var(alg) || matches!(alg, "HS256" | "HS384" | "HS512") {
                 return None;
             }

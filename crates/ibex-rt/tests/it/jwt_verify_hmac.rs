@@ -110,3 +110,21 @@ fn jwt_verify_refused_algs() {
         assert!(!out.status.success(), "{alg} was accepted");
     }
 }
+
+/// T331 review: edge cases measured on the `HAProxy` oracle. An empty key or algorithm (from a
+/// variable) gives no sample, as `chunk_printf()` of an empty string fails there; a token that does
+/// not split or decode is -3 before the public-key algorithms answer -5; and the spaces of an
+/// quoted argument are part of it (` secret` is a different key from `secret`).
+#[test]
+fn jwt_verify_hmac_oracle_edges() {
+    const T1: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0.UUtsUaeO3koQylSZ3wxP4lqVvgFw6mGsVzGNBNF_1sQ"; // key "secret"
+    const T0: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0._TE-uKsReGam2cPQXFGSWPgB_PlHHbZhXuEUI_K3EkA"; // key ""
+    const TA: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0.EmYX0-a77cRyRKolXx96yiQ9s0ehY_x2VRQKtK1Mz68"; // key " secret"
+    const TS: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhIn0.6pEiqFwPLCrOj8h3fejbCQpVPsgjrj9CfYf2oS3UtRQ"; // key " sec ret "
+    let a = common::reserve_addr();
+    let cfg = format!(
+        "global\n  stats socket {{sock}} level admin\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {a}\n  http-request set-var(txn.e) str(\"\")\n  http-request set-var(txn.rs) str(RS256)\n  http-request return status 200 content-type text/plain lf-string \"a%[str({T0}),jwt_verify(HS256,txn.e)]|b%[str(abc),jwt_verify(txn.rs,secret)]|c%[str({T1}),jwt_verify(txn.rs,secret)]|d%[str({T1}),jwt_verify(txn.e,secret)]|e%[str({TS}),jwt_verify(HS256,' sec ret ')]|f%[str({TA}),jwt_verify(HS256,' secret')]|g%[str({T1}),jwt_verify(HS256,'secret ')]\"\n",
+    );
+    let (_ibex, _sock) = start("jwt_verify_edges", &cfg, &[a]);
+    assert_eq!(body(a, GET), "a|b-3|c-5|d|e1|f1|g0");
+}
