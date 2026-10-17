@@ -14229,3 +14229,21 @@ pub fn bind_unix_listener(path: &Path) -> io::Result<(UnixListener, PathBuf)> {
     listener.set_nonblocking(true)?;
     Ok((listener, path_buf))
 }
+
+#[cfg(test)]
+mod inherited_socket_tests {
+    use super::*;
+
+    /// T342: an inherited descriptor that is not a listening stream socket for its address
+    /// is reported on stderr (through `stderr_line!`) and a fresh socket is bound instead.
+    #[test]
+    fn a_mismatched_inherited_socket_falls_back_to_a_fresh_bind() {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp");
+        let addr = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).expect("free port");
+        let fd = rustix::io::dup(&udp).expect("dup");
+        crate::handover::distribute(vec![(crate::handover::Kind::Tcp, addr, fd)], 1);
+        let got = listeners_for(0, addr, 3, &ibex_config::ast::SocketTuning::default()).expect("listeners");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].addr(), addr);
+    }
+}

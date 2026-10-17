@@ -30,9 +30,7 @@ use std::path::Path;
 pub fn eprint_line(args: std::fmt::Arguments<'_>) {
     use std::io::Write as _;
     let mut text = args.to_string();
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
+    text.push('\n'); // exactly one, as eprintln! does
     let _ = std::io::stderr().write_all(text.as_bytes());
 }
 
