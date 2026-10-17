@@ -1312,6 +1312,17 @@ impl Registry {
             out_type: SampleType::Sint,
             func: req_hdr_cnt_fetch,
         });
+        let req_hdr_names_fetch: FetchFn = |ctx, args| {
+            let delim = args.first().and_then(|s| s.chars().next()).unwrap_or(',');
+            let names = req_header_names(ctx);
+            Some(Sample::Str(names.join(&delim.to_string())))
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.hdr_names",
+            out_type: SampleType::Str,
+            func: req_hdr_names_fetch,
+        });
+
 
         self.register_fetch(FetchDesc {
             name: "res.hdr_cnt",
@@ -4891,6 +4902,45 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     }
     matches
 }
+/// Returns the names of request headers, in order, from the first source that has any.
+/// T326
+fn req_header_names(ctx: &SampleContext) -> Vec<String> {
+    if let Some(htx) = ctx.htx_slice {
+        let mut names = Vec::new();
+        for (hn, _hv) in htx.headers() {
+            let n_low = hn.to_ascii_lowercase();
+            if n_low == "connection" { continue; }
+            names.push(n_low);
+        }
+        if !names.is_empty() {
+            return names;
+        }
+    }
+    if let Some(htx) = ctx.htx {
+        let mut names = Vec::new();
+        for hf in htx.headers() {
+            let n_low = hf.name.to_ascii_lowercase();
+            if n_low == "connection" { continue; }
+            names.push(n_low);
+        }
+        if !names.is_empty() {
+            return names;
+        }
+    }
+    if let Some(headers) = ctx.req_headers {
+        let mut names = Vec::new();
+        for (k, _v) in headers {
+            let n_low = k.to_ascii_lowercase();
+            if n_low == "connection" { continue; }
+            names.push(n_low);
+        }
+        if !names.is_empty() {
+            return names;
+        }
+    }
+    Vec::new()
+}
+
 
 /// The response's header `name`. Only the response is read: `ctx.htx_slice` holds the
 /// *request* while a response rule runs, so a `shdr(x-n)` that fell back to it answered
