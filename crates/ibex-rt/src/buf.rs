@@ -18,7 +18,7 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
-use ibex_alloc::PoolHead;
+use ibex_alloc::{PoolHead, PoolReg};
 
 /// Configured buffer sizes (in bytes).
 static BUFSIZE_STANDARD: AtomicUsize = AtomicUsize::new(16_384);
@@ -52,6 +52,9 @@ pub fn get_bufsize_large() -> Option<usize> {
 }
 
 // Global atomic pool statistics counters
+/// Failed pool takes. Nothing increments it yet.
+pub static POOL_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
 static BUF_STD_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 static BUF_STD_USED: AtomicUsize = AtomicUsize::new(0);
 static BUF_STD_CACHED: AtomicUsize = AtomicUsize::new(0);
@@ -78,9 +81,12 @@ pub fn buffer_pool_stats() -> Option<PoolHead> {
         alloc_bytes: allocated * size,
         used,
         cached,
-        needed_avg: used,
-        failures: 0,
+        // `needed_avg` is not tracked (always 0) and `failures` is never incremented: the
+        // fallible take that would count them is another slice. Nothing is made up here.
+        needed_avg: 0,
+        failures: POOL_FAILURES.load(Ordering::Relaxed),
         users: 1,
+        regs: vec![PoolReg { name: "buffer", size, flags: 0, align: 64, file: file!(), line: line!() }],
     })
 }
 
@@ -98,9 +104,12 @@ pub fn small_buffer_pool_stats() -> Option<PoolHead> {
         alloc_bytes: allocated * size,
         used,
         cached,
-        needed_avg: used,
-        failures: 0,
+        // `needed_avg` is not tracked (always 0) and `failures` is never incremented: the
+        // fallible take that would count them is another slice. Nothing is made up here.
+        needed_avg: 0,
+        failures: POOL_FAILURES.load(Ordering::Relaxed),
         users: 1,
+        regs: vec![PoolReg { name: "small_buffer", size, flags: 0, align: 64, file: file!(), line: line!() }],
     })
 }
 
@@ -118,10 +127,79 @@ pub fn large_buffer_pool_stats() -> Option<PoolHead> {
         alloc_bytes: allocated * size,
         used,
         cached,
-        needed_avg: used,
-        failures: 0,
+        // `needed_avg` is not tracked (always 0) and `failures` is never incremented: the
+        // fallible take that would count them is another slice. Nothing is made up here.
+        needed_avg: 0,
+        failures: POOL_FAILURES.load(Ordering::Relaxed),
         users: 1,
+        regs: vec![PoolReg { name: "large_buffer", size, flags: 0, align: 64, file: file!(), line: line!() }],
     })
+}
+
+/// Counters of a per-thread arena (`SessionArena`, `AppletArena`), summed over every worker:
+/// each arena adds to these process-wide atomics as it creates a slot (`allocated`) and as a
+/// slot goes in and out of use (`used`), and takes its share back when it is dropped.
+/// `show pools` reads them; the arenas never read them.
+pub struct ArenaCounters {
+    allocated: AtomicUsize,
+    used: AtomicUsize,
+}
+
+impl ArenaCounters {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { allocated: AtomicUsize::new(0), used: AtomicUsize::new(0) }
+    }
+
+    pub fn slot_created(&self) {
+        self.allocated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn slot_used(&self) {
+        self.used.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn slot_released(&self) {
+        self.used.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// An arena holding `slots` slots, `live` of them in use, goes away.
+    pub fn arena_dropped(&self, slots: usize, live: usize) {
+        self.allocated.fetch_sub(slots, Ordering::Relaxed);
+        self.used.fetch_sub(live, Ordering::Relaxed);
+    }
+
+    /// The pool as `show pools` prints it. The slots that exist and are not in use are the
+    /// arena's free list, which is what `HAProxy` calls the thread cache.
+    #[must_use]
+    pub fn head(&self, reg: PoolReg) -> PoolHead {
+        let allocated = self.allocated.load(Ordering::Relaxed);
+        let live = self.used.load(Ordering::Relaxed).min(allocated);
+        PoolHead {
+            name: reg.name,
+            size: reg.size,
+            align: reg.align,
+            allocated,
+            alloc_bytes: allocated * reg.size,
+            used: live,
+            cached: allocated - live,
+            needed_avg: 0,
+            failures: POOL_FAILURES.load(Ordering::Relaxed),
+            users: 1,
+            regs: vec![reg],
+        }
+    }
+}
+
+impl Default for ArenaCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn register_arena_pools(reg: &ibex_alloc::PoolRegistry) {
+    reg.register_provider("session", crate::engine::session_pool_stats);
+    reg.register_provider("appctx", crate::applet::appctx_pool_stats);
 }
 
 static INIT_REGISTRY: Once = Once::new();
@@ -132,6 +210,7 @@ pub fn ensure_registered() {
         let reg = ibex_alloc::global_pool_registry();
         reg.register_provider("buffer", buffer_pool_stats);
         reg.register_provider("small_buffer", small_buffer_pool_stats);
+        register_arena_pools(reg);
     });
 }
 
@@ -152,6 +231,7 @@ pub fn init_buffer_sizes(standard: usize, small: usize, large: Option<usize>) {
     let reg = ibex_alloc::global_pool_registry();
     reg.register_provider("buffer", buffer_pool_stats);
     reg.register_provider("small_buffer", small_buffer_pool_stats);
+    register_arena_pools(reg);
     if large.is_some() {
         reg.register_provider("large_buffer", large_buffer_pool_stats);
     } else {

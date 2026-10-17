@@ -1895,11 +1895,33 @@ pub struct SessionEntry {
     pub log_sd: u32,
 }
 
+/// Slots of every worker's [`SessionArena`], for `show pools` (pool `session`).
+pub static SESSION_POOL: crate::buf::ArenaCounters = crate::buf::ArenaCounters::new();
+
+/// `show pools` provider for the `session` pool: the slots ever created, those in use.
+#[allow(clippy::unnecessary_wraps)]
+pub fn session_pool_stats() -> Option<ibex_alloc::PoolHead> {
+    Some(SESSION_POOL.head(ibex_alloc::PoolReg {
+        name: "session",
+        size: std::mem::size_of::<Option<SessionEntry>>(),
+        flags: 0,
+        align: std::mem::align_of::<Option<SessionEntry>>(),
+        file: file!(),
+        line: line!(),
+    }))
+}
+
 /// Per-thread storage for active sessions.
 pub struct SessionArena {
     entries: Vec<Option<SessionEntry>>,
     free: Vec<u32>,
     live: usize,
+}
+
+impl Drop for SessionArena {
+    fn drop(&mut self) {
+        SESSION_POOL.arena_dropped(self.entries.len(), self.live);
+    }
 }
 
 impl SessionArena {
@@ -1914,12 +1936,14 @@ impl SessionArena {
 
     pub fn alloc(&mut self, entry: SessionEntry) -> Option<u32> {
         self.live += 1;
+        SESSION_POOL.slot_used();
         if let Some(idx) = self.free.pop() {
             self.entries[idx as usize] = Some(entry);
             Some(idx)
         } else {
             let idx = u32::try_from(self.entries.len()).ok()?;
             self.entries.push(Some(entry));
+            SESSION_POOL.slot_created();
             Some(idx)
         }
     }
@@ -1950,6 +1974,7 @@ impl SessionArena {
         let entry = self.entries.get_mut(idx as usize)?.take();
         if entry.is_some() {
             self.live -= 1;
+            SESSION_POOL.slot_released();
             self.free.push(idx);
         }
         entry
