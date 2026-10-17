@@ -6410,7 +6410,7 @@ fn pb_type(name: &str) -> Option<PbType> {
 }
 
 /// T330: a dotted field path (`parse_dotted_uints()`): numbers separated by dots, the last one
-/// not followed by a dot; an empty number reads as 0 and one too large saturates.
+/// not followed by a dot; an empty number reads as 0 and one too large wraps (`read_uint()`).
 fn pb_field_path(s: &str) -> Option<Vec<u32>> {
     let b = s.as_bytes();
     let mut ids = Vec::new();
@@ -6418,7 +6418,7 @@ fn pb_field_path(s: &str) -> Option<Vec<u32>> {
     while i < b.len() {
         let mut n = 0u32;
         while let Some(d) = b.get(i).filter(|c| c.is_ascii_digit()) {
-            n = n.saturating_mul(10).saturating_add(u32::from(d - b'0'));
+            n = n.wrapping_mul(10).wrapping_add(u32::from(d - b'0'));
             i += 1;
         }
         if i < b.len() {
@@ -6555,7 +6555,8 @@ fn pb_lookup(buf: &[u8], pos: &mut usize, len: &mut usize, ids: &[u32], ty: PbTy
     while *len > 0 && depth < ids.len() {
         let key = pb_varint(buf, pos, len)?;
         let wire = key & 7;
-        let found = key >> 3 == u64::from(*ids.get(depth)?);
+        // HAProxy keeps the field number in an `unsigned int`: the bits above 32 are dropped.
+        let found = (key >> 3) & u64::from(u32::MAX) == u64::from(*ids.get(depth)?);
         if wire == 3 || wire == 4 || wire > 5 {
             return None;
         }

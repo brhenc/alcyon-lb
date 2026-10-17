@@ -302,6 +302,12 @@ const ORACLE: &[(&str, &str, &str)] = &[
     ("0d0000805e", "protobuf(1,float)", "0"),
     ("0d000080de", "protobuf(1,float)", "0"),
     ("0d00002050", "protobuf(1,float)", "2147483648"),
+    // review: HAProxy keeps a field number in an `unsigned int`, so a key for field 2^32+1
+    // matches field 1, and a path number past 2^32 wraps (`read_uint()`).
+    ("8a808080800103616263", "protobuf(1),hex", "616263"),
+    ("000000000a8a808080800103616263", "ungrpc(1),hex", "616263"),
+    ("089601", "protobuf(4294967297,uint32)", "150"),
+    ("089601", "protobuf(4294967296,uint32)", ""),
 ];
 
 #[test]
