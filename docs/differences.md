@@ -282,3 +282,12 @@ All eight normalizers give HAProxy's answers on the paths measured (`path-strip-
 only its own option, with HAProxy's message for any other word. An unknown normalizer is
 refused, as HAProxy does. Ibex does not yet require `expose-experimental-directives` for
 `normalize-uri` (HAProxy 3.5 does).
+
+## `listen()` backlog: the `bind` option `maxconn` is refused (T360)
+
+The backlog of a bind follows HAProxy's `listener_backlog()`: the bind's `backlog`, else the
+proxy's `backlog` (frontend, listen or defaults), else the proxy's `maxconn` (the global one
+when the proxy sets none), else 1024, capped by `net.core.somaxconn`. The one step Ibex does
+not have is the `bind` option `maxconn` (between the proxy's `backlog` and its `maxconn`
+in HAProxy): `bind ... maxconn N` is refused at load, as before. A socket handed over by a
+reload keeps the backlog it was bound with, as in HAProxy.

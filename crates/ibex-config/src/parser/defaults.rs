@@ -38,6 +38,12 @@ pub(crate) fn parse_defaults_directive(
             defaults.maxconn = Some(mc);
             Ok(())
         }
+        "backlog" => {
+            let mut b = defaults.backlog.unwrap_or(0);
+            super::parse_backlog(&mut b, tokens, kw)?;
+            defaults.backlog = Some(b);
+            Ok(())
+        }
         "balance" => {
             let mut b = defaults.balance.unwrap_or(BalanceAlgorithm::RoundRobin);
             parse_balance(&mut b, tokens, kw)?;

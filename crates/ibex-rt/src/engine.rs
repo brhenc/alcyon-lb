@@ -2129,16 +2129,17 @@ fn listeners_for(
     addr: SocketAddr,
     proxy: u32,
     tuning: &ibex_config::ast::SocketTuning,
+    backlog: i32,
 ) -> io::Result<Vec<Listener>> {
     let mut out = Vec::new();
     for fd in crate::handover::take_inherited(worker_id, addr) {
-        match Listener::adopt(fd, addr, 128, proxy, tuning) {
+        match Listener::adopt(fd, addr, proxy, tuning) {
             Ok(l) => out.push(l),
             Err(e) => crate::stderr_line!("[WARNING] {e}; binding a fresh socket instead"),
         }
     }
     if out.is_empty() {
-        out.push(Listener::bind_tuned(addr, 128, proxy, tuning)?);
+        out.push(Listener::bind_tuned(addr, backlog, proxy, tuning)?);
     }
     for l in &out {
         crate::handover::expose(l.addr(), l.borrowed_fd())?;
@@ -4068,7 +4069,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             };
             for (bind_idx, b) in binds.iter().enumerate() {
                 let tls = bind_tls(&listen.name, &binds, b.addr)?;
-                for mut listener in listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&ibex_config::ast::SocketTuning::default()))? {
+                for mut listener in listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&ibex_config::ast::SocketTuning::default()), crate::listener::listener_backlog(b.sock.as_deref().and_then(|s| s.backlog), listen.backlog, listen.maxconn))? {
                     listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
                     listener.maxconn = proxies[proxy_idx].maxconn.clone();
                     listener.name = b.name.as_deref().map(Into::into);
@@ -4113,7 +4114,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     quic_listeners.push(ql);
                 } else {
                     let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?;
-                    for mut listener in listeners_for(worker_id, bind_addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&ibex_config::ast::SocketTuning::default()))? {
+                    for mut listener in listeners_for(worker_id, bind_addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&ibex_config::ast::SocketTuning::default()), crate::listener::listener_backlog(b.sock.as_deref().and_then(|s| s.backlog), frontend.backlog, frontend.maxconn))? {
                         listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
                         listener.maxconn = proxies[proxy_idx].maxconn.clone();
                         listener.name = b.name.as_deref().map(Into::into);
@@ -14291,7 +14292,7 @@ mod inherited_socket_tests {
         let addr = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).expect("free port");
         let fd = rustix::io::dup(&udp).expect("dup");
         crate::handover::distribute(vec![(crate::handover::Kind::Tcp, addr, fd)], 1);
-        let got = listeners_for(0, addr, 3, &ibex_config::ast::SocketTuning::default()).expect("listeners");
+        let got = listeners_for(0, addr, 3, &ibex_config::ast::SocketTuning::default(), 128).expect("listeners");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].addr(), addr);
     }
