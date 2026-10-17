@@ -279,6 +279,7 @@ mod syslog;
 mod systemd_notify;
 mod table_converters;
 mod tarpit;
+mod trailer_case;
 mod tcp_frontend_backend;
 mod tcp_raw_fetches;
 mod tcp_request_rules;

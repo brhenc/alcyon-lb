@@ -85,7 +85,7 @@ fn test_rt_chunked_transfer_encoding() {
                 assert!(req_str.contains("Hello"));
                 assert!(req_str.contains("World"));
                 assert!(req_str.contains("-from-Ibex-Chunked-Test"));
-                assert!(req_str.contains("X-Trailer-Check: client_trailer_ok"));
+                assert!(req_str.contains("x-trailer-check: client_trailer_ok"));
 
                 // Reply with chunked response and response trailer
                 let resp = b"HTTP/1.1 200 OK\r\n\
@@ -159,7 +159,7 @@ fn test_rt_chunked_transfer_encoding() {
     assert!(resp_str.contains("Chunk"), "got: {resp_str}");
     assert!(resp_str.contains("-Server"), "got: {resp_str}");
     assert!(
-        resp_str.contains("X-Server-Trailer: srv_trailer_ok"),
+        resp_str.contains("x-server-trailer: srv_trailer_ok"),
         "got: {resp_str}"
     );
 

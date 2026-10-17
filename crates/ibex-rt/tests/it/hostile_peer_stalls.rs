@@ -416,14 +416,14 @@ fn trailer_lines(c: &mut TcpStream, n: usize) {
 fn a_hundred_trailer_fields_pass_and_a_hundred_and_one_do_not() {
     let be = backend(|c| trailer_lines(c, 100));
     let (px, fe) = start("", be, "10s");
-    let seen = get(fe, Duration::from_secs(3), |b| b.ends_with(b"T: v\r\n\r\n"));
-    assert!(seen.bytes.ends_with(b"T: v\r\n\r\n") && !seen.closed, "{:?}", String::from_utf8_lossy(&seen.bytes));
-    assert_eq!(count(&seen.bytes, b"T: v\r\n"), 100);
+    let seen = get(fe, Duration::from_secs(3), |b| b.ends_with(b"t: v\r\n\r\n"));
+    assert!(seen.bytes.ends_with(b"t: v\r\n\r\n") && !seen.closed, "{:?}", String::from_utf8_lossy(&seen.bytes));
+    assert_eq!(count(&seen.bytes, b"t: v\r\n"), 100);
     drop(px);
 
     let be = backend(|c| trailer_lines(c, 101));
     let (_px, fe) = start("", be, "10s");
     let seen = get(fe, Duration::from_secs(3), |b| b.ends_with(b"</html>\n"));
     assert!(seen.bytes.starts_with(b"HTTP/1.1 502 "), "{:?}", String::from_utf8_lossy(&seen.bytes));
-    assert_eq!(count(&seen.bytes, b"T: v\r\n"), 0, "{:?}", String::from_utf8_lossy(&seen.bytes));
+    assert_eq!(count(&seen.bytes, b"t: v\r\n"), 0, "{:?}", String::from_utf8_lossy(&seen.bytes));
 }
