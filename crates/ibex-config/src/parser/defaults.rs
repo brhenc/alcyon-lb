@@ -196,7 +196,11 @@ pub(crate) fn parse_defaults_directive(
             None => Err(ConfigError::new(kw.line, kw.col, "unique-id-header expects an argument.".to_string())),
         },
         "description" => Err(ConfigError::new(kw.line, kw.col, "'description' not allowed in 'defaults' section.")),
-        other if IGNORED_DEFAULTS_KEYWORDS.iter().any(|(k, _)| *k == other) => Ok(()),
+        "resolvers" => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "'resolvers' is not supported: Ibex does no DNS resolution at run time (out of M1 scope)",
+        )),
         _ => Err(ConfigError::new(
             kw.line,
             kw.col,

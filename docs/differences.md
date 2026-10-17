@@ -183,8 +183,9 @@ Not refused, on purpose:
 - QUIC / HTTP/3 (`quic4@`, `quic6@`, `proto quic`, `alpn h3`): Ibex has a QUIC listener
   (`ibex-quic`, exercised by `crates/ibex-config/tests/it/quic_bind.rs`); it is experimental.
   The reference HAProxy binary here is built without QUIC and refuses these.
-- `resolvers` sections: accepted, their keywords are not used by the data path; a server's
-  `resolvers` keyword and `server-template` are refused (see `server_keywords.rs`).
+- `resolvers` sections (and `resolvers` in `defaults`): refused with a message naming the keyword, as
+  are a server's `resolvers` keyword and `server-template` (see `server_keywords.rs`): Ibex does no
+  DNS resolution at run time (out of M1 scope, docs/milestones.md). HAProxy accepts them (T358 #4).
 
 ## Logs and `show stat` (T165)
 

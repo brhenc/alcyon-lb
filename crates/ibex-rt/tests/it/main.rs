@@ -317,6 +317,7 @@ mod stats_admin_sessions;
 mod stats_csv_schema;
 mod stats_global_keywords;
 mod stats_refresh;
+mod resolvers_refused;
 mod no_directive;
 mod stats_parity;
 mod stats_pid_column;
