@@ -134,6 +134,7 @@ mod h2_frame_limits;
 mod h2_generated_replies;
 mod h2_glitch_counters;
 mod h2_idle_timeout_goaway;
+mod h2_idle_timers;
 mod h2_large_request_body;
 mod h2_multiplexing;
 mod h2_no_frames_after_rst;

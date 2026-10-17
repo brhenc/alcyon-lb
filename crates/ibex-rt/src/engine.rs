@@ -9033,6 +9033,10 @@ impl EngineDispatcher<'_> {
             owner.sess.arm_request(now);
             // The connection's own timer runs again once no stream is attached (T300).
             if owner.sess.h2_owner().is_some_and(|o| o.children.is_empty()) && matches!(owner.sess.cli_state, ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW) {
+                // The connection is idle from the end of its last stream (`idle_start`).
+                if owner.sess.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed >= h.tx_buf.len()) {
+                    owner.sess.h2_idle_start = now;
+                }
                 owner.sess.arm_client(now);
             }
         } else {

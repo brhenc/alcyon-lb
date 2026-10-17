@@ -607,6 +607,15 @@ pub struct TcpSession {
     pub h2_ctx: Option<Box<H2MuxContext>>,
     /// The first GOAWAY of an HTTP/2 `timeout client` has gone: the next expiry closes.
     pub h2_idle_goaway: bool,
+    /// `idle_start` of an HTTP/2 connection (`struct h2c`): when it last went idle (no
+    /// stream, nothing to send), or when the request now being received began. The idle
+    /// timeouts count from here, not from the last byte.
+    pub h2_idle_start: Tick,
+    /// Output was waiting for the client the last time the connection's timer was set
+    /// (`H2_CF_MBUF_HAS_DATA`): when it has gone, the connection is idle from then.
+    pub h2_out_waited: bool,
+    /// A request head was partly received the last time the timer was set.
+    pub h2_head_partial: bool,
     /// The session's part in an HTTP/2 connection (T280): the owner of the connection, with
     /// its streams' entries, or one of those streams. Boxed, as most sessions are neither.
     pub h2_role: Option<Box<H2Role>>,
@@ -1074,6 +1083,9 @@ impl TcpSession {
             stick_stores: Vec::new(),
             h2_ctx: None,
             h2_idle_goaway: false,
+            h2_idle_start: now,
+            h2_out_waited: false,
+            h2_head_partial: false,
             h2_role: None,
             h2_flood_config: ibex_proto::H2FloodConfig::default(),
             is_first_req: true,
@@ -1233,10 +1245,52 @@ impl TcpSession {
     }
 
     pub(crate) fn arm_client(&mut self, now: Tick) {
+        if self.h2_ctx.is_some() {
+            self.arm_h2_connection(now);
+            return;
+        }
         // A stream of an HTTP/2 connection has a timer of its own, as `HAProxy`'s streams
         // have, its connection none while streams are attached (`h2c_may_expire`, T300).
         let ms = self.tunnel_ms().unwrap_or(self.timeouts.client);
         self.cli_exp = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
+    }
+
+    /// The deadline of an HTTP/2 connection (`h2c_update_timeout`, `src/mux_h2.c`). With a
+    /// stream attached it has none (each stream has its own). With output waiting it is
+    /// `timeout client` from now. Idle, and the GOAWAY not yet sent: `idle_start` plus
+    /// `timeout http-keep-alive` if a stream has been seen and no part of the next request
+    /// is buffered, else plus `timeout http-request`, else (neither set) `timeout client`
+    /// from now. After the idle GOAWAY the deadline set at its sending stands (it is the
+    /// `client-fin` or `client` wait).
+    fn arm_h2_connection(&mut self, now: Tick) {
+        let Some(h2) = self.h2_ctx.as_deref() else { return };
+        let client = if self.timeouts.client == 0 { Tick::ETERNITY } else { now.add(self.timeouts.client) };
+        if self.h2_owner().is_some_and(|o| !o.children.is_empty()) {
+            self.cli_exp = Tick::ETERNITY;
+            return;
+        }
+        if h2.tx_consumed < h2.tx_buf.len() {
+            self.h2_out_waited = true;
+            self.cli_exp = client;
+            return;
+        }
+        if std::mem::take(&mut self.h2_out_waited) {
+            self.h2_idle_start = now;
+        }
+        if self.h2_idle_goaway {
+            if !self.cli_exp.is_set() {
+                self.cli_exp = client;
+            }
+            return;
+        }
+        // A HEADERS frame starting ends the keep-alive wait and starts the http-request one.
+        let partial = !h2.rx_buf.is_empty() || h2.continuation_stream.is_some();
+        if partial && !self.h2_head_partial && (h2.continuation_stream.is_some() || h2.rx_buf.get(3) == Some(&1)) {
+            self.h2_idle_start = now;
+        }
+        self.h2_head_partial = partial;
+        let to = if h2.last_client_stream_id > 0 && !partial && self.keep_alive_ms != 0 { self.keep_alive_ms } else { self.http_request_ms };
+        self.cli_exp = if to != 0 { self.h2_idle_start.add(to) } else { client };
     }
 
     /// `timeout tunnel` for this stream, the backend's or the one `set-timeout tunnel` gave
@@ -1290,7 +1344,8 @@ impl TcpSession {
     /// is complete. Between requests the wait is `timeout http-keep-alive`, else
     /// `timeout http-request`; a request's first byte ends it.
     pub fn arm_request(&mut self, now: Tick) {
-        if self.http_request_ms == 0 && self.keep_alive_ms == 0 {
+        // An HTTP/2 connection's idle waits are its own (`arm_h2_connection`).
+        if self.http_request_ms == 0 && self.keep_alive_ms == 0 || self.h2_ctx.is_some() {
             return;
         }
         if self.head_pending() {
@@ -2796,6 +2851,7 @@ impl TcpSession {
                     } else {
                         h2.enqueue_frame(&ibex_proto::h2::Frame::GoAway { last_stream_id: last, error_code: ibex_proto::h2::H2Error::NoError, debug_data: Vec::new() });
                         self.h2_idle_goaway = true;
+                        self.cli_exp = Tick::ETERNITY;
                         self.arm_client(now);
                     }
                     self.ending.get_or_insert(Ending::Timeout(Which::Client));
@@ -2825,6 +2881,10 @@ impl TcpSession {
     /// client's timeout, `408` and all. Whether it fired.
     fn expire_request(&mut self) -> bool {
         self.req_exp = Tick::ETERNITY;
+        // Armed before the connection was known to be HTTP/2: its waits are its own now.
+        if self.h2_ctx.is_some() {
+            return false;
+        }
         let live = (self.head_pending() || self.idle_wait()) && self.cli_timer_live();
         self.req_idle = false;
         live.then(|| {
