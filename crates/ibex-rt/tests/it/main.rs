@@ -235,6 +235,7 @@ mod server_state_refusals;
 mod server_state_transitions;
 mod server_tls;
 mod server_track;
+mod srv_weights;
 mod session_errors;
 mod set_dst_port_retries;
 mod set_src_dst;

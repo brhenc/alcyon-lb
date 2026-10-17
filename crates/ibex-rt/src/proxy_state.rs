@@ -121,6 +121,9 @@ impl ProxyState for ProxiesView<'_> {
             cur_sess: cur_sess(p, i),
             maxconn: p.server_maxconn.get(i),
             sess_rate: p.server_sess_rates.get(i).map_or(0, |r| to_i64(r.rate())),
+            weight: p.server_weights.get(i).unwrap_or(1),
+            iweight: p.server_weights.initial(i).unwrap_or(1),
+            uweight: p.server_weights.get(i).unwrap_or(1),
         })
     }
 
