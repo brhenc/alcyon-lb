@@ -21,6 +21,27 @@ pub mod parser;
 use std::fs;
 use std::path::Path;
 
+/// Writes one diagnostic line to stderr and never panics.
+///
+/// `eprintln!` panics when stderr is a full non-blocking pipe (`log stderr` makes fd 2
+/// `O_NONBLOCK`, and a reloaded process inherits it); `HAProxy` ignores such write errors
+/// on its alerts and warnings. The message is dropped. `ibex-rt` has its own
+/// `stderr_line!` that also counts the drop in `DroppedLogs`.
+pub fn eprint_line(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let mut text = args.to_string();
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let _ = std::io::stderr().write_all(text.as_bytes());
+}
+
+/// `eprintln!` that drops the message instead of panicking; see [`eprint_line`].
+#[macro_export]
+macro_rules! stderr_line {
+    ($($arg:tt)*) => { $crate::eprint_line(format_args!($($arg)*)) };
+}
+
 pub use ast::{
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, Config, CookieConfig, DefaultsSection,
     ErrorPageSource, Forwarded, ForwardedValue, FrontendSection, GlobalSection, GlobalSetVar, StatsAddr, StatsSocket,

@@ -205,7 +205,7 @@ pub(crate) fn unimplemented_server_keyword(tokens: &[Token], i: usize, server: O
     match k.outcome {
         Refuse(why) => Err(ConfigError::new(tok.line, tok.col, format!("{prefix}'{}' is not supported: {why}.", k.name))),
         Ignore(what) => {
-            eprintln!("[ibex] warning: {prefix}'{}' is not implemented and is ignored ({what}).", k.name);
+            crate::stderr_line!("[ibex] warning: {prefix}'{}' is not implemented and is ignored ({what}).", k.name);
             Ok(last)
         }
     }

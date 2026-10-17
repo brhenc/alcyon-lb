@@ -249,14 +249,14 @@ impl SyslogTarget {
             LogTarget::Ring(name) => match crate::ring::find(name) {
                 Some(r) => Sink::Ring(r),
                 None => {
-                    eprintln!("[ibex] warning: log target ring@{name} names no ring section; these lines are dropped");
+                    crate::stderr_line!("[ibex] warning: log target ring@{name} names no ring section; these lines are dropped");
                     Sink::Discard
                 }
             },
             LogTarget::Fd(1) => Sink::Stdout,
             LogTarget::Fd(2) => Sink::Stderr,
             LogTarget::Fd(other) => {
-                eprintln!(
+                crate::stderr_line!(
                     "[ibex] warning: log target fd@{other} is not supported; only \
                      stdout (fd@1), stderr (fd@2) and a syslog address are written"
                 );

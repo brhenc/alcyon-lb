@@ -1054,7 +1054,7 @@ pub(crate) fn parse_option_frontend(
     if tokens[1].text == "abortonclose" {
         // A frontend's own `abortonclose` decides only whether a TLS handshake goes on once
         // the client has shut its side (`ssl_sock_to_buf`); Ibex does not look (T227).
-        eprintln!("[ibex] warning: 'option abortonclose' in a frontend is not implemented and is ignored.");
+        crate::stderr_line!("[ibex] warning: 'option abortonclose' in a frontend is not implemented and is ignored.");
         return Ok(());
     }
     if matches!(tokens[1].text.as_str(), "http-server-close" | "http-keep-alive" | "httpclose") {

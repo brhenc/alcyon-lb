@@ -251,7 +251,7 @@ pub(crate) fn check_option(section: OptSection, tokens: &[Token], kw: &Token) ->
     if let Some((_, why)) = OPTIONS_THAT_MUST_NOT_BE_IGNORED.iter().find(|(o, _)| *o == name) {
         return Err(err(kw, format!("'option {name}' is not supported: {why}.")));
     }
-    eprintln!("[ibex] warning: 'option {name}' is not implemented and is ignored.");
+    crate::stderr_line!("[ibex] warning: 'option {name}' is not implemented and is ignored.");
     Ok(false)
 }
 

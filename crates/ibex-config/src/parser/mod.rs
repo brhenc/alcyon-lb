@@ -895,7 +895,7 @@ const OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[(&str, &str)] = &[
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn parse_no_directive(tokens: &[Token], _kw: &Token) -> Result<(), ConfigError> {
     if tokens.len() >= 2 {
-        eprintln!("[ibex] warning: ignored 'no {}'", tokens[1].text);
+        crate::stderr_line!("[ibex] warning: ignored 'no {}'", tokens[1].text);
     }
     Ok(())
 }

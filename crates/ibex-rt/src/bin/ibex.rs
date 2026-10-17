@@ -194,7 +194,7 @@ fn send_signals_to_pids(pids: &[u32], signal: Signal, quiet: bool) {
             if let Some(target) = Pid::from_raw(pid_i32) {
                 if let Err(err) = kill_process(target, signal) {
                     if !quiet && err != rustix::io::Errno::SRCH {
-                        eprintln!("[WARNING] Failed to send signal {signal:?} to PID {pid}: {err}");
+                        ibex_rt::stderr_line!("[WARNING] Failed to send signal {signal:?} to PID {pid}: {err}");
                     }
                 }
             }
@@ -226,14 +226,14 @@ fn dump_loaded_libraries() {
 
 fn parse_arg_u32(val: &str, flag: &str) -> u32 {
     val.parse::<u32>().unwrap_or_else(|_| {
-        eprintln!("Option {flag}: invalid integer argument '{val}'");
+        ibex_rt::stderr_line!("Option {flag}: invalid integer argument '{val}'");
         process::exit(1);
     })
 }
 
 fn parse_arg_u64(val: &str, flag: &str) -> u64 {
     val.parse::<u64>().unwrap_or_else(|_| {
-        eprintln!("Option {flag}: invalid integer argument '{val}'");
+        ibex_rt::stderr_line!("Option {flag}: invalid integer argument '{val}'");
         process::exit(1);
     })
 }
@@ -250,7 +250,7 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
             "-f" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Option -f expects a configuration file/directory path argument.");
+                    ibex_rt::stderr_line!("Option -f expects a configuration file/directory path argument.");
                     process::exit(1);
                 }
                 opts.config_paths.push(PathBuf::from(&args[i]));
@@ -271,7 +271,7 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
             "-cc" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Option -cc expects a condition expression.");
+                    ibex_rt::stderr_line!("Option -cc expects a condition expression.");
                     process::exit(1);
                 }
                 opts.check_condition = Some(args[i].clone());
@@ -282,7 +282,7 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
             "-C" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Option -C expects a directory path argument.");
+                    ibex_rt::stderr_line!("Option -C expects a directory path argument.");
                     process::exit(1);
                 }
                 opts.change_dir = Some(PathBuf::from(&args[i]));
@@ -332,7 +332,7 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
             "-p" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Option -p expects a pidfile path argument.");
+                    ibex_rt::stderr_line!("Option -p expects a pidfile path argument.");
                     process::exit(1);
                 }
                 opts.pid_file = Some(PathBuf::from(&args[i]));
@@ -340,7 +340,7 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
             "-x" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Option -x requires a unix socket path");
+                    ibex_rt::stderr_line!("Option -x requires a unix socket path");
                     process::exit(1);
                 }
                 opts.old_socket = Some(PathBuf::from(&args[i]));
@@ -360,7 +360,7 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
             "-S" | "-s" | "--stats-socket" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Option -S expects a socket path argument.");
+                    ibex_rt::stderr_line!("Option -S expects a socket path argument.");
                     process::exit(1);
                 }
                 // `-S` is the master CLI (see master.rs); `-s` / `--stats-socket` are Ibex's
@@ -377,7 +377,7 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
             "-n" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Option -n expects an integer argument (maxconn).");
+                    ibex_rt::stderr_line!("Option -n expects an integer argument (maxconn).");
                     process::exit(1);
                 }
                 opts.maxconn = Some(parse_arg_u32(&args[i], "-n"));
@@ -385,7 +385,7 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
             "-N" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Option -N expects an integer argument (maxpconn).");
+                    ibex_rt::stderr_line!("Option -N expects an integer argument (maxpconn).");
                     process::exit(1);
                 }
                 opts.maxpconn = Some(parse_arg_u32(&args[i], "-N"));
@@ -393,7 +393,7 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
             "-m" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("Option -m expects an integer argument (megabytes).");
+                    ibex_rt::stderr_line!("Option -m expects an integer argument (megabytes).");
                     process::exit(1);
                 }
                 opts.memory_limit_mb = Some(parse_arg_u64(&args[i], "-m"));
@@ -441,7 +441,7 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
                 opts.dump_memory_pools = true;
             }
             unknown => {
-                eprintln!("Unknown option: {unknown}");
+                ibex_rt::stderr_line!("Unknown option: {unknown}");
                 print_help(&program);
                 process::exit(1);
             }
@@ -454,12 +454,12 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
 
 /// `HAProxy`'s alert line without a subsystem: `[ALERT]    (<pid>) : <text>`.
 fn config_alert_plain(text: &str) {
-    eprintln!("[ALERT]    ({}) : {text}", process::id());
+    ibex_rt::stderr_line!("[ALERT]    ({}) : {text}", process::id());
 }
 
 /// `HAProxy`'s alert line: `[ALERT]    (<pid>) : config : <text>`.
 fn config_alert(text: &str) {
-    eprintln!("[ALERT]    ({}) : config : {text}", process::id());
+    ibex_rt::stderr_line!("[ALERT]    ({}) : config : {text}", process::id());
 }
 
 /// The file a line of the merged configuration text is in, and its line there.
@@ -515,16 +515,16 @@ fn load_and_merge_configs(config_files: &[PathBuf]) -> (String, Vec<(u32, String
 
 fn report_diagnostics(opts: &CliOptions) {
     if opts.ignore_resolve_fail && !opts.quiet {
-        eprintln!("[DIAG] Flag -dr: ignoring server address resolution failures.");
+        ibex_rt::stderr_line!("[DIAG] Flag -dr: ignoring server address resolution failures.");
     }
     if opts.disable_epoll && !opts.quiet {
-        eprintln!("[DIAG] Flag -de: disabling epoll poller (falling back to standard poll).");
+        ibex_rt::stderr_line!("[DIAG] Flag -de: disabling epoll poller (falling back to standard poll).");
     }
     if opts.disable_poll && !opts.quiet {
-        eprintln!("[DIAG] Flag -dp: disabling poll poller.");
+        ibex_rt::stderr_line!("[DIAG] Flag -dp: disabling poll poller.");
     }
     if opts.dump_memory_pools && !opts.quiet {
-        eprintln!("[DIAG] Flag -dM: memory pool debugging active.");
+        ibex_rt::stderr_line!("[DIAG] Flag -dM: memory pool debugging active.");
     }
     if opts.dump_libs {
         dump_loaded_libraries();
@@ -539,7 +539,7 @@ fn enforce_memory_limit(megs: u64, quiet: bool) {
     };
     if let Err(err) = setrlimit(Resource::As, rlim) {
         if !quiet {
-            eprintln!("[WARNING] Unable to enforce memory limit (-m {megs} MB): {err}");
+            ibex_rt::stderr_line!("[WARNING] Unable to enforce memory limit (-m {megs} MB): {err}");
         }
     }
 }
@@ -547,7 +547,7 @@ fn enforce_memory_limit(megs: u64, quiet: bool) {
 fn handle_pid_file(pid_path: &Path) {
     let pid = std::process::id();
     if let Err(err) = std::fs::write(pid_path, format!("{pid}\n")) {
-        eprintln!("Cannot create pidfile '{}': {err}", pid_path.display());
+        ibex_rt::stderr_line!("Cannot create pidfile '{}': {err}", pid_path.display());
         process::exit(1);
     }
 }
@@ -565,7 +565,7 @@ fn main() {
             Ok(true) => process::exit(0),
             Ok(false) => process::exit(1),
             Err(msg) => {
-                eprintln!("[ALERT] : {msg}");
+                ibex_rt::stderr_line!("[ALERT] : {msg}");
                 process::exit(2);
             }
         }
@@ -596,14 +596,14 @@ fn main() {
     // 1. Change working directory if requested via -C <dir>
     if let Some(ref dir) = opts.change_dir {
         if let Err(err) = std::env::set_current_dir(dir) {
-            eprintln!("Cannot change directory to '{}': {err}", dir.display());
+            ibex_rt::stderr_line!("Cannot change directory to '{}': {err}", dir.display());
             process::exit(1);
         }
     }
 
     // 2. Validate that configuration files were provided
     if opts.config_paths.is_empty() {
-        eprintln!("Error: No configuration file specified. Use -f <path>.");
+        ibex_rt::stderr_line!("Error: No configuration file specified. Use -f <path>.");
         print_help(&program);
         process::exit(1);
     }
@@ -629,7 +629,7 @@ fn main() {
             // buffer size for HTTP/2).
             for (line, text) in &err.alerts {
                 let (file, line) = locate(&config_starts, *line);
-                eprintln!("[ALERT]    ({}) : {}", process::id(), text.replace("{at}", &format!("[{file}:{line}]")));
+                ibex_rt::stderr_line!("[ALERT]    ({}) : {}", process::id(), text.replace("{at}", &format!("[{file}:{line}]")));
             }
             process::exit(1);
         }
@@ -643,7 +643,7 @@ fn main() {
     for m in &config.directive_messages {
         let file = if config_files.len() == 1 { config_files[0].display().to_string() } else { "<config>".to_string() };
         let (sev, pad) = if m.warning { ("WARNING", " ") } else { ("NOTICE", "  ") };
-        eprintln!("[{sev}]{pad} ({}) : config : parsing [{file}:{}]: '{}'.", process::id(), m.line, m.text);
+        ibex_rt::stderr_line!("[{sev}]{pad} ({}) : config : parsing [{file}:{}]: '{}'.", process::id(), m.line, m.text);
     }
 
     // 5-ter. What the keywords printed while they were parsed and went on (a second `user`,
@@ -660,15 +660,15 @@ fn main() {
         let sev = if w.alert { "[ALERT]   " } else { "[WARNING] " };
         let pid = process::id();
         match w.style {
-            WarnStyle::Spaced => eprintln!("{sev} ({pid}) : config : parsing [{file}:{line}] : {}", w.text),
-            WarnStyle::SpacedBlank => eprintln!("{sev} ({pid}) : config : parsing [{file}:{line}] : {}\n", w.text),
-            WarnStyle::Tight => eprintln!("{sev} ({pid}) : config : parsing [{file}:{line}]: {}", w.text),
-            WarnStyle::At => eprintln!("{sev} ({pid}) : config : [{file}:{line}] : {}", w.text),
+            WarnStyle::Spaced => ibex_rt::stderr_line!("{sev} ({pid}) : config : parsing [{file}:{line}] : {}", w.text),
+            WarnStyle::SpacedBlank => ibex_rt::stderr_line!("{sev} ({pid}) : config : parsing [{file}:{line}] : {}\n", w.text),
+            WarnStyle::Tight => ibex_rt::stderr_line!("{sev} ({pid}) : config : parsing [{file}:{line}]: {}", w.text),
+            WarnStyle::At => ibex_rt::stderr_line!("{sev} ({pid}) : config : [{file}:{line}] : {}", w.text),
         }
         warned |= !w.alert;
     }
     for text in config.check_warnings() {
-        eprintln!("[WARNING]  ({}) : {text}", process::id());
+        ibex_rt::stderr_line!("[WARNING]  ({}) : {text}", process::id());
         warned = true;
     }
 
@@ -683,7 +683,7 @@ fn main() {
     //     `HAProxy` checks once everything is read, after the rules' expressions.
     if let Err(err) = config.check_references() {
         for (_, text) in &err.alerts {
-            eprintln!("[ALERT]    ({}) : {text}", process::id());
+            ibex_rt::stderr_line!("[ALERT]    ({}) : {text}", process::id());
         }
         process::exit(1);
     }
@@ -725,14 +725,14 @@ fn main() {
             Ok(child) => {
                 if let Some(ref pidfile) = opts.pid_file {
                     if let Err(err) = std::fs::write(pidfile, format!("{}\n", child.id())) {
-                        eprintln!("Cannot create pidfile '{}': {}", pidfile.display(), err);
+                        ibex_rt::stderr_line!("Cannot create pidfile '{}': {}", pidfile.display(), err);
                         process::exit(1);
                     }
                 }
                 process::exit(0);
             }
             Err(e) => {
-                eprintln!("Failed to daemonize: {e}");
+                ibex_rt::stderr_line!("Failed to daemonize: {e}");
                 process::exit(1);
             }
         }
@@ -753,7 +753,7 @@ fn main() {
         // Certificates are loaded here, not just parsed. Reporting a config valid and
         // then failing to start on it moves the discovery from CI to production.
         if let Err(e) = ibex_rt::validate_tls(&config) {
-            eprintln!("Configuration error: {e}");
+            ibex_rt::stderr_line!("Configuration error: {e}");
             process::exit(1);
         }
         if warned {
@@ -808,7 +808,7 @@ fn main() {
         .install_signal_handlers()
         .and_then(|()| if master_worker { lifecycle.install_term_handler() } else { Ok(()) });
     if let Err(e) = installed {
-        eprintln!("Failed to install signal handlers: {e}");
+        ibex_rt::stderr_line!("Failed to install signal handlers: {e}");
         process::exit(1);
     }
 
@@ -838,7 +838,7 @@ fn main() {
     let strict = config.global.as_ref().is_some_and(|g| g.maxconn.is_some() && !g.no_strict_limits);
     match ibex_rt::globalconn::apply_nofile_limit(u64::try_from(maxsock).unwrap_or(u64::MAX), strict) {
         Ok(None) => {}
-        Ok(Some(warning)) => eprintln!("[WARNING]  ({}) : {warning}", process::id()),
+        Ok(Some(warning)) => ibex_rt::stderr_line!("[WARNING]  ({}) : {warning}", process::id()),
         Err(alert) => {
             config_alert_plain(&alert);
             process::exit(1);
@@ -892,7 +892,7 @@ fn main() {
             match ibex_rt::handover::fetch(old) {
                 Ok(socks) => {
                     if !opts.quiet {
-                        eprintln!("[NOTICE] took over {} listening socket(s) from {}", socks.len(), old.display());
+                        ibex_rt::stderr_line!("[NOTICE] took over {} listening socket(s) from {}", socks.len(), old.display());
                     }
                     ibex_rt::handover::distribute(socks, nbthread);
                 }
@@ -900,7 +900,7 @@ fn main() {
                     // HAProxy's behaviour exactly (src/haproxy.c:2069): refuse to start. The
                     // old process has not been signalled yet -- that only happens once this
                     // one is listening -- so it keeps serving and nothing is lost.
-                    eprintln!("[ALERT] Failed to get the sockets from the old process! ({}: {e})", old.display());
+                    ibex_rt::stderr_line!("[ALERT] Failed to get the sockets from the old process! ({}: {e})", old.display());
                     process::exit(1);
                 }
             }
@@ -912,7 +912,7 @@ fn main() {
     let shared_proxies = match Engine::build_shared_state(&config) {
         Ok(p) => p,
         Err(err) => {
-            eprintln!("Failed to build shared state: {err}");
+            ibex_rt::stderr_line!("Failed to build shared state: {err}");
             process::exit(1);
         }
     };
@@ -921,8 +921,8 @@ fn main() {
     //      reuseport group a client's datagrams are hashed over is whole from its first
     //      datagram on (T210). HAProxy binds all its listeners before creating its threads.
     if let Err(err) = ibex_rt::engine::prebind_quic(&config, nbthread) {
-        eprintln!("[ALERT] {err}");
-        eprintln!("[ALERT] [haproxy.main()] Some protocols failed to start their listeners! Exiting.");
+        ibex_rt::stderr_line!("[ALERT] {err}");
+        ibex_rt::stderr_line!("[ALERT] [haproxy.main()] Some protocols failed to start their listeners! Exiting.");
         process::exit(1);
     }
 
@@ -938,8 +938,8 @@ fn main() {
         let fail = |proto: &str, what: &str, err: std::io::Error, at: &str| -> ! {
             let why = err.to_string();
             let why = why.split(" (os error").next().unwrap_or(&why).to_string();
-            eprintln!("[ALERT] Binding for frontend GLOBAL: protocol {proto}: {what} ({why}) [{at}].");
-            eprintln!("[ALERT] [haproxy.main()] Some protocols failed to start their listeners! Exiting.");
+            ibex_rt::stderr_line!("[ALERT] Binding for frontend GLOBAL: protocol {proto}: {what} ({why}) [{at}].");
+            ibex_rt::stderr_line!("[ALERT] [haproxy.main()] Some protocols failed to start their listeners! Exiting.");
             process::exit(1);
         };
         match addr {
