@@ -2574,43 +2574,44 @@ impl Registry {
         });
     }
 
-/// T330: parse TCP options from a TCP segment binary.
-/// Returns list of (kind, data) pairs.
-fn tcp_options(b: &[u8]) -> Vec<(u8, &[u8])> {
-    if b.len() < 13 {
-        return Vec::new();
+    /// T330: the TCP header length in bytes when `b` holds a complete TCP header (at least 20
+    /// bytes, and as many as its data offset says), otherwise `None` (`tcp_fullhdr_length()`
+    /// in `src/net_helper.c` returning 0, which makes every tcp.options converter give no sample).
+    fn tcp_fullhdr_length(b: &[u8]) -> Option<usize> {
+        if b.len() < 20 {
+            return None;
+        }
+        let len = usize::from(b[12] >> 4) * 4;
+        (len >= 20 && b.len() >= len).then_some(len)
     }
-    let data_offset = (b[12] >> 4) as usize;
-    let header_len = data_offset * 4;
-    if header_len < 20 || header_len > b.len() {
-        return Vec::new();
+
+    /// T330: the offset in the TCP header `b` where option kind `opt` is first seen, if any
+    /// (`tcp_fullhdr_find_opt()` in `src/net_helper.c`). The walk stops at END, at an option whose length
+    /// byte is missing or under 2; an option counts only when its declared length fits the header.
+    fn tcp_fullhdr_find_opt(b: &[u8], opt: u8) -> Option<usize> {
+        let len = Self::tcp_fullhdr_length(b)?;
+        let mut next = 20;
+        while next < len {
+            let curr = next;
+            match b[curr] {
+                0 => break,
+                1 => next += 1,
+                _ if next + 1 < len && b[next + 1] > 1 => next += usize::from(b[next + 1]),
+                _ => break,
+            }
+            if b[curr] == opt && next <= len {
+                return Some(curr);
+            }
+        }
+        None
     }
-    let opts = &b[20..header_len];
-    let mut i = 0usize;
-    let mut out = Vec::new();
-    while i < opts.len() {
-        let kind = opts[i];
-        if kind == 0 {
-            break;
-        }
-        if kind == 1 {
-            out.push((kind, &[] as &[u8]));
-            i += 1;
-            continue;
-        }
-        if i + 1 >= opts.len() {
-            break;
-        }
-        let len = opts[i + 1] as usize;
-        if len < 2 || i + len > opts.len() {
-            break;
-        }
-        let data = &opts[i + 2..i + len];
-        out.push((kind, data));
-        i += len;
+
+    /// T330: the big-endian value of the `n` bytes at `ofs` in `b`. The reference reads them whatever the
+    /// option's declared length; past the end of the input it would read out of bounds, here it
+    /// gives 0.
+    fn tcp_read_be(b: &[u8], ofs: usize, n: usize) -> i64 {
+        b.get(ofs..ofs + n).map_or(0, |d| d.iter().fold(0i64, |v, &x| v << 8 | i64::from(x)))
     }
-    out
-}
 
     #[allow(clippy::too_many_lines)]
     fn register_builtin_converters(&mut self) {
@@ -4383,21 +4384,16 @@ fn tcp_options(b: &[u8]) -> Vec<(u8, &[u8])> {
             },
         });
 
+        // T330: tcp.options.* (src/net_helper.c). An incomplete TCP header gives no sample.
         self.register_converter(ConvDesc {
-
             name: "tcp.options.mss",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Bin(b) => {
-                    let opts = Self::tcp_options(&b);
-                    for (kind, data) in opts {
-                        if kind == 2 && data.len() >= 2 {
-                            let val = i64::from(u16::from_be_bytes([data[0], data[1]]));
-                            return Some(Sample::Sint(val));
-                        }
-                    }
-                    Some(Sample::Sint(0))
+                    Self::tcp_fullhdr_length(&b)?;
+                    let v = Self::tcp_fullhdr_find_opt(&b, 2).map_or(0, |ofs| Self::tcp_read_be(&b, ofs + 2, 2));
+                    Some(Sample::Sint(v))
                 }
                 _ => None,
             },
@@ -4409,9 +4405,8 @@ fn tcp_options(b: &[u8]) -> Vec<(u8, &[u8])> {
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Bin(b) => {
-                    let opts = Self::tcp_options(&b);
-                    let present = opts.iter().any(|(k, _)| *k == 4);
-                    Some(Sample::Sint(i64::from(u8::from(present))))
+                    Self::tcp_fullhdr_length(&b)?;
+                    Some(Sample::Sint(i64::from(Self::tcp_fullhdr_find_opt(&b, 4).is_some())))
                 }
                 _ => None,
             },
@@ -4423,9 +4418,8 @@ fn tcp_options(b: &[u8]) -> Vec<(u8, &[u8])> {
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Bin(b) => {
-                    let opts = Self::tcp_options(&b);
-                    let present = opts.iter().any(|(k, _)| *k == 8);
-                    Some(Sample::Sint(i64::from(u8::from(present))))
+                    Self::tcp_fullhdr_length(&b)?;
+                    Some(Sample::Sint(i64::from(Self::tcp_fullhdr_find_opt(&b, 8).is_some())))
                 }
                 _ => None,
             },
@@ -4437,14 +4431,9 @@ fn tcp_options(b: &[u8]) -> Vec<(u8, &[u8])> {
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Bin(b) => {
-                    let opts = Self::tcp_options(&b);
-                    for (kind, data) in opts {
-                        if kind == 8 && data.len() >= 4 {
-                            let val = i64::from(u32::from_be_bytes([data[0], data[1], data[2], data[3]]));
-                            return Some(Sample::Sint(val));
-                        }
-                    }
-                    Some(Sample::Sint(0))
+                    Self::tcp_fullhdr_length(&b)?;
+                    let v = Self::tcp_fullhdr_find_opt(&b, 8).map_or(0, |ofs| Self::tcp_read_be(&b, ofs + 2, 4));
+                    Some(Sample::Sint(v))
                 }
                 _ => None,
             },
@@ -4456,13 +4445,9 @@ fn tcp_options(b: &[u8]) -> Vec<(u8, &[u8])> {
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Bin(b) => {
-                    let opts = Self::tcp_options(&b);
-                    for (kind, data) in opts {
-                        if kind == 3 && !data.is_empty() {
-                            return Some(Sample::Sint(i64::from(data[0])));
-                        }
-                    }
-                    Some(Sample::Sint(0))
+                    Self::tcp_fullhdr_length(&b)?;
+                    let v = Self::tcp_fullhdr_find_opt(&b, 3).map_or(0, |ofs| Self::tcp_read_be(&b, ofs + 2, 1));
+                    Some(Sample::Sint(v))
                 }
                 _ => None,
             },
@@ -4474,24 +4459,37 @@ fn tcp_options(b: &[u8]) -> Vec<(u8, &[u8])> {
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Bin(b) => {
-                    let opts = Self::tcp_options(&b);
-                    let present = opts.iter().any(|(k, _)| *k == 3);
-                    Some(Sample::Sint(i64::from(u8::from(present))))
+                    Self::tcp_fullhdr_length(&b)?;
+                    Some(Sample::Sint(i64::from(Self::tcp_fullhdr_find_opt(&b, 3).is_some())))
                 }
                 _ => None,
             },
         });
 
+        // One byte per option kind, a truncated or overrunning last option included
+        // (sample_conv_tcp_options_list pushes the kind before it checks the length byte).
         self.register_converter(ConvDesc {
             name: "tcp.options_list",
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, _args| match smp {
                 Sample::Bin(b) => {
-                    let opts = Self::tcp_options(&b);
-                    let mut out = Vec::with_capacity(opts.len());
-                    for (kind, _) in opts {
+                    let len = Self::tcp_fullhdr_length(&b)?;
+                    let mut out = Vec::new();
+                    let mut ofs = 20;
+                    while ofs < len {
+                        let kind = b[ofs];
+                        if kind == 0 {
+                            break;
+                        }
                         out.push(kind);
+                        if kind == 1 {
+                            ofs += 1;
+                        } else if ofs + 1 < len && b[ofs + 1] > 1 {
+                            ofs += usize::from(b[ofs + 1]);
+                        } else {
+                            break;
+                        }
                     }
                     Some(Sample::Bin(out))
                 }

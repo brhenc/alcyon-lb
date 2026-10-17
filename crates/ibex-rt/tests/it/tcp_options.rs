@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T330: tcp.options.* converters
+//! T330: the `tcp.options.*` and `tcp.options_list` converters. Every expected row was measured on
+//! the reference (3.5-dev8) with the same lf-string.
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::os::unix::net::UnixStream;
+use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct Ibex(Child, std::path::PathBuf);
 
@@ -21,109 +20,80 @@ impl Drop for Ibex {
     }
 }
 
-/// Starts ibex on `cfg` (`{sock}` is replaced by the stats socket path), waits for `addrs` and the
-/// socket, then lets the readiness probes slide out of the one-second windows and clears the maxima.
-fn start(tag: &str, cfg: &str, addrs: &[SocketAddr]) -> (Ibex, String) {
-    let dir = std::env::temp_dir().join(format!("qh-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("cli.sock").display().to_string();
-    let path = dir.join("c.cfg");
-    std::fs::write(&path, cfg.replace("{sock}", &sock).replace("{dir}", &dir.display().to_string())).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let ibex = Ibex(child, dir);
-    for a in addrs {
-        assert!(common::wait_listening(*a), "ibex did not listen on {a}");
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !std::path::Path::new(&sock).exists() {
-        assert!(Instant::now() < deadline, "no stats socket");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(2200));
-    cli(&sock, "clear counters");
-    (ibex, sock)
-}
+/// A TCP header prefix (ports, seq, ack); each row appends data offset, flags, window,
+/// checksum, urgent pointer and options.
+const H: &str = "9c4001bb0102030400000000";
 
-fn cli(sock: &str, cmd: &str) -> String {
-    let mut s = UnixStream::connect(sock).expect("cli");
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(format!("{cmd}\n").as_bytes()).unwrap();
-    let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    out
-}
-
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
-/// One request on a new connection; the whole raw answer.
-fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(req).unwrap();
-    let mut out = Vec::new();
-    let _ = s.read_to_end(&mut out);
-    out
-}
-
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
-        }
-    });
-    addr
-}
-
-/// The body of the answer to `req` (what follows the first empty line).
-fn body(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
-}
-
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
-}
+const CONVS: [&str; 7] = [
+    "tcp.options.mss",
+    "tcp.options.sack",
+    "tcp.options.tsopt",
+    "tcp.options.tsval",
+    "tcp.options.wscale",
+    "tcp.options.wsopt",
+    "tcp.options_list,hex",
+];
 
 #[test]
 fn tcp_options_converters() {
+    // input hex -> mss|sack|tsopt|tsval|wscale|wsopt|options_list,hex
+    let rows: [(String, &str); 12] = [
+        // a full SYN: MSS, SACK-permitted, timestamps, NOP, wscale
+        (format!("{H}a002faf000000000020405b40402080a112233440000000001030307"), "1460|1|1|287454020|7|1|0204080103"),
+        // no options
+        (format!("{H}5002faf000000000"), "0|0|0|0|0|0|"),
+        // incomplete header: no sample at all
+        ("0102".to_string(), "||||||"),
+        // data offset 24 past the 20 bytes given: no sample
+        (format!("{H}6002faf000000000"), "||||||"),
+        // wscale with no length byte: its kind is still listed
+        (format!("{H}6002faf00000000001010103"), "0|0|0|0|0|0|01010103"),
+        // MSS whose length (8) runs past the header
+        (format!("{H}6002faf0000000000208a5b4"), "0|0|0|0|0|0|02"),
+        // MSS with length 1
+        (format!("{H}6002faf0000000000201ffff"), "0|0|0|0|0|0|02"),
+        // MSS overrunning the header by one byte
+        (format!("{H}6002faf00000000001010204"), "0|0|0|0|0|0|010102"),
+        // MSS with length 2: the value is read from the two bytes after it anyway
+        (format!("{H}6002faf00000000002020101"), "257|0|0|0|0|0|020101"),
+        // TS with length 4: TSval is read from the four bytes after kind and length
+        (format!("{H}6002faf0000000000804aabbccdd"), "0|0|1|2864434397|0|0|08"),
+        // NOP, then an option whose length (255) runs past the header
+        (format!("{H}6002faf0000000000102ff00"), "0|0|0|0|0|0|0102"),
+        // wscale 0 is present, and its shift count is 0
+        (format!("{H}6002faf00000000001030300"), "0|0|0|0|0|1|0103"),
+    ];
+    let lf = rows
+        .iter()
+        .map(|(hex, _)| CONVS.iter().map(|c| format!("%[bin({hex}),{c}]")).collect::<Vec<_>>().join("|"))
+        .collect::<Vec<_>>()
+        .join(";");
+
     let a = common::reserve_addr();
+    let dir = std::env::temp_dir().join(format!("ibex-tcp-options-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.cfg");
     let cfg = format!(
-        "global\n  stats socket {{sock}} level admin\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"%[bin(9c4001bb0102030400000000a002faf000000000020405b40402080a112233440000000001030307),tcp.options.mss]|%[bin(9c4001bb0102030400000000a002faf000000000020405b40402080a112233440000000001030307),tcp.options.sack]|%[bin(9c4001bb0102030400000000a002faf000000000020405b40402080a112233440000000001030307),tcp.options.tsopt]|%[bin(9c4001bb0102030400000000a002faf000000000020405b40402080a112233440000000001030307),tcp.options.tsval]|%[bin(9c4001bb0102030400000000a002faf000000000020405b40402080a112233440000000001030307),tcp.options.wscale]|%[bin(9c4001bb0102030400000000a002faf000000000020405b40402080a112233440000000001030307),tcp.options.wsopt]|%[bin(9c4001bb0102030400000000a002faf000000000020405b40402080a112233440000000001030307),tcp.options_list,hex]|%[bin(9c4001bb01020304000000005002faf000000000),tcp.options.mss]|%[bin(9c4001bb01020304000000005002faf000000000),tcp.options.sack]|%[bin(9c4001bb01020304000000005002faf000000000),tcp.options.tsopt]|%[bin(9c4001bb01020304000000005002faf000000000),tcp.options.tsval]|%[bin(9c4001bb01020304000000005002faf000000000),tcp.options.wscale]|%[bin(9c4001bb01020304000000005002faf000000000),tcp.options.wsopt]|%[bin(9c4001bb01020304000000005002faf000000000),tcp.options_list,hex]\"",
+        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"{lf}\"\n"
     );
-    let (ibex, _sock) = start("tcp_options", &cfg, &[a]);
-    let b = body(a, GET);
-    assert_eq!(b, "1460|1|1|287454020|7|1|0204080103|0|0|0|0|0|0|");
+    std::fs::write(&path, cfg).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let _ibex = Ibex(child, dir);
+    assert!(common::wait_listening(a), "ibex did not listen on {a}");
+
+    let mut s = TcpStream::connect_timeout(&a, Duration::from_secs(2)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n").unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let out = String::from_utf8_lossy(&out).into_owned();
+    let body = out.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {out:?}"), |(_, b)| b.to_string());
+
+    let got: Vec<&str> = body.split(';').collect();
+    assert_eq!(got.len(), rows.len(), "body: {body:?}");
+    let bad: Vec<String> =
+        rows.iter().zip(got).filter(|((_, want), got)| got != want).map(|((hex, want), got)| format!("{hex}: got {got:?}, want {want:?}")).collect();
+    assert!(bad.is_empty(), "rows differing from HAProxy:\n{}", bad.join("\n"));
 }
