@@ -1347,10 +1347,12 @@ impl CliApplet {
             return;
         } else if first == Some("all") {
             crate::engine::clear_proxy_counters(ctx.proxies, None);
+            crate::stats::SSL_MAX.store(0, std::sync::atomic::Ordering::Relaxed); // T320
             self.finish_msg("");
             return;
         } else {
             crate::engine::clear_proxy_maxima(ctx.proxies);
+            crate::stats::SSL_MAX.store(0, std::sync::atomic::Ordering::Relaxed); // T320
             self.finish_msg("");
             return;
         }
