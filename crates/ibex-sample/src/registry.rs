@@ -3164,6 +3164,28 @@ impl Registry {
                 Some(Sample::Str(out.join(delimiter)))
             },
         });
+        // T331: `tgroup`: the thread group, numbered from 0 (`tgid - 1`); always 0, Ibex
+        // refuses `thread-groups` over 1.
+        self.register_fetch(FetchDesc {
+            name: "tgroup",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(0)),
+        });
+        // T331: `master_id`: the master process's id in master-worker mode, none otherwise.
+        // Ibex's `-W` does not assign one yet (`mworker_prepare_master`: `HAPROXY_MASTER_ID`
+        // when it is a valid GUID, else a UUID v7), so it has no value: a known gap with
+        // `HAProxy` under `-W`. The environment is not read, as `HAProxy` does not without a master.
+        self.register_fetch(FetchDesc {
+            name: "master_id",
+            out_type: SampleType::Str,
+            func: |_ctx, _args| None,
+        });
+        // T331: `quic_enabled`: always 0, Ibex has no QUIC.
+        self.register_fetch(FetchDesc {
+            name: "quic_enabled",
+            out_type: SampleType::Bool,
+            func: |_ctx, _args| Some(Sample::Bool(false)),
+        });
     }
 
     /// T330: the TCP header length in bytes when `b` holds a complete TCP header (at least 20
