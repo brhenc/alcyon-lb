@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::cast::cast;
+use crate::cast::{cast, read_int64};
 use crate::hash::{
     full_hash, hash_crc32, hash_crc32c, hash_djb2, hash_sdbm, hash_wt6, hash_xxh3, hash_xxh32,
     hash_xxh64, md5_digest, sha1_digest, sha224_digest, sha256_digest, sha384_digest,
@@ -3001,12 +3001,15 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "add",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let n = resolve_int_arg(args.first()?)?;
                 match smp {
                     Sample::Sint(val) => Some(Sample::Sint(val.saturating_add(n))),
+                    Sample::Str(s) if !s.is_empty() => {
+                        Some(Sample::Sint(read_int64(s.as_bytes()).saturating_add(n)))
+                    }
                     _ => None,
                 }
             },
@@ -3014,7 +3017,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "sub",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let n = resolve_int_arg(args.first()?)?;
@@ -3027,7 +3030,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "mul",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let factor = resolve_int_arg(args.first()?)?;
@@ -3040,7 +3043,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "div",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let divisor = resolve_int_arg(args.first()?)?;
@@ -3056,7 +3059,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "mod",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let divisor = resolve_int_arg(args.first()?)?;
@@ -3072,7 +3075,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "neg",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Sint(n.saturating_neg())),
@@ -3082,7 +3085,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "and",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let mask = resolve_int_arg(args.first()?)?;
@@ -3095,7 +3098,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "or",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let mask = resolve_int_arg(args.first()?)?;
@@ -3108,7 +3111,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "xor",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
                 let mask = resolve_int_arg(args.first()?)?;
@@ -3121,7 +3124,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "cpl",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Sint(!n)),
@@ -3131,7 +3134,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "bool",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Bool),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Bool(n != 0)),
@@ -3142,7 +3145,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "not",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Bool),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Bool(n == 0)),
@@ -3153,7 +3156,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "odd",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Bool),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Bool((n & 1) != 0)),
@@ -3163,7 +3166,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "even",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Bool),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Bool((n & 1) == 0)),
@@ -3534,7 +3537,7 @@ impl Registry {
 
         self.register_converter(ConvDesc {
             name: "htonl",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Bin),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => Some(Sample::Bin(n.to_be_bytes()[4..8].to_vec())),
@@ -3928,7 +3931,7 @@ impl Registry {
         // --- 7. Time & Date Converters ---
         self.register_converter(ConvDesc {
             name: "http_date",
-            in_type: TypeSpec::Exact(SampleType::Sint),
+            in_type: TypeSpec::Any,
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, args| {
                 // `http_date([<offset>[,<unit>]])`: the unit (s, ms or us) is the input's and
@@ -3990,7 +3993,7 @@ impl Registry {
             };
             self.register_converter(ConvDesc {
                 name,
-                in_type: TypeSpec::Exact(SampleType::Sint),
+                in_type: TypeSpec::Any,
                 out_type: TypeSpec::Exact(SampleType::Str),
                 func,
             });
@@ -4496,6 +4499,23 @@ impl Registry {
                     Some(Sample::Bool(diff == 0))
                 }
                 _ => None,
+            },
+        });
+
+        // `x509_v_err_str`: convert an X.509 verification error code to its name (T328).
+        self.register_converter(ConvDesc {
+            name: "x509_v_err_str",
+            in_type: TypeSpec::Any,
+            out_type: TypeSpec::Exact(SampleType::Str),
+            func: |smp, _args| match smp {
+                Sample::Sint(code) => {
+                    if let Some(name) = x509_v_err_name(code) {
+                        Some(Sample::Str(name.to_string()))
+                    } else {
+                        Some(Sample::Str(code.cast_unsigned().to_string()))
+                    }
+                }
+                _ => Some(Sample::Str("X509_V_OK".to_string())),
             },
         });
     }
@@ -6329,6 +6349,109 @@ mod date_tests {
         assert_eq!(format_http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
         assert_eq!(format_http_date(1_709_164_800), "Thu, 29 Feb 2024 00:00:00 GMT");
     }
+}
+
+/// Returns the X.509 verification error name for a given error code (T328).
+/// Returns `None` for unknown codes.
+fn x509_v_err_name(code: i64) -> Option<&'static str> {
+    Some(match code {
+        0 => "X509_V_OK",
+        1 => "X509_V_ERR_UNSPECIFIED",
+        2 => "X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT",
+        3 => "X509_V_ERR_UNABLE_TO_GET_CRL",
+        4 => "X509_V_ERR_UNABLE_TO_DECRYPT_CERT_SIGNATURE",
+        5 => "X509_V_ERR_UNABLE_TO_DECRYPT_CRL_SIGNATURE",
+        6 => "X509_V_ERR_UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY",
+        7 => "X509_V_ERR_CERT_SIGNATURE_FAILURE",
+        8 => "X509_V_ERR_CRL_SIGNATURE_FAILURE",
+        9 => "X509_V_ERR_CERT_NOT_YET_VALID",
+        10 => "X509_V_ERR_CERT_HAS_EXPIRED",
+        11 => "X509_V_ERR_CRL_NOT_YET_VALID",
+        12 => "X509_V_ERR_CRL_HAS_EXPIRED",
+        13 => "X509_V_ERR_ERROR_IN_CERT_NOT_BEFORE_FIELD",
+        14 => "X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD",
+        15 => "X509_V_ERR_ERROR_IN_CRL_LAST_UPDATE_FIELD",
+        16 => "X509_V_ERR_ERROR_IN_CRL_NEXT_UPDATE_FIELD",
+        17 => "X509_V_ERR_OUT_OF_MEM",
+        18 => "X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT",
+        19 => "X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN",
+        20 => "X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+        21 => "X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+        22 => "X509_V_ERR_CERT_CHAIN_TOO_LONG",
+        23 => "X509_V_ERR_CERT_REVOKED",
+        24 => "X509_V_ERR_NO_ISSUER_PUBLIC_KEY",
+        25 => "X509_V_ERR_PATH_LENGTH_EXCEEDED",
+        26 => "X509_V_ERR_INVALID_PURPOSE",
+        27 => "X509_V_ERR_CERT_UNTRUSTED",
+        28 => "X509_V_ERR_CERT_REJECTED",
+        29 => "X509_V_ERR_SUBJECT_ISSUER_MISMATCH",
+        30 => "X509_V_ERR_AKID_SKID_MISMATCH",
+        31 => "X509_V_ERR_AKID_ISSUER_SERIAL_MISMATCH",
+        32 => "X509_V_ERR_KEYUSAGE_NO_CERTSIGN",
+        33 => "X509_V_ERR_UNABLE_TO_GET_CRL_ISSUER",
+        34 => "X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION",
+        35 => "X509_V_ERR_KEYUSAGE_NO_CRL_SIGN",
+        36 => "X509_V_ERR_UNHANDLED_CRITICAL_CRL_EXTENSION",
+        37 => "X509_V_ERR_INVALID_NON_CA",
+        38 => "X509_V_ERR_PROXY_PATH_LENGTH_EXCEEDED",
+        39 => "X509_V_ERR_KEYUSAGE_NO_DIGITAL_SIGNATURE",
+        40 => "X509_V_ERR_PROXY_CERTIFICATES_NOT_ALLOWED",
+        41 => "X509_V_ERR_INVALID_EXTENSION",
+        42 => "X509_V_ERR_INVALID_POLICY_EXTENSION",
+        43 => "X509_V_ERR_NO_EXPLICIT_POLICY",
+        44 => "X509_V_ERR_DIFFERENT_CRL_SCOPE",
+        45 => "X509_V_ERR_UNSUPPORTED_EXTENSION_FEATURE",
+        46 => "X509_V_ERR_UNNESTED_RESOURCE",
+        47 => "X509_V_ERR_PERMITTED_VIOLATION",
+        48 => "X509_V_ERR_EXCLUDED_VIOLATION",
+        49 => "X509_V_ERR_SUBTREE_MINMAX",
+        50 => "X509_V_ERR_APPLICATION_VERIFICATION",
+        51 => "X509_V_ERR_UNSUPPORTED_CONSTRAINT_TYPE",
+        52 => "X509_V_ERR_UNSUPPORTED_CONSTRAINT_SYNTAX",
+        53 => "X509_V_ERR_UNSUPPORTED_NAME_SYNTAX",
+        54 => "X509_V_ERR_CRL_PATH_VALIDATION_ERROR",
+        55 => "X509_V_ERR_PATH_LOOP",
+        56 => "X509_V_ERR_SUITE_B_INVALID_VERSION",
+        57 => "X509_V_ERR_SUITE_B_INVALID_ALGORITHM",
+        58 => "X509_V_ERR_SUITE_B_INVALID_CURVE",
+        59 => "X509_V_ERR_SUITE_B_INVALID_SIGNATURE_ALGORITHM",
+        60 => "X509_V_ERR_SUITE_B_LOS_NOT_ALLOWED",
+        61 => "X509_V_ERR_SUITE_B_CANNOT_SIGN_P_384_WITH_P_256",
+        62 => "X509_V_ERR_HOSTNAME_MISMATCH",
+        63 => "X509_V_ERR_EMAIL_MISMATCH",
+        64 => "X509_V_ERR_IP_ADDRESS_MISMATCH",
+        65 => "X509_V_ERR_DANE_NO_MATCH",
+        66 => "X509_V_ERR_EE_KEY_TOO_SMALL",
+        67 => "X509_V_ERR_CA_KEY_TOO_SMALL",
+        68 => "X509_V_ERR_CA_MD_TOO_WEAK",
+        69 => "X509_V_ERR_INVALID_CALL",
+        70 => "X509_V_ERR_STORE_LOOKUP",
+        71 => "X509_V_ERR_NO_VALID_SCTS",
+        72 => "X509_V_ERR_PROXY_SUBJECT_NAME_VIOLATION",
+        73 => "X509_V_ERR_OCSP_VERIFY_NEEDED",
+        74 => "X509_V_ERR_OCSP_VERIFY_FAILED",
+        75 => "X509_V_ERR_OCSP_CERT_UNKNOWN",
+        76 => "X509_V_ERR_UNSUPPORTED_SIGNATURE_ALGORITHM",
+        77 => "X509_V_ERR_SIGNATURE_ALGORITHM_MISMATCH",
+        78 => "X509_V_ERR_SIGNATURE_ALGORITHM_INCONSISTENCY",
+        79 => "X509_V_ERR_INVALID_CA",
+        80 => "X509_V_ERR_PATHLEN_INVALID_FOR_NON_CA",
+        81 => "X509_V_ERR_PATHLEN_WITHOUT_KU_KEY_CERT_SIGN",
+        82 => "X509_V_ERR_KU_KEY_CERT_SIGN_INVALID_FOR_NON_CA",
+        83 => "X509_V_ERR_ISSUER_NAME_EMPTY",
+        84 => "X509_V_ERR_SUBJECT_NAME_EMPTY",
+        85 => "X509_V_ERR_MISSING_AUTHORITY_KEY_IDENTIFIER",
+        86 => "X509_V_ERR_MISSING_SUBJECT_KEY_IDENTIFIER",
+        87 => "X509_V_ERR_EMPTY_SUBJECT_ALT_NAME",
+        88 => "X509_V_ERR_EMPTY_SUBJECT_SAN_NOT_CRITICAL",
+        89 => "X509_V_ERR_CA_BCONS_NOT_CRITICAL",
+        90 => "X509_V_ERR_AUTHORITY_KEY_IDENTIFIER_CRITICAL",
+        91 => "X509_V_ERR_SUBJECT_KEY_IDENTIFIER_CRITICAL",
+        92 => "X509_V_ERR_CA_CERT_MISSING_KEY_USAGE",
+        93 => "X509_V_ERR_EXTENSIONS_REQUIRE_VERSION_3",
+        94 => "X509_V_ERR_EC_KEY_EXPLICIT_PARAMS",
+        _ => return None,
+    })
 }
 
 /// A header capture as a sample: a string, or the bytes when a capture length cut a
