@@ -1729,12 +1729,18 @@ impl Registry {
             },
         });
 
+        // T327: capture.req.uri returns path+query only, without scheme/authority.
         self.register_fetch(FetchDesc {
             name: "capture.req.uri",
             out_type: SampleType::Str,
             func: |ctx, _args| {
                 let uri = get_context_uri(ctx)?;
-                Some(Sample::Str(uri.to_string()))
+                let (_prefix, path, query) = split_uri(uri);
+                if query.is_empty() {
+                    Some(Sample::Str(path.to_string()))
+                } else {
+                    Some(Sample::Str(format!("{path}?{query}")))
+                }
             },
         });
 
@@ -4615,18 +4621,10 @@ fn get_context_res_version<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
 }
 
 fn fetch_base(ctx: &SampleContext, _args: &[String]) -> Option<Sample> {
+    // T327: always use the Host header for the host part, even for absolute-form URIs.
     let uri = get_context_uri(ctx)?;
-    let (prefix, path, _) = split_uri(uri);
-    // One arm borrows from `uri`, the other returns an owned String from the header
-    // lookup, so both are normalised to String rather than fighting the lifetimes.
-    let host: String = if prefix.is_empty() {
-        get_req_header(ctx, "host").unwrap_or_default().clone()
-    } else {
-        prefix
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .to_string()
-    };
+    let (_prefix, path, _) = split_uri(uri);
+    let host: String = get_req_header(ctx, "host").unwrap_or_default().clone();
     Some(Sample::Str(format!("{host}{path}")))
 }
 
