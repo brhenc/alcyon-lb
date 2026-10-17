@@ -1295,6 +1295,12 @@ impl Registry {
             out_type: SampleType::Sint,
             func: req_hdr_cnt_fetch,
         });
+        // T302: req.hdrs fetch
+        self.register_fetch(FetchDesc {
+            name: "req.hdrs",
+            out_type: SampleType::Str,
+            func: |ctx, _args| req_header_block(ctx).map(Sample::Str),
+        });
         self.register_fetch(FetchDesc {
             name: "hdr_cnt",
             out_type: SampleType::Sint,
@@ -5112,6 +5118,22 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
         }
     }
     matches
+}
+
+/// T302: `req.hdrs` (`smp_fetch_hdrs`): the request's headers as the H1 parser stores them
+/// ([`crate::h1_clean::h1_clean_headers`]), each `name: value\r\n`, then the `\r\n` that ends
+/// them, there even when no header is. Read from the first request source present; `None`
+/// when there is no request.
+fn req_header_block(ctx: &SampleContext) -> Option<String> {
+    use crate::h1_clean::{h1_clean_headers, header_block};
+    let hdrs = if let Some(htx) = ctx.htx_slice {
+        h1_clean_headers(htx.headers(), true)
+    } else if let Some(htx) = ctx.htx {
+        h1_clean_headers(htx.headers().map(|hf| (hf.name.as_str(), hf.value.as_str())), true)
+    } else {
+        h1_clean_headers(ctx.req_headers?.iter().map(|(k, v)| (k.as_str(), v.as_str())), true)
+    };
+    Some(header_block(&hdrs))
 }
 
 /// The response's header `name`. Only the response is read: `ctx.htx_slice` holds the
