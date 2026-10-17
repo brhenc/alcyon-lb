@@ -17,6 +17,7 @@ mod common;
 
 mod aborted_client_waiting_for_server;
 mod abortonclose;
+mod absolute_uri;
 mod access_log;
 mod access_log_states;
 mod acl_bin_patterns;
