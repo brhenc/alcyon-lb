@@ -807,6 +807,25 @@ fn parse_http_req_rule_at(
             ));
         }
         let normalizer = tokens[2].text.clone();
+        match normalizer.as_str() {
+            "path-merge-slashes" | "query-sort-by-name" | "percent-to-uppercase" | "percent-decode-unreserved" | "fragment-strip" | "fragment-encode" => {}
+            // These rewrite the forwarded path differently from HAProxy (T359); a wrong
+            // rewrite can bypass a path ACL, so they are refused rather than run.
+            "path-strip-dot" | "path-strip-dotdot" => {
+                return Err(ConfigError::new(
+                    tokens[2].line,
+                    tokens[2].col,
+                    format!("normalize-uri {normalizer} is not implemented as HAProxy does it in Ibex yet (T359)."),
+                ));
+            }
+            _ => {
+                return Err(ConfigError::new(
+                    tokens[2].line,
+                    tokens[2].col,
+                    format!("unknown normalizer '{normalizer}'."),
+                ));
+            }
+        }
         let mut full = false;
         let mut strict = false;
         let cond_idx = find_cond_idx(tokens, 3);

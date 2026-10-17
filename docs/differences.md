@@ -273,3 +273,13 @@ in HAProxy).
 | Stalled HTTP/1 upload | 400 at 2x `timeout client` | 400 at 1x `timeout client` (stricter) (VV-9) | none needed |
 | TLS handshake that stalls | `timeout client` only | also `timeout http-request` (stricter) | none needed |
 | h2 connection that never sends a request | GOAWAY at `timeout http-request` | close at `timeout http-request` without GOAWAY | none needed |
+
+## `http-request normalize-uri`: two normalizers refused (T358, T359)
+
+`path-strip-dot` and `path-strip-dotdot` (with or without `full`) are refused at load:
+`normalize-uri <keyword> is not implemented as HAProxy does it in Ibex yet (T359)`
+(`ibex -c` exits 1, `haproxy -c` exits 0). Ibex's versions rewrote the path differently from
+HAProxy (for example `/a//b/../x` and a trailing `.`), which can bypass a path ACL. The
+other six normalizers give HAProxy's answers on the paths measured. An unknown normalizer
+is refused, as HAProxy does. Ibex does not yet require `expose-experimental-directives` for
+`normalize-uri` (HAProxy 3.5 does).
