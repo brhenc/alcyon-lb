@@ -1364,6 +1364,23 @@ impl Registry {
             out_type: SampleType::Str,
             func: |ctx, _args| req_header_block(ctx).map(Sample::Str),
         });
+
+        // T329: req.hdrs_bin (`smp_fetch_hdrs_bin`, src/http_fetch.c). No request headers at
+        // all, no sample, as HAProxy without an HTX message.
+        let req_hdrs_bin_fetch: FetchFn = |ctx, _args| {
+            if let Some(htx) = ctx.htx_slice {
+                return Some(hdrs_bin(htx.headers(), true));
+            }
+            if let Some(htx) = ctx.htx {
+                return Some(hdrs_bin(htx.headers().map(|hf| (hf.name.as_str(), hf.value.as_str())), true));
+            }
+            ctx.req_headers.map(|h| hdrs_bin(h.iter().map(|(k, v)| (k.as_str(), v.as_str())), true))
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.hdrs_bin",
+            out_type: SampleType::Bin,
+            func: req_hdrs_bin_fetch,
+        });
         self.register_fetch(FetchDesc {
             name: "hdr_cnt",
             out_type: SampleType::Sint,
@@ -7270,4 +7287,187 @@ fn x509_v_err_name(code: i64) -> Option<&'static str> {
 /// multi-byte character (captures are bytes, as in `HAProxy`).
 fn capture_sample(bytes: Vec<u8>) -> Sample {
     String::from_utf8(bytes).map_or_else(|e| Sample::Bin(e.into_bytes()), Sample::Str)
+}
+
+/// T329: `HAProxy`'s varint (`encode_varint`, include/haproxy/intops.h), as `req.hdrs_bin`
+/// and `res.hdrs_bin` write lengths: below 240 one byte; otherwise the low four bits of
+/// `i` with `0xF0` set, then seven bits per byte with `0x80` set on all but the last.
+fn encode_varint(out: &mut Vec<u8>, mut i: u64) {
+    let low = |v: u64| v.to_le_bytes()[0];
+    if i < 240 {
+        out.push(low(i));
+        return;
+    }
+    out.push(low(i) | 0xF0);
+    i = (i - 240) >> 4;
+    while i >= 128 {
+        out.push(low(i) | 0x80);
+        i = (i - 128) >> 7;
+    }
+    out.push(low(i));
+}
+
+#[cfg(test)]
+mod varint_tests {
+    use super::encode_varint;
+
+    fn enc(i: u64) -> Vec<u8> {
+        let mut v = Vec::new();
+        encode_varint(&mut v, i);
+        v
+    }
+
+    /// The decoder of include/haproxy/intops.h (`decode_varint`), to check round trips.
+    fn dec(b: &[u8]) -> u64 {
+        let mut i = u64::from(b[0]);
+        if i < 240 {
+            return i;
+        }
+        let mut r = 4;
+        for &c in &b[1..] {
+            i = i.wrapping_add(u64::from(c).wrapping_shl(r));
+            r += 7;
+        }
+        i
+    }
+
+    #[test]
+    fn boundaries() {
+        // Values measured on HAProxy 3.5-dev8 through req.hdrs_bin (239, 240, 300, 2287,
+        // 2288, 5000) and the C algorithm for the rest.
+        assert_eq!(enc(0), [0x00]);
+        assert_eq!(enc(239), [0xEF]);
+        assert_eq!(enc(240), [0xF0, 0x00]);
+        assert_eq!(enc(300), [0xFC, 0x03]);
+        assert_eq!(enc(2287), [0xFF, 0x7F]);
+        assert_eq!(enc(2288), [0xF0, 0x80, 0x00]);
+        assert_eq!(enc(4095), [0xFF, 0xF0, 0x00]);
+        assert_eq!(enc(4096), [0xF0, 0xF1, 0x00]);
+        assert_eq!(enc(5000), [0xF8, 0xA9, 0x01]);
+        assert_eq!(enc(1 << 20), [0xF0, 0xF1, 0xFE, 0x02]);
+        assert_eq!(enc(u64::MAX), [0xFF, 0xF0, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0x0E]);
+        for i in [0, 239, 240, 4095, 4096, 1 << 20, u64::MAX - 1, u64::MAX] {
+            assert_eq!(dec(&enc(i)), i, "{i}");
+        }
+    }
+}
+
+/// T329: `req.hdrs_bin` / `res.hdrs_bin` of a message's headers (`smp_fetch_hdrs_bin`): each
+/// header of [`h1_htx_headers`] as varint name length, lowercase name, varint value length,
+/// value; then two zero bytes.
+fn hdrs_bin<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>, request: bool) -> Sample {
+    let mut buf = Vec::new();
+    for (name, value) in h1_htx_headers(headers, request) {
+        encode_varint(&mut buf, name.len() as u64);
+        buf.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
+        encode_varint(&mut buf, value.len() as u64);
+        buf.extend_from_slice(value.as_bytes());
+    }
+    buf.extend_from_slice(&[0, 0]);
+    Sample::Bin(buf)
+}
+
+/// T329: The headers of an HTTP/1 message as `HAProxy` puts them in its HTX, which Ibex keeps
+/// as received. `Connection` loses its `close` and `keep-alive` tokens
+/// (`h1_parse_connection_header` with `H1_MF_CLEAN_CONN_HDR`) and `Upgrade` its `h2c` and
+/// `h2` ones (`h1_parse_upgrade_header`); a header left empty goes. For a request
+/// (`h1_postparse_req_hdrs`), `Upgrade` goes without a `Connection: upgrade`, and the
+/// `upgrade` token goes from `Connection` without an `Upgrade`. Names and order unchanged.
+fn h1_htx_headers<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>, request: bool) -> Vec<(&'a str, std::borrow::Cow<'a, str>)> {
+    let is = |w: &str, t: &str| w.eq_ignore_ascii_case(t);
+    let (mut conn_upg, mut upg_hdr) = (false, false);
+    let mut out = Vec::new();
+    for (name, value) in headers {
+        let value = if is(name, "connection") {
+            clean_header_list(value, |w| {
+                conn_upg |= is(w, "upgrade");
+                is(w, "close") || is(w, "keep-alive")
+            })
+        } else if is(name, "upgrade") {
+            let v = clean_header_list(value, |w| is(w, "h2c") || is(w, "h2"));
+            upg_hdr |= !v.is_empty();
+            v
+        } else {
+            std::borrow::Cow::Borrowed(value)
+        };
+        if !value.is_empty() || (!is(name, "connection") && !is(name, "upgrade")) {
+            out.push((name, value));
+        }
+    }
+    if request && upg_hdr && !conn_upg {
+        out.retain(|(n, _)| !is(n, "upgrade"));
+    } else if request && conn_upg && !upg_hdr {
+        out = out
+            .into_iter()
+            .filter_map(|(n, v)| {
+                if !is(n, "connection") {
+                    return Some((n, v));
+                }
+                let v = clean_header_list(&v, |w| is(w, "upgrade")).into_owned();
+                (!v.is_empty()).then_some((n, std::borrow::Cow::Owned(v)))
+            })
+            .collect();
+    }
+    out
+}
+
+/// T329: `HAProxy`'s in-place cleanup of a comma-separated header value
+/// (`h1_parse_connection_header`, `h1_parse_upgrade_header`, `http_remove_header_value`):
+/// the words `drop` matches (each trimmed of blanks; commas inside quotes do not split) go.
+/// Until one has gone the value is kept as written, up to the end of the last element
+/// kept; after that each kept word is appended trimmed, after a `,`.
+fn clean_header_list(value: &str, mut drop: impl FnMut(&str) -> bool) -> std::borrow::Cow<'_, str> {
+    let bytes = value.as_bytes();
+    let lws = |ch: u8| matches!(ch, b' ' | b'\t' | b'\r' | b'\n');
+    // The end of the element starting at `at`: the next comma outside quotes (`http_find_hdr_value_end`).
+    let elem_end = |mut at: usize| {
+        let (mut quoted, mut qdpair) = (false, false);
+        while at < bytes.len() {
+            let ch = bytes[at];
+            if qdpair {
+                qdpair = false;
+            } else if quoted {
+                if ch == b'\\' {
+                    qdpair = true;
+                } else if ch == b'"' {
+                    quoted = false;
+                }
+            } else if ch == b'"' {
+                quoted = true;
+            } else if ch == b',' {
+                return at;
+            }
+            at += 1;
+        }
+        at
+    };
+    let (mut start, mut elem_start, mut kept) = (0, 0, 0);
+    let mut rewritten: Option<String> = None;
+    while start < bytes.len() {
+        if lws(bytes[start]) {
+            start += 1;
+            continue;
+        }
+        let end = elem_end(start);
+        let mut word_end = end;
+        while word_end > start && lws(bytes[word_end - 1]) {
+            word_end -= 1;
+        }
+        let word = &value[start..word_end];
+        if !drop(word) {
+            match &mut rewritten {
+                None if kept == elem_start => kept = end,
+                None => rewritten = Some(if kept == 0 { word.to_string() } else { format!("{},{word}", &value[..kept]) }),
+                Some(r) => {
+                    if !r.is_empty() {
+                        r.push(',');
+                    }
+                    r.push_str(word);
+                }
+            }
+        }
+        elem_start = end;
+        start = end + 1;
+    }
+    rewritten.map_or(std::borrow::Cow::Borrowed(&value[..kept]), std::borrow::Cow::Owned)
 }
