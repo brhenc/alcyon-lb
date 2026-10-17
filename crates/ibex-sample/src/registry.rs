@@ -1323,6 +1323,47 @@ impl Registry {
             },
         });
 
+        // T329: res.hdrs - returns the full response header block as URL-encoded string
+        let res_hdrs_fetch: FetchFn = |ctx, _args| {
+            let mut result = String::new();
+            if let Some(headers) = ctx.res_headers {
+                for (k, v) in headers {
+                    // Lowercase the header name as HAProxy does
+                    let name_lower: String = k.to_ascii_lowercase();
+                    result.push_str(&name_lower);
+                    result.push_str(": ");
+                    result.push_str(v);
+                    result.push_str("\r\n");
+                }
+            } else {
+                CURRENT_RES_HEADERS.with(|hdrs| {
+                    for (k, v) in hdrs.borrow().iter() {
+                        let name_lower: String = k.to_ascii_lowercase();
+                        result.push_str(&name_lower);
+                        result.push_str(": ");
+                        result.push_str(v);
+                        result.push_str("\r\n");
+                    }
+                });
+            }
+            // Append the final empty line separating headers from body
+            result.push_str("\r\n");
+            // URL-encode control characters and DEL as %XX
+            let encoded: String = result.bytes().map(|b| {
+                if (32..127).contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            }).collect();
+            Some(Sample::Str(encoded))
+        };
+        self.register_fetch(FetchDesc {
+            name: "res.hdrs",
+            out_type: SampleType::Str,
+            func: res_hdrs_fetch,
+        });
+
         let req_hdr_val_fetch: FetchFn = |ctx, args| {
             let name = args.first()?;
             let val = get_req_header(ctx, name)?;
