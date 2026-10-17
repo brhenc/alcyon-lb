@@ -138,6 +138,7 @@ mod h2_response_body;
 mod h2_stream_entries;
 mod h2_stream_timers;
 mod h2_unread_output_timeout;
+mod h2_unread_response_memory;
 mod h3_end_to_end;
 mod h3_many_threads;
 mod h3_proxy_path;
