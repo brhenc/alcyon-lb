@@ -12072,7 +12072,9 @@ pub(crate) fn sample_to_string(smp: &Sample) -> String {
         Sample::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
         Sample::Ipv4(ip) => ip.to_string(),
         Sample::Ipv6(ip) => ip.to_string(),
-        Sample::Bin(b) => String::from_utf8_lossy(b).to_string(),
+        // T363a: the bytes as bytetext, so a variable gives them back (lossy UTF-8 replaced every
+        // byte from 0x80 up with U+FFFD).
+        Sample::Bin(b) => ibex_regex::bytetext::bytes_to_text(b),
         Sample::Meth(m) => m.as_str().to_string(),
     }
 }

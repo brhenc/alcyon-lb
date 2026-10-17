@@ -6054,7 +6054,8 @@ impl Registry {
                 Sample::Bin(b) => {
                     // The argument is a variable (refused otherwise at load, T341); when it is
                     // not set there is no sample (T327: an empty field in a log-format).
-                    let target_bytes: Vec<u8> = read_var(args.first()?)?.into_bytes();
+                    // T363a: the raw bytes of the variable, not the UTF-8 of its bytetext.
+                    let target_bytes: Vec<u8> = ibex_regex::bytetext::text_to_bytes(&read_var(args.first()?)?).into_owned();
 
                     if b.len() != target_bytes.len() {
                         return Some(Sample::Bool(false));
@@ -6531,7 +6532,8 @@ pub fn sample_to_string(smp: &Sample) -> String {
         }
         Sample::Ipv4(ip) => ip.to_string(),
         Sample::Ipv6(ip) => ip.to_string(),
-        Sample::Bin(b) => String::from_utf8_lossy(b).to_string(),
+        // T363a: bytetext, not lossy UTF-8 (see engine.rs `sample_to_string`).
+        Sample::Bin(b) => ibex_regex::bytetext::bytes_to_text(b),
         Sample::Meth(m) => m.as_str().to_string(),
     }
 }

@@ -422,6 +422,11 @@ Status: **resolved and measured** — cached lookups verified in `crates/ibex-sa
 
 ### 6.12 `str` samples and variables stay UTF-8 (`String`), not arbitrary bytes — **decided 2026-10-10: leave unimplemented**
 
+> **Revisited 2026-10-17 (T363a, T364).** Bytes are now kept losslessly (bytetext; before T363a a binary sample stored in
+> a variable lost every byte >= 0x80 to U+FFFD, which broke `secure_memcmp` against a decoded hash). What remains is
+> the lost **type**: a variable is always `str`, so HAProxy's `bin -> str` NUL cut and typed `set-var` conditions differ
+> (measured table in tasks/T364-typed-variables.md; reg-tests `hashes.vtc`, `cond_set_var.vtc`). T364 plans typed variables.
+
 | | |
 |---|---|
 | **Gained** | Every `str` sample, variable and log field is a Rust `String`: valid UTF-8 by construction, so no converter, regex or log writer has to handle invalid sequences, and `fancy-regex` (which has no byte API) can match every subject. No migration of ~1,200 lines of sample/variable code and ~290 test sites (cost measured by T272 D2, `tasks/T272-progress.md` on agy/T272D f6652b4). |
