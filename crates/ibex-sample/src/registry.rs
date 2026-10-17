@@ -1436,6 +1436,26 @@ impl Registry {
             func: cook_cnt_fetch,
         });
 
+        let cook_names_fetch: FetchFn = |ctx, args| {
+            // T326
+            let delim = args.first().and_then(|s| s.chars().next()).unwrap_or(',');
+            let cookie_hdrs = get_all_req_headers(ctx, "cookie");
+            let mut names = Vec::new();
+            for hdr in cookie_hdrs {
+                for (k, _) in extract_cookies(&hdr) {
+                    names.push(k.to_string());
+                }
+            }
+            let joined = names.join(&delim.to_string());
+            Some(Sample::Str(joined))
+        };
+        self.register_fetch(FetchDesc {
+            name: "req.cook_names",
+            out_type: SampleType::Str,
+            func: cook_names_fetch,
+        });
+
+
         self.register_fetch(FetchDesc {
             name: "res.cook_cnt",
             out_type: SampleType::Sint,
@@ -3894,7 +3914,7 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, args| match smp {
                 Sample::Str(s) => {
-                    let mode = args.first().map(|x| x.as_str()).unwrap_or("");
+                    let mode = args.first().map_or("", |x| x.as_str());
                     // A byte that is not UTF-8 is held as an escape character (T286), and
                     // U+FFFD is the replacement character itself.
                     let invalid = |c: char| c == '\u{FFFD}' || ibex_regex::bytetext::unescape_char(c).is_some();
