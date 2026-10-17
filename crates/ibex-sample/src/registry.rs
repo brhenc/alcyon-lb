@@ -1323,6 +1323,18 @@ impl Registry {
             },
         });
 
+        self.register_fetch(FetchDesc {
+            name: "res.hdr_names",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let names = get_all_res_header_names(ctx);
+                let delim = args.first().map_or(",", |s| s.as_str());
+                let delim_char = delim.chars().next()?;
+                let s = names.join(&delim_char.to_string());
+                Some(Sample::Str(s))
+            },
+        });
+
         let req_hdr_val_fetch: FetchFn = |ctx, args| {
             let name = args.first()?;
             let val = get_req_header(ctx, name)?;
@@ -4918,6 +4930,24 @@ fn get_all_res_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
         });
     }
     matches
+}
+
+/// T326: The response header names (not values), as a `Vec<String>`.
+fn get_all_res_header_names(ctx: &SampleContext) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(headers) = ctx.res_headers {
+        for (k, _v) in headers {
+            names.push(k.to_ascii_lowercase());
+        }
+    }
+    if names.is_empty() {
+        CURRENT_RES_HEADERS.with(|hdrs| {
+            for (k, _v) in hdrs.borrow().iter() {
+                names.push(k.to_ascii_lowercase());
+            }
+        });
+    }
+    names
 }
 
 fn extract_cookies(cookie_header: &str) -> Vec<(&str, &str)> {
