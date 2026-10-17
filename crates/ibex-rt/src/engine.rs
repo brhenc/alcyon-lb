@@ -13701,6 +13701,7 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Pr
                     proxies: Some(&ProxiesView(proxies)),
                     client_addr: sess.client_addr,
                     fc_src: sess.fc_src,
+                    proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
                     so_name: sess.so_name.as_deref(),
                     so_id: sess.so_id,
                     fc_dst: sess.fc_dst,
