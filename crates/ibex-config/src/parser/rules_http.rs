@@ -808,16 +808,8 @@ fn parse_http_req_rule_at(
         }
         let normalizer = tokens[2].text.clone();
         match normalizer.as_str() {
-            "path-merge-slashes" | "query-sort-by-name" | "percent-to-uppercase" | "percent-decode-unreserved" | "fragment-strip" | "fragment-encode" => {}
-            // These rewrite the forwarded path differently from HAProxy (T359); a wrong
-            // rewrite can bypass a path ACL, so they are refused rather than run.
-            "path-strip-dot" | "path-strip-dotdot" => {
-                return Err(ConfigError::new(
-                    tokens[2].line,
-                    tokens[2].col,
-                    format!("normalize-uri {normalizer} is not implemented as HAProxy does it in Ibex yet (T359)."),
-                ));
-            }
+            "path-merge-slashes" | "query-sort-by-name" | "percent-to-uppercase" | "percent-decode-unreserved" | "fragment-strip" | "fragment-encode"
+            | "path-strip-dot" | "path-strip-dotdot" => {}
             _ => {
                 return Err(ConfigError::new(
                     tokens[2].line,
@@ -826,17 +818,38 @@ fn parse_http_req_rule_at(
                 ));
             }
         }
-        let mut full = false;
-        let mut strict = false;
+        // One option, and only where HAProxy takes it (`parse_http_normalize_uri`): `full` after
+        // path-strip-dotdot, `strict` after the two percent normalizers; anything else before
+        // the condition is refused with HAProxy's message.
+        let option = match normalizer.as_str() {
+            "path-strip-dotdot" => Some("full"),
+            "percent-to-uppercase" | "percent-decode-unreserved" => Some("strict"),
+            _ => None,
+        };
         let cond_idx = find_cond_idx(tokens, 3);
         let limit = cond_idx.unwrap_or(tokens.len());
-        for tok in &tokens[3..limit] {
-            if tok.text == "full" {
-                full = true;
-            } else if tok.text == "strict" {
-                strict = true;
+        let mut next = 3;
+        let mut flag = false;
+        if let (Some(opt), Some(tok)) = (option, tokens.get(3).filter(|_| limit > 3)) {
+            if tok.text != opt {
+                return Err(ConfigError::new(
+                    tok.line,
+                    tok.col,
+                    format!("unknown argument '{}' for '{normalizer}' normalizer.", tok.text),
+                ));
             }
+            flag = true;
+            next = 4;
         }
+        if let Some(tok) = tokens.get(next).filter(|_| limit > next) {
+            return Err(ConfigError::new(
+                tok.line,
+                tok.col,
+                format!("'http-request normalize-uri' expects either 'if' or 'unless' followed by a condition but found '{}'.", tok.text),
+            ));
+        }
+        let full = flag && option == Some("full");
+        let strict = flag && option == Some("strict");
         let cond = if let Some(idx) = cond_idx {
             parse_acl_condition_from_tokens(&tokens[idx..])?
         } else {
