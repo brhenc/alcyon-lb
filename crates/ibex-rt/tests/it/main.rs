@@ -354,3 +354,4 @@ mod websocket_handshake;
 mod when_applet;
 mod when_error_retries;
 mod x509_v_err_str;
+mod xxh32_xxh64;

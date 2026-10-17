@@ -176,6 +176,7 @@ pub fn hash_xxh32(input: &[u8], seed: u32) -> u32 {
     const PRIME32_5: u32 = 0x1656_67B1;
 
     let len = input.len();
+    let len_u32 = u32::try_from(len & 0xFFFF_FFFF).unwrap_or(0);
     let mut h32: u32;
 
     if len >= 16 {
@@ -202,6 +203,8 @@ pub fn hash_xxh32(input: &[u8], seed: u32) -> u32 {
             .wrapping_add(v2.rotate_left(7))
             .wrapping_add(v3.rotate_left(12))
             .wrapping_add(v4.rotate_left(18));
+        // T327: the length is added before the 4-byte and 1-byte tails, as in xxHash.
+        h32 = h32.wrapping_add(len_u32);
 
         let rem = chunks.remainder();
         let mut rem_chunks = rem.chunks_exact(4);
@@ -213,7 +216,7 @@ pub fn hash_xxh32(input: &[u8], seed: u32) -> u32 {
             h32 = h32.wrapping_add(u32::from(b).wrapping_mul(PRIME32_5)).rotate_left(11).wrapping_mul(PRIME32_1);
         }
     } else {
-        h32 = seed.wrapping_add(PRIME32_5);
+        h32 = seed.wrapping_add(PRIME32_5).wrapping_add(len_u32);
         let mut chunks = input.chunks_exact(4);
         for chunk in &mut chunks {
             let val = u32::from_le_bytes(chunk.try_into().unwrap_or([0; 4]));
@@ -223,9 +226,6 @@ pub fn hash_xxh32(input: &[u8], seed: u32) -> u32 {
             h32 = h32.wrapping_add(u32::from(b).wrapping_mul(PRIME32_5)).rotate_left(11).wrapping_mul(PRIME32_1);
         }
     }
-
-    let len_u32 = u32::try_from(len & 0xFFFF_FFFF).unwrap_or(0);
-    h32 = h32.wrapping_add(len_u32);
 
     h32 ^= h32 >> 15;
     h32 = h32.wrapping_mul(PRIME32_2);
@@ -245,6 +245,7 @@ pub fn hash_xxh64(input: &[u8], seed: u64) -> u64 {
     const PRIME64_5: u64 = 0x27D4_EB2F_1656_67C5;
 
     let len = input.len();
+    let len_u64 = u64::try_from(len).unwrap_or(u64::MAX);
     let mut h64: u64;
 
     if len >= 32 {
@@ -282,6 +283,8 @@ pub fn hash_xxh64(input: &[u8], seed: u64) -> u64 {
         h64 = merge_round(h64, v2);
         h64 = merge_round(h64, v3);
         h64 = merge_round(h64, v4);
+        // T327: the length is added before the 8, 4 and 1-byte tails, as in xxHash.
+        h64 = h64.wrapping_add(len_u64);
 
         let rem = chunks.remainder();
         let mut rem_8 = rem.chunks_exact(8);
@@ -300,7 +303,7 @@ pub fn hash_xxh64(input: &[u8], seed: u64) -> u64 {
             h64 = (h64 ^ (u64::from(b).wrapping_mul(PRIME64_5))).rotate_left(11).wrapping_mul(PRIME64_1);
         }
     } else {
-        h64 = seed.wrapping_add(PRIME64_5);
+        h64 = seed.wrapping_add(PRIME64_5).wrapping_add(len_u64);
         let mut chunks_8 = input.chunks_exact(8);
         for chunk in &mut chunks_8 {
             let val = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
@@ -317,9 +320,6 @@ pub fn hash_xxh64(input: &[u8], seed: u64) -> u64 {
             h64 = (h64 ^ (u64::from(b).wrapping_mul(PRIME64_5))).rotate_left(11).wrapping_mul(PRIME64_1);
         }
     }
-
-    let len_u64 = u64::try_from(len).unwrap_or(u64::MAX);
-    h64 = h64.wrapping_add(len_u64);
 
     h64 ^= h64 >> 33;
     h64 = h64.wrapping_mul(PRIME64_2);
@@ -975,6 +975,47 @@ mod tests {
         assert_eq!(hash_sdbm(b""), 0);
         assert_eq!(hash_wt6(b""), 0xa53c_965a ^ 0x5ca6_953a);
         assert_eq!(full_hash(0), 2_874_071_335);
+    }
+
+    // T327: reference values from the xxHash library.
+    #[test]
+    fn test_xxh32_xxh64_reference_values() {
+        assert_eq!(hash_xxh32(b"", 0), 46_947_589);
+        assert_eq!(hash_xxh32(b"", 7), 3_618_484_216);
+        assert_eq!(hash_xxh32(b"abc", 0), 852_579_327);
+        assert_eq!(hash_xxh32(b"abc", 7), 1_473_238_068);
+        assert_eq!(hash_xxh32(b"0123456789abcdef0123456789abcdef0123456789", 0), 946_835_922);
+        assert_eq!(hash_xxh32(b"0123456789abcdef0123456789abcdef0123456789", 7), 1_649_559_800);
+        assert_eq!(hash_xxh32(b"/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 0), 73_530_813);
+        assert_eq!(hash_xxh32(b"/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 7), 474_576_879);
+        assert_eq!(hash_xxh32(b"xxxxxxxxxxxxxxx", 0), 775_798_960);
+        assert_eq!(hash_xxh32(b"xxxxxxxxxxxxxxx", 7), 2_121_582_841);
+        assert_eq!(hash_xxh32(b"xxxxxxxxxxxxxxxx", 0), 404_385_805);
+        assert_eq!(hash_xxh32(b"xxxxxxxxxxxxxxxx", 7), 489_421_101);
+        assert_eq!(hash_xxh32(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 0), 1_805_892_444);
+        assert_eq!(hash_xxh32(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 7), 1_453_537_602);
+        assert_eq!(hash_xxh32(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 0), 634_320_413);
+        assert_eq!(hash_xxh32(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 7), 157_744_070);
+        assert_eq!(hash_xxh32(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 0), 827_008_391);
+        assert_eq!(hash_xxh32(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 7), 2_690_349_968);
+        assert_eq!(hash_xxh64(b"", 0), 17_241_709_254_077_376_921);
+        assert_eq!(hash_xxh64(b"", 7), 10_804_243_736_805_655_561);
+        assert_eq!(hash_xxh64(b"abc", 0), 4_952_883_123_889_572_249);
+        assert_eq!(hash_xxh64(b"abc", 7), 11_418_122_616_350_078_679);
+        assert_eq!(hash_xxh64(b"0123456789abcdef0123456789abcdef0123456789", 0), 12_061_080_447_169_366_556);
+        assert_eq!(hash_xxh64(b"0123456789abcdef0123456789abcdef0123456789", 7), 11_302_734_519_168_897_934);
+        assert_eq!(hash_xxh64(b"/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 0), 11_828_475_853_359_227_548);
+        assert_eq!(hash_xxh64(b"/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 7), 11_709_112_072_634_730_519);
+        assert_eq!(hash_xxh64(b"xxxxxxxxxxxxxxx", 0), 666_370_080_032_661_129);
+        assert_eq!(hash_xxh64(b"xxxxxxxxxxxxxxx", 7), 2_253_607_150_921_292_292);
+        assert_eq!(hash_xxh64(b"xxxxxxxxxxxxxxxx", 0), 392_565_628_354_714_129);
+        assert_eq!(hash_xxh64(b"xxxxxxxxxxxxxxxx", 7), 8_590_529_216_852_772_882);
+        assert_eq!(hash_xxh64(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 0), 6_979_749_295_578_388_976);
+        assert_eq!(hash_xxh64(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 7), 3_999_705_164_144_088_606);
+        assert_eq!(hash_xxh64(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 0), 16_347_827_090_234_290_411);
+        assert_eq!(hash_xxh64(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 7), 4_603_572_048_508_418_820);
+        assert_eq!(hash_xxh64(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 0), 12_968_755_452_232_992_934);
+        assert_eq!(hash_xxh64(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 7), 11_510_564_044_383_467_968);
     }
 
     mod hex {

@@ -4332,7 +4332,9 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let seed = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+                // `unsigned int seed = arg_p->data.sint`: the low 32 bits.
+                let [s0, s1, s2, s3, ..] = args.first().and_then(|s| crate::cast::parse_sint_arg(s)).unwrap_or(0).to_le_bytes();
+                let seed = u32::from_le_bytes([s0, s1, s2, s3]);
                 match smp {
                     Sample::Bin(b) => Some(Sample::Sint(i64::from(hash_xxh32(&b, seed)))),
                     _ => None,
@@ -4345,7 +4347,8 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let seed = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+                // `(unsigned long long int)arg_p->data.sint`.
+                let seed = u64::from_ne_bytes(args.first().and_then(|s| crate::cast::parse_sint_arg(s)).unwrap_or(0).to_ne_bytes());
                 match smp {
                     Sample::Bin(b) => {
                         let h = hash_xxh64(&b, seed);
@@ -7199,6 +7202,11 @@ fn hmac_key_is_var(key: &str) -> bool {
 #[must_use]
 pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
     match name {
+        // `ARG1(0,SINT)`: a seed that is no integer is refused, not hashed with as 0.
+        "xxh32" | "xxh64" => args
+            .first()
+            .filter(|a| crate::cast::parse_sint_arg(a).is_none())
+            .map(|a| format!("invalid arg 1 in converter '{name}' : failed to parse '{a}' as type 'integer' at position 1.")),
         _ if name.starts_with("map_") && crate::patref::converter_map(name).is_some() => {
             let (keys, vals) = crate::patref::converter_map(name)?;
             let path = args.first()?.trim_matches(['"', '\'']);
