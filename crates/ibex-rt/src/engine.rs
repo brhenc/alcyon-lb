@@ -8777,6 +8777,15 @@ impl EngineDispatcher<'_> {
                     txn.close_after = true;
                     txn.aborted = true;
                     txn.keepalive_lost = true;
+                    // On HTTP/2 that is the stream alone, reset `REFUSED_STREAM` (the
+                    // client may retry it), and the connection and its other streams go
+                    // on: measured on `HAProxy` 3.5-dev8 (T324). Its client side is done,
+                    // so the close that follows sends no FIN for the whole connection.
+                    if let Some(c) = entry.sess.h2_child_mut() {
+                        c.rst = Some(ibex_proto::h2::H2Error::RefusedStream);
+                        c.finished = true;
+                        entry.sess.cli_state = ScState::Closed;
+                    }
                     return;
                 }
                 if status == 502 {
