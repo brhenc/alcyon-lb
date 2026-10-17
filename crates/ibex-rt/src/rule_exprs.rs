@@ -92,11 +92,12 @@ pub fn check_sample_expr(expr: &str, registry: &Registry) -> Result<(), String> 
             return Err(format!("unknown converter '{conv}'"));
         }
     }
-    if let Ok(parsed) = ibex_sample::Expr::parse(word) {
-        for (name, args) in &parsed.converters {
-            if let Some(msg) = ibex_sample::check_converter_args(name, args) {
-                return Err(msg);
-            }
+    // An expression that does not parse would answer nothing on every request (T341:
+    // `hmac(sha256,var(txn.k))`, an unclosed argument, text after one).
+    let parsed = ibex_sample::Expr::parse(word)?;
+    for (name, args) in &parsed.converters {
+        if let Some(msg) = ibex_sample::check_converter_args(name, args) {
+            return Err(msg);
         }
     }
     Ok(())

@@ -602,6 +602,9 @@ fn test_bare_non_numeric_converter_args_rejected() {
         "int(100),and(bad)",
         "int(100),or(flag)",
         "int(100),xor(mask)",
+        // T341: parentheses do not nest in an argument; HAProxy 3.5-dev8: "invalid args in
+        // converter 'add' : expects an integer or a variable name."
+        "int(100),add(var(req.offset))",
     ];
 
     for expr_str in invalid_expressions {
@@ -618,7 +621,6 @@ fn test_bare_non_numeric_converter_args_rejected() {
         "int(100),add(-5)",
         "int(100),add(0x10)",
         "int(100),add(proc.delta)",
-        "int(100),add(var(req.offset))",
         "int(100),mul(3)",
     ];
 

@@ -120,12 +120,10 @@ impl Expr {
 
         let (expr_part, matcher_part) = split_expr_and_matcher(input);
         let m_tokens = matcher_part.map(tokenize_matcher_part).unwrap_or_default();
-        let chain = split_call_chain(expr_part);
-        if chain.is_empty() {
+        let mut chain = parse_chain(expr_part)?.into_iter();
+        let Some((mut fetch_name, fetch_args)) = chain.next() else {
             return Err("Missing expression".to_string());
-        }
-
-        let (mut fetch_name, fetch_args) = parse_call(chain[0]);
+        };
         if fetch_name.is_empty()
             || !fetch_name
                 .chars()
@@ -135,8 +133,7 @@ impl Expr {
         }
 
         let mut converters = Vec::new();
-        for conv_str in &chain[1..] {
-            let (c_name, c_args) = parse_call(conv_str);
+        for (c_name, c_args) in chain {
             if c_name.is_empty()
                 || !c_name
                     .chars()
@@ -511,8 +508,14 @@ fn split_expr_and_matcher(input: &str) -> (&str, Option<&str>) {
     let mut in_quote = None;
     let mut split_pos = None;
 
+    let mut escaped = false;
     for (i, ch) in input.char_indices() {
-        if let Some(q) = in_quote {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && in_quote != Some('\'') {
+            // `make_arg_list` escapes only these; `\)` still closes the arguments.
+            escaped = matches!(input.as_bytes().get(i + 1), Some(b'\\' | b' ' | b'"' | b'\''));
+        } else if let Some(q) = in_quote {
             if ch == q {
                 in_quote = None;
             }
@@ -535,92 +538,99 @@ fn split_expr_and_matcher(input: &str) -> (&str, Option<&str>) {
     }
 }
 
-fn split_call_chain(expr_part: &str) -> Vec<&str> {
-    let mut calls = Vec::new();
-    let mut paren_depth = 0usize;
-    let mut in_quote = None;
-    let mut start = 0;
-
-    for (i, ch) in expr_part.char_indices() {
-        if let Some(q) = in_quote {
-            if ch == q {
-                in_quote = None;
-            }
-        } else if ch == '"' || ch == '\'' {
-            in_quote = Some(ch);
-        } else if ch == '(' {
-            paren_depth += 1;
-        } else if ch == ')' {
-            paren_depth = paren_depth.saturating_sub(1);
-        } else if ch == ',' && paren_depth == 0 {
-            calls.push(&expr_part[start..i]);
-            start = i + 1;
-        }
-    }
-    if start < expr_part.len() {
-        calls.push(&expr_part[start..]);
-    }
-    calls
-}
-
-fn unquote_arg(arg: &str) -> &str {
-    if (arg.starts_with('"') && arg.ends_with('"') && arg.len() >= 2)
-        || (arg.starts_with('\'') && arg.ends_with('\'') && arg.len() >= 2)
-    {
-        &arg[1..arg.len() - 1]
-    } else {
-        arg
-    }
-}
-
-/// `str( x )` is the string " x ": the one fetch whose argument is data keeps its
-/// whitespace; every other argument is trimmed.
-fn trim_arg<'a>(name: &str, arg: &'a str) -> &'a str {
-    if name == "str" { arg } else { arg.trim() }
-}
-
-fn parse_call(input: &str) -> (String, Vec<String>) {
-    let input = input.trim();
-    if let Some(open_idx) = input.find('(') {
-        let name = input[..open_idx].trim().to_string();
-        let rest = &input[open_idx + 1..];
-        let args_str = rest.rfind(')').map_or(rest, |close_idx| &rest[..close_idx]);
-
+/// The fetch and converters of `expr_part`, each with its arguments: `sample_parse_expr`'s
+/// walk. A name runs to `(` or `,`; its arguments are `make_arg_list`'s ([`scan_arg`]); after
+/// them comes `,` or the end.
+fn parse_chain(expr_part: &str) -> Result<Vec<(String, Vec<String>)>, String> {
+    let b = expr_part.as_bytes();
+    let mut calls: Vec<(String, Vec<String>)> = Vec::new();
+    let mut pos = 0;
+    loop {
+        let name_end = b[pos..].iter().position(|c| matches!(c, b'(' | b',')).map_or(b.len(), |n| pos + n);
+        let name = expr_part[pos..name_end].trim().to_string();
+        pos = name_end;
         let mut args = Vec::new();
-        let mut paren_depth = 0usize;
-        let mut in_quote = None;
-        let mut start = 0;
-
-        for (i, ch) in args_str.char_indices() {
-            if let Some(q) = in_quote {
-                if ch == q {
-                    in_quote = None;
+        if b.get(pos) == Some(&b'(') {
+            pos += 1;
+            loop {
+                let (arg, stop) = scan_arg(b, &mut pos);
+                args.push(arg);
+                match stop {
+                    Some(b',') => pos += 1,
+                    Some(_) => {
+                        pos += 1;
+                        break;
+                    }
+                    None => {
+                        return Err(if calls.is_empty() {
+                            format!("fetch method '{name}' : expected ')'")
+                        } else {
+                            // HAProxy counts the empty argument a missing paren leaves.
+                            let n = if args.len() > 1 { args.len() - 1 } else { args.len() };
+                            format!("invalid arg {} in converter '{name}' : expected ')'", n + 1)
+                        });
+                    }
                 }
-            } else if ch == '"' || ch == '\'' {
-                in_quote = Some(ch);
-            } else if ch == '(' {
-                paren_depth += 1;
-            } else if ch == ')' {
-                paren_depth = paren_depth.saturating_sub(1);
-            } else if ch == ',' && paren_depth == 0 {
-                let arg = trim_arg(&name, &args_str[start..i]);
-                let unquoted = unquote_arg(arg);
-                args.push(unquoted.to_string());
-                start = i + 1;
+            }
+            // `f()` has no argument; `f(,)` has two empty ones.
+            if args.len() == 1 && args[0].is_empty() {
+                args.clear();
             }
         }
-        if start <= args_str.len() {
-            let arg = trim_arg(&name, &args_str[start..]);
-            if !arg.is_empty() || !args.is_empty() {
-                let unquoted = unquote_arg(arg);
-                args.push(unquoted.to_string());
+        let first = calls.is_empty();
+        calls.push((name, args));
+        match b.get(pos) {
+            None => return Ok(calls),
+            Some(b',') => pos += 1,
+            Some(_) if first => return Err("missing comma after fetch keyword".to_string()),
+            Some(_) => {
+                // HAProxy checks a converter's arguments (`val_args`) before it looks for the
+                // comma after them: `hmac(sha256,var(txn.k))` is refused for its key.
+                let (name, args) = calls.last().map_or(("", &[][..]), |c| (c.0.as_str(), c.1.as_slice()));
+                return Err(crate::registry::check_converter_args(name, args)
+                    .unwrap_or_else(|| format!("missing comma after converter '{name}'")));
             }
         }
-
-        (name, args)
-    } else {
-        (input.to_string(), Vec::new())
     }
+}
+
+/// One argument from `b[*pos..]`, as `make_arg_list` (src/arg.c) reads it: blanks are kept;
+/// a quote toggles quoting wherever it is and is dropped; outside single quotes a backslash
+/// escapes `\`, a blank, `"` and `'`, makes `\r`, `\n` and `\t` control characters, and stays
+/// before anything else; an unquoted `,` or `)` ends the argument, and is returned (`None` at
+/// the end of the text). `*pos` is left on the character that stopped it.
+fn scan_arg(b: &[u8], pos: &mut usize) -> (String, Option<u8>) {
+    let (mut squote, mut dquote) = (false, false);
+    let mut out = Vec::new();
+    while let Some(&c) = b.get(*pos) {
+        match c {
+            b'"' if !squote => dquote = !dquote,
+            b'\'' if !dquote => squote = !squote,
+            b'\\' if !squote && *pos + 1 < b.len() => match b[*pos + 1] {
+                n @ (b'\\' | b' ' | b'"' | b'\'') => {
+                    out.push(n);
+                    *pos += 1;
+                }
+                b'r' => {
+                    out.push(b'\r');
+                    *pos += 1;
+                }
+                b'n' => {
+                    out.push(b'\n');
+                    *pos += 1;
+                }
+                b't' => {
+                    out.push(b'\t');
+                    *pos += 1;
+                }
+                _ => out.push(b'\\'),
+            },
+            b',' | b')' if !squote && !dquote => return (String::from_utf8_lossy(&out).into_owned(), Some(c)),
+            _ => out.push(c),
+        }
+        *pos += 1;
+    }
+    (String::from_utf8_lossy(&out).into_owned(), None)
 }
 
 fn tokenize_matcher_part(input: &str) -> Vec<String> {
