@@ -4345,6 +4345,156 @@ impl Registry {
             },
         });
 
+        // T330: ip.src - source address from IP packet
+        self.register_converter(ConvDesc {
+            name: "ip.src",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Addr,
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let ver = b.first()? >> 4;
+                    match ver {
+                        4 => {
+                            if b.len() < 20 {
+                                return None;
+                            }
+                            let octets: [u8; 4] = b[12..16].try_into().ok()?;
+                            Some(Sample::Ipv4(Ipv4Addr::from(octets)))
+                        }
+                        6 => {
+                            if b.len() < 40 {
+                                return None;
+                            }
+                            let octets: [u8; 16] = b[8..24].try_into().ok()?;
+                            Some(Sample::Ipv6(Ipv6Addr::from(octets)))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        });
+
+        // T330: ip.dst - destination address from IP packet
+        self.register_converter(ConvDesc {
+            name: "ip.dst",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Addr,
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let ver = b.first()? >> 4;
+                    match ver {
+                        4 => {
+                            if b.len() < 24 {
+                                return None;
+                            }
+                            let octets: [u8; 4] = b[16..20].try_into().ok()?;
+                            Some(Sample::Ipv4(Ipv4Addr::from(octets)))
+                        }
+                        6 => {
+                            if b.len() < 56 {
+                                return None;
+                            }
+                            let octets: [u8; 16] = b[24..40].try_into().ok()?;
+                            Some(Sample::Ipv6(Ipv6Addr::from(octets)))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        });
+
+        // T330: ip.hdr - IP header bytes (IPv4: IHL*4; IPv6: 40 + extension headers)
+        self.register_converter(ConvDesc {
+            name: "ip.hdr",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let ver = b.first()? >> 4;
+                    match ver {
+                        4 => {
+                            if b.len() < 20 {
+                                return None;
+                            }
+                            let ihl = usize::from(b[0] & 0x0f) * 4;
+                            if ihl < 20 || ihl > b.len() {
+                                return None;
+                            }
+                            Some(Sample::Bin(b[..ihl].to_vec()))
+                        }
+                        6 => {
+                            if b.len() < 40 {
+                                return None;
+                            }
+                            let mut next = *b.get(6)?;
+                            let mut len = 40usize;
+                            while next != 6 && next != 17 {
+                                if b.len() < len + 2 {
+                                    return None;
+                                }
+                                let ext_len = usize::from(*b.get(len + 1)?) * 8 + 8;
+                                next = *b.get(len)?;
+                                len += ext_len;
+                            }
+                            if len > b.len() {
+                                return None;
+                            }
+                            Some(Sample::Bin(b[..len].to_vec()))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        });
+
+        // T330: ip.data - payload after IP header
+        self.register_converter(ConvDesc {
+            name: "ip.data",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Bin),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    let ver = b.first()? >> 4;
+                    match ver {
+                        4 => {
+                            if b.len() < 20 {
+                                return None;
+                            }
+                            let ihl = usize::from(b[0] & 0x0f) * 4;
+                            if ihl < 20 || ihl >= b.len() {
+                                return None;
+                            }
+                            Some(Sample::Bin(b[ihl..].to_vec()))
+                        }
+                        6 => {
+                            if b.len() < 40 {
+                                return None;
+                            }
+                            let mut next = *b.get(6)?;
+                            let mut len = 40usize;
+                            while next != 6 && next != 17 {
+                                if b.len() < len + 2 {
+                                    return None;
+                                }
+                                let ext_len = usize::from(*b.get(len + 1)?) * 8 + 8;
+                                next = *b.get(len)?;
+                                len += ext_len;
+                            }
+                            if len >= b.len() {
+                                return None;
+                            }
+                            Some(Sample::Bin(b[len..].to_vec()))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+        });
+
         self.register_converter(ConvDesc {
             name: "ip.tos",
             in_type: TypeSpec::Exact(SampleType::Bin),
