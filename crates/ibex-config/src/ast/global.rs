@@ -248,6 +248,12 @@ pub struct GlobalSection {
     pub pidfile: Option<String>,
     /// Hard stop timeout on reload/exit.
     pub hard_stop_after: Option<Duration>,
+    /// `tune.ssl.capture-buffer-size` (or its deprecated alias `tune.ssl.capture-cipherlist-size`):
+    /// the bytes of each TLS connection's `ClientHello` capture (`global_ssl.capture_buffer_size`);
+    /// 0, the default, captures nothing and the `ssl_fc_cipherlist_*` fetches give no sample.
+    pub tune_ssl_capture_buffer_size: usize,
+    /// One of the two spellings was given: a second one is refused (`pool_head_ssl_capture`).
+    pub tune_ssl_capture_configured: bool,
     /// Default SSL bind ciphers.
     pub ssl_default_bind_ciphers: Option<String>,
     /// Default SSL bind options.

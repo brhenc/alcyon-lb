@@ -694,6 +694,7 @@ dependencies = [
  "ibex-crypt",
  "ibex-proto",
  "ibex-regex",
+ "ibex-tls",
  "proptest",
  "serde",
  "serde_json",
@@ -723,6 +724,7 @@ version = "0.1.0"
 dependencies = [
  "ebtree",
  "ibex-config",
+ "ibex-crypt",
  "ibex-proto",
  "ibex-sched",
  "rcgen",

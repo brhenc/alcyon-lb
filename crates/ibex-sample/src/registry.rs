@@ -340,6 +340,9 @@ pub struct SslFacts<'a> {
     pub has_crt: bool,
     /// The handshake resumed an earlier session (`ssl_fc_is_resumed`).
     pub resumed: bool,
+    /// The client's `ClientHello` as `tune.ssl.capture-buffer-size` kept it; `None` when the
+    /// size is 0 (`ssl_fc_cipherlist_bin`, `ssl_fc_protocol_hello_id`: no sample).
+    pub capture: Option<&'a ibex_tls::SslCapture>,
 }
 
 /// One server's live state, as the server fetches read it.
@@ -3048,6 +3051,20 @@ impl Registry {
             name: "ssl_fc_sni",
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.ssl_fc.sni.map(|v| Sample::Str(v.to_string())),
+        });
+        // The ClientHello capture (`tune.ssl.capture-buffer-size`, `smp_fetch_ssl_fc_cl_bin`
+        // and `smp_fetch_ssl_fc_protocol_hello_id`, src/ssl_sample.c): no sample without one.
+        // The GREASE filter argument of `ssl_fc_cipherlist_bin` is refused at load
+        // (`argspec::ibex_refusal`) until it is implemented, so only the unfiltered list is here.
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_cipherlist_bin",
+            out_type: SampleType::Bin,
+            func: |ctx, _args| ctx.ssl_fc.capture.map(|c| Sample::Bin(c.ciphersuite().to_vec())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_protocol_hello_id",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.ssl_fc.capture.map(|c| Sample::Sint(i64::from(c.protocol_version))),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_alpn",

@@ -40,10 +40,6 @@ const IGNORED_GLOBAL_KEYWORDS: &[(&str, &str)] = &[
         "Directive allowing daemon fork under systemd; inert in Ibex single-process runtime",
     ),
     (
-        "tune.ssl.capture-buffer-size",
-        "SSL capture buffer size tuning; inert in Ibex Rustls-based TLS subsystem",
-    ),
-    (
         "tune.ssl.default-dh-param",
         "SSL DH parameter size; inert in Ibex Rustls-based TLS subsystem",
     ),
