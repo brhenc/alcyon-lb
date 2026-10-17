@@ -9,7 +9,7 @@
 //! own `maxconn`. The stats socket is not counted. State is process-wide, set when an
 //! engine is built from a configuration that has a `maxconn`.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 static CURR: AtomicU32 = AtomicU32::new(0);
 /// The limit in force (`set maxconn global`); 0 is no limit.
@@ -20,6 +20,11 @@ static HARD: AtomicU32 = AtomicU32::new(0);
 /// (`show info` `Maxsock` and `Ulimit-n`); 0 before it ran.
 static MAXSOCK: AtomicU64 = AtomicU64::new(0);
 static ULIMIT_N: AtomicU64 = AtomicU64::new(0);
+/// Number of listening sockets (T320): one per `bind` address plus one per `stats socket`.
+static LISTENERS: AtomicUsize = AtomicUsize::new(0);
+/// Accepts made while `actconn + 1 >= global maxconn` (T320), the last two slots: client
+/// connections refused afterwards and stats-socket accepts included, as in listener.c.
+static REACHED: AtomicU64 = AtomicU64::new(0);
 
 /// Raises the soft limit on open files to `maxsock` when it is lower, as `HAProxy` does at
 /// startup (`apply_nofile_limit`, src/limits.c): the hard limit is raised along with it when
@@ -136,6 +141,7 @@ pub fn configure(maxconn: Option<u32>, listeners: usize, stats_socket: bool) {
     if maxconn.is_some() {
         CURR.store(0, Ordering::Relaxed);
     }
+    LISTENERS.store(listeners, Ordering::Relaxed);
 }
 
 /// `global.maxsock` as `HAProxy` computes it (`compute_ideal_maxsock` and the socket
@@ -171,6 +177,17 @@ pub fn acquire() {
 pub fn try_acquire() -> bool {
     let max = MAX.load(Ordering::Relaxed);
     CURR.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| (max == 0 || c < max).then_some(c + 1)).is_ok()
+}
+
+/// An accepted connection, limited or not (T320): `HAProxy` counts `MaxconnReached` when
+/// `actconn + 1 >= maxconn` after the accept (listener.c), outside its `BC_O_UNLIMITED` guard,
+/// so the stats socket counts too. Called right after `accept()`, before any rule can refuse
+/// the connection; a client connection's own slot is already in `CURR` there.
+pub fn note_accept() {
+    let max = MAX.load(Ordering::Relaxed);
+    if max != 0 && CURR.load(Ordering::Relaxed).saturating_add(1) >= max {
+        REACHED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// A client connection closed.
@@ -216,4 +233,17 @@ pub fn set(v: i64) -> Result<(), &'static str> {
     let v = if v <= 0 { hard } else { u32::try_from(v).unwrap_or(u32::MAX) };
     MAX.store(v, Ordering::Relaxed);
     Ok(())
+}
+
+/// The number of listening sockets (`show info` `Listeners`).
+#[must_use]
+pub fn listeners() -> usize {
+    LISTENERS.load(Ordering::Relaxed)
+}
+
+/// Accepts made while `actconn + 1 >= global maxconn` ([`note_accept`]; `show info`
+/// `MaxconnReached`). Never reset by `clear counters`.
+#[must_use]
+pub fn reached() -> u64 {
+    REACHED.load(Ordering::Relaxed)
 }
