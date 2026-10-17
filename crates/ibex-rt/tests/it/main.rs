@@ -98,6 +98,7 @@ mod eth_converters;
 mod expect_proxy;
 mod expr_compile_once;
 mod fc_rcvd_proxy;
+mod fc_stream_info;
 mod fd_hygiene;
 mod fetch_arg_refusals;
 mod fetch_availability_by_rule;

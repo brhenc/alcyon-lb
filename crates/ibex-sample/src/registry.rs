@@ -516,6 +516,10 @@ pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("avg_queue", "Ibex has no server queues"),
     ("srv_queue", "Ibex has no server queues"),
     ("be_conn", "Ibex does not count the streams on a backend"),
+    // T331: `HAProxy` asks the front mux; an HTTP/2 stream's entry does not see its connection's.
+    ("fc_nb_streams", "a stream does not see its HTTP/2 connection's stream count"),
+    ("fc_settings_streams_limit", "a stream does not see its HTTP/2 connection's advertised SETTINGS_MAX_CONCURRENT_STREAMS"),
+    ("fc_glitches", "Ibex counts no HTTP/1 glitches, and a stream does not see its HTTP/2 connection's count"),
 ];
 
 /// Why `name` -- a fetch or a converter -- is in [`NOT_IMPLEMENTED`].
@@ -1085,6 +1089,8 @@ impl Registry {
             out_type: SampleType::Sint,
             func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.fc_rttvar.unwrap_or(0)))),
         });
+        // T331: `fc_nb_streams`, `fc_settings_streams_limit` and `fc_glitches` are refused
+        // instead ([`NOT_IMPLEMENTED`]): they were registered here as the constants 1, 1, 0.
         self.register_fetch(FetchDesc {
             name: "bc_rtt",
             out_type: SampleType::Sint,
