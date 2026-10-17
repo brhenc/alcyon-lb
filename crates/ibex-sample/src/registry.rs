@@ -4441,6 +4441,89 @@ impl Registry {
             },
         });
 
+        // `tcp.src`, `tcp.dst`, `tcp.seq`, `tcp.win`, `tcp.flags`: extract TCP header fields
+        // from a binary sample. The input is a binary TCP segment: source port (2 bytes),
+        // destination port (2), sequence number (4), ack number (4), data offset (high nibble)
+        // + flags, window (2), ... all big-endian. Returns `None` when the input is shorter
+        // than 20 bytes. Label T330.
+        self.register_converter(ConvDesc {
+            name: "tcp.src",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    if b.len() < 20 {
+                        return None;
+                    }
+                    let src = i64::from(u16::from_be_bytes([b[0], b[1]]));
+                    Some(Sample::Sint(src))
+                }
+                _ => None,
+            },
+        });
+        self.register_converter(ConvDesc {
+            name: "tcp.dst",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    if b.len() < 20 {
+                        return None;
+                    }
+                    let dst = i64::from(u16::from_be_bytes([b[2], b[3]]));
+                    Some(Sample::Sint(dst))
+                }
+                _ => None,
+            },
+        });
+        self.register_converter(ConvDesc {
+            name: "tcp.seq",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    if b.len() < 20 {
+                        return None;
+                    }
+                    let seq = i64::from(u32::from_be_bytes([b[4], b[5], b[6], b[7]]));
+                    Some(Sample::Sint(seq))
+                }
+                _ => None,
+            },
+        });
+        self.register_converter(ConvDesc {
+            name: "tcp.win",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    if b.len() < 20 {
+                        return None;
+                    }
+                    let win = i64::from(u16::from_be_bytes([b[14], b[15]]));
+                    Some(Sample::Sint(win))
+                }
+                _ => None,
+            },
+        });
+        self.register_converter(ConvDesc {
+            name: "tcp.flags",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |smp, _args| match smp {
+                Sample::Bin(b) => {
+                    if b.len() < 20 {
+                        return None;
+                    }
+                    // TCP flags are in byte 13 (lower 6 bits of the data offset+flags field)
+                    let flags = i64::from(b[13]);
+                    Some(Sample::Sint(flags))
+                }
+                _ => None,
+            },
+        });
+
+
         // `hmac(<alg>,<key>)`: `sample_conv_hmac` (src/sample.c). The key is a variable
         // (scope-prefixed name) or, otherwise, a base64 string; a variable that is not
         // set, a bad base64 key or an unknown algorithm yields no sample.
