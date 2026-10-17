@@ -485,7 +485,7 @@ fn show_info_pairs(
         ("DroppedLogs", crate::syslog::dropped_logs().to_string()),
         ("BusyPolling", zero()),
         ("FailedResolutions", zero()),
-        ("TotalBytesOut", zero()),
+        ("TotalBytesOut", crate::raw::bytes_out().to_string()),
         ("TotalSplicedBytesOut", zero()),
         ("BytesOutRate", zero()),
         ("DebugCommandsIssued", zero()),

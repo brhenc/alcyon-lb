@@ -249,6 +249,7 @@ mod show_info_counters;
 mod show_info_pools;
 mod show_info_rates;
 mod show_info_cum_streams;
+mod show_info_total_bytes_out;
 mod show_table;
 mod smtp_check_partial_lines;
 mod soft_stop;

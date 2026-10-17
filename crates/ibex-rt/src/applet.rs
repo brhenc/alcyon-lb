@@ -329,6 +329,7 @@ impl CliApplet {
             match stream.write(&self.out_buf[self.out_offset..]) {
                 Ok(n) if n > 0 => {
                     self.out_offset += n;
+                    crate::raw::count_out(n);
                     if self.out_offset >= self.out_buf.len() {
                         self.out_buf.clear();
                         self.out_offset = 0;
