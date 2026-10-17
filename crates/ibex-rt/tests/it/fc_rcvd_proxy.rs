@@ -1,131 +1,73 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T331: fc_rcvd_proxy fetch
+//! T331: `fc_rcvd_proxy` is true only on a connection that carried a PROXY header
+//! (`CO_FL_RCVD_PROXY`, connection.c), whatever its kind: v1, v1 UNKNOWN, v2 LOCAL.
+//! Every expected body below was measured on `HAProxy` 3.5-dev8 with this configuration.
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
-struct Ibex(Child, std::path::PathBuf);
-
-impl Drop for Ibex {
-    fn drop(&mut self) {
-        common::stop(&mut self.0);
-        let _ = std::fs::remove_dir_all(&self.1);
-    }
-}
-
-/// Starts ibex on `cfg` (`{sock}` is replaced by the stats socket path), waits for `addrs` and the
-/// socket, then lets the readiness probes slide out of the one-second windows and clears the maxima.
-fn start(tag: &str, cfg: &str, addrs: &[SocketAddr]) -> (Ibex, String) {
-    let dir = std::env::temp_dir().join(format!("qh-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("cli.sock").display().to_string();
-    let path = dir.join("c.cfg");
-    std::fs::write(&path, cfg.replace("{sock}", &sock).replace("{dir}", &dir.display().to_string())).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let ibex = Ibex(child, dir);
-    for a in addrs {
-        assert!(common::wait_listening(*a), "ibex did not listen on {a}");
-    }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !std::path::Path::new(&sock).exists() {
-        assert!(Instant::now() < deadline, "no stats socket");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(2200));
-    cli(&sock, "clear counters");
-    (ibex, sock)
-}
-
-fn cli(sock: &str, cmd: &str) -> String {
-    let mut s = UnixStream::connect(sock).expect("cli");
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(format!("{cmd}\n").as_bytes()).unwrap();
-    let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    out
-}
-
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
-/// One request on a new connection; the whole raw answer.
-fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
-    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    s.write_all(req).unwrap();
-    let mut out = Vec::new();
-    let _ = s.read_to_end(&mut out);
-    out
-}
+/// `{A}` binds with `accept-proxy`, `{B}` without. `/e` goes to a backend with no server,
+/// so the 503 comes from `proxy_error_response` and its `http-error` lf-string.
+const CFG: &str = "global
+  nbthread 1
+defaults
+  mode http
+  timeout connect 1s
+  timeout client 5s
+  timeout server 5s
+frontend fe
+  bind {A} accept-proxy
+  bind {B}
+  http-request return status 200 content-type text/plain lf-string \"%[fc_rcvd_proxy]|%[src]|%[fc_rcvd_proxy,not]\" if !{ path /e }
+  use_backend nosrv
+backend nosrv
+  http-error status 503 content-type text/plain lf-string \"e%[fc_rcvd_proxy]\"
+";
 
 const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+const GET_E: &[u8] = b"GET /e HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+const V1: &[u8] = b"PROXY TCP4 192.0.2.1 192.0.2.2 1111 80\r\n";
+/// A PROXY v2 header: signature, version 2 + LOCAL, family UNSPEC, no address block.
+const V2_LOCAL: &[u8] = b"\r\n\r\n\x00\r\nQUIT\n\x20\x00\x00\x00";
 
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
-        }
-    });
-    addr
-}
-
-/// The body of the answer to `req` (what follows the first empty line).
-fn body(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
-}
-
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
+/// The body of the answer to `pre` followed by `req` on a new connection.
+fn body(addr: SocketAddr, pre: &[u8], req: &[u8]) -> String {
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    s.write_all(&[pre, req].concat()).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let s = String::from_utf8_lossy(&out).into_owned();
+    s.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {s:?}"), |(_, b)| b.to_string())
 }
 
 #[test]
 fn fc_rcvd_proxy_fetch() {
-    let a = common::reserve_addr();
-    let cfg = format!(
-        "global\n  stats socket {{sock}} level admin\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {a} accept-proxy\n  http-request return status 200 content-type text/plain lf-string \"%[fc_rcvd_proxy]|%[src]\""
-    );
-    let (ibex, _sock) = start("fc_rcvd_proxy", &cfg, &[a]);
-    let req1 = b"PROXY TCP4 192.0.2.1 192.0.2.2 1111 80\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-    let req2 = b"PROXY UNKNOWN\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
-    assert_eq!(body(a, req1), "1|192.0.2.1");
-    assert_eq!(body(a, req2), "1|127.0.0.1");
+    let (a, b) = (common::reserve_addr(), common::reserve_addr());
+    let dir = std::env::temp_dir().join(format!("fc-rcvd-proxy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.cfg");
+    std::fs::write(&path, CFG.replace("{A}", &a.to_string()).replace("{B}", &b.to_string())).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let _ibex = common::Ibex(child);
+    assert!(common::wait_listening(a) && common::wait_listening(b), "ibex did not listen");
+
+    let rows = [
+        ("v1 TCP4", a, V1, GET, "1|192.0.2.1|0"),
+        ("v1 UNKNOWN", a, &b"PROXY UNKNOWN\r\n"[..], GET, "1|127.0.0.1|0"),
+        ("v2 LOCAL", a, V2_LOCAL, GET, "1|127.0.0.1|0"),
+        ("bind without accept-proxy", b, &b""[..], GET, "0|127.0.0.1|1"),
+        ("http-error lf-string after a PROXY header", a, V1, GET_E, "e1"),
+        ("http-error lf-string without one", b, &b""[..], GET_E, "e0"),
+    ];
+    let got: Vec<_> = rows.iter().map(|(n, addr, pre, req, _)| (*n, body(*addr, pre, req))).collect();
+    let want: Vec<_> = rows.iter().map(|(n, .., w)| (*n, (*w).to_string())).collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(got, want);
 }

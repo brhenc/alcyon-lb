@@ -808,14 +808,15 @@ impl Registry {
             out_type: SampleType::Ipv4,
             func: fc_src_fetch,
         });
-        // T331: fc_rcvd_proxy fetch
-        let fc_rcvd_proxy_fetch: FetchFn = |_ctx, _args| Some(Sample::Bool(true));
+        // T331: `smp_fetch_fc_rcvd_proxy`: `CO_FL_RCVD_PROXY`, set once a PROXY header
+        // (v1, v1 UNKNOWN, v2 PROXY or LOCAL) has been parsed. `proxy_tlvs` is `Some` exactly
+        // then: `apply_proxy_header` stores every parsed header in `proxy_info`.
+        let fc_rcvd_proxy_fetch: FetchFn = |ctx, _args| Some(Sample::Bool(ctx.proxy_tlvs.is_some()));
         self.register_fetch(FetchDesc {
             name: "fc_rcvd_proxy",
             out_type: SampleType::Bool,
             func: fc_rcvd_proxy_fetch,
         });
-
 
         let http_first_req_fetch: FetchFn =
             |ctx, _args| Some(Sample::Bool(ctx.is_first_req));
