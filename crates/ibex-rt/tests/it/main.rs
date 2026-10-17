@@ -215,6 +215,7 @@ mod privilege_drop;
 mod proc_var_converters;
 mod process_fetches;
 mod process_ids;
+mod protobuf_ungrpc;
 mod protocol_checks;
 mod proto_major;
 mod proxy_header_log;

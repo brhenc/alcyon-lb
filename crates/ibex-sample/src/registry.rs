@@ -4190,6 +4190,26 @@ impl Registry {
             },
         });
 
+        // T330: protobuf and ungrpc read a protocol buffers field of a binary sample.
+        self.register_converter(ConvDesc {
+            name: "protobuf",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Any,
+            func: |smp, args| match smp {
+                Sample::Bin(b) => pb_convert(&b, args, false),
+                _ => None,
+            },
+        });
+        self.register_converter(ConvDesc {
+            name: "ungrpc",
+            in_type: TypeSpec::Exact(SampleType::Bin),
+            out_type: TypeSpec::Any,
+            func: |smp, args| match smp {
+                Sample::Bin(b) => pb_convert(&b, args, true),
+                _ => None,
+            },
+        });
+
         self.register_converter(ConvDesc {
             name: "htonl",
             in_type: TypeSpec::Exact(SampleType::Sint),
@@ -7266,6 +7286,28 @@ fn hmac_key_is_var(key: &str) -> bool {
     ["txn.", "sess.", "req.", "res.", "proc."].iter().any(|p| key.starts_with(p))
 }
 
+/// T330: load-time check of the `protobuf`/`ungrpc` arguments: a dotted field number, then
+/// optionally one of the types `HAProxy` knows.
+fn check_protobuf_args(name: &str, args: &[String]) -> Option<String> {
+    let first = args.first().map_or("", String::as_str);
+    if first.is_empty() {
+        return Some(format!(
+            "invalid arg 1 in converter '{name}' : expected type 'Protocol buffers field number' at position 1, but got nothing."
+        ));
+    }
+    if pb_field_path(first).is_none() {
+        return Some(format!(
+            "invalid arg 1 in converter '{name}' : failed to parse '{first}' as type 'Protocol buffers field number' at position 1."
+        ));
+    }
+    if args.len() > 2 {
+        return Some(format!("invalid arg 2 in converter '{name}' : expected ')' before ',{})'.", args[2..].join(",")));
+    }
+    args.get(1)
+        .filter(|t| pb_type(t).is_none())
+        .map(|t| format!("invalid args in converter '{name}' : Wrong protocol buffer type '{t}'."))
+}
+
 /// Load-time check of a converter's arguments, where `HAProxy` refuses some
 /// (`invalid args in converter '<name>'`). `None` when they are acceptable.
 #[must_use]
@@ -7328,6 +7370,7 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
             _ => Some(format!("invalid args in converter 'set-var' : unknown condition \"{c}\".")),
         }),
         "aes_cbc_enc" | "aes_cbc_dec" | "aes_gcm_enc" | "aes_gcm_dec" => check_aes_args(name, args),
+        "protobuf" | "ungrpc" => check_protobuf_args(name, args),
         "url_enc" => match args {
             [] => None,
             [a] if a.is_empty() || a == "query" => None,
@@ -8027,6 +8070,254 @@ fn x509_v_err_name(code: i64) -> Option<&'static str> {
         94 => "X509_V_ERR_EC_KEY_EXPLICIT_PARAMS",
         _ => return None,
     })
+}
+
+/// T330: the value types a `protobuf`/`ungrpc` field can be read as (`protobuf_type()` in `HAProxy`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PbType {
+    /// No type argument: the raw bytes of the field.
+    Binary,
+    /// `int32`, `uint32`, `int64`, `uint64`, `bool`, `enum`: the varint as an integer.
+    Varint,
+    /// `sint32`, `sint64`: the varint, zigzag decoded.
+    Zigzag,
+    /// `fixed32`: the four little-endian bytes, unsigned.
+    Fixed32,
+    /// `float`: the four bytes read as an IEEE float, then converted to an unsigned integer.
+    Float,
+    /// `sfixed32`: the four little-endian bytes, signed.
+    Sfixed32,
+    /// `fixed64`, `sfixed64`: the eight little-endian bytes.
+    Fixed64,
+    /// `double`: the eight bytes read as an IEEE double, then converted to an unsigned integer.
+    Double,
+}
+
+/// T330: the type named by the second argument, `None` when it is not one `HAProxy` knows.
+fn pb_type(name: &str) -> Option<PbType> {
+    Some(match name {
+        "int32" | "uint32" | "int64" | "uint64" | "bool" | "enum" => PbType::Varint,
+        "sint32" | "sint64" => PbType::Zigzag,
+        "fixed32" => PbType::Fixed32,
+        "float" => PbType::Float,
+        "sfixed32" => PbType::Sfixed32,
+        "fixed64" | "sfixed64" => PbType::Fixed64,
+        "double" => PbType::Double,
+        _ => return None,
+    })
+}
+
+/// T330: a dotted field path (`parse_dotted_uints()`): numbers separated by dots, the last one
+/// not followed by a dot; an empty number reads as 0 and one too large wraps (`read_uint()`).
+fn pb_field_path(s: &str) -> Option<Vec<u32>> {
+    let b = s.as_bytes();
+    let mut ids = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let mut n = 0u32;
+        while let Some(d) = b.get(i).filter(|c| c.is_ascii_digit()) {
+            n = n.wrapping_mul(10).wrapping_add(u32::from(d - b'0'));
+            i += 1;
+        }
+        if i < b.len() {
+            if b[i] != b'.' {
+                return None;
+            }
+            i += 1;
+            if i == b.len() {
+                return None;
+            }
+        }
+        ids.push(n);
+    }
+    Some(ids)
+}
+
+/// T330: reads a varint at `*pos` with `*len` bytes left, advancing both (`protobuf_decode_varint()`).
+/// `None` when it is cut short or longer than ten bytes.
+fn pb_varint(buf: &[u8], pos: &mut usize, len: &mut usize) -> Option<u64> {
+    let mut val = 0u64;
+    let mut shift = 0u32;
+    while *len > 0 {
+        let byte = *buf.get(*pos)?;
+        val |= u64::from(byte & 0x7f) << shift;
+        *pos += 1;
+        *len -= 1;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        if *len == 0 {
+            return None;
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+    Some(val)
+}
+
+/// T330: the integer part of an IEEE number (`neg` its sign, `m` the magnitude as an integer),
+/// as the x86-64 truncating conversion makes it: `None` when it does not fit 64 bits signed,
+/// where the processor answers `i64::MIN`.
+fn pb_signed(neg: bool, m: u128) -> Option<i64> {
+    let m = i64::try_from(m).ok().or_else(|| (neg && m == 1 << 63).then_some(i64::MIN))?;
+    Some(if neg { m.wrapping_neg() } else { m })
+}
+
+/// T330: the magnitude of an IEEE number with `frac_bits` fraction bits, `exp` the biased
+/// exponent and `frac` the fraction, as an integer (a value below one is 0): `None` from 2^64 up.
+fn pb_magnitude(exp: u32, frac: u64, frac_bits: u32, bias: u32) -> Option<u128> {
+    let Some(e) = exp.checked_sub(bias) else { return Some(0) };
+    if e >= 64 {
+        return None;
+    }
+    let mant = u128::from(frac | 1 << frac_bits);
+    Some(if e >= frac_bits { mant << (e - frac_bits) } else { mant >> (frac_bits - e) })
+}
+
+/// T330: what `HAProxy` makes of a `double` field: the value of the double converted to a 64-bit
+/// unsigned integer (as the C compiler does on x86-64), shown as a signed one.
+fn pb_double(bits: u64) -> i64 {
+    let neg = bits >> 63 != 0;
+    let exp = u32::try_from((bits >> 52) & 0x7ff).unwrap_or(0);
+    let frac = bits & ((1 << 52) - 1);
+    if exp == 0x7ff {
+        return if neg || frac != 0 { i64::MIN } else { 0 };
+    }
+    match pb_magnitude(exp, frac, 52, 1023) {
+        None if neg => i64::MIN,
+        None => 0,
+        Some(m) if neg => pb_signed(true, m).unwrap_or(i64::MIN),
+        Some(m) => u64::try_from(m).map_or(0, |u| i64::from_ne_bytes(u.to_ne_bytes())),
+    }
+}
+
+/// T330: what `HAProxy` makes of a `float` field: the value of the float converted to a 32-bit
+/// unsigned integer, that is the low 32 bits of the 64-bit conversion (as on x86-64).
+fn pb_float(bits: u32) -> i64 {
+    let neg = bits >> 31 != 0;
+    let exp = (bits >> 23) & 0xff;
+    let v = if exp == 0xff {
+        i64::MIN
+    } else {
+        pb_magnitude(exp, u64::from(bits & 0x7f_ffff), 23, 127).and_then(|m| pb_signed(neg, m)).unwrap_or(i64::MIN)
+    };
+    let low = v.to_le_bytes();
+    i64::from(u32::from_le_bytes([low[0], low[1], low[2], low[3]]))
+}
+
+/// T330: the sample for the field value at `pos` (`len` bytes left, `vlen` the length of a
+/// length-delimited one), as the `protobuf_smp_store_*()` functions of `HAProxy` make it.
+fn pb_store(buf: &[u8], wire: u64, ty: PbType, pos: usize, len: usize, vlen: usize) -> Option<Sample> {
+    let fixed = |n: usize| -> Option<&[u8]> { if len < n { None } else { buf.get(pos..pos.checked_add(n)?) } };
+    match wire {
+        0 => {
+            let (mut p, mut l) = (pos, len);
+            let v = pb_varint(buf, &mut p, &mut l)?;
+            match ty {
+                PbType::Binary => Some(Sample::Bin(buf.get(pos..p)?.to_vec())),
+                PbType::Varint => Some(Sample::Sint(i64::from_ne_bytes(v.to_ne_bytes()))),
+                PbType::Zigzag => Some(Sample::Sint(i64::from_ne_bytes(((v >> 1) ^ (v & 1).wrapping_neg()).to_ne_bytes()))),
+                _ => None,
+            }
+        }
+        1 => {
+            let b: [u8; 8] = fixed(8)?.try_into().ok()?;
+            match ty {
+                PbType::Binary => Some(Sample::Bin(b.to_vec())),
+                PbType::Fixed64 => Some(Sample::Sint(i64::from_le_bytes(b))),
+                PbType::Double => Some(Sample::Sint(pb_double(u64::from_le_bytes(b)))),
+                _ => None,
+            }
+        }
+        2 if len >= vlen && ty == PbType::Binary => Some(Sample::Bin(buf.get(pos..pos.checked_add(vlen)?)?.to_vec())),
+        5 => {
+            let b: [u8; 4] = fixed(4)?.try_into().ok()?;
+            match ty {
+                PbType::Binary => Some(Sample::Bin(b.to_vec())),
+                PbType::Fixed32 => Some(Sample::Sint(i64::from(u32::from_le_bytes(b)))),
+                PbType::Sfixed32 => Some(Sample::Sint(i64::from(i32::from_le_bytes(b)))),
+                PbType::Float => Some(Sample::Sint(pb_float(u32::from_le_bytes(b)))),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// T330: looks the field `ids` up in the message at `*pos` (`*len` bytes), skipping the siblings
+/// and entering the length-delimited parents, like `protobuf_field_lookup()` of `HAProxy`.
+fn pb_lookup(buf: &[u8], pos: &mut usize, len: &mut usize, ids: &[u32], ty: PbType) -> Option<Sample> {
+    let mut depth = 0;
+    while *len > 0 && depth < ids.len() {
+        let key = pb_varint(buf, pos, len)?;
+        let wire = key & 7;
+        // HAProxy keeps the field number in an `unsigned int`: the bits above 32 are dropped.
+        let found = (key >> 3) & u64::from(u32::MAX) == u64::from(*ids.get(depth)?);
+        if wire == 3 || wire == 4 || wire > 5 {
+            return None;
+        }
+        let mut vlen = 0usize;
+        if wire == 2 {
+            vlen = usize::try_from(pb_varint(buf, pos, len)?).ok().filter(|v| v <= len)?;
+        }
+        if found {
+            if depth + 1 == ids.len() {
+                return pb_store(buf, wire, ty, *pos, *len, vlen);
+            }
+            if wire == 2 {
+                *len = vlen;
+                depth += 1;
+                continue;
+            }
+            return None;
+        }
+        match wire {
+            0 => {
+                pb_varint(buf, pos, len)?;
+            }
+            1 | 5 => {
+                let n = if wire == 1 { 8 } else { 4 };
+                *len = len.checked_sub(n)?;
+                *pos += n;
+            }
+            _ => {
+                *len -= vlen;
+                *pos += vlen;
+            }
+        }
+    }
+    None
+}
+
+/// T330: `protobuf(<field_number>[,<field_type>])` over the whole sample, or, with `grpc`,
+/// `ungrpc(...)`: the same lookup in each gRPC message (5-byte header, then the message) in turn.
+fn pb_convert(buf: &[u8], args: &[String], grpc: bool) -> Option<Sample> {
+    let ids = pb_field_path(args.first()?)?;
+    let ty = match args.get(1) {
+        Some(t) => pb_type(t)?,
+        None => PbType::Binary,
+    };
+    let (mut pos, mut left) = (0usize, buf.len());
+    if !grpc {
+        return pb_lookup(buf, &mut pos, &mut left, &ids, ty);
+    }
+    while left > 5 {
+        let size = buf.get(pos.checked_add(1)?..pos.checked_add(5)?)?;
+        let msg_len = usize::try_from(u32::from_be_bytes(size.try_into().ok()?)).ok()?;
+        pos += 5;
+        left -= 5;
+        if left < msg_len {
+            return None;
+        }
+        let mut msg_left = msg_len;
+        if let Some(s) = pb_lookup(buf, &mut pos, &mut msg_left, &ids, ty) {
+            return Some(s);
+        }
+        left -= msg_len;
+    }
+    None
 }
 
 /// A header capture as a sample: a string, or the bytes when a capture length cut a
