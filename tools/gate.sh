@@ -210,6 +210,19 @@ mkdir -p "$CARGO_TARGET_DIR"
 [ $EXCLUSIVE = 1 ] || export IBEX_GATE_SKIP_MEASURE=1
 echo "gate: CARGO_TARGET_DIR=$CARGO_TARGET_DIR IBEX_GATE_SKIP_MEASURE=${IBEX_GATE_SKIP_MEASURE:-} ${EXTRA_ENV[*]}"
 
+# A measuring gate pauses the local-model queue (cores 32-47 and the GPU) at its next safe
+# point and resumes it on exit; without the harness on this machine this does nothing.
+# IBEX_MUSE_PAUSE names the command, empty to skip.
+MUSE_PAUSE=${IBEX_MUSE_PAUSE-$HOME/ibex-worktrees/qwen/muse-pause}
+if [ $EXCLUSIVE = 1 ] && [ -z "${IBEX_GATE_SKIP_MEASURE:-}" ] && [ -n "$MUSE_PAUSE" ] && [ -x "$MUSE_PAUSE" ]; then
+  if MUSE_ID=$("$MUSE_PAUSE" on --reason "gate measure $REPO" --max-minutes 120); then
+    trap '"$MUSE_PAUSE" off --id "$MUSE_ID" >/dev/null' EXIT
+    echo "gate: local-model queue paused ($MUSE_ID)"
+  else
+    echo "gate: WARNING: the local-model queue could not be paused; measurements may be noisy"
+  fi
+fi
+
 # The slot's target is shared with other worktrees; make cargo rebuild from this one's
 # sources, unless the last gate here was this worktree's and nothing has built since.
 MARK=$CARGO_TARGET_DIR/.gate-last-tree
