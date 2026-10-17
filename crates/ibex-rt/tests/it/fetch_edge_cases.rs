@@ -337,7 +337,12 @@ fn srv_id_and_srv_name_in_http_response() {
 /// They are refused with a reason, rather than loaded and left empty on every request.
 #[test]
 fn tcp_info_counters_are_refused_with_a_reason() {
-    for f in ["fc_unacked", "fc_sacked", "fc_lost", "fc_retrans", "fc_fackets", "fc_reordering"] {
+    // T351: `fc_rtt`, `fc_rttvar`, `bc_rtt` and `bc_rttvar` read TCP_INFO as well; they were
+    // registered and always answered 0.
+    for f in [
+        "fc_unacked", "fc_sacked", "fc_lost", "fc_retrans", "fc_fackets", "fc_reordering", "fc_rtt", "fc_rttvar", "bc_rtt",
+        "bc_rttvar",
+    ] {
         let (code, out) = load(&format!("http-request set-header x \"%[{f}]\""));
         assert_ne!(code, Some(0), "{f} loaded: {out}");
         assert!(out.contains("not implemented in Ibex"), "{f}: {out}");
