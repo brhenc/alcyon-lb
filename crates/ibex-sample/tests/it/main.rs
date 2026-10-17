@@ -23,6 +23,7 @@ mod proptest_rawpayload;
 mod rfc7239;
 mod str_to_int_cast;
 mod t136_edges;
+mod tcp_converters_non_binary;
 mod t20_converters;
 mod t251_concat_cap;
 mod t251_map_tables;

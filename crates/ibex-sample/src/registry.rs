@@ -6035,6 +6035,17 @@ fn url_encode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// `dump_var_value` escapes NUL as `\0` (as `chunk_escape_string` does). A NUL cannot be put in a
+    /// string variable from a configuration: HAProxy 3.5-dev8 drops the `url_dec` of `%00` altogether, and
+    /// dumps a `bin` variable as hex, so no oracle column exists; this pins the code's own rule. Also the
+    /// integer-bare and the CR/LF/backspace/quote/backslash cases.
+    #[test]
+    fn dump_var_value_escapes_control_characters() {
+        assert_eq!(dump_var_value("a\0b"), "\"a\\0b\"");
+        assert_eq!(dump_var_value("a\r\n\x08\"\\"), "\"a\\r\\n\\b\\\"\\\\\"");
+        assert_eq!(dump_var_value("42"), "42");
+    }
+
     use super::*;
 
     /// `url_ip` reads a dotted quad of exactly four parts; a fifth is not an address.
