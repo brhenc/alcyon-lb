@@ -95,12 +95,27 @@ fn authenticated(ctx: &SampleContext, userlist: &str) -> Option<AuthUser> {
 }
 
 pub(crate) fn register(reg: &mut Registry) {
+    // T331f: `smp_fetch_http_auth` gives no sample unless the request carries well-formed Basic
+    // credentials; with them it gives whether `check_user` accepts them.
     reg.register_fetch(FetchDesc {
         name: "http_auth",
         out_type: SampleType::Bool,
-        func: |ctx, args| Some(Sample::Bool(authenticated(ctx, args.first()?).is_some())),
+        func: |ctx, args| {
+            let list = args.first()?;
+            let Credentials::Basic { .. } = credentials(ctx)? else { return None };
+            Some(Sample::Bool(authenticated(ctx, list).is_some()))
+        },
     });
-    // The groups of the user the request authenticates as: an ACL on it matches any of them.
+    // T331f: `smp_fetch_http_auth_grp` gives the user name when the credentials check out, and no
+    // sample otherwise.
+    reg.register_fetch(FetchDesc {
+        name: "http_auth_group",
+        out_type: SampleType::Str,
+        func: |ctx, args| authenticated(ctx, args.first()?).map(|u| Sample::Str(u.name)),
+    });
+    // What an ACL on `http_auth_group(<userlist>)` matches (`pat_match_auth`): any group of the
+    // user the request authenticates as. `eval_all`, the ACL path, reads this; `eval` reads the
+    // plain fetch above.
     reg.register_multi_fetch("http_auth_group", |ctx, args| {
         let Some(list) = args.first() else { return Vec::new() };
         authenticated(ctx, list).map_or_else(Vec::new, |u| u.groups.into_iter().map(Sample::Str).collect())

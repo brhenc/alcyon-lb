@@ -115,6 +115,7 @@ mod global_maxconn_default;
 mod global_sections;
 mod global_set_var_once;
 mod h1_authority;
+mod http_auth_userlist;
 mod h1_case_adjust;
 mod h2_alpn_settings;
 mod h2_buffering;
