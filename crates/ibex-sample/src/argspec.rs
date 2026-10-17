@@ -28,53 +28,37 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 #[path = "argspec_table.rs"]
 mod table;
 
-/// An argument type (`ARGT_*`, `include/haproxy/arg-t.h`).
+/// An argument type (`ARGT_*`, `include/haproxy/arg-t.h`): those the keywords of 3.5-dev8
+/// declare. `ARGT_ID`, `ARGT_TIME`, `ARGT_SIZE`, `ARGT_MAP` and `ARGT_VAR` are declared by
+/// none, and `tools/gen_sample_argspecs.py` stops if one ever is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArgType {
     Sint,
     Str,
-    Id,
     Ipv4,
     Msk4,
     Ipv6,
     Msk6,
-    Time,
-    Size,
     Fe,
     Be,
     Tab,
     Srv,
     Usr,
-    Map,
     Reg,
-    Var,
     PbufFnum,
 }
 
+/// `arg_type_names[]` (`src/arg.c`), in [`ArgType`]'s order.
+const ARG_TYPE_NAMES: [&str; 13] = [
+    "integer", "string", "IPv4 address", "IPv4 mask", "IPv6 address", "IPv6 mask", "frontend", "backend", "table",
+    "server", "user list", "regex", "Protocol buffers field number",
+];
+
 impl ArgType {
-    /// `arg_type_names[]` (`src/arg.c`).
+    /// Its name in `HAProxy`'s messages.
     #[must_use]
     pub fn name(self) -> &'static str {
-        match self {
-            ArgType::Sint => "integer",
-            ArgType::Str => "string",
-            ArgType::Id => "identifier",
-            ArgType::Ipv4 => "IPv4 address",
-            ArgType::Msk4 => "IPv4 mask",
-            ArgType::Ipv6 => "IPv6 address",
-            ArgType::Msk6 => "IPv6 mask",
-            ArgType::Time => "delay",
-            ArgType::Size => "size",
-            ArgType::Fe => "frontend",
-            ArgType::Be => "backend",
-            ArgType::Tab => "table",
-            ArgType::Srv => "server",
-            ArgType::Usr => "user list",
-            ArgType::Map => "map",
-            ArgType::Reg => "regex",
-            ArgType::Var => "variable",
-            ArgType::PbufFnum => "Protocol buffers field number",
-        }
+        ARG_TYPE_NAMES[self as usize]
     }
 }
 
@@ -141,7 +125,6 @@ enum Cast {
 /// `sample_casts` (`src/sample.c`).
 fn cast(from: SmpType, to: SmpType) -> Cast {
     use Cast::{Converts as C, Identity as I, Refused as N};
-    use SmpType as T;
     //            to: ANY SAME BOOL SINT ADDR IPV4 IPV6 STR BIN METH
     const M: [[Cast; 10]; 10] = [
         /* ANY  */ [I, N, C, C, C, C, C, C, C, C],
@@ -155,44 +138,28 @@ fn cast(from: SmpType, to: SmpType) -> Cast {
         /* BIN  */ [I, N, N, N, N, N, N, C, I, C],
         /* METH */ [I, N, N, N, N, N, N, C, C, I],
     ];
-    let idx = |t: SmpType| match t {
-        T::Any => 0,
-        T::Same => 1,
-        T::Bool => 2,
-        T::Sint => 3,
-        T::Addr => 4,
-        T::Ipv4 => 5,
-        T::Ipv6 => 6,
-        T::Str => 7,
-        T::Bin => 8,
-        T::Meth => 9,
-    };
-    M[idx(from)][idx(to)]
+    // `SmpType` is declared in `SMP_T_*` order.
+    M[from as usize][to as usize]
 }
 
 /// An argument once `make_arg_list` and the `val_args` functions have parsed it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Arg {
     Sint(i64),
+    /// A string, and an address or a mask once checked (nothing reads its value at load).
     Str(String),
-    Ipv4(Ipv4Addr),
-    Ipv6(Ipv6Addr),
     Fnum(Vec<u32>),
     Var(String),
 }
 
 impl Arg {
+    // An argument's type is its keyword's declaration, so a `val_args` function always finds
+    // the variant it reads; an absent one reads as `HAProxy`'s zeroed `struct arg` does.
     fn str(&self) -> &str {
-        match self {
-            Arg::Str(s) | Arg::Var(s) => s,
-            _ => "",
-        }
+        if let Arg::Str(s) | Arg::Var(s) = self { s } else { "" }
     }
     fn sint(&self) -> i64 {
-        match self {
-            Arg::Sint(i) => *i,
-            _ => 0,
-        }
+        if let Arg::Sint(i) = self { *i } else { 0 }
     }
 }
 
@@ -205,16 +172,9 @@ fn read_int64(s: &[u8]) -> (i64, usize) {
         _ => (false, 0),
     };
     let mut i: u64 = 0;
-    let mut saturated = false;
     while let Some(d) = s.get(at).filter(|c| c.is_ascii_digit()) {
-        if !saturated {
-            if let Some(n) = i.checked_mul(10).and_then(|t| t.checked_add(u64::from(d - b'0'))) {
-                i = n;
-            } else {
-                i = u64::MAX;
-                saturated = true;
-            }
-        }
+        // `read_uint64`: `ULLONG_MAX` once it overflows, and it stays there.
+        i = i.saturating_mul(10).saturating_add(u64::from(d - b'0'));
         at += 1;
     }
     let v = if neg {
@@ -352,7 +312,7 @@ pub fn make_arg_list(s: &[u8], at: usize, spec: &KwSpec) -> Result<Parsed, (usiz
             }
             let text = String::from_utf8_lossy(&out).into_owned();
             let t = spec.args[pos];
-            let needs_value = matches!(t, ArgType::Sint | ArgType::Ipv4 | ArgType::Msk4 | ArgType::Ipv6 | ArgType::Msk6 | ArgType::Time | ArgType::Size | ArgType::PbufFnum);
+            let needs_value = matches!(t, ArgType::Sint | ArgType::Ipv4 | ArgType::Msk4 | ArgType::Ipv6 | ArgType::Msk6 | ArgType::PbufFnum);
             if needs_value && text.is_empty() {
                 // empty_err: no argument at all is no argument array.
                 if pos == 0 {
@@ -369,10 +329,12 @@ pub fn make_arg_list(s: &[u8], at: usize, spec: &KwSpec) -> Result<Parsed, (usiz
                     Some(v) => Arg::Sint(v),
                     None => return parse_err(),
                 },
-                ArgType::Ipv4 => match text.parse::<Ipv4Addr>() {
-                    Ok(a) => Arg::Ipv4(a),
-                    Err(_) => return parse_err(),
-                },
+                ArgType::Ipv4 => {
+                    if text.parse::<Ipv4Addr>().is_err() {
+                        return parse_err();
+                    }
+                    Arg::Str(text)
+                }
                 ArgType::Msk4 => {
                     let ok = if text.contains('.') { text.parse::<Ipv4Addr>().is_ok() } else { mask_len_ok(&text, 32) };
                     if !ok {
@@ -380,10 +342,12 @@ pub fn make_arg_list(s: &[u8], at: usize, spec: &KwSpec) -> Result<Parsed, (usiz
                     }
                     Arg::Str(text)
                 }
-                ArgType::Ipv6 => match text.parse::<Ipv6Addr>() {
-                    Ok(a) => Arg::Ipv6(a),
-                    Err(_) => return parse_err(),
-                },
+                ArgType::Ipv6 => {
+                    if text.parse::<Ipv6Addr>().is_err() {
+                        return parse_err();
+                    }
+                    Arg::Str(text)
+                }
                 ArgType::Msk6 => {
                     let ok = if text.contains(':') { text.parse::<Ipv6Addr>().is_ok() } else { mask_len_ok(&text, 128) };
                     if !ok {
@@ -395,11 +359,7 @@ pub fn make_arg_list(s: &[u8], at: usize, spec: &KwSpec) -> Result<Parsed, (usiz
                     Some(f) => Arg::Fnum(f),
                     None => return parse_err(),
                 },
-                ArgType::Map | ArgType::Var => {
-                    return Err((pos, format!("parsing for type '{}' was not implemented, please report this bug", ty(pos))));
-                }
-                // No keyword of 3.5-dev8 declares a delay or a size; kept as written.
-                ArgType::Time | ArgType::Size | ArgType::Str | ArgType::Id | ArgType::Fe | ArgType::Be | ArgType::Tab | ArgType::Srv | ArgType::Usr | ArgType::Reg => Arg::Str(text),
+                ArgType::Str | ArgType::Fe | ArgType::Be | ArgType::Tab | ArgType::Srv | ArgType::Usr | ArgType::Reg => Arg::Str(text),
             };
             list.push(arg);
             pos += 1;
@@ -519,7 +479,9 @@ const TLV_NAMES: &[&str] = &[
 /// `when_cond_kw[]`, in `HAProxy`'s order.
 const WHEN_KEYWORDS: &[&str] = &["stopping", "normal", "error", "forwarded", "toapplet", "processed", "acl"];
 
-/// A fetch's `val_args`, by `HAProxy`'s function name. Functions not ported accept.
+/// A fetch's `val_args`, by `HAProxy`'s function name. Functions not ported accept, and so do
+/// those of fetches Ibex does not register, whose names are refused first (`val_distcc`,
+/// `val_blk_arg`).
 #[allow(clippy::too_many_lines)]
 fn val_fetch(val: &str, args: &mut [Arg]) -> Result<(), String> {
     match val {
@@ -595,17 +557,9 @@ fn val_fetch(val: &str, args: &mut [Arg]) -> Result<(), String> {
                 Some(_) => Ok(()),
             }
         }
-        "val_distcc" => {
-            if args.first().map_or(0, |a| a.str().len()) == 4 {
-                Ok(())
-            } else {
-                Err("token name must be exactly 4 characters".to_string())
-            }
-        }
-        "val_fc_time_value" => match args.first() {
-            Some(Arg::Str(u)) if u == "us" || u == "ms" => Ok(()),
-            Some(Arg::Str(u)) => Err(format!("expects 'us' or 'ms', got '{u}'")),
-            _ => Err("Unexpected arg type".to_string()),
+        "val_fc_time_value" => match args.first().map_or("", Arg::str) {
+            "us" | "ms" => Ok(()),
+            u => Err(format!("expects 'us' or 'ms', got '{u}'")),
         },
         "val_cap_id" => match args.first() {
             Some(Arg::Sint(n)) if *n < 0 => Err("capture identifier must be >= 0".to_string()),
@@ -615,16 +569,6 @@ fn val_fetch(val: &str, args: &mut [Arg]) -> Result<(), String> {
             Some(Arg::Str(s)) if !s.is_empty() && s != "with_qm" => Err("supported options are: 'with_qm'".to_string()),
             _ => Ok(()),
         },
-        "val_blk_arg" => {
-            let s = args.first().map_or("", Arg::str);
-            if s.is_empty() {
-                Err("a block position is expected (> 0) or a special block name (head, tail, first)".to_string())
-            } else if matches!(s, "head" | "tail" | "first") || s.bytes().all(|c| c.is_ascii_digit()) {
-                Ok(())
-            } else {
-                Err("invalid block position".to_string())
-            }
-        }
         _ => Ok(()),
     }
 }
@@ -645,16 +589,16 @@ fn val_conv(name: &str, val: &str, args: &mut [Arg]) -> Result<(), ValErr> {
     match val {
         "check_operator" => args.first_mut().map_or(Ok(()), check_operator).map_err(ValErr::Inner),
         "sample_conv_bytes_check" => {
-            if let Some(a) = args.get_mut(0) {
+            // The offset (mandatory) must be >= 0, the length (optional) > 0, unless a variable.
+            for (i, a) in args.iter_mut().enumerate() {
                 check_operator(a).map_err(ValErr::Inner)?;
-                if matches!(a, Arg::Sint(n) if *n < 0) {
-                    return inner("expects a non-negative integer".to_string());
-                }
-            }
-            if let Some(a) = args.get_mut(1) {
-                check_operator(a).map_err(ValErr::Inner)?;
-                if matches!(a, Arg::Sint(n) if *n <= 0) {
-                    return inner("expects a positive integer".to_string());
+                if let Arg::Sint(n) = a {
+                    if i == 0 && *n < 0 {
+                        return inner("expects a non-negative integer".to_string());
+                    }
+                    if i == 1 && *n <= 0 {
+                        return inner("expects a positive integer".to_string());
+                    }
                 }
             }
             Ok(())
@@ -766,8 +710,6 @@ fn arg_text(a: &Arg) -> String {
     match a {
         Arg::Sint(i) => i.to_string(),
         Arg::Str(s) | Arg::Var(s) => s.clone(),
-        Arg::Ipv4(a) => a.to_string(),
-        Arg::Ipv6(a) => a.to_string(),
         Arg::Fnum(f) => f.iter().map(u32::to_string).collect::<Vec<_>>().join("."),
     }
 }
@@ -830,13 +772,12 @@ pub fn check_typed_expr(expr: &str, acl: bool) -> Result<(), String> {
         if how == Cast::Refused {
             return Err(conv_err(format!("converter '{cname}' cannot be applied")));
         }
+        // A converter that keeps its input's type gives what it was cast to when that is not the
+        // identity (`sample_casts[prev][in] != c_none`); every such converter of 3.5-dev8 takes
+        // `ANY`, which casts nothing, so `prev` stays (`debug` after `bin` is `bin`; pinned by
+        // `same_type_converters_take_any`).
         if conv.out_type != SmpType::Same {
             prev = conv.out_type;
-        } else if how != Cast::Identity {
-            // `sample_casts[prev][in] != c_none`: a converter that keeps its input's type
-            // gives what it was cast to; one it takes as it is (`debug` after `bin`) the type
-            // before it.
-            prev = conv.in_type;
         }
         let (args, next) = make_arg_list(s, cend, conv)
             .map_err(|(p, m)| conv_err(format!("invalid arg {} in converter '{cname}' : {m}", p + 1)))?;
@@ -887,18 +828,11 @@ mod tests {
     /// The converters whose input or output type Ibex declares otherwise than `HAProxy`.
     #[test]
     fn declared_converter_types_against_haproxys() {
-        use crate::{SampleType as S, TypeSpec as TS};
+        use crate::TypeSpec as TS;
+        // `SampleType`'s and `SmpType`'s variants have the same names.
         let of = |t: TS| match t {
-            TS::Any => SmpType::Any,
-            TS::Same => SmpType::Same,
-            TS::Addr => SmpType::Addr,
-            TS::Exact(S::Bool) => SmpType::Bool,
-            TS::Exact(S::Sint) => SmpType::Sint,
-            TS::Exact(S::Ipv4) => SmpType::Ipv4,
-            TS::Exact(S::Ipv6) => SmpType::Ipv6,
-            TS::Exact(S::Str) => SmpType::Str,
-            TS::Exact(S::Bin) => SmpType::Bin,
-            TS::Exact(S::Meth) => SmpType::Meth,
+            TS::Exact(t) => format!("{t:?}"),
+            t => format!("{t:?}"),
         };
         let reg = crate::Registry::new();
         let mut differ = Vec::new();
@@ -909,8 +843,9 @@ mod tests {
                 .map(|d| (d.in_type, d.out_type))
                 .or_else(|| reg.get_ctx_converter(name).map(|d| (d.in_type, d.out_type)))
                 .expect("registered");
-            if (of(i), of(o)) != (h.in_type, h.out_type) {
-                differ.push(format!("{name}: ibex {:?}->{:?}, haproxy {:?}->{:?}", of(i), of(o), h.in_type, h.out_type));
+            let haproxy = (format!("{:?}", h.in_type), format!("{:?}", h.out_type));
+            if (of(i), of(o)) != haproxy {
+                differ.push(format!("{name}: ibex {}->{}, haproxy {}->{}", of(i), of(o), haproxy.0, haproxy.1));
             }
         }
         differ.sort();
@@ -929,6 +864,16 @@ mod tests {
             "ungrpc: ibex Bin->Any, haproxy Bin->Bin",
         ];
         assert_eq!(differ, known, "converters whose declared types differ from HAProxy's");
+    }
+
+    /// [`check_typed_expr`] keeps the type before a converter whose output is `SAME`, which is
+    /// `HAProxy`'s rule only while every such converter takes `ANY`.
+    #[test]
+    fn same_type_converters_take_any() {
+        for k in table::CONVERTERS.iter().filter(|k| k.out_type == SmpType::Same) {
+            assert_eq!(k.in_type, SmpType::Any, "{}", k.name);
+        }
+        assert!(table::CONVERTERS.iter().any(|k| k.out_type == SmpType::Same));
     }
 
     #[test]

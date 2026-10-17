@@ -21,10 +21,12 @@ KW = re.compile(
     r'\s*(SMP_T_[A-Z0-9]+)\s*,\s*([A-Z0-9_|\s]+?)\s*[,}]'
 )
 ACL = re.compile(r'\{\s*"([^"]+)"\s*,\s*("([^"]*)"|NULL)\s*,\s*PAT_MATCH_')
+# The types the keywords of 3.5-dev8 declare; argspec.rs's `ArgType` has these and no other.
+# A keyword declaring ID, TIME, SIZE, MAP or VAR stops this with a KeyError: add the type there.
 ARGT = {
-    "SINT": "Sint", "STR": "Str", "ID": "Id", "IPV4": "Ipv4", "MSK4": "Msk4", "IPV6": "Ipv6",
-    "MSK6": "Msk6", "TIME": "Time", "SIZE": "Size", "FE": "Fe", "BE": "Be", "TAB": "Tab",
-    "SRV": "Srv", "USR": "Usr", "MAP": "Map", "REG": "Reg", "VAR": "Var", "PBUF_FNUM": "PbufFnum",
+    "SINT": "Sint", "STR": "Str", "IPV4": "Ipv4", "MSK4": "Msk4", "IPV6": "Ipv6", "MSK6": "Msk6",
+    "FE": "Fe", "BE": "Be", "TAB": "Tab", "SRV": "Srv", "USR": "Usr", "REG": "Reg",
+    "PBUF_FNUM": "PbufFnum",
 }
 SMPT = {
     "ANY": "Any", "SAME": "Same", "BOOL": "Bool", "SINT": "Sint", "ADDR": "Addr", "IPV4": "Ipv4",

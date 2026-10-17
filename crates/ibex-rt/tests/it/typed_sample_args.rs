@@ -150,6 +150,16 @@ fn an_acl_after_ipmask_matches_addresses() {
     assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
 }
 
+/// `digest(sha3-256)` loads on `HAProxy` (an `OpenSSL` digest); Ibex does not compute it and
+/// refuses the configuration rather than give no sample on every request, as it does for
+/// `hmac` (a documented gap, not parity).
+#[test]
+fn a_digest_ibex_does_not_compute_is_refused() {
+    let (rc, text) = check("sha3", &config("set-header", "str(a),digest(sha3-256)"));
+    assert_eq!(rc, 1, "{text}");
+    assert!(text.contains("converter 'digest' with digest 'sha3-256' is not implemented by Ibex"), "{text}");
+}
+
 /// Starts ibex on `cfg`, sends one GET to `bind`, stops it; the whole response.
 fn get(bind: SocketAddr, cfg: &str, tag: &str) -> String {
     let p = std::env::temp_dir().join(format!("ibex_t343_{}_{tag}.cfg", std::process::id()));
@@ -325,6 +335,37 @@ const ACL_CONVERTERS: &[Row] = &[
 ];
 
 const FORMS: &[Row] = &[
+    // T343 covercheck: escapes in an argument (a single-quoted word keeps its backslashes),
+    // a missing comma, the TLV type and the other `val_args` edges.
+    ("set-var", "'str(a\\tb)'", 0, ""),
+    ("set-var", "'str(a\\rb)'", 0, ""),
+    ("set-var", "'str(a\\nb)'", 0, ""),
+    ("set-var", "'str(a\\\\b)'", 0, ""),
+    ("set-var", "'str(a\\ b)'", 0, ""),
+    ("set-var", "'str(a\\\"b)'", 0, ""),
+    ("set-var", "'str(a\\qb)'", 0, ""),
+    ("set-var", "'str(a\\'", 1, "fetch method 'str' : failed to parse '\\' after 'a' as type 'string' at position 1"),
+    ("set-var", "str(a)x", 1, "missing comma after fetch keyword"),
+    ("set-var", "str(a),lower()x", 1, "missing comma after converter 'lower'"),
+    ("set-header", "fc_pp_tlv(-1)", 1, "invalid args in fetch method 'fc_pp_tlv' : Invalid TLV Type '-1'"),
+    ("set-header", "fc_pp_tlv(+5)", 0, ""),
+    ("set-header", "fc_pp_tlv(010)", 0, ""),
+    ("set-header", "fc_pp_tlv(0x)", 1, "invalid args in fetch method 'fc_pp_tlv' : Could not convert type '0x'"),
+    ("set-header", "fc_pp_tlv(ALPN)", 0, ""),
+    ("set-header", "fc_pp_tlv(256)", 1, "invalid args in fetch method 'fc_pp_tlv' : Invalid TLV Type '256'"),
+    ("set-header", "fc_pp_tlv(09)", 1, "invalid args in fetch method 'fc_pp_tlv' : Could not convert type '09'"),
+    ("set-header", "bin(4z)", 1, "invalid args in fetch method 'bin' : an hex digit is expected (found 'z')"),
+    ("set-header", "meth(G@T)", 1, "invalid args in fetch method 'meth' : expects valid method"),
+    ("set-header", "query(with_qm)", 0, ""),
+    ("set-header", "query(x)", 1, "invalid args in fetch method 'query' : supported options are: 'with_qm'"),
+    ("set-header", "query()", 0, ""),
+    ("set-header", "str(a),add_item(;,,)", 1, "invalid args in converter 'add_item' : one of the optional arguments has to be nonempty"),
+    ("set-header", "str(a),be2hex(:,1,2)", 1, "invalid args in converter 'be2hex' : Unsupported truncate value (2)"),
+    ("set-header", "str(a),when(acl)", 1, "invalid args in converter 'when' : 'acl' selector requires an extra argument with the ACL name"),
+    ("acl", "hdr(x),ipmask(abc)", 1, "ACL keyword 'hdr' : invalid arg 1 in converter 'ipmask' : failed to parse 'abc' as type 'IPv4 mask' at position 1"),
+    ("acl", "hdr(x)x", 1, "ACL keyword 'hdr' : missing comma after fetch keyword"),
+    ("set-header", "fc_rtt()", 1, "invalid args in fetch method 'fc_rtt' : expects 'us' or 'ms', got ''"),
+    ("set-header", "fc_rtt", 0, ""),
     ("set-header-uq", "int( 1)", 1, "fetch method 'int' : expected type 'integer' at position 1, but got nothing"),
     ("set-header-uq", "src,ipmask( 24)", 1, "invalid arg 1 in converter 'ipmask' : expected type 'IPv4 mask' at position 1, but got nothing"),
     ("set-header-uq", "str( a b )", 1, "fetch method 'str' : expected ')'"),
