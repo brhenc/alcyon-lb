@@ -3793,15 +3793,9 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let target_arg = args.first()?;
-                // T327: when the variable is not set, return no sample (empty field in log-format).
-                let target_val = if hmac_key_is_var(target_arg) {
-                    CURRENT_VARS
-                        .with(|v| v.borrow().get(target_arg).cloned())
-                        .or_else(|| get_proc_var(target_arg))?
-                } else {
-                    target_arg.clone()
-                };
+                // The argument is a variable (refused otherwise at load, T341); when it is not
+                // set there is no sample (T327: an empty field in a log-format).
+                let target_val = read_var(args.first()?)?;
                 let Sample::Str(s) = smp else { return None };
                 let cmp = s.cmp(&target_val);
                 let res = match cmp {
@@ -6137,16 +6131,9 @@ impl Registry {
             out_type: TypeSpec::Exact(SampleType::Bool),
             func: |smp, args| match smp {
                 Sample::Bin(b) => {
-                    let arg = args.first()?;
-                    // T327: when the variable is not set, return no sample (empty field in log-format).
-                    let target_bytes: Vec<u8> = if hmac_key_is_var(arg) {
-                        CURRENT_VARS
-                            .with(|v| v.borrow().get(arg).cloned())
-                            .or_else(|| get_proc_var(arg))?
-                            .into_bytes()
-                    } else {
-                        arg.as_bytes().to_vec()
-                    };
+                    // The argument is a variable (refused otherwise at load, T341); when it is
+                    // not set there is no sample (T327: an empty field in a log-format).
+                    let target_bytes: Vec<u8> = read_var(args.first()?)?.into_bytes();
 
                     if b.len() != target_bytes.len() {
                         return Some(Sample::Bool(false));
@@ -7776,6 +7763,14 @@ fn check_aes_args(name: &str, args: &[String]) -> Option<String> {
     None
 }
 
+/// A variable `vars_check_arg` accepts: a scope, a dot and a name of letters, digits, `_`
+/// and `.` (measured: `txn.a.b` yes, `txn.`, `txn.a-b`, `TXN.x` no).
+fn is_var_ref(arg: &str) -> bool {
+    ["proc.", "sess.", "txn.", "req.", "res.", "check."].iter().any(|p| {
+        arg.strip_prefix(p).is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.')))
+    })
+}
+
 fn hmac_key_is_var(key: &str) -> bool {
     ["txn.", "sess.", "req.", "res.", "proc."].iter().any(|p| key.starts_with(p))
 }
@@ -7847,6 +7842,14 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
         }
         // T331: a literal <alg> is checked at load time as in HAProxy; the public-key algorithms need
         // a key file that Ibex does not load, so they are refused rather than silently answering.
+        // T341: `smp_check_strcmp` / `smp_check_secure_memcmp`: the argument is a variable.
+        "strcmp" | "secure_memcmp" => match args {
+            [] => Some(format!("invalid args in converter '{name}' : missing variable name.")),
+            [a] if a.is_empty() => Some(format!("invalid args in converter '{name}' : missing variable name.")),
+            [a] if !is_var_ref(a) => Some(format!("invalid args in converter '{name}' : failed to register variable name '{a}'.")),
+            [_] => None,
+            [_, rest @ ..] => Some(format!("invalid arg 2 in converter '{name}' : expected ')' before ',{})'.", rest.join(","))),
+        },
         "jwt_verify" => {
             let alg = args.first()?.as_str();
             if hmac_key_is_var(alg) || matches!(alg, "HS256" | "HS384" | "HS512") {
@@ -8093,24 +8096,25 @@ mod tests {
 
         let secret = b"my_secret_token";
         let target = Sample::Bin(secret.to_vec());
+        CURRENT_VARS.with(|v| {
+            let mut v = v.borrow_mut();
+            v.insert("txn.eq".to_string(), "my_secret_token".to_string());
+            v.insert("txn.ne".to_string(), "my_secret_tokeX".to_string());
+            v.insert("txn.short".to_string(), "short".to_string());
+        });
+        let var = |n: &str| [n.to_string()];
 
         // Equal match
-        assert_eq!(
-            (conv.func)(target.clone(), &["my_secret_token".to_string()]),
-            Some(Sample::Bool(true))
-        );
+        assert_eq!((conv.func)(target.clone(), &var("txn.eq")), Some(Sample::Bool(true)));
 
         // Same length, differing byte
-        assert_eq!(
-            (conv.func)(target.clone(), &["my_secret_tokeX".to_string()]),
-            Some(Sample::Bool(false))
-        );
+        assert_eq!((conv.func)(target.clone(), &var("txn.ne")), Some(Sample::Bool(false)));
 
         // Different length
-        assert_eq!(
-            (conv.func)(target, &["short".to_string()]),
-            Some(Sample::Bool(false))
-        );
+        assert_eq!((conv.func)(target.clone(), &var("txn.short")), Some(Sample::Bool(false)));
+
+        // A literal is no variable (refused at load, T341): no value
+        assert_eq!((conv.func)(target, &var("my_secret_token")), None);
     }
 
     #[test]

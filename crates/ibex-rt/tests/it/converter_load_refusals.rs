@@ -94,3 +94,37 @@ fn a_digest_ibex_does_not_implement_is_refused() {
     assert_eq!(code, Some(1), "{out}");
     assert!(out.contains("hmac"), "{out}");
 }
+
+/// T341: `strcmp` and `secure_memcmp` compare with a variable, and `HAProxy` refuses anything
+/// else at load (`smp_check_strcmp`, `smp_check_secure_memcmp`); Ibex compared the literal.
+/// Measured on 3.5-dev8-885761-29, 2026-10-17: `strcmp(abc)` "failed to register variable name
+/// 'abc'." (also `txn.`, `txn.a-b`, `foo.x`, `TXN.x`, `txn.a$`, `var(txn.k` for
+/// `secure_memcmp(var(txn.k))`); `strcmp()` and `strcmp` "missing variable name.";
+/// `strcmp(txn.k,x)` "invalid arg 2 in converter 'strcmp' : expected ')' before ',x)'.";
+/// accepted: `proc.x`, `sess.x`, `txn.x`, `req.x`, `res.x`, `check.x`, `txn.a.b`.
+#[test]
+fn strcmp_and_secure_memcmp_need_a_variable() {
+    for conv in ["strcmp", "secure_memcmp"] {
+        let refused = [
+            (format!("str(abc),{conv}(abc)"), format!("invalid args in converter '{conv}' : failed to register variable name 'abc'.")),
+            (format!("str(abc),{conv}(txn.)"), format!("invalid args in converter '{conv}' : failed to register variable name 'txn.'.")),
+            (format!("str(abc),{conv}(txn.a-b)"), format!("invalid args in converter '{conv}' : failed to register variable name 'txn.a-b'.")),
+            (format!("str(abc),{conv}(foo.x)"), format!("invalid args in converter '{conv}' : failed to register variable name 'foo.x'.")),
+            (format!("str(abc),{conv}(TXN.x)"), format!("invalid args in converter '{conv}' : failed to register variable name 'TXN.x'.")),
+            (format!("str(abc),{conv}(var(txn.k))"), format!("invalid args in converter '{conv}' : failed to register variable name 'var(txn.k'.")),
+            (format!("str(abc),{conv}()"), format!("invalid args in converter '{conv}' : missing variable name.")),
+            (format!("str(abc),{conv}"), format!("invalid args in converter '{conv}' : missing variable name.")),
+            (format!("str(abc),{conv}(txn.k,x)"), format!("invalid arg 2 in converter '{conv}' : expected ')' before ',x)'.")),
+        ];
+        for (expr, text) in &refused {
+            let (code, out) = check(expr);
+            assert_eq!(code, Some(1), "`{expr}` must be refused: {out}");
+            assert!(out.contains(text.as_str()), "`{expr}`: expected {text:?} in: {out}");
+        }
+        for var in ["proc.x", "sess.x", "txn.x", "req.x", "res.x", "check.x", "txn.a.b"] {
+            let expr = format!("str(abc),{conv}({var})");
+            let (code, out) = check(&expr);
+            assert_eq!(code, Some(0), "`{expr}` must load: {out}");
+        }
+    }
+}
