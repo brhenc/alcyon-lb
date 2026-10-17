@@ -37,6 +37,9 @@ pub const TX_ROOM: usize = 65536;
 
 /// The size of one receive buffer of the connection's budget (`tune.bufsize`, 16 KB).
 const RX_BUF: usize = 16384;
+/// The body bytes one receive buffer holds: [`RX_BUF`] less the HTX header (40 bytes) and
+/// one data block (8), `htx_free_data_space` of an empty rxbuf. A 16 KB DATA frame spans two.
+const RX_SLOT_DATA: usize = RX_BUF - 40 - 8;
 
 static H2_OPS: MuxOps = MuxOps {
     name: "h2",
@@ -59,6 +62,9 @@ pub struct H2StreamCtx {
     /// A stream holds at most its receive window of them: the next DATA frame waits in
     /// `rx_buf`, and the connection's demux with it, until they drain (T235).
     pub rx_buffered: usize,
+    /// DATA payload bytes the stream has stored since it last held none: where its next
+    /// byte falls in its chain of receive buffers ([`Self::rx_slots`]).
+    pub rx_fill: usize,
     /// The receive window the stream has been granted beyond the initial one, as a size: 0
     /// until a body that needs more starts to flow ([`H2MuxContext::grow_rx_window`]). The
     /// stream holds at most this much (or the initial window) of DATA the data path has not
@@ -70,6 +76,19 @@ pub struct H2StreamCtx {
 }
 
 impl H2StreamCtx {
+    /// The connection's receive buffers the stream holds with `extra` more bytes stored: one
+    /// per [`RX_SLOT_DATA`] the bytes it was given span, less those the data path has
+    /// emptied. `HAProxy` keeps a buffer until it is empty (`h2s_put_rxbuf`), so a stream
+    /// whose 16 KB frame was mostly taken still holds two.
+    #[must_use]
+    pub fn rx_slots(&self, extra: usize) -> usize {
+        let (fill, held) = (self.rx_fill + extra, self.rx_buffered + extra);
+        if held == 0 {
+            return 0;
+        }
+        fill.div_ceil(RX_SLOT_DATA) - (fill - held) / RX_SLOT_DATA
+    }
+
     #[must_use]
     pub fn new(id: u32, initial_send_window: i32, initial_recv_window: i32) -> Self {
         Self {
@@ -82,6 +101,7 @@ impl H2StreamCtx {
             is_shut: false,
             dispatched: false,
             rx_buffered: 0,
+            rx_fill: 0,
             rx_limit: 0,
             abs_prefix: None,
         }
@@ -269,6 +289,9 @@ impl H2MuxContext {
     pub fn rx_taken(&mut self, stream_id: u32, n: usize) {
         if let Some(s) = self.streams.get_mut(&stream_id) {
             s.rx_buffered = s.rx_buffered.saturating_sub(n);
+            if s.rx_buffered == 0 {
+                s.rx_fill = 0;
+            }
         }
         // The first update of the connection window opens it wide (`h2c_send_conn_wu`,
         // `H2_CF_WINDOW_OPENED`): what the connection can be sent is bounded by the streams'
@@ -288,6 +311,13 @@ impl H2MuxContext {
     pub fn rx_budget(&self) -> usize {
         let forced = self.flood_config.rxbuf.div_ceil(RX_BUF - 9);
         (forced.max(self.max_concurrent_streams as usize) + 1) * RX_BUF
+    }
+
+    /// The connection's receive buffers ([`Self::rx_budget`] less the list head of
+    /// `bl_init(nb_rxbufs + 1)`): what the streams' stored DATA may occupy.
+    #[must_use]
+    pub fn rx_slots(&self) -> usize {
+        self.rx_budget() / RX_BUF - 1
     }
 
     /// Grows the receive window of stream `stream_id`, which is receiving a body, to its
@@ -784,20 +814,31 @@ impl Mux for MuxH2 {
 
 impl MuxH2 {
     /// Whether the frame `header` announces must wait: DATA for a stream that already holds
-    /// its receive window of bytes (`H2_CF_DEM_SFULL`). The window is not policed -- HAProxy
-    /// does not either -- but what a client sends past it stays in the socket.
+    /// its receive window of bytes (`H2_CF_DEM_SFULL`), or that would need more of the
+    /// connection's receive buffers than are free (`H2_CF_DEM_RXBUF`: `h2s_get_rxbuf` finds
+    /// no slot). The window is not policed -- HAProxy does not either -- but what a client
+    /// sends past it stays in the socket, and so do the HEADERS behind it: streams whose
+    /// server is slow to connect hold the demux, not a pending connect each (T322, MY-10:
+    /// `HAProxy` holds 7 streams of the red team's shape, Ibex opened all 100).
+    ///
+    /// The first frame is let through whatever the buffers hold only when no stream holds
+    /// any, so that a pool smaller than a frame cannot wedge the connection (`HAProxy`
+    /// takes what fits of a frame and so always moves).
     fn demux_blocked(ctx: &H2MuxContext, header: &FrameHeader) -> bool {
         if header.frame_type != crate::h2::FrameType::Data || !ctx.is_server {
             return false;
         }
         let limit = usize::try_from(ctx.local_initial_window).unwrap_or(0).max(DEFAULT_MAX_FRAME_SIZE as usize);
         let Some(s) = ctx.streams.get(&header.stream_id) else { return false };
-        if s.state != H2StreamState::Open || s.rx_buffered == 0 {
+        if s.state != H2StreamState::Open {
             return false;
         }
         let len = header.length as usize;
-        s.rx_buffered + len > limit.max(s.rx_limit)
-            || ctx.streams.values().map(|s| s.rx_buffered).sum::<usize>() + len > ctx.rx_budget()
+        if s.rx_buffered > 0 && s.rx_buffered + len > limit.max(s.rx_limit) {
+            return true;
+        }
+        let held: usize = ctx.streams.values().map(|s| s.rx_slots(0)).sum();
+        held > 0 && held - s.rx_slots(0) + s.rx_slots(len) > ctx.rx_slots()
     }
 
     fn process_headers_block(
@@ -1125,6 +1166,7 @@ impl MuxH2 {
                     // so it is counted and dropped.
                     if !data.is_empty() && stream.state == H2StreamState::Open {
                         stream.rx_buffered += data.len();
+                        stream.rx_fill += data.len();
                         stream.rx_htx.push(HtxBlock::Data(data));
                     }
                     if (flags & frame_flags::END_STREAM) != 0 {
@@ -1663,8 +1705,8 @@ mod tests {
     }
 
     /// The budget: with no stream consumed, 100 streams send DATA until the connection holds
-    /// its budget (101 buffers of 16 KB), and not a frame more; the rest waits. The fuzz
-    /// target `h2_mux` holds the connection under 2 MiB with the same.
+    /// its buffers (100 of 16 KB; a 16 KB frame spans two), and not a frame more; the rest
+    /// waits. The fuzz target `h2_mux` holds the connection under 2 MiB with the same.
     #[test]
     fn the_connection_holds_no_more_than_its_budget_of_unconsumed_data() {
         let (mux, mut ctx) = open_conn();
@@ -1688,7 +1730,8 @@ mod tests {
         }
         let held: usize = ctx.streams.values().map(|s| s.rx_buffered).sum();
         assert!(held <= budget, "held {held} > budget {budget}");
-        assert!(held > budget - 16384 * 3, "held {held}: the budget is not used");
+        let slots: usize = ctx.streams.values().map(|s| s.rx_slots(0)).sum();
+        assert_eq!((slots, ctx.rx_slots()), (100, 100), "every buffer is used, held {held}");
         assert!(ctx.rx_buf.len() < 3 * 16393, "only the frames waiting are kept: {}", ctx.rx_buf.len());
         // Taking a stream's data makes room for the frames waiting.
         let taken = ctx.streams.get(&1).map_or(0, |s| s.rx_buffered);
@@ -1696,6 +1739,38 @@ mod tests {
         ctx.resume();
         let held2: usize = ctx.streams.values().map(|s| s.rx_buffered).sum();
         assert!(held2 > held - taken, "held {held2} after taking {taken} of {held}");
+    }
+
+    /// The red team's shape (MY-10): one POST of 88 x 16 KB, then POSTs of one 16 KB frame,
+    /// nothing taken (the server connect hangs). `HAProxy` 3.5-dev8 (`show sess all`): the
+    /// big stream holds 89 receive buffers, streams 3 to 11 two each, stream 13 one and the
+    /// demux stops there (`.maxid=13 .nbst=7`); the HEADERS behind it stay in the socket.
+    #[test]
+    fn streams_stop_being_demuxed_when_the_receive_buffers_are_used() {
+        let (mux, mut ctx) = open_conn();
+        let mut wire = post_headers(1);
+        for _ in 0..88 {
+            wire.extend(data(1, 16384, 0));
+        }
+        for k in 1..100 {
+            wire.extend(post_headers(1 + 2 * k));
+            wire.extend(data(1 + 2 * k, 16384, 0));
+        }
+        for chunk in wire.chunks(16393) {
+            if !ctx.wants_input() {
+                break;
+            }
+            let _ = mux.parse(&mut ctx, chunk);
+        }
+        assert_eq!(ctx.streams.get(&1).map(|s| s.rx_slots(0)), Some(89));
+        assert_eq!(ctx.streams.keys().copied().collect::<Vec<_>>(), vec![1, 3, 5, 7, 9, 11, 13]);
+        assert_eq!(ctx.streams.get(&13).map(|s| s.rx_buffered), Some(0), "the frame of 13 waits");
+        assert!(!ctx.wants_input(), "the connection is not read");
+        // A stream the data path empties gives its buffers back, and the demux goes on.
+        ctx.rx_taken(3, 16384);
+        ctx.resume();
+        assert_eq!(ctx.streams.get(&13).map(|s| s.rx_buffered), Some(16384));
+        assert!(ctx.streams.contains_key(&15));
     }
 
     /// `tune.h2.fe.rxbuf` raises the budget (`nb_rxbufs = max(rxbuf / (bufsize - 9), streams)`).
