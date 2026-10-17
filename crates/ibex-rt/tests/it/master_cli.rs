@@ -683,3 +683,58 @@ fn a_reload_that_cannot_start_a_worker_keeps_the_old_one() {
     assert_eq!(get(port).unwrap(), "v1");
     assert_eq!(show_proc(&master(&sock, "show proc")).0.reloads, "1 [failed: 1]");
 }
+
+/// T354: repeated failed reloads, as an operator sees them. Measured on HAProxy
+/// 3.5-dev8-885761-29 (`-W -S`, a bogus keyword, then `reload` and SIGUSR2 six times): the
+/// master row of `show proc` reads `N [failed: 1]` throughout -- `failed` is whether the
+/// last reload failed, not a running total, because HAProxy's master starts each reload
+/// afresh -- and goes back to `[failed: 0]` after a good one. The master's own log says
+/// `Reloading HAProxy` before each attempt.
+#[test]
+fn consecutive_failed_reloads_report_failed_1_and_log_the_reload() {
+    let dir = PathBuf::from(format!("/tmp/t354f-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("m.sock");
+    let cfg = dir.join("c.cfg");
+    let log = dir.join("master.log");
+    let port = common::reserve_port();
+    std::fs::write(&cfg, config(port, "v1")).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .args(["-W", "-S"])
+        .arg(&sock)
+        .arg("-f")
+        .arg(&cfg)
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::options().append(true).open(&log).unwrap())
+        .spawn()
+        .expect("spawn");
+    let mpid = child.id();
+    let _m = Master { child, dir: dir.clone() };
+    wait_for_socket(&sock);
+    assert!(common::wait_listening(std::net::SocketAddr::from(([127, 0, 0, 1], port))));
+
+    std::fs::write(&cfg, "global\n  bogus_kw\n").unwrap();
+    let mut rows = Vec::new();
+    for i in 0..3 {
+        if i == 1 {
+            sig(mpid, rustix::process::Signal::Usr2);
+            std::thread::sleep(Duration::from_millis(1500));
+        } else {
+            assert!(master(&sock, "reload").starts_with("Success=0\n"));
+        }
+        rows.push(show_proc(&master(&sock, "show proc")).0.reloads);
+    }
+    assert_eq!(rows, ["1 [failed: 1]", "2 [failed: 1]", "3 [failed: 1]"], "failed is 0 or 1, not a total");
+
+    std::fs::write(&cfg, config(port, "v2")).unwrap();
+    assert!(master(&sock, "reload").starts_with("Success=1\n"));
+    assert_eq!(show_proc(&master(&sock, "show proc")).0.reloads, "4 [failed: 0]");
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        text.matches(&format!("[NOTICE]   ({mpid}) : Reloading HAProxy\n")).count(),
+        4,
+        "one 'Reloading HAProxy' per attempt, the failed ones included: {text}"
+    );
+}
