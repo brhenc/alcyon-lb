@@ -1150,21 +1150,14 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "base32",
             out_type: SampleType::Sint,
-            func: |ctx, args| {
-                let base_smp = fetch_base(ctx, args)?;
-                let Sample::Str(s) = base_smp else { return None };
-                let h = full_hash(hash_djb2(s.as_bytes()));
-                Some(Sample::Sint(i64::from(h)))
-            },
+            func: |ctx, _args| Some(Sample::Sint(i64::from(base32_hash(ctx)?))),
         });
 
         self.register_fetch(FetchDesc {
             name: "base32+src",
             out_type: SampleType::Bin,
-            func: |ctx, args| {
-                let base_smp = fetch_base(ctx, args)?;
-                let Sample::Str(s) = base_smp else { return None };
-                let h = full_hash(hash_djb2(s.as_bytes()));
+            func: |ctx, _args| {
+                let h = base32_hash(ctx)?;
                 let mut out = Vec::with_capacity(20);
                 out.extend_from_slice(&h.to_be_bytes());
                 if let Some(sa) = ctx.client_addr {
@@ -4628,6 +4621,19 @@ fn fetch_base(ctx: &SampleContext, _args: &[String]) -> Option<Sample> {
             .to_string()
     };
     Some(Sample::Str(format!("{host}{path}")))
+}
+
+/// `HAProxy`'s `smp_fetch_base32`: SDBM from 0 over the Host header's value, when there is
+/// one (never an absolute URI's authority), then over the path up to `?` when it starts with
+/// `/`, then `full_hash`.
+fn base32_hash(ctx: &SampleContext) -> Option<u32> {
+    let uri = get_context_uri(ctx)?;
+    let (_, path, _) = split_uri(uri);
+    let mut input = get_req_header(ctx, "host").map(String::into_bytes).unwrap_or_default();
+    if path.starts_with('/') {
+        input.extend_from_slice(path.as_bytes());
+    }
+    Some(full_hash(hash_sdbm(&input)))
 }
 
 fn fetch_req_cook(ctx: &SampleContext, args: &[String]) -> Option<Sample> {
