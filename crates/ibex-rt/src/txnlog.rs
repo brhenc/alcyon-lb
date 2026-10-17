@@ -47,6 +47,10 @@ pub struct StreamLog {
     /// and response.
     pub req_captures: Vec<Option<Vec<u8>>>,
     pub res_captures: Vec<Option<Vec<u8>>>,
+    /// T331: the lengths of those slots, which the `capture-req` and `capture-res` converters
+    /// cut their values at (`ibex_sample::capture_write`); empty before the request is parsed.
+    pub req_capture_lens: ibex_sample::capture_write::SlotLens,
+    pub res_capture_lens: ibex_sample::capture_write::SlotLens,
     /// `unique-id-format`'s value for this stream.
     pub unique_id: Option<String>,
     /// The configuration line of the last rule that ended a rule set for this request
@@ -93,6 +97,8 @@ impl StreamLog {
             request_line: None,
             req_captures: Vec::new(),
             res_captures: Vec::new(),
+            req_capture_lens: std::sync::Arc::from([]),
+            res_capture_lens: std::sync::Arc::from([]),
             unique_id: None,
             last_rule: None,
             prio_class: 0,
