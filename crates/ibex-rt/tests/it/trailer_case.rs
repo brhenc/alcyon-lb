@@ -5,7 +5,6 @@
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +53,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -71,8 +62,6 @@ fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let _ = s.read_to_end(&mut out);
     out
 }
-
-const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
 
 fn http_cfg(global: &str, body: &str) -> String {
     format!(
@@ -126,22 +115,20 @@ fn trailer_names_are_lowercased() {
     // The backend should have received the request with lowercased trailer names.
     // The last chunk is 0\r\n, then trailer lines with lowercased names, then \r\n\r\n.
     let expected_trailers = b"0\r\nx-t: v\r\nanother-trailer: W\r\n\r\n";
-    let end_pos = received.len();
     assert!(
         received.ends_with(expected_trailers),
         "backend received trailers with wrong case: {:?} (expected: {:?})",
-        &received[end_pos - expected_trailers.len()..],
+        String::from_utf8_lossy(&received),
         expected_trailers
     );
 
     // Check what the client received.
     // The client should receive the response with lowercased trailer names.
     let expected_client_trailers = b"0\r\nres-trailer: Abc\r\nx-up: Q\r\n\r\n";
-    let resp_end = resp.len();
     assert!(
         resp.ends_with(expected_client_trailers),
         "client received trailers with wrong case: {:?} (expected: {:?})",
-        &resp[resp_end - expected_client_trailers.len()..],
+        String::from_utf8_lossy(&resp),
         expected_client_trailers
     );
 
