@@ -1097,6 +1097,12 @@ impl Registry {
             out_type: SampleType::Str,
             func: response_version_fetch,
         });
+        // T329e: `resp_ver`, the alias of `res.ver` (`src/http_fetch.c`).
+        self.register_fetch(FetchDesc {
+            name: "resp_ver",
+            out_type: SampleType::Str,
+            func: response_version_fetch,
+        });
 
         let status_fetch: FetchFn = |ctx, _args| {
             if let Some(h) = ctx.htx_slice {

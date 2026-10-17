@@ -232,6 +232,7 @@ mod res_hdrs;
 mod req_hdr_names;
 mod req_cook_names;
 mod res_cook_names;
+mod response_aliases;
 mod response_fetch_in_request;
 mod response_head_validation;
 mod response_te;
