@@ -238,6 +238,7 @@ mod reload_robustness;
 mod reload_under_load;
 mod replace_path_targets;
 mod req_body_param;
+mod registry_cover_rows;
 mod req_hdrs_bin;
 mod request_date;
 mod request_framing_smuggling;

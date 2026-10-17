@@ -163,6 +163,120 @@ const CASES: &[Case] = &[
     ("101100044d5154540402003c00047465737400", "0", &[("connect", "keepalive", "")]),
     // a packet type the converters do not parse
     ("c000", "0", &[("disconnect", "17", "")]),
+    // Parser refusals (gate covercheck after the 2026-10-17 integration), all measured on
+    // HAProxy 3.5-dev8: multi-byte lengths (130-byte client id, 130-byte property block), a
+    // fourth varint continuation byte, a repeated property, an unknown property, a property of
+    // the wrong packet, a will delay interval, a bad protocol name / version / flag set, short
+    (
+        "108e0100044d5154540402003c008278787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878",
+        "1",
+        &[("connect", "client_identifier", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")],
+    ),
+    (
+        "10910100044d5154540502003c820115007f79797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979797979000163",
+        "1",
+        &[("connect", "21", "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"), ("connect", "client_identifier", "c")],
+    ),
+    (
+        "10ffffffff01",
+        "0",
+        &[("connect", "flags", "")],
+    ),
+    (
+        "101800044d5154540502003c0a11000000011100000002000163",
+        "0",
+        &[("connect", "17", "")],
+    ),
+    (
+        "101100044d5154540502003c03990000000163",
+        "0",
+        &[("connect", "17", "")],
+    ),
+    (
+        "101000044d5154540502003c022401000163",
+        "0",
+        &[("connect", "17", "")],
+    ),
+    (
+        "101a00044d5154540506003c00000163051800000005000174000170",
+        "1",
+        &[("connect", "24", "5"), ("connect", "will_topic", "t")],
+    ),
+    (
+        "100d0004585858580402003c000163",
+        "0",
+        &[("connect", "protocol_name", "")],
+    ),
+    (
+        "100d00044d5154540902003c000163",
+        "0",
+        &[("connect", "protocol_version", "")],
+    ),
+    (
+        "100d00044d5154540403003c000163",
+        "0",
+        &[("connect", "flags", "")],
+    ),
+    (
+        "2000",
+        "0",
+        &[("connack", "flags", "")],
+    ),
+    (
+        "200100",
+        "0",
+        &[("connack", "flags", "")],
+    ),
+    (
+        "10",
+        "",
+        &[("connect", "flags", "")],
+    ),
+    (
+        "0000",
+        "0",
+        &[("connect", "flags", "")],
+    ),
+    (
+        "6000",
+        "0",
+        &[("connect", "flags", "")],
+    ),
+    (
+        "6200",
+        "0",
+        &[("connect", "flags", "")],
+    ),
+    (
+        "3000",
+        "0",
+        &[("connect", "flags", "")],
+    ),
+    (
+        "101200044d5154540502003c0416000164000163",
+        "0",
+        &[("connect", "22", "")],
+    ),
+    (
+        "100d00044d5154540401003c000163",
+        "0",
+        &[("connect", "flags", "")],
+    ),
+    (
+        "100d00044d5154540418003c000163",
+        "0",
+        &[("connect", "flags", "")],
+    ),
+    (
+        "20020205",
+        "0",
+        &[("connack", "flags", "")],
+    ),
+    (
+        "102600044d5154540506003c00000163110101020000000708000272740900026364000174000170",
+        "1",
+        &[("connect", "1", "1"), ("connect", "2", "7"), ("connect", "8", "rt"), ("connect", "9", "cd"), ("connect", "will_payload", "p")],
+    ),
 ];
 
 fn expected_line(valid: &str, fields: &[Field]) -> String {
@@ -240,4 +354,53 @@ fn mqtt_field_value_is_binary() {
     );
     let (_ibex, _sock) = start("mqtt_bin", &cfg, &[a]);
     assert_eq!(body(a, GET), "a|b|cmqtt|d60|e2|str");
+}
+
+/// Which `(packet type, field)` pairs load, for the packet types the converters do not parse
+/// (`mqtt_check_type_fieldname`): `None` is accepted, `Some(msg)` the message `haproxy -c` gives.
+/// Types by name and by number. Measured on `HAProxy` 3.5-dev8 (gate covercheck after the
+/// 2026-10-17 integration).
+#[test]
+fn mqtt_type_and_field_pairs_load_as_in_haproxy() {
+    let dir = std::env::temp_dir().join(format!("qh-mqtt-pairs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pairs: &[(&str, &str, Option<&str>)] = &[
+        ("publish", "1", None),
+        ("publish", "reason_code", Some("Unknown MQTT field name 'reason_code' for packet type 'publish'.")),
+        ("puback", "reason_code", None),
+        ("pubrel", "31", None),
+        ("pubcomp", "38", None),
+        ("subscribe", "11", None),
+        ("subscribe", "31", Some("Unknown MQTT field name '31' for packet type 'subscribe'.")),
+        ("suback", "31", None),
+        ("unsuback", "38", None),
+        ("unsubscribe", "38", None),
+        ("unsubscribe", "31", Some("Unknown MQTT field name '31' for packet type 'unsubscribe'.")),
+        ("auth", "21", None),
+        ("auth", "reason_code", Some("Unknown MQTT field name 'reason_code' for packet type 'auth'.")),
+        ("pingreq", "38", Some("Unknown MQTT field name '38' for packet type 'pingreq'.")),
+        ("3", "1", None),
+        ("14", "28", None),
+        ("0", "flags", Some("Unknown MQTT type '0'.")),
+        ("16", "flags", Some("Unknown MQTT type '16'.")),
+    ];
+    for (ty, field, want) in pairs {
+        let path = dir.join("c.cfg");
+        let cfg = http_cfg(
+            "",
+            &format!("frontend fe\n  bind 127.0.0.1:48402\n  http-request return status 200 content-type text/plain lf-string \"%[str(a),mqtt_field_value({ty},{field})]\"\n"),
+        );
+        std::fs::write(&path, cfg.replace("{sock}", &dir.join("s").display().to_string())).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(&path).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        match want {
+            None => assert!(out.status.success(), "({ty},{field}) was refused: {text:?}"),
+            Some(msg) => {
+                assert!(!out.status.success(), "({ty},{field}) was accepted");
+                assert!(text.contains(msg), "({ty},{field}): wanted {msg:?} in {text:?}");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
