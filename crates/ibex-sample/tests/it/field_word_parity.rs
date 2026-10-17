@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-//! T359f: `field` and `word` as HAProxy 3.5-dev8 (`src/sample.c` `sample_conv_field`, `sample_conv_word`).
+//! T359f: `field` and `word` as `HAProxy` 3.5-dev8 (`src/sample.c` `sample_conv_field`, `sample_conv_word`).
 
 use ibex_sample::registry::Registry;
 use ibex_sample::sample::Sample;

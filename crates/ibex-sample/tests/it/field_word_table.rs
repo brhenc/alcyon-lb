@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T359f: 2688 rows (the verifier's table for the Muse case). Every row measured on HAProxy 3.5-dev8-885761-29, 2026-10-17:
+//! T359f: 2688 rows (the verifier's table for the Muse case). Every row measured on `HAProxy` 3.5-dev8-885761-29, 2026-10-17:
 //! `req.hdr(a),<conv>(<args>)` with `-m found` telling "no sample" (None) from an empty string.
 
 use ibex_sample::registry::Registry;
 use ibex_sample::sample::Sample;
 
-/// (converter, input, arguments, HAProxy's answer).
+/// (converter, input, arguments, `HAProxy`'s answer).
 const ROWS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("field", "a:b:c:d", &["1", ":"], Some("a")),
     ("word", "a:b:c:d", &["1", ":"], Some("a")),
