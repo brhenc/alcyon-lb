@@ -5,7 +5,6 @@
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +53,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -81,57 +72,27 @@ fn http_cfg(global: &str, body: &str) -> String {
     )
 }
 
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
-        }
-    });
-    addr
-}
-
 /// The body of the answer to `req` (what follows the first empty line).
 fn body(addr: SocketAddr, req: &[u8]) -> String {
     let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
+    s.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {s:?}"), |(_, b)| b.to_string())
 }
 
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
-}
-
-/// T327: strcmp and secure_memcmp return no sample when the variable is not set.
+/// T327: `strcmp` and `secure_memcmp` return no sample when the variable is not set.
 /// When the variable IS set, they behave normally.
 #[test]
 fn strcmp_unset_var_returns_no_sample() {
     let a = common::reserve_addr();
-    let b = backend(b"OK");
-    let cfg = http_cfg("", &format!(
+    let cfg = http_cfg("  set-var proc.k str(abc)\n", &format!(
         "frontend fe\n  bind {a}\n  http-request set-var(txn.y) str(abc)\n\
-         http-request return status 200 content-type text/plain lf-string \"[%[str(abc),strcmp(txn.z)]|%[str(abc),secure_memcmp(txn.z)]|%[str(abc),strcmp(txn.y)]|%[str(abd),strcmp(txn.y)]|%[str(abc),secure_memcmp(txn.y)]]\"\n\
-         default_backend be\nbackend be\n  server s {b}"
+         http-request return status 200 content-type text/plain lf-string \"[%[str(abc),strcmp(txn.z)]|%[str(abc),secure_memcmp(txn.z)]|%[str(abc),strcmp(txn.y)]|%[str(abd),strcmp(txn.y)]|%[str(abc),secure_memcmp(txn.y)]\
+         |%[str(abc),secure_memcmp(proc.k)]|%[str(abc),strcmp(proc.k)]|%[str(abd),strcmp(proc.k)]]\"\n"
     ));
     let (ibex, _sock) = start("t327-cmp", &cfg, &[a]);
     let b = body(a, GET);
     // When variable is unset: strcmp returns empty (no sample), secure_memcmp returns empty (no sample)
-    // When variable IS set: strcmp(abc,abc)=0, strcmp(abd,abc)=1, secure_memcmp(abc,abc)=1
-    assert_eq!(b, "[||0|1|1]", "body mismatch: {b}");
+    // When variable IS set: strcmp(abc,abc)=0, strcmp(abd,abc)=1, secure_memcmp(abc,abc)=1.
+    // A proc variable set in global is found too (HAProxy 3.5-dev8: [||0|1|1|1|0|1]).
+    assert_eq!(b, "[||0|1|1|1|0|1]", "body mismatch: {b}");
     drop(ibex);
 }

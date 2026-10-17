@@ -2669,7 +2669,9 @@ impl Registry {
                 let target_arg = args.first()?;
                 // T327: when the variable is not set, return no sample (empty field in log-format).
                 let target_val = if hmac_key_is_var(target_arg) {
-                    CURRENT_VARS.with(|v| v.borrow().get(target_arg).cloned())?
+                    CURRENT_VARS
+                        .with(|v| v.borrow().get(target_arg).cloned())
+                        .or_else(|| get_proc_var(target_arg))?
                 } else {
                     target_arg.clone()
                 };
@@ -4487,7 +4489,9 @@ impl Registry {
                     let arg = args.first()?;
                     // T327: when the variable is not set, return no sample (empty field in log-format).
                     let target_bytes: Vec<u8> = if hmac_key_is_var(arg) {
-                        CURRENT_VARS.with(|v| v.borrow().get(arg).cloned())?
+                        CURRENT_VARS
+                            .with(|v| v.borrow().get(arg).cloned())
+                            .or_else(|| get_proc_var(arg))?
                             .into_bytes()
                     } else {
                         arg.as_bytes().to_vec()
@@ -5965,21 +5969,18 @@ mod tests {
         let target = Sample::Bin(secret.to_vec());
 
         // Equal match
-        CURRENT_VARS.with(|v| v.borrow_mut().insert("my_secret_token".to_string(), "my_secret_token".to_string()));
         assert_eq!(
             (conv.func)(target.clone(), &["my_secret_token".to_string()]),
             Some(Sample::Bool(true))
         );
 
         // Same length, differing byte
-        CURRENT_VARS.with(|v| v.borrow_mut().insert("my_secret_tokeX".to_string(), "my_secret_tokeX".to_string()));
         assert_eq!(
             (conv.func)(target.clone(), &["my_secret_tokeX".to_string()]),
             Some(Sample::Bool(false))
         );
 
         // Different length
-        CURRENT_VARS.with(|v| v.borrow_mut().insert("short".to_string(), "short".to_string()));
         assert_eq!(
             (conv.func)(target, &["short".to_string()]),
             Some(Sample::Bool(false))
