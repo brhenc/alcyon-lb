@@ -5392,84 +5392,11 @@ fn hdr_values(v: &str) -> Vec<&str> {
     }
 }
 
-/// T327: `value` without the elements equal (ignoring case) to one of `drop`, rewritten as the
-/// oracle's `h1_parse_connection_header` / `h1_parse_upgrade_header` rewrite it in place:
-/// the value is kept verbatim up to the first dropped element, and what follows is rejoined
-/// with bare commas (so "x,,y, close,,z" becomes "x,,y,,z").
-fn h1_drop_tokens(value: &str, drop: &[&str]) -> String {
-    let bytes = value.as_bytes();
-    let mut out: Vec<u8> = Vec::new();
-    // `prev`: where the previous element ended; `out` is still the verbatim prefix of the
-    // value while its length equals `prev` ("no rewrite done till now").
-    let (mut prev, mut at) = (0usize, 0usize);
-    while at < bytes.len() {
-        if matches!(bytes[at], b' ' | b'\t' | b'\r' | b'\n') {
-            at += 1;
-            continue;
-        }
-        let end = hdr_value_end(bytes, at);
-        let mut len = end - at;
-        while len > 0 && matches!(bytes[at + len - 1], b' ' | b'\t' | b'\r' | b'\n') {
-            len -= 1;
-        }
-        let word = &bytes[at..at + len];
-        if !drop.iter().any(|d| word.eq_ignore_ascii_case(d.as_bytes())) {
-            if out.len() == prev {
-                out = bytes[..end].to_vec();
-            } else {
-                if !out.is_empty() {
-                    out.push(b',');
-                }
-                out.extend_from_slice(word);
-            }
-        }
-        prev = end;
-        at = end + 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// T327: `hdrs` as the oracle's H1 parser leaves them in HTX (`H1_MF_CLEAN_CONN_HDR`): `close` and
-/// `keep-alive` are cut out of Connection, `h2c` and `h2` out of Upgrade, and a line left empty
-/// is removed. For a request (`h1_postparse_req_hdrs`) an Upgrade without `Connection: upgrade`
-/// is removed, and `upgrade` is cut out of Connection when no Upgrade header is left. Ibex
-/// keeps these headers as received, so the header-count fetches apply this view; the other
-/// header fetches do not yet (follow-up: clean them once, when the message is parsed).
+/// T327: `hdrs` as the oracle's H1 parser leaves them in HTX, for the header-count fetches:
+/// [`crate::h1_clean::h1_clean_headers`] (the one implementation of that cleaning, shared
+/// with `req.hdrs`/`res.hdrs` and the `*.hdr_names` fetches).
 fn h1_cleaned_headers(hdrs: Vec<(String, String)>, is_req: bool) -> Vec<(String, String)> {
-    let (mut conn_upg, mut upg_hdr) = (false, false);
-    let mut out: Vec<(String, String)> = Vec::with_capacity(hdrs.len());
-    for (n, v) in hdrs {
-        if n.eq_ignore_ascii_case("connection") {
-            conn_upg |= hdr_values(&v).iter().any(|w| w.eq_ignore_ascii_case("upgrade"));
-            let v = h1_drop_tokens(&v, &["close", "keep-alive"]);
-            if !v.is_empty() {
-                out.push((n, v));
-            }
-        } else if n.eq_ignore_ascii_case("upgrade") {
-            let v = h1_drop_tokens(&v, &["h2c", "h2"]);
-            if !v.is_empty() {
-                upg_hdr = true;
-                out.push((n, v));
-            }
-        } else {
-            out.push((n, v));
-        }
-    }
-    if is_req && upg_hdr && !conn_upg {
-        out.retain(|(n, _)| !n.eq_ignore_ascii_case("upgrade"));
-    } else if is_req && conn_upg && !upg_hdr {
-        out = out
-            .into_iter()
-            .filter_map(|(n, v)| {
-                if !n.eq_ignore_ascii_case("connection") {
-                    return Some((n, v));
-                }
-                let v = h1_drop_tokens(&v, &["upgrade"]);
-                (!v.is_empty()).then_some((n, v))
-            })
-            .collect();
-    }
-    out
+    crate::h1_clean::h1_clean_headers(hdrs.iter().map(|(n, v)| (n.as_str(), v.as_str())), is_req)
 }
 
 fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
