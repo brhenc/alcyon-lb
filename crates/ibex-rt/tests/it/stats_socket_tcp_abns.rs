@@ -334,3 +334,74 @@ fn show_cli_sockets_lists_every_socket_with_its_own_level() {
     assert_eq!(ask(tcp(v4), "operator;show cli sockets"), format!("\n{want}"), "after the session dropped its level");
     common::stop(&mut child);
 }
+
+/// T354. An `abns@` stats socket across a plain `-sf` reload. `HAProxy` 3.5-dev8-885761-29
+/// (`haproxy -f c.cfg`, then `haproxy -f c.cfg -sf <pid>`): the new process takes the name
+/// (the old one is told to pause with SIGTTOU when the bind finds it in use), answers on it,
+/// and the old process exits. Ibex had no pause: the new process died with `Address already
+/// in use` and the old one went on serving.
+#[test]
+fn an_abns_stats_socket_survives_a_sf_reload() {
+    let abns = format!("ibex-t354-sf-{}", std::process::id());
+    let port = common::reserve_port();
+    let lines = format!("\tstats socket abns@{abns} level admin\ndefaults\n\tmode http\n\ttimeout client 5s\n\ttimeout connect 1s\n\ttimeout server 5s\nfrontend fe\n\tbind 127.0.0.1:{port}\n\thttp-request return status 200 content-type text/plain string ok");
+    let (mut old, f) = start(&lines, &[]);
+    let pid_of = |s: UnixStream| -> String {
+        ask(s, "show info").lines().find(|l| l.starts_with("Pid: ")).unwrap_or("").to_string()
+    };
+    let first = pid_of(wait("abns@", || abstract_stream(&abns, true)));
+    assert_eq!(first, format!("Pid: {}", old.id()));
+
+    let mut new = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(f.path())
+        .arg("-sf")
+        .arg(old.id().to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut old_gone = false;
+    while Instant::now() < deadline && !old_gone {
+        old_gone = old.try_wait().expect("wait").is_some();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let answer = abstract_stream(&abns, true).map(pid_of);
+    let new_alive = new.try_wait().expect("wait").is_none();
+    let _ = Command::new("kill").arg("-USR1").arg(new.id().to_string()).status();
+    let _ = new.wait();
+    let _ = Command::new("kill").arg("-USR1").arg(old.id().to_string()).status();
+    let _ = old.wait();
+    assert!(new_alive, "the new process must start");
+    assert!(old_gone, "the old process exits after the reload");
+    assert_eq!(answer, Some(format!("Pid: {}", new.id())), "the CLI is now the new process's");
+}
+
+/// T354. When the successor then fails to start, the old process takes its abstract name
+/// back (HAProxy: SIGTTIN) and keeps serving the CLI.
+#[test]
+fn a_failed_sf_successor_gives_the_abns_name_back() {
+    let abns = format!("ibex-t354-ttin-{}", std::process::id());
+    let port = common::reserve_port();
+    let good = format!("\tstats socket abns@{abns} level admin\ndefaults\n\tmode http\n\ttimeout client 5s\n\ttimeout connect 1s\n\ttimeout server 5s\nfrontend fe\n\tbind 127.0.0.1:{port}\n\thttp-request return status 200 content-type text/plain string ok");
+    let (mut old, _f) = start(&good, &[]);
+    let pid_of = |s: UnixStream| -> String {
+        ask(s, "show info").lines().find(|l| l.starts_with("Pid: ")).unwrap_or("").to_string()
+    };
+    assert_eq!(pid_of(wait("abns@", || abstract_stream(&abns, true))), format!("Pid: {}", old.id()));
+
+    // The same stats socket, and a frontend that cannot start: a port in use without
+    // SO_REUSEPORT (bound by the test), after the stats socket has been bound.
+    let hog = std::net::TcpListener::bind("127.0.0.1:0").expect("hog");
+    let hog_port = hog.local_addr().expect("addr").port();
+    let bad = good.replace(&format!("bind 127.0.0.1:{port}"), &format!("bind 127.0.0.1:{hog_port}"));
+    let (mut new, _g) = start(&bad, &["-sf".to_string(), old.id().to_string()]);
+    let st = new.wait().expect("wait");
+    assert!(!st.success(), "the successor must fail: {st:?}");
+    std::thread::sleep(Duration::from_millis(300));
+    let now = wait("abns@ again", || abstract_stream(&abns, true));
+    assert_eq!(pid_of(now), format!("Pid: {}", old.id()), "the old process serves its CLI again");
+    let _ = Command::new("kill").arg("-USR1").arg(old.id().to_string()).status();
+    let _ = old.wait();
+}

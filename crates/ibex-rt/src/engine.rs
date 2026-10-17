@@ -2007,6 +2007,10 @@ pub struct Engine {
     /// The `stats socket` lines after the first, each with its own level (`HAProxy` binds
     /// them all).
     extra_cli: Vec<ExtraCli>,
+    /// The abstract stats sockets given up on `SIGTTOU`: which one (`None` the first) and
+    /// the name as bound.
+    paused_abns: Vec<(Option<usize>, Vec<u8>)>,
+    abns_paused: bool,
     /// The listeners were stopped because `global maxconn` was reached (`globalconn`).
     global_paused: bool,
     /// `accept` failed for want of a resource (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`):
@@ -2099,6 +2103,68 @@ struct ExtraCli {
 }
 
 impl Engine {
+    /// `SIGTTOU` (T354): lets go of the abstract stats sockets, whose names a successor
+    /// started with `-sf` cannot share; it sends this when its bind finds one in use, as
+    /// `HAProxy`'s does. Connections already accepted go on. The other listeners stay: they
+    /// are `SO_REUSEPORT`, and closing them would reset what waits in their queues.
+    fn pause_abns_cli(&mut self) {
+        use std::os::linux::net::SocketAddrExt;
+        let abstract_name = |l: &crate::cli_listener::CliListener| -> Option<Vec<u8>> {
+            match l {
+                crate::cli_listener::CliListener::Unix(u) => {
+                    u.local_addr().ok()?.as_abstract_name().map(<[u8]>::to_vec)
+                }
+                crate::cli_listener::CliListener::Tcp(_) => None,
+            }
+        };
+        if self.cli_listener.as_ref().and_then(abstract_name).is_some() {
+            if let Some(l) = self.cli_listener.take() {
+                if let Some(n) = abstract_name(&l) {
+                    self.paused_abns.push((None, n));
+                }
+                self.fdtab.remove(l.as_raw_fd());
+                let _ = self.poller.delete(l.as_fd());
+            }
+        }
+        for (i, x) in self.extra_cli.iter_mut().enumerate() {
+            if x.listener.as_ref().and_then(abstract_name).is_some() {
+                if let Some(l) = x.listener.take() {
+                    if let Some(n) = abstract_name(&l) {
+                        self.paused_abns.push((Some(i), n));
+                    }
+                    self.fdtab.remove(l.as_raw_fd());
+                    let _ = self.poller.delete(l.as_fd());
+                }
+            }
+        }
+    }
+
+    /// `SIGTTIN` (T354): the successor did not start; binds the names given up again.
+    fn resume_abns_cli(&mut self) {
+        use std::os::linux::net::SocketAddrExt;
+        for (which, bytes) in std::mem::take(&mut self.paused_abns) {
+            let bound = std::os::unix::net::SocketAddr::from_abstract_name(&bytes)
+                .and_then(|a| std::os::unix::net::UnixListener::bind_addr(&a))
+                .and_then(|l| l.set_nonblocking(true).map(|()| l));
+            let Ok(l) = bound else { continue };
+            let l = crate::cli_listener::CliListener::from(l);
+            let fd = l.as_raw_fd();
+            let state = match which {
+                None => FdState::CliListener,
+                Some(i) => FdState::CliExtra(u32::try_from(i).unwrap_or(u32::MAX)),
+            };
+            self.fdtab.insert(fd, state, Interest::READ);
+            if self.poller.add(l.as_fd(), raw_fd_to_u64(fd), !self.cli_paused, false).is_err() {
+                self.fdtab.remove(fd);
+                continue;
+            }
+            match which {
+                None => self.cli_listener = Some(l),
+                Some(i) => self.extra_cli[i].listener = Some(l),
+            }
+        }
+    }
+
     /// The lines of `show cli sockets`: every CLI socket, in configuration order, with the
     /// level it was bound at (T354).
     fn cli_sockets_text(&self) -> String {
@@ -4184,6 +4250,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             cli_socket_path: None,
             cli_socket_name: None,
             extra_cli: Vec::new(),
+            paused_abns: Vec::new(),
+            abns_paused: false,
             global_paused: false,
             accept_limited: None,
             fe_paused: false,
@@ -5411,6 +5479,17 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     .is_some_and(crate::lifecycle::Lifecycle::soft_stop_requested)
             {
                 self.begin_soft_stop();
+            }
+            if let Some(lc) = self.lifecycle.as_ref() {
+                let want = lc.pause_requested();
+                if want != self.abns_paused && !self.stopping {
+                    self.abns_paused = want;
+                    if want {
+                        self.pause_abns_cli();
+                    } else {
+                        self.resume_abns_cli();
+                    }
+                }
             }
             if self.stopping {
                 if quiet {

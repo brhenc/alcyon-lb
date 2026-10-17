@@ -930,7 +930,10 @@ fn main() {
         use ibex_config::StatsAddr;
         use ibex_rt::cli_listener::CliListener;
         let name = addr.name();
+        let old_pids: Vec<u32> = opts.sf_pids.iter().chain(&opts.st_pids).copied().collect();
         let fail = |proto: &str, what: &str, err: std::io::Error, at: &str| -> ! {
+            // A process told to let go of its abstract name takes it back.
+            send_signals_to_pids(&old_pids, Signal::Ttin, true);
             let why = err.to_string();
             let why = why.split(" (os error").next().unwrap_or(&why).to_string();
             ibex_rt::stderr_line!("[ALERT] Binding for frontend GLOBAL: protocol {proto}: {what} ({why}) [{at}].");
@@ -951,10 +954,30 @@ fn main() {
                     Err(err) => fail("unix_stream", "cannot bind UNIX socket", err, p),
                 }
             }
-            StatsAddr::Abstract { name: n, padded } => match CliListener::bind_abstract(n, *padded) {
-                Ok(l) => (l, name, None),
-                Err(err) => fail("abns", "cannot bind UNIX socket", err, &name),
-            },
+            StatsAddr::Abstract { name: n, padded } => {
+                // An abstract name cannot be shared, so when a process we replace (`-sf`,
+                // `-st`) still holds it, it is told to pause (SIGTTOU: it lets go of its
+                // abstract stats sockets) and the bind is retried, as HAProxy does (T354).
+                let mut paused = false;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                loop {
+                    match CliListener::bind_abstract(n, *padded) {
+                        Ok(l) => break (l, name, None),
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::AddrInUse
+                                && !old_pids.is_empty()
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            if !paused {
+                                send_signals_to_pids(&old_pids, Signal::Ttou, true);
+                                paused = true;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        Err(err) => fail("abns", "cannot bind UNIX socket", err, &name),
+                    }
+                }
+            }
             StatsAddr::Tcp(a) => match CliListener::bind_tcp(*a) {
                 Ok(l) => (l, name, None),
                 Err(err) => fail(if a.is_ipv4() { "tcpv4" } else { "tcpv6" }, "cannot bind socket", err, &a.to_string()),
@@ -995,6 +1018,8 @@ fn main() {
         let mailboxes = mailboxes.clone();
         let (cli_pre, extra_pre) = if worker_id == 0 { (cli_pre.take(), extra_pre.take()) } else { (None, None) };
         let lifecycle_clone = lifecycle.clone();
+        // Told to pause for our abstract stats socket, they are told to resume if we fail.
+        let replaced: Vec<u32> = opts.sf_pids.iter().chain(&opts.st_pids).copied().collect();
         let ready_tx = ready_tx.clone();
         let go = std::sync::Arc::clone(&go);
 
@@ -1008,6 +1033,7 @@ fn main() {
                 Ok(eng) => eng,
                 Err(err) => {
                     ibex_rt::stderr_line!("Failed to initialize Ibex engine (worker {}): {}", worker_id, err);
+                    send_signals_to_pids(&replaced, Signal::Ttin, true);
                     process::exit(1);
                 }
             };

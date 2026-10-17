@@ -26,6 +26,10 @@ pub struct Lifecycle {
     soft_stop: Arc<AtomicBool>,
     reload: Arc<AtomicBool>,
     terminate: Arc<AtomicBool>,
+    /// Set by `SIGTTOU` (a successor could not bind a name this process holds: let go of
+    /// it) and cleared by `SIGTTIN` (the successor gave up: take it back). A level, not an
+    /// edge: every worker looks at it.
+    paused: Arc<AtomicBool>,
 }
 
 impl Lifecycle {
@@ -45,7 +49,26 @@ impl Lifecycle {
         // in master-worker mode; with a handler registered it is never fatal, and the binary
         // acts on it only under `-W` / `-Ws`.
         signal_hook::flag::register(signal_hook::consts::SIGUSR2, Arc::clone(&self.reload))?;
+        // HAProxy's pause and resume (`src/haproxy.c`): a new process whose bind finds an
+        // address in use sends SIGTTOU to the processes it replaces, and SIGTTIN if it then
+        // fails to start. Only the abstract stats sockets, which cannot be shared, react.
+        let mut signals = signal_hook::iterator::Signals::new([
+            signal_hook::consts::SIGTTOU,
+            signal_hook::consts::SIGTTIN,
+        ])?;
+        let paused = Arc::clone(&self.paused);
+        std::thread::Builder::new().name("ttou".into()).spawn(move || {
+            for sig in signals.forever() {
+                paused.store(sig == signal_hook::consts::SIGTTOU, Ordering::Relaxed);
+            }
+        })?;
         Ok(())
+    }
+
+    /// Whether the last of `SIGTTOU` and `SIGTTIN` was `SIGTTOU`.
+    #[must_use]
+    pub fn pause_requested(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
     }
 
     /// Makes `SIGTERM` a clean, immediate stop that exits 0, as it is for `HAProxy`'s master
