@@ -215,6 +215,7 @@ mod multithread;
 mod multi_value_occurrence;
 mod no_log;
 mod normalize_uri_percent;
+mod normalize_uri_refused;
 mod node_description;
 mod nofile_limit;
 mod nul_in_text_output;
