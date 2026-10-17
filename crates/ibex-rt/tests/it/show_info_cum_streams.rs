@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T320: show info CumStreams
+//! T320: `show info` `CumStreams`.
 
 use crate::common;
 
@@ -104,30 +104,25 @@ fn test_cum_streams() {
     for _ in 0..5 {
         ka.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
         let mut buf = Vec::new();
-        loop {
+        while !buf.windows(10).any(|w| w == b"0123456789") {
             let mut tmp = [0u8; 4096];
             match ka.read(&mut tmp) {
-                Ok(0) => break, // connection closed
+                Ok(0) | Err(_) => break,
                 Ok(n) => buf.extend_from_slice(&tmp[..n]),
-                Err(_) => break,
-            }
-            if buf.len() >= 10 {
-                break;
             }
         }
+        assert!(buf.windows(10).any(|w| w == b"0123456789"), "keep-alive response incomplete: {buf:?}");
     }
     drop(ka);
 
     // The expected CumStreams after A: 15 (10 single + 5 keep-alive) + number of show info reads since A
     // (each show info connection itself counts as a stream). Poll up to 2s for the streams to be counted.
     let deadline = Instant::now() + Duration::from_secs(2);
-    let mut last_info = a_info.clone();
-    let mut last_cum = a_cum;
+    let mut last_cum;
     let mut extra_reads = 0u64;
     loop {
         extra_reads += 1;
-        last_info = info(&sock);
-        last_cum = num(&last_info, "CumStreams");
+        last_cum = num(&info(&sock), "CumStreams");
         let expected = a_cum + 15 + extra_reads;
         if last_cum >= expected {
             break;
@@ -141,4 +136,73 @@ fn test_cum_streams() {
     let expected = a_cum + 15 + extra_reads;
     assert_eq!(last_cum, expected, "CumStreams was {last_cum}, expected {expected} (a_cum={a_cum}, extra_reads={extra_reads})");
     drop(ibex);
+}
+
+/// Measured on `HAProxy` 3.5-dev8, as the change of `CumStreams` between two `show info`
+/// reads less the second read's own stream: 3 connect-and-close, 3 unparsable requests
+/// (400), 3 partial requests then close, one partial request left to `timeout
+/// http-request` (408), 3 x 47 garbage bytes to a `proto h2` bind -> 0 each. A stream
+/// exists only once a request was parsed (`stream_new`); 3 good requests -> 3, and 3
+/// connect-and-close on a TCP frontend -> 3 (a TCP session is a stream at once).
+#[test]
+fn connections_without_a_request_are_not_streams() {
+    let h1 = common::reserve_addr();
+    let h2 = common::reserve_addr();
+    let tcp = common::reserve_addr();
+    let (_ibex, sock) = start(
+        "cum_streams_probes",
+        &http_cfg(
+            "",
+            &format!(
+                "  timeout http-request 1s
+                 frontend fe
+  bind {h1}
+  http-request return status 200
+                 frontend h2
+  bind {h2} proto h2
+  http-request return status 200
+                 frontend t
+  mode tcp
+  bind {tcp}
+  tcp-request content reject
+"
+            ),
+        ),
+        &[h1, h2, tcp],
+    );
+    let delta = |what: &str, f: &dyn Fn()| -> u64 {
+        let before = num(&info(&sock), "CumStreams");
+        f();
+        std::thread::sleep(Duration::from_millis(300));
+        let after = num(&info(&sock), "CumStreams");
+        assert!(after > before, "{what}: CumStreams went from {before} to {after}");
+        after - before - 1
+    };
+    // A TCP frontend that rejects at once may reset the connection before `connect` returns.
+    let connect_close = |a: SocketAddr| drop(TcpStream::connect_timeout(&a, Duration::from_secs(2)));
+    assert_eq!(delta("connect and close", &|| (0..3).for_each(|_| connect_close(h1))), 0, "connect and close");
+    assert_eq!(delta("unparsable request", &|| (0..3).for_each(|_| drop(get(h1, b"BLAH\r\n\r\n")))), 0, "unparsable request");
+    assert_eq!(
+        delta("partial request then close", &|| (0..3).for_each(|_| {
+            let mut s = TcpStream::connect_timeout(&h1, Duration::from_secs(2)).expect("connect");
+            s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap();
+        })),
+        0,
+        "partial request then close"
+    );
+    assert_eq!(
+        delta("408", &|| {
+            let mut s = TcpStream::connect_timeout(&h1, Duration::from_secs(2)).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s.write_all(b"GET / HTTP/1.1\r\n").unwrap();
+            let mut out = Vec::new();
+            let _ = s.read_to_end(&mut out);
+            assert!(out.starts_with(b"HTTP/1.1 408"), "expected a 408: {:?}", String::from_utf8_lossy(&out));
+        }),
+        0,
+        "408"
+    );
+    assert_eq!(delta("h2 garbage", &|| (0..3).for_each(|_| drop(get(h2, &[0x5a; 47])))), 0, "garbage to an h2 bind");
+    assert_eq!(delta("good requests", &|| (0..3).for_each(|_| drop(get(h1, GET)))), 3, "good requests");
+    assert_eq!(delta("tcp connect", &|| (0..3).for_each(|_| connect_close(tcp))), 3, "TCP connect and close");
 }

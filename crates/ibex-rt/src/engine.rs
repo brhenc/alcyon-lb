@@ -2552,9 +2552,13 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
         return;
     }
     entry.stats_done = true;
-    // T320: count every finished stream (HTTP transaction or TCP session).
-    crate::stats::CUM_STREAMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let http = entry.sess.mode == Mode::Http;
+    // `show info` `CumStreams`: `HAProxy` makes a stream for a TCP session at once, and for
+    // HTTP only once a request was parsed (`stream_new`); a probe, an unparsable request,
+    // a 408 or garbage to an h2 bind never had one.
+    if !http || entry.sess.log.request.is_some() {
+        crate::stats::CUM_STREAMS.fetch_add(1, Ordering::Relaxed);
+    }
     // Only what the counters need of the log line's data: the whole `LogData` costs a
     // measurable share of a request (T172).
     let s = &entry.sess;
