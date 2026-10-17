@@ -353,11 +353,13 @@ enum Node {
 /// A compiled log-format string.
 #[derive(Clone, Debug)]
 pub struct LogFormat {
-    /// A boxed slice, so that with `global` this is no larger than a `Vec`: every proxy holds
-    /// two of these.
+    /// A boxed slice: every proxy holds two of these.
     nodes: Box<[Node]>,
     /// The options `%o` gave, for the whole line: whether it is a JSON object or a CBOR map.
     global: Opts,
+    /// `LOG_OPT_HTTP`: the value goes into an HTTP header, so each sample has the bytes of
+    /// `http_encode_map` written `%XX` (`lf_encode_chunk`).
+    http: bool,
 }
 
 /// Applies `%{+Q,-X,...}` to `opts` (`parse_logformat_node_args`). Unknown names are
@@ -444,12 +446,14 @@ impl LogFormat {
     }
 
     /// Compiles a `unique-id-format`: like [`LogFormat::compile`], but an absent value
-    /// prints nothing rather than `-` (`HAProxy` compiles it without `LOG_OPT_MANDATORY`).
+    /// prints nothing rather than `-` (`HAProxy` compiles it without `LOG_OPT_MANDATORY`),
+    /// and a sample has the bytes of `http_encode_map` written `%XX`, since the id may go
+    /// into a header (`LOG_OPT_HTTP`, `proxy_finalize`).
     ///
     /// # Errors
     /// As [`LogFormat::compile`].
     pub fn compile_unique_id(fmt: &str, registry: &Registry) -> Result<Self, String> {
-        Self::compile_with(fmt, registry, false)
+        Self::compile_with(fmt, registry, false).map(|f| LogFormat { http: true, ..f })
     }
 
     /// `%(name[:type])`, at `i` (the `(`): the name and cast, and where they end.
@@ -599,7 +603,7 @@ impl LogFormat {
                 Node::Text(_) => {}
             }
         }
-        Ok(LogFormat { nodes: nodes.into_boxed_slice(), global })
+        Ok(LogFormat { nodes: nodes.into_boxed_slice(), global, http: false })
     }
 
     /// Whether the format reads the request line (`%r`, `%HM`, `%HU`, ...): `HAProxy`
@@ -718,6 +722,17 @@ impl LogFormat {
                     // Outside a log line an empty value writes nothing, not `-`.
                     Some(Sample::Str(v)) if !log && v.is_empty() && !o.quote && !o.encoded() => {}
                     Some(Sample::Bin(v)) if !log && v.is_empty() && !o.quote && !o.encoded() => {}
+                    Some(s) if self.http && !o.encoded() => {
+                        let mut plain = Out(Vec::new());
+                        sample(&mut plain, &s, o, Cast::Same, !e.converters.is_empty());
+                        for &c in &plain.0 {
+                            if crate::engine::http_encoded(c) {
+                                let _ = write!(out, "%{c:02X}");
+                            } else {
+                                out.0.push(c);
+                            }
+                        }
+                    }
                     Some(s) => sample(out, &s, o, named.as_ref().map_or(Cast::Same, |n| n.cast), !e.converters.is_empty()),
                     None => missing(out, o, log),
                 },

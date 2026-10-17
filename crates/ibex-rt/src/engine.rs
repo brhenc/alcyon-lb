@@ -10700,7 +10700,7 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::Redirect(r) => {
                         // `http_apply_redirect_rule` (src/http_ana.c).
                         let ctx = make_ctx!(sess);
-                        let target = format_sample_string(&r.target, &ctx, registry);
+                        let target = format_http_string(&r.target, &ctx, registry);
                         let uri = sess.req_uri.as_deref().unwrap_or("/");
                         let (pfx, path, query) = split_uri(uri);
                         let query_part = if query.is_empty() { String::new() } else { format!("?{query}") };
@@ -10741,7 +10741,7 @@ impl EngineDispatcher<'_> {
                         match &r.cookie {
                             Some(ibex_config::RedirectCookie::Set(c)) => reply.push_str(&format!("set-cookie: {c}; path=/;\r\n")),
                             Some(ibex_config::RedirectCookie::SetFmt(f)) => {
-                                reply.push_str(&format!("set-cookie: {}; path=/;\r\n", format_sample_string(f, &ctx, registry)));
+                                reply.push_str(&format!("set-cookie: {}; path=/;\r\n", format_http_string(f, &ctx, registry)));
                             }
                             Some(ibex_config::RedirectCookie::Clear(n)) => reply.push_str(&format!("set-cookie: {n}; path=/; Max-Age=0;\r\n")),
                             None => {}
@@ -10751,7 +10751,7 @@ impl EngineDispatcher<'_> {
                         return Ok(RuleFlow::Replied);
                     }
                     ibex_config::HttpReqAction::SetPath { fmt } => {
-                        let new_path = format_sample_string(fmt, &make_ctx!(sess), registry);
+                        let new_path = format_http_string(fmt, &make_ctx!(sess), registry);
                         let rebuilt = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let (pfx, _, query) = split_uri(current_uri);
@@ -10781,7 +10781,7 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::SetPathq { fmt } => {
-                        let new_pathq = format_sample_string(fmt, &make_ctx!(sess), registry);
+                        let new_pathq = format_http_string(fmt, &make_ctx!(sess), registry);
                         let rebuilt = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let (pfx, _, _) = split_uri(current_uri);
@@ -10826,7 +10826,7 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::SetQuery { fmt } => {
-                        let new_query = format_sample_string(fmt, &make_ctx!(sess), registry);
+                        let new_query = format_http_string(fmt, &make_ctx!(sess), registry);
                         let rebuilt = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             let (pfx, path, _) = split_uri(current_uri);
@@ -10837,13 +10837,13 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     ibex_config::HttpReqAction::SetUri { fmt } => {
-                        let new_uri = format_sample_string(fmt, &make_ctx!(sess), registry);
+                        let new_uri = format_http_string(fmt, &make_ctx!(sess), registry);
                         if !req_set_uri(sess, new_uri) && STRICT_MODE.get() {
                             return Err(500);
                         }
                     }
                     ibex_config::HttpReqAction::SetMethod { fmt } => {
-                        let new_method = format_sample_string(fmt, &make_ctx!(sess), registry);
+                        let new_method = format_http_string(fmt, &make_ctx!(sess), registry);
                         if !req_set_method(sess, new_method) && STRICT_MODE.get() {
                             return Err(500);
                         }
@@ -10998,13 +10998,13 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::SetHeader { name, fmt } => {
                         // A header that does not fit fails the request in strict mode and is
                         // skipped otherwise (`fail_rewrite`).
-                        let val = format_sample_string(fmt, &make_ctx!(sess), registry);
+                        let val = format_http_string(fmt, &make_ctx!(sess), registry);
                         if !req_rule_header(sess, name, &val, true) && STRICT_MODE.get() {
                             return Err(500);
                         }
                     }
                     ibex_config::HttpReqAction::AddHeader { name, fmt } => {
-                        let val = format_sample_string(fmt, &make_ctx!(sess), registry);
+                        let val = format_http_string(fmt, &make_ctx!(sess), registry);
                         if !req_rule_header(sess, name, &val, false) && STRICT_MODE.get() {
                             return Err(500);
                         }
@@ -12029,6 +12029,44 @@ fn rebuild_uri(prefix: &str, path: &str, query: &str) -> String {
 }
 
 pub(crate) fn format_sample_string(fmt: &str, ctx: &SampleContext, registry: &Registry) -> String {
+    render_sample_format(fmt, ctx, registry, false)
+}
+
+/// [`format_sample_string`] for a format `HAProxy` parses with `LOG_OPT_HTTP` (a header
+/// value, the request line parts, a redirect): each sample value has the bytes of
+/// `http_encode_map` written `%XX`, so that a CR LF in it cannot end the header or the
+/// line (`lf_encode_chunk`, `src/log.c`). The text of the format itself is left alone.
+pub(crate) fn format_http_string(fmt: &str, ctx: &SampleContext, registry: &Registry) -> String {
+    render_sample_format(fmt, ctx, registry, true)
+}
+
+/// `http_encode_map` (`init_log`, `src/log.c`): the bytes a header value cannot carry --
+/// 0x00-0x08, 0x0a-0x1f and DEL. TAB, `%` and bytes from 0x80 (obs-text) pass.
+pub(crate) fn http_encoded(b: u8) -> bool {
+    b <= 0x08 || (0x0a..=0x1f).contains(&b) || b == 0x7f
+}
+
+/// Appends `v` (text in [`ibex_regex::bytetext`] form) with the bytes [`http_encoded`]
+/// selects written `%XX`.
+fn push_http_encoded(out: &mut String, v: &str) {
+    if !v.bytes().any(http_encoded) {
+        out.push_str(v);
+        return;
+    }
+    let bytes = ibex_regex::bytetext::text_to_bytes(v);
+    let mut enc = Vec::with_capacity(bytes.len() + 8);
+    for &b in bytes.iter() {
+        if http_encoded(b) {
+            enc.extend_from_slice(format!("%{b:02X}").as_bytes());
+        } else {
+            enc.push(b);
+        }
+    }
+    out.push_str(&ibex_regex::bytetext::bytes_to_text(&enc));
+}
+
+fn render_sample_format(fmt: &str, ctx: &SampleContext, registry: &Registry, http: bool) -> String {
+    let push = |out: &mut String, v: &str| if http { push_http_encoded(out, v) } else { out.push_str(v) };
     let mut out = String::with_capacity(fmt.len());
     let mut chars = fmt.chars().peekable();
 
@@ -12059,9 +12097,9 @@ pub(crate) fn format_sample_string(fmt: &str, ctx: &SampleContext, registry: &Re
                             // first NUL.
                             Sample::Bin(b) => {
                                 let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-                                out.push_str(&ibex_regex::bytetext::bytes_to_text(&b[..end]));
+                                push(&mut out, &ibex_regex::bytetext::bytes_to_text(&b[..end]));
                             }
-                            _ => out.push_str(&sample_to_string(&smp)),
+                            _ => push(&mut out, &sample_to_string(&smp)),
                         }
                     }
                 }
@@ -12972,7 +13010,7 @@ fn replace_uri_part(
 ) -> Option<Result<String, ()>> {
     let re = ibex_regex::UserRegex::cached(regex).ok()?;
     let caps = re.captures(part)?;
-    let fmt = format_sample_string(repl, ctx, registry);
+    let fmt = format_http_string(repl, ctx, registry);
     Some(exp_replace(&fmt, &caps).ok_or(()))
 }
 
@@ -13072,14 +13110,14 @@ fn res_action(
         ResOp::Redirect(location, code, cookie) => {
             // `http_apply_redirect_rule` (src/http_ana.c) for a `location` redirect: the
             // answer to the client is the redirect, and the server's response is dropped.
-            let mut reply = format!("HTTP/1.1 {code} {}\r\ncontent-length: 0\r\nlocation: {}\r\n", status_reason(code), format_sample_string(location, ctx, registry));
+            let mut reply = format!("HTTP/1.1 {code} {}\r\ncontent-length: 0\r\nlocation: {}\r\n", status_reason(code), format_http_string(location, ctx, registry));
             if matches!(code, 302 | 303 | 307) {
                 reply.push_str("cache-control: no-cache\r\n");
             }
             match cookie {
                 Some(ibex_config::RedirectCookie::Set(c)) => reply.push_str(&format!("set-cookie: {c}; path=/;\r\n")),
                 Some(ibex_config::RedirectCookie::SetFmt(f)) => {
-                    reply.push_str(&format!("set-cookie: {}; path=/;\r\n", format_sample_string(f, ctx, registry)));
+                    reply.push_str(&format!("set-cookie: {}; path=/;\r\n", format_http_string(f, ctx, registry)));
                 }
                 Some(ibex_config::RedirectCookie::Clear(n)) => reply.push_str(&format!("set-cookie: {n}; path=/; Max-Age=0;\r\n")),
                 None => {}
@@ -13109,7 +13147,7 @@ fn res_action(
             return Ok(true);
         }
         ResOp::Add(name, fmt) => {
-            let val = format_sample_string(fmt, ctx, registry);
+            let val = format_http_string(fmt, ctx, registry);
             if !res_htx_resize(0, htx_hdr_size(name, &val)) {
                 return failed();
             }
@@ -13187,7 +13225,7 @@ fn res_action(
 
     // `set-header`: every occurrence goes, then one is added at the end
     // (`http_action_set_header`) -- the removal stays when the addition does not fit.
-    let val = format_sample_string(act_fmt, ctx, registry);
+    let val = format_http_string(act_fmt, ctx, registry);
     let freed: usize = hdrs.iter().filter(|(k, _)| k.eq_ignore_ascii_case(act_name)).map(|(k, v)| htx_hdr_size(k, v)).sum();
     hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(act_name));
     res_htx_resize(freed, 0);
@@ -13726,7 +13764,7 @@ fn build_templated_error_response(
         while let Some(stripped) = rest.strip_prefix("\0HDR:") {
             if let Some((line, r)) = stripped.split_once('\n') {
                 if let Some((k, v)) = line.split_once(':') {
-                    let formatted_v = format_sample_string(v, ctx, registry);
+                    let formatted_v = format_http_string(v, ctx, registry);
                     custom_headers.push((k.to_string(), formatted_v));
                 }
                 rest = r;
