@@ -329,6 +329,7 @@ impl CliApplet {
             match stream.write(&self.out_buf[self.out_offset..]) {
                 Ok(n) if n > 0 => {
                     self.out_offset += n;
+                    crate::stats::BYTES_OUT.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                     if self.out_offset >= self.out_buf.len() {
                         self.out_buf.clear();
                         self.out_offset = 0;
