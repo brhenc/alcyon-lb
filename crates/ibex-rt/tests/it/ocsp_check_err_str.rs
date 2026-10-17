@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T328: ocsp_check_err_str converter
+//! T328: `ocsp_check_err_str` converter
 
 use crate::common;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
@@ -54,14 +53,6 @@ fn cli(sock: &str, cmd: &str) -> String {
     out
 }
 
-fn info(sock: &str) -> HashMap<String, String> {
-    cli(sock, "show info").lines().filter_map(|l| l.split_once(": ")).map(|(k, v)| (k.to_string(), v.to_string())).collect()
-}
-
-fn num(i: &HashMap<String, String>, k: &str) -> u64 {
-    i.get(k).unwrap_or_else(|| panic!("show info has no {k}")).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", i[k]))
-}
-
 /// One request on a new connection; the whole raw answer.
 fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
@@ -74,63 +65,21 @@ fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
 
 const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
 
-fn http_cfg(global: &str, body: &str) -> String {
-    format!(
-        "global\n  stats socket {{sock}} level admin\n{global}\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
-    )
-}
-
-/// A server on a free port that reads each request head, answers `resp` and closes the connection.
-fn backend(resp: &'static [u8]) -> SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = l.local_addr().unwrap();
-    std::thread::spawn(move || {
-        for c in l.incoming() {
-            let Ok(mut c) = c else { continue };
-            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
-            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match c.read(&mut b) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => head.extend_from_slice(&b[..n]),
-                }
-            }
-            let _ = c.write_all(resp);
-        }
-    });
-    addr
-}
-
 /// The body of the answer to `req` (what follows the first empty line).
 fn body(addr: SocketAddr, req: &[u8]) -> String {
     let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
-}
-
-/// The value of the `x-out` header in the answer to `req`.
-fn xout(addr: SocketAddr, req: &[u8]) -> String {
-    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
-    let head = s.split("\r\n\r\n").next().unwrap_or("");
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("x-out")).map(|(_, v)| v.trim().to_string()))
-        .unwrap_or_else(|| panic!("no x-out header in the answer: {s:?}"))
+    s.split_once("\r\n\r\n").map_or_else(|| panic!("no answer: {s:?}"), |(_, b)| b.to_string())
 }
 
 #[test]
 fn ocsp_check_err_str_converter() {
-    // T328: ocsp_check_err_str converter
     let a = common::reserve_addr();
     let cfg = format!(
-        "global\n  stats socket {{sock}} level admin\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {}\n  http-request return status 200 content-type text/plain lf-string \"[%[int(0),ocsp_check_err_str]|%[int(1),ocsp_check_err_str]|%[int(5),ocsp_check_err_str]|%[int(8),ocsp_check_err_str]|%[int(11),ocsp_check_err_str]|%[int(12),ocsp_check_err_str]|%[int(-1),ocsp_check_err_str]]\"",
-        a
+        "global\n  stats socket {{sock}} level admin\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {a}\n  http-request return status 200 content-type text/plain lf-string \"[%[int(0),ocsp_check_err_str]|%[int(1),ocsp_check_err_str]|%[int(5),ocsp_check_err_str]|%[int(8),ocsp_check_err_str]|%[int(11),ocsp_check_err_str]|%[int(12),ocsp_check_err_str]|%[int(-1),ocsp_check_err_str]|%[int(4294967297),ocsp_check_err_str]|%[str(6),ocsp_check_err_str]]\""
     );
-    let ( _ibex, _sock) = start("ocsp_check_err_str", &cfg, &[a]);
+    let (_ibex, _sock) = start("ocsp_check_err_str", &cfg, &[a]);
     let b = body(a, GET);
-    // Expected body from HAProxy: [|OCSP verification failed|OCSP response not yet valid (contains a date in the future)|unable to get issuer certificate|Timeout||]
-    // Actually mapping: 0 => empty, 1 => OCSP verification failed, 5 => OCSP response not yet valid..., 8 => unable to get issuer certificate, 11 => Timeout, 12 => ? maybe empty? Wait table: 11 => Timeout, 12 => ? According to table, 12 is not listed? List shows 1..11. 12 maybe unknown. And -1 => empty.
-    // The expected string from table: [|OCSP verification failed|OCSP response not yet valid (contains a date in the future)|unable to get issuer certificate|Timeout||]
-    // That matches indices: 0 empty,1,5,8,11,12,-1
-    // So 12 should be empty (unknown)
-    assert_eq!(b, "[|OCSP verification failed|OCSP response not yet valid (contains a date in the future)|unable to get issuer certificate|Timeout||]");
+    // HAProxy 3.5-dev8: 0 and codes outside 1..=11 give an empty string; the code is read as a
+    // 32-bit int (4294967297 is 1) and a string input is cast to an integer first.
+    assert_eq!(b, "[|OCSP verification failed|OCSP response not yet valid (contains a date in the future)|unable to get issuer certificate|Timeout|||OCSP verification failed|OCSP response has expired]");
 }

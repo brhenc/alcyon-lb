@@ -4498,14 +4498,17 @@ impl Registry {
                 _ => None,
             },
         });
-        // T328: ocsp_check_err_str converter
+        // `ocsp_check_err_str` (T328): an OCSP check error code to its text. HAProxy's
+        // `ssl_ocsp_check_err_to_str(int)` takes the low 32 bits; 0 and codes outside 1..=11
+        // give an empty string.
         self.register_converter(ConvDesc {
             name: "ocsp_check_err_str",
             in_type: TypeSpec::Exact(SampleType::Sint),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, _args| match smp {
                 Sample::Sint(n) => {
-                    let s = match n {
+                    let code = i32::from_le_bytes(n.to_le_bytes()[..4].try_into().ok()?);
+                    let s = match code {
                         1 => "OCSP verification failed",
                         2 => "OCSP unknown cert",
                         3 => "OCSP response(s) invalid",
@@ -4520,11 +4523,10 @@ impl Registry {
                         _ => "",
                     };
                     Some(Sample::Str(s.to_string()))
-                },
+                }
                 _ => None,
             },
         });
-
     }
 
     /// Applies a chain of converters to a sample value, with the runtime state the context
