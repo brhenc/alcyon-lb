@@ -3512,6 +3512,12 @@ mod tests {
         // be. (The owner's pass was modelled before the stream's run, not after it: a run
         // that drained a `req` the pass had found full ended with nothing "to run it", while
         // the engine runs the owner after it -- 1 in ~8 runs failed, T300.)
+        //
+        // The socket event is the engine's: write interest as `interests` gives it
+        // (`update_interests` registers it), and the run it brings comes when the server's
+        // socket can take bytes, not at once. Running the stream again at once while the
+        // reader thread had not drained the socket spun the 1000 runs through `EAGAIN`
+        // with the body still held (1 in ~10 runs of the whole lib, most on busy cores).
         let done = |s: &super::TcpSession| s.h2_active().expect("served").body.done;
         for run in 0..1000 {
             s.process(ibex_sched::Tick(1000)).expect("process");
@@ -3522,8 +3528,17 @@ mod tests {
             if done(&s) && s.req.is_empty() {
                 break;
             }
-            let woken = moved || !s.req.is_empty() || s.wants_rerun();
+            let srv_write_wanted = s.interests().1.write;
+            let woken = moved || srv_write_wanted || s.wants_rerun();
             assert!(woken, "run {run}: {} body bytes moved on, the rest held with nothing to run the session again", s.h2_active().expect("served").body.consumed);
+            if !moved && !s.wants_rerun() {
+                // Only the socket event will run it: wait for it, as the poller does.
+                use rustix::event::{poll, PollFd, PollFlags};
+                let fd = s.srv.as_ref().expect("the server's socket");
+                let mut fds = [PollFd::new(fd, PollFlags::OUT)];
+                let n = poll(&mut fds, 10_000).expect("poll");
+                assert_eq!(n, 1, "run {run}: the server's socket never became writable");
+            }
         }
         assert!(done(&s), "the body was moved on whole");
         drop(s);
