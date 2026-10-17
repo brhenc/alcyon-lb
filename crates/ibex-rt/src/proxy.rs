@@ -1278,9 +1278,8 @@ impl TcpSession {
             self.h2_idle_start = now;
         }
         if self.h2_idle_goaway {
-            if !self.cli_exp.is_set() {
-                self.cli_exp = client;
-            }
+            // The GOAWAY queued its own output wait (above), which stands; never eternity here.
+            self.cli_exp = if self.cli_exp.is_set() { self.cli_exp } else { client };
             return;
         }
         // A HEADERS frame starting ends the keep-alive wait and starts the http-request one.
