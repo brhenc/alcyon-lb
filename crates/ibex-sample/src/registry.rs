@@ -1293,19 +1293,36 @@ impl Registry {
         });
 
         let req_hdr_cnt_fetch: FetchFn = |ctx, args| {
-            let name = args.first()?;
-            let count = get_all_req_headers(ctx, name).len();
+            let count = if let Some(name) = args.first() {
+                get_all_req_headers(ctx, name).len()
+            } else {
+                // Count all request header lines (excluding Connection)
+                get_all_req_headers_all(ctx).len()
+            };
             Some(Sample::Sint(len_to_sint(count)))
+        };
+        // T327: req.hdr_cnt and hdr_cnt count comma-separated values, not lines
+        let req_hdr_val_cnt_fetch: FetchFn = |ctx, args| {
+            let total = if let Some(name) = args.first() {
+                // Count values for a specific header name
+                let vals = get_all_req_headers(ctx, name);
+                vals.iter().map(|v| v.split(',').count()).sum::<usize>()
+            } else {
+                // Count values across all request headers (excluding Connection)
+                let all = get_all_req_headers_all(ctx);
+                all.iter().map(|(_, v)| v.split(',').count()).sum::<usize>()
+            };
+            Some(Sample::Sint(len_to_sint(total)))
         };
         self.register_fetch(FetchDesc {
             name: "req.hdr_cnt",
             out_type: SampleType::Sint,
-            func: req_hdr_cnt_fetch,
+            func: req_hdr_val_cnt_fetch,
         });
         self.register_fetch(FetchDesc {
             name: "hdr_cnt",
             out_type: SampleType::Sint,
-            func: req_hdr_cnt_fetch,
+            func: req_hdr_val_cnt_fetch,
         });
         self.register_fetch(FetchDesc {
             name: "req.fhdr_cnt",
@@ -4890,6 +4907,37 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
         }
     }
     matches
+}
+
+/// Returns all request header `(name, value)` pairs, excluding `Connection`.
+/// Used by `req.hdr_cnt` without a name argument (T327).
+fn get_all_req_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
+    let mut all = Vec::new();
+    if let Some(htx) = ctx.htx_slice {
+        for (hn, hv) in htx.headers() {
+            if !hn.eq_ignore_ascii_case("connection") {
+                all.push((hn.to_string(), hv.to_string()));
+            }
+        }
+        if !all.is_empty() {
+            return all;
+        }
+    }
+    if let Some(htx) = ctx.htx {
+        for hf in htx.headers() {
+            if !hf.name.eq_ignore_ascii_case("connection") {
+                all.push((hf.name.clone(), hf.value.clone()));
+            }
+        }
+    }
+    if let Some(headers) = ctx.req_headers {
+        for (k, v) in headers {
+            if !k.eq_ignore_ascii_case("connection") {
+                all.push((k.clone(), v.clone()));
+            }
+        }
+    }
+    all
 }
 
 /// The response's header `name`. Only the response is read: `ctx.htx_slice` holds the
