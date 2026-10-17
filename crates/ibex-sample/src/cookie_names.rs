@@ -157,13 +157,13 @@ pub fn values<'a>(elem: &'a str, name: &str, list: bool) -> Vec<&'a str> {
 /// goes in front of a name only when `out` is not empty, so an empty name vanishes at the
 /// start and keeps its slot after that. `is_req` reads a `Cookie` value, else a
 /// `Set-Cookie` one.
-pub fn append(out: &mut String, value: &str, is_req: bool, delim: char) {
+pub fn append(out: &mut String, value: &str, is_req: bool, delim: &str) {
     let mut push = |elem: &str| {
         let v = elem.as_bytes();
         let mut from = 0;
         while let Some((beg, end, next)) = next_name(v, from, is_req) {
             if !out.is_empty() {
-                out.push(delim);
+                out.push_str(delim);
             }
             // `beg` and `end` border ASCII bytes or the ends, so they are char boundaries.
             out.push_str(elem.get(beg..end).unwrap_or(""));
@@ -191,7 +191,7 @@ mod tests {
     fn names(values: &[&str], is_req: bool) -> String {
         let mut out = String::new();
         for v in values {
-            append(&mut out, v, is_req, ',');
+            append(&mut out, v, is_req, ",");
         }
         out
     }
