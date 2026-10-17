@@ -221,3 +221,23 @@ fn mqtt_converters_refuse_bad_arguments() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// T330 review: `sample_conv_mqtt_field_value()` never sets the sample type, so the value stays
+/// binary (the converter's input type) even for the numeric fields: it casts to a string but not to
+/// an integer, and `-m int` never matches. Measured on the `HAProxy` oracle.
+#[test]
+fn mqtt_field_value_is_binary() {
+    let a = common::reserve_addr();
+    const H: &str = "101000044d5154540402003c000474657374";
+    let line = format!(
+        "a%[bin({H}),mqtt_field_value(connect,keepalive),add(1)]|b%[bin({H}),mqtt_field_value(connect,protocol_version),mul(2)]|c%[bin({H}),mqtt_field_value(connect,protocol_name),lower]|d%[bin({H}),mqtt_field_value(connect,keepalive)]|e%[bin({H}),mqtt_field_value(connect,keepalive),length]"
+    );
+    let cfg = http_cfg(
+        "  nbthread 1\n",
+        &format!(
+            "frontend fe\n  bind {a}\n  acl ka60 bin({H}),mqtt_field_value(connect,keepalive) -m int 60\n  acl kas bin({H}),mqtt_field_value(connect,keepalive) -m str 60\n  http-request return status 200 content-type text/plain lf-string \"{line}|int\" if ka60\n  http-request return status 200 content-type text/plain lf-string \"{line}|str\" if kas\n"
+        ),
+    );
+    let (_ibex, _sock) = start("mqtt_bin", &cfg, &[a]);
+    assert_eq!(body(a, GET), "a|b|cmqtt|d60|e2|str");
+}

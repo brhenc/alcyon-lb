@@ -1104,13 +1104,12 @@ fn mqtt_is_valid(msg: &[u8]) -> Option<Sample> {
 fn mqtt_field_value(msg: &[u8], args: &[String]) -> Option<Sample> {
     let ty = mqtt::type_id(args.first()?)?;
     let field = mqtt::field_id(ty, args.get(1)?)?;
-    Some(match mqtt::field_value(msg, ty, field)? {
-        mqtt::Value::Num(n) => Sample::Str(n.to_string()),
-        mqtt::Value::Bytes(b) => match std::str::from_utf8(b) {
-            Ok(s) => Sample::Str(s.to_string()),
-            Err(_) => Sample::Bin(b.to_vec()),
-        },
-    })
+    // HAProxy declares a string but never sets the sample type, so the value stays binary (the
+    // input type): it casts to a string, not to an integer.
+    Some(Sample::Bin(match mqtt::field_value(msg, ty, field)? {
+        mqtt::Value::Num(n) => n.to_string().into_bytes(),
+        mqtt::Value::Bytes(b) => b.to_vec(),
+    }))
 }
 
 /// T330: load-time check of `mqtt_field_value`'s arguments (`sample_conv_mqtt_field_value_check`).
