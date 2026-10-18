@@ -234,10 +234,8 @@ impl Drop for StatRow {
         }
         // A thread that is going away has no pool left to give back to.
         let _ = ROW_POOL.try_with(|p| {
-            if let Ok(mut p) = p.try_borrow_mut() {
-                if p.len() < 8 {
-                    p.push(fields);
-                }
+            if let Some(mut p) = p.try_borrow_mut().ok().filter(|p| p.len() < 8) {
+                p.push(fields);
             }
         });
     }
@@ -376,10 +374,14 @@ pub fn node_name() -> String {
 
 /// Calls `f` with the node name (`global node`, or the host name) without copying it.
 pub fn with_node<R>(f: impl FnOnce(&str) -> R) -> R {
-    if let Ok(id) = IDENTITY.read() {
-        if let Some(n) = id.0.as_deref() {
-            return f(n);
-        }
+    node_of(IDENTITY.read(), f)
+}
+
+/// [`with_node`] on the result of taking the lock: a lock that cannot be taken gives the host name.
+fn node_of<G: std::ops::Deref<Target = (Option<String>, Option<String>)>, E, R>(id: Result<G, E>, f: impl FnOnce(&str) -> R) -> R {
+    let held = id.ok();
+    if let Some(n) = held.as_deref().and_then(|id| id.0.as_deref()) {
+        return f(n);
     }
     let u = rustix::system::uname();
     f(u.nodename().to_string_lossy().trim())
@@ -387,7 +389,13 @@ pub fn with_node<R>(f: impl FnOnce(&str) -> R) -> R {
 
 /// Calls `f` with `global description` when one was given, without copying it.
 pub fn with_description<R>(f: impl FnOnce(Option<&str>) -> R) -> R {
-    match IDENTITY.read() {
+    description_of(IDENTITY.read(), f)
+}
+
+/// [`with_description`] on the result of taking the lock: a lock poisoned (or otherwise not
+/// taken) gives no description.
+fn description_of<G: std::ops::Deref<Target = (Option<String>, Option<String>)>, E, R>(id: Result<G, E>, f: impl FnOnce(Option<&str>) -> R) -> R {
+    match id {
         Ok(id) => f(id.1.as_deref()),
         Err(_) => f(None),
     }
@@ -1272,5 +1280,26 @@ mod tests {
                 "line {i} has {comma_count} commas (< 51): {line}"
             );
         }
+    }
+
+    fn host_name_for_test() -> String {
+        rustix::system::uname().nodename().to_string_lossy().trim().to_string()
+    }
+
+    /// With no `global node` the host name is given, with no `global description` none; a lock
+    /// that cannot be taken gives no description, and a thread's pool of rows holds eight.
+    #[test]
+    fn identity_defaults_and_a_full_row_pool() {
+        assert!(with_node(|n| !n.is_empty() && n == n.trim()));
+        assert_eq!(with_description(|d| d.map(str::to_string)), None);
+        let held: (Option<String>, Option<String>) = (None, Some("d".into()));
+        assert_eq!(description_of(Ok::<_, ()>(&held), |d| d.map(str::to_string)), Some("d".to_string()));
+        assert_eq!(description_of(Err::<&(Option<String>, Option<String>), ()>(()), |d| d.map(str::to_string)), None);
+        assert_eq!(node_of(Ok::<_, ()>(&held), |n| n.to_string()), host_name_for_test());
+        assert_eq!(node_of(Err::<&(Option<String>, Option<String>), ()>(()), |n| n.to_string()), host_name_for_test());
+        let named: (Option<String>, Option<String>) = (Some("n1".into()), None);
+        assert_eq!(node_of(Ok::<_, ()>(&named), |n| n.to_string()), "n1");
+        let rows: Vec<StatRow> = (0..10).map(|_| StatRow::new()).collect();
+        drop(rows);
     }
 }

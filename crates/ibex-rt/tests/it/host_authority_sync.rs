@@ -14,6 +14,11 @@ use std::time::Duration;
 
 /// What the server receives (head only) when ibex, configured with `rule`, gets `req`.
 fn upstream_head(tag: &str, rule: &str, req: &str) -> String {
+    upstream_head_in(tag, "", rule, req)
+}
+
+/// [`upstream_head`] with `global` lines (each ended by a newline) in a `global` section.
+fn upstream_head_in(tag: &str, global: &str, rule: &str, req: &str) -> String {
     let srv = TcpListener::bind("127.0.0.1:0").unwrap();
     let sp = srv.local_addr().unwrap().port();
     let bind = common::reserve_addr();
@@ -22,7 +27,7 @@ fn upstream_head(tag: &str, rule: &str, req: &str) -> String {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("c.cfg");
     let cfg = format!(
-        "defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {bind}\n  {rule}\n  default_backend be\nbackend be\n  server s1 127.0.0.1:{sp}\n"
+        "global\n{global}defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {bind}\n  {rule}\n  default_backend be\nbackend be\n  server s1 127.0.0.1:{sp}\n"
     );
     std::fs::write(&path, cfg).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
@@ -99,4 +104,58 @@ fn set_uri_updates_host() {
     let abs = "GET http://a.com/p HTTP/1.1\r\nHost: a.com\r\n\r\n";
     check("hc1", "http-request set-uri http://z.com/zz", abs, "GET http://z.com/zz HTTP/1.1", &["host: z.com"]);
     check("hc2", "http-request set-uri /zz", abs, "GET /zz HTTP/1.1", &["host: a.com"]);
+}
+
+/// What the client is answered (the first line) when ibex, configured with `global` and `rule`,
+/// gets `req`; the server is not there, as the cases here end before a connection to it.
+fn status_in(tag: &str, global: &str, rule: &str, req: &str) -> String {
+    let bind = common::reserve_addr();
+    let dir = std::env::temp_dir().join(format!("qh-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.cfg");
+    let cfg = format!(
+        "global\n{global}defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {bind}\n  {rule}\n  default_backend be\nbackend be\n  server s1 127.0.0.1:9\n"
+    );
+    std::fs::write(&path, cfg).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    assert!(common::wait_listening(bind), "ibex did not listen");
+    let mut c = TcpStream::connect(bind).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+    c.write_all(req.as_bytes()).unwrap();
+    let mut buf = [0u8; 256];
+    let n = c.read(&mut buf).unwrap_or(0);
+    common::stop(&mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+    String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string()
+}
+
+/// Measured on the same oracle (2026-10-18): the new value is the authority already there, so
+/// the target stays as it is; a `CONNECT` authority-form target follows the `Host` rewrite.
+#[test]
+fn the_same_host_and_connect_targets() {
+    let abs = "GET http://a.com/p HTTP/1.1\r\nHost: a.com\r\n\r\n";
+    check("hd1", "http-request set-header host a.com", abs, "GET http://a.com/p HTTP/1.1", &["host: a.com"]);
+    check(
+        "hd2",
+        "http-request set-header host n.org:443",
+        "CONNECT a.com:443 HTTP/1.1\r\nHost: a.com:443\r\n\r\n",
+        "CONNECT n.org:443 HTTP/1.1",
+        &["host: n.org:443"],
+    );
+}
+
+/// With `tune.bufsize 1024` and `tune.maxrewrite 256`, measured on the oracle: a `set-uri` to an
+/// authority of 452 bytes goes through (the server gets the target and the `Host` of the same
+/// authority), one of 454 does not fit and is a 500.
+#[test]
+fn a_set_uri_that_leaves_no_room_for_host_is_a_500() {
+    let global = "  tune.bufsize 1024\n  tune.maxrewrite 256\n";
+    let abs = "GET http://a.com/p HTTP/1.1\r\nHost: a.com\r\n\r\n";
+    let fits = "z".repeat(452);
+    let (l, h) = line_and_hosts(&upstream_head_in("he1", global, &format!("http-request set-uri http://{fits}.com/zz"), abs));
+    assert_eq!(l, format!("GET http://{fits}.com/zz HTTP/1.1"));
+    assert_eq!(h, vec![format!("host: {fits}.com")]);
+    let toobig = "z".repeat(454);
+    assert_eq!(status_in("he2", global, &format!("http-request set-uri http://{toobig}.com/zz"), abs), "HTTP/1.1 500 Internal Server Error");
 }

@@ -113,6 +113,12 @@ pub fn intern(name: &str) -> Option<u32> {
         return Some(id);
     }
     let mut w = NAMES.write().ok()?;
+    intern_locked(&mut w, name)
+}
+
+/// [`intern`] under the write lock: another thread may have given `name` its number between
+/// the read that missed and the write lock.
+fn intern_locked(w: &mut Names, name: &str) -> Option<u32> {
     if let Some(&id) = w.ids.get(name) {
         return Some(id);
     }
@@ -123,6 +129,21 @@ pub fn intern(name: &str) -> Option<u32> {
     w.names.push(name.into());
     w.ids.insert(name.into(), id);
     Some(id)
+}
+
+/// Makes `slots` at least `len` long; `None` (and `slots` as it was) when the memory is not there.
+fn grow_to(slots: &mut Vec<Slot>, len: usize) -> Option<()> {
+    if slots.len() < len {
+        reserve_more(slots, len - slots.len())?;
+        slots.resize_with(len, Slot::default);
+    }
+    Some(())
+}
+
+/// Room for `extra` more elements in `v`; `None` when the memory is not there (the allocator
+/// refuses, or the size cannot be addressed).
+fn reserve_more<T>(v: &mut Vec<T>, extra: usize) -> Option<()> {
+    v.try_reserve(extra).ok()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -246,10 +267,7 @@ impl Slot {
             }
             Bytes::Ref(b) => {
                 self.buf.clear();
-                if self.buf.try_reserve(b.len()).is_err() {
-                    self.val = Val::Bool(self.as_bool());
-                    return;
-                }
+                let Some(()) = reserve_more(&mut self.buf, b.len()) else { return self.val = Val::Bool(self.as_bool()) };
                 self.buf.extend_from_slice(b);
             }
         }
@@ -395,13 +413,8 @@ impl VarStore {
 
     fn write(&mut self, id: u32, scope: Scope, v: In<'_>) -> bool {
         let i = id as usize;
-        if i >= self.slots.len() {
-            // Grows only for a name this store has not held yet: on warm-up.
-            if self.slots.try_reserve(i + 1 - self.slots.len()).is_err() {
-                return false;
-            }
-            self.slots.resize_with(i + 1, Slot::default);
-        }
+        // Grows only for a name this store has not held yet: on warm-up.
+        let Some(()) = grow_to(&mut self.slots, i + 1) else { return false };
         let slot = &mut self.slots[i];
         slot.scope = scope;
         slot.set(v);
@@ -447,12 +460,7 @@ impl VarStore {
         self.clear_scope(scope);
         for (i, s) in from.slots.iter().enumerate() {
             if s.scope == scope && s.val != Val::Absent {
-                if i >= self.slots.len() {
-                    if self.slots.try_reserve(i + 1 - self.slots.len()).is_err() {
-                        return;
-                    }
-                    self.slots.resize_with(i + 1, Slot::default);
-                }
+                let Some(()) = grow_to(&mut self.slots, i + 1) else { return };
                 self.slots[i].clone_from(s);
             }
         }
@@ -474,12 +482,7 @@ impl VarStore {
                     }
                 }
                 (Some(c), a) if !a.is_some_and(|a| a.same_value(c)) => {
-                    if i >= self.slots.len() {
-                        if self.slots.try_reserve(i + 1 - self.slots.len()).is_err() {
-                            return;
-                        }
-                        self.slots.resize_with(i + 1, Slot::default);
-                    }
+                    let Some(()) = grow_to(&mut self.slots, i + 1) else { return };
                     self.slots[i].clone_from(c);
                 }
                 _ => {}
@@ -524,12 +527,7 @@ impl Clone for VarStore {
 
     fn clone_from(&mut self, from: &Self) {
         self.clear();
-        if self.slots.len() < from.slots.len() {
-            if self.slots.try_reserve(from.slots.len() - self.slots.len()).is_err() {
-                return;
-            }
-            self.slots.resize_with(from.slots.len(), Slot::default);
-        }
+        let Some(()) = grow_to(&mut self.slots, from.slots.len()) else { return };
         for (d, s) in self.slots.iter_mut().zip(&from.slots) {
             if s.val != Val::Absent {
                 d.clone_from(s);
@@ -989,5 +987,62 @@ mod tests {
         let b = VarStore::new();
         assert_eq!(b.slots.as_ptr(), ptr);
         assert!(b.is_empty());
+    }
+    /// The paths of the stores that cannot grow: no memory, or a size nothing can address.
+    #[test]
+    fn a_store_that_cannot_grow_is_left_as_it_is() {
+        let mut v: Vec<u8> = Vec::new();
+        assert_eq!(reserve_more(&mut v, usize::MAX), None);
+        assert_eq!(reserve_more(&mut v, 8), Some(()));
+        let mut slots: Vec<Slot> = Vec::new();
+        assert_eq!(grow_to(&mut slots, usize::MAX / 2), None);
+        assert!(slots.is_empty());
+        assert_eq!(grow_to(&mut slots, 3), Some(()));
+        assert_eq!(slots.len(), 3);
+        assert_eq!(grow_to(&mut slots, 2), Some(()));
+        assert_eq!(slots.len(), 3);
+    }
+
+    /// The thread's store is borrowed while a stream's run ends: `leave` empties nothing and
+    /// goes on; with no stream running, `with_stream` runs on the store it is given.
+    #[test]
+    fn leave_while_borrowed_and_a_stream_not_running() {
+        assert_eq!(with_current(|_| leave(None)), Some(()));
+        let mut own = VarStore::new();
+        assert_eq!(with_stream(&mut own, |s| s.is_empty()), Some(true));
+        assert_eq!(In::Owned(Sample::Sint(1)).extra_bytes(), 0);
+        assert_eq!(In::Ref(&Sample::Str("h\u{e9}".into())).extra_bytes(), 2);
+    }
+
+    /// Another thread may name a variable between the read that missed and the write lock;
+    /// the names stop at `MAX_NAMES`.
+    #[test]
+    fn a_name_is_numbered_once_and_the_table_is_capped() {
+        let mut w = Names::default();
+        assert_eq!(intern_locked(&mut w, "txn.a"), Some(0));
+        assert_eq!(intern_locked(&mut w, "txn.a"), Some(0));
+        for i in 1..MAX_NAMES {
+            assert_eq!(intern_locked(&mut w, &format!("txn.n{i}")), u32::try_from(i).ok());
+        }
+        assert_eq!(intern_locked(&mut w, "txn.one-too-many"), None);
+        assert_eq!(intern_locked(&mut w, "txn.a"), Some(0));
+    }
+
+    /// A value set by reference keeps its type for every kind, an unusual method included,
+    /// and is counted by its bytes.
+    #[test]
+    fn a_value_set_by_reference_keeps_every_type() {
+        let mut s = VarStore::new();
+        for v in [
+            Sample::Bin(vec![1, 2, 3]),
+            Sample::Meth(HttpMethod::Other("PURGE".to_string())),
+            Sample::Meth(HttpMethod::Patch),
+        ] {
+            assert!(set_in(&mut s, "txn.t363ref", In::Ref(&v)));
+            assert_eq!(s.get("txn.t363ref"), Some(v.clone()));
+        }
+        assert!(set_in(&mut s, "txn.t363ref2", In::Ref(&Sample::Meth(HttpMethod::Other("PURGE".to_string())))));
+        let z = s.sizes();
+        assert_eq!(z.all, 2 * VAR_STRUCT_COST + 5);
     }
 }

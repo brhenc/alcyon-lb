@@ -470,3 +470,22 @@ pub fn http_errors_section_code(name: &str, code: u16) -> Option<Vec<u8>> {
     HTTP_ERRORS_SECTIONS.with_borrow(|m| m.get(name).and_then(|t| t.get(&code).cloned()))
 }
 
+
+#[cfg(test)]
+mod headers_bin_tests {
+    use super::HeadersBinOp;
+
+    #[test]
+    fn the_encoded_name_round_trips_for_every_operation() {
+        for m in ["str", "beg", "end", "sub"] {
+            let op = HeadersBinOp::del_from_match(m).unwrap();
+            assert_eq!(op.keyword(), "del-headers-bin");
+            assert_eq!(HeadersBinOp::decode_name(&op.encode_name("p-")), Some((op, "p-")));
+        }
+        for op in [HeadersBinOp::Set, HeadersBinOp::Add] {
+            assert_eq!(HeadersBinOp::decode_name(&op.encode_name("")), Some((op, "")));
+        }
+        assert_eq!(HeadersBinOp::del_from_match("reg"), None);
+        assert_eq!(HeadersBinOp::decode_name("x-a"), None);
+    }
+}

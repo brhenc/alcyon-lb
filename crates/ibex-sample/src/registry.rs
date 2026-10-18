@@ -9462,3 +9462,23 @@ fn parse_count(arg: &str) -> i32 {
     let v = n as i32;
     v
 }
+
+#[cfg(test)]
+mod dn_sample_tests {
+    use super::dn_sample;
+
+    /// The contents of a Name (what the certificate parser hands over): `SET { SEQUENCE { 2.5.4.3, UTF8String "a" } }`, i.e. `CN=a`.
+    const NAME: &[u8] = &[0x31, 0x0A, 0x30, 0x08, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0C, 0x01, b'a'];
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The format argument alone selects the RFC 2253 form; `val_dnfmt` refuses any other
+    /// word at load time, so the refusal here is only the defensive arm.
+    #[test]
+    fn the_format_without_an_entry_is_rfc2253() {
+        assert_eq!(dn_sample(NAME, &args(&["", "", "rfc2253"])), Some(crate::Sample::Str("CN=a".into())));
+        assert_eq!(dn_sample(NAME, &args(&["", "", "xx"])), None);
+    }
+}
