@@ -4679,6 +4679,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
     pub fn step(&mut self, now: Tick) -> io::Result<usize> {
         self.now = now;
+        crate::watchdog::progress();
+        crate::watchdog::set_streams(self.sessions.live());
         self.wake_queued();
 
         // 1. Expire scheduler timers
@@ -4760,7 +4762,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // 3. Poll readiness events
         let mut events = std::mem::take(&mut self.events);
         events.clear();
-        self.poller.poll(Some(poll_timeout), |ev| events.push(ev))?;
+        crate::watchdog::sleeping(true);
+        let polled = self.poller.poll(Some(poll_timeout), |ev| events.push(ev));
+        crate::watchdog::sleeping(false);
+        crate::watchdog::progress();
+        polled?;
 
         // The time now, not the time the pass started: everything below arms its timers from
         // `now`, and a connection accepted or a request read after the poller waited would
@@ -4776,6 +4782,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mut quic_ready: Vec<usize> = Vec::new();
         let mut mail = false;
         for &ev in &events {
+            // A descriptor handled keeps the thread from being killed, not from being
+            // reported: `fd_update_events` clears `TH_FL_STUCK` (src/fd.c:685), only a
+            // task run clears `sched_stuck`.
+            crate::watchdog::under_control();
             match self.fdtab.state(ev.fd) {
                 FdState::Listener { listener: l_idx } => {
                     let l_idx = l_idx as usize;
@@ -12024,6 +12034,15 @@ impl EngineDispatcher<'_> {
 
 impl Dispatch for EngineDispatcher<'_> {
     fn run(&mut self, kind: WorkKind, _state: u32) -> Outcome {
+        let outcome = self.run_task(kind);
+        // `sched_stuck = 0` after every task (src/task.c:681): one store, no syscall.
+        crate::watchdog::progress();
+        outcome
+    }
+}
+
+impl EngineDispatcher<'_> {
+    fn run_task(&mut self, kind: WorkKind) -> Outcome {
         match kind.kind() {
             Some(Kind::Stream) => {
                 let session_idx = kind.index();

@@ -550,7 +550,7 @@ fn show_info_pairs(
         ("Niced_tasks", zero()),
         ("CurrStreams", zero()),
         ("CumStreams", crate::stats::CUM_STREAMS.load(std::sync::atomic::Ordering::Relaxed).to_string()),
-        ("BlockedTrafficWarnings", zero()),
+        ("BlockedTrafficWarnings", crate::watchdog::blocked_traffic_warnings().to_string()),
         ("PatternsAdded", zero()),
         ("PatternsFreed", zero()),
         ("NbThreadGroups", "1".to_string()),

@@ -248,6 +248,8 @@ pub struct GlobalSection {
     pub pidfile: Option<String>,
     /// Hard stop timeout on reload/exit.
     pub hard_stop_after: Option<Duration>,
+    /// `warn-blocked-traffic-after`: the watchdog's tick and warning delay, 1 to 1000 ms.
+    pub warn_blocked_traffic_after: Option<Duration>,
     /// Default SSL bind ciphers.
     pub ssl_default_bind_ciphers: Option<String>,
     /// Default SSL bind options.

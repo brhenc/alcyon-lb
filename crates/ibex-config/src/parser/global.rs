@@ -583,6 +583,32 @@ pub(crate) fn parse_global_directive(
             *slot = Some(set);
             Ok(())
         }
+        // `wdt_parse_warn_blocked` (src/wdt.c:209), its texts measured with `haproxy -c`.
+        // Words after the time are ignored, as there.
+        "warn-blocked-traffic-after" => {
+            let name = "warn-blocked-traffic-after";
+            let Some(arg) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' expects <time> as argument between 1 and 1000 ms.")));
+            };
+            let ms = match parse_time_ms_err(&arg.text) {
+                Ok(ms) => ms,
+                Err(TimeMsErr::Over) => {
+                    return Err(ConfigError::new(arg.line, arg.col, format!("timer overflow in argument '{}' to '{name}' (maximum value is 1000 ms)", arg.text)));
+                }
+                Err(TimeMsErr::Char(c)) => {
+                    return Err(ConfigError::new(arg.line, arg.col, format!("unexpected character '{c}' in argument to <{name}>.")));
+                }
+            };
+            if !(1..=1000).contains(&ms) {
+                return Err(ConfigError::new(
+                    arg.line,
+                    arg.col,
+                    format!("timer out of range in argument '{}' to '{name}' (value must be between 1 and 1000 ms)", arg.text),
+                ));
+            }
+            global.warn_blocked_traffic_after = Some(Duration::from_millis(ms.into()));
+            Ok(())
+        }
         "hard-stop-after" => {
             if tokens.len() >= 2 {
                 global.hard_stop_after = Some(parse_timeout(&tokens[1], "hard-stop-after")?);
@@ -1063,4 +1089,40 @@ fn c_atoi(s: &str) -> i64 {
     };
     let n = digits.bytes().take_while(u8::is_ascii_digit).fold(0i64, |a, d| a.saturating_mul(10).saturating_add(i64::from(d - b'0')));
     i64::from((if neg { -n } else { n }) as i32)
+}
+
+enum TimeMsErr {
+    Over,
+    Char(char),
+}
+
+/// A time in milliseconds as `parse_time_err(.., TIME_UNIT_MS)` (src/tools.c:2936) reads
+/// it: digits, then `us` (rounded up), `ms`, `s`, `m`, `h` or `d`; none is milliseconds.
+/// `HAProxy` warns about characters after the unit and takes the value: so does this, without
+/// the warning.
+fn parse_time_ms_err(text: &str) -> Result<u32, TimeMsErr> {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return Err(TimeMsErr::Char(text.chars().next().unwrap_or('\0')));
+    }
+    let value: u128 = text[..digits].parse().unwrap_or(u128::MAX);
+    let unit = &text[digits..];
+    // (multiplier, divisor) from the unit to milliseconds.
+    let (mul, div): (u128, u128) = if unit.is_empty() || unit.starts_with("ms") {
+        (1, 1)
+    } else if unit.starts_with("us") {
+        (1, 1000)
+    } else if unit.starts_with('s') {
+        (1000, 1)
+    } else if unit.starts_with('m') {
+        (60_000, 1)
+    } else if unit.starts_with('h') {
+        (3_600_000, 1)
+    } else if unit.starts_with('d') {
+        (86_400_000, 1)
+    } else {
+        return Err(TimeMsErr::Char(unit.chars().next().unwrap_or('\0')));
+    };
+    let ms = value.saturating_mul(mul).saturating_add(div - 1) / div;
+    u32::try_from(ms).ok().filter(|m| *m < 0x8000_0000).ok_or(TimeMsErr::Over)
 }

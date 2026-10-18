@@ -988,6 +988,7 @@ fn main() {
     // One configuration for every worker, as the proxies are (T160): a worker reads it
     // while it starts, and a copy each held it for the life of the process.
     let config = std::sync::Arc::new(config);
+    ibex_rt::watchdog::init(nbthread);
     for worker_id in 0..nbthread {
         let config_clone = std::sync::Arc::clone(&config);
         let proxies_clone = shared_proxies.clone();
@@ -999,6 +1000,9 @@ fn main() {
         let go = std::sync::Arc::clone(&go);
 
         let t = std::thread::spawn(move || {
+            // Before the ready message, so before the chroot: it opens this thread's
+            // /proc/thread-self/schedstat.
+            ibex_rt::watchdog::register(worker_id);
             let started = Engine::new_worker(&config_clone, capacity, worker_id, proxies_clone).and_then(|mut eng| {
                 let boxes = mailboxes.as_ref().map_err(|m| std::io::Error::other(m.clone()))?;
                 eng.share_mailboxes(boxes, worker_id)?;
@@ -1057,6 +1061,12 @@ fn main() {
         if ready_rx.recv().is_err() {
             break;
         }
+    }
+    // HAProxy arms its watchdog per thread at thread init (src/wdt.c:246) and does not fail
+    // to start without it.
+    let warn_after = config.global.as_ref().and_then(|g| g.warn_blocked_traffic_after).unwrap_or(ibex_rt::watchdog::DEFAULT_WARN_AFTER);
+    if let Err(e) = ibex_rt::watchdog::start(warn_after) {
+        ibex_rt::stderr_line!("[WARNING]  ({}) : Failed to start the watchdog thread ({e}), disabling lockup detection.", process::id());
     }
     let unused = ibex_rt::handover::drop_unused_inherited();
     if unused > 0 && !opts.quiet {

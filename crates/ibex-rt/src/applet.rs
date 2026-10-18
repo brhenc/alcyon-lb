@@ -150,6 +150,9 @@ impl CliLevel {
             "show info", "show stat", "show servers state", "show table", "show pools", "show version",
             "show cli", "show resolvers", "show events", "show servers conn", "help", "prompt", "quit",
             "set severity-output", "set timeout", "user",
+            // Checked by its handler: without `expert-mode on`, which only an admin can
+            // set, it answers "restricted to expert mode only" whatever the level.
+            "debug dev loop",
         ] {
             if is(p) {
                 return Self::User;
@@ -208,6 +211,8 @@ pub struct CliApplet {
     pub interactive: bool,
     /// `experimental-mode on` was sent on this connection.
     experimental: bool,
+    /// `expert-mode on` was sent on this connection, and the level has not gone down since.
+    expert: bool,
     pub timeout_ms: u32,
     pub last_activity: Tick,
     pub is_done: bool,
@@ -259,6 +264,7 @@ impl CliApplet {
             out_offset: 0,
             interactive: false,
             experimental: false,
+            expert: false,
             timeout_ms: DEFAULT_CLI_TIMEOUT_MS,
             last_activity: now,
             is_done: false,
@@ -448,6 +454,10 @@ impl CliApplet {
                 continue;
             }
             self.execute_command(cmd, ctx);
+            // Each command is a run of HAProxy's CLI task, after which its scheduler counts
+            // the thread as making progress (measured: 20 x `debug dev loop 80` on one line
+            // are not reported, T361).
+            crate::watchdog::progress();
             if self.pending.is_some() {
                 // The rest of the line runs once this command is answered.
                 self.pending_rest = Some(sub_commands[i + 1..].join(";")).filter(|r| !r.is_empty());
@@ -473,6 +483,8 @@ impl CliApplet {
         } else if cmd == "user" || cmd == "operator" {
             // The levels only go down.
             self.level = self.level.min(if cmd == "user" { CliLevel::User } else { CliLevel::Operator });
+            // HAProxy replaces the whole level, mode bits included.
+            self.expert = false;
             self.finish_msg("");
         } else if cmd == "show cli level" {
             self.finish_msg(self.level.name());
@@ -700,6 +712,29 @@ impl CliApplet {
             self.handle_set_weight(rest.trim(), ctx);
         } else if let Some(rest) = cmd.strip_prefix("set maxconn ") {
             self.handle_set_maxconn(rest.trim(), ctx);
+        } else if cmd == "expert-mode" || cmd.starts_with("expert-mode ") {
+            // `cli_parse_expert_experimental_mode` (src/cli.c:2254): no argument reports
+            // it, `on` sets it and any other word clears it.
+            match cmd.split_whitespace().nth(1) {
+                None => {
+                    let msg = format!("expert-mode is {}", if self.expert { "ON" } else { "OFF" });
+                    self.finish_msg(&msg);
+                }
+                Some(arg) => {
+                    self.expert = arg == "on";
+                    self.finish_msg("");
+                }
+            }
+        } else if cmd == "debug dev loop" || cmd.starts_with("debug dev loop ") {
+            if !self.expert {
+                self.finish_msg("This command is restricted to expert mode only.");
+            } else if cmd.split_whitespace().nth(4) == Some("isolated") {
+                // HAProxy stops every other thread for the loop; Ibex cannot (T361 slice 5).
+                self.finish_msg("'debug dev loop ... isolated' is not supported: Ibex has no thread isolation.");
+            } else {
+                Self::debug_dev_loop(cmd);
+                self.finish_msg("");
+            }
         } else if cmd == "experimental-mode on" || cmd == "experimental-mode off" {
             self.experimental = cmd.ends_with(" on");
             if self.interactive {
@@ -1536,6 +1571,25 @@ impl CliApplet {
 
     /// Ends a command that answers `msg` (empty for success): HAProxy's CLI prints the message
     /// and one more empty line, so a command with nothing to say still answers `"\n"`.
+    /// `debug dev loop <ms> [warn]` (src/debug.c:1281): spins this thread for `<ms>` of
+    /// wall time, which is how the watchdog is tested (T361). `warn` says the loop is under
+    /// control, so it is reported but not killed. A missing or bad `<ms>` is 0 (`atoi`).
+    /// `isolated` is refused by the caller.
+    fn debug_dev_loop(cmd: &str) {
+        let mut words = cmd.split_whitespace().skip(3);
+        let ms = words.next().map_or(0, |w| {
+            let digits = w.bytes().take_while(u8::is_ascii_digit).count();
+            w[..digits].parse::<u64>().unwrap_or(0)
+        });
+        let warn = words.next() == Some("warn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < deadline {
+            if warn {
+                crate::watchdog::under_control();
+            }
+        }
+    }
+
     fn finish_msg(&mut self, msg: &str) {
         if !msg.is_empty() {
             self.out_buf.extend_from_slice(msg.as_bytes());

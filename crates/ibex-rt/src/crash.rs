@@ -37,6 +37,6 @@ pub fn abort_on_panic() {
 /// exits with 134, the status a shell reports for SIGABRT, instead. `LLVM_PROFILE_FILE` is
 /// what `cargo llvm-cov` sets; a deployed binary is not instrumented and never sees it.
 /// tests/panic_policy.rs sets it too, so that the test suite makes no crash reports.
-fn die() -> ! {
+pub(crate) fn die() -> ! {
     if std::env::var_os("LLVM_PROFILE_FILE").is_some() { std::process::exit(134) } else { std::process::abort() }
 }
