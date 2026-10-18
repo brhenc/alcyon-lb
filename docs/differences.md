@@ -387,3 +387,24 @@ apply to the reply; a `metrics=` value over 512 bytes decoded, or more than 8 of
 every sample of a family costs a regeneration of the object's `show stat` row, so a scrape of
 thousands of servers takes CPU (a few ms per 16 KiB chunk, release build). `scope=global` alone is
 the cheap memory-only scrape.
+
+## `abns@` stats sockets across a `-sf` reload (T354, T370)
+
+An abstract name cannot be shared, so a `-sf` successor whose bind finds one in use sends
+`SIGTTOU` and the old process lets go of it (`Paused frontend GLOBAL.`); if the successor then
+fails to start it sends `SIGTTIN` and the old process binds the name back once (`Resumed frontend
+GLOBAL.`). A name something else holds at that moment is reported with HAProxy's two lines
+(`Resuming listener: protocol abns_stream: cannot bind UNIX socket (already in use) [abns@NAME].`,
+`Some proxies refused to resume, ...`) and tried again on the next `SIGTTIN`, as on HAProxy; neither
+polls for it. Two differences:
+
+* HAProxy sends `SIGTTIN` and only then closes its sockets (`src/haproxy.c:2115-2116`), so the old
+  process's one bind can race the successor's exit (0 losses in 30 on an idle host; the Ibex
+  equivalent lost 1 in 3 under the gate's load). Ibex joins its workers, so every socket it bound
+  is closed, before it signals.
+* `SIGTTOU` pauses every listener on HAProxy (`Paused frontend fe.` for each proxy; its TCP stats
+  socket refuses connections until `SIGTTIN`). Ibex pauses only the abstract stats sockets: the
+  others are `SO_REUSEPORT` and the successor binds beside them, and closing them would reset what
+  waits in their queues. Only `Paused frontend GLOBAL.` / `Resumed frontend GLOBAL.` are printed.
+  A unix socket file is renamed over by the successor on both and is lost to the old process if
+  the successor then fails (`Connection refused`, measured on both).

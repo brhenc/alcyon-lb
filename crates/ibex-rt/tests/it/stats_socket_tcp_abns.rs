@@ -406,15 +406,90 @@ fn a_failed_sf_successor_gives_the_abns_name_back() {
     let _ = old.wait();
 }
 
-/// Gate 48. The successor tells the old process to resume (SIGTTIN) just before it exits,
-/// while its socket may still hold the name; the old process's first bind then fails with
-/// `Address already in use` and, before the fix, gave the name up for good (1 run in 3 under
-/// the gate's load). Here the name is held by the test for 400 ms after SIGTTIN.
+/// A stand-in for the process being replaced, so the handover can be observed from its
+/// side: it holds `name` (zero-padded, as `abns@`), lets go of it on SIGTTOU, and on SIGTTIN
+/// tries to bind it back exactly once, at once, as HAProxy's `protocol_resume_all` does, and
+/// prints `bound` or `busy`. It needs no retry if the successor has closed its socket before
+/// it signals.
+fn old_process_stand_in(name: &str) -> Child {
+    const SCRIPT: &str = r#"
+import os, signal, socket, sys
+addr = b"\0" + sys.argv[1].encode().ljust(107, b"\0")
+held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+held.bind(addr); held.listen(1)
+def ttou(sig, frame):
+    held.close()
+def ttin(sig, frame):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.bind(addr); print("bound", flush=True)
+    except OSError as e:
+        print("busy", e.errno, flush=True)
+    os._exit(0)
+signal.signal(signal.SIGTTOU, ttou)
+signal.signal(signal.SIGTTIN, ttin)
+print("ready", flush=True)
+while True:
+    signal.pause()
+"#;
+    Command::new("python3")
+        .args(["-I", "-c", SCRIPT, name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("python3")
+}
+
+/// T370. A `-sf` successor that fails to start closes its abstract stats socket before it
+/// sends SIGTTIN, so the old process takes the name back at its first try. `HAProxy` sends
+/// SIGTTIN first and unbinds after (src/haproxy.c:2115-2116) and still took the name back
+/// 30 times in 30 on an idle host, because its resume runs from the event loop a wake-up
+/// later; under the gate's load Ibex lost it 1 run in 3 (gate 48). Here the old side is a
+/// stand-in that binds once, at once, when SIGTTIN arrives.
 #[test]
-fn an_abns_name_still_held_when_sigttin_arrives_is_taken_back_once_free() {
+fn a_failed_sf_successor_frees_its_abns_name_before_it_signals() {
+    let abns = format!("ibex-t370-order-{}", std::process::id());
+    let mut stand_in = old_process_stand_in(&abns);
+    let mut out = std::io::BufReader::new(stand_in.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut out, &mut line).expect("ready");
+    assert_eq!(line.trim(), "ready");
+    assert!(abstract_stream(&abns, true).is_some(), "the stand-in holds the name");
+
+    let hog = std::net::TcpListener::bind("127.0.0.1:0").expect("hog");
+    let hog_port = hog.local_addr().expect("addr").port();
+    let lines = format!("\tstats socket abns@{abns} level admin\ndefaults\n\tmode http\n\ttimeout client 5s\n\ttimeout connect 1s\n\ttimeout server 5s\nfrontend fe\n\tbind 127.0.0.1:{hog_port}\n\thttp-request return status 200 content-type text/plain string ok");
+    let (mut new, _g) = start(&lines, &["-sf".to_string(), stand_in.id().to_string()]);
+    let st = new.wait().expect("wait");
+    assert!(!st.success(), "the successor must fail: {st:?}");
+    line.clear();
+    std::io::BufRead::read_line(&mut out, &mut line).expect("verdict");
+    let _ = stand_in.wait();
+    assert_eq!(line.trim(), "bound", "the name must be free when SIGTTIN arrives");
+}
+
+/// T370. The name is held by something else when SIGTTIN arrives: as `HAProxy`
+/// 3.5-dev8-885761-29 (measured: `kill -TTOU`, bind the name from outside, `kill -TTIN`),
+/// the one bind fails and is reported, the name is not polled for, and the next SIGTTIN
+/// takes it back once it is free.
+///
+/// ```text
+/// [ALERT]    (pid) : Resuming listener: protocol abns_stream: cannot bind UNIX socket (already in use) [abns@NAME].
+/// [WARNING]  (pid) : Some proxies refused to resume, probably due to a conflict on a listening port. You may want to try again after the conflicting application is stopped, otherwise a restart might be needed to resume safe operations.
+/// ```
+#[test]
+fn an_abns_name_still_held_when_sigttin_arrives_is_reported_and_taken_back_on_the_next_sigttin() {
     use std::os::linux::net::SocketAddrExt;
-    let abns = format!("ibex-g48-held-{}", std::process::id());
-    let (mut p, _f) = start(&format!("\tstats socket abns@{abns} level admin"), &[]);
+    let abns = format!("ibex-t370-held-{}", std::process::id());
+    let f = cfg(&format!("\tstats socket abns@{abns} level admin"));
+    let err = tempfile::NamedTempFile::new().expect("stderr file");
+    let mut p = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(f.path())
+        .stdout(Stdio::null())
+        .stderr(err.reopen().expect("reopen"))
+        .spawn()
+        .expect("spawn");
     drop(wait("abns@", || abstract_stream(&abns, true)));
     let sig = |s: &str| {
         let _ = Command::new("kill").arg(format!("-{s}")).arg(p.id().to_string()).status();
@@ -426,9 +501,23 @@ fn an_abns_name_still_held_when_sigttin_arrives_is_taken_back_once_free() {
     let addr = std::os::unix::net::SocketAddr::from_abstract_name(&bytes).expect("addr");
     let hold = std::os::unix::net::UnixListener::bind_addr(&addr).expect("the test takes the name");
     sig("TTIN");
-    std::thread::sleep(Duration::from_millis(400));
+    let text = wait("the refusal is reported", || {
+        let t = std::fs::read_to_string(err.path()).unwrap_or_default();
+        t.contains("refused to resume").then_some(t)
+    });
+    assert!(
+        text.contains(&format!("[ALERT]    ({}) : Resuming listener: protocol abns_stream: cannot bind UNIX socket (already in use) [abns@{abns}].", p.id())),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("[WARNING]  ({}) : Some proxies refused to resume, probably due to a conflict on a listening port. You may want to try again after the conflicting application is stopped, otherwise a restart might be needed to resume safe operations.", p.id())),
+        "{text}"
+    );
     drop(hold);
-    let s = wait("abns@ once free", || abstract_stream(&abns, true));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(abstract_stream(&abns, true).is_none(), "the name is not polled for once it is free");
+    sig("TTIN");
+    let s = wait("abns@ after the next SIGTTIN", || abstract_stream(&abns, true));
     assert!(ask(s, "show cli level").contains("admin"));
     common::stop(&mut p);
 }
@@ -436,7 +525,7 @@ fn an_abns_name_still_held_when_sigttin_arrives_is_taken_back_once_free() {
 /// T354. SIGTTOU and SIGTTIN sent straight to a process with several stats sockets: every
 /// abns@ one (the first and an extra) lets go of its name and takes it back, as HAProxy
 /// 3.5-dev8-885761-29 does (measured: `kill -TTOU` frees both abstract names, `kill -TTIN`
-/// binds them again, `show cli sockets` lists all three afterwards). Known gap: HAProxy also
+/// binds them again, `show cli sockets` lists all three afterwards). Known gap: `HAProxy` also
 /// pauses its TCP stats socket (connection refused until SIGTTIN); Ibex leaves it open, so
 /// its queued connections are not reset, and this test does not assert on it.
 #[test]
