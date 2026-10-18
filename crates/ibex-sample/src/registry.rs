@@ -1935,7 +1935,7 @@ impl Registry {
             name: "baseq",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                fetch_base_path(ctx, true)
+                fetch_base_path(ctx, false)
             },
         });
 
@@ -6232,6 +6232,31 @@ impl Registry {
         converters: &[(&str, Vec<String>)],
         ctx: &SampleContext,
     ) -> Vec<Sample> {
+        self.eval_all_opt(fetch_name, fetch_args, converters, ctx, false)
+    }
+
+    /// `eval_all` for an ACL (`acl_exec_cond`): a converter that gives no sample for an occurrence
+    /// ends the expression there (`continue` to the next line of the ACL), the later occurrences
+    /// of the fetch are not tried.
+    #[must_use]
+    pub fn eval_all_acl(
+        &self,
+        fetch_name: &str,
+        fetch_args: &[String],
+        converters: &[(&str, Vec<String>)],
+        ctx: &SampleContext,
+    ) -> Vec<Sample> {
+        self.eval_all_opt(fetch_name, fetch_args, converters, ctx, true)
+    }
+
+    fn eval_all_opt(
+        &self,
+        fetch_name: &str,
+        fetch_args: &[String],
+        converters: &[(&str, Vec<String>)],
+        ctx: &SampleContext,
+        stop_at_failure: bool,
+    ) -> Vec<Sample> {
         let initial_samples = if let Some(mf) = self.multi_fetches.get(fetch_name) {
             mf(ctx, fetch_args)
         } else if let Some(f_desc) = self.get_fetch(fetch_name) {
@@ -6242,8 +6267,10 @@ impl Registry {
 
         let mut out = Vec::with_capacity(initial_samples.len());
         for smp in initial_samples {
-            if let Some(res) = self.apply_converters_in(ctx, smp, converters) {
-                out.push(res);
+            match self.apply_converters_in(ctx, smp, converters) {
+                Some(res) => out.push(res),
+                None if stop_at_failure => break,
+                None => {}
             }
         }
         out
