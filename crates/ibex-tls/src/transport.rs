@@ -27,6 +27,9 @@ pub struct RustlsTlsInfo {
     pub peer_issuer_dn: Option<String>,
     pub peer_not_after: Option<i64>,
     pub peer_has_cert: bool,
+    /// The certificate this side presented (server side: the one the resolver picked for the
+    /// `ClientHello`), for the `ssl_f_*` fetches. A shared handle: nothing is copied per connection.
+    pub local_cert: Option<std::sync::Arc<rustls::sign::CertifiedKey>>,
     /// The `ClientHello` as `tune.ssl.capture-buffer-size` keeps it (server side only); `None`
     /// when the size is 0 or the hello was too short to reach its cipher suites.
     pub capture: Option<crate::capture::SslCapture>,
@@ -45,6 +48,7 @@ impl Default for RustlsTlsInfo {
             peer_issuer_dn: None,
             peer_not_after: None,
             peer_has_cert: false,
+            local_cert: None,
             capture: None,
         }
     }

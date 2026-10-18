@@ -513,3 +513,14 @@ choosing; nothing is decided yet.
 | **Differs 3** | The `proc`/`global` total is the `proc.` variables plus the variables of the stream that is running, not those of every session. HAProxy's counter is process-wide. S6 (store) and S7 (sessions) are where the other sessions' counters can be kept. |
 | **Differs 4** | `sess-max-size` counts one stream's variables; with several H2 streams on a connection HAProxy shares one `sess` counter (S7). |
 | **Status** | `check-max-size` is enforced (`vars::set_in`, check.rs `run_var_rules`) but has no end-to-end test. |
+
+## ssl_f_* certificate fetches (T398)
+
+`ssl_f_der`, `ssl_f_sha1`, `ssl_f_serial`, `ssl_f_version`, `ssl_f_notafter`, `ssl_f_notbefore`,
+`ssl_f_sig_alg`, `ssl_f_key_alg`, `ssl_f_s_dn` and `ssl_f_i_dn` read the certificate the resolver
+picks for the ClientHello (`ibex_tls::x509`, a bounds-checked DER walk; no OpenSSL). Gap against
+HAProxy: attribute-type and algorithm OIDs are named from a table of the common ones. `OpenSSL`
+knows many more short names; Ibex shows a missing attribute as dotted (`1.2.3.4`) and a missing
+signature or key algorithm as `UNDEF`. DN values are copied as raw bytes (no charset conversion
+of BMPString/UniversalString) in the one-line form; `rfc2253` dumps non-text types as `#<hex>`.
+The `ssl_c_*` fetches (the peer's certificate) are not implemented here.

@@ -409,6 +409,9 @@ impl TlsConn {
             let made = match gate.acceptor.accept() {
                 Ok(None) => continue,
                 Ok(Some(accepted)) => {
+                    // The certificate this ClientHello gets, for `ssl_f_*`: the resolver answers the
+                    // same way when rustls asks it for the handshake.
+                    self.ctx.tls_info.local_cert = rustls::server::ResolvesServerCert::resolve(&*gate.config.cert_resolver, accepted.client_hello());
                     let ours = &gate.config.alpn_protocols;
                     let disjoint = !ours.is_empty()
                         && accepted.client_hello().alpn().is_some_and(|mut theirs| theirs.all(|t| !ours.iter().any(|o| o.as_slice() == t)));
@@ -638,6 +641,7 @@ pub(crate) fn facts_of(info: &ibex_tls::RustlsTlsInfo) -> ibex_sample::SslFacts<
         protocol: info.protocol_version.as_deref(),
         alpn: info.alpn.as_deref(),
         has_crt: info.peer_has_cert,
+        local_crt: info.local_cert.as_ref().and_then(|k| k.cert.first()).map(|c| c.as_ref()),
         resumed: info.session_resumed,
         capture: info.capture.as_ref(),
     }

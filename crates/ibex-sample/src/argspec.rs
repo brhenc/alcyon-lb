@@ -565,6 +565,12 @@ fn val_fetch(val: &str, args: &mut [Arg]) -> Result<(), String> {
             Some(Arg::Sint(n)) if *n < 0 => Err("capture identifier must be >= 0".to_string()),
             _ => Ok(()),
         },
+        "val_dnfmt" => match args.get(2) {
+            Some(Arg::Str(f)) if !f.is_empty() && f != "rfc2253" => {
+                Err("only rfc2253 or a blank value are currently supported as the format argument.".to_string())
+            }
+            _ => Ok(()),
+        },
         "val_query" => match args.first() {
             Some(Arg::Str(s)) if !s.is_empty() && s != "with_qm" => Err("supported options are: 'with_qm'".to_string()),
             _ => Ok(()),

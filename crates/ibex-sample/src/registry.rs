@@ -300,6 +300,8 @@ pub struct SslFacts<'a> {
     pub alpn: Option<&'a [u8]>,
     /// The peer sent a certificate (`ssl_c_used`).
     pub has_crt: bool,
+    /// The DER of the certificate this side presented (`ssl_f_*`); `None` for plaintext.
+    pub local_crt: Option<&'a [u8]>,
     /// The handshake resumed an earlier session (`ssl_fc_is_resumed`).
     pub resumed: bool,
     /// The client's `ClientHello` as `tune.ssl.capture-buffer-size` kept it; `None` when the
@@ -535,6 +537,30 @@ fn server_arg<'a>(ctx: &'a SampleContext, arg: &'a str) -> Option<(&'a str, &'a 
 }
 
 /// A server fetch: the named server's [`ServerState`] through `f`.
+/// The certificate this side presented, as DER and parsed (`ssl_f_*`).
+fn local_cert<'a>(ctx: &SampleContext<'a>) -> Option<(&'a [u8], ibex_tls::x509::Cert<'a>)> {
+    let der = ctx.ssl_fc.local_crt?;
+    Some((der, ibex_tls::x509::Cert::parse(der)?))
+}
+
+/// `ssl_x_s_dn`/`ssl_x_i_dn`: `(<entry>[,<occ>[,<format>]])`. An entry wins over a format; with
+/// neither, the one-line `/CN=a/O=b` form.
+fn dn_sample(name: &[u8], args: &[String]) -> Option<Sample> {
+    let arg = |i: usize| args.get(i).map_or("", String::as_str);
+    let out = if !arg(0).is_empty() {
+        let pos = if arg(1).is_empty() { 1 } else { arg(1).parse::<i64>().ok()? };
+        ibex_tls::x509::dn_entry(name, arg(0), pos)?
+    } else if !arg(2).is_empty() {
+        if arg(2) != "rfc2253" {
+            return None;
+        }
+        ibex_tls::x509::dn_rfc2253(name)?
+    } else {
+        ibex_tls::x509::dn_oneline(name)?
+    };
+    Some(Sample::Str(String::from_utf8_lossy(&out).into_owned()))
+}
+
 fn server_fetch(ctx: &SampleContext, args: &[String], f: fn(ServerState) -> Sample) -> Option<Sample> {
     let (be, srv) = server_arg(ctx, args.first()?)?;
     ctx.proxies?.server(be, srv).map(f)
@@ -3149,6 +3175,71 @@ impl Registry {
             name: "ssl_c_used",
             out_type: SampleType::Bool,
             func: |ctx, _args| Some(Sample::Bool(ctx.ssl_fc.has_crt)),
+        });
+        // T398: `ssl_f_*`, the certificate the frontend presented (`SSL_get_certificate`):
+        // `SslFacts::local_crt`, set from the resolver's answer to the ClientHello. No sample on a
+        // plaintext connection. `ssl_c_*` (the peer's) wait for the client-certificate work.
+        self.register_fetch(FetchDesc {
+            name: "ssl_f_der",
+            out_type: SampleType::Bin,
+            func: |ctx, _args| local_cert(ctx).map(|(der, _)| Sample::Bin(der.to_vec())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_f_sha1",
+            out_type: SampleType::Bin,
+            func: |ctx, _args| local_cert(ctx).map(|(der, _)| Sample::Bin(sha1_digest(der).to_vec())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_f_serial",
+            out_type: SampleType::Bin,
+            func: |ctx, _args| local_cert(ctx).map(|(_, c)| Sample::Bin(c.serial.to_vec())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_f_version",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| local_cert(ctx).map(|(_, c)| Sample::Sint(i64::from(c.version) + 1)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_f_notafter",
+            out_type: SampleType::Str,
+            func: |ctx, _args| {
+                let (_, c) = local_cert(ctx)?;
+                ibex_tls::x509::time_text(c.not_after).map(|t| Sample::Str(String::from_utf8_lossy(t).into_owned()))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_f_notbefore",
+            out_type: SampleType::Str,
+            func: |ctx, _args| {
+                let (_, c) = local_cert(ctx)?;
+                ibex_tls::x509::time_text(c.not_before).map(|t| Sample::Str(String::from_utf8_lossy(t).into_owned()))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_f_sig_alg",
+            out_type: SampleType::Str,
+            func: |ctx, _args| local_cert(ctx).map(|(_, c)| Sample::Str(ibex_tls::x509::sig_alg_name(c.sig_oid).to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_f_key_alg",
+            out_type: SampleType::Str,
+            func: |ctx, _args| local_cert(ctx).map(|(_, c)| Sample::Str(ibex_tls::x509::key_alg_name(c.key_oid).to_string())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_f_s_dn",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let (_, c) = local_cert(ctx)?;
+                dn_sample(c.subject, args)
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_f_i_dn",
+            out_type: SampleType::Str,
+            func: |ctx, args| {
+                let (_, c) = local_cert(ctx)?;
+                dn_sample(c.issuer, args)
+            },
         });
         self.register_fetch(FetchDesc {
             name: "ssl_bc",
