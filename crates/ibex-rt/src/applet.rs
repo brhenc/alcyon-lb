@@ -869,15 +869,15 @@ impl CliApplet {
             };
             let registry = crate::engine::sample_registry();
             let ctx = ibex_sample::SampleContext::default();
+            // `set var ... expr` keeps the sample's type, `fmt` stores a string (T364).
             let val = if is_fmt {
-                crate::engine::format_sample_string(expr, &ctx, registry)
+                ibex_sample::Sample::Str(crate::engine::format_sample_string(expr, &ctx, registry))
             } else if let Ok(e) = ibex_sample::Expr::parse(expr) {
-                e.eval_sample(registry, &ctx)
-                    .map_or_else(|| expr.to_string(), |smp| crate::engine::sample_to_string(&smp))
+                e.eval_sample(registry, &ctx).unwrap_or_else(|| ibex_sample::Sample::Str(expr.to_string()))
             } else {
-                expr.to_string()
+                ibex_sample::Sample::Str(expr.to_string())
             };
-            ibex_sample::set_proc_var(var_name, val);
+            ibex_sample::vars::set_proc(var_name, val);
         }
         if self.interactive {
             self.out_buf.extend_from_slice(b"\n> ");

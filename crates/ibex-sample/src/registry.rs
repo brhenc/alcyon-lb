@@ -22,7 +22,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, LazyLock, RwLock};
 
 thread_local! {
-    pub static CURRENT_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
     /// The timeouts of the stream running on the thread, for the `*_timeout` fetches; set
     /// by the engine for the length of one run of a stream, `None` outside one.
     pub static CURRENT_TIMEOUTS: Cell<Option<StreamTimeouts>> = const { Cell::new(None) };
@@ -68,8 +67,10 @@ pub struct StreamTimeouts {
     pub cur: [u32; 6],
 }
 
-pub static GLOBAL_PROC_VARS:LazyLock<RwLock<HashMap<String, String>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+pub use crate::vars::{
+    get_proc_var, set_current_vars, set_proc_var, unset_proc_var, VarMap, CURRENT_VARS, GLOBAL_PROC_VARS,
+};
+pub use crate::vars::conds_hold as var_conds_hold;
 
 pub static SAMPLE_REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 
@@ -78,32 +79,6 @@ pub fn sample_registry() -> &'static Registry {
     &SAMPLE_REGISTRY
 }
 
-#[must_use]
-pub fn get_proc_var(name: &str) -> Option<String> {
-    GLOBAL_PROC_VARS.read().ok()?.get(name).cloned()
-}
-
-/// The conditions of `set-var(<name>,<cond>...)` against what is known of the variable and the
-/// sample (`var_set`, src/vars.c): `exists`/`is_set` describe the variable, `empty` the new
-/// sample. `ifgt` and `iflt` are refused when the configuration loads.
-#[must_use]
-pub fn var_conds_hold(spec: &str, exists: bool, is_set: bool, empty: bool) -> bool {
-    spec.split(',').skip(1).all(|c| {
-        (c != "ifexists" || exists)
-            && (c != "ifnotexists" || !exists)
-            && (c != "ifset" || is_set)
-            && (c != "ifnotset" || !is_set)
-            && (c != "ifempty" || empty)
-            && (c != "ifnotempty" || !empty)
-    })
-}
-
-/// `unset-var` of a process variable: it stays declared but has no value.
-pub fn unset_proc_var(name: &str) {
-    if let Ok(mut lock) = GLOBAL_PROC_VARS.write() {
-        lock.remove(name);
-    }
-}
 
 /// Where `debug()` writes a line: the runtime's event sinks, given the sink's name.
 pub type DebugSinkFn = fn(&str, &[u8]);
@@ -126,20 +101,7 @@ pub fn take_debug_destinations() -> Vec<String> {
     DEBUG_DESTS.with(|d| std::mem::take(&mut *d.borrow_mut()))
 }
 
-pub fn set_proc_var(name: &str, val: String) {
-    if let Ok(mut lock) = GLOBAL_PROC_VARS.write() {
-        lock.insert(name.to_string(), val);
-    }
-}
 
-
-// Not generalised over the hasher: these write straight into a thread-local declared as
-// `HashMap<String, String>` with the default hasher, so a generic `S` could not be stored
-// without converting the map anyway.
-#[allow(clippy::implicit_hasher)]
-pub fn set_current_vars(vars: HashMap<String, String>) {
-    CURRENT_VARS.with(|v| *v.borrow_mut() = vars);
-}
 
 pub fn set_current_res_headers(headers: Vec<(String, String)>) {
     CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = headers);
@@ -294,7 +256,7 @@ pub struct SampleContext<'a> {
     /// condition then gives no sample.
     pub acls: Option<&'a crate::acls::Acls>,
     pub is_first_req: bool,
-    pub vars: Option<&'a HashMap<String, String>>,
+    pub vars: Option<&'a VarMap>,
     pub timeouts: Option<&'a HashMap<String, u32>>,
     /// The backend's `retries`, for `be_max_retries`.
     pub be_max_retries: Option<u16>,
@@ -688,16 +650,9 @@ fn resolve_int_arg(arg: &str) -> Option<i64> {
     } else {
         trimmed
     };
-    if var_name.starts_with("proc.") {
-        get_proc_var(var_name).and_then(|s| s.parse::<i64>().ok())
-    } else if var_name.starts_with("sess.")
-        || var_name.starts_with("req.")
-        || var_name.starts_with("txn.")
-        || var_name.starts_with("res.")
-    {
-        CURRENT_VARS.with(|v| {
-            v.borrow().get(var_name).and_then(|s| s.parse::<i64>().ok())
-        })
+    // `sample_conv_var2smp_sint`: the variable cast to `sint` from its own type (T364).
+    if ["proc.", "sess.", "req.", "txn.", "res."].iter().any(|p| var_name.starts_with(p)) {
+        crate::vars::var_arg_int(var_name)
     } else {
         None
     }
@@ -710,11 +665,8 @@ fn resolve_var_str(arg: &str) -> String {
     } else {
         trimmed
     };
-    if var_name.starts_with("proc.") {
-        get_proc_var(var_name).unwrap_or_default()
-    } else {
-        CURRENT_VARS.with(|v| v.borrow().get(var_name).cloned().unwrap_or_default())
-    }
+    // The variable cast to `str` from its own type; none, or no cast, is an empty piece.
+    crate::vars::var_arg_str(var_name).unwrap_or_default()
 }
 
 impl Default for Registry {
@@ -3435,20 +3387,17 @@ impl Registry {
         });
         self.register_fetch(FetchDesc {
             name: "var",
+            // `smp_fetch_var`: the stored sample, of the type it was set with (T364); the
+            // default, when the variable is not set, is a string.
             out_type: SampleType::Str,
             func: |ctx, args| {
                 let var_name = args.first()?;
-                if var_name.starts_with("proc.") {
-                    return get_proc_var(var_name).map(Sample::Str)
-                        .or_else(|| args.get(1).cloned().map(Sample::Str));
-                }
-                if let Some(v_map) = ctx.vars {
-                    if let Some(val) = v_map.get(var_name) {
-                        return Some(Sample::Str(val.clone()));
-                    }
-                }
-                CURRENT_VARS.with(|v| v.borrow().get(var_name).cloned().map(Sample::Str))
-                    .or_else(|| args.get(1).cloned().map(Sample::Str))
+                let stored = if var_name.starts_with("proc.") {
+                    crate::vars::get(var_name)
+                } else {
+                    ctx.vars.and_then(|m| m.get(var_name).cloned()).or_else(|| crate::vars::get(var_name))
+                };
+                stored.or_else(|| args.get(1).cloned().map(Sample::Str))
             },
         });
         self.register_fetch(FetchDesc {
@@ -3560,15 +3509,17 @@ impl Registry {
                 };
                 let prefix = args.get(1).map_or("", String::as_str);
                 let delimiter = args.get(2).map_or(", ", String::as_str);
-                let mut stream: Vec<(String, String)> = ctx.vars.map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
-                CURRENT_VARS.with(|v| {
-                    for (k, val) in v.borrow().iter() {
+                // T364 S4 prints each by its type; until then, as its text.
+                let text = |(k, v): (&String, &Sample)| (k.clone(), sample_to_string(v));
+                let mut stream: Vec<(String, String)> = ctx.vars.map(|m| m.iter().map(text).collect()).unwrap_or_default();
+                crate::vars::with_current(|m| {
+                    for (k, val) in m {
                         if !stream.iter().any(|(n, _)| n == k) {
-                            stream.push((k.clone(), val.clone()));
+                            stream.push((k.clone(), sample_to_string(val)));
                         }
                     }
                 });
-                let process: Vec<(String, String)> = GLOBAL_PROC_VARS.read().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
+                let process: Vec<(String, String)> = crate::vars::proc_snapshot().into_iter().map(|(k, v)| (k, sample_to_string(&v))).collect();
                 let mut out = Vec::new();
                 for scope in scopes {
                     let vars = if *scope == "proc" { &process } else { &stream };
@@ -3740,7 +3691,7 @@ impl Registry {
             func: |smp, args| {
                 // The argument is a variable (refused otherwise at load, T341); when it is not
                 // set there is no sample (T327: an empty field in a log-format).
-                let target_val = read_var(args.first()?)?;
+                let target_val = crate::vars::var_arg_str(args.first()?)?;
                 let Sample::Str(s) = smp else { return None };
                 // sample_conv_strcmp: strncmp() on the common length gives the difference of
                 // the first differing (unsigned) bytes; equal prefixes give -1 / 0 / 1 by length.
@@ -5529,29 +5480,9 @@ impl Registry {
             in_type: TypeSpec::Any,
             out_type: TypeSpec::Any, // SMP_T_ANY in HAProxy: what follows takes any type (T341)
             func: |smp, args| {
-                { // `set-var` always has its variable name: the load refuses `set-var()`
-                    let spec = args.join(",");
-                    let spec = spec.as_str();
-                    let name = spec.split(',').next().unwrap_or("");
-                    let is_proc = name.starts_with("proc.");
-                    let is_set = if is_proc {
-                        get_proc_var(name).is_some()
-                    } else {
-                        CURRENT_VARS.with(|v| v.borrow().contains_key(name))
-                    };
-                    let empty = matches!(&smp, Sample::Str(s) if s.is_empty())
-                        || matches!(&smp, Sample::Bin(b) if b.is_empty());
-                    if var_conds_hold(spec, is_proc || is_set, is_set, empty) {
-                        let val_str = sample_to_string(&smp);
-                        if is_proc {
-                            set_proc_var(name, val_str);
-                        } else {
-                            CURRENT_VARS.with(|v| {
-                                v.borrow_mut().insert(name.to_string(), val_str);
-                            });
-                        }
-                    }
-                }
+                // `set-var` always has its variable name: the load refuses `set-var()`. The
+                // variable keeps the sample's type (T364).
+                crate::vars::set_cond(&args.join(","), smp.clone());
                 Some(smp)
             },
         });
@@ -5563,13 +5494,7 @@ impl Registry {
             func: |smp, args| {
                 // A `proc.` variable is the process's, not the stream's (T156).
                 if let Some(var_name) = args.first() {
-                    if var_name.starts_with("proc.") {
-                        unset_proc_var(var_name);
-                    } else {
-                        CURRENT_VARS.with(|v| {
-                            v.borrow_mut().remove(var_name);
-                        });
-                    }
+                    crate::vars::unset(var_name);
                 }
                 Some(smp)
             },
@@ -6084,12 +6009,8 @@ impl Registry {
                 let key_arg = args.get(1)?.trim();
                 let is_var = hmac_key_is_var(key_arg);
                 let key = if is_var {
-                    let v = if key_arg.starts_with("proc.") {
-                        get_proc_var(key_arg)
-                    } else {
-                        CURRENT_VARS.with(|v| v.borrow().get(key_arg).cloned())
-                    };
-                    v?
+                    // `sample_conv_var2smp_str`: cast to `str` from the variable's type.
+                    crate::vars::var_arg_str(key_arg)?
                 } else {
                     key_arg.to_string()
                 };
@@ -6124,7 +6045,7 @@ impl Registry {
                 // empty one is no sample. The argument is taken as written, spaces included.
                 let resolve = |arg: &str| -> Option<String> {
                     let mut v = if hmac_key_is_var(arg) {
-                        if arg.starts_with("proc.") { get_proc_var(arg) } else { CURRENT_VARS.with(|v| v.borrow().get(arg).cloned()) }
+                        crate::vars::var_arg_str(arg)
                     } else {
                         Some(arg.to_string())
                     }?;
@@ -6232,8 +6153,9 @@ impl Registry {
                 Sample::Bin(b) => {
                     // The argument is a variable (refused otherwise at load, T341); when it is
                     // not set there is no sample (T327: an empty field in a log-format).
-                    // T363a: the raw bytes of the variable, not the UTF-8 of its bytetext.
-                    let target_bytes: Vec<u8> = ibex_regex::bytetext::text_to_bytes(&read_var(args.first()?)?).into_owned();
+                    // T363a: the raw bytes of the variable, not the UTF-8 of its bytetext; T364:
+                    // cast to `bin` from its type (`sample_conv_var2smp(.., SMP_T_BIN)`).
+                    let target_bytes: Vec<u8> = crate::vars::var_arg_bin(args.first()?)?;
 
                     if b.len() != target_bytes.len() {
                         return Some(Sample::Bool(false));
@@ -7892,23 +7814,15 @@ fn split_host_port(s: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The text a variable named `name` holds, in the scope its prefix names.
+/// The variable named `name` cast to `str` (`sample_conv_var2smp_str`).
 fn read_var(name: &str) -> Option<String> {
-    if name.starts_with("proc.") {
-        get_proc_var(name)
-    } else {
-        CURRENT_VARS.with(|v| v.borrow().get(name).cloned())
-    }
+    crate::vars::var_arg_str(name)
 }
 
-/// Sets a variable from a converter: in the stream's map, which the engine hands back to
-/// the session when the step ends.
+/// Sets a variable to a string from a converter: in the stream's map, which the engine hands
+/// back to the session when the step ends.
 fn write_var(name: &str, value: String) {
-    if name.starts_with("proc.") {
-        set_proc_var(name, value);
-        return;
-    }
-    CURRENT_VARS.with(|v| v.borrow_mut().insert(name.to_string(), value));
+    crate::vars::set(name, Sample::Str(value));
 }
 
 /// A base64 argument: the text of the variable it names, or the literal, decoded.
@@ -8302,7 +8216,7 @@ mod tests {
     fn unset_var_removes_a_stream_variable_from_the_running_stream() {
         let reg = Registry::new();
         let conv = reg.get_converter("unset-var").expect("unset-var is registered");
-        CURRENT_VARS.with(|v| v.borrow_mut().insert("txn.t156".to_string(), "v".to_string()));
+        CURRENT_VARS.with(|v| v.borrow_mut().insert("txn.t156".to_string(), Sample::Str("v".to_string())));
         set_proc_var("proc.t156", "p".to_string());
         assert_eq!((conv.func)(Sample::Sint(1), &["txn.t156".to_string()]), Some(Sample::Sint(1)));
         assert!(CURRENT_VARS.with(|v| !v.borrow().contains_key("txn.t156")));
@@ -8425,9 +8339,9 @@ mod tests {
         let target = Sample::Bin(secret.to_vec());
         CURRENT_VARS.with(|v| {
             let mut v = v.borrow_mut();
-            v.insert("txn.eq".to_string(), "my_secret_token".to_string());
-            v.insert("txn.ne".to_string(), "my_secret_tokeX".to_string());
-            v.insert("txn.short".to_string(), "short".to_string());
+            v.insert("txn.eq".to_string(), Sample::Str("my_secret_token".to_string()));
+            v.insert("txn.ne".to_string(), Sample::Str("my_secret_tokeX".to_string()));
+            v.insert("txn.short".to_string(), Sample::Str("short".to_string()));
         });
         let var = |n: &str| [n.to_string()];
 

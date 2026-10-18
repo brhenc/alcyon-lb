@@ -432,6 +432,10 @@ Status: **resolved and measured** — cached lookups verified in `crates/ibex-sa
 > a variable lost every byte >= 0x80 to U+FFFD, which broke `secure_memcmp` against a decoded hash). What remains is
 > the lost **type**: a variable is always `str`, so HAProxy's `bin -> str` NUL cut and typed `set-var` conditions differ
 > (measured table in tasks/T364-typed-variables.md; reg-tests `hashes.vtc`, `cond_set_var.vtc`). T364 plans typed variables.
+>
+> **T364 S2 (2026-10-18): the type half is done.** A variable holds a `Sample` (`crates/ibex-sample/src/vars.rs`),
+> so `var()` gives back what was stored and casts start from that type, as in HAProxy. What stays decided as above is
+> the other half only: `Sample::Str` is a `String` (bytetext), not bytes.
 
 | | |
 |---|---|

@@ -53,8 +53,9 @@ use std::time::{Duration, Instant};
 // yet" and renders `-`, where the old engine-local default reported a 200 that had
 // never been sent.
 use ibex_sample::registry::{
-    set_proc_var, TimeoutKind, CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_TIMEOUTS, CURRENT_VARS,
+    TimeoutKind, CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_TIMEOUTS, CURRENT_VARS,
 };
+use ibex_sample::vars::VarMap;
 
 thread_local! {
     pub static WORKER_ID: Cell<usize> = const { Cell::new(0) };
@@ -4143,15 +4144,15 @@ fn init_global_vars(global: Option<&ibex_config::GlobalSection>) {
         let sample_reg = sample_registry();
         let sample_ctx = SampleContext::default();
         for set_var in &global.set_vars {
+            // `set-var` keeps the sample's type, `set-var-fmt` stores a string (T364).
             let val = if set_var.is_fmt {
-                format_sample_string(&set_var.expr, &sample_ctx, sample_reg)
+                Sample::Str(format_sample_string(&set_var.expr, &sample_ctx, sample_reg))
             } else if let Ok(e) = Expr::cached(&set_var.expr) {
-                e.eval_sample(sample_reg, &sample_ctx)
-                    .map_or_else(|| set_var.expr.clone(), |smp| sample_to_string(&smp))
+                e.eval_sample(sample_reg, &sample_ctx).unwrap_or_else(|| Sample::Str(set_var.expr.clone()))
             } else {
-                set_var.expr.clone()
+                Sample::Str(set_var.expr.clone())
             };
-            set_proc_var(&set_var.name, val);
+            ibex_sample::vars::set_proc(&set_var.name, val);
         }
     }
 }
@@ -6255,9 +6256,9 @@ fn eval_tcp_req_session_rules(
                 // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                 // The expression is a sample fetch, checked at load; one that cannot be parsed or
                 // fetched sets nothing.
-                let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)));
-                if let Some((empty, val)) = val {
-                    store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val, empty);
+                let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &ctx));
+                if let Some(val) = val {
+                    store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
                 }
             }
             ibex_config::TcpReqSessionAction::SetVarFmt { var_name, fmt } => {
@@ -6508,9 +6509,9 @@ fn eval_tcp_req_content_rules(
                 // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                 // The expression is a sample fetch, checked at load; one that cannot be parsed or
                 // fetched sets nothing.
-                let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)));
-                if let Some((empty, val)) = val {
-                    store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val, empty);
+                let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &ctx));
+                if let Some(val) = val {
+                    store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
                 }
             }
             ibex_config::TcpReqContentAction::SetVarFmt { var_name, fmt } => {
@@ -6674,22 +6675,22 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
 /// `set-var(<name>) <expr>`: `action_store` (src/vars.c) -- a sample that cannot be
 /// fetched sets nothing.
 fn set_var_from_expr(
-    sess_vars: &mut HashMap<String, String>,
-    req_vars: &mut HashMap<String, String>,
+    sess_vars: &mut VarMap,
+    req_vars: &mut VarMap,
     name: &str,
     expr: &str,
     ctx: &SampleContext,
     registry: &Registry,
 ) {
     if let Some(val) = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, ctx)) {
-        store_var_smp(sess_vars, req_vars, name, sample_to_string(&val), sample_is_empty(&val));
+        store_var_smp(sess_vars, req_vars, name, val);
     }
 }
 
 /// `unset-var(<name>)`, from the scope it lives in.
-fn unset_var(sess_vars: &mut HashMap<String, String>, req_vars: &mut HashMap<String, String>, name: &str) {
+fn unset_var(sess_vars: &mut VarMap, req_vars: &mut VarMap, name: &str) {
     if name.starts_with("proc.") {
-        ibex_sample::unset_proc_var(name);
+        ibex_sample::vars::unset(name);
         return;
     }
     if name.starts_with("sess.") {
@@ -6697,27 +6698,17 @@ fn unset_var(sess_vars: &mut HashMap<String, String>, req_vars: &mut HashMap<Str
     } else {
         req_vars.remove(name);
     }
-    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().remove(name));
-}
-
-/// Whether a sample is empty for `ifempty`/`ifnotempty` (`var_set`, src/vars.c): only a
-/// string or a binary of no bytes is; an integer, a boolean or an address never is.
-fn sample_is_empty(smp: &Sample) -> bool {
-    match smp {
-        Sample::Str(s) => s.is_empty(),
-        Sample::Bin(b) => b.is_empty(),
-        _ => false,
-    }
+    ibex_sample::vars::unset(name);
 }
 
 /// Stores a variable where its scope lives, and where the rules after it read it.
 ///
 /// `set-var-fmt(<name>) <fmt>`: the format is built in a trash chunk, so the value is cut
 /// at `tune.bufsize - 1` bytes (T251).
-fn store_var(sess_vars: &mut HashMap<String, String>, req_vars: &mut HashMap<String, String>, name: &str, mut val: String) {
+/// The value is a `str`, as `HAProxy`'s `SMP_T_STR` (T364).
+fn store_var(sess_vars: &mut VarMap, req_vars: &mut VarMap, name: &str, mut val: String) {
     ibex_sample::registry::truncate_to_trash(&mut val);
-    let empty = val.is_empty();
-    store_var_smp(sess_vars, req_vars, name, val, empty);
+    store_var_smp(sess_vars, req_vars, name, Sample::Str(val));
 }
 
 /// `name[,<cond>...]` of `set-var(...)`: the variable is set only when every condition holds
@@ -6725,17 +6716,14 @@ fn store_var(sess_vars: &mut HashMap<String, String>, req_vars: &mut HashMap<Str
 /// (a process variable always exists, as the configuration declares it, but is set only
 /// once it has a value), `ifempty`/`ifnotempty` at the new sample. The parser refuses
 /// `ifgt` and `iflt` (see `check_set_var_conds`).
-fn store_var_smp(
-    sess_vars: &mut HashMap<String, String>,
-    req_vars: &mut HashMap<String, String>,
-    spec: &str,
-    val: String,
-    empty: bool,
-) {
+///
+/// The variable keeps the sample's type (T364): `var()` gives back this `Sample`.
+fn store_var_smp(sess_vars: &mut VarMap, req_vars: &mut VarMap, spec: &str, val: Sample) {
     let name = spec.split(',').next().unwrap_or("");
     let is_proc = name.starts_with("proc.");
+    let empty = ibex_sample::vars::is_empty(&val);
     let is_set = if is_proc {
-        ibex_sample::get_proc_var(name).is_some()
+        ibex_sample::vars::is_set(name)
     } else if name.starts_with("sess.") {
         sess_vars.contains_key(name)
     } else {
@@ -6747,12 +6735,12 @@ fn store_var_smp(
         return;
     }
     if is_proc {
-        ibex_sample::set_proc_var(name, val);
+        ibex_sample::vars::set_proc(name, val);
         return;
     }
     let map = if name.starts_with("sess.") { sess_vars } else { req_vars };
     map.insert(name.to_string(), val.clone());
-    ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().insert(name.to_string(), val));
+    ibex_sample::vars::set(name, val);
 }
 
 /// Runs `f` with `sess`'s variables in the thread's `CURRENT_VARS`, where the fetches and
@@ -11394,9 +11382,9 @@ impl EngineDispatcher<'_> {
                         // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                         // The expression is a sample fetch, checked at load; one that cannot be parsed or
                         // fetched sets nothing.
-                        let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &make_ctx!(sess))).map(|smp| (sample_is_empty(&smp), sample_to_string(&smp)));
-                        if let Some((empty, val)) = val {
-                            store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val, empty);
+                        let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &make_ctx!(sess)));
+                        if let Some(val) = val {
+                            store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
                         }
                     }
                     ibex_config::HttpReqAction::SetVarFmt { var_name, fmt } => {
@@ -13599,8 +13587,8 @@ fn res_action(
     status_msg: &mut String,
     ctx: &SampleContext,
     registry: &Registry,
-    sess_vars: &mut HashMap<String, String>,
-    req_vars: &mut HashMap<String, String>,
+    sess_vars: &mut VarMap,
+    req_vars: &mut VarMap,
 ) -> Result<bool, ResStop> {
     // A rewrite that does not fit: the response fails in strict mode, and the rule is
     // skipped otherwise (`fail_rewrite`, `src/http_act.c`).
@@ -13764,8 +13752,8 @@ fn run_res_rules<'a>(
     ctx: &SampleContext,
     mut caps: Option<(&mut Vec<Option<Vec<u8>>>, &[(String, usize)])>,
     registry: &Registry,
-    sess_vars: &mut HashMap<String, String>,
-    req_vars: &mut HashMap<String, String>,
+    sess_vars: &mut VarMap,
+    req_vars: &mut VarMap,
     mut wait: Option<ResWait<'_>>,
 ) -> Result<Option<usize>, ResStop> {
     let (hdrs, status, status_msg) = head;
@@ -13844,8 +13832,8 @@ fn eval_after_res_rules(
     ctx: &SampleContext,
     mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
-    sess_vars: &mut HashMap<String, String>,
-    req_vars: &mut HashMap<String, String>,
+    sess_vars: &mut VarMap,
+    req_vars: &mut VarMap,
 ) -> Result<(), ResStop> {
     let (hdrs, status, status_msg) = head;
     req_vars.retain(|k, _| !k.starts_with("req."));
@@ -14382,7 +14370,7 @@ mod registry_tests {
     #[test]
     fn engine_var_writes_are_visible_to_the_sample_registry() {
         CURRENT_VARS.with(|v| {
-            v.borrow_mut().insert("txn.probe".to_string(), "seen".to_string())
+            v.borrow_mut().insert("txn.probe".to_string(), Sample::Str("seen".to_string()))
         });
 
         let reg = build_sample_registry();
