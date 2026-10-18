@@ -30,10 +30,11 @@ pub struct StreamLog {
     pub request: Option<Instant>,
     /// The connection to a server was first attempted (`t_queue`).
     pub queue: Option<Instant>,
-    /// The server the stream chose, as (backend, server) indexes, kept while no connection
+    /// The index of the server the stream chose in `srv_backend_idx`, kept while no connection
     /// is attached (connecting, retrying): HAProxy's `s->target` stays on the server, so
-    /// the line names it (`%s`) when the client leaves before the connect succeeds.
-    pub server: Option<(usize, usize)>,
+    /// the line names it (`%s`) when the client leaves before the connect succeeds. Held as
+    /// index + 1 in four bytes, which keeps `SessionEntry` within its bound (struct_sizes.rs).
+    pub server: Option<std::num::NonZeroU32>,
     /// The connection to the server was established (`t_connect`).
     pub connect: Option<Instant>,
     /// The response head arrived (`t_data`).
@@ -76,6 +77,12 @@ pub struct StreamLog {
     pub be_queue: u64,
     /// `option logasap`: the line went out with the response head; none follows.
     pub asap_done: bool,
+}
+
+/// A server index as `StreamLog::server` holds it (index + 1); `None` past `u32::MAX - 1`.
+#[must_use]
+pub fn server_slot(idx: usize) -> Option<std::num::NonZeroU32> {
+    std::num::NonZeroU32::new(u32::try_from(idx).ok()?.checked_add(1)?)
 }
 
 impl StreamLog {
