@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 // yet" and renders `-`, where the old engine-local default reported a 200 that had
 // never been sent.
 use ibex_sample::registry::{
-    TimeoutKind, CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_TIMEOUTS, CURRENT_VARS,
+    TimeoutKind, CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_RES_TR, CURRENT_SRV_STATUS, CURRENT_TIMEOUTS, CURRENT_VARS,
 };
 use ibex_sample::vars::VarMap;
 
@@ -10130,6 +10130,12 @@ impl EngineDispatcher<'_> {
         }
 
         CURRENT_RES_STATUS.set(status);
+        CURRENT_SRV_STATUS.set(status);
+        // `t_data - t_connect` (`smp_fetch_reX_timers`).
+        CURRENT_RES_TR.set(match (entry.sess.log.data, entry.sess.log.connect) {
+            (Some(d), Some(c)) => i64::try_from(d.saturating_duration_since(c).as_millis()).unwrap_or(i64::MAX),
+            _ => -1,
+        });
         CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
         // `HAProxy` caps `tune.maxrewrite` at half the buffer (`src/haproxy.c`).
         let reserve = entry.sess.maxrewrite.min(entry.sess.bufsize / 2);
@@ -14254,6 +14260,10 @@ fn after_res_on_reply<'r>(
     };
 
     CURRENT_RES_STATUS.set(status);
+    // A reply Ibex built has no server status and no Tr (HAProxy: 0 and -1), whatever response
+    // this thread handled before.
+    CURRENT_SRV_STATUS.set(0);
+    CURRENT_RES_TR.set(-1);
     CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
     res_htx_init(sess.bufsize, None, &version, &reason, &hdrs, raw.len() - hdr_end - eoh_len);
     // The variables are the session's own, in `CURRENT_VARS` for the run that makes the
@@ -14321,6 +14331,8 @@ fn after_res_on_reply<'r>(
     sess.req_vars = req_vars;
     sess.log.res_captures = res_caps;
     CURRENT_RES_STATUS.set(0);
+    CURRENT_SRV_STATUS.set(0);
+    CURRENT_RES_TR.set(-1);
     CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clear());
     result.map_err(|_| ())?;
 
