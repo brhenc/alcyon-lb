@@ -213,6 +213,7 @@ fn failing_pool() -> Option<ibex_alloc::PoolHead> {
         needed_avg: 2,
         failures: 7,
         users: 1,
+        reg: None,
     })
 }
 

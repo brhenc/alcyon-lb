@@ -1792,7 +1792,6 @@ impl CliApplet {
     }
 }
 
-/// Per-thread storage for active CLI applet sessions.
 /// Slots of every worker's [`AppletArena`], for `show pools` (pool `appctx`).
 pub static APPCTX_POOL: crate::buf::ArenaCounters = crate::buf::ArenaCounters::new();
 
@@ -1815,6 +1814,7 @@ impl Drop for AppletArena {
     }
 }
 
+/// Per-thread storage for active CLI applet sessions.
 pub struct AppletArena {
     entries: Vec<Option<CliApplet>>,
     free: Vec<u32>,

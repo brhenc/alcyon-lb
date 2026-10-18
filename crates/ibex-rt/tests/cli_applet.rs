@@ -741,6 +741,35 @@ mod pools {
         (g, be, o, i)
     }
 
+    /// In the interactive mode (`prompt`) the dump and the error end with the empty line and
+    /// then the prompt, no more: HAProxy's `Total:` line is followed by `\n\n> `.
+    #[test]
+    fn show_pools_in_prompt_mode_ends_with_the_prompt() {
+        let (_g, _be, o, i) = pair("prompt");
+        for p in [&o, &i] {
+            let mut s = UnixStream::connect(&p.sock).expect("cli connect");
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut read_to_prompt = |s: &mut UnixStream| {
+                let mut got = Vec::new();
+                let mut b = [0u8; 4096];
+                while !got.ends_with(b"> ") {
+                    let n = s.read(&mut b).expect("cli read");
+                    assert!(n > 0, "closed: {}", String::from_utf8_lossy(&got));
+                    got.extend_from_slice(&b[..n]);
+                }
+                String::from_utf8(got).unwrap()
+            };
+            s.write_all(b"prompt\n").unwrap();
+            assert_eq!(read_to_prompt(&mut s), "\n> ");
+            s.write_all(b"show pools 1\n").unwrap();
+            let dump = read_to_prompt(&mut s);
+            assert!(dump.starts_with("Dumping pools usage (limited to the first 1 entries)."), "{dump}");
+            assert!(dump.ends_with(" by thread caches).\n\n> "), "{dump}");
+            s.write_all(b"show pools bogus\n").unwrap();
+            assert_eq!(read_to_prompt(&mut s), format!("{ERR}> "));
+        }
+    }
+
     #[test]
     fn show_pools_rejects_what_it_does_not_know() {
         let (_g, _be, o, i) = pair("bogus");

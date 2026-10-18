@@ -258,8 +258,10 @@ pub struct PoolHead {
     pub needed_avg: usize,
     pub failures: usize,
     pub users: usize,
-    /// What `show pools detailed` lists under the pool: one entry per registrant.
-    pub regs: Vec<PoolReg>,
+    /// What `show pools detailed` lists under the pool. Inline, not a `Vec`: the Prometheus
+    /// scrape reads every provider's head and must not allocate. Every pool Ibex has is
+    /// provided by one place, so one registrant is all there is.
+    pub reg: Option<PoolReg>,
 }
 
 /// One registrant of a pool (`HAProxy`'s `struct pool_registration`), for `show pools detailed`.
@@ -382,8 +384,8 @@ impl PoolRegistry {
         pools.retain(|p| !(by == 3 && p.allocated == 0) && prefix.is_none_or(|x| p.name.starts_with(x)));
         match by {
             1 => pools.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes())),
-            2 => pools.sort_by(|a, b| b.size.cmp(&a.size)),
-            3 => pools.sort_by(|a, b| b.alloc_bytes.cmp(&a.alloc_bytes)),
+            2 => pools.sort_by_key(|p| std::cmp::Reverse(p.size)),
+            3 => pools.sort_by_key(|p| std::cmp::Reverse(p.alloc_bytes)),
             _ => {}
         }
         if maxcnt == 0 || maxcnt > pools.len() {
@@ -421,7 +423,7 @@ impl PoolRegistry {
                 p.name.as_ptr() as usize,
             );
             if detailed {
-                for r in &p.regs {
+                if let Some(r) = &p.reg {
                     // C's "%#x" prints a zero as "0".
                     let flags = if r.flags == 0 { "0".to_string() } else { format!("{:#x}", r.flags) };
                     let _ = writeln!(
@@ -522,7 +524,7 @@ mod tests {
             needed_avg: 12,
             failures: 0,
             users: 1,
-            regs: Vec::new(),
+            reg: None,
         })
     }
 
