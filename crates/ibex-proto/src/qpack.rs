@@ -126,6 +126,11 @@ pub fn decode_qpack_static(block: &[u8]) -> Result<Vec<HeaderField>, H3Error> {
     let mut headers = Vec::new();
 
     while offset < block.len() {
+        // T358 #5: at most 201 field lines, as HAProxy's decoder (src/qpack-dec.c:316-320: a list of
+        // `tune.max_http_hdr * 2` = 202 entries, the last one kept for the end marker) and Ibex's HPACK.
+        if headers.len() >= crate::hpack::MAX_DECODED_FIELDS {
+            return Err(H3Error::QpackDecompressionFailed);
+        }
         let b = block[offset];
         if (b & 0xc0) == 0xc0 {
             // Indexed Field Line (Static)
