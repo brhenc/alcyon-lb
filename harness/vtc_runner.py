@@ -67,6 +67,19 @@ class Color:
         return f"{cls.BOLD}{s}{cls.RESET}"
 
 
+
+def vtest_hex(text):
+    """Bytes of a `sendhex`/`expect`-style hex string as VTest reads it (vtc_hex_to_bin): whitespace
+    and newlines between digits are skipped, any other non-hex character is an error, and an odd last
+    digit is the high nibble of a final byte (`if (i & 1) VSB_putc(vsb, b)`: "a5f" is a5 f0)."""
+    digits = "".join(ch for ch in text if not ch.isspace())
+    bad = next((ch for ch in digits if ch not in "0123456789abcdefABCDEF"), None)
+    if bad is not None:
+        raise ValueError(f"Illegal hex string ({bad!r})")
+    if len(digits) % 2:
+        digits += "0"
+    return bytes.fromhex(digits)
+
 def get_free_port() -> int:
     """Allocate an ephemeral port on loopback."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -1409,7 +1422,7 @@ class MockServerRunner:
                         hex_str = " ".join(args).strip()
                         if len(hex_str) >= 2 and hex_str[0] == hex_str[-1] and hex_str[0] in "\"'":
                             hex_str = hex_str[1:-1]
-                        writer.write(bytes.fromhex(hex_str.replace(" ", "")))
+                        writer.write(vtest_hex(hex_str))
                         await writer.drain()
 
                     elif cmd == "recv":
@@ -1636,7 +1649,7 @@ class MockClientRunner:
                         hex_str = " ".join(args).strip()
                         if len(hex_str) >= 2 and hex_str[0] == hex_str[-1] and hex_str[0] in "\"'":
                             hex_str = hex_str[1:-1]
-                        pending += bytes.fromhex(hex_str.replace(" ", ""))
+                        pending += vtest_hex(hex_str)
 
                     elif cmd == "recv":
                         # vtest reads exactly <n> bytes, failing on an early EOF.

@@ -258,5 +258,19 @@ class ClientSendCoalescing(unittest.TestCase):
         self.assertEqual(got, [b"\r\n\nQhi"])
 
 
+class VtestHex(unittest.TestCase):
+    """`sendhex` / hex `expect` strings parse as VTest's vtc_hex_to_bin (T363l, converter/mqtt.vtc)."""
+
+    def test_whitespace_and_newlines_between_digits_are_skipped(self):
+        self.assertEqual(vtc_runner.vtest_hex("30 0C\n\t02 01"), b"\x30\x0c\x02\x01")
+
+    def test_an_odd_last_digit_is_the_high_nibble_of_a_last_byte(self):
+        self.assertEqual(vtc_runner.vtest_hex("a5f"), b"\xa5\xf0")
+
+    def test_a_non_hex_character_is_an_error(self):
+        with self.assertRaises(ValueError):
+            vtc_runner.vtest_hex("3x")
+
+
 if __name__ == "__main__":
     unittest.main()
