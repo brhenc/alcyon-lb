@@ -874,7 +874,7 @@ mod tests {
 
         // Test var with regsub
         crate::CURRENT_VARS.with(|v| {
-            v.borrow_mut().insert("sess.str3".to_string(), "this is a string".to_string());
+            v.borrow_mut().insert("sess.str3".to_string(), Sample::Str("this is a string".to_string()));
         });
         let expr_var = Expr::parse("var(sess.str3),regsub(is a,is also a)").unwrap();
         let val = expr_var.eval_sample(&registry, &ctx);

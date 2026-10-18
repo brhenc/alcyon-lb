@@ -362,7 +362,7 @@ pub struct H2Child {
     pub tls: Option<Arc<ibex_tls::RustlsTlsInfo>>,
     /// The connection's session variables as the stream got them: what it changed of them
     /// goes back to the connection, and only that, as other streams may have set others.
-    pub sess_vars_at_start: HashMap<String, String>,
+    pub sess_vars_at_start: ibex_sample::VarMap,
 }
 
 impl H2Child {
@@ -596,8 +596,8 @@ pub struct TcpSession {
     /// The backend has `tcp-response content` rules for this stream: they start, with
     /// this inspect-delay, once the server connection is up (`server_connected`).
     pub res_inspect_armed: Option<Option<u32>>,
-    pub sess_vars: HashMap<String, String>,
-    pub req_vars: HashMap<String, String>,
+    pub sess_vars: ibex_sample::VarMap,
+    pub req_vars: ibex_sample::VarMap,
     /// What this stream measured for its log line, and its captures and unique ID.
     pub log: crate::txnlog::StreamLog,
     pub tracked_sc: [Option<(usize, StickKey)>; 3],

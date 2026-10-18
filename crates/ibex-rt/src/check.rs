@@ -260,7 +260,7 @@ pub struct CheckRun {
     pub check_fd: Option<RawFd>,
     pub sub_state: CheckSubState,
     /// The check's variables (`http-check set-var`, scope `check`), for the run in progress.
-    pub vars: HashMap<String, String>,
+    pub vars: ibex_sample::VarMap,
     /// When the check started, for its duration.
     pub start_tick: Tick,
 }
@@ -733,7 +733,7 @@ fn with_check_ctx<R>(
     check: &ServerCheckState,
     px: &Proxy,
     proxies: &[Proxy],
-    vars: &HashMap<String, String>,
+    vars: &ibex_sample::VarMap,
     resp: Option<&HttpResp>,
     f: impl FnOnce(&LogData, &ibex_sample::SampleContext) -> R,
 ) -> R {
@@ -778,7 +778,7 @@ fn run_var_rules(
     check: &ServerCheckState,
     proxies: &[Proxy],
     rules: &[ResolvedHttpRule],
-    vars: &mut HashMap<String, String>,
+    vars: &mut ibex_sample::VarMap,
     resp: Option<&HttpResp>,
 ) {
     let Some(px) = proxies.get(check.proxy()) else { return };
@@ -789,7 +789,6 @@ fn run_var_rules(
                 ibex_sample::Expr::cached(expr)
                     .ok()
                     .and_then(|e| e.eval_sample(reg, ctx))
-                    .map(|smp| crate::engine::sample_to_string(&smp))
             });
             // An expression that gives no sample leaves the variable as it was.
             if let Some(v) = val {
