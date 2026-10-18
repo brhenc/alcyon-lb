@@ -817,6 +817,7 @@ pub(crate) fn parse_global_directive(
                     name: var_name,
                     expr,
                     is_fmt: false,
+                    line: tokens[0].line,
                 });
             }
             Ok(())
@@ -829,6 +830,7 @@ pub(crate) fn parse_global_directive(
                     name: var_name,
                     expr,
                     is_fmt: true,
+                    line: tokens[0].line,
                 });
             }
             Ok(())

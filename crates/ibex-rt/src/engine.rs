@@ -4147,10 +4147,9 @@ fn init_global_vars(global: Option<&ibex_config::GlobalSection>) {
             // `set-var` keeps the sample's type, `set-var-fmt` stores a string (T364).
             let val = if set_var.is_fmt {
                 Sample::Str(format_sample_string(&set_var.expr, &sample_ctx, sample_reg))
-            } else if let Ok(e) = Expr::cached(&set_var.expr) {
-                e.eval_sample(sample_reg, &sample_ctx).unwrap_or_else(|| Sample::Str(set_var.expr.clone()))
             } else {
-                Sample::Str(set_var.expr.clone())
+                // The expression was checked when the configuration loaded.
+                Expr::cached(&set_var.expr).ok().and_then(|e| e.eval_sample(sample_reg, &sample_ctx)).unwrap_or_else(|| Sample::Str(set_var.expr.clone()))
             };
             ibex_sample::vars::set_proc(&set_var.name, val);
         }

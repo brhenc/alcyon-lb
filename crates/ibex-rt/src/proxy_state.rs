@@ -728,6 +728,11 @@ pub fn check_expr(config: &Config, registry: &Registry, at: Where<'_>, expr: &st
 /// # Errors
 /// The first that fails, with its line.
 pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), String> {
+    // `set-var` in the global section: an expression that does not parse is refused at load
+    // (`parsing [g.cfg:2] : unknown fetch method 'x'` on `HAProxy`), and is not stored as text.
+    for v in config.global.iter().flat_map(|g| g.set_vars.iter()).filter(|v| !v.is_fmt) {
+        crate::rule_exprs::check_sample_expr(&v.expr, registry).map_err(|e| format!("parsing [line {}]: {e}", v.line))?;
+    }
     for r in &config.sample_refs {
         let in_line = |e: String| format!("parsing [line {}]: {e}", r.line);
         // The patterns of an anonymous ACL, which a named one has checked since `validate_acls`.
