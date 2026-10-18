@@ -3,7 +3,7 @@
 
 //! T364 S3: `set-var(<name>,ifgt)` and `,iflt)` compare the stored and the new value only when
 //! both are `sint` (`var_set`, src/vars.c); with any other pair of types the condition is
-//! ignored and the variable is set. Expected values measured on HAProxy 3.5-dev8 (probe e2.py).
+//! ignored and the variable is set. Expected values measured on `HAProxy` 3.5-dev8 (probe e2.py).
 
 use crate::common;
 use std::io::{Read, Write};

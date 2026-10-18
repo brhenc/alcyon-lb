@@ -124,7 +124,7 @@ pub fn is_empty(smp: &Sample) -> bool {
 /// sample (`var_set`, src/vars.c): `exists`/`is_set` describe the variable, `stored` is its
 /// value, `new` the sample. `ifgt` holds when the stored value is greater than the sample's,
 /// `iflt` when it is less, but only when both are `sint`; with any other pair of types (or no
-/// stored value) the comparison is ignored, as in HAProxy.
+/// stored value) the comparison is ignored, as in `HAProxy`.
 #[must_use]
 pub fn conds_hold(spec: &str, exists: bool, is_set: bool, stored: Option<&Sample>, new: &Sample) -> bool {
     let empty = is_empty(new);
