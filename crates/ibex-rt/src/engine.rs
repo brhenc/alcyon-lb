@@ -1545,6 +1545,8 @@ pub struct Proxy {
     pub use_servers: Vec<ibex_config::UseServerRule>,
     /// `force-be-switch` conditions (frontends and listens).
     pub force_be_switch: Vec<ibex_config::AclCondition>,
+    /// `monitor fail` conditions (frontends and listens): one that holds turns the `monitor-uri` answer into a 503.
+    pub monitor_fail: Vec<ibex_config::AclCondition>,
     /// The names of the backends and listens the configuration disables: they are not
     /// instantiated, and only `force-be-switch` lets a rule choose one (then it has no
     /// server to give).
@@ -3640,6 +3642,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         use_backends: listen.use_backends.clone(),
         use_servers: listen.use_servers.clone(),
         force_be_switch: listen.force_be_switch.clone(),
+        monitor_fail: listen.monitor_fail.clone(),
         disabled_backends: Arc::default(),
         monitor_uri: listen.monitor_uri.as_deref().map(Into::into),
         acls: compile_acls(&listen.acls),
@@ -3765,6 +3768,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         use_backends: fe.use_backends.clone(),
         use_servers: Vec::new(),
         force_be_switch: fe.force_be_switch.clone(),
+        monitor_fail: fe.monitor_fail.clone(),
         disabled_backends: Arc::default(),
         monitor_uri: fe.monitor_uri.as_deref().map(Into::into),
         acls: compile_acls(&fe.acls),
@@ -3895,6 +3899,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         use_backends: Vec::new(),
         use_servers: be.use_servers.clone(),
         force_be_switch: Vec::new(),
+        monitor_fail: Vec::new(),
         disabled_backends: Arc::default(),
         monitor_uri: None,
         acls: compile_acls(&be.acls),
@@ -10833,7 +10838,22 @@ impl EngineDispatcher<'_> {
                 req_uri
             };
             if path == m_uri {
-                send_proxy_reply(&mut entry.sess, proxies, proxy_idx, proxy_idx, MONITOR_URI_RESPONSE);
+                // `monitor fail if|unless <cond>` (`http_wait_for_request`): any condition that
+                // holds makes the answer a 503, which goes through the proxy's error page
+                // (`errorfile`, `errorloc`) like any error the proxy generates.
+                let failed = !proxies[proxy_idx].monitor_fail.is_empty() && {
+                    let proxy = &proxies[proxy_idx];
+                    let view = ProxiesView(proxies);
+                    let stick = StickView::new(proxies, &entry.sess.tracked_sc);
+                    let ctx = Self::request_ctx(&entry.sess, proxy, &view, &stick);
+                    let registry = sample_registry();
+                    proxy.monitor_fail.iter().any(|c| crate::proxy::eval_acl_condition(c, &proxy.acls, registry, &ctx))
+                };
+                if failed {
+                    reply_error(entry, proxies, 503);
+                } else {
+                    send_proxy_reply(&mut entry.sess, proxies, proxy_idx, proxy_idx, MONITOR_URI_RESPONSE);
+                }
                 return None;
             }
         }
