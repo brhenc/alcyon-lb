@@ -204,6 +204,33 @@ pub struct StatRow {
     fields: Vec<String>,
 }
 
+/// Column name -> position, for [`StatRow::set`].
+static FIELD_INDEX: std::sync::LazyLock<std::collections::HashMap<&'static str, usize>> =
+    std::sync::LazyLock::new(|| STAT_FIELDS.iter().enumerate().map(|(i, n)| (*n, i)).collect());
+
+thread_local! {
+    /// Rows given back by [`StatRow`]'s `Drop`, with the capacity their strings grew to: the
+    /// next row of this thread starts from them, so a scrape allocates no row after the first.
+    static ROW_POOL: std::cell::RefCell<Vec<Vec<String>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Drop for StatRow {
+    fn drop(&mut self) {
+        let mut fields = std::mem::take(&mut self.fields);
+        for f in &mut fields {
+            f.clear();
+        }
+        // A thread that is going away has no pool left to give back to.
+        let _ = ROW_POOL.try_with(|p| {
+            if let Ok(mut p) = p.try_borrow_mut() {
+                if p.len() < 8 {
+                    p.push(fields);
+                }
+            }
+        });
+    }
+}
+
 impl Default for StatRow {
     fn default() -> Self {
         Self::new()
@@ -213,24 +240,28 @@ impl Default for StatRow {
 impl StatRow {
     #[must_use]
     pub fn new() -> Self {
-        let mut fields = vec![String::new(); STAT_FIELD_COUNT];
-        fields[119] = "-".to_string();
+        let pooled = ROW_POOL.try_with(|p| p.try_borrow_mut().ok().and_then(|mut p| p.pop())).ok().flatten();
+        let mut fields = pooled.unwrap_or_else(|| (0..STAT_FIELD_COUNT).map(|_| String::with_capacity(24)).collect());
+        fields[119].push('-');
         StatRow { fields }
     }
 
     /// Sets a column by name. An unknown name is ignored rather than panicking: a typo
     /// must not take down a proxy that was only asked for statistics.
     pub fn set(&mut self, name: &str, value: impl std::fmt::Display) {
-        if let Some(i) = STAT_FIELDS.iter().position(|f| *f == name) {
-            self.fields[i] = value.to_string();
+        use std::fmt::Write;
+        if let Some(&i) = FIELD_INDEX.get(name) {
+            let f = &mut self.fields[i];
+            f.clear();
+            let _ = write!(f, "{value}");
         }
     }
 
     /// Sets `name` to `value` unless the row already has one.
     fn default_to(&mut self, name: &str, value: &str) {
-        let field = STAT_FIELDS.iter().position(|f| *f == name).and_then(|i| self.fields.get_mut(i));
+        let field = FIELD_INDEX.get(name).and_then(|&i| self.fields.get_mut(i));
         if let Some(f) = field.filter(|f| f.is_empty()) {
-            *f = value.to_string();
+            f.push_str(value);
         }
     }
 
@@ -245,10 +276,10 @@ impl StatRow {
             self.default_to(n, "0");
         }
         // Module counters: every column after the `-` separator.
-        let module: Vec<&str> = STAT_FIELDS[120..].to_vec();
+        let module: &[&str] = &STAT_FIELDS[120..];
         match obj {
             'F' => {
-                for n in &module {
+                for n in module {
                     self.default_to(n, "0");
                 }
                 for n in ["sess_other", "h1sess", "h2sess", "h3sess", "req_other", "h1req", "h2req", "h3req"] {
@@ -260,7 +291,7 @@ impl StatRow {
                 }
             }
             'B' => {
-                for n in &module {
+                for n in module {
                     self.default_to(n, "0");
                 }
                 for n in ["agg_server_status", "agg_server_check_status", "agg_check_status"] {
@@ -289,11 +320,11 @@ impl StatRow {
         match fmt {
             StatFormat::Csv => {
                 // `HAProxy` ends every row with a comma after the last column.
-                let mut row = self.finish();
-                if !row.ends_with(",\n") {
-                    row.insert(row.len() - 1, ',');
+                for f in &self.fields {
+                    out.push_str(f);
+                    out.push(',');
                 }
-                out.push_str(&row);
+                out.push('\n');
             }
             _ => crate::stats_typed::emit_stat_row(out, &self.fields, fmt),
         }
@@ -329,6 +360,25 @@ pub fn node_name() -> String {
     }
     // uname(2), not /proc, which is not there in a chroot (T240).
     rustix::system::uname().nodename().to_string_lossy().trim().to_string()
+}
+
+/// Calls `f` with the node name (`global node`, or the host name) without copying it.
+pub fn with_node<R>(f: impl FnOnce(&str) -> R) -> R {
+    if let Ok(id) = IDENTITY.read() {
+        if let Some(n) = id.0.as_deref() {
+            return f(n);
+        }
+    }
+    let u = rustix::system::uname();
+    f(u.nodename().to_string_lossy().trim())
+}
+
+/// Calls `f` with `global description` when one was given, without copying it.
+pub fn with_description<R>(f: impl FnOnce(Option<&str>) -> R) -> R {
+    match IDENTITY.read() {
+        Ok(id) => f(id.1.as_deref()),
+        Err(_) => f(None),
+    }
 }
 
 /// `global description`, if one was given.
@@ -462,24 +512,68 @@ pub fn note_sched(tasks: usize, run_queue: usize) {
     SCHED_RUNQ.store(run_queue, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The `show info` pairs for the Prometheus scrape: the same function as the CLI's, fed from
-/// the proxies' counters and the recorded start time and task counts, so the numbers agree.
-#[must_use]
-pub fn process_info_pairs(proxies: &[Proxy]) -> Vec<(&'static str, String)> {
-    let active_conns: u32 = proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
-    let max_conns: u32 = proxies.iter().map(|p| p.maxconn.get()).sum();
-    let cum_conns: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
-    let cum_reqs: u64 = proxies.iter().filter_map(|p| p.ids.tc.get()).map(|c| c.fe.req_tot.load(std::sync::atomic::Ordering::Relaxed)).sum();
-    show_info_pairs(
+/// Fills `p` with the `show info` pairs for the Prometheus scrape: the same function as the
+/// CLI's, fed from the proxies' counters and the recorded start time and task counts, so the
+/// numbers agree.
+pub fn process_info_pairs(p: &mut InfoPairs, proxies: &[Proxy]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (mut active_conns, mut max_conns, mut cum_conns, mut cum_reqs) = (0u32, 0u32, 0u64, 0u64);
+    for px in proxies {
+        active_conns += px.stats.iter().map(|s| s.act_conn.load(Relaxed)).sum::<u32>();
+        max_conns += px.maxconn.get();
+        cum_conns += px.stats.iter().map(|s| s.cum_conn.load(Relaxed)).sum::<u64>();
+        cum_reqs += px.ids.tc.get().map_or(0, |c| c.fe.req_tot.load(Relaxed));
+    }
+    p.n = 0;
+    fill_info_pairs(
+        p,
         *PROCESS_START.get_or_init(Instant::now),
         std::process::id(),
-        SCHED_TASKS.load(std::sync::atomic::Ordering::Relaxed),
-        SCHED_RUNQ.load(std::sync::atomic::Ordering::Relaxed),
+        SCHED_TASKS.load(Relaxed),
+        SCHED_RUNQ.load(Relaxed),
         active_conns,
         max_conns,
         cum_conns,
         cum_reqs,
-    )
+    );
+}
+
+/// The `show info` pairs, held so that a refill reuses the values' storage: a scrape fills the
+/// same one every time and allocates nothing once it has been through once.
+#[derive(Default)]
+pub struct InfoPairs {
+    pub v: Vec<(&'static str, String)>,
+    n: usize,
+}
+
+impl InfoPairs {
+    fn put(&mut self, name: &'static str, val: std::fmt::Arguments<'_>) {
+        use std::fmt::Write;
+        if self.n == self.v.len() {
+            self.v.push((name, String::with_capacity(32)));
+        }
+        let slot = &mut self.v[self.n];
+        slot.0 = name;
+        slot.1.clear();
+        let _ = slot.1.write_fmt(val);
+        self.n += 1;
+    }
+
+    /// The pairs of the last fill.
+    #[must_use]
+    pub fn pairs(&self) -> &[(&'static str, String)] {
+        &self.v[..self.n]
+    }
+
+    /// Room for every pair, so that the first fill allocates nothing either.
+    #[must_use]
+    pub fn presized() -> Self {
+        let mut p = InfoPairs::default();
+        for _ in 0..96 {
+            p.v.push(("", String::with_capacity(48)));
+        }
+        p
+    }
 }
 
 fn show_info_pairs(
@@ -492,6 +586,23 @@ fn show_info_pairs(
     cum_conns: u64,
     cum_reqs: u64,
 ) -> Vec<(&'static str, String)> {
+    let mut p = InfoPairs::default();
+    fill_info_pairs(&mut p, start_time, pid, total_tasks, run_queue_len, active_conns, max_conns, cum_conns, cum_reqs);
+    p.v.truncate(p.n);
+    p.v
+}
+
+fn fill_info_pairs(
+    p: &mut InfoPairs,
+    start_time: Instant,
+    pid: u32,
+    total_tasks: usize,
+    run_queue_len: usize,
+    active_conns: u32,
+    max_conns: u32,
+    cum_conns: u64,
+    cum_reqs: u64,
+) {
     // `Ulimit-n` and `Maxsock`: as the startup settled them (`globalconn::apply_nofile_limit`),
     // or else the descriptors the process may hold (`getrlimit`).
     let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile).current.unwrap_or(0);
@@ -507,99 +618,90 @@ fn show_info_pairs(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs().saturating_sub(total_secs));
     let idle_pct = cpu::get_idle_pct();
-    let node = node_name();
-    let zero = || "0".to_string();
     let (pool_alloc, pool_used) = ibex_alloc::global_pool_registry().totals();
-    let mut pairs = vec![
-        ("Name", "Ibex".to_string()),
-        ("Version", "0.1.0".to_string()),
-        ("Release_date", "2026/09/21".to_string()),
-        ("Nbthread", nbthread.to_string()),
-        ("Nbproc", "1".to_string()),
-        ("Process_num", "1".to_string()),
-        ("Pid", pid.to_string()),
-        ("Uptime", format!("{days}d {hours}h{mins:02}m{secs:02}s")),
-        ("Uptime_sec", total_secs.to_string()),
-        ("Memmax_MB", crate::globalconn::memmax_mb().to_string()),
-        ("PoolAlloc_MB", (pool_alloc / 1_048_576).to_string()),
-        ("PoolUsed_MB", (pool_used / 1_048_576).to_string()),
-        ("PoolFailed", ibex_alloc::global_pool_registry().failures().to_string()),
-        ("Ulimit-n", ulimit_n.to_string()),
-        ("Maxsock", maxsock.to_string()),
-        ("Maxconn", maxconn.to_string()),
-        ("Hard_maxconn", hard_maxconn.to_string()),
-        ("CurrConns", active_conns.to_string()),
-        ("CumConns", cum_conns.to_string()),
-        ("CumReq", cum_reqs.to_string()),
-        ("MaxSslConns", zero()),
-        ("CurrSslConns", SSL_CURR.load(std::sync::atomic::Ordering::Relaxed).to_string()),
-        ("CumSslConns", SSL_CUM.load(std::sync::atomic::Ordering::Relaxed).to_string()),
-        ("Maxpipes", zero()),
-        ("PipesUsed", zero()),
-        ("PipesFree", zero()),
-        ("ConnRate", crate::engine::GLOBAL_CONN_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).rate().to_string()),
-        ("ConnRateLimit", zero()),
-        ("MaxConnRate", crate::engine::MAX_CONN_RATE.load(std::sync::atomic::Ordering::Relaxed).to_string()),
-        ("SessRate", crate::engine::GLOBAL_SESS_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).rate().to_string()),
-        ("SessRateLimit", zero()),
-        ("MaxSessRate", crate::engine::MAX_SESS_RATE.load(std::sync::atomic::Ordering::Relaxed).to_string()),
-        ("SslRate", SSL_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).rate().to_string()),
-        ("SslRateLimit", zero()),
-        ("MaxSslRate", SSL_MAX.load(std::sync::atomic::Ordering::Relaxed).to_string()),
-        ("SslFrontendKeyRate", zero()),
-        ("SslFrontendMaxKeyRate", zero()),
-        ("SslFrontendSessionReuse_pct", zero()),
-        ("SslBackendKeyRate", zero()),
-        ("SslBackendMaxKeyRate", zero()),
-        ("SslCacheLookups", zero()),
-        ("SslCacheMisses", zero()),
-        ("CompressBpsIn", zero()),
-        ("CompressBpsOut", zero()),
-        ("CompressBpsRateLim", zero()),
-        ("ZlibMemUsage", zero()),
-        ("MaxZlibMemUsage", zero()),
-        ("Tasks", total_tasks.to_string()),
-        ("Run_queue", run_queue_len.to_string()),
-        ("Idle_pct", idle_pct.to_string()),
-        ("node", node),
-        ("Stopping", zero()),
-        ("Jobs", zero()),
-        ("Unstoppable Jobs", zero()),
-        ("Listeners", crate::globalconn::listeners().to_string()),
-        ("ActivePeers", zero()),
-        ("ConnectedPeers", zero()),
-        ("DroppedLogs", crate::syslog::dropped_logs().to_string()),
-        ("BusyPolling", zero()),
-        ("FailedResolutions", zero()),
-        ("TotalBytesOut", crate::raw::bytes_out().to_string()),
-        ("TotalSplicedBytesOut", zero()),
-        ("BytesOutRate", zero()),
-        ("DebugCommandsIssued", zero()),
-        ("CumRecvLogs", zero()),
-        ("Build info", "0.1.0".to_string()),
-        ("Memmax_bytes", (crate::globalconn::memmax_mb().wrapping_mul(1_048_576)).to_string()),
-        ("PoolAlloc_bytes", pool_alloc.to_string()),
-        ("PoolUsed_bytes", pool_used.to_string()),
-        ("Start_time_sec", start_sec.to_string()),
-        ("Tainted", zero()),
-        ("TotalWarnings", zero()),
-        ("MaxconnReached", crate::globalconn::reached().to_string()),
-        ("BootTime_ms", zero()),
-        ("Niced_tasks", zero()),
-        ("CurrStreams", zero()),
-        ("CumStreams", crate::stats::CUM_STREAMS.load(std::sync::atomic::Ordering::Relaxed).to_string()),
-        ("BlockedTrafficWarnings", crate::watchdog::blocked_traffic_warnings().to_string()),
-        ("PatternsAdded", zero()),
-        ("PatternsFreed", zero()),
-        ("NbThreadGroups", "1".to_string()),
-        ("Worker_id", worker_id().to_string()),
-    ];
-    // `description` is only there when one was configured, right after `node`.
-    if let Some(d) = description() {
-        let at = pairs.iter().position(|(k, _)| *k == "node").map_or(pairs.len(), |p| p + 1);
-        pairs.insert(at, ("description", d));
-    }
-    pairs
+    p.put("Name", format_args!("{}", "Ibex"));
+    p.put("Version", format_args!("{}", "0.1.0"));
+    p.put("Release_date", format_args!("{}", "2026/09/21"));
+    p.put("Nbthread", format_args!("{}", nbthread));
+    p.put("Nbproc", format_args!("{}", "1"));
+    p.put("Process_num", format_args!("{}", "1"));
+    p.put("Pid", format_args!("{}", pid));
+    p.put("Uptime", format_args!("{days}d {hours}h{mins:02}m{secs:02}s"));
+    p.put("Uptime_sec", format_args!("{}", total_secs));
+    p.put("Memmax_MB", format_args!("{}", crate::globalconn::memmax_mb()));
+    p.put("PoolAlloc_MB", format_args!("{}", (pool_alloc / 1_048_576)));
+    p.put("PoolUsed_MB", format_args!("{}", (pool_used / 1_048_576)));
+    p.put("PoolFailed", format_args!("{}", ibex_alloc::global_pool_registry().failures()));
+    p.put("Ulimit-n", format_args!("{}", ulimit_n));
+    p.put("Maxsock", format_args!("{}", maxsock));
+    p.put("Maxconn", format_args!("{}", maxconn));
+    p.put("Hard_maxconn", format_args!("{}", hard_maxconn));
+    p.put("CurrConns", format_args!("{}", active_conns));
+    p.put("CumConns", format_args!("{}", cum_conns));
+    p.put("CumReq", format_args!("{}", cum_reqs));
+    p.put("MaxSslConns", format_args!("{}", "0"));
+    p.put("CurrSslConns", format_args!("{}", SSL_CURR.load(std::sync::atomic::Ordering::Relaxed)));
+    p.put("CumSslConns", format_args!("{}", SSL_CUM.load(std::sync::atomic::Ordering::Relaxed)));
+    p.put("Maxpipes", format_args!("{}", "0"));
+    p.put("PipesUsed", format_args!("{}", "0"));
+    p.put("PipesFree", format_args!("{}", "0"));
+    p.put("ConnRate", format_args!("{}", crate::engine::GLOBAL_CONN_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).rate()));
+    p.put("ConnRateLimit", format_args!("{}", "0"));
+    p.put("MaxConnRate", format_args!("{}", crate::engine::MAX_CONN_RATE.load(std::sync::atomic::Ordering::Relaxed)));
+    p.put("SessRate", format_args!("{}", crate::engine::GLOBAL_SESS_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).rate()));
+    p.put("SessRateLimit", format_args!("{}", "0"));
+    p.put("MaxSessRate", format_args!("{}", crate::engine::MAX_SESS_RATE.load(std::sync::atomic::Ordering::Relaxed)));
+    p.put("SslRate", format_args!("{}", SSL_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).rate()));
+    p.put("SslRateLimit", format_args!("{}", "0"));
+    p.put("MaxSslRate", format_args!("{}", SSL_MAX.load(std::sync::atomic::Ordering::Relaxed)));
+    p.put("SslFrontendKeyRate", format_args!("{}", "0"));
+    p.put("SslFrontendMaxKeyRate", format_args!("{}", "0"));
+    p.put("SslFrontendSessionReuse_pct", format_args!("{}", "0"));
+    p.put("SslBackendKeyRate", format_args!("{}", "0"));
+    p.put("SslBackendMaxKeyRate", format_args!("{}", "0"));
+    p.put("SslCacheLookups", format_args!("{}", "0"));
+    p.put("SslCacheMisses", format_args!("{}", "0"));
+    p.put("CompressBpsIn", format_args!("{}", "0"));
+    p.put("CompressBpsOut", format_args!("{}", "0"));
+    p.put("CompressBpsRateLim", format_args!("{}", "0"));
+    p.put("ZlibMemUsage", format_args!("{}", "0"));
+    p.put("MaxZlibMemUsage", format_args!("{}", "0"));
+    p.put("Tasks", format_args!("{}", total_tasks));
+    p.put("Run_queue", format_args!("{}", run_queue_len));
+    p.put("Idle_pct", format_args!("{}", idle_pct));
+    crate::stats::with_node(|n| p.put("node", format_args!("{n}")));
+    crate::stats::with_description(|d| if let Some(d) = d { p.put("description", format_args!("{d}")) });
+    p.put("Stopping", format_args!("{}", "0"));
+    p.put("Jobs", format_args!("{}", "0"));
+    p.put("Unstoppable Jobs", format_args!("{}", "0"));
+    p.put("Listeners", format_args!("{}", crate::globalconn::listeners()));
+    p.put("ActivePeers", format_args!("{}", "0"));
+    p.put("ConnectedPeers", format_args!("{}", "0"));
+    p.put("DroppedLogs", format_args!("{}", crate::syslog::dropped_logs()));
+    p.put("BusyPolling", format_args!("{}", "0"));
+    p.put("FailedResolutions", format_args!("{}", "0"));
+    p.put("TotalBytesOut", format_args!("{}", crate::raw::bytes_out()));
+    p.put("TotalSplicedBytesOut", format_args!("{}", "0"));
+    p.put("BytesOutRate", format_args!("{}", "0"));
+    p.put("DebugCommandsIssued", format_args!("{}", "0"));
+    p.put("CumRecvLogs", format_args!("{}", "0"));
+    p.put("Build info", format_args!("{}", "0.1.0"));
+    p.put("Memmax_bytes", format_args!("{}", (crate::globalconn::memmax_mb().wrapping_mul(1_048_576))));
+    p.put("PoolAlloc_bytes", format_args!("{}", pool_alloc));
+    p.put("PoolUsed_bytes", format_args!("{}", pool_used));
+    p.put("Start_time_sec", format_args!("{}", start_sec));
+    p.put("Tainted", format_args!("{}", "0"));
+    p.put("TotalWarnings", format_args!("{}", "0"));
+    p.put("MaxconnReached", format_args!("{}", crate::globalconn::reached()));
+    p.put("BootTime_ms", format_args!("{}", "0"));
+    p.put("Niced_tasks", format_args!("{}", "0"));
+    p.put("CurrStreams", format_args!("{}", "0"));
+    p.put("CumStreams", format_args!("{}", crate::stats::CUM_STREAMS.load(std::sync::atomic::Ordering::Relaxed)));
+    p.put("BlockedTrafficWarnings", format_args!("{}", crate::watchdog::blocked_traffic_warnings()));
+    p.put("PatternsAdded", format_args!("{}", "0"));
+    p.put("PatternsFreed", format_args!("{}", "0"));
+    p.put("NbThreadGroups", format_args!("{}", "1"));
+    p.put("Worker_id", format_args!("{}", worker_id()));
 }
 
 /// Generates the full `show stat` CSV text for all configured proxies and servers.
@@ -737,55 +839,65 @@ pub(crate) fn write_server_row(
         "srv"
     };
     let srv_addr = proxy.servers.at(s_idx);
-    let (status_str, chkfail, chkdown, check_status, check_code, last_chk, check_duration, check_desc) =
-        if let Some(c) = check_state {
-            // A star while a check is running; the code only for the statuses that carry
-            // data (L57DATA and above); the info text as `last_chk`.
-            let check_status = if c.in_progress {
-                format!("* {}", c.last_status_code)
-            } else {
-                c.last_status_code.to_string()
-            };
-            let check_code = if c.carries_code() { c.http_code.unwrap_or(0).to_string() } else { String::new() };
-            (
-                c.status_word(),
-                c.failed_checks,
-                c.down_transitions,
-                check_status,
-                check_code,
-                c.last_status_info.as_deref().unwrap_or_default().to_string(),
-                // From the first completed check on (`HCHK_STATUS_CHECKED`), not while `INI`.
-                if c.last_status_code == "INI" { String::new() } else { c.check_duration_ms.to_string() },
-                // `get_check_status_description`: the fixed text of the status.
-                c.last_status_desc.to_string(),
-            )
-        } else {
-            let s = proxy
-                .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
-            let tracker = !crate::track::tracked_label(proxy, s_idx).is_empty();
-            let s_str = match s {
-                ServerStatus::Up if tracker => "UP".to_string(),
-                ServerStatus::Up => "no check".to_string(),
-                ServerStatus::Down => "DOWN".to_string(),
-                ServerStatus::Drain => "DRAIN".to_string(),
-                // The maintenance of a tracker's target says where it comes from.
-                ServerStatus::Maint if crate::track::inherited(proxy, s_idx) => {
-                    format!("MAINT (via {})", crate::track::tracked_label(proxy, s_idx))
-                }
-                ServerStatus::Maint => "MAINT".to_string(),
-            };
-            (s_str, 0, 0, String::new(), String::new(), String::new(), String::new(), String::new())
-        };
+    // Everything below is written into the row's strings as it is read: a `show stat` row of
+    // a scrape allocates nothing (T369).
+    struct Word<'a>(Option<&'a ServerCheckState>, &'static str, &'a str);
+    impl std::fmt::Display for Word<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self.0 {
+                Some(c) => write!(f, "{}", crate::check::StatusWord(c)),
+                None if self.2.is_empty() => f.write_str(self.1),
+                None => write!(f, "MAINT (via {})", self.2),
+            }
+        }
+    }
+    struct Star<'a>(bool, &'a str);
+    impl std::fmt::Display for Star<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if self.0 {
+                f.write_str("* ")?;
+            }
+            f.write_str(self.1)
+        }
+    }
+    struct Opt<T>(Option<T>);
+    impl<T: std::fmt::Display> std::fmt::Display for Opt<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.as_ref().map_or(Ok(()), |v| write!(f, "{v}"))
+        }
+    }
+    let status_str = if let Some(c) = check_state {
+        Word(Some(c), "", "")
+    } else {
+        let s = proxy.server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
+        let tracker = !crate::track::tracked_label(proxy, s_idx).is_empty();
+        match s {
+            ServerStatus::Up if tracker => Word(None, "UP", ""),
+            ServerStatus::Up => Word(None, "no check", ""),
+            ServerStatus::Down => Word(None, "DOWN", ""),
+            ServerStatus::Drain => Word(None, "DRAIN", ""),
+            // The maintenance of a tracker's target says where it comes from.
+            ServerStatus::Maint if crate::track::inherited(proxy, s_idx) => Word(None, "", crate::track::tracked_label(proxy, s_idx)),
+            ServerStatus::Maint => Word(None, "MAINT", ""),
+        }
+    };
+    let (chkfail, chkdown) = check_state.map_or((0, 0), |c| (c.failed_checks, c.down_transitions));
+    // A star while a check is running; the code only for the statuses that carry data
+    // (L57DATA and above); the info text as `last_chk`.
+    let check_status = Opt(check_state.map(|c| Star(c.in_progress, c.last_status_code)));
+    let check_code = Opt(check_state.filter(|c| c.carries_code()).map(|c| c.http_code.unwrap_or(0)));
+    let last_chk = check_state.and_then(|c| c.last_status_info.as_deref()).unwrap_or("");
+    // From the first completed check on (`HCHK_STATUS_CHECKED`), not while `INI`.
+    let check_duration = Opt(check_state.filter(|c| c.last_status_code != "INI").map(|c| c.check_duration_ms));
+    // `get_check_status_description`: the fixed text of the status.
+    let check_desc = check_state.map_or("", |c| c.last_status_desc);
     let has_check = check_state.is_some();
 
     let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
     let (act, bck) = if is_backup { (0, 1) } else { (1, 0) };
     let scur = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
     let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
-    let slim = proxy
-        .server_maxconn
-        .get(s_idx)
-        .map_or(String::new(), |m| m.to_string());
+    let slim = Opt(proxy.server_maxconn.get(s_idx));
 
     let mut r = StatRow::new();
     r.set("pxname", &proxy.name);
@@ -796,7 +908,7 @@ pub(crate) fn write_server_row(
     r.set("qmax", 0);
     r.set("scur", scur);
     r.set("smax", c.smax.load(std::sync::atomic::Ordering::Relaxed).max(scur));
-    r.set("slim", &slim);
+    r.set("slim", slim);
     r.set("stot", ld(&c.stot));
     r.set("dresp", 0);
     r.set("eresp", ld(&c.eresp));

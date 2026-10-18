@@ -379,7 +379,11 @@ Not done: `extra-counters` is accepted and adds nothing (Ibex has no stats-modul
 with another message). With several workers, check columns are those of the worker that answers
 the scrape (the same as `show stat`).
 
-A scrape allocates, unlike the hand-written renderer it replaced: about 117 allocations per proxy,
-server or backend row (the `show stat` rows) and 84 for the process section, none that grow with
-traffic (`crates/ibex-rt/tests/promex.rs` prints them). `scope=global` alone is the cheap
-memory-only scrape.
+A scrape allocates nothing (T369, `tasks/T369-prometheus-scrape-without-allocations.md`): it is
+produced a chunk at a time into the session's response buffer, resuming from a cursor, as HAProxy's
+applet does, so memory is one buffer whatever the number of servers; `crates/ibex-rt/tests/promex.rs`
+pins 0 allocations including the first scrape. Differences: `http-after-response` rules do not
+apply to the reply; a `metrics=` value over 512 bytes decoded, or more than 8 of them, is a 400;
+every sample of a family costs a regeneration of the object's `show stat` row, so a scrape of
+thousands of servers takes CPU (a few ms per 16 KiB chunk, release build). `scope=global` alone is
+the cheap memory-only scrape.

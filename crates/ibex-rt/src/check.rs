@@ -577,16 +577,7 @@ impl ServerCheckState {
     /// likewise, `DOWN`, or `DOWN n/rise` while a down server climbs.
     #[must_use]
     pub fn status_word(&self) -> String {
-        let (health, rise, fall) = (i64::from(self.health), i64::from(self.config.rise), i64::from(self.config.fall));
-        let full = self.health >= self.full_health();
-        match self.status {
-            ServerStatus::Maint => "MAINT".to_string(),
-            ServerStatus::Down if self.health > 0 => format!("DOWN {health}/{rise}"),
-            ServerStatus::Down => "DOWN".to_string(),
-            ServerStatus::Up if !self.enabled => "no check".to_string(),
-            st @ (ServerStatus::Up | ServerStatus::Drain) if full => st.as_str().to_string(),
-            st => format!("{} {}/{fall}", st.as_str(), health - rise + 1),
-        }
+        StatusWord(self).to_string()
     }
 
     /// True for the statuses from L57DATA on, the ones that have a `code` (log line and
@@ -3980,6 +3971,25 @@ mod tests {
             assert_eq!(step.next, Some(Tick(10_000)), "{:?}", s.run.sub_state);
             assert_eq!(std::mem::discriminant(&s.run.sub_state), kind, "{:?}", s.run.sub_state);
             cleanup_check_socket(&mut s, &mut fdtab, &mut poller);
+        }
+    }
+}
+
+/// [`ServerCheckState::status_word`] written without building a `String`.
+pub struct StatusWord<'a>(pub &'a ServerCheckState);
+
+impl std::fmt::Display for StatusWord<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.0;
+        let (health, rise, fall) = (i64::from(s.health), i64::from(s.config.rise), i64::from(s.config.fall));
+        let full = s.health >= s.full_health();
+        match s.status {
+            ServerStatus::Maint => f.write_str("MAINT"),
+            ServerStatus::Down if s.health > 0 => write!(f, "DOWN {health}/{rise}"),
+            ServerStatus::Down => f.write_str("DOWN"),
+            ServerStatus::Up if !s.enabled => f.write_str("no check"),
+            st @ (ServerStatus::Up | ServerStatus::Drain) if full => f.write_str(st.as_str()),
+            st => write!(f, "{} {}/{fall}", st.as_str(), health - rise + 1),
         }
     }
 }

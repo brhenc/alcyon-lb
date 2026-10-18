@@ -5,13 +5,31 @@
 
 use ibex_config::ast::{BackendSection, Config, FrontendSection, Mode, Server};
 use ibex_rt::engine::Engine;
-use ibex_rt::promex::{self, Query};
+use ibex_rt::promex::{self, Cursor};
 use std::time::Duration;
 
+/// One whole scrape through `scrape_chunk` into 16 KiB buffers, the chunks decoded.
+fn scrape(engine: &Engine, uri: &str) -> String {
+    let mut body = String::new();
+    let mut cur = Cursor::start();
+    let mut dst = vec![0u8; 16384];
+    while !cur.finished {
+        let n = promex::scrape_chunk(&mut cur, &engine.proxies, &engine.checks, 1, uri, &mut dst);
+        let mut rest = std::str::from_utf8(&dst[..n]).expect("utf8");
+        while let Some((len, after)) = rest.split_once("\r\n") {
+            let len = usize::from_str_radix(len, 16).expect("hex");
+            if len == 0 {
+                break;
+            }
+            body.push_str(&after[..len]);
+            rest = &after[len + 2..];
+        }
+    }
+    body
+}
+
 fn render(engine: &Engine) -> String {
-    let mut out = String::new();
-    promex::render(&engine.proxies, &engine.checks, 1, &Query::default(), &mut out);
-    out
+    scrape(engine, "/metrics")
 }
 
 fn one_server_engine(check: bool) -> Engine {
@@ -63,40 +81,37 @@ fn check_counters_are_nan_gauges_without_a_check_and_counters_with_one() {
 #[global_allocator]
 static ALLOC: ibex_alloc::CountingAllocator = ibex_alloc::CountingAllocator::new();
 
-/// What a scrape allocates. It was 0 for the hand-written renderer, which printed made-up
-/// values for the proxies (T368 replaced it by the `show stat` rows and the `show info`
-/// pairs, so that a number here is the number there). Now it is the cost of those: a number of
-/// allocations per row and per `show info` field that does not depend on traffic, and none in
-/// the rendering itself once `out` has room. The bound below is generous per row; the count
-/// printed is the measurement.
+/// A scrape allocates nothing, the first one included (T369): the scratch is made when the
+/// engine starts, the output goes into the caller's buffer a chunk at a time, and what does
+/// not fit waits for the next call. 5 frontends and 5 backends of 100 servers make about 10
+/// buffers of output, so the resume path runs; the count over the whole scrape must be 0.
 #[test]
-fn scrape_allocations_are_per_row_and_bounded() {
+fn a_scrape_allocates_nothing_the_first_one_included() {
     let mut frontends = Vec::new();
     let mut backends = Vec::new();
-    let (n_px, n_srv) = (10usize, 20usize);
-    for i in 0..n_px {
+    for i in 0..5 {
         frontends.push(FrontendSection { name: format!("fe_{i}"), bind: Some("127.0.0.1:0".parse().unwrap()), mode: Mode::Http, ..Default::default() });
-        let servers = (0..n_srv).map(|j| Server::new(format!("s_{j}"), "127.0.0.1:80".parse().unwrap())).collect();
+        let servers = (0..100).map(|j| Server::new(format!("s_{j}"), "127.0.0.1:80".parse().unwrap())).collect();
         backends.push(BackendSection { name: format!("be_{i}"), mode: Mode::Http, servers, ..Default::default() });
     }
     let engine = Engine::new(&Config { frontends, backends, ..Default::default() }, 64).expect("Engine::new");
-    let mut out = String::with_capacity(8 * 1024 * 1024);
-    promex::render(&engine.proxies, &engine.checks, 1, &Query::default(), &mut out); // warm up
-    out.clear();
-    let before = ibex_alloc::alloc_counters();
-    promex::render(&engine.proxies, &engine.checks, 1, &Query::default(), &mut out);
-    let diff = before.diff(&ibex_alloc::alloc_counters());
-    let rows = n_px * (n_srv + 2);
-    println!("Allocations: {} allocs, {} bytes, for {rows} rows ({} per row)", diff.alloc_count, diff.bytes_allocated, diff.alloc_count / rows);
-    assert!(diff.alloc_count < rows * 600 + 2000, "a scrape allocates per row, not more: {} allocs", diff.alloc_count);
-    // Only the process section, which a memory-only scrape asks for, is cheap and constant.
-    let q = promex::parse_query("/metrics?scope=global").expect("query");
-    out.clear();
-    let before = ibex_alloc::alloc_counters();
-    promex::render(&engine.proxies, &engine.checks, 1, &q, &mut out);
-    let diff = before.diff(&ibex_alloc::alloc_counters());
-    println!("scope=global: {} allocs, {} bytes", diff.alloc_count, diff.bytes_allocated);
-    assert!(diff.alloc_count < 200, "scope=global: {} allocs", diff.alloc_count);
+    let mut dst = vec![0u8; 16384];
+    for (label, uri) in [("first", "/metrics"), ("second", "/metrics"), ("scope=global", "/metrics?scope=global"), ("no-maint", "/metrics?scope=server&no-maint&desc-labels&metrics=-haproxy_server_weight")] {
+        let mut cur = Cursor::start();
+        let (mut chunks, mut bytes) = (0, 0);
+        let before = ibex_alloc::alloc_counters();
+        while !cur.finished {
+            let n = promex::scrape_chunk(&mut cur, &engine.proxies, &engine.checks, 1, uri, &mut dst);
+            chunks += usize::from(n > 0);
+            bytes += n;
+        }
+        let diff = before.diff(&ibex_alloc::alloc_counters());
+        println!("{label}: {} allocs, {} bytes allocated, {chunks} chunks, {bytes} bytes out", diff.alloc_count, diff.bytes_allocated);
+        assert_eq!(diff.alloc_count, 0, "{label}: a scrape must not allocate");
+        if uri == "/metrics" {
+            assert!(chunks >= 8, "{label}: {chunks} chunks; the resume path is not exercised");
+        }
+    }
 }
 
 fn failing_pool() -> Option<ibex_alloc::PoolHead> {

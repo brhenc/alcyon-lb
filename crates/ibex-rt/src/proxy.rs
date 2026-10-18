@@ -579,6 +579,8 @@ pub struct TcpSession {
     pub cli_failed: bool,
     pub created_at: Instant,
     pub pending_resp: Option<Box<(Vec<u8>, usize)>>,
+    /// A Prometheus scrape being produced into `rep`, chunk by chunk (`crate::promex::pump`).
+    pub scrape: Option<crate::promex::Cursor>,
     pub fc_src: Option<SocketAddr>,
     pub fc_dst: Option<SocketAddr>,
     pub tcp_inspect_done: bool,
@@ -1068,6 +1070,7 @@ impl TcpSession {
             bufsize: crate::buf::get_bufsize(),
             maxrewrite: 1024,
             pending_resp: None,
+            scrape: None,
             fc_src: None,
             fc_dst: None,
             tcp_inspect_done: true,
@@ -1183,6 +1186,7 @@ impl TcpSession {
     pub fn has_pending_output(&self) -> bool {
         self.rep_window() > 0
             || self.pending_resp.as_deref().is_some_and(|(d, o)| *o < d.len())
+            || self.scrape.is_some()
             || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
             || self.h2_child().is_some_and(|c| c.owner_tx_pending)
     }
@@ -1689,6 +1693,19 @@ impl TcpSession {
         self.pending_resp = (n < raw.len()).then(|| Box::new((raw.to_vec(), n)));
     }
 
+    /// Answers a Prometheus scrape: the head now, the body as [`crate::promex::pump`] fills
+    /// `rep` (chunked, like a server's response relayed). A `HEAD` gets the head alone.
+    pub fn start_scrape(&mut self) {
+        self.write_reply_with(crate::promex::REPLY_HEAD, true);
+        let head_only = self.txn.as_ref().is_some_and(|t| t.client_head);
+        if !head_only {
+            if let Some(t) = self.txn.as_mut() {
+                t.rsp = txn::MsgState::head(txn::Framing::Chunked);
+            }
+            self.scrape = Some(crate::promex::Cursor::start());
+        }
+    }
+
     /// Clears what belonged to the transaction that just ended, so the next request on
     /// this connection starts from nothing. The one place that list lives.
     pub fn reset_for_next_request(&mut self) {
@@ -1697,6 +1714,7 @@ impl TcpSession {
         self.txn = None;
         self.req_method = None;
         self.req_uri = None;
+        self.scrape = None;
         self.req_headers = None;
         self.clear_htx();
         self.req_vars.clear();
@@ -2484,7 +2502,7 @@ impl TcpSession {
                     self.srv_state,
                     ScState::ShutR | ScState::Closed | ScState::Error
                 );
-                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && !self.res_inspect_pending {
+                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && self.scrape.is_none() && !self.res_inspect_pending {
                     self.shutw_cli();
                     self.cli_state = ScState::ShutW;
                     self.ending
@@ -2511,7 +2529,7 @@ impl TcpSession {
                     self.srv_state,
                     ScState::ShutR | ScState::Closed | ScState::Error
                 );
-                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && !self.res_inspect_pending {
+                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && self.scrape.is_none() && !self.res_inspect_pending {
                     self.shutw_cli();
                     self.cli_state = ScState::Closed;
                     self.srv_state = ScState::Closed;
@@ -2992,6 +3010,7 @@ impl TcpSession {
         // at 0 had a core spin on EPOLLOUT (T248). A `WINDOW_UPDATE` arrives as a read.
         let has_pending = if self.h2_ctx.is_some() {
             self.pending_resp.as_deref().is_some_and(|(d, o)| *o < d.len())
+                || self.scrape.is_some()
                 || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
         } else {
             self.has_pending_output()

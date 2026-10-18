@@ -312,7 +312,9 @@ fn memory_and_connection_metrics_move_with_a_burst() {
     assert!(read(&after, "haproxy_process_current_connections") <= read(&before, "haproxy_process_current_connections") + 1.0, "connections come back");
     assert!(read(&after, "haproxy_process_pool_used_bytes") <= read(&during, "haproxy_process_pool_used_bytes"), "pool use does not stay up");
     // `show info` reads the same sources.
-    let info = ibex_rt::stats::process_info_pairs(&run.engine.proxies);
+    let mut pairs = ibex_rt::stats::InfoPairs::default();
+    ibex_rt::stats::process_info_pairs(&mut pairs, &run.engine.proxies);
+    let info = pairs.pairs();
     for (k, fam) in [("PoolAlloc_bytes", "haproxy_process_pool_allocated_bytes"), ("Memmax_bytes", "haproxy_process_max_memory_bytes"), ("PoolFailed", "haproxy_process_pool_failures_total")] {
         let v = info.iter().find(|(n, _)| *n == k).expect(k).1.parse::<f64>().expect("number");
         assert!((read(&after, fam) - v).abs() <= v.max(1.0) * 0.5 + 65536.0, "{fam} and {k} disagree: {} vs {v}", read(&after, fam));
