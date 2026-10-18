@@ -63,6 +63,7 @@ mod ssl_capture_size;
 mod ssl_server_verify;
 mod stats_show_desc_node;
 mod stats_show_node_validation;
+mod stats_unknown_words;
 mod stick_table_keywords;
 mod tcp_response_content;
 mod timeout_keywords;

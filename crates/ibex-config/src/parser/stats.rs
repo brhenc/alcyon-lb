@@ -74,10 +74,23 @@ pub(crate) fn parse_stats_directive(
             stats.show_node = Some(name.into());
             Ok(())
         }
-        _ => {
+        "enable" => {
             stats.enable = true;
             Ok(())
         }
+        // HAProxy's, which Ibex does not implement: refused rather than dropped. `auth`
+        // dropped would serve the page to anyone where HAProxy answers 401.
+        w @ ("auth" | "realm" | "scope" | "hide-version" | "show-version" | "show-modules" | "http-request") => Err(
+            ConfigError::new(kw.line, kw.col, format!("'stats {w}' is not implemented: Ibex would serve the stats page without it.")),
+        ),
+        w => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!(
+                "unknown stats parameter '{w}', expects 'admin', 'uri', 'realm', 'auth', 'scope', 'enable', 'hide-version', \
+                 'show-node', 'show-desc' , 'show-legends' or 'show-version'."
+            ),
+        )),
     }
 }
 

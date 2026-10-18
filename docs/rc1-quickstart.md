@@ -97,6 +97,10 @@ User-visible ones; the full list is [differences.md](differences.md) and [../tra
 - Refused at load (the config fails, it does not run without it): `compression` (planned for M5),
   `cache`, `peers`, Lua, SPOE/`filter`, FastCGI, `resolvers` and `server-template` (no run-time
   DNS: use IP addresses or names resolved at start), OpenSSL-only keywords.
+- **Stats page:** no password protection yet. `stats auth`, `realm`, `scope`, `hide-version`,
+  `show-version`, `show-modules` and `stats http-request` are refused at load (before RC1 they were
+  accepted and ignored, so `stats auth` served the page to anyone). Bind the stats page to
+  127.0.0.1 or a private address, or use the `stats socket` CLI.
 - TLS: ECDHE only, no finite-field DHE (`DHE-*` ciphers, `ssl-dh-param-file`; `tradeoff.md` 6.18).
   Every current browser does ECDHE. The `ssl_c_*` fetches (the client's certificate) are missing.
 - **Check your ACL names by hand** (T430 #1): a rule naming an ACL that does not exist
