@@ -218,6 +218,7 @@ mod master_cli;
 mod maxconn_client_left;
 mod maxsock_limit;
 mod memmax;
+mod session_arena_capacity;
 mod monitor_uri;
 mod mqtt;
 mod multithread;

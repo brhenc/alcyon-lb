@@ -71,3 +71,48 @@ fn a_converter_failure_ends_the_acl_expression() {
     let got = client.join().expect("client");
     assert_eq!(got, ["[14]", "[234]", "[14]", "[14]", "[234]", "[2345]", "[234]", "[2345]"]);
 }
+
+/// Outside an ACL the last occurrence gives the value: an earlier one a converter fails on
+/// does not matter, a failure on the last leaves the value empty (`set-header`-style `hdr`, same configuration on HAProxy
+/// 3.5-dev8-885761-29, 2026-10-18).
+#[test]
+fn outside_an_acl_a_converter_failure_does_not_stop_the_later_occurrences() {
+    let fe = common::reserve_addr();
+    let cfg = "defaults
+  mode http
+  timeout connect 1s
+  timeout client 5s
+  timeout server 5s
+frontend fe
+  bind @FE@
+  http-request return status 200 hdr y \"[%[req.hdr(x),ipmask(24)]]\"
+";
+    let config = ibex_config::parse_str(&cfg.replace("@FE@", &fe.to_string())).expect("parse");
+    let mut engine = Engine::new(&config, 64).expect("Engine::new");
+    let cases: [(&str, &str); 4] = [
+        ("X: abc\r\nX: 1.2.3.4\r\nX: 5.6.7.8\r\n", "[5.6.7.0]"),
+        ("X: 1.2.3.4\r\nX: abc\r\n", "[]"),
+        ("X: 1.2.3.4\r\nX: 5.6.7.8\r\nX: zz\r\nX: 9.9.9.9\r\n", "[9.9.9.0]"),
+        ("X: abc\r\n", "[]"),
+    ];
+    let client = thread::spawn(move || {
+        cases
+            .iter()
+            .map(|(h, _)| {
+                let mut s = TcpStream::connect(fe).expect("connect");
+                s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+                write!(s, "GET / HTTP/1.1\r\nHost: x\r\n{h}Connection: close\r\n\r\n").expect("send");
+                let mut out = String::new();
+                let _ = s.read_to_string(&mut out);
+                out.lines().find_map(|l| l.strip_prefix("y: ")).unwrap_or("-").to_string()
+            })
+            .collect::<Vec<_>>()
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !client.is_finished() && Instant::now() < deadline {
+        let _ = engine.run_once();
+        thread::sleep(Duration::from_millis(1));
+    }
+    let got = client.join().expect("client");
+    assert_eq!(got, ["[5.6.7.0]", "[]", "[9.9.9.0]", "[]"]);
+}

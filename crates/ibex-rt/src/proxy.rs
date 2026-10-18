@@ -1759,19 +1759,13 @@ impl TcpSession {
     /// same bytes as different requests.
     fn validate_request_head(&mut self, head_len: usize) -> io::Result<bool> {
         // The built-in parser is a value on this frame: a `Box<dyn HttpStream>` per request
-        // head was an allocation per request (Z2, 56 bytes). Only the parsers behind the
-        // seam (differential runs, the FFI one) still box theirs.
-        let mut h1_parser;
-        let mut boxed_parser;
-        let stream: &mut dyn ibex_proto::parser::HttpStream = if self.parser_kind == ibex_proto::parser::ParserKind::H1 {
-            h1_parser = ibex_proto::H1Parser::new(false);
-            &mut h1_parser
-        } else {
-            let parser = ibex_proto::parser::build(self.parser_kind)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            boxed_parser = parser.stream(false);
-            &mut *boxed_parser
-        };
+        // head was an allocation per request (Z2, 56 bytes). Nothing sets `parser_kind` to
+        // another parser (the other kinds are not built into this crate: `build` refuses them,
+        // and the FFI one needs a feature `ibex-rt` does not have), so a boxed one would be a
+        // branch no run can take; a kind added later must come with its way in.
+        debug_assert_eq!(self.parser_kind, ibex_proto::parser::ParserKind::H1, "only the built-in parser is wired");
+        let mut h1_parser = ibex_proto::H1Parser::new(false);
+        let stream: &mut dyn ibex_proto::parser::HttpStream = &mut h1_parser;
         stream.set_accept_unsafe_request(self.accept_unsafe_request);
         // The head HAProxy holds in `tune.bufsize` may not fit this HTX, whose descriptors
         // are twice as large: the buffer is made large enough for the head and one

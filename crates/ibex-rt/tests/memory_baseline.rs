@@ -68,13 +68,37 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
 mod common;
 
-const H1: u16 = 47480;
-const H2: u16 = 47481;
-const TLS: u16 = 47482;
-const BACKEND: u16 = 47483;
-const DOWN: u16 = 47484;
-const UDP: u16 = 47485;
-const DIR: &str = "/tmp/mem-baseline";
+/// The six ports of the run, reserved once with `common::reserve_port` (the oracle run, which
+/// is sequential with the Ibex one, gets the same ones).
+static PORTS: std::sync::OnceLock<[u16; 6]> = std::sync::OnceLock::new();
+
+fn ports() -> [u16; 6] {
+    *PORTS.get_or_init(|| std::array::from_fn(|_| common::reserve_port()))
+}
+
+fn port_h1() -> u16 {
+    ports()[0]
+}
+fn port_h2() -> u16 {
+    ports()[1]
+}
+fn port_tls() -> u16 {
+    ports()[2]
+}
+fn backend_port() -> u16 {
+    ports()[3]
+}
+fn down() -> u16 {
+    ports()[4]
+}
+fn udp() -> u16 {
+    ports()[5]
+}
+
+/// Work directory of this process.
+fn dir() -> String {
+    format!("/tmp/mem-baseline-{}", std::process::id())
+}
 const ORACLE: &str = "/home/bhenc/reference/haproxy/haproxy";
 const IDLE: Duration = Duration::from_millis(1500);
 const RSS_SLACK_KB: i64 = 2048;
@@ -85,7 +109,7 @@ fn addr(port: u16) -> SocketAddr {
 
 /// A keep-alive HTTP backend: `200 ok` to every request, a thread per connection.
 fn backend() {
-    let l = TcpListener::bind(addr(BACKEND)).expect("bind backend");
+    let l = TcpListener::bind(addr(backend_port())).expect("bind backend");
     std::thread::spawn(move || {
         for s in l.incoming().flatten() {
             std::thread::spawn(move || serve(s));
@@ -117,7 +141,7 @@ fn serve(mut s: TcpStream) {
 /// Owns the UDP log socket and counts the datagrams (`option httplog` lines).
 fn log_sink() -> Arc<AtomicUsize> {
     let n = Arc::new(AtomicUsize::new(0));
-    let u = UdpSocket::bind(addr(UDP)).expect("bind udp");
+    let u = UdpSocket::bind(addr(udp())).expect("bind udp");
     let c: Arc<AtomicUsize> = Arc::clone(&n);
     std::thread::spawn(move || {
         let mut b = [0u8; 4096];
@@ -137,13 +161,14 @@ fn cert() -> (String, CertificateDer<'static>) {
 }
 
 fn config(sock: &str, pem: &str) -> String {
+    let (h1, h2, tls, backend, down, udp) = (port_h1(), port_h2(), port_tls(), backend_port(), down(), udp());
     format!(
-        "global\n  nbthread 1\n  stats socket {sock} level admin\n  log 127.0.0.1:{UDP} local0\n\
+        "global\n  nbthread 1\n  stats socket {sock} level admin\n  log 127.0.0.1:{udp} local0\n\
          defaults\n  mode http\n  log global\n  option httplog\n  timeout connect 2s\n  timeout client 10s\n  timeout server 10s\n\
-         frontend fe\n  bind 127.0.0.1:{H1}\n  bind 127.0.0.1:{H2} proto h2\n  bind 127.0.0.1:{TLS} ssl crt {pem}\n\
+         frontend fe\n  bind 127.0.0.1:{h1}\n  bind 127.0.0.1:{h2} proto h2\n  bind 127.0.0.1:{tls} ssl crt {pem}\n\
          \x20 http-request deny if {{ path_beg /forbidden }}\n  use_backend down if {{ path_beg /down }}\n  default_backend up\n\
-         backend up\n  server s 127.0.0.1:{BACKEND}\n\
-         backend down\n  retries 0\n  server s 127.0.0.1:{DOWN}\n"
+         backend up\n  server s 127.0.0.1:{backend}\n\
+         backend down\n  retries 0\n  server s 127.0.0.1:{down}\n"
     )
 }
 
@@ -156,18 +181,19 @@ struct Proc {
 
 impl Proc {
     fn start(who: &'static str, bin: &str) -> Proc {
-        std::fs::create_dir_all(DIR).unwrap();
-        for p in [H1, H2, TLS, DOWN] {
+        let dir = dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for p in [port_h1(), port_h2(), port_tls(), down()] {
             assert!(TcpStream::connect(addr(p)).is_err(), "port {p} is in use");
         }
         let (pem, _) = CERT.get_or_init(cert).clone();
-        let pem_path = format!("{DIR}/{who}.pem");
+        let pem_path = format!("{dir}/{who}.pem");
         std::fs::write(&pem_path, pem).unwrap();
-        let sock = format!("{DIR}/{who}.sock");
+        let sock = format!("{dir}/{who}.sock");
         let _ = std::fs::remove_file(&sock);
-        let cfg_path = format!("{DIR}/{who}.cfg");
+        let cfg_path = format!("{dir}/{who}.cfg");
         std::fs::write(&cfg_path, config(&sock, &pem_path)).unwrap();
-        let log = std::fs::File::create(format!("{DIR}/{who}.log")).unwrap();
+        let log = std::fs::File::create(format!("{dir}/{who}.log")).unwrap();
         let child = Command::new(bin)
             .args(["-f", &cfg_path])
             .stdin(Stdio::null())
@@ -175,7 +201,7 @@ impl Proc {
             .stderr(log)
             .spawn()
             .expect("spawn");
-        for p in [H1, H2, TLS] {
+        for p in [port_h1(), port_h2(), port_tls()] {
             assert!(common::wait_listening(addr(p)), "{who} never listened on {p}");
         }
         Proc { child, sock, who, ibex: who == "ibex" }
@@ -312,7 +338,7 @@ fn tcp(port: u16) -> TcpStream {
 }
 
 fn h1_keepalive(_: &Env, n: usize) {
-    let mut s = tcp(H1);
+    let mut s = tcp(port_h1());
     let mut r = BufReader::new(s.try_clone().unwrap());
     for _ in 0..n {
         s.write_all(req("/", false).as_bytes()).unwrap();
@@ -337,31 +363,31 @@ fn one_close(port: u16, path: &str, want: u16) {
 
 fn h1_close(_: &Env, n: usize) {
     for _ in 0..n {
-        one_close(H1, "/", 200);
+        one_close(port_h1(), "/", 200);
     }
 }
 
 fn r503(_: &Env, n: usize) {
     for _ in 0..n {
-        one_close(H1, "/down", 503);
+        one_close(port_h1(), "/down", 503);
     }
 }
 
 fn r403(_: &Env, n: usize) {
     for _ in 0..n {
-        one_close(H1, "/forbidden", 403);
+        one_close(port_h1(), "/forbidden", 403);
     }
 }
 
 fn aborts(_: &Env, n: usize) {
     for _ in 0..n {
-        let mut s = tcp(H1);
+        let mut s = tcp(port_h1());
         s.write_all(b"GET / HTTP/1.1\r\nHost: loc").unwrap();
     }
 }
 
 fn burst(_: &Env, n: usize) {
-    let mut v: Vec<TcpStream> = (0..n).map(|_| tcp(H1)).collect();
+    let mut v: Vec<TcpStream> = (0..n).map(|_| tcp(port_h1())).collect();
     for s in &mut v {
         s.write_all(req("/", false).as_bytes()).unwrap();
     }
@@ -383,7 +409,7 @@ fn frame(kind: u8, flags: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
 fn h2(_: &Env, n: usize) {
     let conns = 20.min(n);
     for _ in 0..conns {
-        let mut s = tcp(H2);
+        let mut s = tcp(port_h2());
         let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         hello.extend(frame(4, 0, 0, &[]));
         s.write_all(&hello).unwrap();
@@ -418,7 +444,7 @@ struct Env {
 
 fn tls_conn(env: &Env) -> StreamOwned<ClientConnection, TcpStream> {
     let c = ClientConnection::new(Arc::clone(&env.tls), ServerName::try_from("localhost").unwrap()).unwrap();
-    StreamOwned::new(c, tcp(TLS))
+    StreamOwned::new(c, tcp(port_tls()))
 }
 
 fn tls_keepalive(env: &Env, n: usize) {

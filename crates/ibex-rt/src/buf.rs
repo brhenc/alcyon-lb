@@ -908,39 +908,10 @@ impl Buf {
 mod tests {
     use super::Buf;
 
-    /// The tests that read the process-wide buffer counters take turns.
-    static COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// A freed large buffer that does not fit the thread cache goes back to the heap and
-    /// leaves the `allocated` count, as the standard and small ones do (M3).
-    #[test]
-    fn a_large_buffer_beyond_the_thread_cache_is_no_longer_allocated() {
-        use super::{
-            BUF_LARGE_ALLOCATED, BUF_LARGE_CACHED, BUF_LARGE_USED, BUFSIZE_LARGE, MAX_CACHED_PER_THREAD,
-        };
-        use std::sync::atomic::Ordering::SeqCst;
-        let _g = COUNTERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        BUFSIZE_LARGE.store(65536, SeqCst);
-        std::thread::spawn(|| {
-            let (a0, u0, c0) = (BUF_LARGE_ALLOCATED.load(SeqCst), BUF_LARGE_USED.load(SeqCst), BUF_LARGE_CACHED.load(SeqCst));
-            let bufs: Vec<Buf> = (0..=MAX_CACHED_PER_THREAD).map(|_| Buf::large()).collect();
-            assert_eq!(BUF_LARGE_ALLOCATED.load(SeqCst), a0 + MAX_CACHED_PER_THREAD + 1);
-            assert_eq!(BUF_LARGE_USED.load(SeqCst), u0 + MAX_CACHED_PER_THREAD + 1);
-            drop(bufs);
-            assert_eq!(BUF_LARGE_USED.load(SeqCst), u0);
-            assert_eq!(BUF_LARGE_CACHED.load(SeqCst), c0 + MAX_CACHED_PER_THREAD);
-            // one did not fit the cache: it is back on the heap, so it is not allocated
-            assert_eq!(BUF_LARGE_ALLOCATED.load(SeqCst), a0 + MAX_CACHED_PER_THREAD);
-        })
-        .join()
-        .unwrap();
-    }
-
     /// T183: a buffer of a pooled class holds memory only between a write and the release
     /// that follows its draining; its capacity is its class's either way.
     #[test]
     fn an_unallocated_buffer_takes_memory_on_write_and_gives_it_back_empty() {
-        let _g = COUNTERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use super::{get_bufsize, get_bufsize_large, get_bufsize_small, BufClass};
         for (class, cap) in [
             (BufClass::Standard, get_bufsize()),

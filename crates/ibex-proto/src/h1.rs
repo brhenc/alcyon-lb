@@ -636,15 +636,12 @@ impl H1Parser {
 
 
 
-        if duplicate_cl || comma_cl || padded_cl {
+        // Every flag is set along with a first header and a parsed value (a value that is not
+        // UTF-8 is refused before the head gets here), so the pair is there whenever one is.
+        let to_rewrite = if duplicate_cl || comma_cl || padded_cl { first_cl_idx.zip(seen_cl) } else { None };
+        if let Some((first_idx, cl)) = to_rewrite {
             // Forwarded as the one value it stands for (tasks/T276), in canonical digits.
             self.head_rewritten = true;
-            let (Some(first_idx), Some(cl)) = (first_cl_idx, seen_cl) else {
-                // Unreachable in practice: a Content-Length value that is not UTF-8 is refused
-                // above, so the flags imply both are set. Refuse rather than panic.
-                self.phase = H1Phase::Error;
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length value"));
-            };
             // Canonical decimal digits of `cl`, formatted by hand (usize is at most 20 digits).
             let mut val_buf = [0u8; 20];
             let mut start = val_buf.len();

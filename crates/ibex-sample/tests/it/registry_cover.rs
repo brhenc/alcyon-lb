@@ -292,3 +292,19 @@ fn header_occurrences_from_every_source_of_the_context() {
     check(&SampleContext::default(), "res.", "the response being processed");
     ibex_sample::registry::set_current_res_headers(Vec::new());
 }
+
+/// A converter that gives no sample for one occurrence of a multi-value fetch: outside an ACL
+/// that occurrence is left out and the others are still converted; in an ACL the expression
+/// ends there (`acl_exec_cond`, T362, measured on HAProxy 3.5-dev8-885761-29). The
+/// user-visible non-ACL paths (`%[...]`, `set-var`) take the fetch's single sample (T337) and
+/// are checked on the binary in `acl_multivalue_converter_failure`.
+#[test]
+fn a_converter_failing_on_one_occurrence_is_skipped_outside_an_acl_and_ends_an_acl() {
+    let reg = Registry::new();
+    let hdrs = pairs(&[("Host", "h"), ("X", "a:1"), ("X", "b"), ("X", "c:3")]);
+    let ctx = SampleContext { req_headers: Some(&hdrs), ..Default::default() };
+    let conv = [("field", vec!["2".to_string(), ":".to_string()])];
+    let args = ["x".to_string()];
+    assert_eq!(reg.eval_all("req.hdr", &args, &conv, &ctx), [Sample::Str("1".into()), Sample::Str("3".into())]);
+    assert_eq!(reg.eval_all_acl("req.hdr", &args, &conv, &ctx), [Sample::Str("1".into())]);
+}

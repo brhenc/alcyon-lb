@@ -316,11 +316,11 @@ impl PoolRegistry {
     /// Calls `f` with the stats of every registered provider, without allocating (the
     /// Prometheus render must not).
     pub fn for_each(&self, mut f: impl FnMut(&PoolHead)) {
-        if let Ok(list) = self.providers.read() {
-            for (_, provider) in list.iter() {
-                if let Some(p) = provider() {
-                    f(&p);
-                }
+        // A poisoned lock still holds a valid list: the stats are read, not the list changed.
+        let list = self.providers.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (_, provider) in list.iter() {
+            if let Some(p) = provider() {
+                f(&p);
             }
         }
     }
@@ -554,6 +554,52 @@ mod tests {
         assert_eq!(reg.totals(), (0, 0));
         reg.register_provider("buffer", sample_buffer_stats);
         assert_eq!(reg.totals(), (1_097_728, 67 * 16384));
+    }
+
+    /// `for_each` (Prometheus, `PoolFailed`) skips a provider reporting nothing, goes on to
+    /// the ones after it, and still reads after a panic while the list was held.
+    #[test]
+    fn test_for_each_skips_absent_and_survives_a_poisoned_list() {
+        let reg = PoolRegistry::new();
+        reg.register_provider("absent", absent_stats);
+        reg.register_provider("buffer", sample_buffer_stats);
+        let mut names = Vec::new();
+        reg.for_each(|p| names.push(p.name));
+        assert_eq!(names, ["buffer"]);
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _held = reg.providers.write().unwrap();
+                    panic!("poison the list");
+                })
+                .join();
+        });
+        assert!(reg.providers.is_poisoned());
+        assert_eq!(reg.failures(), 0);
+        let mut n = 0;
+        reg.for_each(|_| n += 1);
+        assert_eq!(n, 1);
+    }
+
+    /// `detailed` prints a registrant line for a pool that has one and nothing for one that
+    /// has none.
+    #[test]
+    fn test_detailed_lists_only_pools_with_a_registrant() {
+        let reg = PoolRegistry::new();
+        reg.register_provider("buffer", sample_buffer_stats);
+        let plain = reg.show_pools(&["detailed"]);
+        assert!(!plain.contains("      >"), "{plain}");
+        reg.register_provider("reg", with_reg_stats);
+        let d = reg.show_pools(&["detailed"]);
+        assert!(d.contains("      >  withreg     : size=32 flags=0x8 align=8 [x.rs:7]\n"), "{d}");
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn with_reg_stats() -> Option<PoolHead> {
+        let mut p = sample_buffer_stats()?;
+        p.name = "reg";
+        p.reg = Some(PoolReg { name: "withreg", size: 32, flags: 8, align: 8, file: "x.rs", line: 7 });
+        Some(p)
     }
 }
 
