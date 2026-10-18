@@ -24,6 +24,7 @@ mod access_log;
 mod access_log_states;
 mod acl_bin_patterns;
 mod acl_conditions;
+mod acl_multivalue_converter_failure;
 mod acl_keyword_families;
 mod acl_pattern_lists;
 mod acl_pattern_tokens;

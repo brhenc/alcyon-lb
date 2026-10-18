@@ -331,7 +331,8 @@ impl Expr {
     }
 
     fn eval_line(&self, registry: &Registry, ctx: &SampleContext) -> bool {
-        let samples = self.eval_all_samples(registry, ctx);
+        let conv_refs: Vec<(&str, Vec<String>)> = self.converters.iter().map(|(name, args)| (name.as_str(), args.clone())).collect();
+        let samples = registry.eval_all_acl(&self.fetch_name, &self.fetch_args, &conv_refs, ctx);
         if samples.is_empty() {
             return false;
         }
