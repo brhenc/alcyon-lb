@@ -2636,7 +2636,12 @@ fn stream_log_data<'a>(entry: &'a SessionEntry, proxies: &'a [Proxy], proxy_idx:
     let be = proxies.get(entry.backend_idx).filter(|_| proxies.len() > 1).unwrap_or(fe);
     crate::logfmt::LogData {
         server_addr: entry.sess.bc_dst(),
-        server: entry.target_server_idx.and_then(|i| proxies.get(entry.srv_backend_idx)?.server_ids.get(i)).map(String::as_str),
+        server: entry
+            .target_server_idx
+            .map(|i| (entry.srv_backend_idx, i))
+            .or(entry.sess.log.server)
+            .and_then(|(b, i)| proxies.get(b)?.server_ids.get(i))
+            .map(String::as_str),
         term_state: term_state(entry),
         // The stream has let go of its backend when the line is made: only the others count.
         beconn: {
@@ -6821,6 +6826,7 @@ fn register_new_session(
         }
     }
 
+    sess.log.server = target_server_idx.map(|i| (proxy_idx, i));
     let (cli_want, srv_want) = sess.interests();
     let cli_interest = Interest {
         readable: cli_want.read,
@@ -7954,6 +7960,7 @@ fn retry_server_connect(
     }
     entry.target_server_idx = s_idx;
     entry.srv_backend_idx = be_idx;
+    entry.sess.log.server = s_idx.map(|i| (be_idx, i));
     count_connect(proxies, be_idx, s_idx, false);
 
     maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
@@ -11722,6 +11729,7 @@ impl EngineDispatcher<'_> {
         let s_idx = cookie_server.or_else(|| proxies[be_idx].servers.iter().position(|s| s == target_addr));
         entry.target_server_idx = s_idx;
         entry.srv_backend_idx = be_idx;
+        entry.sess.log.server = s_idx.map(|i| (be_idx, i));
 
         maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 

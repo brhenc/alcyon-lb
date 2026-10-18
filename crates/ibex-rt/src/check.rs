@@ -381,7 +381,7 @@ impl ServerCheckState {
             tls: None,
             exp: Tick::ETERNITY,
             next_check: now,
-            last_status_desc: "Initial state",
+            last_status_desc: "Initializing",
             // HAProxy seeds this with HCHK_STATUS_INI ("Initializing"), a placeholder that
             // matches no real check result code, so the first real outcome always differs
             // from it and `report = (status != prev_status)` (src/check.c) is always true.
@@ -1325,7 +1325,7 @@ fn strerror(err: &io::Error) -> String {
 
 fn format_l4_connect_error(err: &io::Error) -> String {
     if err.kind() == io::ErrorKind::ConnectionRefused || err.raw_os_error() == Some(111) {
-        "ECONNREFUSED returned by OS".to_string()
+        "ECONNREFUSED returned by OS (Connection refused)".to_string()
     } else {
         format!("General socket error ({})", strerror(err))
     }
@@ -3464,7 +3464,7 @@ mod tests {
 
         // ECONNREFUSED keeps its own wording, which HAProxy special-cases too.
         let refused = io::Error::from_raw_os_error(111);
-        assert_eq!(format_l4_connect_error(&refused), "ECONNREFUSED returned by OS");
+        assert_eq!(format_l4_connect_error(&refused), "ECONNREFUSED returned by OS (Connection refused)");
     }
 
     /// HAProxy seeds a fresh check's status with `HCHK_STATUS_INI` ("Initializing"), a
