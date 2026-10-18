@@ -6705,14 +6705,13 @@ fn store_var(sess_vars: &mut VarMap, req_vars: &mut VarMap, name: &str, mut val:
 /// `name[,<cond>...]` of `set-var(...)`: the variable is set only when every condition holds
 /// (`var_set`, src/vars.c). `ifexists`/`ifset` and their negations look at the variable
 /// (a process variable always exists, as the configuration declares it, but is set only
-/// once it has a value), `ifempty`/`ifnotempty` at the new sample. The parser refuses
-/// `ifgt` and `iflt` (see `check_set_var_conds`).
+/// once it has a value), `ifempty`/`ifnotempty` at the new sample, `ifgt`/`iflt` compare the
+/// stored and the new value when both are `sint`.
 ///
 /// The variable keeps the sample's type (T364): `var()` gives back this `Sample`.
 fn store_var_smp(sess_vars: &mut VarMap, req_vars: &mut VarMap, spec: &str, val: Sample) {
     let name = spec.split(',').next().unwrap_or("");
     let is_proc = name.starts_with("proc.");
-    let empty = ibex_sample::vars::is_empty(&val);
     let is_set = if is_proc {
         ibex_sample::vars::is_set(name)
     } else if name.starts_with("sess.") {
@@ -6721,7 +6720,14 @@ fn store_var_smp(sess_vars: &mut VarMap, req_vars: &mut VarMap, spec: &str, val:
         req_vars.contains_key(name)
     };
     let exists = is_proc || is_set;
-    let ok = ibex_sample::var_conds_hold(spec, exists, is_set, empty);
+    let stored = if is_proc {
+        ibex_sample::vars::get_proc(name)
+    } else if name.starts_with("sess.") {
+        sess_vars.get(name).cloned()
+    } else {
+        req_vars.get(name).cloned()
+    };
+    let ok = ibex_sample::var_conds_hold(spec, exists, is_set, stored.as_ref(), &val);
     if !ok {
         return;
     }

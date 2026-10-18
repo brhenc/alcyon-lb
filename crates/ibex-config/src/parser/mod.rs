@@ -1981,21 +1981,13 @@ backend be_out
 
 /// The conditions after the name in `set-var(<name>[,<cond>...])` and `set-var-fmt(...)`
 /// (`vars_parse_cond_param`, src/vars.c): `ifexists`, `ifnotexists`, `ifempty`,
-/// `ifnotempty`, `ifset` and `ifnotset` are honoured when the action runs. `ifgt` and
-/// `iflt` compare the sample with the variable's own type, which Ibex's variables do not
-/// carry yet, so they are refused rather than ignored. Any other word is HAProxy's
+/// `ifnotempty`, `ifset`, `ifnotset`, `ifgt` and `iflt` are honoured when the action runs
+/// (`ifgt`/`iflt` compare two `sint`). Any other word is HAProxy's
 /// "unknown condition".
 pub(crate) fn check_set_var_conds(tok: &Token, spec: &str) -> Result<(), ConfigError> {
     for cond in spec.split(',').skip(1).filter(|c| !c.is_empty()) {
         match cond {
-            "ifexists" | "ifnotexists" | "ifempty" | "ifnotempty" | "ifset" | "ifnotset" => {}
-            "ifgt" | "iflt" => {
-                return Err(ConfigError::new(
-                    tok.line,
-                    tok.col,
-                    format!("condition \"{cond}\" needs typed variables, which Ibex does not implement"),
-                ));
-            }
+            "ifexists" | "ifnotexists" | "ifempty" | "ifnotempty" | "ifset" | "ifnotset" | "ifgt" | "iflt" => {}
             _ => {
                 return Err(ConfigError::new(tok.line, tok.col, format!("unknown condition \"{cond}\".")));
             }

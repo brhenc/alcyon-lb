@@ -121,10 +121,17 @@ pub fn is_empty(smp: &Sample) -> bool {
 }
 
 /// The conditions of `set-var(<name>,<cond>...)` against what is known of the variable and the
-/// sample (`var_set`, src/vars.c): `exists`/`is_set` describe the variable, `empty` the new
-/// sample. `ifgt` and `iflt` are refused when the configuration loads.
+/// sample (`var_set`, src/vars.c): `exists`/`is_set` describe the variable, `stored` is its
+/// value, `new` the sample. `ifgt` holds when the stored value is greater than the sample's,
+/// `iflt` when it is less, but only when both are `sint`; with any other pair of types (or no
+/// stored value) the comparison is ignored, as in HAProxy.
 #[must_use]
-pub fn conds_hold(spec: &str, exists: bool, is_set: bool, empty: bool) -> bool {
+pub fn conds_hold(spec: &str, exists: bool, is_set: bool, stored: Option<&Sample>, new: &Sample) -> bool {
+    let empty = is_empty(new);
+    let ints = match (stored, new) {
+        (Some(Sample::Sint(a)), Sample::Sint(b)) => Some((*a, *b)),
+        _ => None,
+    };
     spec.split(',').skip(1).all(|c| {
         (c != "ifexists" || exists)
             && (c != "ifnotexists" || !exists)
@@ -132,6 +139,8 @@ pub fn conds_hold(spec: &str, exists: bool, is_set: bool, empty: bool) -> bool {
             && (c != "ifnotset" || !is_set)
             && (c != "ifempty" || empty)
             && (c != "ifnotempty" || !empty)
+            && (c != "ifgt" || ints.is_none_or(|(a, b)| a > b))
+            && (c != "iflt" || ints.is_none_or(|(a, b)| a < b))
     })
 }
 
@@ -142,7 +151,8 @@ pub fn conds_hold(spec: &str, exists: bool, is_set: bool, empty: bool) -> bool {
 pub fn set_cond(spec: &str, smp: Sample) -> bool {
     let name = spec.split(',').next().unwrap_or("");
     let set_now = is_set(name);
-    if !conds_hold(spec, is_proc(name) || set_now, set_now, is_empty(&smp)) {
+    let stored = get(name);
+    if !conds_hold(spec, is_proc(name) || set_now, set_now, stored.as_ref(), &smp) {
         return false;
     }
     set(name, smp);
