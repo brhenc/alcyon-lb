@@ -521,7 +521,7 @@ pub fn parse_payload_lv_args(args: &[String]) -> Result<(i64, i64, LvOffset), St
     if let Some(s) = args.get(2).filter(|s| !s.is_empty()) {
         let relative = s.starts_with(['+', '-']);
         let v: i64 = s.parse().map_err(|_| "payload offset2 is not a number".to_string())?;
-        if off1 + size + v < 0 {
+        if off1.saturating_add(size).saturating_add(v) < 0 {
             return Err("payload offset2 too negative".into());
         }
         off2 = if relative { LvOffset::Relative(v) } else { LvOffset::Absolute(v) };
@@ -536,7 +536,7 @@ pub fn payload_lv(d: &[u8], args: &[String]) -> Raw<Vec<u8>> {
     let Ok((len_offset, len_size, off2)) = parse_payload_lv_args(args) else { return Raw::No };
     let data = len(d);
     let max = i64::try_from(BUFSIZE).unwrap_or(i64::MAX);
-    if len_offset + len_size > data {
+    if len_offset.saturating_add(len_size) > data {
         return Raw::TooShort;
     }
     // HAProxy accumulates into an `unsigned int`: a length wider than 4 bytes wraps.
@@ -549,12 +549,12 @@ pub fn payload_lv(d: &[u8], args: &[String]) -> Raw<Vec<u8>> {
     // and the fetch then tests the low bit and shifts: an absolute offset therefore comes
     // out halved, and an odd one is taken as relative. Measured, and kept.
     let buf_offset = match off2 {
-        LvOffset::Implicit => len_offset + len_size,
-        LvOffset::Relative(v) => len_offset + len_size + v,
-        LvOffset::Absolute(v) if v & 1 != 0 => len_offset + len_size + (v >> 1),
+        LvOffset::Implicit => len_offset.saturating_add(len_size),
+        LvOffset::Relative(v) => len_offset.saturating_add(len_size).saturating_add(v),
+        LvOffset::Absolute(v) if v & 1 != 0 => len_offset.saturating_add(len_size).saturating_add(v >> 1),
         LvOffset::Absolute(v) => v >> 1,
     };
-    if buf_size == 0 || buf_size > max || buf_offset + buf_size > max {
+    if buf_size == 0 || buf_size > max || buf_offset.saturating_add(buf_size) > max {
         return Raw::No;
     }
     if buf_offset + buf_size > data {
