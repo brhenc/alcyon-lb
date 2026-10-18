@@ -30,6 +30,10 @@ pub struct StreamLog {
     pub request: Option<Instant>,
     /// The connection to a server was first attempted (`t_queue`).
     pub queue: Option<Instant>,
+    /// The server the stream chose, as (backend, server) indexes, kept while no connection
+    /// is attached (connecting, retrying): HAProxy's `s->target` stays on the server, so
+    /// the line names it (`%s`) when the client leaves before the connect succeeds.
+    pub server: Option<(usize, usize)>,
     /// The connection to the server was established (`t_connect`).
     pub connect: Option<Instant>,
     /// The response head arrived (`t_data`).
@@ -85,6 +89,7 @@ impl StreamLog {
             first_byte: None,
             request: None,
             queue: None,
+            server: None,
             connect: None,
             data: None,
             bytes_in_at_start: bytes_in,

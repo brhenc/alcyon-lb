@@ -42,6 +42,7 @@ mod balance_source_consistent;
 mod bind_name;
 mod bind_options_per_bind;
 mod listen_backlog;
+mod log_abort_during_connect;
 mod body_after_head_rewrite;
 mod bufsize_h2_alpn;
 mod canonical_haproxy_35_e2e;
