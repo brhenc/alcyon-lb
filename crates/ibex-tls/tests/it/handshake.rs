@@ -245,3 +245,17 @@ fn test_alpn_negotiation_fallback() {
     assert_eq!(s_info.alpn(), Some(&b"http/1.1"[..]));
     assert_eq!(c_info.alpn(), Some(&b"http/1.1"[..]));
 }
+
+/// `with_capture_buffer_size` reaches the server context `init` builds: a transport made
+/// with a capture size taps the ClientHello, one without does not (covercheck, T344).
+#[test]
+fn the_transport_capture_size_reaches_the_server_context() {
+    let (cert, _der) = generate_test_cert(vec!["example.com".to_string()]);
+    let mut resolver = IbexCertResolver::new();
+    resolver.add_exact("example.com", cert);
+    let server_config = TlsConfig::new().with_cert_resolver(Arc::new(resolver)).build_server_config().unwrap();
+    let plain = RustlsTransport::new_dual(Some(Arc::clone(&server_config)), None, None);
+    assert!(!plain.init(1, true).unwrap().tapping());
+    let capturing = RustlsTransport::new_dual(Some(server_config), None, None).with_capture_buffer_size(256);
+    assert!(capturing.init(1, true).unwrap().tapping());
+}

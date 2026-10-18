@@ -65,10 +65,8 @@ fn be16(b: &[u8], at: usize) -> Option<u16> {
 }
 
 fn pairs(b: &[u8]) -> impl Iterator<Item = u16> + '_ {
-    b.chunks_exact(2).filter_map(|p| match p {
-        [a, b] => Some(u16::from_be_bytes([*a, *b])),
-        _ => None,
-    })
+    // Whole pairs only; a trailing odd byte is dropped.
+    b.as_chunks::<2>().0.iter().map(|p| u16::from_be_bytes(*p))
 }
 
 fn joined(v: &[u16]) -> String {
@@ -216,6 +214,30 @@ mod tests {
         assert_eq!(alpn_ends(Some(&[0xba, 0xad]), true), "bd");
         assert_eq!(alpn_ends(Some(b"http/1.1"), false), "h1");
         assert_eq!(alpn_ends(Some(&[0x30, 0xab]), false), "09");
+    }
+
+    /// Every arm of the third part's text, in both modes, and the version codes (covercheck).
+    #[test]
+    fn third_part_arms_and_version_codes() {
+        let mk = |exts: &str, sigalgs: &str, spec: bool| Ja4Parts {
+            prefix: String::new(),
+            alpn_foxio: String::new(),
+            alpn_spec: String::new(),
+            b: String::new(),
+            exts: exts.to_string(),
+            sigalgs: sigalgs.to_string(),
+            spec,
+        };
+        assert_eq!(mk("", "", false).c(), "");
+        assert_eq!(mk("", "", true).c(), "");
+        assert_eq!(mk("0005", "", false).c(), "0005");
+        assert_eq!(mk("0005", "0403", false).c(), "0005_0403");
+        assert_eq!(mk("", "0403", false).c(), "_0403");
+        assert_eq!(mk("", "0403", true).c(), "");
+        for (v, c) in [(0x0304, "13"), (0x0303, "12"), (0x0302, "11"), (0x0301, "10"), (0x0300, "s3"), (0x0002, "s2"), (0x1234, "00")] {
+            assert_eq!(version_code(v), c);
+        }
+        assert_eq!(pairs(&[1, 2, 3, 4, 5]).collect::<Vec<_>>(), vec![0x0102, 0x0304]);
     }
 
     #[test]

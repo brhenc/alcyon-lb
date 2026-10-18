@@ -1696,6 +1696,20 @@ mod tests {
         );
     }
 
+    /// A WINDOW_UPDATE that would push a window past 2^31-1 is a flow-control error, on the
+    /// connection and on a stream (gate 48, covercheck of VV-4's checked_add).
+    #[test]
+    fn send_window_update_refuses_to_overflow_a_window() {
+        let mut mux = H2Multiplexer::new(H2Role::Server);
+        mux.handle_frame(Frame::Headers { flags: 0x4, stream_id: 1, header_block: vec![0x82] })
+            .expect("headers");
+        mux.conn_recv_window = i32::MAX - 5;
+        assert_eq!(mux.send_window_update(0, 10), Err(H2Error::FlowControlError));
+        mux.streams.get_mut(&1).expect("stream").recv_window = i32::MAX - 5;
+        assert_eq!(mux.send_window_update(1, 10), Err(H2Error::FlowControlError));
+        assert!(mux.send_window_update(1, 5).is_ok());
+    }
+
     #[test]
     fn test_continuation_atomicity_enforcement() {
         let mut mux = H2Multiplexer::new(H2Role::Server);

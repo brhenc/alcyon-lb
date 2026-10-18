@@ -1911,6 +1911,15 @@ pub fn session_pool_stats() -> Option<ibex_alloc::PoolHead> {
     }))
 }
 
+/// Gives back capacity that a burst past the creation one left behind: when it is above
+/// four times what is still needed (the live length or `floor`), down to twice that.
+fn shrink_burst_capacity<T>(entries: &mut Vec<T>, floor: usize) {
+    let keep = entries.len().max(floor);
+    if entries.capacity() > 4 * keep {
+        entries.shrink_to(2 * keep);
+    }
+}
+
 /// Per-thread storage for active sessions.
 pub struct SessionArena {
     entries: Vec<Option<SessionEntry>>,
@@ -2011,10 +2020,7 @@ impl SessionArena {
         if cut > 0 {
             SESSION_POOL.slots_trimmed(cut);
             // Only capacity above the creation one (a burst past the pre-size) is given back.
-            let keep = self.entries.len().max(self.floor);
-            if self.entries.capacity() > 4 * keep {
-                self.entries.shrink_to(2 * keep);
-            }
+            shrink_burst_capacity(&mut self.entries, self.floor);
             if self.live == 0 {
                 self.free.clear();
             }
@@ -14232,7 +14238,21 @@ fn build_templated_error_response(
 
 #[cfg(test)]
 mod arena_tests {
-    use super::SessionArena;
+    use super::{shrink_burst_capacity, SessionArena};
+
+    /// Capacity above four times what is needed comes back to twice that; the creation
+    /// capacity (`floor`) and a modest burst are kept (gate 48, covercheck).
+    #[test]
+    fn a_burst_past_four_times_the_need_is_given_back_but_not_the_floor() {
+        let mut v: Vec<Option<u32>> = Vec::with_capacity(1000);
+        v.push(Some(1));
+        shrink_burst_capacity(&mut v, 100);
+        assert!(v.capacity() >= 200 && v.capacity() < 1000, "{}", v.capacity());
+        let mut w: Vec<Option<u32>> = Vec::with_capacity(1000);
+        w.push(Some(1));
+        shrink_burst_capacity(&mut w, 250);
+        assert_eq!(w.capacity(), 1000, "1000 is not above 4 x 250");
+    }
 
     /// Two entries at once are two distinct, live ones (T280): the same index twice, or one
     /// past the end, is none.
