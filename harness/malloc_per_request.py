@@ -43,9 +43,9 @@ BACKEND_PORT, FRONT_PORT, LOG_PORT = 47440, 47441, 47442
 # (config, shape) -> (keep-alive pin, new-connection pin). Measured 2026-10-18 on 1a86b96b
 # (the plan-2100 table, §2.1, reproduced). The ratchet: counts may go down, never up.
 PINS = {
-    ("bare", "min"): (3, 3),    # GET / HTTP/1.1 + Host
-    ("bare", "ab"): (6, 6),     # HTTP/1.0 + Connection: Keep-Alive (ab -k)
-    ("blog", "curl"): (63, 65), # log + httplog + forwardfor + acl + set-header x2
+    ("bare", "min"): (2, 2),    # GET / HTTP/1.1 + Host
+    ("bare", "ab"): (5, 5),     # HTTP/1.0 + Connection: Keep-Alive (ab -k)
+    ("blog", "curl"): (62, 64), # log + httplog + forwardfor + acl + set-header x2
 }
 
 REQ = {

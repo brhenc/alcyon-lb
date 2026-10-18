@@ -209,7 +209,9 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
     // 2026-10-17: 6 allocs, 202 bytes, one of them a 32-byte `Box<SocketAddr>` for `bc_dst`
     // made on every server connect (853f2b94; measuring gate 4 -> 5 allocs/req). `bc_dst`
     // is derived from the stream's target now: 5 allocs, 170 bytes. Pinned there.
-    let max_allowed_allocs: usize = 5;
+    // 2026-10-18 (Z2): the `Box<H1Parser>` made per request head (56 bytes) is a value on the
+    // stack now: 4 allocs, 114 bytes.
+    let max_allowed_allocs: usize = 4;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
         "a steady state HTTP request allocated {} times (> {}); diff: {:?}",
@@ -217,7 +219,7 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
         max_allowed_allocs,
         diff
     );
-    let max_allowed_bytes: usize = 170;
+    let max_allowed_bytes: usize = 114;
     assert!(
         diff.bytes_allocated <= max_allowed_bytes,
         "a steady state HTTP request allocated {} bytes (> {}); diff: {:?}",
