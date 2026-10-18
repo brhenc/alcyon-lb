@@ -246,8 +246,9 @@ async def parse_http_request(reader: asyncio.StreamReader) -> Optional[HttpReque
     return req
 
 
-async def parse_http_response(reader: asyncio.StreamReader, req_method: str = "GET") -> Optional[HttpResponse]:
-    """Parse HTTP response from stream."""
+async def parse_http_response(reader: asyncio.StreamReader, req_method: str = "GET", headers_only: bool = False) -> Optional[HttpResponse]:
+    """Parse HTTP response from stream. With `headers_only` (vtest `rxresphdrs`) the body is left
+    unread in the reader, for a later `recv`."""
     header_data = await read_until_bytes(reader, b"\r\n\r\n")
     if not header_data:
         return None
@@ -283,6 +284,9 @@ async def parse_http_response(reader: asyncio.StreamReader, req_method: str = "G
     resp = HttpResponse(status=status, reason=reason, proto=proto, headers=headers)
 
     body_bytes = bytearray(parts[1]) if len(parts) > 1 else bytearray()
+    if headers_only:
+        reader._buffer[:0] = body_bytes  # type: ignore[attr-defined]
+        return resp
     if req_method.upper() == "HEAD" or status in (204, 304) or (100 <= status < 200):
         resp.body = b""
         return resp
@@ -1615,7 +1619,7 @@ class MockClientRunner:
                         await writer.drain()
 
                     elif cmd in ("rxresp", "rxresphdrs"):
-                        cur_resp = await parse_http_response(reader, req_method=last_req_method)
+                        cur_resp = await parse_http_response(reader, req_method=last_req_method, headers_only=cmd == "rxresphdrs")
                         if cur_resp is None:
                             raise ConnectionResetError(f"Client {self.client_id} expected HTTP response but got EOF")
                         if self.verbose:

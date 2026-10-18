@@ -381,6 +381,7 @@ mod tls_handshake_per_pass;
 mod tls_resumption_many_clients;
 mod tls_xprt;
 mod trailer_case;
+mod drop_trailers;
 mod tune_maxaccept;
 mod transport_edges;
 mod txn_variables_race;

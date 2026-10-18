@@ -192,6 +192,9 @@ const IMPLEMENTED: &[&str] = &[
     // The case of the header names in the global table is restored (T244).
     "h1-case-adjust-bogus-client",
     "h1-case-adjust-bogus-server",
+    // Dropped where the H1 body is forwarded (`MsgState::canonical_chunk_lines`) and by the H2 bridge (T381).
+    "http-drop-request-trailers",
+    "http-drop-response-trailers",
 ];
 
 fn find(name: &str) -> Option<&'static OptSpec> {

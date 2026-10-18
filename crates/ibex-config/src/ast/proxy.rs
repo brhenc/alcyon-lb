@@ -887,6 +887,10 @@ pub const LOG_OPT_ASAP: u8 = 4;
 pub const H1_ADJ_CLIENT: u8 = 1;
 /// `h1_adjust` bit: `option h1-case-adjust-bogus-server` (the request to the server).
 pub const H1_ADJ_SERVER: u8 = 2;
+/// `h1_adjust` bit: `option http-drop-request-trailers` (a backend's: the request to the server).
+pub const H1_DROP_REQ_TRAILERS: u8 = 4;
+/// `h1_adjust` bit: `option http-drop-response-trailers` (a frontend's: the response to the client).
+pub const H1_DROP_RES_TRAILERS: u8 = 8;
 
 /// The `LOG_OPT_*` bit of the option `name`, 0 for any other.
 #[must_use]

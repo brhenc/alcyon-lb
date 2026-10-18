@@ -359,14 +359,14 @@ fn option_redispatch_in_defaults_is_inherited() {
 }
 
 /// An option that changes what reaches the server is refused rather than ignored.
-/// `HAProxy` 3.5-dev8 accepts `option http-drop-request-trailers` in a backend and drops the
-/// request's trailers; Ibex does not, and the server would receive them. (`option forwarded`
-/// was the example until T124 implemented it.) A tuning option is accepted with a warning.
+/// `HAProxy` 3.5-dev8 accepts `option allbackups` in a backend and sends traffic to all the
+/// backup servers; Ibex does not. (`option forwarded` was the example until T124 implemented
+/// it, `http-drop-request-trailers` until T381.) A tuning option is accepted with a warning.
 #[test]
 fn ibex_c_refuses_an_option_it_cannot_honour_and_warns_about_tuning() {
-    let (code, text) = check("trailers.cfg", &format!("{DEFAULTS}backend b\n  option http-drop-request-trailers\n  server s1 127.0.0.1:8080\n"));
-    assert_ne!(code, Some(0), "`option http-drop-request-trailers` was accepted and would do nothing:\n{text}");
-    assert!(text.contains("http-drop-request-trailers"), "{text}");
+    let (code, text) = check("trailers.cfg", &format!("{DEFAULTS}backend b\n  option allbackups\n  server s1 127.0.0.1:8080\n"));
+    assert_ne!(code, Some(0), "`option allbackups` was accepted and would do nothing:\n{text}");
+    assert!(text.contains("allbackups"), "{text}");
 
     let (code, text) = check("tcpka.cfg", &format!("{DEFAULTS}backend b\n  option srvtcpka\n  server s1 127.0.0.1:8080\n"));
     assert_eq!(code, Some(0), "{text}");

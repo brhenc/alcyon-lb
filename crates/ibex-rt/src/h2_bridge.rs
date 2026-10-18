@@ -395,7 +395,7 @@ pub(crate) fn pump_h2_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, r
             }
             HtxBlock::Trailer(h) => {
                 // Trailers can follow only a chunked body: with a length they are dropped.
-                if st.chunked {
+                if st.chunked && !st.drop_trailers {
                     let mut line = Vec::with_capacity(h.name.len() + h.value.len() + 7);
                     if !st.trailing {
                         line.extend_from_slice(b"0\r\n");

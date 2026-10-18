@@ -574,7 +574,13 @@ impl MsgState {
     /// violation on, and what follows the end of the message (a pipelined request) are
     /// kept as they are; the violation is [`Self::check_body`]'s to judge. Nothing moves
     /// until a line has shrunk: per chunk, the cost is a scan of its size line.
-    pub fn canonical_chunk_lines(&self, data: &mut [u8]) -> usize {
+    ///
+    /// With `drop_trailers` (`option http-drop-request-trailers`, `-response-`), a trailer
+    /// section that is whole in `data` is cut to the blank line that ends the message, as
+    /// `HAProxy` skips the trailer blocks when it writes the message out; one that is not
+    /// whole yet is left as it is, to be cut when the rest of it has come (the section is
+    /// never forwarded in parts, see [`Chunk::at_boundary`]).
+    pub fn canonical_chunk_lines(&self, data: &mut [u8], drop_trailers: bool) -> usize {
         let mut i = 0;
         let mut c = match *self {
             MsgState::Head { left, body: Framing::Chunked } => {
@@ -609,6 +615,21 @@ impl MsgState {
                 w += take;
                 c = if take as u64 == n { Chunk::DataCr } else { Chunk::Data(n - take as u64) };
                 continue;
+            }
+            if drop_trailers && c == (Chunk::Trailer { len: 0, fields: 0 }) {
+                // The last-chunk line is behind us: all of the section, or none of it.
+                let mut pay = 0;
+                return match c.scan(&data[i..], &mut pay, false) {
+                    // Only a blank line (`\r\n`, or a lone `\n` that cannot be widened in place).
+                    (n, Ok(None)) if n <= 2 => keep_rest(data, i, w),
+                    (n, Ok(None)) => {
+                        data[w..w + 2].copy_from_slice(b"\r\n");
+                        i += n;
+                        w += 2;
+                        keep_rest(data, i, w)
+                    }
+                    _ => keep_rest(data, i, w),
+                };
             }
             if c != CHUNK_START {
                 // The CRLF after a chunk's data, or the trailer section.
@@ -2090,9 +2111,26 @@ mod tests {
     /// What `canonical_chunk_lines` leaves of `data` from state `s`.
     fn canonical(s: MsgState, data: &[u8]) -> Vec<u8> {
         let mut d = data.to_vec();
-        let n = s.canonical_chunk_lines(&mut d);
+        let n = s.canonical_chunk_lines(&mut d, false);
         d.truncate(n);
         d
+    }
+
+    /// T381: a whole trailer section is cut to the blank line; a partial one is left alone;
+    /// what follows the message stays.
+    #[test]
+    fn a_trailer_section_is_cut_when_whole() {
+        let drop = |data: &[u8]| {
+            let mut d = data.to_vec();
+            let n = MsgState::Body(Body::Chunked(CHUNK_START)).canonical_chunk_lines(&mut d, true);
+            d.truncate(n);
+            d
+        };
+        assert_eq!(drop(b"5\r\nhello\r\n0\r\nx-a: 1\r\ny: 2\r\n\r\nGET /"), b"5\r\nhello\r\n0\r\n\r\nGET /");
+        assert_eq!(drop(b"0\r\n\r\n"), b"0\r\n\r\n");
+        assert_eq!(drop(b"0\r\nx-a: 1\n\n"), b"0\r\n\r\n");
+        assert_eq!(drop(b"0\r\nx-a: 1\r\n"), b"0\r\nx-a: 1\r\n", "not whole yet");
+        assert_eq!(drop(b"0\r\nhost: 1\r\n\r\n"), b"0\r\nhost: 1\r\n\r\n", "a refused section is the check's to judge");
     }
 
     /// Size lines as `HAProxy` writes them (T302): extensions and blanks dropped, upper-case

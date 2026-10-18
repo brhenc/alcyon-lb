@@ -4215,7 +4215,7 @@ impl Engine {
     // `h1-case-adjust-bogus-*` option write names from (`h1_get_hdrs_map`).
     let h1_table: Arc<std::collections::HashMap<String, String>> =
         Arc::new(config.global.iter().flat_map(|g| g.h1_case_adjust.iter().cloned()).collect());
-    for p in proxies.iter_mut().filter(|p| p.h1_adjust != 0) {
+    for p in proxies.iter_mut().filter(|p| p.h1_adjust & (ibex_config::H1_ADJ_CLIENT | ibex_config::H1_ADJ_SERVER) != 0) {
         p.h1_case = Arc::clone(&h1_table);
     }
     crate::track::attach(&mut proxies, config);
@@ -7176,6 +7176,7 @@ fn init_client_session(
     sess.http_request_ms = fe.stats_config.raw_timeouts.http_request.map_or(0, millis_to_u32);
     sess.keep_alive_ms = fe.stats_config.raw_timeouts.http_keep_alive.map_or(0, millis_to_u32);
     sess.close_client = client_close(proxies, proxy_idx);
+    sess.drop_rsp_trailers = fe.h1_adjust & ibex_config::H1_DROP_RES_TRAILERS != 0;
     sess.arm_request(now);
     sess.keep_request_line = (!fe.log_target_idx.is_empty() && fe.log_format.as_ref().is_some_and(|f| f.uses_request_line()))
         || fe.unique_id_format.as_ref().is_some_and(|f| f.uses_request_line());
@@ -7701,6 +7702,7 @@ fn h2_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     if ch.reset || crate::h2_bridge::stream_is_reset(h2, ch.stream.id) {
         return false;
     }
+    ch.stream.body.drop_trailers = cs.drop_req_trailers;
     let (mut moved, trailers) = crate::h2_bridge::pump_request_body(h2, &mut ch.stream, &mut cs.req);
     // A stream's entry has its transaction until it is freed.
     let Some(t) = cs.txn.as_mut() else { return moved };
@@ -11581,6 +11583,8 @@ impl EngineDispatcher<'_> {
         entry.backend_idx = be_idx;
         enter_backend(entry, proxies, be_idx);
         entry.sess.retry_conn = proxies[be_idx].ids.retry_on & ibex_config::RE_CONN_FAILED != 0;
+        // `option http-drop-request-trailers` is the backend's (`h1_snd_buf`, on the server connection).
+        entry.sess.set_drop_req_trailers(proxies[be_idx].h1_adjust & ibex_config::H1_DROP_REQ_TRAILERS != 0);
         // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
         proxies[be_idx].counters().be_sess_rate.tick();
         // `stream_set_backend` (src/stream.c): switching to a backend takes its retry

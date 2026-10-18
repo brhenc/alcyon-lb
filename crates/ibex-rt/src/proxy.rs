@@ -536,6 +536,11 @@ pub struct TcpSession {
     pub keep_alive_ms: u32,
     /// `option httpclose` in the frontend: each response closes the client connection.
     pub close_client: bool,
+    /// `option http-drop-request-trailers` of the stream's backend (set when it is chosen,
+    /// false until then and for each new request): the request's trailer section is cut.
+    pub drop_req_trailers: bool,
+    /// `option http-drop-response-trailers` of the frontend: the response's trailer section is cut.
+    pub drop_rsp_trailers: bool,
     /// `req_exp` is the idle wait, not a request head's.
     pub req_idle: bool,
     pub req_exp: Tick,
@@ -693,6 +698,8 @@ pub struct H2ReqBody {
     pub done: bool,
     /// The last chunk has been written with trailers after it.
     pub trailing: bool,
+    /// `option http-drop-request-trailers`: the trailers are counted and not written.
+    pub drop_trailers: bool,
     /// What the trailers add to `%U`: each name and value, and the byte of their end.
     pub trailer_bytes: u64,
     /// DATA bytes moved into the server-bound buffer, and how many of them the client has
@@ -877,6 +884,7 @@ impl TcpSession {
         c.http_request_ms = owner.http_request_ms;
         c.keep_alive_ms = owner.keep_alive_ms;
         c.close_client = owner.close_client;
+        c.drop_rsp_trailers = owner.drop_rsp_trailers;
         c.bytes_in = owner.bytes_in;
         c.bytes_out = owner.bytes_out;
         // The bytes not credited yet are the stream's to credit (with its request): the
@@ -1077,6 +1085,8 @@ impl TcpSession {
             http_request_ms: 0,
             keep_alive_ms: 0,
             close_client: false,
+            drop_req_trailers: false,
+            drop_rsp_trailers: false,
             req_idle: false,
             req_exp: Tick::ETERNITY,
             srv_exp: Tick::ETERNITY,
@@ -1572,7 +1582,7 @@ impl TcpSession {
             return;
         }
         let Some(t) = &self.txn else { return };
-        let n = t.req.canonical_chunk_lines(self.req.readable_mut());
+        let n = t.req.canonical_chunk_lines(self.req.readable_mut(), self.drop_req_trailers);
         self.req.cut(n, self.req.len());
     }
 
@@ -1583,8 +1593,17 @@ impl TcpSession {
             return;
         }
         let Some(t) = &self.txn else { return };
-        let n = t.rsp.canonical_chunk_lines(self.rep.readable_mut());
+        let n = t.rsp.canonical_chunk_lines(self.rep.readable_mut(), self.drop_rsp_trailers);
         self.rep.cut(n, self.rep.len());
+    }
+
+    /// The stream's backend is chosen: `drop` is its `option http-drop-request-trailers`. A
+    /// request whose trailer section is already in `req` loses it now.
+    pub fn set_drop_req_trailers(&mut self, drop: bool) {
+        self.drop_req_trailers = drop;
+        if drop {
+            self.rewrite_req_chunk_framing();
+        }
     }
 
     /// Rewrites each trailer line of the request in `req` ended by a lone LF to end by
@@ -2482,6 +2501,7 @@ impl TcpSession {
                 // The client's own method: rules that rewrite it have not run yet.
                 txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
                 self.txn = Some(txn);
+                self.drop_req_trailers = false;
                 self.rewrite_req_chunk_framing();
                 self.cli_state = ScState::Established;
                 changed = true;
