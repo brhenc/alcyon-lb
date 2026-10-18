@@ -5004,8 +5004,63 @@ impl Registry {
         
         let json_query_conv: ConvFn = |smp, args| {
             let path = args.first()?;
+            let int_mode = args.get(1).is_some_and(|s| s == "int");
             let Sample::Str(s) = smp else { return None };
-            json_extract(&s, path).map(Sample::Str)
+            // T363: return HAProxy types for json_query
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(&s) else { return None };
+            let path = path.trim_start_matches("$.");
+            let path = path.trim_start_matches('/');
+            let mut parts = Vec::new();
+            let mut current_part = String::new();
+            let mut chars = path.chars().peekable();
+            let is_slash_delim = path.starts_with('/');
+            while let Some(c) = chars.next() {
+                if c == '\\' {
+                    if let Some(&next_c) = chars.peek() {
+                        if next_c == '.' || next_c == '\\' {
+                            current_part.push(next_c);
+                            chars.next();
+                            continue;
+                        }
+                    }
+                    current_part.push(c);
+                } else if (is_slash_delim && c == '/') || (!is_slash_delim && c == '.') {
+                    parts.push(current_part);
+                    current_part = String::new();
+                } else {
+                    current_part.push(c);
+                }
+            }
+            parts.push(current_part);
+            let mut current = &val;
+            for part in parts {
+                if part.is_empty() {
+                    continue;
+                }
+                if let Ok(idx) = part.parse::<usize>() {
+                    if let Some(elem) = current.get(idx) {
+                        current = elem;
+                        continue;
+                    }
+                }
+                current = current.get(&part)?;
+            }
+            // Map value to Sample according to HAProxy semantics
+            match current {
+                serde_json::Value::String(s) => Some(Sample::Str(s.clone())),
+                serde_json::Value::Bool(b) => Some(Sample::Bool(*b)),
+                serde_json::Value::Number(n) => {
+                    if int_mode {
+                        n.as_i64().map(Sample::Sint)
+                    } else {
+                        Some(Sample::Str(n.to_string()))
+                    }
+                }
+                serde_json::Value::Array(_) => {
+                    serde_json::to_string(current).ok().map(Sample::Str)
+                }
+                serde_json::Value::Object(_) | serde_json::Value::Null => None,
+            }
         };
 
         self.register_converter(ConvDesc {
