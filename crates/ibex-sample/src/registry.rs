@@ -3495,9 +3495,8 @@ impl Registry {
         // joined by <delimiter> (default ", "), only those whose name after the scope starts with <prefix>.
         // Without <scope> it visits sess, txn, req, res and proc in that order, as configuration.txt says;
         // HAProxy 3.5-dev8's binary dumps only the current context's scope (txn in a stream) instead, which
-        // has been reported upstream: Ibex follows the documentation here. Ibex keeps variable values as
-        // strings, so a value that reads as an integer is printed unquoted and any other is quoted (HAProxy
-        // prints by the stored type). Within a scope the names are sorted; HAProxy's order is its hash tree's.
+        // has been reported upstream: Ibex follows the documentation here. Each value prints by its stored
+        // type, as HAProxy does (T364 S4). Within a scope the names are sorted; HAProxy's order is its hash tree's.
         // T329
         self.register_fetch(FetchDesc {
             name: "dump_all_vars",
@@ -3509,25 +3508,23 @@ impl Registry {
                 };
                 let prefix = args.get(1).map_or("", String::as_str);
                 let delimiter = args.get(2).map_or(", ", String::as_str);
-                // T364 S4 prints each by its type; until then, as its text.
-                let text = |(k, v): (&String, &Sample)| (k.clone(), sample_to_string(v));
-                let mut stream: Vec<(String, String)> = ctx.vars.map(|m| m.iter().map(text).collect()).unwrap_or_default();
+                let mut stream: Vec<(String, Sample)> = ctx.vars.map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
                 crate::vars::with_current(|m| {
                     for (k, val) in m {
                         if !stream.iter().any(|(n, _)| n == k) {
-                            stream.push((k.clone(), sample_to_string(val)));
+                            stream.push((k.clone(), val.clone()));
                         }
                     }
                 });
-                let process: Vec<(String, String)> = crate::vars::proc_snapshot().into_iter().map(|(k, v)| (k, sample_to_string(&v))).collect();
+                let process: Vec<(String, Sample)> = crate::vars::proc_snapshot();
                 let mut out = Vec::new();
                 for scope in scopes {
                     let vars = if *scope == "proc" { &process } else { &stream };
-                    let mut found: Vec<&(String, String)> = vars
+                    let mut found: Vec<&(String, Sample)> = vars
                         .iter()
                         .filter(|(k, _)| k.strip_prefix(scope).and_then(|r| r.strip_prefix('.')).is_some_and(|r| r.starts_with(prefix)))
                         .collect();
-                    found.sort();
+                    found.sort_by(|a, b| a.0.cmp(&b.0));
                     out.extend(found.into_iter().map(|(k, v)| format!("{k}={}", dump_var_value(v))));
                 }
                 Some(Sample::Str(out.join(delimiter)))
@@ -6592,27 +6589,40 @@ pub fn check_dump_all_vars_args(fetch: &str, args: &[String]) -> Option<String> 
     ))
 }
 
-/// A variable's value as `dump_all_vars` prints it: an integer bare, anything else quoted with `"`, `\\`,
-/// CR, LF, backspace and NUL escaped (as `chunk_escape_string` does in `HAProxy`). T329
-fn dump_var_value(val: &str) -> String {
-    if let Ok(n) = val.parse::<i64>() {
-        return n.to_string();
-    }
-    let mut out = String::with_capacity(val.len() + 2);
-    out.push('"');
-    for c in val.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\r' => out.push_str("\\r"),
-            '\n' => out.push_str("\\n"),
-            '\x08' => out.push_str("\\b"),
-            '\0' => out.push_str("\\0"),
-            c => out.push(c),
+/// A variable's value as `dump_all_vars` prints it, by its stored type (`smp_fetch_dump_all_vars`): a string
+/// quoted with `"`, `\\`, CR, LF, backspace and NUL escaped (as `chunk_escape_string` does), a `bin` as
+/// upper-case hex, an integer bare, a bool as `true`/`false`, an address as text, a method quoted. T329, T364 S4
+fn dump_var_value(val: &Sample) -> String {
+    use std::fmt::Write as _;
+    let quote = |t: &str| {
+        let mut out = String::with_capacity(t.len() + 2);
+        out.push('"');
+        for c in t.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\r' => out.push_str("\\r"),
+                '\n' => out.push_str("\\n"),
+                '\x08' => out.push_str("\\b"),
+                '\0' => out.push_str("\\0"),
+                c => out.push(c),
+            }
         }
+        out.push('"');
+        out
+    };
+    match val {
+        Sample::Str(t) => quote(t),
+        Sample::Bin(b) => b.iter().fold(String::with_capacity(b.len() * 2), |mut o, x| {
+            let _ = write!(o, "{x:02X}");
+            o
+        }),
+        Sample::Sint(n) => n.to_string(),
+        Sample::Bool(b) => b.to_string(),
+        Sample::Ipv4(a) => a.to_string(),
+        Sample::Ipv6(a) => a.to_string(),
+        Sample::Meth(m) => quote(m.as_str()),
     }
-    out.push('"');
-    out
 }
 
 #[must_use]
@@ -8159,9 +8169,11 @@ mod tests {
     /// integer-bare and the CR/LF/backspace/quote/backslash cases.
     #[test]
     fn dump_var_value_escapes_control_characters() {
-        assert_eq!(dump_var_value("a\0b"), "\"a\\0b\"");
-        assert_eq!(dump_var_value("a\r\n\x08\"\\"), "\"a\\r\\n\\b\\\"\\\\\"");
-        assert_eq!(dump_var_value("42"), "42");
+        assert_eq!(dump_var_value(&Sample::Str("a\0b".into())), "\"a\\0b\"");
+        assert_eq!(dump_var_value(&Sample::Str("a\r\n\x08\"\\".into())), "\"a\\r\\n\\b\\\"\\\\\"");
+        // A string that reads as an integer is still a string: quoted (T364 S4).
+        assert_eq!(dump_var_value(&Sample::Str("42".into())), "\"42\"");
+        assert_eq!(dump_var_value(&Sample::Sint(42)), "42");
     }
 
     use super::*;

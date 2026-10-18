@@ -408,3 +408,11 @@ polls for it. Two differences:
   waits in their queues. Only `Paused frontend GLOBAL.` / `Resumed frontend GLOBAL.` are printed.
   A unix socket file is renamed over by the successor on both and is lost to the old process if
   the successor then fails (`Connection refused`, measured on both).
+
+## `dump_all_vars`: variables are listed sorted by name (T364 S4)
+
+`dump_all_vars` prints each variable by its stored type, as HAProxy does (string quoted and escaped, `bin`
+as upper-case hex, integer bare, `true`/`false`, address as text, method quoted), and CLI `get var`
+prints the stored type name. Within one scope Ibex lists the variables sorted by name; HAProxy walks its
+hash tree, so its order differs between processes (it is seeded per process). A rule must not depend on
+the order in either.
