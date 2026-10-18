@@ -237,11 +237,7 @@ pub fn hash_xxh32(input: &[u8], seed: u32) -> u32 {
 
 pub use ibex_crypt::xxh64::hash_xxh64;
 
-/// Fallback 64-bit XXH3 hash implementation matching `HAProxy`.
-#[must_use]
-pub fn hash_xxh3(input: &[u8], seed: u64) -> u64 {
-    hash_xxh64(input, seed)
-}
+pub use ibex_crypt::xxh3::hash_xxh3;
 
 /// SHA-1 (160-bit) message digest.
 #[must_use]
