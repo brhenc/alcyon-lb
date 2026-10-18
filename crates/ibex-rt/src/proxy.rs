@@ -1758,9 +1758,20 @@ impl TcpSession {
     /// malformed chunk size. Each of these is a way for two intermediaries to read the
     /// same bytes as different requests.
     fn validate_request_head(&mut self, head_len: usize) -> io::Result<bool> {
-        let parser = ibex_proto::parser::build(self.parser_kind)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let mut stream = parser.stream(false);
+        // The built-in parser is a value on this frame: a `Box<dyn HttpStream>` per request
+        // head was an allocation per request (Z2, 56 bytes). Only the parsers behind the
+        // seam (differential runs, the FFI one) still box theirs.
+        let mut h1_parser;
+        let mut boxed_parser;
+        let stream: &mut dyn ibex_proto::parser::HttpStream = if self.parser_kind == ibex_proto::parser::ParserKind::H1 {
+            h1_parser = ibex_proto::H1Parser::new(false);
+            &mut h1_parser
+        } else {
+            let parser = ibex_proto::parser::build(self.parser_kind)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            boxed_parser = parser.stream(false);
+            &mut *boxed_parser
+        };
         stream.set_accept_unsafe_request(self.accept_unsafe_request);
         // The head HAProxy holds in `tune.bufsize` may not fit this HTX, whose descriptors
         // are twice as large: the buffer is made large enough for the head and one
