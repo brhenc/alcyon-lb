@@ -6,6 +6,72 @@
 use super::*;
 use std::cell::RefCell;
 
+/// What a `*-headers-bin` action does with the list it is given, and for `del-headers-bin`
+/// how a name of the list is matched against the headers (`-m str|beg|end|sub`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadersBinOp {
+    Set,
+    Add,
+    DelStr,
+    DelBeg,
+    DelEnd,
+    DelSub,
+}
+
+impl HeadersBinOp {
+    /// The word of the action in the configuration.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Set => "set-headers-bin",
+            Self::Add => "add-headers-bin",
+            Self::DelStr | Self::DelBeg | Self::DelEnd | Self::DelSub => "del-headers-bin",
+        }
+    }
+
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Set => "set",
+            Self::Add => "add",
+            Self::DelStr => "str",
+            Self::DelBeg => "beg",
+            Self::DelEnd => "end",
+            Self::DelSub => "sub",
+        }
+    }
+
+    /// The `-m` word of a `del-headers-bin`, `None` for a method it does not take.
+    #[must_use]
+    pub fn del_from_match(m: &str) -> Option<Self> {
+        match m {
+            "str" => Some(Self::DelStr),
+            "beg" => Some(Self::DelBeg),
+            "end" => Some(Self::DelEnd),
+            "sub" => Some(Self::DelSub),
+            _ => None,
+        }
+    }
+
+    /// `http-response` and `http-after-response` carry the action as a header action named
+    /// `"\0hdrs-bin:<op>:<prefix>"` whose format is the sample expression.
+    #[must_use]
+    pub fn encode_name(self, prefix: &str) -> String {
+        format!("\0hdrs-bin:{}:{prefix}", self.code())
+    }
+
+    /// The operation and the prefix of a name made by [`Self::encode_name`].
+    #[must_use]
+    pub fn decode_name(name: &str) -> Option<(Self, &str)> {
+        let (op, prefix) = name.strip_prefix("\0hdrs-bin:")?.split_once(':')?;
+        let op = match op {
+            "set" => Self::Set,
+            "add" => Self::Add,
+            m => Self::del_from_match(m)?,
+        };
+        Some((op, prefix))
+    }
+}
+
 /// Modern HTTP-request action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpReqAction {
@@ -71,6 +137,14 @@ pub enum HttpReqAction {
     },
     DelHeader {
         name: String,
+    },
+    /// `add-headers-bin`, `set-headers-bin` and `del-headers-bin <sample> [prefix <p> | -m <m>]`:
+    /// `expr` yields a varint-encoded header list, `prefix` (add/set) keeps the names that
+    /// start with it.
+    HeadersBin {
+        op: HeadersBinOp,
+        expr: String,
+        prefix: String,
     },
     ReplaceHeader {
         name: String,

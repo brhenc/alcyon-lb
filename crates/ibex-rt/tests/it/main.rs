@@ -126,6 +126,7 @@ mod global_set_var_once;
 mod h1_authority;
 mod http_auth_userlist;
 mod h1_case_adjust;
+mod headers_bin_actions;
 mod h2_alpn_settings;
 mod h2_buffering;
 mod h2_early_response_rst;
