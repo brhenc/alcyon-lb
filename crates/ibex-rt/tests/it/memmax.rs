@@ -96,28 +96,29 @@ fn check(name: &str, port: u16, tls: bool, megs: &str, maxconn: &str, bytes: &st
 
 #[test]
 fn m64_cleartext() {
-    check("m64", 47462, false, "64", "1800", "67108864");
+    check("m64", common::reserve_port(), false, "64", "1800", "67108864");
 }
 
 #[test]
 fn m8_cleartext() {
-    check("m8", 47463, false, "8", "220", "8388608");
+    check("m8", common::reserve_port(), false, "8", "220", "8388608");
 }
 
 #[test]
 fn m64_tls() {
-    check("m64tls", 47464, true, "64", "470", "67108864");
+    check("m64tls", common::reserve_port(), true, "64", "470", "67108864");
 }
 
 #[test]
 fn m8_tls() {
-    check("m8tls", 47465, true, "8", "32", "8388608");
+    check("m8tls", common::reserve_port(), true, "8", "32", "8388608");
 }
 
 #[test]
 fn explicit_maxconn_cleartext_is_kept() {
-    let (cfg, sock) = config("m64mc", 47466, false, "  maxconn 100000\n");
-    let run = spawn("64", &cfg, sock, 47466);
+    let port = common::reserve_port();
+    let (cfg, sock) = config("m64mc", port, false, "  maxconn 100000\n");
+    let run = spawn("64", &cfg, sock, port);
     let info = show_info(&run.sock);
     assert_eq!(field(&info, "Maxconn"), "100000", "{info}");
     assert_eq!(field(&info, "Memmax_MB"), "64", "{info}");
@@ -125,7 +126,7 @@ fn explicit_maxconn_cleartext_is_kept() {
 
 #[test]
 fn explicit_maxconn_too_high_for_tls_is_refused() {
-    let (cfg, _sock) = config("m64refuse", 47467, true, "  maxconn 100000\n");
+    let (cfg, _sock) = config("m64refuse", common::reserve_port(), true, "  maxconn 100000\n");
     let out = Command::new(env!("CARGO_BIN_EXE_ibex")).args(["-m", "64", "-f", &cfg]).output().expect("run ibex");
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr: {err}");
@@ -142,11 +143,12 @@ fn explicit_maxconn_too_high_for_tls_is_refused() {
 /// `maxconn` is 220 and it serves all of them.
 #[test]
 fn m8_with_200_keepalive_connections_does_not_abort() {
-    let (cfg, sock) = config("m8abort", 47468, false, "");
-    let mut run = spawn("8", &cfg, sock, 47468);
+    let port = common::reserve_port();
+    let (cfg, sock) = config("m8abort", port, false, "");
+    let mut run = spawn("8", &cfg, sock, port);
     let mut conns = Vec::new();
     for i in 0..200 {
-        let mut c = std::net::TcpStream::connect("127.0.0.1:47468").expect("connect");
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
         c.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
         c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
         let mut buf = [0u8; 512];
