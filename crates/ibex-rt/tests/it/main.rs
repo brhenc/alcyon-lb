@@ -135,6 +135,7 @@ mod h2_pending_connect_streams;
 mod h2_connection_end_log;
 mod h2_flood_knobs;
 mod h2_frame_flags;
+mod h2_flow_errors;
 mod h2_frame_limits;
 mod h2_generated_replies;
 mod h2_glitch_counters;
