@@ -604,10 +604,7 @@ impl LogFormat {
                 }
             }
         }
-        // A format's trailing blanks are not kept: the parser adds a separator only when
-        // something follows it (measured: `log-format "%ci x "` sends no trailing space).
-        let kept = text.trim_end_matches(' ').len();
-        text.truncate(kept);
+        // T363: preserve trailing blanks to match HAProxy log-format behavior
         flush(&mut text, &mut nodes);
         for n in &mut nodes {
             match n {

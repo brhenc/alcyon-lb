@@ -199,6 +199,7 @@ mod log_encodings;
 mod log_filtering;
 mod log_forward;
 mod log_format_sd;
+mod log_format_trailing_blank;
 mod log_parity;
 mod log_rc_redispatch;
 mod cli_stderr_messages;
