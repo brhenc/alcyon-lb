@@ -859,23 +859,23 @@ pub fn load_cert_file(path: &std::path::Path) -> Result<(Vec<CertificateDer<'sta
 /// certificate declaring a name longer than the bytes that follow it panicked the
 /// process -- reachable from any truncated or corrupt file in a `crt` path, which is
 /// to say from an operator mistake as easily as from an attacker.
-struct Der<'a> {
+pub(crate) struct Der<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 /// One DER element: its tag and its contents.
-struct Tlv<'a> {
-    tag: u8,
-    value: &'a [u8],
+pub(crate) struct Tlv<'a> {
+    pub(crate) tag: u8,
+    pub(crate) value: &'a [u8],
 }
 
 impl<'a> Der<'a> {
-    const fn new(buf: &'a [u8]) -> Self {
+    pub(crate) const fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
-    const fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.pos >= self.buf.len()
     }
 
@@ -906,7 +906,7 @@ impl<'a> Der<'a> {
 
     /// Reads one tag-length-value. `None` if the declared length exceeds what is left,
     /// which is the check whose absence caused the panic.
-    fn tlv(&mut self) -> Option<Tlv<'a>> {
+    pub(crate) fn tlv(&mut self) -> Option<Tlv<'a>> {
         let tag = self.byte()?;
         let len = self.length()?;
         let end = self.pos.checked_add(len)?;
@@ -916,7 +916,7 @@ impl<'a> Der<'a> {
     }
 
     /// Reads the next element and descends into its contents.
-    fn child(&mut self) -> Option<Der<'a>> {
+    pub(crate) fn child(&mut self) -> Option<Der<'a>> {
         Some(Der::new(self.tlv()?.value))
     }
 }

@@ -22,6 +22,7 @@ pub mod config;
 pub mod ja4;
 pub mod resolver;
 pub mod transport;
+pub mod x509;
 
 pub use arena::{
     TlsArena, TlsArenaError, TlsSession, TlsSlot, DEFAULT_TLS_BUF_CAPACITY, MAX_TLS_SLOTS,
