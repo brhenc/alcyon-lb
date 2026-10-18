@@ -36,6 +36,7 @@ mod rst_ttl;
 mod http_rule_keywords;
 mod if_conditions;
 mod if_error_position;
+mod monitor_fail;
 mod lexer_hex_escape;
 mod log_format_config;
 mod log_tag_sample;

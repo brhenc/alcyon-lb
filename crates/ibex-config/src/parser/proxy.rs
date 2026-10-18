@@ -114,6 +114,7 @@ pub(crate) fn parse_listen_header(
         acls: Vec::new(),
         use_backends: Vec::new(),
         force_be_switch: Vec::new(),
+        monitor_fail: Vec::new(),
         monitor_uri: None,
         default_backend: defaults.and_then(|d| d.default_backend.clone()),
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
@@ -193,6 +194,7 @@ pub(crate) fn parse_frontend_header(
         default_backend: defaults.and_then(|d| d.default_backend.clone()),
         use_backends: Vec::new(),
         force_be_switch: Vec::new(),
+        monitor_fail: Vec::new(),
         monitor_uri: None,
         acls: Vec::new(),
         cliexp: Vec::new(),
@@ -406,6 +408,7 @@ pub(crate) fn parse_listen_directive(
         "use-server" => parse_use_server(&mut proxy.use_servers, tokens, kw),
         "force-be-switch" => parse_force_be_switch(&mut proxy.force_be_switch, tokens, kw),
         "monitor-uri" => parse_monitor_uri(&mut proxy.monitor_uri, tokens, kw),
+        "monitor" => parse_monitor(&mut proxy.monitor_fail, tokens, kw),
         "default_backend" => parse_default_backend(&mut proxy.default_backend, tokens, kw),
         "option" => parse_option_listen(proxy, tokens, kw),
         "no" => parse_no_listen(proxy, tokens, kw),
@@ -577,6 +580,7 @@ pub(crate) fn parse_frontend_directive(
             ),
         )),
         "monitor-uri" => parse_monitor_uri(&mut fe.monitor_uri, tokens, kw),
+        "monitor" => parse_monitor(&mut fe.monitor_fail, tokens, kw),
         "default_backend" => parse_default_backend(&mut fe.default_backend, tokens, kw),
         "stick-table" => parse_stick_table(&mut fe.stick_table, tokens, kw),
         // A frontend has no backend capability: `HAProxy` warns and ignores the line.
@@ -761,6 +765,9 @@ pub(crate) fn parse_backend_directive(
         },
         // `HAProxy`: "'capture' ignored because backend has no frontend capability".
         "capture" => parse_capture(&mut Vec::new(), &mut Vec::new(), 0, tokens, kw),
+        // `HAProxy`: "'monitor' ignored because backend has no frontend capability" (a warning);
+        // the line is checked, then dropped.
+        "monitor" => parse_monitor(&mut Vec::new(), tokens, kw),
         other => Err(ConfigError::new(
             kw.line,
             kw.col,
@@ -1220,6 +1227,27 @@ pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &T
         Some("accept-unsafe-violations-in-http-response") => be.stats.accept_unsafe_response = false,
         _ => {}
     }
+    Ok(())
+}
+
+/// `monitor fail if|unless <cond>` (frontend and listen sections): `src/cfgparse-listen.c`.
+fn parse_monitor(
+    monitor_fail: &mut Vec<crate::ast::AclCondition>,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.get(1).map(|t| t.text.as_str()) != Some("fail") {
+        return Err(ConfigError::new(kw.line, kw.col, "'monitor' only supports 'fail'."));
+    }
+    if !matches!(tokens.get(2).map(|t| t.text.as_str()), Some("if" | "unless")) {
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "'monitor fail' requires either 'if' or 'unless' followed by a condition.",
+        ));
+    }
+    // The check above leaves a condition to parse, so this never yields `None`.
+    monitor_fail.extend(parse_acl_condition_from_tokens(&tokens[2..])?);
     Ok(())
 }
 

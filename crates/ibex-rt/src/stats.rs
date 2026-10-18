@@ -1204,6 +1204,7 @@ mod tests {
             use_backends: Vec::new(),
             use_servers: Vec::new(),
             force_be_switch: Vec::new(),
+            monitor_fail: Vec::new(),
             disabled_backends: std::sync::Arc::default(),
             monitor_uri: None,
             acls: ibex_sample::Acls::default(),

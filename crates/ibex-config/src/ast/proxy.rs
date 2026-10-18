@@ -320,6 +320,8 @@ pub struct ListenSection {
     /// `force-be-switch if|unless <cond>`: when one matches, `use_backend` and
     /// `default_backend` may pick a backend that is disabled.
     pub force_be_switch: Vec<AclCondition>,
+    /// `monitor fail if|unless <cond>`: when one holds, the `monitor-uri` answer is a 503.
+    pub monitor_fail: Vec<AclCondition>,
     /// `monitor-uri <uri>`: requests for this URI are answered by the proxy itself, for
     /// an external load balancer's health probe (`src/http_ana.c`).
     pub monitor_uri: Option<String>,
@@ -472,6 +474,7 @@ impl Default for ListenSection {
             acls: Vec::new(),
             use_backends: Vec::new(),
             force_be_switch: Vec::new(),
+            monitor_fail: Vec::new(),
             monitor_uri: None,
             default_backend: None,
             balance: BalanceAlgorithm::RoundRobin,
@@ -542,6 +545,8 @@ pub struct FrontendSection {
     /// `force-be-switch if|unless <cond>`: when one matches, `use_backend` and
     /// `default_backend` may pick a backend that is disabled.
     pub force_be_switch: Vec<AclCondition>,
+    /// `monitor fail if|unless <cond>`: when one holds, the `monitor-uri` answer is a 503.
+    pub monitor_fail: Vec<AclCondition>,
     /// `monitor-uri <uri>`: requests for this URI are answered by the proxy itself, for
     /// an external load balancer's health probe (`src/http_ana.c`).
     pub monitor_uri: Option<String>,
@@ -642,6 +647,7 @@ impl Default for FrontendSection {
             default_backend: None,
             use_backends: Vec::new(),
             force_be_switch: Vec::new(),
+            monitor_fail: Vec::new(),
             monitor_uri: None,
             acls: Vec::new(),
             cliexp: Vec::new(),

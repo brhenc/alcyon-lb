@@ -202,6 +202,7 @@ pub(crate) fn parse_defaults_directive(
             None => Err(ConfigError::new(kw.line, kw.col, "unique-id-header expects an argument.".to_string())),
         },
         "description" => Err(ConfigError::new(kw.line, kw.col, "'description' not allowed in 'defaults' section.")),
+        "monitor" => Err(ConfigError::new(kw.line, kw.col, "'monitor' not allowed in 'defaults' section.")),
         _ => Err(ConfigError::new(
             kw.line,
             kw.col,
