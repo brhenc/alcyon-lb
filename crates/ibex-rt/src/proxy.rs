@@ -1383,7 +1383,7 @@ impl TcpSession {
 
     /// Attaches a server-side connection with a specific transport (`ServerXprt`).
     pub fn attach_server_with_xprt(&mut self, fd: OwnedFd, xprt: ServerXprt, now: Tick) {
-        self.log.queue.get_or_insert_with(std::time::Instant::now);
+        self.log.queue.get_or_insert_with(crate::txnlog::loop_now);
         self.srv = Some(fd);
         self.srv_xprt = xprt;
         self.srv_cant_recv = false;
@@ -1413,7 +1413,7 @@ impl TcpSession {
         if self.mode == Mode::Tcp && self.tunnel_ms().is_some() {
             self.arm_client(now);
         }
-        self.log.connect = Some(std::time::Instant::now());
+        self.log.connect = Some(crate::txnlog::loop_now());
         // `AN_RES_INSPECT` runs from here, before any of the response has arrived.
         if let Some(delay) = self.res_inspect_armed.take() {
             self.res_inspect_pending = true;
@@ -2329,7 +2329,7 @@ impl TcpSession {
                 // (`HAProxy` takes it from the HTX start line), before any rule rewrites it
                 // (and keeps its first `tune.http.logurilen`, 1024, bytes). The head forwarded
                 // may have been regenerated just above, so its length is read again.
-                self.log.request = Some(std::time::Instant::now());
+                self.log.request = Some(crate::txnlog::loop_now());
                 if self.keep_request_line {
                     let head = self.req.readable();
                     let line_end = head.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(head.len());

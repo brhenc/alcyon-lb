@@ -38,17 +38,6 @@ fn line_after(after: Duration) -> String {
     f.write_all(cfg.as_bytes()).expect("write cfg");
     let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
     assert!(common::wait_listening(fe), "ibex never listened");
-    // A first request after start-up pays for lazily initialised state: on a debug build the
-    // wait for the first connect attempt (`Tw`) then reads 1 ms, where HAProxy (and a
-    // warm Ibex) read 0 (measured 2026-10-18: HAProxy 0 in 12/12 runs, with and without
-    // CPU load; Ibex debug 1 on 3/4 first requests after a probe, 0 on the next). The
-    // log's server field is what is under test, so that request is made, and skipped.
-    {
-        let mut w = TcpStream::connect(fe).expect("connect");
-        w.set_read_timeout(Some(Duration::from_millis(100))).expect("timeout");
-        w.write_all(b"GET /warm HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
-        let _ = w.read(&mut [0u8; 200]);
-    }
     let mut c = TcpStream::connect(fe).expect("connect");
     c.set_read_timeout(Some(after)).expect("timeout");
     c.write_all(b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
