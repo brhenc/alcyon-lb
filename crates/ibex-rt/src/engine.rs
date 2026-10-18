@@ -2153,14 +2153,12 @@ impl Engine {
                 None => FdState::CliListener,
                 Some(i) => FdState::CliExtra(u32::try_from(i).unwrap_or(u32::MAX)),
             };
-            self.fdtab.insert(fd, state, Interest::READ);
-            if self.poller.add(l.as_fd(), raw_fd_to_u64(fd), !self.cli_paused, false).is_err() {
-                self.fdtab.remove(fd);
-                continue;
-            }
-            match which {
-                None => self.cli_listener = Some(l),
-                Some(i) => self.extra_cli[i].listener = Some(l),
+            if self.poller.add(l.as_fd(), raw_fd_to_u64(fd), !self.cli_paused, false).is_ok() {
+                self.fdtab.insert(fd, state, Interest::READ);
+                match which {
+                    None => self.cli_listener = Some(l),
+                    Some(i) => self.extra_cli[i].listener = Some(l),
+                }
             }
         }
     }

@@ -405,3 +405,39 @@ fn a_failed_sf_successor_gives_the_abns_name_back() {
     let _ = Command::new("kill").arg("-USR1").arg(old.id().to_string()).status();
     let _ = old.wait();
 }
+
+/// T354. SIGTTOU and SIGTTIN sent straight to a process with several stats sockets: every
+/// abns@ one (the first and an extra) lets go of its name and takes it back, as HAProxy
+/// 3.5-dev8-885761-29 does (measured: `kill -TTOU` frees both abstract names, `kill -TTIN`
+/// binds them again, `show cli sockets` lists all three afterwards). Known gap: HAProxy also
+/// pauses its TCP stats socket (connection refused until SIGTTIN); Ibex leaves it open, so
+/// its queued connections are not reset, and this test does not assert on it.
+#[test]
+fn sigttou_and_sigttin_release_and_rebind_every_abns_stats_socket() {
+    let abns = format!("ibex-t354-sig-{}", std::process::id());
+    let tcp_addr = common::reserve_addr();
+    let port = common::reserve_port();
+    let lines = format!("\tstats socket abns@{abns}x level admin\n\tstats socket {tcp_addr} level admin\n\tstats socket abns@{abns}y level user\ndefaults\n\tmode http\n\ttimeout client 5s\n\ttimeout connect 1s\n\ttimeout server 5s\nfrontend fe\n\tbind 127.0.0.1:{port}\n\thttp-request return status 200 content-type text/plain string ok");
+    let (mut p, _f) = start(&lines, &[]);
+    let sig = |s: &str| {
+        let _ = Command::new("kill").arg(format!("-{s}")).arg(p.id().to_string()).status();
+    };
+    let (x, y) = (format!("{abns}x"), format!("{abns}y"));
+    drop(wait("abns@x", || abstract_stream(&x, true)));
+    drop(wait("abns@y", || abstract_stream(&y, true)));
+    sig("TTOU");
+    wait("both names released", || (abstract_stream(&x, true).is_none() && abstract_stream(&y, true).is_none()).then_some(()));
+    // the TCP socket still answers and lists all three sockets
+    let listing = wait("tcp cli", || {
+        let s = TcpStream::connect(tcp_addr).ok()?;
+        Some(ask(s, "show cli sockets"))
+    });
+    assert!(listing.contains(&format!("abns@{x} admin all")) && listing.contains(&format!("abns@{y} user all")), "{listing}");
+    sig("TTIN");
+    let sy = wait("abns@y again", || abstract_stream(&y, true));
+    assert!(ask(sy, "show cli level").contains("user"));
+    let sx = wait("abns@x again", || abstract_stream(&x, true));
+    assert!(ask(sx, "show cli level").contains("admin"));
+    sig("USR1");
+    let _ = p.wait();
+}

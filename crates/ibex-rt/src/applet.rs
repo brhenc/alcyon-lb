@@ -200,7 +200,7 @@ pub struct CliApplet {
     /// for `show cli sockets`.
     pub socket_name: Option<String>,
     /// Every CLI socket of the process with the level it was bound at, one line each, for
-    /// `show cli sockets`; empty when the engine did not say (then `socket_name` is used).
+    /// `show cli sockets`; the engine fills it for every applet.
     pub socket_list: String,
     pub stream: Option<CliStream>,
     pub raw_fd: RawFd,
@@ -481,12 +481,7 @@ impl CliApplet {
         } else if cmd == "show cli level" {
             self.finish_msg(self.level.name());
         } else if cmd == "show cli sockets" {
-            let list = if self.socket_list.is_empty() {
-                format!("{} {} all", self.socket_name.clone().unwrap_or_default(), self.level.name())
-            } else {
-                self.socket_list.clone()
-            };
-            let msg = format!("# socket lvl processes\n{list}");
+            let msg = format!("# socket lvl processes\n{}", self.socket_list);
             self.finish_msg(&msg);
         } else if cmd == "show version" {
             self.finish_msg(env!("CARGO_PKG_VERSION"));

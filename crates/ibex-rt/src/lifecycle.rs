@@ -30,6 +30,8 @@ pub struct Lifecycle {
     /// it) and cleared by `SIGTTIN` (the successor gave up: take it back). A level, not an
     /// edge: every worker looks at it.
     paused: Arc<AtomicBool>,
+    ttou: Arc<AtomicBool>,
+    ttin: Arc<AtomicBool>,
 }
 
 impl Lifecycle {
@@ -52,22 +54,22 @@ impl Lifecycle {
         // HAProxy's pause and resume (`src/haproxy.c`): a new process whose bind finds an
         // address in use sends SIGTTOU to the processes it replaces, and SIGTTIN if it then
         // fails to start. Only the abstract stats sockets, which cannot be shared, react.
-        let mut signals = signal_hook::iterator::Signals::new([
-            signal_hook::consts::SIGTTOU,
-            signal_hook::consts::SIGTTIN,
-        ])?;
-        let paused = Arc::clone(&self.paused);
-        std::thread::Builder::new().name("ttou".into()).spawn(move || {
-            for sig in signals.forever() {
-                paused.store(sig == signal_hook::consts::SIGTTOU, Ordering::Relaxed);
-            }
-        })?;
+        // Plain flags: no thread and no self-pipe (a pipe or socketpair is a descriptor the
+        // process would hold for nothing).
+        signal_hook::flag::register(signal_hook::consts::SIGTTOU, Arc::clone(&self.ttou))?;
+        signal_hook::flag::register(signal_hook::consts::SIGTTIN, Arc::clone(&self.ttin))?;
         Ok(())
     }
 
     /// Whether the last of `SIGTTOU` and `SIGTTIN` was `SIGTTOU`.
     #[must_use]
     pub fn pause_requested(&self) -> bool {
+        if self.ttou.swap(false, Ordering::Relaxed) {
+            self.paused.store(true, Ordering::Relaxed);
+        }
+        if self.ttin.swap(false, Ordering::Relaxed) {
+            self.paused.store(false, Ordering::Relaxed);
+        }
         self.paused.load(Ordering::Relaxed)
     }
 
