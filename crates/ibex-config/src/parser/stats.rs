@@ -85,10 +85,10 @@ pub(crate) fn parse_stats_directive(
             };
             // `stats_add_auth`: the password is what follows the first colon, none is empty.
             let (user, pass) = account.text.split_once(':').unwrap_or((account.text.as_str(), ""));
-            if stats.auth_users.iter().any(|(u, _)| &**u == user) {
+            if stats.auth.get_or_insert_default().users.iter().any(|(u, _)| &**u == user) {
                 warn::push(kw.line, WarnStyle::Spaced, &format!("uri auth: ignoring duplicated user '{user}'."));
             } else {
-                stats.auth_users.push((user.into(), pass.into()));
+                stats.auth.get_or_insert_default().users.push((user.into(), pass.into()));
             }
             Ok(())
         }
@@ -96,26 +96,26 @@ pub(crate) fn parse_stats_directive(
             let Some(realm) = tokens.get(2) else {
                 return Err(ConfigError::new(kw.line, kw.col, "'realm' needs an realm name."));
             };
-            stats.auth_realm = Some(realm.text.as_str().into());
+            stats.auth.get_or_insert_default().realm = Some(realm.text.as_str().into());
             Ok(())
         }
         "hide-version" => {
-            stats.show_version = false;
+            stats.auth.get_or_insert_default().show_version = false;
             Ok(())
         }
         "show-version" => {
-            stats.show_version = true;
+            stats.auth.get_or_insert_default().show_version = true;
             Ok(())
         }
         "http-request" => {
-            if stats.http_req_rules.last().is_some_and(|r| r.cond.is_none()) {
+            if stats.auth.get_or_insert_default().http_req_rules.last().is_some_and(|r| r.cond.is_none()) {
                 warn::push(kw.line, WarnStyle::Tight, "previous 'stats' action has no condition attached, further entries are NOOP.");
             }
-            let before = stats.http_req_rules.len();
-            parse_http_req_rule(&mut stats.http_req_rules, &tokens[1..], kw)?;
+            let before = stats.auth.get_or_insert_default().http_req_rules.len();
+            parse_http_req_rule(&mut stats.auth.get_or_insert_default().http_req_rules, &tokens[1..], kw)?;
             // The stats page answers allow, deny and auth; any other action would parse and do
             // nothing there (AGENTS.md rule 5).
-            for r in &stats.http_req_rules[before..] {
+            for r in &stats.auth.get_or_insert_default().http_req_rules[before..] {
                 let plain = match &r.action {
                     HttpReqAction::Allow | HttpReqAction::Auth { .. } => true,
                     HttpReqAction::Deny { content_type, lf_string, error_page, .. } => {
@@ -124,7 +124,7 @@ pub(crate) fn parse_stats_directive(
                     _ => false,
                 };
                 if !plain {
-                    stats.http_req_rules.truncate(before);
+                    stats.auth.get_or_insert_default().http_req_rules.truncate(before);
                     return Err(ConfigError::new(
                         kw.line,
                         kw.col,
@@ -167,31 +167,32 @@ pub(crate) fn finish_stats_auth(
         .chain(frontends.iter_mut().map(|p| (&p.name, &mut p.stats)))
         .chain(backends.iter_mut().map(|p| (&p.name, &mut p.stats)));
     for (name, stats) in all {
-        if stats.auth_users.is_empty() && stats.auth_realm.is_none() {
+        let Some(auth) = stats.auth.as_deref_mut() else { continue };
+        if auth.users.is_empty() && auth.realm.is_none() {
             continue;
         }
-        if !stats.http_req_rules.is_empty() {
+        if !auth.http_req_rules.is_empty() {
             return Err(ConfigError::new(
                 0,
                 0,
                 format!("proxy '{name}': stats 'auth'/'realm' and 'http-request' can't be used at the same time."),
             ));
         }
-        if stats.auth_users.is_empty() {
+        if auth.users.is_empty() {
             continue;
         }
         let list = format!(".internal-stats-userlist.{name}");
         register_userlist(Userlist {
             name: list.clone(),
-            users: stats
-                .auth_users
+            users: auth
+                .users
                 .iter()
                 .map(|(u, p)| UserlistUser { name: u.to_string(), password: Some(p.to_string()), password_is_hash: false, groups: Vec::new() })
                 .collect(),
             ..Userlist::default()
         });
-        stats.http_req_rules.push(HttpReqRule {
-            action: HttpReqAction::Auth { realm: stats.auth_realm.as_deref().map(str::to_string) },
+        auth.http_req_rules.push(HttpReqRule {
+            action: HttpReqAction::Auth { realm: auth.realm.as_deref().map(str::to_string) },
             cond: Some(AclCondition {
                 is_if: false,
                 terms: vec![AclTerm { negated: false, name: format!("{{ http_auth({list}) }}") }],

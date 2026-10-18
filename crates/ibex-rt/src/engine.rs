@@ -10665,7 +10665,7 @@ impl EngineDispatcher<'_> {
     /// rule matching serves it (`http_req_get_intercept_rule` over `uri_auth->http_req_rules`).
     /// The condition sees the request line, headers and addresses of the stream.
     fn stats_rules_reply(entry: &mut SessionEntry, proxies: &Proxies, serving: usize) -> bool {
-        let rules = &proxies[serving].stats_config.http_req_rules;
+        let rules = proxies[serving].stats_config.http_req_rules();
         if rules.is_empty() {
             return false;
         }
@@ -11006,29 +11006,6 @@ impl EngineDispatcher<'_> {
                     send_proxy_reply(&mut entry.sess, proxies, proxy_idx, proxy_idx, MONITOR_URI_RESPONSE);
                 }
                 return None;
-            }
-        }
-
-        // Serve the stats page before anything else routes this request.
-        //
-        // This dispatch was dropped when the action-rule engine was wired in, leaving
-        // `is_stats_request` and `handle_stats_request` orphaned -- clippy flagged both
-        // as never used. The effect was that every request to `stats uri` fell through
-        // to normal backend routing and returned 503, so the stats page and the whole
-        // web admin stopped working.
-        if resume.is_none()
-            && (proxies[proxy_idx].stats_config.enable
-                || proxies[proxy_idx].stats_config.uri.is_some()
-                || proxies[proxy_idx].stats_config.admin)
-        {
-            let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
-            let configured_uri = proxies[proxy_idx].stats_config.uri.as_deref();
-            if Self::is_stats_request(req_uri, configured_uri)
-                || (proxies[proxy_idx].servers.is_empty()
-                    && proxies[proxy_idx].default_backend.is_none()
-                    && proxies[proxy_idx].use_backends.is_empty())
-            {
-                return Self::handle_stats_request(entry, proxies, checks, pid, now, proxy_idx);
             }
         }
 
@@ -11774,6 +11751,31 @@ impl EngineDispatcher<'_> {
                 // Held for the body: back here when it is.
                 Ok(RuleFlow::Suspend) => return None,
                 Ok(RuleFlow::Next) => {}
+            }
+        }
+
+        // Serve the stats page once the frontend's `http-request` rules have accepted the
+        // request, as `http_process_req_common` does (a `deny` blocks the page, a `set-path`
+        // moves the request onto or off the stats URI); before any backend is chosen.
+        //
+        // This dispatch was dropped when the action-rule engine was wired in, leaving
+        // `is_stats_request` and `handle_stats_request` orphaned -- clippy flagged both
+        // as never used. The effect was that every request to `stats uri` fell through
+        // to normal backend routing and returned 503, so the stats page and the whole
+        // web admin stopped working.
+        if !resume_be
+            && (proxies[proxy_idx].stats_config.enable
+                || proxies[proxy_idx].stats_config.uri.is_some()
+                || proxies[proxy_idx].stats_config.admin)
+        {
+            let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
+            let configured_uri = proxies[proxy_idx].stats_config.uri.as_deref();
+            if Self::is_stats_request(req_uri, configured_uri)
+                || (proxies[proxy_idx].servers.is_empty()
+                    && proxies[proxy_idx].default_backend.is_none()
+                    && proxies[proxy_idx].use_backends.is_empty())
+            {
+                return Self::handle_stats_request(entry, proxies, checks, pid, now, proxy_idx);
             }
         }
 

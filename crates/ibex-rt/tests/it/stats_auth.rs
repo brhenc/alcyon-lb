@@ -39,13 +39,14 @@ fn b64(s: &str) -> String {
 /// Loads `top` (before the proxies) and the `listen` body `body`, sends `request` and returns
 /// the whole reply.
 fn exchange(top: &str, body: &str, request: &str) -> String {
+    raw(&format!("{top}defaults\n  mode http\n  timeout client 5s\n  timeout connect 5s\n  timeout server 5s\nlisten l\n  bind ADDR\n  stats uri /st\n{body}"), request)
+}
+
+/// Runs the configuration `template` (`ADDR` is the address of its one bind).
+fn raw(template: &str, request: &str) -> String {
     let _one = ONE_ENGINE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let addr = common::reserve_addr();
-    let cfg = parse_str(&format!(
-        "{top}defaults\n  mode http\n  timeout client 5s\n  timeout connect 5s\n  timeout server 5s\n\
-         listen l\n  bind {addr}\n  stats uri /st\n{body}"
-    ))
-    .expect("parse");
+    let cfg = parse_str(&template.replace("ADDR", &addr.to_string())).expect("parse");
     let mut engine = Engine::new(&cfg, 64).expect("engine");
     let mut c = TcpStream::connect(addr).expect("connect");
     c.set_nonblocking(true).unwrap();
@@ -188,4 +189,59 @@ fn version_is_shown_only_with_show_version() {
     assert!(!page("").contains(&format!("version {v}")));
     assert!(page("  stats show-version\n").contains(&format!("<h1>IBEX version {v}</h1>")));
     assert!(!page("  stats show-version\n  stats hide-version\n").contains(&format!("version {v}")));
+}
+
+fn path(top: &str, body: &str, p: &str) -> String {
+    // A server, so that a request off the stats URI is routed, not answered by the page.
+    let body = format!("{body}  server s 127.0.0.1:1\n");
+    status(&exchange(top, &body, &format!("GET {p} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))).to_string()
+}
+
+/// The stats page is served after the proxy's `http-request` rules, never around them
+/// (`http_process_req_common`; every status here measured on HAProxy 3.5-dev8).
+#[test]
+fn the_proxys_http_request_rules_run_before_the_stats_page() {
+    let deny = "  acl trusted src 10.0.0.0/8\n  http-request deny if !trusted\n";
+    assert_eq!(path("", deny, "/st"), "HTTP/1.1 403 Forbidden");
+    assert_eq!(path("", deny, "/x"), "HTTP/1.1 403 Forbidden");
+    assert_eq!(path("", "  http-request redirect location /elsewhere\n", "/st"), "HTTP/1.1 302 Found");
+    assert_eq!(path("", "  http-request return status 202\n", "/st"), "HTTP/1.1 202 Accepted");
+    // The path as the rules left it decides.
+    assert_eq!(path("", "  http-request set-path /st if { path /x }\n", "/x"), "HTTP/1.1 200 OK");
+    assert_eq!(
+        path("", "  http-request set-path /nostats if { path /st }\n  http-request deny if { path /nostats }\n", "/st"),
+        "HTTP/1.1 403 Forbidden"
+    );
+    // `allow` ends the rules; the page follows.
+    let allow = "  http-request allow if { path /st }\n  http-request deny\n";
+    assert_eq!(path("", allow, "/st"), "HTTP/1.1 200 OK");
+    assert_eq!(path("", allow, "/x"), "HTTP/1.1 403 Forbidden");
+}
+
+#[test]
+fn a_backends_stats_page_follows_the_backends_rules_and_the_frontends_page_precedes_use_backend() {
+    let get = |cfg: &str| {
+        status(&raw(
+            &format!("defaults\n  mode http\n  timeout client 5s\n  timeout connect 5s\n  timeout server 5s\n{cfg}"),
+            "GET /st HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        ))
+        .to_string()
+    };
+    assert_eq!(
+        get("frontend f\n  bind ADDR\n  default_backend b\nbackend b\n  http-request deny if { path /st }\n  stats enable\n  stats uri /st\n"),
+        "HTTP/1.1 403 Forbidden"
+    );
+    assert_eq!(
+        get("frontend f\n  bind ADDR\n  use_backend b if { path /st }\n  stats enable\n  stats uri /st\nbackend b\n  http-request deny\n"),
+        "HTTP/1.1 200 OK"
+    );
+}
+
+/// `monitor-uri` answers before any `http-request` rule (measured: 200 for the probe, 403 for
+/// the rest, under `http-request deny`).
+#[test]
+fn monitor_uri_precedes_the_rules() {
+    let m = "  monitor-uri /mon\\n  http-request deny\\n".replace("\\n", "\n");
+    assert_eq!(path("", &m, "/mon"), "HTTP/1.1 200 OK");
+    assert_eq!(path("", &m, "/x"), "HTTP/1.1 403 Forbidden");
 }

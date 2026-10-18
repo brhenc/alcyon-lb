@@ -412,14 +412,8 @@ pub struct StatsConfig {
     pub show_legends: bool,
     pub show_desc: Option<Box<str>>,
     pub show_node: Option<Box<str>>,
-    /// `stats auth <user>:<password>`, in the order written (a repeated user is ignored).
-    pub auth_users: Vec<(Box<str>, Box<str>)>,
-    /// `stats realm`.
-    pub auth_realm: Option<Box<str>>,
-    /// `stats show-version` (and not `hide-version` after it): the page names the build.
-    pub show_version: bool,
-    /// `stats http-request`, then the rule `stats auth` becomes (see `finish_stats_auth`).
-    pub http_req_rules: Vec<HttpReqRule>,
+    /// `stats auth`, `realm`, `show-version` and `http-request`; boxed, as almost no proxy has them.
+    pub auth: Option<Box<StatsAuth>>,
     pub raw_timeouts: TimeoutConfig,
     pub forwardfor: Option<String>,
     /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
@@ -437,13 +431,38 @@ pub struct StatsConfig {
     pub accept_unsafe_response: bool,
 }
 
+/// What `stats auth`, `stats realm`, `stats show-version` and `stats http-request` set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatsAuth {
+    /// `stats auth <user>:<password>`, in the order written (a repeated user is ignored).
+    pub users: Vec<(Box<str>, Box<str>)>,
+    /// `stats realm`.
+    pub realm: Option<Box<str>>,
+    /// `stats show-version` (and not `hide-version` after it): the page names the build.
+    pub show_version: bool,
+    /// `stats http-request`, then the rule `stats auth` becomes (see `finish_stats_auth`).
+    pub http_req_rules: Vec<HttpReqRule>,
+}
+
 impl StatsConfig {
+    /// The `stats http-request` rules, `stats auth`'s included.
+    #[must_use]
+    pub fn http_req_rules(&self) -> &[HttpReqRule] {
+        self.auth.as_deref().map_or(&[], |a| &a.http_req_rules)
+    }
+
+    /// Whether the page names the build (`stats show-version`).
+    #[must_use]
+    pub fn show_version(&self) -> bool {
+        self.auth.as_deref().is_some_and(|a| a.show_version)
+    }
+
     /// What a proxy takes from the `defaults` it follows. HAProxy keeps no `stats auth`,
     /// `realm`, `show-version` or `http-request` of a `defaults` section (measured on 3.5-dev8:
     /// a proxy after `defaults` + `stats auth` serves its page to anyone).
     #[must_use]
     pub fn inherited(&self) -> Self {
-        Self { auth_users: Vec::new(), auth_realm: None, show_version: false, http_req_rules: Vec::new(), ..self.clone() }
+        Self { auth: None, ..self.clone() }
     }
 }
 
