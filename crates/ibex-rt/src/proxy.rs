@@ -1676,7 +1676,8 @@ impl TcpSession {
             // The body is not sent: the head, and the message is over, with the length the
             // head announced for a body that is not there. Held as a body, a HEAD's reply
             // was dropped whole (`skip_head_body`) and the client got nothing.
-            txn::MsgState::Head { left: head_len.min(raw.len()), body: txn::Framing::None }
+            // `raw` is the head alone by now, with `connection: close` in it when that was added.
+            txn::MsgState::Head { left: raw.len(), body: txn::Framing::None }
         } else {
             txn::MsgState::Body(txn::Body::Length(raw.len() as u64))
         };

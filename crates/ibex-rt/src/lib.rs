@@ -48,6 +48,8 @@ pub mod rule_exprs;
 pub mod srv_rt;
 pub mod srv_tls;
 pub mod stats;
+pub mod promex;
+mod promex_tables;
 pub mod statcnt;
 pub mod xprt;
 pub mod stats_html;

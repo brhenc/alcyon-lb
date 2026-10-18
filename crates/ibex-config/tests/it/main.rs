@@ -56,6 +56,7 @@ mod server_keywords;
 mod server_tls;
 mod set_dst_port_retries;
 mod set_timeout_rule;
+mod use_service_prometheus;
 mod ssl_capture_size;
 mod ssl_server_verify;
 mod stats_show_desc_node;

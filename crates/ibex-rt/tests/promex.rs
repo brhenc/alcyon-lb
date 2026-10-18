@@ -1,34 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-// Own binary (T260): installs its own #[global_allocator] (and includes src/promex.rs by path)
-
-pub use ibex_rt::engine;
-pub use ibex_rt::check;
-pub use ibex_rt::globalconn;
-
-#[path = "../src/promex.rs"]
-pub mod promex;
+// Own binary (T260): installs its own #[global_allocator] to count what a scrape allocates.
+// The families, types and label keys against HAProxy are in tests/it/prometheus_exporter.rs.
 
 use ibex_config::ast::{BackendSection, Config, FrontendSection, Mode, Server};
 use ibex_rt::engine::Engine;
-use std::collections::HashMap;
+use ibex_rt::promex::{self, Query};
 use std::time::Duration;
 
-fn parse_prom_metrics(output: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for line in output.lines() {
-        if line.starts_with("# TYPE ") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() == 4 {
-                map.insert(parts[2].to_string(), parts[3].to_string());
-            }
-        }
-    }
-    map
+fn render(engine: &Engine) -> String {
+    let mut out = String::new();
+    promex::render(&engine.proxies, &engine.checks, 1, &Query::default(), &mut out);
+    out
 }
 
-#[test]
-fn differential_test() {
+fn one_server_engine(check: bool) -> Engine {
     let fe = FrontendSection {
         name: "fe_http".into(),
         bind: Some("127.0.0.1:0".parse().unwrap()),
@@ -37,7 +23,8 @@ fn differential_test() {
         clitimeout: Some(Duration::from_secs(5)),
         ..Default::default()
     };
-    
+    let mut srv = Server::new("s1", "127.0.0.1:8080".parse().unwrap());
+    srv.check = check;
     let config = Config {
         frontends: vec![fe],
         backends: vec![BackendSection {
@@ -45,94 +32,27 @@ fn differential_test() {
             mode: Mode::Http,
             contimeout: Some(Duration::from_secs(5)),
             srvtimeout: Some(Duration::from_secs(5)),
-            servers: vec![Server::new("s1", "127.0.0.1:8080".parse().unwrap())],
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-
-    let engine = Engine::new(&config, 64).expect("Engine::new");
-    let stats = promex::StatsSnapshot {
-        proxies: &engine.proxies,
-        checks: &engine.checks,
-        start_time: engine.start_time,
-        pid: 1,
-        total_tasks: 10,
-        run_queue_len: 2,
-        active_conns: 15,
-        max_conns: 1000,
-    };
-    
-    let mut ibex_out = String::new();
-    promex::render(&stats, &mut ibex_out);
-    
-    let ibex_metrics = parse_prom_metrics(&ibex_out);
-
-    // A server without `check` has no check counters: HAProxy leaves the field empty
-    // (stats-proxy.c, ST_I_PX_CHKFAIL/CHKDOWN), prints NaN, and the family takes its type
-    // from that empty value, gauge. Measured with HAProxy 3.5-dev7 (see the oracle file).
-    for family in ["haproxy_server_check_failures_total", "haproxy_server_check_up_down_total"] {
-        let line = format!("{family}{{proxy=\"be_http\",server=\"s1\"}} NaN");
-        assert!(ibex_out.contains(&line), "expected `{line}` in:\n{ibex_out}");
-    }
-    
-    // The oracle, captured from HAProxy and kept with the tests (how: see the file's header).
-    // It was read from /tmp/oracle_metrics.txt, which nothing in the repository wrote, so the
-    // test failed on every machine but the one it was written on.
-    let oracle_str = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/promex_oracle_types.txt"))
-        .expect("read the promex oracle");
-    let oracle_metrics = parse_prom_metrics(&oracle_str);
-    
-    let mut missing_in_ibex = Vec::new();
-    for name in oracle_metrics.keys() {
-        if !ibex_metrics.contains_key(name) {
-            missing_in_ibex.push(name.clone());
-        }
-    }
-    
-    for (name, typ) in &ibex_metrics {
-        assert!(oracle_metrics.contains_key(name), "Ibex invented metric {name} which HAProxy does not have");
-        assert_eq!(oracle_metrics.get(name).unwrap(), typ, "Type mismatch for {name}");
-    }
-    
-    missing_in_ibex.sort();
-    println!("--- Metrics HAProxy emits that Ibex cannot yet: ---");
-    for m in &missing_in_ibex {
-        println!("{m}");
-    }
-    println!("---------------------------------------------------");
-    println!("Ibex emits {} metrics.", ibex_metrics.len());
-    println!("HAProxy emits {} metrics.", oracle_metrics.len());
-}
-
-/// With `check` on the server the counters exist: a number, and the family is a counter
-/// (`ST_I_PX_CHKFAIL`/`CHKDOWN` are `FN_COUNTER` in stats-proxy.c).
-#[test]
-fn check_counters_of_a_checked_server_are_counters() {
-    let mut srv = Server::new("s1", "127.0.0.1:8080".parse().unwrap());
-    srv.check = true;
-    let config = Config {
-        backends: vec![BackendSection {
-            name: "be_http".into(),
-            mode: Mode::Http,
             servers: vec![srv],
             ..Default::default()
         }],
         ..Default::default()
     };
-    let engine = Engine::new(&config, 64).expect("Engine::new");
-    let stats = promex::StatsSnapshot {
-        proxies: &engine.proxies,
-        checks: &engine.checks,
-        start_time: engine.start_time,
-        pid: 1,
-        total_tasks: 0,
-        run_queue_len: 0,
-        active_conns: 0,
-        max_conns: 0,
-    };
-    let mut out = String::new();
-    promex::render(&stats, &mut out);
+    Engine::new(&config, 64).expect("Engine::new")
+}
+
+/// A server without `check` has no check counters: HAProxy leaves the field empty
+/// (stats-proxy.c, ST_I_PX_CHKFAIL/CHKDOWN), prints NaN, and the family takes its type from
+/// that empty value, gauge. Measured with HAProxy 3.5-dev8 built with PROMEX. With `check` the
+/// counters exist: a number, and the family is a counter (`FN_COUNTER`).
+#[test]
+fn check_counters_are_nan_gauges_without_a_check_and_counters_with_one() {
+    let out = render(&one_server_engine(false));
+    for family in ["haproxy_server_check_failures_total", "haproxy_server_check_up_down_total"] {
+        assert!(out.contains(&format!("# TYPE {family} gauge\n")), "{family} in:\n{out}");
+        let line = format!("{family}{{proxy=\"be_http\",server=\"s1\"}} NaN\n");
+        assert!(out.contains(&line), "expected `{line}` in:\n{out}");
+    }
+    let out = render(&one_server_engine(true));
     for family in ["haproxy_server_check_failures_total", "haproxy_server_check_up_down_total"] {
         assert!(out.contains(&format!("# TYPE {family} counter\n")), "{family} type in:\n{out}");
         let line = format!("{family}{{proxy=\"be_http\",server=\"s1\"}} 0\n");
@@ -143,62 +63,40 @@ fn check_counters_of_a_checked_server_are_counters() {
 #[global_allocator]
 static ALLOC: ibex_alloc::CountingAllocator = ibex_alloc::CountingAllocator::new();
 
+/// What a scrape allocates. It was 0 for the hand-written renderer, which printed made-up
+/// values for the proxies (T368 replaced it by the `show stat` rows and the `show info`
+/// pairs, so that a number here is the number there). Now it is the cost of those: a number of
+/// allocations per row and per `show info` field that does not depend on traffic, and none in
+/// the rendering itself once `out` has room. The bound below is generous per row; the count
+/// printed is the measurement.
 #[test]
-fn test_allocations() {
+fn scrape_allocations_are_per_row_and_bounded() {
     let mut frontends = Vec::new();
     let mut backends = Vec::new();
-    for i in 0..100 {
-        frontends.push(FrontendSection {
-            name: format!("fe_{i}"),
-            bind: Some("127.0.0.1:0".parse().unwrap()),
-            mode: Mode::Http,
-            ..Default::default()
-        });
-        
-        let mut servers = Vec::new();
-        for j in 0..600 {
-            servers.push(Server::new(format!("s_{j}"), "127.0.0.1:80".parse().unwrap()));
-        }
-        
-        backends.push(BackendSection {
-            name: format!("be_{i}"),
-            mode: Mode::Http,
-            servers,
-            ..Default::default()
-        });
+    let (n_px, n_srv) = (10usize, 20usize);
+    for i in 0..n_px {
+        frontends.push(FrontendSection { name: format!("fe_{i}"), bind: Some("127.0.0.1:0".parse().unwrap()), mode: Mode::Http, ..Default::default() });
+        let servers = (0..n_srv).map(|j| Server::new(format!("s_{j}"), "127.0.0.1:80".parse().unwrap())).collect();
+        backends.push(BackendSection { name: format!("be_{i}"), mode: Mode::Http, servers, ..Default::default() });
     }
-    
-    let config = Config {
-        frontends,
-        backends,
-        ..Default::default()
-    };
-    
-    let engine = Engine::new(&config, 64).expect("Engine::new");
-    let stats = promex::StatsSnapshot {
-        proxies: &engine.proxies,
-        checks: &engine.checks,
-        start_time: engine.start_time,
-        pid: 1,
-        total_tasks: 10,
-        run_queue_len: 2,
-        active_conns: 15,
-        max_conns: 1000,
-    };
-    
-    let mut out = String::with_capacity(10 * 1024 * 1024);
-    
-    // warmup
-    promex::render(&stats, &mut out);
+    let engine = Engine::new(&Config { frontends, backends, ..Default::default() }, 64).expect("Engine::new");
+    let mut out = String::with_capacity(8 * 1024 * 1024);
+    promex::render(&engine.proxies, &engine.checks, 1, &Query::default(), &mut out); // warm up
     out.clear();
-    
     let before = ibex_alloc::alloc_counters();
-    promex::render(&stats, &mut out);
-    let after = ibex_alloc::alloc_counters();
-    
-    let diff = before.diff(&after);
-    println!("Allocations: {} allocs, {} bytes", diff.alloc_count, diff.bytes_allocated);
-    assert_eq!(diff.alloc_count, 0, "rendering must not allocate");
+    promex::render(&engine.proxies, &engine.checks, 1, &Query::default(), &mut out);
+    let diff = before.diff(&ibex_alloc::alloc_counters());
+    let rows = n_px * (n_srv + 2);
+    println!("Allocations: {} allocs, {} bytes, for {rows} rows ({} per row)", diff.alloc_count, diff.bytes_allocated, diff.alloc_count / rows);
+    assert!(diff.alloc_count < rows * 600 + 2000, "a scrape allocates per row, not more: {} allocs", diff.alloc_count);
+    // Only the process section, which a memory-only scrape asks for, is cheap and constant.
+    let q = promex::parse_query("/metrics?scope=global").expect("query");
+    out.clear();
+    let before = ibex_alloc::alloc_counters();
+    promex::render(&engine.proxies, &engine.checks, 1, &q, &mut out);
+    let diff = before.diff(&ibex_alloc::alloc_counters());
+    println!("scope=global: {} allocs, {} bytes", diff.alloc_count, diff.bytes_allocated);
+    assert!(diff.alloc_count < 200, "scope=global: {} allocs", diff.alloc_count);
 }
 
 fn failing_pool() -> Option<ibex_alloc::PoolHead> {
@@ -234,20 +132,7 @@ fn memory_metrics_and_pool_failed() {
     assert!(info.lines().any(|l| l == "Memmax_MB: 64"), "{info}");
     assert!(info.lines().any(|l| l == "Memmax_bytes: 67108864"), "{info}");
 
-    let config = Config::default();
-    let engine = Engine::new(&config, 64).expect("Engine::new");
-    let stats = promex::StatsSnapshot {
-        proxies: &engine.proxies,
-        checks: &engine.checks,
-        start_time: engine.start_time,
-        pid: 1,
-        total_tasks: 0,
-        run_queue_len: 0,
-        active_conns: 0,
-        max_conns: 0,
-    };
-    let mut out = String::new();
-    promex::render(&stats, &mut out);
+    let out = render(&Engine::new(&Config::default(), 64).expect("Engine::new"));
     for (name, ty, help, value) in [
         ("haproxy_process_max_memory_bytes", "gauge", "Worker process's hard limit on memory usage in bytes (-m on command line)", "67108864"),
         ("haproxy_process_pool_allocated_bytes", "gauge", "Amount of memory allocated in pools (in bytes)", ""),

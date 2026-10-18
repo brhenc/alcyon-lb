@@ -4295,6 +4295,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let log_targets = resolve_log_targets(config, &mut []);
 
         let start_time = Instant::now();
+        crate::stats::note_process_start(start_time);
         let now = Tick(1);
         
         let checks = if worker_id == 0 {
@@ -5018,6 +5019,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let pid = self.pid;
         let total_tasks = self.scheduler.live_tasks();
         let run_queue_len = self.scheduler.run_queue_len();
+        crate::stats::note_sched(total_tasks, run_queue_len);
 
         let mut timer_updates = std::mem::take(&mut self.timer_updates);
         timer_updates.clear();
@@ -10902,6 +10904,7 @@ impl EngineDispatcher<'_> {
                 if matches!(
                     rule.action,
                     ibex_config::HttpReqAction::Return { .. }
+                        | ibex_config::HttpReqAction::UseServicePrometheus
                         | ibex_config::HttpReqAction::Deny { .. }
                         | ibex_config::HttpReqAction::Allow
                         | ibex_config::HttpReqAction::Auth { .. }
@@ -10929,6 +10932,17 @@ impl EngineDispatcher<'_> {
                             }
                         };
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &full_resp);
+                        return Ok(RuleFlow::Replied);
+                    }
+                    // `use-service prometheus-exporter`: the metrics page answers the request and
+                    // no later rule runs (`ACT_RET_STOP`). This is where the configuration
+                    // keyword reaches `promex::scrape_reply`.
+                    ibex_config::HttpReqAction::UseServicePrometheus => {
+                        sess.log.applet = true;
+                        let uri = sess.req_uri.clone().unwrap_or_default();
+                        let method = sess.req_method.clone().unwrap_or_default();
+                        let reply = crate::promex::scrape_reply(&proxies[..], &*checks, pid, &method, &uri, false);
+                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &reply);
                         return Ok(RuleFlow::Replied);
                     }
                     ibex_config::HttpReqAction::Deny {

@@ -444,6 +444,44 @@ fn worker_id() -> &'static str {
 /// `Listeners`, `TotalBytesOut`, the SSL and compression rates, ...) print 0 where
 /// HAProxy prints a measurement.
 #[allow(clippy::too_many_arguments)]
+/// When the process started, set by the first engine (the one `show info` and the Prometheus
+/// scrape both count `Uptime_sec` from), and the scheduler's task counts as the last pass of
+/// the engine loop saw them: a request rule answering a scrape cannot reach the scheduler.
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static SCHED_TASKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SCHED_RUNQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Records the engine's start time (the first one wins).
+pub fn note_process_start(t: Instant) {
+    let _ = PROCESS_START.set(t);
+}
+
+/// Records the scheduler's `Tasks` and `Run_queue` for [`process_info_pairs`].
+pub fn note_sched(tasks: usize, run_queue: usize) {
+    SCHED_TASKS.store(tasks, std::sync::atomic::Ordering::Relaxed);
+    SCHED_RUNQ.store(run_queue, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `show info` pairs for the Prometheus scrape: the same function as the CLI's, fed from
+/// the proxies' counters and the recorded start time and task counts, so the numbers agree.
+#[must_use]
+pub fn process_info_pairs(proxies: &[Proxy]) -> Vec<(&'static str, String)> {
+    let active_conns: u32 = proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
+    let max_conns: u32 = proxies.iter().map(|p| p.maxconn.get()).sum();
+    let cum_conns: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
+    let cum_reqs: u64 = proxies.iter().filter_map(|p| p.ids.tc.get()).map(|c| c.fe.req_tot.load(std::sync::atomic::Ordering::Relaxed)).sum();
+    show_info_pairs(
+        *PROCESS_START.get_or_init(Instant::now),
+        std::process::id(),
+        SCHED_TASKS.load(std::sync::atomic::Ordering::Relaxed),
+        SCHED_RUNQ.load(std::sync::atomic::Ordering::Relaxed),
+        active_conns,
+        max_conns,
+        cum_conns,
+        cum_reqs,
+    )
+}
+
 fn show_info_pairs(
     start_time: Instant,
     pid: u32,
@@ -631,7 +669,7 @@ fn balance_name(proxy: &Proxy) -> &'static str {
     }
 }
 
-fn write_frontend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u32, iid: u32) {
+pub(crate) fn write_frontend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u32, iid: u32) {
     let c = proxy.ids.tc.get().map_or(&*EMPTY, |p| &p.fe);
     let http = proxy.mode == ibex_config::Mode::Http;
     let mut r = StatRow::new();
@@ -683,7 +721,7 @@ fn write_frontend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u3
     r.emit(out, fmt);
 }
 
-fn write_server_row(
+pub(crate) fn write_server_row(
     out: &mut String,
     fmt: StatFormat,
     proxy: &Proxy,
@@ -807,7 +845,7 @@ fn write_server_row(
     r.emit(out, fmt);
 }
 
-fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u32, iid: u32) {
+pub(crate) fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u32, iid: u32) {
     use std::sync::atomic::Ordering::Relaxed;
     let c = proxy.ids.tc.get().map_or(&*EMPTY, |p| &p.be);
     let http = proxy.mode == ibex_config::Mode::Http;

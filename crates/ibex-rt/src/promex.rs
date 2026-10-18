@@ -1,646 +1,495 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-use crate::check::{ServerCheckState, ServerStatus};
-use crate::engine::Proxy;
-use std::fmt::Write;
-use std::time::Instant;
+//! The Prometheus exporter, `http-request use-service prometheus-exporter` (T368).
+//!
+//! HAProxy's `addons/promex/service-prometheus.c` walks the stats columns and prints each one
+//! that has a Prometheus name, for every frontend, backend and server. This does the same
+//! over the same sources as the CLI: the process section is `show info`
+//! ([`crate::stats::process_info_pairs`]: memory, pools, `Memmax`, connections) and the
+//! proxy sections are `show stat` rows, so a number here is the number there. A column
+//! Ibex does not track (the per-connection-pool gauges, `lastsess`, the byte counters by
+//! direction, the aggregate check states, agent checks) has no family: it is left out, not
+//! printed as 0 (docs/differences.md lists them). The names, types and HELP texts are in
+//! `promex_tables.rs`, generated from a HAProxy 3.5-dev8 built with `USE_PROMEX=1`.
+//!
+//! A scrape allocates: the `show info` pairs and one `show stat` CSV with its field offsets
+//! (what `show stat` itself costs), in a handful of buffers whose number does not depend on
+//! the traffic. The rendering into the caller's `String` allocates nothing once that has
+//! room.
 
-pub struct StatsSnapshot<'a> {
-    pub proxies: &'a [Proxy],
-    pub checks: &'a [ServerCheckState],
-    pub start_time: Instant,
-    pub pid: u32,
-    pub total_tasks: usize,
-    pub run_queue_len: usize,
-    pub active_conns: u32,
-    pub max_conns: u32,
+use crate::check::ServerCheckState;
+use crate::engine::Proxy;
+use crate::promex_tables::{Metric, BACK, FRONT, PROCESS, SRV};
+use std::collections::HashMap;
+use std::fmt::Write;
+use std::sync::LazyLock;
+
+pub const SCOPE_GLOBAL: u8 = 1;
+pub const SCOPE_FRONT: u8 = 2;
+pub const SCOPE_BACK: u8 = 4;
+pub const SCOPE_SERVER: u8 = 8;
+/// Accepted (`scope=listener`), nothing in it: Ibex has no per-listener stats.
+pub const SCOPE_LISTENER: u8 = 16;
+/// `scope=resolvers`: accepted, nothing in it: Ibex has no resolvers section to count.
+pub const SCOPE_RESOLVERS: u8 = 32;
+pub const SCOPE_ALL: u8 = 63;
+
+/// What the request's query string asked for (`promex_parse_uri`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Query {
+    pub scopes: u8,
+    /// `no-maint`: servers in maintenance are left out.
+    pub no_maint: bool,
+    /// `desc-labels`: a `desc` label on what has a `description`.
+    pub desc_labels: bool,
+    /// `metrics=a,-b`: the full names asked for / refused. Empty `include` with
+    /// `include_by_default` means everything not excluded.
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub include_by_default: bool,
 }
 
-pub fn render(stats: &StatsSnapshot, out: &mut String) {
-    out.push_str("# HELP haproxy_process_relative_process_id Relative worker process number (1)\n");
-    out.push_str("# TYPE haproxy_process_relative_process_id gauge\n");
-    let _ = writeln!(out, "haproxy_process_relative_process_id {}", stats.pid);
-
-    out.push_str("# HELP haproxy_process_uptime_seconds How long ago this worker process was started (seconds)\n");
-    out.push_str("# TYPE haproxy_process_uptime_seconds gauge\n");
-    let _ = writeln!(
-        out,
-        "haproxy_process_uptime_seconds {}",
-        stats.start_time.elapsed().as_secs()
-    );
-
-    out.push_str("# HELP haproxy_process_max_connections Hard limit on the number of per-process connections (configured or imposed by Ulimit-n)\n");
-    out.push_str("# TYPE haproxy_process_max_connections gauge\n");
-    let _ = writeln!(out, "haproxy_process_max_connections {}", stats.max_conns);
-
-    out.push_str("# HELP haproxy_process_hard_max_connections Hard limit on the number of per-process connections (imposed by Memmax_MB or Ulimit-n)\n");
-    out.push_str("# TYPE haproxy_process_hard_max_connections gauge\n");
-    let _ = writeln!(
-        out,
-        "haproxy_process_hard_max_connections {}",
-        stats.max_conns
-    );
-
-    // Memory (src/stats.c:106-112): Memmax_bytes is a u32 in HAProxy, so it wraps above 4095 MB.
-    out.push_str("# HELP haproxy_process_max_memory_bytes Worker process's hard limit on memory usage in bytes (-m on command line)\n");
-    out.push_str("# TYPE haproxy_process_max_memory_bytes gauge\n");
-    let _ = writeln!(out, "haproxy_process_max_memory_bytes {}", crate::globalconn::memmax_mb().wrapping_mul(1_048_576));
-
-    let (mut pool_alloc, mut pool_used, mut pool_failures) = (0u64, 0u64, 0u64);
-    ibex_alloc::global_pool_registry().for_each(|p| {
-        pool_alloc += p.alloc_bytes as u64;
-        pool_used += (p.used * p.size) as u64;
-        pool_failures += p.failures as u64;
-    });
-    out.push_str("# HELP haproxy_process_pool_allocated_bytes Amount of memory allocated in pools (in bytes)\n");
-    out.push_str("# TYPE haproxy_process_pool_allocated_bytes gauge\n");
-    let _ = writeln!(out, "haproxy_process_pool_allocated_bytes {pool_alloc}");
-
-    out.push_str("# HELP haproxy_process_pool_used_bytes Amount of pool memory currently used (in bytes)\n");
-    out.push_str("# TYPE haproxy_process_pool_used_bytes gauge\n");
-    let _ = writeln!(out, "haproxy_process_pool_used_bytes {pool_used}");
-
-    out.push_str("# HELP haproxy_process_pool_failures_total Number of failed pool allocations since this worker was started\n");
-    out.push_str("# TYPE haproxy_process_pool_failures_total counter\n");
-    let _ = writeln!(out, "haproxy_process_pool_failures_total {pool_failures}");
-
-    out.push_str("# HELP haproxy_process_current_connections Current number of connections on this worker process\n");
-    out.push_str("# TYPE haproxy_process_current_connections gauge\n");
-    let _ = writeln!(
-        out,
-        "haproxy_process_current_connections {}",
-        stats.active_conns
-    );
-
-    out.push_str("# HELP haproxy_process_current_tasks Total number of tasks in the current worker process (active + sleeping)\n");
-    out.push_str("# TYPE haproxy_process_current_tasks gauge\n");
-    let _ = writeln!(out, "haproxy_process_current_tasks {}", stats.total_tasks);
-
-    out.push_str("# HELP haproxy_process_current_run_queue Total number of active tasks+tasklets in the current worker process\n");
-    out.push_str("# TYPE haproxy_process_current_run_queue gauge\n");
-    let _ = writeln!(
-        out,
-        "haproxy_process_current_run_queue {}",
-        stats.run_queue_len
-    );
-
-    out.push_str("# HELP haproxy_frontend_current_sessions Number of current sessions on the frontend, backend or server\n");
-    out.push_str("# TYPE haproxy_frontend_current_sessions gauge\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_frontend_current_sessions{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()
-        );
+impl Default for Query {
+    fn default() -> Self {
+        Query { scopes: SCOPE_ALL, no_maint: false, desc_labels: false, include: Vec::new(), exclude: Vec::new(), include_by_default: true }
     }
+}
 
-    out.push_str("# HELP haproxy_frontend_max_sessions Highest value of current sessions encountered since process started\n");
-    out.push_str("# TYPE haproxy_frontend_max_sessions gauge\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_frontend_max_sessions{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.max_conn.load(std::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0)
-        );
+/// `url_decode(.., 1)`: `%XX` and `+`; `None` on a bad escape.
+fn url_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let h = b.get(i + 1..i + 3)?;
+                let v = u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?;
+                out.push(v);
+                i += 2;
+            }
+            c => out.push(c),
+        }
+        i += 1;
     }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
 
-    out.push_str(
-        "# HELP haproxy_frontend_sessions_total Total number of sessions since process started\n",
-    );
-    out.push_str("# TYPE haproxy_frontend_sessions_total counter\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_frontend_sessions_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
-        );
-    }
-
-    out.push_str("# HELP haproxy_frontend_bytes_in_total Total number of request bytes since process started\n");
-    out.push_str("# TYPE haproxy_frontend_bytes_in_total counter\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_frontend_bytes_in_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
-        );
-    }
-
-    out.push_str("# HELP haproxy_frontend_bytes_out_total Total number of response bytes since process started\n");
-    out.push_str("# TYPE haproxy_frontend_bytes_out_total counter\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_frontend_bytes_out_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
-        );
-    }
-
-    out.push_str("# HELP haproxy_frontend_requests_denied_total Total number of denied requests since process started\n");
-    out.push_str("# TYPE haproxy_frontend_requests_denied_total counter\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_frontend_requests_denied_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
-        );
-    }
-
-    out.push_str("# HELP haproxy_frontend_responses_denied_total Total number of denied responses since process started\n");
-    out.push_str("# TYPE haproxy_frontend_responses_denied_total counter\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_frontend_responses_denied_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
-        );
-    }
-
-    out.push_str("# HELP haproxy_frontend_denied_connections_total Total number of incoming connections blocked on a listener/frontend by a tcp-request connection rule since the worker process started\n");
-    out.push_str("# TYPE haproxy_frontend_denied_connections_total counter\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_frontend_denied_connections_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.denied_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
-        );
-    }
-
-    out.push_str("# HELP haproxy_frontend_limit_sessions Frontend/listener/server's maxconn, backend's fullconn\n");
-    out.push_str("# TYPE haproxy_frontend_limit_sessions gauge\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_frontend_limit_sessions{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.maxconn
-        );
-    }
-
-    out.push_str(
-        "# HELP haproxy_frontend_status Current status of the service, per state label value.\n",
-    );
-    out.push_str("# TYPE haproxy_frontend_status gauge\n");
-    for proxy in stats.proxies {
-        let _ = write!(out, "haproxy_frontend_status{{{{proxy=\"{0}\",state=\"DOWN\"}}}} 0\nhaproxy_frontend_status{{{{proxy=\"{0}\",state=\"UP\"}}}} 1\n", proxy.name);
-    }
-
-    out.push_str("# HELP haproxy_backend_current_sessions Number of current sessions on the frontend, backend or server\n");
-    out.push_str("# TYPE haproxy_backend_current_sessions gauge\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_backend_current_sessions{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()
-        );
-    }
-
-    out.push_str("# HELP haproxy_backend_max_sessions Highest value of current sessions encountered since process started\n");
-    out.push_str("# TYPE haproxy_backend_max_sessions gauge\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_backend_max_sessions{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.max_conn.load(std::sync::atomic::Ordering::Relaxed)).max().unwrap_or(0)
-        );
-    }
-
-    out.push_str(
-        "# HELP haproxy_backend_sessions_total Total number of sessions since process started\n",
-    );
-    out.push_str("# TYPE haproxy_backend_sessions_total counter\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_backend_sessions_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
-        );
-    }
-
-    out.push_str("# HELP haproxy_backend_bytes_in_total Total number of request bytes since process started\n");
-    out.push_str("# TYPE haproxy_backend_bytes_in_total counter\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_backend_bytes_in_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
-        );
-    }
-
-    out.push_str("# HELP haproxy_backend_bytes_out_total Total number of response bytes since process started\n");
-    out.push_str("# TYPE haproxy_backend_bytes_out_total counter\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_backend_bytes_out_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
-        );
-    }
-
-    out.push_str("# HELP haproxy_backend_requests_denied_total Total number of denied requests since process started\n");
-    out.push_str("# TYPE haproxy_backend_requests_denied_total counter\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_backend_requests_denied_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
-        );
-    }
-
-    out.push_str("# HELP haproxy_backend_responses_denied_total Total number of denied responses since process started\n");
-    out.push_str("# TYPE haproxy_backend_responses_denied_total counter\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_backend_responses_denied_total{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()
-        );
-    }
-
-    out.push_str("# HELP haproxy_backend_active_servers Total number of active UP servers with a non-zero weight\n");
-    out.push_str("# TYPE haproxy_backend_active_servers gauge\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_backend_active_servers{{proxy=\"{0}\"}} {1}",
-            proxy.name, 1
-        );
-    }
-
-    out.push_str("# HELP haproxy_backend_backup_servers Total number of backup UP servers with a non-zero weight\n");
-    out.push_str("# TYPE haproxy_backend_backup_servers gauge\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_backend_backup_servers{{proxy=\"{0}\"}} {1}",
-            proxy.name, 0
-        );
-    }
-
-    out.push_str("# HELP haproxy_backend_weight Server's effective weight, or sum of active servers' effective weights for a backend\n");
-    out.push_str("# TYPE haproxy_backend_weight gauge\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_backend_weight{{proxy=\"{0}\"}} {1}",
-            proxy.name, 1
-        );
-    }
-
-    out.push_str("# HELP haproxy_backend_limit_sessions Frontend/listener/server's maxconn, backend's fullconn\n");
-    out.push_str("# TYPE haproxy_backend_limit_sessions gauge\n");
-    for proxy in stats.proxies {
-        let _ = writeln!(
-            out,
-            "haproxy_backend_limit_sessions{{proxy=\"{0}\"}} {1}",
-            proxy.name, proxy.maxconn
-        );
-    }
-
-    out.push_str(
-        "# HELP haproxy_backend_status Current status of the service, per state label value.\n",
-    );
-    out.push_str("# TYPE haproxy_backend_status gauge\n");
-    for proxy in stats.proxies {
-        let _ = write!(out, "haproxy_backend_status{{{{proxy=\"{0}\",state=\"DOWN\"}}}} 0\nhaproxy_backend_status{{{{proxy=\"{0}\",state=\"UP\"}}}} 1\n", proxy.name);
-    }
-
-    out.push_str("# HELP haproxy_server_current_sessions Number of current sessions on the frontend, backend or server\n");
-    out.push_str("# TYPE haproxy_server_current_sessions gauge\n");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
-            } else {
-                "srv"
-            };
-            let _check_state = stats
-                .checks
-                .iter()
-                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-            let _ = writeln!(
-                out,
-                "haproxy_server_current_sessions{{proxy=\"{0}\",server=\"{1}\"}} {2}",
-                proxy.name,
-                srv_name,
-                proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0)
-            );
+/// Reads the query string of `uri`. `None` is HAProxy's `400`: a `scope` with no value or a
+/// scope that does not exist, a bad escape, a value holding a second `=`.
+#[must_use]
+pub fn parse_query(uri: &str) -> Option<Query> {
+    let mut q = Query::default();
+    let Some((_, qs)) = uri.split_once('?') else { return Some(q) };
+    let qs = qs.split('#').next().unwrap_or("");
+    let mut scope_seen = false;
+    for part in qs.split('&') {
+        let (k, v) = match part.split_once('=') {
+            Some((k, v)) => (k, Some(v)),
+            None => (part, None),
+        };
+        if v.is_some_and(|v| v.contains('=')) {
+            return None;
+        }
+        let key = url_decode(k)?;
+        let val = match v {
+            Some(v) => Some(url_decode(v)?),
+            None => None,
+        };
+        match key.as_str() {
+            "scope" => {
+                if !scope_seen {
+                    scope_seen = true;
+                    q.scopes = 0;
+                }
+                match val.as_deref()? {
+                    "" => q.scopes = 0,
+                    "*" => q.scopes = SCOPE_ALL,
+                    "global" => q.scopes |= SCOPE_GLOBAL,
+                    "server" => q.scopes |= SCOPE_SERVER,
+                    "backend" => q.scopes |= SCOPE_BACK,
+                    "frontend" => q.scopes |= SCOPE_FRONT,
+                    "listener" => q.scopes |= SCOPE_LISTENER,
+                    "resolvers" => q.scopes |= SCOPE_RESOLVERS,
+                    _ => return None,
+                }
+            }
+            "metrics" => {
+                for m in val?.split(',') {
+                    if let Some(x) = m.strip_prefix('-') {
+                        if !x.is_empty() {
+                            q.exclude.push(x.to_string());
+                        }
+                    } else if !m.is_empty() {
+                        q.include_by_default = false;
+                        q.include.push(m.to_string());
+                    }
+                }
+            }
+            "no-maint" => q.no_maint = true,
+            "desc-labels" => q.desc_labels = true,
+            // `extra-counters` adds the stats modules' counters (`h1`, `h2`, `ssl`, ...),
+            // which Ibex does not count: accepted, and nothing is added.
+            _ => {}
         }
     }
+    Some(q)
+}
 
-    out.push_str("# HELP haproxy_server_max_sessions Highest value of current sessions encountered since process started\n");
-    out.push_str("# TYPE haproxy_server_max_sessions gauge\n");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
-            } else {
-                "srv"
-            };
-            let _check_state = stats
-                .checks
-                .iter()
-                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-            let _ = writeln!(
-                out,
-                "haproxy_server_max_sessions{{proxy=\"{0}\",server=\"{1}\"}} {2}",
-                proxy.name, srv_name, 0
-            );
+impl Query {
+    /// `promex_filter_metric`: is the family `name` refused by `metrics=`?
+    fn refuses(&self, name: &str) -> bool {
+        if self.include.is_empty() && self.exclude.is_empty() {
+            return false;
+        }
+        if self.exclude.iter().any(|e| e == name) {
+            return true;
+        }
+        !self.include.iter().any(|i| i == name) && !self.include_by_default
+    }
+}
+
+fn header(out: &mut String, name: &str, help: &str, ty: &str) {
+    let _ = write!(out, "# HELP {name} {help}\n# TYPE {name} {ty}\n");
+}
+
+fn ty(counter: bool) -> &'static str {
+    if counter {
+        "counter"
+    } else {
+        "gauge"
+    }
+}
+
+/// The value of a `show info` pair as a sample value: a number, or `NaN`.
+fn num(v: &str) -> &str {
+    if v.is_empty() || v.parse::<f64>().is_err() {
+        "NaN"
+    } else {
+        v
+    }
+}
+
+fn render_process(proxies: &[Proxy], q: &Query, out: &mut String) {
+    let pairs = crate::stats::process_info_pairs(proxies);
+    let desc = crate::stats::description();
+    let get = |col: &str| pairs.iter().find(|(k, _)| *k == col).map(|(_, v)| v.as_str());
+    let desc_label = |out: &mut String, first: bool| {
+        if let (Some(d), true) = (desc.as_deref(), q.desc_labels) {
+            let _ = write!(out, "{}desc=\"{d}\"", if first { "" } else { "," });
+        }
+    };
+    for m in PROCESS {
+        if q.refuses(m.name) {
+            continue;
+        }
+        // A column `show info` does not print has no family here.
+        let Some(v) = get(m.col) else { continue };
+        let label_name = match m.name {
+            "haproxy_process_node" => Some("node"),
+            "haproxy_process_worker_id" => Some("worker_id"),
+            "haproxy_process_build_info" => Some("version"),
+            _ => None,
+        };
+        if let Some(l) = label_name {
+            if v.is_empty() {
+                continue;
+            }
+            header(out, m.name, m.help, "gauge");
+            let _ = write!(out, "{}{{{l}=\"{v}\"", m.name);
+            if q.desc_labels {
+                desc_label(out, false);
+            }
+            out.push_str("} 1\n");
+            continue;
+        }
+        header(out, m.name, m.help, ty(m.counter));
+        let _ = write!(out, "{}", m.name);
+        if q.desc_labels && desc.is_some() {
+            out.push('{');
+            desc_label(out, true);
+            out.push('}');
+        }
+        let _ = writeln!(out, " {}", num(v));
+    }
+    if let Some(d) = desc.as_deref() {
+        let name = "haproxy_process_description";
+        if !q.refuses(name) {
+            header(out, name, "Worker process's description string", "gauge");
+            let _ = writeln!(out, "{name}{{desc=\"{d}\"}} 1");
         }
     }
+}
 
-    out.push_str(
-        "# HELP haproxy_server_sessions_total Total number of sessions since process started\n",
-    );
-    out.push_str("# TYPE haproxy_server_sessions_total counter\n");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
-            } else {
-                "srv"
-            };
-            let _check_state = stats
-                .checks
-                .iter()
-                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-            let _ = writeln!(
-                out,
-                "haproxy_server_sessions_total{{proxy=\"{0}\",server=\"{1}\"}} {2}",
-                proxy.name, srv_name, 0
-            );
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Front,
+    Back,
+    Server,
+}
+
+struct Row {
+    p_idx: usize,
+    kind: Kind,
+    /// Index of the row's first field start in `Rows::offs`.
+    off: usize,
+}
+
+/// The `show stat` rows of every proxy, with where each field of each begins.
+struct Rows {
+    csv: String,
+    rows: Vec<Row>,
+    offs: Vec<u32>,
+}
+
+static COLS: LazyLock<HashMap<&'static str, usize>> =
+    LazyLock::new(|| crate::stats::STAT_FIELDS.iter().enumerate().map(|(i, n)| (*n, i)).collect());
+
+impl Rows {
+    fn collect(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) -> Rows {
+        let mut csv = String::with_capacity(4096);
+        let mut rows = Vec::new();
+        let mut offs: Vec<u32> = Vec::new();
+        let mut order: Vec<usize> = (0..proxies.len()).collect();
+        order.sort_by_key(|&i| proxies[i].ids.decl);
+        let mut mark = |csv: &String, p_idx: usize, kind: Kind, from: usize, rows: &mut Vec<Row>, offs: &mut Vec<u32>| {
+            let off = offs.len();
+            offs.push(u32::try_from(from).unwrap_or(u32::MAX));
+            for (i, b) in csv.as_bytes()[from..].iter().enumerate() {
+                if *b == b',' {
+                    offs.push(u32::try_from(from + i + 1).unwrap_or(u32::MAX));
+                }
+            }
+            // The row ends at its LF: the sentinel is one past it, so that the last field
+            // ends where `-1` puts it.
+            offs.push(u32::try_from(csv.len()).unwrap_or(u32::MAX));
+            rows.push(Row { p_idx, kind, off });
+        };
+        for p_idx in order {
+            let proxy = &proxies[p_idx];
+            let iid = proxy.ids.iid;
+            if proxy.has_frontend {
+                let from = csv.len();
+                crate::stats::write_frontend_row(&mut csv, crate::stats_typed::StatFormat::Csv, proxy, pid, iid);
+                mark(&csv, p_idx, Kind::Front, from, &mut rows, &mut offs);
+            }
+            for s_idx in 0..proxy.servers.len() {
+                let from = csv.len();
+                let check = checks.iter().find(|c| c.proxy() == p_idx && c.server() == s_idx);
+                crate::stats::write_server_row(&mut csv, crate::stats_typed::StatFormat::Csv, proxy, s_idx, check, pid, iid, proxy.server_puid(s_idx));
+                mark(&csv, p_idx, Kind::Server, from, &mut rows, &mut offs);
+            }
+            if proxy.has_backend {
+                let from = csv.len();
+                crate::stats::write_backend_row(&mut csv, crate::stats_typed::StatFormat::Csv, proxy, pid, iid);
+                mark(&csv, p_idx, Kind::Back, from, &mut rows, &mut offs);
+            }
         }
+        Rows { csv, rows, offs }
     }
 
-    out.push_str("# HELP haproxy_server_bytes_in_total Total number of request bytes since process started\n");
-    out.push_str("# TYPE haproxy_server_bytes_in_total counter\n");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
-            } else {
-                "srv"
-            };
-            let _check_state = stats
-                .checks
-                .iter()
-                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-            let _ = writeln!(
-                out,
-                "haproxy_server_bytes_in_total{{proxy=\"{0}\",server=\"{1}\"}} {2}",
-                proxy.name, srv_name, 0
-            );
+    /// Field `col` of row `r`; empty when the row has no such column.
+    fn field(&self, r: &Row, col: usize) -> &str {
+        match (self.offs.get(r.off + col), self.offs.get(r.off + col + 1)) {
+            (Some(&a), Some(&b)) if b > a => &self.csv[a as usize..(b as usize).saturating_sub(1).max(a as usize)],
+            _ => "",
         }
     }
+}
 
-    out.push_str("# HELP haproxy_server_bytes_out_total Total number of response bytes since process started\n");
-    out.push_str("# TYPE haproxy_server_bytes_out_total counter\n");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
-            } else {
-                "srv"
-            };
-            let _check_state = stats
-                .checks
-                .iter()
-                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-            let _ = writeln!(
-                out,
-                "haproxy_server_bytes_out_total{{proxy=\"{0}\",server=\"{1}\"}} {2}",
-                proxy.name, srv_name, 0
-            );
-        }
+/// Columns whose value Ibex does not keep: `show stat` prints the default `HAProxy` prints for
+/// an object that saw nothing (`StatRow::default_untracked`), which a scrape must not pass for a
+/// measurement. The families of these columns are not served.
+const UNTRACKED: &[&str] = &[
+    "intercepted",
+    "cache_hint_hits",
+    "agg_server_status",
+    "agg_server_check_status",
+    "agg_check_status",
+    "lastsess",
+    "priv_idle_cur",
+    "srv_icur",
+    "idle_conn_cur",
+    "safe_conn_cur",
+    "used_conn_cur",
+    "need_conn_est",
+    "reqbin",
+    "reqbout",
+    "resbin",
+    "resbout",
+    "check_status",
+    "agent_status",
+    "agent_code",
+    "agent_duration",
+];
+
+/// Columns that exist for an HTTP proxy only (`px->mode != PR_MODE_HTTP` skips them).
+const HTTP_ONLY: &[&str] = &[
+    "req_rate_max",
+    "req_tot",
+    "intercepted",
+    "cache_lookups",
+    "cache_hits",
+    "cache_hint_hits",
+    "comp_in",
+    "comp_out",
+    "comp_byp",
+    "comp_rsp",
+    "hrsp_1xx",
+];
+
+const TIME_AVG: &[&str] = &["qtime", "ctime", "rtime", "ttime", "qt_max", "ct_max", "rt_max", "tt_max", "check_duration"];
+
+/// `UP` / `DOWN` / `MAINT` / `DRAIN` / `NOLB` of a `show stat` status word.
+fn server_state(status: &str) -> &'static str {
+    if status.starts_with("MAINT") {
+        "MAINT"
+    } else if status.starts_with("DRAIN") {
+        "DRAIN"
+    } else if status.starts_with("NOLB") {
+        "NOLB"
+    } else if status.starts_with("UP") {
+        "UP"
+    } else {
+        "DOWN"
     }
+}
 
-    out.push_str("# HELP haproxy_server_responses_denied_total Total number of denied responses since process started\n");
-    out.push_str("# TYPE haproxy_server_responses_denied_total counter\n");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
-            } else {
-                "srv"
-            };
-            let _check_state = stats
-                .checks
-                .iter()
-                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-            let _ = writeln!(
-                out,
-                "haproxy_server_responses_denied_total{{proxy=\"{0}\",server=\"{1}\"}} {2}",
-                proxy.name, srv_name, 0
-            );
+fn render_objects(rows: &Rows, proxies: &[Proxy], table: &[Metric], kind: Kind, q: &Query, out: &mut String) {
+    let status_col = COLS.get("status").copied().unwrap_or(0);
+    for m in table {
+        if q.refuses(m.name) || UNTRACKED.contains(&m.col) {
+            continue;
         }
-    }
-
-    out.push_str("# HELP haproxy_server_weight Server's effective weight, or sum of active servers' effective weights for a backend\n");
-    out.push_str("# TYPE haproxy_server_weight gauge\n");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
-            } else {
-                "srv"
+        let Some(&col) = COLS.get(m.col) else { continue };
+        let mut first = true;
+        for r in rows.rows.iter().filter(|r| r.kind == kind) {
+            let proxy = &proxies[r.p_idx];
+            if HTTP_ONLY.contains(&m.col) && proxy.mode != ibex_config::Mode::Http {
+                continue;
+            }
+            let value = rows.field(r, col);
+            let status = rows.field(r, status_col);
+            if kind == Kind::Server && q.no_maint && status.starts_with("MAINT") {
+                continue;
+            }
+            // A server without a check has no check code, and a check that never ran no duration.
+            let checked = COLS.get("check_status").is_some_and(|&c| !rows.field(r, c).is_empty());
+            if kind == Kind::Server && (m.col == "check_code" && !checked || m.col == "check_duration" && value.is_empty()) {
+                continue;
+            }
+            // `check_code` is 0 for a check that got no layer 5-7 answer (`status < L57DATA`).
+            let value = if m.col == "check_code" && value.is_empty() { "0" } else { value };
+            let pname = rows.field(r, 0);
+            let svname = rows.field(r, 1);
+            let desc = if q.desc_labels { proxy.desc.as_deref() } else { None };
+            let mut labels = String::new();
+            let _ = write!(labels, "proxy=\"{pname}\"");
+            if let Some(d) = desc {
+                let _ = write!(labels, ",desc=\"{d}\"");
+            }
+            if kind == Kind::Server {
+                let _ = write!(labels, ",server=\"{svname}\"");
+            }
+            let head = |out: &mut String, first: &mut bool, counter: bool| {
+                if *first {
+                    header(out, m.name, m.help, ty(counter));
+                    *first = false;
+                }
             };
-            let _check_state = stats
-                .checks
-                .iter()
-                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-            let _ = writeln!(
-                out,
-                "haproxy_server_weight{{proxy=\"{0}\",server=\"{1}\"}} {2}",
-                proxy.name,
-                srv_name,
-                proxy.server_weights.get(s_idx).unwrap_or(1)
-            );
-        }
-    }
-
-    out.push_str(
-        "# HELP haproxy_server_active Total number of active UP servers with a non-zero weight\n",
-    );
-    out.push_str("# TYPE haproxy_server_active gauge\n");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
+            if m.col == "status" {
+                let states: &[&str] = match kind {
+                    Kind::Server => &["DOWN", "UP", "MAINT", "DRAIN", "NOLB"],
+                    _ => &["DOWN", "UP"],
+                };
+                let cur = match kind {
+                    Kind::Server => server_state(status),
+                    Kind::Front => {
+                        if status.starts_with("STOP") {
+                            "DOWN"
+                        } else {
+                            "UP"
+                        }
+                    }
+                    Kind::Back => {
+                        if status.starts_with("UP") {
+                            "UP"
+                        } else {
+                            "DOWN"
+                        }
+                    }
+                };
+                head(out, &mut first, false);
+                for s in states {
+                    let _ = writeln!(out, "{}{{{labels},state=\"{s}\"}} {}", m.name, u8::from(*s == cur));
+                }
+                continue;
+            }
+            if m.col == "hrsp_1xx" {
+                head(out, &mut first, true);
+                for (i, code) in ["1xx", "2xx", "3xx", "4xx", "5xx", "other"].iter().enumerate() {
+                    let c = COLS.get(["hrsp_1xx", "hrsp_2xx", "hrsp_3xx", "hrsp_4xx", "hrsp_5xx", "hrsp_other"][i]).copied().unwrap_or(0);
+                    let _ = writeln!(out, "{}{{{labels},code=\"{code}\"}} {}", m.name, num(rows.field(r, c)));
+                }
+                continue;
+            }
+            // The type of a family is the type of its first value: an empty one (no check
+            // on the first server) makes the family a gauge, as HAProxy prints it.
+            let counter = m.counter && !value.is_empty();
+            head(out, &mut first, counter);
+            if TIME_AVG.contains(&m.col) && !value.is_empty() {
+                let ms: f64 = value.parse().unwrap_or(0.0);
+                let _ = writeln!(out, "{}{{{labels}}} {:.6}", m.name, ms / 1000.0);
             } else {
-                "srv"
-            };
-            let _check_state = stats
-                .checks
-                .iter()
-                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-            let _ = writeln!(
-                out,
-                "haproxy_server_active{{proxy=\"{0}\",server=\"{1}\"}} {2}",
-                proxy.name,
-                srv_name,
-                i32::from(!proxy.server_backups.get(s_idx).copied().unwrap_or(false))
-            );
-        }
-    }
-
-    out.push_str(
-        "# HELP haproxy_server_backup Total number of backup UP servers with a non-zero weight\n",
-    );
-    out.push_str("# TYPE haproxy_server_backup gauge\n");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
-            } else {
-                "srv"
-            };
-            let _check_state = stats
-                .checks
-                .iter()
-                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-            let _ = writeln!(
-                out,
-                "haproxy_server_backup{{proxy=\"{0}\",server=\"{1}\"}} {2}",
-                proxy.name,
-                srv_name,
-                i32::from(proxy.server_backups.get(s_idx).copied().unwrap_or(false))
-            );
-        }
-    }
-
-    write_check_counter(
-        out,
-        stats,
-        "haproxy_server_check_failures_total",
-        "Total number of failed individual health checks per server/backend, since the worker process started",
-        |c| c.failed_checks,
-    );
-    write_check_counter(
-        out,
-        stats,
-        "haproxy_server_check_up_down_total",
-        "Total number of failed checks causing UP to DOWN server transitions, per server/backend, since the worker process started",
-        |c| c.down_transitions,
-    );
-
-    out.push_str("# HELP haproxy_server_limit_sessions Frontend/listener/server's maxconn, backend's fullconn\n");
-    out.push_str("# TYPE haproxy_server_limit_sessions gauge\n");
-    for proxy in stats.proxies.iter() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
-            } else {
-                "srv"
-            };
-            if let Some(m) = proxy.server_maxconn.get(s_idx) {
-                let _ = writeln!(
-                    out,
-                    "haproxy_server_limit_sessions{{proxy=\"{0}\",server=\"{1}\"}} {2}",
-                    proxy.name, srv_name, m
-                );
-            } else {
-                let _ = writeln!(
-                    out,
-                    "haproxy_server_limit_sessions{{proxy=\"{0}\",server=\"{1}\"}} NaN",
-                    proxy.name, srv_name
-                );
+                let _ = writeln!(out, "{}{{{labels}}} {}", m.name, num(value));
             }
         }
     }
+}
 
-    out.push_str(
-        "# HELP haproxy_server_status Current status of the service, per state label value.\n",
-    );
-    out.push_str("# TYPE haproxy_server_status gauge\n");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = if s_idx < proxy.server_ids.len() {
-                &proxy.server_ids[s_idx]
-            } else {
-                "srv"
-            };
-            let _check_state = stats
-                .checks
-                .iter()
-                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-            let is_up = if let Some(c) = _check_state {
-                c.status == ServerStatus::Up
-            } else {
-                proxy
-                    .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up)
-                    == ServerStatus::Up
-            };
-            let is_down = if let Some(c) = _check_state {
-                c.status == ServerStatus::Down
-            } else {
-                proxy
-                    .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up)
-                    == ServerStatus::Down
-            };
-            let _ = writeln!(
-                out,
-                "haproxy_server_status{{{{proxy=\"{0}\",server=\"{1}\",state=\"DOWN\"}}}} {2}",
-                proxy.name,
-                srv_name,
-                i32::from(is_down)
-            );
-            let _ = writeln!(
-                out,
-                "haproxy_server_status{{{{proxy=\"{0}\",server=\"{1}\",state=\"UP\"}}}} {2}",
-                proxy.name,
-                srv_name,
-                i32::from(is_up)
-            );
-            let _ = writeln!(
-                out,
-                "haproxy_server_status{{{{proxy=\"{0}\",server=\"{1}\",state=\"MAINT\"}}}} 0",
-                proxy.name, srv_name
-            );
-            let _ = writeln!(
-                out,
-                "haproxy_server_status{{{{proxy=\"{0}\",server=\"{1}\",state=\"DRAIN\"}}}} 0",
-                proxy.name, srv_name
-            );
-            let _ = writeln!(
-                out,
-                "haproxy_server_status{{{{proxy=\"{0}\",server=\"{1}\",state=\"NOLB\"}}}} 0",
-                proxy.name, srv_name
-            );
+/// Renders a scrape of the proxies, checks and process into `out`.
+pub fn render(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32, q: &Query, out: &mut String) {
+    if q.scopes & SCOPE_GLOBAL != 0 {
+        render_process(proxies, q, out);
+    }
+    if q.scopes & (SCOPE_FRONT | SCOPE_BACK | SCOPE_SERVER) != 0 {
+        let rows = Rows::collect(proxies, checks, pid);
+        if q.scopes & SCOPE_FRONT != 0 {
+            render_objects(&rows, proxies, FRONT, Kind::Front, q, out);
+        }
+        if q.scopes & SCOPE_BACK != 0 {
+            render_objects(&rows, proxies, BACK, Kind::Back, q, out);
+        }
+        if q.scopes & SCOPE_SERVER != 0 {
+            render_objects(&rows, proxies, SRV, Kind::Server, q, out);
         }
     }
 }
 
-
-/// A per-server health-check counter. A server without `check` has none: `HAProxy` leaves
-/// the field empty (`stats-proxy.c`, `ST_I_PX_CHKFAIL`/`ST_I_PX_CHKDOWN`) and prints `NaN`,
-/// and promex types the family by the first value it prints, so the family is a `gauge`
-/// when the first server has no check (measured, HAProxy 3.5-dev7).
-fn write_check_counter(
-    out: &mut String,
-    stats: &StatsSnapshot<'_>,
-    family: &str,
-    help: &str,
-    value: impl Fn(&ServerCheckState) -> u64,
-) {
-    let check = |p_idx: usize, s_idx: usize| {
-        stats.checks.iter().find(|c| c.proxy() == p_idx && c.server() == s_idx)
+/// The reply to a scrape: HAProxy's head (`cache-control: no-cache`, the text exposition
+/// type, chunked) and the body in one chunk. `HEAD` gets the head only; a query string
+/// HAProxy refuses gets its `400`.
+#[must_use]
+pub fn scrape_reply(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32, method: &str, uri: &str, close: bool) -> Vec<u8> {
+    let Some(q) = parse_query(uri) else {
+        return b"HTTP/1.1 400 Bad request\r\ncontent-length: 90\r\ncache-control: no-cache\r\ncontent-type: text/html\r\nconnection: close\r\n\r\n<html><body><h1>400 Bad request</h1>\nYour browser sent an invalid request.\n</body></html>\n".to_vec();
     };
-    let first = stats
-        .proxies
-        .iter()
-        .enumerate()
-        .find(|(_, p)| !p.servers.is_empty())
-        .map(|(p_idx, _)| check(p_idx, 0).is_some());
-    let kind = if first == Some(false) { "gauge" } else { "counter" };
-    let _ = writeln!(out, "# HELP {family} {help}");
-    let _ = writeln!(out, "# TYPE {family} {kind}");
-    for (p_idx, proxy) in stats.proxies.iter().enumerate() {
-        for s_idx in 0..proxy.servers.len() {
-            let srv_name = proxy.server_ids.get(s_idx).map_or("srv", String::as_str);
-            let _ = write!(out, "{family}{{proxy=\"{0}\",server=\"{srv_name}\"}} ", proxy.name);
-            let _ = match check(p_idx, s_idx) {
-                Some(c) => writeln!(out, "{}", value(c)),
-                None => writeln!(out, "NaN"),
-            };
-        }
+    let mut body = String::with_capacity(32 * 1024);
+    render(proxies, checks, pid, &q, &mut body);
+    let mut out = Vec::with_capacity(body.len() + 256);
+    out.extend_from_slice(b"HTTP/1.1 200 OK\r\ncache-control: no-cache\r\ncontent-type: text/plain; version=0.0.4\r\ntransfer-encoding: chunked\r\n");
+    if close {
+        out.extend_from_slice(b"connection: close\r\n");
     }
+    out.extend_from_slice(b"\r\n");
+    if method != "HEAD" {
+        if !body.is_empty() {
+            out.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+            out.extend_from_slice(body.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+    }
+    out
 }

@@ -170,7 +170,7 @@ without it. HAProxy accepts them (when built with the feature).
 
 | family | refused keywords |
 |---|---|
-| Lua | `lua-load`, `lua-load-per-thread`, `lua-prepend-path`, `tune.lua.*`, `http-request` / `http-response` actions `lua.<name>`, `tcp-request ... lua.<name>` ("lua actions require Lua support"), `lua.<name>` fetches and converters in `%[...]`, `use-service` |
+| Lua | `lua-load`, `lua-load-per-thread`, `lua-prepend-path`, `tune.lua.*`, `http-request` / `http-response` actions `lua.<name>`, `tcp-request ... lua.<name>` ("lua actions require Lua support"), `lua.<name>` fetches and converters in `%[...]`, `use-service` as a section keyword and `tcp-request content use-service` (`http-request use-service prometheus-exporter` works, see below) |
 | SPOE and filters | `filter spoe`, `filter compression`, any `filter` line |
 | Compression | `compression algo/type/offload/...` |
 | Peers | `peers` sections, `stick-table ... peers <name>` |
@@ -347,3 +347,39 @@ is refused at load. The two differences:
 
 Of the 72 published vectors in `crates/ibex-sample/testdata/ja4_vectors.txt` (all FoxIO's values,
 all given by `foxio`), only `tls-non-ascii-alpn.pcapng` gives a different string under `spec`.
+
+## `http-request use-service prometheus-exporter` (T368)
+
+Served: `http-request use-service prometheus-exporter [if|unless <cond>]` in a frontend, listen or
+backend, as HAProxy's PROMEX does (the shipped reference binary is built without PROMEX; the
+oracle here was the same source built with `USE_PROMEX=1`). Any other service name is refused
+with HAProxy's message (`'<name>' unknown service name.`). The reply, the families, their types
+and label keys, and the query parameters `scope=` (`global`, `frontend`, `backend`, `server`,
+`listener`, `resolvers`, `*`, empty), `no-maint`, `desc-labels` and `metrics=a,-b` follow
+`addons/promex/service-prometheus.c`; a bad query is its 400.
+
+The numbers come from the CLI's sources: the `haproxy_process_*` families are `show info`
+(pools, `Memmax`, connections, `PoolFailed`), the frontend, backend and server families are
+`show stat` rows, so a value here is the value there. `Tasks` and `Run_queue` are those of the last
+pass of the engine loop (a request rule cannot reach the scheduler).
+
+Left out, because Ibex does not count them (printing 0 would pass a default for a measurement):
+
+| families | why |
+|---|---|
+| `haproxy_{frontend,backend,server}_{req,res}_bytes_{in,out}_total` | bytes by direction are not tracked |
+| `haproxy_server_{idle,private_idle,unsafe_idle,safe_idle,used,need}_connections_current` | no per-server connection pool gauges |
+| `haproxy_{backend,server}_last_session_seconds` | `lastsess` is not tracked |
+| `haproxy_frontend_intercepted_requests_total`, `haproxy_{frontend,backend}_http_cache_hint_hits_total` | not tracked |
+| `haproxy_backend_agg_server_status`, `_agg_server_check_status`, `_agg_check_status`, `haproxy_server_check_status`, `haproxy_server_agent_*` | per-state check/agent aggregates; Ibex has no agent checks |
+| `haproxy_resolver_*` | no resolvers |
+
+Not done: `extra-counters` is accepted and adds nothing (Ibex has no stats-module counters: `h1`,
+`h2`, `ssl`, ...), and `tcp-request content use-service` stays refused (HAProxy refuses it too,
+with another message). With several workers, check columns are those of the worker that answers
+the scrape (the same as `show stat`).
+
+A scrape allocates, unlike the hand-written renderer it replaced: about 117 allocations per proxy,
+server or backend row (the `show stat` rows) and 84 for the process section, none that grow with
+traffic (`crates/ibex-rt/tests/promex.rs` prints them). `scope=global` alone is the cheap
+memory-only scrape.
