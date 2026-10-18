@@ -20,7 +20,6 @@ use ibex_proto::endpoint::ScState;
 use ibex_proto::htx::HtxBlock;
 use ibex_proto::mux_h2::H2MuxContext;
 use std::os::fd::AsFd;
-use std::time::Instant;
 
 /// A stream taken from the mux to be served: everything its transaction starts from.
 pub struct H2Dispatch {
@@ -107,7 +106,7 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) {
     if sess.keep_request_line {
         sess.log.request_line = d.request_line;
     }
-    sess.log.request = Some(Instant::now());
+    sess.log.request = Some(crate::txnlog::loop_now());
     let wire_req_buf: Vec<u8>;
     let wire_req: &[u8] = if chunked {
         let at = find_eoh(&d.head).map_or(d.head.len(), |(h, _)| h);
@@ -286,7 +285,7 @@ pub fn abort_reset_stream(sess: &mut TcpSession) -> bool {
             raw::abort_with_rst(srv.as_fd());
         }
         if sess.queue.take().is_some() {
-            sess.log.queue.get_or_insert_with(Instant::now);
+            sess.log.queue.get_or_insert_with(crate::txnlog::loop_now);
             sess.log.term = Some(*b"CQ");
         } else if txn.local {
             // A reply of the proxy's own keeps the status and ending it was given.

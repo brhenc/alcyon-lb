@@ -85,13 +85,30 @@ pub fn server_slot(idx: usize) -> Option<std::num::NonZeroU32> {
     std::num::NonZeroU32::new(u32::try_from(idx).ok()?.checked_add(1)?)
 }
 
+thread_local! {
+    /// The loop's clock for this pass (`now_ns`, refreshed by `clock_update_date` after the poller).
+    static LOOP_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sets the thread's clock for the pass that is starting (once per loop iteration, after the poller).
+pub fn set_loop_now(t: Instant) {
+    LOOP_NOW.with(|c| c.set(Some(t)));
+}
+
+/// The time every log timer is stamped from: the loop's per-iteration clock, as `HAProxy`'s
+/// `now_ns`, so two events of one pass carry one timestamp. A clock read where no loop runs.
+#[must_use]
+pub fn loop_now() -> Instant {
+    LOOP_NOW.with(std::cell::Cell::get).unwrap_or_else(Instant::now)
+}
+
 impl StreamLog {
     /// A stream starting now, on a session whose counters read `bytes_in`/`bytes_out`.
     #[must_use]
     pub fn start(bytes_in: u64, bytes_out: u64) -> StreamLog {
         let date = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         StreamLog {
-            start: Instant::now(),
+            start: loop_now(),
             date: (i64::try_from(date.as_secs()).unwrap_or(0), date.subsec_millis()),
             first_byte: None,
             request: None,
@@ -127,7 +144,7 @@ impl StreamLog {
 
     /// Records the first request byte, once.
     pub fn first_byte_now(&mut self) {
-        self.first_byte.get_or_insert_with(Instant::now);
+        self.first_byte.get_or_insert_with(loop_now);
     }
 
     /// `%ts`: the cause and the phase the stream ended in (`sess_term_cond`,

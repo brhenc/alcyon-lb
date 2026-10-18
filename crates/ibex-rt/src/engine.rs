@@ -2774,7 +2774,7 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         t_queue: l.ms(l.queue),
         t_connect: l.ms(l.connect),
         t_data: l.ms(l.data),
-        t_close: if l.asap_done || fe.log_opts & ibex_config::LOG_OPT_ASAP != 0 { l.ms(l.data.or(Some(std::time::Instant::now()))) } else { l.ms(Some(std::time::Instant::now())) },
+        t_close: if l.asap_done || fe.log_opts & ibex_config::LOG_OPT_ASAP != 0 { l.ms(l.data.or(Some(crate::txnlog::loop_now()))) } else { l.ms(Some(crate::txnlog::loop_now())) },
         plus: fe.log_opts & ibex_config::LOG_OPT_ASAP != 0,
         status: stream_status(s),
         bytes_out: stream_bytes_out(s),
@@ -2834,7 +2834,7 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     let tw = if t_queue >= 0 { t_queue - t_request } else { -1 };
     let tc = if t_connect >= 0 { t_connect - t_queue } else { -1 };
     let tr = if t_data >= 0 { t_data - t_connect } else { -1 };
-    let ta = l.ms(Some(std::time::Instant::now()));
+    let ta = l.ms(Some(crate::txnlog::loop_now()));
     let answered = entry.sess.log.data.is_some();
     let srv_idx = entry.target_server_idx.filter(|_| routed);
     let be_idx = entry.backend_idx;
@@ -4731,7 +4731,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// Computes the current monotonic tick.
     #[must_use]
     pub fn current_tick(&self) -> Tick {
-        let elapsed = self.start_time.elapsed();
+        self.tick_at(Instant::now())
+    }
+
+    /// The tick of an instant already read (the loop's clock for the pass).
+    fn tick_at(&self, at: Instant) -> Tick {
+        let elapsed = at.saturating_duration_since(self.start_time);
         let ms = u32::try_from(elapsed.as_millis() & 0xFFFF_FFFF).unwrap_or(u32::MAX);
         Tick(if ms == 0 { 1 } else { ms })
     }
@@ -5010,7 +5015,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // otherwise have its deadlines early by the time the engine was idle (up to the 100
         // ms poll bound). One clock read per loop pass, as HAProxy's `tv_update_date` after
         // its poller. The timers that expired during the wait are woken by it too.
-        let now = self.current_tick();
+        let pass_start = Instant::now();
+        crate::txnlog::set_loop_now(pass_start);
+        let now = self.tick_at(pass_start);
         self.now = now;
         self.scheduler.set_now(now);
         let _ = self.scheduler.wake_expired_tasks();
@@ -8756,7 +8763,7 @@ impl EngineDispatcher<'_> {
             }
             let queued = entry.sess.queue.take().is_some();
             if queued {
-                entry.sess.log.queue.get_or_insert_with(Instant::now);
+                entry.sess.log.queue.get_or_insert_with(crate::txnlog::loop_now);
             }
             entry.sess.log.term = Some([b'C', if queued { b'Q' } else { b'C' }]);
             if let Some(srv) = entry.sess.srv.as_ref() {
@@ -9944,7 +9951,7 @@ impl EngineDispatcher<'_> {
         let resume = wait.filter(|w| !w.inspect);
         // The final response head: `t_data`, and `capture response header`.
         if wait.is_none() {
-            entry.sess.log.data = Some(std::time::Instant::now());
+            entry.sess.log.data = Some(crate::txnlog::loop_now());
             // What `%B` counts of this head: the message as the server sent it.
             txn.rsp_htx = crate::txn::htx_head_size(held.as_deref().unwrap_or(&entry.sess.rep.readable()[..total_hdr_len]), false);
         }
@@ -11818,7 +11825,7 @@ impl EngineDispatcher<'_> {
                 // Its server timer is the last transaction's; this one starts its own.
                 // The connection is already there, so `%Tw` and `%Tc` are both 0, not
                 // -1 and the time from the request to now.
-                entry.sess.log.queue.get_or_insert_with(Instant::now);
+                entry.sess.log.queue.get_or_insert_with(crate::txnlog::loop_now);
                 if entry.sess.srv_park_exp.is_set() {
                     entry.sess.srv_park_exp = Tick::ETERNITY;
                     server_actconn_add(entry, proxies, true);
@@ -11962,7 +11969,7 @@ impl EngineDispatcher<'_> {
                 entry.sess.queue = None;
                 proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
                 entry.sess.log.term = Some(*b"sQ");
-                entry.sess.log.queue.get_or_insert_with(Instant::now);
+                entry.sess.log.queue.get_or_insert_with(crate::txnlog::loop_now);
                 reply_error(entry, proxies, 503);
             }
             return None;
@@ -13027,7 +13034,7 @@ fn wait_for_request_body(
     // The request is complete for the log when its body is here (`Tq`), and never was when
     // the wait ends otherwise.
     match outcome {
-        BodyWait::Ready if held.is_some() => sess.log.request = Some(std::time::Instant::now()),
+        BodyWait::Ready if held.is_some() => sess.log.request = Some(crate::txnlog::loop_now()),
         BodyWait::TimedOut | BodyWait::ClientGone | BodyWait::Malformed => sess.log.request = None,
         _ => {}
     }
