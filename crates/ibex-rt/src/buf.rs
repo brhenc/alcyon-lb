@@ -165,6 +165,11 @@ impl ArenaCounters {
         self.used.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// `n` empty slots at the end of an arena were given back.
+    pub fn slots_trimmed(&self, n: usize) {
+        self.allocated.fetch_sub(n, Ordering::Relaxed);
+    }
+
     /// An arena holding `slots` slots, `live` of them in use, goes away.
     pub fn arena_dropped(&self, slots: usize, live: usize) {
         self.allocated.fetch_sub(slots, Ordering::Relaxed);

@@ -1937,15 +1937,18 @@ impl SessionArena {
     pub fn alloc(&mut self, entry: SessionEntry) -> Option<u32> {
         self.live += 1;
         SESSION_POOL.slot_used();
-        if let Some(idx) = self.free.pop() {
-            self.entries[idx as usize] = Some(entry);
-            Some(idx)
-        } else {
-            let idx = u32::try_from(self.entries.len()).ok()?;
-            self.entries.push(Some(entry));
-            SESSION_POOL.slot_created();
-            Some(idx)
+        // A trimmed tail leaves stale indices in `free`, and a regrown slot can be listed twice:
+        // only a slot that exists and is empty is reused.
+        while let Some(idx) = self.free.pop() {
+            if let Some(slot @ None) = self.entries.get_mut(idx as usize) {
+                *slot = Some(entry);
+                return Some(idx);
+            }
         }
+        let idx = u32::try_from(self.entries.len()).ok()?;
+        self.entries.push(Some(entry));
+        SESSION_POOL.slot_created();
+        Some(idx)
     }
 
     #[must_use]
@@ -1976,8 +1979,30 @@ impl SessionArena {
             self.live -= 1;
             SESSION_POOL.slot_released();
             self.free.push(idx);
+            self.trim_tail();
         }
         entry
+    }
+
+    /// Gives back the empty slots at the end, so a burst of connections does not leave its
+    /// peak in memory (and in `show pools`) for good; `HAProxy` keeps the peak, this is
+    /// the safer side for an operator watching for a leak.
+    fn trim_tail(&mut self) {
+        let before = self.entries.len();
+        while matches!(self.entries.last(), Some(None)) {
+            self.entries.pop();
+        }
+        let cut = before - self.entries.len();
+        if cut > 0 {
+            SESSION_POOL.slots_trimmed(cut);
+            if self.entries.capacity() > 4 * self.entries.len().max(64) {
+                self.entries.shrink_to(2 * self.entries.len().max(64));
+            }
+            if self.live == 0 {
+                self.free.clear();
+                self.free.shrink_to(64);
+            }
+        }
     }
 
     #[must_use]
