@@ -214,6 +214,18 @@ thread_local! {
     static ROW_POOL: std::cell::RefCell<Vec<Vec<String>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+const ROW_FIELD_CAP: usize = 24;
+
+/// Puts one `show stat` row, its strings sized for long values, into this thread's pool.
+pub fn reserve_row_pool() {
+    // The lookup tables are built on first use: build them now.
+    std::sync::LazyLock::force(&FIELD_INDEX);
+    std::sync::LazyLock::force(&EMPTY);
+    let _ = PROCESS_START.get_or_init(Instant::now);
+    let fields: Vec<String> = (0..STAT_FIELD_COUNT).map(|_| String::with_capacity(64)).collect();
+    let _ = ROW_POOL.try_with(|p| p.borrow_mut().push(fields));
+}
+
 impl Drop for StatRow {
     fn drop(&mut self) {
         let mut fields = std::mem::take(&mut self.fields);
@@ -241,7 +253,7 @@ impl StatRow {
     #[must_use]
     pub fn new() -> Self {
         let pooled = ROW_POOL.try_with(|p| p.try_borrow_mut().ok().and_then(|mut p| p.pop())).ok().flatten();
-        let mut fields = pooled.unwrap_or_else(|| (0..STAT_FIELD_COUNT).map(|_| String::with_capacity(24)).collect());
+        let mut fields = pooled.unwrap_or_else(|| (0..STAT_FIELD_COUNT).map(|_| String::with_capacity(ROW_FIELD_CAP)).collect());
         fields[119].push('-');
         StatRow { fields }
     }

@@ -254,23 +254,21 @@ thread_local! {
 const TRASH_CAP: usize = 8192;
 const ROW_CAP: usize = 16384;
 
-/// Allocates what a scrape uses on this thread and runs one through, so that the first real
-/// one allocates nothing: the scratch strings, the `show info` values, the `show stat` row
-/// pool. Called when the engine starts, on the worker's thread.
-pub fn prewarm(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) {
+/// Allocates what a scrape uses on this thread, without rendering one: the scratch strings, the
+/// `show info` values, a `show stat` row (strings of 64 bytes) and boxes for 16 concurrent scrapes.
+/// Called when the engine starts, on the worker's thread, only if a `use-service
+/// prometheus-exporter` rule is configured. A value that outgrows its string, or a 17th
+/// concurrent scrape, allocates once.
+pub fn prewarm() {
+    LazyLock::force(&COLS);
     TRASH.with_borrow_mut(|t| t.reserve(TRASH_CAP));
     ROW.with_borrow_mut(|(s, o)| {
         s.reserve(ROW_CAP);
         o.reserve(256);
     });
     INFO.with_borrow_mut(|i| *i = crate::stats::InfoPairs::presized());
-    let mut dst = vec![0u8; 16384];
-    let mut cur = Cursor::start();
-    let mut guard = 0;
-    while !cur.finished && guard < 1_000_000 {
-        scrape_chunk(&mut cur, proxies, checks, pid, "/metrics", &mut dst);
-        guard += 1;
-    }
+    crate::stats::reserve_row_pool();
+    crate::proxy::reserve_scrape_boxes(16);
 }
 
 /// Position `pos` of the proxies in declaration order (`show stat`'s order).
@@ -599,14 +597,14 @@ pub fn scrape_chunk(cur: &mut Cursor, proxies: &[Proxy], checks: &[ServerCheckSt
 /// Fills the session's response buffer with the next chunk of its scrape, if the buffer has
 /// room; called on every pass over the session while `sess.scrape` is set.
 pub fn pump(sess: &mut crate::proxy::TcpSession, proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) {
-    let Some(mut cur) = sess.scrape else { return };
+    let Some(mut cur) = sess.scrape() else { return };
     if sess.rep.writable().is_empty() && sess.rep.len() < sess.rep.capacity() {
         sess.rep.compact();
     }
     let uri = sess.req_uri.as_deref().unwrap_or("");
     let n = scrape_chunk(&mut cur, proxies, checks, pid, uri, sess.rep.writable());
     sess.rep.commit(n);
-    sess.scrape = if cur.finished { None } else { Some(cur) };
+    sess.set_scrape(if cur.finished { None } else { Some(cur) });
 }
 
 /// Whether `uri` is a query string HAProxy answers with a 400.

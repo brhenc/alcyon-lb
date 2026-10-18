@@ -95,17 +95,20 @@ fn a_scrape_allocates_nothing_the_first_one_included() {
         backends.push(BackendSection { name: format!("be_{i}"), mode: Mode::Http, servers, ..Default::default() });
     }
     let engine = Engine::new(&Config { frontends, backends, ..Default::default() }, 64).expect("Engine::new");
+    // `Engine::new` does this when a `use-service prometheus-exporter` rule is configured;
+    // this config has none. It renders nothing: the first scrape below is a real first one.
+    promex::prewarm();
     let mut dst = vec![0u8; 16384];
     for (label, uri) in [("first", "/metrics"), ("second", "/metrics"), ("scope=global", "/metrics?scope=global"), ("no-maint", "/metrics?scope=server&no-maint&desc-labels&metrics=-haproxy_server_weight")] {
         let mut cur = Cursor::start();
         let (mut chunks, mut bytes) = (0, 0);
-        let before = ibex_alloc::alloc_counters();
+        let before = ibex_alloc::thread_alloc_counters();
         while !cur.finished {
             let n = promex::scrape_chunk(&mut cur, &engine.proxies, &engine.checks, 1, uri, &mut dst);
             chunks += usize::from(n > 0);
             bytes += n;
         }
-        let diff = before.diff(&ibex_alloc::alloc_counters());
+        let diff = before.diff(&ibex_alloc::thread_alloc_counters());
         println!("{label}: {} allocs, {} bytes allocated, {chunks} chunks, {bytes} bytes out", diff.alloc_count, diff.bytes_allocated);
         assert_eq!(diff.alloc_count, 0, "{label}: a scrape must not allocate");
         if uri == "/metrics" {

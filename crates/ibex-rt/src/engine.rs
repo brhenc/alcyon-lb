@@ -4381,8 +4381,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         fdtab.insert(mb_fd, FdState::Mailbox, Interest::READ);
         poller.add(mailboxes.fd(0), raw_fd_to_u64(mb_fd), true, false)?;
 
-        // The first Prometheus scrape allocates nothing: its scratch is made here, on this thread.
-        crate::promex::prewarm(&proxies[..], &checks, std::process::id());
+        // A configured Prometheus exporter gets its scratch here, on this thread, sized without rendering.
+        if proxies.iter().any(|p| p.http_req_rules.iter().any(|r| matches!(r.action, ibex_config::HttpReqAction::UseServicePrometheus))) {
+            crate::promex::prewarm();
+        }
 
         Ok(Engine {
             quic_listeners,
@@ -9566,7 +9568,7 @@ impl EngineDispatcher<'_> {
 
             // Step 3.5: the HTTP transaction -- rules, routing, the response head, and its end.
             let mut pending_admin = None;
-            if entry.sess.scrape.is_some() {
+            if entry.sess.scrape().is_some() {
                 crate::promex::pump(&mut entry.sess, self.proxies, self.checks, self.pid);
             }
             if entry.sess.mode == Mode::Http && !entry.sess.is_done() {

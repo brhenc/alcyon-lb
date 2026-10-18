@@ -429,6 +429,39 @@ pub fn bc_connect_now_errno(e: &io::Error) -> &'static ibex_sample::ConnErr<'sta
 
 /// One TCP / HTTP session: two connections, two buffers, two state machines.
 #[allow(clippy::struct_excessive_bools)]
+/// What waits to go into a session's `rep`.
+pub enum PendingOut {
+    /// The rest of a local reply, and how much of it is in `rep`.
+    Raw(Vec<u8>, usize),
+    /// A Prometheus scrape being produced.
+    Scrape(crate::promex::Cursor),
+}
+
+impl PendingOut {
+    fn has_output(&self) -> bool {
+        match self {
+            PendingOut::Raw(d, o) => *o < d.len(),
+            PendingOut::Scrape(_) => true,
+        }
+    }
+}
+
+thread_local! {
+    /// Boxes for [`PendingOut::Scrape`], made by `promex::prewarm`.
+    static SCRAPE_BOXES: std::cell::RefCell<Vec<Box<PendingOut>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Makes room for `n` scrape boxes on this thread (start-up, when the config has the rule).
+pub fn reserve_scrape_boxes(n: usize) {
+    SCRAPE_BOXES.with(|l| {
+        let mut l = l.borrow_mut();
+        l.reserve_exact(n);
+        while l.len() < n {
+            l.push(Box::new(PendingOut::Scrape(crate::promex::Cursor::start())));
+        }
+    });
+}
+
 pub struct TcpSession {
     /// The client's socket, none for a stream of an HTTP/2 connection (T280). Outside this
     /// module it is reached through `cli_fd` only.
@@ -578,9 +611,10 @@ pub struct TcpSession {
     /// before its preface is not logged (`HAProxy` only logs a read0 there, T272).
     pub cli_failed: bool,
     pub created_at: Instant,
-    pub pending_resp: Option<Box<(Vec<u8>, usize)>>,
-    /// A Prometheus scrape being produced into `rep`, chunk by chunk (`crate::promex::pump`).
-    pub scrape: Option<crate::promex::Cursor>,
+    /// Output still to go into `rep`: the overflow of a local reply, or a Prometheus scrape
+    /// produced chunk by chunk (`crate::promex::pump`). One pointer for both, so that only
+    /// the sessions that have one pay for it.
+    pub pending_resp: Option<Box<PendingOut>>,
     pub fc_src: Option<SocketAddr>,
     pub fc_dst: Option<SocketAddr>,
     pub tcp_inspect_done: bool,
@@ -1070,7 +1104,6 @@ impl TcpSession {
             bufsize: crate::buf::get_bufsize(),
             maxrewrite: 1024,
             pending_resp: None,
-            scrape: None,
             fc_src: None,
             fc_dst: None,
             tcp_inspect_done: true,
@@ -1185,8 +1218,7 @@ impl TcpSession {
     #[must_use]
     pub fn has_pending_output(&self) -> bool {
         self.rep_window() > 0
-            || self.pending_resp.as_deref().is_some_and(|(d, o)| *o < d.len())
-            || self.scrape.is_some()
+            || self.pending_resp.as_deref().is_some_and(PendingOut::has_output)
             || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
             || self.h2_child().is_some_and(|c| c.owner_tx_pending)
     }
@@ -1690,7 +1722,45 @@ impl TcpSession {
         let n = raw.len().min(w.len());
         w[..n].copy_from_slice(&raw[..n]);
         self.rep.commit(n);
-        self.pending_resp = (n < raw.len()).then(|| Box::new((raw.to_vec(), n)));
+        self.pending_resp = (n < raw.len()).then(|| Box::new(PendingOut::Raw(raw.to_vec(), n)));
+    }
+
+    /// The scrape being produced, if any.
+    #[must_use]
+    pub fn scrape(&self) -> Option<crate::promex::Cursor> {
+        match self.pending_resp.as_deref() {
+            Some(PendingOut::Scrape(c)) => Some(*c),
+            _ => None,
+        }
+    }
+
+    /// Sets (or ends) the scrape. The box comes from, and goes back to, a per-thread free
+    /// list, so a scrape allocates no more than a response does.
+    pub fn set_scrape(&mut self, c: Option<crate::promex::Cursor>) {
+        match (c, self.pending_resp.as_deref_mut()) {
+            (Some(c), Some(PendingOut::Scrape(slot))) => *slot = c,
+            (Some(c), _) => {
+                let b = SCRAPE_BOXES.try_with(|l| l.borrow_mut().pop()).ok().flatten();
+                self.pending_resp = Some(match b {
+                    Some(mut b) => {
+                        *b = PendingOut::Scrape(c);
+                        b
+                    }
+                    None => Box::new(PendingOut::Scrape(c)),
+                });
+            }
+            (None, Some(PendingOut::Scrape(_))) => {
+                if let Some(b) = self.pending_resp.take() {
+                    let _ = SCRAPE_BOXES.try_with(|l| {
+                        let mut l = l.borrow_mut();
+                        if l.len() < l.capacity() {
+                            l.push(b);
+                        }
+                    });
+                }
+            }
+            (None, _) => {}
+        }
     }
 
     /// Answers a Prometheus scrape: the head now, the body as [`crate::promex::pump`] fills
@@ -1702,7 +1772,7 @@ impl TcpSession {
             if let Some(t) = self.txn.as_mut() {
                 t.rsp = txn::MsgState::head(txn::Framing::Chunked);
             }
-            self.scrape = Some(crate::promex::Cursor::start());
+            self.set_scrape(Some(crate::promex::Cursor::start()));
         }
     }
 
@@ -1714,7 +1784,7 @@ impl TcpSession {
         self.txn = None;
         self.req_method = None;
         self.req_uri = None;
-        self.scrape = None;
+        self.set_scrape(None);
         self.req_headers = None;
         self.clear_htx();
         self.req_vars.clear();
@@ -2425,7 +2495,7 @@ impl TcpSession {
         }
 
         // Drain pending synthetic response into rep if space is available
-        if let Some((ref data, ref mut offset)) = self.pending_resp.as_deref_mut() {
+        if let Some(PendingOut::Raw(ref data, ref mut offset)) = self.pending_resp.as_deref_mut() {
             if self.rep.writable().is_empty() && self.rep.len() < self.rep.capacity() {
                 self.rep.compact();
             }
@@ -2496,7 +2566,7 @@ impl TcpSession {
                     self.srv_state,
                     ScState::ShutR | ScState::Closed | ScState::Error
                 );
-                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && self.scrape.is_none() && !self.res_inspect_pending {
+                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && !self.res_inspect_pending {
                     self.shutw_cli();
                     self.cli_state = ScState::ShutW;
                     self.ending
@@ -2523,7 +2593,7 @@ impl TcpSession {
                     self.srv_state,
                     ScState::ShutR | ScState::Closed | ScState::Error
                 );
-                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && self.scrape.is_none() && !self.res_inspect_pending {
+                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && !self.res_inspect_pending {
                     self.shutw_cli();
                     self.cli_state = ScState::Closed;
                     self.srv_state = ScState::Closed;
@@ -3003,8 +3073,7 @@ impl TcpSession {
         // poller for writability with nothing to write, and a client whose window stayed
         // at 0 had a core spin on EPOLLOUT (T248). A `WINDOW_UPDATE` arrives as a read.
         let has_pending = if self.h2_ctx.is_some() {
-            self.pending_resp.as_deref().is_some_and(|(d, o)| *o < d.len())
-                || self.scrape.is_some()
+            self.pending_resp.as_deref().is_some_and(PendingOut::has_output)
                 || self.h2_ctx.as_ref().is_some_and(|h| h.tx_consumed < h.tx_buf.len())
         } else {
             self.has_pending_output()
