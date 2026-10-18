@@ -492,6 +492,10 @@ pub struct TcpSession {
     pub srvexp: Vec<CompiledExp>,
     pub req_uri: Option<String>,
     pub req_method: Option<String>,
+    /// Bytes of the request body the HTX message holds (block header included), fixed when
+    /// the rules first size it: the body is read once, so a later rule list (the backend's)
+    /// finds it as it was, less the room the rewrites before it took (`req_htx_init`).
+    pub req_body_htx: std::cell::Cell<Option<usize>>,
     pub req_headers: Option<Vec<(String, String)>>,
     pub htx_buf: Buf,
     pub htx_tail: usize,
@@ -1048,6 +1052,7 @@ impl TcpSession {
             srvexp,
             req_uri: None,
             req_method: None,
+            req_body_htx: std::cell::Cell::new(None),
             req_headers: None,
             htx_buf: Buf::unallocated(crate::buf::BufClass::Standard),
             htx_tail: 0,
@@ -1786,6 +1791,7 @@ impl TcpSession {
         self.log = crate::txnlog::StreamLog::start(self.bytes_in, self.bytes_out);
         self.txn = None;
         self.req_method = None;
+        self.req_body_htx.set(None);
         self.req_uri = None;
         self.set_scrape(None);
         self.req_headers = None;
