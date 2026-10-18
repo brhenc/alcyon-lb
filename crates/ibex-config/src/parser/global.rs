@@ -643,6 +643,53 @@ pub(crate) fn parse_global_directive(
                 )),
             }
         }
+        // `ssl_parse_global_capture_buffer` over `ssl_parse_global_int` (src/cfgparse-ssl.c):
+        // the alias warns first, then `too_many_args`, an empty argument, `atoi` (a word is 0)
+        // and a negative value are refused, and only then a second occurrence of either name.
+        "tune.ssl.capture-buffer-size" | "tune.ssl.capture-cipherlist-size" => {
+            let name = kw.text.as_str();
+            if name == "tune.ssl.capture-cipherlist-size" {
+                global.load_warnings.push(LoadWarning {
+                    line: kw.line,
+                    alert: false,
+                    text: "'tune.ssl.capture-cipherlist-size' is deprecated and will be removed in version 2.7. Please use 'tune.ssl.capture-buffer-size' instead.".into(),
+                    style: crate::ast::global::WarnStyle::Tight,
+                });
+            }
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'{name}' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            let Some(arg) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' expects an integer argument.")));
+            };
+            let Ok(size) = usize::try_from(c_atoi(&arg.text)) else {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' expects a positive numeric value.")));
+            };
+            if global.tune_ssl_capture_configured {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' is already configured.")));
+            }
+            global.tune_ssl_capture_buffer_size = size;
+            global.tune_ssl_capture_configured = true;
+            Ok(())
+        }
+        "ibex.ja4-compat" => {
+            let name = kw.text.as_str();
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'{name}' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            let spec = match tokens.get(1).map(|t| t.text.as_str()) {
+                Some("foxio") => false,
+                Some("spec") => true,
+                Some(other) => return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' expects 'foxio' or 'spec', not '{other}'."))),
+                None => return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' expects 'foxio' or 'spec'."))),
+            };
+            if global.ibex_ja4_compat_configured {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' already specified.")));
+            }
+            global.ibex_ja4_compat_spec = spec;
+            global.ibex_ja4_compat_configured = true;
+            Ok(())
+        }
         "ssl-default-bind-ciphers" => {
             if tokens.len() >= 2 {
                 global.ssl_default_bind_ciphers = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));

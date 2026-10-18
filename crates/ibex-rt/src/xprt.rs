@@ -33,8 +33,9 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 /// the project wants the errno rather than [`Io`].
 ///
 /// `drained` is whether the last read left the socket empty: shorter than asked, or
-/// `EAGAIN` (see [`TlsConn::sock_drained`]).
-struct Sock<'a>(BorrowedFd<'a>, bool, Vec<u8>, usize);
+/// `EAGAIN` (see [`TlsConn::sock_drained`]). The last field, while the `ClientHello` capture
+/// runs, keeps every byte read for it (`RustlsContext::tap_client_bytes`).
+struct Sock<'a>(BorrowedFd<'a>, bool, Vec<u8>, usize, Option<Vec<u8>>);
 
 impl Read for Sock<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -50,6 +51,9 @@ impl Read for Sock<'_> {
                 let room = HEAD_LEN.saturating_sub(self.2.len());
                 self.2.extend_from_slice(&buf[..n.min(room)]);
                 self.3 += n;
+                if let Some(tap) = self.4.as_mut() {
+                    tap.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+                }
                 Ok(n)
             }
             Io::Eof => Ok(0),
@@ -328,7 +332,7 @@ impl TlsConn {
     /// Called from both directions. A partial write is not an error: rustls keeps the
     /// remainder and [`Self::wants_write`] stays true, so the poller brings us back.
     fn flush(&mut self, fd: BorrowedFd<'_>) -> io::Result<()> {
-        let mut sock = Sock(fd, false, Vec::new(), 0);
+        let mut sock = Sock(fd, false, Vec::new(), 0, None);
         loop {
             let wants = match self.ctx.session.as_ref() {
                 Some(TlsSession::Server(c)) => c.wants_write(),
@@ -359,9 +363,13 @@ impl TlsConn {
     ///
     /// Returns `Ok(false)` at end of stream.
     fn fill(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
-        let mut sock = Sock(fd, false, Vec::new(), 0);
+        let mut sock = Sock(fd, false, Vec::new(), 0, self.ctx.tapping().then(Vec::new));
         let prior = self.rx_total;
         let r = self.fill_from(&mut sock);
+        // After rustls has read them, so that the tap knows the version the server chose.
+        if let Some(bytes) = sock.4.take() {
+            self.ctx.tap_client_bytes(&bytes);
+        }
         self.sock_drained = sock.1;
         self.rx_total += sock.3;
         if matches!(r, Ok(true)) && sock.3 > 0 && !self.ctx.handshake_done && matches!(raw::peek(fd, &mut [0u8; 1]), Ok(Io::Eof)) {
@@ -631,6 +639,7 @@ pub(crate) fn facts_of(info: &ibex_tls::RustlsTlsInfo) -> ibex_sample::SslFacts<
         alpn: info.alpn.as_deref(),
         has_crt: info.peer_has_cert,
         resumed: info.session_resumed,
+        capture: info.capture.as_ref(),
     }
 }
 
@@ -871,7 +880,18 @@ impl std::fmt::Debug for ClientXprt {
 /// the handshake runs later, on the connection's first reads.
 #[must_use]
 pub fn accept_tls(fd: &impl AsRawFd, config: std::sync::Arc<rustls::ServerConfig>) -> ClientXprt {
-    let mut tls = TlsConn::new(RustlsContext::new_server_pending(fd.as_raw_fd()));
+    accept_tls_capturing(fd, config, 0, false)
+}
+
+/// As [`accept_tls`], keeping `capture_size` bytes of the `ClientHello`
+/// (`tune.ssl.capture-buffer-size`) for the `ssl_fc_cipherlist_*` fetches; 0 captures nothing.
+/// `ja4_spec` is `ibex.ja4-compat spec`; it reaches `ssl_fc_ja4` through the capture.
+#[must_use]
+pub fn accept_tls_capturing(fd: &impl AsRawFd, config: std::sync::Arc<rustls::ServerConfig>, capture_size: usize, ja4_spec: bool) -> ClientXprt {
+    let mut ctx = RustlsContext::new_server_pending(fd.as_raw_fd());
+    ctx.enable_capture(capture_size);
+    ctx.set_ja4_spec(ja4_spec);
+    let mut tls = TlsConn::new(ctx);
     tls.gate = Some(Box::new(Gate { acceptor: rustls::server::Acceptor::default(), config }));
     ClientXprt::Tls(Box::new(tls))
 }
@@ -890,6 +910,25 @@ mod tests {
         assert_eq!(openssl_cipher_name("TLS13_AES_256_GCM_SHA384"), "TLS_AES_256_GCM_SHA384");
         // One the table does not know keeps rustls's name.
         assert_eq!(openssl_cipher_name("TLS_FUTURE_SUITE"), "TLS_FUTURE_SUITE");
+    }
+
+    /// Every suite the small table maps agrees with the generated id table
+    /// (`ibex_tls::cipher_names`), by the suite's IANA id.
+    #[test]
+    fn cipher_names_agree_with_the_id_table() {
+        for (iana, id) in [
+            ("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", 0xc02b_u16),
+            ("TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", 0xc02c),
+            ("TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", 0xcca9),
+            ("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", 0xc02f),
+            ("TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", 0xc030),
+            ("TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", 0xcca8),
+            ("TLS13_AES_128_GCM_SHA256", 0x1301),
+            ("TLS13_AES_256_GCM_SHA384", 0x1302),
+            ("TLS13_CHACHA20_POLY1305_SHA256", 0x1303),
+        ] {
+            assert_eq!(Some(openssl_cipher_name(iana)), ibex_tls::cipher_names::openssl_cipher_name_by_id(id), "{iana}");
+        }
     }
 
     /// A plaintext client has no handshake to fail: a read error on it is an ordinary

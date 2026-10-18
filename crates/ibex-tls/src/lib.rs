@@ -16,7 +16,10 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 pub mod arena;
+pub mod capture;
+pub mod cipher_names;
 pub mod config;
+pub mod ja4;
 pub mod resolver;
 pub mod transport;
 
@@ -28,5 +31,7 @@ pub use config::{
     install_default_crypto_provider, load_ca_file, load_cert_file, load_server_ca, load_system_ca_roots,
     parse_server_name, versions_between, BackendTlsOptions, NoServerAuth, ServerVerifier, TlsConfig, TlsEngineKind,
 };
+pub use ja4::Ja4Parts;
+pub use capture::{exclude_tls_grease, HelloTap, SslCapture};
 pub use resolver::IbexCertResolver;
 pub use transport::{RustlsContext, RustlsTlsInfo, RustlsTransport};

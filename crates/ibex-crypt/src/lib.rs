@@ -15,6 +15,8 @@
 //! The setting (salt, rounds, cost) is validated as libxcrypt validates it, measured with
 //! glibc 2.4x `crypt()` on 2026-10-04: see `tests/vectors.txt`.
 
+pub mod xxh64;
+
 use md5::{Digest, Md5};
 use std::fmt::Write as _;
 use subtle::ConstantTimeEq;

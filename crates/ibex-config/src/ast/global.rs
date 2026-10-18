@@ -255,6 +255,17 @@ pub struct GlobalSection {
     pub warn_blocked_traffic_after: Option<Duration>,
     /// `ibex.watchdog-warn-only` (Ibex only): the watchdog warns but never aborts.
     pub ibex_watchdog_warn_only: bool,
+    /// `tune.ssl.capture-buffer-size` (or its deprecated alias `tune.ssl.capture-cipherlist-size`):
+    /// the bytes of each TLS connection's `ClientHello` capture (`global_ssl.capture_buffer_size`);
+    /// 0, the default, captures nothing and the `ssl_fc_cipherlist_*` fetches give no sample.
+    pub tune_ssl_capture_buffer_size: usize,
+    /// One of the two spellings was given: a second one is refused (`pool_head_ssl_capture`).
+    pub tune_ssl_capture_configured: bool,
+    /// `ibex.ja4-compat spec` (Ibex-only): `ssl_fc_ja4` follows the JA4 specification text where
+    /// FoxIO's tools differ; false (`foxio`, the default) follows the tools.
+    pub ibex_ja4_compat_spec: bool,
+    /// `ibex.ja4-compat` was given: a second one is refused.
+    pub ibex_ja4_compat_configured: bool,
     /// Default SSL bind ciphers.
     pub ssl_default_bind_ciphers: Option<String>,
     /// Default SSL bind options.

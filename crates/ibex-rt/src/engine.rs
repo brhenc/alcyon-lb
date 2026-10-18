@@ -2110,6 +2110,10 @@ pub struct Engine {
     global_bufsize: usize,
     /// Global `tune.maxrewrite` value, stored per-engine for the same reason.
     global_maxrewrite: usize,
+    /// `tune.ssl.capture-buffer-size`: the `ClientHello` bytes each TLS client connection keeps
+    /// for the `ssl_fc_cipherlist_*` fetches; 0 keeps none.
+    ssl_capture_size: usize,
+    ssl_ja4_spec: bool,
     /// `tune.maxaccept`: how many connections one listener wakeup accepts in a row before
     /// the pass goes on to its other work (`listener_accept`: `for (; max_accept;
     /// max_accept--)`); the rest of the backlog is found by the next pass, the listener
@@ -4341,6 +4345,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             log_targets,
             log_tag: syslog_tag(config.global.as_ref().and_then(|g| g.log_tag.as_deref()).unwrap_or("haproxy")).to_string(),
             global_bufsize: bufsize,
+            ssl_capture_size: config.global.as_ref().map_or(0, |g| g.tune_ssl_capture_buffer_size),
+            ssl_ja4_spec: config.global.as_ref().is_some_and(|g| g.ibex_ja4_compat_spec),
             global_maxrewrite: config
                 .global
                 .as_ref()
@@ -6795,6 +6801,8 @@ fn register_new_session(
         fc_src,
         fc_dst,
         tls.as_ref(),
+        engine.ssl_capture_size,
+        engine.ssl_ja4_spec,
         tracked_sc,
         engine.global_bufsize,
         engine.global_maxrewrite,
@@ -7044,6 +7052,8 @@ fn init_client_session(
     fc_src: SocketAddr,
     fc_dst: SocketAddr,
     tls: Option<&Arc<rustls::ServerConfig>>,
+    ssl_capture_size: usize,
+    ssl_ja4_spec: bool,
     tracked_sc: [Option<(usize, StickKey)>; 3],
     global_bufsize: usize,
     global_maxrewrite: usize,
@@ -7058,7 +7068,7 @@ fn init_client_session(
     let srvexp = proxies[proxy_idx].srvexp.clone();
     // The TLS transport is built on the accepted socket before the session owns it, so
     // there is no session without a client socket to account for (T342).
-    let tls_xprt = tls.map(|cfg| crate::xprt::accept_tls(&cli_fd, Arc::clone(cfg)));
+    let tls_xprt = tls.map(|cfg| crate::xprt::accept_tls_capturing(&cli_fd, Arc::clone(cfg), ssl_capture_size, ssl_ja4_spec));
 
     let mut sess = TcpSession::new_with_mode(
         crate::proxy::ClientSide::Fd(cli_fd),

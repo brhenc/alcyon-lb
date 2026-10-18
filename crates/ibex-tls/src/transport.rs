@@ -27,6 +27,9 @@ pub struct RustlsTlsInfo {
     pub peer_issuer_dn: Option<String>,
     pub peer_not_after: Option<i64>,
     pub peer_has_cert: bool,
+    /// The `ClientHello` as `tune.ssl.capture-buffer-size` keeps it (server side only); `None`
+    /// when the size is 0 or the hello was too short to reach its cipher suites.
+    pub capture: Option<crate::capture::SslCapture>,
 }
 
 impl Default for RustlsTlsInfo {
@@ -42,6 +45,7 @@ impl Default for RustlsTlsInfo {
             peer_issuer_dn: None,
             peer_not_after: None,
             peer_has_cert: false,
+            capture: None,
         }
     }
 }
@@ -101,6 +105,9 @@ pub struct RustlsContext {
     pub rx_raw: Vec<u8>,
     /// Pending outgoing raw TLS wire ciphertext produced by rustls to send over socket.
     pub tx_raw: Vec<u8>,
+    /// The `ClientHello` capture while the handshake runs (server side, size > 0 only): fed
+    /// the client's bytes, moved into `tls_info.capture` when the handshake completes.
+    pub hello_tap: Option<Box<crate::capture::HelloTap>>,
 }
 
 impl RustlsContext {
@@ -119,6 +126,7 @@ impl RustlsContext {
             },
             rx_raw: Vec::with_capacity(16_384),
             tx_raw: Vec::with_capacity(16_384),
+            hello_tap: None,
         }
     }
 
@@ -135,6 +143,7 @@ impl RustlsContext {
             tls_info: RustlsTlsInfo { peer_verify: VerifyResult::NotRequested, ..Default::default() },
             rx_raw: Vec::with_capacity(16_384),
             tx_raw: Vec::with_capacity(16_384),
+            hello_tap: None,
         }
     }
 
@@ -160,12 +169,46 @@ impl RustlsContext {
             },
             rx_raw: Vec::with_capacity(16_384),
             tx_raw: Vec::with_capacity(16_384),
+            hello_tap: None,
         }
     }
 
-    /// Appends incoming encrypted wire data to `rx_raw`.
+    /// Appends incoming encrypted wire data to `rx_raw`, and shows it to the `ClientHello`
+    /// capture first.
     pub fn feed_raw_input(&mut self, data: &[u8]) {
+        self.tap_client_bytes(data);
         self.rx_raw.extend_from_slice(data);
+    }
+
+    /// Captures the `ClientHello` of this server-side connection, keeping `size` bytes
+    /// (`tune.ssl.capture-buffer-size`). 0 captures nothing and allocates nothing.
+    pub fn enable_capture(&mut self, size: usize) {
+        self.hello_tap = crate::capture::HelloTap::new(size).map(Box::new);
+    }
+
+    /// `ibex.ja4-compat`: `true` for `spec`. Call after [`Self::enable_capture`].
+    pub fn set_ja4_spec(&mut self, spec: bool) {
+        if let Some(tap) = self.hello_tap.as_mut() {
+            tap.set_ja4_spec(spec);
+        }
+    }
+
+    /// Shows bytes the client sent, in order, to the `ClientHello` capture while the handshake
+    /// runs. Called by whichever path reads the socket (`feed_raw_input`, or the runtime's
+    /// own reads), once per byte.
+    pub fn tap_client_bytes(&mut self, data: &[u8]) {
+        let Some(tap) = self.hello_tap.as_mut() else { return };
+        let tls12 = match &self.session {
+            Some(TlsSession::Server(c)) => c.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_2),
+            _ => false,
+        };
+        tap.feed(data, tls12);
+    }
+
+    /// Whether the `ClientHello` capture still wants the client's bytes.
+    #[must_use]
+    pub fn tapping(&self) -> bool {
+        self.hello_tap.is_some()
     }
 
     /// Drains and returns all outgoing encrypted wire data from `tx_raw`.
@@ -236,6 +279,12 @@ impl RustlsContext {
             }
             None => {}
         }
+        // The capture lives as long as the connection (`ssl_sock_capture_free_func` frees it
+        // with the SSL object); no ClientHello comes after the handshake (rustls does not
+        // renegotiate), so the tap and its buffers go now.
+        if let Some(tap) = self.hello_tap.take() {
+            self.tls_info.capture = tap.into_capture();
+        }
     }
 }
 
@@ -245,9 +294,19 @@ pub struct RustlsTransport {
     server_config: Option<Arc<ServerConfig>>,
     client_config: Option<Arc<ClientConfig>>,
     default_server_name: Option<ServerName<'static>>,
+    /// `tune.ssl.capture-buffer-size` for the server contexts this makes; 0 captures nothing.
+    capture_size: usize,
 }
 
 impl RustlsTransport {
+    /// Server contexts made from here on capture `size` bytes of the `ClientHello`
+    /// (`tune.ssl.capture-buffer-size`); 0, the default, captures nothing.
+    #[must_use]
+    pub const fn with_capture_buffer_size(mut self, size: usize) -> Self {
+        self.capture_size = size;
+        self
+    }
+
     /// Creates a new transport with the provided server configuration.
     #[must_use]
     pub fn new_server(server_config: Arc<ServerConfig>) -> Self {
@@ -255,6 +314,7 @@ impl RustlsTransport {
             server_config: Some(server_config),
             client_config: None,
             default_server_name: None,
+            capture_size: 0,
         }
     }
 
@@ -265,6 +325,7 @@ impl RustlsTransport {
             server_config: None,
             client_config: Some(client_config),
             default_server_name: Some(server_name),
+            capture_size: 0,
         }
     }
 
@@ -279,6 +340,7 @@ impl RustlsTransport {
             server_config,
             client_config,
             default_server_name: server_name,
+            capture_size: 0,
         }
     }
 }
@@ -296,7 +358,9 @@ impl Transport for RustlsTransport {
                 io::Error::new(io::ErrorKind::InvalidInput, "Missing server TLS config")
             })?;
             let conn = ServerConnection::new(config).map_err(io::Error::other)?;
-            Ok(RustlsContext::new_server(fd, conn))
+            let mut ctx = RustlsContext::new_server(fd, conn);
+            ctx.enable_capture(self.capture_size);
+            Ok(ctx)
         } else {
             let config = self.client_config.clone().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "Missing client TLS config")

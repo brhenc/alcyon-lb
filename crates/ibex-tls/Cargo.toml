@@ -16,6 +16,7 @@ tracing = { workspace = true }
 rustix = { version = "0.38", features = ["event", "net", "std"] }
 rustls-pemfile = "2.2.0"
 ibex-config = { path = "../ibex-config" }
+ibex-crypt = { path = "../ibex-crypt" }
 
 [dev-dependencies]
 # Test-only: the e2e harness drives a reference TLS endpoint. Nothing in src/ uses

@@ -21,6 +21,7 @@ pub mod expr;
 pub mod fix;
 mod h1_clean;
 pub mod hash;
+pub mod ja4;
 pub mod localtime;
 pub mod matcher;
 pub mod patref;

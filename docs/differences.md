@@ -312,3 +312,38 @@ connections. Differences left: Ibex's per-connection cost is a constant calibrat
 HAProxy's results (`sizeof(struct stream)` has no Ibex counterpart), `maxsslconn` and
 `tune.ssl.cachesize` are not configurable, so `MaxSslConns` stays 0 and the
 `Automatically setting global.maxconn ...` notice is not printed.
+
+## `ssl_fc_ja4`: an Ibex-only fetch (T344)
+
+`ssl_fc_ja4` returns the JA4 TLS client fingerprint (`t13d1516h2_8daaf6152771_e5627efa2ab1`),
+built from the whole captured ClientHello: GREASE-free sorted cipher and extension lists,
+the offered ALPN, and a truncated SHA-256. **HAProxy has no such fetch**: `haproxy -c` refuses
+a configuration that uses it (`unknown fetch method 'ssl_fc_ja4'`), so such a configuration
+does not run on HAProxy. It gives a sample only when the ClientHello capture exists, that is
+`tune.ssl.capture-buffer-size` is above 0 (its value does not matter; 0 or unset gives no
+sample, as for the other capture fetches). Only JA4 is implemented, not JA4S/JA4H/JA4X/JA4T or
+QUIC (`q`) fingerprints. The JA4 specification is by FoxIO; JA4 (TLS client fingerprinting only)
+is under the BSD 3-Clause licence in `LICENSE-JA4` of <https://github.com/FoxIO-LLC/ja4>:
+"Copyright (c) 2026 FoxIO. All rights reserved", redistribution with the notice permitted, the
+name of FoxIO not to be used to endorse. Ibex implements the specification text and uses FoxIO's
+published test vectors (`crates/ibex-sample/testdata/ja4_vectors.txt`); no FoxIO code is copied.
+Where FoxIO's tools and the specification text differ, the default is the tools; see
+`ibex.ja4-compat` below.
+
+### `ibex.ja4-compat foxio|spec` (Ibex-only global keyword; HAProxy refuses it as unknown)
+
+Where FoxIO's published tools and the JA4 specification text disagree, `ssl_fc_ja4` follows the
+tools by default (`foxio`), because the fingerprint databases operators compare against are
+produced by those tools. `ibex.ja4-compat spec` follows the specification text. Any other value
+is refused at load. The two differences:
+
+* A non-alphanumeric end of the first ALPN value. `foxio`: the character itself, or `9` for a
+  byte of 0x80 or more (`0xBA 0xAD` gives `99`; FoxIO's published vector for
+  `tls-non-ascii-alpn.pcapng`). `spec`: the first and last hex digit of the value (`bd`; `/x`
+  gives `28`).
+* No extension to list but signature algorithms present (no real ClientHello: the algorithms
+  come in an extension). `foxio`: the third part hashes `_` and the algorithms. `spec`: twelve
+  zeros. Only a unit test reaches it.
+
+Of the 72 published vectors in `crates/ibex-sample/testdata/ja4_vectors.txt` (all FoxIO's values,
+all given by `foxio`), only `tls-non-ascii-alpn.pcapng` gives a different string under `spec`.
