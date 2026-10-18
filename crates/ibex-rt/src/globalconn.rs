@@ -127,6 +127,88 @@ pub fn ideal_maxconn(nofile_hard: Option<u64>, listeners: usize, stats_socket: b
     u32::try_from((nofile.saturating_sub(1).saturating_sub(overhead)) / 2).unwrap_or(u32::MAX).max(1)
 }
 
+static MEMMAX_MB: AtomicU32 = AtomicU32::new(0);
+
+/// `show info` `Memmax_MB`: the `-m` value (`global.rlimit_memmax`), 0 without `-m`.
+#[must_use]
+pub fn memmax_mb() -> u32 {
+    MEMMAX_MB.load(Ordering::Relaxed)
+}
+
+/// Records the `-m <megs>` budget for `show info` and `/metrics`.
+pub fn set_memmax_mb(megs: u32) {
+    MEMMAX_MB.store(megs, Ordering::Relaxed);
+}
+
+/// `STREAM_MAX_COST` of include/haproxy/defaults.h:538, `sizeof(struct stream) + 2 *
+/// sizeof(struct channel) + 2 * sizeof(struct connection) + requri_len + 2 * cookie_len`.
+/// Ibex has no such structs; the value is the one that reproduces the `maxconn` and the
+/// "absolute maximum possible value without SSL" HAProxy 3.5-dev8-885761-29 prints for
+/// `-m` 5, 10, 64, 100 and 1000 (35719 or 35720 per connection at the default bufsize;
+/// 2952 is the upper of the two).
+const STREAM_MAX_COST: u64 = 2952;
+/// `SSL_SESSION_MAX_COST` and `SSL_HANDSHAKE_MAX_COST` (defaults.h:525, 530).
+const SSL_SESSION_MAX_COST: u64 = 16 * 1024;
+const SSL_HANDSHAKE_MAX_COST: u64 = 76 * 1024;
+/// `MEM_USABLE_RATIO` (defaults.h:548).
+const MEM_USABLE_RATIO: f64 = 0.97;
+
+/// `round_2dig` (src/tools.c:670): the first two digits, then zeros.
+fn round_2dig(mut i: u64) -> u64 {
+    let mut mul = 1;
+    while i >= 100 {
+        i /= 10;
+        mul *= 10;
+    }
+    i * mul
+}
+
+/// What `-m` does to `global.maxconn` (`compute_ideal_maxconn`, src/limits.c:285-365):
+/// `-m` is a budget, not an rlimit. `maxconn` is the configured one. `sides` counts the
+/// sides that use TLS (a `bind ... ssl`: 1, `server ... ssl`: 1, both: 2).
+///
+/// Returns the `maxconn` to run with: the computed one when none was configured, the
+/// configured one otherwise. `ssl_cache` is `tune.ssl.cachesize` (200 bytes an entry,
+/// only counted when TLS is used), `bufsize` is `tune.bufsize`.
+///
+/// # Errors
+/// The alert `HAProxy` exits 1 with when the configured `maxconn` leaves no room for the
+/// TLS connections (it has no equivalent for a cleartext-only configuration).
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+pub fn memmax_maxconn(megs: u32, maxconn: Option<u32>, sides: u64, bufsize: u64, ssl_cache: u64) -> Result<u32, String> {
+    let per_conn = STREAM_MAX_COST + 2 * bufsize;
+    let ssl_cost = SSL_SESSION_MAX_COST + SSL_HANDSHAKE_MAX_COST;
+    let mut mem = (u64::from(megs) * 1_048_576) as i64;
+    if sides > 0 {
+        mem -= (ssl_cache * 200) as i64;
+    }
+    let mem = (mem as f64 * MEM_USABLE_RATIO) as i64;
+    let avail = mem.max(0) as u64;
+    let cap = |v: u64| u32::try_from(round_2dig(v)).unwrap_or(u32::MAX);
+    match (maxconn, sides) {
+        (None, 0) => {
+            let n = cap(avail / per_conn);
+            if n == 0 {
+                return Err(format!("Cannot compute the automatic maxconn because global.maxsslconn is already too high for the global.memmax value ({megs} MB). The absolute maximum possible value is {}, but 0 was found.", avail / ssl_cost));
+            }
+            Ok(n)
+        }
+        (None, sides) => Ok(cap(avail / (per_conn + sides * SSL_SESSION_MAX_COST + SSL_HANDSHAKE_MAX_COST))),
+        (Some(mc), 0) => Ok(mc),
+        (Some(mc), sides) => {
+            let sslmem = mem - i64::from(mc) * per_conn as i64;
+            let maxsslconn = if sslmem > 0 { round_2dig(sslmem as u64 / ssl_cost) } else { 0 };
+            if sslmem <= 0 || maxsslconn < sides {
+                return Err(format!(
+                    "Cannot compute the automatic maxsslconn because global.maxconn is already too high for the global.memmax value ({megs} MB). The absolute maximum possible value without SSL is {}, but {mc} was found and SSL is in use.",
+                    avail / per_conn
+                ));
+            }
+            Ok(mc)
+        }
+    }
+}
+
 /// Called once per engine built from `config`: the limit is the configured `maxconn`, or the
 /// one `HAProxy` computes from the file descriptor limit; counting starts from zero when it
 /// is configured.

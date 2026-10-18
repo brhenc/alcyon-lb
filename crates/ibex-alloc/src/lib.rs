@@ -311,6 +311,27 @@ impl PoolRegistry {
         }
     }
 
+    /// Calls `f` with the stats of every registered provider, without allocating (the
+    /// Prometheus render must not).
+    pub fn for_each(&self, mut f: impl FnMut(&PoolHead)) {
+        if let Ok(list) = self.providers.read() {
+            for (_, provider) in list.iter() {
+                if let Some(p) = provider() {
+                    f(&p);
+                }
+            }
+        }
+    }
+
+    /// Sum of the `failures` counters of every registered provider (`pool_total_failures()`,
+    /// `show info` `PoolFailed`).
+    #[must_use]
+    pub fn failures(&self) -> u64 {
+        let mut total = 0;
+        self.for_each(|p| total += p.failures as u64);
+        total
+    }
+
     /// Unregisters a pool stats provider.
     pub fn unregister_provider(&self, name: &'static str) {
         if let Ok(mut list) = self.providers.write() {

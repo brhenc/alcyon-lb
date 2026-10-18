@@ -13,7 +13,7 @@ mod identity;
 mod master;
 
 use ibex_rt::Engine;
-use rustix::process::{kill_process, Pid, Resource, Rlimit, setrlimit, Signal};
+use rustix::process::{kill_process, Pid, Signal};
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -526,19 +526,6 @@ fn report_diagnostics(opts: &CliOptions) {
     }
 }
 
-fn enforce_memory_limit(megs: u64, quiet: bool) {
-    let bytes = megs.saturating_mul(1024 * 1024);
-    let rlim = Rlimit {
-        current: Some(bytes),
-        maximum: Some(bytes),
-    };
-    if let Err(err) = setrlimit(Resource::As, rlim) {
-        if !quiet {
-            ibex_rt::stderr_line!("[WARNING] Unable to enforce memory limit (-m {megs} MB): {err}");
-        }
-    }
-}
-
 fn handle_pid_file(pid_path: &Path) {
     let pid = std::process::id();
     if let Err(err) = std::fs::write(pid_path, format!("{pid}\n")) {
@@ -789,8 +776,9 @@ fn main() {
     });
 
     // 10. Enforce memory limits if requested (-m <megabytes>)
+    //     A budget for `maxconn`, not an rlimit (see `engine::apply_memmax`).
     if let Some(megs) = opts.memory_limit_mb {
-        enforce_memory_limit(megs, opts.quiet);
+        config.global.get_or_insert_with(Default::default).memmax_mb = Some(u32::try_from(megs).unwrap_or(u32::MAX));
     }
 
     // 11. SIGUSR1 is the soft stop, as in HAProxy. Installed before any listener exists,
@@ -827,10 +815,14 @@ fn main() {
 
     // The soft limit on open files goes up to `maxsock` before any socket is opened;
     // `maxsock` counts `maxconn`, settled first.
-    ibex_rt::engine::configure_maxconn(&config);
-    let maxsock = ibex_rt::engine::config_maxsock(&config, nbthread);
     // A `maxconn` computed from the hard limit fits it: only a configured one is refused.
     let strict = config.global.as_ref().is_some_and(|g| g.maxconn.is_some() && !g.no_strict_limits);
+    if let Err(alert) = ibex_rt::engine::apply_memmax(&mut config) {
+        config_alert_plain(&alert);
+        process::exit(1);
+    }
+    ibex_rt::engine::configure_maxconn(&config);
+    let maxsock = ibex_rt::engine::config_maxsock(&config, nbthread);
     match ibex_rt::globalconn::apply_nofile_limit(u64::try_from(maxsock).unwrap_or(u64::MAX), strict) {
         Ok(None) => {}
         Ok(Some(warning)) => ibex_rt::stderr_line!("[WARNING]  ({}) : {warning}", process::id()),

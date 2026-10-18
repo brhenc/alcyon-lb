@@ -291,3 +291,16 @@ when the proxy sets none), else 1024, capped by `net.core.somaxconn`. The one st
 not have is the `bind` option `maxconn` (between the proxy's `backlog` and its `maxconn`
 in HAProxy): `bind ... maxconn N` is refused at load, as before. A socket handed over by a
 reload keeps the backlog it was bound with, as in HAProxy.
+
+## `-m <megs>` is a connection budget, not an rlimit (both)
+
+On HAProxy and on Ibex, `-m` sets no system limit: HAProxy never calls `setrlimit` for it
+(src/limits.c), it shows the value as `Memmax_MB` / `Memmax_bytes` and sizes `maxconn` from
+it (`STREAM_MAX_COST + 2 * tune.bufsize` per connection, 97% of the budget, TLS costs when a
+`bind` or `server` uses `ssl`; a configured `maxconn` that leaves no room for TLS is refused,
+exit 1). Ibex does the same. An `RLIMIT_AS` would be wrong for Ibex: past it `malloc`
+returns NULL and Rust aborts the whole worker (exit 134), where HAProxy only refuses
+connections. Differences left: Ibex's per-connection cost is a constant calibrated on
+HAProxy's results (`sizeof(struct stream)` has no Ibex counterpart), `maxsslconn` and
+`tune.ssl.cachesize` are not configurable, so `MaxSslConns` stays 0 and the
+`Automatically setting global.maxconn ...` notice is not printed.

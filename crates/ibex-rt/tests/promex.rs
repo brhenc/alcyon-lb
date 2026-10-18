@@ -4,6 +4,7 @@
 
 pub use ibex_rt::engine;
 pub use ibex_rt::check;
+pub use ibex_rt::globalconn;
 
 #[path = "../src/promex.rs"]
 pub mod promex;
@@ -198,4 +199,60 @@ fn test_allocations() {
     let diff = before.diff(&after);
     println!("Allocations: {} allocs, {} bytes", diff.alloc_count, diff.bytes_allocated);
     assert_eq!(diff.alloc_count, 0, "rendering must not allocate");
+}
+
+fn failing_pool() -> Option<ibex_alloc::PoolHead> {
+    Some(ibex_alloc::PoolHead {
+        name: "memmax_test",
+        size: 64,
+        align: 8,
+        allocated: 4,
+        alloc_bytes: 256,
+        used: 2,
+        cached: 0,
+        needed_avg: 2,
+        failures: 7,
+        users: 1,
+    })
+}
+
+/// `PoolFailed` and the four `haproxy_process_*` memory metrics read the counters through
+/// the pool registry (the sum of every provider's `failures`) and the `-m` budget. Nothing in
+/// the data path increments a pool's `failures` yet (the fallible buffer take is a later
+/// slice), so this test registers a provider that reports 7 failures rather than provoking
+/// one. Names, HELP texts and types are from HAProxy's source, not measured: the reference
+/// binary is built without PROMEX (src/stats.c:106-112 `.alt_name`/`.desc`; promex gives a
+/// `FN_COUNTER` field the counter type, `FN_LIMIT` and the rest gauge).
+#[test]
+fn memory_metrics_and_pool_failed() {
+    ibex_alloc::global_pool_registry().register_provider("memmax_test", failing_pool);
+    ibex_rt::globalconn::set_memmax_mb(64);
+
+    let info = ibex_rt::stats::format_show_info(std::time::Instant::now(), 1, 0, 0, 0, 0);
+    assert!(info.lines().any(|l| l == "PoolFailed: 7"), "{info}");
+    assert!(info.lines().any(|l| l == "Memmax_MB: 64"), "{info}");
+    assert!(info.lines().any(|l| l == "Memmax_bytes: 67108864"), "{info}");
+
+    let config = Config::default();
+    let engine = Engine::new(&config, 64).expect("Engine::new");
+    let stats = promex::StatsSnapshot {
+        proxies: &engine.proxies,
+        checks: &engine.checks,
+        start_time: engine.start_time,
+        pid: 1,
+        total_tasks: 0,
+        run_queue_len: 0,
+        active_conns: 0,
+        max_conns: 0,
+    };
+    let mut out = String::new();
+    promex::render(&stats, &mut out);
+    for (name, ty, help, value) in [
+        ("haproxy_process_max_memory_bytes", "gauge", "Worker process's hard limit on memory usage in bytes (-m on command line)", "67108864"),
+        ("haproxy_process_pool_allocated_bytes", "gauge", "Amount of memory allocated in pools (in bytes)", ""),
+        ("haproxy_process_pool_used_bytes", "gauge", "Amount of pool memory currently used (in bytes)", ""),
+        ("haproxy_process_pool_failures_total", "counter", "Number of failed pool allocations since this worker was started", "7"),
+    ] {
+        assert!(out.contains(&format!("# HELP {name} {help}\n# TYPE {name} {ty}\n{name} {value}")), "{name} in:\n{out}");
+    }
 }

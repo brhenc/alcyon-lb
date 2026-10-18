@@ -73,8 +73,9 @@ fn debug_flags_announce_themselves() {
     }
 }
 
-/// `-sf` naming a process ibex may not signal (pid 1) and `-m` above the hard address-space
-/// limit: both are warnings, the proxy starts anyway.
+/// `-sf` naming a process ibex may not signal (pid 1) is a warning, the proxy starts anyway;
+/// `-m` above the hard address-space limit is not one: `-m` is a `maxconn` budget and sets no
+/// rlimit, on HAProxy and on Ibex (see `memmax.rs`).
 #[test]
 fn signal_and_memory_limit_failures_warn_and_start() {
     let dir = std::path::PathBuf::from(format!("/tmp/t342b-cli2-{}", std::process::id()));
@@ -95,7 +96,7 @@ fn signal_and_memory_limit_failures_warn_and_start() {
     common::stop(&mut ibex);
     let mut text = String::new();
     err.read_to_string(&mut text).unwrap();
-    assert!(text.contains("[WARNING] Unable to enforce memory limit (-m 4096 MB):"), "{text:?}");
+    assert!(!text.contains("memory limit"), "{text:?}");
     assert!(text.contains("[WARNING] Failed to send signal Usr1 to PID 1:"), "{text:?}");
 }
 

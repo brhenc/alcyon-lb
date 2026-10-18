@@ -41,6 +41,29 @@ pub fn render(stats: &StatsSnapshot, out: &mut String) {
         stats.max_conns
     );
 
+    // Memory (src/stats.c:106-112): Memmax_bytes is a u32 in HAProxy, so it wraps above 4095 MB.
+    out.push_str("# HELP haproxy_process_max_memory_bytes Worker process's hard limit on memory usage in bytes (-m on command line)\n");
+    out.push_str("# TYPE haproxy_process_max_memory_bytes gauge\n");
+    let _ = writeln!(out, "haproxy_process_max_memory_bytes {}", crate::globalconn::memmax_mb().wrapping_mul(1_048_576));
+
+    let (mut pool_alloc, mut pool_used, mut pool_failures) = (0u64, 0u64, 0u64);
+    ibex_alloc::global_pool_registry().for_each(|p| {
+        pool_alloc += p.alloc_bytes as u64;
+        pool_used += (p.used * p.size) as u64;
+        pool_failures += p.failures as u64;
+    });
+    out.push_str("# HELP haproxy_process_pool_allocated_bytes Amount of memory allocated in pools (in bytes)\n");
+    out.push_str("# TYPE haproxy_process_pool_allocated_bytes gauge\n");
+    let _ = writeln!(out, "haproxy_process_pool_allocated_bytes {pool_alloc}");
+
+    out.push_str("# HELP haproxy_process_pool_used_bytes Amount of pool memory currently used (in bytes)\n");
+    out.push_str("# TYPE haproxy_process_pool_used_bytes gauge\n");
+    let _ = writeln!(out, "haproxy_process_pool_used_bytes {pool_used}");
+
+    out.push_str("# HELP haproxy_process_pool_failures_total Number of failed pool allocations since this worker was started\n");
+    out.push_str("# TYPE haproxy_process_pool_failures_total counter\n");
+    let _ = writeln!(out, "haproxy_process_pool_failures_total {pool_failures}");
+
     out.push_str("# HELP haproxy_process_current_connections Current number of connections on this worker process\n");
     out.push_str("# TYPE haproxy_process_current_connections gauge\n");
     let _ = writeln!(
