@@ -208,6 +208,7 @@ impl Expr {
                         "len" => "len",
                         "bin" => "bin",
                         "found" => "found",
+                        "bool" => "bool",
                         other => return Err(format!("unknown matching method '{other}' when parsing ACL expression")),
                     };
                     forced = true;

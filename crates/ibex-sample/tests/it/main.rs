@@ -15,6 +15,7 @@
 mod converter_batch_coverage;
 mod converters_bulk;
 mod converters_never_panic;
+mod matcher_bool;
 mod matcher_unknown_method;
 mod proptest_cast;
 mod proptest_cidr;

@@ -59,6 +59,8 @@ pub enum Matcher {
     Bin(Vec<u8>),
     /// Matches if sample exists / is found.
     Found,
+    /// Matches when the sample, cast to an integer, is non-zero (`pat_match_nothing`).
+    Bool,
 }
 
 /// Integer comparison operators for matchers.
@@ -241,6 +243,8 @@ impl Matcher {
                     .map_err(|e| e.to_string())
             }
             "found" => Ok(Matcher::Found),
+            // `pat_parse_nothing`: any pattern after `-m bool` is accepted and unused.
+            "bool" => Ok(Matcher::Bool),
             "bin" => {
                 // `parse_binary`: whole bytes written as hex digits, in the pattern's own
                 // word. The length is checked first, then each digit.
@@ -347,6 +351,7 @@ impl Matcher {
     pub fn matches(&self, sample: &Sample) -> bool {
         match self {
             Matcher::Found => true,
+            Matcher::Bool => matches!(cast(sample.clone(), SampleType::Sint), Some(Sample::Sint(v)) if v != 0),
             Matcher::Any(list) => list.iter().any(|m| m.matches(sample)),
             Matcher::File(f) => f.matches(sample),
             Matcher::Word { pattern, delimiters, case_insensitive } => {
