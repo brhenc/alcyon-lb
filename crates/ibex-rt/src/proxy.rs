@@ -2489,10 +2489,13 @@ impl TcpSession {
                         txn::BodyCheck::Fine | txn::BodyCheck::Held { .. } => {}
                     }
                 }
-                let mut txn = HttpTxn::new(framing, close || self.close_client);
-                txn.req_htx = req_htx;
                 let line = self.req.readable().split(|&b| b == b'\n').next().map_or(&[][..], <[u8]>::trim_ascii_end);
                 let ver = &line[line.len().saturating_sub(8)..];
+                // A chunked HTTP/1.0 request closes the connection after its response, whatever
+                // `Connection` says (`H1_MF_CONN_CLO`; measured on 3.5-dev8, T430 row 2).
+                let chunked10 = framing == txn::Framing::Chunked && !ibex_proto::h1::version_is_11(ver);
+                let mut txn = HttpTxn::new(framing, close || self.close_client || chunked10);
+                txn.req_htx = req_htx;
                 txn.req_http11 = ibex_proto::h1::version_is_11(ver);
                 txn.req_version = txn::version_digits(ver).unwrap_or(txn.req_version);
                 // The client's own method: rules that rewrite it have not run yet.

@@ -1488,3 +1488,118 @@ fn timeout_client_does_not_cut_off_a_slow_server() {
     let mut c = Client::connect(fe);
     assert_eq!(c.get("/slow").map(|r| r.body_str()).as_deref(), Some("GET /slow 0"));
 }
+
+// ---- the Connection header on HTTP/1.0 requests (T430 row 2) -----------------------
+
+/// What the server is sent in `Connection`, what the client is answered with, and whether the
+/// client connection is closed, for an HTTP/1.0 POST in each mode. An HTTP/1.0 request with
+/// `Transfer-Encoding: chunked` gets no `Connection` token to the server (`keep-alive` would
+/// be wrong: its message ends with the connection) and its client connection closes whatever
+/// the client asked for (`option httpclose` in the frontend alone leaves the server side as the
+/// default mode has it). Measured on HAProxy 3.5-dev8 (`/home/bhenc/reference/haproxy`),
+/// 2026-10-18; run with `IBEX_TXN_BIN` set to it to re-measure.
+#[test]
+fn http10_connection_header_by_framing_and_mode() {
+    // (framing, client Connection, server Connection, client answer Connection, closed)
+    type Case = (&'static str, &'static str, &'static str, &'static str, bool);
+    const DEFAULT: &[Case] = &[
+        ("none", "", "keep-alive", "close", true),
+        ("none", "keep-alive", "keep-alive", "keep-alive", false),
+        ("none", "close", "keep-alive", "close", true),
+        ("cl", "", "keep-alive", "close", true),
+        ("cl", "keep-alive", "keep-alive", "keep-alive", false),
+        ("cl", "close", "keep-alive", "close", true),
+        ("te", "", "", "close", true),
+        ("te", "keep-alive", "", "close", true),
+        ("te", "close", "", "close", true),
+    ];
+    const SERVER_CLOSE: &[Case] = &[
+        ("none", "", "", "close", true),
+        ("none", "keep-alive", "", "keep-alive", false),
+        ("none", "close", "", "close", true),
+        ("cl", "", "", "close", true),
+        ("cl", "keep-alive", "", "keep-alive", false),
+        ("cl", "close", "", "close", true),
+        ("te", "", "", "close", true),
+        ("te", "keep-alive", "", "close", true),
+        ("te", "close", "", "close", true),
+    ];
+    const HTTPCLOSE: &[Case] = &[
+        ("none", "", "keep-alive", "close", true),
+        ("none", "keep-alive", "keep-alive", "close", true),
+        ("none", "close", "keep-alive", "close", true),
+        ("cl", "", "keep-alive", "close", true),
+        ("cl", "keep-alive", "keep-alive", "close", true),
+        ("cl", "close", "keep-alive", "close", true),
+        ("te", "", "", "close", true),
+        ("te", "keep-alive", "", "close", true),
+        ("te", "close", "", "close", true),
+    ];
+    let mut bad = Vec::new();
+    for (mode, cases) in [("", DEFAULT), ("  option http-server-close\n", SERVER_CLOSE), ("  option httpclose\n", HTTPCLOSE)] {
+        let (_p, fe, seen) = simple(|r| Reply::ok(&r.path), mode);
+        for (i, (framing, conn, want_srv, want_rsp, want_closed)) in cases.iter().enumerate() {
+            let conn_line = if conn.is_empty() { String::new() } else { format!("Connection: {conn}\r\n") };
+            let (fr, body) = match *framing {
+                "cl" => ("Content-Length: 5\r\n\r\n", "hello"),
+                "te" => ("Transfer-Encoding: chunked\r\n\r\n", "5\r\nhello\r\n0\r\n\r\n"),
+                _ => ("\r\n", ""),
+            };
+            let mut c = Client::connect(fe);
+            c.send(format!("POST /c{i} HTTP/1.0\r\nHost: x\r\n{conn_line}{fr}{body}").as_bytes());
+            let r = c.final_response();
+            let rsp = r.as_ref().and_then(|r| r.header("connection")).unwrap_or("");
+            let closed = c.closed_within(Duration::from_millis(500));
+            let head = seen.lock().unwrap().iter().find(|s| s.path == format!("/c{i}")).map(|s| s.head.to_ascii_lowercase());
+            let srv = head.as_deref().and_then(|h| h.lines().find_map(|l| l.strip_prefix("connection:"))).map_or("", str::trim);
+            if (srv, rsp, closed) != (*want_srv, *want_rsp, *want_closed) {
+                bad.push(format!("mode {mode:?} {framing} conn={conn:?}: server {srv:?} answer {rsp:?} closed {closed} (want {want_srv:?} {want_rsp:?} {want_closed})"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+// ---- the Connection header on replies to a request that cannot be parsed (T430 row 3) --
+
+/// `HAProxy` sends the page for a request it cannot parse as it is and closes: the built-in
+/// 400 and 408 pages carry `Connection: close` themselves, the 413, 414, 422 and 431 ones do
+/// not, and nothing is added (not even to an `errorfile` without it). Measured on 3.5-dev8
+/// (`/home/bhenc/reference/haproxy`), 2026-10-18; every one of them closes the connection.
+#[test]
+fn a_parse_error_reply_has_no_connection_header_but_the_pages() {
+    let long_uri = format!("GET /{} HTTP/1.1\r\nHost: x\r\n\r\n", "a".repeat(20000));
+    let big_head = format!("GET / HTTP/1.1\r\nHost: x\r\nX: {}\r\n\r\n", "a".repeat(20000));
+    let cases: [(&str, &[u8], u16, bool); 6] = [
+        ("bad header", b"GET / HTTP/1.1\r\nBad\r\n\r\n", 400, true),
+        ("1.0 chunked GET", b"GET / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", 413, false),
+        ("uri too long", long_uri.as_bytes(), 414, false),
+        ("unknown coding", b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n", 422, false),
+        ("head too big", big_head.as_bytes(), 431, false),
+        ("incomplete head", b"GET / HTTP/1.1\r\nHost: x\r\n", 408, true),
+    ];
+    let mut bad = Vec::new();
+    let (_p, fe, _) = simple(echo, "  timeout http-request 1s\n");
+    for (name, req, status, page_has_close) in cases {
+        let mut c = Client::connect(fe);
+        c.send(req);
+        let r = c.final_response();
+        let got = r.as_ref().map(|r| (r.status, r.header("connection").is_some()));
+        let closed = c.closed_within(Duration::from_secs(1));
+        if got != Some((status, page_has_close)) || !closed {
+            bad.push(format!("{name}: {got:?} closed {closed}, want {:?}", Some((status, page_has_close))));
+        }
+    }
+    // A custom page is sent as written.
+    let mut page = NamedTempFile::new().expect("errorfile");
+    page.write_all(b"HTTP/1.0 400 Bad request\r\nContent-Length: 3\r\nContent-Type: text/plain\r\n\r\nbad").unwrap();
+    let (_p2, fe2, _) = simple(echo, &format!("  errorfile 400 {}\n", page.path().display()));
+    let mut c = Client::connect(fe2);
+    c.send(b"GET / HTTP/1.1\r\nBad\r\n\r\n");
+    let r = c.final_response();
+    let got = r.as_ref().map(|r| (r.status, r.header("connection").is_some()));
+    if got != Some((400, false)) || !c.closed_within(Duration::from_secs(1)) {
+        bad.push(format!("errorfile 400: {got:?}, want (400, false) then closed"));
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

@@ -7585,8 +7585,9 @@ fn reply_parse_error(entry: &mut SessionEntry, proxies: &[Proxy], status: u16) {
     // The H1 mux's own error reply goes through HTX, which writes the header names in lower
     // case (measured on 3.5-dev8: `content-length: 105`, `cache-control: ...`).
     rewrite_header_names(&mut page, client_case_table(&proxies[entry.proxy_idx]));
-    // HAProxy's 431 does not say `Connection: close`, though it closes.
-    entry.sess.write_reply_with(&page, status != 431);
+    // The page goes out as it is: HAProxy adds no `Connection: close` to the 413, 414, 422 and
+    // 431 it closes after, nor to an `errorfile` 400 without one (T430 row 3).
+    entry.sess.write_reply_with(&page, false);
     count_parse_error(entry, proxies, status);
 }
 
@@ -13048,6 +13049,12 @@ fn client_close(proxies: &[Proxy], fe_idx: usize) -> bool {
 /// `keep-alive` for an HTTP/1.0 request that keeps it; [`crate::txn::request_connection_token`]).
 fn rewrite_request_connection(sess: &mut TcpSession, close: bool) {
     let http11 = sess.txn.as_ref().is_none_or(|t| t.req_http11);
+    // An HTTP/1.0 request with a chunked body is sent without a `Connection` token at all:
+    // `keep-alive` would be wrong for a message that ends with its connection (T430 row 2).
+    let close = close
+        || (!http11
+            && crate::find_eoh(sess.req.readable())
+                .is_some_and(|(h, e)| crate::txn::request_framing(&sess.req.readable()[..h + e]) == crate::txn::Framing::Chunked));
     // One look at the head, no copy. The usual request has no `Connection`, or one that is
     // all `keep-alive` and `close` and goes whole, cut out of the head where it is.
     let scan = crate::find_eoh(sess.req.readable()).map(|(h, e)| crate::txn::scan_connection(&sess.req.readable()[..h + e]));
