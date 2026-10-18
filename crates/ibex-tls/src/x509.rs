@@ -39,14 +39,13 @@ impl<'a> Cert<'a> {
     pub fn parse(der: &'a [u8]) -> Option<Self> {
         let mut cert = Der::new(der).child()?;
         let mut tbs = cert.child()?;
-        let mut first = tbs.tlv()?;
-        let mut version = 0;
-        if first.tag == 0xA0 {
+        let first = tbs.tlv()?;
+        let (version, serial) = if first.tag == 0xA0 {
             let v = Der::new(first.value).tlv()?;
-            version = *v.value.last()?;
-            first = tbs.tlv()?;
-        }
-        let serial = first.value;
+            (*v.value.last()?, tbs.tlv()?.value)
+        } else {
+            (0, first.value)
+        };
         let sig = tbs.tlv()?;
         let sig_oid = Der::new(sig.value).tlv()?.value;
         let issuer = tbs.tlv()?.value;
@@ -357,5 +356,174 @@ mod tests {
     fn garbage_is_no_certificate() {
         assert!(Cert::parse(&[0x30, 0x84, 0xff, 0xff, 0xff, 0xff]).is_none());
         assert!(Cert::parse(&[]).is_none());
+    }
+
+    fn tlv(tag: u8, v: &[u8]) -> Vec<u8> {
+        let mut o = vec![tag];
+        if v.len() < 0x80 {
+            o.push(u8::try_from(v.len()).unwrap());
+        } else {
+            o.extend_from_slice(&[0x82, u8::try_from(v.len() >> 8).unwrap(), u8::try_from(v.len() & 0xff).unwrap()]);
+        }
+        o.extend_from_slice(v);
+        o
+    }
+
+    /// A `Name` with one RDN per slice of (oid, string tag, value).
+    fn name(rdns: &[&[(&[u8], u8, &[u8])]]) -> Vec<u8> {
+        let mut o = Vec::new();
+        for rdn in rdns {
+            let mut set = Vec::new();
+            for (oid, tag, val) in *rdn {
+                let mut atv = tlv(0x06, oid);
+                atv.extend(tlv(*tag, val));
+                set.extend(tlv(0x30, &atv));
+            }
+            o.extend(tlv(0x31, &set));
+        }
+        o
+    }
+
+    const CN: &[u8] = &[0x55, 4, 3];
+    const O: &[u8] = &[0x55, 4, 10];
+
+    #[test]
+    fn a_generated_certificate_is_read_field_by_field() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["x.test".to_string()]).unwrap();
+        params.distinguished_name.push(rcgen::DnType::CommonName, "x.test");
+        let cert = params.self_signed(&key).unwrap();
+        let c = Cert::parse(cert.der()).unwrap();
+        assert_eq!(c.version, 2);
+        assert_eq!(sig_alg_name(c.sig_oid), "ecdsa-with-SHA256");
+        assert_eq!(key_alg_name(c.key_oid), "id-ecPublicKey");
+        assert_eq!(dn_oneline(c.subject).unwrap(), b"/CN=x.test");
+        assert_eq!(dn_oneline(c.issuer).unwrap(), b"/CN=x.test");
+        assert!(matches!(c.not_before.0, 0x17 | 0x18));
+    }
+
+    #[test]
+    fn algorithm_tables() {
+        let rsa = |n: u8| [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, n];
+        for (n, want) in [
+            (4, "RSA-MD5"),
+            (5, "RSA-SHA1"),
+            (10, "RSASSA-PSS"),
+            (11, "RSA-SHA256"),
+            (12, "RSA-SHA384"),
+            (13, "RSA-SHA512"),
+            (14, "RSA-SHA224"),
+            (99, "UNDEF"),
+        ] {
+            assert_eq!(sig_alg_name(&rsa(n)), want);
+        }
+        let ec = |t: &[u8]| [&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04][..], t].concat();
+        for (t, want) in [
+            (&[1][..], "ecdsa-with-SHA1"),
+            (&[3, 1], "ecdsa-with-SHA224"),
+            (&[3, 2], "ecdsa-with-SHA256"),
+            (&[3, 3], "ecdsa-with-SHA384"),
+            (&[3, 4], "ecdsa-with-SHA512"),
+            (&[9], "UNDEF"),
+        ] {
+            assert_eq!(sig_alg_name(&ec(t)), want);
+        }
+        assert_eq!(sig_alg_name(&[0x2B, 0x65, 0x70]), "ED25519");
+        assert_eq!(sig_alg_name(&[0x2B, 0x65, 0x71]), "ED448");
+        assert_eq!(sig_alg_name(&[1, 2]), "UNDEF");
+        for (oid, want) in [
+            (&rsa(1)[..], "rsaEncryption"),
+            (&rsa(10), "RSASSA-PSS"),
+            (&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01], "id-ecPublicKey"),
+            (&[0x2A, 0x86, 0x48, 0xCE, 0x38, 0x04, 0x01], "DSA"),
+            (&[0x2B, 0x65, 0x6E], "X25519"),
+            (&[0x2B, 0x65, 0x6F], "X448"),
+            (&[0x2B, 0x65, 0x70], "ED25519"),
+            (&[0x2B, 0x65, 0x71], "ED448"),
+            (&[1, 2], "UNDEF"),
+        ] {
+            assert_eq!(key_alg_name(oid), want);
+        }
+    }
+
+    #[test]
+    fn attribute_names() {
+        for (n, want) in [
+            (3, "CN"), (4, "SN"), (5, "serialNumber"), (6, "C"), (7, "L"), (8, "ST"), (9, "street"),
+            (10, "O"), (11, "OU"), (12, "title"), (13, "description"), (15, "businessCategory"),
+            (17, "postalCode"), (41, "name"), (42, "GN"), (43, "initials"), (44, "generationQualifier"),
+            (46, "dnQualifier"), (65, "pseudonym"), (97, "organizationIdentifier"), (99, "2.5.4.99"),
+        ] {
+            assert_eq!(attr_name(&[0x55, 4, n]), want);
+        }
+        let pk = |n: u8| [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, n];
+        assert_eq!(attr_name(&pk(1)), "emailAddress");
+        assert_eq!(attr_name(&pk(2)), "unstructuredName");
+        assert_eq!(attr_name(&pk(8)), "unstructuredAddress");
+        assert_eq!(attr_name(&pk(7)), "1.2.840.113549.1.9.7");
+        let uid = [0x09, 0x92, 0x26, 0x89, 0x93, 0xF2, 0x2C, 0x64, 0x01];
+        assert_eq!(attr_name(&[&uid[..], &[1]].concat()), "UID");
+        assert_eq!(attr_name(&[&uid[..], &[0x19]].concat()), "DC");
+    }
+
+    #[test]
+    fn dn_entry_counts_from_either_end_and_refuses_nul() {
+        let n = name(&[&[(CN, 0x0C, b"a")], &[(O, 0x0C, b"b")], &[(CN, 0x0C, b"c")]]);
+        assert_eq!(dn_entry(&n, "cn", 1).unwrap(), b"a");
+        assert_eq!(dn_entry(&n, "CN", 2).unwrap(), b"c");
+        assert_eq!(dn_entry(&n, "CN", -1).unwrap(), b"c");
+        assert_eq!(dn_entry(&n, "CN", -2).unwrap(), b"a");
+        assert_eq!(dn_entry(&n, "CN", 3), None);
+        assert_eq!(dn_entry(&n, "CN", 0), None);
+        assert_eq!(dn_entry(&n, "OU", 1), None);
+        let mid = name(&[&[(CN, 0x0C, b"a\x00b")]]);
+        assert_eq!(dn_entry(&mid, "CN", 1), None);
+        assert_eq!(dn_oneline(&mid), None);
+        let tail = name(&[&[(CN, 0x0C, b"a\x00\x00")]]);
+        assert_eq!(dn_entry(&tail, "CN", 1).unwrap(), b"a\0");
+        assert_eq!(dn_oneline(&[]), None);
+    }
+
+    #[test]
+    fn rfc2253_form() {
+        let n = name(&[
+            &[(O, 0x0C, b"Org, Inc")],
+            &[(CN, 0x13, b"a"), (CN, 0x0C, b" b\x01\xc3\xa9 ")],
+            &[(CN, 0x04, b"\x01\x02")],
+        ]);
+        assert_eq!(dn_rfc2253(&n).unwrap(), b"CN=#04020102,CN=a+CN=\\ b\\01\\C3\\A9\\ ,O=Org\\, Inc".to_vec());
+        assert_eq!(dn_rfc2253(&[]), None);
+        // Measured on HAProxy 3.5-dev8 for subject `O=Org\, Inc, CN=" b#x", CN=a#`.
+        let o = name(&[&[(O, 0x0C, b"Org, Inc")], &[(CN, 0x0C, b" b#x")], &[(CN, 0x0C, b"a#")]]);
+        assert_eq!(dn_oneline(&o).unwrap(), b"/O=Org, Inc/CN= b#x/CN=a#");
+        assert_eq!(dn_rfc2253(&o).unwrap(), b"CN=a#,CN=\\ b#x,O=Org\\, Inc");
+        // A value of 128 bytes of a non-string type gets a long-form length in its hex dump.
+        let big = name(&[&[(CN, 0x04, &[7u8; 130])]]);
+        let got = dn_rfc2253(&big).unwrap();
+        assert!(got.starts_with(b"CN=#04810082") || got.starts_with(b"CN=#048182"), "{}", String::from_utf8_lossy(&got));
+        // '#' leads a string value: escaped.
+        assert_eq!(dn_rfc2253(&name(&[&[(CN, 0x0C, b"#x")]])).unwrap(), b"CN=\\#x");
+    }
+
+    #[test]
+    fn malformed_names_and_certificates_are_refused_not_panicked_on() {
+        for bad in [&[0x31][..], &[0x31, 0x05, 0x30], &[0x31, 0x02, 0x30, 0x00], &[0x31, 0x84, 0xff, 0xff, 0xff, 0xff]] {
+            assert_eq!(dn_oneline(bad), None);
+            assert_eq!(dn_rfc2253(bad), None);
+            assert_eq!(dn_entry(bad, "CN", 1), None);
+        }
+        // Every truncation of a real certificate is refused or parsed, never a panic.
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["x.test".to_string()]).unwrap();
+        let der = params.self_signed(&key).unwrap().der().to_vec();
+        for n in 0..der.len() {
+            let _ = Cert::parse(&der[..n]);
+        }
+        // A version with nothing after it.
+        let tbs = tlv(0x30, &tlv(0xA0, &tlv(0x02, &[2])));
+        assert!(Cert::parse(&tlv(0x30, &tbs)).is_none());
+        // A version field with an empty INTEGER.
+        let tbs = tlv(0x30, &tlv(0xA0, &tlv(0x02, &[])));
+        assert!(Cert::parse(&tlv(0x30, &tbs)).is_none());
     }
 }
