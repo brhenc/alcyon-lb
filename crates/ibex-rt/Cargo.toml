@@ -87,6 +87,11 @@ path = "tests/h2_held_streams_memory.rs"
 name = "idle_conn_memory"
 path = "tests/idle_conn_memory.rs"
 
+# Own process: reads the child's VmRSS and times idle periods (process-wide state)
+[[test]]
+name = "memory_baseline"
+path = "tests/memory_baseline.rs"
+
 # Own process: lowers the test process's RLIMIT_NOFILE (other tests would get EMFILE)
 [[test]]
 name = "logfwd_accept_emfile"

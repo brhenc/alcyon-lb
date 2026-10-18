@@ -18,7 +18,7 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
-use ibex_alloc::PoolHead;
+use ibex_alloc::{PoolHead, PoolReg};
 
 /// Configured buffer sizes (in bytes).
 static BUFSIZE_STANDARD: AtomicUsize = AtomicUsize::new(16_384);
@@ -52,7 +52,12 @@ pub fn get_bufsize_large() -> Option<usize> {
 }
 
 // Global atomic pool statistics counters
+/// Failed pool takes. Nothing increments it yet.
+pub static POOL_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
 static BUF_STD_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+/// Standard buffers ever taken from the heap (never decremented): what `trim_idle` watches.
+static BUF_STD_FRESH: AtomicUsize = AtomicUsize::new(0);
 static BUF_STD_USED: AtomicUsize = AtomicUsize::new(0);
 static BUF_STD_CACHED: AtomicUsize = AtomicUsize::new(0);
 
@@ -78,9 +83,12 @@ pub fn buffer_pool_stats() -> Option<PoolHead> {
         alloc_bytes: allocated * size,
         used,
         cached,
-        needed_avg: used,
-        failures: 0,
+        // `needed_avg` is not tracked (always 0) and `failures` is never incremented: the
+        // fallible take that would count them is another slice. Nothing is made up here.
+        needed_avg: 0,
+        failures: POOL_FAILURES.load(Ordering::Relaxed),
         users: 1,
+        reg: Some(PoolReg { name: "buffer", size, flags: 0, align: 64, file: file!(), line: line!() }),
     })
 }
 
@@ -98,9 +106,12 @@ pub fn small_buffer_pool_stats() -> Option<PoolHead> {
         alloc_bytes: allocated * size,
         used,
         cached,
-        needed_avg: used,
-        failures: 0,
+        // `needed_avg` is not tracked (always 0) and `failures` is never incremented: the
+        // fallible take that would count them is another slice. Nothing is made up here.
+        needed_avg: 0,
+        failures: POOL_FAILURES.load(Ordering::Relaxed),
         users: 1,
+        reg: Some(PoolReg { name: "small_buffer", size, flags: 0, align: 64, file: file!(), line: line!() }),
     })
 }
 
@@ -118,10 +129,79 @@ pub fn large_buffer_pool_stats() -> Option<PoolHead> {
         alloc_bytes: allocated * size,
         used,
         cached,
-        needed_avg: used,
-        failures: 0,
+        // `needed_avg` is not tracked (always 0) and `failures` is never incremented: the
+        // fallible take that would count them is another slice. Nothing is made up here.
+        needed_avg: 0,
+        failures: POOL_FAILURES.load(Ordering::Relaxed),
         users: 1,
+        reg: Some(PoolReg { name: "large_buffer", size, flags: 0, align: 64, file: file!(), line: line!() }),
     })
+}
+
+/// Counters of a per-thread arena (`SessionArena`, `AppletArena`), summed over every worker:
+/// each arena adds to these process-wide atomics as it creates a slot (`allocated`) and as a
+/// slot goes in and out of use (`used`), and takes its share back when it is dropped.
+/// `show pools` reads them; the arenas never read them.
+#[derive(Default)]
+pub struct ArenaCounters {
+    allocated: AtomicUsize,
+    used: AtomicUsize,
+}
+
+impl ArenaCounters {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { allocated: AtomicUsize::new(0), used: AtomicUsize::new(0) }
+    }
+
+    pub fn slot_created(&self) {
+        self.allocated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn slot_used(&self) {
+        self.used.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn slot_released(&self) {
+        self.used.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// `n` empty slots at the end of an arena were given back.
+    pub fn slots_trimmed(&self, n: usize) {
+        self.allocated.fetch_sub(n, Ordering::Relaxed);
+    }
+
+    /// An arena holding `slots` slots, `live` of them in use, goes away.
+    pub fn arena_dropped(&self, slots: usize, live: usize) {
+        self.allocated.fetch_sub(slots, Ordering::Relaxed);
+        self.used.fetch_sub(live, Ordering::Relaxed);
+    }
+
+    /// The pool as `show pools` prints it. The slots that exist and are not in use are the
+    /// arena's free list, which is what `HAProxy` calls the thread cache.
+    #[must_use]
+    pub fn head(&self, reg: PoolReg) -> PoolHead {
+        let allocated = self.allocated.load(Ordering::Relaxed);
+        let live = self.used.load(Ordering::Relaxed).min(allocated);
+        PoolHead {
+            name: reg.name,
+            size: reg.size,
+            align: reg.align,
+            allocated,
+            alloc_bytes: allocated * reg.size,
+            used: live,
+            cached: allocated - live,
+            needed_avg: 0,
+            failures: POOL_FAILURES.load(Ordering::Relaxed),
+            users: 1,
+            reg: Some(reg),
+        }
+    }
+}
+
+fn register_arena_pools(reg: &ibex_alloc::PoolRegistry) {
+    reg.register_provider("session", crate::engine::session_pool_stats);
+    reg.register_provider("appctx", crate::applet::appctx_pool_stats);
 }
 
 static INIT_REGISTRY: Once = Once::new();
@@ -132,6 +212,7 @@ pub fn ensure_registered() {
         let reg = ibex_alloc::global_pool_registry();
         reg.register_provider("buffer", buffer_pool_stats);
         reg.register_provider("small_buffer", small_buffer_pool_stats);
+        register_arena_pools(reg);
     });
 }
 
@@ -152,6 +233,7 @@ pub fn init_buffer_sizes(standard: usize, small: usize, large: Option<usize>) {
     let reg = ibex_alloc::global_pool_registry();
     reg.register_provider("buffer", buffer_pool_stats);
     reg.register_provider("small_buffer", small_buffer_pool_stats);
+    register_arena_pools(reg);
     if large.is_some() {
         reg.register_provider("large_buffer", large_buffer_pool_stats);
     } else {
@@ -203,7 +285,7 @@ pub fn heap_trims() -> usize {
 /// least `TRIM_MIN_FRESH` buffers had to be allocated from the heap since the last trim and
 /// none has been for `TRIM_QUIET`, the trim is done.
 pub fn trim_idle(now: std::time::Instant) {
-    let allocated = BUF_STD_ALLOCATED.load(Ordering::Relaxed);
+    let allocated = BUF_STD_FRESH.load(Ordering::Relaxed);
     let mut state = TRIM_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -277,6 +359,7 @@ fn alloc_standard() -> Box<[u8]> {
         buf
     } else {
         BUF_STD_ALLOCATED.fetch_add(1, Ordering::Relaxed);
+        BUF_STD_FRESH.fetch_add(1, Ordering::Relaxed);
         BUF_STD_USED.fetch_add(1, Ordering::Relaxed);
         vec![0u8; target_sz].into_boxed_slice()
     }
@@ -367,10 +450,12 @@ impl Drop for Buf {
                     });
                     if !pushed {
                         BUF_STD_USED.fetch_sub(1, Ordering::Relaxed);
+                        BUF_STD_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
                     }
                 } else {
                     // Grown by a head rewrite: not poolable, but no longer in use.
                     BUF_STD_USED.fetch_sub(1, Ordering::Relaxed);
+                    BUF_STD_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
                 }
             }
             BufClass::Small => {
@@ -390,6 +475,7 @@ impl Drop for Buf {
                     });
                     if !pushed {
                         BUF_SMALL_USED.fetch_sub(1, Ordering::Relaxed);
+                        BUF_SMALL_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -410,6 +496,7 @@ impl Drop for Buf {
                         });
                         if !pushed {
                             BUF_LARGE_USED.fetch_sub(1, Ordering::Relaxed);
+                            BUF_LARGE_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -571,6 +658,7 @@ impl Buf {
             });
             if !pushed {
                 BUF_SMALL_USED.fetch_sub(1, Ordering::Relaxed);
+                BUF_SMALL_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
             }
         }
 
@@ -820,10 +908,39 @@ impl Buf {
 mod tests {
     use super::Buf;
 
+    /// The tests that read the process-wide buffer counters take turns.
+    static COUNTERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A freed large buffer that does not fit the thread cache goes back to the heap and
+    /// leaves the `allocated` count, as the standard and small ones do (M3).
+    #[test]
+    fn a_large_buffer_beyond_the_thread_cache_is_no_longer_allocated() {
+        use super::{
+            BUF_LARGE_ALLOCATED, BUF_LARGE_CACHED, BUF_LARGE_USED, BUFSIZE_LARGE, MAX_CACHED_PER_THREAD,
+        };
+        use std::sync::atomic::Ordering::SeqCst;
+        let _g = COUNTERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        BUFSIZE_LARGE.store(65536, SeqCst);
+        std::thread::spawn(|| {
+            let (a0, u0, c0) = (BUF_LARGE_ALLOCATED.load(SeqCst), BUF_LARGE_USED.load(SeqCst), BUF_LARGE_CACHED.load(SeqCst));
+            let bufs: Vec<Buf> = (0..=MAX_CACHED_PER_THREAD).map(|_| Buf::large()).collect();
+            assert_eq!(BUF_LARGE_ALLOCATED.load(SeqCst), a0 + MAX_CACHED_PER_THREAD + 1);
+            assert_eq!(BUF_LARGE_USED.load(SeqCst), u0 + MAX_CACHED_PER_THREAD + 1);
+            drop(bufs);
+            assert_eq!(BUF_LARGE_USED.load(SeqCst), u0);
+            assert_eq!(BUF_LARGE_CACHED.load(SeqCst), c0 + MAX_CACHED_PER_THREAD);
+            // one did not fit the cache: it is back on the heap, so it is not allocated
+            assert_eq!(BUF_LARGE_ALLOCATED.load(SeqCst), a0 + MAX_CACHED_PER_THREAD);
+        })
+        .join()
+        .unwrap();
+    }
+
     /// T183: a buffer of a pooled class holds memory only between a write and the release
     /// that follows its draining; its capacity is its class's either way.
     #[test]
     fn an_unallocated_buffer_takes_memory_on_write_and_gives_it_back_empty() {
+        let _g = COUNTERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         use super::{get_bufsize, get_bufsize_large, get_bufsize_small, BufClass};
         for (class, cap) in [
             (BufClass::Standard, get_bufsize()),

@@ -1895,11 +1895,33 @@ pub struct SessionEntry {
     pub log_sd: u32,
 }
 
+/// Slots of every worker's [`SessionArena`], for `show pools` (pool `session`).
+pub static SESSION_POOL: crate::buf::ArenaCounters = crate::buf::ArenaCounters::new();
+
+/// `show pools` provider for the `session` pool: the slots ever created, those in use.
+#[allow(clippy::unnecessary_wraps)]
+pub fn session_pool_stats() -> Option<ibex_alloc::PoolHead> {
+    Some(SESSION_POOL.head(ibex_alloc::PoolReg {
+        name: "session",
+        size: std::mem::size_of::<Option<SessionEntry>>(),
+        flags: 0,
+        align: std::mem::align_of::<Option<SessionEntry>>(),
+        file: file!(),
+        line: line!(),
+    }))
+}
+
 /// Per-thread storage for active sessions.
 pub struct SessionArena {
     entries: Vec<Option<SessionEntry>>,
     free: Vec<u32>,
     live: usize,
+}
+
+impl Drop for SessionArena {
+    fn drop(&mut self) {
+        SESSION_POOL.arena_dropped(self.entries.len(), self.live);
+    }
 }
 
 impl SessionArena {
@@ -1914,14 +1936,19 @@ impl SessionArena {
 
     pub fn alloc(&mut self, entry: SessionEntry) -> Option<u32> {
         self.live += 1;
-        if let Some(idx) = self.free.pop() {
-            self.entries[idx as usize] = Some(entry);
-            Some(idx)
-        } else {
-            let idx = u32::try_from(self.entries.len()).ok()?;
-            self.entries.push(Some(entry));
-            Some(idx)
+        SESSION_POOL.slot_used();
+        // A trimmed tail leaves stale indices in `free`, and a regrown slot can be listed twice:
+        // only a slot that exists and is empty is reused.
+        while let Some(idx) = self.free.pop() {
+            if let Some(slot @ None) = self.entries.get_mut(idx as usize) {
+                *slot = Some(entry);
+                return Some(idx);
+            }
         }
+        let idx = u32::try_from(self.entries.len()).ok()?;
+        self.entries.push(Some(entry));
+        SESSION_POOL.slot_created();
+        Some(idx)
     }
 
     #[must_use]
@@ -1950,9 +1977,32 @@ impl SessionArena {
         let entry = self.entries.get_mut(idx as usize)?.take();
         if entry.is_some() {
             self.live -= 1;
+            SESSION_POOL.slot_released();
             self.free.push(idx);
+            self.trim_tail();
         }
         entry
+    }
+
+    /// Gives back the empty slots at the end, so a burst of connections does not leave its
+    /// peak in memory (and in `show pools`) for good; `HAProxy` keeps the peak, this is
+    /// the safer side for an operator watching for a leak.
+    fn trim_tail(&mut self) {
+        let before = self.entries.len();
+        while matches!(self.entries.last(), Some(None)) {
+            self.entries.pop();
+        }
+        let cut = before - self.entries.len();
+        if cut > 0 {
+            SESSION_POOL.slots_trimmed(cut);
+            if self.entries.capacity() > 4 * self.entries.len().max(64) {
+                self.entries.shrink_to(2 * self.entries.len().max(64));
+            }
+            if self.live == 0 {
+                self.free.clear();
+                self.free.shrink_to(64);
+            }
+        }
     }
 
     #[must_use]
@@ -3309,6 +3359,29 @@ pub fn prebind_quic(config: &Config, workers: usize) -> io::Result<()> {
             })?;
         }
     }
+    Ok(())
+}
+
+/// `-m <megs>` as `HAProxy` applies it (`compute_ideal_maxconn`, src/limits.c): the budget
+/// is recorded for `show info` and `/metrics`, and sizes `global maxconn` when the
+/// configuration has none; a configured one that leaves no room for TLS is refused.
+/// Nothing is limited at the system level: past the budget `malloc` would fail and Rust
+/// aborts the process, where `HAProxy` just refuses connections (docs/differences.md).
+///
+/// # Errors
+/// The alert text `HAProxy` exits 1 with.
+pub fn apply_memmax(config: &mut Config) -> Result<(), String> {
+    let Some(g) = config.global.as_mut() else { return Ok(()) };
+    let Some(megs) = g.memmax_mb else { return Ok(()) };
+    crate::globalconn::set_memmax_mb(megs);
+    let bind_ssl = config.listens.iter().any(|l| l.binds.iter().any(|b| b.ssl))
+        || config.frontends.iter().any(|f| frontend_binds(f).iter().any(|b| b.ssl));
+    let server_ssl = config.backends.iter().flat_map(|b| &b.servers).chain(config.listens.iter().flat_map(|l| &l.servers)).any(|s| s.ssl.as_ref().is_some_and(|x| x.ssl));
+    let sides = u64::from(bind_ssl) + u64::from(server_ssl);
+    let bufsize = g.bufsize.map_or(16384, |b| b as u64);
+    // `tune.ssl.cachesize` is not configurable in Ibex: SSLCACHESIZE (defaults.h:515).
+    let maxconn = crate::globalconn::memmax_maxconn(megs, g.maxconn, sides, bufsize, 20000)?;
+    g.maxconn = Some(maxconn);
     Ok(())
 }
 

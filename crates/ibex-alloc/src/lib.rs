@@ -258,6 +258,22 @@ pub struct PoolHead {
     pub needed_avg: usize,
     pub failures: usize,
     pub users: usize,
+    /// What `show pools detailed` lists under the pool. Inline, not a `Vec`: the Prometheus
+    /// scrape reads every provider's head and must not allocate. Every pool Ibex has is
+    /// provided by one place, so one registrant is all there is.
+    pub reg: Option<PoolReg>,
+}
+
+/// One registrant of a pool (`HAProxy`'s `struct pool_registration`), for `show pools detailed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolReg {
+    pub name: &'static str,
+    pub size: usize,
+    pub flags: u32,
+    pub align: usize,
+    /// The Rust `file!()` / `line!()` of the code that provides the pool.
+    pub file: &'static str,
+    pub line: u32,
 }
 
 /// Provider function returning current [`PoolHead`] stats for a pool.
@@ -266,7 +282,7 @@ pub type PoolStatsFn = fn() -> Option<PoolHead>;
 /// Registry of active memory pools in the runtime.
 ///
 /// Decoupled from the data path: does not perform lock acquisitions or heap allocations
-/// during buffer take or return. Pools register atomic stats providers, and [`dump_pools_info`]
+/// during buffer take or return. Pools register atomic stats providers, and [`PoolRegistry::show_pools`]
 /// queries them on-demand when `show pools` is invoked.
 pub struct PoolRegistry {
     providers: RwLock<Vec<(&'static str, PoolStatsFn)>>,
@@ -297,6 +313,27 @@ impl PoolRegistry {
         }
     }
 
+    /// Calls `f` with the stats of every registered provider, without allocating (the
+    /// Prometheus render must not).
+    pub fn for_each(&self, mut f: impl FnMut(&PoolHead)) {
+        if let Ok(list) = self.providers.read() {
+            for (_, provider) in list.iter() {
+                if let Some(p) = provider() {
+                    f(&p);
+                }
+            }
+        }
+    }
+
+    /// Sum of the `failures` counters of every registered provider (`pool_total_failures()`,
+    /// `show info` `PoolFailed`).
+    #[must_use]
+    pub fn failures(&self) -> u64 {
+        let mut total = 0;
+        self.for_each(|p| total += p.failures as u64);
+        total
+    }
+
     /// Unregisters a pool stats provider.
     pub fn unregister_provider(&self, name: &'static str) {
         if let Ok(mut list) = self.providers.write() {
@@ -311,64 +348,105 @@ impl PoolRegistry {
         }
     }
 
-    /// Dumps all pools in `HAProxy`-compatible `show pools` format.
+    /// `show pools [byname|bysize|byusage] [detailed] [match <pfx>] [<nb>]` as `HAProxy`
+    /// prints it (`cli_parse_show_pools` and `dump_pools_info` in `src/pool.c`). `args` are
+    /// the words after `show pools`; an unknown one yields `HAProxy`'s error text.
+    ///
+    /// `used` counts the blocks held in thread caches too, as `HAProxy`'s does. The limit
+    /// cuts the printed lines only: `Total:` covers every pool that matched.
     #[must_use]
-    pub fn dump_pools_info(&self) -> String {
+    pub fn show_pools(&self, args: &[&str]) -> String {
+        const USAGE: &str = "Expects either 'byname', 'bysize', 'byusage', 'match <pfx>', 'detailed', or a max number of output lines.\n\n";
+        let (mut by, mut detailed, mut prefix, mut maxcnt) = (0u8, false, None, 0usize);
+        let mut it = args.iter().copied().peekable();
+        while let Some(a) = it.next() {
+            match a {
+                "byname" => by = 1,
+                "bysize" => by = 2,
+                "byusage" => by = 3,
+                "detailed" => detailed = true,
+                "match" if it.peek().is_some_and(|n| !n.is_empty()) => prefix = it.next(),
+                _ if a.as_bytes().first().is_some_and(u8::is_ascii_digit) => {
+                    // C's atoi: the leading digits.
+                    let digits = a.bytes().take_while(u8::is_ascii_digit).count();
+                    maxcnt = a[..digits].parse().unwrap_or(usize::MAX);
+                }
+                _ => return USAGE.to_string(),
+            }
+        }
+
         let providers: Vec<PoolStatsFn> = self
             .providers
             .read()
             .map(|list| list.iter().map(|(_, f)| *f).collect())
             .unwrap_or_default();
+        let mut pools: Vec<PoolHead> = providers.into_iter().filter_map(|f| f()).collect();
+        pools.retain(|p| !(by == 3 && p.allocated == 0) && prefix.is_none_or(|x| p.name.starts_with(x)));
+        match by {
+            1 => pools.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes())),
+            2 => pools.sort_by_key(|p| std::cmp::Reverse(p.size)),
+            3 => pools.sort_by_key(|p| std::cmp::Reverse(p.alloc_bytes)),
+            _ => {}
+        }
+        if maxcnt == 0 || maxcnt > pools.len() {
+            maxcnt = pools.len();
+        }
 
-        let mut out = String::new();
-        out.push_str("Dumping pools usage. Use SIGQUIT to flush them.\n");
+        let mut out = String::from("Dumping pools usage");
+        if pools.len() > maxcnt {
+            let _ = write!(out, " (limited to the first {maxcnt} entries)");
+        }
+        out.push_str(". Use SIGQUIT to flush them.\n");
 
-        let mut total_alloc_bytes: u64 = 0;
-        let mut total_used_bytes: u64 = 0;
-        let mut total_cached_bytes: u64 = 0;
-        let mut count = 0;
-
-        for provider in providers {
-            let Some(p) = provider() else {
+        let (mut total_alloc, mut total_used, mut total_cached) = (0u64, 0u64, 0u64);
+        for (i, p) in pools.iter().enumerate() {
+            total_alloc += p.alloc_bytes as u64;
+            total_used += ((p.used + p.cached) * p.size) as u64;
+            total_cached += (p.cached * p.size) as u64;
+            if i >= maxcnt {
                 continue;
-            };
-            count += 1;
-            let alloc_bytes = p.alloc_bytes as u64;
-            let used_bytes = (p.used * p.size) as u64;
-            let cached_bytes = (p.cached * p.size) as u64;
-            total_alloc_bytes += alloc_bytes;
-            total_used_bytes += used_bytes;
-            total_cached_bytes += cached_bytes;
-
-            let ptr_val = p.name.as_ptr() as usize;
+            }
+            // Ibex merges no pools, so `[SHARED]` is never printed.
             let _ = writeln!(
                 out,
-                "  - Pool {} ({} bytes) : {} allocated ({} bytes), {} used (~{} by thread caches), needed_avg {}, {} failures, {} users, @0x{:x} [SHARED]",
+                "  - Pool {} ({} bytes/{}) : {} allocated ({} bytes), {} used (~{} by thread caches), needed_avg {}, {} failures, {} users, @0x{:x}",
                 p.name,
                 p.size,
+                p.align,
                 p.allocated,
-                alloc_bytes,
-                p.used,
+                p.alloc_bytes,
+                p.used + p.cached,
                 p.cached,
                 p.needed_avg,
                 p.failures,
                 p.users,
-                ptr_val,
+                p.name.as_ptr() as usize,
             );
+            if detailed {
+                if let Some(r) = &p.reg {
+                    // C's "%#x" prints a zero as "0".
+                    let flags = if r.flags == 0 { "0".to_string() } else { format!("{:#x}", r.flags) };
+                    let _ = writeln!(
+                        out,
+                        "      >  {:<12}: size={} flags={} align={} [{}:{}]",
+                        r.name, r.size, flags, r.align, r.file, r.line
+                    );
+                }
+            }
         }
 
-        let _ = writeln!(
+        // The CLI adds the empty line that ends every answer.
+        let _ = write!(
             out,
-            "Total: {count} pools, {total_alloc_bytes} bytes allocated, \
-             {total_used_bytes} used (~{total_cached_bytes} by thread caches)."
+            "Total: {} pools, {total_alloc} bytes allocated, {total_used} used (~{total_cached} by thread caches).\n\n",
+            pools.len()
         );
-
         out
     }
 
     /// Returns the total allocated and used bytes across all pools.
     ///
-    /// T320: Matches the arithmetic used in [`Self::dump_pools_info`]'s `Total:` line.
+    /// Matches the arithmetic of [`Self::show_pools`]'s `Total:` line (`used` includes the caches).
     #[must_use]
     pub fn totals(&self) -> (u64, u64) {
         let providers: Vec<PoolStatsFn> = self
@@ -385,7 +463,7 @@ impl PoolRegistry {
                 continue;
             };
             let alloc_bytes = p.alloc_bytes as u64;
-            let used_bytes = (p.used * p.size) as u64;
+            let used_bytes = ((p.used + p.cached) * p.size) as u64;
             total_alloc_bytes += alloc_bytes;
             total_used_bytes += used_bytes;
         }
@@ -446,6 +524,7 @@ mod tests {
             needed_avg: 12,
             failures: 0,
             users: 1,
+            reg: None,
         })
     }
 
@@ -454,9 +533,9 @@ mod tests {
         let registry = PoolRegistry::new();
         registry.register_provider("buffer", sample_buffer_stats);
 
-        let dump = registry.dump_pools_info();
+        let dump = registry.show_pools(&[]);
         assert!(dump.starts_with("Dumping pools usage. Use SIGQUIT to flush them.\n"));
-        assert!(dump.contains("- Pool buffer (16384 bytes) : 67 allocated (1097728 bytes), 67 used"));
+        assert!(dump.contains("- Pool buffer (16384 bytes/8) : 67 allocated (1097728 bytes), 67 used"));
         assert!(dump.contains("Total: 1 pools, 1097728 bytes allocated, 1097728 used"));
     }
 

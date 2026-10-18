@@ -677,11 +677,13 @@ impl CliApplet {
             self.handle_show_stat(cmd, ctx);
         } else if cmd == "show table" || cmd.starts_with("show table ") {
             self.handle_show_table(cmd, ctx);
-        } else if cmd == "show pools" || cmd.starts_with("show pools") {
-            let output = ibex_alloc::global_pool_registry().dump_pools_info();
+        } else if cmd == "show pools" || cmd.starts_with("show pools ") {
+            let args: Vec<&str> = cmd["show pools".len()..].split_whitespace().collect();
+            // The answer ends with the empty line already, also when it is the error.
+            let output = ibex_alloc::global_pool_registry().show_pools(&args);
             self.out_buf.extend_from_slice(output.as_bytes());
             if self.interactive {
-                self.out_buf.extend_from_slice(b"\n> ");
+                self.out_buf.extend_from_slice(b"> ");
             } else {
                 self.is_done = true;
             }
@@ -1847,6 +1849,28 @@ impl CliApplet {
     }
 }
 
+/// Slots of every worker's [`AppletArena`], for `show pools` (pool `appctx`).
+pub static APPCTX_POOL: crate::buf::ArenaCounters = crate::buf::ArenaCounters::new();
+
+/// `show pools` provider for the `appctx` pool: the slots ever created, those in use.
+#[allow(clippy::unnecessary_wraps)]
+pub fn appctx_pool_stats() -> Option<ibex_alloc::PoolHead> {
+    Some(APPCTX_POOL.head(ibex_alloc::PoolReg {
+        name: "appctx",
+        size: std::mem::size_of::<Option<CliApplet>>(),
+        flags: 0,
+        align: std::mem::align_of::<Option<CliApplet>>(),
+        file: file!(),
+        line: line!(),
+    }))
+}
+
+impl Drop for AppletArena {
+    fn drop(&mut self) {
+        APPCTX_POOL.arena_dropped(self.entries.len(), self.live);
+    }
+}
+
 /// Per-thread storage for active CLI applet sessions.
 pub struct AppletArena {
     entries: Vec<Option<CliApplet>>,
@@ -1866,12 +1890,14 @@ impl AppletArena {
 
     pub fn alloc(&mut self, entry: CliApplet) -> Option<u32> {
         self.live += 1;
+        APPCTX_POOL.slot_used();
         if let Some(idx) = self.free.pop() {
             self.entries[idx as usize] = Some(entry);
             Some(idx)
         } else {
             let idx = u32::try_from(self.entries.len()).ok()?;
             self.entries.push(Some(entry));
+            APPCTX_POOL.slot_created();
             Some(idx)
         }
     }
@@ -1889,6 +1915,7 @@ impl AppletArena {
         let entry = self.entries.get_mut(idx as usize)?.take();
         if entry.is_some() {
             self.live -= 1;
+            APPCTX_POOL.slot_released();
             self.free.push(idx);
         }
         entry
