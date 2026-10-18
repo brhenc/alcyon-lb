@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
+use crate::HeadersBinOp;
 use super::{
     find_cond_idx, join_tokens_until, parse_acl_condition_from_tokens, parse_error_body_args,
     parse_rule_condition, parse_gpc_array_action, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
@@ -150,6 +151,56 @@ fn one_arg_and_cond(tokens: &[Token], kw: &str, act_token: &Token) -> Result<(St
             ),
         )),
     }
+}
+
+/// `add-headers-bin`, `set-headers-bin <sample> [prefix <p>]` and `del-headers-bin <sample>
+/// [-m str|beg|end|sub]` of the rule list `list` (`parse_http_set_headers_bin`,
+/// `parse_http_del_headers_bin`, `src/http_act.c`): the operation, the sample expression, the
+/// prefix (empty for none) and the condition.
+fn parse_headers_bin(
+    list: &str,
+    tokens: &[Token],
+    act_token: &Token,
+) -> Result<(HeadersBinOp, String, String, Option<AclCondition>), ConfigError> {
+    let act = act_token.text.as_str();
+    let refuse = |msg: &str| {
+        ConfigError::new(act_token.line, act_token.col, format!("error detected while parsing '{list} {act}' rule : {msg}"))
+    };
+    let word = |i: usize| tokens.get(i).map_or("", |t| t.text.as_str());
+    let expr = word(2).to_string();
+    if act == "del-headers-bin" {
+        if expr.is_empty() {
+            return Err(refuse("expects at least 1 argument."));
+        }
+        let (op, at) = if word(3) == "-m" {
+            if word(4).is_empty() {
+                return Err(refuse("-m flag expects exactly 1 argument."));
+            }
+            let op = match word(4) {
+                "reg" => return Err(refuse("-m reg is unsupported with del-headers-bin due to performance reasons.")),
+                m => HeadersBinOp::del_from_match(m).ok_or_else(|| refuse(&format!("-m with unsupported matching method '{m}'.")))?,
+            };
+            (op, 5)
+        } else {
+            (HeadersBinOp::DelStr, 3)
+        };
+        let cond = expect_cond_in(list, tokens, at, act_token)?;
+        return Ok((op, expr, String::new(), cond));
+    }
+    if expr.is_empty() {
+        return Err(refuse("expects exactly one argument or three arguments <headers> prefix <pfx>."));
+    }
+    let op = if act == "set-headers-bin" { HeadersBinOp::Set } else { HeadersBinOp::Add };
+    let (prefix, at) = if word(3) == "prefix" {
+        if word(4).is_empty() {
+            return Err(refuse("expects 1 argument: <headers>; or 3 arguments: <headers> prefix <pfx>."));
+        }
+        (word(4).to_string(), 5)
+    } else {
+        (String::new(), 3)
+    };
+    let cond = expect_cond_in(list, tokens, at, act_token)?;
+    Ok((op, expr, prefix, cond))
 }
 
 /// `strtol(s, &end, 0)` with `*end == '\0'`: decimal, `0x` hex or leading-`0` octal, with
@@ -545,6 +596,9 @@ fn parse_http_req_rule_at(
             cond,
             line: 0,
         });
+    } else if matches!(act_str, "add-headers-bin" | "set-headers-bin" | "del-headers-bin") {
+        let (op, expr, prefix, cond) = parse_headers_bin("http-request", tokens, act_token)?;
+        rules.push(HttpReqRule { action: HttpReqAction::HeadersBin { op, expr, prefix }, cond, line: 0 });
     } else if act_str == "replace-header" {
         if tokens.len() < 5 {
             return Err(ConfigError::new(
@@ -1143,6 +1197,9 @@ fn parse_http_res_rule_at(
             cond,
             line: 0,
         });
+    } else if matches!(act_str, "add-headers-bin" | "set-headers-bin" | "del-headers-bin") {
+        let (op, expr, prefix, cond) = parse_headers_bin("http-response", tokens, act_token)?;
+        rules.push(HttpResRule { action: HttpResAction::SetHeader { name: op.encode_name(&prefix), fmt: expr }, cond, line: 0 });
     } else if act_str == "set-status" {
         if tokens.len() < 3 {
             return Err(ConfigError::new(
@@ -1665,6 +1722,9 @@ pub(crate) fn parse_http_after_res_rule(
             action: HttpAfterResAction::DelHeader { name: encoded_name },
             cond,
         });
+    } else if matches!(act_str, "add-headers-bin" | "set-headers-bin" | "del-headers-bin") {
+        let (op, expr, prefix, cond) = parse_headers_bin("http-after-response", tokens, act_token)?;
+        rules.push(HttpAfterResRule { action: HttpAfterResAction::SetHeader { name: op.encode_name(&prefix), fmt: expr }, cond });
     } else if act_str == "set-status" {
         if tokens.len() < 3 {
             return Err(ConfigError::new(

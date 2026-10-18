@@ -11525,6 +11525,17 @@ impl EngineDispatcher<'_> {
                         del_req_header(sess, name);
                         res_htx_resize(freed, 0);
                     }
+                    ibex_config::HttpReqAction::HeadersBin { op, expr, prefix } => {
+                        // A list that cannot be fetched changes nothing (`sample_fetch_as_type`).
+                        let bin = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &make_ctx!(sess))).map(sample_to_bin);
+                        if let Some(bin) = bin {
+                            match req_headers_bin(sess, *op, prefix, &bin) {
+                                crate::hdrs_bin::Walk::Done => {}
+                                crate::hdrs_bin::Walk::Rewrite if !STRICT_MODE.get() => {}
+                                crate::hdrs_bin::Walk::Rewrite | crate::hdrs_bin::Walk::Invalid => return Err(500),
+                            }
+                        }
+                    }
                     ibex_config::HttpReqAction::ReplaceHeader { name, regex, repl } => {
                         if replace_req_header(sess, name, regex, repl).is_err() {
                             return Err(500);
@@ -13342,6 +13353,45 @@ fn req_update_host(sess: &mut TcpSession) -> bool {
     ok
 }
 
+/// The bytes of a sample as `sample_fetch_as_type(.., SMP_T_BIN)` gives them.
+fn sample_to_bin(smp: Sample) -> Vec<u8> {
+    match smp {
+        Sample::Bin(b) => b,
+        Sample::Str(s) => s.into_bytes(),
+        other => sample_to_string(&other).into_bytes(),
+    }
+}
+
+/// The pattern `header_name_matches` takes for a `del-headers-bin` name: the name itself for
+/// `-m str`, `"\0m:<method>:<name>"` for the others.
+fn hdrs_bin_del_pattern(op: ibex_config::HeadersBinOp, name: &str) -> std::borrow::Cow<'_, str> {
+    use ibex_config::HeadersBinOp as Op;
+    let method = match op {
+        Op::DelBeg => "beg",
+        Op::DelEnd => "end",
+        Op::DelSub => "sub",
+        _ => return std::borrow::Cow::Borrowed(name),
+    };
+    std::borrow::Cow::Owned(format!("\0m:{method}:{name}"))
+}
+
+/// `add-headers-bin`, `set-headers-bin` and `del-headers-bin` on the request, whose list is
+/// `bin` (T382, `http_action_set_headers_bin` and `http_action_del_headers_bin`): each entry
+/// is an `add-header`, `set-header` or `del-header` (`-m` as the action says), through the
+/// same paths as those rules, so the HTX room they take is the one those rules take.
+fn req_headers_bin(sess: &mut TcpSession, op: ibex_config::HeadersBinOp, prefix: &str, bin: &[u8]) -> crate::hdrs_bin::Walk {
+    use ibex_config::HeadersBinOp as Op;
+    match op {
+        Op::Set | Op::Add => crate::hdrs_bin::walk_set(bin, prefix, &mut |n, v| req_rule_header(sess, n, v, op == Op::Set)),
+        _ => crate::hdrs_bin::walk_del(bin, &mut |n| {
+            let pat = hdrs_bin_del_pattern(op, n);
+            let freed = sess.htx_slice().map_or(0, |h| h.headers().filter(|(k, _)| header_name_matches(k, &pat)).map(|(k, v)| htx_hdr_size(k, v)).sum());
+            del_req_header(sess, &pat);
+            res_htx_resize(freed, 0);
+        }),
+    }
+}
+
 fn replace_req_header(sess: &mut TcpSession, name: &str, regex: &str, repl: &str) -> Result<(), ()> {
     rewrite_req_header_values(sess, name, regex, repl, false)
 }
@@ -13639,6 +13689,31 @@ impl<'a> ResOp<'a> {
     }
 }
 
+/// [`req_headers_bin`] for the response headers `hdrs`.
+fn res_headers_bin(op: ibex_config::HeadersBinOp, prefix: &str, bin: &[u8], hdrs: &mut Vec<(String, String)>) -> crate::hdrs_bin::Walk {
+    use ibex_config::HeadersBinOp as Op;
+    match op {
+        Op::Set | Op::Add => crate::hdrs_bin::walk_set(bin, prefix, &mut |n, v| {
+            if op == Op::Set {
+                let freed: usize = hdrs.iter().filter(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(k, v)| htx_hdr_size(k, v)).sum();
+                hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(n));
+                res_htx_resize(freed, 0);
+            }
+            if !res_htx_resize(0, htx_hdr_size(n, v)) {
+                return false;
+            }
+            hdrs.push((n.to_string(), v.to_string()));
+            true
+        }),
+        _ => crate::hdrs_bin::walk_del(bin, &mut |n| {
+            let pat = hdrs_bin_del_pattern(op, n);
+            let freed: usize = hdrs.iter().filter(|(k, _)| header_name_matches(k, &pat)).map(|(k, v)| htx_hdr_size(k, v)).sum();
+            hdrs.retain(|(k, _)| !header_name_matches(k, &pat));
+            res_htx_resize(freed, 0);
+        }),
+    }
+}
+
 /// Bytes an HTX header block takes: the 8-byte block descriptor, the name and the value
 /// (`htx_add_header`, `include/haproxy/htx.h`).
 fn htx_hdr_size(name: &str, value: &str) -> usize {
@@ -13896,6 +13971,19 @@ fn res_action(
     if act_name == "\0strict-mode" {
         STRICT_MODE.set(act_fmt == "on");
         return Ok(true);
+    }
+    if let Some((op, prefix)) = ibex_config::HeadersBinOp::decode_name(act_name) {
+        // `add-headers-bin`, `set-headers-bin` and `del-headers-bin` (T382). A list that cannot
+        // be fetched changes nothing.
+        let Some(smp) = Expr::cached(act_fmt).ok().and_then(|e| e.eval_sample(registry, ctx)) else { return Ok(true) };
+        let bin = sample_to_bin(smp);
+        let walk = res_headers_bin(op, prefix, &bin, hdrs);
+        publish(hdrs);
+        return match walk {
+            crate::hdrs_bin::Walk::Done => Ok(true),
+            crate::hdrs_bin::Walk::Rewrite => failed(),
+            crate::hdrs_bin::Walk::Invalid => Err(ResStop::Page(500)),
+        };
     }
     let replace = act_name
         .strip_prefix("\0replace-header:")

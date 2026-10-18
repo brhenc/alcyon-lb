@@ -24,6 +24,7 @@ pub mod globalconn;
 pub mod dgram;
 pub mod engine;
 pub mod fdtab;
+pub(crate) mod hdrs_bin;
 pub mod lb;
 pub mod mailbox;
 pub mod listener;

@@ -277,6 +277,7 @@ fn http_req(a: &HttpReqAction) -> Exprs<'_> {
         HttpReqAction::SetVar { var_name, expr } => vec![(format!("set-var({var_name})"), expr, false)],
         HttpReqAction::Capture { expr, .. } => vec![("capture".into(), expr, false)],
         HttpReqAction::Pause { expr: Some(expr), .. } => vec![("pause".into(), expr, false)],
+        HttpReqAction::HeadersBin { op, expr, .. } => vec![(op.keyword().into(), expr, false)],
         HttpReqAction::ScSetGpt0 { sc, expr } => vec![(format!("sc-set-gpt0({sc})"), expr, true)],
         HttpReqAction::ScAddGpc { idx, sc, expr } => vec![(format!("sc-add-gpc({idx},{sc})"), expr, true)],
         HttpReqAction::ScSetGpt { idx, sc, expr } => vec![(format!("sc-set-gpt({idx},{sc})"), expr, true)],
@@ -287,6 +288,11 @@ fn http_req(a: &HttpReqAction) -> Exprs<'_> {
 /// `http-response` and `http-after-response` encode `set-var` as a header action named
 /// `"\0set-var:<var>"` (`set-var-fmt`, a log format, is `"\0set-var-fmt:<var>"`).
 fn res_set_var<'a>(name: &str, fmt: &'a str) -> Exprs<'a> {
+    if let Some((op, _)) = ibex_config::HeadersBinOp::decode_name(name) {
+        // `add-headers-bin`, `set-headers-bin` and `del-headers-bin` (T382) carry their list's
+        // sample the same way.
+        return vec![(op.keyword().into(), fmt, false)];
+    }
     name.strip_prefix("\0set-var:")
         .map(|v| vec![(format!("set-var({v})"), fmt, false)])
         .unwrap_or_default()
