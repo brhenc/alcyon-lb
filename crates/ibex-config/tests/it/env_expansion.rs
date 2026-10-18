@@ -176,3 +176,13 @@ fn file_reset_replay_empty_single_quotes_open_default_and_vanishing_line() {
     // preproc.rs: a line whose only word is an unset `[*]` reference has no words and is dropped.
     assert!(notices("global\n\"${IBEX_T430_NO[*]}\"\n.notice ok\n") == ["ok"]);
 }
+
+#[test]
+fn preprocess_skips_a_line_without_tokens() {
+    // `lex` never yields one that parse_str lets through (a token-less line is kept only
+    // with a lex error), but `Line` is public and `preprocess` indexes the first token.
+    let mut lines = ibex_config::lexer::lex("global\n.notice ok\n");
+    lines.insert(1, ibex_config::lexer::Line { line_number: 2, tokens: Vec::new(), error: None, raw: String::new() });
+    let out = ibex_config::preproc::preprocess(lines).unwrap();
+    assert_eq!(out.len(), 1);
+}
