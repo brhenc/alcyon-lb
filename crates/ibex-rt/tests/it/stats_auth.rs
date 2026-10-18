@@ -245,3 +245,50 @@ fn monitor_uri_precedes_the_rules() {
     assert_eq!(path("", &m, "/mon"), "HTTP/1.1 200 OK");
     assert_eq!(path("", &m, "/x"), "HTTP/1.1 403 Forbidden");
 }
+
+#[test]
+fn error_pages_of_the_proxy_answer_a_stats_deny_and_auth() {
+    // http-error template (measured: 403, content-length 4, content-type text/plain, body "nope").
+    let r = get("", "  http-error status 403 content-type text/plain string \"nope\"\n  stats http-request deny\n", None);
+    assert!(r.starts_with("HTTP/1.1 403 Forbidden\r\n") && r.ends_with("\r\n\r\nnope") && r.contains("content-type: text/plain\r\n"), "{r}");
+    // errorfile 401: the file as it is, plus the www-authenticate header (measured).
+    let f = std::env::temp_dir().join(format!("stats-auth-e401-{}.http", std::process::id()));
+    std::fs::write(&f, b"HTTP/1.0 401 Unauthorized\r\nContent-Length: 4\r\n\r\nNOPE").unwrap();
+    let r = get("", &format!("  errorfile 401 {}\n  stats auth u:p\n", f.display()), None);
+    let _ = std::fs::remove_file(&f);
+    // (Ibex adds `connection: close`, which HAProxy leaves out of a raw errorfile.)
+    assert!(
+        r.starts_with("HTTP/1.0 401 Unauthorized\r\ncontent-length: 4\r\nwww-authenticate: Basic realm=\"HAProxy Statistics\"\r\n")
+            && r.ends_with("\r\n\r\nNOPE"),
+        "{r}"
+    );
+}
+
+#[test]
+fn a_realm_without_accounts_protects_nothing() {
+    // Measured: `stats realm` alone leaves the page open.
+    assert_eq!(status(&get("", "  stats realm Foo\n", None)), "HTTP/1.1 200 OK");
+}
+
+/// A proxy with no `stats` line shares the defaults' stats setup whole, accounts included; one
+/// with any `stats` line starts from nothing (measured on HAProxy 3.5-dev8, VV-17).
+#[test]
+fn defaults_stats_are_shared_by_a_proxy_without_stats_lines() {
+    let dflt = "defaults\n  mode http\n  timeout client 5s\n  timeout connect 5s\n  timeout server 5s\n  stats enable\n  stats uri /st\n  stats auth u:p\n  stats realm DR\n";
+    let get = |own: &str, path: &str, auth: &str| {
+        raw(
+            &format!("{dflt}frontend f\n  bind ADDR\n{own}"),
+            &format!("GET {path} HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n"),
+        )
+    };
+    let r = get("", "/st", "");
+    assert_eq!(status(&r), "HTTP/1.1 401 Unauthorized");
+    assert!(r.contains("www-authenticate: Basic realm=\"DR\"\r\n"), "{r}");
+    assert_eq!(status(&get("", "/st", "Authorization: Basic dTpw\r\n")), "HTTP/1.1 200 OK");
+    // Its own `stats uri` (or `stats admin`) leaves nothing of the defaults: /st is not the page.
+    for own in ["  stats uri /x\n", "  stats admin if TRUE\n", "  stats realm Own\n"] {
+        let own = format!("{own}  http-request deny if {{ path /st }}\n");
+        assert_eq!(status(&get(&own, "/st", "")), "HTTP/1.1 403 Forbidden", "{own}");
+    }
+    assert_eq!(status(&get("  stats uri /x\n", "/x", "")), "HTTP/1.1 200 OK");
+}

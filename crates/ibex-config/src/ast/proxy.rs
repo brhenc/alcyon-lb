@@ -412,6 +412,8 @@ pub struct StatsConfig {
     pub show_legends: bool,
     pub show_desc: Option<Box<str>>,
     pub show_node: Option<Box<str>>,
+    /// A `stats` line of the proxy's own has dropped what `defaults` set (see `detach`).
+    pub detached: bool,
     /// `stats auth`, `realm`, `show-version` and `http-request`; boxed, as almost no proxy has them.
     pub auth: Option<Box<StatsAuth>>,
     pub raw_timeouts: TimeoutConfig,
@@ -445,6 +447,24 @@ pub struct StatsAuth {
 }
 
 impl StatsConfig {
+    /// The first `stats` line of a proxy drops everything `defaults` set for the stats page
+    /// (`stats_uri_auth_drop` in cfgparse-listen.c): not the uri alone, the auth and the
+    /// rest too. The fields that are not the page's stay.
+    pub fn detach(&mut self) {
+        if !self.detached {
+            self.detached = true;
+            self.enable = false;
+            self.uri = None;
+            self.refresh = None;
+            self.admin = false;
+            self.admin_cond = None;
+            self.show_legends = false;
+            self.show_desc = None;
+            self.show_node = None;
+            self.auth = None;
+        }
+    }
+
     /// The `stats http-request` rules, `stats auth`'s included.
     #[must_use]
     pub fn http_req_rules(&self) -> &[HttpReqRule] {
@@ -457,12 +477,12 @@ impl StatsConfig {
         self.auth.as_deref().is_some_and(|a| a.show_version)
     }
 
-    /// What a proxy takes from the `defaults` it follows. HAProxy keeps no `stats auth`,
-    /// `realm`, `show-version` or `http-request` of a `defaults` section (measured on 3.5-dev8:
-    /// a proxy after `defaults` + `stats auth` serves its page to anyone).
+    /// What a proxy takes from the `defaults` it follows. HAProxy shares the defaults' whole
+    /// stats page setup (uri, auth, realm, ...) with a proxy that has no `stats` line, and a
+    /// proxy with one starts from nothing (`detach`); measured on 3.5-dev8.
     #[must_use]
     pub fn inherited(&self) -> Self {
-        Self { auth: None, ..self.clone() }
+        Self { detached: false, ..self.clone() }
     }
 }
 

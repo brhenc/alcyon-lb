@@ -10701,25 +10701,25 @@ impl EngineDispatcher<'_> {
             if !matches {
                 continue;
             }
-            let page = |status: u16| -> Vec<u8> {
-                // A `http-error` that is a template is not built here: the stock page answers.
-                match resolve_error_body(&proxies[serving], &proxies[serving], status, Some(&ibex_config::ErrorPageSource::DefaultErrorfiles), None, None) {
-                    ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
-                    ResolvedErrorBody::Custom { .. } => builtin_error_page(status).or_else(|| builtin_error_page(403)).unwrap_or_default().to_vec(),
-                }
-            };
-            let resp: Vec<u8> = match &rule.action {
-                ibex_config::HttpReqAction::Allow => return false,
+            let (status, realm) = match &rule.action {
                 ibex_config::HttpReqAction::Deny { deny_status, .. } => {
                     proxies[serving].counters().denied_req.fetch_add(1, Ordering::Relaxed);
-                    page(deny_status.unwrap_or(403))
+                    (deny_status.unwrap_or(403), None)
                 }
-                ibex_config::HttpReqAction::Auth { realm } => {
-                    let realm = realm.as_deref().unwrap_or("HAProxy Statistics");
-                    with_header_at_end_of_head(&page(401), &format!("www-authenticate: Basic realm=\"{realm}\""))
-                }
-                _ => continue,
+                ibex_config::HttpReqAction::Auth { realm } => (401, Some(realm.as_deref().unwrap_or("HAProxy Statistics"))),
+                // `allow` (the parser lets nothing else in): the page follows.
+                _ => return false,
             };
+            let mut resp: Vec<u8> = match resolve_error_body(&proxies[serving], &proxies[serving], status, Some(&ibex_config::ErrorPageSource::DefaultErrorfiles), None, None) {
+                ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
+                // An `http-error` template: its text does not look at the request here.
+                ResolvedErrorBody::Custom { content_type, lf_string } => {
+                    build_templated_error_response(status, content_type, lf_string, &SampleContext::default(), registry)
+                }
+            };
+            if let Some(realm) = realm {
+                resp = with_header_at_end_of_head(&resp, &format!("www-authenticate: Basic realm=\"{realm}\""));
+            }
             send_proxy_reply(sess, &proxies[..], serving, serving, &resp);
             return true;
         }
@@ -11770,11 +11770,7 @@ impl EngineDispatcher<'_> {
         {
             let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
             let configured_uri = proxies[proxy_idx].stats_config.uri.as_deref();
-            if Self::is_stats_request(req_uri, configured_uri)
-                || (proxies[proxy_idx].servers.is_empty()
-                    && proxies[proxy_idx].default_backend.is_none()
-                    && proxies[proxy_idx].use_backends.is_empty())
-            {
+            if Self::is_stats_request(req_uri, configured_uri) {
                 return Self::handle_stats_request(entry, proxies, checks, pid, now, proxy_idx);
             }
         }

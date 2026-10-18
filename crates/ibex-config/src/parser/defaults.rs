@@ -58,7 +58,7 @@ pub(crate) fn parse_defaults_directive(
         }
         "id" => Err(ConfigError::new(kw.line, kw.col, "'id' not allowed in 'defaults' section.")),
         "default-server" => parse_default_server(&mut defaults.default_server, tokens, kw),
-        "stats" => parse_stats_directive(&mut defaults.stats, tokens, kw),
+        "stats" => parse_stats_directive(&mut defaults.stats, tokens, kw, true),
         "errorfile" | "errorfiles" | "http-error" | "errorloc" | "errorloc302" | "errorloc303" => {
             parse_proxy_error_page(&mut defaults.error_files, &mut defaults.error_replies, tokens, kw)
         }

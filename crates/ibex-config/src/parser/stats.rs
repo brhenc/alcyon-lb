@@ -8,7 +8,11 @@ pub(crate) fn parse_stats_directive(
     stats: &mut StatsConfig,
     tokens: &[Token],
     kw: &Token,
+    in_defaults: bool,
 ) -> Result<(), ConfigError> {
+    if !in_defaults {
+        stats.detach();
+    }
     if tokens.len() < 2 {
         stats.enable = true;
         return Ok(());
@@ -42,6 +46,8 @@ pub(crate) fn parse_stats_directive(
             stats.refresh = Some(parse_timeout(&interval, "stats refresh")?);
             Ok(())
         }
+        "admin" if in_defaults => Err(ConfigError::new(kw.line, kw.col, "'stats admin' not allowed in 'defaults' section.")),
+        "http-request" if in_defaults => Err(ConfigError::new(kw.line, kw.col, "'stats' not allowed in 'defaults' section.")),
         "admin" => {
             stats.admin = true;
             if tokens.len() >= 4 && (tokens[2].text == "if" || tokens[2].text == "unless") {

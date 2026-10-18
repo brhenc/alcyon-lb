@@ -69,3 +69,22 @@ fn stats_auth_and_realm_and_http_request_refusals_are_haproxys() {
     assert!(m("stats http-request set-header a b").contains("supports only"));
     assert!(m("stats http-request return status 200").contains("supports only"));
 }
+
+#[test]
+fn stats_warnings_have_haproxys_text() {
+    let texts = |line: &str| -> Vec<String> {
+        cfg(line).expect(line).proxy_warnings.iter().map(|w| w.text.clone()).collect()
+    };
+    assert!(texts("stats auth d:1\n  stats auth d:2").contains(&"uri auth: ignoring duplicated user 'd'.".to_string()));
+    assert!(texts("stats http-request allow\n  stats http-request deny")
+        .contains(&"previous 'stats' action has no condition attached, further entries are NOOP.".to_string()));
+    // `stats realm` alone loads (and protects nothing, as on HAProxy).
+    cfg("stats realm R").expect("realm alone");
+}
+
+#[test]
+fn stats_admin_and_http_request_are_refused_in_defaults() {
+    let d = |line: &str| parse_str(&format!("defaults\n  mode http\n  {line}\nfrontend f\n  bind 127.0.0.1:1\n")).expect_err(line).to_string();
+    assert!(d("stats admin if TRUE").contains("'stats admin' not allowed in 'defaults' section."));
+    assert!(d("stats http-request deny").contains("'stats' not allowed in 'defaults' section."));
+}

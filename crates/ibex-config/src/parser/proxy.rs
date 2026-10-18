@@ -431,7 +431,7 @@ pub(crate) fn parse_listen_directive(
         "http-after-response" => {
             in_section(parse_http_after_res_rule(&mut proxy.http_after_res_rules, tokens, kw), "proxy", &proxy.name)
         }
-        "stats" => parse_stats_directive(&mut proxy.stats, tokens, kw),
+        "stats" => parse_stats_directive(&mut proxy.stats, tokens, kw, false),
         "http-check" => {
             take_own_http_check(&mut proxy.http_check_own, &mut proxy.httpchk, &mut proxy.http_checks);
             parse_http_check_directive(&mut proxy.http_checks, tokens, kw)?;
@@ -593,7 +593,7 @@ pub(crate) fn parse_frontend_directive(
         "track-sc0" | "track-sc1" | "track-sc2" => {
             parse_track_rule(&mut fe.stick_rules, tokens, kw)
         }
-        "stats" => parse_stats_directive(&mut fe.stats, tokens, kw),
+        "stats" => parse_stats_directive(&mut fe.stats, tokens, kw, false),
         "http-check" => {
             Err(ConfigError::new(
                 kw.line,
@@ -705,7 +705,7 @@ pub(crate) fn parse_backend_directive(
         "track-sc0" | "track-sc1" | "track-sc2" => {
             parse_track_rule(&mut be.stick_rules, tokens, kw)
         }
-        "stats" => parse_stats_directive(&mut be.stats, tokens, kw),
+        "stats" => parse_stats_directive(&mut be.stats, tokens, kw, false),
         // `log` is valid in every proxy section, backends included. It was wired for
         // global, listen and frontend but not here, which alone blocked 19 reg-tests
         // -- the health-check suites all declare their syslog target on the backend.
