@@ -518,6 +518,45 @@ fn parse_tcp_req_content_at(
                 let expr = join_tokens_until(tokens, 3, cond_idx);
                 rules.push(TcpReqContentRule { action: TcpReqContentAction::SetDst { expr }, cond, line: 0 });
             }
+            "capture" => {
+                // `tcp_parse_capture`: `capture <sample> len <n>`, the length is mandatory.
+                let refuse = |what: &str| {
+                    ConfigError::new(act_tok.line, act_tok.col, format!("'tcp-request content capture' : {what}"))
+                };
+                let word = |i: usize| tokens.get(i).map_or("", |t| t.text.as_str());
+                if word(3).is_empty() {
+                    return Err(refuse("missing fetch method"));
+                }
+                let mut len = 0usize;
+                let mut next = 4;
+                if word(4) == "len" {
+                    // atoi(3): digits after an optional sign, anything else reads 0.
+                    let t = word(5).trim_start();
+                    let (neg, digits) = t.strip_prefix('-').map_or((false, t.strip_prefix('+').unwrap_or(t)), |d| (true, d));
+                    let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+                    let n = digits[..end].parse::<usize>().unwrap_or(if end == 0 { 0 } else { usize::MAX });
+                    if neg || n == 0 {
+                        return Err(refuse("length must be > 0"));
+                    }
+                    len = n;
+                    next = 6;
+                }
+                if len == 0 {
+                    return Err(refuse("a positive 'len' argument is mandatory"));
+                }
+                if let Some(t) = tokens.get(next) {
+                    if t.text != "if" && t.text != "unless" {
+                        return Err(ConfigError::new(
+                            t.line,
+                            t.col,
+                            format!("'tcp-request content capture' only accepts 'if' or 'unless' (got '{}')", t.text),
+                        ));
+                    }
+                }
+                let (_, cond) = parse_rule_condition(tokens, next)?;
+                let action = TcpReqContentAction::Capture { expr: tokens[3].text.clone(), len, id: None };
+                rules.push(TcpReqContentRule { action, cond, line: 0 });
+            }
             "switch-mode" => {
                 rules.push(parse_tcp_content_switch_mode(tokens)?);
             }

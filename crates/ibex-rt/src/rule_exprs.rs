@@ -341,6 +341,7 @@ fn tcp_content(a: &TcpReqContentAction) -> Exprs<'_> {
         TcpReqContentAction::SetVar { var_name, expr } => vec![(format!("set-var({var_name})"), expr, false)],
         TcpReqContentAction::SetSrc { expr } => vec![("set-src".into(), expr, false)],
         TcpReqContentAction::SetDst { expr } => vec![("set-dst".into(), expr, false)],
+        TcpReqContentAction::Capture { expr, .. } => vec![("capture".into(), expr, false)],
         TcpReqContentAction::ScSetGpt0 { sc, expr } => vec![(format!("sc-set-gpt0({sc})"), expr, true)],
         TcpReqContentAction::ScAddGpc { idx, sc, expr } => vec![(format!("sc-add-gpc({idx},{sc})"), expr, true)],
         TcpReqContentAction::ScSetGpt { idx, sc, expr } => vec![(format!("sc-set-gpt({idx},{sc})"), expr, true)],
@@ -625,6 +626,12 @@ pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), Stri
                 "error detected in backend '{0}' while parsing 'http-request capture' rule : proxy '{0}' has no frontend capability.",
                 b.name
             ));
+        }
+    }
+    // The same for `tcp-request content capture`, which has no `id` form.
+    for b in &config.backends {
+        if b.tcp_req_content_rules.iter().any(|r| matches!(r.action, ibex_config::TcpReqContentAction::Capture { .. })) {
+            return Err(format!("'tcp-request content capture' : proxy '{}' has no frontend capability", b.name));
         }
     }
     for (name, rules, caps) in sections {

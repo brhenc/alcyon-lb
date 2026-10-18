@@ -45,6 +45,10 @@ pub enum TcpReqSessionAction {
     SetDst { expr: String },
     SetSrcPort { expr: String },
     SetDstPort { expr: String },
+    /// `capture <sample> len <n>`: the sample, cut at `len`, in a slot of its own in the
+    /// request captures of the proxy holding the rule. `id` is that slot, assigned when the
+    /// proxy is built (`None` until then); a stream whose frontend is another proxy ignores it.
+    Capture { expr: String, len: usize, id: Option<usize> },
     SilentDrop,
     /// `silent-drop rst-ttl <1-255>`: the RST is sent with that TTL (`SilentDrop` is a TTL of 1).
     SilentDropTtl(u8),
@@ -82,6 +86,10 @@ pub enum TcpReqContentAction {
     SetDst { expr: String },
     SetSrcPort { expr: String },
     SetDstPort { expr: String },
+    /// `capture <sample> len <n>`: the sample, cut at `len`, in a slot of its own in the
+    /// request captures of the proxy holding the rule. `id` is that slot, assigned when the
+    /// proxy is built (`None` until then); a stream whose frontend is another proxy ignores it.
+    Capture { expr: String, len: usize, id: Option<usize> },
     SilentDrop,
     /// `silent-drop rst-ttl <1-255>`: the RST is sent with that TTL (`SilentDrop` is a TTL of 1).
     SilentDropTtl(u8),
