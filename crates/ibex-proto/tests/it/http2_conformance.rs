@@ -555,13 +555,25 @@ fn test_flow_control_window_update_stream_and_connection_levels() {
         .expect("parse conn window update");
     assert_eq!(ctx.conn_send_window, 65_535);
 
-    // Negative test: 0-increment WINDOW_UPDATE is a PROTOCOL_ERROR
+    // Negative tests (RFC 9113 6.9, HAProxy measured): a 0-increment WINDOW_UPDATE is a
+    // stream error PROTOCOL_ERROR on a stream and a connection error on the connection.
     let zero_win_up = Frame::WindowUpdate {
         stream_id: 1,
         increment: 0,
     };
-    let res = mux.parse(&mut ctx, &zero_win_up.encode());
-    assert!(res.is_err(), "Zero WINDOW_UPDATE increment must error");
+    let before = ctx.tx_buf.len();
+    mux.parse(&mut ctx, &zero_win_up.encode()).expect("a stream error keeps the connection");
+    assert!(ctx.goaway_sent.is_none());
+    assert!(
+        ctx.tx_buf[before..].windows(13).any(|w| w[3] == 3 && w[5..9] == [0, 0, 0, 1] && w[9..13] == [0, 0, 0, 1]),
+        "no RST_STREAM PROTOCOL_ERROR"
+    );
+    let zero_conn = Frame::WindowUpdate {
+        stream_id: 0,
+        increment: 0,
+    };
+    let res = mux.parse(&mut ctx, &zero_conn.encode());
+    assert!(res.is_err(), "Zero WINDOW_UPDATE increment on the connection must error");
     assert_eq!(ctx.goaway_sent.unwrap().1, H2Error::ProtocolError);
 }
 

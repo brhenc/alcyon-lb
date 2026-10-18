@@ -278,9 +278,9 @@ impl H2MuxContext {
         };
         self.enqueue_frame(&frame);
         if stream_id == 0 {
-            self.conn_recv_window = self.conn_recv_window.saturating_add(increment as i32);
+            self.conn_recv_window = self.conn_recv_window.saturating_add(i32::try_from(increment).unwrap_or(i32::MAX));
         } else if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.recv_window = stream.recv_window.saturating_add(increment as i32);
+            stream.recv_window = stream.recv_window.saturating_add(i32::try_from(increment).unwrap_or(i32::MAX));
         }
     }
 
@@ -1038,6 +1038,22 @@ impl MuxH2 {
                             SettingsParameter::InitialWindowSize => {
                                 let new_win = val as i32;
                                 let delta = new_win - ctx.remote_initial_window;
+                                // A stream window past 2^31-1 is a connection error
+                                // FLOW_CONTROL_ERROR (RFC 9113 section 6.9.2). HAProxy keeps
+                                // `sws + miw` in an int32_t that wraps: no error, the stream
+                                // stalls; the RFC's answer is kept here (checked before
+                                // anything is applied).
+                                if delta > 0 && ctx.streams.values().any(|st| st.send_window.checked_add(delta).is_none()) {
+                                    ctx.send_goaway(
+                                        ctx.last_client_stream_id,
+                                        H2Error::FlowControlError,
+                                        b"SETTINGS_INITIAL_WINDOW_SIZE overflows a stream window",
+                                    );
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "SETTINGS_INITIAL_WINDOW_SIZE overflows a stream window",
+                                    ));
+                                }
                                 ctx.remote_initial_window = new_win;
                                 for stream in ctx.streams.values_mut() {
                                     stream.send_window = stream.send_window.saturating_add(delta);
@@ -1190,7 +1206,7 @@ impl MuxH2 {
                 // went; before, when the window falls below 32 KB.
                 let (low, full) = if ctx.rx_window_opened { (1 << 30, i32::MAX) } else { (32768, DEFAULT_INITIAL_WINDOW_SIZE) };
                 if ctx.conn_recv_window < low {
-                    let replenish = (full - ctx.conn_recv_window) as u32;
+                    let replenish = (i64::from(full) - i64::from(ctx.conn_recv_window)).clamp(0, i64::from(i32::MAX)) as u32;
                     ctx.send_window_update(0, replenish);
                 }
             }
@@ -1199,16 +1215,36 @@ impl MuxH2 {
                 stream_id,
                 increment,
             } => {
+                // A frame for a stream that was never opened is a connection error
+                // (`h2_frame_check_vs_state`, measured: GOAWAY PROTOCOL_ERROR, last stream
+                // the highest one seen); one for a closed stream is ignored whatever its
+                // increment (`h2c_handle_window_update`).
+                let idle = stream_id != 0
+                    && ctx.is_server
+                    && stream_id > ctx.last_client_stream_id
+                    && !ctx.streams.contains_key(&stream_id);
+                if idle {
+                    ctx.send_goaway(ctx.last_client_stream_id, H2Error::ProtocolError, b"WINDOW_UPDATE on an idle stream");
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "WINDOW_UPDATE on an idle stream"));
+                }
                 if increment == 0 {
-                    ctx.send_goaway(
-                        stream_id,
-                        H2Error::ProtocolError,
-                        b"zero window update increment",
-                    );
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Zero window update increment",
-                    ));
+                    // Zero on the connection is a connection error, on a stream a stream
+                    // error (RFC 9113 section 6.9, `h2c_handle_window_update`, measured).
+                    if stream_id == 0 {
+                        ctx.send_goaway(
+                            ctx.last_client_stream_id,
+                            H2Error::ProtocolError,
+                            b"zero window update increment",
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Zero window update increment",
+                        ));
+                    }
+                    if ctx.streams.contains_key(&stream_id) {
+                        ctx.send_rst_stream(stream_id, H2Error::ProtocolError);
+                    }
+                    return Ok(());
                 }
 
                 // Past 2^31-1 the window overflows (RFC 9113 6.9.1): a connection error for
@@ -1604,6 +1640,23 @@ mod tests {
         assert!(ctx.goaway_sent.is_none());
         let rst_code = &ctx.tx_buf[ctx.tx_buf.len() - 4..];
         assert_eq!(rst_code, &[0, 0, 0, 3]);
+    }
+
+    /// A client that sends DATA past the window it was granted (not policed, as in HAProxy)
+    /// drives the receive window negative, down to i32::MIN: the replenishment must not
+    /// overflow (it did: `i32::MAX - window`, a panic in debug, a wrapped increment in release)
+    /// and must stay a legal increment.
+    #[test]
+    fn receive_window_far_below_zero_is_replenished_without_overflow() {
+        let (mux, mut ctx) = open_conn();
+        mux.parse(&mut ctx, &post_headers(1)).expect("open");
+        ctx.rx_window_opened = true;
+        ctx.conn_recv_window = i32::MIN + 10;
+        let before = ctx.tx_buf.len();
+        mux.parse(&mut ctx, &data(1, 100, 0)).expect("data");
+        let wu = ctx.tx_buf[before..].windows(13).find(|w| w[3] == 8 && w[5..9] == [0, 0, 0, 0]).expect("WINDOW_UPDATE");
+        let inc = u32::from_be_bytes([wu[9], wu[10], wu[11], wu[12]]);
+        assert!(inc <= i32::MAX as u32 && inc > 0, "increment {inc:#x}");
     }
 
     fn open_conn() -> (MuxH2, H2MuxContext) {

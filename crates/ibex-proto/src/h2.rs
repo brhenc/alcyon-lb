@@ -661,12 +661,8 @@ impl Frame {
                 let increment =
                     u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
                         & 0x7fff_ffff;
-                if increment == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "WINDOW_UPDATE increment must be non-zero",
-                    ));
-                }
+                // A zero increment decodes: whether it is a stream or a connection error
+                // depends on the stream, which only the mux knows (RFC 9113 section 6.9).
                 Ok(Frame::WindowUpdate {
                     stream_id: header.stream_id,
                     increment,
@@ -1435,9 +1431,9 @@ impl H2Multiplexer {
         }
         let inc_i32 = i32::try_from(increment).map_err(|_| H2Error::FlowControlError)?;
         if stream_id == 0 {
-            self.conn_recv_window += inc_i32;
+            self.conn_recv_window = self.conn_recv_window.checked_add(inc_i32).ok_or(H2Error::FlowControlError)?;
         } else if let Some(stream) = self.streams.get_mut(&stream_id) {
-            stream.recv_window += inc_i32;
+            stream.recv_window = stream.recv_window.checked_add(inc_i32).ok_or(H2Error::FlowControlError)?;
         }
         Ok(Frame::WindowUpdate {
             stream_id,
