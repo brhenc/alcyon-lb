@@ -1916,6 +1916,12 @@ pub struct SessionArena {
     entries: Vec<Option<SessionEntry>>,
     free: Vec<u32>,
     live: usize,
+    /// The capacity it was created with (`maxconn`'s pre-size): never given back, since
+    /// untouched capacity costs no resident memory and growing it again is a `realloc` on
+    /// the request path.
+    floor: usize,
+    /// The most slots it has held since its memory was last made fresh.
+    peak: usize,
 }
 
 impl Drop for SessionArena {
@@ -1931,7 +1937,15 @@ impl SessionArena {
             entries: Vec::with_capacity(cap),
             free: Vec::with_capacity(cap),
             live: 0,
+            floor: cap,
+            peak: 0,
         }
+    }
+
+    /// Slots the arena can hold before it grows.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
     }
 
     pub fn alloc(&mut self, entry: SessionEntry) -> Option<u32> {
@@ -1947,6 +1961,7 @@ impl SessionArena {
         }
         let idx = u32::try_from(self.entries.len()).ok()?;
         self.entries.push(Some(entry));
+        self.peak = self.peak.max(self.entries.len());
         SESSION_POOL.slot_created();
         Some(idx)
     }
@@ -1995,12 +2010,22 @@ impl SessionArena {
         let cut = before - self.entries.len();
         if cut > 0 {
             SESSION_POOL.slots_trimmed(cut);
-            if self.entries.capacity() > 4 * self.entries.len().max(64) {
-                self.entries.shrink_to(2 * self.entries.len().max(64));
+            // Only capacity above the creation one (a burst past the pre-size) is given back.
+            let keep = self.entries.len().max(self.floor);
+            if self.entries.capacity() > 4 * keep {
+                self.entries.shrink_to(2 * keep);
             }
             if self.live == 0 {
                 self.free.clear();
-                self.free.shrink_to(64);
+            }
+            // The slots a burst wrote stay resident when only the length goes down: once the
+            // arena is a fraction of its peak, its live slots move to a fresh buffer of the same
+            // capacity (untouched, so not resident) and the old one goes back to the system.
+            if self.peak >= 256 + 8 * self.entries.len() {
+                let mut fresh = Vec::with_capacity(self.entries.capacity());
+                fresh.append(&mut self.entries);
+                self.entries = fresh;
+                self.peak = self.entries.len();
             }
         }
     }

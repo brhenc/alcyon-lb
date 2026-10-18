@@ -3449,7 +3449,9 @@ impl Registry {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos();
-                let seed_u32 = u32::try_from(seed & u128::from(u32::MAX)).unwrap_or(0);
+                // The low 32 bits of the clock: the truncation is the point.
+                #[allow(clippy::cast_possible_truncation)]
+                let seed_u32 = seed as u32;
                 let r = i64::from(full_hash(seed_u32) % max.max(1));
                 Some(Sample::Sint(r))
             },

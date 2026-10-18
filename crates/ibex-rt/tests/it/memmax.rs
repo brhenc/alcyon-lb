@@ -124,6 +124,35 @@ fn explicit_maxconn_cleartext_is_kept() {
     assert_eq!(field(&info, "Memmax_MB"), "64", "{info}");
 }
 
+/// A configured `maxconn` that leaves room for the TLS connections is kept (the oracle,
+/// `-m 64`, `maxconn 100`, one `bind ... ssl`: `Maxconn: 100`, `Hard_maxconn: 100`).
+#[test]
+fn explicit_maxconn_with_room_for_tls_is_kept() {
+    let port = common::reserve_port();
+    let (cfg, sock) = config("m64mctls", port, true, "  maxconn 100\n");
+    let run = spawn("64", &cfg, sock, port);
+    let info = show_info(&run.sock);
+    assert_eq!(field(&info, "Maxconn"), "100", "{info}");
+    assert_eq!(field(&info, "Hard_maxconn"), "100", "{info}");
+    assert_eq!(field(&info, "Memmax_MB"), "64", "{info}");
+}
+
+/// A budget that cannot hold one connection of the configured buffer size is refused with
+/// the oracle's alert (`-m 1`, `tune.bufsize 2000000`, cleartext: exit 1, "The absolute
+/// maximum possible value is 10, but 0 was found.").
+#[test]
+fn budget_too_small_for_one_connection_is_refused() {
+    let port = common::reserve_port();
+    let (cfg, _sock) = config("m1big", port, false, "  tune.bufsize 2000000\n");
+    let out = Command::new(env!("CARGO_BIN_EXE_ibex")).args(["-m", "1", "-f", &cfg]).output().expect("run ibex");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {err}");
+    assert!(
+        err.contains("Cannot compute the automatic maxconn because global.maxsslconn is already too high for the global.memmax value (1 MB). The absolute maximum possible value is 10, but 0 was found."),
+        "stderr: {err}"
+    );
+}
+
 #[test]
 fn explicit_maxconn_too_high_for_tls_is_refused() {
     let (cfg, _sock) = config("m64refuse", common::reserve_port(), true, "  maxconn 100000\n");
