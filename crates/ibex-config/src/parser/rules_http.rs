@@ -420,6 +420,26 @@ fn parse_http_req_rule_at(
             cond,
             line: 0,
         });
+    } else if act_str == "use-service" {
+        // `http_parse_use_service` (src/http_act.c) takes the name, then looks it up with
+        // `service_find`; only the exporter exists here. The `if`/`unless` condition follows.
+        let name = tokens.get(2).filter(|t| t.text != "if" && t.text != "unless");
+        let Some(name) = name else {
+            return Err(ConfigError::new(
+                act_token.line,
+                act_token.col,
+                "error detected while parsing 'http-request use-service' rule : 'use-service' expects a service name..",
+            ));
+        };
+        if name.text != "prometheus-exporter" {
+            return Err(ConfigError::new(
+                act_token.line,
+                act_token.col,
+                format!("error detected while parsing 'http-request use-service' rule : '{}' unknown service name..", name.text),
+            ));
+        }
+        let (_, cond) = parse_rule_condition(tokens, 3)?;
+        rules.push(HttpReqRule { action: HttpReqAction::UseServicePrometheus, cond, line: 0 });
     } else if act_str == "allow" {
         let cond_idx = find_cond_idx(tokens, 2);
         let cond = if let Some(idx) = cond_idx {

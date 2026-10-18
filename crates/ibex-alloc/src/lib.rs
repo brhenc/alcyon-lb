@@ -449,25 +449,13 @@ impl PoolRegistry {
     /// Matches the arithmetic of [`Self::show_pools`]'s `Total:` line (`used` includes the caches).
     #[must_use]
     pub fn totals(&self) -> (u64, u64) {
-        let providers: Vec<PoolStatsFn> = self
-            .providers
-            .read()
-            .map(|list| list.iter().map(|(_, f)| *f).collect())
-            .unwrap_or_default();
-
+        // `for_each`, not a copy of the provider list: a scrape calls this and allocates nothing.
         let mut total_alloc_bytes: u64 = 0;
         let mut total_used_bytes: u64 = 0;
-
-        for provider in providers {
-            let Some(p) = provider() else {
-                continue;
-            };
-            let alloc_bytes = p.alloc_bytes as u64;
-            let used_bytes = ((p.used + p.cached) * p.size) as u64;
-            total_alloc_bytes += alloc_bytes;
-            total_used_bytes += used_bytes;
-        }
-
+        self.for_each(|p| {
+            total_alloc_bytes += p.alloc_bytes as u64;
+            total_used_bytes += ((p.used + p.cached) * p.size) as u64;
+        });
         (total_alloc_bytes, total_used_bytes)
     }
 }

@@ -50,6 +50,10 @@ pub enum HttpReqAction {
         error_page: Option<ErrorPageSource>,
     },
     Allow,
+    /// `use-service prometheus-exporter`: the request is answered with the metrics page and
+    /// no later rule runs (T368). The `scope`, `no-maint` and `extra-counters` query
+    /// parameters are read from the request URI at run time.
+    UseServicePrometheus,
     /// `reject`: the connection is closed with no response (a stream of an HTTP/2
     /// connection is reset with `ENHANCE_YOUR_CALM`).
     Reject,

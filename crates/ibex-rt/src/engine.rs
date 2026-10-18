@@ -4353,6 +4353,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let log_targets = resolve_log_targets(config, &mut []);
 
         let start_time = Instant::now();
+        crate::stats::note_process_start(start_time);
         let now = Tick(1);
         
         let checks = if worker_id == 0 {
@@ -4367,6 +4368,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mb_fd = mailboxes.fd(0).as_raw_fd();
         fdtab.insert(mb_fd, FdState::Mailbox, Interest::READ);
         poller.add(mailboxes.fd(0), raw_fd_to_u64(mb_fd), true, false)?;
+
+        // The first Prometheus scrape allocates nothing: its scratch is made here, on this thread.
+        crate::promex::prewarm(&proxies[..], &checks, std::process::id());
 
         Ok(Engine {
             quic_listeners,
@@ -5077,6 +5081,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let pid = self.pid;
         let total_tasks = self.scheduler.live_tasks();
         let run_queue_len = self.scheduler.run_queue_len();
+        crate::stats::note_sched(total_tasks, run_queue_len);
 
         let mut timer_updates = std::mem::take(&mut self.timer_updates);
         timer_updates.clear();
@@ -9551,6 +9556,9 @@ impl EngineDispatcher<'_> {
 
             // Step 3.5: the HTTP transaction -- rules, routing, the response head, and its end.
             let mut pending_admin = None;
+            if entry.sess.scrape.is_some() {
+                crate::promex::pump(&mut entry.sess, self.proxies, self.checks, self.pid);
+            }
             if entry.sess.mode == Mode::Http && !entry.sess.is_done() {
                 pending_admin = Self::http_step(
                     entry,
@@ -10964,6 +10972,7 @@ impl EngineDispatcher<'_> {
                 if matches!(
                     rule.action,
                     ibex_config::HttpReqAction::Return { .. }
+                        | ibex_config::HttpReqAction::UseServicePrometheus
                         | ibex_config::HttpReqAction::Deny { .. }
                         | ibex_config::HttpReqAction::Allow
                         | ibex_config::HttpReqAction::Auth { .. }
@@ -10991,6 +11000,21 @@ impl EngineDispatcher<'_> {
                             }
                         };
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &full_resp);
+                        return Ok(RuleFlow::Replied);
+                    }
+                    // `use-service prometheus-exporter`: the metrics page answers the request and
+                    // no later rule runs (`ACT_RET_STOP`). This is where the configuration
+                    // keyword reaches `promex::scrape_reply`.
+                    ibex_config::HttpReqAction::UseServicePrometheus => {
+                        sess.log.applet = true;
+                        if sess.req_uri.as_deref().is_some_and(|u| !crate::promex::query_ok(u)) {
+                            send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, crate::promex::BAD_QUERY);
+                        } else {
+                            // The body is produced into the response buffer by
+                            // `promex::pump` on every pass over the session.
+                            sess.start_scrape();
+                            crate::promex::pump(sess, &proxies[..], &*checks, pid);
+                        }
                         return Ok(RuleFlow::Replied);
                     }
                     ibex_config::HttpReqAction::Deny {
