@@ -792,7 +792,7 @@ fn run_var_rules(
             });
             // An expression that gives no sample leaves the variable as it was.
             if let Some(v) = val {
-                vars.insert(var_name.clone(), v);
+                ibex_sample::vars::set_in(vars, var_name, v);
             }
         } else if let ResolvedHttpRule::UnsetVar { var_name } = rule {
             vars.remove(var_name);
