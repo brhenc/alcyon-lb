@@ -2932,6 +2932,17 @@ impl TcpSession {
         if self.h2_owner().is_some_and(|o| !o.children.is_empty()) {
             return false;
         }
+        // A request whose buffer is full and not yet taken by the server (the connect still
+        // pending, or the server slow) owes nothing either: `sc_rcv_may_expire` is false while
+        // the channel has no room (`SC_FL_NEED_ROOM`), so `timeout client` does not run. Without
+        // this the held streams of an HTTP/2 connection timed out, freed their receive buffers
+        // and let the demux open a connect for each stream behind them (T379, VV-16).
+        if self.mode == Mode::Http
+            && self.txn.as_ref().is_some_and(|t| !t.req.is_done() && !t.local)
+            && self.req.readable().len() >= self.bufsize.saturating_sub(self.maxrewrite)
+        {
+            return false;
+        }
         // Once an HTTP request is complete the client owes nothing until its response
         // starts: the wait belongs to `timeout server`, as in HAProxy.
         let awaiting_server = self.mode == Mode::Http
