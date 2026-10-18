@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use crate::dgram::{DgramBuf, DgramOut, DgramSocket};
 use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
 
+use ibex_proto::h3::H3Error;
 use ibex_proto::htx::{HtxBlock, HtxSlice};
 use ibex_proto::mux_h3;
 use ibex_proto::qpack;
@@ -30,6 +31,9 @@ const DGRAM_BUF_SIZE: usize = 2048;
 const CMSG_BUF_SIZE: usize = 128;
 /// H3_NO_ERROR (RFC 9114 section 8.1), the application error code of a graceful close.
 const H3_NO_ERROR: u64 = 0x100;
+/// Two eight-byte varints: the largest frame header, which a buffer may hold on top of a
+/// frame at the cap.
+const MAX_FRAME_HEADER: usize = 16;
 
 /// The QUIC sockets bound by [`prebind`] before the workers start, one per worker and
 /// address, each waiting for its worker to take it.
@@ -268,6 +272,13 @@ impl QuicListener {
     #[must_use]
     pub const fn frontend(&self) -> Option<usize> {
         self.frontend
+    }
+
+    /// Bytes of request streams held for parsing, over every connection (for tests).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn pending_request_bytes(&self) -> usize {
+        self.h3.values().flat_map(|st| st.req.values()).map(Vec::len).sum()
     }
 
     /// The request streams created since the last call, for the engine to adopt.
@@ -808,17 +819,26 @@ impl QuicListener {
         if st.answered.contains(&stream_id) {
             return;
         }
-        st.req.entry(stream_id).or_default().extend_from_slice(&chunk);
-        let buf = st.req.get(&stream_id).cloned().unwrap_or_default();
+        let held = st.req.entry(stream_id).or_default();
+        held.extend_from_slice(&chunk);
 
-        // A HEADERS frame can be split across datagrams; Ok(None) means wait for more.
-        let Ok(Some(field_section)) = mux_h3::take_request_headers(&buf) else {
-            return;
+        // HAProxy's per-stream receive buffer is `tune.bufsize` less its 4-byte reserve
+        // (`qcm_stream_rx_bufsz`), and a non-DATA frame longer than that is H3_EXCESSIVE_LOAD
+        // (`h3.c` `h3_rcv_buf`). A HEADERS frame can be split across datagrams, so
+        // `Ok(None)` means wait for more -- but never for more than one buffer of it.
+        let cap = crate::buf::get_bufsize().saturating_sub(4);
+        let field_section = match mux_h3::take_request_headers(held, cap) {
+            Ok(Some(section)) => section,
+            Ok(None) if held.len() <= cap + MAX_FRAME_HEADER => return,
+            _ => {
+                st.req.remove(&stream_id);
+                self.endpoint.close_connection(conn_id, H3Error::ExcessiveLoad as u64, b"");
+                return;
+            }
         };
 
-        let st = self.h3.entry(conn_id).or_default();
         st.answered.push(stream_id);
-        st.req.remove(&stream_id);
+        let buf = st.req.remove(&stream_id).unwrap_or_default();
 
         if self.frontend.is_some() {
             self.start_relay(conn_id, stream_id, &buf, fin);

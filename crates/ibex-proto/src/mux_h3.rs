@@ -213,8 +213,9 @@ pub fn read_uni_stream_type(buf: &[u8]) -> Option<(UniStreamKind, usize)> {
 /// is the extension mechanism and clients do send grease.
 ///
 /// # Errors
-/// Returns an error if a frame header is malformed.
-pub fn take_request_headers(buf: &[u8]) -> Result<Option<Vec<u8>>, H3Error> {
+/// Returns an error if a frame header is malformed, or announces a non-DATA frame longer
+/// than `max_frame` ([`H3Error::ExcessiveLoad`]).
+pub fn take_request_headers(buf: &[u8], max_frame: usize) -> Result<Option<Vec<u8>>, H3Error> {
     let mut offset = 0usize;
     while offset < buf.len() {
         let start = offset;
@@ -228,8 +229,14 @@ pub fn take_request_headers(buf: &[u8]) -> Result<Option<Vec<u8>>, H3Error> {
             let _ = start;
             return Ok(None);
         };
+        // HAProxy (`h3.c` `h3_rcv_buf`): any frame but DATA longer than the stream's receive
+        // buffer is H3_EXCESSIVE_LOAD, decided from the frame header, before a payload
+        // byte is buffered.
+        if frame_type != FRAME_DATA && len > max_frame as u64 {
+            return Err(H3Error::ExcessiveLoad);
+        }
         let len = usize::try_from(len).map_err(|_| H3Error::FrameError)?;
-        if offset + len > buf.len() {
+        if offset.saturating_add(len) > buf.len() {
             return Ok(None);
         }
         let payload = &buf[offset..offset + len];
@@ -303,14 +310,14 @@ mod tests {
         encode_frame(&mut buf, 0x21, b"grease");
         encode_frame(&mut buf, FRAME_HEADERS, &[0x00, 0x00, 0xd9]);
         assert_eq!(
-            take_request_headers(&buf).unwrap(),
+            take_request_headers(&buf, 16380).unwrap(),
             Some(vec![0x00, 0x00, 0xd9]),
             "a grease frame before HEADERS must be skipped"
         );
 
         let partial = &buf[..buf.len() - 1];
         assert_eq!(
-            take_request_headers(partial).unwrap(),
+            take_request_headers(partial, 16380).unwrap(),
             None,
             "an incomplete frame is not an error"
         );

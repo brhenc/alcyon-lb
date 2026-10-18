@@ -54,6 +54,8 @@ struct Rig {
     conn: Connection,
     buf: Vec<u8>,
     lost: bool,
+    /// Why the server's connection ended, as the client saw it.
+    lost_reason: Option<ibex_quic::quinn_proto::ConnectionError>,
     _guard: Option<std::sync::RwLockReadGuard<'static, ()>>,
 }
 
@@ -83,7 +85,7 @@ impl Rig {
         sock.set_nonblocking(true).expect("nonblocking");
         let mut ep = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
         let (handle, conn) = ep.connect(Instant::now(), client_cfg, server.addr(), "localhost").expect("connect");
-        let mut rig = Self { server, sock, ep, handle, conn, buf: vec![0u8; 65536], lost: false, _guard: guard };
+        let mut rig = Self { server, sock, ep, handle, conn, buf: vec![0u8; 65536], lost: false, lost_reason: None, _guard: guard };
         assert!(rig.run_until(|r| r.connected()), "no handshake");
         rig
     }
@@ -123,8 +125,9 @@ impl Rig {
             }
         }
         while let Some(ev) = self.conn.poll() {
-            if matches!(ev, Event::ConnectionLost { .. }) {
+            if let Event::ConnectionLost { reason } = ev {
                 self.lost = true;
+                self.lost_reason = Some(reason);
             }
         }
     }
@@ -472,4 +475,129 @@ fn no_descriptor_for_the_relay_is_a_503() {
     setrlimit(Resource::Nofile, saved).expect("restore");
     drop(held);
     assert_eq!(status(&resp), 503);
+}
+
+// F1 (T358 footgun #2): the per-stream HTTP/3 request buffer is bounded.
+//
+// Expected values come from HAProxy's source, because the reference binary is built -QUIC
+// and cannot run these: src/h3.c:2037-2070 (h3_rcv_buf): for every frame type but DATA,
+// `if (flen > qcm_stream_rx_bufsz()) { qcc_set_error(qcc, H3_ERR_EXCESSIVE_LOAD, 1, ...);
+// goto err; }`, decided from the frame header, a connection error 0x107; a shorter,
+// incomplete frame just pauses parsing (`if (flen > b_data(b)) break;`).
+// qcm_stream_rx_bufsz() = global.tune.bufsize - NCB_RESERVED_SZ (include/haproxy/mux_quic.h:56-59;
+// NCB_RESERVED_SZ = sizeof(ncb_sz_t) = 4, ncbuf-t.h:68) = 16380 by default.
+
+const H3_EXCESSIVE_LOAD: u64 = 0x107;
+const FRAME_CAP: usize = 16_384 - 4;
+
+fn varint(v: u64) -> Vec<u8> {
+    let mut b = Vec::new();
+    ibex_proto::mux_h3::encode_varint(&mut b, v);
+    b
+}
+
+/// A request HEADERS frame whose payload is exactly `payload_len` bytes.
+fn headers_of_len(payload_len: usize) -> Vec<u8> {
+    let frame_len = |pad: usize| {
+        let value = "x".repeat(pad);
+        let f = headers(&[("x-pad", value.as_str())]);
+        let mut off = 0;
+        let _ = ibex_proto::h3::parse_varint(&f, &mut off);
+        (ibex_proto::h3::parse_varint(&f, &mut off).expect("len") as usize, f)
+    };
+    // The field section grows one byte per pad byte at these sizes.
+    let (base, _) = frame_len(1000);
+    let (len, f) = frame_len(1000 + payload_len - base);
+    assert_eq!(len, payload_len);
+    f
+}
+
+/// Runs the rig until the server closes the connection; returns the largest number of bytes
+/// the listener held for request streams at any step.
+fn run_to_close(rig: &mut Rig) -> usize {
+    let mut peak = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !rig.lost && Instant::now() < deadline {
+        rig.step();
+        peak = peak.max(rig.server.pending_request_bytes());
+    }
+    peak
+}
+
+fn assert_excessive_load(rig: &Rig) {
+    assert!(rig.lost, "the connection was not closed");
+    match rig.lost_reason.as_ref().expect("reason") {
+        ibex_quic::quinn_proto::ConnectionError::ApplicationClosed(c) => {
+            assert_eq!(c.error_code, VarInt::from_u32(H3_EXCESSIVE_LOAD as u32), "{c:?}");
+        }
+        other => panic!("closed with {other:?}, want H3_EXCESSIVE_LOAD"),
+    }
+}
+
+/// A stream that keeps sending without ever completing a HEADERS frame is cut off with
+/// H3_EXCESSIVE_LOAD, and the listener never holds more than a buffer's worth of it.
+#[test]
+fn a_request_stream_over_the_cap_is_refused_and_bounded() {
+    let mut rig = Rig::new();
+    // A DATA frame (no length check of its own) announcing 2^40 bytes, before any HEADERS.
+    let mut first = varint(0x00);
+    first.extend(varint(1 << 40));
+    let id = rig.open(&first, false);
+    let mut sent = 0;
+    let mut peak = 0;
+    while sent < 256 * 1024 && !rig.lost {
+        rig.send(id, &[b'a'; 1200], false);
+        sent += 1200;
+        rig.step();
+        peak = peak.max(rig.server.pending_request_bytes());
+    }
+    peak = peak.max(run_to_close(&mut rig));
+    assert_excessive_load(&rig);
+    assert!(peak <= FRAME_CAP + 16, "the listener held {peak} bytes of one stream (cap {FRAME_CAP})");
+    assert_eq!(rig.server.pending_request_bytes(), 0, "the buffer is released");
+}
+
+/// A HEADERS frame (or any non-DATA frame) declaring more than the cap is refused from its
+/// header, before a payload byte is buffered.
+#[test]
+fn a_headers_frame_declaring_more_than_the_cap_is_refused_before_buffering() {
+    for ty in [0x01u64, 0x21] {
+        let mut rig = Rig::new();
+        let mut first = varint(ty);
+        first.extend(varint(FRAME_CAP as u64 + 1));
+        first.extend([b'a'; 100]);
+        rig.open(&first, false);
+        let peak = run_to_close(&mut rig);
+        assert_excessive_load(&rig);
+        assert!(peak <= first.len() && peak < 1000, "type {ty:#x}: held {peak} bytes");
+        assert!(peak < 2 * 100, "type {ty:#x}: payload buffered ({peak})");
+    }
+    // A length no usize holds is refused the same way.
+    let mut rig = Rig::new();
+    let mut first = varint(0x01);
+    first.extend(varint(1 << 40));
+    rig.open(&first, false);
+    run_to_close(&mut rig);
+    assert_excessive_load(&rig);
+}
+
+/// A HEADERS frame of exactly the cap, delivered in pieces, is a request; one byte more is not.
+#[test]
+fn a_headers_frame_just_under_the_cap_still_works() {
+    let mut rig = Rig::new();
+    let f = headers_of_len(FRAME_CAP);
+    let id = rig.open(&f[..f.len() / 2], false);
+    rig.step();
+    rig.send(id, &f[f.len() / 2..], true);
+    let mut eng = rig.accept();
+    let got = engine_read(&mut eng, &mut rig, b"\r\n\r\n");
+    assert!(got.starts_with(b"POST /up HTTP/1.1\r\n"), "{}", String::from_utf8_lossy(&got[..40.min(got.len())]));
+    assert!(!rig.lost);
+    drop(eng);
+    drop(rig);
+
+    let mut rig = Rig::new();
+    rig.open(&headers_of_len(FRAME_CAP + 1), true);
+    run_to_close(&mut rig);
+    assert_excessive_load(&rig);
 }
