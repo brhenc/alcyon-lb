@@ -2,6 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 use super::*;
+use super::acl_scope;
 
 pub(crate) fn parse_acl(acls: &mut Vec<AclRule>, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
     if tokens.len() < 3 || tokens[1].text.is_empty() || tokens[2].text.is_empty() {
@@ -14,6 +15,7 @@ pub(crate) fn parse_acl(acls: &mut Vec<AclRule>, tokens: &[Token], kw: &Token) -
     let name = tokens[1].text.clone();
     validate_acl_regexes(&tokens[2..])?;
     let expr = tokens[2..].iter().map(|t| expr_word(&t.text)).collect::<Vec<_>>().join(" ");
+    acl_scope::declare(&name);
     acls.push(AclRule { name, expr });
     Ok(())
 }
@@ -78,6 +80,7 @@ pub(crate) fn parse_acl_condition_from_tokens(tokens: &[Token]) -> Result<Option
             // `HAProxy` reads a brace only as a word of its own.
             return Err(ConfigError::new(tok.line, tok.col, format!("unknown ACL or sample keyword '{text}'")));
         } else {
+            acl_scope::check_term(text, tok)?;
             terms.push(AclTerm { negated: bang, name: text.to_string() });
             i += 1;
         }

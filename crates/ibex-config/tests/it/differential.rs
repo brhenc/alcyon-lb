@@ -121,6 +121,10 @@ fn test_tcp_request_content_parsing() {
     let cfg_str = r"
 frontend fe
     bind :8080
+    acl is_ssl ssl_fc
+    acl is_trusted src 10.0.0.0/8
+    acl is_bad src 192.0.2.0/24
+    acl is_local src 127.0.0.0/8
     tcp-request content sc-inc-gpc0
     tcp-request content sc-inc-gpc0(0)
     tcp-request content sc-inc-gpc0(1)
@@ -139,6 +143,7 @@ frontend fe
     tcp-request content silent-drop if is_bad !is_local
 
 backend be
+    acl is_valid src 10.0.0.0/8
     tcp-request content track-sc0 src table t_backend if is_valid
     tcp-request content switch-mode http
 ";
@@ -319,6 +324,9 @@ fn test_tcp_request_session_parsing() {
     let cfg_str = r"
 frontend fe
     bind :8080
+    acl is_local src 127.0.0.0/8
+    acl is_trusted src 10.0.0.0/8
+    acl is_bad src 192.0.2.0/24
     tcp-request session track-sc0 src
     tcp-request session track-sc1 src table t1
     tcp-request session track-sc2 src
@@ -333,6 +341,7 @@ frontend fe
 
 listen li
     bind :8081
+    acl is_allowed src 10.0.0.0/8
     tcp-request session track-sc0 src table t_listen if is_allowed
     tcp-request session accept
 ";
@@ -480,6 +489,9 @@ fn test_tcp_request_connection_parsing() {
     let cfg_str = r"
 frontend fe
     bind :8080
+    acl is_local src 127.0.0.0/8
+    acl is_trusted src 10.0.0.0/8
+    acl is_bad src 192.0.2.0/24
     tcp-request connection track-sc0 src
     tcp-request connection track-sc1 src table t1
     tcp-request connection track-sc2 src
@@ -491,6 +503,7 @@ frontend fe
 
 listen li
     bind :8081
+    acl is_allowed src 10.0.0.0/8
     tcp-request connection track-sc1 src table t_listen if is_allowed
     tcp-request connection accept
 ";

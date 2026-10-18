@@ -112,6 +112,7 @@ pub(crate) use scalars::*;
 pub(crate) mod error_pages;
 pub(crate) mod sample_refs;
 pub(crate) mod scope;
+pub(crate) mod acl_scope;
 pub(crate) mod warn;
 pub(crate) mod refs;
 pub use sample_refs::log_format_exprs;
@@ -145,6 +146,14 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     clear_http_errors_sections();
     clear_userlists();
     warn::reset();
+    acl_scope::begin();
+    struct EndScope;
+    impl Drop for EndScope {
+        fn drop(&mut self) {
+            acl_scope::end();
+        }
+    }
+    let _end_scope = EndScope;
 
     let mut global: Option<GlobalSection> = None;
     let mut proxy_warnings: Vec<crate::ast::global::LoadWarning> = Vec::new();
@@ -175,6 +184,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         }
 
         scope::check(tokens)?;
+        acl_scope::enter_line(tokens);
         let kw = &tokens[0];
         match kw.text.as_str() {
             "global" => {

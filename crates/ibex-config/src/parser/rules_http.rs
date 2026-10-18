@@ -1910,6 +1910,10 @@ pub(crate) fn set_timeout_sides(rules: &[HttpReqRule], kw: &Token, name: &str, h
 /// the rule parsers do not know the section, so the caller names it here.
 pub(crate) fn in_section(r: Result<(), ConfigError>, kind: &str, name: &str) -> Result<(), ConfigError> {
     r.map_err(|mut e| {
+        // An unknown ACL is worded by `acl_scope` as HAProxy words it, with no section.
+        if e.message.contains("no such ACL") {
+            return e;
+        }
         if let Some(rest) = e.message.strip_prefix("error detected while parsing") {
             e.message = format!("error detected in {kind} '{name}' while parsing{rest}");
         }
