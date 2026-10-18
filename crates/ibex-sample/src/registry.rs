@@ -1935,7 +1935,7 @@ impl Registry {
             name: "baseq",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                fetch_base_path(ctx, false)
+                fetch_base_path(ctx, true)
             },
         });
 
