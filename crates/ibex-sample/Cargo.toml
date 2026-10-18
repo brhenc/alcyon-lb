@@ -9,6 +9,7 @@ autotests = false
 [dependencies]
 ibex-crypt = { path = "../ibex-crypt" }
 ibex-proto = { path = "../ibex-proto" }
+ibex-tls = { path = "../ibex-tls" }
 getrandom = "0.2"
 ibex-regex = { workspace = true }
 aes = "0.8"
