@@ -1159,7 +1159,7 @@ class SyslogRunner:
         self.port = self.sock.getsockname()[1]
         self.macro_engine.set(f"{self.syslog_id}_addr", "127.0.0.1")
         self.macro_engine.set(f"{self.syslog_id}_port", str(self.port))
-        self.macro_engine.set(f"{self.syslog_id}_sock", f"127.0.0.1 {self.port}")
+        self.macro_engine.set(f"{self.syslog_id}_sock", f"127.0.0.1:{self.port}")
 
     def start(self) -> None:
         def loop():
@@ -1294,7 +1294,7 @@ class MockServerRunner:
         self.port = self.srv.sockets[0].getsockname()[1]
         self.macro_engine.set(f"{self.server_id}_addr", "127.0.0.1")
         self.macro_engine.set(f"{self.server_id}_port", str(self.port))
-        self.macro_engine.set(f"{self.server_id}_sock", f"127.0.0.1 {self.port}")
+        self.macro_engine.set(f"{self.server_id}_sock", f"127.0.0.1:{self.port}")
 
     async def _handle_incoming(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         if self.verbose:

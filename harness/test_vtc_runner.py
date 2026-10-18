@@ -192,6 +192,30 @@ class MasterCliVersusStatsSocket(unittest.TestCase):
         self.assertIn("defaults", cfg[3].strip() + "".join(cfg[4:]))
 
 
+class SockMacroIsAddrColonPort(unittest.TestCase):
+    """VTest expands `${s1_sock}` to `addr:port`, so `server s1 ${s1_sock}` is a valid HAProxy
+    line (T401). The runner used `addr port`, which HAProxy itself rejects."""
+
+    def test_server_sock_macro(self):
+        eng = vtc_runner.MacroEngine()
+        sd = vtc_runner.ServerBlock(server_id="s1", opts_before=[], actions=[], modifiers_after=[])
+        r = vtc_runner.MockServerRunner(sd, eng, {})
+
+        async def go():
+            await r.initialize_socket()
+            r.srv.close()
+        asyncio.run(go())
+        self.assertEqual(eng.get("s1_sock"), f"127.0.0.1:{r.port}")
+        self.assertEqual(eng.get("s1_addr"), "127.0.0.1")
+
+    def test_syslog_sock_macro(self):
+        eng = vtc_runner.MacroEngine()
+        r = vtc_runner.SyslogRunner("S1", eng, [])
+        r.initialize_socket()
+        r.sock.close()
+        self.assertEqual(eng.get("S1_sock"), f"127.0.0.1:{r.port}")
+
+
 class VtcQuotingTest(unittest.TestCase):
     """`expect ... == {Basic realm="protected area"}` lost its quotes to shlex, so
     http-rules/http_auth.vtc failed on the runner, not on the proxy (T151 item 4)."""
