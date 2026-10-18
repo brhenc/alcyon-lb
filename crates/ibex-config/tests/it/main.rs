@@ -42,6 +42,7 @@ mod log_tag_sample;
 mod m1_scope_refusals;
 mod no_memory_trimming;
 mod node_description;
+mod pause_rule;
 mod preproc;
 mod proxy_ids;
 mod proxy_options;

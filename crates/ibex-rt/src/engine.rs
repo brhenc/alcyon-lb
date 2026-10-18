@@ -2693,6 +2693,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         prio: (s.log.prio_class, s.log.prio_offset),
         bc_err: s.bc_err.copied(),
         bc_reused: Some(s.txn.as_ref().is_some_and(|t| t.srv_reused)),
+        term_state: Some(sess_term_state(s)),
         bc_dst: s.bc_dst(),
         ..Default::default()
     }
@@ -2700,7 +2701,12 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
 
 /// `%ts` (`StreamLog::term_state`).
 fn term_state(entry: &SessionEntry) -> [u8; 2] {
-    let s = &entry.sess;
+    sess_term_state(&entry.sess)
+}
+
+/// The termination state of a stream as it is now (`txn.sess_term_state` reads the flags
+/// when it is evaluated).
+fn sess_term_state(s: &TcpSession) -> [u8; 2] {
     s.log.term_state(s.ending, s.mode == Mode::Http, s.txn.as_ref().is_some_and(|t| t.rsp.is_done()))
 }
 
@@ -6622,6 +6628,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         captures_res_hdr: Some(&sess.log.res_captures),
         bc_err: sess.bc_err.copied(),
         bc_reused: Some(sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
+        term_state: Some(sess_term_state(sess)),
         bc_dst: sess.bc_dst(),
         ..Default::default()
     };
@@ -10202,6 +10209,7 @@ impl EngineDispatcher<'_> {
             stream: Some(stream_facts(&entry.sess, Some(status))),
             bc_err: entry.sess.bc_err.copied(),
             bc_reused: Some(entry.sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
+            term_state: Some(sess_term_state(&entry.sess)),
             bc_dst: entry.sess.bc_dst(),
             last_rule: last_rule_at(entry.sess.log.last_rule),
             prio: (entry.sess.log.prio_class, entry.sess.log.prio_offset),
@@ -10331,6 +10339,15 @@ impl EngineDispatcher<'_> {
                 let caps = (!fe_res_slots.is_empty()).then_some((&mut res_caps, &fe_res_slots[..]));
                 let mut check = |rule: usize, time_ms: u32, at_least: u32| -> BodyWait {
                     let here = resume.filter(|w| w.list == list && w.rule == rule);
+                    if at_least == PAUSE_RULE {
+                        // `pause`: the deadline is set once, and the body is not waited for.
+                        let deadline = here.map_or_else(|| now.add(time_ms), |w| w.deadline);
+                        if (here.is_none() && time_ms == 0) || deadline.is_expired(now) {
+                            return BodyWait::Ready;
+                        }
+                        held = Some(crate::txn::RspWait { list, rule, deadline, inspect: false });
+                        return BodyWait::Pending;
+                    }
                     let deadline = here.map_or_else(
                         || if time_ms > 0 { now.add(time_ms) } else { Tick::ETERNITY },
                         |w| w.deadline,
@@ -10990,6 +11007,7 @@ impl EngineDispatcher<'_> {
                         last_rule: last_rule_at($s.log.last_rule),
                         prio: ($s.log.prio_class, $s.log.prio_offset),
                         be_max_retries: Some(be_retries),
+                        term_state: Some(sess_term_state(&$s)),
                         cur_max_retries: Some($s.max_retries),
                         acls: Some(acls),
                         act_conn,
@@ -11503,6 +11521,28 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::ScSetGpt { idx, sc, expr } => {
                         let val = resolve_gpt0_val(expr, registry, &make_ctx!(sess));
                         sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
+                    }
+                    ibex_config::HttpReqAction::Pause { time_ms, expr } => {
+                        // `http_action_pause`: the wait starts once (the stream's `body_wait`
+                        // holds its deadline across the yields, as a tarpit's does), and the
+                        // rules go on when it has passed. No value, or one not above 0, is no
+                        // wait.
+                        let held = sess.txn.as_ref().and_then(|t| t.body_wait).filter(|w| w.tarpit && w.backend == be_stage && w.rule == rule_idx);
+                        let deadline = if let Some(w) = held {
+                            Some(w.deadline)
+                        } else {
+                            let ms = pause_ms(*time_ms, expr.as_deref(), registry, &make_ctx!(sess));
+                            (ms > 0).then(|| now.add(ms))
+                        };
+                        if let Some(deadline) = deadline.filter(|d| !d.is_expired(now)) {
+                            if let Some(t) = sess.txn.as_mut() {
+                                t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline, tarpit: true, inspect: false });
+                            }
+                            return Ok(RuleFlow::Suspend);
+                        }
+                        if let Some(t) = sess.txn.as_mut() {
+                            t.body_wait = None;
+                        }
                     }
                     ibex_config::HttpReqAction::WaitForBody { time_ms, at_least } => {
                         match wait_for_request_body(sess, &proxies[pages_idx], be_stage, rule_idx, *time_ms, *at_least, now) {
@@ -12616,6 +12656,20 @@ fn render_sample_format(fmt: &str, ctx: &SampleContext, registry: &Registry, htt
     out
 }
 
+/// The wait of a `pause` rule, in ms: its fixed time, or what its expression gives (cast to
+/// an integer; no value, or one not above 0, is 0), at most 2147483647.
+fn pause_ms(time_ms: u32, expr: Option<&str>, registry: &Registry, ctx: &SampleContext) -> u32 {
+    let Some(expr) = expr else { return time_ms };
+    let n = Expr::cached(expr)
+        .ok()
+        .and_then(|e| e.eval_sample(registry, ctx))
+        .and_then(|smp| ibex_sample::cast::cast(smp, ibex_sample::SampleType::Sint));
+    match n {
+        Some(Sample::Sint(n)) => u32::try_from(n.clamp(0, 0x7fff_ffff)).unwrap_or(0),
+        _ => 0,
+    }
+}
+
 fn parse_timeout_val(s: &str) -> u32 {
     let s = s.trim();
     let (num_str, factor) = if let Some(stripped) = s.strip_suffix("ms") {
@@ -13425,7 +13479,13 @@ enum ResRule<'a> {
     Capture(&'a str, usize),
     /// `wait-for-body time <ms> at-least <bytes>`.
     Wait(u32, u32),
+    /// `pause <time|expr>`: the time, the expression.
+    Pause(u32, Option<&'a str>),
 }
+
+/// The `at_least` a [`ResWait`] check is called with for a `pause` rule: its `time_ms` is
+/// then the pause, and the check says whether it is still running.
+const PAUSE_RULE: u32 = u32::MAX;
 
 impl<'a> ResOp<'a> {
     fn of_res(a: &'a ibex_config::HttpResAction) -> ResRule<'a> {
@@ -13440,6 +13500,7 @@ impl<'a> ResOp<'a> {
             }
             ibex_config::HttpResAction::Capture { expr, id } => return ResRule::Capture(expr, *id),
             ibex_config::HttpResAction::WaitForBody { time_ms, at_least } => return ResRule::Wait(*time_ms, *at_least),
+            ibex_config::HttpResAction::Pause { time_ms, expr } => return ResRule::Pause(*time_ms, expr.as_deref()),
         })
     }
 
@@ -13798,6 +13859,18 @@ fn run_res_rules<'a>(
                 }
                 continue;
             }
+            ResRule::Pause(time_ms, expr) => {
+                let Some(w) = wait.as_mut() else { continue };
+                let ms = pause_ms(time_ms, expr, registry, ctx);
+                match (w.check)(idx, ms, PAUSE_RULE) {
+                    // Held: the pass resumes at this rule when the pause is over.
+                    BodyWait::Pending => {
+                        STRICT_MODE.set(true);
+                        return Ok(Some(idx));
+                    }
+                    _ => continue,
+                }
+            }
             ResRule::Wait(time_ms, at_least) => {
                 let Some(w) = wait.as_mut() else { continue };
                 match (w.check)(idx, time_ms, at_least) {
@@ -14102,6 +14175,7 @@ fn after_res_on_reply<'r>(
             captures_res_hdr: Some(&res_caps_in),
             bc_err: sess.bc_err.copied(),
             bc_reused: Some(sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
+            term_state: Some(sess_term_state(sess)),
             bc_dst: sess.bc_dst(),
             ..Default::default()
         };

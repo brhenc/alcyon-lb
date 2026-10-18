@@ -232,6 +232,9 @@ pub struct SampleContext<'a> {
     /// The stream's server connection was taken over from an earlier one (`SF_SRV_REUSED`);
     /// `None` where there is no stream. What `bc_reused` reads.
     pub bc_reused: Option<bool>,
+    /// The stream's termination state as it stands: the cause and the phase (`%ts`), what
+    /// `txn.sess_term_state` reads. `None` where there is no stream.
+    pub term_state: Option<[u8; 2]>,
     /// The address the backend connection was made to (`conn_dst` of the stream's `scb`),
     /// `None` without one. What `bc_dst` and `bc_dst_port` read; `server_addr` is the
     /// frontend's.
@@ -1800,6 +1803,13 @@ impl Registry {
             name: "txn.redispatched",
             out_type: SampleType::Bool,
             func: |ctx, _args| ctx.stream.map(|f| Sample::Bool(f.redispatched)),
+        });
+        // `txn.sess_term_state` (`smp_fetch_sess_term_state`): the two characters of `%ts`, as
+        // they are when the fetch is evaluated.
+        self.register_fetch(FetchDesc {
+            name: "txn.sess_term_state",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.term_state.map(|t| Sample::Str(t.iter().map(|&b| char::from(b)).collect())),
         });
         // `txn.status`: the status the log reports, `status` where a response is read.
         self.register_fetch(FetchDesc {

@@ -360,6 +360,7 @@ mod struct_sizes;
 mod syslog;
 mod systemd_notify;
 mod table_converters;
+mod pause_rule;
 mod tarpit;
 mod tcp_frontend_backend;
 mod tcp_options;

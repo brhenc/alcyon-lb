@@ -207,6 +207,12 @@ pub enum HttpReqAction {
         time_ms: Option<u32>,
         at_least: u32,
     },
+    /// `pause <time|expr>`: the rules after this one wait `time_ms` (or, with `expr`, the
+    /// milliseconds it gives; none when it has no value or is not above 0).
+    Pause {
+        time_ms: u32,
+        expr: Option<String>,
+    },
 }
 
 /// The argument of `set-retries`: an integer from 0 to 100, or an expression evaluated per
@@ -242,6 +248,8 @@ pub enum HttpResAction {
     /// run once the response body is complete, or `at_least` bytes of it are here, or the
     /// buffer is full; after `time_ms` the client gets a 504.
     WaitForBody { time_ms: u32, at_least: u32 },
+    /// `pause <time|expr>`, as for `http-request`.
+    Pause { time_ms: u32, expr: Option<String> },
     /// `http-response redirect location <fmt> [code <c>] [set-cookie <c>|clear-cookie <n>]`:
     /// the response is replaced by an empty redirect to `location` (a log-format string).
     /// `HAProxy` refuses the `prefix` and `scheme` types in a response.

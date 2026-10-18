@@ -276,6 +276,7 @@ fn http_req(a: &HttpReqAction) -> Exprs<'_> {
         }
         HttpReqAction::SetVar { var_name, expr } => vec![(format!("set-var({var_name})"), expr, false)],
         HttpReqAction::Capture { expr, .. } => vec![("capture".into(), expr, false)],
+        HttpReqAction::Pause { expr: Some(expr), .. } => vec![("pause".into(), expr, false)],
         HttpReqAction::ScSetGpt0 { sc, expr } => vec![(format!("sc-set-gpt0({sc})"), expr, true)],
         HttpReqAction::ScAddGpc { idx, sc, expr } => vec![(format!("sc-add-gpc({idx},{sc})"), expr, true)],
         HttpReqAction::ScSetGpt { idx, sc, expr } => vec![(format!("sc-set-gpt({idx},{sc})"), expr, true)],
@@ -295,6 +296,7 @@ fn http_res(a: &HttpResAction) -> Exprs<'_> {
     match a {
         HttpResAction::SetHeader { name, fmt } => res_set_var(name, fmt),
         HttpResAction::Capture { expr, .. } => vec![("capture".into(), expr, false)],
+        HttpResAction::Pause { expr: Some(expr), .. } => vec![("pause".into(), expr, false)],
         _ => Vec::new(),
     }
 }
@@ -398,6 +400,13 @@ impl Section<'_> {
                     }
                 });
                 res.map_err(|e| {
+                    // `parse_http_pause` reports any expression it cannot parse by its first
+                    // character.
+                    let e = if action == "pause" {
+                        format!("unexpected character '{}' in rule 'pause'.", expr.chars().next().unwrap_or('\0'))
+                    } else {
+                        e
+                    };
                     format!("error detected in {} while parsing '{kw} {action}' rule : {e}", self.what)
                 })?;
                 // A request rule has no response to read: its fetches would read the one of
