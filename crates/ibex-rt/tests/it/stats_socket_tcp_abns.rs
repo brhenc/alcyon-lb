@@ -406,6 +406,33 @@ fn a_failed_sf_successor_gives_the_abns_name_back() {
     let _ = old.wait();
 }
 
+/// Gate 48. The successor tells the old process to resume (SIGTTIN) just before it exits,
+/// while its socket may still hold the name; the old process's first bind then fails with
+/// `Address already in use` and, before the fix, gave the name up for good (1 run in 3 under
+/// the gate's load). Here the name is held by the test for 400 ms after SIGTTIN.
+#[test]
+fn an_abns_name_still_held_when_sigttin_arrives_is_taken_back_once_free() {
+    use std::os::linux::net::SocketAddrExt;
+    let abns = format!("ibex-g48-held-{}", std::process::id());
+    let (mut p, _f) = start(&format!("\tstats socket abns@{abns} level admin"), &[]);
+    drop(wait("abns@", || abstract_stream(&abns, true)));
+    let sig = |s: &str| {
+        let _ = Command::new("kill").arg(format!("-{s}")).arg(p.id().to_string()).status();
+    };
+    sig("TTOU");
+    wait("name released", || abstract_stream(&abns, true).is_none().then_some(()));
+    let mut bytes = abns.as_bytes().to_vec();
+    bytes.resize(107, 0);
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(&bytes).expect("addr");
+    let hold = std::os::unix::net::UnixListener::bind_addr(&addr).expect("the test takes the name");
+    sig("TTIN");
+    std::thread::sleep(Duration::from_millis(400));
+    drop(hold);
+    let s = wait("abns@ once free", || abstract_stream(&abns, true));
+    assert!(ask(s, "show cli level").contains("admin"));
+    common::stop(&mut p);
+}
+
 /// T354. SIGTTOU and SIGTTIN sent straight to a process with several stats sockets: every
 /// abns@ one (the first and an extra) lets go of its name and takes it back, as HAProxy
 /// 3.5-dev8-885761-29 does (measured: `kill -TTOU` frees both abstract names, `kill -TTIN`

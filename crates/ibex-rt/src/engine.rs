@@ -2086,6 +2086,7 @@ pub struct Engine {
     /// the name as bound.
     paused_abns: Vec<(Option<usize>, Vec<u8>)>,
     abns_paused: bool,
+    abns_retry_until: Option<Instant>,
     /// The listeners were stopped because `global maxconn` was reached (`globalconn`).
     global_paused: bool,
     /// `accept` failed for want of a resource (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`):
@@ -2215,10 +2216,19 @@ impl Engine {
     fn resume_abns_cli(&mut self) {
         use std::os::linux::net::SocketAddrExt;
         for (which, bytes) in std::mem::take(&mut self.paused_abns) {
+            // The successor sends SIGTTIN just before it exits, so its socket may still hold
+            // the name: keep the entry and try again (`retry_abns_cli`).
+            let held = |bytes: Vec<u8>| (which, bytes);
             let bound = std::os::unix::net::SocketAddr::from_abstract_name(&bytes)
                 .and_then(|a| std::os::unix::net::UnixListener::bind_addr(&a))
                 .and_then(|l| l.set_nonblocking(true).map(|()| l));
-            let Ok(l) = bound else { continue };
+            let l = match bound {
+                Ok(l) => l,
+                Err(_) => {
+                    self.paused_abns.push(held(bytes));
+                    continue;
+                }
+            };
             let l = crate::cli_listener::CliListener::from(l);
             let fd = l.as_raw_fd();
             let state = match which {
@@ -2234,6 +2244,23 @@ impl Engine {
                 }
             });
         }
+    }
+
+    /// Names still to take back after `SIGTTIN`, tried on each turn of the loop for at most
+    /// 30 seconds.
+    fn retry_abns_cli(&mut self) {
+        if self.paused_abns.is_empty() {
+            self.abns_retry_until = None;
+            return;
+        }
+        let now = Instant::now();
+        let until = *self.abns_retry_until.get_or_insert(now + Duration::from_secs(30));
+        if now >= until {
+            self.paused_abns.clear();
+            self.abns_retry_until = None;
+            return;
+        }
+        self.resume_abns_cli();
     }
 
     /// The lines of `show cli sockets`: every CLI socket, in configuration order, with the
@@ -4351,6 +4378,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             extra_cli: Vec::new(),
             paused_abns: Vec::new(),
             abns_paused: false,
+            abns_retry_until: None,
             global_paused: false,
             accept_limited: None,
             fe_paused: false,
@@ -5599,6 +5627,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 } else {
                     self.resume_abns_cli();
                 }
+            }
+            if !self.abns_paused && !self.stopping && !self.paused_abns.is_empty() {
+                self.retry_abns_cli();
             }
             if self.stopping {
                 if quiet {
