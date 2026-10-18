@@ -639,16 +639,26 @@ impl H1Parser {
         if duplicate_cl || comma_cl || padded_cl {
             // Forwarded as the one value it stands for (tasks/T276), in canonical digits.
             self.head_rewritten = true;
-            let first_idx = first_cl_idx.unwrap();
-            let mut val_buf = [0u8; 20];
-            let val_bytes = {
-                use std::io::Write;
-                let mut slice = &mut val_buf[..];
-                write!(slice, "{}", seen_cl.unwrap()).unwrap();
-                let len = 20 - slice.len();
-                &val_buf[..len]
+            let (Some(first_idx), Some(cl)) = (first_cl_idx, seen_cl) else {
+                // Unreachable in practice: a Content-Length value that is not UTF-8 is refused
+                // above, so the flags imply both are set. Refuse rather than panic.
+                self.phase = H1Phase::Error;
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length value"));
             };
-            
+            // Canonical decimal digits of `cl`, formatted by hand (usize is at most 20 digits).
+            let mut val_buf = [0u8; 20];
+            let mut start = val_buf.len();
+            let mut n = cl;
+            loop {
+                start -= 1;
+                val_buf[start] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            let val_bytes = &val_buf[start..];
+
             htx.replace_block_value(first_idx, val_bytes)
                 .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
             

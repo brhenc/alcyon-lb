@@ -54,6 +54,7 @@ impl Aes {
 
     /// Encrypts one block.
     #[must_use]
+    #[allow(clippy::expect_used, reason = "Aes::new admits only 16/24/32-byte keys (the field is private) and IV/counter are fixed-size blocks, so the length-checked constructor cannot fail")]
     pub fn encrypt_block(&self, block: &[u8; BLOCK]) -> [u8; BLOCK] {
         let mut b = (*block).into();
         with_aes!(self.key, C => C::new_from_slice(&self.key).expect("key length checked").encrypt_block(&mut b));
@@ -62,6 +63,7 @@ impl Aes {
 
     /// Decrypts one block.
     #[must_use]
+    #[allow(clippy::expect_used, reason = "Aes::new admits only 16/24/32-byte keys (the field is private) and IV/counter are fixed-size blocks, so the length-checked constructor cannot fail")]
     pub fn decrypt_block(&self, block: &[u8; BLOCK]) -> [u8; BLOCK] {
         let mut b = (*block).into();
         with_aes!(self.key, C => C::new_from_slice(&self.key).expect("key length checked").decrypt_block(&mut b));
@@ -72,6 +74,7 @@ impl Aes {
 /// CBC encryption with PKCS#7 padding; the result is a whole number of blocks, one more
 /// than `data` fills.
 #[must_use]
+#[allow(clippy::expect_used, reason = "Aes::new admits only 16/24/32-byte keys (the field is private) and IV/counter are fixed-size blocks, so the length-checked constructor cannot fail")]
 pub fn cbc_encrypt(aes: &Aes, iv: &[u8; BLOCK], data: &[u8]) -> Vec<u8> {
     with_aes!(aes.key, C => cbc::Encryptor::<C>::new_from_slices(&aes.key, iv)
         .expect("key and iv lengths checked")
@@ -81,6 +84,7 @@ pub fn cbc_encrypt(aes: &Aes, iv: &[u8; BLOCK], data: &[u8]) -> Vec<u8> {
 /// CBC decryption; `None` when `data` is not a whole, non-empty number of blocks or its
 /// padding is not valid PKCS#7.
 #[must_use]
+#[allow(clippy::expect_used, reason = "Aes::new admits only 16/24/32-byte keys (the field is private) and IV/counter are fixed-size blocks, so the length-checked constructor cannot fail")]
 pub fn cbc_decrypt(aes: &Aes, iv: &[u8; BLOCK], data: &[u8]) -> Option<Vec<u8>> {
     if data.is_empty() {
         return None;
@@ -115,6 +119,7 @@ fn gcm_j0(h: &[u8; BLOCK], nonce: &[u8]) -> [u8; BLOCK] {
 
 /// Everything GCM does to `data`: the counter-mode transformation (`apply`) and the tag over
 /// `aad` and the cipher text; `encrypt` says which side of `apply` the cipher text is on.
+#[allow(clippy::expect_used, reason = "Aes::new admits only 16/24/32-byte keys (the field is private) and IV/counter are fixed-size blocks, so the length-checked constructor cannot fail")]
 fn gcm(aes: &Aes, nonce: &[u8], aad: &[u8], data: &[u8], encrypt: bool) -> (Vec<u8>, [u8; BLOCK]) {
     let h = aes.encrypt_block(&[0u8; BLOCK]);
     let j0 = gcm_j0(&h, nonce);

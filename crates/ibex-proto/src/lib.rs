@@ -62,6 +62,7 @@
     clippy::must_use_candidate
 )]
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 pub mod actions;
 pub mod authority;
 pub mod conn;

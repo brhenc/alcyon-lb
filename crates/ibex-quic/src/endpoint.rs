@@ -474,9 +474,8 @@ impl QuicTransport for QuicEndpoint {
 
     fn poll_transmit(&mut self, now: Instant, out: &mut [u8]) -> Option<Transmit> {
         // 1. First priority: queued stateless transmits (Retry, Version Negotiation, etc.)
-        if let Some(entry) = self.pending_transmits.front() {
-            if out.len() >= entry.data.len() {
-                let entry = self.pending_transmits.pop_front().expect("front exists");
+        if self.pending_transmits.front().is_some_and(|e| out.len() >= e.data.len()) {
+            if let Some(entry) = self.pending_transmits.pop_front() {
                 out[..entry.data.len()].copy_from_slice(&entry.data);
                 return Some(entry.transmit);
             }
