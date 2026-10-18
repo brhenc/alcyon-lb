@@ -3449,7 +3449,7 @@ impl Registry {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos();
-                let seed_u32 = u32::from_ne_bytes(seed.to_ne_bytes()[..4].try_into().unwrap());
+                let seed_u32 = u32::try_from(seed & u128::from(u32::MAX)).unwrap_or(0);
                 let r = i64::from(full_hash(seed_u32) % max.max(1));
                 Some(Sample::Sint(r))
             },

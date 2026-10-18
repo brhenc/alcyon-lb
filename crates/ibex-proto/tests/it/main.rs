@@ -19,6 +19,7 @@ mod http1_conformance;
 mod http2_conformance;
 mod htx_differential;
 mod layering;
+mod no_panic;
 mod parser_seam;
 mod proxy_protocol_tests;
 mod qpack_static;
