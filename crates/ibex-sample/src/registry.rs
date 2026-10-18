@@ -5002,58 +5002,65 @@ impl Registry {
             },
         });
         
+        /// C's `printf("%g")`: six significant digits, trailing zeros dropped, an exponent
+        /// below -4 or from 6 up.
+        fn format_g(v: f64) -> String {
+            if !v.is_finite() {
+                return if v.is_nan() { "nan".into() } else if v < 0.0 { "-inf".into() } else { "inf".into() };
+            }
+            let e = format!("{v:.5e}");
+            let (mant, exp) = e.split_once('e').unwrap_or((&e, "0"));
+            let exp: i32 = exp.parse().unwrap_or(0);
+            let trim = |t: String| if t.contains('.') { t.trim_end_matches('0').trim_end_matches('.').to_string() } else { t };
+            if (-4..6).contains(&exp) {
+                trim(format!("{v:.*}", usize::try_from(5 - exp).unwrap_or(0)))
+            } else {
+                format!("{}e{}{:02}", trim(mant.to_string()), if exp < 0 { '-' } else { '+' }, exp.abs())
+            }
+        }
+
         let json_query_conv: ConvFn = |smp, args| {
             let path = args.first()?;
             let int_mode = args.get(1).is_some_and(|s| s == "int");
             let Sample::Str(s) = smp else { return None };
             // T363: return HAProxy types for json_query
             let Ok(val) = serde_json::from_str::<serde_json::Value>(&s) else { return None };
-            let path = path.trim_start_matches("$.");
-            let path = path.trim_start_matches('/');
-            let mut parts = Vec::new();
-            let mut current_part = String::new();
-            let mut chars = path.chars().peekable();
-            let is_slash_delim = path.starts_with('/');
-            while let Some(c) = chars.next() {
-                if c == '\\' {
-                    if let Some(&next_c) = chars.peek() {
-                        if next_c == '.' || next_c == '\\' {
-                            current_part.push(next_c);
-                            chars.next();
-                            continue;
-                        }
-                    }
-                    current_part.push(c);
-                } else if (is_slash_delim && c == '/') || (!is_slash_delim && c == '.') {
-                    parts.push(current_part);
-                    current_part = String::new();
-                } else {
-                    current_part.push(c);
-                }
-            }
-            parts.push(current_part);
+            // mjson's JSONPath (src/mjson.c): `$`, then `.key` (a backslash takes the next
+            // character literally, so `\.` is a dot in a key) and `[index]`; anything
+            // else, including a path not starting with `$`, finds nothing.
             let mut current = &val;
-            for part in parts {
-                if part.is_empty() {
-                    continue;
-                }
-                if let Ok(idx) = part.parse::<usize>() {
-                    if let Some(elem) = current.get(idx) {
-                        current = elem;
-                        continue;
+            let mut chars = path.strip_prefix('$')?.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '[' {
+                    let idx: String = chars.by_ref().take_while(|&c| c != ']').collect();
+                    current = current.get(idx.parse::<usize>().ok()?)?;
+                } else if c == '.' {
+                    let mut key = String::new();
+                    while let Some(&k) = chars.peek() {
+                        if k == '.' || k == '[' {
+                            break;
+                        }
+                        chars.next();
+                        key.push(if k == '\\' { chars.next().unwrap_or(k) } else { k });
                     }
+                    current = current.get(&key)?;
+                } else {
+                    return None;
                 }
-                current = current.get(&part)?;
             }
             // Map value to Sample according to HAProxy semantics
             match current {
                 serde_json::Value::String(s) => Some(Sample::Str(s.clone())),
                 serde_json::Value::Bool(b) => Some(Sample::Bool(*b)),
                 serde_json::Value::Number(n) => {
+                    // mjson reads a double; `int` is strtoll of the text, kept to +-(2^53-1).
+                    // A float is truncated here (HAProxy reads the integer prefix of its text).
+                    const MAX: i64 = (1 << 53) - 1;
                     if int_mode {
-                        n.as_i64().map(Sample::Sint)
+                        let v = n.as_i64().or_else(|| n.as_f64().map(|f| f.trunc() as i64))?;
+                        (-MAX..=MAX).contains(&v).then_some(Sample::Sint(v))
                     } else {
-                        Some(Sample::Str(n.to_string()))
+                        Some(Sample::Str(format_g(n.as_f64()?)))
                     }
                 }
                 serde_json::Value::Array(_) => {

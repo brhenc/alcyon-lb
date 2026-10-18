@@ -1091,7 +1091,7 @@ fn main() {
     // HAProxy arms its watchdog per thread at thread init (src/wdt.c:246) and does not fail
     // to start without it.
     let warn_after = config.global.as_ref().and_then(|g| g.warn_blocked_traffic_after).unwrap_or(ibex_rt::watchdog::DEFAULT_WARN_AFTER);
-    if let Err(e) = ibex_rt::watchdog::start(warn_after) {
+    if let Err(e) = ibex_rt::watchdog::start(warn_after, config.global.as_ref().is_some_and(|g| g.ibex_watchdog_warn_only)) {
         ibex_rt::stderr_line!("[WARNING]  ({}) : Failed to start the watchdog thread ({e}), disabling lockup detection.", process::id());
     }
     let unused = ibex_rt::handover::drop_unused_inherited();

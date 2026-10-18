@@ -609,6 +609,15 @@ pub(crate) fn parse_global_directive(
             global.warn_blocked_traffic_after = Some(Duration::from_millis(ms.into()));
             Ok(())
         }
+        // Ibex only (an `ibex.` prefix cannot clash with a HAProxy keyword): the watchdog
+        // (T361) keeps its warnings but does not abort the process.
+        "ibex.watchdog-warn-only" => {
+            if let Some(extra) = tokens.get(1) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'ibex.watchdog-warn-only' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            global.ibex_watchdog_warn_only = true;
+            Ok(())
+        }
         "hard-stop-after" => {
             if tokens.len() >= 2 {
                 global.hard_stop_after = Some(parse_timeout(&tokens[1], "hard-stop-after")?);

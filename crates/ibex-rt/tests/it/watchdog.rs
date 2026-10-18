@@ -272,3 +272,51 @@ fn experimental_mode_at_the_prompt_returns_the_prompt() {
     assert_eq!(String::from_utf8_lossy(&got), "\n> \n> \n> ");
     common::stop(&mut ibex.child);
 }
+
+/// `ibex.watchdog-warn-only` (Ibex only; `HAProxy` 3.5-dev8-885761-29 refuses it as an unknown
+/// keyword, measured with `haproxy -c`): the same spin that kills the process in
+/// `a_spinning_thread_aborts_the_process` is warned about every tick, 1.2 s and beyond, and
+/// the process stays alive and serves its CLI afterwards.
+#[test]
+fn watchdog_warn_only_warns_and_never_aborts() {
+    let mut ibex = start_with("warnonly", "  ibex.watchdog-warn-only\n");
+    let _conn = ibex.cli_send("expert-mode on; debug dev loop 3000");
+    assert!(ibex.wait_exit(Duration::from_millis(3500)).is_none(), "ibex exited: {}", ibex.stderr());
+    let n = blocked_warnings(&ibex);
+    assert!(n >= 12, "{n} warnings");
+    common::stop(&mut ibex.child);
+    let err = ibex.stderr();
+    assert!(err.contains("WARNING! thread 1 has stopped processing traffic for "), "{err}");
+    assert!(!err.contains("PANIC!"), "{err}");
+}
+
+/// The keyword takes no argument.
+#[test]
+fn watchdog_warn_only_takes_no_argument() {
+    let dir = std::env::temp_dir().join(format!("ibex_t361_wo_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let cfg = dir.join("c.cfg");
+    for (arg, ok) in [("", true), (" on", false)] {
+        std::fs::write(&cfg, format!("global\n  ibex.watchdog-warn-only{arg}\nfrontend f\n  bind 127.0.0.1:0\n  mode http\n  http-request return status 200\n")).expect("cfg");
+        let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(&cfg).stdin(Stdio::null()).output().expect("run");
+        let err = String::from_utf8_lossy(&out.stderr);
+        if ok {
+            assert_eq!(out.status.code(), Some(0), "{err}");
+        } else {
+            assert_eq!(out.status.code(), Some(1), "{err}");
+            assert!(err.contains("parsing [") && err.contains(":2] : 'ibex.watchdog-warn-only' cannot handle unexpected argument 'on'."), "{err}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `debug dev loop <ms> isolated` stops every other thread in `HAProxy` (src/debug.c:1281);
+/// Ibex has no thread isolation, so it refuses the form instead of running it unisolated.
+#[test]
+fn debug_dev_loop_isolated_is_refused() {
+    let ibex = start("isolated");
+    assert_eq!(
+        ibex.cli("expert-mode on; debug dev loop 20 isolated"),
+        "\n'debug dev loop ... isolated' is not supported: Ibex has no thread isolation.\n\n"
+    );
+}

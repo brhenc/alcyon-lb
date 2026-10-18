@@ -2117,25 +2117,18 @@ impl Engine {
                 crate::cli_listener::CliListener::Tcp(_) => None,
             }
         };
-        if self.cli_listener.as_ref().and_then(abstract_name).is_some() {
-            if let Some(l) = self.cli_listener.take() {
-                if let Some(n) = abstract_name(&l) {
-                    self.paused_abns.push((None, n));
-                }
-                self.fdtab.remove(l.as_raw_fd());
-                let _ = self.poller.delete(l.as_fd());
-            }
-        }
-        for (i, x) in self.extra_cli.iter_mut().enumerate() {
-            if x.listener.as_ref().and_then(abstract_name).is_some() {
-                if let Some(l) = x.listener.take() {
-                    if let Some(n) = abstract_name(&l) {
-                        self.paused_abns.push((Some(i), n));
-                    }
-                    self.fdtab.remove(l.as_raw_fd());
-                    let _ = self.poller.delete(l.as_fd());
-                }
-            }
+        let first = std::iter::once((None, &mut self.cli_listener));
+        let extra = self.extra_cli.iter_mut().enumerate().map(|(i, x)| (Some(i), &mut x.listener));
+        for (which, slot) in first.chain(extra) {
+            let Some((name, l)) = slot
+                .take_if(|l| abstract_name(l).is_some())
+                .map(|l| (abstract_name(&l).unwrap_or_default(), l))
+            else {
+                continue;
+            };
+            self.paused_abns.push((which, name));
+            self.fdtab.remove(l.as_raw_fd());
+            let _ = self.poller.delete(l.as_fd());
         }
     }
 
@@ -2153,13 +2146,14 @@ impl Engine {
                 None => FdState::CliListener,
                 Some(i) => FdState::CliExtra(u32::try_from(i).unwrap_or(u32::MAX)),
             };
-            if self.poller.add(l.as_fd(), raw_fd_to_u64(fd), !self.cli_paused, false).is_ok() {
+            let added = self.poller.add(l.as_fd(), raw_fd_to_u64(fd), !self.cli_paused, false).ok();
+            let _ = added.map(|()| {
                 self.fdtab.insert(fd, state, Interest::READ);
                 match which {
                     None => self.cli_listener = Some(l),
                     Some(i) => self.extra_cli[i].listener = Some(l),
                 }
-            }
+            });
         }
     }
 
@@ -5489,15 +5483,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             {
                 self.begin_soft_stop();
             }
-            if let Some(lc) = self.lifecycle.as_ref() {
-                let want = lc.pause_requested();
-                if want != self.abns_paused && !self.stopping {
-                    self.abns_paused = want;
-                    if want {
-                        self.pause_abns_cli();
-                    } else {
-                        self.resume_abns_cli();
-                    }
+            let want = self.lifecycle.as_ref().map_or(self.abns_paused, |lc| lc.pause_requested());
+            if want != self.abns_paused && !self.stopping {
+                self.abns_paused = want;
+                if want {
+                    self.pause_abns_cli();
+                } else {
+                    self.resume_abns_cli();
                 }
             }
             if self.stopping {

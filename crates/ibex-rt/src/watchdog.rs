@@ -57,12 +57,8 @@ struct Slot {
     /// The worker's live sessions (`stream_cnt` in the warning).
     streams: AtomicU32,
     /// How the monitor reads this worker's CPU time; set when it registers.
-    clock: OnceLock<Clock>,
-}
-
-enum Clock {
     /// `/proc/thread-self/schedstat` of the worker, opened by it.
-    Sched(File),
+    clock: OnceLock<File>,
 }
 
 struct Watchdog {
@@ -100,21 +96,24 @@ pub fn init(nbthread: usize) {
     let _ = WATCHDOG.set(Watchdog { slots });
 }
 
-/// Makes the calling thread worker `id`. Called by the worker itself, before the chroot.
-pub fn register(id: usize) {
-    let Some(slot) = WATCHDOG.get().and_then(|w| w.slots.get(id)) else { return };
-    // Without a CPU clock the thread is not watched (wall-clock detection is T361 slice 4);
-    // HAProxy says the same when its timer cannot be set up (src/wdt.c:260).
-    match File::open("/proc/thread-self/schedstat") {
-        Ok(f) if read_sched(&f).is_some() => {
-            let _ = slot.clock.set(Clock::Sched(f));
-        }
-        _ => crate::stderr_line!(
+/// Opens the CPU clock of the calling thread. Without one the thread is not watched
+/// (wall-clock detection is T361 slice 4); `HAProxy` says the same when its timer cannot be
+/// set up (src/wdt.c:260).
+fn open_clock(path: &str, id: usize) -> Option<File> {
+    File::open(path).ok().filter(|f| read_sched(f).is_some()).or_else(|| {
+        crate::stderr_line!(
             "[WARNING]  ({}) : Failed to setup watchdog timer for thread {}, disabling lockup detection.",
             std::process::id(),
             id + 1
-        ),
-    }
+        );
+        None
+    })
+}
+
+/// Makes the calling thread worker `id`. Called by the worker itself, before the chroot.
+pub fn register(id: usize) {
+    let Some(slot) = WATCHDOG.get().and_then(|w| w.slots.get(id)) else { return };
+    let _ = open_clock("/proc/thread-self/schedstat", id).map(|f| slot.clock.set(f));
     MINE.with(|m| m.set(Some(slot)));
 }
 
@@ -162,16 +161,18 @@ pub fn under_control() {
     });
 }
 
-/// Starts the monitor thread, ticking every `warn_after`. Once, after [`init`].
+/// Starts the monitor thread, ticking every `warn_after`. Once, after [`init`]. With
+/// `warn_only` (`ibex.watchdog-warn-only`) a thread stuck for good is warned about, never
+/// aborted on.
 ///
 /// # Errors
 /// The thread could not be spawned.
-pub fn start(warn_after: Duration) -> std::io::Result<()> {
+pub fn start(warn_after: Duration, warn_only: bool) -> std::io::Result<()> {
     let Some(wd) = WATCHDOG.get() else { return Ok(()) };
-    std::thread::Builder::new().name("ibex-wdt".into()).spawn(move || monitor(wd, warn_after)).map(|_| ())
+    std::thread::Builder::new().name("ibex-wdt".into()).spawn(move || monitor(wd, warn_after, warn_only)).map(|_| ())
 }
 
-fn monitor(wd: &'static Watchdog, tick: Duration) -> ! {
+fn monitor(wd: &'static Watchdog, tick: Duration, warn_only: bool) -> ! {
     let tick_ns = u64::try_from(tick.as_nanos()).unwrap_or(u64::MAX);
     // HAProxy's timer runs on the thread's CPU clock: it fires after exactly one tick of
     // CPU. This one sleeps a tick of wall time, in which the thread gets at most a tick of
@@ -191,11 +192,8 @@ fn monitor(wd: &'static Watchdog, tick: Duration) -> ! {
                 accused[i] = None;
                 continue;
             }
-            let now = match s.clock.get() {
-                Some(Clock::Sched(f)) => read_sched(f),
-                None => None,
-            };
-            let Some(now) = now else { continue };
+            // A thread without a clock reads as no CPU used, so it is never accused.
+            let now = s.clock.get().and_then(read_sched).unwrap_or(0);
             let Some(since) = accused[i] else {
                 accused[i] = Some(now);
                 continue;
@@ -204,7 +202,7 @@ fn monitor(wd: &'static Watchdog, tick: Duration) -> ! {
             if stuck_for.saturating_add(slack) < tick_ns {
                 continue;
             }
-            if s.stuck.load(Relaxed) {
+            if s.stuck.load(Relaxed) && !warn_only {
                 panic_now(i);
             }
             if stuck_for.saturating_add(slack) >= STUCK_NS {
@@ -262,6 +260,12 @@ fn panic_now(worker: usize) -> ! {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn a_missing_clock_is_no_clock() {
+        assert!(open_clock("/proc/thread-self/no-such-file", 0).is_none());
+        assert!(open_clock("/proc/thread-self/schedstat", 0).is_some());
+    }
 
     #[test]
     fn schedstat_first_field_is_read() {

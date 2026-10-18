@@ -291,3 +291,11 @@ when the proxy sets none), else 1024, capped by `net.core.somaxconn`. The one st
 not have is the `bind` option `maxconn` (between the proxy's `backlog` and its `maxconn`
 in HAProxy): `bind ... maxconn N` is refused at load, as before. A socket handed over by a
 reload keeps the backlog it was bound with, as in HAProxy.
+
+## `ibex.watchdog-warn-only`: an Ibex-only global keyword (T361)
+
+HAProxy's watchdog warns about a thread that has stopped processing traffic and, once it has been stuck for a
+second, aborts the process (exit status 134); no HAProxy keyword turns the abort off. Ibex does the same by
+default. `ibex.watchdog-warn-only` (global, no argument; HAProxy refuses it as an unknown keyword) keeps the
+warnings and `BlockedTrafficWarnings` and never aborts, for an operator who prefers a slow process to a restart.
+The `ibex.` prefix keeps it from clashing with a future HAProxy keyword.
