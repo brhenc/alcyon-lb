@@ -50,9 +50,6 @@ pub(crate) fn end() {
 pub(crate) fn enter_line(tokens: &[Token]) {
     SCOPE.with(|s| {
         let mut s = s.borrow_mut();
-        if !s.active {
-            return;
-        }
         let kw = tokens.first().map_or("", |t| t.text.as_str());
         let kind = match kw {
             "frontend" => Some("frontend"),
@@ -110,13 +107,7 @@ pub(crate) fn check_term(name: &str, at: &Token) -> Result<(), ConfigError> {
             "http-request" | "http-response" | "http-after-response" => {
                 format!("error detected while parsing an '{} {}' condition : {no}.", w(0), w(1))
             }
-            "stats" if w(1) == "http-request" => {
-                format!("error detected while parsing an '{} {}' condition : {no}.", w(1), w(2))
-            }
             "stats" => format!("error detected while parsing a 'stats {}' rule : {no}.", w(1)),
-            "redirect" => {
-                format!("error detected in {} '{}' while parsing redirect rule : error in condition: {no}.", s.kind, s.proxy)
-            }
             "monitor" => format!("error detected while parsing a 'monitor fail' condition : {no}."),
             "stick" => format!("'stick': error detected while parsing sticking condition : {no}."),
             "force-be-switch" => format!("'force-be-switch' : {no}."),
@@ -124,4 +115,20 @@ pub(crate) fn check_term(name: &str, at: &Token) -> Result<(), ConfigError> {
         };
         Err(ConfigError::new(at.line, at.col, msg))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rule_without_a_text_of_its_own_gets_the_generic_one() {
+        begin();
+        let tok = |t: &str| Token { text: t.to_string(), line: 3, col: 1 };
+        enter_line(&[tok("backend"), tok("b")]);
+        enter_line(&[tok("some-rule"), tok("if"), tok("nosuch")]);
+        let e = check_term("nosuch", &tok("nosuch")).unwrap_err();
+        end();
+        assert_eq!(e.message, "error detected while parsing a 'some-rule' rule : no such ACL : 'nosuch'.");
+    }
 }
