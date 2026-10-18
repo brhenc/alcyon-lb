@@ -66,3 +66,41 @@ fn server_status_comp_and_header_timer() {
     let tr: i64 = f[4].parse().unwrap_or_else(|_| panic!("Tr {:?}", f[4]));
     assert!((290..400).contains(&tr), "Tr {tr}");
 }
+
+/// A reply Ibex builds itself after a proxied 201 on the same worker: HAProxy (3.5-dev8) gives
+/// `[0|403|-1]` for `/deny` and `/ret`, and `[201|201|<ms>]` again for a proxied one.
+#[test]
+fn local_reply_does_not_inherit_previous_response() {
+    let a = common::reserve_addr();
+    let be = backend();
+    let dir = std::env::temp_dir().join(format!("t385b-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.cfg");
+    std::fs::write(
+        &path,
+        format!(
+            "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+             frontend fe\n  bind {a}\n  http-request deny if {{ path /deny }}\n  http-request return status 403 if {{ path /ret }}\n  \
+             default_backend b\n  http-after-response set-header x-out \"[%[server_status]|%[status]|%[res.timer.hdr]]\"\n\
+             backend b\n  server s {be}\n"
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    assert!(common::wait_listening(a), "ibex did not listen");
+    let mut got = Vec::new();
+    for p in ["/", "/deny", "/ret", "/"] {
+        let mut s = TcpStream::connect(a).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        s.write_all(format!("GET {p} HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        let l = out.lines().find(|l| l.starts_with("x-out:")).unwrap_or_else(|| panic!("no x-out for {p}: {out:?}")).trim_start_matches("x-out:").trim().to_string();
+        got.push(l);
+    }
+    common::stop(&mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(got[0].starts_with("[201|201|") && got[3].starts_with("[201|201|"), "{got:?}");
+    assert_eq!(got[1], "[0|403|-1]", "{got:?}");
+    assert_eq!(got[2], "[0|403|-1]", "{got:?}");
+}

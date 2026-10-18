@@ -14061,6 +14061,10 @@ fn after_res_on_reply<'r>(
     };
 
     CURRENT_RES_STATUS.set(status);
+    // A reply Ibex built has no server status and no Tr (HAProxy: 0 and -1), whatever response
+    // this thread handled before.
+    CURRENT_SRV_STATUS.set(0);
+    CURRENT_RES_TR.set(-1);
     CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
     res_htx_init(sess.bufsize, None, &version, &reason, &hdrs, raw.len() - hdr_end - eoh_len);
     // The variables are the session's own, in `CURRENT_VARS` for the run that makes the
@@ -14127,6 +14131,8 @@ fn after_res_on_reply<'r>(
     sess.req_vars = req_vars;
     sess.log.res_captures = res_caps;
     CURRENT_RES_STATUS.set(0);
+    CURRENT_SRV_STATUS.set(0);
+    CURRENT_RES_TR.set(-1);
     CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clear());
     result.map_err(|_| ())?;
 

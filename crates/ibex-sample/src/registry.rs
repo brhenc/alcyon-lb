@@ -1817,10 +1817,8 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "server_status",
             out_type: SampleType::Sint,
-            func: |_ctx, _args| {
-                let st = CURRENT_SRV_STATUS.get();
-                (st > 0).then(|| Sample::Sint(i64::from(st)))
-            },
+            // 0 when no server answered (HAProxy: a locally built reply gives 0, not no value).
+            func: |_ctx, _args| Some(Sample::Sint(i64::from(CURRENT_SRV_STATUS.get()))),
         });
         // The compression filter is not implemented: no response is compressed, no algorithm named.
         self.register_fetch(FetchDesc {
