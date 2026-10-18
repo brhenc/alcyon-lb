@@ -138,9 +138,7 @@ pub fn expr_output_type(fetch: &str, converters: &[(String, Vec<String>)]) -> Op
         }
         // A converter that keeps its input's type is skipped, unless switching to the next
         // type is not free: then the sample is of that type.
-        if cast(Ty::Any, next) != Cast::None {
-            return Some(next);
-        }
+        if cast(Ty::Any, next) != Cast::None { return Some(next) }
         next = in_ty;
     }
     let cur = fetch_type_override(fetch).or_else(|| sample_registry().get_fetch(fetch).map(|f| of_sample_type(f.out_type)))?;
@@ -189,6 +187,9 @@ mod tests {
         assert_eq!(expr_output_type("str", &conv(&["b64dec"])), Some(Ty::Bin));
         assert_eq!(expr_output_type("int", &conv(&["hex"])), Some(Ty::Str));
         assert_eq!(expr_output_type("no_such_fetch", &[]), None);
+        // `debug` keeps its input's type (`TypeSpec::Same`): the expression is the fetch's.
+        assert_eq!(expr_output_type("str", &conv(&["debug"])), Some(Ty::Str));
+        assert_eq!(expr_output_type("src", &conv(&["debug"])), Some(Ty::Addr));
     }
 
     #[test]

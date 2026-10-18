@@ -2474,11 +2474,7 @@ impl TcpSession {
                 let line = self.req.readable().split(|&b| b == b'\n').next().map_or(&[][..], <[u8]>::trim_ascii_end);
                 let ver = &line[line.len().saturating_sub(8)..];
                 txn.req_http11 = ibex_proto::h1::version_is_11(ver);
-                if let [.., major, b'.', minor] = ver {
-                    if major.is_ascii_digit() && minor.is_ascii_digit() {
-                        txn.req_version = (major - b'0') * 10 + (minor - b'0');
-                    }
-                }
+                txn.req_version = txn::version_digits(ver).unwrap_or(txn.req_version);
                 // The client's own method: rules that rewrite it have not run yet.
                 txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
                 self.txn = Some(txn);

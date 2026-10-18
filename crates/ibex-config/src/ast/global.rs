@@ -321,6 +321,8 @@ pub struct GlobalSetVar {
     pub expr: String,
     /// Whether this variable uses format-string interpolation (`set-var-fmt`).
     pub is_fmt: bool,
+    /// 1-based line of the configuration it is written on.
+    pub line: usize,
 }
 
 

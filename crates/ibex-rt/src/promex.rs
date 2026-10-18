@@ -268,6 +268,7 @@ pub fn prewarm() {
     });
     INFO.with_borrow_mut(|i| *i = crate::stats::InfoPairs::presized());
     crate::stats::reserve_row_pool();
+    crate::stats::prewarm_worker_id();
     crate::proxy::reserve_scrape_boxes(16);
 }
 

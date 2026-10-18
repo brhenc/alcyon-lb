@@ -1645,9 +1645,26 @@ pub fn version_text(v: u8) -> Option<&'static str> {
     VERSION_TEXT.get(usize::from(v)).and_then(|t| std::str::from_utf8(t).ok())
 }
 
+/// The version a request line ends in (`1.1` is 11), `None` when its last three bytes are not
+/// `<digit>.<digit>`: `HttpTxn::req_version` then stays unknown.
+#[must_use]
+pub fn version_digits(ver: &[u8]) -> Option<u8> {
+    let [.., major @ b'0'..=b'9', b'.', minor @ b'0'..=b'9'] = ver else { return None };
+    Some((major - b'0') * 10 + (minor - b'0'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_version_is_the_two_digits_around_the_dot() {
+        assert_eq!(version_digits(b"HTTP/1.1"), Some(11));
+        assert_eq!(version_digits(b"HTTP/2.0"), Some(20));
+        assert_eq!(version_digits(b"HTTP/1.x"), None);
+        assert_eq!(version_digits(b"/ HTTP11"), None);
+        assert_eq!(version_digits(b"1."), None);
+    }
 
     fn fwd(state: MsgState, data: &[u8]) -> (usize, MsgState) {
         let mut s = state;

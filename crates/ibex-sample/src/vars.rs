@@ -62,10 +62,9 @@ pub fn get_proc(name: &str) -> Option<Sample> {
 pub fn set_proc(name: &str, smp: Sample) {
     // The running stream's variables count in the process total too (see [`admit`]).
     let stream = if limits_set() { with_current(|m| scan(&[m]).sess).unwrap_or(0) } else { 0 };
-    if let Ok(mut lock) = GLOBAL_PROC_VARS.write() {
-        if let Some(smp) = admit(&[&*lock], stream, name, smp) {
-            lock.insert(name.to_string(), smp);
-        }
+    let Ok(mut lock) = GLOBAL_PROC_VARS.write() else { return };
+    if let Some(smp) = admit(&[&*lock], stream, name, smp) {
+        lock.insert(name.to_string(), smp);
     }
 }
 
@@ -349,28 +348,22 @@ pub fn var_arg(name: &str, ty: SampleType) -> Option<Sample> {
 /// [`var_arg`] to `sint`, as the integer.
 #[must_use]
 pub fn var_arg_int(name: &str) -> Option<i64> {
-    match var_arg(name, SampleType::Sint)? {
-        Sample::Sint(n) => Some(n),
-        _ => None,
-    }
+    let Sample::Sint(n) = var_arg(name, SampleType::Sint)? else { return None };
+    Some(n)
 }
 
 /// [`var_arg`] to `str`, as the text (bytetext: a byte from 0x80 is the char of that value).
 #[must_use]
 pub fn var_arg_str(name: &str) -> Option<String> {
-    match var_arg(name, SampleType::Str)? {
-        Sample::Str(s) => Some(s),
-        _ => None,
-    }
+    let Sample::Str(s) = var_arg(name, SampleType::Str)? else { return None };
+    Some(s)
 }
 
 /// [`var_arg`] to `bin`, as the bytes.
 #[must_use]
 pub fn var_arg_bin(name: &str) -> Option<Vec<u8>> {
-    match var_arg(name, SampleType::Bin)? {
-        Sample::Bin(b) => Some(b),
-        _ => None,
-    }
+    let Sample::Bin(b) = var_arg(name, SampleType::Bin)? else { return None };
+    Some(b)
 }
 
 // The `String` shims, for the CLI and the tests written against the untyped store

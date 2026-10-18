@@ -871,10 +871,17 @@ impl CliApplet {
             // `set var ... expr` keeps the sample's type, `fmt` stores a string (T364).
             let val = if is_fmt {
                 ibex_sample::Sample::Str(crate::engine::format_sample_string(expr, &ctx, registry))
-            } else if let Ok(e) = ibex_sample::Expr::parse(expr) {
-                e.eval_sample(registry, &ctx).unwrap_or_else(|| ibex_sample::Sample::Str(expr.to_string()))
             } else {
-                ibex_sample::Sample::Str(expr.to_string())
+                // An expression that does not parse is refused with the parser's message, and
+                // the variable is left alone (cli_parse_set_var).
+                let parsed = crate::rule_exprs::check_sample_expr(expr, registry).and_then(|()| ibex_sample::Expr::parse(expr));
+                match parsed {
+                    Ok(e) => e.eval_sample(registry, &ctx).unwrap_or_else(|| ibex_sample::Sample::Str(expr.to_string())),
+                    Err(err) => {
+                        self.finish_msg(&err);
+                        return;
+                    }
+                }
             };
             ibex_sample::vars::set_proc(var_name, val);
         }
