@@ -446,6 +446,65 @@ fn the_option_times_out_on_timeout_http_request_else_timeout_client() {
     }
 }
 
+/// T373. `option http-buffer-request` waits on the `timeout http-request` of the proxy the
+/// request is in (`s->be->timeout.httpreq`, http_ana.c:852); unset, there is no deadline of
+/// the wait's own, and only the `timeout client` read timer, which each read refreshes,
+/// applies. Measured on 3.5-dev8-885761-29: client 1s, a body byte every 300 ms for 3 s:
+/// 200, no 408, the server sees the request at ~3.0 s, log `3006/0/1/1/3008 200 ----`.
+#[test]
+fn the_option_without_timeout_http_request_does_not_time_out_a_client_that_keeps_sending() {
+    let srv = server();
+    let (_i, fe) = start(&cfg("timeout client 1s\n  option http-buffer-request", ""), srv.addr, None);
+    let mut c = Client::connect(fe);
+    c.send(b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\n");
+    for _ in 0..10 {
+        c.pause(300).send(b"a");
+    }
+    let (resp, _) = c.read(Duration::from_millis(1500));
+    assert!(text(&resp).starts_with("HTTP/1.1 200"), "a client sending every 300 ms (timeout client 1s): {}", text(&resp));
+    let seen = srv.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].body, b"aaaaaaaaaa");
+}
+
+/// Same measurement: `timeout http-request 10s` in the frontend, `1s` in the backend that
+/// holds the option, a body byte every 300 ms: `408 cR--` at 1.00 s (the backend's value
+/// applies, trickling does not extend it), log `-1/-1/-1/-1/999 408 0 - - cR--`.
+#[test]
+fn the_option_in_a_backend_times_out_on_that_backends_timeout_http_request() {
+    let srv = server();
+    let logs = UdpSocket::bind("127.0.0.1:0").expect("log socket");
+    logs.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    let cfg = format!(
+        "{DEFAULTS}frontend fe\n  bind {{fe}}\n  option httplog\n  log {{log}} local0\n  timeout http-request 10s\n  \
+         default_backend be\nbackend be\n  timeout http-request 1s\n  option http-buffer-request\n  server s {{srv}}\n"
+    );
+    let (_i, fe) = start(&cfg, srv.addr, Some(logs.local_addr().expect("addr")));
+    let mut c = Client::connect(fe);
+    c.send(POST_CL10);
+    let mut early = Vec::new();
+    for _ in 0..8 {
+        c.pause(300).send(b"a");
+        c.s.set_nonblocking(true).ok();
+        let mut b = [0u8; 512];
+        if let Ok(n) = c.s.read(&mut b) {
+            early.extend_from_slice(&b[..n]);
+        }
+        c.s.set_nonblocking(false).ok();
+        if !early.is_empty() {
+            break;
+        }
+    }
+    let (rest, _) = c.read(Duration::from_millis(500));
+    early.extend_from_slice(&rest);
+    let at = c.t0.elapsed();
+    assert!(text(&early).starts_with("HTTP/1.1 408"), "{}", text(&early));
+    assert!(at < Duration::from_millis(2300), "the 408 was still not here after {at:?}; the backend's wait is 1 s");
+    assert!(srv.seen().is_empty(), "the request reached the server");
+    let line = log_line_of(&logs, "POST /x");
+    assert!(line.contains(" 408 ") && line.contains(" cR-- "), "{line}");
+}
+
 #[test]
 fn a_malformed_request_body_is_a_400_and_never_reaches_the_server() {
     // HAProxy, a chunked request whose first chunk size is `zz`: `400 Bad request`, nothing
