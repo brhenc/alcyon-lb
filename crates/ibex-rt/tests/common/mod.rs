@@ -36,6 +36,9 @@ static HELD: Mutex<Vec<File>> = Mutex::new(Vec::new());
 ///   even after a crash;
 /// * was bindable at the moment it was handed out, which skips ports that something
 ///   outside the tests is using.
+///
+/// The caller binds later, so a short window remains in which a process outside the tests
+/// could take the port; the lock only excludes other users of this helper.
 pub fn reserve_addr() -> SocketAddr {
     static NEXT: AtomicU16 = AtomicU16::new(0);
     let dir = std::env::temp_dir().join("ibex-test-ports");

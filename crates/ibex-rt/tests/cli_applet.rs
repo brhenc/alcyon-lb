@@ -483,17 +483,11 @@ mod pools {
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     const ORACLE: &str = "/home/bhenc/reference/haproxy/haproxy";
-    const ORACLE_PORT: u16 = 47450;
-    const IBEX_PORT: u16 = 47451;
-    const BACKEND_PORT: u16 = 47452;
     const ERR: &str = "Expects either 'byname', 'bysize', 'byusage', 'match <pfx>', 'detailed', or a max number of output lines.\n\n";
-
-    /// The ports are fixed: one test at a time.
-    static SERIAL: Mutex<()> = Mutex::new(());
 
     struct Proxy {
         child: Option<std::process::Child>,
@@ -503,8 +497,8 @@ mod pools {
     }
 
     impl Proxy {
-        fn start(ibex: bool, dir: &str) -> Proxy {
-            let port = if ibex { IBEX_PORT } else { ORACLE_PORT };
+        fn start(ibex: bool, dir: &str, backend_port: u16) -> Proxy {
+            let port = crate::common::reserve_port();
             let name = if ibex { "ibex" } else { "oracle" };
             std::fs::create_dir_all(dir).unwrap();
             let sock = format!("{dir}/{name}.sock");
@@ -513,7 +507,7 @@ mod pools {
                 "global\n    nbthread 1\n    stats socket {sock} level admin\n\
                  defaults\n    mode http\n    timeout connect 5s\n    timeout client 10s\n    timeout server 10s\n\
                  frontend f\n    bind 127.0.0.1:{port}\n    default_backend b\n\
-                 backend b\n    server s 127.0.0.1:{BACKEND_PORT}\n"
+                 backend b\n    server s 127.0.0.1:{backend_port}\n"
             );
             let path = format!("{dir}/{name}.cfg");
             std::fs::write(&path, cfg).unwrap();
@@ -578,11 +572,12 @@ mod pools {
         }
     }
 
-    struct Backend(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+    struct Backend(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>, u16);
 
     impl Backend {
         fn start() -> Backend {
-            let l = TcpListener::bind(("127.0.0.1", BACKEND_PORT)).expect("backend port");
+            let port = crate::common::reserve_port();
+            let l = TcpListener::bind(("127.0.0.1", port)).expect("backend port");
             l.set_nonblocking(true).unwrap();
             let run = Arc::new(AtomicBool::new(true));
             let r = run.clone();
@@ -613,7 +608,7 @@ mod pools {
                     }
                 }
             });
-            Backend(run, Some(h))
+            Backend(run, Some(h), port)
         }
     }
 
@@ -731,21 +726,20 @@ mod pools {
         }
     }
 
-    /// Both proxies and a backend, one test at a time.
-    fn pair(test: &str) -> (std::sync::MutexGuard<'static, ()>, Backend, Proxy, Proxy) {
-        let g = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = format!("/tmp/mem-show-pools/{test}");
+    /// Both proxies and a backend, each on a port reserved with `common::reserve_port`.
+    fn pair(test: &str) -> (Backend, Proxy, Proxy) {
+        let dir = format!("/tmp/mem-show-pools/{test}-{}", std::process::id());
         let be = Backend::start();
-        let o = Proxy::start(false, &dir);
-        let i = Proxy::start(true, &dir);
-        (g, be, o, i)
+        let o = Proxy::start(false, &dir, be.2);
+        let i = Proxy::start(true, &dir, be.2);
+        (be, o, i)
     }
 
     /// In the interactive mode (`prompt`) the dump and the error end with the empty line and
     /// then the prompt, no more: HAProxy's `Total:` line is followed by `\n\n> `.
     #[test]
     fn show_pools_in_prompt_mode_ends_with_the_prompt() {
-        let (_g, _be, o, i) = pair("prompt");
+        let (_be, o, i) = pair("prompt");
         for p in [&o, &i] {
             let mut s = UnixStream::connect(&p.sock).expect("cli connect");
             s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -772,7 +766,7 @@ mod pools {
 
     #[test]
     fn show_pools_rejects_what_it_does_not_know() {
-        let (_g, _be, o, i) = pair("bogus");
+        let (_be, o, i) = pair("bogus");
         for bad in ["bogus", "byname bogus", "match", "-1"] {
             let cmd = format!("show pools {bad}");
             assert_eq!(o.cli(&cmd), ERR, "oracle {bad}");
@@ -782,7 +776,7 @@ mod pools {
 
     #[test]
     fn show_pools_limit_and_sort_orders() {
-        let (_g, _be, o, i) = pair("sorts");
+        let (_be, o, i) = pair("sorts");
         for p in [&o, &i] {
             let r = p.pools("byname 2");
             assert_eq!(r.header, "Dumping pools usage (limited to the first 2 entries). Use SIGQUIT to flush them.");
@@ -805,7 +799,7 @@ mod pools {
 
     #[test]
     fn show_pools_match_prefix_and_totals() {
-        let (_g, _be, o, i) = pair("match");
+        let (_be, o, i) = pair("match");
         for p in [&o, &i] {
             let r = p.pools("match buf");
             assert!(!r.lines.is_empty(), "{}", r.raw);
@@ -823,7 +817,7 @@ mod pools {
 
     #[test]
     fn show_pools_line_shape_and_totals() {
-        let (_g, _be, o, i) = pair("shape");
+        let (_be, o, i) = pair("shape");
         let _c = i.keepalive();
         let _d = o.keepalive();
         for p in [&o, &i] {
@@ -861,7 +855,7 @@ mod pools {
 
     #[test]
     fn show_pools_counters_follow_traffic() {
-        let (_g, _be, _o, i) = pair("counters");
+        let (_be, _o, i) = pair("counters");
         // The probes that waited for the listeners are closed but may not be reaped yet.
         let mut rest = i.pools("");
         for _ in 0..100 {
