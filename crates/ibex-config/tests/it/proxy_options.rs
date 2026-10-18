@@ -116,7 +116,6 @@ const IBEX_REFUSES: &[(&str, &str)] = &[
     ("http-restrict-req-hdr-names reject", "fbld"),
     ("http-drop-request-trailers", "bld"),
     ("http-drop-response-trailers", "fld"),
-    ("checkcache", "bld"),
     ("disable-h2-upgrade", "fld"),
     // Which server is used.
     ("allbackups", "bld"),

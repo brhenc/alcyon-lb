@@ -165,6 +165,8 @@ const IMPLEMENTED: &[&str] = &[
     "httpclose",
     // A server a cookie or stick table names is used when it is down (T149b).
     "persist",
+    // A cacheable response that sets a cookie is answered 502 (T388).
+    "checkcache",
     "log-health-checks",
     // A connection that carried nothing is not logged (T128).
     "dontlognull",

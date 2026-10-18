@@ -490,23 +490,34 @@ fn starts_with_ci(v: &str, prefix: &str) -> bool {
 /// `http_check_response_for_cacheability`.
 #[must_use]
 pub fn response_cacheable(req: ReqKind, status: u16, hdrs: &[(String, String)]) -> bool {
+    response_cache_flags(req, status, hdrs).0
+}
+
+/// `(TX_CACHEABLE, TX_CACHE_COOK)`: the second is cleared by `no-cache="set-cookie"` alone,
+/// and the first, alone, by a response with neither freshness information nor a validator.
+/// `option checkcache` blocks a response with both set and a `Set-Cookie`.
+#[must_use]
+pub fn response_cache_flags(req: ReqKind, status: u16, hdrs: &[(String, String)]) -> (bool, bool) {
     let mut cacheable = req.safe_method && matches!(status, 200 | 203 | 204 | 206 | 300 | 301 | 404 | 405 | 410 | 414 | 501);
+    let mut cook = cacheable;
     if status < 200 {
-        return false;
+        return (false, false);
     }
     if let Some((_, v)) = hdrs.iter().find(|(k, _)| k.eq_ignore_ascii_case("pragma")) {
         if v.trim().eq_ignore_ascii_case("no-cache") {
-            return false;
+            return (false, false);
         }
     }
     let (mut fresh, mut null_maxage) = (false, false);
     for v in comma_values(hdrs, "cache-control") {
         if v.eq_ignore_ascii_case("public") {
             cacheable = true;
+            cook = true;
         } else if v.eq_ignore_ascii_case("max-age=0") {
             null_maxage = true;
         } else if v.eq_ignore_ascii_case("no-cache=\"set-cookie\"") {
             // Only the cookie is not to be cached.
+            cook = false;
         } else if v.eq_ignore_ascii_case("private")
             || starts_with_ci(v, "private=")
             || v.eq_ignore_ascii_case("no-cache")
@@ -516,6 +527,7 @@ pub fn response_cacheable(req: ReqKind, status: u16, hdrs: &[(String, String)]) 
             || v.eq_ignore_ascii_case("s-maxage=0")
         {
             cacheable = false;
+            cook = false;
         } else if starts_with_ci(v, "s-maxage") {
             fresh = true;
             null_maxage = false;
@@ -525,6 +537,7 @@ pub fn response_cacheable(req: ReqKind, status: u16, hdrs: &[(String, String)]) 
     }
     if null_maxage {
         cacheable = false;
+        cook = false;
     }
     let has_hdr = |n: &str| hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case(n));
     if !fresh {
@@ -534,7 +547,7 @@ pub fn response_cacheable(req: ReqKind, status: u16, hdrs: &[(String, String)]) 
     if !fresh && !validator {
         cacheable = false;
     }
-    cacheable
+    (cacheable, cook)
 }
 
 /// The server the response came from, as far as the cookie is concerned.

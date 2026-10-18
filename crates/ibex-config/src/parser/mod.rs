@@ -832,11 +832,6 @@ const CHECK_OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[&str] = &[
 const OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[(&str, &str)] = &[
     ("http-drop-request-trailers", "Ibex does not drop request trailers; the server would receive them"),
     ("http-drop-response-trailers", "Ibex does not drop response trailers; the client would receive them"),
-    (
-        "checkcache",
-        "Ibex does not block cacheable responses that set a cookie; a shared cache could serve one \
-         client's cookie to another",
-    ),
     ("disable-h2-upgrade", "Ibex would still accept HTTP/2 on this HTTP/1 listener"),
     (
         "allbackups",

@@ -96,6 +96,7 @@ mod content_switching;
 mod converter_aes_language;
 mod converter_edge_cases;
 mod converter_load_refusals;
+mod checkcache;
 mod cookie_persistence;
 mod curl_parity;
 mod debug_converter;
