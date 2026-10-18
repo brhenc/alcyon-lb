@@ -25,6 +25,37 @@ fn parse_one_expr_and_cond(
     Ok((expr.text.clone(), expect_cond_at(tokens, 3, act_token)?))
 }
 
+/// `return [status <code>] [content-type <t>] [body source] [hdr <name> <fmt>]... [if|unless <cond>]`,
+/// the arguments of `http-request return` and `http-response return` alike
+/// (`http_parse_http_reply`): status, content type, formatted body, error page, condition.
+#[allow(clippy::type_complexity)]
+fn parse_return_action(
+    tokens: &[Token],
+) -> Result<(u16, Option<String>, Option<String>, Option<ErrorPageSource>, Option<AclCondition>), ConfigError> {
+    let cond_idx = find_cond_idx(tokens, 2);
+    let limit = cond_idx.unwrap_or(tokens.len());
+
+    // `errorfiles <name>` (if present) must pick a single status code out of a whole
+    // section, so `status` is resolved first, in a pre-scan, exactly like HAProxy's own
+    // two-pass argument parsing for this action.
+    let mut status = 200u16;
+    for i in 2..limit {
+        if tokens[i].text == "status" && i + 1 < limit {
+            status = parse_u16(&tokens[i + 1], "status")?;
+            break;
+        }
+    }
+
+    let (content_type, lf_string, error_page) = parse_error_body_args(tokens, 2, limit, status)?;
+
+    let cond = if let Some(idx) = cond_idx {
+        parse_acl_condition_from_tokens(&tokens[idx..])?
+    } else {
+        None
+    };
+    Ok((status, content_type, lf_string, error_page, cond))
+}
+
 /// The optional `if`/`unless` condition starting at `tokens[at]`; any other word there is
 /// refused, as `HAProxy` refuses it.
 /// The `reason <text>` of `set-status <code> reason <text>` (`tokens[3]`, `tokens[4]`), as
@@ -331,34 +362,9 @@ fn parse_http_req_rule_at(
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt { idx, sc, expr }, cond, line: 0 });
     } else if act_str == "return" {
-        let cond_idx = find_cond_idx(tokens, 2);
-        let limit = cond_idx.unwrap_or(tokens.len());
-
-        // `errorfiles <name>` (if present) must pick a single status code out of a whole
-        // section, so `status` is resolved first, in a pre-scan, exactly like HAProxy's own
-        // two-pass argument parsing for this action.
-        let mut status = 200u16;
-        for i in 2..limit {
-            if tokens[i].text == "status" && i + 1 < limit {
-                status = parse_u16(&tokens[i + 1], "status")?;
-                break;
-            }
-        }
-
-        let (content_type, lf_string, error_page) = parse_error_body_args(tokens, 2, limit, status)?;
-
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let (status, content_type, lf_string, error_page, cond) = parse_return_action(tokens)?;
         rules.push(HttpReqRule {
-            action: HttpReqAction::Return {
-                status,
-                content_type,
-                lf_string,
-                error_page,
-            },
+            action: HttpReqAction::Return { status, content_type, lf_string, error_page },
             cond,
             line: 0,
         });
@@ -1324,6 +1330,9 @@ fn parse_http_res_rule_at(
     } else if act_str == "redirect" {
         let (action, cond) = parse_res_redirect(tokens)?;
         rules.push(HttpResRule { action, cond, line: 0 });
+    } else if act_str == "return" {
+        let (status, content_type, lf_string, error_page, cond) = parse_return_action(tokens)?;
+        rules.push(HttpResRule { action: HttpResAction::Return { status, content_type, lf_string, error_page }, cond, line: 0 });
     } else if act_str == "wait-for-body" {
         let (time_ms, at_least, cond) = parse_wait_for_body(tokens, "http-response", act_token)?;
         rules.push(HttpResRule { action: HttpResAction::WaitForBody { time_ms, at_least }, cond, line: 0 });

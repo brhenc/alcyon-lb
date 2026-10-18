@@ -246,6 +246,14 @@ pub enum HttpResAction {
     /// the response is replaced by an empty redirect to `location` (a log-format string).
     /// `HAProxy` refuses the `prefix` and `scheme` types in a response.
     Redirect { location: String, code: u16, cookie: Option<RedirectCookie> },
+    /// `http-response return ...`: the server's response is dropped and the client gets this
+    /// reply, built as `http-request return` builds it (see `HttpReqAction::Return`).
+    Return {
+        status: u16,
+        content_type: Option<String>,
+        lf_string: Option<String>,
+        error_page: Option<ErrorPageSource>,
+    },
 }
 
 /// The three kinds of `http-request redirect`.
