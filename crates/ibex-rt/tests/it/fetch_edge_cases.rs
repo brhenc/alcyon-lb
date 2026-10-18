@@ -205,10 +205,9 @@ fn load(rule: &str) -> (Option<i32>, String) {
 }
 
 /// HAProxy: `unknown condition "ifbad".` on the action and `invalid args in converter 'set-var'
-/// : unknown condition "ifbad".` on the converter. `ifgt` and `iflt` are valid there, but need
-/// typed variables, so Ibex refuses them rather than ignore them.
+/// : unknown condition "ifbad".` on the converter. `ifgt` and `iflt` are valid there (T364 S3).
 #[test]
-fn set_var_unknown_and_untyped_conditions_are_refused_at_load() {
+fn set_var_unknown_conditions_are_refused_at_load() {
     for rule in [
         "http-request set-var(txn.x,ifbad) str(a)",
         "http-request set-var(txn.x,IFEXISTS) str(a)",
@@ -218,9 +217,6 @@ fn set_var_unknown_and_untyped_conditions_are_refused_at_load() {
         "tcp-request session set-var(sess.x,ifbad) str(a)",
         "http-request set-header x \"%[str(a),set-var(txn.x,ifbad)]\"",
         "http-request set-header x \"%[str(a),set-var()]\"",
-        "http-request set-var(txn.x,ifgt) int(1)",
-        "http-request set-var(txn.x,iflt) int(1)",
-        "http-request set-header x \"%[int(1),set-var(txn.x,iflt)]\"",
     ] {
         let (code, out) = load(rule);
         assert_ne!(code, Some(0), "{rule} loaded: {out}");
@@ -231,6 +227,9 @@ fn set_var_unknown_and_untyped_conditions_are_refused_at_load() {
         "http-request set-var(txn.x,) str(a)",
         "http-request set-var-fmt(txn.x,ifnotset) a",
         "http-request set-header x \"%[str(a),set-var(txn.x,ifempty,ifset)]\"",
+        "http-request set-var(txn.x,ifgt) int(1)",
+        "http-request set-var(txn.x,iflt) int(1)",
+        "http-request set-header x \"%[int(1),set-var(txn.x,iflt)]\"",
     ] {
         let (code, out) = load(rule);
         assert_eq!(code, Some(0), "{rule} refused: {out}");

@@ -8106,10 +8106,7 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
             Some("invalid args in converter 'set-var' : Empty variable name cannot be accepted.".to_string())
         }
         "set-var" => args.iter().skip(1).filter(|c| !c.is_empty()).find_map(|c| match c.as_str() {
-            "ifexists" | "ifnotexists" | "ifempty" | "ifnotempty" | "ifset" | "ifnotset" => None,
-            "ifgt" | "iflt" => Some(format!(
-                "invalid args in converter 'set-var' : condition \"{c}\" needs typed variables, which Ibex does not implement"
-            )),
+            "ifexists" | "ifnotexists" | "ifempty" | "ifnotempty" | "ifset" | "ifnotset" | "ifgt" | "iflt" => None,
             _ => Some(format!("invalid args in converter 'set-var' : unknown condition \"{c}\".")),
         }),
         "aes_cbc_enc" | "aes_cbc_dec" | "aes_gcm_enc" | "aes_gcm_dec" => check_aes_args(name, args),
