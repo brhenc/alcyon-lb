@@ -11,3 +11,4 @@
 //! a test file no target compiles.
 
 mod glibc_vectors;
+mod xxh3;

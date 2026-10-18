@@ -28,6 +28,7 @@ mod sample_arg_tokens;
 mod field_word_count_overflow;
 mod field_word_parity;
 mod field_word_table;
+mod hash_seeds;
 mod json_query_types;
 mod str_to_int_cast;
 mod t136_edges;

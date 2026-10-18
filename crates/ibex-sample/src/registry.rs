@@ -4737,7 +4737,7 @@ impl Registry {
             func: |smp, args| match smp {
                 Sample::Bin(b) => {
                     let mut h = hash_crc32(&b);
-                    if args.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) != 0 {
+                    if args.first().and_then(|s| crate::cast::parse_sint_arg(s)).unwrap_or(0) != 0 {
                         h = full_hash(h);
                     }
                     Some(Sample::Sint(i64::from(h)))
@@ -4753,7 +4753,7 @@ impl Registry {
             func: |smp, args| match smp {
                 Sample::Bin(b) => {
                     let mut h = hash_crc32c(&b);
-                    if args.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) != 0 {
+                    if args.first().and_then(|s| crate::cast::parse_sint_arg(s)).unwrap_or(0) != 0 {
                         h = full_hash(h);
                     }
                     Some(Sample::Sint(i64::from(h)))
@@ -4769,7 +4769,7 @@ impl Registry {
             func: |smp, args| match smp {
                 Sample::Bin(b) => {
                     let mut h = hash_djb2(&b);
-                    if args.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) != 0 {
+                    if args.first().and_then(|s| crate::cast::parse_sint_arg(s)).unwrap_or(0) != 0 {
                         h = full_hash(h);
                     }
                     Some(Sample::Sint(i64::from(h)))
@@ -4785,7 +4785,7 @@ impl Registry {
             func: |smp, args| match smp {
                 Sample::Bin(b) => {
                     let mut h = hash_sdbm(&b);
-                    if args.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) != 0 {
+                    if args.first().and_then(|s| crate::cast::parse_sint_arg(s)).unwrap_or(0) != 0 {
                         h = full_hash(h);
                     }
                     Some(Sample::Sint(i64::from(h)))
@@ -4801,7 +4801,7 @@ impl Registry {
             func: |smp, args| match smp {
                 Sample::Bin(b) => {
                     let mut h = hash_wt6(&b);
-                    if args.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0) != 0 {
+                    if args.first().and_then(|s| crate::cast::parse_sint_arg(s)).unwrap_or(0) != 0 {
                         h = full_hash(h);
                     }
                     Some(Sample::Sint(i64::from(h)))
@@ -4847,7 +4847,8 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Bin),
             out_type: TypeSpec::Exact(SampleType::Sint),
             func: |smp, args| {
-                let seed = args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+                // `(unsigned long long int)arg_p->data.sint`, then `XXH3_64bits_withSeed`.
+                let seed = u64::from_ne_bytes(args.first().and_then(|s| crate::cast::parse_sint_arg(s)).unwrap_or(0).to_ne_bytes());
                 match smp {
                     Sample::Bin(b) => {
                         let h = hash_xxh3(&b, seed);
@@ -8052,8 +8053,8 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
             .first()
             .filter(|a| crate::cast::parse_sint_arg(a).is_none())
             .map(|a| format!("invalid arg 1 in converter 'ip.fp' : failed to parse '{a}' as type 'integer' at position 1.")),
-        // `ARG1(0,SINT)`: a seed that is no integer is refused, not hashed with as 0.
-        "xxh32" | "xxh64" => args
+        // `ARG1(0,SINT)`: a seed (or avalanche flag) that is no integer is refused, not read as 0.
+        "crc32" | "crc32c" | "djb2" | "sdbm" | "wt6" | "xxh32" | "xxh64" | "xxh3" => args
             .first()
             .filter(|a| crate::cast::parse_sint_arg(a).is_none())
             .map(|a| format!("invalid arg 1 in converter '{name}' : failed to parse '{a}' as type 'integer' at position 1.")),
