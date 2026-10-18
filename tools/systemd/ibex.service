@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+#
+# systemd unit for Ibex release candidates, modelled on HAProxy's admin/systemd/haproxy.service.in
+# with the sandboxing switched on. See tools/systemd/README.md and docs/rc1-quickstart.md.
+
+[Unit]
+Description=Ibex Load Balancer
+Documentation=https://github.com/haproxy/haproxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/default/ibex
+Environment="CONFIG=/etc/ibex/ibex.cfg" "PIDFILE=/run/ibex/ibex.pid" "EXTRAOPTS=-S /run/ibex/master.sock"
+# -Ws: master-worker, reload on SIGUSR2, and READY=1 / RELOADING=1 / STOPPING=1 sent to systemd.
+ExecStart=/usr/local/sbin/ibex -Ws -f $CONFIG -p $PIDFILE $EXTRAOPTS
+# Check the new configuration first; a bad one fails `systemctl reload` before any signal is sent.
+ExecReload=/usr/local/sbin/ibex -Ws -f $CONFIG -c $EXTRAOPTS
+ExecReload=/bin/kill -USR2 $MAINPID
+# SIGTERM to the master only (it stops the worker); SIGKILL to what is left after TimeoutStopSec.
+KillMode=mixed
+Restart=always
+RestartSec=1
+Type=notify
+TimeoutStopSec=30
+LimitNOFILE=65536
+
+# /run/ibex for the pidfile, the master socket and the stats socket (admin.sock in the example).
+RuntimeDirectory=ibex
+RuntimeDirectoryMode=0755
+
+# Sandboxing (HAProxy's list, enabled, plus the strict file system). ProtectSystem=strict makes
+# everything but /run/ibex, /tmp and /dev read-only: the reload hand-over socket lives under
+# $TMPDIR (/tmp), which PrivateTmp gives the service alone. If you write files elsewhere (an
+# `ibex.cfg` `server-state-file`, a log file), add the directory to ReadWritePaths=.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=~@cpu-emulation @keyring @module @obsolete @raw-io
+# If the certificate is under /home, replace ProtectHome=true with ProtectHome=read-only.
+
+[Install]
+WantedBy=multi-user.target
