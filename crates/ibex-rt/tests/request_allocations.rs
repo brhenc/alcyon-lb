@@ -637,3 +637,85 @@ fn sixty_thousand_backends_with_checks_no_further_growth() {
 }
 
 
+
+/// Sends one request on the keep-alive connection `client` and runs the engine until its whole
+/// response (`http-request return ... string ok`, so a 2-byte body) is back.
+fn drive_keepalive_request(client: &mut TcpStream, engine: &mut Engine) {
+    client.write_all(b"GET /api/test HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("write req");
+    let start = Instant::now();
+    let mut response = Vec::new();
+    let mut buf = [0u8; 512];
+    while start.elapsed() < Duration::from_secs(2) {
+        let _ = engine.run_once();
+        if let Ok(n) = client.read(&mut buf) {
+            response.extend_from_slice(&buf[..n]);
+            if response.ends_with(b"\r\n\r\nok") {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(response.starts_with(b"HTTP/1.1 200"), "response: {:?}", String::from_utf8_lossy(&response));
+    assert!(response.ends_with(b"\r\n\r\nok"), "response: {:?}", String::from_utf8_lossy(&response));
+    for _ in 0..3 {
+        let _ = engine.run_once();
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The allocations of the third request on one keep-alive connection to a frontend running
+/// `rules` (then `http-request return`).
+fn keepalive_request_allocations(rules: &str) -> usize {
+    let (l, addr) = loopback0();
+    drop(l);
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend f\n  bind {addr}\n{rules}  http-request return status 200 content-type text/plain string ok\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = TcpStream::connect(addr).expect("connect to frontend");
+    client.set_nonblocking(true).expect("set_nonblocking");
+    drive_keepalive_request(&mut client, &mut engine);
+    drive_keepalive_request(&mut client, &mut engine);
+    let before = ibex_alloc::alloc_counters();
+    drive_keepalive_request(&mut client, &mut engine);
+    let diff = before.diff(&ibex_alloc::alloc_counters());
+    drop(client);
+    for _ in 0..5 {
+        let _ = engine.run_once();
+    }
+    diff.alloc_count
+}
+
+/// T364 S6: storing a variable allocates nothing on a keep-alive request. The store keeps its
+/// slots and arena from one transaction to the next (design typed-variables-2026-10-18 §2.5).
+/// Measured before S6 (release, 2026-10-18): none 7, 1 int 9, 1 str 12, int+str+sess 16, 5 ints
+/// 17 (the name copied into two maps per set, the value cloned, and `str()` decoding its
+/// argument on every request). After: 7 each.
+#[test]
+fn set_var_on_a_keep_alive_request_allocates_nothing() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let none = keepalive_request_allocations("");
+    let cases = [
+        ("1 int", "  http-request set-var(txn.a) int(5)\n".to_string()),
+        ("1 str", "  http-request set-var(txn.s) str(hello)\n".to_string()),
+        (
+            "int+str+sess",
+            "  http-request set-var(txn.a) int(5)\n  http-request set-var(txn.s) str(hello)\n  \
+             http-request set-var(sess.c) int(1)\n"
+                .to_string(),
+        ),
+        (
+            "5 ints",
+            ["a", "b", "c", "d", "e"].iter().map(|n| format!("  http-request set-var(txn.{n}) int(5)\n")).collect::<Vec<_>>().concat(),
+        ),
+    ];
+    let mut got = Vec::new();
+    for (name, rules) in &cases {
+        got.push((*name, keepalive_request_allocations(rules)));
+    }
+    println!("[MEASUREMENT T364 S6] keep-alive request allocations: none {none}, {got:?}");
+    for (name, n) in got {
+        assert_eq!(n, none, "set-var ({name}) allocated {n} times on a keep-alive request, {none} without it");
+    }
+}

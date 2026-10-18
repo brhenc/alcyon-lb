@@ -46,5 +46,5 @@ pub use registry::{set_debug_sink, take_debug_destinations, DebugSinkFn,
     ServerState, SampleContext, ConnErr, SslFacts, StickData, StickGpc, StickOp, StickState, StreamFacts, StreamTimeouts, TimeoutKind, CURRENT_VARS, STOPPING, THREAD_ID, GLOBAL_PROC_VARS, SAMPLE_REGISTRY,
 };
 pub use rawpayload::{check_args as check_raw_fetch_args, raw_may_change};
-pub use vars::VarMap;
+pub use vars::{Scope as VarScope, VarStore};
 pub use sample::{Sample, SampleType, TypeSpec, SAMPLE_TYPES_COUNT};

@@ -20,7 +20,13 @@ pub struct Expr {
     /// The other `acl` lines of the same name: an ACL declared several times matches if
     /// any of its lines does (`find_acl_by_name` + `acl_exec_cond` walk the whole list).
     pub alternates: Vec<Expr>,
+    /// The value of a constant expression ([`Expr::constant`]), computed on first use.
+    constant: std::sync::OnceLock<Option<Sample>>,
 }
+
+/// The fetches whose sample is a function of their arguments only (`smp_fetch_const_*`,
+/// src/sample.c): with no converter, the expression is a constant.
+const CONST_FETCHES: [&str; 7] = ["str", "int", "bin", "bool", "ipv4", "ipv6", "meth"];
 
 /// `is_idchar` (include/haproxy/tools.h): what a fetch or converter name may contain.
 fn is_idchar(c: char) -> bool {
@@ -305,7 +311,22 @@ impl Expr {
             converters,
             matcher,
             alternates: Vec::new(),
+            constant: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The sample of a constant expression (`str(hello)`, `int(5)`: a constant fetch and no
+    /// converter), evaluated once and borrowed after, as `HAProxy`'s `smp_fetch_const_str`
+    /// points at its argument: `set-var` copies it into the variable with no allocation
+    /// (T364 S6). `None` for any other expression.
+    #[must_use]
+    pub fn constant(&self, registry: &Registry) -> Option<&Sample> {
+        if !self.converters.is_empty() || self.matcher.is_some() || !CONST_FETCHES.contains(&self.fetch_name.as_str()) {
+            return None;
+        }
+        self.constant
+            .get_or_init(|| registry.eval(&self.fetch_name, &self.fetch_args, &[], &SampleContext::default()))
+            .as_ref()
     }
 
     /// Evaluates the expression against the sample context to produce a sample value.
@@ -883,7 +904,7 @@ mod tests {
 
         // Test var with regsub
         crate::CURRENT_VARS.with(|v| {
-            v.borrow_mut().insert("sess.str3".to_string(), Sample::Str("this is a string".to_string()));
+            v.borrow_mut().insert("sess.str3", Sample::Str("this is a string".to_string()));
         });
         let expr_var = Expr::parse("var(sess.str3),regsub(is a,is also a)").unwrap();
         let val = expr_var.eval_sample(&registry, &ctx);

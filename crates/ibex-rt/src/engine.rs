@@ -53,9 +53,9 @@ use std::time::{Duration, Instant};
 // yet" and renders `-`, where the old engine-local default reported a 200 that had
 // never been sent.
 use ibex_sample::registry::{
-    TimeoutKind, CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_TIMEOUTS, CURRENT_VARS,
+    TimeoutKind, CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_TIMEOUTS,
 };
-use ibex_sample::vars::VarMap;
+use ibex_sample::vars::VarStore;
 
 thread_local! {
     pub static WORKER_ID: Cell<usize> = const { Cell::new(0) };
@@ -6258,17 +6258,20 @@ fn eval_tcp_req_session_rules(
                 // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                 // The expression is a sample fetch, checked at load; one that cannot be parsed or
                 // fetched sets nothing.
-                let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &ctx));
-                if let Some(val) = val {
-                    store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
+                // A constant (`str(hello)`) is copied in, with no allocation (T364 S6).
+                let e = Expr::cached(expr).ok();
+                if let Some(c) = e.as_deref().and_then(|e| e.constant(registry)) {
+                    store_var_in(&mut sess.vars, var_name, ibex_sample::vars::In::Ref(c));
+                } else if let Some(val) = e.as_deref().and_then(|e| e.eval_sample(registry, &ctx)) {
+                    store_var_smp(&mut sess.vars, var_name, val);
                 }
             }
             ibex_config::TcpReqSessionAction::SetVarFmt { var_name, fmt } => {
                 let val = format_sample_string(fmt, &ctx, registry);
-                store_var(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
+                store_var(&mut sess.vars, var_name, val);
             }
             ibex_config::TcpReqSessionAction::UnsetVar { var_name } => {
-                unset_var(&mut sess.sess_vars, &mut sess.req_vars, var_name);
+                unset_var(&mut sess.vars, var_name);
             }
             ibex_config::TcpReqSessionAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
             ibex_config::TcpReqSessionAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
@@ -6351,7 +6354,7 @@ fn eval_tcp_req_content_rules(
         raw_req: (sess.mode == Mode::Tcp).then_some(req_bytes),
         // In HTTP mode the request is parsed by the time these rules run, and `path`,
         // `hdr()` and the like read it, as they do in `HAProxy`. Built from the fields: the
-        // rules change `sess_vars` while this borrows.
+        // rules change `vars` while this borrows.
         htx_slice: sess.has_htx.then(|| ibex_proto::htx::HtxSliceRef::new(sess.htx_buf.raw_slice(), sess.htx_blocks)),
         req_uri: sess.req_uri.as_deref(),
         req_method: sess.req_method.as_deref(),
@@ -6511,17 +6514,20 @@ fn eval_tcp_req_content_rules(
                 // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                 // The expression is a sample fetch, checked at load; one that cannot be parsed or
                 // fetched sets nothing.
-                let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &ctx));
-                if let Some(val) = val {
-                    store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
+                // A constant (`str(hello)`) is copied in, with no allocation (T364 S6).
+                let e = Expr::cached(expr).ok();
+                if let Some(c) = e.as_deref().and_then(|e| e.constant(registry)) {
+                    store_var_in(&mut sess.vars, var_name, ibex_sample::vars::In::Ref(c));
+                } else if let Some(val) = e.as_deref().and_then(|e| e.eval_sample(registry, &ctx)) {
+                    store_var_smp(&mut sess.vars, var_name, val);
                 }
             }
             ibex_config::TcpReqContentAction::SetVarFmt { var_name, fmt } => {
                 let val = format_sample_string(fmt, &ctx, registry);
-                store_var(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
+                store_var(&mut sess.vars, var_name, val);
             }
             ibex_config::TcpReqContentAction::UnsetVar { var_name } => {
-                unset_var(&mut sess.sess_vars, &mut sess.req_vars, var_name);
+                unset_var(&mut sess.vars, var_name);
             }
             ibex_config::TcpReqContentAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
             ibex_config::TcpReqContentAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
@@ -6663,44 +6669,36 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
                 return ContentEvalResult::SilentDrop(1);
             }
             ibex_config::TcpResAction::SetVar { var_name, expr } => {
-                set_var_from_expr(&mut sess.sess_vars, &mut sess.req_vars, var_name, expr, &ctx, registry);
+                set_var_from_expr(&mut sess.vars, var_name, expr, &ctx, registry);
             }
             ibex_config::TcpResAction::SetVarFmt { var_name, fmt } => {
-                store_var(&mut sess.sess_vars, &mut sess.req_vars, var_name, format_sample_string(fmt, &ctx, registry));
+                store_var(&mut sess.vars, var_name, format_sample_string(fmt, &ctx, registry));
             }
-            ibex_config::TcpResAction::UnsetVar { var_name } => unset_var(&mut sess.sess_vars, &mut sess.req_vars, var_name),
+            ibex_config::TcpResAction::UnsetVar { var_name } => unset_var(&mut sess.vars, var_name),
         }
     }
     ContentEvalResult::Done
 }
 
 /// `set-var(<name>) <expr>`: `action_store` (src/vars.c) -- a sample that cannot be
-/// fetched sets nothing.
-fn set_var_from_expr(
-    sess_vars: &mut VarMap,
-    req_vars: &mut VarMap,
-    name: &str,
-    expr: &str,
-    ctx: &SampleContext,
-    registry: &Registry,
-) {
-    if let Some(val) = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, ctx)) {
-        store_var_smp(sess_vars, req_vars, name, val);
+/// fetched sets nothing. A constant expression (`str(hello)`, `int(5)`) is evaluated once and
+/// copied into the variable: no allocation (T364 S6).
+fn set_var_from_expr(vars: &mut VarStore, name: &str, expr: &str, ctx: &SampleContext, registry: &Registry) {
+    let Ok(e) = Expr::cached(expr) else { return };
+    if let Some(c) = e.constant(registry) {
+        store_var_in(vars, name, ibex_sample::vars::In::Ref(c));
+    } else if let Some(val) = e.eval_sample(registry, ctx) {
+        store_var_smp(vars, name, val);
     }
 }
 
 /// `unset-var(<name>)`, from the scope it lives in.
-fn unset_var(sess_vars: &mut VarMap, req_vars: &mut VarMap, name: &str) {
+fn unset_var(vars: &mut VarStore, name: &str) {
     if name.starts_with("proc.") {
         ibex_sample::vars::unset(name);
         return;
     }
-    if name.starts_with("sess.") {
-        sess_vars.remove(name);
-    } else {
-        req_vars.remove(name);
-    }
-    ibex_sample::vars::unset(name);
+    ibex_sample::vars::with_stream(vars, |m| m.remove(name));
 }
 
 /// Stores a variable where its scope lives, and where the rules after it read it.
@@ -6708,9 +6706,9 @@ fn unset_var(sess_vars: &mut VarMap, req_vars: &mut VarMap, name: &str) {
 /// `set-var-fmt(<name>) <fmt>`: the format is built in a trash chunk, so the value is cut
 /// at `tune.bufsize - 1` bytes (T251).
 /// The value is a `str`, as `HAProxy`'s `SMP_T_STR` (T364).
-fn store_var(sess_vars: &mut VarMap, req_vars: &mut VarMap, name: &str, mut val: String) {
+fn store_var(vars: &mut VarStore, name: &str, mut val: String) {
     ibex_sample::registry::truncate_to_trash(&mut val);
-    store_var_smp(sess_vars, req_vars, name, Sample::Str(val));
+    store_var_smp(vars, name, Sample::Str(val));
 }
 
 /// `name[,<cond>...]` of `set-var(...)`: the variable is set only when every condition holds
@@ -6720,54 +6718,45 @@ fn store_var(sess_vars: &mut VarMap, req_vars: &mut VarMap, name: &str, mut val:
 /// stored and the new value when both are `sint`.
 ///
 /// The variable keeps the sample's type (T364): `var()` gives back this `Sample`.
-fn store_var_smp(sess_vars: &mut VarMap, req_vars: &mut VarMap, spec: &str, val: Sample) {
+fn store_var_smp(vars: &mut VarStore, spec: &str, val: Sample) {
+    store_var_in(vars, spec, ibex_sample::vars::In::Owned(val));
+}
+
+/// [`store_var_smp`] of a sample to keep or to copy. `vars` is the session's store; while the
+/// stream runs its variables are the thread's (`ibex_sample::vars::with_stream`).
+fn store_var_in(vars: &mut VarStore, spec: &str, val: ibex_sample::vars::In<'_>) {
+    use ibex_sample::vars::In;
     let name = spec.split(',').next().unwrap_or("");
-    let is_proc = name.starts_with("proc.");
-    let is_set = if is_proc {
-        ibex_sample::vars::is_set(name)
-    } else if name.starts_with("sess.") {
-        sess_vars.contains_key(name)
-    } else {
-        req_vars.contains_key(name)
+    let new = match &val {
+        In::Owned(s) => s,
+        In::Ref(s) => *s,
     };
-    let exists = is_proc || is_set;
-    let stored = if is_proc {
-        ibex_sample::vars::get_proc(name)
-    } else if name.starts_with("sess.") {
-        sess_vars.get(name).cloned()
+    // Only an integer is compared (`ifgt`/`iflt`): the stored value is not copied to look at it.
+    let check = |m: &VarStore| (m.contains_key(name), m.int(name).map(Sample::Sint));
+    let (is_set, stored) = if name.starts_with("proc.") {
+        (ibex_sample::vars::is_set(name), ibex_sample::vars::get_proc(name).filter(|s| matches!(s, Sample::Sint(_))))
     } else {
-        req_vars.get(name).cloned()
+        ibex_sample::vars::with_stream(vars, |m| check(m)).unwrap_or((false, None))
     };
-    let ok = ibex_sample::var_conds_hold(spec, exists, is_set, stored.as_ref(), &val);
-    if !ok {
+    let exists = name.starts_with("proc.") || is_set;
+    if !ibex_sample::var_conds_hold(spec, exists, is_set, stored.as_ref(), new) {
         return;
     }
-    if is_proc {
-        ibex_sample::vars::set_proc(name, val);
-        return;
-    }
-    // The thread's map takes it first, with the accounting of `tune.vars.*`; what it stored
-    // (a refused set stores nothing, a string that does not fit a `bool`) goes in the session's too.
-    let Some(stored) = ibex_sample::vars::store(&[&*sess_vars, &*req_vars], name, val) else {
-        return;
-    };
-    let map = if name.starts_with("sess.") { sess_vars } else { req_vars };
-    map.insert(name.to_string(), stored);
+    ibex_sample::vars::with_stream(vars, |m| ibex_sample::vars::set_in(m, name, val));
 }
 
 /// Runs `f` with `sess`'s variables in the thread's `CURRENT_VARS`, where the fetches and
 /// converters read them, and puts them back in the session after (T152).
 ///
-/// `CURRENT_VARS` is one map per thread, and every stream on the thread runs through it in
+/// `CURRENT_VARS` is one store per thread, and every stream on the thread runs through it in
 /// turn: a stream that waits (for its server, its body, a tarpit) leaves the thread to the
-/// others, so the map holds a stream's variables only while that stream runs. It is filled
+/// others, so the store holds a stream's variables only while that stream runs. It is filled
 /// here, for the length of one run and never across a wait, and emptied after, so a
 /// stream reads its own variables or none -- never those of the stream that ran last.
 ///
-/// The variables are moved, not copied: the session's maps are empty while `f` runs and
-/// the thread's map is the one every write lands in (`store_var` writes both; the
-/// `set-var` converter, which has no session, writes only it). What it holds after `f` is
-/// what the session keeps. No allocation, whatever the number of variables.
+/// The store is swapped, not copied (`ibex_sample::vars::enter`/`leave`): the session's is the
+/// thread's empty one while `f` runs, and every write lands in the thread's. No allocation,
+/// whatever the number of variables (T364 S6).
 fn with_stream_vars<R>(sess: &mut TcpSession, fe: &Proxy, f: impl FnOnce(&mut TcpSession) -> R) -> R {
     stream_vars_enter(sess, fe);
     let out = f(sess);
@@ -6777,41 +6766,28 @@ fn with_stream_vars<R>(sess: &mut TcpSession, fe: &Proxy, f: impl FnOnce(&mut Tc
 
 /// The start of [`with_stream_vars`].
 fn stream_vars_enter(sess: &mut TcpSession, fe: &Proxy) {
-    CURRENT_VARS.with(|v| {
-        let mut map = v.borrow_mut();
-        map.clear();
-        map.extend(sess.sess_vars.drain());
-        map.extend(sess.req_vars.drain());
-    });
+    ibex_sample::vars::enter(&mut sess.vars);
     // T331: the slots' lengths, for the converters that write them.
     ibex_sample::capture_write::enter(fe.req_capture_slots.clone(), fe.res_capture_slots.clone());
 }
 
-/// The end of [`with_stream_vars`]: what the thread's map holds goes back to the scope it
-/// belongs to in `sess`, or is dropped with a stream that is gone.
+/// The end of [`with_stream_vars`]: the thread's store goes back to `sess`, or is emptied
+/// with a stream that is gone.
 fn stream_vars_leave(sess: Option<&mut TcpSession>) {
     // T331: what `capture-req` and `capture-res` wrote goes into the slots; a stream that is
     // gone has none to take it.
     let writes = ibex_sample::capture_write::leave();
-    CURRENT_VARS.with(|v| {
-        let mut map = v.borrow_mut();
-        let Some(sess) = sess else {
-            map.clear();
-            return;
-        };
-        sess.sess_vars.clear();
-        sess.req_vars.clear();
-        for (k, val) in map.drain() {
-            let scope = if k.starts_with("sess.") { &mut sess.sess_vars } else { &mut sess.req_vars };
-            scope.insert(k, val);
+    let Some(sess) = sess else {
+        ibex_sample::vars::leave(None);
+        return;
+    };
+    ibex_sample::vars::leave(Some(&mut sess.vars));
+    for (res, id, val) in writes {
+        let slots = if res { &mut sess.log.res_captures } else { &mut sess.log.req_captures };
+        if let Some(slot) = slots.get_mut(id) {
+            *slot = Some(val);
         }
-        for (res, id, val) in writes {
-            let slots = if res { &mut sess.log.res_captures } else { &mut sess.log.req_captures };
-            if let Some(slot) = slots.get_mut(id) {
-                *slot = Some(val);
-            }
-        }
-    });
+    }
 }
 
 /// The timeouts the `*_timeout` fetches report for a stream of frontend `fe` on backend
@@ -10299,14 +10275,14 @@ impl EngineDispatcher<'_> {
                         break 'rules None;
                     }
                     ibex_config::TcpResAction::SetVar { var_name, expr } => {
-                        set_var_from_expr(&mut entry.sess.sess_vars, &mut entry.sess.req_vars, var_name, expr, &tcp_ctx, registry);
+                        set_var_from_expr(&mut entry.sess.vars, var_name, expr, &tcp_ctx, registry);
                     }
                     ibex_config::TcpResAction::SetVarFmt { var_name, fmt } => {
                         let val = format_sample_string(fmt, &tcp_ctx, registry);
-                        store_var(&mut entry.sess.sess_vars, &mut entry.sess.req_vars, var_name, val);
+                        store_var(&mut entry.sess.vars, var_name, val);
                     }
                     ibex_config::TcpResAction::UnsetVar { var_name } => {
-                        unset_var(&mut entry.sess.sess_vars, &mut entry.sess.req_vars, var_name);
+                        unset_var(&mut entry.sess.vars, var_name);
                     }
                 }
             }
@@ -10317,8 +10293,7 @@ impl EngineDispatcher<'_> {
             // proxy; an `allow` ends only its own list.
             // `http-response capture` writes the frontend's slots, whichever proxy the rule is in.
             // The response side starts with the request's `req.*` variables gone.
-            entry.sess.req_vars.retain(|k, _| !k.starts_with("req."));
-            CURRENT_VARS.with(|v| v.borrow_mut().retain(|k, _| !k.starts_with("req.")));
+            ibex_sample::vars::with_stream(&mut entry.sess.vars, |m| m.clear_scope(ibex_sample::VarScope::Req));
             let fe_res_slots = &proxies[fe_idx].res_capture_slots;
             let mut stopped = None;
             LAST_RULE.set(None);
@@ -10364,8 +10339,7 @@ impl EngineDispatcher<'_> {
                     &ctx,
                     caps,
                     registry,
-                    &mut entry.sess.sess_vars,
-                    &mut entry.sess.req_vars,
+                    &mut entry.sess.vars,
                     Some(ResWait { start, check: &mut check }),
                 ) {
                     Err(stop) => {
@@ -10416,8 +10390,7 @@ impl EngineDispatcher<'_> {
                 &ctx,
                 Some(&mut res_caps),
                 registry,
-                &mut entry.sess.sess_vars,
-                &mut entry.sess.req_vars,
+                &mut entry.sess.vars,
             );
             entry.sess.log.res_captures.clone_from(&res_caps);
             if let Err(stop) = after {
@@ -11394,17 +11367,20 @@ impl EngineDispatcher<'_> {
                         // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                         // The expression is a sample fetch, checked at load; one that cannot be parsed or
                         // fetched sets nothing.
-                        let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &make_ctx!(sess)));
-                        if let Some(val) = val {
-                            store_var_smp(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
+                        // A constant (`str(hello)`) is copied in, with no allocation (T364 S6).
+                        let e = Expr::cached(expr).ok();
+                        if let Some(c) = e.as_deref().and_then(|e| e.constant(registry)) {
+                            store_var_in(&mut sess.vars, var_name, ibex_sample::vars::In::Ref(c));
+                        } else if let Some(val) = e.as_deref().and_then(|e| e.eval_sample(registry, &make_ctx!(sess))) {
+                            store_var_smp(&mut sess.vars, var_name, val);
                         }
                     }
                     ibex_config::HttpReqAction::SetVarFmt { var_name, fmt } => {
                         let val = format_sample_string(fmt, &make_ctx!(sess), registry);
-                        store_var(&mut sess.sess_vars, &mut sess.req_vars, var_name, val);
+                        store_var(&mut sess.vars, var_name, val);
                     }
                     ibex_config::HttpReqAction::UnsetVar { var_name } => {
-                        unset_var(&mut sess.sess_vars, &mut sess.req_vars, var_name);
+                        unset_var(&mut sess.vars, var_name);
                     }
                     ibex_config::HttpReqAction::StrictMode { on } => {
                         STRICT_MODE.set(*on);
@@ -13599,8 +13575,7 @@ fn res_action(
     status_msg: &mut String,
     ctx: &SampleContext,
     registry: &Registry,
-    sess_vars: &mut VarMap,
-    req_vars: &mut VarMap,
+    vars: &mut VarStore,
 ) -> Result<bool, ResStop> {
     // A rewrite that does not fit: the response fails in strict mode, and the rule is
     // skipped otherwise (`fail_rewrite`, `src/http_act.c`).
@@ -13645,7 +13620,7 @@ fn res_action(
         }
         ResOp::Del(name) => {
             if let Some(var_name) = name.strip_prefix("\0unset-var:") {
-                unset_var(sess_vars, req_vars, var_name);
+                unset_var(vars, var_name);
                 return Ok(true);
             }
             let freed: usize = hdrs.iter().filter(|(k, _)| header_name_matches(k, name)).map(|(k, v)| htx_hdr_size(k, v)).sum();
@@ -13685,15 +13660,15 @@ fn res_action(
             Some((c, r)) => (c, Some(r)),
             None => (act_fmt, None),
         };
-        return res_action(ResOp::Status(code.parse().unwrap_or(*status), reason), hdrs, status, status_msg, ctx, registry, sess_vars, req_vars);
+        return res_action(ResOp::Status(code.parse().unwrap_or(*status), reason), hdrs, status, status_msg, ctx, registry, vars);
     }
     if let Some(var_name) = act_name.strip_prefix("\0set-var:") {
         // A fetch that finds nothing leaves the variable as it was (`action_store`).
-        set_var_from_expr(sess_vars, req_vars, var_name, act_fmt, ctx, registry);
+        set_var_from_expr(vars, var_name, act_fmt, ctx, registry);
         return Ok(true);
     }
     if let Some(var_name) = act_name.strip_prefix("\0set-var-fmt:") {
-        store_var(sess_vars, req_vars, var_name, format_sample_string(act_fmt, ctx, registry));
+        store_var(vars, var_name, format_sample_string(act_fmt, ctx, registry));
         return Ok(true);
     }
     if act_name == "\0strict-mode" {
@@ -13764,8 +13739,7 @@ fn run_res_rules<'a>(
     ctx: &SampleContext,
     mut caps: Option<(&mut Vec<Option<Vec<u8>>>, &[(String, usize)])>,
     registry: &Registry,
-    sess_vars: &mut VarMap,
-    req_vars: &mut VarMap,
+    vars: &mut VarStore,
     mut wait: Option<ResWait<'_>>,
 ) -> Result<Option<usize>, ResStop> {
     let (hdrs, status, status_msg) = head;
@@ -13817,7 +13791,7 @@ fn run_res_rules<'a>(
         if line != 0 && matches!(op, ResOp::Redirect(..) | ResOp::Return(..) | ResOp::Set("\0allow" | "\0deny" | "\0silent-drop", _)) {
             LAST_RULE.set(Some(line));
         }
-        match res_action(op, hdrs, status, status_msg, ctx, registry, sess_vars, req_vars) {
+        match res_action(op, hdrs, status, status_msg, ctx, registry, vars) {
             Ok(true) => {}
             Ok(false) => break,
             Err(stop) => {
@@ -13844,19 +13818,17 @@ fn eval_after_res_rules(
     ctx: &SampleContext,
     mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
-    sess_vars: &mut VarMap,
-    req_vars: &mut VarMap,
+    vars: &mut VarStore,
 ) -> Result<(), ResStop> {
     let (hdrs, status, status_msg) = head;
-    req_vars.retain(|k, _| !k.starts_with("req."));
-    CURRENT_VARS.with(|v| v.borrow_mut().retain(|k, _| !k.starts_with("req.")));
+    ibex_sample::vars::with_stream(vars, |m| m.clear_scope(ibex_sample::VarScope::Req));
     let order: &[usize] = if fe_idx == be_idx { &[be_idx] } else { &[be_idx, fe_idx] };
     for &px in order {
         let rules = proxies[px].http_after_res_rules.iter().map(|r| (ResOp::of_after_res(&r.action), r.cond.as_ref(), 0));
         // `http-after-response capture` writes the frontend's slots, whichever proxy the rule is in.
         let fe_slots = &proxies[fe_idx].res_capture_slots;
         let caps = res_caps.as_deref_mut().filter(|_| !fe_slots.is_empty()).map(|c| (c, &fe_slots[..]));
-        run_res_rules(rules, &proxies[px].acls, (&mut *hdrs, &mut *status, &mut *status_msg), ctx, caps, registry, sess_vars, req_vars, None)?;
+        run_res_rules(rules, &proxies[px].acls, (&mut *hdrs, &mut *status, &mut *status_msg), ctx, caps, registry, vars, None)?;
     }
     Ok(())
 }
@@ -14059,8 +14031,7 @@ fn after_res_on_reply<'r>(
     res_htx_init(sess.bufsize, None, &version, &reason, &hdrs, raw.len() - hdr_end - eoh_len);
     // The variables are the session's own, in `CURRENT_VARS` for the run that makes the
     // reply (`step_stream`).
-    let mut sess_vars = std::mem::take(&mut sess.sess_vars);
-    let mut req_vars = std::mem::take(&mut sess.req_vars);
+    let mut vars = std::mem::take(&mut sess.vars);
     let mut res_caps = std::mem::take(&mut sess.log.res_captures);
     let res_caps_in = res_caps.clone();
     let result = {
@@ -14113,12 +14084,10 @@ fn after_res_on_reply<'r>(
             &ctx,
             Some(&mut res_caps),
             sample_registry(),
-            &mut sess_vars,
-            &mut req_vars,
+            &mut vars,
         )
     };
-    sess.sess_vars = sess_vars;
-    sess.req_vars = req_vars;
+    sess.vars = vars;
     sess.log.res_captures = res_caps;
     CURRENT_RES_STATUS.set(0);
     CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clear());
@@ -14365,8 +14334,9 @@ mod cut_at_tests {
 mod registry_tests {
     use super::{
         build_sample_registry,
-        CURRENT_RES_STATUS, CURRENT_VARS,
+        CURRENT_RES_STATUS,
     };
+    use ibex_sample::CURRENT_VARS;
     use ibex_sample::{Expr, Sample, SampleContext};
 
     /// The engine's registry must read the *same* thread-locals the engine writes.
@@ -14382,7 +14352,7 @@ mod registry_tests {
     #[test]
     fn engine_var_writes_are_visible_to_the_sample_registry() {
         CURRENT_VARS.with(|v| {
-            v.borrow_mut().insert("txn.probe".to_string(), Sample::Str("seen".to_string()))
+            v.borrow_mut().insert("txn.probe", Sample::Str("seen".to_string()))
         });
 
         let reg = build_sample_registry();
