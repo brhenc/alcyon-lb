@@ -1448,6 +1448,9 @@ pub struct HttpTxn {
     pub rsp_wait: Option<RspWait>,
     /// The proxy is answering this request itself; nothing is read from a server.
     pub local: bool,
+    /// The local reply replaced a server response that was complete (`http-response return`):
+    /// the server connection goes back to the pool all the same.
+    pub keeps_srv: bool,
     /// The one decision to close the client connection once this transaction ends.
     pub close_after: bool,
     /// The client's request is HTTP/1.1 (the response's `Connection` header depends on it).
@@ -1527,6 +1530,7 @@ impl HttpTxn {
             req_body: None,
             rsp_wait: None,
             local: false,
+            keeps_srv: false,
             close_after,
             req_http11: true,
             req_version: 255,

@@ -9135,7 +9135,7 @@ impl EngineDispatcher<'_> {
         if leftover {
             entry.sess.rep.clear();
         }
-        let reusable = txn.srv_reusable && !txn.local && !leftover && txn.req.is_done() && txn.rsp.is_done();
+        let reusable = (txn.srv_reusable || txn.keeps_srv) && (!txn.local || txn.keeps_srv) && !leftover && txn.req.is_done() && txn.rsp.is_done();
         if reusable {
             entry.srv_served = (entry.srv_served + 1).min(2);
         }
@@ -10461,7 +10461,12 @@ impl EngineDispatcher<'_> {
             // that came with it (measured: 51 for `200`, `content-length: 2`, `ok`), not
             // the reply that replaces it (`HttpTxn::response_sent` skips a local one).
             let mut pay = 0;
-            MsgState::head(framing).advance_counted(entry.sess.rep.readable(), &mut pay);
+            // Whether the server's response was all here and its connection fit for another
+            // request: a reply that replaces it leaves the connection to the pool then (the
+            // rest of a larger response is not read, and the connection is closed).
+            let mut srv_msg = MsgState::head(framing);
+            let used = srv_msg.advance_counted(entry.sess.rep.readable(), &mut pay);
+            let srv_complete = srv_msg.is_done() && used == entry.sess.rep.readable().len() && entry.sess.txn.as_ref().is_some_and(|t| t.srv_reusable);
             if let Some(t) = entry.sess.txn.as_mut().and_then(|t| t.rsp_htx.as_mut()) {
                 *t += pay;
             }
@@ -10474,6 +10479,24 @@ impl EngineDispatcher<'_> {
                     entry.sess.log.term = Some(*b"LH");
                     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
                     send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &raw);
+                }
+                ResStop::Return { status, content_type, lf_string, error_page } => {
+                    // The server's response is already truncated when the reply is built
+                    // (`http_reply_message`): its status and headers fetch as nothing.
+                    CURRENT_RES_STATUS.set(0);
+                    CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clear());
+                    let res_ctx = SampleContext { res_version: None, ..ctx.clone() };
+                    let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
+                    let raw: Vec<u8> = match resolve_error_body(&proxies[be_idx], &proxies[entry.proxy_idx], status, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref()) {
+                        ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
+                        ResolvedErrorBody::Custom { content_type, lf_string } => build_templated_error_response(status, content_type, lf_string, &res_ctx, registry),
+                    };
+                    // The proxy's own answer, not a refusal: `LH`.
+                    entry.sess.log.term = Some(*b"LH");
+                    send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &raw);
+                    if let Some(t) = entry.sess.txn.as_mut() {
+                        t.keeps_srv = srv_complete;
+                    }
                 }
                 // The response is read and counted (its status is the log's) but never sent:
                 // `PR`, `dreq` on the frontend and the backend (measured).
@@ -13365,6 +13388,9 @@ enum ResStop {
     Empty(u16),
     /// A whole reply the rule made (`http-response redirect`).
     Reply(Vec<u8>),
+    /// `http-response return`: the reply is built from the rule's arguments once the
+    /// server's response is gone (`http_action_return`), as `http-request return` builds it.
+    Return { status: u16, content_type: Option<String>, lf_string: Option<String>, error_page: Option<ibex_config::ErrorPageSource> },
     /// `http-response silent-drop`: nothing goes to the client, which is not told.
     SilentDrop,
 }
@@ -13380,6 +13406,8 @@ enum ResOp<'a> {
     Status(u16, Option<&'a str>),
     /// `http-response redirect location <fmt> code <c> [cookie]`.
     Redirect(&'a str, u16, Option<&'a ibex_config::RedirectCookie>),
+    /// `http-response return`: status, content type, formatted body, error page.
+    Return(u16, Option<&'a str>, Option<&'a str>, Option<&'a ibex_config::ErrorPageSource>),
 }
 
 /// The `wait-for-body` of a response rule list: the rule the pass starts at, and the check a
@@ -13407,6 +13435,9 @@ impl<'a> ResOp<'a> {
             ibex_config::HttpResAction::DelHeader { name } => Self::Del(name),
             ibex_config::HttpResAction::SetStatus { status, reason } => Self::Status(*status, reason.as_deref()),
             ibex_config::HttpResAction::Redirect { location, code, cookie } => Self::Redirect(location, *code, cookie.as_ref()),
+            ibex_config::HttpResAction::Return { status, content_type, lf_string, error_page } => {
+                Self::Return(*status, content_type.as_deref(), lf_string.as_deref(), error_page.as_ref())
+            }
             ibex_config::HttpResAction::Capture { expr, id } => return ResRule::Capture(expr, *id),
             ibex_config::HttpResAction::WaitForBody { time_ms, at_least } => return ResRule::Wait(*time_ms, *at_least),
         })
@@ -13576,6 +13607,14 @@ fn res_action(
     let failed = || if STRICT_MODE.get() { Err(ResStop::Page(500)) } else { Ok(true) };
     let publish = |hdrs: &Vec<(String, String)>| CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clone_from(hdrs));
     let (act_name, act_fmt) = match op {
+        ResOp::Return(status, content_type, lf_string, error_page) => {
+            return Err(ResStop::Return {
+                status,
+                content_type: content_type.map(str::to_string),
+                lf_string: lf_string.map(str::to_string),
+                error_page: error_page.cloned(),
+            });
+        }
         ResOp::Redirect(location, code, cookie) => {
             // `http_apply_redirect_rule` (src/http_ana.c) for a `location` redirect: the
             // answer to the client is the redirect, and the server's response is dropped.
@@ -13775,7 +13814,7 @@ fn run_res_rules<'a>(
             }
         };
         // `allow`, `deny` and `redirect` end the rules: they are the last rule (`LAST_RULE`).
-        if line != 0 && matches!(op, ResOp::Redirect(..) | ResOp::Set("\0allow" | "\0deny" | "\0silent-drop", _)) {
+        if line != 0 && matches!(op, ResOp::Redirect(..) | ResOp::Return(..) | ResOp::Set("\0allow" | "\0deny" | "\0silent-drop", _)) {
             LAST_RULE.set(Some(line));
         }
         match res_action(op, hdrs, status, status_msg, ctx, registry, sess_vars, req_vars) {

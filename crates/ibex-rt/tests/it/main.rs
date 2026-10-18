@@ -196,6 +196,7 @@ mod jwt_verify_hmac;
 mod keepalive_abort_accounting;
 mod keepalive_binary;
 mod large_response_latency;
+mod http_response_return;
 mod last_rule_redirect;
 mod lb_attempt_counters;
 mod lb_chash;
