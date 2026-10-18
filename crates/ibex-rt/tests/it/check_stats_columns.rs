@@ -60,6 +60,19 @@ fn fake(greet: &'static [u8], reply: &'static [u8], second: &'static [u8], close
     addr
 }
 
+/// Accepts, optionally sends `greet`, and closes at once.
+fn closer(greet: &'static [u8]) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { break };
+            let _ = s.write_all(greet);
+        }
+    });
+    addr
+}
+
 fn query(sock: &std::path::Path, cmd: &str) -> String {
     let mut s = UnixStream::connect(sock).expect("connect stats");
     s.write_all(format!("{cmd}\n").as_bytes()).expect("write");
@@ -70,6 +83,16 @@ fn query(sock: &std::path::Path, cmd: &str) -> String {
 
 /// (check_status, check_code, last_chk, servers-state check_status, servers-state result)
 fn columns(check_line: &str, server: SocketAddr, wait: Duration) -> (String, String, String, String, String) {
+    let (c, _desc) = columns_desc(check_line, server, wait);
+    c
+}
+
+/// `columns`, and the `check_desc` column.
+fn columns_desc(
+    check_line: &str,
+    server: SocketAddr,
+    wait: Duration,
+) -> ((String, String, String, String, String), String) {
     let dir = tempfile::TempDir::new().expect("tmp");
     let sock = dir.path().join("stats.sock");
     let front = common::reserve_addr();
@@ -101,7 +124,10 @@ fn columns(check_line: &str, server: SocketAddr, wait: Duration) -> (String, Str
     let col = |n: &str| row[header.iter().position(|h| *h == n).expect(n)].to_string();
     let state = query(&sock, "show servers state b");
     let f: Vec<&str> = state.lines().nth(2).expect("state line").split_whitespace().collect();
-    (col("check_status"), col("check_code"), col("last_chk"), f[10].to_string(), f[11].to_string())
+    (
+        (col("check_status"), col("check_code"), col("last_chk"), f[10].to_string(), f[11].to_string()),
+        col("check_desc"),
+    )
 }
 
 fn t(s: &(String, String, String, String, String)) -> (&str, &str, &str, &str, &str) {
@@ -150,4 +176,44 @@ fn http_check_columns() {
 fn a_check_in_progress_has_a_star() {
     let c = columns("  option redis-check", fake(b"", b"", b"", false), Duration::from_millis(500));
     assert_eq!((c.0.as_str(), c.1.as_str(), c.2.as_str()), ("* INI", "", ""));
+}
+
+/// VV-15: `check_desc` is the fixed text of the check status (`get_check_status_description`),
+/// and an OS connect error's `last_chk` ends with `(strerror)`. Measured on HAProxy
+/// 3.5-dev8-885761-29 (2026-10-18), see `tasks/T341-fix-round-follow-ups.md`.
+#[test]
+fn check_desc_is_the_status_description() {
+    // smtpchk, the server accepts and closes
+    let (c, d) = columns_desc("  option smtpchk", closer(b""), SETTLE);
+    assert_eq!((c.0.as_str(), d.as_str()), ("L7RSP", "Layer7 invalid response"));
+    // smtpchk, the server sends "22" and closes
+    let (c, d) = columns_desc("  option smtpchk", closer(b"22"), SETTLE);
+    assert_eq!((c.0.as_str(), c.2.as_str(), d.as_str()), ("L7RSP", "22", "Layer7 invalid response"));
+    let (c, d) = columns_desc("  option redis-check", fake(b"", b"-ERR\r\n", b"", true), SETTLE);
+    assert_eq!((c.0.as_str(), d.as_str()), ("L7STS", "Layer7 wrong status"));
+    let (c, d) = columns_desc(
+        "  option httpchk GET /",
+        fake(b"", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", b"", false),
+        SETTLE,
+    );
+    assert_eq!((c.0.as_str(), d.as_str()), ("L7OK", "Layer7 check passed"));
+    let (c, d) = columns_desc("  option tcp-check\n  tcp-check connect", fake(b"", b"", b"", false), SETTLE);
+    assert_eq!((c.0.as_str(), d.as_str()), ("L4OK", "Layer4 check passed"));
+    // still running its first check: the description of INI
+    let (c, d) = columns_desc("  option redis-check", fake(b"", b"", b"", false), Duration::from_millis(500));
+    assert_eq!((c.0.as_str(), d.as_str()), ("* INI", "Initializing"));
+}
+
+#[test]
+fn a_refused_connect_has_the_strerror_suffix() {
+    let closed = common::reserve_addr();
+    let (c, d) = columns_desc("  option tcp-check\n  tcp-check connect", closed, SETTLE);
+    assert_eq!((c.0.as_str(), d.as_str()), ("L4CON", "Layer4 connection problem"));
+    assert_eq!(c.2, "ECONNREFUSED returned by OS (Connection refused) at step 1 of tcp-check (connect)");
+    // the plain port check too
+    let (c, d) = columns_desc("", closed, SETTLE);
+    assert_eq!(
+        (c.0.as_str(), c.2.as_str(), d.as_str()),
+        ("L4CON", "ECONNREFUSED returned by OS (Connection refused)", "Layer4 connection problem")
+    );
 }
