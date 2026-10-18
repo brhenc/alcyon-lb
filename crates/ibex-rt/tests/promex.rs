@@ -78,6 +78,123 @@ fn check_counters_are_nan_gauges_without_a_check_and_counters_with_one() {
     }
 }
 
+/// Two servers without a check, set to the admin states `show stat` prints as MAINT and DRAIN,
+/// and a tcp-mode proxy beside an http one.
+fn states_engine() -> Engine {
+    let mut servers: Vec<Server> = ["up", "maint", "drain"].iter().map(|n| Server::new(*n, "127.0.0.1:8080".parse().unwrap())).collect();
+    for s in &mut servers {
+        s.check = false;
+    }
+    let config = Config {
+        frontends: vec![
+            FrontendSection { name: "fe_http".into(), bind: Some("127.0.0.1:0".parse().unwrap()), mode: Mode::Http, default_backend: Some("be".into()), ..Default::default() },
+            FrontendSection { name: "fe_tcp".into(), bind: Some("127.0.0.1:0".parse().unwrap()), mode: Mode::Tcp, default_backend: Some("be_tcp".into()), ..Default::default() },
+        ],
+        backends: vec![
+            BackendSection { name: "be".into(), mode: Mode::Http, servers, ..Default::default() },
+            BackendSection { name: "be_tcp".into(), mode: Mode::Tcp, servers: vec![Server::new("t1", "127.0.0.1:8081".parse().unwrap())], ..Default::default() },
+        ],
+        ..Default::default()
+    };
+    let engine = Engine::new(&config, 64).expect("Engine::new");
+    let be = engine.proxies.iter().find(|p| p.name == "be").expect("be");
+    be.server_statuses[0].store(ibex_rt::check::ServerStatus::Up as u8, std::sync::atomic::Ordering::Relaxed);
+    be.server_statuses[1].store(ibex_rt::check::ServerStatus::Maint as u8, std::sync::atomic::Ordering::Relaxed);
+    be.server_statuses[2].store(ibex_rt::check::ServerStatus::Drain as u8, std::sync::atomic::Ordering::Relaxed);
+    engine
+}
+
+/// The `state` label of the one sample set to 1 for `server` in `haproxy_server_status`.
+fn state_of(out: &str, server: &str) -> String {
+    let prefix = format!("haproxy_server_status{{proxy=\"be\",server=\"{server}\",state=\"");
+    let l = out.lines().find(|l| l.starts_with(&prefix) && l.ends_with(" 1")).unwrap_or_else(|| panic!("{server} in:\n{out}"));
+    l[prefix.len()..].split('"').next().unwrap().to_string()
+}
+
+/// A server in maintenance or draining is the sample of its own state (the label set is
+/// `DOWN UP MAINT DRAIN NOLB`, as HAProxy's), `no-maint` leaves the one in maintenance out,
+/// and the metrics that only an HTTP proxy has are not printed for a tcp one.
+#[test]
+fn server_states_no_maint_and_tcp_proxies() {
+    let engine = states_engine();
+    let out = scrape(&engine, "/metrics?scope=server");
+    assert_eq!(state_of(&out, "maint"), "MAINT");
+    assert_eq!(state_of(&out, "drain"), "DRAIN");
+    assert!(out.contains("haproxy_server_status{proxy=\"be\",server=\"maint\",state=\"NOLB\"} 0\n"), "{out}");
+    let out = scrape(&engine, "/metrics?scope=server&no-maint");
+    assert!(!out.contains("server=\"maint\""), "{out}");
+    assert!(out.contains("server=\"drain\""), "{out}");
+    // `hrsp_1xx` (http_responses_total) is an HTTP column: the tcp frontend has none.
+    let out = scrape(&engine, "/metrics?scope=frontend&metrics=haproxy_frontend_http_responses_total");
+    assert!(out.contains("proxy=\"fe_http\"") && !out.contains("proxy=\"fe_tcp\""), "{out}");
+}
+
+/// The query string is URL-decoded: `%XX` and `+`. A bad escape and a ninth `metrics=` are
+/// refused (the scrape ends at once: `finished`, no byte written).
+#[test]
+fn the_query_string_is_url_decoded_and_a_bad_one_ends_the_scrape() {
+    let engine = one_server_engine(false);
+    // (`uptime` moves between two scrapes and the description is another test's: compare names.)
+    let names = |b: &str| -> Vec<String> { b.lines().filter_map(|l| l.strip_prefix("# TYPE ")).map(|l| l.split(' ').next().unwrap().to_string()).filter(|n| n != "haproxy_process_description").collect() };
+    let escaped = scrape(&engine, "/metrics?scope=%67lobal&x+y=1&no%2Dmaint");
+    let plain = scrape(&engine, "/metrics?scope=global");
+    assert!(!names(&plain).is_empty() && names(&escaped) == names(&plain), "{escaped}");
+    assert!(promex::query_ok("/metrics?x+y=1"));
+    for bad in ["/metrics?scope=%zz", "/metrics?scope=%6", "/metrics?scope=global+", "/metrics?metrics=a&metrics=b&metrics=c&metrics=d&metrics=e&metrics=f&metrics=g&metrics=h&metrics=i"] {
+        assert!(!promex::query_ok(bad), "{bad}");
+        let mut cur = Cursor::start();
+        let mut dst = vec![0u8; 4096];
+        let n = promex::scrape_chunk(&mut cur, &engine.proxies, &engine.checks, 1, bad, &mut dst);
+        assert!(n == 0 && cur.finished, "{bad}: {n} bytes, finished {}", cur.finished);
+    }
+    assert!(promex::query_ok("/metrics?metrics=a&metrics=b&metrics=c&metrics=d&metrics=e&metrics=f&metrics=g&metrics=h"));
+}
+
+/// A buffer with less than `MIN_ROOM` free gets nothing and the cursor does not move; a unit
+/// larger than a whole buffer ends the scrape rather than loop (a 10000-byte `description`
+/// with `desc-labels` makes the `status` unit that big).
+#[test]
+fn a_small_buffer_gets_nothing_and_a_unit_too_big_ends_the_scrape() {
+    let engine = one_server_engine(false);
+    let mut cur = Cursor::start();
+    let mut small = vec![0u8; promex::MIN_ROOM - 1];
+    assert_eq!(promex::scrape_chunk(&mut cur, &engine.proxies, &engine.checks, 1, "/metrics", &mut small), 0);
+    assert!(!cur.finished);
+
+    let big = "d".repeat(10000);
+    let fe = FrontendSection { name: "fe_big".into(), bind: Some("127.0.0.1:0".parse().unwrap()), mode: Mode::Http, description: Some(big.clone()), ..Default::default() };
+    let engine = Engine::new(&Config { frontends: vec![fe], ..Default::default() }, 64).expect("Engine::new");
+    let out = scrape(&engine, "/metrics?scope=frontend&desc-labels");
+    // The units before the first oversized one are there; the scrape ended without the rest.
+    let plain = scrape(&engine, "/metrics?scope=frontend");
+    assert!(plain.contains("haproxy_frontend_status{proxy=\"fe_big\",state=\"UP\"} 1"), "{plain}");
+    let samples = |b: &str| b.lines().filter(|l| l.starts_with("haproxy_frontend_")).count();
+    assert!(samples(&out) > 0 && samples(&out) < samples(&plain), "{} of {} samples", samples(&out), samples(&plain));
+}
+
+/// `global description` is a family of its own and a `desc` label with `desc-labels`; a
+/// proxy's `description` is the `desc` label of its samples. The one test of this binary
+/// that sets the process-wide identity.
+#[test]
+fn descriptions_are_a_family_and_the_desc_label() {
+    // A `node` that is empty has no sample, the other labelled families do.
+    ibex_rt::stats::set_identity(Some(""), None);
+    let out = scrape(&Engine::new(&Config::default(), 64).expect("Engine::new"), "/metrics?scope=global");
+    assert!(!out.contains("haproxy_process_node"), "{out}");
+    ibex_rt::stats::set_identity(Some("n1"), Some("blog edge"));
+    let fe = FrontendSection { name: "fe_d".into(), bind: Some("127.0.0.1:0".parse().unwrap()), mode: Mode::Http, description: Some("front door".into()), ..Default::default() };
+    let engine = Engine::new(&Config { frontends: vec![fe], ..Default::default() }, 64).expect("Engine::new");
+    let out = scrape(&engine, "/metrics?scope=global");
+    assert!(out.contains("# TYPE haproxy_process_description gauge\nhaproxy_process_description{desc=\"blog edge\"} 1\n"), "{out}");
+    assert!(out.contains("haproxy_process_node{node=\"n1\"} 1\n"), "{out}");
+    let out = scrape(&engine, "/metrics?scope=global&desc-labels");
+    assert!(out.contains("haproxy_process_node{node=\"n1\",desc=\"blog edge\"} 1\n"), "{out}");
+    assert!(out.contains("haproxy_process_uptime_seconds{desc=\"blog edge\"} "), "{out}");
+    let out = scrape(&engine, "/metrics?scope=frontend&desc-labels&metrics=haproxy_frontend_current_sessions");
+    assert!(out.contains("haproxy_frontend_current_sessions{proxy=\"fe_d\",desc=\"front door\"} 0\n"), "{out}");
+    ibex_rt::stats::set_identity(None, None);
+}
+
 #[global_allocator]
 static ALLOC: ibex_alloc::CountingAllocator = ibex_alloc::CountingAllocator::new();
 

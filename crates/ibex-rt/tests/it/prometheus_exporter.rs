@@ -320,3 +320,42 @@ fn memory_and_connection_metrics_move_with_a_burst() {
         assert!((read(&after, fam) - v).abs() <= v.max(1.0) * 0.5 + 65536.0, "{fam} and {k} disagree: {} vs {v}", read(&after, fam));
     }
 }
+
+/// A scrape bigger than the response buffer, read slowly by the client: the producer fills the
+/// buffer, waits for the client to take some, compacts and goes on (`pump`), and the client
+/// gets the whole body, well formed, ending with the closing chunk.
+#[test]
+fn a_slow_reader_gets_the_whole_scrape_through_a_full_buffer() {
+    let fe = common::reserve_addr();
+    let mut cfg = format!("defaults\n  mode http\n  timeout connect 1s\n  timeout client 10s\n  timeout server 5s\nfrontend fe\n  bind {fe}\n  http-request use-service prometheus-exporter\nbackend be\n");
+    for i in 0..400 {
+        cfg.push_str(&format!("  server s{i} 127.0.0.1:{}\n", 20000 + i));
+    }
+    let config = ibex_config::parse_str(&cfg).expect("parse");
+    let mut engine = Engine::new(&config, 64).expect("Engine::new");
+    let client = thread::spawn(move || {
+        let mut s = TcpStream::connect(fe).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+        s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("send");
+        let mut out = Vec::new();
+        let mut buf = [0u8; 2048];
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !client.is_finished() && Instant::now() < deadline {
+        let _ = engine.run_once();
+        thread::sleep(Duration::from_millis(1));
+    }
+    let answer = client.join().expect("client");
+    assert!(answer.starts_with("HTTP/1.1 200 OK\r\n") && answer.ends_with("0\r\n\r\n"), "{}", &answer[..answer.len().min(200)]);
+    let body = body_of(&answer);
+    assert!(body.len() > 300_000, "{} bytes", body.len());
+    assert_eq!(body.lines().filter(|l| l.starts_with("haproxy_server_status{") && l.contains("server=\"s399\"")).count(), 5);
+}

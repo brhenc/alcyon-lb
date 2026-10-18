@@ -436,10 +436,9 @@ fn gen_row(c: &Ctx<'_>, kind: Kind, p_idx: usize, s_idx: usize, buf: &mut String
 }
 
 fn field<'r>(buf: &'r str, offs: &[u32], col: usize) -> &'r str {
-    match (offs.get(col), offs.get(col + 1)) {
-        (Some(&a), Some(&b)) if b > a => &buf[a as usize..(b as usize).saturating_sub(1).max(a as usize)],
-        _ => "",
-    }
+    // A field runs to the comma that ends it; the last one to the end of the row. A column
+    // the row does not have is empty.
+    offs.get(col..col + 2).map_or("", |w| &buf[w[0] as usize..(w[1] as usize).saturating_sub(1).max(w[0] as usize)])
 }
 
 /// The lines of metric `m` for one object into `out`; whether a sample was printed (the
@@ -587,21 +586,17 @@ pub fn scrape_chunk(cur: &mut Cursor, proxies: &[Proxy], checks: &[ServerCheckSt
         dst[plen + w..plen + w + 2].copy_from_slice(b"\r\n");
         return plen + w + 2;
     }
-    if cur.phase == PH_DONE {
-        dst[..5].copy_from_slice(b"0\r\n\r\n");
-        cur.finished = true;
-        return 5;
-    }
-    0
+    // The loop above ends at `PH_DONE` or with `w > 0` (or was not entered: already done).
+    dst[..5].copy_from_slice(b"0\r\n\r\n");
+    cur.finished = true;
+    5
 }
 
 /// Fills the session's response buffer with the next chunk of its scrape, if the buffer has
 /// room; called on every pass over the session while `sess.scrape` is set.
 pub fn pump(sess: &mut crate::proxy::TcpSession, proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) {
     let Some(mut cur) = sess.scrape() else { return };
-    if sess.rep.writable().is_empty() && sess.rep.len() < sess.rep.capacity() {
-        sess.rep.compact();
-    }
+    // `writable` compacts a buffer whose consumed head leaves the tail exhausted.
     let uri = sess.req_uri.as_deref().unwrap_or("");
     let n = scrape_chunk(&mut cur, proxies, checks, pid, uri, sess.rep.writable());
     sess.rep.commit(n);
@@ -653,14 +648,12 @@ const HTTP_ONLY: &[&str] = &[
 
 const TIME_AVG: &[&str] = &["qtime", "ctime", "rtime", "ttime", "qt_max", "ct_max", "rt_max", "tt_max", "check_duration"];
 
-/// `UP` / `DOWN` / `MAINT` / `DRAIN` / `NOLB` of a `show stat` status word.
+/// `UP` / `DOWN` / `MAINT` / `DRAIN` of (`NOLB` is a state Ibex does not have) a `show stat` status word.
 fn server_state(status: &str) -> &'static str {
     if status.starts_with("MAINT") {
         "MAINT"
     } else if status.starts_with("DRAIN") {
         "DRAIN"
-    } else if status.starts_with("NOLB") {
-        "NOLB"
     } else if status.starts_with("UP") {
         "UP"
     } else {
