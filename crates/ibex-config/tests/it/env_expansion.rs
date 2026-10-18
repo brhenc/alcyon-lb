@@ -158,3 +158,21 @@ fn the_recorded_changes_can_be_replayed_on_the_process() {
     apply_to_process(&[EnvOp::Unset(vec!["IBEX_T430_R1".into()])]);
     assert!(std::env::var_os("IBEX_T430_R1").is_none());
 }
+
+#[test]
+fn file_reset_replay_empty_single_quotes_open_default_and_vanishing_line() {
+    // env.rs file(): `${.FILE}` is the name given to `set_file`.
+    ibex_config::env::set_file("t430.cfg");
+    assert_eq!(notices("global\n.notice \"${.FILE}\"\n"), ["t430.cfg"]);
+    // env.rs Reset replay: keep everything but one variable.
+    std::env::set_var("IBEX_T430_RESET_ME", "1");
+    let keep: Vec<String> = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).filter(|k| k != "IBEX_T430_RESET_ME").collect();
+    ibex_config::env::apply_to_process(&[ibex_config::env::EnvOp::Reset(keep)]);
+    assert!(std::env::var_os("IBEX_T430_RESET_ME").is_none());
+    // lexer.rs: closing an empty '' makes an empty word (a directive may have one).
+    assert_eq!(notices("global\n.notice ''\n"), [""]);
+    // lexer.rs: a default value that is never closed is an unmatched brace.
+    assert!(refusal("global\n.notice \"${IBEX_T430_NO-abc\"\n").contains("unmatched brace"));
+    // preproc.rs: a line whose only word is an unset `[*]` reference has no words and is dropped.
+    assert!(notices("global\n\"${IBEX_T430_NO[*]}\"\n.notice ok\n") == ["ok"]);
+}
