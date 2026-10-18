@@ -2374,4 +2374,8 @@ mod tests {
         // A pipelined request after the message is left as it is.
         assert_eq!(trailers_of(b"X-A:  v\r\n\r\nGET / HTTP/1.1\r\n\r\n"), b"0\r\nx-a: v\r\n\r\nGET / HTTP/1.1\r\n\r\n");
     }
+    #[test]
+    fn a_trailer_line_ended_by_a_lone_lf_has_no_room_for_the_space() {
+        assert_eq!(trailers_of(b"X-A:v\n\r\n"), b"0\r\nx-a:v\n\r\n");
+    }
 }

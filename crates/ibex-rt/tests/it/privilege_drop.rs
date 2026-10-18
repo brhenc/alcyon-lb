@@ -279,3 +279,34 @@ fn an_unprivileged_chroot_auto_refuses_to_start() {
     }
     refuses_to_start(&[], " chroot auto", ".main()] Cannot chroot(/tmp/haproxy.");
 }
+
+/// A reload whose new process cannot write the pidfile (HAProxy's master writes it before the
+/// workers are replaced; Ibex's new worker does) ends that process with the alert, and the old
+/// one goes on serving what it was started with.
+#[test]
+fn a_reload_that_cannot_write_the_pidfile_leaves_the_old_worker_serving() {
+    let port = common::reserve_port();
+    let cfg = write_cfg("", port, "one");
+    let mut child = spawn(&["-W"], &cfg);
+    let first = served(port, "one");
+    let dir = cfg.parent().expect("dir").to_path_buf();
+    // The pidfile becomes a directory: it cannot be written, not even by this user.
+    let _ = std::fs::remove_file(dir.join("pid"));
+    std::fs::create_dir(dir.join("pid")).expect("pid dir");
+    let _ = write_cfg("", port, "two");
+    if let Some(pid) = i32::try_from(child.id()).ok().and_then(rustix::process::Pid::from_raw) {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::Usr2);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut err = String::new();
+    while Instant::now() < deadline && !err.contains("Cannot create pidfile") {
+        std::thread::sleep(Duration::from_millis(50));
+        err = std::fs::read_to_string(dir.join("stderr")).unwrap_or_default();
+    }
+    let still = get(port);
+    let _ = std::fs::remove_dir(dir.join("pid"));
+    let err = format!("{err}{}", reap(&mut child, &cfg));
+    assert!(first, "never served:\n{err}");
+    assert!(err.contains("Cannot create pidfile"), "{err}");
+    assert_eq!(still.as_deref(), Some("one"), "{err}");
+}

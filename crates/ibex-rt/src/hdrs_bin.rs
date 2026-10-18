@@ -122,4 +122,13 @@ mod tests {
         assert_eq!(walk_del(&[3, b'x', b'-', b'a'], &mut |_| {}), Walk::Invalid);
         assert_eq!(walk_del(&[9, b'x'], &mut |_| {}), Walk::Rewrite);
     }
+    #[test]
+    fn a_continued_varint_and_a_header_that_does_not_fit() {
+        // 0xF0 then 0x81 (continued, added whole as HAProxy does) then 0x00: 240 + (0x81 << 4).
+        let mut p = 0;
+        assert_eq!(varint(&[0xF0, 0x81, 0x00], &mut p), Some(240 + (0x81 << 4)));
+        assert_eq!(p, 3);
+        // A write that fails ends the walk as a rewrite failure.
+        assert_eq!(walk_set(&[3, b'x', b'-', b'a', 1, b'x', 0, 0], "", &mut |_, _| false), Walk::Rewrite);
+    }
 }

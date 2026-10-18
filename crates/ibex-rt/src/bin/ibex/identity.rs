@@ -58,6 +58,11 @@ fn warning(text: &str) {
 /// the processes being replaced have been told to resume (T370).
 #[must_use]
 pub fn chroot(prog: &str, id: &Identity) -> bool {
+    chroot_with(prog, id, empty_dir)
+}
+
+/// [`chroot`] with the maker of the `auto` directory given.
+fn chroot_with(prog: &str, id: &Identity, empty_dir: fn() -> Result<String, &'static str>) -> bool {
     let Some(path) = id.chroot.as_deref() else { return true };
     let (dir, entered) = match path {
         "auto" => {
@@ -114,5 +119,18 @@ pub fn set_identity(prog: &str, id: &Identity) {
         if setuid(Uid::from_raw(uid as u32)).is_err() {
             fail(&format!("[{prog}.main()] Cannot set uid {uid}."));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `chroot auto` whose directory cannot be made is `Cannot create(<template>)` and a
+    /// refusal to start (`do_chroot`); nothing is entered.
+    #[test]
+    fn chroot_auto_without_a_directory_is_refused() {
+        let id = Identity { chroot: Some("auto".into()), uid: None, gid: None };
+        assert!(!chroot_with("ibex", &id, || Err("/tmp/haproxy.XXXXXX")));
     }
 }

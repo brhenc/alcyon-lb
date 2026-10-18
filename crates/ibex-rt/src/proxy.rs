@@ -1774,14 +1774,12 @@ impl TcpSession {
                 });
             }
             (None, Some(PendingOut::Scrape(_))) => {
-                if let Some(b) = self.pending_resp.take() {
-                    let _ = SCRAPE_BOXES.try_with(|l| {
-                        let mut l = l.borrow_mut();
-                        if l.len() < l.capacity() {
-                            l.push(b);
-                        }
-                    });
-                }
+                let b = self.pending_resp.take();
+                let _ = SCRAPE_BOXES.try_with(|l| {
+                    let mut l = l.borrow_mut();
+                    let room = l.len() < l.capacity();
+                    b.filter(|_| room).into_iter().for_each(|b| l.push(b));
+                });
             }
             (None, _) => {}
         }
@@ -3856,5 +3854,20 @@ mod tests {
         assert_eq!(h3_log_line("GET /a HTTP/1.1", None), "GET /a HTTP/3.0");
         assert_eq!(h3_log_line("OPTIONS * HTTP/1.1", Some("h")), "OPTIONS * HTTP/3.0");
         assert_eq!(h3_log_line("garbage", Some("h")), "garbage");
+    }
+
+    /// The rest of a local reply is output while bytes of it are left; a scrape begun with no box
+    /// ready makes one, and one ended with no room on the free list drops it.
+    #[test]
+    fn pending_output_and_a_scrape_without_a_spare_box() {
+        use super::PendingOut;
+        assert!(PendingOut::Raw(vec![1, 2, 3], 1).has_output());
+        assert!(!PendingOut::Raw(vec![1, 2, 3], 3).has_output());
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut s = super::TcpSession::new(std::os::fd::OwnedFd::from(a), Default::default(), 0, ibex_sched::Tick::ETERNITY);
+        s.set_scrape(Some(crate::promex::Cursor::start()));
+        assert!(s.scrape().is_some() && s.has_pending_output());
+        s.set_scrape(None);
+        assert!(s.scrape().is_none());
     }
 }

@@ -536,6 +536,19 @@ fn handle_pid_file(pid_path: &Path) -> bool {
     true
 }
 
+/// A worker could not serve a CLI / stats socket it was handed: the start is told, with the reason.
+fn adoption_failed(e: &std::io::Error, ready_tx: &std::sync::mpsc::Sender<Result<(), ()>>) {
+    ibex_rt::stderr_line!("Failed to serve a CLI / stats socket: {e}");
+    let _ = ready_tx.send(Err(()));
+}
+
+/// Starts the watchdog with `start`; a failure is a warning, not the end of the start.
+fn start_watchdog(start: fn(std::time::Duration, bool) -> std::io::Result<()>, warn_after: std::time::Duration, warn_only: bool) {
+    if let Err(e) = start(warn_after, warn_only) {
+        ibex_rt::stderr_line!("[WARNING]  ({}) : Failed to start the watchdog thread ({e}), disabling lockup detection.", process::id());
+    }
+}
+
 /// What a worker, bound and waiting, is told: to serve, or to drop what it bound and
 /// return (a start abandoned after a bind, see `abort_start` in `main`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1104,11 +1117,7 @@ fn main() {
                 }
                 Ok(())
             })();
-            if let Err(e) = adopted {
-                ibex_rt::stderr_line!("Failed to serve a CLI / stats socket: {e}");
-                let _ = ready_tx.send(Err(()));
-                return;
-            }
+            let Ok(()) = adopted.map_err(|e| adoption_failed(&e, &ready_tx)) else { return };
             engine.set_lifecycle(lifecycle_clone);
             let _ = ready_tx.send(Ok(()));
             drop(ready_tx);
@@ -1148,9 +1157,7 @@ fn main() {
     // HAProxy arms its watchdog per thread at thread init (src/wdt.c:246) and does not fail
     // to start without it.
     let warn_after = config.global.as_ref().and_then(|g| g.warn_blocked_traffic_after).unwrap_or(ibex_rt::watchdog::DEFAULT_WARN_AFTER);
-    if let Err(e) = ibex_rt::watchdog::start(warn_after, config.global.as_ref().is_some_and(|g| g.ibex_watchdog_warn_only)) {
-        ibex_rt::stderr_line!("[WARNING]  ({}) : Failed to start the watchdog thread ({e}), disabling lockup detection.", process::id());
-    }
+    start_watchdog(ibex_rt::watchdog::start, warn_after, config.global.as_ref().is_some_and(|g| g.ibex_watchdog_warn_only));
     let unused = ibex_rt::handover::drop_unused_inherited();
     if unused > 0 && !opts.quiet {
         ibex_rt::stderr_line!("[NOTICE] closed {unused} inherited socket(s) that no bind in this configuration uses");
@@ -1405,4 +1412,21 @@ fn supervise(
         let _ = t.join();
     }
     process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_socket_that_cannot_be_served_fails_the_start() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        adoption_failed(&std::io::Error::from_raw_os_error(9), &tx);
+        assert_eq!(rx.recv(), Ok(Err(())));
+    }
+
+    #[test]
+    fn a_watchdog_that_cannot_start_is_only_a_warning() {
+        start_watchdog(|_, _| Err(std::io::Error::from_raw_os_error(11)), std::time::Duration::from_millis(10), false);
+    }
 }

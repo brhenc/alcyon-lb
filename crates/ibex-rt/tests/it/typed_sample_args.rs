@@ -359,6 +359,8 @@ const FORMS: &[Row] = &[
     ("set-header", "query(with_qm)", 0, ""),
     ("set-header", "query(x)", 1, "invalid args in fetch method 'query' : supported options are: 'with_qm'"),
     ("set-header", "query()", 0, ""),
+    ("set-header", "ssl_f_s_dn(CN,1,xx)", 1, "invalid args in fetch method 'ssl_f_s_dn' : only rfc2253 or a blank value are currently supported as the format argument."),
+    ("set-header", "ssl_f_s_dn(CN,1,rfc2253)", 0, ""),
     ("set-header", "str(a),add_item(;,,)", 1, "invalid args in converter 'add_item' : one of the optional arguments has to be nonempty"),
     ("set-header", "str(a),be2hex(:,1,2)", 1, "invalid args in converter 'be2hex' : Unsupported truncate value (2)"),
     ("set-header", "str(a),when(acl)", 1, "invalid args in converter 'when' : 'acl' selector requires an extra argument with the ACL name"),

@@ -132,3 +132,33 @@ fn sess_term_state_reads_the_state_of_the_stream_at_that_moment() {
         assert!(tar.starts_with("HTTP/1.1 500") && header(&tar, "x-as") == Some("PT"), "{tar:?}");
     });
 }
+
+/// `ibex -c` on a frontend carrying `rule`: (exit code, stdout + stderr).
+fn check(rule: &str) -> (Option<i32>, String) {
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind 127.0.0.1:1\n  {rule}\n  default_backend b\nbackend b\n  server s 127.0.0.1:1\n"
+    );
+    let mut file = NamedTempFile::new().expect("tmp");
+    file.write_all(cfg.as_bytes()).expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(file.path()).output().expect("run ibex -c");
+    (out.status.code(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+}
+
+/// Measured with `haproxy -c` (3.5-dev8-885761-29, 2026-10-18): both directions refuse an
+/// expression that does not parse by its first character, and accept a fetch with a converter.
+#[test]
+fn an_expression_is_checked_in_both_directions() {
+    for dir in ["request", "response"] {
+        let (code, out) = check(&format!("http-{dir} pause nosuch"));
+        assert_eq!(code, Some(1), "{dir}: {out}");
+        assert!(
+            out.contains(&format!("error detected in frontend 'fe' while parsing 'http-{dir} pause' rule : unexpected character 'n' in rule 'pause'.")),
+            "{dir}: {out}"
+        );
+    }
+    for rule in ["http-response pause var(txn.a)", "http-response pause res.hdr(x),mul(1)"] {
+        let (code, out) = check(rule);
+        assert_eq!(code, Some(0), "{rule}: {out}");
+    }
+}

@@ -10177,10 +10177,8 @@ impl EngineDispatcher<'_> {
         CURRENT_RES_STATUS.set(status);
         CURRENT_SRV_STATUS.set(status);
         // `t_data - t_connect` (`smp_fetch_reX_timers`).
-        CURRENT_RES_TR.set(match (entry.sess.log.data, entry.sess.log.connect) {
-            (Some(d), Some(c)) => i64::try_from(d.saturating_duration_since(c).as_millis()).unwrap_or(i64::MAX),
-            _ => -1,
-        });
+        let tr = entry.sess.log.data.zip(entry.sess.log.connect).map(|(d, c)| d.saturating_duration_since(c).as_millis());
+        CURRENT_RES_TR.set(tr.map_or(-1, |ms| i64::try_from(ms).unwrap_or(i64::MAX)));
         CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
         // `HAProxy` caps `tune.maxrewrite` at half the buffer (`src/haproxy.c`).
         let reserve = entry.sess.maxrewrite.min(entry.sess.bufsize / 2);
@@ -13428,7 +13426,12 @@ fn sample_to_bin(smp: Sample) -> Vec<u8> {
     match smp {
         Sample::Bin(b) => b,
         Sample::Str(s) => s.into_bytes(),
-        other => sample_to_string(&other).into_bytes(),
+        // `c_int2bin` and `c_bool2bin`: eight bytes, big-endian; `c_addr2bin`: the address.
+        Sample::Sint(n) => n.to_be_bytes().to_vec(),
+        Sample::Bool(b) => i64::from(b).to_be_bytes().to_vec(),
+        Sample::Ipv4(ip) => ip.octets().to_vec(),
+        Sample::Ipv6(ip) => ip.octets().to_vec(),
+        Sample::Meth(m) => m.as_str().as_bytes().to_vec(),
     }
 }
 
@@ -15021,5 +15024,27 @@ mod inherited_socket_tests {
         let got = listeners_for(0, addr, 3, &ibex_config::ast::SocketTuning::default(), 128).expect("listeners");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].addr(), addr);
+    }
+}
+
+#[cfg(test)]
+mod sample_to_bin_tests {
+    use super::*;
+
+    /// `sample_casts[*][SMP_T_BIN]` (src/sample.c): `c_int2bin` and `c_bool2bin` make eight bytes
+    /// big-endian, `c_addr2bin` the address, `c_meth2str` the method; a string or a binary keeps
+    /// its bytes. The integer case against `haproxy`: `set-headers-bin int(5)` changes nothing
+    /// (its first byte is the 0 that ends the list).
+    #[test]
+    fn a_sample_is_cast_to_binary_as_haproxy_casts_it() {
+        assert_eq!(sample_to_bin(Sample::Sint(5)), [0, 0, 0, 0, 0, 0, 0, 5]);
+        assert_eq!(sample_to_bin(Sample::Sint(-1)), [0xff; 8]);
+        assert_eq!(sample_to_bin(Sample::Bool(true)), [0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(sample_to_bin(Sample::Bool(false)), [0; 8]);
+        assert_eq!(sample_to_bin(Sample::Ipv4(std::net::Ipv4Addr::new(1, 2, 3, 4))), [1, 2, 3, 4]);
+        assert_eq!(sample_to_bin(Sample::Ipv6(std::net::Ipv6Addr::LOCALHOST)).len(), 16);
+        assert_eq!(sample_to_bin(Sample::Meth(ibex_proto::htx::HttpMethod::Get)), b"GET");
+        assert_eq!(sample_to_bin(Sample::Str("ab".into())), b"ab");
+        assert_eq!(sample_to_bin(Sample::Bin(vec![0, 1])), [0, 1]);
     }
 }

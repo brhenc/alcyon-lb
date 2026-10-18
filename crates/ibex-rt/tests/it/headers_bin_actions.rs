@@ -91,6 +91,12 @@ fn hex(entries: &[&str], terminated: bool) -> String {
 
 const DEFAULTS: &str = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n";
 
+fn rules_extra(rules: &mut String) {
+    for (path, expr) in [("strlist", "str(abc)"), ("intlist", "int(5)"), ("nofetch", "req.hdr(x-absent)")] {
+        rules.push_str(&format!("  http-request set-headers-bin {expr} if {{ path_end /{path} }}\n"));
+    }
+}
+
 /// The rule lines the request side is tested with: each is selected by the path.
 fn req_cfg(addr: SocketAddr) -> String {
     let h = |e: &[&str], t| hex(e, t);
@@ -121,6 +127,9 @@ fn req_cfg(addr: SocketAddr) -> String {
     rule("deltrunc", "del-headers-bin", "09782d61".into(), "");
     rule("delnoterm", "del-headers-bin", "03782d61".into(), "");
     rule("delendnoterm", "del-headers-bin", "0161".into(), " -m end");
+    // Lists that are not `bin(...)`: a string (cut inside its first entry), an integer, and a
+    // fetch that gives nothing (the rule changes nothing). Measured on the same oracle.
+    rules_extra(&mut rules);
     format!(
         "global\n  stats socket {{sock}} level admin\n{DEFAULTS}frontend fe\n  bind {addr}\n  http-request strict-mode off if {{ path_beg /soft }}\n{rules}  http-request return status 200 content-type text/plain lf-string \"%[req.hdrs]\"\n"
     )
@@ -172,6 +181,10 @@ fn request_side_headers_bin() {
     ok(addr, "/delzero", &ALL);
     ok(addr, "/zero2", &ALL);
     ok(addr, "/zero3", &ALL);
+    // A list that is a string, an integer or not there at all.
+    err500(addr, "/strlist");
+    ok(addr, "/intlist", &ALL);
+    ok(addr, "/nofetch", &ALL);
 }
 
 #[test]
@@ -196,6 +209,7 @@ fn request_side_headers_bin_soft_rewrite() {
     ok(addr, "/soft/trunc", &ALL);
     ok(addr, "/soft/deltrunc", &ALL);
     ok(addr, "/soft/zero", &ALL);
+    ok(addr, "/soft/strlist", &ALL);
     ok(addr, "/soft/goodthentrunc", &["x-b: 2", "expect: z", "x-a: x"]);
     err500(addr, "/soft/noterm");
     err500(addr, "/soft/delnoterm");
@@ -290,4 +304,34 @@ fn headers_bin_config_errors() {
         let (ok, err) = check(rule);
         assert!(ok, "{rule}: {err}");
     }
+}
+
+/// `n` copies of `add-headers-bin` of a 900-byte header on the response, with `tune.bufsize
+/// 4096`. Measured on the same oracle: two fit (200, two `x-big`), six do not (500).
+fn big_cfg(addr: SocketAddr, be: SocketAddr, n: usize) -> String {
+    let mut list = vec![5u8];
+    list.extend_from_slice(b"x-big");
+    // `encode_varint` of 900: (900 | 240) & 255, then (900 - 240) >> 4 = 41.
+    list.extend_from_slice(&[(900u32 | 240) as u8, 41]);
+    list.extend(std::iter::repeat_n(b'A', 900));
+    list.extend_from_slice(&[0, 0]);
+    let bin: String = list.iter().map(|b| format!("{b:02x}")).collect();
+    let rules = format!("  http-response add-headers-bin bin({bin}) if {{ var(txn.t) -m str many }}\n").repeat(n);
+    format!(
+        "global\n  stats socket {{sock}} level admin\n  tune.bufsize 4096\n{DEFAULTS}frontend fe\n  bind {addr}\n  http-request set-var(txn.t) req.hdr(x-t)\n  default_backend be\nbackend be\n  server s1 {be}\n{rules}"
+    )
+}
+
+#[test]
+fn response_headers_bin_that_do_not_fit_the_buffer_are_a_500() {
+    let be = backend();
+    let ok_addr = common::reserve_addr();
+    let _fits = start("hdrsbin_fit", &big_cfg(ok_addr, be, 2), &[ok_addr]);
+    let r = get(ok_addr, b"GET / HTTP/1.1\r\nHost: a\r\nx-t: many\r\nConnection: close\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 200"), "{r:.60}");
+    assert_eq!(r.matches("x-big: ").count(), 2);
+    let full_addr = common::reserve_addr();
+    let _full = start("hdrsbin_full", &big_cfg(full_addr, be, 6), &[full_addr]);
+    let r = get(full_addr, b"GET / HTTP/1.1\r\nHost: a\r\nx-t: many\r\nConnection: close\r\n\r\n");
+    assert!(r.starts_with("HTTP/1.1 500"), "{r:.60}");
 }
