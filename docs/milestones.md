@@ -44,7 +44,7 @@ produced it.
 ### Scope (out, refused clearly by the parser)
 
 Lua, SPOE, peers sync,
-compression (unless T162 shows it is nearly done), cache, FastCGI, DNS-resolved servers
+compression (moved to M5, decided 2026-10-18), cache, FastCGI, DNS-resolved servers
 beyond what already works, OpenSSL-specific engines/keywords. Each refusal names the
 keyword and says it is unsupported (AGENTS.md §5); listed in `docs/differences.md`.
 
@@ -262,6 +262,14 @@ Turn M1's remaining refusals into support, in order of how often real configs us
 (the smoke corpus of 529 configs shows which): compression, cache, SPOE, FastCGI. Lua last
 or never: an embedded Lua means a C library or a pure-Rust Lua engine, and that is a
 memory-safety decision for the user to make.
+
+Compression (user, 2026-10-18: not in M1; T428): `compression algo/type/offload/direction` and
+`filter compression`. Start from `crates/slz` (an allocation-free port of libslz, compress
+only, already in the tree); decompression (`compression direction request`, the
+`decompression/*` reg-tests) needs a pure-Rust inflater such as `miniz_oxide`. The oracle is
+built `-SLZ` and without zlib, so `compression/basic` and all five `decompression/*` tests
+are skipped on it: build a second HAProxy with `USE_SLZ=1` (or `USE_ZLIB=1`) to measure
+against before starting. Compressed responses need their own pool chunks (tradeoff.md §6.13).
 
 ### M6 — scale
 

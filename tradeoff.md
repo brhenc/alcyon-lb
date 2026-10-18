@@ -513,3 +513,14 @@ choosing; nothing is decided yet.
 | **Differs 3** | The `proc`/`global` total is the `proc.` variables plus the variables of the stream that is running, not those of every session. HAProxy's counter is process-wide. S6 (store) and S7 (sessions) are where the other sessions' counters can be kept. |
 | **Differs 4** | `sess-max-size` counts one stream's variables; with several H2 streams on a connection HAProxy shares one `sess` counter (S7). |
 | **Status** | `check-max-size` is enforced (`vars::set_in`, check.rs `run_var_rules`) but has no end-to-end test. |
+
+### 6.18 No finite-field DHE (`DHE-*` ciphers, `ssl-dh-param-file`, DH in `crt` files) — **decided 2026-10-18: not supported; ECDHE only**
+| | |
+|---|---|
+| **What HAProxy does** | With OpenSSL, a `bind ... ciphers "DHE-RSA-AES256-GCM-SHA384" ssl-max-ver TLSv1.2` offers TLS 1.2 finite-field Diffie-Hellman, with parameters from `ssl-dh-param-file`, from a DH block appended to the `crt` PEM (also via `set ssl cert`), or generated to the size of `tune.ssl.default-dh-param` (capped by the key size). `reg-tests/ssl/ssl_dh.vtc` checks it with `openssl s_client` ("Server Temp Key: DH, 2048 bits"). |
+| **Why Ibex has none** | rustls 0.23 (0.23.45 in the tree) parses DHE in its TLS 1.2 handshake and has a `SupportedKxGroup::ffdhe_group` hook, but neither of its crypto providers ships a DHE cipher suite or an FFDHE key-exchange group. Ibex uses the `ring` provider (crates/ibex-tls/Cargo.toml), whose groups are X25519, P-256 and P-384. Offering DHE would mean Ibex writing its own provider: TLS 1.2 DHE suite definitions plus a constant-time modular exponentiation over 2048-4096-bit numbers. That is new crypto code of our own, which is exactly what the memory-safety rule for dependencies (pure-Rust, no home-made crypto) and the sealed TLS trait (§3.3) are there to avoid. |
+| **Why that is acceptable** | rustls leaves FFDHE out by design. ECDHE gives the same forward secrecy, faster, with standard curves. DHE carries a history of weak or custom primes (Logjam, 2015), servers that reuse the key, and the Raccoon timing attack on TLS 1.2 DHE (2020). Browsers no longer offer DHE suites (Chrome since 2016, Firefox since 2020), so a client that can only do DHE is a very old or embedded one. |
+| **What Ibex does** | TLS 1.2 and 1.3 with ECDHE (X25519, P-256, P-384). `tune.ssl.default-dh-param` is accepted and has no effect (parser/mod.rs inert list): there is no DHE for it to size, so a config written for HAProxy keeps loading. A DHE cipher name and `ssl-dh-param-file` must be refused at load with a message naming this section (T399), and a DH block in a `crt` PEM ignored with a warning (T399). |
+| **Board** | `ssl/ssl_dh.vtc` cannot pass; T399 marks it OUT_OF_SCOPE in the runner. |
+| **Status** | **decided** (user, 2026-10-18). |
+| **Revisit if** | rustls or a provider we already depend on ships FFDHE, or a user brings a client that cannot do ECDHE. |
