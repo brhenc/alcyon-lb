@@ -32,6 +32,10 @@ pub struct Lifecycle {
     paused: Arc<AtomicBool>,
     ttou: Arc<AtomicBool>,
     ttin: Arc<AtomicBool>,
+    /// A `SIGTTIN` not yet acted on: an edge, for a resume that failed last time (the
+    /// name was still held) and is tried again on the next signal, as `HAProxy`'s
+    /// `protocol_resume_all` is (T370).
+    resumed: Arc<AtomicBool>,
 }
 
 impl Lifecycle {
@@ -69,8 +73,16 @@ impl Lifecycle {
         }
         if self.ttin.swap(false, Ordering::Relaxed) {
             self.paused.store(false, Ordering::Relaxed);
+            self.resumed.store(true, Ordering::Relaxed);
         }
         self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Whether a `SIGTTIN` arrived since the last call (after `pause_requested`, which
+    /// records it).
+    #[must_use]
+    pub fn take_resume(&self) -> bool {
+        self.resumed.swap(false, Ordering::Relaxed)
     }
 
     /// Makes `SIGTERM` a clean, immediate stop that exits 0, as it is for `HAProxy`'s master

@@ -54,12 +54,20 @@ fn warning(text: &str) {
     ibex_rt::stderr_line!("[WARNING]  ({}) : {text}", process::id());
 }
 
-/// `do_chroot`. Exits 1 when it fails.
-pub fn chroot(prog: &str, id: &Identity) {
-    let Some(path) = id.chroot.as_deref() else { return };
+/// `do_chroot`. False, after the alert, when it fails: the caller ends the process once
+/// the processes being replaced have been told to resume (T370).
+#[must_use]
+pub fn chroot(prog: &str, id: &Identity) -> bool {
+    let Some(path) = id.chroot.as_deref() else { return true };
     let (dir, entered) = match path {
         "auto" => {
-            let tmp = empty_dir().unwrap_or_else(|t| fail(&format!("[{prog}.main()] Cannot create({t}) for chroot auto.")));
+            let tmp = match empty_dir() {
+                Ok(tmp) => tmp,
+                Err(t) => {
+                    alert(&format!("[{prog}.main()] Cannot create({t}) for chroot auto."));
+                    return false;
+                }
+            };
             // The directory is gone once we are in it: nothing can be put in it.
             let inside = std::env::set_current_dir(&tmp).is_ok();
             let _ = std::fs::remove_dir(&tmp);
@@ -69,8 +77,10 @@ pub fn chroot(prog: &str, id: &Identity) {
         _ => (path.to_string(), rustix::process::chroot(path).is_ok()),
     };
     if !entered || std::env::set_current_dir("/").is_err() {
-        fail(&format!("[{prog}.main()] Cannot chroot({dir})."));
+        alert(&format!("[{prog}.main()] Cannot chroot({dir})."));
+        return false;
     }
+    true
 }
 
 fn fail(text: &str) -> ! {

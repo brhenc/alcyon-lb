@@ -2089,10 +2089,10 @@ pub struct Engine {
     /// them all).
     extra_cli: Vec<ExtraCli>,
     /// The abstract stats sockets given up on `SIGTTOU`: which one (`None` the first) and
-    /// the name as bound.
+    /// the name as bound. One a `SIGTTIN` could not bind back (still held) stays here for
+    /// the next `SIGTTIN`.
     paused_abns: Vec<(Option<usize>, Vec<u8>)>,
     abns_paused: bool,
-    abns_retry_until: Option<Instant>,
     /// The listeners were stopped because `global maxconn` was reached (`globalconn`).
     global_paused: bool,
     /// `accept` failed for want of a resource (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`):
@@ -2203,6 +2203,7 @@ impl Engine {
                 crate::cli_listener::CliListener::Tcp(_) => None,
             }
         };
+        let mut released = false;
         let first = std::iter::once((None, &mut self.cli_listener));
         let extra = self.extra_cli.iter_mut().enumerate().map(|(i, x)| (Some(i), &mut x.listener));
         for (which, slot) in first.chain(extra) {
@@ -2215,23 +2216,43 @@ impl Engine {
             self.paused_abns.push((which, name));
             self.fdtab.remove(l.as_raw_fd());
             let _ = self.poller.delete(l.as_fd());
+            released = true;
+        }
+        if released {
+            crate::stderr_line!("[WARNING]  ({}) : Paused frontend GLOBAL.", std::process::id());
         }
     }
 
-    /// `SIGTTIN` (T354): the successor did not start; binds the names given up again.
+    /// `SIGTTIN` (T354): the successor did not start; binds the names given up again, each
+    /// tried once, as `HAProxy`'s `protocol_resume_all` does (src/protocol.c:453). An Ibex
+    /// successor closes its sockets before it signals (T370), so a name it held is free
+    /// here; one something else holds is reported with `HAProxy`'s lines (measured on
+    /// 3.5-dev8-885761-29) and kept for the next `SIGTTIN`:
+    ///
+    /// ```text
+    /// [ALERT]    (pid) : Resuming listener: protocol abns_stream: cannot bind UNIX socket (already in use) [abns@NAME].
+    /// [WARNING]  (pid) : Some proxies refused to resume, probably due to a conflict on a listening port. You may want to try again after the conflicting application is stopped, otherwise a restart might be needed to resume safe operations.
+    /// ```
     fn resume_abns_cli(&mut self) {
         use std::os::linux::net::SocketAddrExt;
+        let mut refused = false;
         for (which, bytes) in std::mem::take(&mut self.paused_abns) {
-            // The successor sends SIGTTIN just before it exits, so its socket may still hold
-            // the name: keep the entry and try again (`retry_abns_cli`).
-            let held = |bytes: Vec<u8>| (which, bytes);
             let bound = std::os::unix::net::SocketAddr::from_abstract_name(&bytes)
                 .and_then(|a| std::os::unix::net::UnixListener::bind_addr(&a))
                 .and_then(|l| l.set_nonblocking(true).map(|()| l));
             let l = match bound {
                 Ok(l) => l,
-                Err(_) => {
-                    self.paused_abns.push(held(bytes));
+                Err(err) => {
+                    // `abns@` is bound zero-padded to the whole `sun_path`; `abnsz@` is not.
+                    let proto = if bytes.len() == 107 { "abns_stream" } else { "abnsz_stream" };
+                    let shown = String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string();
+                    let why = if err.kind() == std::io::ErrorKind::AddrInUse { "already in use".to_string() } else { err.to_string() };
+                    crate::stderr_line!(
+                        "[ALERT]    ({}) : Resuming listener: protocol {proto}: cannot bind UNIX socket ({why}) [abns@{shown}].",
+                        std::process::id()
+                    );
+                    refused = true;
+                    self.paused_abns.push((which, bytes));
                     continue;
                 }
             };
@@ -2250,23 +2271,14 @@ impl Engine {
                 }
             });
         }
-    }
-
-    /// Names still to take back after `SIGTTIN`, tried on each turn of the loop for at most
-    /// 30 seconds.
-    fn retry_abns_cli(&mut self) {
-        if self.paused_abns.is_empty() {
-            self.abns_retry_until = None;
-            return;
+        if refused {
+            crate::stderr_line!(
+                "[WARNING]  ({}) : Some proxies refused to resume, probably due to a conflict on a listening port. You may want to try again after the conflicting application is stopped, otherwise a restart might be needed to resume safe operations.",
+                std::process::id()
+            );
+        } else {
+            crate::stderr_line!("[WARNING]  ({}) : Resumed frontend GLOBAL.", std::process::id());
         }
-        let now = Instant::now();
-        let until = *self.abns_retry_until.get_or_insert(now + Duration::from_secs(30));
-        if now >= until {
-            self.paused_abns.clear();
-            self.abns_retry_until = None;
-            return;
-        }
-        self.resume_abns_cli();
     }
 
     /// The lines of `show cli sockets`: every CLI socket, in configuration order, with the
@@ -4384,7 +4396,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             extra_cli: Vec::new(),
             paused_abns: Vec::new(),
             abns_paused: false,
-            abns_retry_until: None,
             global_paused: false,
             accept_limited: None,
             fe_paused: false,
@@ -5626,16 +5637,15 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 self.begin_soft_stop();
             }
             let want = self.lifecycle.as_ref().map_or(self.abns_paused, |lc| lc.pause_requested());
-            if want != self.abns_paused && !self.stopping {
+            // A SIGTTIN after a resume that was refused (the name still held) tries again.
+            let again = !want && !self.paused_abns.is_empty() && self.lifecycle.as_ref().is_some_and(crate::lifecycle::Lifecycle::take_resume);
+            if (want != self.abns_paused || again) && !self.stopping {
                 self.abns_paused = want;
                 if want {
                     self.pause_abns_cli();
                 } else {
                     self.resume_abns_cli();
                 }
-            }
-            if !self.abns_paused && !self.stopping && !self.paused_abns.is_empty() {
-                self.retry_abns_cli();
             }
             if self.stopping {
                 if quiet {

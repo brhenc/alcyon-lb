@@ -526,12 +526,23 @@ fn report_diagnostics(opts: &CliOptions) {
     }
 }
 
-fn handle_pid_file(pid_path: &Path) {
+/// Writes the pidfile; false (after the alert) when it cannot be.
+fn handle_pid_file(pid_path: &Path) -> bool {
     let pid = std::process::id();
     if let Err(err) = std::fs::write(pid_path, format!("{pid}\n")) {
         ibex_rt::stderr_line!("Cannot create pidfile '{}': {err}", pid_path.display());
-        process::exit(1);
+        return false;
     }
+    true
+}
+
+/// What a worker, bound and waiting, is told: to serve, or to drop what it bound and
+/// return (a start abandoned after a bind, see `abort_start` in `main`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    Wait,
+    Go,
+    Abort,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -726,7 +737,9 @@ fn main() {
     //    on naming the process that is still serving.
     if let Some(ref pidfile) = opts.pid_file {
         if !reload_child && master_dir.is_none() {
-            handle_pid_file(pidfile);
+            if !handle_pid_file(pidfile) {
+                process::exit(1);
+            }
         }
     }
 
@@ -918,19 +931,39 @@ fn main() {
     //      (HAProxy: `protocol_bind_all`). Worker 0 serves them.
     // A TCP or abstract stats socket (T246) is bound here the same way; `mode` applies to
     // socket files only, as on the oracle, which accepts it on the others and ignores it.
-    let bind_cli = |addr: &ibex_config::StatsAddr, mode: Option<u32>| -> (ibex_rt::cli_listener::CliListener, String, Option<PathBuf>) {
+    // The processes being replaced (`-sf`, `-st`): told to let go of their abstract stats
+    // sockets when a bind finds one in use, and told to take them back (`abort_start`) if
+    // this process then fails to start.
+    let replaced: Vec<u32> = opts.sf_pids.iter().chain(&opts.st_pids).copied().collect();
+    // A start that fails after a bind, as HAProxy's `main` ends one (src/haproxy.c:2113-2117,
+    // 3779-3780, 3822-3823), but with every socket this process bound closed *before* the
+    // old processes are told to resume (T370): an abstract name is free only once its
+    // socket is closed, and HAProxy's order (SIGTTIN, then `protocol_unbind_all`) lets the
+    // old process's one bind race the exit. The workers are told to abort and joined, so
+    // their listeners are gone, then the signal goes out.
+    let abort_start = |go: &std::sync::Arc<(std::sync::Mutex<Start>, std::sync::Condvar)>, threads: Vec<std::thread::JoinHandle<()>>| -> ! {
+        {
+            let (lock, cvar) = &**go;
+            *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Start::Abort;
+            cvar.notify_all();
+        }
+        for t in threads {
+            let _ = t.join();
+        }
+        send_signals_to_pids(&replaced, Signal::Ttin, true);
+        process::exit(1);
+    };
+    let bind_cli = |addr: &ibex_config::StatsAddr, mode: Option<u32>| -> Result<(ibex_rt::cli_listener::CliListener, String, Option<PathBuf>), ()> {
         use ibex_config::StatsAddr;
         use ibex_rt::cli_listener::CliListener;
         let name = addr.name();
-        let old_pids: Vec<u32> = opts.sf_pids.iter().chain(&opts.st_pids).copied().collect();
-        let fail = |proto: &str, what: &str, err: std::io::Error, at: &str| -> ! {
-            // A process told to let go of its abstract name takes it back.
-            send_signals_to_pids(&old_pids, Signal::Ttin, true);
+        let old_pids = &replaced;
+        let fail = |proto: &str, what: &str, err: std::io::Error, at: &str| -> Result<(CliListener, String, Option<PathBuf>), ()> {
             let why = err.to_string();
             let why = why.split(" (os error").next().unwrap_or(&why).to_string();
             ibex_rt::stderr_line!("[ALERT] Binding for frontend GLOBAL: protocol {proto}: {what} ({why}) [{at}].");
             ibex_rt::stderr_line!("[ALERT] [haproxy.main()] Some protocols failed to start their listeners! Exiting.");
-            process::exit(1);
+            Err(())
         };
         match addr {
             StatsAddr::Unix(p) => {
@@ -941,7 +974,7 @@ fn main() {
                             use std::os::unix::fs::PermissionsExt;
                             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
                         }
-                        (l.into(), name, Some(path))
+                        Ok((l.into(), name, Some(path)))
                     }
                     Err(err) => fail("unix_stream", "cannot bind UNIX socket", err, p),
                 }
@@ -954,45 +987,55 @@ fn main() {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
                 loop {
                     match CliListener::bind_abstract(n, *padded) {
-                        Ok(l) => break (l, name, None),
+                        Ok(l) => break Ok((l, name, None)),
                         Err(err)
                             if err.kind() == std::io::ErrorKind::AddrInUse
                                 && !old_pids.is_empty()
                                 && std::time::Instant::now() < deadline =>
                         {
                             if !paused {
-                                send_signals_to_pids(&old_pids, Signal::Ttou, true);
+                                send_signals_to_pids(old_pids, Signal::Ttou, true);
                                 paused = true;
                             }
                             std::thread::sleep(std::time::Duration::from_millis(20));
                         }
-                        Err(err) => fail("abns", "cannot bind UNIX socket", err, &name),
+                        Err(err) => break fail("abns", "cannot bind UNIX socket", err, &name),
                     }
                 }
             }
             StatsAddr::Tcp(a) => match CliListener::bind_tcp(*a) {
-                Ok(l) => (l, name, None),
+                Ok(l) => Ok((l, name, None)),
                 Err(err) => fail(if a.is_ipv4() { "tcpv4" } else { "tcpv6" }, "cannot bind socket", err, &a.to_string()),
             },
         }
     };
-    let mut cli_pre = cli_socket.as_ref().map(|a| bind_cli(a, stats_socket_mode));
-    let mut extra_pre: Option<Vec<_>> = Some(
-        extra_sockets
-            .iter()
-            .map(|x| {
-                let level = x.level.as_deref().and_then(ibex_rt::applet::CliLevel::parse).unwrap_or(ibex_rt::applet::CliLevel::Operator);
-                let (l, name, file) = bind_cli(&x.addr, x.mode);
-                (l, name, file, level)
-            })
-            .collect(),
-    );
-
-    // Each worker reports once it is listening. `-sf` and READY=1 wait for all of them.
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    // Each worker reports once it is listening, or that it could not start. `-sf` and
+    // READY=1 wait for all of them.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), ()>>();
     // And then waits for `go` before it accepts anything: the process changes root, group
     // and user in between (see identity.rs), and nothing is served before it has.
-    let go = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let go = std::sync::Arc::new((std::sync::Mutex::new(Start::Wait), std::sync::Condvar::new()));
+    let mut cli_pre = match cli_socket.as_ref().map(|a| bind_cli(a, stats_socket_mode)).transpose() {
+        Ok(pre) => pre,
+        Err(()) => abort_start(&go, Vec::new()),
+    };
+    let extra_bound: Result<Vec<_>, ()> = extra_sockets
+        .iter()
+        .map(|x| {
+            let level = x.level.as_deref().and_then(ibex_rt::applet::CliLevel::parse).unwrap_or(ibex_rt::applet::CliLevel::Operator);
+            let (l, name, file) = bind_cli(&x.addr, x.mode)?;
+            Ok((l, name, file, level))
+        })
+        .collect();
+    let mut extra_pre: Option<Vec<_>> = match extra_bound {
+        Ok(v) => Some(v),
+        Err(()) => {
+            // The sockets bound so far are dropped with the partial list and `cli_pre`.
+            drop(cli_pre);
+            abort_start(&go, Vec::new())
+        }
+    };
+
     let mut threads = Vec::new();
     // The idle server connections, one slot per worker, taken across workers unless
     // `tune.idle-pool.shared off`.
@@ -1011,8 +1054,6 @@ fn main() {
         let mailboxes = mailboxes.clone();
         let (cli_pre, extra_pre) = if worker_id == 0 { (cli_pre.take(), extra_pre.take()) } else { (None, None) };
         let lifecycle_clone = lifecycle.clone();
-        // Told to pause for our abstract stats socket, they are told to resume if we fail.
-        let replaced: Vec<u32> = opts.sf_pids.iter().chain(&opts.st_pids).copied().collect();
         let ready_tx = ready_tx.clone();
         let go = std::sync::Arc::clone(&go);
 
@@ -1025,12 +1066,14 @@ fn main() {
                 eng.share_mailboxes(boxes, worker_id)?;
                 Ok(eng)
             });
+            // A worker that cannot start reports it and returns, dropping what it bound;
+            // the main thread ends the process (`abort_start`) once every worker has.
             let mut engine = match started {
                 Ok(eng) => eng,
                 Err(err) => {
                     ibex_rt::stderr_line!("Failed to initialize Ibex engine (worker {}): {}", worker_id, err);
-                    send_signals_to_pids(&replaced, Signal::Ttin, true);
-                    process::exit(1);
+                    let _ = ready_tx.send(Err(()));
+                    return;
                 }
             };
             engine.share_idle_pools(&idle_pools, worker_id);
@@ -1041,25 +1084,39 @@ fn main() {
             if let Some(n) = stats_maxconn {
                 engine.set_cli_maxconn(n as usize);
             }
-            if let Some((listener, name, file)) = cli_pre {
-                if let Some(level) = stats_socket_level {
-                    engine.set_cli_level(level);
+            let adopted = (|| -> std::io::Result<()> {
+                if let Some((listener, name, file)) = cli_pre {
+                    if let Some(level) = stats_socket_level {
+                        engine.set_cli_level(level);
+                    }
+                    // Only an epoll_ctl failure on a fresh descriptor can fail here.
+                    engine.adopt_cli(listener, name, file)?;
                 }
-                // Only an epoll_ctl failure on a fresh descriptor can fail here.
-                engine.adopt_cli(listener, name, file).unwrap_or_else(|e| { ibex_rt::stderr_line!("Failed to serve a CLI / stats socket: {e}"); process::exit(1) });
-            }
-            for (listener, name, file, level) in extra_pre.into_iter().flatten() {
-                engine.adopt_extra_cli(listener, name, file, level).unwrap_or_else(|e| { ibex_rt::stderr_line!("Failed to serve a CLI / stats socket: {e}"); process::exit(1) });
+                for (listener, name, file, level) in extra_pre.into_iter().flatten() {
+                    engine.adopt_extra_cli(listener, name, file, level)?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = adopted {
+                ibex_rt::stderr_line!("Failed to serve a CLI / stats socket: {e}");
+                let _ = ready_tx.send(Err(()));
+                return;
             }
             engine.set_lifecycle(lifecycle_clone);
-            let _ = ready_tx.send(());
+            let _ = ready_tx.send(Ok(()));
             drop(ready_tx);
             let (lock, cvar) = &*go;
             let mut released = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            while !*released {
+            while matches!(*released, Start::Wait) {
                 released = cvar.wait(released).unwrap_or_else(std::sync::PoisonError::into_inner);
             }
+            let start = *released;
             drop(released);
+            if matches!(start, Start::Abort) {
+                // Closes this worker's listeners before the old processes are signalled.
+                drop(engine);
+                return;
+            }
             if let Err(err) = engine.run_loop() {
                 ibex_rt::stderr_line!("Engine error (worker {}): {}", worker_id, err);
                 process::exit(1);
@@ -1074,10 +1131,11 @@ fn main() {
     //     are up. These used to run before the engine was built: a reload signalled the old
     //     process to stop before the new one was listening, so there was always a window
     //     with nothing accepting, and READY=1 reported a service that did not exist yet. A
-    //     worker that fails to start exits the process, so this cannot wait forever.
+    //     worker that fails to start says so (or, if it panicked, closes its end), and the
+    //     start is abandoned with every worker's sockets closed first.
     for _ in 0..nbthread {
-        if ready_rx.recv().is_err() {
-            break;
+        if !matches!(ready_rx.recv(), Ok(Ok(()))) {
+            abort_start(&go, threads);
         }
     }
     // HAProxy arms its watchdog per thread at thread init (src/wdt.c:246) and does not fail
@@ -1095,10 +1153,14 @@ fn main() {
     // to), and a chroot or identity that fails exits 1 before anything is served.
     if reload_child {
         if let Some(ref pidfile) = opts.pid_file {
-            handle_pid_file(pidfile);
+            if !handle_pid_file(pidfile) {
+                abort_start(&go, threads);
+            }
         }
     }
-    identity::chroot(&program, &identity);
+    if !identity::chroot(&program, &identity) {
+        abort_start(&go, threads);
+    }
     if !opts.sf_pids.is_empty() {
         send_signals_to_pids(&opts.sf_pids, Signal::Usr1, opts.quiet);
     }
@@ -1110,7 +1172,7 @@ fn main() {
     ibex_rt::globalconn::settle_fd_ceiling();
     {
         let (lock, cvar) = &*go;
-        *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        *lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Start::Go;
         cvar.notify_all();
     }
     if master_dir.is_some() {
