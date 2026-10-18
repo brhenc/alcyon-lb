@@ -1043,7 +1043,7 @@ fn test_conv_strcmp() {
     );
     assert_eq!(
         eval_conv("strcmp", Sample::Str("gamma".into()), &["txn.cmp"]),
-        Some(Sample::Sint(1))
+        Some(Sample::Sint(5))
     );
     // 2. Empty input
     assert_eq!(

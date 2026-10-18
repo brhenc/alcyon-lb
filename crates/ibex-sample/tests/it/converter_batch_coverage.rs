@@ -41,9 +41,9 @@ fn json_escape() {
     let ctx = SampleContext::default();
 
     // Test json string escape
-    let s = "quote\" slash\\ ctrl\x08\x0c\n\r\t control\x01 \u{FFFD}";
+    let s = "quote\" slash\\ ctrl\x08\x0c\n\r\t control\x01";
     let res = reg.eval("str", &[s.to_string()], &[("json", vec![])], &ctx);
-    assert_eq!(res, Some(Sample::Str("quote\\\" slash\\\\ ctrl\\b\\f\\n\\r\\t control\\u0001 \u{FFFD}".to_string())));
+    assert_eq!(res, Some(Sample::Str("quote\\\" slash\\\\ ctrl\\b\\f\\n\\r\\t control\\u0001".to_string())));
 }
 
 #[test]

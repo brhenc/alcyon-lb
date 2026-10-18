@@ -134,7 +134,8 @@ fn c_bool2str(smp: Sample) -> Option<Sample> {
 
 fn c_bool2bin(smp: Sample) -> Option<Sample> {
     match smp {
-        Sample::Bool(b) => Some(Sample::Bin(vec![u8::from(b)])),
+        // c_bool2bin: 8 bytes, big endian.
+        Sample::Bool(b) => Some(Sample::Bin(i64::from(b).to_be_bytes().to_vec())),
         _ => None,
     }
 }

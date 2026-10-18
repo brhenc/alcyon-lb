@@ -3654,7 +3654,7 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, _args| match smp {
-                Sample::Str(s) => Some(Sample::Str(s.to_lowercase())),
+                Sample::Str(s) => Some(Sample::Str(s.to_ascii_lowercase())),
                 _ => None,
             },
         });
@@ -3664,7 +3664,8 @@ impl Registry {
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
             func: |smp, _args| match smp {
-                Sample::Str(s) => Some(Sample::Str(s.to_uppercase())),
+                // sample_conv_str2upper: ASCII only; bytetext escapes pass unchanged.
+                Sample::Str(s) => Some(Sample::Str(s.to_ascii_uppercase())),
                 _ => None,
             },
         });
@@ -3741,11 +3742,17 @@ impl Registry {
                 // set there is no sample (T327: an empty field in a log-format).
                 let target_val = read_var(args.first()?)?;
                 let Sample::Str(s) = smp else { return None };
-                let cmp = s.cmp(&target_val);
-                let res = match cmp {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Equal => 0,
-                    std::cmp::Ordering::Greater => 1,
+                // sample_conv_strcmp: strncmp() on the common length gives the difference of
+                // the first differing (unsigned) bytes; equal prefixes give -1 / 0 / 1 by length.
+                let a = ibex_regex::bytetext::text_to_bytes(&s);
+                let b = ibex_regex::bytetext::text_to_bytes(&target_val);
+                let res = match a.iter().zip(b.iter()).find(|(x, y)| x != y) {
+                    Some((x, y)) => i64::from(*x) - i64::from(*y),
+                    None => match a.len().cmp(&b.len()) {
+                        std::cmp::Ordering::Less => -1,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    },
                 };
                 Some(Sample::Sint(res))
             },
@@ -5078,6 +5085,29 @@ impl Registry {
                     let invalid = |c: char| c == '\u{FFFD}' || ibex_regex::bytetext::unescape_char(c).is_some();
                     if mode == "utf8" && s.chars().any(invalid) {
                         return Some(Sample::Str(String::new()));
+                    }
+                    if mode != "utf8" && mode != "utf8s" {
+                        // IT_ASCII (default): every byte on its own; a byte that is not
+                        // printable ASCII (control, 0x7f, >= 0x80) becomes \u00XX.
+                        let mut out = String::new();
+                        for b in ibex_regex::bytetext::text_to_bytes(&s).iter() {
+                            match *b {
+                                b'"' => out.push_str("\\\""),
+                                b'\\' => out.push_str("\\\\"),
+                                b'/' => out.push_str("\\/"),
+                                8 => out.push_str("\\b"),
+                                12 => out.push_str("\\f"),
+                                b'\r' => out.push_str("\\r"),
+                                b'\n' => out.push_str("\\n"),
+                                b'\t' => out.push_str("\\t"),
+                                0x20..=0x7e => out.push(char::from(*b)),
+                                _ => {
+                                    use std::fmt::Write;
+                                    let _ = write!(out, "\\u{:04x}", *b);
+                                }
+                            }
+                        }
+                        return Some(Sample::Str(out));
                     }
                     let s = if mode == "utf8s" {
                         s.chars().filter(|c| !invalid(*c)).collect()
