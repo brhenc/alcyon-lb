@@ -493,6 +493,11 @@ pub fn format_show_info_as(
 }
 
 /// This worker's identifier (`Worker_id`): a random UUID, drawn once.
+/// Draws the identifier now, so the first `show info` or scrape does not read the file.
+pub fn prewarm_worker_id() {
+    worker_id();
+}
+
 fn worker_id() -> &'static str {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
