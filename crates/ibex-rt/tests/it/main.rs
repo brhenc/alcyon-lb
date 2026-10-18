@@ -24,6 +24,7 @@ mod access_log;
 mod access_log_states;
 mod acl_bin_patterns;
 mod acl_conditions;
+mod acl_match_type;
 mod acl_multivalue_converter_failure;
 mod return_header_spaces;
 mod prometheus_exporter;
