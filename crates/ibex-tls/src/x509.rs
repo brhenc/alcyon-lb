@@ -403,6 +403,25 @@ mod tests {
     }
 
     #[test]
+    fn a_v1_certificate_has_no_version_field() {
+        let alg = |oid: &[u8]| tlv(0x30, &tlv(0x06, oid));
+        let mut tbs = tlv(0x02, &[0x01, 0x02]);
+        tbs.extend(alg(&[0x2B, 0x65, 0x70]));
+        tbs.extend(tlv(0x30, &name(&[&[(CN, 0x0C, b"i")]])));
+        tbs.extend(tlv(0x30, &[tlv(0x17, b"330917162600Z"), tlv(0x17, b"430917162600Z")].concat()));
+        tbs.extend(tlv(0x30, &name(&[&[(CN, 0x0C, b"s")]])));
+        tbs.extend(tlv(0x30, &alg(&[0x2B, 0x65, 0x6E])));
+        let der = tlv(0x30, &tlv(0x30, &tbs));
+        let c = Cert::parse(&der).unwrap();
+        assert_eq!(c.version, 0);
+        assert_eq!(c.serial, &[1, 2]);
+        assert_eq!(sig_alg_name(c.sig_oid), "ED25519");
+        assert_eq!(key_alg_name(c.key_oid), "X25519");
+        assert_eq!(time_text(c.not_after), Some(&b"430917162600Z"[..]));
+        assert_eq!(dn_oneline(c.subject).unwrap(), b"/CN=s");
+    }
+
+    #[test]
     fn algorithm_tables() {
         let rsa = |n: u8| [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, n];
         for (n, want) in [
