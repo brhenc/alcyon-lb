@@ -12946,7 +12946,7 @@ fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
 /// `Forwarded`): false, nothing added, when the request as it is now (the model of
 /// [`req_htx_init`]) has no room for it.
 fn add_req_header_fit(sess: &mut TcpSession, name: &str, val: &str) -> bool {
-    if !res_htx_resize(0, htx_hdr_size(name, val)) {
+    if !htx_hdr_add(name, val) {
         return false;
     }
     sess.htx_reserve(name.len() + val.len());
@@ -13110,7 +13110,16 @@ fn req_htx_init(sess: &TcpSession) {
     let line = 8 + 20 + sess.req_method.as_deref().map_or(3, str::len) + sess.req_uri.as_deref().map_or(1, str::len) + 8;
     let head = line + hdrs + 9;
     let reserve = sess.maxrewrite.min(sess.bufsize / 2);
-    let body = if body == 0 { 0 } else { (8 + body).min(size.saturating_sub(reserve).saturating_sub(head)) };
+    // The body is clamped once, against the head as it was read; a rewrite after that has
+    // the reserve to itself and does not shrink the body again.
+    let body = match sess.req_body_htx.get() {
+        Some(b) => b,
+        None => {
+            let b = if body == 0 { 0 } else { (8 + body).min(size.saturating_sub(reserve).saturating_sub(head)) };
+            sess.req_body_htx.set(Some(b));
+            b
+        }
+    };
     RES_HTX.set((head + body, size));
 }
 
@@ -13161,7 +13170,7 @@ fn req_rule_header(sess: &mut TcpSession, name: &str, val: &str, replace: bool) 
         del_req_header(sess, name);
         res_htx_resize(freed, 0);
     }
-    if !res_htx_resize(0, htx_hdr_size(name, val)) {
+    if !htx_hdr_add(name, val) {
         return false;
     }
     sess.htx_reserve(name.len() + val.len());
@@ -13203,7 +13212,7 @@ fn rewrite_req_header_values(sess: &mut TcpSession, name: &str, regex: &str, rep
         };
         match new {
             Some(n) if n == *v => {}
-            Some(n) if res_htx_resize(htx_hdr_size(k, v), htx_hdr_size(k, &n)) => edits.push((*i, v.clone(), n)),
+            Some(n) if n.len() <= HTX_HDR_VALUE_MAX_LEN && res_htx_resize(htx_hdr_size(k, v), htx_hdr_size(k, &n)) => edits.push((*i, v.clone(), n)),
             _ => {
                 failed = true;
                 break;
@@ -13484,6 +13493,17 @@ fn res_htx_init(bufsize: usize, reserve: Option<usize>, version: &str, reason: &
     RES_HTX.set((head + body, size));
 }
 
+/// The longest header value an HTX block holds (`HTX_HDR_VALUE_MAX_LEN`, `include/haproxy/htx-t.h`):
+/// a rewrite that would make a longer one fails whatever room the buffer has (measured on
+/// `HAProxy` 3.5-dev8: 1048575 bytes fit, 1048576 give a 500).
+const HTX_HDR_VALUE_MAX_LEN: usize = 1_048_575;
+
+/// Adds a header of `name` and `value` to the sized HTX message: false, the message left as
+/// it was, when the value is past [`HTX_HDR_VALUE_MAX_LEN`] or the header does not fit.
+fn htx_hdr_add(name: &str, value: &str) -> bool {
+    value.len() <= HTX_HDR_VALUE_MAX_LEN && res_htx_resize(0, htx_hdr_size(name, value))
+}
+
 /// Replaces `free` bytes of the HTX message by `take` bytes: false, the message left as it
 /// was, when they do not fit.
 fn res_htx_resize(free: usize, take: usize) -> bool {
@@ -13656,7 +13676,7 @@ fn res_action(
         }
         ResOp::Add(name, fmt) => {
             let val = format_http_string(fmt, ctx, registry);
-            if !res_htx_resize(0, htx_hdr_size(name, &val)) {
+            if !htx_hdr_add(name, &val) {
                 return failed();
             }
             hdrs.push((name.to_string(), val));
@@ -13720,7 +13740,7 @@ fn res_action(
                 replace_each_value(v, &re, repl)
             };
             match new_v {
-                Some(n) if res_htx_resize(htx_hdr_size(k, v), htx_hdr_size(k, &n)) => *v = n,
+                Some(n) if n.len() <= HTX_HDR_VALUE_MAX_LEN && res_htx_resize(htx_hdr_size(k, v), htx_hdr_size(k, &n)) => *v = n,
                 _ => {
                     result = failed();
                     break;
@@ -13737,7 +13757,7 @@ fn res_action(
     let freed: usize = hdrs.iter().filter(|(k, _)| k.eq_ignore_ascii_case(act_name)).map(|(k, v)| htx_hdr_size(k, v)).sum();
     hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(act_name));
     res_htx_resize(freed, 0);
-    let fits = res_htx_resize(0, htx_hdr_size(act_name, &val));
+    let fits = htx_hdr_add(act_name, &val);
     if fits {
         hdrs.push((act_name.to_string(), val));
     }

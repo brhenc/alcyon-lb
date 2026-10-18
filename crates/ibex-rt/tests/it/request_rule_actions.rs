@@ -569,3 +569,51 @@ fn a_request_line_rewrite_fails_when_the_buffer_is_full() {
         assert_eq!(received(&resp, &["after"]), ["after"], "{what} off: the next rule ran");
     }
 }
+
+/// The room a backend's `http-request` rules have is what the frontend's rules left: the
+/// body was read into the buffer once, up to `tune.bufsize - tune.maxrewrite`, and a header
+/// the frontend added took from the reserve; it does not give way again for the backend
+/// (`strict_rw_mode.vtc`). With bufsize 2048, maxrewrite 128 and a 2000 byte body,
+/// HAProxy 3.5-dev8 answers 500 (`PR--`) when the backend adds a 60 byte value after the
+/// frontend added one; Ibex sized the request again at the backend and answered 200.
+#[test]
+fn a_backend_rewrite_fails_when_the_frontend_used_the_reserve() {
+    let v = "1234567890".repeat(6);
+    let cfg = |be: &str| {
+        format!(
+            "global\n  tune.bufsize 2048\n  tune.maxrewrite 128\n{DEFAULTS}  option http-buffer-request\n\
+             frontend f\n  bind {{fe}}\n  http-request set-header x-hdr1 {v}\n  default_backend b\n\
+             backend b\n{be}  server s {{srv}}\n"
+        )
+    };
+    let post = format!("GET /req HTTP/1.1\r\nHost: x\r\nContent-Length: 2000\r\n\r\n{}", "a".repeat(2000));
+    let (_a, fe) = start(&cfg(""), Some(echo_server()));
+    assert!(one(fe, &post).starts_with("HTTP/1.1 200 "), "frontend header alone fits");
+    let (_b, fe) = start(&cfg(&format!("  http-request set-header x-hdr3 {v}\n")), Some(echo_server()));
+    let resp = one(fe, &post);
+    assert!(resp.starts_with("HTTP/1.1 500 "), "{}", &resp[..resp.len().min(120)]);
+}
+
+/// An HTX header value is at most `HTX_HDR_VALUE_MAX_LEN` (1048575) bytes: a rewrite that
+/// would make a longer one fails, whatever room the buffer has (`replace_header_limits.vtc`).
+/// Measured on HAProxy 3.5-dev8 with `tune.bufsize 4194304` and a 524287 byte `x-test`:
+/// doubling it and adding one byte gives 200, adding two gives 500, for `replace-value`,
+/// `replace-header` and `set-header`. Ibex answered 200 to all.
+#[test]
+fn a_header_value_past_the_htx_limit_fails_the_rewrite() {
+    let cfg = "global\n  tune.bufsize 4194304\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+        frontend f\n  bind {fe}\n\
+        \x20 http-request replace-value x-test (.*) \\1\\1x if { path /rv1 }\n\
+        \x20 http-request replace-value x-test (.*) \\1\\1xx if { path /rv2 }\n\
+        \x20 http-request replace-header x-test (.*) \\1\\1x if { path /rh1 }\n\
+        \x20 http-request replace-header x-test (.*) \\1\\1xx if { path /rh2 }\n\
+        \x20 http-request set-header y \"%[req.hdr(x-test)]%[req.hdr(x-test)]x\" if { path /sh1 }\n\
+        \x20 http-request set-header y \"%[req.hdr(x-test)]%[req.hdr(x-test)]xx\" if { path /sh2 }\n\
+        \x20 http-request del-header x-test\n  http-request del-header y\n  default_backend b\n\
+        backend b\n  server s {srv}\n";
+    let (_ibex, fe) = start(cfg, Some(echo_server()));
+    for (path, status) in [("rv1", "200"), ("rv2", "500"), ("rh1", "200"), ("rh2", "500"), ("sh1", "200"), ("sh2", "500")] {
+        let r = one(fe, &format!("GET /{path} HTTP/1.1\r\nHost: x\r\nx-test: {}\r\n\r\n", "a".repeat(524_287)));
+        assert!(r.starts_with(&format!("HTTP/1.1 {status} ")), "{path}: {}", &r[..r.len().min(40)]);
+    }
+}
