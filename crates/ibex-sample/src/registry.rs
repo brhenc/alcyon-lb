@@ -146,6 +146,20 @@ fn is_local_sample(addr: Option<SocketAddr>) -> Option<Sample> {
 /// Set once the process is stopping (`when(stopping)`).
 pub static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// T386: the process CPU usage in percent (`cpu_usage_proc`, `_thr`, `_grp`), read through a
+/// function `ibex-rt` installs (`/proc/self/stat`, re-read at most every 500 ms, as
+/// `HAProxy` refreshes `idle_pct` about once a second). Without one the usage is 0.
+pub static CPU_USAGE_SOURCE: std::sync::OnceLock<fn() -> u8> = std::sync::OnceLock::new();
+
+/// A stream is being processed (`smp->strm` is set).
+fn has_stream(ctx: &SampleContext<'_>) -> bool {
+    ctx.stream.is_some() || ctx.fe_id.is_some()
+}
+
+fn cpu_usage_pct() -> i64 {
+    CPU_USAGE_SOURCE.get().map_or(0, |f| i64::from(f()))
+}
+
 thread_local! {
     /// T326: the engine thread this code runs on (0..nbthread-1), for `thread`; set by
     /// `Engine::new_worker`, so every sample context on that thread reads the same value.
@@ -3590,16 +3604,10 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "date_us",
             out_type: SampleType::Sint,
+            // The microsecond part of the date (`date.tv_usec`), 0..999999.
             func: |_ctx, _args| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                // Saturating rather than wrapping: microseconds since the epoch exceed
-                // i64 only past the year 294247, so this is unreachable, but a wrap
-                // would hand out a negative timestamp instead of an obviously clamped one.
-                Some(Sample::Sint(
-                    i64::try_from(now.as_micros()).unwrap_or(i64::MAX),
-                ))
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                Some(Sample::Sint(i64::from(now.subsec_micros())))
             },
         });
         self.register_fetch(FetchDesc {
@@ -3676,6 +3684,22 @@ impl Registry {
             out_type: SampleType::Str,
             func: |_ctx, _args| None,
         });
+        // T386: the per-stream scheduler counters and the CPU usage. `HAProxy` gives no value
+        // without a stream (`smp->strm`). Ibex keeps no per-stream task counters: the time
+        // counters are 0, as in `HAProxy` with `profiling.tasks` off (the default), and
+        // `cpu_calls` is 1, the call that evaluates the fetch (known gap: `HAProxy` counts
+        // every wakeup of the stream).
+        self.register_fetch(FetchDesc {
+            name: "cpu_calls",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| has_stream(ctx).then_some(Sample::Sint(1)),
+        });
+        for name in ["cpu_ns_tot", "cpu_ns_avg", "lat_ns_tot", "lat_ns_avg"] {
+            self.register_fetch(FetchDesc { name, out_type: SampleType::Sint, func: |ctx, _args| has_stream(ctx).then_some(Sample::Sint(0)) });
+        }
+        for name in ["cpu_usage_proc", "cpu_usage_thr", "cpu_usage_grp"] {
+            self.register_fetch(FetchDesc { name, out_type: SampleType::Sint, func: |_ctx, _args| Some(Sample::Sint(cpu_usage_pct())) });
+        }
         // T331: `quic_enabled`: always 0, Ibex has no QUIC.
         self.register_fetch(FetchDesc {
             name: "quic_enabled",

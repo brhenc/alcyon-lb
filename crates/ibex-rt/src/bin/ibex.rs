@@ -586,6 +586,13 @@ fn main() {
     let reload_child = std::env::var_os("IBEX_RELOAD_CHILD").is_some();
     std::env::remove_var("IBEX_RELOAD_CHILD");
 
+    // `HAProxy` exports the local peer name (the host name) as HAPROXY_LOCALPEER before it
+    // reads the configuration, replacing any inherited value. Still single-threaded here: no
+    // worker exists yet. (`-L` and the `localpeer` keyword, which override it, are not parsed.)
+    if let Ok(host) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+        std::env::set_var("HAPROXY_LOCALPEER", host.trim());
+    }
+
     // 1. Change working directory if requested via -C <dir>
     if let Some(ref dir) = opts.change_dir {
         if let Err(err) = std::env::set_current_dir(dir) {
