@@ -156,6 +156,7 @@ impl Expr {
         // a fetch and a default match method (`haproxy -dKacl`). Any other name is the
         // fetch itself, where HAProxy also lets a few bare names (`hdr_val`, `scook`, ...)
         // stand for the dotted ones Ibex registers.
+        let kw = fetch_name.clone();
         let mut default_method = "found";
         if let Some((fetch, method)) = acl_keyword(&fetch_name) {
             fetch_name = fetch.to_string();
@@ -189,6 +190,13 @@ impl Expr {
                     let m_method = tokens
                         .get(idx)
                         .ok_or_else(|| "Missing matcher method after -m".to_string())?;
+                    // `parse_acl_expr`: unless the method is `found`, the expression's output
+                    // type must cast to what the method matches on. An unknown name is
+                    // refused below; a type nobody can name (an unregistered fetch) is not
+                    // checked here.
+                    if let Some(ty) = crate::acl_types::expr_output_type(&fetch_name, &converters) {
+                        crate::acl_types::check_match_method(m_method, &kw, ty)?;
+                    }
                     match_method = match m_method.as_str() {
                         "str" => "str",
                         "beg" => "beg",
