@@ -56,6 +56,8 @@ pub fn get_bufsize_large() -> Option<usize> {
 pub static POOL_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
 static BUF_STD_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+/// Standard buffers ever taken from the heap (never decremented): what `trim_idle` watches.
+static BUF_STD_FRESH: AtomicUsize = AtomicUsize::new(0);
 static BUF_STD_USED: AtomicUsize = AtomicUsize::new(0);
 static BUF_STD_CACHED: AtomicUsize = AtomicUsize::new(0);
 
@@ -283,7 +285,7 @@ pub fn heap_trims() -> usize {
 /// least `TRIM_MIN_FRESH` buffers had to be allocated from the heap since the last trim and
 /// none has been for `TRIM_QUIET`, the trim is done.
 pub fn trim_idle(now: std::time::Instant) {
-    let allocated = BUF_STD_ALLOCATED.load(Ordering::Relaxed);
+    let allocated = BUF_STD_FRESH.load(Ordering::Relaxed);
     let mut state = TRIM_STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -357,6 +359,7 @@ fn alloc_standard() -> Box<[u8]> {
         buf
     } else {
         BUF_STD_ALLOCATED.fetch_add(1, Ordering::Relaxed);
+        BUF_STD_FRESH.fetch_add(1, Ordering::Relaxed);
         BUF_STD_USED.fetch_add(1, Ordering::Relaxed);
         vec![0u8; target_sz].into_boxed_slice()
     }
@@ -447,10 +450,12 @@ impl Drop for Buf {
                     });
                     if !pushed {
                         BUF_STD_USED.fetch_sub(1, Ordering::Relaxed);
+                        BUF_STD_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
                     }
                 } else {
                     // Grown by a head rewrite: not poolable, but no longer in use.
                     BUF_STD_USED.fetch_sub(1, Ordering::Relaxed);
+                    BUF_STD_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
                 }
             }
             BufClass::Small => {
@@ -470,6 +475,7 @@ impl Drop for Buf {
                     });
                     if !pushed {
                         BUF_SMALL_USED.fetch_sub(1, Ordering::Relaxed);
+                        BUF_SMALL_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -490,6 +496,7 @@ impl Drop for Buf {
                         });
                         if !pushed {
                             BUF_LARGE_USED.fetch_sub(1, Ordering::Relaxed);
+                            BUF_LARGE_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -651,6 +658,7 @@ impl Buf {
             });
             if !pushed {
                 BUF_SMALL_USED.fetch_sub(1, Ordering::Relaxed);
+                BUF_SMALL_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
             }
         }
 
