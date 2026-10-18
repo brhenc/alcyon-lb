@@ -35,3 +35,7 @@ mod tcp_converters_non_binary;
 mod t20_converters;
 mod t251_concat_cap;
 mod t251_map_tables;
+mod t364d1_bool2bin;
+mod t364d4_json_ascii;
+mod t364d5_case_ascii;
+mod t364d6_strcmp;

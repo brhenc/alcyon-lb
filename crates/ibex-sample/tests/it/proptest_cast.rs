@@ -100,12 +100,12 @@ proptest! {
         prop_assert_eq!(back_bool, Sample::Bool(b));
     }
 
-    /// Bool -> Bin produces 1 byte (0 or 1).
+    /// Bool -> Bin produces 8 big-endian bytes (c_bool2bin).
     #[test]
     fn prop_cast_bool_bin(b in any::<bool>()) {
         let smp = Sample::Bool(b);
         let as_bin = cast(smp, SampleType::Bin).expect("Bool -> Bin cast");
-        prop_assert_eq!(as_bin, Sample::Bin(vec![u8::from(b)]));
+        prop_assert_eq!(as_bin, Sample::Bin(i64::from(b).to_be_bytes().to_vec()));
     }
 
     /// Sint -> Str -> Sint round-trip for arbitrary 64-bit signed integers.
