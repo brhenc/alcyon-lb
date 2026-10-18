@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-use crate::lexer::Line;
+use crate::lexer::{lex_line_expanding, Line, LineEnv};
+use crate::env::{self, EnvOp};
 use crate::error::ConfigError;
 use crate::ast::DirectiveMessage;
 
@@ -73,18 +74,52 @@ pub fn preprocess(lines: Vec<Line>) -> Result<Vec<Line>, ConfigError> {
 ///
 /// As [`preprocess`], and for an `.alert` or a message directive with too many arguments.
 pub fn preprocess_with_messages(lines: Vec<Line>) -> Result<(Vec<Line>, Vec<DirectiveMessage>), ConfigError> {
+    env::begin();
+    // `HAProxy` reads the configuration twice. The first pass, "discovery", runs only the
+    // keywords that must act before anything else, the environment ones among them
+    // (`KWF_DISCOVERY`): a `${VAR}` above a `setenv` sees it, and the second pass runs it
+    // again in its place. Whatever is wrong with the file is reported by the second pass.
+    let _ = pass(lines.clone(), true);
+    pass(lines, false)
+}
+
+/// One reading of the configuration; see [`preprocess_with_messages`].
+#[allow(clippy::too_many_lines)]
+fn pass(lines: Vec<Line>, discovery: bool) -> Result<(Vec<Line>, Vec<DirectiveMessage>), ConfigError> {
     let mut messages = Vec::new();
     let mut out = Vec::new();
     let mut blocks: Vec<Branch> = Vec::new();
+    let mut section: Option<String> = None;
 
     let last_line = lines.last().map_or(1, |l| l.line_number);
     // What `enabled()` reads: the `global` lines read so far, in the branches taken.
     let mut opts = crate::cond::EnabledOpts::default();
     let mut in_global = false;
 
-    for line in lines {
+    for mut line in lines {
         if line.tokens.is_empty() {
             continue;
+        }
+
+        // The environment of a line is the one the lines above it left, and a line in a
+        // branch that is left out is not looked at.
+        let is_cond = matches!(line.tokens[0].text.as_str(), ".if" | ".elif" | ".else" | ".endif");
+        if !is_cond && !blocks.last().is_some_and(|b| b.masked()) {
+            let (tokens, error) = lex_line_expanding(&line.raw, line.line_number, &LineEnv { section: section.as_deref() });
+            // The environment keywords are run by the first pass, which complains of what
+            // is wrong with them before the check of empty arguments is made: leave those
+            // to the keyword's parser.
+            let words: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
+            let own_refusal = in_global
+                && matches!(words.first(), Some(&("setenv" | "presetenv" | "unsetenv")))
+                && env_op(&words).is_none();
+            if let Some((col, msg)) = error.filter(|_| !own_refusal) {
+                return Err(ConfigError::new(line.line_number, col, msg));
+            }
+            line.tokens = tokens;
+            if line.tokens.is_empty() {
+                continue;
+            }
         }
 
         let first = line.tokens[0].text.as_str();
@@ -149,6 +184,7 @@ pub fn preprocess_with_messages(lines: Vec<Line>) -> Result<(Vec<Line>, Vec<Dire
                 }
                 let text = line.tokens.get(1).map(|t| t.text.clone()).unwrap_or_default();
                 match first {
+                    _ if discovery => {}
                     ".alert" => return Err(at(line.tokens[0].col, format!("'{text}'."))),
                     ".diag" => {}
                     _ => messages.push(DirectiveMessage { warning: first == ".warning", line: line.line_number, text }),
@@ -160,11 +196,17 @@ pub fn preprocess_with_messages(lines: Vec<Line>) -> Result<(Vec<Line>, Vec<Dire
             _ => {
                 if SECTIONS.contains(&first) {
                     in_global = first == "global";
+                    section = Some(first.to_owned());
                 } else if in_global {
                     let words: Vec<&str> = line.tokens.iter().map(|t| t.text.as_str()).collect();
                     opts.global_line(&words);
+                    if let Some(op) = env_op(&words) {
+                        env::apply_to_overlay(op);
+                    }
                 }
-                out.push(line);
+                if !discovery {
+                    out.push(line);
+                }
             }
         }
     }
@@ -174,4 +216,19 @@ pub fn preprocess_with_messages(lines: Vec<Line>) -> Result<(Vec<Line>, Vec<Dire
     }
 
     Ok((out, messages))
+}
+
+/// The change a `global` line makes to the environment, when it is well formed (the
+/// keyword's parser reports the other cases).
+fn env_op(words: &[&str]) -> Option<EnvOp> {
+    match words {
+        ["setenv" | "presetenv", name, value] if !name.is_empty() && !value.is_empty() => Some(EnvOp::Set {
+            name: (*name).to_owned(),
+            value: (*value).to_owned(),
+            overwrite: words[0] == "setenv",
+        }),
+        ["unsetenv", names @ ..] if !names.is_empty() && !names[0].is_empty() => Some(EnvOp::Unset(names.iter().map(|n| (*n).to_owned()).collect())),
+        ["resetenv", keep @ ..] => Some(EnvOp::Reset(keep.iter().map(|n| (*n).to_owned()).collect())),
+        _ => None,
+    }
 }

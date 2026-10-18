@@ -648,6 +648,9 @@ fn main() {
     let (combined_config, config_starts) = load_and_merge_configs(&config_files);
 
     // 5. Parse unified configuration AST
+    if config_files.len() == 1 {
+        ibex_config::env::set_file(&config_files[0].display().to_string());
+    }
     let mut config = match ibex_config::parse_str(&combined_config) {
         Ok(cfg) => cfg,
         Err(err) if !err.alerts.is_empty() => {
@@ -664,6 +667,10 @@ fn main() {
             config_failed(&config_starts, Some(err.line), &err.message);
         }
     };
+
+    // `setenv`, `presetenv`, `unsetenv` and `resetenv` change the environment of the process,
+    // and of the children it starts. No thread exists yet, which `set_var` needs.
+    ibex_config::env::apply_to_process(&config.env_ops);
 
     // 5-bis. `.warning` and `.notice` lines of the configuration, as HAProxy prints them
     //     while it loads (`.alert` has failed the parse).

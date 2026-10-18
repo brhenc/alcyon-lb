@@ -157,7 +157,7 @@ fn predicate(name: &str, args: &[String], opts: &EnabledOpts) -> bool {
     let a = args.first().map_or("", String::as_str);
     let b = args.get(1).map_or("", String::as_str);
     match name {
-        "defined" => std::env::var_os(a).is_some(),
+        "defined" => crate::env::get(a).is_some(),
         "feature" => feature(a),
         "enabled" => opts.enabled(a),
         "streq" => a == b,
@@ -658,7 +658,7 @@ fn expand_env(c: &[char], i: usize, out: &mut String, unhandled: &str) -> Result
         if name.is_empty() || c.get(k) != Some(&'}') {
             return Err(unhandled.into());
         }
-        out.push_str(&std::env::var(&name).ok().or(default).unwrap_or_default());
+        out.push_str(&crate::env::get(&name).or(default).unwrap_or_default());
         return Ok(k + 1);
     }
     let n = name_end(i);
@@ -666,7 +666,7 @@ fn expand_env(c: &[char], i: usize, out: &mut String, unhandled: &str) -> Result
     if name.is_empty() || name.starts_with(|x: char| x.is_ascii_digit()) {
         return Err(unhandled.into());
     }
-    out.push_str(&std::env::var(&name).unwrap_or_default());
+    out.push_str(&crate::env::get(&name).unwrap_or_default());
     Ok(n)
 }
 

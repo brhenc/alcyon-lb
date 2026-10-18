@@ -27,6 +27,7 @@ mod cond_enabled;
 mod connection_limits;
 mod cookie_config;
 mod differential;
+mod env_expansion;
 mod global_identity;
 mod h2_max_concurrent_streams;
 mod global_sections;

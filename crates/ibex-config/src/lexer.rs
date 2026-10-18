@@ -24,12 +24,26 @@ pub struct Line {
     pub tokens: Vec<Token>,
     /// Set when `parse_line` would refuse the line: the 1-based column and the message.
     pub error: Option<(usize, String)>,
+    /// The line as written, for [`lex_line_expanding`] to read again once the environment
+    /// it sees is known.
+    pub raw: String,
+}
+
+/// Where a line is, for the `${.LINE}`, `${.FILE}` and `${.SECTION}` pseudo-variables.
+#[derive(Debug, Clone, Copy)]
+pub struct LineEnv<'a> {
+    /// The keyword that opened the current section, if any.
+    pub section: Option<&'a str>,
 }
 
 /// Lexes `HAProxy` configuration text into a list of non-empty tokenized lines.
 ///
+/// `$` is taken literally here; the lines are read again with [`lex_line_expanding`] when
+/// the preprocessor reaches them, as `HAProxy` expands the environment of a line only
+/// after the lines before it have been read (`setenv`).
+///
 /// Follows `HAProxy` 1.0.2 lexical conventions:
-/// - Comments start with `#` or `;` and continue to the end of the line.
+/// - Comments start with `#` and continue to the end of the line.
 /// - Whitespace (spaces, tabs, form feeds) separates arguments.
 /// - Backslash escapes as `parse_line` reads them: `\ `, `\\`, `\#`, `\'`, `\"`, `\t`, `\n`,
 ///   `\r`, `\xHH` outside single quotes; any other backslash is kept.
@@ -40,12 +54,13 @@ pub fn lex(input: &str) -> Vec<Line> {
 
     for (line_idx, raw_line) in input.lines().enumerate() {
         let line_number = line_idx + 1;
-        let (tokens, error) = lex_line(raw_line, line_number);
+        let (tokens, error) = lex_line(raw_line, line_number, None);
         if !tokens.is_empty() || error.is_some() {
             lines.push(Line {
                 line_number,
                 tokens,
                 error,
+                raw: raw_line.to_owned(),
             });
         }
     }
@@ -53,9 +68,47 @@ pub fn lex(input: &str) -> Vec<Line> {
     lines
 }
 
+/// Reads one line again the way the configuration parser does, `$` included: inside double
+/// quotes `$VAR`, `${VAR}`, `${VAR-default}` and `${VAR[*]}` (the value split into words)
+/// are replaced by the environment (`parse_line` with `PARSE_OPT_ENV`, src/tools.c). An
+/// argument left empty is refused, as `HAProxy` does, for it would end the argument list.
+#[must_use]
+pub fn lex_line_expanding(raw_line: &str, line_number: usize, env: &LineEnv) -> (Vec<Token>, Option<(usize, String)>) {
+    lex_line(raw_line, line_number, Some(env))
+}
+
+/// The word being built, as `parse_line` keeps it (`in_arg`, `empty_quote`).
+#[derive(Default)]
+struct Word {
+    text: Vec<u8>,
+    in_arg: bool,
+    /// Nothing but quotes so far: closing them makes an empty argument.
+    empty_quote: bool,
+    /// 1-based column where the word began to exist, and where it was found empty.
+    begin: usize,
+    unknown_var: Option<usize>,
+}
+
+impl Word {
+    fn mark(&mut self, col: usize) {
+        if !self.in_arg {
+            self.in_arg = true;
+            self.begin = col;
+        }
+    }
+
+    fn emit(&mut self, bytes: &[u8], col: usize) {
+        self.mark(col);
+        self.text.extend_from_slice(bytes);
+        self.empty_quote = false;
+    }
+}
+
 /// Tokenizes a single line of input according to `HAProxy` rules.
-fn lex_line(raw_line: &str, line_number: usize) -> (Vec<Token>, Option<(usize, String)>) {
+#[allow(clippy::too_many_lines)]
+fn lex_line(raw_line: &str, line_number: usize, env: Option<&LineEnv>) -> (Vec<Token>, Option<(usize, String)>) {
     let mut tokens = Vec::new();
+    let mut empties: Vec<(usize, usize)> = Vec::new();
     let chars: Vec<char> = raw_line.chars().collect();
     let len = chars.len();
     let mut idx = 0;
@@ -103,18 +156,35 @@ fn lex_line(raw_line: &str, line_number: usize) -> (Vec<Token>, Option<(usize, S
         // Start of a token (1-based column)
         let token_col = idx + 1;
         // Bytes, not chars: `\xHH` is a byte (see `hex_escapes_are_bytes`).
-        let mut token_text: Vec<u8> = Vec::new();
-        let push = |t: &mut Vec<u8>, c: char| t.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
+        let mut word = Word::default();
         let mut quote_mode = None;
+        let mut quote_at = 0;
+        let mut finish = |word: &mut Word, tokens: &mut Vec<Token>, empties: &mut Vec<(usize, usize)>| {
+            if word.in_arg {
+                if word.text.is_empty() {
+                    empties.push((tokens.len(), word.unknown_var.unwrap_or(word.begin)));
+                }
+                tokens.push(Token {
+                    text: ibex_regex::bytetext::bytes_to_text(&word.text),
+                    line: line_number,
+                    col: token_col,
+                });
+            }
+            *word = Word::default();
+        };
 
         while idx < end_idx {
             let ch = chars[idx];
+            let col = idx + 1;
             if quote_mode == Some('\'') {
                 // Single quotes take everything literally, backslashes included.
                 if ch == '\'' {
+                    if word.empty_quote {
+                        word.mark(col);
+                    }
                     quote_mode = None;
                 } else {
-                    push(&mut token_text, ch);
+                    word.emit(ch.encode_utf8(&mut [0u8; 4]).as_bytes(), col);
                 }
                 idx += 1;
             } else if ch == '\\' && idx + 1 < end_idx {
@@ -124,19 +194,22 @@ fn lex_line(raw_line: &str, line_number: usize) -> (Vec<Token>, Option<(usize, S
                 let hex = |i: usize| chars.get(i).and_then(|c| c.to_digit(16)).filter(|_| i < end_idx);
                 match next {
                     ' ' | '\\' | '#' | '\'' | '"' => {
-                        push(&mut token_text, next);
+                        word.emit(next.encode_utf8(&mut [0u8; 4]).as_bytes(), col);
                         idx += 2;
                     }
                     '$' if quote_mode == Some('"') => {
-                        push(&mut token_text, next);
+                        word.emit(b"$", col);
                         idx += 2;
                     }
                     't' | 'n' | 'r' => {
-                        token_text.push(match next {
-                            't' => b'\t',
-                            'n' => b'\n',
-                            _ => b'\r',
-                        });
+                        word.emit(
+                            &[match next {
+                                't' => b'\t',
+                                'n' => b'\n',
+                                _ => b'\r',
+                            }],
+                            col,
+                        );
                         idx += 2;
                     }
                     'x' => {
@@ -151,40 +224,157 @@ fn lex_line(raw_line: &str, line_number: usize) -> (Vec<Token>, Option<(usize, S
                                 )),
                             );
                         };
-                        token_text.push(u8::try_from(h1 * 16 + h2).unwrap_or(0));
+                        word.emit(&[u8::try_from(h1 * 16 + h2).unwrap_or(0)], col);
                         idx += 4;
                     }
                     _ => {
-                        push(&mut token_text, ch);
+                        word.emit(b"\\", col);
                         idx += 1;
                     }
                 }
             } else if quote_mode == Some('"') {
                 if ch == '"' {
+                    if word.empty_quote {
+                        word.mark(col);
+                    }
                     quote_mode = None;
+                    idx += 1;
+                } else if ch == '$' && env.is_some() {
+                    let exp = match expand(&chars, idx, end_idx, line_number, env) {
+                        Ok(e) => e,
+                        Err(e) => return (tokens, Some(e)),
+                    };
+                    idx = exp.next;
+                    if exp.words {
+                        word.empty_quote = false;
+                    }
+                    if let Some(value) = exp.value {
+                        word.unknown_var = None;
+                        for c in value.chars() {
+                            if exp.words && is_haproxy_space(c) {
+                                finish(&mut word, &mut tokens, &mut empties);
+                            } else {
+                                word.emit(c.encode_utf8(&mut [0u8; 4]).as_bytes(), col);
+                            }
+                        }
+                    } else if !exp.words {
+                        word.mark(col);
+                        word.unknown_var.get_or_insert(exp.name_col);
+                    }
                 } else {
-                    push(&mut token_text, ch);
+                    word.emit(ch.encode_utf8(&mut [0u8; 4]).as_bytes(), col);
+                    idx += 1;
                 }
-                idx += 1;
             } else if ch == '"' || ch == '\'' {
                 quote_mode = Some(ch);
+                quote_at = idx;
+                word.empty_quote = true;
                 idx += 1;
             } else if is_haproxy_space(ch) {
                 break;
             } else {
-                push(&mut token_text, ch);
+                word.emit(ch.encode_utf8(&mut [0u8; 4]).as_bytes(), col);
                 idx += 1;
             }
         }
 
-        tokens.push(Token {
-            text: ibex_regex::bytetext::bytes_to_text(&token_text),
-            line: line_number,
-            col: token_col,
-        });
+        if quote_mode.is_some() {
+            return (tokens, Some((quote_at + 1, format!("unmatched quote at position {}", quote_at + 1))));
+        }
+        finish(&mut word, &mut tokens, &mut empties);
+    }
+
+    // `HAProxy` refuses an empty argument (a `""` or an unset variable) on any line but a
+    // `.` directive: what follows it would be dropped without a word.
+    if env.is_some() && !tokens.first().is_some_and(|t| t.text.starts_with('.')) {
+        if let Some(&(n, pos)) = empties.first() {
+            return (
+                tokens,
+                Some((pos, format!("argument number {n} at position {pos} is empty and marks the end of the argument list"))),
+            );
+        }
     }
 
     (tokens, None)
+}
+
+/// What a `$` in double quotes stands for.
+struct Expansion {
+    /// The value, or `None` for a variable that is not set.
+    value: Option<String>,
+    /// Index of the first char after the reference.
+    next: usize,
+    /// `${VAR[*]}`: the value is split into words.
+    words: bool,
+    /// 1-based column of the variable's name.
+    name_col: usize,
+}
+
+/// `parse_line`'s reading of `$VAR`, `${VAR}`, `${VAR-default}` and `${VAR[*]}` at `chars[at]`.
+fn expand(
+    chars: &[char],
+    at: usize,
+    end: usize,
+    line_number: usize,
+    env: Option<&LineEnv>,
+) -> Result<Expansion, (usize, String)> {
+    let get = |i: usize| if i < end { chars.get(i).copied() } else { None };
+    let mut i = at + 1;
+    let mut brace = None;
+    if get(i) == Some('{') {
+        brace = Some(i);
+        i += 1;
+    }
+    if !get(i).is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '.') {
+        return Err((i + 1, format!("forbidden first char in environment variable name at position {}", i + 1)));
+    }
+    let start = i;
+    if get(i) == Some('.') {
+        i += 1;
+    }
+    while get(i).is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+        i += 1;
+    }
+    let name: String = chars[start..i].iter().collect();
+    let mut value = if name.starts_with('.') {
+        match name.as_str() {
+            ".LINE" => Some(line_number.to_string()),
+            ".FILE" => Some(crate::env::file()),
+            ".SECTION" => env.and_then(|e| e.section).map(str::to_owned),
+            _ => return Err((start + 1, format!("forbidden first char in environment variable name at position {}", start + 1))),
+        }
+    } else {
+        crate::env::get(&name)
+    };
+    let mut words = false;
+    if get(i) == Some('[') && brace.is_some() {
+        let at_bracket = i;
+        i += 1;
+        if get(i) != Some('*') || get(i + 1) != Some(']') {
+            return Err((at_bracket + 1, format!("truncated or invalid word expansion sequence at position {}", at_bracket + 1)));
+        }
+        i += 2;
+        words = true;
+    }
+    if let Some(b) = brace {
+        let unmatched = (b + 1, format!("unmatched brace in environment variable name at position {}", b + 1));
+        if get(i) == Some('-') {
+            let from = i + 1;
+            while get(i).is_some_and(|c| c != '}') {
+                i += 1;
+            }
+            if get(i).is_none() {
+                return Err(unmatched);
+            }
+            if value.is_none() {
+                value = Some(chars[from..i].iter().collect());
+            }
+        } else if get(i) != Some('}') {
+            return Err(unmatched);
+        }
+        i += 1;
+    }
+    Ok(Expansion { value, next: i, words, name_col: start + 1 })
 }
 
 /// Checks whether a character is treated as whitespace by `HAProxy` 1.0.2 `isspace()`.
