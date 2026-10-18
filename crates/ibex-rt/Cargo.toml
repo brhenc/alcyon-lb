@@ -136,3 +136,7 @@ path = "tests/tcp_proxy.rs"
 [[test]]
 name = "worker_proxy_memory"
 path = "tests/worker_proxy_memory.rs"
+
+[[test]]
+name = "stats_auth_userlists"
+path = "tests/stats_auth_userlists.rs"
