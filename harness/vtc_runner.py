@@ -1815,8 +1815,9 @@ class VtcExecutor:
             await asyncio.sleep(0.05)
         raise RuntimeError(f"Could not connect to HAProxy CLI socket {cli_sock}")
 
-    async def _execute_haproxy_cli(self, haproxy_id: str, block: str) -> None:
-        cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
+    async def _execute_haproxy_cli(self, haproxy_id: str, block: str, master: bool = False) -> None:
+        # `-mcli` talks to the master socket (`-S`), `-cli` to the worker's `stats socket`.
+        cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.master.sock" if master else f"{haproxy_id}.sock")
         # Like vtest, a new connection for every `send`: a non-interactive stats-socket
         # connection runs one command line and closes, on HAProxy and on Ibex alike (T146).
 
@@ -1828,8 +1829,12 @@ class VtcExecutor:
                 continue
             if line.startswith("send "):
                 cmd = line[5:].strip()
-                if (cmd.startswith('"') and cmd.endswith('"')) or (cmd.startswith("'") and cmd.endswith("'")):
-                    cmd = cmd[1:-1]
+                if cmd.startswith('"') and cmd.endswith('"') and len(cmd) > 1:
+                    # varnishtest resolves the backslash escapes of a double-quoted string
+                    # (`Mon\\ User` reaches HAProxy as `Mon\ User`) and expands its macros.
+                    cmd = self.macro_engine.expand(_unescape_vtc_string(cmd[1:-1]))
+                elif cmd.startswith("'") and cmd.endswith("'") and len(cmd) > 1:
+                    cmd = self.macro_engine.expand(cmd[1:-1])
                 reader, writer = await self._cli_connect(cli_sock)
                 writer.write((cmd + "\n").encode("utf-8"))
                 await writer.drain()
@@ -2160,13 +2165,20 @@ class VtcExecutor:
                 opts = args[1:]
                 if "-cli" in opts:
                     await self._execute_haproxy_cli(haproxy_id, block or "")
+                elif "-mcli" in opts:
+                    await self._execute_haproxy_cli(haproxy_id, block or "", master=True)
                 elif block is not None:
                     conf_type = "-conf"
                     start_imm = False
                     expect_exit = None
+                    master_args: List[str] = []
                     idx = 0
                     while idx < len(opts):
-                        if opts[idx] in ("-conf", "-conf-OK", "-conf-BAD"):
+                        if opts[idx] in ("-W", "-Ws"):
+                            master_args.append(opts[idx])
+                        elif opts[idx] == "-S":
+                            master_args += ["-S", os.path.join(self.tmpdir, f"{haproxy_id}.master.sock")]
+                        elif opts[idx] in ("-conf", "-conf-OK", "-conf-BAD"):
                             conf_type = opts[idx]
                         elif opts[idx] == "-start":
                             start_imm = True
@@ -2231,9 +2243,9 @@ class VtcExecutor:
                             cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
                             # The CLI is the config's `stats socket` (see the prelude above),
                             # in the foreground, as vtest runs it.
-                            mw = []
+                            mw = [a for a in master_args if a in ("-W", "-Ws")]
                             proc = subprocess.Popen(
-                                [self.target_binary, "-f", cfg_path, "-d"],
+                                [self.target_binary, *master_args, "-f", cfg_path, "-d"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                             )

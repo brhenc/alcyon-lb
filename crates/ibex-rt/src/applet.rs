@@ -448,7 +448,7 @@ impl CliApplet {
     }
 
     fn execute_line(&mut self, line: &str, ctx: &mut AppletContext) {
-        let sub_commands: Vec<&str> = line.split(';').collect();
+        let sub_commands = split_commands(line);
         for (i, raw_cmd) in sub_commands.iter().enumerate() {
             let cmd = raw_cmd.trim();
             if cmd.is_empty() {
@@ -1942,11 +1942,31 @@ fn atoi(s: &str) -> i64 {
     if neg { -n } else { n }
 }
 
+/// The commands of a line, cut at each `;` that no backslash protects: `cli_parse_request`
+/// skips the character after a backslash when it looks for the end of a command, so `\;`
+/// stays in its command (and `cli_words` later turns it into `;`).
+pub fn split_commands(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut escaped) = (0, false);
+    for (i, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == ';' {
+            out.push(&line[start..i]);
+            start = i + 1;
+        }
+    }
+    out.push(&line[start..]);
+    out
+}
+
 /// The words of a CLI command line the way `cli_parse_request` cuts them: blanks (space,
 /// tab) separate words, `\\` is one backslash, and a backslash before any other character
 /// (a blank included) goes, the character staying in the word. A lone backslash at the
 /// end stays. There is no quoting.
-pub(crate) fn cli_words(line: &str) -> Vec<String> {
+pub fn cli_words(line: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut cur = String::new();
     let mut in_word = false;

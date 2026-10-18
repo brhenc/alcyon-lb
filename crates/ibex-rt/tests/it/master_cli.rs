@@ -252,6 +252,9 @@ fn show_proc_reload_and_forwarding_on_the_master_socket() {
     assert_eq!(master(&sock, "help"), HELP);
     assert_eq!(master(&sock, "show version"), format!("{VERSION}\n\n"));
     assert_eq!(master(&sock, "echo hi there"), "hi there\n\n");
+    // T363h, measured on HAProxy 3.5-dev8: a backslash protects `;` from the separator and
+    // goes itself, so `echo a\;b;echo c` is two commands, the first printing `a;b`.
+    assert_eq!(master(&sock, "echo a\\;b;echo c"), "a;b\n\nc\n\n");
     assert_eq!(master(&sock, "show cli level"), "admin\n\n");
     assert_eq!(master(&sock, "show cli sockets"), "\n");
     assert_eq!(master(&sock, "show version;;show version"), format!("{VERSION}\n\n\n{VERSION}\n\n"));

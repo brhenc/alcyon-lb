@@ -246,3 +246,19 @@ fn acl_command_errors() {
     // Inline patterns are not changeable here: refused rather than accepted and ignored.
     assert!(cli(&ibex, "add acl #1 /q").contains("cannot be changed at runtime"));
 }
+
+/// T363h: a backslash protects the character after it from the command separator too
+/// (`cli_parse_request` skips it when it looks for `;`), so `\;` and `\ ` reach the ACL as
+/// `;` and a blank. Measured on HAProxy 3.5-dev8 (`add acl <f> Mon\ User\ Agent\;`, then
+/// `show acl <f>`: `Mon User Agent;`); an unescaped `;` still ends the command.
+#[test]
+fn escaped_semicolon_and_blanks_stay_in_the_acl_value() {
+    let ibex = start();
+    let f = ibex.acl.display().to_string();
+    assert_eq!(cli(&ibex, &format!("add acl {f} Mon\\ User\\ Agent\\;")), "\n");
+    assert_eq!(entries(&cli(&ibex, &format!("show acl {f}"))), ["/x", "/y", "Mon User Agent;"]);
+    assert_eq!(cli(&ibex, &format!("del acl {f} Mon\\ User\\ Agent\\;")), "\n");
+    assert_eq!(entries(&cli(&ibex, &format!("show acl {f}"))), ["/x", "/y"]);
+    // An unescaped `;` ends the command: the second one runs as well (prompt mode).
+    assert_eq!(entries(&cli(&ibex, &format!("add acl {f} /m;show acl {f}"))), ["/x", "/y", "/m"]);
+}

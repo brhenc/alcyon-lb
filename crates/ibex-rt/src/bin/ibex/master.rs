@@ -621,7 +621,7 @@ fn session(shared: &Shared, stream: UnixStream) {
         let text = line.trim_end_matches(['\n', '\r']);
         let mut reply = String::new();
         // An empty command (an empty line, `a;;b`) answers an empty line, as HAProxy's.
-        for cmd in text.split(';').map(str::trim) {
+        for cmd in ibex_rt::applet::split_commands(text).into_iter().map(str::trim) {
             reply.push_str(&if cmd.is_empty() { "\n".to_string() } else { command(shared, &mut s, cmd) });
             if s.done {
                 break;
@@ -694,7 +694,7 @@ fn command(shared: &Shared, s: &mut Session, cmd: &str) -> String {
             s.done = true;
             String::new()
         }
-        ["echo", ..] => format!("{}\n\n", cmd["echo".len()..].trim_start()),
+        ["echo", ..] => format!("{}\n\n", ibex_rt::applet::cli_words(cmd["echo".len()..].trim_start()).join(" ")),
         ["user"] => {
             s.level = Level::User;
             String::new()
