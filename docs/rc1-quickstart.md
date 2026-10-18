@@ -94,19 +94,28 @@ not verified.
 
 User-visible ones; the full list is [differences.md](differences.md) and [../tradeoff.md](../tradeoff.md).
 
-- Refused at load (the config fails, it does not run without it): `compression`, `cache`,
-  `peers`, Lua, SPOE/`filter`, FastCGI, `resolvers` and `server-template` (no run-time DNS: use
-  IP addresses or names resolved at start), OpenSSL-only keywords.
-- Variables hold text, not typed values (T364 in progress; `tradeoff.md` 6.12): binary samples
-  stored in variables are handled as bytes since T363a, other typed behaviour of `set-var` and
-  converters may differ from HAProxy.
-- `http-response return` is in progress.
+- Refused at load (the config fails, it does not run without it): `compression` (planned for M5),
+  `cache`, `peers`, Lua, SPOE/`filter`, FastCGI, `resolvers` and `server-template` (no run-time
+  DNS: use IP addresses or names resolved at start), OpenSSL-only keywords.
+- TLS: ECDHE only, no finite-field DHE (`DHE-*` ciphers, `ssl-dh-param-file`; `tradeoff.md` 6.18).
+  Every current browser does ECDHE. The `ssl_c_*` fetches (the client's certificate) are missing.
+- **Check your ACL names by hand** (T430 #1): a rule naming an ACL that does not exist
+  (`use_backend b if nosuchacl`) loads, where HAProxy refuses it; a typo then silently never matches.
+- **Environment variables inside double quotes** are not expanded (T430 #11): with `P` in the
+  environment, `hdr x "${P}"` sends `${P}` where HAProxy sends the value. `bind ${P}` works.
+  `setenv`/`presetenv`/`unsetenv`/`resetenv` in `global` are refused at load (T430 #21). Of the
+  `HAPROXY_*` variables HAProxy exports, only `HAPROXY_LOCALPEER` (the host name) is set.
+- Variables keep their sample type and a keep-alive `set-var` allocates nothing (T364); the
+  `tune.vars.*` accounting differs from HAProxy's in four small ways (`tradeoff.md` 6.17).
 - Memory: object pools are not implemented yet (T372; `tradeoff.md` 6.13): the request path
   still allocates, so RSS follows the traffic and is given back later than HAProxy would. An
-  in-flight request keeps a 16 KiB buffer after its head is forwarded (T371: 18 KB per slow
-  connection against HAProxy's 4.5 KB), so many slow uploads cost more memory than with HAProxy.
+  HTTP/1 request gives its head buffer back once the head is forwarded (T371); an HTTP/2 or
+  HTTP/3 one keeps it to the end of the transaction.
+- A chunked HTTP/1 server's trailers do not reach an HTTP/2 client (T430 #4; matters for gRPC
+  through an HTTP/1 backend).
 - Known small differences being fixed: IPv4-mapped addresses in `-m ip` matching (T377), quotes and
-  `$` in the config lexer (T378), `-c` errors do not name the file, a Prometheus scrape omits a
-  few families (`differences.md`, "prometheus-exporter").
+  `$` in the config lexer (T378), `-c` errors do not name the file and some messages are worded
+  differently (T430 #9), a Prometheus scrape omits a few families (`differences.md`,
+  "prometheus-exporter"), `monitor` in a backend is accepted without HAProxy's warning.
 - A thread blocked off-CPU (a deadlock) is not caught by the watchdog, as in HAProxy.
 - QUIC/HTTP-3 is experimental; do not enable it on the production site.
