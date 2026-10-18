@@ -548,3 +548,28 @@ fn test_extended_version_advertises_reachable_h2() {
         "-vv must list H2 in available multiplexers when reachable"
     );
 }
+
+/// `git` in this checkout, trimmed; `None` without git (a tarball build).
+fn git(args: &[&str]) -> Option<String> {
+    let out = Command::new("git").args(args).current_dir(env!("CARGO_MANIFEST_DIR")).output().ok()?;
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (out.status.success() && !s.is_empty()).then_some(s)
+}
+
+/// `-v` names the commit the binary was built from and `-vq` the release it descends from
+/// (`git describe` of the last `ibex-*` tag), as HAProxy's `3.5-dev8-885761-29` does: a bug
+/// report's `ibex -v` must say which build it came from.
+#[test]
+fn the_version_names_the_tag_and_the_commit() {
+    let Some(commit) = git(&["rev-parse", "--short=8", "HEAD"]) else { return };
+    let run = |arg: &str| String::from_utf8(Command::new(IBEX_BIN).arg(arg).output().unwrap().stdout).unwrap();
+    let v = run("-v");
+    assert!(v.contains(&format!("(commit {commit})")), "-v: {v}");
+    let vq = run("-vq");
+    let vq = vq.trim();
+    match git(&["describe", "--tags", "--match", "ibex-*", "--abbrev=8"]) {
+        Some(d) => assert_eq!(vq, format!("{}-{}", env!("CARGO_PKG_VERSION"), d.trim_start_matches("ibex-")), "-vq"),
+        None => assert_eq!(vq, format!("{}-g{commit}", env!("CARGO_PKG_VERSION")), "-vq"),
+    }
+    assert!(v.starts_with(&format!("Ibex version {vq} ")), "-v: {v}");
+}

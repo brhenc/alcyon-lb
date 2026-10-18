@@ -61,7 +61,7 @@ struct CliOptions {
 }
 
 fn print_help(program: &str) {
-    println!("Ibex 0.1.0 - Memory-Safe Soft-Realtime Load Balancer (HAProxy 3.5 compatibility)");
+    println!("Ibex {} - Memory-Safe Soft-Realtime Load Balancer (HAProxy 3.5 compatibility)", ibex_rt::version::VERSION);
     println!("Usage : {program} [-f <cfgfile|cfgdir>]* [ -vdVD ] [ -n <maxconn> ] [ -N <maxpconn> ]");
     println!("        [ -p <pidfile> ] [ -m <max megs> ] [ -C <dir> ] [-- <cfgfile>*]");
     println!("        -v displays version ; -vv shows known build options.");
@@ -88,8 +88,22 @@ fn print_help(program: &str) {
     println!("        -h, --help show this help message");
 }
 
+/// `Ibex version 0.1.0-rc1 2026/10/18 (commit bc168dca) - <url>`: the date and commit only
+/// when the build had git.
+fn print_version_line() {
+    use ibex_rt::version::{COMMIT, DATE, VERSION};
+    print!("Ibex version {VERSION}");
+    if !DATE.is_empty() {
+        print!(" {DATE}");
+    }
+    if !COMMIT.is_empty() {
+        print!(" (commit {COMMIT})");
+    }
+    println!(" - https://github.com/project-ibex/ibex");
+}
+
 fn print_version() {
-    println!("Ibex version 0.1.0 2026/09/21 - https://github.com/project-ibex/ibex");
+    print_version_line();
     println!("HAProxy 3.5 Compatibility Layer (Memory-Safe Soft-Realtime Engine)");
     println!("Running on: Linux x86_64");
 }
@@ -97,12 +111,12 @@ fn print_version() {
 fn print_plain_version(arg: &str) {
     match arg {
         "-vqs" | "-vqb" => println!("0.1"),
-        _ => println!("0.1.0"),
+        _ => println!("{}", ibex_rt::version::VERSION),
     }
 }
 
 fn print_extended_version() {
-    println!("Ibex version 0.1.0 2026/09/21 - https://github.com/project-ibex/ibex");
+    print_version_line();
     println!("HAProxy 3.5 Compatibility Layer (Memory-Safe Soft-Realtime Engine)");
     println!("Running on: Linux x86_64");
     println!();

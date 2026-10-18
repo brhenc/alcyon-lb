@@ -645,8 +645,8 @@ fn fill_info_pairs(
     let idle_pct = cpu::get_idle_pct();
     let (pool_alloc, pool_used) = ibex_alloc::global_pool_registry().totals();
     p.put("Name", format_args!("{}", "Ibex"));
-    p.put("Version", format_args!("{}", "0.1.0"));
-    p.put("Release_date", format_args!("{}", "2026/09/21"));
+    p.put("Version", format_args!("{}", crate::version::VERSION));
+    p.put("Release_date", format_args!("{}", crate::version::DATE));
     p.put("Nbthread", format_args!("{}", nbthread));
     p.put("Nbproc", format_args!("{}", "1"));
     p.put("Process_num", format_args!("{}", "1"));
@@ -710,7 +710,7 @@ fn fill_info_pairs(
     p.put("BytesOutRate", format_args!("{}", "0"));
     p.put("DebugCommandsIssued", format_args!("{}", "0"));
     p.put("CumRecvLogs", format_args!("{}", "0"));
-    p.put("Build info", format_args!("{}", "0.1.0"));
+    p.put("Build info", format_args!("{}", crate::version::VERSION));
     p.put("Memmax_bytes", format_args!("{}", (crate::globalconn::memmax_mb().wrapping_mul(1_048_576))));
     p.put("PoolAlloc_bytes", format_args!("{}", pool_alloc));
     p.put("PoolUsed_bytes", format_args!("{}", pool_used));

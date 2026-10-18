@@ -11,6 +11,17 @@
 
 #![forbid(unsafe_code)]
 
+/// What `ibex -v` and `show info` call this build, from git at build time (`build.rs`).
+pub mod version {
+    /// The package version and `git describe` of the last `ibex-*` tag: `0.1.0-rc1`,
+    /// `0.1.0-rc1-3-gabcdef12`; the package version alone without git.
+    pub const VERSION: &str = env!("IBEX_VERSION");
+    /// The short commit; empty without git.
+    pub const COMMIT: &str = env!("IBEX_COMMIT");
+    /// The commit's date, `2026/10/18`; empty without git.
+    pub const DATE: &str = env!("IBEX_DATE");
+}
+
 pub mod applet;
 pub mod buf;
 pub mod check;
