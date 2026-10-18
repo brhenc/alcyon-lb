@@ -51,6 +51,8 @@ const HEADERS: &[(&str, &str)] = &[
     ("x-cl1", "%[ssl_fc_cipherlist_bin(1),hex]"),
     ("x-clhex", "%[ssl_fc_cipherlist_hex]"),
     ("x-clhex1", "%[ssl_fc_cipherlist_hex(1)]"),
+    ("x-clstr", "%[ssl_fc_cipherlist_str]"),
+    ("x-clstr1", "%[ssl_fc_cipherlist_str(1)]"),
     ("x-xxh", "%[ssl_fc_cipherlist_xxh]"),
     ("x-hid", "%[ssl_fc_protocol_hello_id]"),
     ("x-ext", "%[ssl_fc_extlist_bin,hex]"),

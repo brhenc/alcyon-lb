@@ -309,11 +309,8 @@ impl HelloTap {
         }
         self.rec.extend_from_slice(bytes);
         let mut used = 0usize;
-        while let Some(head) = self.rec.get(used..used + 5) {
-            let (typ, len) = match head {
-                [t, _, _, h, l] => (*t, usize::from(u16::from_be_bytes([*h, *l]))),
-                _ => break,
-            };
+        while let Some([t, _, _, h, l]) = self.rec.get(used..used + 5) {
+            let (typ, len) = (*t, usize::from(u16::from_be_bytes([*h, *l])));
             if len > MAX_RECORD {
                 self.stop();
                 return;
@@ -339,11 +336,8 @@ impl HelloTap {
     /// Parses the complete handshake messages in `hs`. `false` when the stream cannot be TLS.
     fn messages(&mut self) -> bool {
         let mut used = 0usize;
-        while let Some(head) = self.hs.get(used..used + 4) {
-            let len = match head {
-                [_, a, b, c] => (usize::from(*a) << 16) | (usize::from(*b) << 8) | usize::from(*c),
-                _ => break,
-            };
+        while let Some([_, a, b, c]) = self.hs.get(used..used + 4) {
+            let len = (usize::from(*a) << 16) | (usize::from(*b) << 8) | usize::from(*c);
             if len > MAX_HANDSHAKE {
                 return false;
             }
@@ -617,5 +611,34 @@ mod tests {
         t.feed(&records(&m, 10), true);
         assert!(t.capture().is_none());
         assert!(HelloTap::new(0).is_none(), "size 0: no tap");
+    }
+
+    /// A message whose own length field is right but whose body ends early, at every length:
+    /// each check of the C (`msg + n > end` -> return) ends the parse where it is. Computed from
+    /// the C, not measured: `HAProxy` is never shown such a message by a TLS client.
+    #[test]
+    fn a_body_that_ends_early_stops_at_the_c_check() {
+        let full = client_hello(&[0x13, 0x01, 0x13, 0x02], &[0, 10, 0, 4, 0, 2, 0, 29]);
+        let body = &full[4..];
+        // Cipher list ends at 2 + 32 + 1 + 2 + 4 = 41; compression at 43; ext length at 45.
+        for n in 0..body.len() {
+            let mut m = vec![1, 0, (n >> 8) as u8, n as u8];
+            m.extend(&body[..n]);
+            let got = parse(&m, 1024);
+            if n < 41 {
+                assert!(got.is_none(), "body of {n} bytes");
+            } else {
+                assert_eq!(got.unwrap().ciphersuite(), &[0x13, 0x01, 0x13, 0x02], "body of {n} bytes");
+            }
+        }
+    }
+
+    /// A record longer than TLS allows is not TLS: the tap stops and keeps what it has.
+    #[test]
+    fn an_oversized_record_stops_the_tap() {
+        let mut t = HelloTap::new(1024).unwrap();
+        t.feed(&[22, 3, 1, 0xff, 0xff], false);
+        t.feed(&records(&unhex(HELLO1), 10), false);
+        assert!(t.capture().is_none());
     }
 }

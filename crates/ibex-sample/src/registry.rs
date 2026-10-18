@@ -3064,9 +3064,28 @@ impl Registry {
             name: "ssl_fc_cipherlist_hex",
             out_type: SampleType::Bin,
             // `dump_binary`: upper-case hex (`hextab`), declared BIN, so `,hex` doubles it.
-            func: |ctx, args| match capture_list(ctx, args, ibex_tls::SslCapture::ciphersuite)? {
-                Sample::Bin(b) => Some(Sample::Bin(hex_encode(&b).into_bytes())),
-                _ => None,
+            func: |ctx, args| {
+                let list = capture_bytes(ctx, args, ibex_tls::SslCapture::ciphersuite)?;
+                Some(Sample::Bin(hex_encode(&list).into_bytes()))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_cipherlist_str",
+            out_type: SampleType::Str,
+            // `smp_fetch_ssl_fc_cl_str`: each 2-byte id through `SSL_CIPHER_find` and
+            // `SSL_CIPHER_get_name`, `UNKNOWN(%04x)` for a miss, comma-joined; a trailing odd
+            // byte (a list cut by the capture size) is not looked at.
+            func: |ctx, args| {
+                let list = capture_bytes(ctx, args, ibex_tls::SslCapture::ciphersuite)?;
+                let names: Vec<String> = list
+                    .chunks_exact(2)
+                    .map(|p| {
+                        let id = u16::from_be_bytes([p[0], p[1]]);
+                        ibex_tls::cipher_names::openssl_cipher_name_by_id(id)
+                            .map_or_else(|| format!("UNKNOWN({id:04x})"), str::to_string)
+                    })
+                    .collect();
+                Some(Sample::Str(names.join(",")))
             },
         });
         self.register_fetch(FetchDesc {
@@ -7502,11 +7521,15 @@ fn format_time_ns(epoch: i64, nanos: u32, format: &str, local: bool) -> String {
 
 /// One captured list for the `ssl_fc_*list_bin` fetches: the bytes as captured, or with
 /// `GREASE` removed when the integer argument is not 0; no sample without a capture.
-fn capture_list(ctx: &SampleContext, args: &[String], list: fn(&ibex_tls::SslCapture) -> &[u8]) -> Option<Sample> {
+fn capture_bytes(ctx: &SampleContext, args: &[String], list: fn(&ibex_tls::SslCapture) -> &[u8]) -> Option<Vec<u8>> {
     let c = ctx.ssl_fc.capture?;
     let bytes = list(c);
     let filter = args.first().and_then(|a| a.parse::<i64>().ok()).unwrap_or(0) != 0;
-    Some(Sample::Bin(if filter { ibex_tls::exclude_tls_grease(bytes, 16384) } else { bytes.to_vec() }))
+    Some(if filter { ibex_tls::exclude_tls_grease(bytes, 16384) } else { bytes.to_vec() })
+}
+
+fn capture_list(ctx: &SampleContext, args: &[String], list: fn(&ibex_tls::SslCapture) -> &[u8]) -> Option<Sample> {
+    capture_bytes(ctx, args, list).map(Sample::Bin)
 }
 
 fn hex_encode(data: &[u8]) -> String {
