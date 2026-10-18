@@ -15,14 +15,8 @@ fn cfg(line: &str) -> Result<ibex_config::Config, ibex_config::ConfigError> {
 #[test]
 fn the_stats_words_ibex_does_not_implement_are_refused() {
     for line in [
-        "stats auth admin:secret",
-        "stats realm Private",
         "stats scope be",
-        "stats hide-version",
-        "stats show-version",
         "stats show-modules",
-        "stats http-request deny",
-        "stats http-request auth realm x",
     ] {
         let e = cfg(line).expect_err(line);
         assert!(e.to_string().contains("is not implemented"), "{line}: {e}");
@@ -43,8 +37,35 @@ fn a_stats_word_haproxy_does_not_know_is_refused_with_its_message() {
 
 #[test]
 fn stats_enable_and_the_implemented_words_still_load() {
+    for line in [
+        "stats auth admin:secret",
+        "stats auth a:b\n  stats auth c:d\n  stats realm Private",
+        "stats hide-version",
+        "stats show-version",
+        "stats http-request deny",
+        "stats http-request auth realm x unless { src 1.2.3.4 }",
+        "stats http-request allow if TRUE\n  stats http-request deny deny_status 404",
+    ] {
+        cfg(line).expect(line);
+    }
     for line in ["stats enable", "stats refresh 5s", "stats admin if TRUE", "stats show-legends", "stats show-desc d", "stats show-node n"] {
         let c = cfg(line).expect(line);
         assert!(c.frontends[0].stats.enable, "{line}");
     }
+}
+
+#[test]
+fn stats_auth_and_realm_and_http_request_refusals_are_haproxys() {
+    let m = |line: &str| cfg(line).expect_err(line).to_string();
+    assert!(m("stats auth").contains("'auth' needs a user:password account."));
+    assert!(m("stats realm").contains("'realm' needs an realm name."));
+    for line in ["stats auth a:b\n  stats http-request deny", "stats realm R\n  stats http-request deny", "stats http-request allow\n  stats auth a:b"] {
+        assert!(
+            m(line).contains("proxy 'f': stats 'auth'/'realm' and 'http-request' can't be used at the same time."),
+            "{line}"
+        );
+    }
+    // An action the stats page does not run would parse and do nothing.
+    assert!(m("stats http-request set-header a b").contains("supports only"));
+    assert!(m("stats http-request return status 200").contains("supports only"));
 }

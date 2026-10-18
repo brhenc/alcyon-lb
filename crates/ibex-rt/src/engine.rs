@@ -10660,6 +10660,72 @@ impl EngineDispatcher<'_> {
         }
     }
 
+    /// `stats http-request` (and the rule `stats auth` became): the first rule whose condition
+    /// holds answers. `allow` serves the page, `deny` and `auth` reply and return true; no
+    /// rule matching serves it (`http_req_get_intercept_rule` over `uri_auth->http_req_rules`).
+    /// The condition sees the request line, headers and addresses of the stream.
+    fn stats_rules_reply(entry: &mut SessionEntry, proxies: &Proxies, serving: usize) -> bool {
+        let rules = &proxies[serving].stats_config.http_req_rules;
+        if rules.is_empty() {
+            return false;
+        }
+        let registry = sample_registry();
+        let sess = &mut entry.sess;
+        let name = proxies[serving].name.as_str();
+        for rule in rules {
+            let matches = match &rule.cond {
+                None => true,
+                Some(cond) => {
+                    let ctx = SampleContext {
+                        proxies: Some(&ProxiesView(proxies)),
+                        client_addr: sess.client_addr,
+                        server_addr: sess.server_addr,
+                        fc_src: sess.fc_src,
+                        fc_dst: sess.fc_dst,
+                        is_first_req: sess.is_first_req,
+                        ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
+                        fc_http_major: sess.fc_http_major(),
+                        req_version: sess.client_version(),
+                        req_uri: sess.req_uri.as_deref(),
+                        req_method: sess.req_method.as_deref(),
+                        htx_slice: sess.htx_slice(),
+                        req_headers: sess.req_headers.as_deref(),
+                        fe_name: Some(name),
+                        fe_id: Some(proxies[serving].ids.iid),
+                        acls: Some(&proxies[serving].acls),
+                        ..Default::default()
+                    };
+                    eval_condition(cond, &ctx, &proxies[serving].acls, registry)
+                }
+            };
+            if !matches {
+                continue;
+            }
+            let page = |status: u16| -> Vec<u8> {
+                // A `http-error` that is a template is not built here: the stock page answers.
+                match resolve_error_body(&proxies[serving], &proxies[serving], status, Some(&ibex_config::ErrorPageSource::DefaultErrorfiles), None, None) {
+                    ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
+                    ResolvedErrorBody::Custom { .. } => builtin_error_page(status).or_else(|| builtin_error_page(403)).unwrap_or_default().to_vec(),
+                }
+            };
+            let resp: Vec<u8> = match &rule.action {
+                ibex_config::HttpReqAction::Allow => return false,
+                ibex_config::HttpReqAction::Deny { deny_status, .. } => {
+                    proxies[serving].counters().denied_req.fetch_add(1, Ordering::Relaxed);
+                    page(deny_status.unwrap_or(403))
+                }
+                ibex_config::HttpReqAction::Auth { realm } => {
+                    let realm = realm.as_deref().unwrap_or("HAProxy Statistics");
+                    with_header_at_end_of_head(&page(401), &format!("www-authenticate: Basic realm=\"{realm}\""))
+                }
+                _ => continue,
+            };
+            send_proxy_reply(sess, &proxies[..], serving, serving, &resp);
+            return true;
+        }
+        false
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_stats_request(
         entry: &mut SessionEntry,
@@ -10670,6 +10736,9 @@ impl EngineDispatcher<'_> {
         serving: usize,
     ) -> Option<crate::stats_html::AdminAction> {
         entry.sess.log.applet = true;
+        if Self::stats_rules_reply(entry, proxies, serving) {
+            return None;
+        }
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
 
         // `stats refresh`: HAProxy sends `Refresh: <seconds, rounded up>` unless the URI carries

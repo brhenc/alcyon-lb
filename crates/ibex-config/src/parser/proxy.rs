@@ -139,7 +139,7 @@ pub(crate) fn parse_listen_header(
         forwardfor_if_none: defaults.is_some_and(|d| d.forwardfor_if_none),
         forwarded: defaults.and_then(|d| d.forwarded.clone()),
         originalto: defaults.and_then(|d| d.originalto.clone()),
-        stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
+        stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.inherited()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
         error_replies: defaults.map_or_else(HashMap::new, |d| d.error_replies.clone()),
     })
@@ -230,7 +230,7 @@ pub(crate) fn parse_frontend_header(
         forwardfor: defaults.and_then(|d| d.forwardfor.clone()),
         forwardfor_if_none: defaults.is_some_and(|d| d.forwardfor_if_none),
         originalto: defaults.and_then(|d| d.originalto.clone()),
-        stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
+        stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.inherited()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
         error_replies: defaults.map_or_else(HashMap::new, |d| d.error_replies.clone()),
     })
@@ -327,7 +327,7 @@ pub(crate) fn parse_backend_header(
         forwardfor_if_none: defaults.is_some_and(|d| d.forwardfor_if_none),
         forwarded: defaults.and_then(|d| d.forwarded.clone()),
         originalto: defaults.and_then(|d| d.originalto.clone()),
-        stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.clone()),
+        stats: defaults.map_or_else(StatsConfig::default, |d| d.stats.inherited()),
         error_files: defaults.map_or_else(HashMap::new, |d| d.error_files.clone()),
         error_replies: defaults.map_or_else(HashMap::new, |d| d.error_replies.clone()),
     })

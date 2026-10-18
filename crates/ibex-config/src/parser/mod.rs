@@ -497,6 +497,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
 
     stick::allocate_server_id(&mut listens, &mut frontends, &mut backends);
     validate_config(global.as_ref(), &listens, &frontends, &backends)?;
+    stats::finish_stats_auth(&mut listens, &mut frontends, &mut backends)?;
     let mut userlists = take_userlists();
     for list in &mut userlists {
         list.resolve().map_err(|(line, msg)| ConfigError::new(line, 1, msg))?;

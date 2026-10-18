@@ -412,6 +412,14 @@ pub struct StatsConfig {
     pub show_legends: bool,
     pub show_desc: Option<Box<str>>,
     pub show_node: Option<Box<str>>,
+    /// `stats auth <user>:<password>`, in the order written (a repeated user is ignored).
+    pub auth_users: Vec<(Box<str>, Box<str>)>,
+    /// `stats realm`.
+    pub auth_realm: Option<Box<str>>,
+    /// `stats show-version` (and not `hide-version` after it): the page names the build.
+    pub show_version: bool,
+    /// `stats http-request`, then the rule `stats auth` becomes (see `finish_stats_auth`).
+    pub http_req_rules: Vec<HttpReqRule>,
     pub raw_timeouts: TimeoutConfig,
     pub forwardfor: Option<String>,
     /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
@@ -427,6 +435,16 @@ pub struct StatsConfig {
     /// `accept-invalid-http-response`): what `ibex_proto::response_head` lets through from a
     /// server under the option (T275).
     pub accept_unsafe_response: bool,
+}
+
+impl StatsConfig {
+    /// What a proxy takes from the `defaults` it follows. HAProxy keeps no `stats auth`,
+    /// `realm`, `show-version` or `http-request` of a `defaults` section (measured on 3.5-dev8:
+    /// a proxy after `defaults` + `stats auth` serves its page to anyone).
+    #[must_use]
+    pub fn inherited(&self) -> Self {
+        Self { auth_users: Vec::new(), auth_realm: None, show_version: false, http_req_rules: Vec::new(), ..self.clone() }
+    }
 }
 
 impl Default for ListenSection {

@@ -2,6 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 use super::*;
+use crate::ast::WarnStyle;
 
 pub(crate) fn parse_stats_directive(
     stats: &mut StatsConfig,
@@ -78,11 +79,67 @@ pub(crate) fn parse_stats_directive(
             stats.enable = true;
             Ok(())
         }
-        // HAProxy's, which Ibex does not implement: refused rather than dropped. `auth`
-        // dropped would serve the page to anyone where HAProxy answers 401.
-        w @ ("auth" | "realm" | "scope" | "hide-version" | "show-version" | "show-modules" | "http-request") => Err(
-            ConfigError::new(kw.line, kw.col, format!("'stats {w}' is not implemented: Ibex would serve the stats page without it.")),
-        ),
+        "auth" => {
+            let Some(account) = tokens.get(2) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'auth' needs a user:password account."));
+            };
+            // `stats_add_auth`: the password is what follows the first colon, none is empty.
+            let (user, pass) = account.text.split_once(':').unwrap_or((account.text.as_str(), ""));
+            if stats.auth_users.iter().any(|(u, _)| &**u == user) {
+                warn::push(kw.line, WarnStyle::Spaced, &format!("uri auth: ignoring duplicated user '{user}'."));
+            } else {
+                stats.auth_users.push((user.into(), pass.into()));
+            }
+            Ok(())
+        }
+        "realm" => {
+            let Some(realm) = tokens.get(2) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'realm' needs an realm name."));
+            };
+            stats.auth_realm = Some(realm.text.as_str().into());
+            Ok(())
+        }
+        "hide-version" => {
+            stats.show_version = false;
+            Ok(())
+        }
+        "show-version" => {
+            stats.show_version = true;
+            Ok(())
+        }
+        "http-request" => {
+            if stats.http_req_rules.last().is_some_and(|r| r.cond.is_none()) {
+                warn::push(kw.line, WarnStyle::Tight, "previous 'stats' action has no condition attached, further entries are NOOP.");
+            }
+            let before = stats.http_req_rules.len();
+            parse_http_req_rule(&mut stats.http_req_rules, &tokens[1..], kw)?;
+            // The stats page answers allow, deny and auth; any other action would parse and do
+            // nothing there (AGENTS.md rule 5).
+            for r in &stats.http_req_rules[before..] {
+                let plain = match &r.action {
+                    HttpReqAction::Allow | HttpReqAction::Auth { .. } => true,
+                    HttpReqAction::Deny { content_type, lf_string, error_page, .. } => {
+                        content_type.is_none() && lf_string.is_none() && matches!(error_page, None | Some(ErrorPageSource::DefaultErrorfiles))
+                    }
+                    _ => false,
+                };
+                if !plain {
+                    stats.http_req_rules.truncate(before);
+                    return Err(ConfigError::new(
+                        kw.line,
+                        kw.col,
+                        "'stats http-request' supports only 'allow', 'auth' and 'deny [deny_status <code>]' in Ibex.",
+                    ));
+                }
+            }
+            Ok(())
+        }
+        // HAProxy's, which Ibex does not implement: refused rather than dropped.
+        w @ ("scope" | "show-modules") => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("'stats {w}' is not implemented: Ibex would serve the stats page without it."),
+        )),
         w => Err(ConfigError::new(
             kw.line,
             kw.col,
@@ -94,3 +151,53 @@ pub(crate) fn parse_stats_directive(
     }
 }
 
+
+/// `stats auth` becomes, as in HAProxy's `check_config_validity`, the rule
+/// `http-request auth [realm <realm>] unless { http_auth(<its userlist>) }` appended to the
+/// `stats http-request` rules, over a userlist of the accounts. `stats auth` or `realm`
+/// together with `stats http-request` is refused.
+pub(crate) fn finish_stats_auth(
+    listens: &mut [ListenSection],
+    frontends: &mut [FrontendSection],
+    backends: &mut [BackendSection],
+) -> Result<(), ConfigError> {
+    let all = listens
+        .iter_mut()
+        .map(|p| (&p.name, &mut p.stats))
+        .chain(frontends.iter_mut().map(|p| (&p.name, &mut p.stats)))
+        .chain(backends.iter_mut().map(|p| (&p.name, &mut p.stats)));
+    for (name, stats) in all {
+        if stats.auth_users.is_empty() && stats.auth_realm.is_none() {
+            continue;
+        }
+        if !stats.http_req_rules.is_empty() {
+            return Err(ConfigError::new(
+                0,
+                0,
+                format!("proxy '{name}': stats 'auth'/'realm' and 'http-request' can't be used at the same time."),
+            ));
+        }
+        if stats.auth_users.is_empty() {
+            continue;
+        }
+        let list = format!(".internal-stats-userlist.{name}");
+        register_userlist(Userlist {
+            name: list.clone(),
+            users: stats
+                .auth_users
+                .iter()
+                .map(|(u, p)| UserlistUser { name: u.to_string(), password: Some(p.to_string()), password_is_hash: false, groups: Vec::new() })
+                .collect(),
+            ..Userlist::default()
+        });
+        stats.http_req_rules.push(HttpReqRule {
+            action: HttpReqAction::Auth { realm: stats.auth_realm.as_deref().map(str::to_string) },
+            cond: Some(AclCondition {
+                is_if: false,
+                terms: vec![AclTerm { negated: false, name: format!("{{ http_auth({list}) }}") }],
+            }),
+            line: 0,
+        });
+    }
+    Ok(())
+}
