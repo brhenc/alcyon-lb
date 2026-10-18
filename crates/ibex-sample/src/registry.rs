@@ -6795,7 +6795,9 @@ fn visit_header_lines(ctx: &SampleContext, name: &str, res: bool, f: &mut dyn Fn
 fn visit_header_values(ctx: &SampleContext, name: &str, res: bool, full: bool, f: &mut dyn FnMut(&str)) {
     visit_header_lines(ctx, name, res, &mut |line| {
         if full {
-            f(line);
+            // `__http_find_header` skips LWS on both sides even for a full line (`set-header`
+            // can store them; the wire keeps them).
+            f(line.trim_matches([' ', '\t']));
             return;
         }
         let b = line.as_bytes();
