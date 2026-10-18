@@ -880,15 +880,17 @@ impl std::fmt::Debug for ClientXprt {
 /// the handshake runs later, on the connection's first reads.
 #[must_use]
 pub fn accept_tls(fd: &impl AsRawFd, config: std::sync::Arc<rustls::ServerConfig>) -> ClientXprt {
-    accept_tls_capturing(fd, config, 0)
+    accept_tls_capturing(fd, config, 0, false)
 }
 
 /// As [`accept_tls`], keeping `capture_size` bytes of the `ClientHello`
 /// (`tune.ssl.capture-buffer-size`) for the `ssl_fc_cipherlist_*` fetches; 0 captures nothing.
+/// `ja4_spec` is `ibex.ja4-compat spec`; it reaches `ssl_fc_ja4` through the capture.
 #[must_use]
-pub fn accept_tls_capturing(fd: &impl AsRawFd, config: std::sync::Arc<rustls::ServerConfig>, capture_size: usize) -> ClientXprt {
+pub fn accept_tls_capturing(fd: &impl AsRawFd, config: std::sync::Arc<rustls::ServerConfig>, capture_size: usize, ja4_spec: bool) -> ClientXprt {
     let mut ctx = RustlsContext::new_server_pending(fd.as_raw_fd());
     ctx.enable_capture(capture_size);
+    ctx.set_ja4_spec(ja4_spec);
     let mut tls = TlsConn::new(ctx);
     tls.gate = Some(Box::new(Gate { acceptor: rustls::server::Acceptor::default(), config }));
     ClientXprt::Tls(Box::new(tls))

@@ -19,7 +19,7 @@ fn h12(s: &str) -> String {
 /// `t13d1516h2_8daaf6152771_e5627efa2ab1`.
 #[must_use]
 pub fn ja4(p: &Ja4Parts) -> String {
-    format!("{}_{}_{}", p.a, h12(&p.b), h12(&p.c))
+    format!("{}_{}_{}", p.a(), h12(&p.b), h12(&p.c()))
 }
 
 #[cfg(test)]
@@ -36,18 +36,45 @@ mod tests {
         assert_eq!(h12(""), "000000000000");
     }
 
+    /// The two modes differ when there is nothing to list but signature algorithms: no real
+    /// hello does that, so the parts are built by hand. FoxIO's Python tool hashes `_` and the
+    /// algorithms, the specification says twelve zeros.
+    #[test]
+    fn no_extensions_but_sigalgs_by_mode() {
+        let mut p = Ja4Parts { prefix: "t13d0100".into(), alpn_foxio: "00".into(), alpn_spec: "00".into(), b: "1301".into(), sigalgs: "0403,0804".into(), ..Ja4Parts::default() };
+        assert_eq!(ja4(&p), format!("t13d010000_{}_{}", h12("1301"), h12("_0403,0804")));
+        p.spec = true;
+        assert_eq!(ja4(&p), format!("t13d010000_{}_000000000000", h12("1301")));
+        // With extensions the two modes agree.
+        p.exts = "000d".into();
+        assert_eq!(p.c(), "000d_0403,0804");
+        p.spec = false;
+        assert_eq!(p.c(), "000d_0403,0804");
+    }
+
     /// Every ClientHello in `testdata/ja4_vectors.txt` (FoxIO's published pcaps and expected values).
     #[test]
     fn published_vectors() {
         let mut n = 0;
+        let mut differs = Vec::new();
         for line in include_str!("../testdata/ja4_vectors.txt").lines().filter(|l| !l.starts_with('#')) {
             let mut f = line.split('\t');
             let (want, hex, src) = (f.next().unwrap(), f.next().unwrap(), f.next().unwrap());
             let msg: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
-            let parts = ibex_tls::ja4::parse(&msg).unwrap_or_else(|| panic!("{src}: not parsed"));
-            assert_eq!(ja4(&parts), want, "{src}");
+            let mut parts = ibex_tls::ja4::parse(&msg).unwrap_or_else(|| panic!("{src}: not parsed"));
+            // The file holds FoxIO's own published values: foxio mode must give all of them.
+            let (foxio, spec) = (ja4(&parts), {
+                parts.spec = true;
+                ja4(&parts)
+            });
+            if foxio != spec {
+                differs.push(format!("{src}: foxio {foxio}, spec {spec}"));
+            }
+            assert_eq!(foxio, want, "{src} (foxio mode)");
             n += 1;
         }
         assert!(n > 10, "{n} vectors");
+        // Only the non-ASCII ALPN vector changes between the modes.
+        assert_eq!(differs, ["tls-non-ascii-alpn.pcapng: foxio t13d151699_8daaf6152771_e5627efa2ab1, spec t13d1516bd_8daaf6152771_e5627efa2ab1"]);
     }
 }

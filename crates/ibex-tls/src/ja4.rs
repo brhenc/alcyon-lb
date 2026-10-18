@@ -11,16 +11,47 @@
 //! part `a` and the two lists to hash; the hashing (`SHA-256`, 12 hex characters) is done by the
 //! fetch, which has the digest.
 
-/// What JA4 needs from a `ClientHello`: `t13d1516h2` and the text of the two hashed parts.
+/// What `JA4` needs from a `ClientHello`: the readable part and the text of the two hashed
+/// parts, with the two places where FoxIO's tools and the specification text differ kept
+/// apart (`ibex.ja4-compat`, [`Ja4Parts::spec`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ja4Parts {
-    /// `t`, the version, `d`/`i`, cipher count, extension count, ALPN ends: `t13d1516h2`.
-    pub a: String,
+    /// `t`, the version, `d`/`i`, cipher count, extension count: `t13d1516`.
+    pub prefix: String,
+    /// The ALPN characters as FoxIO's tools print them (`99` for a non-ASCII end).
+    pub alpn_foxio: String,
+    /// The ALPN characters as the specification says (hex digits for a non-alphanumeric end).
+    pub alpn_spec: String,
     /// The sorted cipher suites, 4 lower-case hex digits each, comma-joined; empty for none.
     pub b: String,
-    /// The sorted extension ids without SNI and ALPN, then `_` and the signature algorithms in
-    /// their order; empty when there is no extension to hash.
-    pub c: String,
+    /// The sorted extension ids without SNI and ALPN, comma-joined; empty for none.
+    pub exts: String,
+    /// The signature algorithms in their order, comma-joined; empty for none.
+    pub sigalgs: String,
+    /// `ibex.ja4-compat spec`: follow the specification text, not FoxIO's tools.
+    pub spec: bool,
+}
+
+impl Ja4Parts {
+    /// `t13d1516h2`.
+    #[must_use]
+    pub fn a(&self) -> String {
+        format!("{}{}", self.prefix, if self.spec { &self.alpn_spec } else { &self.alpn_foxio })
+    }
+
+    /// The text hashed for the third part; empty when it is twelve zeros. The two modes differ
+    /// only when there is no extension to list but signature algorithms: the specification says
+    /// "no extensions: zeros", FoxIO's Python tool hashes `_` and the algorithms. (No real hello
+    /// has signature algorithms without the extension that carries them.)
+    #[must_use]
+    pub fn c(&self) -> String {
+        match (self.exts.is_empty(), self.sigalgs.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => if self.spec { String::new() } else { format!("_{}", self.sigalgs) },
+            (false, true) => self.exts.clone(),
+            (false, false) => format!("{}_{}", self.exts, self.sigalgs),
+        }
+    }
 }
 
 fn is_grease(v: u16) -> bool {
@@ -56,11 +87,16 @@ fn version_code(v: u16) -> &'static str {
     }
 }
 
-/// The first and last character of the first ALPN value; hex characters of the value when
-/// either end is not an ASCII letter or digit (spec examples: `0xAB 0xCD` is `ad`).
-fn alpn_ends(first: Option<&[u8]>) -> String {
+/// The first and last character of the first ALPN value. `spec`: hex digits of the value when
+/// either end is not an ASCII letter or digit (spec examples: `0xAB 0xCD` is `ad`). Otherwise
+/// FoxIO's tools: the character itself, `9` for a byte of 0x80 or more.
+fn alpn_ends(first: Option<&[u8]>, spec: bool) -> String {
     let Some(val) = first.filter(|x| !x.is_empty()) else { return "00".to_string() };
     let (Some(&head), Some(&tail)) = (val.first(), val.last()) else { return "00".to_string() };
+    if !spec {
+        let c = |b: u8| if b.is_ascii() { char::from(b) } else { '9' };
+        return format!("{}{}", c(head), c(tail));
+    }
     if head.is_ascii_alphanumeric() && tail.is_ascii_alphanumeric() {
         return format!("{}{}", char::from(head), char::from(tail));
     }
@@ -135,24 +171,20 @@ pub fn parse(msg: &[u8]) -> Option<Ja4Parts> {
     }
     exts.retain(|e| *e != 16);
     exts.sort_unstable();
-    let c = if exts.is_empty() {
-        String::new()
-    } else if sigalgs.is_empty() {
-        joined(&exts)
-    } else {
-        format!("{}_{}", joined(&exts), joined(&sigalgs))
-    };
     Some(Ja4Parts {
-        a: format!(
-            "t{}{}{:02}{:02}{}",
+        prefix: format!(
+            "t{}{}{:02}{:02}",
             version_code(version),
             if sni { 'd' } else { 'i' },
             ciphers.len().min(99),
             ext_count.min(99),
-            alpn_ends(alpn_first)
         ),
+        alpn_foxio: alpn_ends(alpn_first, false),
+        alpn_spec: alpn_ends(alpn_first, true),
         b: joined(&ciphers),
-        c,
+        exts: joined(&exts),
+        sigalgs: joined(&sigalgs),
+        spec: false,
     })
 }
 
@@ -175,10 +207,15 @@ mod tests {
             (b"http/1.1", "h1"),
             (b"x", "xx"),
         ] {
-            assert_eq!(alpn_ends(Some(v)), want, "{v:02x?}");
+            assert_eq!(alpn_ends(Some(v), true), want, "{v:02x?}");
         }
-        assert_eq!(alpn_ends(None), "00");
-        assert_eq!(alpn_ends(Some(&[])), "00");
+        assert_eq!(alpn_ends(None, true), "00");
+        assert_eq!(alpn_ends(Some(&[]), true), "00");
+        // FoxIO's tools: the character itself, `9` from 0x80 up.
+        assert_eq!(alpn_ends(Some(&[0xba, 0xad]), false), "99");
+        assert_eq!(alpn_ends(Some(&[0xba, 0xad]), true), "bd");
+        assert_eq!(alpn_ends(Some(b"http/1.1"), false), "h1");
+        assert_eq!(alpn_ends(Some(&[0x30, 0xab]), false), "09");
     }
 
     #[test]

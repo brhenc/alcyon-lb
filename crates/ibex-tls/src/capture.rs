@@ -295,13 +295,20 @@ pub struct HelloTap {
     hs: Vec<u8>,
     capture: Option<SslCapture>,
     done: bool,
+    /// `ibex.ja4-compat spec`: the JA4 of each capture follows the specification text.
+    ja4_spec: bool,
 }
 
 impl HelloTap {
     /// A tap keeping `cap` bytes, or `None` at 0: `HAProxy` registers no callback then.
     #[must_use]
     pub fn new(cap: usize) -> Option<Self> {
-        (cap > 0).then(|| Self { cap, rec: Vec::new(), hs: Vec::new(), capture: None, done: false })
+        (cap > 0).then(|| Self { cap, rec: Vec::new(), hs: Vec::new(), capture: None, done: false, ja4_spec: false })
+    }
+
+    /// `ibex.ja4-compat spec` (true) or `foxio` (false, the default) for the captures made from now on.
+    pub fn set_ja4_spec(&mut self, spec: bool) {
+        self.ja4_spec = spec;
     }
 
     /// Feeds bytes the client sent, in order. `tls12` is whether the session negotiated TLS 1.2
@@ -346,6 +353,9 @@ impl HelloTap {
             }
             let Some(msg) = self.hs.get(used..used + 4 + len) else { break };
             parse_clienthello(msg, self.cap, &mut self.capture);
+            if let Some(j) = self.capture.as_mut().and_then(|cap| cap.ja4.as_mut()) {
+                j.spec = self.ja4_spec;
+            }
             used += 4 + len;
         }
         self.hs.drain(..used.min(self.hs.len()));

@@ -73,9 +73,17 @@ fn start(size: Option<u32>) -> (Ibex, SocketAddr) {
 }
 
 fn start_with(size: Option<u32>, headers: &[(&str, &str)]) -> (Ibex, SocketAddr) {
+    start_cfg(size, headers, "")
+}
+
+/// `extra`: more `global` lines (`ibex.ja4-compat`).
+fn start_cfg(size: Option<u32>, headers: &[(&str, &str)], extra: &str) -> (Ibex, SocketAddr) {
     let crt = cert();
     let addr = common::reserve_addr();
-    let global = size.map_or_else(String::new, |n| format!("global\n  tune.ssl.capture-buffer-size {n}\n"));
+    let global = format!(
+        "global\n{}{extra}",
+        size.map_or_else(String::new, |n| format!("  tune.ssl.capture-buffer-size {n}\n"))
+    );
     let ja3 = "%[ssl_fc_protocol_hello_id],%[ssl_fc_cipherlist_bin(1),be2dec(-,2)],%[ssl_fc_extlist_bin(1),be2dec(-,2)],\
                %[ssl_fc_eclist_bin(1),be2dec(-,2)],%[ssl_fc_ecformats_bin,be2dec(-,1)]";
     let hdrs: String = headers.iter().map(|(n, e)| format!(" hdr {n} \"{e}\"")).collect();
@@ -109,6 +117,9 @@ const C2: &str = "-tls1_2 -cipher ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA
 const C3: &str = "-servername localhost";
 const C4: &str = "-tls1_3 -ciphersuites TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256 -groups X25519:P-256 \
                   -sigalgs ECDSA+SHA256:RSA-PSS+SHA256 -noservername -alpn http/1.1";
+/// Client 1 with a first ALPN value that is not a letter or digit at either end (`/x`).
+const C9: &str = "-tls1_3 -ciphersuites TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256 -groups X25519:P-256 \
+                  -sigalgs ECDSA+SHA256:RSA-PSS+SHA256 -servername localhost -alpn /x";
 const C7: &str = "-tls1_3 -ciphersuites TLS_AES_128_GCM_SHA256 -groups P-521:X25519 -servername localhost";
 /// 164 bytes of ciphers: `ALL:COMPLEMENTOFALL` with the TLS 1.3 suites (OpenSSL only offers
 /// what the protocol range allows, so not the 300+ bytes the plan hoped for).
@@ -138,6 +149,7 @@ fn get(addr: SocketAddr, client: u8) -> String {
             3 => C3,
             4 => C4,
             8 => C8,
+            9 => C9,
             _ => C7,
         };
         let mut child = Command::new("openssl")
@@ -339,5 +351,22 @@ fn haproxy_refuses_ja4() {
         let out = Command::new(haproxy).arg("-c").arg("-f").arg(f.path()).output().unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success() && err.contains("unknown fetch method 'ssl_fc_ja4'"), "{err}");
+    }
+}
+
+/// `ibex.ja4-compat`: a first ALPN value `/x` is `/x` for FoxIO's tools and `28` (hex digits of
+/// `2f78`) for the specification text; everything else of the fingerprint is client 1's. The
+/// default is `foxio`. (The non-ASCII case, `99` against `bd`, is in the `ibex-sample` vectors:
+/// a TLS client library cannot be made to offer it.)
+#[test]
+fn ja4_compat_picks_the_alpn_rule() {
+    for (extra, want) in [
+        ("", "t13d0212/x_88d8eb61a8ee_f7b8ee8a4e9e"),
+        ("  ibex.ja4-compat foxio\n", "t13d0212/x_88d8eb61a8ee_f7b8ee8a4e9e"),
+        ("  ibex.ja4-compat spec\n", "t13d021228_88d8eb61a8ee_f7b8ee8a4e9e"),
+    ] {
+        let (_ibex, addr) = start_cfg(Some(1024), &[("x-ja4", "%[ssl_fc_ja4]")], extra);
+        let r = get(addr, 9);
+        assert_eq!(hdr(&r, "x-ja4"), want, "{extra:?}: {r}");
     }
 }

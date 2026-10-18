@@ -254,6 +254,11 @@ pub struct GlobalSection {
     pub tune_ssl_capture_buffer_size: usize,
     /// One of the two spellings was given: a second one is refused (`pool_head_ssl_capture`).
     pub tune_ssl_capture_configured: bool,
+    /// `ibex.ja4-compat spec` (Ibex-only): `ssl_fc_ja4` follows the JA4 specification text where
+    /// FoxIO's tools differ; false (`foxio`, the default) follows the tools.
+    pub ibex_ja4_compat_spec: bool,
+    /// `ibex.ja4-compat` was given: a second one is refused.
+    pub ibex_ja4_compat_configured: bool,
     /// Default SSL bind ciphers.
     pub ssl_default_bind_ciphers: Option<String>,
     /// Default SSL bind options.

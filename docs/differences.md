@@ -306,7 +306,23 @@ is under the BSD 3-Clause licence in `LICENSE-JA4` of <https://github.com/FoxIO-
 "Copyright (c) 2026 FoxIO. All rights reserved", redistribution with the notice permitted, the
 name of FoxIO not to be used to endorse. Ibex implements the specification text and uses FoxIO's
 published test vectors (`crates/ibex-sample/testdata/ja4_vectors.txt`); no FoxIO code is copied.
-One deliberate deviation from FoxIO's own tools: for an ALPN value whose first or last byte is
-not a letter or digit, the specification says to use the first and last hex digit of the value
-(`0xBA 0xAD` gives `bd`); FoxIO's Python and Rust tools print `99` and their published vector
-says so. Ibex follows the specification text.
+Where FoxIO's tools and the specification text differ, the default is the tools; see
+`ibex.ja4-compat` below.
+
+### `ibex.ja4-compat foxio|spec` (Ibex-only global keyword; HAProxy refuses it as unknown)
+
+Where FoxIO's published tools and the JA4 specification text disagree, `ssl_fc_ja4` follows the
+tools by default (`foxio`), because the fingerprint databases operators compare against are
+produced by those tools. `ibex.ja4-compat spec` follows the specification text. Any other value
+is refused at load. The two differences:
+
+* A non-alphanumeric end of the first ALPN value. `foxio`: the character itself, or `9` for a
+  byte of 0x80 or more (`0xBA 0xAD` gives `99`; FoxIO's published vector for
+  `tls-non-ascii-alpn.pcapng`). `spec`: the first and last hex digit of the value (`bd`; `/x`
+  gives `28`).
+* No extension to list but signature algorithms present (no real ClientHello: the algorithms
+  come in an extension). `foxio`: the third part hashes `_` and the algorithms. `spec`: twelve
+  zeros. Only a unit test reaches it.
+
+Of the 72 published vectors in `crates/ibex-sample/testdata/ja4_vectors.txt` (all FoxIO's values,
+all given by `foxio`), only `tls-non-ascii-alpn.pcapng` gives a different string under `spec`.

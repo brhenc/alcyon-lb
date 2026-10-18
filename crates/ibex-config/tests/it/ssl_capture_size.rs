@@ -60,3 +60,17 @@ fn the_deprecated_alias_sets_the_same_size_and_warns() {
         (3, "'tune.ssl.capture-buffer-size' is already configured.".to_string())
     );
 }
+
+/// `ibex.ja4-compat` is Ibex-only (T344 JA4): it picks FoxIO's tools or the specification text
+/// where they differ. `HAProxy` has no such keyword (it refuses it as an unknown one).
+#[test]
+fn ja4_compat_is_stored_and_checked() {
+    assert!(!global("global\n daemon\n").ibex_ja4_compat_spec, "unset: foxio");
+    assert!(!global("global\n ibex.ja4-compat foxio\n").ibex_ja4_compat_spec);
+    assert!(global("global\n ibex.ja4-compat spec\n").ibex_ja4_compat_spec);
+    let k = "ibex.ja4-compat";
+    assert_eq!(refusal(&format!("global\n {k} nginx\n")).1, format!("'{k}' expects 'foxio' or 'spec', not 'nginx'."));
+    assert_eq!(refusal(&format!("global\n {k}\n")).1, format!("'{k}' expects 'foxio' or 'spec'."));
+    assert_eq!(refusal(&format!("global\n {k} spec foxio\n")).1, format!("'{k}' cannot handle unexpected argument 'foxio'."));
+    assert_eq!(refusal(&format!("global\n {k} spec\n {k} foxio\n")), (3, format!("'{k}' already specified.")));
+}

@@ -186,6 +186,13 @@ impl RustlsContext {
         self.hello_tap = crate::capture::HelloTap::new(size).map(Box::new);
     }
 
+    /// `ibex.ja4-compat`: `true` for `spec`. Call after [`Self::enable_capture`].
+    pub fn set_ja4_spec(&mut self, spec: bool) {
+        if let Some(tap) = self.hello_tap.as_mut() {
+            tap.set_ja4_spec(spec);
+        }
+    }
+
     /// Shows bytes the client sent, in order, to the `ClientHello` capture while the handshake
     /// runs. Called by whichever path reads the socket (`feed_raw_input`, or the runtime's
     /// own reads), once per byte.

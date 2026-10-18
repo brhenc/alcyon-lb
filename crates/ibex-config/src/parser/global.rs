@@ -637,6 +637,24 @@ pub(crate) fn parse_global_directive(
             global.tune_ssl_capture_configured = true;
             Ok(())
         }
+        "ibex.ja4-compat" => {
+            let name = kw.text.as_str();
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'{name}' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            let spec = match tokens.get(1).map(|t| t.text.as_str()) {
+                Some("foxio") => false,
+                Some("spec") => true,
+                Some(other) => return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' expects 'foxio' or 'spec', not '{other}'."))),
+                None => return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' expects 'foxio' or 'spec'."))),
+            };
+            if global.ibex_ja4_compat_configured {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{name}' already specified.")));
+            }
+            global.ibex_ja4_compat_spec = spec;
+            global.ibex_ja4_compat_configured = true;
+            Ok(())
+        }
         "ssl-default-bind-ciphers" => {
             if tokens.len() >= 2 {
                 global.ssl_default_bind_ciphers = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
