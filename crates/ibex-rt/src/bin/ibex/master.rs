@@ -379,6 +379,9 @@ impl Master {
                 w.leaving = true;
             }
             st.startup_logs.clear();
+            // On the master's stderr only: the startup logs are what `reload` answers with.
+            let line = format!("[NOTICE]   ({}) : Reloading HAProxy\n", shared.pid);
+            let _ = ibex_rt::syslog::write_stderr_nonblocking(line.as_bytes());
             if self.systemd {
                 ibex_rt::systemd::notify_reloading();
             }
@@ -482,7 +485,9 @@ impl Master {
         if ok {
             st.failed = 0;
         } else if !self.first {
-            st.failed += 1;
+            // Whether the last reload failed, as HAProxy: its master starts each reload
+            // afresh, so a second failure in a row still reads 1.
+            st.failed = 1;
         }
         st.results += 1;
         self.first = false;

@@ -306,3 +306,138 @@ fn x_hands_the_tcp_stats_socket_over() {
     let _ = new.stderr.take().expect("stderr").read_to_string(&mut err);
     assert!(err.contains("took over 1 listening socket(s)"), "the TCP CLI was not handed over: {err}");
 }
+
+/// T354. `HAProxy` 3.5-dev8-885761-29 (`stats socket` on a unix path at admin, another at
+/// operator, a TCP one at user, abnsz@ prints as abns@; asked on each, and after `user;`): every socket is listed,
+/// in configuration order, each with the level it was bound at -- not the level the
+/// asking session has dropped to, and not only the socket asked on.
+#[test]
+fn show_cli_sockets_lists_every_socket_with_its_own_level() {
+    let p4 = common::reserve_port();
+    let p6 = common::reserve_port();
+    let abns = format!("ibex-t354-{}", std::process::id());
+    let lines = format!(
+        "\tstats socket 127.0.0.1:{p4} level admin mode 600\n\
+         \tstats socket ipv6@[::1]:{p6}\n\
+         \tstats socket abns@{abns} level user\n\
+         \tstats socket abnsz@{abns}z"
+    );
+    let (mut child, _f) = start(&lines, &[]);
+    let v4: SocketAddr = format!("127.0.0.1:{p4}").parse().expect("addr");
+    let want = format!(
+        "# socket lvl processes\nipv4@127.0.0.1:{p4} admin all\nipv6@[::1]:{p6} operator all\n\
+         abns@{abns} user all\nabns@{abns}z operator all\n\n"
+    );
+    assert_eq!(ask(tcp(v4), "show cli sockets"), want, "asked on the first socket");
+    let s = wait("abns@", || abstract_stream(&abns, true));
+    assert_eq!(ask(s, "show cli sockets"), want, "asked on another one");
+    assert_eq!(ask(tcp(v4), "operator;show cli sockets"), format!("\n{want}"), "after the session dropped its level");
+    common::stop(&mut child);
+}
+
+/// T354. An `abns@` stats socket across a plain `-sf` reload. `HAProxy` 3.5-dev8-885761-29
+/// (`haproxy -f c.cfg`, then `haproxy -f c.cfg -sf <pid>`): the new process takes the name
+/// (the old one is told to pause with SIGTTOU when the bind finds it in use), answers on it,
+/// and the old process exits. Ibex had no pause: the new process died with `Address already
+/// in use` and the old one went on serving.
+#[test]
+fn an_abns_stats_socket_survives_a_sf_reload() {
+    let abns = format!("ibex-t354-sf-{}", std::process::id());
+    let port = common::reserve_port();
+    let lines = format!("\tstats socket abns@{abns} level admin\ndefaults\n\tmode http\n\ttimeout client 5s\n\ttimeout connect 1s\n\ttimeout server 5s\nfrontend fe\n\tbind 127.0.0.1:{port}\n\thttp-request return status 200 content-type text/plain string ok");
+    let (mut old, f) = start(&lines, &[]);
+    let pid_of = |s: UnixStream| -> String {
+        ask(s, "show info").lines().find(|l| l.starts_with("Pid: ")).unwrap_or("").to_string()
+    };
+    let first = pid_of(wait("abns@", || abstract_stream(&abns, true)));
+    assert_eq!(first, format!("Pid: {}", old.id()));
+
+    let mut new = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(f.path())
+        .arg("-sf")
+        .arg(old.id().to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut old_gone = false;
+    while Instant::now() < deadline && !old_gone {
+        old_gone = old.try_wait().expect("wait").is_some();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let answer = abstract_stream(&abns, true).map(pid_of);
+    let new_alive = new.try_wait().expect("wait").is_none();
+    let _ = Command::new("kill").arg("-USR1").arg(new.id().to_string()).status();
+    let _ = new.wait();
+    let _ = Command::new("kill").arg("-USR1").arg(old.id().to_string()).status();
+    let _ = old.wait();
+    assert!(new_alive, "the new process must start");
+    assert!(old_gone, "the old process exits after the reload");
+    assert_eq!(answer, Some(format!("Pid: {}", new.id())), "the CLI is now the new process's");
+}
+
+/// T354. When the successor then fails to start, the old process takes its abstract name
+/// back (HAProxy: SIGTTIN) and keeps serving the CLI.
+#[test]
+fn a_failed_sf_successor_gives_the_abns_name_back() {
+    let abns = format!("ibex-t354-ttin-{}", std::process::id());
+    let port = common::reserve_port();
+    let good = format!("\tstats socket abns@{abns} level admin\ndefaults\n\tmode http\n\ttimeout client 5s\n\ttimeout connect 1s\n\ttimeout server 5s\nfrontend fe\n\tbind 127.0.0.1:{port}\n\thttp-request return status 200 content-type text/plain string ok");
+    let (mut old, _f) = start(&good, &[]);
+    let pid_of = |s: UnixStream| -> String {
+        ask(s, "show info").lines().find(|l| l.starts_with("Pid: ")).unwrap_or("").to_string()
+    };
+    assert_eq!(pid_of(wait("abns@", || abstract_stream(&abns, true))), format!("Pid: {}", old.id()));
+
+    // The same stats socket, and a frontend that cannot start: a port in use without
+    // SO_REUSEPORT (bound by the test), after the stats socket has been bound.
+    let hog = std::net::TcpListener::bind("127.0.0.1:0").expect("hog");
+    let hog_port = hog.local_addr().expect("addr").port();
+    let bad = good.replace(&format!("bind 127.0.0.1:{port}"), &format!("bind 127.0.0.1:{hog_port}"));
+    let (mut new, _g) = start(&bad, &["-sf".to_string(), old.id().to_string()]);
+    let st = new.wait().expect("wait");
+    assert!(!st.success(), "the successor must fail: {st:?}");
+    std::thread::sleep(Duration::from_millis(300));
+    let now = wait("abns@ again", || abstract_stream(&abns, true));
+    assert_eq!(pid_of(now), format!("Pid: {}", old.id()), "the old process serves its CLI again");
+    let _ = Command::new("kill").arg("-USR1").arg(old.id().to_string()).status();
+    let _ = old.wait();
+}
+
+/// T354. SIGTTOU and SIGTTIN sent straight to a process with several stats sockets: every
+/// abns@ one (the first and an extra) lets go of its name and takes it back, as HAProxy
+/// 3.5-dev8-885761-29 does (measured: `kill -TTOU` frees both abstract names, `kill -TTIN`
+/// binds them again, `show cli sockets` lists all three afterwards). Known gap: HAProxy also
+/// pauses its TCP stats socket (connection refused until SIGTTIN); Ibex leaves it open, so
+/// its queued connections are not reset, and this test does not assert on it.
+#[test]
+fn sigttou_and_sigttin_release_and_rebind_every_abns_stats_socket() {
+    let abns = format!("ibex-t354-sig-{}", std::process::id());
+    let tcp_addr = common::reserve_addr();
+    let port = common::reserve_port();
+    let lines = format!("\tstats socket abns@{abns}x level admin\n\tstats socket {tcp_addr} level admin\n\tstats socket abns@{abns}y level user\ndefaults\n\tmode http\n\ttimeout client 5s\n\ttimeout connect 1s\n\ttimeout server 5s\nfrontend fe\n\tbind 127.0.0.1:{port}\n\thttp-request return status 200 content-type text/plain string ok");
+    let (mut p, _f) = start(&lines, &[]);
+    let sig = |s: &str| {
+        let _ = Command::new("kill").arg(format!("-{s}")).arg(p.id().to_string()).status();
+    };
+    let (x, y) = (format!("{abns}x"), format!("{abns}y"));
+    drop(wait("abns@x", || abstract_stream(&x, true)));
+    drop(wait("abns@y", || abstract_stream(&y, true)));
+    sig("TTOU");
+    wait("both names released", || (abstract_stream(&x, true).is_none() && abstract_stream(&y, true).is_none()).then_some(()));
+    // the TCP socket still answers and lists all three sockets
+    let listing = wait("tcp cli", || {
+        let s = TcpStream::connect(tcp_addr).ok()?;
+        Some(ask(s, "show cli sockets"))
+    });
+    assert!(listing.contains(&format!("abns@{x} admin all")) && listing.contains(&format!("abns@{y} user all")), "{listing}");
+    sig("TTIN");
+    let sy = wait("abns@y again", || abstract_stream(&y, true));
+    assert!(ask(sy, "show cli level").contains("user"));
+    let sx = wait("abns@x again", || abstract_stream(&x, true));
+    assert!(ask(sx, "show cli level").contains("admin"));
+    sig("USR1");
+    let _ = p.wait();
+}
