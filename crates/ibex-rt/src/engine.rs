@@ -11319,7 +11319,7 @@ impl EngineDispatcher<'_> {
                             None => {}
                             Some(Err(())) => return Err(500),
                             Some(Ok(rebuilt)) => {
-                                if !req_set_uri(sess, rebuilt) && STRICT_MODE.get() {
+                                if !(req_set_uri(sess, rebuilt) && req_update_host(sess)) && STRICT_MODE.get() {
                                     return Err(500);
                                 }
                             }
@@ -11338,7 +11338,7 @@ impl EngineDispatcher<'_> {
                     }
                     ibex_config::HttpReqAction::SetUri { fmt } => {
                         let new_uri = format_http_string(fmt, &make_ctx!(sess), registry);
-                        if !req_set_uri(sess, new_uri) && STRICT_MODE.get() {
+                        if !(req_set_uri(sess, new_uri) && req_update_host(sess)) && STRICT_MODE.get() {
                             return Err(500);
                         }
                     }
@@ -13248,7 +13248,88 @@ fn req_rule_header(sess: &mut TcpSession, name: &str, val: &str, replace: bool) 
     }
     sess.htx_reserve(name.len() + val.len());
     add_req_header(sess, name, val);
-    true
+    // `http_add_header(.., update_authority = 1)`.
+    !name.eq_ignore_ascii_case("host") || req_update_authority(sess, val)
+}
+
+/// Where the authority sits in a request target, as `http_parse_authority` finds it with
+/// `no_userinfo`: after the scheme and `//`, after any user information, up to the first of
+/// `/`, `?` and `#`. `scheme_required` is `http_update_authority`'s case, a target that
+/// carries an authority (absolute-form, or `CONNECT`'s authority-form, which has no scheme);
+/// without it a target with no scheme is read as an authority, as `http_update_host` does.
+fn uri_authority_span(uri: &str, connect: bool, scheme_required: bool) -> Option<(usize, usize)> {
+    let b = uri.as_bytes();
+    let mut start = 0;
+    if !connect {
+        // `http_parse_scheme`: a letter, then letters, digits, `+`, `-`, `.`, then `://`.
+        let n = b.iter().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.')).count();
+        if n > 0 && b[0].is_ascii_alphabetic() && b[n..].starts_with(b"://") {
+            start = n + 3;
+        } else if scheme_required {
+            return None;
+        }
+    }
+    let end = start + b[start..].iter().position(|c| matches!(c, b'/' | b'?' | b'#')).unwrap_or(b.len() - start);
+    if let Some(at) = b[start..end].iter().rposition(|c| *c == b'@') {
+        start += at + 1;
+    }
+    (start < end).then_some((start, end))
+}
+
+/// A `Host` header was rewritten to `host`: the authority of the request target follows
+/// (`http_update_authority`). False when the new target does not fit.
+fn req_update_authority(sess: &mut TcpSession, host: &str) -> bool {
+    let connect = sess.req_method.as_deref() == Some("CONNECT");
+    let Some(uri) = sess.req_uri.as_deref() else { return true };
+    let Some((a, e)) = uri_authority_span(uri, connect, true) else { return true };
+    if &uri[a..e] == host {
+        return true;
+    }
+    let mut new = String::with_capacity(uri.len() - (e - a) + host.len());
+    new.push_str(&uri[..a]);
+    new.push_str(host);
+    new.push_str(&uri[e..]);
+    req_set_uri(sess, new)
+}
+
+/// The target was replaced by `set-uri` or `replace-uri`: every `Host` header takes its
+/// authority (`http_update_host`); an origin-form or `*` target leaves them alone. False when
+/// a value does not fit.
+fn req_update_host(sess: &mut TcpSession) -> bool {
+    let connect = sess.req_method.as_deref() == Some("CONNECT");
+    let Some(uri) = sess.req_uri.as_deref() else { return true };
+    if uri.is_empty() || uri.starts_with('/') || uri == "*" {
+        return true;
+    }
+    let Some((a, e)) = uri_authority_span(uri, connect, false) else { return true };
+    let auth = uri[a..e].to_string();
+    let hosts: Vec<(usize, String)> = sess
+        .htx_slice()
+        .map_or_else(Vec::new, |h| h.header_blocks().filter(|(_, k, _)| k.eq_ignore_ascii_case("host")).map(|(i, _, v)| (i, v.to_string())).collect());
+    let mut ok = true;
+    let mut edits: Vec<usize> = Vec::new();
+    for (i, v) in &hosts {
+        if *v == auth {
+            continue;
+        }
+        if !res_htx_resize(htx_hdr_size("host", v), htx_hdr_size("host", &auth)) {
+            ok = false;
+            break;
+        }
+        edits.push(*i);
+    }
+    if edits.is_empty() {
+        return ok;
+    }
+    sess.htx_reserve(edits.len() * (auth.len() + 64));
+    sess.with_htx_mut(|htx| {
+        for i in &edits {
+            let _ = htx.replace_block_value(*i, auth.as_bytes());
+        }
+    });
+    sess.req_headers = sess.htx_slice().map(|h| h.headers().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+    rebuild_req_buffer(sess);
+    ok
 }
 
 fn replace_req_header(sess: &mut TcpSession, name: &str, regex: &str, repl: &str) -> Result<(), ()> {
@@ -13301,6 +13382,12 @@ fn rewrite_req_header_values(sess: &mut TcpSession, name: &str, regex: &str, rep
         }
     });
     rebuild_req_buffer(sess);
+    // `http_replace_header(_value)(.., update_authority = 1)`: the last value written.
+    if name.eq_ignore_ascii_case("host") {
+        if let Some((_, _, last)) = edits.last() {
+            failed |= !req_update_authority(sess, last);
+        }
+    }
     if failed && STRICT_MODE.get() {
         Err(())
     } else {
