@@ -229,6 +229,42 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        "tune.vars.global-max-size"
+        | "tune.vars.proc-max-size"
+        | "tune.vars.sess-max-size"
+        | "tune.vars.txn-max-size"
+        | "tune.vars.reqres-max-size"
+        | "tune.vars.check-max-size"
+        | "tune.vars.from-map.max" => {
+            // `vars_max_size` (src/vars.c): `strtol(args[1], &end, 10)` into an `unsigned int`; the
+            // whole word must parse, so `12k` is refused, `-5` wraps and no word at all is 0.
+            let name = kw.text.as_str();
+            let word = tokens.get(1).map_or("", |t| t.text.as_str());
+            let digits = word.strip_prefix(['-', '+']).unwrap_or(word);
+            if !word.is_empty() && (digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit())) {
+                return Err(ConfigError::new(kw.line, kw.col, format!("{name}: '{word}' is an invalid size")));
+            }
+            let mut n: i64 = 0;
+            for b in digits.bytes() {
+                n = n.saturating_mul(10).saturating_add(i64::from(b - b'0'));
+            }
+            if word.starts_with('-') {
+                n = -n;
+            }
+            #[allow(clippy::cast_possible_truncation)] // the C assignment to `unsigned int`
+            let v = n as u32;
+            let l = &mut global.vars_limits;
+            match name {
+                "tune.vars.global-max-size" => l.global = v,
+                "tune.vars.proc-max-size" => l.proc_ = v,
+                "tune.vars.sess-max-size" => l.sess = v,
+                "tune.vars.txn-max-size" => l.txn = v,
+                "tune.vars.reqres-max-size" => l.reqres = v,
+                "tune.vars.check-max-size" => l.check = v,
+                _ => l.from_map_max = v,
+            }
+            Ok(())
+        }
         "tune.maxrewrite" => {
             if tokens.len() < 2 {
                 return Err(ConfigError::new(kw.line, kw.col, "'tune.maxrewrite' expects an integer argument."));

@@ -111,6 +111,20 @@ impl StatusCodeSet {
 
 /// A `stats socket` line after the first (the first fills [`GlobalSection::stats_socket`]
 /// and its companions).
+/// `tune.vars.*-max-size` and `tune.vars.from-map.max`: `unsigned int` in `HAProxy` (src/vars.c),
+/// 0 for no limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VarsLimits {
+    pub global: u32,
+    pub proc_: u32,
+    pub sess: u32,
+    pub txn: u32,
+    pub reqres: u32,
+    pub check: u32,
+    /// `tune.vars.from-map.max`; `set-vars-from-map` is refused by the parser, so nothing reads it yet.
+    pub from_map_max: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StatsSocket {
     /// The unix socket path; for the other forms, [`StatsAddr::name`].
@@ -209,6 +223,8 @@ pub struct GlobalSection {
     /// `tune.pool-low-fd-ratio`: the percentage of `maxsock` in use past which a server keeps
     /// no more idle connections than it was seen to need (20 when unset).
     pub pool_low_fd_ratio: Option<u8>,
+    /// The `tune.vars.*` limits (T364 S5).
+    pub vars_limits: VarsLimits,
     /// Buffer size in bytes (`tune.bufsize`).
     pub bufsize: Option<usize>,
     /// Small buffer size in bytes (`tune.bufsize.small`).
