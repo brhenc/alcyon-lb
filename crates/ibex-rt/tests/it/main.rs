@@ -400,5 +400,6 @@ mod watchdog;
 mod websocket_handshake;
 mod when_applet;
 mod when_error_retries;
+mod response_status_timer_fetches;
 mod x509_v_err_str;
 mod xxh32_xxh64;

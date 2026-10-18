@@ -27,6 +27,11 @@ thread_local! {
     pub static CURRENT_TIMEOUTS: Cell<Option<StreamTimeouts>> = const { Cell::new(None) };
     pub static CURRENT_RES_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     pub static CURRENT_RES_STATUS: Cell<u16> = const { Cell::new(0) };
+    /// T385: the status as the server sent it (`txn->server_status`), which `set-status` leaves
+    /// alone; 0 before a server response.
+    pub static CURRENT_SRV_STATUS: Cell<u16> = const { Cell::new(0) };
+    /// T385: `res.timer.hdr` (`%Tr`) in milliseconds, -1 until the response head has arrived.
+    pub static CURRENT_RES_TR: Cell<i64> = const { Cell::new(-1) };
 }
 
 /// The timeouts a `set-timeout` names, as indexes into [`StreamTimeouts`]' arrays.
@@ -1806,6 +1811,32 @@ impl Registry {
             name: "txn.status",
             out_type: SampleType::Sint,
             func: status_fetch,
+        });
+
+        // T385: `server_status`, `res.comp`, `res.comp_algo`, `res.timer.hdr`.
+        self.register_fetch(FetchDesc {
+            name: "server_status",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| {
+                let st = CURRENT_SRV_STATUS.get();
+                (st > 0).then(|| Sample::Sint(i64::from(st)))
+            },
+        });
+        // The compression filter is not implemented: no response is compressed, no algorithm named.
+        self.register_fetch(FetchDesc {
+            name: "res.comp",
+            out_type: SampleType::Bool,
+            func: |_ctx, _args| Some(Sample::Bool(false)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.comp_algo",
+            out_type: SampleType::Str,
+            func: |_ctx, _args| Some(Sample::Str(String::new())),
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.timer.hdr",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(CURRENT_RES_TR.get())),
         });
 
         // `smp_fetch_proto_http` (`src/http_fetch.c`), registered as `req.proto_http` and, T326,
