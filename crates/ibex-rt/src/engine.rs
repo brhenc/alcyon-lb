@@ -2499,11 +2499,13 @@ fn with_buffered_request(rules: &mut Vec<ibex_config::HttpReqRule>, on: bool) {
 fn capture_slots(
     headers: &[ibex_config::HeaderCapture],
     rules: &mut [ibex_config::HttpReqRule],
+    tcp_rules: &mut [ibex_config::TcpReqContentRule],
 ) -> Arc<[(String, usize)]> {
     let rule_slots = rules
         .iter()
         .filter(|r| matches!(r.action, ibex_config::HttpReqAction::Capture { id: None, .. }))
-        .count();
+        .count()
+        + tcp_rules.iter().filter(|r| matches!(r.action, ibex_config::TcpReqContentAction::Capture { .. })).count();
     let mut slots: Vec<Option<(String, usize)>> = vec![None; headers.len() + rule_slots];
     for h in headers {
         if let Some(s) = slots.get_mut(h.slot) {
@@ -2516,6 +2518,15 @@ fn capture_slots(
             *id = free.next();
             if let Some(slot) = id.and_then(|i| slots.get_mut(i)) {
                 *slot = Some((String::new(), len.unwrap_or(usize::MAX)));
+            }
+        }
+    }
+    // `tcp-request content capture` rules take the slots after the `http-request` ones.
+    for r in tcp_rules.iter_mut() {
+        if let ibex_config::TcpReqContentAction::Capture { len, id, .. } = &mut r.action {
+            *id = free.next();
+            if let Some(slot) = id.and_then(|i| slots.get_mut(i)) {
+                *slot = Some((String::new(), *len));
             }
         }
     }
@@ -2584,7 +2595,18 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &[Proxy], fe_idx: usize,
             .map(|htx| htx.headers().map(|(k, v)| (k, ibex_regex::bytetext::text_to_bytes(v))).collect())
             .unwrap_or_default();
         let headers: Vec<(&[u8], &[u8])> = owned.iter().map(|(k, v)| (k.as_bytes(), v.as_ref())).collect();
-        entry.sess.log.req_captures = capture_values(fe.req_capture_slots.iter().map(|(n, l)| (n.as_str(), *l)), &headers);
+        let mut values = capture_values(fe.req_capture_slots.iter().map(|(n, l)| (n.as_str(), *l)), &headers);
+        // What `tcp-request content capture` wrote before the request was parsed is in the
+        // slots of its own (no header name), which nothing here fills.
+        let tcp_captures = fe.tcp_req_content_rules.iter().any(|r| matches!(r.action, ibex_config::TcpReqContentAction::Capture { .. }));
+        if tcp_captures && entry.sess.log.req_captures.len() == values.len() {
+            for ((slot, old), (name, _)) in values.iter_mut().zip(entry.sess.log.req_captures.iter_mut()).zip(fe.req_capture_slots.iter()) {
+                if name.is_empty() && slot.is_none() {
+                    *slot = old.take();
+                }
+            }
+        }
+        entry.sess.log.req_captures = values;
     }
     // The response's slots exist from here on, empty until a response fills them: `%hs`
     // is `{}` for a transaction the server never answered, and nothing for a request
@@ -3565,7 +3587,8 @@ fn server_forced_ids(count: usize, extras: &ibex_config::ast::ServerExtras) -> V
 fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, listen: &ibex_config::ListenSection) -> Proxy {
     let mut http_req_rules = listen.http_req_rules.clone();
     with_buffered_request(&mut http_req_rules, listen.buffer_request);
-    let req_capture_slots = capture_slots(&listen.req_header_captures, &mut http_req_rules);
+    let mut tcp_req_content_rules = listen.tcp_req_content_rules.clone();
+    let req_capture_slots = capture_slots(&listen.req_header_captures, &mut http_req_rules, &mut tcp_req_content_rules);
     let timeouts = section_timeouts(&listen.timeouts, listen.clitimeout, listen.srvtimeout, listen.contimeout);
 
     let retries = u16::try_from(listen.retries).unwrap_or(u16::MAX);
@@ -3672,7 +3695,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         server_check_tls: Vec::new(),
         tcp_req_conn_rules: listen.tcp_req_conn_rules.clone(),
         tcp_req_session_rules: listen.tcp_req_session_rules.clone(),
-        tcp_req_content_rules: listen.tcp_req_content_rules.clone(),
+        tcp_req_content_rules,
         tcp_req_inspect_delay: listen.tcp_req_inspect_delay,
         tcp_res_content_rules: listen.tcp_res_content_rules.clone(),
         tcp_res_inspect_delay: listen.tcp_res_inspect_delay,
@@ -3708,7 +3731,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
 fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe: &ibex_config::FrontendSection) -> Proxy {
     let mut http_req_rules = fe.http_req_rules.clone();
     with_buffered_request(&mut http_req_rules, fe.buffer_request);
-    let req_capture_slots = capture_slots(&fe.req_header_captures, &mut http_req_rules);
+    let mut tcp_req_content_rules = fe.tcp_req_content_rules.clone();
+    let req_capture_slots = capture_slots(&fe.req_header_captures, &mut http_req_rules, &mut tcp_req_content_rules);
     let timeouts = section_timeouts(&fe.timeouts, fe.clitimeout, None, None);
 
     let mut cliexp = Vec::new();
@@ -3798,7 +3822,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         server_check_tls: Vec::new(),
         tcp_req_conn_rules: fe.tcp_req_conn_rules.clone(),
         tcp_req_session_rules: fe.tcp_req_session_rules.clone(),
-        tcp_req_content_rules: fe.tcp_req_content_rules.clone(),
+        tcp_req_content_rules,
         tcp_req_inspect_delay: fe.tcp_req_inspect_delay,
         tcp_res_content_rules: Vec::new(),
         tcp_res_inspect_delay: None,
@@ -6317,10 +6341,12 @@ enum ContentEvalResult {
 #[allow(clippy::too_many_lines)]
 fn eval_tcp_req_content_rules(
     proxy: &Proxy,
+    fe_idx: usize,
     proxies: &[Proxy],
     registry: &Registry,
     sess: &mut TcpSession,
     now: Tick,
+    start: usize,
 ) -> ContentEvalResult {
     if proxy.tcp_req_content_rules.is_empty() {
         return ContentEvalResult::Done;
@@ -6382,7 +6408,7 @@ fn eval_tcp_req_content_rules(
     };
 
     let mut has_missing_data = false;
-    for rule in &proxy.tcp_req_content_rules {
+    for (rule_idx, rule) in proxy.tcp_req_content_rules.iter().enumerate().skip(start) {
         let cond_res = match &rule.cond {
             None => crate::proxy::AclEvalResult::Matched,
             Some(cond) => crate::proxy::eval_acl_condition_extended(
@@ -6488,6 +6514,21 @@ fn eval_tcp_req_content_rules(
                 } else if let Ok(sa) = val.parse::<SocketAddr>() {
                     sess.client_addr = Some(sa);
                     ctx.client_addr = Some(sa);
+                }
+            }
+            ibex_config::TcpReqContentAction::Capture { expr, len, id } => {
+                // The slot is the holding proxy's own; a stream from another frontend has
+                // none and the rule is ignored (`tcp_action_capture`: `px != strm_fe(s)`).
+                if std::ptr::eq(proxy, &proxies[fe_idx]) {
+                    let val = Expr::cached(expr).ok().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| sample_to_string(&smp));
+                    if let (Some(id), Some(val)) = (id, val) {
+                        // The context borrows the slots: the rules after this one run on a new
+                        // pass, over the written slots, in place of this one.
+                        if let Some(slot) = sess.log.req_captures.get_mut(*id) {
+                            *slot = Some(cut_at(&val, *len).into_owned());
+                        }
+                        return eval_tcp_req_content_rules(proxy, fe_idx, proxies, registry, sess, now, rule_idx + 1);
+                    }
                 }
             }
             ibex_config::TcpReqContentAction::SetDst { expr } => {
@@ -9519,12 +9560,20 @@ impl EngineDispatcher<'_> {
             // Step 3.4: Content inspection for TCP rules (or before HTTP request parsing)
             if !entry.sess.tcp_inspect_done && !entry.sess.is_done() {
                 let proxy_idx = entry.proxy_idx;
+                // The request's capture slots exist from the first rule that can fill one:
+                // `begin_http_stream` keeps what these rules wrote in the slots no header fills.
+                if self.proxies[proxy_idx].tcp_req_content_rules.iter().any(|r| matches!(r.action, ibex_config::TcpReqContentAction::Capture { .. })) {
+                    entry.sess.log.req_captures.clear();
+                    entry.sess.log.req_captures.resize(self.proxies[proxy_idx].req_capture_slots.len(), None);
+                }
                 match eval_tcp_req_content_rules(
                     &self.proxies[proxy_idx],
+                    proxy_idx,
                     self.proxies,
                     sample_registry(),
                     &mut entry.sess,
                     now,
+                    0,
                 ) {
                     ContentEvalResult::Done => {
                         entry.sess.tcp_inspect_done = true;
@@ -11633,7 +11682,10 @@ impl EngineDispatcher<'_> {
                         // `id` names one of the frontend's slots (a backend's rule too); without
                         // it the rule's own, which the engine assigned when the proxy was built.
                         // An `id` past the frontend's slots captures nothing.
-                        if let (Some(target_id), Some(val)) = (id, val) {
+                        // A rule with its own slot (`len`) belongs to the proxy that holds it; a
+                        // stream coming from another frontend has no such slot (`px != strm_fe`).
+                        let foreign = len.is_some() && pages_idx != proxy_idx;
+                        if let (Some(target_id), Some(val), false) = (id, val, foreign) {
                             // With `id`, the length is the declared slot's.
                             let max = len.or_else(|| proxies[proxy_idx].req_capture_slots.get(*target_id).map(|(_, l)| *l));
                             if let Some(slot) = sess.log.req_captures.get_mut(*target_id) {
@@ -11720,10 +11772,12 @@ impl EngineDispatcher<'_> {
             entry.sess.inspect_exp = deadline;
             let res = eval_tcp_req_content_rules(
                 &proxies[be_idx],
+                proxy_idx,
                 proxies,
                 sample_registry(),
                 &mut entry.sess,
                 now,
+                0,
             );
             entry.sess.inspect_exp = None;
             let wait = (res == ContentEvalResult::Waiting).then(|| crate::txn::BodyWait {
@@ -12149,10 +12203,12 @@ impl EngineDispatcher<'_> {
             }
             let res = eval_tcp_req_content_rules(
                 &proxies[be_idx],
+                entry.proxy_idx,
                 proxies,
                 sample_registry(),
                 &mut entry.sess,
                 now,
+                0,
             );
             if res == ContentEvalResult::Waiting {
                 // Held until the delay is over, or the request says more: the server is
