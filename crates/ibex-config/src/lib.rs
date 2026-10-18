@@ -13,6 +13,7 @@
 
 pub mod ast;
 pub mod cond;
+pub mod env;
 pub mod error;
 pub mod lexer;
 pub mod preproc;
@@ -73,5 +74,6 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
             ),
         )
     })?;
+    env::set_file(&path_ref.to_string_lossy());
     parse_str(&content)
 }

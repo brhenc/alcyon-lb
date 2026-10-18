@@ -23,7 +23,7 @@ fn expand_vars(s: &str) -> String {
             if has_brace && i < chars.len() && chars[i] == '}' {
                 i += 1;
             }
-            if let Ok(val) = std::env::var(&var_name) {
+            if let Some(val) = crate::env::get(&var_name) {
                 out.push_str(&val);
             }
         } else {

@@ -836,6 +836,35 @@ pub(crate) fn parse_global_directive(
             Ok(())
         }
         other if IGNORED_GLOBAL_KEYWORDS.iter().any(|(k, _)| *k == other) => Ok(()),
+        // The change itself was made while the lines were read (`crate::preproc`), for the
+        // `${VAR}` below to see it, and is replayed on the process by the caller
+        // (`Config::env_ops`). This arm only refuses what `cfg_parse_global_env_opts` refuses.
+        "setenv" | "presetenv" => {
+            if let Some(extra) = tokens.get(3) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text)));
+            }
+            let arg = |i: usize| tokens.get(i).map_or("", |t| t.text.as_str());
+            if arg(1).is_empty() {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' expects environment variable name.\n.", kw.text)));
+            }
+            if arg(2).is_empty() {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' expects environment variable value for '{}'.\n.", kw.text, arg(1))));
+            }
+            if !crate::env::valid_name(arg(1)) || arg(2).contains('\0') {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' failed on variable '{}' : Invalid argument.\n", kw.text, arg(1))));
+            }
+            Ok(())
+        }
+        "unsetenv" => {
+            if tokens.len() < 2 || tokens[1].text.is_empty() {
+                return Err(ConfigError::new(kw.line, kw.col, "'unsetenv' expects at least one variable name.\n"));
+            }
+            if let Some(t) = tokens[1..].iter().find(|t| !crate::env::valid_name(&t.text)) {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'unsetenv' failed on variable '{}' : Invalid argument.\n", t.text)));
+            }
+            Ok(())
+        }
+        "resetenv" => Ok(()),
         "h1-case-adjust" => {
             // `cfg_parse_h1_header_case_adjust`, src/mux_h1.c (measured on 3.5-dev8).
             if tokens.len() > 3 {

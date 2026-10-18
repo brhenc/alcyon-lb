@@ -137,6 +137,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         return Err(ConfigError::new(line, col, msg));
     }
     let (lines, directive_messages) = crate::preproc::preprocess_with_messages(lexed)?;
+    let env_ops = crate::env::take_ops();
 
     // `http-errors` sections are resolved eagerly into a process-wide registry as they are
     // parsed (see `crate::ast::rules_http`), the same way `crate::ast::checks` resolves
@@ -514,6 +515,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         userlists,
         proxy_order,
         directive_messages,
+        env_ops,
         proxy_warnings: {
             proxy_warnings.extend(warn::take());
             proxy_warnings.sort_by_key(|w| w.line);
