@@ -129,6 +129,15 @@ fn server_states_no_maint_and_tcp_proxies() {
     assert!(out.contains("proxy=\"fe_http\"") && !out.contains("proxy=\"fe_tcp\""), "{out}");
 }
 
+/// A running server without `check` is `UP`, as `promex_srv_status` gives it (it reads
+/// `cur_state`, `SRV_ST_RUNNING`, not the `no check` status word): alerting on
+/// `state="DOWN"` must not fire for every unchecked server.
+#[test]
+fn a_running_server_without_check_is_up() {
+    let out = scrape(&states_engine(), "/metrics?scope=server");
+    assert_eq!(state_of(&out, "up"), "UP");
+}
+
 /// The query string is URL-decoded: `%XX` and `+`. A bad escape and a ninth `metrics=` are
 /// refused (the scrape ends at once: `finished`, no byte written).
 #[test]

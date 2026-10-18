@@ -654,7 +654,8 @@ fn server_state(status: &str) -> &'static str {
         "MAINT"
     } else if status.starts_with("DRAIN") {
         "DRAIN"
-    } else if status.starts_with("UP") {
+    } else if status.starts_with("UP") || status == "no check" {
+        // `no check` is a running server nothing checks: `SRV_ST_RUNNING`, so `UP`.
         "UP"
     } else {
         "DOWN"
