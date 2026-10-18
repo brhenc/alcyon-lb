@@ -4265,6 +4265,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let bufsize_small = config.global.as_ref().and_then(|g| g.bufsize_small).unwrap_or(1024);
         let bufsize_large = config.global.as_ref().and_then(|g| g.bufsize_large);
         crate::buf::init_buffer_sizes(bufsize, bufsize_small, bufsize_large);
+        let vl = config.global.as_ref().map(|g| g.vars_limits).unwrap_or_default();
+        ibex_sample::vars::set_limits(vl.global, vl.proc_, vl.sess, vl.txn, vl.reqres, vl.check);
         if bufsize_large.is_some() {
             crate::buf::preallocate_large_buffers();
         }
@@ -6729,9 +6731,13 @@ fn store_var_smp(sess_vars: &mut VarMap, req_vars: &mut VarMap, spec: &str, val:
         ibex_sample::vars::set_proc(name, val);
         return;
     }
+    // The thread's map takes it first, with the accounting of `tune.vars.*`; what it stored
+    // (a refused set stores nothing, a string that does not fit a `bool`) goes in the session's too.
+    let Some(stored) = ibex_sample::vars::store(&[&*sess_vars, &*req_vars], name, val) else {
+        return;
+    };
     let map = if name.starts_with("sess.") { sess_vars } else { req_vars };
-    map.insert(name.to_string(), val.clone());
-    ibex_sample::vars::set(name, val);
+    map.insert(name.to_string(), stored);
 }
 
 /// Runs `f` with `sess`'s variables in the thread's `CURRENT_VARS`, where the fetches and

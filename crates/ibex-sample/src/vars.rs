@@ -21,6 +21,7 @@ use crate::sample::{Sample, SampleType};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, RwLock};
 
 /// The variables of one stream (`sess.`, `txn.`, `req.`, `res.`) or of the process (`proc.`),
@@ -57,10 +58,14 @@ pub fn get_proc(name: &str) -> Option<Sample> {
     GLOBAL_PROC_VARS.read().ok()?.get(name).cloned()
 }
 
-/// Sets `proc.<name>`.
+/// Sets `proc.<name>`, unless it does not fit `tune.vars.proc-max-size` / `global-max-size`.
 pub fn set_proc(name: &str, smp: Sample) {
+    // The running stream's variables count in the process total too (see [`admit`]).
+    let stream = if limits_set() { with_current(|m| scan(&[m]).sess).unwrap_or(0) } else { 0 };
     if let Ok(mut lock) = GLOBAL_PROC_VARS.write() {
-        lock.insert(name.to_string(), smp);
+        if let Some(smp) = admit(&[&*lock], stream, name, smp) {
+            lock.insert(name.to_string(), smp);
+        }
     }
 }
 
@@ -95,7 +100,181 @@ pub fn set(name: &str, smp: Sample) {
         set_proc(name, smp);
         return;
     }
-    with_current_mut(|m| m.insert(name.to_string(), smp));
+    let procs = if limits_set() { proc_size() } else { 0 };
+    with_current_mut(|m| {
+        if let Some(smp) = admit(&[&*m], procs, name, smp) {
+            m.insert(name.to_string(), smp);
+        }
+    });
+}
+
+/// [`set`] for the engine's `set-var` rules, which also keep the value in the session's own
+/// maps `extra` (empty while the stream runs, and the same entries as the thread's map
+/// otherwise). Gives the sample that was stored, `None` when it was refused.
+pub fn store(extra: &[&VarMap], name: &str, smp: Sample) -> Option<Sample> {
+    if !limits_set() {
+        return with_current_mut(|m| m.insert(name.to_string(), smp.clone())).map(|_| smp);
+    }
+    let procs = if limits_set() { proc_size() } else { 0 };
+    with_current_mut(|m| {
+        let mut views: Vec<&VarMap> = vec![&*m];
+        views.extend_from_slice(extra);
+        let stored = admit(&views, procs, name, smp)?;
+        m.insert(name.to_string(), stored.clone());
+        Some(stored)
+    })
+    .flatten()
+}
+
+/// Sets a variable of a health check's run (`check.` scope; `tune.vars.check-max-size`).
+pub fn set_in(map: &mut VarMap, name: &str, smp: Sample) {
+    let procs = if limits_set() { proc_size() } else { 0 };
+    if let Some(smp) = admit(&[&*map], procs, name, smp) {
+        map.insert(name.to_string(), smp);
+    }
+}
+
+// Accounting: `var_accounting_add` / `var_accounting_diff` (src/vars.c).
+
+/// What `sizeof(struct var)` is in the x86-64 build of HAProxy 3.5-dev8 (measured: a limit of 87
+/// refuses one `int` variable, 88 takes it). Ibex's own entries are smaller (design §2.5); the
+/// accounting uses HAProxy's number so that a limit means the same.
+pub const VAR_STRUCT_COST: u64 = 88;
+
+/// The limits, in the order global, proc, sess, txn, reqres, check; 0 is none.
+static LIMITS: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
+
+/// Sets `tune.vars.{global,proc,sess,txn,reqres,check}-max-size`.
+pub fn set_limits(global: u32, proc_: u32, sess: u32, txn: u32, reqres: u32, check: u32) {
+    for (a, v) in LIMITS.iter().zip([global, proc_, sess, txn, reqres, check]) {
+        a.store(v, Ordering::Relaxed);
+    }
+}
+
+fn limit(i: usize) -> u64 {
+    u64::from(LIMITS[i].load(Ordering::Relaxed))
+}
+
+fn limits_set() -> bool {
+    (0..6).any(|i| limit(i) != 0)
+}
+
+/// The bytes a value holds beyond its `struct var`: a `str`, a `bin`, a method that is not one of
+/// the known ones (a `str` is bytetext: a character per byte).
+fn extra_bytes(s: &Sample) -> u64 {
+    let n = match s {
+        Sample::Str(t) => t.chars().count(),
+        Sample::Bin(b) => b.len(),
+        Sample::Meth(ibex_proto::htx::HttpMethod::Other(m)) => m.len(),
+        _ => 0,
+    };
+    n as u64
+}
+
+#[derive(Default, Clone, Copy)]
+struct Sizes {
+    /// `sess.`, `txn.`, `req.`, `res.` and `check.`: what a session's counter holds.
+    sess: u64,
+    txn: u64,
+    reqres: u64,
+    check: u64,
+}
+
+/// The sizes of the variables in `maps` (a name in two of them counts once, from the first).
+fn scan(maps: &[&VarMap]) -> Sizes {
+    let mut z = Sizes::default();
+    for (i, m) in maps.iter().enumerate() {
+        for (k, v) in m.iter() {
+            if maps[..i].iter().any(|e| e.contains_key(k)) {
+                continue;
+            }
+            let c = VAR_STRUCT_COST + extra_bytes(v);
+            match k.split('.').next() {
+                Some("req" | "res") => {
+                    z.reqres += c;
+                    z.txn += c;
+                    z.sess += c;
+                }
+                Some("txn") => {
+                    z.txn += c;
+                    z.sess += c;
+                }
+                Some("sess") => z.sess += c,
+                Some("check") => {
+                    z.check += c;
+                    z.sess += c;
+                }
+                _ => {}
+            }
+        }
+    }
+    z
+}
+
+/// The size of the `proc.` variables.
+fn proc_size() -> u64 {
+    GLOBAL_PROC_VARS.read().map_or(0, |m| m.values().map(|v| VAR_STRUCT_COST + extra_bytes(v)).sum())
+}
+
+/// Whether setting the variable `name` to `new` fits the limits, and what is stored: `var_set`
+/// with its two `var_accounting_add` calls. `maps` holds the variables of the scope's owner (the
+/// stream, the check run, or the `proc.` map), `procs` the bytes of the rest of the process that
+/// the `proc` and `global` limits also count.
+///
+/// - The variable does not exist: its `struct var` must fit, or nothing is created (`None`).
+/// - A `str`, `bin` or unusual method replaces what the variable held (its bytes are given back)
+///   and must fit its bytes too; if not the variable stays, as a `bool` that takes no memory.
+///   HAProxy's keeps the integer it held in the union, so that `int(7)` then a string that does
+///   not fit still prints `7`; Ibex stores `Bool(old != 0)` (T364 Q1, tradeoff.md).
+///
+/// Counted per scope as HAProxy does: `req`/`res` in `reqres`, `txn` and `sess`, `txn` in `sess`,
+/// `check` in `check` and `sess`, and every one in `proc`. Not counted: sessions other than
+/// this one (a process total is this process's `proc.` variables and the running stream's; S6/S7
+/// bring the rest) and the 88 bytes HAProxy charges for each `proc.` name the configuration only
+/// mentions (it creates them at load).
+fn admit(maps: &[&VarMap], procs: u64, name: &str, new: Sample) -> Option<Sample> {
+    if !limits_set() {
+        return Some(new);
+    }
+    let old = maps.iter().find_map(|m| m.get(name));
+    let z = scan(maps);
+    let scope = name.split('.').next().unwrap_or("");
+    let proc_total = procs + if scope == "proc" { z_total_proc(maps) } else { z.sess };
+    // Whether `size - minus + add` fits every limit `scope` counts in.
+    let fits = |add: u64, minus: u64| {
+        let over = |size: u64, lim: u64| lim != 0 && (size + add).saturating_sub(minus) > lim;
+        let (reqres, txn, sess, check) = (z.reqres, z.txn, z.sess, z.check);
+        match scope {
+            "req" | "res" if over(reqres, limit(4)) || over(txn, limit(3)) => return false,
+            "txn" if over(txn, limit(3)) => return false,
+            "check" if over(check, limit(5)) => return false,
+            "req" | "res" | "txn" | "sess" | "check" if over(sess, limit(2)) => return false,
+            _ => {}
+        }
+        !(over(proc_total, limit(1)) || over(proc_total, limit(0)))
+    };
+    let created = old.is_none();
+    if created && !fits(VAR_STRUCT_COST, 0) {
+        return None;
+    }
+    let held = old.map_or(0, extra_bytes);
+    if matches!(new, Sample::Str(_) | Sample::Bin(_) | Sample::Meth(ibex_proto::htx::HttpMethod::Other(_)))
+        && !fits(if created { VAR_STRUCT_COST } else { 0 } + extra_bytes(&new), held)
+    {
+        let was = match old {
+            Some(Sample::Sint(n)) => *n != 0,
+            Some(Sample::Bool(b)) => *b,
+            Some(Sample::Ipv4(a)) => !a.is_unspecified(),
+            _ => false,
+        };
+        return Some(Sample::Bool(was));
+    }
+    Some(new)
+}
+
+/// The size of the `proc.` variables in `maps`' first map.
+fn z_total_proc(maps: &[&VarMap]) -> u64 {
+    maps.first().map_or(0, |m| m.values().map(|v| VAR_STRUCT_COST + extra_bytes(v)).sum())
 }
 
 /// Removes the variable `name` (`var_unset`). A `proc.` variable stays declared, with no value.
