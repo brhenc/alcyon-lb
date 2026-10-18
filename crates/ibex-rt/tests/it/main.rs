@@ -121,6 +121,7 @@ mod fetch_availability_by_rule;
 mod fetch_counters;
 mod fetch_edge_cases;
 mod forwardfor_no_room;
+mod maxrewrite_clamp;
 mod getsocks_blocking;
 mod global_maxconn;
 mod global_maxconn_default;

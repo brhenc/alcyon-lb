@@ -1388,9 +1388,33 @@ fn head_cost(head: &[u8], request: bool) -> usize {
 
 /// [`head_cost`] of a head whose [`htx_head_size`] is `size`.
 fn head_cost_of(head: &[u8], size: Option<u64>) -> usize {
-    let blocks = 2 + head.split(|&b| b == b'\n').skip(1).take_while(|l| !l.is_empty() && *l != b"\r").count();
+    // A `Connection` header left with no token is not in the HTX message at all, so it has
+    // no block either (as `htx_head_size` leaves it out of the data).
+    let blocks = 2 + head
+        .split(|&b| b == b'\n')
+        .skip(1)
+        .take_while(|l| !l.is_empty() && *l != b"\r")
+        .filter(|l| !connection_emptied(l))
+        .count();
     let data = size.map_or(head.len(), |n| usize::try_from(n).unwrap_or(usize::MAX));
     data.saturating_add(40 + 8 * blocks)
+}
+
+/// Whether a header line is a `Connection` whose tokens are all ones HTX drops (`close`,
+/// `keep-alive`, `upgrade`), with at least one: the header is then gone from the message.
+fn connection_emptied(line: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|&b| b == b':') else { return false };
+    if !ascii_trim_end(&line[..colon]).eq_ignore_ascii_case(b"connection") {
+        return false;
+    }
+    let mut any = false;
+    for t in line[colon + 1..].split(|&b| b == b',').map(ascii_trim).filter(|t| !t.is_empty()) {
+        if !(t.eq_ignore_ascii_case(b"close") || t.eq_ignore_ascii_case(b"keep-alive") || t.eq_ignore_ascii_case(b"upgrade")) {
+            return false;
+        }
+        any = true;
+    }
+    any
 }
 
 /// What a request head takes of `HAProxy`'s buffer once parsed into HTX, which is what
