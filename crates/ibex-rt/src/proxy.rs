@@ -1101,7 +1101,7 @@ impl TcpSession {
         s
     }
 
-    /// The version the client spoke, where it is not HTTP/1.x (`req.ver`): the HTX start line of
+    /// The version the client spoke (`req.ver`): where it is not HTTP/1.x, or after the HTX is gone: the HTX start line of
     /// an h2 or h3 request is rewritten to HTTP/1.1 for the server leg, but `HAProxy` reads the
     /// version of the message the client sent (`2.0`, `3.0`).
     #[must_use]
@@ -1110,8 +1110,11 @@ impl TcpSession {
             Some("HTTP/3.0")
         } else if self.is_h2() {
             Some("HTTP/2.0")
-        } else {
+        } else if self.has_htx {
             None
+        } else {
+            // The head's HTX is gone once it is forwarded: the version is kept apart.
+            self.txn.as_ref().and_then(|t| txn::version_text(t.req_version))
         }
     }
 
@@ -1749,6 +1752,21 @@ impl TcpSession {
         }
     }
 
+    /// The request head is on the wire to the server: the parsed HTX has no reader left, and a
+    /// request whose body is still arriving would pin its 16 KiB for as long as the client
+    /// takes (`HAProxy` empties the channel buffer once the head is forwarded). What later
+    /// stages read of the request is kept apart from it: the method, URI and request line
+    /// (`%r`, `%HU`, `%HM`), the header captures (`log.req_captures`), the retry snapshot of
+    /// `retry-on` (`L7Retry::Saved`) and `req_headers`. Nothing reads the HTX of a request
+    /// after this point (`req.hdr` is refused in response rules and logs, as in `HAProxy`);
+    /// the next request parses a new one.
+    fn release_forwarded_head(&mut self) {
+        if self.has_htx {
+            self.clear_htx();
+            self.release_idle_buffers();
+        }
+    }
+
     /// Discards the body of a request the proxy has already answered, as it arrives, up
     /// to its end; what follows it is the next request.
     fn drain_request(&mut self) {
@@ -2383,10 +2401,14 @@ impl TcpSession {
                 }
                 let mut txn = HttpTxn::new(framing, close || self.close_client);
                 txn.req_htx = req_htx;
-                txn.req_http11 = self.req.readable().split(|&b| b == b'\n').next().is_some_and(|l| {
-                    let l = l.trim_ascii_end();
-                    ibex_proto::h1::version_is_11(&l[l.len().saturating_sub(8)..])
-                });
+                let line = self.req.readable().split(|&b| b == b'\n').next().map_or(&[][..], <[u8]>::trim_ascii_end);
+                let ver = &line[line.len().saturating_sub(8)..];
+                txn.req_http11 = ibex_proto::h1::version_is_11(ver);
+                if let [.., major, b'.', minor] = ver {
+                    if major.is_ascii_digit() && minor.is_ascii_digit() {
+                        txn.req_version = (major - b'0') * 10 + (minor - b'0');
+                    }
+                }
                 // The client's own method: rules that rewrite it have not run yet.
                 txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
                 self.txn = Some(txn);
@@ -2631,6 +2653,7 @@ impl TcpSession {
                 };
             }
         }
+        let mut head_gone = false;
         if self.srv_state.can_write() && (window > 0 || self.srv_xprt.wants_write()) {
             let r = {
                 let sfd = self
@@ -2648,9 +2671,13 @@ impl TcpSession {
                     if self.mode == Mode::Http {
                         if let Some(t) = self.txn.as_mut() {
                             t.request_consumed(self.req.readable(), n);
+                            head_gone = !matches!(t.req, txn::MsgState::Head { .. });
                         }
                     }
                     self.req.consume(n);
+                    if head_gone {
+                        self.release_forwarded_head();
+                    }
                     changed = true;
                 }
                 Io::Closed => {

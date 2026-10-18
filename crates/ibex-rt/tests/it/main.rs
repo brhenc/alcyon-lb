@@ -308,6 +308,7 @@ mod shared_counters;
 mod shdr_scook_aliases;
 mod show_info_counters;
 mod show_info_pools;
+mod slow_body_buffers;
 mod show_info_rates;
 mod show_info_cum_streams;
 mod show_info_total_bytes_out;

@@ -1451,6 +1451,9 @@ pub struct HttpTxn {
     /// The one decision to close the client connection once this transaction ends.
     pub close_after: bool,
     /// The client's request is HTTP/1.1 (the response's `Connection` header depends on it).
+    /// The version on the request line as major * 10 + minor (`HTTP/1.1` is 11), 255 until it
+    /// is read; `req.ver` reads it after the head's HTX is released (T371).
+    pub req_version: u8,
     pub req_http11: bool,
     /// The server may keep its connection once this response is done.
     pub srv_reusable: bool,
@@ -1526,6 +1529,7 @@ impl HttpTxn {
             local: false,
             close_after,
             req_http11: true,
+            req_version: 255,
             srv_reusable: true,
             srv_reused: false,
             keepalive_lost: false,
@@ -1616,6 +1620,25 @@ impl HttpTxn {
     pub fn finished(&self) -> bool {
         self.rsp.is_done() && (self.req.is_done() || self.close_after)
     }
+}
+
+/// `HTTP/<digit>.<digit>`, the version of the request line the parser accepts, by major * 10 + minor.
+static VERSION_TEXT: [[u8; 8]; 100] = {
+    let mut t = [[0u8; 8]; 100];
+    let mut i = 0;
+    while i < 100 {
+        #[allow(clippy::cast_possible_truncation)]
+        let (major, minor) = (b'0' + (i / 10) as u8, b'0' + (i % 10) as u8);
+        t[i] = [b'H', b'T', b'T', b'P', b'/', major, b'.', minor];
+        i += 1;
+    }
+    t
+};
+
+/// The text of a version kept as `HttpTxn::req_version`.
+#[must_use]
+pub fn version_text(v: u8) -> Option<&'static str> {
+    VERSION_TEXT.get(usize::from(v)).and_then(|t| std::str::from_utf8(t).ok())
 }
 
 #[cfg(test)]
