@@ -114,7 +114,6 @@ const IBEX_REFUSES: &[(&str, &str)] = &[
     ("spop-check", "bld"),
     // What reaches the server or the client.
     ("http-restrict-req-hdr-names reject", "fbld"),
-    ("checkcache", "bld"),
     ("disable-h2-upgrade", "fld"),
     // Which server is used.
     ("allbackups", "bld"),

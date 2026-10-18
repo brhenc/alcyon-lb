@@ -1442,6 +1442,9 @@ pub struct ProxyIdInfo {
     pub http_mode: ibex_config::ast::HttpMode,
     /// `option persist`: a server named by a cookie or a stick table is used when it is down.
     pub persist: bool,
+    /// `option checkcache`: a cacheable response that sets a cookie is answered 502
+    /// (`http_process_res_common`).
+    pub checkcache: bool,
     /// `retry-on`, as the `ibex_config::RE_*` bits: what a failed attempt is retried on.
     pub retry_on: u32,
 }
@@ -3602,6 +3605,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_pool: pool_cfgs(&listen.servers),
             http_mode: listen.http_mode,
             persist: listen.persist,
+            checkcache: listen.checkcache,
             retry_on: listen.retry_on,
             ..ProxyIdInfo::default()
         }),
@@ -3863,6 +3867,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_pool: pool_cfgs(&be.servers),
             http_mode: be.http_mode,
             persist: be.persist,
+            checkcache: be.checkcache,
             retry_on: be.retry_on,
             ..ProxyIdInfo::default()
         }),
@@ -10056,6 +10061,7 @@ impl EngineDispatcher<'_> {
             || !proxies[fe_idx].http_after_res_rules.is_empty()
             || !proxies[be_idx].tcp_res_content_rules.is_empty()
             || proxies[be_idx].cookie.is_some()
+            || proxies[be_idx].ids.checkcache
             || !proxies[be_idx].srvexp.is_empty();
 
         if !has_rules {
@@ -10434,6 +10440,25 @@ impl EngineDispatcher<'_> {
                     txn.ck.sck = sck;
                 }
                 CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+            }
+
+            // `option checkcache`: a response that may be stored by a cache and sets a cookie is
+            // blocked (`http_process_res_common`). The fetches in the rules above may have
+            // changed the headers, so this reads them as they now are.
+            if proxies[be_idx].ids.checkcache
+                && hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+                && {
+                    let req = crate::cookie::ReqKind {
+                        safe_method: matches!(entry.sess.req_method.as_deref().unwrap_or(""), "GET" | "HEAD" | "OPTIONS" | "TRACE"),
+                        post: entry.sess.req_method.as_deref() == Some("POST"),
+                    };
+                    let (cacheable, cook) = crate::cookie::response_cache_flags(req, status, &hdrs);
+                    cacheable && cook
+                }
+            {
+                let srv = ctx.srv_name.unwrap_or("<dispatch>");
+                crate::stderr_line!("[ALERT] Blocking cacheable cookie in response from instance {}, server {}.", proxies[be_idx].name, srv);
+                break 'rules Some(ResStop::Page(502));
             }
 
             // 2. and 3. `http-after-response`, the backend's then the frontend's.

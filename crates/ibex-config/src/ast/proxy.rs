@@ -78,6 +78,8 @@ pub struct DefaultsSection {
     pub http_mode: HttpMode,
     /// `option persist`: a server a cookie or stick table names is used even when it is down.
     pub persist: bool,
+    /// `option checkcache`: a cacheable response that sets a cookie is blocked with a 502.
+    pub checkcache: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
     /// `option http-ignore-probes`: a connection that sends nothing before it closes or
@@ -301,6 +303,8 @@ pub struct ListenSection {
     pub http_mode: HttpMode,
     /// `option persist`: a server a cookie or stick table names is used even when it is down.
     pub persist: bool,
+    /// `option checkcache`: a cacheable response that sets a cookie is blocked with a 502.
+    pub checkcache: bool,
     /// `option dontlognull`: no log line for a connection that carried nothing.
     pub dontlognull: bool,
     /// `option http-ignore-probes`: a connection that sends nothing before it closes or
@@ -466,6 +470,7 @@ impl Default for ListenSection {
             h1_adjust: 0,
             http_mode: HttpMode::KeepAlive,
             persist: false,
+            checkcache: false,
             dontlognull: false,
             http_ignore_probes: false,
             log_opts: 0,
@@ -719,6 +724,8 @@ pub struct BackendSection {
     pub http_mode: HttpMode,
     /// `option persist`: a server a cookie or stick table names is used even when it is down.
     pub persist: bool,
+    /// `option checkcache`: a cacheable response that sets a cookie is blocked with a 502.
+    pub checkcache: bool,
     /// Operating mode (tcp, http, health).
     pub mode: Mode,
     /// Whether this backend is disabled.
@@ -831,6 +838,7 @@ impl Default for BackendSection {
             h1_adjust: 0,
             http_mode: HttpMode::KeepAlive,
             persist: false,
+            checkcache: false,
             mode: Mode::Tcp,
             disabled: false,
             id: None,

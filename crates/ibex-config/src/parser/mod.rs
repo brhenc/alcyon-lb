@@ -830,11 +830,6 @@ const CHECK_OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[&str] = &[
 ///
 /// None of these appears in a reg-test that passed before T94.
 const OPTIONS_THAT_MUST_NOT_BE_IGNORED: &[(&str, &str)] = &[
-    (
-        "checkcache",
-        "Ibex does not block cacheable responses that set a cookie; a shared cache could serve one \
-         client's cookie to another",
-    ),
     ("disable-h2-upgrade", "Ibex would still accept HTTP/2 on this HTTP/1 listener"),
     (
         "allbackups",
