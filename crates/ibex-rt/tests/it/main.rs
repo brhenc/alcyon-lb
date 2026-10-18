@@ -259,6 +259,7 @@ mod reads_per_request;
 mod redispatch;
 mod res_hdr_names;
 mod res_hdr_cnt_values;
+mod fhdr_trims_lws;
 mod regex_bytes;
 mod regex_group_refs;
 mod regex_nocapture;
