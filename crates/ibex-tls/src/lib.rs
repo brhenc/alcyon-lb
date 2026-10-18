@@ -16,6 +16,7 @@
 
 pub mod arena;
 pub mod capture;
+pub mod cipher_names;
 pub mod config;
 pub mod resolver;
 pub mod transport;
