@@ -15,12 +15,12 @@ needs `fixed_on`; `fixed` (time) feeds the mean time to fix. Check with
 never an open finding. Then `python3 tools/findings.py --md` and commit the CSVs and this file.
 
 ```
-== (a) open findings: 13 of 72
-severity     bypass       dos      leak    parity      perf     flaky  total
-critical          0         0         0         0         0         0      0
-high              1         0         0         0         0         0      1
-medium            0         0         0         0         0         0      0
-low               0         4         1         5         1         1     12
+== (a) open findings: 13 of 73
+severity        dos      leak    parity      perf     flaky  total
+critical          0         0         0         0         0      0
+high              0         0         0         0         0      0
+medium            0         0         0         0         0      0
+low               4         1         6         1         1     13
 
 == (b) new findings per method per day
 day                  vv-soak          vv-probe           redteam    fuzz-libfuzzer fuzz-differential            review              gate
@@ -28,13 +28,13 @@ day                  vv-soak          vv-probe           redteam    fuzz-libfuzz
 2026-10-11                 0                 6                 6                 0                 7                 5                 2
 2026-10-12                 1                 0                 3                 0                 0                 0                 0
 2026-10-17                 0                 3                 0                 0                 0                 0                 0
-2026-10-18                 0                 2                 0                 0                 0                 0                 0
+2026-10-18                 0                 3                 0                 0                 0                 0                 0
 
 == (c) clean hours since the method's last new finding (runs on the main lineage)
 method               hours  last finding     runs
 vv-battery             1.8  never            6
 vv-soak                7.0  2026-10-12 14:38 2
-vv-probe               0.0  2026-10-18 21:24 0
+vv-probe               0.0  2026-10-18 22:05 0
 vv-recheck             0.9  never            4
 redteam                5.6  2026-10-12 12:31 37
 fuzz-libfuzzer         3.0  2026-10-10 22:18 4
@@ -43,5 +43,5 @@ review                 0.0  2026-10-11 11:00 0
 gate                   0.0  2026-10-11 08:20 0
 
 == (d) mean time found -> fixed
-18.9 h over 31 findings with both timestamps (58 fixed in all)
+18.3 h over 32 findings with both timestamps (59 fixed in all)
 ```
