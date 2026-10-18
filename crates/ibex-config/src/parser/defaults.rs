@@ -248,6 +248,8 @@ pub(crate) fn parse_option_defaults(
         "http-ignore-probes" => defaults.http_ignore_probes = true,
         "h1-case-adjust-bogus-client" => defaults.h1_adjust |= crate::ast::H1_ADJ_CLIENT,
         "h1-case-adjust-bogus-server" => defaults.h1_adjust |= crate::ast::H1_ADJ_SERVER,
+        "http-drop-request-trailers" => defaults.h1_adjust |= crate::ast::H1_DROP_REQ_TRAILERS,
+        "http-drop-response-trailers" => defaults.h1_adjust |= crate::ast::H1_DROP_RES_TRAILERS,
         "dontlog-normal" | "log-separate-errors" | "logasap" => defaults.log_opts |= crate::ast::log_opt_bit(&tokens[1].text),
         "accept-unsafe-violations-in-http-request" => defaults.stats.accept_unsafe_request = true,
         "accept-unsafe-violations-in-http-response" | "accept-invalid-http-response" => {
@@ -284,6 +286,8 @@ pub(crate) fn parse_no_defaults(defaults: &mut DefaultsSection, tokens: &[Token]
         Some("http-ignore-probes") => defaults.http_ignore_probes = false,
         Some("h1-case-adjust-bogus-client") => defaults.h1_adjust &= !crate::ast::H1_ADJ_CLIENT,
         Some("h1-case-adjust-bogus-server") => defaults.h1_adjust &= !crate::ast::H1_ADJ_SERVER,
+        Some("http-drop-request-trailers") => defaults.h1_adjust &= !crate::ast::H1_DROP_REQ_TRAILERS,
+        Some("http-drop-response-trailers") => defaults.h1_adjust &= !crate::ast::H1_DROP_RES_TRAILERS,
         Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => defaults.log_opts &= !crate::ast::log_opt_bit(n),
         Some("accept-unsafe-violations-in-http-request") => defaults.stats.accept_unsafe_request = false,
         Some("accept-unsafe-violations-in-http-response") => defaults.stats.accept_unsafe_response = false,

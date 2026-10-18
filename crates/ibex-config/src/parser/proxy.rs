@@ -213,7 +213,7 @@ pub(crate) fn parse_frontend_header(
         http_mode: defaults.map_or(HttpMode::KeepAlive, |d| d.http_mode),
         dontlognull: defaults.is_some_and(|d| d.dontlognull),
         http_ignore_probes: defaults.is_some_and(|d| d.http_ignore_probes),
-        h1_adjust: defaults.map_or(0, |d| d.h1_adjust & crate::ast::H1_ADJ_CLIENT),
+        h1_adjust: defaults.map_or(0, |d| d.h1_adjust & (crate::ast::H1_ADJ_CLIENT | crate::ast::H1_DROP_RES_TRAILERS)),
         log_opts: defaults.map_or(0, |d| d.log_opts),
         stick_table: None,
         stick_rules: Vec::new(),
@@ -286,7 +286,7 @@ pub(crate) fn parse_backend_header(
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
         buffer_request: defaults.is_some_and(|d| d.buffer_request),
         abortonclose: defaults.and_then(|d| d.abortonclose),
-        h1_adjust: defaults.map_or(0, |d| d.h1_adjust & crate::ast::H1_ADJ_SERVER),
+        h1_adjust: defaults.map_or(0, |d| d.h1_adjust & (crate::ast::H1_ADJ_SERVER | crate::ast::H1_DROP_REQ_TRAILERS)),
         http_mode: defaults.map_or(HttpMode::KeepAlive, |d| d.http_mode),
         persist: defaults.is_some_and(|d| d.persist),
         mode,
@@ -1016,6 +1016,8 @@ pub(crate) fn parse_option_listen(
         "http-ignore-probes" => proxy.http_ignore_probes = true,
         "h1-case-adjust-bogus-client" => proxy.h1_adjust |= crate::ast::H1_ADJ_CLIENT,
         "h1-case-adjust-bogus-server" => proxy.h1_adjust |= crate::ast::H1_ADJ_SERVER,
+        "http-drop-request-trailers" => proxy.h1_adjust |= crate::ast::H1_DROP_REQ_TRAILERS,
+        "http-drop-response-trailers" => proxy.h1_adjust |= crate::ast::H1_DROP_RES_TRAILERS,
         "dontlog-normal" | "log-separate-errors" | "logasap" => proxy.log_opts |= crate::ast::log_opt_bit(&tokens[1].text),
         "accept-unsafe-violations-in-http-request" => proxy.stats.accept_unsafe_request = true,
         "accept-unsafe-violations-in-http-response" | "accept-invalid-http-response" => {
@@ -1088,6 +1090,10 @@ pub(crate) fn parse_option_frontend(
         fe.h1_adjust |= crate::ast::H1_ADJ_CLIENT;
         return Ok(());
     }
+    if tokens[1].text == "http-drop-response-trailers" {
+        fe.h1_adjust |= crate::ast::H1_DROP_RES_TRAILERS;
+        return Ok(());
+    }
     if matches!(tokens[1].text.as_str(), "dontlog-normal" | "log-separate-errors" | "logasap") {
         fe.log_opts |= crate::ast::log_opt_bit(&tokens[1].text);
         return Ok(());
@@ -1134,6 +1140,7 @@ pub(crate) fn parse_option_backend(
         "httpclose" => be.http_mode = HttpMode::Close,
         "persist" => be.persist = true,
         "h1-case-adjust-bogus-server" => be.h1_adjust |= crate::ast::H1_ADJ_SERVER,
+        "http-drop-request-trailers" => be.h1_adjust |= crate::ast::H1_DROP_REQ_TRAILERS,
         "http-keep-alive" => be.http_mode = HttpMode::KeepAlive,
         "accept-unsafe-violations-in-http-response" | "accept-invalid-http-response" => {
             be.stats.accept_unsafe_response = true;
@@ -1172,6 +1179,8 @@ pub(crate) fn parse_no_listen(proxy: &mut ListenSection, tokens: &[Token], kw: &
         Some("http-ignore-probes") => proxy.http_ignore_probes = false,
         Some("h1-case-adjust-bogus-client") => proxy.h1_adjust &= !crate::ast::H1_ADJ_CLIENT,
         Some("h1-case-adjust-bogus-server") => proxy.h1_adjust &= !crate::ast::H1_ADJ_SERVER,
+        Some("http-drop-request-trailers") => proxy.h1_adjust &= !crate::ast::H1_DROP_REQ_TRAILERS,
+        Some("http-drop-response-trailers") => proxy.h1_adjust &= !crate::ast::H1_DROP_RES_TRAILERS,
         Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => proxy.log_opts &= !crate::ast::log_opt_bit(n),
         Some("accept-unsafe-violations-in-http-request") => proxy.stats.accept_unsafe_request = false,
         Some("accept-unsafe-violations-in-http-response") => proxy.stats.accept_unsafe_response = false,
@@ -1199,6 +1208,7 @@ pub(crate) fn parse_no_frontend(fe: &mut FrontendSection, tokens: &[Token], kw: 
         Some("dontlognull") => fe.dontlognull = false,
         Some("http-ignore-probes") => fe.http_ignore_probes = false,
         Some("h1-case-adjust-bogus-client") => fe.h1_adjust &= !crate::ast::H1_ADJ_CLIENT,
+        Some("http-drop-response-trailers") => fe.h1_adjust &= !crate::ast::H1_DROP_RES_TRAILERS,
         Some(n @ ("dontlog-normal" | "log-separate-errors" | "logasap")) => fe.log_opts &= !crate::ast::log_opt_bit(n),
         _ => {}
     }
@@ -1222,6 +1232,7 @@ pub(crate) fn parse_no_backend(be: &mut BackendSection, tokens: &[Token], kw: &T
         Some("httpclose") if be.http_mode == HttpMode::Close => be.http_mode = HttpMode::KeepAlive,
         Some("persist") => be.persist = false,
         Some("h1-case-adjust-bogus-server") => be.h1_adjust &= !crate::ast::H1_ADJ_SERVER,
+        Some("http-drop-request-trailers") => be.h1_adjust &= !crate::ast::H1_DROP_REQ_TRAILERS,
         Some("log-health-checks") => be.log_health_checks = false,
         Some("forwarded") => be.forwarded = None,
         Some("accept-unsafe-violations-in-http-response") => be.stats.accept_unsafe_response = false,
