@@ -835,20 +835,19 @@ impl CliApplet {
             self.finish_msg("Missing process-wide variable identifier.");
             return;
         }
-        let Some(val) = var_name.starts_with("proc.").then(|| ibex_sample::get_proc_var(var_name)).flatten() else {
+        let Some(smp) = var_name.starts_with("proc.").then(|| ibex_sample::vars::get_proc(var_name)).flatten() else {
             self.finish_msg("Variable not found.");
             return;
         };
-        let typ = if val.parse::<i64>().is_ok() {
-            "sint"
-        } else if val == "true" || val == "false" {
-            "bool"
-        } else if val.parse::<std::net::IpAddr>().is_ok() {
-            "ip"
-        } else {
-            "str"
+        // The value cast to a string (`bin` stops at its first NUL byte), a byte that is not printable
+        // ASCII shown as `.`: `isprint` in the oracle's loop. The type is the stored one (T364 S4).
+        let bytes: Vec<u8> = match &smp {
+            ibex_sample::Sample::Bin(b) => b.iter().copied().take_while(|&c| c != 0).collect(),
+            ibex_sample::Sample::Str(t) => ibex_regex::bytetext::text_to_bytes(t).into_owned(),
+            other => ibex_sample::registry::sample_to_string(other).into_bytes(),
         };
-        self.finish_msg(&format!("{var_name}: type={typ} value=<{val}>"));
+        let shown: String = bytes.iter().map(|&c| if (0x20..0x7f).contains(&c) { char::from(c) } else { '.' }).collect();
+        self.finish_msg(&format!("{var_name}: type={} value=<{shown}>", smp.sample_type().as_str()));
     }
 
     fn handle_set_var(&mut self, rest: &str) {
