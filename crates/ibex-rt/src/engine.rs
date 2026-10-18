@@ -11475,7 +11475,7 @@ impl EngineDispatcher<'_> {
                         sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
                     }
                     ibex_config::HttpReqAction::WaitForBody { time_ms, at_least } => {
-                        match wait_for_request_body(sess, &proxies[proxy_idx], be_stage, rule_idx, *time_ms, *at_least, now) {
+                        match wait_for_request_body(sess, &proxies[pages_idx], be_stage, rule_idx, *time_ms, *at_least, now) {
                             BodyWait::Ready => {}
                             BodyWait::Pending => return Ok(RuleFlow::Suspend),
                             BodyWait::TimedOut => {
@@ -12960,8 +12960,9 @@ enum BodyWait {
 }
 
 /// `http-request wait-for-body time <t> [at-least <bytes>]`, or the wait `option
-/// http-buffer-request` stands for (`time_ms` unset: `timeout http-request`, else `timeout
-/// client`, of the frontend), reached at rule `rule` of the frontend's list or, with
+/// http-buffer-request` stands for (`time_ms` unset: the `timeout http-request` of the proxy
+/// whose rules these are, as `s->be->timeout.httpreq`; unset, no deadline of its own: the
+/// `timeout client` read timer applies), reached at rule `rule` of the frontend's list or, with
 /// `backend`, the backend's.
 ///
 /// The request stays in `req` until its rules are done, so the body arrives there and is
@@ -12998,7 +12999,7 @@ fn wait_for_request_body(
                 del_req_header(sess, "expect");
             }
             let timeouts = &fe.stats_config.raw_timeouts;
-            let wait_ms = time_ms.or_else(|| timeouts.http_request.or(timeouts.client).map(millis_to_u32));
+            let wait_ms = time_ms.or_else(|| timeouts.http_request.map(millis_to_u32));
             wait_ms.filter(|ms| *ms > 0).map_or(Tick::ETERNITY, |ms| now.add(ms))
         }
     };
