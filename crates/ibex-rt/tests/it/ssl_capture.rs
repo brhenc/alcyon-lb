@@ -69,12 +69,16 @@ const HEADERS: &[(&str, &str)] = &[
 ];
 
 fn start(size: Option<u32>) -> (Ibex, SocketAddr) {
+    start_with(size, HEADERS)
+}
+
+fn start_with(size: Option<u32>, headers: &[(&str, &str)]) -> (Ibex, SocketAddr) {
     let crt = cert();
     let addr = common::reserve_addr();
     let global = size.map_or_else(String::new, |n| format!("global\n  tune.ssl.capture-buffer-size {n}\n"));
     let ja3 = "%[ssl_fc_protocol_hello_id],%[ssl_fc_cipherlist_bin(1),be2dec(-,2)],%[ssl_fc_extlist_bin(1),be2dec(-,2)],\
                %[ssl_fc_eclist_bin(1),be2dec(-,2)],%[ssl_fc_ecformats_bin,be2dec(-,1)]";
-    let hdrs: String = HEADERS.iter().map(|(n, e)| format!(" hdr {n} \"{e}\"")).collect();
+    let hdrs: String = headers.iter().map(|(n, e)| format!(" hdr {n} \"{e}\"")).collect();
     let cfg = format!(
         "{global}defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
          frontend t\n  bind {addr} ssl crt {}\n  http-request set-header x-ja3 \"{ja3}\"\n  \
@@ -273,5 +277,67 @@ fn argument_errors() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{expr} accepted: {err}");
         assert!(err.contains(text), "{expr}: wanted `{text}` in {err}");
+    }
+}
+
+/// `ssl_fc_ja4` is Ibex-only (T344 JA4, user decision 2026-10-18): `HAProxy` refuses it, Ibex
+/// answers. No oracle for the value; the expected strings are the JA4 rule of FoxIO's
+/// `technical_details/JA4.md` applied to the lists `HAProxy` measured for the same clients
+/// (`ssl_capture_table.rs`, N = 1024: `x-cl1`, `x-ext1`, `x-sa1`, `x-sv1`) and the ALPN each
+/// client offers (`http/1.1` for 1, 2 and 4, curl `h2,http/1.1`, none for the others). The rule
+/// itself is checked against FoxIO's published vectors in `ibex-sample`'s `ja4` tests.
+const JA4: &[(u8, &str)] = &[
+    (1, "t13d0212h1_88d8eb61a8ee_f7b8ee8a4e9e"),
+    (2, "t12d0209h1_d23a474016f0_7a0c0693ab17"),
+    (3, "t13d351200_bfa337485184_a141b6f9fa1c"),
+    (4, "t13i0211h1_88d8eb61a8ee_f7b8ee8a4e9e"),
+    (5, "t13d351200_bfa337485184_a141b6f9fa1c"),
+    (6, "t13i0411h2_9caa18292e23_e6e6d98f61e7"),
+    (7, "t13d011100_0f2cb44170f4_c657c3cd4f7d"),
+    (8, "t13d821200_ce333ca46318_a141b6f9fa1c"),
+];
+
+fn ja4_check(size: Option<u32>) {
+    let (_ibex, addr) = start_with(size, &[("x-ja4", "%[ssl_fc_ja4]")]);
+    for &(client, want) in JA4 {
+        let r = get(addr, client);
+        let want = if matches!(size, Some(n) if n > 0) { want } else { "<none>" };
+        assert_eq!(hdr(&r, "x-ja4"), want, "client {client}, N {size:?}: {r}");
+    }
+}
+
+#[test]
+fn ja4_is_answered_with_the_capture_on() {
+    ja4_check(Some(1024));
+}
+
+/// The fingerprint reads the whole hello, so a small buffer does not change it.
+#[test]
+fn ja4_does_not_depend_on_the_buffer_size() {
+    ja4_check(Some(16));
+}
+
+#[test]
+fn ja4_gives_no_sample_without_a_capture() {
+    ja4_check(Some(0));
+    ja4_check(None);
+}
+
+/// `HAProxy -c` refuses the fetch (so a configuration using it does not run on HAProxy), Ibex
+/// accepts it. Skipped when the reference binary is not installed.
+#[test]
+fn haproxy_refuses_ja4() {
+    let haproxy = std::path::Path::new("/home/bhenc/reference/haproxy/haproxy");
+    let mut f = NamedTempFile::new().unwrap();
+    f.write_all(
+        b"frontend t\n  mode http\n  bind 127.0.0.1:1\n  http-request return status 200 hdr x \"%[ssl_fc_ja4]\"\n",
+    )
+    .unwrap();
+    let ibex = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(f.path()).output().unwrap();
+    assert!(ibex.status.success(), "{}", String::from_utf8_lossy(&ibex.stderr));
+    if haproxy.exists() {
+        let out = Command::new(haproxy).arg("-c").arg("-f").arg(f.path()).output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && err.contains("unknown fetch method 'ssl_fc_ja4'"), "{err}");
     }
 }

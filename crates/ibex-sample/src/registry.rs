@@ -3088,6 +3088,17 @@ impl Registry {
                 Some(Sample::Str(names.join(",")))
             },
         });
+        // Ibex-only (no HAProxy fetch of this name; see docs/differences.md): the JA4 TLS client
+        // fingerprint of the captured ClientHello. It needs the capture (`tune.ssl.capture-buffer-size`
+        // > 0) to exist, though it does not depend on the size.
+        self.register_fetch(FetchDesc {
+            name: "ssl_fc_ja4",
+            out_type: SampleType::Str,
+            func: |ctx, _args| {
+                let parts = ctx.ssl_fc.capture?.ja4.as_ref()?;
+                Some(Sample::Str(crate::ja4::ja4(parts)))
+            },
+        });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_cipherlist_xxh",
             out_type: SampleType::Sint,
@@ -8493,6 +8504,8 @@ mod oracle_tests {
     /// with `file:line` citations) and by grepping the `smp_fetch` registration tables in
     /// the reference tree directly.
     const NOT_IN_HAPROXY_FETCHES: &[&str] = &[
+        // Ibex-only by decision (user, 2026-10-18; T344): the JA4 TLS client fingerprint.
+        "ssl_fc_ja4",
         "be_client_timeout", "fe_connect_timeout", "fe_queue_timeout",
         "fe_server_timeout", "fe_tunnel_timeout", "req.uri", "res.proto_http", "res.status",
         "res_ver",

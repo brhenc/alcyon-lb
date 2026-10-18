@@ -29,6 +29,8 @@ pub struct SslCapture {
     pub ec_formats: Range<usize>,
     pub supver: Range<usize>,
     pub sigalgs: Range<usize>,
+    /// The JA4 parts of the whole hello (Ibex-only, `ssl_fc_ja4`); independent of the size.
+    pub ja4: Option<crate::ja4::Ja4Parts>,
 }
 
 impl SslCapture {
@@ -169,6 +171,7 @@ pub fn parse_clienthello(msg: &[u8], cap: usize, into: &mut Option<SslCapture>) 
         protocol_version: u16::try_from(protocol_version).unwrap_or(0),
         data,
         ciphersuite: 0..cs_take,
+        ja4: crate::ja4::parse(msg),
         ..SslCapture::default()
     };
     pos += cs_len;
@@ -622,7 +625,8 @@ mod tests {
         let body = &full[4..];
         // Cipher list ends at 2 + 32 + 1 + 2 + 4 = 41; compression at 43; ext length at 45.
         for n in 0..body.len() {
-            let mut m = vec![1, 0, (n >> 8) as u8, n as u8];
+            let [hi, lo] = u16::try_from(n).unwrap().to_be_bytes();
+            let mut m = vec![1, 0, hi, lo];
             m.extend(&body[..n]);
             let got = parse(&m, 1024);
             if n < 41 {

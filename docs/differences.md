@@ -291,3 +291,22 @@ when the proxy sets none), else 1024, capped by `net.core.somaxconn`. The one st
 not have is the `bind` option `maxconn` (between the proxy's `backlog` and its `maxconn`
 in HAProxy): `bind ... maxconn N` is refused at load, as before. A socket handed over by a
 reload keeps the backlog it was bound with, as in HAProxy.
+
+## `ssl_fc_ja4`: an Ibex-only fetch (T344)
+
+`ssl_fc_ja4` returns the JA4 TLS client fingerprint (`t13d1516h2_8daaf6152771_e5627efa2ab1`),
+built from the whole captured ClientHello: GREASE-free sorted cipher and extension lists,
+the offered ALPN, and a truncated SHA-256. **HAProxy has no such fetch**: `haproxy -c` refuses
+a configuration that uses it (`unknown fetch method 'ssl_fc_ja4'`), so such a configuration
+does not run on HAProxy. It gives a sample only when the ClientHello capture exists, that is
+`tune.ssl.capture-buffer-size` is above 0 (its value does not matter; 0 or unset gives no
+sample, as for the other capture fetches). Only JA4 is implemented, not JA4S/JA4H/JA4X/JA4T or
+QUIC (`q`) fingerprints. The JA4 specification is by FoxIO; JA4 (TLS client fingerprinting only)
+is under the BSD 3-Clause licence in `LICENSE-JA4` of <https://github.com/FoxIO-LLC/ja4>:
+"Copyright (c) 2026 FoxIO. All rights reserved", redistribution with the notice permitted, the
+name of FoxIO not to be used to endorse. Ibex implements the specification text and uses FoxIO's
+published test vectors (`crates/ibex-sample/testdata/ja4_vectors.txt`); no FoxIO code is copied.
+One deliberate deviation from FoxIO's own tools: for an ALPN value whose first or last byte is
+not a letter or digit, the specification says to use the first and last hex digit of the value
+(`0xBA 0xAD` gives `bd`); FoxIO's Python and Rust tools print `99` and their published vector
+says so. Ibex follows the specification text.
