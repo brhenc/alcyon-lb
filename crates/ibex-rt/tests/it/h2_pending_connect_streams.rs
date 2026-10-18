@@ -321,7 +321,7 @@ fn start(hung: SocketAddr, defaults_extra: &str) -> (Proxy, u32, u16, u16) {
         &cfg,
         format!(
             "global\n\tnbthread 1\n\tmaxconn 60\n\n\
-             defaults\n\tmode http\n\t{defaults_extra}\n\ttimeout client 60s\n\ttimeout server 60s\n\n\
+             defaults\n\tmode http\n\ttimeout client 60s\n\ttimeout server 60s\n\t{defaults_extra}\n\n\
              frontend fe\n\tbind 127.0.0.1:{h2} proto h2\n\tbind 127.0.0.1:{h1}\n\
              \tuse_backend slow if {{ path_beg /slow }}\n\tdefault_backend ok\n\n\
              backend slow\n\tserver s1 {hung}\n\n\
@@ -415,4 +415,54 @@ fn streams_whose_connect_fails_give_their_buffers_back() {
     eprintln!("answered {:?}, reset {} {codes:?}, closed {}", c.answered.values().collect::<std::collections::BTreeSet<_>>(), c.reset.len(), c.closed);
     assert!(!c.closed, "the connection stays up");
     assert_eq!(c.answered.len() + c.reset.len(), 100, "every stream ends, answered or reset");
+}
+
+/// The fds and resets of `CONNS` attacker connections held `secs` seconds over a backend that
+/// never accepts, after `extra` lines of `defaults`: (peak fds over idle, streams reset,
+/// connections closed).
+fn hold(extra: &str, secs: u64) -> (usize, usize, usize) {
+    let (_hung, hung_addr, _filler) = full_listener();
+    let (proxy, pid, h2, _) = start(hung_addr, extra);
+    let _proxy = proxy;
+    let idle = fds(pid);
+    let mut clients: Vec<Client> = (0..CONNS).map(|_| Client::new(h2)).collect();
+    let end = Instant::now() + Duration::from_secs(secs);
+    let mut peak = 0;
+    while Instant::now() < end {
+        for c in &mut clients {
+            c.io();
+            c.send_some(Duration::from_millis(500));
+            c.io();
+        }
+        peak = peak.max(fds(pid).saturating_sub(idle));
+        thread::sleep(Duration::from_millis(2));
+    }
+    let reset: usize = clients.iter().map(|c| c.reset.len()).sum();
+    let closed = clients.iter().filter(|c| c.closed).count();
+    eprintln!("peak +{peak} fds over idle {idle}; streams reset {reset}; connections closed {closed}");
+    (peak, reset, closed)
+}
+
+/// `timeout connect` expiring on a stream that waits for its connect is a retry, as
+/// `back_handle_st_cer` does it (`retries` 3 by default: four attempts of `timeout connect`,
+/// then 503 `sC`), so the held streams keep the demux and the fds stay flat until the last
+/// attempt is spent (T379). Measured on HAProxy 3.5-dev8 (`timeout connect 2s`, 7 s): +24.
+#[test]
+fn a_connect_timeout_retries_and_does_not_free_the_demux() {
+    let (peak, reset, closed) = hold("timeout connect 2s", 7);
+    assert!(peak <= CONNS * 16, "+{peak} fds for {CONNS} connections: connects keep opening after timeout connect");
+    assert_eq!((reset, closed), (0, 0));
+}
+
+/// A stream whose request data fills its buffer and waits for the server (here: for the connect)
+/// owes the client nothing: `sc_rcv_may_expire` is false while the channel has no room
+/// (`SC_FL_NEED_ROOM`), so `timeout client` does not end it, the demux stays held, and the
+/// connects stay at HAProxy's seven a connection (T379, VV-16: Ibex timed the streams out at
+/// `timeout client`, the demux went on and each connection opened ~50 connects). Measured on
+/// HAProxy 3.5-dev8 (`timeout client 3s`, `timeout connect 60s`, 8 s): +24 fds, nothing reset.
+#[test]
+fn a_full_request_buffer_waiting_for_the_server_does_not_time_out_at_timeout_client() {
+    let (peak, reset, closed) = hold("timeout connect 60s\n\ttimeout client 3s", 8);
+    assert!(peak <= CONNS * 16, "+{peak} fds for {CONNS} connections: held streams timed out at timeout client");
+    assert_eq!((reset, closed), (0, 0), "no stream is reset and no connection closed");
 }
