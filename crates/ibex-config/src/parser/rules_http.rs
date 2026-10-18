@@ -268,6 +268,35 @@ fn parse_wait_for_body(
     Ok((time, at_least, cond))
 }
 
+/// `parse_http_pause` (src/http_act.c): a time (ms by default), else a sample expression.
+/// Returns the time, the expression, and the index the condition starts at.
+fn parse_pause(tokens: &[Token], side: &str, act_token: &Token) -> Result<(u32, Option<String>, Option<AclCondition>), ConfigError> {
+    let fail = |msg: String| ConfigError::new(act_token.line, act_token.col, format!("error detected while parsing '{side} pause' rule : {msg}"));
+    let arg = tokens.get(2).map_or("", |t| t.text.as_str());
+    let (time_ms, expr) = match parse_time_ms(arg) {
+        Ok(0) => return Err(fail("null value is not valid for a 'pause' rule".to_string())),
+        Ok(ms) => (ms, None),
+        Err(m) if m.starts_with("time overflow") => {
+            return Err(fail(format!("timer overflow in argument '{arg}' to rule 'pause' (maximum value is 2147483647 ms or ~24.8 days)")));
+        }
+        // Not a time: a sample expression, checked with the rules' others (`rule_exprs`).
+        Err(_) if arg.starts_with(|c: char| c.is_ascii_alphabetic()) && !matches!(arg, "if" | "unless") => (0, Some(arg.to_string())),
+        Err(_) => return Err(fail(format!("unexpected character '{}' in rule 'pause'", arg.chars().find(|c| !c.is_ascii_digit()).unwrap_or('\0')))),
+    };
+    let cond = match tokens.get(3) {
+        None => None,
+        Some(t) if t.text == "if" || t.text == "unless" => parse_acl_condition_from_tokens(&tokens[3..])?,
+        Some(t) => {
+            return Err(ConfigError::new(
+                t.line,
+                t.col,
+                format!("'{side} pause' expects either 'if' or 'unless' followed by a condition but found '{}'.", t.text),
+            ));
+        }
+    };
+    Ok((time_ms, expr, cond))
+}
+
 #[allow(clippy::too_many_lines)]
 /// Parses one rule and gives what it pushed the line it was written on.
 pub(crate) fn parse_http_req_rule(
@@ -1012,6 +1041,9 @@ fn parse_http_req_rule_at(
     } else if act_str == "wait-for-body" {
         let (time, at_least, cond) = parse_wait_for_body(tokens, "http-request", act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::WaitForBody { time_ms: Some(time), at_least }, cond, line: 0 });
+    } else if act_str == "pause" {
+        let (time_ms, expr, cond) = parse_pause(tokens, "http-request", act_token)?;
+        rules.push(HttpReqRule { action: HttpReqAction::Pause { time_ms, expr }, cond, line: 0 });
     } else {
         return Err(ConfigError::new(
             act_token.line,
@@ -1336,6 +1368,9 @@ fn parse_http_res_rule_at(
     } else if act_str == "wait-for-body" {
         let (time_ms, at_least, cond) = parse_wait_for_body(tokens, "http-response", act_token)?;
         rules.push(HttpResRule { action: HttpResAction::WaitForBody { time_ms, at_least }, cond, line: 0 });
+    } else if act_str == "pause" {
+        let (time_ms, expr, cond) = parse_pause(tokens, "http-response", act_token)?;
+        rules.push(HttpResRule { action: HttpResAction::Pause { time_ms, expr }, cond, line: 0 });
     } else {
         return Err(ConfigError::new(
             act_token.line,
