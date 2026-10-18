@@ -104,3 +104,78 @@ fn local_reply_does_not_inherit_previous_response() {
     assert_eq!(got[1], "[0|403|-1]", "{got:?}");
     assert_eq!(got[2], "[0|403|-1]", "{got:?}");
 }
+
+/// T385, h2: three concurrent streams of one h2c connection on one thread, A (server answers 201
+/// after 300 ms), B (`deny`, answered while A waits) and C (server answers 201 at once). Measured on
+/// HAProxy 3.5-dev8: A `[201|201|~300]`, B `[0|403|-1]`, C `[201|201|~1]`, and the log lines
+/// (`%[server_status] %Tr`) `/slow 201 ~300`, `/deny 0 -1`, `/fast 201 ~1`.
+#[test]
+fn h2_streams_keep_their_own_status_and_timer() {
+    let a = common::reserve_addr();
+    let be = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { continue };
+                std::thread::spawn(move || {
+                    let mut b = [0u8; 4096];
+                    let n = c.read(&mut b).unwrap_or(0);
+                    if b[..n].windows(5).any(|w| w == b"/slow") {
+                        std::thread::sleep(Duration::from_millis(300));
+                    }
+                    let _ = c.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                });
+            }
+        });
+        addr
+    };
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let dir = std::env::temp_dir().join(format!("t385c-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.cfg");
+    std::fs::write(
+        &path,
+        format!(
+            "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+             frontend fe\n  bind {a} proto h2\n  log {} format raw local0\n  log-format \"L %HP %[server_status] %Tr\"\n  \
+             http-request deny if {{ path /deny }}\n  default_backend b\n  \
+             http-after-response set-header x-out \"[%[server_status]|%[status]|%[res.timer.hdr]]\"\n\
+             backend b\n  server s {be}\n",
+            udp.local_addr().unwrap()
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    assert!(common::wait_listening(a), "ibex did not listen");
+    let url = |p: &str| format!("http://{a}/{p}");
+    let st = Command::new("curl")
+        .current_dir(&dir)
+        .args(["-s", "--http2-prior-knowledge", "--parallel", "--parallel-immediate", "-i", "-o", "a", &url("slow"), "-o", "b", &url("deny"), "-o", "c", &url("fast")])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let mut logs = Vec::new();
+    let mut buf = [0u8; 1024];
+    while logs.len() < 4 {
+        let Ok(n) = udp.recv(&mut buf) else { break };
+        logs.push(String::from_utf8_lossy(&buf[..n]).trim().to_string());
+    }
+    let xout = |f: &str| {
+        let t = std::fs::read_to_string(dir.join(f)).unwrap();
+        t.lines().find(|l| l.starts_with("x-out:")).unwrap_or_else(|| panic!("no x-out in {f}: {t:?}")).trim_start_matches("x-out:").trim().to_string()
+    };
+    let (xa, xb, xc) = (xout("a"), xout("b"), xout("c"));
+    common::stop(&mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+    let tr = |s: &str| -> i64 { s.trim_end_matches(']').rsplit('|').next().unwrap().parse().unwrap() };
+    assert!(xa.starts_with("[201|201|") && (290..450).contains(&tr(&xa)), "A {xa}");
+    assert_eq!(xb, "[0|403|-1]", "B");
+    assert!(xc.starts_with("[201|201|") && (0..150).contains(&tr(&xc)), "C {xc}");
+    let log = |p: &str| logs.iter().find(|l| l.contains(p)).unwrap_or_else(|| panic!("no log for {p}: {logs:?}")).split(' ').skip(2).collect::<Vec<_>>().join(" ");
+    let (ls, ld, lf) = (log("/slow"), log("/deny"), log("/fast"));
+    assert!(ls.starts_with("201 ") && (290..450).contains(&ls[4..].parse::<i64>().unwrap()), "log slow {ls}");
+    assert_eq!(ld, "0 -1", "log deny");
+    assert!(lf.starts_with("201 ") && (0..150).contains(&lf[4..].parse::<i64>().unwrap()), "log fast {lf}");
+}
