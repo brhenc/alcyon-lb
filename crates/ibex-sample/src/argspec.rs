@@ -434,10 +434,12 @@ fn vars_check(name: &str) -> Result<(), String> {
         ["psess.", "ptxn.", "preq.", "pres."].iter().find_map(|p| name.strip_prefix(p)).filter(|r| !r.is_empty())
     };
     let Some(rest) = rest else { return Err("(null)".to_string()) };
-    match rest.bytes().find(|c| !c.is_ascii_alphanumeric() && !matches!(c, b'_' | b'.')) {
-        Some(c) => Err(format!("Invalid character '{}' in variable name {rest}", char::from(c))),
-        None => Ok(()),
+    if let Some(c) = rest.bytes().find(|c| !c.is_ascii_alphanumeric() && !matches!(c, b'_' | b'.')) {
+        return Err(format!("Invalid character '{}' in variable name {rest}", char::from(c)));
     }
+    // The name gets its number at load (T364 S6), not on the first request.
+    let _ = crate::vars::intern(name);
+    Ok(())
 }
 
 /// Whether `name` is a variable `vars_check_arg` accepts.

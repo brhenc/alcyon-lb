@@ -2347,7 +2347,7 @@ mod tests {
     /// Writes `section` (after a last-chunk line) through [`MsgState::canonical_chunk_lines`].
     fn trailers_of(section: &[u8]) -> Vec<u8> {
         let mut body = [b"0\r\n".as_slice(), section].concat();
-        let n = MsgState::Body(Body::Chunked(CHUNK_START)).canonical_chunk_lines(&mut body);
+        let n = MsgState::Body(Body::Chunked(CHUNK_START)).canonical_chunk_lines(&mut body, false);
         body.truncate(n);
         body
     }

@@ -34,7 +34,6 @@ use ibex_proto::{rewrite_header_block, CompiledExp};
 use ibex_sample::{Expr, Registry, SampleContext};
 use ibex_sched::Tick;
 use ibex_stick_table::StickKey;
-use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -362,7 +361,7 @@ pub struct H2Child {
     pub tls: Option<Arc<ibex_tls::RustlsTlsInfo>>,
     /// The connection's session variables as the stream got them: what it changed of them
     /// goes back to the connection, and only that, as other streams may have set others.
-    pub sess_vars_at_start: ibex_sample::VarMap,
+    pub sess_vars_at_start: ibex_sample::VarStore,
 }
 
 impl H2Child {
@@ -639,8 +638,9 @@ pub struct TcpSession {
     /// The backend has `tcp-response content` rules for this stream: they start, with
     /// this inspect-delay, once the server connection is up (`server_connected`).
     pub res_inspect_armed: Option<Option<u32>>,
-    pub sess_vars: ibex_sample::VarMap,
-    pub req_vars: ibex_sample::VarMap,
+    /// The stream's variables, every scope (`sess.`, `txn.`, `req.`, `res.`); in the thread's
+    /// `CURRENT_VARS` while the stream runs, swapped (T364 S6).
+    pub vars: ibex_sample::VarStore,
     /// What this stream measured for its log line, and its captures and unique ID.
     pub log: crate::txnlog::StreamLog,
     pub tracked_sc: [Option<(usize, StickKey)>; 3],
@@ -911,7 +911,7 @@ impl TcpSession {
         // one (`end_txn` armed them for the next request of the connection).
         c.tcp_inspect_done = std::mem::replace(&mut owner.tcp_inspect_done, true);
         c.inspect_exp = owner.inspect_exp.take();
-        c.sess_vars.clone_from(&owner.sess_vars);
+        c.vars.copy_scope_from(&owner.vars, ibex_sample::VarScope::Sess);
         c.log = owner.log.clone();
         c.tracked_sc.clone_from(&owner.tracked_sc);
         c.h2_flood_config = owner.h2_flood_config;
@@ -929,7 +929,11 @@ impl TcpSession {
             rst: None,
             goaway: None,
             tls,
-            sess_vars_at_start: owner.sess_vars.clone(),
+            sess_vars_at_start: {
+                let mut v = ibex_sample::VarStore::new();
+                v.copy_scope_from(&owner.vars, ibex_sample::VarScope::Sess);
+                v
+            },
         })));
         c
     }
@@ -942,14 +946,8 @@ impl TcpSession {
         // Other streams may be served beside this one: what it changed is merged in, the
         // rest of the connection's state is left as they made it.
         let at_start = child.h2_child_mut().map(|c| std::mem::take(&mut c.sess_vars_at_start)).unwrap_or_default();
-        for k in at_start.keys().filter(|k| !child.sess_vars.contains_key(*k)) {
-            self.sess_vars.remove(k);
-        }
-        for (k, v) in child.sess_vars.drain() {
-            if at_start.get(&k) != Some(&v) {
-                self.sess_vars.insert(k, v);
-            }
-        }
+        self.vars.merge_sess_from(&child.vars, &at_start);
+        child.vars.clear_scope(ibex_sample::VarScope::Sess);
         for (mine, theirs) in self.tracked_sc.iter_mut().zip(&mut child.tracked_sc) {
             if mine.is_none() {
                 *mine = theirs.take();
@@ -1127,8 +1125,7 @@ impl TcpSession {
             res_inspect_pending: false,
             res_inspect_exp: None,
             res_inspect_armed: None,
-            sess_vars: HashMap::new(),
-            req_vars: HashMap::new(),
+            vars: ibex_sample::VarStore::new(),
             log: crate::txnlog::StreamLog::start(0, 0),
             tracked_sc: [None, None, None],
             stick_stores: Vec::new(),
@@ -1815,13 +1812,13 @@ impl TcpSession {
         self.set_scrape(None);
         self.req_headers = None;
         self.clear_htx();
-        self.req_vars.clear();
+        self.vars.clear_txn();
         if let Some(set) = self.timeouts_set.take() {
             self.timeouts = set.before;
         }
         // The stream is running, so its variables are in the thread's map
         // (`engine::with_stream_vars`): the transaction's go from there too.
-        ibex_sample::CURRENT_VARS.with(|v| v.borrow_mut().retain(|k, _| k.starts_with("sess.")));
+        ibex_sample::vars::with_current_mut(ibex_sample::VarStore::clear_txn);
         self.stick_stores.clear();
         self.is_first_req = false;
         // How the last transaction ended is not how the next one will: a 503 after refused

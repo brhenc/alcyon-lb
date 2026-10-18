@@ -464,6 +464,15 @@ and ~137). The user's direction (2026-10-18) goes further: runtime memory is a s
 pool chunk, aiming at soft-realtime (no allocation after start-up), because malloc can block and a
 failed one aborts the worker.
 
+**Variables (T364 S6, 2026-10-18): 0 per keep-alive request.** `set-var` stores into a slot store
+with interned names whose value buffers keep their capacity (`ibex-sample/src/vars.rs`); a stream's
+store is swapped into the thread for a run, and ended sessions' stores are kept per thread (one
+owner type, to move onto T372 P0 `Pool<T>`). Shipped binary, `nbthread 1`, allocations per keep-alive
+request: none 9; 1 int 11 -> 9; 1 str 14 -> 9; int+str+sess 18 -> 9; 5 ints 19 -> 9. Left: reading
+a `str`/`bin` variable copies it into an owned `Sample` (1 allocation; HAProxy's `smp_dup` uses a
+trash chunk), and a non-constant expression's sample is allocated by the evaluator, as are
+`Expr::eval_sample`'s converter-argument clones. Both go only with borrowed samples in the evaluator.
+
 **Open design questions, to be decided by testing** (user, 2026-10-18: "this will require more
 testing to determine the correct way to run"). Each lists the options and what to measure before
 choosing; nothing is decided yet.

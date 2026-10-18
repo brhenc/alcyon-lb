@@ -8,7 +8,7 @@
 //! held, T364 Q1), how `bin` and method values are sized, and which scopes count where.
 
 use ibex_proto::htx::HttpMethod;
-use ibex_sample::vars::{self, VarMap, VAR_STRUCT_COST};
+use ibex_sample::vars::{self, In, VarStore, VAR_STRUCT_COST};
 use ibex_sample::Sample;
 use std::net::Ipv4Addr;
 
@@ -18,28 +18,28 @@ fn limits_refuse_what_does_not_fit_and_leave_the_old_value_as_a_bool() {
 
     // check scope: 2 variables of 88 bytes fit 200, a third does not.
     vars::set_limits(0, 0, 0, 0, 0, 200);
-    let mut map = VarMap::new();
-    vars::set_in(&mut map, "check.a", Sample::Sint(1));
-    vars::set_in(&mut map, "check.b", Sample::Sint(2));
-    vars::set_in(&mut map, "check.c", Sample::Sint(3));
+    let mut map = VarStore::new();
+    vars::set_in(&mut map, "check.a", In::Owned(Sample::Sint(1)));
+    vars::set_in(&mut map, "check.b", In::Owned(Sample::Sint(2)));
+    vars::set_in(&mut map, "check.c", In::Owned(Sample::Sint(3)));
     assert!(map.contains_key("check.a") && map.contains_key("check.b"));
     assert!(!map.contains_key("check.c"), "a third check variable is over check-max-size");
 
     // The other scopes and value kinds are counted when the next one is set: a `sess.` variable,
     // a `bin`, a method that is not a known one, and a name in no scope that counts.
     vars::set_limits(0, 0, 100_000, 0, 0, 0);
-    let mut map = VarMap::new();
-    vars::set_in(&mut map, "sess.s", Sample::Sint(1));
-    vars::set_in(&mut map, "sess.bin", Sample::Bin(vec![1, 2, 3, 4]));
-    vars::set_in(&mut map, "sess.meth", Sample::Meth(HttpMethod::Other("FOOBAR".into())));
-    vars::set_in(&mut map, "check.k", Sample::Sint(1));
-    vars::set_in(&mut map, "foo.bar", Sample::Sint(1));
-    vars::set_in(&mut map, "sess.last", Sample::Sint(1));
-    assert_eq!(map.len(), 6, "all fit 100000 bytes");
+    let mut map = VarStore::new();
+    vars::set_in(&mut map, "sess.s", In::Owned(Sample::Sint(1)));
+    vars::set_in(&mut map, "sess.bin", In::Owned(Sample::Bin(vec![1, 2, 3, 4])));
+    vars::set_in(&mut map, "sess.meth", In::Owned(Sample::Meth(HttpMethod::Other("FOOBAR".into()))));
+    vars::set_in(&mut map, "check.k", In::Owned(Sample::Sint(1)));
+    vars::set_in(&mut map, "foo.bar", In::Owned(Sample::Sint(1)));
+    vars::set_in(&mut map, "sess.last", In::Owned(Sample::Sint(1)));
+    assert_eq!(map.entries().len(), 6, "all fit 100000 bytes");
     // 'sess.s' 88 + bin 92 + meth 94 + check 88 (also in sess) + last 88 = 450; a string of 100 000
     // does not fit and sess.bin keeps its place; a bin of 1 byte more than it held fits.
-    vars::set_in(&mut map, "sess.s", Sample::Str("x".repeat(100_000)));
-    assert_eq!(map["sess.s"], Sample::Bool(true), "an integer 1 that a string did not replace is true");
+    vars::set_in(&mut map, "sess.s", In::Owned(Sample::Str("x".repeat(100_000))));
+    assert_eq!(map.get("sess.s"), Some(Sample::Bool(true)), "an integer 1 that a string did not replace is true");
 
     // proc scope: 200 bytes; a bool, an address and an integer 0 stay as booleans.
     vars::set_limits(0, 200, 0, 0, 0, 0);

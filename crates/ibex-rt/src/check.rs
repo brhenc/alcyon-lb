@@ -25,7 +25,6 @@ use ibex_config::ast::{
 };
 use ibex_sched::task::TaskRef;
 use ibex_sched::Tick;
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 use std::net::SocketAddr;
@@ -260,7 +259,7 @@ pub struct CheckRun {
     pub check_fd: Option<RawFd>,
     pub sub_state: CheckSubState,
     /// The check's variables (`http-check set-var`, scope `check`), for the run in progress.
-    pub vars: ibex_sample::VarMap,
+    pub vars: ibex_sample::VarStore,
     /// When the check started, for its duration.
     pub start_tick: Tick,
 }
@@ -271,7 +270,7 @@ impl CheckRun {
             tcp_connect_step: None,
             check_fd: None,
             sub_state: CheckSubState::Idle,
-            vars: HashMap::new(),
+            vars: ibex_sample::VarStore::new(),
             start_tick: Tick(0),
         }
     }
@@ -733,7 +732,7 @@ fn with_check_ctx<R>(
     check: &ServerCheckState,
     px: &Proxy,
     proxies: &[Proxy],
-    vars: &ibex_sample::VarMap,
+    vars: &ibex_sample::VarStore,
     resp: Option<&HttpResp>,
     f: impl FnOnce(&LogData, &ibex_sample::SampleContext) -> R,
 ) -> R {
@@ -778,7 +777,7 @@ fn run_var_rules(
     check: &ServerCheckState,
     proxies: &[Proxy],
     rules: &[ResolvedHttpRule],
-    vars: &mut ibex_sample::VarMap,
+    vars: &mut ibex_sample::VarStore,
     resp: Option<&HttpResp>,
 ) {
     let Some(px) = proxies.get(check.proxy()) else { return };
@@ -792,7 +791,7 @@ fn run_var_rules(
             });
             // An expression that gives no sample leaves the variable as it was.
             if let Some(v) = val {
-                ibex_sample::vars::set_in(vars, var_name, v);
+                ibex_sample::vars::set_in(vars, var_name, ibex_sample::vars::In::Owned(v));
             }
         } else if let ResolvedHttpRule::UnsetVar { var_name } = rule {
             vars.remove(var_name);
@@ -1651,7 +1650,7 @@ pub fn step_check(
                 let base = chk.connect_addr.map_or(check.addr.ip(), |a| a.ip());
                 let target_addr = SocketAddr::new(base, chk.check_port.unwrap_or(check.addr.port()));
                 // The variables of this run: the rules before the request set them.
-                let mut vars = HashMap::new();
+                let mut vars = ibex_sample::VarStore::new();
                 run_var_rules(check, proxies, &chk.pre_rules, &mut vars, None);
                 check.run.vars = vars;
                 let payload = build_http_request_payload(chk, target_addr, check, proxies);

@@ -9,69 +9,637 @@
 //! type with the cast table (`cast.rs`), as it would straight from the fetch: a `bin` variable
 //! into a string converter stops at its first NUL, an `int` into `hex` is its 8 bytes.
 //!
-//! Every read and write of a variable goes through this module. Storage today is a map keyed
-//! by the full name (`txn.x`), one per thread for the running stream ([`CURRENT_VARS`]) and one
-//! per process for `proc.` ([`GLOBAL_PROC_VARS`]); T364 S6 replaces it underneath this API.
+//! Every read and write of a variable goes through this module.
 //!
-//! The thread map is a `RefCell`. Every borrow is a `try_borrow*` held inside one function of
+//! # Storage, and why a request allocates nothing for it (T364 S6)
+//!
+//! - **Names are interned** once per process ([`intern`]): `vars_check` interns every name the
+//!   configuration checks at load, and a name first seen at run time is interned on its first
+//!   set (warm-up). A name is a `u32` index from then on.
+//! - **A [`VarStore`] is a slot vector** indexed by that number. A slot holds a scalar inline,
+//!   or the bytes of a `str`/`bin`/unusual method in its own buffer. Clearing a slot keeps the
+//!   buffer's capacity, so the next transaction's value of the same variable is copied into it:
+//!   a keep-alive connection sets its variables with no allocation once the first request has
+//!   sized the buffers. A value bigger than the buffer adopts the sample's own allocation (a
+//!   move, no copy); a value copied from a constant reserves with `try_reserve`, and a failed
+//!   reservation is `HAProxy`'s failed `malloc` in `var_set`: the variable becomes a `bool`.
+//! - **One store per stream** holds its `sess.`, `txn.`, `req.` and `res.` variables. While the
+//!   stream runs, the store is swapped into the thread's [`CURRENT_VARS`] ([`enter`]/[`leave`],
+//!   a `mem::swap`: nothing is copied or allocated) so the fetches and converters, which get no
+//!   stream, read it. The end of a transaction clears the `txn`/`req`/`res` slots.
+//! - **Spare stores** of ended sessions are kept per thread ([`VarStore::new`] takes one, `Drop`
+//!   gives it back), so a new connection reuses the slots and buffers of an old one. This is the
+//!   only cache of stores in the tree; T372 P0 replaces it with `ibex_alloc::Pool<T>`
+//!   (docs/design/pools-2026-10-18.md §4.1): see [`SPARE`].
+//! - Reading a `str`/`bin` variable still copies it into an owned [`Sample`] (one allocation):
+//!   a borrowed sample in the evaluator is tradeoff.md §6.13 work, not this store's.
+//!
+//! `proc.` variables are one store per process ([`GLOBAL_PROC_VARS`]), a health check's run has
+//! its own (`check.`).
+//!
+//! The thread store is a `RefCell`. Every borrow is a `try_borrow*` held inside one function of
 //! this module: a nested borrow reads as "no variable" or writes nothing, never a panic.
 
 use crate::cast::cast;
 use crate::sample::{Sample, SampleType};
+use ibex_proto::htx::HttpMethod;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, RwLock};
 
-/// The variables of one stream (`sess.`, `txn.`, `req.`, `res.`) or of the process (`proc.`),
-/// keyed by the full name.
-pub type VarMap = HashMap<String, Sample>;
+// ---------------------------------------------------------------------------------------------
+// Names
+
+/// The scope a variable name starts with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Scope {
+    Proc,
+    Sess,
+    Txn,
+    Req,
+    Res,
+    Check,
+    /// `psess.`/`ptxn.`/... (no sub-streams in Ibex) or anything else.
+    #[default]
+    Other,
+}
+
+impl Scope {
+    /// The scope of the full name `name`.
+    #[must_use]
+    pub fn of(name: &str) -> Self {
+        match name.split('.').next() {
+            Some("proc") => Self::Proc,
+            Some("sess") => Self::Sess,
+            Some("txn") => Self::Txn,
+            Some("req") => Self::Req,
+            Some("res") => Self::Res,
+            Some("check") => Self::Check,
+            _ => Self::Other,
+        }
+    }
+
+    /// The scopes a transaction owns: they end with it.
+    const fn of_txn(self) -> bool {
+        matches!(self, Self::Txn | Self::Req | Self::Res)
+    }
+}
+
+/// Every variable name the process has seen, and its number.
+#[derive(Default)]
+struct Names {
+    ids: HashMap<Box<str>, u32>,
+    names: Vec<Box<str>>,
+}
+
+/// The names only grow; a configuration has a few dozen. The cap keeps a runaway (a name built
+/// at run time) from growing every store without bound.
+const MAX_NAMES: usize = 1 << 16;
+
+static NAMES: LazyLock<RwLock<Names>> = LazyLock::new(|| RwLock::new(Names::default()));
+
+/// The number of `name`, if it has one.
+fn lookup(name: &str) -> Option<u32> {
+    NAMES.read().ok()?.ids.get(name).copied()
+}
+
+/// The number of `name`, given it on first sight: at load for the names the configuration
+/// checks (`vars_check`), else on the first set. `None` past [`MAX_NAMES`].
+pub fn intern(name: &str) -> Option<u32> {
+    if let Some(id) = lookup(name) {
+        return Some(id);
+    }
+    let mut w = NAMES.write().ok()?;
+    if let Some(&id) = w.ids.get(name) {
+        return Some(id);
+    }
+    if w.names.len() >= MAX_NAMES {
+        return None;
+    }
+    let id = u32::try_from(w.names.len()).ok()?;
+    w.names.push(name.into());
+    w.ids.insert(name.into(), id);
+    Some(id)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slots
+
+/// The known methods, as a slot keeps them (an unusual one is its bytes).
+const METHODS: [HttpMethod; 9] = [
+    HttpMethod::Get,
+    HttpMethod::Head,
+    HttpMethod::Post,
+    HttpMethod::Put,
+    HttpMethod::Delete,
+    HttpMethod::Connect,
+    HttpMethod::Options,
+    HttpMethod::Trace,
+    HttpMethod::Patch,
+];
+
+/// What a slot holds; the bytes of `Str`/`Bin`/`MethOther` are in the slot's buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Val {
+    #[default]
+    Absent,
+    Bool(bool),
+    Sint(i64),
+    Ipv4(Ipv4Addr),
+    Ipv6(Ipv6Addr),
+    Meth(u8),
+    Str,
+    Bin,
+    MethOther,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Slot {
+    val: Val,
+    scope: Scope,
+    /// The value's bytes for a `Str` (its UTF-8: bytetext), `Bin` or `MethOther`; empty
+    /// otherwise. Its capacity outlives the value.
+    buf: Vec<u8>,
+}
+
+impl Slot {
+    fn clear(&mut self) {
+        self.val = Val::Absent;
+        self.buf.clear();
+    }
+
+    fn sample(&self) -> Option<Sample> {
+        Some(match self.val {
+            Val::Absent => return None,
+            Val::Bool(b) => Sample::Bool(b),
+            Val::Sint(n) => Sample::Sint(n),
+            Val::Ipv4(a) => Sample::Ipv4(a),
+            Val::Ipv6(a) => Sample::Ipv6(a),
+            Val::Meth(m) => Sample::Meth(METHODS.get(usize::from(m))?.clone()),
+            // The one copy of a read (module doc): borrowed samples are §6.13 work.
+            Val::Str => Sample::Str(String::from_utf8(self.buf.clone()).ok()?),
+            Val::Bin => Sample::Bin(self.buf.clone()),
+            Val::MethOther => Sample::Meth(HttpMethod::Other(String::from_utf8(self.buf.clone()).ok()?)),
+        })
+    }
+
+    /// The bytes the value holds beyond its `struct var` (accounting): a `str` counts a
+    /// character per byte of bytetext.
+    fn extra_bytes(&self) -> u64 {
+        let n = match self.val {
+            Val::Str => self.buf.iter().filter(|&&b| b & 0xC0 != 0x80).count(),
+            Val::Bin | Val::MethOther => self.buf.len(),
+            _ => 0,
+        };
+        n as u64
+    }
+
+    fn same_value(&self, other: &Slot) -> bool {
+        self.val == other.val && self.buf == other.buf
+    }
+
+    /// What a failed allocation leaves (`var_set`): a `bool` of what the variable held.
+    fn as_bool(&self) -> bool {
+        match self.val {
+            Val::Sint(n) => n != 0,
+            Val::Bool(b) => b,
+            Val::Ipv4(a) => !a.is_unspecified(),
+            _ => false,
+        }
+    }
+
+    /// Sets the value from `v`. Bytes go into the buffer when it has the room; else an owned
+    /// sample's own allocation becomes the buffer, and a borrowed one is copied after a
+    /// `try_reserve` (on failure the variable becomes a `bool`).
+    fn set(&mut self, v: In<'_>) {
+        let (val, bytes): (Val, Bytes<'_>) = match v {
+            In::Owned(s) => match s {
+                Sample::Bool(b) => (Val::Bool(b), Bytes::None),
+                Sample::Sint(n) => (Val::Sint(n), Bytes::None),
+                Sample::Ipv4(a) => (Val::Ipv4(a), Bytes::None),
+                Sample::Ipv6(a) => (Val::Ipv6(a), Bytes::None),
+                Sample::Str(t) => (Val::Str, Bytes::Owned(t.into_bytes())),
+                Sample::Bin(b) => (Val::Bin, Bytes::Owned(b)),
+                Sample::Meth(HttpMethod::Other(m)) => (Val::MethOther, Bytes::Owned(m.into_bytes())),
+                Sample::Meth(m) => (Val::Meth(meth_code(&m)), Bytes::None),
+            },
+            In::Ref(s) => match s {
+                Sample::Bool(b) => (Val::Bool(*b), Bytes::None),
+                Sample::Sint(n) => (Val::Sint(*n), Bytes::None),
+                Sample::Ipv4(a) => (Val::Ipv4(*a), Bytes::None),
+                Sample::Ipv6(a) => (Val::Ipv6(*a), Bytes::None),
+                Sample::Str(t) => (Val::Str, Bytes::Ref(t.as_bytes())),
+                Sample::Bin(b) => (Val::Bin, Bytes::Ref(b)),
+                Sample::Meth(HttpMethod::Other(m)) => (Val::MethOther, Bytes::Ref(m.as_bytes())),
+                Sample::Meth(m) => (Val::Meth(meth_code(m)), Bytes::None),
+            },
+        };
+        match bytes {
+            Bytes::None => self.buf.clear(),
+            Bytes::Owned(b) if b.len() > self.buf.capacity() => self.buf = b,
+            Bytes::Owned(b) => {
+                self.buf.clear();
+                self.buf.extend_from_slice(&b);
+            }
+            Bytes::Ref(b) => {
+                self.buf.clear();
+                if self.buf.try_reserve(b.len()).is_err() {
+                    self.val = Val::Bool(self.as_bool());
+                    return;
+                }
+                self.buf.extend_from_slice(b);
+            }
+        }
+        self.val = val;
+    }
+}
+
+fn meth_code(m: &HttpMethod) -> u8 {
+    METHODS.iter().position(|k| k == m).and_then(|i| u8::try_from(i).ok()).unwrap_or(0)
+}
+
+enum Bytes<'a> {
+    None,
+    Owned(Vec<u8>),
+    Ref(&'a [u8]),
+}
+
+/// A value to store: a sample that is the store's to keep, or one it copies (a constant of the
+/// configuration, which then costs no allocation at all).
+pub enum In<'a> {
+    Owned(Sample),
+    Ref(&'a Sample),
+}
+
+impl In<'_> {
+    fn is_bytes(&self) -> bool {
+        let s = match self {
+            In::Owned(s) => s,
+            In::Ref(s) => *s,
+        };
+        matches!(s, Sample::Str(_) | Sample::Bin(_) | Sample::Meth(HttpMethod::Other(_)))
+    }
+
+    fn extra_bytes(&self) -> u64 {
+        let s = match self {
+            In::Owned(s) => s,
+            In::Ref(s) => *s,
+        };
+        let n = match s {
+            Sample::Str(t) => t.chars().count(),
+            Sample::Bin(b) => b.len(),
+            Sample::Meth(HttpMethod::Other(m)) => m.len(),
+            _ => 0,
+        };
+        n as u64
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The store
+
+/// The variables of one owner: a stream (all its `sess.`/`txn.`/`req.`/`res.` ones), the
+/// process (`proc.`) or a health check's run (`check.`). See the module doc.
+#[derive(Debug, Default)]
+pub struct VarStore {
+    slots: Vec<Slot>,
+}
+
+/// The spare stores of this thread (module doc), at most [`SPARE_MAX`].
+///
+/// T372 P0 slots in here: this list and [`VarStore::new`]/`Drop` become
+/// `declare_pool!(static VAR_STORES: Pool<Vec<Slot>>, "vars")`, `VarStore` a `PoolBox` of it and
+/// [`VarStore::recycle`] its `Reset`. Nothing else in the tree caches stores.
+const SPARE_MAX: usize = 256;
+/// The bytes of value buffers a spare store keeps; past it, its buffers are freed on return.
+const SPARE_KEEP_BYTES: usize = 4096;
+
+thread_local! {
+    /// [`SPARE_MAX`] spare stores' slots.
+    static SPARE: RefCell<Vec<Vec<Slot>>> = const { RefCell::new(Vec::new()) };
+    /// Whether a stream runs on this thread ([`enter`]/[`leave`]): its store is then in
+    /// [`CURRENT_VARS`], and the session's own is empty.
+    static RUNNING: Cell<bool> = const { Cell::new(false) };
+}
+
+impl VarStore {
+    /// An empty store, with nothing allocated.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    /// An empty store, the slots and buffers of a spare one if this thread has one.
+    #[must_use]
+    pub fn new() -> Self {
+        let slots = SPARE.try_with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.pop())).ok().flatten();
+        Self { slots: slots.unwrap_or_default() }
+    }
+
+    /// Empties the store for the spare list: values gone, buffers kept up to
+    /// [`SPARE_KEEP_BYTES`] in all.
+    fn recycle(slots: &mut [Slot]) {
+        let mut kept = 0;
+        for s in slots {
+            s.clear();
+            kept += s.buf.capacity();
+            if kept > SPARE_KEEP_BYTES {
+                s.buf = Vec::new();
+            }
+        }
+    }
+
+    fn slot(&self, name: &str) -> Option<&Slot> {
+        let s = self.slots.get(lookup(name)? as usize)?;
+        (s.val != Val::Absent).then_some(s)
+    }
+
+    /// The value of `name`.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<Sample> {
+        self.slot(name)?.sample()
+    }
+
+    /// The value of `name` when it is an integer (`ifgt`/`iflt` compare only those).
+    #[must_use]
+    pub fn int(&self, name: &str) -> Option<i64> {
+        match self.slot(name)?.val {
+            Val::Sint(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Whether `name` has a value.
+    #[must_use]
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.slot(name).is_some()
+    }
+
+    /// Whether no variable has a value.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(|s| s.val == Val::Absent)
+    }
+
+    /// Sets `name` with no accounting (a test, or a value already admitted). Nothing is stored
+    /// past [`MAX_NAMES`] names or when the slots cannot grow.
+    pub fn insert(&mut self, name: impl AsRef<str>, smp: Sample) {
+        let name = name.as_ref();
+        if let Some(id) = intern(name) {
+            self.write(id, Scope::of(name), In::Owned(smp));
+        }
+    }
+
+    fn write(&mut self, id: u32, scope: Scope, v: In<'_>) -> bool {
+        let i = id as usize;
+        if i >= self.slots.len() {
+            // Grows only for a name this store has not held yet: on warm-up.
+            if self.slots.try_reserve(i + 1 - self.slots.len()).is_err() {
+                return false;
+            }
+            self.slots.resize_with(i + 1, Slot::default);
+        }
+        let slot = &mut self.slots[i];
+        slot.scope = scope;
+        slot.set(v);
+        true
+    }
+
+    /// Removes `name` (its buffer stays for the next value).
+    pub fn remove(&mut self, name: &str) {
+        if let Some(s) = lookup(name).and_then(|id| self.slots.get_mut(id as usize)) {
+            s.clear();
+        }
+    }
+
+    /// Removes every variable.
+    pub fn clear(&mut self) {
+        self.slots.iter_mut().for_each(Slot::clear);
+    }
+
+    /// Removes the variables of `scope`.
+    pub fn clear_scope(&mut self, scope: Scope) {
+        self.slots.iter_mut().filter(|s| s.scope == scope).for_each(Slot::clear);
+    }
+
+    /// Removes the variables of the transaction (`txn.`, `req.`, `res.`): the session's stay.
+    pub fn clear_txn(&mut self) {
+        self.slots.iter_mut().filter(|s| s.scope.of_txn()).for_each(Slot::clear);
+    }
+
+    /// Every variable, named, sorted by number (for `dump_all_vars`, which sorts by name).
+    #[must_use]
+    pub fn entries(&self) -> Vec<(String, Sample)> {
+        let Ok(names) = NAMES.read() else { return Vec::new() };
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| Some((names.names.get(i)?.to_string(), s.sample()?)))
+            .collect()
+    }
+
+    /// Makes this store's `scope` variables those of `from` (an H2 stream starts with its
+    /// connection's `sess.` variables).
+    pub fn copy_scope_from(&mut self, from: &VarStore, scope: Scope) {
+        self.clear_scope(scope);
+        for (i, s) in from.slots.iter().enumerate() {
+            if s.scope == scope && s.val != Val::Absent {
+                if i >= self.slots.len() {
+                    if self.slots.try_reserve(i + 1 - self.slots.len()).is_err() {
+                        return;
+                    }
+                    self.slots.resize_with(i + 1, Slot::default);
+                }
+                self.slots[i].clone_from(s);
+            }
+        }
+    }
+
+    /// What an H2 stream `child` changed of its connection's `sess.` variables (from
+    /// `at_start`, which it was given) comes back to this, the connection's store: a variable
+    /// it removed is removed, one it set differently is set. The others stay as other
+    /// streams made them.
+    pub fn merge_sess_from(&mut self, child: &VarStore, at_start: &VarStore) {
+        let n = child.slots.len().max(at_start.slots.len());
+        for i in 0..n {
+            let c = child.slots.get(i).filter(|s| s.scope == Scope::Sess && s.val != Val::Absent);
+            let a = at_start.slots.get(i).filter(|s| s.scope == Scope::Sess && s.val != Val::Absent);
+            match (c, a) {
+                (None, Some(_)) => {
+                    if let Some(s) = self.slots.get_mut(i) {
+                        s.clear();
+                    }
+                }
+                (Some(c), a) if !a.is_some_and(|a| a.same_value(c)) => {
+                    if i >= self.slots.len() {
+                        if self.slots.try_reserve(i + 1 - self.slots.len()).is_err() {
+                            return;
+                        }
+                        self.slots.resize_with(i + 1, Slot::default);
+                    }
+                    self.slots[i].clone_from(c);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The accounting sizes of the variables held.
+    fn sizes(&self) -> Sizes {
+        let mut z = Sizes::default();
+        for s in self.slots.iter().filter(|s| s.val != Val::Absent) {
+            let c = VAR_STRUCT_COST + s.extra_bytes();
+            z.all += c;
+            match s.scope {
+                Scope::Req | Scope::Res => {
+                    z.reqres += c;
+                    z.txn += c;
+                    z.sess += c;
+                }
+                Scope::Txn => {
+                    z.txn += c;
+                    z.sess += c;
+                }
+                Scope::Sess => z.sess += c,
+                Scope::Check => {
+                    z.check += c;
+                    z.sess += c;
+                }
+                Scope::Proc | Scope::Other => {}
+            }
+        }
+        z
+    }
+}
+
+impl Clone for VarStore {
+    fn clone(&self) -> Self {
+        let mut c = Self::new();
+        c.clone_from(self);
+        c
+    }
+
+    fn clone_from(&mut self, from: &Self) {
+        self.clear();
+        if self.slots.len() < from.slots.len() {
+            if self.slots.try_reserve(from.slots.len() - self.slots.len()).is_err() {
+                return;
+            }
+            self.slots.resize_with(from.slots.len(), Slot::default);
+        }
+        for (d, s) in self.slots.iter_mut().zip(&from.slots) {
+            if s.val != Val::Absent {
+                d.clone_from(s);
+            }
+        }
+    }
+}
+
+impl Drop for VarStore {
+    fn drop(&mut self) {
+        if self.slots.capacity() == 0 {
+            return;
+        }
+        let mut slots = std::mem::take(&mut self.slots);
+        Self::recycle(&mut slots);
+        let _ = SPARE.try_with(|s| {
+            let Ok(mut s) = s.try_borrow_mut() else { return };
+            // The list is sized once, on the first return: no allocation after that.
+            if s.len() < SPARE_MAX && (s.len() < s.capacity() || s.try_reserve_exact(SPARE_MAX).is_ok()) {
+                s.push(slots);
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The thread's store and the process's
 
 thread_local! {
     /// The variables of the stream running on this thread, for the fetches and converters,
-    /// which get no stream. The engine moves a stream's variables in for each run and back out
-    /// after (`with_stream_vars`, ibex-rt engine.rs).
-    pub static CURRENT_VARS: RefCell<VarMap> = RefCell::new(HashMap::new());
+    /// which get no stream. [`enter`] swaps a stream's store in for each run, [`leave`] back.
+    pub static CURRENT_VARS: RefCell<VarStore> = const { RefCell::new(VarStore::empty()) };
 }
 
 /// The `proc.` variables, shared by every thread.
-pub static GLOBAL_PROC_VARS: LazyLock<RwLock<VarMap>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+pub static GLOBAL_PROC_VARS: LazyLock<RwLock<VarStore>> = LazyLock::new(|| RwLock::new(VarStore::empty()));
+
+/// A stream's run starts: its store `vars` becomes the thread's (a swap), and `vars` holds the
+/// thread's empty one until [`leave`].
+pub fn enter(vars: &mut VarStore) {
+    let _ = CURRENT_VARS.try_with(|c| {
+        if let Ok(mut c) = c.try_borrow_mut() {
+            std::mem::swap(&mut *c, vars);
+            vars.clear();
+        }
+    });
+    let _ = RUNNING.try_with(|r| r.set(true));
+}
+
+/// A stream's run ends: the thread's store goes back to `vars`, or, for a stream that is
+/// gone (`None`), is emptied.
+pub fn leave(vars: Option<&mut VarStore>) {
+    let _ = CURRENT_VARS.try_with(|c| {
+        if let Ok(mut c) = c.try_borrow_mut() {
+            if let Some(vars) = vars {
+                std::mem::swap(&mut *c, vars);
+            }
+            c.clear();
+        }
+    });
+    let _ = RUNNING.try_with(|r| r.set(false));
+}
+
+/// Runs `f` on the store of the stream whose own is `own`: the thread's while the stream runs
+/// ([`enter`]), `own` otherwise. `None` when the thread's is already borrowed.
+pub fn with_stream<R>(own: &mut VarStore, f: impl FnOnce(&mut VarStore) -> R) -> Option<R> {
+    if RUNNING.try_with(Cell::get).unwrap_or(false) {
+        with_current_mut(f)
+    } else {
+        Some(f(own))
+    }
+}
 
 fn is_proc(name: &str) -> bool {
     name.starts_with("proc.")
 }
 
 /// Runs `f` on the thread's stream variables; `None` when they are already borrowed.
-pub fn with_current<R>(f: impl FnOnce(&VarMap) -> R) -> Option<R> {
+pub fn with_current<R>(f: impl FnOnce(&VarStore) -> R) -> Option<R> {
     CURRENT_VARS.try_with(|v| v.try_borrow().ok().map(|m| f(&m))).ok().flatten()
 }
 
 /// Runs `f` on the thread's stream variables, to change them; `None` when they are borrowed.
-pub fn with_current_mut<R>(f: impl FnOnce(&mut VarMap) -> R) -> Option<R> {
+pub fn with_current_mut<R>(f: impl FnOnce(&mut VarStore) -> R) -> Option<R> {
     CURRENT_VARS.try_with(|v| v.try_borrow_mut().ok().map(|mut m| f(&mut m))).ok().flatten()
 }
 
 /// The value of `proc.<name>`.
 #[must_use]
 pub fn get_proc(name: &str) -> Option<Sample> {
-    GLOBAL_PROC_VARS.read().ok()?.get(name).cloned()
+    GLOBAL_PROC_VARS.read().ok()?.get(name)
 }
 
 /// Sets `proc.<name>`, unless it does not fit `tune.vars.proc-max-size` / `global-max-size`.
 pub fn set_proc(name: &str, smp: Sample) {
+    set_proc_in(name, In::Owned(smp));
+}
+
+fn set_proc_in(name: &str, v: In<'_>) {
     // The running stream's variables count in the process total too (see [`admit`]).
-    let stream = if limits_set() { with_current(|m| scan(&[m]).sess).unwrap_or(0) } else { 0 };
-    let Ok(mut lock) = GLOBAL_PROC_VARS.write() else { return };
-    if let Some(smp) = admit(&[&*lock], stream, name, smp) {
-        lock.insert(name.to_string(), smp);
+    let stream = if limits_set() { with_current(|m| m.sizes().sess).unwrap_or(0) } else { 0 };
+    if let Ok(mut lock) = GLOBAL_PROC_VARS.write() {
+        put(&mut lock, name, v, stream);
     }
 }
 
 /// The `proc.` variables, copied out (for `dump_all_vars`).
 #[must_use]
 pub fn proc_snapshot() -> Vec<(String, Sample)> {
-    GLOBAL_PROC_VARS.read().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default()
+    GLOBAL_PROC_VARS.read().map(|m| m.entries()).unwrap_or_default()
 }
 
 /// The value of the variable `name` (scope prefix included): `vars_get_by_desc`. A `proc.`
@@ -81,7 +649,7 @@ pub fn get(name: &str) -> Option<Sample> {
     if is_proc(name) {
         return get_proc(name);
     }
-    with_current(|m| m.get(name).cloned()).flatten()
+    with_current(|m| m.get(name)).flatten()
 }
 
 /// Whether the variable `name` has a value.
@@ -93,51 +661,44 @@ pub fn is_set(name: &str) -> bool {
     with_current(|m| m.contains_key(name)).unwrap_or(false)
 }
 
-/// Sets the variable `name` to `smp`, with no condition.
+/// Sets the variable `name` to `smp`, with no condition, in the running stream's store.
 pub fn set(name: &str, smp: Sample) {
     if is_proc(name) {
         set_proc(name, smp);
         return;
     }
     let procs = if limits_set() { proc_size() } else { 0 };
-    with_current_mut(|m| {
-        if let Some(smp) = admit(&[&*m], procs, name, smp) {
-            m.insert(name.to_string(), smp);
-        }
-    });
+    with_current_mut(|m| put(m, name, In::Owned(smp), procs));
 }
 
-/// [`set`] for the engine's `set-var` rules, which also keep the value in the session's own
-/// maps `extra` (empty while the stream runs, and the same entries as the thread's map
-/// otherwise). Gives the sample that was stored, `None` when it was refused.
-pub fn store(extra: &[&VarMap], name: &str, smp: Sample) -> Option<Sample> {
-    if !limits_set() {
-        return with_current_mut(|m| m.insert(name.to_string(), smp.clone())).map(|_| smp);
+/// Sets the variable `name` of the stream store `vars` (or of the process, for `proc.`),
+/// with the accounting of `tune.vars.*`. Says whether it set it.
+pub fn set_in(vars: &mut VarStore, name: &str, v: In<'_>) -> bool {
+    if is_proc(name) {
+        set_proc_in(name, v);
+        return true;
     }
     let procs = if limits_set() { proc_size() } else { 0 };
-    with_current_mut(|m| {
-        let mut views: Vec<&VarMap> = vec![&*m];
-        views.extend_from_slice(extra);
-        let stored = admit(&views, procs, name, smp)?;
-        m.insert(name.to_string(), stored.clone());
-        Some(stored)
-    })
-    .flatten()
+    put(vars, name, v, procs)
 }
 
-/// Sets a variable of a health check's run (`check.` scope; `tune.vars.check-max-size`).
-pub fn set_in(map: &mut VarMap, name: &str, smp: Sample) {
-    let procs = if limits_set() { proc_size() } else { 0 };
-    if let Some(smp) = admit(&[&*map], procs, name, smp) {
-        map.insert(name.to_string(), smp);
-    }
+/// Stores `v` in `store` if it fits the limits: `var_set`.
+fn put(store: &mut VarStore, name: &str, v: In<'_>, procs: u64) -> bool {
+    let Some(id) = intern(name) else { return false };
+    let scope = Scope::of(name);
+    let v = match admit(store, procs, id, scope, &v) {
+        Admit::Refuse => return false,
+        Admit::Bool(b) => In::Owned(Sample::Bool(b)),
+        Admit::Store => v,
+    };
+    store.write(id, scope, v)
 }
 
 // Accounting: `var_accounting_add` / `var_accounting_diff` (src/vars.c).
 
-/// What `sizeof(struct var)` is in the x86-64 build of HAProxy 3.5-dev8 (measured: a limit of 87
+/// What `sizeof(struct var)` is in the x86-64 build of `HAProxy` 3.5-dev8 (measured: a limit of 87
 /// refuses one `int` variable, 88 takes it). Ibex's own entries are smaller (design §2.5); the
-/// accounting uses HAProxy's number so that a limit means the same.
+/// accounting uses `HAProxy`'s number so that a limit means the same.
 pub const VAR_STRUCT_COST: u64 = 88;
 
 /// The limits, in the order global, proc, sess, txn, reqres, check; 0 is none.
@@ -158,18 +719,6 @@ fn limits_set() -> bool {
     (0..6).any(|i| limit(i) != 0)
 }
 
-/// The bytes a value holds beyond its `struct var`: a `str`, a `bin`, a method that is not one of
-/// the known ones (a `str` is bytetext: a character per byte).
-fn extra_bytes(s: &Sample) -> u64 {
-    let n = match s {
-        Sample::Str(t) => t.chars().count(),
-        Sample::Bin(b) => b.len(),
-        Sample::Meth(ibex_proto::htx::HttpMethod::Other(m)) => m.len(),
-        _ => 0,
-    };
-    n as u64
-}
-
 #[derive(Default, Clone, Copy)]
 struct Sizes {
     /// `sess.`, `txn.`, `req.`, `res.` and `check.`: what a session's counter holds.
@@ -177,103 +726,68 @@ struct Sizes {
     txn: u64,
     reqres: u64,
     check: u64,
-}
-
-/// The sizes of the variables in `maps` (a name in two of them counts once, from the first).
-fn scan(maps: &[&VarMap]) -> Sizes {
-    let mut z = Sizes::default();
-    for (i, m) in maps.iter().enumerate() {
-        for (k, v) in m.iter() {
-            if maps[..i].iter().any(|e| e.contains_key(k)) {
-                continue;
-            }
-            let c = VAR_STRUCT_COST + extra_bytes(v);
-            match k.split('.').next() {
-                Some("req" | "res") => {
-                    z.reqres += c;
-                    z.txn += c;
-                    z.sess += c;
-                }
-                Some("txn") => {
-                    z.txn += c;
-                    z.sess += c;
-                }
-                Some("sess") => z.sess += c,
-                Some("check") => {
-                    z.check += c;
-                    z.sess += c;
-                }
-                _ => {}
-            }
-        }
-    }
-    z
+    /// Every variable of the store (the `proc.` store's total).
+    all: u64,
 }
 
 /// The size of the `proc.` variables.
 fn proc_size() -> u64 {
-    GLOBAL_PROC_VARS.read().map_or(0, |m| m.values().map(|v| VAR_STRUCT_COST + extra_bytes(v)).sum())
+    GLOBAL_PROC_VARS.read().map_or(0, |m| m.sizes().all)
 }
 
-/// Whether setting the variable `name` to `new` fits the limits, and what is stored: `var_set`
-/// with its two `var_accounting_add` calls. `maps` holds the variables of the scope's owner (the
-/// stream, the check run, or the `proc.` map), `procs` the bytes of the rest of the process that
-/// the `proc` and `global` limits also count.
+enum Admit {
+    Refuse,
+    Store,
+    Bool(bool),
+}
+
+/// Whether setting the variable `id` (of `scope`) to `new` fits the limits: `var_set` with its
+/// two `var_accounting_add` calls. `store` holds the variables of the scope's owner (the
+/// stream, the check run, or the `proc.` store), `procs` the bytes of the rest of the process
+/// that the `proc` and `global` limits also count.
 ///
-/// - The variable does not exist: its `struct var` must fit, or nothing is created (`None`).
+/// - The variable does not exist: its `struct var` must fit, or nothing is created (`Refuse`).
 /// - A `str`, `bin` or unusual method replaces what the variable held (its bytes are given back)
 ///   and must fit its bytes too; if not the variable stays, as a `bool` that takes no memory.
-///   HAProxy's keeps the integer it held in the union, so that `int(7)` then a string that does
+///   `HAProxy`'s keeps the integer it held in the union, so that `int(7)` then a string that does
 ///   not fit still prints `7`; Ibex stores `Bool(old != 0)` (T364 Q1, tradeoff.md).
 ///
-/// Counted per scope as HAProxy does: `req`/`res` in `reqres`, `txn` and `sess`, `txn` in `sess`,
+/// Counted per scope as `HAProxy` does: `req`/`res` in `reqres`, `txn` and `sess`, `txn` in `sess`,
 /// `check` in `check` and `sess`, and every one in `proc`. Not counted: sessions other than
-/// this one (a process total is this process's `proc.` variables and the running stream's; S6/S7
-/// bring the rest) and the 88 bytes HAProxy charges for each `proc.` name the configuration only
+/// this one (a process total is this process's `proc.` variables and the running stream's; S7
+/// brings the rest) and the 88 bytes `HAProxy` charges for each `proc.` name the configuration only
 /// mentions (it creates them at load).
-fn admit(maps: &[&VarMap], procs: u64, name: &str, new: Sample) -> Option<Sample> {
+fn admit(store: &VarStore, procs: u64, id: u32, scope: Scope, new: &In<'_>) -> Admit {
     if !limits_set() {
-        return Some(new);
+        return Admit::Store;
     }
-    let old = maps.iter().find_map(|m| m.get(name));
-    let z = scan(maps);
-    let scope = name.split('.').next().unwrap_or("");
-    let proc_total = procs + if scope == "proc" { z_total_proc(maps) } else { z.sess };
+    let old = store.slots.get(id as usize).filter(|s| s.val != Val::Absent);
+    let z = store.sizes();
+    let proc_total = procs + if scope == Scope::Proc { z.all } else { z.sess };
     // Whether `size - minus + add` fits every limit `scope` counts in.
     let fits = |add: u64, minus: u64| {
         let over = |size: u64, lim: u64| lim != 0 && (size + add).saturating_sub(minus) > lim;
         let (reqres, txn, sess, check) = (z.reqres, z.txn, z.sess, z.check);
         match scope {
-            "req" | "res" if over(reqres, limit(4)) || over(txn, limit(3)) => return false,
-            "txn" if over(txn, limit(3)) => return false,
-            "check" if over(check, limit(5)) => return false,
-            "req" | "res" | "txn" | "sess" | "check" if over(sess, limit(2)) => return false,
+            Scope::Req | Scope::Res if over(reqres, limit(4)) || over(txn, limit(3)) => return false,
+            Scope::Txn if over(txn, limit(3)) => return false,
+            Scope::Check if over(check, limit(5)) => return false,
+            Scope::Req | Scope::Res | Scope::Txn | Scope::Sess | Scope::Check if over(sess, limit(2)) => {
+                return false
+            }
             _ => {}
         }
         !(over(proc_total, limit(1)) || over(proc_total, limit(0)))
     };
     let created = old.is_none();
     if created && !fits(VAR_STRUCT_COST, 0) {
-        return None;
+        return Admit::Refuse;
     }
-    let held = old.map_or(0, extra_bytes);
-    if matches!(new, Sample::Str(_) | Sample::Bin(_) | Sample::Meth(ibex_proto::htx::HttpMethod::Other(_)))
-        && !fits(if created { VAR_STRUCT_COST } else { 0 } + extra_bytes(&new), held)
-    {
-        let was = match old {
-            Some(Sample::Sint(n)) => *n != 0,
-            Some(Sample::Bool(b)) => *b,
-            Some(Sample::Ipv4(a)) => !a.is_unspecified(),
-            _ => false,
-        };
-        return Some(Sample::Bool(was));
+    let held = old.map_or(0, Slot::extra_bytes);
+    if new.is_bytes() && !fits(if created { VAR_STRUCT_COST } else { 0 } + new.extra_bytes(), held) {
+        return Admit::Bool(old.is_some_and(Slot::as_bool));
     }
-    Some(new)
-}
-
-/// The size of the `proc.` variables in `maps`' first map.
-fn z_total_proc(maps: &[&VarMap]) -> u64 {
-    maps.first().map_or(0, |m| m.values().map(|v| VAR_STRUCT_COST + extra_bytes(v)).sum())
+    Admit::Store
 }
 
 /// Removes the variable `name` (`var_unset`). A `proc.` variable stays declared, with no value.
@@ -322,6 +836,7 @@ pub fn conds_hold(spec: &str, exists: bool, is_set: bool, stored: Option<&Sample
     })
 }
 
+
 /// `set-var(<name>[,<cond>...])` from a converter, where only the thread's variables are at
 /// hand: sets the variable when the conditions hold, and says whether it did. A `proc.`
 /// variable always exists (the configuration declares it) and is set once it has a value.
@@ -329,7 +844,13 @@ pub fn conds_hold(spec: &str, exists: bool, is_set: bool, stored: Option<&Sample
 pub fn set_cond(spec: &str, smp: Sample) -> bool {
     let name = spec.split(',').next().unwrap_or("");
     let set_now = is_set(name);
-    let stored = get(name);
+    // Only an integer is compared (`ifgt`/`iflt`): no copy of a string to look at it.
+    let stored = if is_proc(name) {
+        GLOBAL_PROC_VARS.read().ok().and_then(|m| m.int(name))
+    } else {
+        with_current(|m| m.int(name)).flatten()
+    }
+    .map(Sample::Sint);
     if !conds_hold(spec, is_proc(name) || set_now, set_now, stored.as_ref(), &smp) {
         return false;
     }
@@ -366,6 +887,7 @@ pub fn var_arg_bin(name: &str) -> Option<Vec<u8>> {
     Some(b)
 }
 
+
 // The `String` shims, for the CLI and the tests written against the untyped store
 // (crates/ibex-sample/tests/sample_semantics.rs is frozen).
 
@@ -389,7 +911,12 @@ pub fn unset_proc_var(name: &str) {
 // Not generalised over the hasher: the map is converted anyway.
 #[allow(clippy::implicit_hasher)]
 pub fn set_current_vars(vars: HashMap<String, String>) {
-    with_current_mut(|m| *m = vars.into_iter().map(|(k, v)| (k, Sample::Str(v))).collect());
+    with_current_mut(|m| {
+        m.clear();
+        for (k, v) in vars {
+            m.insert(k, Sample::Str(v));
+        }
+    });
 }
 
 #[cfg(test)]
@@ -417,8 +944,50 @@ mod tests {
         set("txn.t364n", Sample::Sint(1));
         let inner = with_current_mut(|_| get("txn.t364n"));
         assert_eq!(inner, Some(None));
-        let inner = with_current(|_| with_current_mut(VarMap::clear));
+        let inner = with_current(|_| with_current_mut(VarStore::clear));
         assert_eq!(inner, Some(None));
         assert_eq!(get("txn.t364n"), Some(Sample::Sint(1)));
+    }
+
+    /// S6: a slot keeps its buffer when cleared, so the next value of the same variable is
+    /// copied into it; every type comes back as it went in.
+    #[test]
+    fn a_slot_reuses_its_buffer_and_keeps_every_type() {
+        let mut s = VarStore::new();
+        let meth = Sample::Meth(HttpMethod::Other("PURGE".to_string()));
+        for v in [
+            Sample::Bool(true),
+            Sample::Sint(-3),
+            Sample::Ipv6(std::net::Ipv6Addr::LOCALHOST),
+            Sample::Meth(HttpMethod::Patch),
+            meth.clone(),
+            Sample::Bin(vec![0, 0xff]),
+            Sample::Str("h\u{e9}llo".to_string()),
+        ] {
+            s.insert("txn.t364r", v.clone());
+            assert_eq!(s.get("txn.t364r"), Some(v));
+        }
+        let cap = s.slot("txn.t364r").map(|x| x.buf.capacity());
+        s.clear_txn();
+        assert!(!s.contains_key("txn.t364r"));
+        assert!(set_in(&mut s, "txn.t364r", In::Ref(&Sample::Str("abc".to_string()))));
+        assert_eq!(s.slots[lookup("txn.t364r").unwrap() as usize].buf.capacity(), cap.unwrap());
+        assert_eq!(s.get("txn.t364r"), Some(Sample::Str("abc".to_string())));
+        s.insert("sess.t364r", Sample::Sint(1));
+        s.clear_txn();
+        assert_eq!(s.get("sess.t364r"), Some(Sample::Sint(1)));
+        assert!(s.get("txn.t364r").is_none());
+    }
+
+    /// S6: a store given back is taken again by the next session of the thread.
+    #[test]
+    fn a_dropped_store_is_reused_by_the_next() {
+        let mut a = VarStore::new();
+        a.insert("txn.t364d", Sample::Str("x".repeat(100)));
+        let ptr = a.slots.as_ptr();
+        drop(a);
+        let b = VarStore::new();
+        assert_eq!(b.slots.as_ptr(), ptr);
+        assert!(b.is_empty());
     }
 }

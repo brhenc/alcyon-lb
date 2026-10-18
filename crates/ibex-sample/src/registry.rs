@@ -73,7 +73,7 @@ pub struct StreamTimeouts {
 }
 
 pub use crate::vars::{
-    get_proc_var, set_current_vars, set_proc_var, unset_proc_var, VarMap, CURRENT_VARS, GLOBAL_PROC_VARS,
+    get_proc_var, set_current_vars, set_proc_var, unset_proc_var, VarStore, CURRENT_VARS, GLOBAL_PROC_VARS,
 };
 pub use crate::vars::conds_hold as var_conds_hold;
 
@@ -278,7 +278,7 @@ pub struct SampleContext<'a> {
     /// condition then gives no sample.
     pub acls: Option<&'a crate::acls::Acls>,
     pub is_first_req: bool,
-    pub vars: Option<&'a VarMap>,
+    pub vars: Option<&'a VarStore>,
     pub timeouts: Option<&'a HashMap<String, u32>>,
     /// The backend's `retries`, for `be_max_retries`.
     pub be_max_retries: Option<u16>,
@@ -3539,7 +3539,7 @@ impl Registry {
                 let stored = if var_name.starts_with("proc.") {
                     crate::vars::get(var_name)
                 } else {
-                    ctx.vars.and_then(|m| m.get(var_name).cloned()).or_else(|| crate::vars::get(var_name))
+                    ctx.vars.and_then(|m| m.get(var_name)).or_else(|| crate::vars::get(var_name))
                 };
                 stored.or_else(|| args.get(1).cloned().map(Sample::Str))
             },
@@ -3646,14 +3646,12 @@ impl Registry {
                 };
                 let prefix = args.get(1).map_or("", String::as_str);
                 let delimiter = args.get(2).map_or(", ", String::as_str);
-                let mut stream: Vec<(String, Sample)> = ctx.vars.map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
-                crate::vars::with_current(|m| {
-                    for (k, val) in m {
-                        if !stream.iter().any(|(n, _)| n == k) {
-                            stream.push((k.clone(), val.clone()));
-                        }
+                let mut stream: Vec<(String, Sample)> = ctx.vars.map(VarStore::entries).unwrap_or_default();
+                for (k, val) in crate::vars::with_current(VarStore::entries).unwrap_or_default() {
+                    if !stream.iter().any(|(n, _)| *n == k) {
+                        stream.push((k, val));
                     }
-                });
+                }
                 let process: Vec<(String, Sample)> = crate::vars::proc_snapshot();
                 let mut out = Vec::new();
                 for scope in scopes {
@@ -8382,7 +8380,7 @@ mod tests {
     fn unset_var_removes_a_stream_variable_from_the_running_stream() {
         let reg = Registry::new();
         let conv = reg.get_converter("unset-var").expect("unset-var is registered");
-        CURRENT_VARS.with(|v| v.borrow_mut().insert("txn.t156".to_string(), Sample::Str("v".to_string())));
+        CURRENT_VARS.with(|v| v.borrow_mut().insert("txn.t156", Sample::Str("v".to_string())));
         set_proc_var("proc.t156", "p".to_string());
         assert_eq!((conv.func)(Sample::Sint(1), &["txn.t156".to_string()]), Some(Sample::Sint(1)));
         assert!(CURRENT_VARS.with(|v| !v.borrow().contains_key("txn.t156")));
@@ -8505,9 +8503,9 @@ mod tests {
         let target = Sample::Bin(secret.to_vec());
         CURRENT_VARS.with(|v| {
             let mut v = v.borrow_mut();
-            v.insert("txn.eq".to_string(), Sample::Str("my_secret_token".to_string()));
-            v.insert("txn.ne".to_string(), Sample::Str("my_secret_tokeX".to_string()));
-            v.insert("txn.short".to_string(), Sample::Str("short".to_string()));
+            v.insert("txn.eq", Sample::Str("my_secret_token".to_string()));
+            v.insert("txn.ne", Sample::Str("my_secret_tokeX".to_string()));
+            v.insert("txn.short", Sample::Str("short".to_string()));
         });
         let var = |n: &str| [n.to_string()];
 
