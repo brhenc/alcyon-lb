@@ -386,6 +386,7 @@ mod tls_resumption_many_clients;
 mod tls_xprt;
 mod trailer_case;
 mod drop_trailers;
+mod trailer_values;
 mod tune_maxaccept;
 mod transport_edges;
 mod txn_variables_race;

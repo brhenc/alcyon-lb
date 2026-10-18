@@ -616,20 +616,28 @@ impl MsgState {
                 c = if take as u64 == n { Chunk::DataCr } else { Chunk::Data(n - take as u64) };
                 continue;
             }
-            if drop_trailers && c == (Chunk::Trailer { len: 0, fields: 0 }) {
-                // The last-chunk line is behind us: all of the section, or none of it.
-                let mut pay = 0;
-                return match c.scan(&data[i..], &mut pay, false) {
-                    // Only a blank line (`\r\n`, or a lone `\n` that cannot be widened in place).
-                    (n, Ok(None)) if n <= 2 => keep_rest(data, i, w),
-                    (n, Ok(None)) => {
-                        data[w..w + 2].copy_from_slice(b"\r\n");
-                        i += n;
-                        w += 2;
-                        keep_rest(data, i, w)
-                    }
-                    _ => keep_rest(data, i, w),
-                };
+            if matches!(c, Chunk::Trailer { len: 0, fields: 0 }) {
+                if drop_trailers {
+                    // The last-chunk line is behind us: all of the section, or none of it.
+                    let mut pay = 0;
+                    return match c.scan(&data[i..], &mut pay, false) {
+                        // Only a blank line (`\r\n`, or a lone `\n` that cannot be widened in place).
+                        (n, Ok(None)) if n <= 2 => keep_rest(data, i, w),
+                        (n, Ok(None)) => {
+                            data[w..w + 2].copy_from_slice(b"\r\n");
+                            i += n;
+                            w += 2;
+                            keep_rest(data, i, w)
+                        }
+                        _ => keep_rest(data, i, w),
+                    };
+                }
+                // A trailer section held whole is written out as HAProxy writes its HTX
+                // trailers (T363f); a partial one is left for when it is whole.
+                if let (n, Ok(None)) = c.scan(&data[i..], &mut 0, false) {
+                    w += normalize_trailer_section(data, i, n, w);
+                    return keep_rest(data, i + n, w);
+                }
             }
             if c != CHUNK_START {
                 // The CRLF after a chunk's data, or the trailer section.
@@ -676,6 +684,79 @@ impl MsgState {
             i = j;
         }
         w
+    }
+}
+
+/// Rewrites the trailer section `data[from..from + len]` (whole, and valid per [`Chunk::scan`])
+/// to `data[to..]`, `to <= from`, the way `HAProxy` writes trailers out of HTX
+/// (`h1_headers_to_hdr_list` then `h1_format_htx_trailers`): the name in lower case, a fold
+/// (`CRLF` or `LF` then a blank) made of blanks, the value without the blanks around it
+/// and `: ` between them, `CRLF` at the end of the line. Returns the bytes written.
+///
+/// The output never outgrows the input, so it is written in place: where `HAProxy` adds a
+/// byte the input has not got (`x:v`, `x:`, a line ended by a lone LF) it is left out, the
+/// field meaning the same. Nothing is allocated.
+fn normalize_trailer_section(data: &mut [u8], from: usize, len: usize, to: usize) -> usize {
+    let is_blank = |b: u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n');
+    let end = from + len;
+    let (mut r, mut w) = (from, to);
+    loop {
+        // The blank line ends the section.
+        if data[r] == b'\n' || data[r..end] == *b"\r\n" {
+            let n = end - r;
+            data.copy_within(r..end, w);
+            return w + n - to;
+        }
+        let name_len = data[r..end].iter().position(|&b| b == b':').unwrap_or(0);
+        // The value runs to a line end that no blank follows.
+        let vs = r + name_len + 1;
+        let mut le = vs;
+        while data[le] != b'\n' || matches!(data[le + 1], b' ' | b'\t') {
+            le += 1;
+        }
+        let line_end = le + 1;
+        let mut ve = if le > vs && data[le - 1] == b'\r' { le - 1 } else { le };
+        let mut vb = vs;
+        while vb < ve && is_blank(data[vb]) {
+            vb += 1;
+        }
+        while ve > vb && is_blank(data[ve - 1]) {
+            ve -= 1;
+        }
+        let value_len = ve - vb;
+        let room = line_end - r;
+        // `name: value\r\n`, else without the space, else ended by a lone LF.
+        let (space, crlf) = if name_len + 2 + value_len + 2 <= room {
+            (true, true)
+        } else if name_len + 1 + value_len + 2 <= room {
+            (false, true)
+        } else {
+            (false, false)
+        };
+        data[r..r + name_len].make_ascii_lowercase();
+        data.copy_within(r..r + name_len, w);
+        // The value moves before the colon and the space are written: with room to spare
+        // they may stand where its first byte was.
+        let vo = w + name_len + 1 + usize::from(space);
+        data.copy_within(vb..ve, vo);
+        for b in &mut data[vo..vo + value_len] {
+            if *b == b'\r' || *b == b'\n' {
+                *b = b' ';
+            }
+        }
+        data[w + name_len] = b':';
+        if space {
+            data[w + name_len + 1] = b' ';
+        }
+        let mut o = vo + value_len;
+        if crlf {
+            data[o] = b'\r';
+            o += 1;
+        }
+        data[o] = b'\n';
+        o += 1;
+        r = line_end;
+        w = o;
     }
 }
 
@@ -2262,5 +2343,35 @@ mod tests {
     #[test]
     fn a_head_without_an_end_is_left_alone() {
         assert_eq!(rewrite_response_connection("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n", false, true, false), None);
+    }
+    /// Writes `section` (after a last-chunk line) through [`MsgState::canonical_chunk_lines`].
+    fn trailers_of(section: &[u8]) -> Vec<u8> {
+        let mut body = [b"0\r\n".as_slice(), section].concat();
+        let n = MsgState::Body(Body::Chunked(CHUNK_START)).canonical_chunk_lines(&mut body);
+        body.truncate(n);
+        body
+    }
+
+    #[test]
+    fn a_trailer_field_that_would_grow_is_written_in_place() {
+        // HAProxy writes `x-a: v`; the byte it adds is not made room for.
+        assert_eq!(trailers_of(b"X-A:v\r\n\r\n"), b"0\r\nx-a:v\r\n\r\n");
+        assert_eq!(trailers_of(b"X-A:\r\n\r\n"), b"0\r\nx-a:\r\n\r\n");
+        // Slack in the line is used for it.
+        assert_eq!(trailers_of(b"X-A:v  \r\n\r\n"), b"0\r\nx-a: v\r\n\r\n");
+    }
+
+    #[test]
+    fn a_trailer_section_not_whole_is_not_trimmed() {
+        // `v  w` must not lose its blanks when `w` has not arrived yet.
+        assert_eq!(trailers_of(b"x-a: v  "), b"0\r\nx-a: v  ");
+        assert_eq!(trailers_of(b"x-a: v  \r\n"), b"0\r\nx-a: v  \r\n");
+    }
+
+    #[test]
+    fn trailer_fields_are_trimmed_folded_and_lowercased() {
+        assert_eq!(trailers_of(b"X-A: a\r\n b\r\nX-B:\t c \r\n\r\n"), b"0\r\nx-a: a   b\r\nx-b: c\r\n\r\n");
+        // A pipelined request after the message is left as it is.
+        assert_eq!(trailers_of(b"X-A:  v\r\n\r\nGET / HTTP/1.1\r\n\r\n"), b"0\r\nx-a: v\r\n\r\nGET / HTTP/1.1\r\n\r\n");
     }
 }
