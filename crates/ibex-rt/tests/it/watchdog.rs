@@ -212,6 +212,10 @@ fn warn_blocked_traffic_after_is_checked() {
         ("0", Some(range("0"))),
         ("1001", Some(range("1001"))),
         ("5s", Some(range("5s"))),
+        ("0us", Some(range("0us"))),
+        ("1m", Some(range("1m"))),
+        ("1h", Some(range("1h"))),
+        ("1d", Some(range("1d"))),
         ("abc", Some(format!("unexpected character 'a' in argument to <{kw}>."))),
         ("10x", Some(format!("unexpected character 'x' in argument to <{kw}>."))),
         ("0.5", Some(format!("unexpected character '.' in argument to <{kw}>."))),
@@ -219,6 +223,8 @@ fn warn_blocked_traffic_after_is_checked() {
         ("1", None),
         ("1000", None),
         ("1s", None),
+        ("1000us", None),
+        ("1001us", None),
         ("50ms", None),
         ("100 extra", None),
     ];
@@ -251,4 +257,18 @@ fn warn_blocked_traffic_after_moves_the_warning() {
     assert!(blocked_warnings(&ibex) >= 1, "{}", ibex.stderr());
     common::stop(&mut ibex.child);
     assert!(ibex.stderr().contains("WARNING! thread 1 has stopped processing traffic for "));
+}
+
+/// `experimental-mode on|off` at the prompt answers with the prompt again, as `HAProxy`
+/// does (measured: `\n> ` for `prompt` and for each of the two commands).
+#[test]
+fn experimental_mode_at_the_prompt_returns_the_prompt() {
+    let mut ibex = start("expprompt");
+    let mut s = UnixStream::connect(&ibex.sock).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    s.write_all(b"prompt\nexperimental-mode on\nexperimental-mode off\nquit\n").expect("write");
+    let mut got = Vec::new();
+    let _ = s.read_to_end(&mut got);
+    assert_eq!(String::from_utf8_lossy(&got), "\n> \n> \n> ");
+    common::stop(&mut ibex.child);
 }

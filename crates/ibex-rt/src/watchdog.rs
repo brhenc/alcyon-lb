@@ -37,7 +37,7 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// `HAProxy`'s default `warn-blocked-traffic-after` (src/wdt.c:48).
 pub const DEFAULT_WARN_AFTER: Duration = Duration::from_millis(100);
@@ -63,8 +63,6 @@ struct Slot {
 enum Clock {
     /// `/proc/thread-self/schedstat` of the worker, opened by it.
     Sched(File),
-    /// No schedstat: the monotonic clock.
-    Wall,
 }
 
 struct Watchdog {
@@ -105,18 +103,18 @@ pub fn init(nbthread: usize) {
 /// Makes the calling thread worker `id`. Called by the worker itself, before the chroot.
 pub fn register(id: usize) {
     let Some(slot) = WATCHDOG.get().and_then(|w| w.slots.get(id)) else { return };
-    let clock = match File::open("/proc/thread-self/schedstat") {
-        Ok(f) if read_sched(&f).is_some() => Clock::Sched(f),
-        _ => {
-            crate::stderr_line!(
-                "[WARNING]  ({}) : Failed to read the CPU time of thread {} (/proc/thread-self/schedstat), its lockup detection uses the wall clock.",
-                std::process::id(),
-                id + 1
-            );
-            Clock::Wall
+    // Without a CPU clock the thread is not watched (wall-clock detection is T361 slice 4);
+    // HAProxy says the same when its timer cannot be set up (src/wdt.c:260).
+    match File::open("/proc/thread-self/schedstat") {
+        Ok(f) if read_sched(&f).is_some() => {
+            let _ = slot.clock.set(Clock::Sched(f));
         }
-    };
-    let _ = slot.clock.set(clock);
+        _ => crate::stderr_line!(
+            "[WARNING]  ({}) : Failed to setup watchdog timer for thread {}, disabling lockup detection.",
+            std::process::id(),
+            id + 1
+        ),
+    }
     MINE.with(|m| m.set(Some(slot)));
 }
 
@@ -181,7 +179,6 @@ fn monitor(wd: &'static Watchdog, tick: Duration) -> ! {
     // and every report come one tick late (measured: first warning at 298 ms, panic at
     // ~1.3 s, against HAProxy's 201 ms and ~1.2 s).
     let slack = tick_ns / 2;
-    let epoch = Instant::now();
     let n = wd.slots.len();
     let mut seen = vec![0u64; n];
     let mut accused: Vec<Option<u64>> = vec![None; n];
@@ -196,7 +193,6 @@ fn monitor(wd: &'static Watchdog, tick: Duration) -> ! {
             }
             let now = match s.clock.get() {
                 Some(Clock::Sched(f)) => read_sched(f),
-                Some(Clock::Wall) => u64::try_from(epoch.elapsed().as_nanos()).ok(),
                 None => None,
             };
             let Some(now) = now else { continue };
@@ -265,6 +261,7 @@ fn panic_now(worker: usize) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn schedstat_first_field_is_read() {
