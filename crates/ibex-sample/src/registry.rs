@@ -7528,7 +7528,7 @@ fn format_time_ns(epoch: i64, nanos: u32, format: &str, local: bool) -> String {
 
     let zone = crate::localtime::zone();
     let offset = if local { zone.offset_at(epoch) } else { 0 };
-    let (days, secs) = split_epoch(epoch + i64::from(offset));
+    let (days, secs) = split_epoch(epoch.saturating_add(i64::from(offset)));
 
     let (y, m, d) = civil_from_days(days);
     let wday_idx = weekday_index(days);
