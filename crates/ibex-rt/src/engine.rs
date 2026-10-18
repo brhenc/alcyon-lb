@@ -4481,7 +4481,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 .global
                 .as_ref()
                 .and_then(|g| g.maxrewrite)
-                .unwrap_or(1024),
+                .unwrap_or(1024)
+                // haproxy.c: `if (maxrewrite >= bufsize / 2) maxrewrite = bufsize / 2;`
+                .min(bufsize / 2),
             maxaccept: config
                 .global
                 .as_ref()
@@ -7232,7 +7234,8 @@ fn init_client_session(
     sess.maxrewrite = proxies[proxy_idx]
         .stats_config
         .maxrewrite
-        .unwrap_or(global_maxrewrite);
+        .unwrap_or(global_maxrewrite)
+        .min(global_bufsize / 2);
 
     // A TLS bind's connection is TLS from its first byte and never falls back to cleartext
     // (the downgrade `bind_tls` refuses to start with); a failed handshake closes it.
