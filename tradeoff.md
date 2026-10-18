@@ -450,6 +450,28 @@ Status: **resolved and measured** — cached lookups verified in `crates/ibex-sa
 | **Status** | **measured** 2026-10-17 (`~/ibex-worktrees/review/pools-haproxy-vs-ibex-2026-10-17.md`). Planning of the pools (which objects, per-thread caches, a bounded and fallible take on the request path, what to do when a pool is empty, how to count and test "0 allocations per request" on the real binary) is set for the 2026-10-17 21:00 planning session (Fable), with T344. |
 | **Revisit if** | Done when the request path makes 0 allocations per request on the shipped binary (counted, pinned in a test), and an empty pool fails one stream, not the process. |
 
+**Plan (2026-10-18).** Spec of HAProxy's pools and the port design: `docs/design/pools-2026-10-18.md`
+(119 pools in HAProxy's source, 76 registered with a blog config, measured sizes; slices P0-P9 in
+its §5, tracked as T372). Measured on the oracle while writing it: HAProxy does **not** pre-allocate
+its pools (2 buffers + 4 emergency buffers per thread at start, grows on demand, never shrinks), so
+its "0 malloc per request" holds after warm-up; it still mallocs on some request paths (`set-var`:
+2 per request; OpenSSL: 9 per TLS keep-alive request, 714 per new TLS connection; Ibex on rustls: 3
+and ~137). The user's direction (2026-10-18) goes further: runtime memory is a stack variable or a
+pool chunk, aiming at soft-realtime (no allocation after start-up), because malloc can block and a
+failed one aborts the worker.
+
+**Open design questions, to be decided by testing** (user, 2026-10-18: "this will require more
+testing to determine the correct way to run"). Each lists the options and what to measure before
+choosing; nothing is decided yet.
+
+| | Question | Options | What decides it |
+|---|---|---|---|
+| **Q1** | Grow or fixed pools? | (a) HAProxy's grow-on-demand-and-keep; (b) fixed, pre-sized at start from `maxconn`/`-m` (auto maxconn on the 64-core host is 524274: ~17 GB of buffers, so fixed needs an explicit limit); (c) grow by default with a fixed mode as an opt-in; (d) grow, pre-warmed at start to a fraction of maxconn | RSS at idle and after a burst for a blog config, allocations during the first burst, latency of the first requests after start (soak + netfuzz 40k shapes), behaviour at the limit |
+| **Q2** | Give memory back after a burst? | (a) keep shrinking (`trim_idle`, `SessionArena::trim_tail`, the back-to-baseline leak test, merged 10-17/18): RSS returns, the next burst mallocs again; (b) keep the peak as HAProxy (flat after the burst; the leak test then checks "no growth after the first burst" instead of "back to baseline"); (c) shrink only in grow mode | repeated bursts in the soak: RSS curve and malloc count per burst under (a) and (b); whether an operator can still tell a leak from a kept peak (`show pools` used vs allocated) |
+| **Q3** | No buffer available? | (a) wait in a queue as HAProxy (`b_alloc` wait list, emergency buffers; the spec's recommendation, queue pre-sized so waiting cannot allocate); (b) fail the stream (plan-2100 Z4, M1 shape) | `tune.buffers.limit` small on both proxies: who is served, latency, log flags; slow-client attack (T371 shapes) with the limit reached |
+| **Q4** | Hold Ibex to 0 where HAProxy itself mallocs? | (a) 0 everywhere (vars pool P7, rustls unbuffered API, error snapshots); (b) match HAProxy's exceptions and list them here | allocation census per path (`review/alloc-census-2026-10-18.md`), cost of each exception under attack |
+| **Q5** | `show pools` names | (a) HAProxy's name only where the object really corresponds, Ibex names otherwise (spec proposal); (b) HAProxy's full list for script compatibility | which scripts/dashboards read `show pools` (likely few); honesty rule (AGENTS.md 5: no name for an object that does not exist) |
+
 ### 6.14 Slow-client defences not implemented yet — **not a decision to leave out; tracked in T349 for M1**
 
 | | |
