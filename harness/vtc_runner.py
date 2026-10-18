@@ -168,8 +168,8 @@ async def read_until_bytes(reader: asyncio.StreamReader, delimiter: bytes, max_l
             raise ValueError(f"Stream exceeded maximum length {max_len} before finding delimiter {delimiter!r}")
 
 
-async def parse_http_request(reader: asyncio.StreamReader) -> Optional[HttpRequest]:
-    """Parse HTTP request from stream."""
+async def parse_http_request(reader: asyncio.StreamReader, headers_only: bool = False) -> Optional[HttpRequest]:
+    """Parse HTTP request from stream. `headers_only` (rxreqhdrs) leaves the body in the stream."""
     header_data = await read_until_bytes(reader, b"\r\n\r\n")
     if not header_data:
         return None
@@ -211,6 +211,9 @@ async def parse_http_request(reader: asyncio.StreamReader) -> Optional[HttpReque
     req = HttpRequest(method=method, url=url, proto=proto, headers=headers)
 
     body_bytes = bytearray(parts[1]) if len(parts) > 1 else bytearray()
+    if headers_only:
+        reader._buffer[:0] = body_bytes  # type: ignore[attr-defined]
+        return req
     cl_hdr = req.get_header("Content-Length")
     te_hdr = req.get_header("Transfer-Encoding")
 
@@ -246,8 +249,10 @@ async def parse_http_request(reader: asyncio.StreamReader) -> Optional[HttpReque
     return req
 
 
-async def parse_http_response(reader: asyncio.StreamReader, req_method: str = "GET") -> Optional[HttpResponse]:
-    """Parse HTTP response from stream."""
+async def parse_http_response(
+    reader: asyncio.StreamReader, req_method: str = "GET", headers_only: bool = False
+) -> Optional[HttpResponse]:
+    """Parse HTTP response from stream. `headers_only` (rxresphdrs) leaves the body in the stream."""
     header_data = await read_until_bytes(reader, b"\r\n\r\n")
     if not header_data:
         return None
@@ -283,6 +288,9 @@ async def parse_http_response(reader: asyncio.StreamReader, req_method: str = "G
     resp = HttpResponse(status=status, reason=reason, proto=proto, headers=headers)
 
     body_bytes = bytearray(parts[1]) if len(parts) > 1 else bytearray()
+    if headers_only:
+        reader._buffer[:0] = body_bytes  # type: ignore[attr-defined]
+        return resp
     if req_method.upper() == "HEAD" or status in (204, 304) or (100 <= status < 200):
         resp.body = b""
         return resp
@@ -1316,7 +1324,7 @@ class MockServerRunner:
                     args = [self.macro_engine.expand(a) for a in action.args]
 
                     if cmd in ("rxreq", "rxreqhdrs"):
-                        cur_req = await parse_http_request(reader)
+                        cur_req = await parse_http_request(reader, headers_only=(cmd == "rxreqhdrs"))
                         if cur_req is None:
                             raise ConnectionResetError(f"Server {self.server_id} expected HTTP request but got EOF")
                         self.req_history.append(cur_req)
@@ -1360,7 +1368,7 @@ class MockServerRunner:
                                     headers.append((hk.strip(), hv.lstrip(" \t")))
                             elif opt == "-body" and idx + 1 < len(args):
                                 idx += 1
-                                body = args[idx]
+                                body = decode_hex_escapes(args[idx])
                             elif opt == "-bodylen" and idx + 1 < len(args):
                                 idx += 1
                                 try:
@@ -1575,7 +1583,7 @@ class MockClientRunner:
                                     headers.append((hk.strip(), hv.lstrip(" \t")))
                             elif opt == "-body" and idx + 1 < len(args):
                                 idx += 1
-                                body = args[idx]
+                                body = decode_hex_escapes(args[idx])
                             elif opt == "-bodylen" and idx + 1 < len(args):
                                 idx += 1
                                 try:
@@ -1615,7 +1623,9 @@ class MockClientRunner:
                         await writer.drain()
 
                     elif cmd in ("rxresp", "rxresphdrs"):
-                        cur_resp = await parse_http_response(reader, req_method=last_req_method)
+                        cur_resp = await parse_http_response(
+                            reader, req_method=last_req_method, headers_only=(cmd == "rxresphdrs")
+                        )
                         if cur_resp is None:
                             raise ConnectionResetError(f"Client {self.client_id} expected HTTP response but got EOF")
                         if self.verbose:

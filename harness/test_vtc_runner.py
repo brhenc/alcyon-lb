@@ -257,6 +257,44 @@ class ClientSendCoalescing(unittest.TestCase):
         self.assertEqual(self.writes, [b"\r\n\nQhi"])
         self.assertEqual(got, [b"\r\n\nQhi"])
 
+    def test_txreq_body_escapes_are_bytes(self):
+        # `-body "0\\r\\n\\r\\n"` is CR LF on the wire, not a backslash and an `r`
+        # (T363f, http_transfer_encoding.vtc: the literal text made a valid chunked request a 400).
+        A = vtc_runner.ActionItem
+        got = self._received([A("txreq", ["-method", "POST", "-nolen", "-hdr", "Transfer-Encoding: chunked",
+                                          "-body", "0\\r\\n\\r\\nx\\x41"])])
+        self.assertTrue(b"".join(got).endswith(b"\r\n\r\n0\r\n\r\nxA"), got)
+
+
+class HeadersOnly(unittest.TestCase):
+    """`rxreqhdrs` / `rxresphdrs` stop after the head: the body is for a later `recv` (T363f,
+    http_transfer_encoding.vtc c12 reads 47 bytes of a chunked body and its trailers)."""
+
+    @staticmethod
+    def _reader(data: bytes) -> asyncio.StreamReader:
+        r = asyncio.StreamReader()
+        r.feed_data(data)
+        r.feed_eof()
+        return r
+
+    def test_request_head_leaves_the_chunked_body_unread(self):
+        async def go():
+            r = self._reader(b"POST /t HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nx: y\r\n\r\n")
+            req = await vtc_runner.parse_http_request(r, headers_only=True)
+            self.assertEqual(req.url, "/t")
+            self.assertEqual(await r.readexactly(21), b"5\r\nhello\r\n0\r\nx: y\r\n\r\n")
+
+        asyncio.run(go())
+
+    def test_response_head_leaves_the_body_unread(self):
+        async def go():
+            r = self._reader(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+            resp = await vtc_runner.parse_http_response(r, headers_only=True)
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(await r.readexactly(5), b"hello")
+
+        asyncio.run(go())
+
 
 class VtestHex(unittest.TestCase):
     """`sendhex` / hex `expect` strings parse as VTest's vtc_hex_to_bin (T363l, converter/mqtt.vtc)."""
