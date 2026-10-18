@@ -21,5 +21,6 @@ mod htx_differential;
 mod layering;
 mod parser_seam;
 mod proxy_protocol_tests;
+mod qpack_field_cap;
 mod qpack_static;
 mod smuggling_cl_te;
