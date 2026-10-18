@@ -90,7 +90,9 @@ fn resp_ver_is_res_ver() {
 }
 
 #[test]
-fn server_status_is_refused_until_plumbed() {
+fn server_status_loads_now_that_it_is_plumbed() {
+    // Refused until T385 gave it the server's own status; response_status_timer_fetches.rs
+    // checks the value it answers.
     let (ok, said) = check("srv", &format!("{DEFAULTS}backend b\n  http-response set-header x \"%[server_status]\"\n  server s 127.0.0.1:1\n"));
-    assert!(!ok, "server_status loaded but would answer the rewritten status: {said}");
+    assert!(ok, "server_status is refused: {said}");
 }

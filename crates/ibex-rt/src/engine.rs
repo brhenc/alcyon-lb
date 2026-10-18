@@ -1483,6 +1483,20 @@ impl std::ops::Deref for Proxies {
     }
 }
 
+/// A proxy's `monitor-uri` and the `monitor fail` conditions that turn its answer into a 503.
+#[derive(Debug, Clone)]
+pub struct Monitor {
+    pub uri: Box<str>,
+    pub fail: Vec<ibex_config::AclCondition>,
+}
+
+impl Monitor {
+    /// `None` without a `monitor-uri`: `monitor fail` acts on that request only.
+    fn boxed(uri: Option<&str>, fail: &[ibex_config::AclCondition]) -> Option<Box<Self>> {
+        uri.map(|uri| Box::new(Self { uri: uri.into(), fail: fail.to_vec() }))
+    }
+}
+
 /// A configured proxy instance.
 #[derive(Debug, Clone)]
 // More than three bools, and they are genuinely independent switches rather than a state
@@ -1548,13 +1562,13 @@ pub struct Proxy {
     pub use_servers: Vec<ibex_config::UseServerRule>,
     /// `force-be-switch` conditions (frontends and listens).
     pub force_be_switch: Vec<ibex_config::AclCondition>,
-    /// `monitor fail` conditions (frontends and listens): one that holds turns the `monitor-uri` answer into a 503.
-    pub monitor_fail: Vec<ibex_config::AclCondition>,
     /// The names of the backends and listens the configuration disables: they are not
     /// instantiated, and only `force-be-switch` lets a rule choose one (then it has no
     /// server to give).
     pub disabled_backends: Arc<Vec<String>>,
-    pub monitor_uri: Option<Box<str>>,
+    /// `monitor-uri` and its `monitor fail` conditions (frontends and listens); boxed, as
+    /// `Proxy` is paid for per backend.
+    pub monitor: Option<Box<Monitor>>,
     pub acls: ibex_sample::Acls,
     pub stick_table: Option<Arc<StickTable>>,
     pub stick_rules: Vec<StickRule>,
@@ -3675,9 +3689,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         use_backends: listen.use_backends.clone(),
         use_servers: listen.use_servers.clone(),
         force_be_switch: listen.force_be_switch.clone(),
-        monitor_fail: listen.monitor_fail.clone(),
         disabled_backends: Arc::default(),
-        monitor_uri: listen.monitor_uri.as_deref().map(Into::into),
+        monitor: Monitor::boxed(listen.monitor_uri.as_deref(), &listen.monitor_fail),
         acls: compile_acls(&listen.acls),
         stick_table,
         stick_rules: listen.stick_rules.clone(),
@@ -3802,9 +3815,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         use_backends: fe.use_backends.clone(),
         use_servers: Vec::new(),
         force_be_switch: fe.force_be_switch.clone(),
-        monitor_fail: fe.monitor_fail.clone(),
         disabled_backends: Arc::default(),
-        monitor_uri: fe.monitor_uri.as_deref().map(Into::into),
+        monitor: Monitor::boxed(fe.monitor_uri.as_deref(), &fe.monitor_fail),
         acls: compile_acls(&fe.acls),
         stick_table,
         stick_rules: fe.stick_rules.clone(),
@@ -3934,9 +3946,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         use_backends: Vec::new(),
         use_servers: be.use_servers.clone(),
         force_be_switch: Vec::new(),
-        monitor_fail: Vec::new(),
         disabled_backends: Arc::default(),
-        monitor_uri: None,
+        monitor: None,
         acls: compile_acls(&be.acls),
         stick_table,
         stick_rules: be.stick_rules.clone(),
@@ -10902,7 +10913,8 @@ impl EngineDispatcher<'_> {
         // `monitor-uri`: answer the probe here, before any rule or backend sees it. The
         // response is HAProxy's, byte for byte (`src/http_ana.c`), and matches the path of
         // an absolute-form request too.
-        if let Some(m_uri) = proxies[proxy_idx].monitor_uri.as_deref().filter(|_| resume.is_none()) {
+        if let Some(mon) = proxies[proxy_idx].monitor.as_deref().filter(|_| resume.is_none()) {
+            let m_uri = &*mon.uri;
             let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
             let path = if m_uri.starts_with('/') && req_uri.contains("://") {
                 split_uri(req_uri).1
@@ -10913,13 +10925,13 @@ impl EngineDispatcher<'_> {
                 // `monitor fail if|unless <cond>` (`http_wait_for_request`): any condition that
                 // holds makes the answer a 503, which goes through the proxy's error page
                 // (`errorfile`, `errorloc`) like any error the proxy generates.
-                let failed = !proxies[proxy_idx].monitor_fail.is_empty() && {
+                let failed = !mon.fail.is_empty() && {
                     let proxy = &proxies[proxy_idx];
                     let view = ProxiesView(proxies);
                     let stick = StickView::new(proxies, &entry.sess.tracked_sc);
                     let ctx = Self::request_ctx(&entry.sess, proxy, &view, &stick);
                     let registry = sample_registry();
-                    proxy.monitor_fail.iter().any(|c| crate::proxy::eval_acl_condition(c, &proxy.acls, registry, &ctx))
+                    mon.fail.iter().any(|c| crate::proxy::eval_acl_condition(c, &proxy.acls, registry, &ctx))
                 };
                 if failed {
                     reply_error(entry, proxies, 503);
