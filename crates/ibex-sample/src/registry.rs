@@ -5005,9 +5005,7 @@ impl Registry {
         /// C's `printf("%g")`: six significant digits, trailing zeros dropped, an exponent
         /// below -4 or from 6 up.
         fn format_g(v: f64) -> String {
-            if !v.is_finite() {
-                return if v.is_nan() { "nan".into() } else if v < 0.0 { "-inf".into() } else { "inf".into() };
-            }
+            // serde_json numbers are finite, so there is no inf or nan to print.
             let e = format!("{v:.5e}");
             let (mant, exp) = e.split_once('e').unwrap_or((&e, "0"));
             let exp: i32 = exp.parse().unwrap_or(0);
@@ -8352,7 +8350,7 @@ mod tests {
         let res_json = reg.eval(
             "str",
             &[json_input.to_string()],
-            &[("json_query", vec!["user.name".to_string()])],
+            &[("json_query", vec!["$.user.name".to_string()])],
             &ctx,
         );
         assert_eq!(res_json, Some(Sample::Str("bob".to_string())));
