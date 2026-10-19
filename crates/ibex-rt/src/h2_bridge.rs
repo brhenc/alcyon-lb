@@ -104,7 +104,7 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) {
         c.stream = d.stream;
     }
     if sess.keep_request_line {
-        sess.log.request_line = d.request_line;
+        sess.log.request_line.set_opt(d.request_line.as_deref());
     }
     sess.log.request = Some(crate::txnlog::loop_now());
     let wire_req_buf: Vec<u8>;

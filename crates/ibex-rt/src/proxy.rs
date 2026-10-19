@@ -464,7 +464,7 @@ pub fn reserve_scrape_boxes(n: usize) {
 /// The request's method or URI as the session keeps it between requests (T436): one `String`
 /// per session whose capacity survives `reset`, so a keep-alive request copies its line into
 /// memory it already has instead of allocating a new `String` per request.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ReqText {
     buf: String,
     set: bool,
@@ -994,7 +994,7 @@ impl TcpSession {
         }
         self.stick_acct_in = self.stick_acct_in.max(child.stick_acct_in);
         self.stick_out_pending += child.stick_out_pending + child.log.bytes_from_server;
-        self.log = crate::txnlog::StreamLog::start(self.bytes_in, self.bytes_out);
+        self.log.restart(self.bytes_in, self.bytes_out);
         self.is_first_req = false;
         self.ending = None;
         if let Some(exp) = inspect {
@@ -1841,7 +1841,7 @@ impl TcpSession {
     /// this connection starts from nothing. The one place that list lives.
     pub fn reset_for_next_request(&mut self) {
         self.stick_out_pending += self.log.bytes_from_server;
-        self.log = crate::txnlog::StreamLog::start(self.bytes_in, self.bytes_out);
+        self.log.restart(self.bytes_in, self.bytes_out);
         self.txn = None;
         self.req_method.reset();
         self.req_body_htx.set(None);
@@ -2452,14 +2452,17 @@ impl TcpSession {
                 if self.keep_request_line {
                     let head = self.req.readable();
                     let line_end = head.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(head.len());
-                    let mut line = String::from_utf8_lossy(&head[..line_end.min(1024)]).into_owned();
+                    // Into the buffer the connection's previous request line used (T437).
+                    let line = String::from_utf8_lossy(&head[..line_end.min(1024)]);
                     if self.h3 {
+                        let line = line.into_owned();
                         let host = self.htx_slice().and_then(|h| {
                             h.headers().find(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.to_string())
                         });
-                        line = h3_log_line(&line, host.as_deref());
+                        self.log.request_line.set(&h3_log_line(&line, host.as_deref()));
+                    } else {
+                        self.log.request_line.set(&line);
                     }
-                    self.log.request_line = Some(line);
                 }
 
                 if !self.cliexp.is_empty() {

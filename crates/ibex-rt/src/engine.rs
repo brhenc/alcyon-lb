@@ -2549,24 +2549,6 @@ pub(crate) fn log_hostname() -> &'static str {
     NAME.get_or_init(hostname)
 }
 
-/// The values of `slots` (`None` for a slot a rule fills) in a message head: the last
-/// occurrence of each header, cut to its length (`capture_headers`, src/http_ana.c).
-fn capture_values<'a>(slots: impl Iterator<Item = (&'a str, usize)>, headers: &[(&[u8], &[u8])]) -> Vec<Option<Vec<u8>>> {
-    slots
-        .map(|(name, len)| {
-            // A slot no header fills (`declare capture`, a rule's) has no name.
-            if name.is_empty() {
-                return None;
-            }
-            // Bytes, not text: a header that is not UTF-8 is captured as the server sent it.
-            headers.iter().rev().find(|(k, _)| k.trim_ascii().eq_ignore_ascii_case(name.as_bytes())).map(|(_, v)| {
-                let v = v.trim_ascii();
-                v[..len.min(v.len())].to_vec()
-            })
-        })
-        .collect()
-}
-
 /// `s` cut to at most `len` bytes: a capture is bytes, and one that ends inside a
 /// character keeps the byte it cut at, as in `HAProxy`.
 fn cut_at(s: &str, len: usize) -> std::borrow::Cow<'_, [u8]> {
@@ -2584,31 +2566,41 @@ fn cut_at(s: &str, len: usize) -> std::borrow::Cow<'_, [u8]> {
 fn begin_http_stream(entry: &mut SessionEntry, proxies: &[Proxy], fe_idx: usize, pid: u32) {
     let fe = &proxies[fe_idx];
     if !fe.req_capture_slots.is_empty() {
-        // A request that reached here was parsed into HTX (H1 and H2 alike).
-        // A value is text holding any escaped byte of a header that is not UTF-8 (T286).
-        let owned: Vec<(&str, std::borrow::Cow<'_, [u8]>)> = entry
-            .sess
-            .htx_slice()
-            .map(|htx| htx.headers().map(|(k, v)| (k, ibex_regex::bytetext::text_to_bytes(v))).collect())
-            .unwrap_or_default();
-        let headers: Vec<(&[u8], &[u8])> = owned.iter().map(|(k, v)| (k.as_bytes(), v.as_ref())).collect();
-        let mut values = capture_values(fe.req_capture_slots.iter().map(|(n, l)| (n.as_str(), *l)), &headers);
+        // Into the slots' memory of the connection's previous request (T437): taken out
+        // while the HTX is read, put back.
+        let mut caps = std::mem::take(&mut entry.sess.log.req_captures);
         // What `tcp-request content capture` wrote before the request was parsed is in the
         // slots of its own (no header name), which nothing here fills.
         let tcp_captures = fe.tcp_req_content_rules.iter().any(|r| matches!(r.action, ibex_config::TcpReqContentAction::Capture { .. }));
-        if tcp_captures && entry.sess.log.req_captures.len() == values.len() {
-            for ((slot, old), (name, _)) in values.iter_mut().zip(entry.sess.log.req_captures.iter_mut()).zip(fe.req_capture_slots.iter()) {
-                if name.is_empty() && slot.is_none() {
-                    *slot = old.take();
+        let keep_tcp = tcp_captures && caps.len() == fe.req_capture_slots.len();
+        if !keep_tcp {
+            crate::txnlog::reset_captures(&mut caps, fe.req_capture_slots.len());
+        }
+        // A request that reached here was parsed into HTX (H1 and H2 alike).
+        let htx = entry.sess.htx_slice();
+        for (slot, (name, len)) in caps.iter_mut().zip(fe.req_capture_slots.iter()) {
+            // A slot no header fills (`declare capture`, a rule's) has no name.
+            if name.is_empty() {
+                continue;
+            }
+            // The last header of the name, as bytes: a value is text holding any escaped byte
+            // of a header that is not UTF-8 (T286), captured as the client sent it.
+            let found = htx.as_ref().and_then(|h| h.headers().filter(|(k, _)| k.as_bytes().trim_ascii().eq_ignore_ascii_case(name.as_bytes())).last());
+            match found {
+                Some((_, v)) => {
+                    let v = ibex_regex::bytetext::text_to_bytes(v);
+                    let v = v.trim_ascii();
+                    crate::txnlog::set_capture(slot, &v[..(*len).min(v.len())]);
                 }
+                None => crate::txnlog::clear_capture(slot),
             }
         }
-        entry.sess.log.req_captures = values;
+        entry.sess.log.req_captures = caps;
     }
     // The response's slots exist from here on, empty until a response fills them: `%hs`
     // is `{}` for a transaction the server never answered, and nothing for a request
     // that never parsed.
-    entry.sess.log.res_captures = vec![None; fe.res_capture_slots.len()];
+    crate::txnlog::reset_captures(&mut entry.sess.log.res_captures, fe.res_capture_slots.len());
     // T331: what the `capture-req` and `capture-res` converters cut at.
     // The run that parsed the request has started already, with no slots to give.
     ibex_sample::capture_write::enter(fe.req_capture_slots.clone(), fe.res_capture_slots.clone());
@@ -3054,9 +3046,9 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
 /// the STRUCTURED-DATA its first `sd_len` bytes (`send_log` splits it).
 fn with_sd(sd: Option<&crate::logfmt::LogFormat>, fmt: &crate::logfmt::LogFormat, data: &crate::logfmt::LogData, ctx: &SampleContext) -> (Vec<u8>, u32) {
     let Some(sd) = sd else {
-        return (fmt.render_bytes(data, sample_registry(), ctx), 0);
+        return (fmt.render_line(data, sample_registry(), ctx), 0);
     };
-    let mut line = sd.render_bytes(data, sample_registry(), ctx);
+    let mut line = sd.render_line(data, sample_registry(), ctx);
     let sd_len = u32::try_from(line.len()).unwrap_or(0);
     fmt.render_append(&mut line, data, sample_registry(), ctx);
     (line, sd_len)
@@ -9733,6 +9725,7 @@ impl EngineDispatcher<'_> {
         if let Some((line, sd, err)) = log_line {
             let fe = self.sessions.get(session_idx).map_or(0, |e| e.proxy_idx);
             self.send_stream_log(fe, err, &line, sd);
+            crate::logfmt::recycle_line(line);
         }
 
         if let Some(cmd) = pending_admin {
@@ -9780,6 +9773,7 @@ impl EngineDispatcher<'_> {
             });
             if let Some((fe, line, sd, err)) = line {
                 self.send_stream_log(fe, err, &line, sd);
+                crate::logfmt::recycle_line(line);
             }
             if let Some(mut entry) = self.sessions.free(session_idx) {
                 if entry.sess.is_h2_child() {
@@ -10046,19 +10040,25 @@ impl EngineDispatcher<'_> {
         if wait.is_none() && !fe_caps.is_empty() {
             // From the bytes of the head, not a lossy copy of them.
             let head = &entry.sess.rep.readable()[..total_hdr_len];
-            let headers: Vec<(&[u8], &[u8])> = head
-                .split(|&b| b == b'\n')
-                .skip(1)
-                .filter_map(|l| {
-                    let colon = l.iter().position(|&b| b == b':')?;
-                    Some((&l[..colon], l[colon + 1..].strip_suffix(b"\r").unwrap_or(&l[colon + 1..])))
-                })
-                .collect();
             // T331: a slot whose header the response lacks keeps what a converter wrote to it.
-            let found = capture_values(fe_caps.iter().map(|(n, l)| (n.as_str(), *l)), &headers);
-            for (slot, new) in entry.sess.log.res_captures.iter_mut().zip(found) {
-                if new.is_some() {
-                    *slot = new;
+            // A slot no header fills (a rule's) has no name. The value goes into the slot's
+            // memory of the previous response (T437).
+            for (slot, (name, len)) in entry.sess.log.res_captures.iter_mut().zip(fe_caps.iter()) {
+                if name.is_empty() {
+                    continue;
+                }
+                let found = head
+                    .split(|&b| b == b'\n')
+                    .skip(1)
+                    .filter_map(|l| {
+                        let colon = l.iter().position(|&b| b == b':')?;
+                        Some((&l[..colon], l[colon + 1..].strip_suffix(b"\r").unwrap_or(&l[colon + 1..])))
+                    })
+                    .filter(|(k, _)| k.trim_ascii().eq_ignore_ascii_case(name.as_bytes()))
+                    .last();
+                if let Some((_, v)) = found {
+                    let v = v.trim_ascii();
+                    crate::txnlog::set_capture(slot, &v[..(*len).min(v.len())]);
                 }
             }
         }
@@ -11933,7 +11933,7 @@ impl EngineDispatcher<'_> {
                             let max = len.or_else(|| proxies[proxy_idx].req_capture_slots.get(*target_id).map(|(_, l)| *l));
                             if let Some(slot) = sess.log.req_captures.get_mut(*target_id) {
                                 ibex_sample::capture_write::discard(false, *target_id);
-                                *slot = Some(cut_at(&val, max.unwrap_or(usize::MAX)).into_owned());
+                                crate::txnlog::set_capture(slot, &cut_at(&val, max.unwrap_or(usize::MAX)));
                             }
                         }
                     }
