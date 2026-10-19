@@ -75,10 +75,15 @@ fn server() -> SocketAddr {
     addr
 }
 
-/// An address nothing listens on: a connect to it is refused.
-fn refused() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    l.local_addr().unwrap()
+/// An address nothing listens on: a connect to it is refused. The port stays bound (and not
+/// listening) for as long as the returned socket lives; a port that was only freed was, in a
+/// loaded parallel run, taken by another test's listener, which then answered the connect.
+fn refused() -> (SocketAddr, rustix::fd::OwnedFd) {
+    use rustix::net::{AddressFamily, SocketAddrAny, SocketFlags, SocketType};
+    let sock = rustix::net::socket_with(AddressFamily::INET, SocketType::STREAM, SocketFlags::CLOEXEC, None).expect("socket");
+    rustix::net::bind_v4(&sock, &std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let Ok(SocketAddrAny::V4(addr)) = rustix::net::getsockname(&sock) else { panic!("an IPv4 address") };
+    (SocketAddr::V4(addr), sock)
 }
 
 /// `b`'s BACKEND and server lines of `show stat`, by `svname`, numeric fields only.
@@ -157,7 +162,7 @@ fn run(backend: &str, requests: &[(Option<&str>, bool)]) -> Stats {
 /// pick that sent the request to it; the server that answered counts its own attempts.
 #[test]
 fn each_attempt_and_pick_is_counted_on_the_server_it_was_made_on() {
-    let (s1, s2) = (server(), refused());
+    let (s1, (s2, _held)) = (server(), refused());
     let mut reqs = vec![(None, true); 6];
     reqs.extend([(None, false); 4]);
     let st = run(&format!("  balance roundrobin\n  retries 3\n  option redispatch 1\n  server s1 {s1}\n  server s2 {s2}\n"), &reqs);
@@ -187,6 +192,7 @@ fn a_server_the_cookie_chose_is_not_counted_as_balanced() {
 /// Retries on one server: every attempt counted there, one pick per request (already so).
 #[test]
 fn retries_on_one_server_count_every_attempt_there() {
-    let st = run(&format!("  retries 2\n  server s1 {}\n", refused()), &[(None, true); 3]);
+    let (dead, _held) = refused();
+    let st = run(&format!("  retries 2\n  server s1 {dead}\n"), &[(None, true); 3]);
     assert_eq!((get(&st, "s1", "stot"), get(&st, "s1", "lbtot"), get(&st, "s1", "wretr"), get(&st, "s1", "econ")), (9, 3, 6, 3));
 }

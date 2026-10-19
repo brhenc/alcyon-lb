@@ -215,12 +215,16 @@ fn stick_on_in_tcp_mode_sticks_a_key() {
     let s = tcp_servers();
     let fe = common::reserve_addr();
     let fe2 = SocketAddr::new("127.0.0.2".parse().unwrap(), fe.port());
+    // The readiness probe connects here, to a key of its own: it takes a server, and on a
+    // loaded host the server is connected before the probe's close is seen and the key is
+    // stored, which would stick the probe's address (`fe`'s) to s1.
+    let probe = SocketAddr::new("127.0.0.3".parse().unwrap(), fe.port());
     let cfg = format!(
         "global\n  nbthread 1\ndefaults\n  mode tcp\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
-         listen l\n  bind {fe}\n  bind {fe2}\n  balance roundrobin\n  stick-table type ip size 1k expire 1m\n  stick on dst\n{}",
+         listen l\n  bind {fe}\n  bind {fe2}\n  bind {probe}\n  balance roundrobin\n  stick-table type ip size 1k expire 1m\n  stick on dst\n{}",
         servers(&s)
     );
-    let _ibex = start(&cfg, fe);
+    let _ibex = start(&cfg, probe);
     let mut got = Vec::new();
     for addr in [fe, fe2, fe, fe2, fe] {
         let mut c = TcpStream::connect(addr).expect("connect");
@@ -230,8 +234,7 @@ fn stick_on_in_tcp_mode_sticks_a_key() {
         got.push(String::from_utf8_lossy(&buf[..n]).to_string());
         thread::sleep(Duration::from_millis(50));
     }
-    // The readiness probe of `start` took s1 and closed at once: HAProxy stores nothing for
-    // it either (measured with the same probe).
+    // The readiness probe of `start` took s1 and closed at once (on its own key, see above).
     assert_eq!(got, ["s2", "s3", "s2", "s3", "s2"]);
 }
 
