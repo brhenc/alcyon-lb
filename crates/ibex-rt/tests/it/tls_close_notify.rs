@@ -146,6 +146,8 @@ fn backend_tls_connection_ends_with_close_notify() {
     let srv = TcpListener::bind("127.0.0.1:0").unwrap();
     let srv_addr = srv.local_addr().unwrap();
     let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let on_server = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let on_server_w = on_server.clone();
     thread::spawn(move || {
         for s in srv.incoming() {
             let Ok(mut tcp) = s else { return };
@@ -156,6 +158,7 @@ fn backend_tls_connection_ends_with_close_notify() {
             if !matches!(tls.read(&mut b), Ok(n) if n > 0) {
                 continue;
             }
+            on_server_w.store(true, std::sync::atomic::Ordering::SeqCst);
             // No answer: the client gives up, and the session ends with the server connection
             // still attached. Does the end of that connection carry a close_notify?
             let clean = loop {
@@ -177,9 +180,14 @@ fn backend_tls_connection_ends_with_close_notify() {
     let mut c = TcpStream::connect(addr).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     c.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
-    thread::sleep(Duration::from_millis(300));
+    // The client gives up once its request is on the server: a loaded host takes longer than
+    // 300 ms to get it there (and a client that left earlier is never sent to the server).
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !on_server.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
     drop(c);
-    let clean = rx.recv_timeout(Duration::from_secs(5)).expect("the server saw its connection end");
+    let clean = rx.recv_timeout(Duration::from_secs(20)).expect("the server saw its connection end");
     assert!(clean, "Ibex closed the backend TLS connection with a bare FIN, no close_notify");
 }
 

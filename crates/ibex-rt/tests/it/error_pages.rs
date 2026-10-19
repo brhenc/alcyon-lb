@@ -82,8 +82,10 @@ fn start(cfg: &str, pages: Vec<NamedTempFile>) -> (Ibex, SocketAddr) {
 /// closes, or two seconds pass. The bool is whether the peer closed.
 fn get(c: &mut TcpStream, path: &str, quiet: Duration) -> (String, bool) {
     c.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
-    c.set_read_timeout(Some(quiet)).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // `quiet` ends the response once it has begun; for its first byte a loaded host gets
+    // far longer than 300 ms.
+    c.set_read_timeout(Some(quiet.max(Duration::from_secs(10)))).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
     let mut resp = Vec::new();
     let mut buf = [0u8; 4096];
     let mut closed = false;
@@ -93,7 +95,10 @@ fn get(c: &mut TcpStream, path: &str, quiet: Duration) -> (String, bool) {
                 closed = true;
                 break;
             }
-            Ok(n) => resp.extend_from_slice(&buf[..n]),
+            Ok(n) => {
+                resp.extend_from_slice(&buf[..n]);
+                c.set_read_timeout(Some(quiet)).unwrap();
+            }
             Err(_) => break,
         }
     }

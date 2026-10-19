@@ -41,7 +41,18 @@ fn start(tag: &str, cfg: &str, addrs: &[SocketAddr]) -> (Ibex, String) {
         assert!(Instant::now() < deadline, "no stats socket");
         std::thread::sleep(Duration::from_millis(20));
     }
-    std::thread::sleep(Duration::from_millis(2200));
+    // The readiness probes of a TLS port are counted when the proxy gets to them, which on a
+    // loaded host can be later than any fixed wait: wait until `CumSslConns` has stood still
+    // for longer than the rate window (2.2 s), so that no probe is counted after the clear.
+    let mut seen = num(&info(&sock), "CumSslConns");
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(2200));
+        let now = num(&info(&sock), "CumSslConns");
+        if now == seen {
+            break;
+        }
+        seen = now;
+    }
     cli(&sock, "clear counters");
     (ibex, sock)
 }

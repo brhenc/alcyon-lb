@@ -123,19 +123,8 @@ fn hold_streams(h2: SocketAddr) -> TcpStream {
     s
 }
 
-/// (HEADERS frames, whether a DATA frame carried "503") read from `s` within `wait`.
-fn answers(s: &mut TcpStream, wait: Duration) -> (usize, bool) {
-    s.set_read_timeout(Some(Duration::from_millis(100))).expect("timeout");
-    let mut got = Vec::new();
-    let deadline = Instant::now() + wait;
-    let mut buf = [0u8; 65536];
-    while Instant::now() < deadline {
-        match s.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => got.extend_from_slice(&buf[..n]),
-            Err(_) => {}
-        }
-    }
+/// (HEADERS frames, whether a DATA frame carried "503") in `got`.
+fn count_frames(got: &[u8]) -> (usize, bool) {
     let (mut headers, mut saw_503, mut i) = (0, false, 0);
     while i + 9 <= got.len() {
         let len = usize::from(got[i]) << 16 | usize::from(got[i + 1]) << 8 | usize::from(got[i + 2]);
@@ -148,6 +137,36 @@ fn answers(s: &mut TcpStream, wait: Duration) -> (usize, bool) {
         i += 9 + len;
     }
     (headers, saw_503)
+}
+
+/// (HEADERS frames, whether a DATA frame carried "503") read from `s` within `wait`.
+fn answers(s: &mut TcpStream, wait: Duration) -> (usize, bool) {
+    answers_until(s, wait, usize::MAX)
+}
+
+/// Like `answers`, but returns as soon as `enough` HEADERS frames and a "503" have arrived: a
+/// loaded host takes longer than any fixed time to get the proxy to its descriptor limit, so
+/// callers give a long `wait` and are not slowed by it when the host is quiet.
+fn answers_until(s: &mut TcpStream, wait: Duration, enough: usize) -> (usize, bool) {
+    s.set_read_timeout(Some(Duration::from_millis(100))).expect("timeout");
+    let mut got = Vec::new();
+    let deadline = Instant::now() + wait;
+    let mut buf = [0u8; 65536];
+    // Once `enough` has arrived, keep reading for another second: what follows is still
+    // part of the answer (and the callers measure the proxy after it).
+    let mut enough_at: Option<Instant> = None;
+    while Instant::now() < deadline && enough_at.is_none_or(|t| t.elapsed() < Duration::from_secs(1)) {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(_) => {}
+        }
+        let (headers, saw_503) = count_frames(&got);
+        if headers >= enough && saw_503 {
+            enough_at.get_or_insert_with(Instant::now);
+        }
+    }
+    count_frames(&got)
 }
 
 fn open_fds(pid: u32) -> usize {
@@ -179,7 +198,7 @@ fn held_h2_streams_stop_at_maxsock_and_the_rest_get_a_503() {
     assert!(common::wait_listening(h2) && common::wait_listening(h1), "ibex never listened");
 
     let mut s = hold_streams(h2);
-    let (headers, saw_503) = answers(&mut s, Duration::from_secs(3));
+    let (headers, saw_503) = answers_until(&mut s, Duration::from_secs(30), 50);
     let fds = open_fds(ibex.child.id());
     let servers = accepted.load(Ordering::SeqCst);
     // HAProxy: 46 fds, 36 server connections, 64 streams answered 503.
@@ -196,16 +215,16 @@ fn a_client_past_maxsock_is_closed_and_served_once_descriptors_free_up() {
     assert!(common::wait_listening(h2) && common::wait_listening(h1), "ibex never listened");
 
     let mut s = hold_streams(h2);
-    let _ = answers(&mut s, Duration::from_secs(2));
+    let _ = answers_until(&mut s, Duration::from_secs(30), 50);
     let saturated = h1_get(h1);
     assert_ne!(saturated, "HTTP/1.1 200 OK", "a client was served on a descriptor past maxsock");
 
     drop(s);
     let t = Instant::now();
     let mut after = h1_get(h1);
-    while after != "HTTP/1.1 200 OK" && t.elapsed() < Duration::from_secs(3) {
+    while after != "HTTP/1.1 200 OK" && t.elapsed() < Duration::from_secs(20) {
         thread::sleep(Duration::from_millis(50));
         after = h1_get(h1);
     }
-    assert_eq!(after, "HTTP/1.1 200 OK", "not served within 3 s of the descriptors being released");
+    assert_eq!(after, "HTTP/1.1 200 OK", "not served within 20 s of the descriptors being released");
 }

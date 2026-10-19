@@ -50,8 +50,11 @@ fn waiting_client(sent: &[u8], how: Leave) -> Option<String> {
     assert!(common::wait_listening(fe), "ibex never listened");
     let _ = std::fs::remove_file(&path);
     // `wait_listening` connected and left: that connection has a line of its own.
+    // On a loaded host the line comes late: wait for it, not for 100 ms.
     let mut buf = [0u8; 2048];
+    collector.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
     let _ = collector.recv(&mut buf);
+    collector.set_read_timeout(Some(Duration::from_millis(100))).expect("timeout");
 
     // The one connection `maxconn` allows, held while its request is at the server.
     let mut holder = TcpStream::connect(fe).expect("connect");
@@ -77,7 +80,7 @@ fn waiting_client(sent: &[u8], how: Leave) -> Option<String> {
     drop(holder);
 
     let mut log = None;
-    let end = Instant::now() + Duration::from_secs(3);
+    let end = Instant::now() + Duration::from_secs(15);
     while log.is_none() && Instant::now() < end {
         if let Ok(n) = collector.recv(&mut buf) {
             let line = String::from_utf8_lossy(&buf[..n]).into_owned();

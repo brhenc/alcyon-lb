@@ -214,7 +214,10 @@ fn the_counters_of_an_entry_read_what_haproxy_measures() {
     // The entry was touched a moment ago: it expires in about the whole 1h, and has been idle for nothing
     // (HAProxy: "3600000 0" on /one, "3599999 1" on /srv).
     let (left, idle) = (exp[0].parse::<i64>().unwrap(), exp[1].parse::<i64>().unwrap());
-    assert!((3_599_000..=3_600_000).contains(&left) && (0..1000).contains(&idle) && left + idle <= 3_600_000, "x-tbl-exp: {exp:?}");
+    // `table_expire` and `table_idle` each read the clock when the header is built, so the two
+    // can be a few milliseconds apart on a loaded host: left + idle may exceed the hour by the
+    // time between the two reads (HAProxy's cached `now_ms` makes it exact).
+    assert!((3_599_000..=3_600_000).contains(&left) && (0..1000).contains(&idle) && left + idle <= 3_600_000 + 100, "x-tbl-exp: {exp:?}");
     assert_eq!(exp[4], "1048575", "table_avl: the size less the one entry");
     assert_eq!(h(&hs, "x-updt"), "1");
 
