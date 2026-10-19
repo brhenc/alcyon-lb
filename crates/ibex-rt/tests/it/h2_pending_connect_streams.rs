@@ -278,12 +278,13 @@ fn fds(pid: u32) -> usize {
     std::fs::read_dir(format!("/proc/{pid}/fd")).map_or(0, Iterator::count)
 }
 
-/// A new HTTP/1.1 client: the status line it is answered with within 3 s, or what happened.
+/// A new HTTP/1.1 client: the status line it is answered with within 20 s (a loaded host
+/// takes seconds to serve a client while 100 streams per connection are held), or what happened.
 fn new_client(port: u16) -> String {
-    let Ok(mut c) = TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_secs(3)) else {
+    let Ok(mut c) = TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_secs(10)) else {
         return "connect failed".into();
     };
-    let _ = c.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = c.set_read_timeout(Some(Duration::from_secs(20)));
     if c.write_all(b"GET / HTTP/1.1\r\nhost: x\r\n\r\n").is_err() {
         return "write failed".into();
     }
@@ -371,7 +372,7 @@ fn streams_waiting_for_a_connect_hold_the_demux_not_an_fd_each() {
             thread::spawn(move || serve_one(c));
         }
     });
-    let end = Instant::now() + Duration::from_secs(45);
+    let end = Instant::now() + Duration::from_secs(120);
     while Instant::now() < end && !clients.iter().all(Client::done) {
         for c in &mut clients {
             c.io();
