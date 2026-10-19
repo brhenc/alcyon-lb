@@ -10676,6 +10676,34 @@ impl EngineDispatcher<'_> {
         }
     }
 
+    /// Whether a `stats` rule's condition holds for the request (no condition: always). The
+    /// condition sees the request line, headers and addresses of the stream.
+    fn stats_cond_holds(sess: &crate::proxy::TcpSession, proxies: &Proxies, serving: usize, cond: Option<&ibex_config::AclCondition>) -> bool {
+        let registry = sample_registry();
+        let name = proxies[serving].name.as_str();
+        let Some(cond) = cond else { return true };
+        let ctx = SampleContext {
+            proxies: Some(&ProxiesView(proxies)),
+            client_addr: sess.client_addr,
+            server_addr: sess.server_addr,
+            fc_src: sess.fc_src,
+            fc_dst: sess.fc_dst,
+            is_first_req: sess.is_first_req,
+            ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
+            fc_http_major: sess.fc_http_major(),
+            req_version: sess.client_version(),
+            req_uri: sess.req_uri.as_deref(),
+            req_method: sess.req_method.as_deref(),
+            htx_slice: sess.htx_slice(),
+            req_headers: sess.req_headers.as_deref(),
+            fe_name: Some(name),
+            fe_id: Some(proxies[serving].ids.iid),
+            acls: Some(&proxies[serving].acls),
+            ..Default::default()
+        };
+        eval_condition(cond, &ctx, &proxies[serving].acls, registry)
+    }
+
     /// `stats http-request` (and the rule `stats auth` became): the first rule whose condition
     /// holds answers. `allow` serves the page, `deny` and `auth` reply and return true; no
     /// rule matching serves it (`http_req_get_intercept_rule` over `uri_auth->http_req_rules`).
@@ -10687,33 +10715,8 @@ impl EngineDispatcher<'_> {
         }
         let registry = sample_registry();
         let sess = &mut entry.sess;
-        let name = proxies[serving].name.as_str();
         for rule in rules {
-            let matches = match &rule.cond {
-                None => true,
-                Some(cond) => {
-                    let ctx = SampleContext {
-                        proxies: Some(&ProxiesView(proxies)),
-                        client_addr: sess.client_addr,
-                        server_addr: sess.server_addr,
-                        fc_src: sess.fc_src,
-                        fc_dst: sess.fc_dst,
-                        is_first_req: sess.is_first_req,
-                        ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
-                        fc_http_major: sess.fc_http_major(),
-                        req_version: sess.client_version(),
-                        req_uri: sess.req_uri.as_deref(),
-                        req_method: sess.req_method.as_deref(),
-                        htx_slice: sess.htx_slice(),
-                        req_headers: sess.req_headers.as_deref(),
-                        fe_name: Some(name),
-                        fe_id: Some(proxies[serving].ids.iid),
-                        acls: Some(&proxies[serving].acls),
-                        ..Default::default()
-                    };
-                    eval_condition(cond, &ctx, &proxies[serving].acls, registry)
-                }
-            };
+            let matches = Self::stats_cond_holds(sess, proxies, serving, rule.cond.as_ref());
             if !matches {
                 continue;
             }
@@ -10742,6 +10745,119 @@ impl EngineDispatcher<'_> {
         false
     }
 
+    /// `stats admin`: the page is administrable when a `stats admin` line has no condition or
+    /// its condition holds (`uri_auth->admin_rules`, `http_handle_stats`).
+    fn stats_admin_allowed(sess: &crate::proxy::TcpSession, proxies: &Proxies, serving: usize) -> bool {
+        let cfg = &proxies[serving].stats_config;
+        // No rule recorded (a configuration built without the parser) is `stats admin` alone.
+        cfg.admin && (cfg.admin_rules.is_empty() || cfg.admin_rules.iter().any(|c| Self::stats_cond_holds(sess, proxies, serving, c.as_ref())))
+    }
+
+    /// The stats page's URI prefix as the redirect and the banner's link name it, with the
+    /// flags of the request that stay (`;up`, and `;norefresh` when the page refreshes).
+    fn stats_self_link(proxies: &Proxies, serving: usize, req_uri: &str) -> String {
+        let cfg = &proxies[serving].stats_config;
+        let prefix = cfg.uri.as_deref().unwrap_or("/haproxy?stats");
+        let rest = req_uri.get(prefix.len()..).unwrap_or("");
+        let mut link = String::from(prefix);
+        if rest.contains(";up") {
+            link.push_str(";up");
+        }
+        if cfg.refresh.is_some() && rest.contains(";norefresh") {
+            link.push_str(";norefresh");
+        }
+        link
+    }
+
+    /// `stats_send_http_redirect`: the answer to an admin POST, whatever came of it.
+    fn stats_redirect(entry: &mut SessionEntry, proxies: &Proxies, serving: usize, code: crate::stats_post::StCode) {
+        let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
+        let cfg = &proxies[serving].stats_config;
+        let prefix = cfg.uri.as_deref().unwrap_or("/haproxy?stats");
+        let rest = req_uri.get(prefix.len()..).unwrap_or("");
+        let mut loc = format!("{prefix};st={}", code.name());
+        if rest.contains(";up") {
+            loc.push_str(";up");
+        }
+        if cfg.refresh.is_some() && rest.contains(";norefresh") {
+            loc.push_str(";norefresh");
+        }
+        let resp = format!(
+            "HTTP/1.1 303 See Other\r\ncache-control: no-cache\r\ncontent-type: text/plain\r\ncontent-length: 0\r\nlocation: {loc}\r\nconnection: close\r\n\r\n"
+        );
+        stats_write_reply(entry, proxies, resp.as_bytes());
+    }
+
+    /// The HTML page, with the banner a `;st=<CODE>` in the URI asks for.
+    fn stats_page(proxies: &Proxies, checks: &[ServerCheckState], pid: u32, serving: usize, req_uri: &str) -> String {
+        let cfg = &proxies[serving].stats_config;
+        let html = crate::stats_html::render_stats_html_for(proxies, checks, pid, cfg);
+        let prefix = cfg.uri.as_deref().unwrap_or("/haproxy?stats");
+        match crate::stats_post::StCode::from_uri(req_uri.get(prefix.len()..).unwrap_or("")) {
+            Some(code) => crate::stats_post::with_banner(html, &code.banner(&Self::stats_self_link(proxies, serving, req_uri))),
+            None => html,
+        }
+    }
+
+    /// The request's header lines, from the HTX message or, without one, the parsed list.
+    fn stats_req_headers(sess: &crate::proxy::TcpSession) -> Vec<(&str, &str)> {
+        match (sess.htx_slice(), sess.req_headers.as_deref()) {
+            (Some(htx), _) => htx.headers().collect(),
+            (None, Some(h)) => h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
+            (None, None) => Vec::new(),
+        }
+    }
+
+    /// An admin POST as `stats_process_http_post` handles it; the code is the answer.
+    fn stats_admin_post(
+        entry: &SessionEntry,
+        proxies: &Proxies,
+        checks: &mut [ServerCheckState],
+        now: Tick,
+        body: &str,
+        nhdr: usize,
+        head_len: usize,
+        declared: usize,
+    ) -> crate::stats_post::StCode {
+        use crate::stats_post::{process_post, StCode, Verb};
+        if !crate::stats_post::fits_buffer(entry.sess.bufsize, head_len, nhdr, body.len().max(declared)) {
+            return StCode::Excd;
+        }
+        let mut backend = |name: &str| proxies.iter().position(|p| p.has_backend && p.name == name);
+        let mut apply = |p: usize, verb: Verb, name: &str| -> Option<bool> {
+            let s = proxies[p].server_ids.iter().position(|id| id == name)?;
+            let cur = proxies[p].server_statuses.get(s).map_or(0, |a| a.load(Ordering::Relaxed));
+            let maint = ServerStatus::from(cur) == ServerStatus::Maint;
+            let drain = cur == check::DRAIN_DOWN || cur == ServerStatus::Drain as u8;
+            let set = |to: ServerStatus, checks: &mut [ServerCheckState]| {
+                crate::track::apply_admin(proxies, checks, p, s, to);
+                true
+            };
+            Some(match verb {
+                Verb::Ready => set(ServerStatus::Up, checks),
+                Verb::Drain => set(ServerStatus::Drain, checks),
+                Verb::Maint => set(ServerStatus::Maint, checks),
+                Verb::Disable => !maint && set(ServerStatus::Maint, checks),
+                Verb::Enable => maint && set(ServerStatus::Up, checks),
+                // A server in maintenance keeps its state: Ibex has one admin state, HAProxy
+                // two flags (the drain flag is set under the maintenance one).
+                Verb::Stop => !drain && (maint || set(ServerStatus::Drain, checks)),
+                Verb::Start => drain && set(ServerStatus::Up, checks),
+                Verb::Dhlth => set_health_check_enabled(checks, proxies, &proxies[p].name, name, false, now),
+                Verb::Ehlth => set_health_check_enabled(checks, proxies, &proxies[p].name, name, true, now),
+                Verb::Hrunn | Verb::Hdown => {
+                    if crate::track::is_tracking(proxies, p, s) {
+                        false
+                    } else {
+                        crate::track::apply_health(proxies, checks, p, s, verb == Verb::Hrunn);
+                        true
+                    }
+                }
+            })
+        };
+        process_post(body, &mut backend, &mut apply)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_stats_request(
         entry: &mut SessionEntry,
@@ -10765,6 +10881,50 @@ impl EngineDispatcher<'_> {
             }
             _ => String::new(),
         };
+
+        // An admin POST: refused unless the page is administrable and the request is not a
+        // cross-site one; the form's own verbs are `stats_process_http_post`'s, answered by a
+        // redirect to the page. The dashboard's script (JSON requests) and the verbs only Ibex
+        // has (weight, maxconn, counters, sessions) go on below.
+        let is_post = entry.sess.req_method.as_deref() == Some("POST");
+        let admin_ok = (is_post || req_uri.contains('?')) && Self::stats_admin_allowed(&entry.sess, proxies, serving);
+        if is_post {
+            let hdrs = Self::stats_req_headers(&entry.sess);
+            let same_origin = crate::stats_post::same_origin(&hdrs);
+            if !admin_ok || !same_origin {
+                Self::stats_redirect(entry, proxies, serving, crate::stats_post::StCode::Deny);
+                return None;
+            }
+            let body = crate::proxy::find_eoh(entry.sess.req.readable())
+                .map(|(h, e)| String::from_utf8_lossy(entry.sess.req.readable().get(h + e..).unwrap_or(&[])).into_owned())
+                .unwrap_or_default();
+            let legacy = body.trim().starts_with('{')
+                || crate::stats_post::uses_ibex_keys(&body)
+                || req_uri.contains("/api/")
+                || hdrs.iter().any(|(k, v)| {
+                    (k.eq_ignore_ascii_case("accept") || k.eq_ignore_ascii_case("content-type")) && v.contains("application/json")
+                })
+                || crate::stats_html::parse_admin_action("", &body).is_some_and(|c| {
+                    matches!(
+                        c.action.as_str(),
+                        "weight" | "maxconn" | "clear_counters" | "kill_sessions" | "shutdown_sessions" | "enable_health" | "disable_health"
+                    )
+                });
+            if !legacy {
+                let code = {
+                    let head_len = crate::proxy::find_eoh(entry.sess.req.readable()).map_or(0, |(h, e)| h + e);
+                    // The body that fits counts as the whole of it: what the client declares is the size.
+                    let declared = hdrs
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    Self::stats_admin_post(entry, proxies, checks, now, &body, hdrs.len(), head_len, declared)
+                };
+                Self::stats_redirect(entry, proxies, serving, code);
+                return None;
+            }
+        }
 
         // 1. CSV telemetry
         if req_uri.contains(";csv") || req_uri.ends_with("/csv") {
@@ -10818,7 +10978,7 @@ impl EngineDispatcher<'_> {
             };
 
         let query_str = req_uri.split_once('?').map_or("", |x| x.1);
-        let admin_cmd = crate::stats_html::parse_admin_action(query_str, &body_str);
+        let admin_cmd = crate::stats_html::parse_admin_action(query_str, &body_str).filter(|_| admin_ok);
 
         if let Some(cmd) = admin_cmd {
             let is_json_req = req_uri.contains("/api/")
@@ -10917,7 +11077,7 @@ impl EngineDispatcher<'_> {
                 return Some(cmd);
             }
 
-            let html = crate::stats_html::render_stats_html_for(proxies, checks, pid, &proxies[serving].stats_config);
+            let html = Self::stats_page(proxies, checks, pid, serving, req_uri);
             let resp = format!(
                 "HTTP/1.1 200 OK\r\n\
                  Content-Type: text/html; charset=utf-8\r\n\
@@ -10935,7 +11095,7 @@ impl EngineDispatcher<'_> {
         }
 
         // 4. Default: Render full HTML dashboard
-        let html = crate::stats_html::render_stats_html_for(proxies, checks, pid, &proxies[serving].stats_config);
+        let html = Self::stats_page(proxies, checks, pid, serving, req_uri);
         let resp = format!(
             "HTTP/1.1 200 OK\r\n\
              Content-Type: text/html; charset=utf-8\r\n\
@@ -11791,6 +11951,29 @@ impl EngineDispatcher<'_> {
             let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
             let configured_uri = proxies[proxy_idx].stats_config.uri.as_deref();
             if Self::is_stats_request(req_uri, configured_uri) {
+                // An admin POST is read whole before it acts (`AN_REQ_HTTP_BODY`): held here
+                // until its body is, then back past the rules that already ran.
+                if entry.sess.req_method.as_deref() == Some("POST") && Self::stats_admin_allowed(&entry.sess, proxies, proxy_idx) {
+                    let at = proxies[proxy_idx].http_req_rules.len();
+                    match wait_for_request_body(&mut entry.sess, &proxies[proxy_idx], false, at, None, 0, now) {
+                        BodyWait::Ready => {}
+                        BodyWait::Pending => return None,
+                        BodyWait::TimedOut => {
+                            entry.sess.log.term.get_or_insert(*b"cR");
+                            reply_error(entry, proxies, 408);
+                            return None;
+                        }
+                        BodyWait::ClientGone => {
+                            entry.sess.log.term.get_or_insert(*b"CR");
+                            reply_error(entry, proxies, 400);
+                            return None;
+                        }
+                        BodyWait::Malformed => {
+                            reply_error(entry, proxies, 400);
+                            return None;
+                        }
+                    }
+                }
                 return Self::handle_stats_request(entry, proxies, checks, pid, now, proxy_idx);
             }
         }
