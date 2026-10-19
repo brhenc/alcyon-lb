@@ -10884,6 +10884,8 @@ impl EngineDispatcher<'_> {
         if Self::stats_rules_reply(entry, proxies, serving) {
             return None;
         }
+        // The page, the redirect and the banner are the applet's answers: `LR`.
+        entry.sess.log.term.get_or_insert(*b"LR");
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
 
         // `stats refresh`: HAProxy sends `Refresh: <seconds, rounded up>` unless the URI carries
@@ -11971,18 +11973,29 @@ impl EngineDispatcher<'_> {
                     match wait_for_request_body(&mut entry.sess, &proxies[proxy_idx], false, at, None, 0, now) {
                         BodyWait::Ready => {}
                         BodyWait::Pending => return None,
+                        // The applet is the one that answers (measured: `LR`) a body that does
+                        // not come in time or is cut short; a body that is not one is a bad request.
                         BodyWait::TimedOut => {
-                            entry.sess.log.term.get_or_insert(*b"cR");
+                            entry.sess.log.term.get_or_insert(*b"LR");
                             reply_error(entry, proxies, 408);
                             return None;
                         }
                         BodyWait::ClientGone => {
-                            entry.sess.log.term.get_or_insert(*b"CR");
+                            entry.sess.log.term.get_or_insert(*b"LR");
                             reply_error(entry, proxies, 400);
                             return None;
                         }
                         BodyWait::Malformed => {
-                            reply_error(entry, proxies, 400);
+                            // Cut off with no answer, logged 400 (measured): the applet gets a
+                            // body that is not one after it started, the mux's 400 is for the head.
+                            entry.sess.log.status = Some(400);
+                            entry.sess.log.term = Some(*b"LR");
+                            if let Some(txn) = entry.sess.txn.as_mut() {
+                                txn.close_after = true;
+                                txn.aborted = true;
+                            }
+                            entry.sess.cli_state = ScState::Closed;
+                            entry.sess.srv_state = ScState::Closed;
                             return None;
                         }
                     }
@@ -15368,5 +15381,21 @@ mod accept_pause_tests {
         engine.listeners[0].maxconn.dec();
         engine.resume_paused_listeners();
         assert!(!engine.fdtab.interest(lfd).is_none(), "the listener must be polled again");
+    }
+}
+
+#[cfg(test)]
+mod stats_req_headers_tests {
+    use super::*;
+
+    /// The headers the stats POST checks come from the HTX message, else the parsed list
+    /// (an HTTP/2 stream), else there are none.
+    #[test]
+    fn stats_req_headers_falls_back_to_the_parsed_list() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut s = TcpSession::new(OwnedFd::from(a), Default::default(), 0, Tick::ETERNITY);
+        assert!(EngineDispatcher::stats_req_headers(&s).is_empty());
+        s.req_headers = Some(vec![("Origin".to_string(), "http://evil".to_string())]);
+        assert_eq!(EngineDispatcher::stats_req_headers(&s), [("Origin", "http://evil")]);
     }
 }
