@@ -1353,18 +1353,26 @@ pub fn strip_connection_tokens(hdrs: &mut Vec<(String, String)>) {
         return;
     }
     let mut tokens = ConnTokens::default();
-    hdrs.retain_mut(|(k, v)| {
-        if !k.eq_ignore_ascii_case("connection") {
-            return true;
+    // The strings of what goes are given back (T437), so a steady stream of responses with a
+    // `Connection` header allocates nothing here.
+    let mut i = 0;
+    while i < hdrs.len() {
+        if !hdrs[i].0.eq_ignore_ascii_case("connection") {
+            i += 1;
+            continue;
         }
-        match clean_connection_value(v, false, &mut tokens) {
+        match clean_connection_value(&hdrs[i].1, false, &mut tokens) {
             Some(c) => {
-                *v = c;
-                true
+                crate::reuse::give(std::mem::replace(&mut hdrs[i].1, c));
+                i += 1;
             }
-            None => false,
+            None => {
+                let (k, v) = hdrs.remove(i);
+                crate::reuse::give(k);
+                crate::reuse::give(v);
+            }
         }
-    });
+    }
 }
 
 /// The response headers the rules left, read again as `HAProxy` writes them out
