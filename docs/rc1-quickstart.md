@@ -20,6 +20,15 @@ install -m 0644 tools/systemd/ibex.service /etc/systemd/system/ibex.service
 systemctl daemon-reload && systemctl enable --now ibex
 ```
 
+A faster binary (measured 2026-10-19, T435: about 13% fewer user instructions per proxied request than
+`release-perf`, which is itself about 4% below `release`) comes from a profile-guided build:
+`tools/pgo-build.sh --target-dir /var/tmp/ibex-pgo --out ./ibex-pgo` builds an instrumented ibex, drives a
+mixed training load against it (HTTP/1 keep-alive and close, TLS, h2, h2c, rules, logging, error
+paths; the config is `tools/pgo/train.cfg`), merges the profile and builds the final binary, whose path it
+prints. It needs `llvm-profdata` of the same LLVM version as `rustc -vV`, plus `h2load`, `socat`, `openssl`,
+`curl` and `nc`, and takes two fat-LTO builds (about 5 minutes each on 48 cores, 11 minutes in all). The profile is not
+checked in: regenerate it for each release. `--bolt` adds a reorder-only BOLT pass (needs `llvm-bolt`).
+
 `examples/personal-website.cfg`: HTTPS on :443 with h2 (ALPN), :80 redirecting to https (301),
 HSTS, `option httplog` to stdout (the journal), a stats socket, the Prometheus exporter on
 `/metrics` from localhost only, timeouts, `maxconn`, `nbthread 2`. It also loads with HAProxy
