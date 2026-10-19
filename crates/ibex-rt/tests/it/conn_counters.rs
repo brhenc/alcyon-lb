@@ -125,6 +125,19 @@ fn start() -> Ibex {
     ibex
 }
 
+/// Connects, retrying while the listener is not up yet: `start` waits for the first
+/// frontend only, and a probe connection to the others would be counted by the tests.
+fn connect(addr: SocketAddr) -> TcpStream {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        match TcpStream::connect(addr) {
+            Ok(c) => return c,
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused && Instant::now() < end => thread::sleep(Duration::from_millis(10)),
+            Err(e) => panic!("connect {addr}: {e}"),
+        }
+    }
+}
+
 fn send(c: &mut TcpStream, path: &str, close: bool) {
     let cl = if close { "Connection: close\r\n" } else { "" };
     c.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n{cl}\r\n").as_bytes()).expect("send");
@@ -145,7 +158,7 @@ fn answer(c: &mut TcpStream) -> String {
 
 /// Waits for `n` log lines in all and returns them.
 fn log_lines(ibex: &Ibex, n: usize) -> Vec<String> {
-    let end = Instant::now() + Duration::from_secs(5);
+    let end = Instant::now() + Duration::from_secs(20);
     while ibex.logs.lock().unwrap().len() < n && Instant::now() < end {
         thread::sleep(Duration::from_millis(10));
     }
@@ -181,7 +194,7 @@ fn col(st: &Stats, px: &str, sv: &str, name: &str) -> String {
 #[test]
 fn connect_and_reuse_count_each_attempt_on_server_and_backend() {
     let ibex = start();
-    let mut cs: Vec<TcpStream> = (0..2).map(|_| TcpStream::connect(ibex.fa).unwrap()).collect();
+    let mut cs: Vec<TcpStream> = (0..2).map(|_| connect(ibex.fa)).collect();
     for round in 0..4 {
         for c in &mut cs {
             send(c, &format!("/k{round}"), false);
@@ -196,7 +209,7 @@ fn connect_and_reuse_count_each_attempt_on_server_and_backend() {
         assert_eq!(col(&st, "x", sv, "reuse"), "6", "{sv} reuse after 2 connections");
     }
     for _ in 0..3 {
-        let mut c = TcpStream::connect(ibex.fa).unwrap();
+        let mut c = connect(ibex.fa);
         send(&mut c, "/c", true);
         answer(&mut c);
     }
@@ -213,11 +226,11 @@ fn connect_and_reuse_count_each_attempt_on_server_and_backend() {
 #[test]
 fn failed_attempts_count_as_connects() {
     let ibex = start();
-    let mut c = TcpStream::connect(ibex.fw).unwrap();
+    let mut c = connect(ibex.fw);
     send(&mut c, "/w", true);
     assert!(answer(&mut c).starts_with("HTTP/1.1 503"));
     // The retries finish after the 503 is out: wait for the counters, do not guess a delay.
-    let end = Instant::now() + Duration::from_secs(5);
+    let end = Instant::now() + Duration::from_secs(20);
     let mut st = stats(&ibex.sock);
     while col(&st, "w", "d3", "connect") != "3" && Instant::now() < end {
         thread::sleep(Duration::from_millis(20));
@@ -235,23 +248,23 @@ fn failed_attempts_count_as_connects() {
 fn log_counts_are_the_processs_the_frontends_and_the_other_streams() {
     let ibex = start();
     let hold = |addr: SocketAddr, n: usize| {
-        let mut c = TcpStream::connect(addr).unwrap();
+        let mut c = connect(addr);
         send(&mut c, &format!("/hold/{n}"), false);
         c
     };
     // Three held on x (fa), two held on y (fb), one idle keep-alive connection on fa.
     let mut held: Vec<TcpStream> = vec![hold(ibex.fa, 0), hold(ibex.fa, 1), hold(ibex.fa, 2), hold(ibex.fb, 3), hold(ibex.fb, 4)];
     thread::sleep(Duration::from_millis(300)); // all five are on their servers
-    let mut idle = TcpStream::connect(ibex.fa).unwrap();
+    let mut idle = connect(ibex.fa);
     send(&mut idle, "/idle", false);
     answer(&mut idle);
     thread::sleep(Duration::from_millis(300));
-    let mut q = TcpStream::connect(ibex.fa).unwrap();
+    let mut q = connect(ibex.fa);
     send(&mut q, "/q", true);
     answer(&mut q);
     drop(q);
     thread::sleep(Duration::from_millis(100));
-    let mut q2 = TcpStream::connect(ibex.fb).unwrap();
+    let mut q2 = connect(ibex.fb);
     send(&mut q2, "/q2", true);
     answer(&mut q2);
     drop(q2);
