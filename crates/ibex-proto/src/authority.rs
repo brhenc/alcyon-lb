@@ -156,16 +156,54 @@ fn host_value<'a>(view: &HtxSliceRef<'a>, i: usize) -> Option<&'a [u8]> {
 /// The request is invalid (HAProxy answers 400): two `Host` values that differ, a CONNECT
 /// target without a port, or an authority that does not match `Host`.
 pub fn check_and_normalize(htx: &mut HtxSlice<'_>, accept_unsafe: bool) -> io::Result<bool> {
+    check_and_normalize_with(htx, accept_unsafe, Known::default())
+}
+
+/// What the parser already knows of the head it hands to [`check_and_normalize_with`]
+/// (T436), so that it is not read from the HTX again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Known {
+    /// Where the one `Host` header is (`Some(None)`: there is none), when there is at most one.
+    pub one_host: Option<Option<usize>>,
+    /// The request target, when the parser read it.
+    pub target: Option<Target>,
+}
+
+/// What [`check_and_normalize_with`] asks of a request target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Target {
+    /// It holds a `#`.
+    pub fragment: bool,
+    /// It is in origin form (or `*`, or empty): no authority to check.
+    pub origin: bool,
+}
+
+impl Target {
+    /// What a target is.
+    #[must_use]
+    pub fn of(uri: &[u8]) -> Self {
+        Target { fragment: memchr::memchr(b'#', uri).is_some(), origin: matches!(uri.first(), None | Some(b'/' | b'*')) }
+    }
+}
+
+/// [`check_and_normalize`], with what the parser [`Known`]s of the head.
+///
+/// # Errors
+/// As [`check_and_normalize`].
+pub fn check_and_normalize_with(htx: &mut HtxSlice<'_>, accept_unsafe: bool, known: Known) -> io::Result<bool> {
+    let one_host = known.one_host;
     let mut rewritten = false;
 
     // 1. Host headers of this message: the first is kept, a repeat of it dropped. Read in
     // place, so a request in origin-form -- nearly all of them -- allocates nothing here
     // (`tests/htx_allocation.rs`).
-    let first = (0..htx.num_blocks())
-        .rev()
-        .find(|&i| htx.block_type(i) == Some(HtxBlockType::ReqLine))
-        .map_or(0, |i| i + 1);
-    let mut host_at: Option<usize> = None;
+    let first = if one_host.is_some() {
+        htx.num_blocks()
+    } else {
+        (0..htx.num_blocks()).rev().find(|&i| htx.block_type(i) == Some(HtxBlockType::ReqLine)).map_or(0, |i| i + 1)
+    };
+    let mut host_at: Option<usize> = one_host.flatten();
+    debug_assert!(host_at.is_none_or(|i| host_value(&htx.as_ref(), i).is_some()), "the parser's Host is not at {host_at:?}");
     for i in first..htx.num_blocks() {
         let view = htx.as_ref();
         let Some(value) = host_value(&view, i) else { continue };
@@ -183,7 +221,9 @@ pub fn check_and_normalize(htx: &mut HtxSlice<'_>, accept_unsafe: bool) -> io::R
 
     // A `#` anywhere in the target is an invalid request line (`h1_headers_to_hdr_list`,
     // `http_msg_rquri2`); it is checked first so that no form of target escapes it.
-    if !accept_unsafe && htx.req_line().is_some_and(|r| r.uri.contains('#')) {
+    let target = known.target.or_else(|| htx.as_ref().req_line_bytes().map(|r| Target::of(r.uri)));
+    debug_assert!(known.target.is_none() || known.target == htx.as_ref().req_line_bytes().map(|r| Target::of(r.uri)), "the parser's target");
+    if !accept_unsafe && target.is_some_and(|t| t.fragment) {
         return Err(invalid("a fragment in the request target"));
     }
     // The first `Host` of any request (`h1_parse_msg_hdrs`).
@@ -193,11 +233,13 @@ pub fn check_and_normalize(htx: &mut HtxSlice<'_>, accept_unsafe: bool) -> io::R
         }
     }
 
+    // Origin-form (nearly every request) is done here, read as bytes.
+    if target.is_none_or(|t| t.origin) {
+        return Ok(rewritten);
+    }
     let (method, uri) = match htx.req_line() {
-        Some(r) if !(r.uri.starts_with('/') || r.uri.starts_with('*') || r.uri.is_empty()) => {
-            (r.method.to_string(), r.uri.to_string())
-        }
-        _ => return Ok(rewritten),
+        Some(r) => (r.method.to_string(), r.uri.to_string()),
+        None => return Ok(rewritten),
     };
     let host: Option<String> = match host_at {
         Some(i) => Some(

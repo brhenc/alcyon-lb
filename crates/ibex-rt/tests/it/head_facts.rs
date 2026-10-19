@@ -216,3 +216,37 @@ fn a_rule_editing_a_header_after_its_facts() {
         false,
     );
 }
+
+/// T436 C: a header value with obs-text (Latin-1 bytes, not UTF-8) is a header like any other
+/// for every reader of the request: it is found, counted and fetched as its bytes, and a `Host`
+/// after it is still found. (Measured on 3.5-dev8 alongside the cases above.)
+#[test]
+fn an_obs_text_header_value_is_read_as_its_bytes() {
+    let ret = "  http-request return status 200 content-type text/plain lf-string ";
+    let obs = b"GET / HTTP/1.1\r\nHost: a\r\nX-Foo: \xe9t\xe9\r\n\r\n";
+    let reply = |body: &str| format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/plain\r\n\r\n{body}", body.len());
+    check(
+        "forwardfor if-none",
+        "  option forwardfor if-none\n",
+        b"GET / HTTP/1.1\r\nHost: a\r\nX-Forwarded-For: 1.2.3.\xe9\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nbe",
+        &["GET / HTTP/1.1\r\nhost: a\r\nx-forwarded-for: 1.2.3.\u{fffd}"],
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nbe",
+        false,
+    );
+    check("found", &format!("{ret}found if {{ req.hdr(x-foo) -m found }}\n"), obs, OK, &[], &reply("found"), false);
+    check("hdr_cnt", &format!("{ret}n=%[req.hdr_cnt(x-foo)]\n"), obs, OK, &[], &reply("n=1"), false);
+    check("hdr", &format!("{ret}v=%[req.hdr(x-foo),hex]\n"), obs, OK, &[], &reply("v=E974E9"), false);
+    check("fhdr", &format!("{ret}v=%[req.fhdr(x-foo),hex]\n"), obs, OK, &[], &reply("v=E974E9"), false);
+    check("hdrs", &format!("{ret}l=%[req.hdrs,length]\n"), obs, OK, &[], &reply("l=23"), false);
+    check(
+        "Host after it",
+        &format!("{ret}h=%[req.hdr(host)]\n"),
+        b"GET / HTTP/1.1\r\nX-Foo: \xe9t\xe9\r\nHost: a\r\n\r\n",
+        OK,
+        &[],
+        &reply("h=a"),
+        false,
+    );
+    check("forwarded", "", obs, OK, &["GET / HTTP/1.1\r\nhost: a\r\nx-foo: \u{fffd}t\u{fffd}"], "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok", false);
+}

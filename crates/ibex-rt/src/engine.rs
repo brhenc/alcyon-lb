@@ -9970,9 +9970,7 @@ impl EngineDispatcher<'_> {
             let raw = &entry.sess.rep.readable()[..total_hdr_len];
             let method = entry.sess.req_method.as_deref();
             if let Some(f) = rsp_facts {
-                // ASCII: the status line is text as it is.
-                let first = &raw[..memchr::memchr(b'\n', raw).unwrap_or(raw.len())];
-                let status = crate::txn::status_of(std::str::from_utf8(first).unwrap_or_default());
+                let status = crate::txn::status_of_line(&raw[..memchr::memchr(b'\n', raw).unwrap_or(raw.len())]);
                 let framing = f.response_framing(method, status).unwrap_or_else(|| crate::txn::response_framing(&String::from_utf8_lossy(raw), method, status));
                 (status, framing, f.wants_close(), ibex_proto::response_head::is_http11(raw))
             } else {
@@ -14664,7 +14662,7 @@ fn rewrite_header_names_before(buf: &mut [u8], eoh: Option<(usize, usize)>, tabl
         let end = memchr::memchr(b'\n', &buf[at..head]).map_or(head, |i| at + i + 1);
         // A folded line has no name of its own: nothing of it is lower-cased.
         let folded = matches!(buf[at], b' ' | b'\t');
-        let colon = buf[at..end].iter().position(|&b| b == b':').filter(|_| !folded).map_or(at, |i| at + i);
+        let colon = memchr::memchr(b':', &buf[at..end]).filter(|_| !folded).map_or(at, |i| at + i);
         buf[at..colon].make_ascii_lowercase();
         // The name is read as text only when there is a table to look it up in (T433).
         if let Some(to) = table.and_then(|t| t.get(std::str::from_utf8(&buf[at..colon]).ok()?)) {

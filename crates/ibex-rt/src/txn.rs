@@ -1361,6 +1361,13 @@ pub fn rewrite_response_connection(head: &str, close: bool, req_http11: bool, tu
     changed.then_some(out)
 }
 
+/// [`status_of`] of a status line (without its line feed), on its bytes (T436).
+#[must_use]
+pub fn status_of_line(line: &[u8]) -> u16 {
+    let mut words = line.split(|&b| b == b' ');
+    words.nth(1).and_then(|c| std::str::from_utf8(c).ok()).and_then(|c| c.trim().parse().ok()).unwrap_or(0)
+}
+
 /// The status of a response head, 0 if the status line does not parse.
 #[must_use]
 pub fn status_of(head: &str) -> u16 {
@@ -2421,6 +2428,14 @@ mod tests {
         for h in &heads {
             assert_eq!(htx_head_cost_and_size(h), (reference_head_cost(h, true), htx_head_size_general(h, true)), "{:?}", String::from_utf8_lossy(h));
             assert_eq!(htx_response_head_cost(h), reference_head_cost(h, false), "{:?}", String::from_utf8_lossy(h));
+        }
+    }
+
+    /// The status read from the bytes of a status line is the one read from the head.
+    #[test]
+    fn status_of_line_reads_as_status_of() {
+        for l in ["HTTP/1.1 200 OK", "HTTP/1.1  200", "HTTP/1.1 +404 x", "HTTP/1.1 2000", "HTTP/1.1", "", "HTTP/1.1 \u{b}301\r", "HTTP/1.1 99 \u{e9}", "HTTP/1.1 \u{a0}200"] {
+            assert_eq!(status_of_line(l.as_bytes()), status_of(&format!("{l}\nX: 1\n")), "{l:?}");
         }
     }
 

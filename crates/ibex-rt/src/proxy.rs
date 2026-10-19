@@ -2412,11 +2412,15 @@ impl TcpSession {
                         // parser edits no `Connection` line of a head they are read from.
                         let conn_tokens = facts.map(|f| (f.conn_close, f.conn_keep_alive));
                         debug_assert!(conn_tokens.is_none_or(|t| t == (connection().any(|v| txn::connection_has(v, "close")), connection().any(|v| txn::connection_has(v, "keep-alive")))));
-                        if let Some(req) = htx.req_line() {
+                        // Read as bytes (T436); the method and the target are text (the HTX holds
+                        // UTF-8), and are read as text only when the whole line is.
+                        let line = htx.req_line_bytes().and_then(|r| Some((std::str::from_utf8(r.method).ok()?, std::str::from_utf8(r.uri).ok()?, r.version)));
+                        debug_assert_eq!(line, htx.req_line().map(|r| (r.method, r.uri, r.version.as_bytes())));
+                        if let Some((method, uri, version)) = line {
                             // Copied into the session's own buffers: no allocation once warm.
-                            self.req_method.set(req.method);
-                            self.req_uri.set(req.uri);
-                            if req.version == "HTTP/1.0"
+                            self.req_method.set(method);
+                            self.req_uri.set(uri);
+                            if version == b"HTTP/1.0"
                                 && !conn_tokens.map_or_else(|| connection().any(|v| txn::connection_has(v, "keep-alive")), |t| t.1)
                             {
                                 conn_close = true;
