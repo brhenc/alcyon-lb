@@ -74,20 +74,31 @@ fn the_log_options_filter_and_raise_the_level() {
     // A connection on which nothing was sent, then a real request: only the second is logged.
     drop(TcpStream::connect(("127.0.0.1", null)).expect("connect"));
     thread::sleep(Duration::from_millis(100));
-    assert_eq!(get(null, "/real"), "HTTP/1.1 200 OK");
-    assert_eq!(get(norm, "/ok"), "HTTP/1.1 200 OK");
-    assert_eq!(get(norm, "/dead"), "HTTP/1.1 503 Service Unavailable");
-    assert_eq!(get(sep, "/ok"), "HTTP/1.1 200 OK");
-    assert_eq!(get(sep, "/dead"), "HTTP/1.1 503 Service Unavailable");
-    assert_eq!(get(asap, "/ok"), "HTTP/1.1 200 OK");
     let mut got = Vec::new();
     let mut buf = [0u8; 2048];
-    while let Ok(n) = sink.recv(&mut buf) {
+    let mut take = |got: &mut Vec<(u32, String)>, wait: Duration| {
+        sink.set_read_timeout(Some(wait)).ok();
+        let Ok(n) = sink.recv(&mut buf) else { return false };
         let m = String::from_utf8_lossy(&buf[..n]).into_owned();
         let pri: u32 = m.trim_start_matches('<').split('>').next().unwrap_or("0").parse().unwrap_or(0);
         let text = m.split(": ").skip(1).collect::<Vec<_>>().join(": ");
         got.push((pri, text.trim_end().to_string()));
-    }
+        true
+    };
+    // The lines of different connections reach the socket in no fixed order on a loaded host:
+    // each request that is logged waits for its own line before the next one is sent.
+    let patient = Duration::from_secs(10);
+    assert_eq!(get(null, "/real"), "HTTP/1.1 200 OK");
+    take(&mut got, patient);
+    assert_eq!(get(norm, "/ok"), "HTTP/1.1 200 OK");
+    assert_eq!(get(norm, "/dead"), "HTTP/1.1 503 Service Unavailable");
+    take(&mut got, patient);
+    assert_eq!(get(sep, "/ok"), "HTTP/1.1 200 OK");
+    take(&mut got, patient);
+    assert_eq!(get(sep, "/dead"), "HTTP/1.1 503 Service Unavailable");
+    take(&mut got, patient);
+    assert_eq!(get(asap, "/ok"), "HTTP/1.1 200 OK");
+    while take(&mut got, Duration::from_millis(1500)) {}
     common::stop(&mut child);
     let _ = std::fs::remove_file(&path);
     // With logasap the line is the one sent with the response head, and the byte count and
