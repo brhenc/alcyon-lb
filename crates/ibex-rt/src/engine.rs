@@ -10875,7 +10875,7 @@ impl EngineDispatcher<'_> {
         // redirect to the page. The dashboard's script (JSON requests) and the verbs only Ibex
         // has (weight, maxconn, counters, sessions) go on below.
         let is_post = entry.sess.req_method.as_deref() == Some("POST");
-        let admin_ok = (is_post || req_uri.contains('?')) && Self::stats_admin_allowed(&entry.sess, proxies, serving);
+        let admin_ok = is_post && Self::stats_admin_allowed(&entry.sess, proxies, serving);
         if is_post {
             let hdrs = Self::stats_req_headers(&entry.sess);
             let same_origin = crate::stats_post::same_origin(&hdrs);
@@ -10966,7 +10966,7 @@ impl EngineDispatcher<'_> {
             };
 
         let query_str = req_uri.split_once('?').map_or("", |x| x.1);
-        let admin_cmd = crate::stats_html::parse_admin_action(query_str, &body_str).filter(|_| admin_ok);
+        let admin_cmd = crate::stats_html::parse_admin_action(query_str, &body_str).filter(|_| admin_ok && is_post);
 
         if let Some(cmd) = admin_cmd {
             let is_json_req = req_uri.contains("/api/")
