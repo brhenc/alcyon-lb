@@ -76,6 +76,13 @@ fn check(tag: &str, cfg: &str) -> (i32, String) {
     (out.status.code().unwrap_or(-1), text)
 }
 
+/// An unquoted `%[...]` with a blank in it is several words. `HAProxy` reads the first as the
+/// format and reports its expression error; Ibex checks the words after the action's
+/// arguments first (T432) and reports the first stray one. Both refuse the line.
+fn stray_word_first(alert: &str) -> bool {
+    alert.contains("expects either 'if' or 'unless' followed by a condition but found")
+}
+
 /// Every row of `rows` on `ibex -c`; panics listing those that differ from `HAProxy`.
 fn run(group: &str, rows: &[Row]) {
     let mut bad = Vec::new();
@@ -84,7 +91,7 @@ fn run(group: &str, rows: &[Row]) {
         let alert = text.lines().find(|l| l.contains("ALERT")).unwrap_or("").to_string();
         if got != rc {
             bad.push(format!("{ctx} {expr}: exit {got}, HAProxy {rc} ({core}) | {alert}"));
-        } else if rc != 0 && !text.contains(core) {
+        } else if rc != 0 && !text.contains(core) && !(ctx == "set-header-uq" && expr.contains(' ') && stray_word_first(&alert)) {
             bad.push(format!("{ctx} {expr}: refused, but not with \"{core}\" | {alert}"));
         }
     }

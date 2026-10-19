@@ -18,7 +18,7 @@ pub(crate) fn parse_tcp_req_connection(
     let act_tok = &tokens[2];
     match act_tok.text.as_str() {
         "track-sc0" | "track-sc1" | "track-sc2" => {
-            let (expr, table, cond_start) = parse_track_sc_args(tokens, 3)?;
+            let (expr, table, cond_start) = parse_track_sc_args(tokens, 3, &|t| tcp_trailing_word(tokens, t))?;
             let cond = match cond_start {
                 Some(idx) => parse_acl_condition_from_tokens(&tokens[idx..])?,
                 None => None,
@@ -45,29 +45,25 @@ pub(crate) fn parse_tcp_req_connection(
             rules.push(TcpReqConnRule { action: TcpReqConnAction::Accept, cond });
         }
         "set-src" => {
-            let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-            let expr = join_tokens_until(tokens, 3, cond_idx);
+            let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
             rules.push(TcpReqConnRule { action: TcpReqConnAction::SetSrc { expr }, cond });
         }
         "set-src-port" => {
-                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-                let expr = join_tokens_until(tokens, 3, cond_idx);
+                let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
                 if expr.is_empty() {
                     return Err(ConfigError::new(act_tok.line, act_tok.col, "missing fetch method"));
                 }
                 rules.push(TcpReqConnRule { action: TcpReqConnAction::SetSrcPort { expr }, cond });
             }
             "set-dst-port" => {
-                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-                let expr = join_tokens_until(tokens, 3, cond_idx);
+                let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
                 if expr.is_empty() {
                     return Err(ConfigError::new(act_tok.line, act_tok.col, "missing fetch method"));
                 }
                 rules.push(TcpReqConnRule { action: TcpReqConnAction::SetDstPort { expr }, cond });
             }
             "set-dst" => {
-            let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-            let expr = join_tokens_until(tokens, 3, cond_idx);
+            let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
             rules.push(TcpReqConnRule { action: TcpReqConnAction::SetDst { expr }, cond });
         }
         "expect-proxy" => {
@@ -78,13 +74,6 @@ pub(crate) fn parse_tcp_req_connection(
                     act_tok.line,
                     act_tok.col,
                     format!("'tcp-request connection expect-proxy' only supports 'layer4' (got '{arg}')"),
-                ));
-            }
-            if let Some(t) = tokens.get(4).filter(|t| t.text != "if" && t.text != "unless") {
-                return Err(ConfigError::new(
-                    t.line,
-                    t.col,
-                    format!("'tcp-request connection expect-proxy' only accepts 'if' or 'unless' (got '{}')", t.text),
                 ));
             }
             let (_, cond) = parse_rule_condition(tokens, 4)?;
@@ -138,8 +127,7 @@ pub(crate) fn parse_tcp_req_session(
             .trim_end_matches(')')
             .to_string();
         check_set_var_conds(&tokens[2], &var_name)?;
-        let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-        let expr = join_tokens_until(tokens, 3, cond_idx);
+        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
         let action = if is_fmt {
             TcpReqSessionAction::SetVarFmt { var_name, fmt: expr }
         } else {
@@ -160,8 +148,7 @@ pub(crate) fn parse_tcp_req_session(
         let (_, cond) = parse_rule_condition(tokens, 3)?;
         rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScIncGpc1 { sc }, cond });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_tok)? {
-        let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
-        let expr = join_tokens_until(tokens, 3, cond_idx);
+        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
         // No value is 0, as `HAProxy` reads it (`strtol` stops at the end of the line).
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScSetGpt0 { sc, expr }, cond });
@@ -169,21 +156,19 @@ pub(crate) fn parse_tcp_req_session(
         let (_, cond) = parse_rule_condition(tokens, 3)?;
         rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScIncGpc { idx, sc }, cond });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-add-gpc", act_tok)? {
-        let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
-        let expr = join_tokens_until(tokens, 3, cond_idx);
+        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScAddGpc { idx, sc, expr }, cond });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-set-gpt", act_tok)? {
-        let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
-        let expr = join_tokens_until(tokens, 3, cond_idx);
+        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScSetGpt { idx, sc, expr }, cond });
     } else {
         match act_str.as_str() {
             "track-sc0" | "track-sc1" | "track-sc2" => {
-                let (expr, table, cond_start) = parse_track_sc_args(tokens, 3)?;
+                let (expr, table, cond_start) = parse_track_sc_args(tokens, 3, &|t| tcp_trailing_word(tokens, t))?;
                 let cond = match cond_start {
                     Some(idx) => parse_acl_condition_from_tokens(&tokens[idx..])?,
                     None => None,
@@ -210,29 +195,25 @@ pub(crate) fn parse_tcp_req_session(
                 rules.push(TcpReqSessionRule { action: TcpReqSessionAction::Accept, cond });
             }
             "set-src" => {
-                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-                let expr = join_tokens_until(tokens, 3, cond_idx);
+                let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
                 rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SetSrc { expr }, cond });
             }
             "set-src-port" => {
-                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-                let expr = join_tokens_until(tokens, 3, cond_idx);
+                let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
                 if expr.is_empty() {
                     return Err(ConfigError::new(act_tok.line, act_tok.col, "missing fetch method"));
                 }
                 rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SetSrcPort { expr }, cond });
             }
             "set-dst-port" => {
-                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-                let expr = join_tokens_until(tokens, 3, cond_idx);
+                let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
                 if expr.is_empty() {
                     return Err(ConfigError::new(act_tok.line, act_tok.col, "missing fetch method"));
                 }
                 rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SetDstPort { expr }, cond });
             }
             "set-dst" => {
-                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-                let expr = join_tokens_until(tokens, 3, cond_idx);
+                let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
                 rules.push(TcpReqSessionRule { action: TcpReqSessionAction::SetDst { expr }, cond });
             }
             "expect-proxy" => {
@@ -287,8 +268,7 @@ pub(crate) fn parse_tcp_content_var(
             .trim_end_matches(')')
             .to_string();
         check_set_var_conds(&tokens[2], &var_name)?;
-        let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-        let expr = join_tokens_until(tokens, 3, cond_idx);
+        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
         let action = if is_fmt {
             TcpReqContentAction::SetVarFmt { var_name, fmt: expr }
         } else {
@@ -315,17 +295,13 @@ pub(crate) fn parse_tcp_content_switch_mode(
     tokens: &[Token],
 ) -> Result<TcpReqContentRule, ConfigError> {
     let mut proto = None;
-    let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
-    let limit = cond_idx.unwrap_or(tokens.len());
-    let mut i = 4;
-    while i < limit {
-        if tokens[i].text == "proto" && i + 1 < limit {
-            proto = Some(tokens[i + 1].text.clone());
-            i += 2;
-        } else {
-            i += 1;
-        }
+    // `switch-mode http [proto <name>]`, then the condition.
+    let mut at = 4;
+    if let Some(name) = tokens.get(5).filter(|_| tokens.get(4).is_some_and(|t| t.text == "proto")) {
+        proto = Some(name.text.clone());
+        at = 6;
     }
+    let (_, cond) = parse_rule_condition(tokens, at)?;
     Ok(TcpReqContentRule {
         action: TcpReqContentAction::SwitchModeHttp { proto },
         cond,
@@ -437,8 +413,7 @@ fn parse_tcp_req_content_at(
         let (_, cond) = parse_rule_condition(tokens, 3)?;
         rules.push(TcpReqContentRule { action: TcpReqContentAction::ScIncGpc1 { sc }, cond, line: 0 });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_tok)? {
-        let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
-        let expr = join_tokens_until(tokens, 3, cond_idx);
+        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
         // No value is 0, as `HAProxy` reads it (`strtol` stops at the end of the line).
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqContentRule { action: TcpReqContentAction::ScSetGpt0 { sc, expr }, cond, line: 0 });
@@ -446,14 +421,12 @@ fn parse_tcp_req_content_at(
         let (_, cond) = parse_rule_condition(tokens, 3)?;
         rules.push(TcpReqContentRule { action: TcpReqContentAction::ScIncGpc { idx, sc }, cond, line: 0 });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-add-gpc", act_tok)? {
-        let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
-        let expr = join_tokens_until(tokens, 3, cond_idx);
+        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqContentRule { action: TcpReqContentAction::ScAddGpc { idx, sc, expr }, cond, line: 0 });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-set-gpt", act_tok)? {
-        let (cond_idx, cond) = parse_rule_condition(tokens, 4)?;
-        let expr = join_tokens_until(tokens, 3, cond_idx);
+        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqContentRule { action: TcpReqContentAction::ScSetGpt { idx, sc, expr }, cond, line: 0 });
@@ -466,7 +439,7 @@ fn parse_tcp_req_content_at(
     } else {
         match act_str.as_str() {
             "track-sc0" | "track-sc1" | "track-sc2" => {
-                let (expr, table, cond_start) = parse_track_sc_args(tokens, 3)?;
+                let (expr, table, cond_start) = parse_track_sc_args(tokens, 3, &|t| tcp_trailing_word(tokens, t))?;
                 let cond = match cond_start {
                     Some(idx) => parse_acl_condition_from_tokens(&tokens[idx..])?,
                     None => None,
@@ -493,29 +466,25 @@ fn parse_tcp_req_content_at(
                 rules.push(TcpReqContentRule { action: TcpReqContentAction::Accept, cond, line: 0 });
             }
             "set-src" => {
-                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-                let expr = join_tokens_until(tokens, 3, cond_idx);
+                let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
                 rules.push(TcpReqContentRule { action: TcpReqContentAction::SetSrc { expr }, cond, line: 0 });
             }
             "set-src-port" => {
-                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-                let expr = join_tokens_until(tokens, 3, cond_idx);
+                let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
                 if expr.is_empty() {
                     return Err(ConfigError::new(act_tok.line, act_tok.col, "missing fetch method"));
                 }
                 rules.push(TcpReqContentRule { action: TcpReqContentAction::SetSrcPort { expr }, cond, line: 0 });
             }
             "set-dst-port" => {
-                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-                let expr = join_tokens_until(tokens, 3, cond_idx);
+                let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
                 if expr.is_empty() {
                     return Err(ConfigError::new(act_tok.line, act_tok.col, "missing fetch method"));
                 }
                 rules.push(TcpReqContentRule { action: TcpReqContentAction::SetDstPort { expr }, cond, line: 0 });
             }
             "set-dst" => {
-                let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-                let expr = join_tokens_until(tokens, 3, cond_idx);
+                let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
                 rules.push(TcpReqContentRule { action: TcpReqContentAction::SetDst { expr }, cond, line: 0 });
             }
             "capture" => {
@@ -543,15 +512,6 @@ fn parse_tcp_req_content_at(
                 }
                 if len == 0 {
                     return Err(refuse("a positive 'len' argument is mandatory"));
-                }
-                if let Some(t) = tokens.get(next) {
-                    if t.text != "if" && t.text != "unless" {
-                        return Err(ConfigError::new(
-                            t.line,
-                            t.col,
-                            format!("'tcp-request content capture' only accepts 'if' or 'unless' (got '{}')", t.text),
-                        ));
-                    }
                 }
                 let (_, cond) = parse_rule_condition(tokens, next)?;
                 let action = TcpReqContentAction::Capture { expr: tokens[3].text.clone(), len, id: None };
@@ -610,9 +570,9 @@ pub(crate) fn parse_listen_tcp_request(
             listen.tcp_req_inspect_delay = Some(parse_inspect_delay(&tokens[2], "request", "proxy", &listen.name)?);
             Ok(())
         }
-        "connection" => parse_tcp_req_connection(&mut listen.tcp_req_conn_rules, tokens, kw),
-        "session" => parse_tcp_req_session(&mut listen.tcp_req_session_rules, tokens, kw),
-        "content" => parse_tcp_req_content(&mut listen.tcp_req_content_rules, tokens, kw),
+        "connection" => in_proxy(parse_tcp_req_connection(&mut listen.tcp_req_conn_rules, tokens, kw), "proxy", &listen.name),
+        "session" => in_proxy(parse_tcp_req_session(&mut listen.tcp_req_session_rules, tokens, kw), "proxy", &listen.name),
+        "content" => in_proxy(parse_tcp_req_content(&mut listen.tcp_req_content_rules, tokens, kw), "proxy", &listen.name),
         other => Err(ConfigError::new(
             tokens[1].line,
             tokens[1].col,
@@ -645,9 +605,9 @@ pub(crate) fn parse_frontend_tcp_request(
             fe.tcp_req_inspect_delay = Some(parse_inspect_delay(&tokens[2], "request", "proxy", &fe.name)?);
             Ok(())
         }
-        "connection" => parse_tcp_req_connection(&mut fe.tcp_req_conn_rules, tokens, kw),
-        "session" => parse_tcp_req_session(&mut fe.tcp_req_session_rules, tokens, kw),
-        "content" => parse_tcp_req_content(&mut fe.tcp_req_content_rules, tokens, kw),
+        "connection" => in_proxy(parse_tcp_req_connection(&mut fe.tcp_req_conn_rules, tokens, kw), "frontend", &fe.name),
+        "session" => in_proxy(parse_tcp_req_session(&mut fe.tcp_req_session_rules, tokens, kw), "frontend", &fe.name),
+        "content" => in_proxy(parse_tcp_req_content(&mut fe.tcp_req_content_rules, tokens, kw), "frontend", &fe.name),
         other => Err(ConfigError::new(
             tokens[1].line,
             tokens[1].col,
@@ -680,7 +640,7 @@ pub(crate) fn parse_backend_tcp_request(
             be.tcp_req_inspect_delay = Some(parse_inspect_delay(&tokens[2], "request", "proxy", &be.name)?);
             Ok(())
         }
-        "content" => parse_tcp_req_content(&mut be.tcp_req_content_rules, tokens, kw),
+        "content" => in_proxy(parse_tcp_req_content(&mut be.tcp_req_content_rules, tokens, kw), "backend", &be.name),
         "connection" | "session" => Err(ConfigError::new(
             tokens[1].line,
             tokens[1].col,
@@ -740,6 +700,7 @@ pub(crate) fn parse_sc_counter_action(
 pub(crate) fn parse_track_sc_args(
     tokens: &[Token],
     start: usize,
+    refuse: &dyn Fn(&Token) -> ConfigError,
 ) -> Result<(String, Option<String>, Option<usize>), ConfigError> {
     if tokens.len() <= start {
         return Err(ConfigError::new(
@@ -760,7 +721,9 @@ pub(crate) fn parse_track_sc_args(
             cond_start = Some(i);
             break;
         } else {
-            i += 1;
+            // `track-scN <expr> [table <t>]` and then the condition; a word that is neither
+            // is refused, not skipped (a `table` with no name lands here too).
+            return Err(refuse(&tokens[i]));
         }
     }
     Ok((expr, table, cond_start))

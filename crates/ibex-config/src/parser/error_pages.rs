@@ -223,7 +223,7 @@ fn parse_http_error_directive(
         ));
     }
     let code = parse_u16(&tokens[2], "http-error status")?;
-    let (content_type, lf_string, error_page) = parse_error_body_args(tokens, 3, tokens.len(), code)?;
+    let (content_type, lf_string, error_page) = parse_error_body_args(tokens, 3, tokens.len(), code, None)?;
     match error_page {
         Some(ErrorPageSource::DefaultErrorfiles) => {
             replies.remove(&code);
@@ -248,6 +248,9 @@ fn parse_http_error_directive(
 /// `status_for_errorfiles`, since `errorfiles <name>` must pick a single status code out of
 /// a whole section.
 ///
+/// `owner` is the rule list and action when a rule line is being parsed (see the unknown-word
+/// arm).
+///
 /// Returns the content-type, the encoded custom-header/body string (the existing
 /// `\0HDR:`/`\0BODY:` convention `http-request return` already produces), and the page
 /// source, if any of the page-selection keywords was given.
@@ -257,6 +260,7 @@ pub(crate) fn parse_error_body_args(
     start: usize,
     limit: usize,
     status_for_errorfiles: u16,
+    owner: Option<(&str, &Token)>,
 ) -> Result<(Option<String>, Option<String>, Option<ErrorPageSource>), ConfigError> {
     let mut content_type = None;
     let mut lf_string = None;
@@ -336,11 +340,16 @@ pub(crate) fn parse_error_body_args(
             // does Ibex: skipping it accepted a line whose argument then did nothing. A
             // keyword missing its value lands here too.
             other => {
-                return Err(ConfigError::new(
-                    tokens[i].line,
-                    tokens[i].col,
-                    format!("unknown or incomplete argument '{other}'"),
-                ));
+                // A rule (`http-request deny`, `return`...) says what `HAProxy` says: the
+                // word is where the condition should start. `http-error` has its own text.
+                let msg = match owner {
+                    Some((list, act)) => format!(
+                        "'{list} {}' expects either 'if' or 'unless' followed by a condition but found '{other}'.",
+                        act.text
+                    ),
+                    None => format!("unknown or incomplete argument '{other}'"),
+                };
+                return Err(ConfigError::new(tokens[i].line, tokens[i].col, msg));
             }
         }
     }

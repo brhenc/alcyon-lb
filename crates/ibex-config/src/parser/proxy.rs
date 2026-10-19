@@ -457,7 +457,7 @@ pub(crate) fn parse_listen_directive(
                     proxy.tcp_res_inspect_delay = Some(parse_inspect_delay(&tokens[2], "response", "proxy", &proxy.name)?);
                     Ok(())
                 }
-                "content" => parse_tcp_res_content(&mut proxy.tcp_res_content_rules, tokens, kw),
+                "content" => in_proxy(parse_tcp_res_content(&mut proxy.tcp_res_content_rules, tokens, kw), "proxy", &proxy.name),
                 other => Err(ConfigError::new(
                     tokens[1].line,
                     tokens[1].col,
@@ -736,7 +736,7 @@ pub(crate) fn parse_backend_directive(
                     be.tcp_res_inspect_delay = Some(parse_inspect_delay(&tokens[2], "response", "proxy", &be.name)?);
                     Ok(())
                 }
-                "content" => parse_tcp_res_content(&mut be.tcp_res_content_rules, tokens, kw),
+                "content" => in_proxy(parse_tcp_res_content(&mut be.tcp_res_content_rules, tokens, kw), "backend", &be.name),
                 other => Err(ConfigError::new(
                     tokens[1].line,
                     tokens[1].col,

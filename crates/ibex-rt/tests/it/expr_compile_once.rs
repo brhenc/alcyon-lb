@@ -142,7 +142,7 @@ fn rewrite_regexes_are_not_compiled_per_request() {
     let rules = "  http-request replace-path ^/api/(.*) /v1/\\1\n  \
                  http-request replace-uri ^(.*)$ \\1\n  \
                  http-request replace-header Host (.*) \\1\n  \
-                 http-request del-header X-Foo -m reg ^x-f";
+                 http-request del-header ^x-f -m reg";
     assert_eq!(compiles_per_request(rules, "/api/t", "HTTP/1.1 200"), (0, 0));
 }
 
