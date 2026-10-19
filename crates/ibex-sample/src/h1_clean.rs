@@ -47,7 +47,8 @@ fn value_end(v: &[u8], mut s: usize) -> usize {
 /// the value stays as it came (up to the end of the last element kept, blanks included);
 /// after it, each kept element is appended trimmed, behind a bare `,`. Elements end at a
 /// comma outside a quoted string. `drop` sees every element, kept or not.
-pub(crate) fn drop_items(value: &str, mut drop: impl FnMut(&str) -> bool) -> String {
+#[must_use]
+pub fn drop_items(value: &str, mut drop: impl FnMut(&str) -> bool) -> String {
     let v = value.as_bytes();
     let mut out = String::new();
     // `p`: the end of the last element seen. `out.len() == p` is the C's
