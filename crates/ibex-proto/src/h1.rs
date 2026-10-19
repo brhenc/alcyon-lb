@@ -1286,7 +1286,7 @@ fn parse_response_line_borrowed(line: &str) -> io::Result<(&str, u16, &str)> {
 }
 
 /// True for RFC 9110 `tchar`, the only octets allowed in a header field name.
-const fn is_tchar(b: u8) -> bool {
+pub(crate) const fn is_tchar(b: u8) -> bool {
     matches!(b,
         b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
         | b'^' | b'_' | b'`' | b'|' | b'~'
