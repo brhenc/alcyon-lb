@@ -544,3 +544,17 @@ knows many more short names; Ibex shows a missing attribute as dotted (`1.2.3.4`
 signature or key algorithm as `UNDEF`. DN values are copied as raw bytes (no charset conversion
 of BMPString/UniversalString) in the one-line form; `rfc2253` dumps non-text types as `#<hex>`.
 The `ssl_c_*` fetches (the peer's certificate) are not implemented here.
+
+### 6.20 Spare strings for the rules (T437) — **accepted for now; T444 bounds and wipes them**
+
+The header rules, formats, ACL fetches and `return` replies reuse per-thread strings
+(`ibex_sample::spare`, `ibex_rt::reuse`) instead of allocating each request: a string that leaves
+a header list or a sample goes back to its thread's spares, and the next one takes it with its
+capacity. That is what brings the survey's rules from 65 allocations per request to 0 (and
+`http-request return` from 4 to 0; `crates/ibex-rt/tests/request_allocations.rs`).
+
+| | |
+|---|---|
+| **Cost** | Per thread, up to 512 spare strings of at most 16 KiB each (8 MiB worst case; in practice a few dozen of 64 bytes), plus 16 spare header lists and four scratch buffers. They are never given back to the allocator while the thread lives, and they do not show in `show pools`. |
+| **Security** | A spare is cleared (`String::clear`), not wiped: the bytes of an earlier request's header values or samples stay in its capacity until overwritten. Nothing reads past the length, but a memory disclosure elsewhere would find them. |
+| **Status** | **accepted** until T444 bounds them under the pool accounting and wipes them on release (as `tune.ibex.zero-buffers`, T437 part 5b, does for buffers). |

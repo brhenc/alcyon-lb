@@ -6382,19 +6382,8 @@ impl Registry {
     }
 
     /// Applies a chain of converters to a sample value, with the runtime state the context
-    /// converters read.
-    #[must_use]
-    pub fn apply_converters_in(
-        &self,
-        ctx: &SampleContext,
-        smp: Sample,
-        converters: &[(&str, Vec<String>)],
-    ) -> Option<Sample> {
-        self.apply_converters_g(ctx, smp, converters)
-    }
-
-    /// [`Self::apply_converters_in`] for a list of converters of any string type (an
-    /// [`crate::expr::Expr`]'s own, with no copy of it).
+    /// converters read. The converters' names are of any string type (an
+    /// [`crate::expr::Expr`]'s own are passed with no copy of them).
     pub(crate) fn apply_converters_g<S: AsRef<str>>(
         &self,
         ctx: &SampleContext,
@@ -8451,6 +8440,20 @@ fn ip_header_length(b: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// An ACL line on a fetch the registry does not have matches nothing (`any_acl`, T437), as
+    /// the list it replaced was empty for one.
+    #[test]
+    fn an_unknown_fetch_matches_nothing() {
+        let reg = super::Registry::new();
+        let none: &[(&str, Vec<String>)] = &[];
+        let mut seen = 0;
+        assert!(!reg.any_acl("no.such.fetch", &[], none, &super::SampleContext::default(), |_| {
+            seen += 1;
+            true
+        }));
+        assert_eq!(seen, 0);
+    }
+
     /// `dump_var_value` escapes NUL as `\0` (as `chunk_escape_string` does). A NUL cannot be put in a
     /// string variable from a configuration: HAProxy 3.5-dev8 drops the `url_dec` of `%00` altogether, and
     /// dumps a `bin` variable as hex, so no oracle column exists; this pins the code's own rule. Also the

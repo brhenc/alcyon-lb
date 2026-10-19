@@ -13056,8 +13056,8 @@ pub(crate) fn format_sample_into(out: &mut String, fmt: &str, ctx: &SampleContex
     render_sample_format_into(out, fmt, ctx, registry, false);
 }
 
-/// `smp` as [`sample_to_string`] writes it, appended to `out` through `push`, with no string
-/// of its own for a number, an address or a method.
+/// `smp` as a format writes it, appended to `out` through `push`, with no string of its own
+/// for a number, an address or a method.
 fn push_sample(out: &mut String, smp: &Sample, push: &dyn Fn(&mut String, &str)) {
     use std::fmt::Write as _;
     match smp {
@@ -13074,10 +13074,14 @@ fn push_sample(out: &mut String, smp: &Sample, push: &dyn Fn(&mut String, &str))
             let _ = write!(out, "{ip}");
         }
         Sample::Meth(m) => out.push_str(m.as_str()),
-        Sample::Bin(b) => match std::str::from_utf8(b) {
-            Ok(t) if !ibex_regex::bytetext::has_escapes(t) => push(out, t),
-            _ => push(out, &ibex_regex::bytetext::bytes_to_text(b)),
-        },
+        // Written as text, a binary is cast with `c_bin2str`: it ends at the first NUL.
+        Sample::Bin(b) => {
+            let b = &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())];
+            match std::str::from_utf8(b) {
+                Ok(t) if !ibex_regex::bytetext::has_escapes(t) => push(out, t),
+                _ => push(out, &ibex_regex::bytetext::bytes_to_text(b)),
+            }
+        }
     }
 }
 
@@ -13107,18 +13111,7 @@ fn render_sample_format_into(out: &mut String, fmt: &str, ctx: &SampleContext, r
                 let expr_str = &fmt[start..end];
                 if let Ok(expr) = Expr::cached(expr_str) {
                     if let Some(smp) = expr.eval_sample(registry, ctx) {
-                        match &smp {
-                            // Written as text, a binary is cast with `c_bin2str`: it ends at the
-                            // first NUL.
-                            Sample::Bin(b) => {
-                                let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-                                match std::str::from_utf8(&b[..end]) {
-                                    Ok(t) if !ibex_regex::bytetext::has_escapes(t) => push(out, t),
-                                    _ => push(out, &ibex_regex::bytetext::bytes_to_text(&b[..end])),
-                                }
-                            }
-                            _ => push_sample(out, &smp, &push),
-                        }
+                        push_sample(out, &smp, &push);
                         ibex_sample::spare::give_sample(smp);
                     }
                 }

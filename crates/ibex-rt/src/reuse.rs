@@ -238,6 +238,22 @@ mod tests {
         assert_eq!(PPairs::new().capacity(), lcap);
     }
 
+    /// A list that never held anything, or one grown past what is kept, is not kept.
+    #[test]
+    fn an_empty_or_oversized_list_is_not_kept() {
+        while SPARE_LISTS.with(|s| s.borrow_mut().pop()).is_some() {}
+        drop(PPairs::new());
+        assert_eq!(SPARE_LISTS.with(|s| s.borrow().len()), 0);
+        let mut big = PPairs::new();
+        big.reserve(2000);
+        drop(big);
+        assert_eq!(SPARE_LISTS.with(|s| s.borrow().len()), 0);
+        let mut one = PPairs::new();
+        one.push((string_from("a"), string_from("b")));
+        drop(one);
+        assert_eq!(SPARE_LISTS.with(|s| s.borrow().len()), 1);
+    }
+
     /// A scratch taken while another call has it is a fresh one.
     #[test]
     fn a_nested_scratch_is_a_fresh_one() {
