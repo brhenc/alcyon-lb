@@ -20,7 +20,7 @@ use ibex_proto::h2::{
     FRAME_HEADER_LEN, H2_CONN_PREFACE,
 };
 use ibex_proto::hpack::HpackEncoder;
-use ibex_proto::htx::{HeaderField, HttpMethod};
+use ibex_proto::htx::HeaderField;
 use ibex_proto::mux::Mux;
 use ibex_proto::mux_h2::MuxH2;
 use std::io::{Read, Write};
@@ -185,10 +185,10 @@ fn test_rt_http2_socket_multiplexing_concurrent_streams() {
     for &sid in &stream_ids {
         let stream = server_ctx.streams.get(&sid).expect("stream exists");
         assert_eq!(stream.state, H2StreamState::HalfClosedRemote);
-        assert_eq!(stream.rx_htx.req_line().unwrap().method, HttpMethod::Get);
+        assert_eq!(stream.request_method(), Some("GET"));
         assert_eq!(
-            stream.rx_htx.req_line().unwrap().uri,
-            format!("/item/{sid}")
+            stream.request_uri(),
+            Some(format!("/item/{sid}").as_str())
         );
 
         // Verify rcv_buf read
@@ -305,7 +305,7 @@ fn test_rt_http2_hpack_dynamic_table_socket_pipeline() {
     mux.parse(&mut server_ctx, &buf[..n2]).unwrap();
 
     let st3 = server_ctx.streams.get(&3).expect("stream 3 exists");
-    assert_eq!(st3.rx_htx.get_header("x-api-key"), Some("secret-key-12345"));
+    assert_eq!(st3.request_header("x-api-key"), Some("secret-key-12345"));
 }
 
 /// 4. Flow Control (`WINDOW_UPDATE`) when payload exceeds initial window over socket.

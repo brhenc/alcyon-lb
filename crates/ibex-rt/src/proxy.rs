@@ -311,6 +311,20 @@ pub struct H2Owner {
     /// DATA last, so that one with a big body cannot take the connection's window from the
     /// others pass after pass (`HAProxy`'s `send_list`, round robin).
     pub next_child: usize,
+    /// The memory a stream that is over held for its request, for the next (T437).
+    pub spare: H2ChildSpare,
+}
+
+/// What a stream's session holds of its request and gives back to its connection when it
+/// ends ([`TcpSession::h2_child_done`]), so that the next stream does not allocate it again.
+#[derive(Default)]
+pub struct H2ChildSpare {
+    pub req_uri: ReqText,
+    pub req_method: ReqText,
+    pub request_line: ReqText,
+    pub req_headers: Option<Vec<(String, String)>>,
+    /// The box of the stream's role ([`TcpSession::h2_role`]).
+    pub role: Option<Box<H2Role>>,
 }
 
 /// A child of an owner, as the owner knows it. The arena reuses indices and task slots: a
@@ -952,13 +966,25 @@ impl TcpSession {
         c.inspect_exp = owner.inspect_exp.take();
         c.vars.copy_scope_from(&owner.vars, ibex_sample::VarScope::Sess);
         c.log = owner.log.clone();
+        // The memory the connection's last stream held for its request (T437).
+        let mut spare_role = None;
+        if let Some(o) = owner.h2_owner_mut() {
+            let sp = &mut o.spare;
+            c.req_uri = std::mem::take(&mut sp.req_uri);
+            c.req_method = std::mem::take(&mut sp.req_method);
+            c.log.request_line = std::mem::take(&mut sp.request_line);
+            // Its strings are reused in place: `start_request`, which runs next, writes the
+            // stream's own headers over them before anything reads the list.
+            c.req_headers = sp.req_headers.take();
+            spare_role = sp.role.take();
+        }
         c.tracked_sc.clone_from(&owner.tracked_sc);
         c.h2_flood_config = owner.h2_flood_config;
         c.is_first_req = owner.is_first_req;
         c.reset_with_request = owner.reset_with_request;
         c.keep_request_line = owner.keep_request_line;
         c.accept_unsafe_request = owner.accept_unsafe_request;
-        c.h2_role = Some(Box::new(H2Role::Child(H2Child {
+        let role = H2Role::Child(H2Child {
             owner: Some(owner_ref),
             stream,
             reset: false,
@@ -973,7 +999,14 @@ impl TcpSession {
                 v.copy_scope_from(&owner.vars, ibex_sample::VarScope::Sess);
                 v
             },
-        })));
+        });
+        c.h2_role = Some(match spare_role {
+            Some(mut b) => {
+                *b = role;
+                b
+            }
+            None => Box::new(role),
+        });
         c
     }
 
@@ -995,6 +1028,19 @@ impl TcpSession {
         self.stick_acct_in = self.stick_acct_in.max(child.stick_acct_in);
         self.stick_out_pending += child.stick_out_pending + child.log.bytes_from_server;
         self.log.restart(self.bytes_in, self.bytes_out);
+        // The memory the stream held for its request is the next stream's (T437).
+        if let Some(o) = self.h2_owner_mut() {
+            let sp = &mut o.spare;
+            sp.req_uri = std::mem::take(&mut child.req_uri);
+            sp.req_uri.reset();
+            sp.req_method = std::mem::take(&mut child.req_method);
+            sp.req_method.reset();
+            sp.request_line = std::mem::take(&mut child.log.request_line);
+            sp.request_line.reset();
+            sp.req_headers = child.req_headers.take();
+            // Nothing reads the stream's role once it is over: its entry is being freed.
+            sp.role = child.h2_role.take();
+        }
         self.is_first_req = false;
         self.ending = None;
         if let Some(exp) = inspect {
@@ -1006,7 +1052,19 @@ impl TcpSession {
         // every request walked all of them: 88% of the CPU of an h2 request (T186).
         // A stream another entry still serves is kept until that one is over.
         let (Some(H2Role::Owner(o)), Some(h2)) = (self.h2_role.as_deref(), self.h2_ctx.as_mut()) else { return };
-        h2.streams.retain(|id, s| o.children.iter().any(|l| l.stream_id == *id) || !matches!(s.state, ibex_proto::H2StreamState::Closed | ibex_proto::H2StreamState::Reset(_)));
+        // Their memory is the next streams' (T437).
+        let mut streams = std::mem::take(&mut h2.streams);
+        streams.retain(|id, s| {
+            let keep = o.children.iter().any(|l| l.stream_id == *id) || !matches!(s.state, ibex_proto::H2StreamState::Closed | ibex_proto::H2StreamState::Reset(_));
+            if !keep {
+                h2.recycle_stream(s);
+            }
+            keep
+        });
+        h2.streams = streams;
+        if h2.streams.is_empty() {
+            h2.trim_idle();
+        }
     }
 
     /// Whether the client connection is TLS and its handshake is not done yet.

@@ -20,7 +20,7 @@ use ibex_proto::h2::{
     SettingsParameter, DEFAULT_INITIAL_WINDOW_SIZE, FRAME_HEADER_LEN, H2_CONN_PREFACE,
 };
 use ibex_proto::hpack::{HpackDecoder, HpackEncoder};
-use ibex_proto::htx::{HeaderField, HttpMethod};
+use ibex_proto::htx::HeaderField;
 use ibex_proto::mux::{Mux, ShutMode};
 use ibex_proto::mux_h2::MuxH2;
 
@@ -259,25 +259,25 @@ fn test_concurrent_stream_multiplexing() {
     // Verify Stream 1
     let st1 = ctx.streams.get(&1).expect("stream 1");
     assert_eq!(st1.state, H2StreamState::HalfClosedRemote);
-    assert_eq!(st1.rx_htx.req_line().unwrap().method, HttpMethod::Get);
-    assert_eq!(st1.rx_htx.req_line().unwrap().uri, "/api/v1/users");
+    assert_eq!(st1.request_method(), Some("GET"));
+    assert_eq!(st1.request_uri(), Some("/api/v1/users"));
 
     // Verify Stream 3 (reassembled data across multiple chunks)
     let st3 = ctx.streams.get(&3).expect("stream 3");
     assert_eq!(st3.state, H2StreamState::HalfClosedRemote);
-    assert_eq!(st3.rx_htx.req_line().unwrap().method, HttpMethod::Post);
-    assert_eq!(st3.rx_htx.req_line().unwrap().uri, "/api/v1/upload");
+    assert_eq!(st3.request_method(), Some("POST"));
+    assert_eq!(st3.request_uri(), Some("/api/v1/upload"));
     assert_eq!(st3.rx_htx.body_bytes(), b"chunk-alpha-chunk-beta");
 
     // Verify Stream 5
     let st5 = ctx.streams.get(&5).expect("stream 5");
     assert_eq!(st5.state, H2StreamState::HalfClosedRemote);
-    assert_eq!(st5.rx_htx.req_line().unwrap().uri, "/static/logo.png");
+    assert_eq!(st5.request_uri(), Some("/static/logo.png"));
 
     // Verify Stream 7
     let st7 = ctx.streams.get(&7).expect("stream 7");
     assert_eq!(st7.state, H2StreamState::HalfClosedRemote);
-    assert_eq!(st7.rx_htx.req_line().unwrap().method, HttpMethod::Put);
+    assert_eq!(st7.request_method(), Some("PUT"));
     assert_eq!(st7.rx_htx.body_bytes(), b"{\"name\":\"item42\"}");
 
     // Test Reading parsed stream via rcv_buf endpoint pivot

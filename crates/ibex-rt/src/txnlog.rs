@@ -190,14 +190,14 @@ impl StreamLog {
     pub fn restart(&mut self, bytes_in: u64, bytes_out: u64) {
         let mut request_line = std::mem::take(&mut self.request_line);
         request_line.reset();
-        let mut req_captures = std::mem::take(&mut self.req_captures);
-        release_captures(&mut req_captures);
-        let mut res_captures = std::mem::take(&mut self.res_captures);
-        release_captures(&mut res_captures);
+        let mut request_slots = std::mem::take(&mut self.req_captures);
+        release_captures(&mut request_slots);
+        let mut response_slots = std::mem::take(&mut self.res_captures);
+        release_captures(&mut response_slots);
         *self = StreamLog::start(bytes_in, bytes_out);
         self.request_line = request_line;
-        self.req_captures = req_captures;
-        self.res_captures = res_captures;
+        self.req_captures = request_slots;
+        self.res_captures = response_slots;
     }
 
     /// Milliseconds from the stream's start to `t`, -1 if it never happened.

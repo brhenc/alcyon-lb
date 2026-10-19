@@ -885,7 +885,7 @@ fn a_request_logged_with_httplog_allocates_nothing() {
     let (many, _) = logged_proxied_allocations(1100, "  option httplog\n");
     println!("[MEASUREMENT T437 1] httplog allocations: 100 requests {few}, 1100 requests {many}");
     assert!(lines > 0, "no log line arrived");
-    assert_eq!(many, few, "1000 more logged requests made {} more allocations", many as i64 - few as i64);
+    assert_eq!(many, few, "1000 more logged requests made {} more allocations", many.abs_diff(few));
 }
 
 /// T437 part 1: a custom `log-format` with `%{+Q}r`, `%HU`.. and header captures allocates
@@ -902,7 +902,7 @@ fn a_request_logged_with_a_capture_allocates_nothing() {
     let (many, _) = logged_proxied_allocations(1100, fe);
     println!("[MEASUREMENT T437 1] log-format + header capture allocations: 100 requests {few}, 1100 requests {many}");
     assert!(lines > 0, "no log line arrived");
-    assert_eq!(many, few, "1000 more logged requests made {} more allocations", many as i64 - few as i64);
+    assert_eq!(many, few, "1000 more logged requests made {} more allocations", many.abs_diff(few));
 }
 
 /// The survey's `log-format` scenario (T437): `http-request capture` and `%[capture.req.hdr(0)]`.
@@ -919,7 +919,7 @@ fn a_request_logged_with_a_capture_rule_allocates_only_in_the_samples() {
     let (many, _) = logged_proxied_allocations(1100, fe);
     println!("[MEASUREMENT T437 1] log-format + capture rule allocations: 100 requests {few}, 1100 requests {many}");
     assert!(lines > 0, "no log line arrived");
-    assert!(many - few <= 3 * 1000, "1000 more logged requests made {} more allocations (bound 3 per request)", many as i64 - few as i64);
+    assert!(many.saturating_sub(few) <= 3 * 1000, "1000 more logged requests made {} more allocations (bound 3 per request)", many.abs_diff(few));
 }
 
 /// A minimal h2c client on one connection: requests on streams 1, 3, 5.., from fixed
@@ -946,7 +946,7 @@ impl H2cClient {
         ibex_proto::hpack::encode_string_literal("/api/test?q=1", true, &mut v);
         v.push(0x41); // :authority, incremental indexing
         ibex_proto::hpack::encode_string_literal("localhost", true, &mut v);
-        v.push(0x40 | 58); // user-agent
+        v.push(0x40 | 0x3a); // user-agent, static index 58
         ibex_proto::hpack::encode_string_literal("alloc-test/1.0", true, &mut v);
         v.push(0x10); // never indexed, new name
         ibex_proto::hpack::encode_string_literal("x-trace", true, &mut v);
@@ -1050,14 +1050,17 @@ fn h2c_proxied_allocations(n: usize) -> usize {
 }
 
 /// T437 part 4: a steady-state h2c request proxied to an HTTP/1.1 server allocates nothing.
-/// Measured before (2026-10-19, uprobe on malloc under h2load, main 5bcdce4b): 49.7 per
-/// request: HPACK decode (a `String` per name and value), the HTX of owned blocks, the
-/// bridge's owned copies of the head, and the response encoded into new `Vec`s.
+/// Measured before (2026-10-19, main 5bcdce4b): 49.7 per request (uprobe on malloc under
+/// h2load), 53 in this test: HPACK decode (a `String` per name and value), the HTX of owned
+/// blocks, the bridge's owned copies of the head, the response encoded into new `Vec`s, the
+/// stream's session and the engine's per-pass queues.
 #[test]
 fn an_h2c_request_allocates_nothing() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let few = h2c_proxied_allocations(100);
     let many = h2c_proxied_allocations(1100);
     println!("[MEASUREMENT T437 4] h2c allocations: 100 requests {few}, 1100 requests {many}");
-    assert_eq!(many, few, "1000 more h2c requests made {} more allocations ({:.2} per request)", many as i64 - few as i64, (many as f64 - few as f64) / 1000.0);
+    // Measured after (2026-10-19): 0 and 0 or 1, and 1 for 2100, 4100 and 8100 requests: a
+    // buffer of the connection grows once, at a moment the timing decides, not per request.
+    assert!(many <= few + 1, "1000 more h2c requests made {} more allocations", many.abs_diff(few));
 }

@@ -2425,6 +2425,11 @@ impl Htx {
         self.blocks.push(block);
     }
 
+    /// No block; the memory of the list is kept (T437).
+    pub fn clear(&mut self) {
+        self.blocks.clear();
+    }
+
     #[must_use]
     pub fn blocks(&self) -> &[HtxBlock] {
         &self.blocks

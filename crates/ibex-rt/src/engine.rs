@@ -2135,6 +2135,11 @@ pub struct Engine {
     pub worker_id: usize,
     events: Vec<crate::poller::Event>,
     timer_updates: Vec<(TaskRef, Tick)>,
+    /// The tasks a pass wakes and the HTTP/2 connections whose streams it spawns, kept
+    /// from one pass to the next, as `timer_updates` (T437: a `Vec` each pass allocated as
+    /// soon as anything was pushed).
+    wake_scratch: Vec<TaskRef>,
+    h2_spawn_scratch: Vec<(u32, TaskRef)>,
     /// Every syslog target the config declared, global and per-proxy. Proxies reference
     /// these by index through `Proxy::log_target_idx`.
     log_targets: Vec<SyslogTarget>,
@@ -4447,6 +4452,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             worker_id,
             events: Vec::with_capacity(capacity * 2),
             timer_updates: Vec::with_capacity(capacity * 2),
+            wake_scratch: Vec::new(),
+            h2_spawn_scratch: Vec::new(),
             log_targets,
             log_tag: syslog_tag(config.global.as_ref().and_then(|g| g.log_tag.as_deref()).unwrap_or("haproxy")).to_string(),
             global_bufsize: bufsize,
@@ -5137,9 +5144,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             run_queue_len,
             now,
             timer_updates,
-            wake_queue: Vec::new(),
+            wake_queue: std::mem::take(&mut self.wake_scratch),
             heavy: Vec::new(),
-            h2_spawn: Vec::new(),
+            h2_spawn: std::mem::take(&mut self.h2_spawn_scratch),
             log_targets: &self.log_targets,
             log_tag: &self.log_tag,
             idle_backend_pool: &mut self.idle_backend_pool,
@@ -5163,18 +5170,20 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 self.scheduler.set_heavy(task_ref, true);
             }
         }
-        let h2_spawn = std::mem::take(&mut dispatcher.h2_spawn);
+        let mut h2_spawn = std::mem::take(&mut dispatcher.h2_spawn);
         let mut wake_queue = std::mem::take(&mut dispatcher.wake_queue);
         self.timer_updates = dispatcher.timer_updates;
-        for (owner_idx, owner_task) in h2_spawn {
+        for (owner_idx, owner_task) in h2_spawn.drain(..) {
             self.spawn_h2_children(owner_idx, owner_task, &mut wake_queue);
         }
-        for task_ref in wake_queue {
+        for task_ref in wake_queue.drain(..) {
             if self.scheduler.is_live(task_ref) {
                 self.scheduler
                     .tasklet_wakeup(task_ref, Class::Urgent, state::WOKEN_IO);
             }
         }
+        self.h2_spawn_scratch = h2_spawn;
+        self.wake_scratch = wake_queue;
         // Slots this pass freed go to the queue now, not on the next poll's timeout.
         self.wake_queued();
         self.resume_cli_after_close();
@@ -5229,7 +5238,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             // A server connection the last stream kept goes to this one, as the session
             // kept it for its next request.
             move_server(owner, child, &mut self.fdtab);
-            crate::h2_bridge::start_request(&mut child.sess, d);
+            let head = crate::h2_bridge::start_request(&mut child.sess, d);
+            if let Some(h2) = owner.sess.h2_ctx.as_deref_mut() {
+                h2.give_back_head(head);
+            }
             // The stream's own `timeout client` starts with it (T300).
             child.sess.arm_client(now);
             if let Some(o) = owner.sess.h2_owner_mut() {
