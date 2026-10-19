@@ -73,6 +73,10 @@ pub struct H2StreamCtx {
     /// `scheme://authority` of a request that carried both pseudo-headers: what `HAProxy`
     /// puts before the path in the start line it logs and counts (`GET http://x/g HTTP/2.0`).
     pub abs_prefix: Option<String>,
+    /// The request is one `HAProxy` takes and answers 400 (`HTX_FL_PARSING_ERROR`): a
+    /// method or scheme that is not a token, a URI with a control byte
+    /// ([`crate::h2::check_request_fields`]). It is not forwarded.
+    pub bad_request: bool,
 }
 
 impl H2StreamCtx {
@@ -104,6 +108,7 @@ impl H2StreamCtx {
             rx_fill: 0,
             rx_limit: 0,
             abs_prefix: None,
+            bad_request: false,
         }
     }
 }
@@ -890,7 +895,10 @@ impl MuxH2 {
             let trailer_bytes: usize = decoded_headers.iter().map(|h| h.name.len() + h.value.len()).sum();
             let too_big = decoded_headers.len() > MAX_REQUEST_TRAILERS
                 || trailer_bytes + TRAILER_BLOCK_OVERHEAD * decoded_headers.len() > MAX_REQUEST_TRAILER_ROOM;
-            if (flags & frame_flags::END_STREAM) == 0 || too_big || decoded_headers.iter().any(|h| h.name.starts_with(':')) {
+            // A trailer field is checked as `http_trailers_to_htx` checks it (T449): one
+            // with CR or LF would end the chunked body early for the server.
+            let malformed = crate::h2::check_trailer_fields(decoded_headers.iter().map(|h| (h.name.as_str(), h.value.as_str()))).is_err();
+            if (flags & frame_flags::END_STREAM) == 0 || too_big || malformed {
                 ctx.send_rst_stream(stream_id, H2Error::ProtocolError);
                 return Ok(());
             }
@@ -919,6 +927,15 @@ impl MuxH2 {
         let too_big = ctx.is_server
             && decoded_headers.iter().map(|h| h.name.len() + h.value.len()).sum::<usize>() > MAX_REQUEST_HEAD_BYTES;
 
+        // Each field is checked before any head is written from it (T449): a CR LF in a
+        // value, a name or a pseudo-header written into the HTTP/1 head is a header, or a
+        // request, the server trusts. Malformed is a stream error; a method or URI HAProxy
+        // takes and then refuses is a 400.
+        // (A client connection's response is not checked: no server is spoken to in h2,
+        // `proto h2` on a server is refused by the parser.)
+        let checked = if ctx.is_server {
+            crate::h2::check_request_fields(decoded_headers.iter().map(|h| (h.name.as_str(), h.value.as_str())))
+        } else { Ok(false) };
         let abs_prefix = {
             let get = |n: &str| decoded_headers.iter().find(|h| h.name == n).map(|h| h.value.as_str());
             get(":scheme").zip(get(":authority")).map(|(s, a)| format!("{s}://{a}"))
@@ -936,7 +953,8 @@ impl MuxH2 {
         ctx.highest_opened = ctx.highest_opened.max(stream_id);
 
         // Extract pseudo-headers and construct HTX blocks
-        let converted = if too_many || too_big {
+        stream.bad_request = checked == Ok(true);
+        let converted = if too_many || too_big || checked.is_err() {
             Err(())
         } else {
             crate::htx::pseudo_headers_to_htx(decoded_headers, HttpVersion::Http20).map_err(|_| ())

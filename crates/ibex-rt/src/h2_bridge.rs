@@ -34,6 +34,9 @@ pub struct H2Dispatch {
     pub method: Option<String>,
     pub uri: Option<String>,
     pub headers: Vec<(String, String)>,
+    /// A request `HAProxy` answers 400 without contacting a server
+    /// ([`ibex_proto::H2StreamCtx::bad_request`]).
+    pub bad_request: bool,
 }
 
 /// Takes the lowest stream of the connection that has its whole request head and has not
@@ -82,6 +85,7 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
         method: stream.rx_htx.req_line().map(|r| r.method.as_str().to_string()),
         uri: stream.rx_htx.req_line().map(|r| r.uri.clone()),
         headers: stream.rx_htx.headers().map(|h| (h.name.clone(), h.value.clone())).collect(),
+        bad_request: stream.bad_request,
     })
 }
 
@@ -151,6 +155,9 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) {
     txn.req_htx = Some(d.req_htx);
     sess.txn = Some(txn);
     sess.cli_state = ScState::Established;
+    if d.bad_request {
+        sess.fail_request(400);
+    }
 }
 
 /// The DATA frames of a stream being served that have come since: moved into `req` as far
@@ -478,6 +485,7 @@ mod tests {
             method: None,
             uri: None,
             headers: Vec::new(),
+            bad_request: false,
         }
     }
 

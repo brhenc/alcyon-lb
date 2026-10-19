@@ -29,7 +29,7 @@ fn invalid(what: &'static str) -> io::Error {
 /// `http_authority_has_forbidden_char` (`include/haproxy/http.h`): a byte outside `!`..`~`,
 /// or one of `, # / ? @ \`, or a bracket that is not the delimiter of an IP literal (`[`
 /// first, `]` last or before a colon), or a bracket left open.
-fn has_forbidden_char(v: &[u8]) -> bool {
+pub(crate) fn has_forbidden_char(v: &[u8]) -> bool {
     let mut brackets = false;
     for (i, &c) in v.iter().enumerate() {
         if c < 0x21 || c > 0x7e || matches!(c, b',' | b'#' | b'/' | b'?' | b'@' | b'[' | b'\\' | b']') {

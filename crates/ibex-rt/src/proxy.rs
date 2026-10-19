@@ -1909,7 +1909,7 @@ impl TcpSession {
 
     /// The request cannot be parsed. It is answered with `status` -- by the engine, which
     /// has the error pages -- and the connection closes; nothing more is read from it.
-    fn fail_request(&mut self, status: u16) {
+    pub(crate) fn fail_request(&mut self, status: u16) {
         self.log.term = Some(*b"PR");
         self.req.clear();
         self.txn = Some(HttpTxn::failed(status));
