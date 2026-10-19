@@ -125,11 +125,15 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) {
     if need * 2 <= crate::buf::get_bufsize_small() && sess.htx_buf.raw_slice().is_empty() {
         sess.htx_buf = Buf::unallocated(crate::buf::BufClass::Small);
     }
-    let raw = sess.htx_buf.raw_slice_mut();
+    let raw = sess.htx_buf.htx_slice_mut();
     let mut slice = ibex_proto::htx::HtxSlice::new(raw);
-    if p_stream.parse(&d.head, &mut slice).is_ok() {
-        sess.htx_tail = slice.tail_addr();
-        sess.htx_blocks = slice.num_blocks();
+    let parsed = p_stream.parse(&d.head, &mut slice).is_ok();
+    let (tail, blocks) = (slice.tail_addr(), slice.num_blocks());
+    // What a refused head wrote is zeroed on release like the rest (`tune.ibex.zero-buffers`).
+    sess.htx_buf.note_htx(tail, blocks * ibex_proto::htx::HTX_DESC_SIZE);
+    if parsed {
+        sess.htx_tail = tail;
+        sess.htx_blocks = blocks;
         sess.has_htx = true;
         sess.htx_modified = false;
     }

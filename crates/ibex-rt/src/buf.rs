@@ -413,6 +413,26 @@ fn alloc_large() -> Box<[u8]> {
     }
 }
 
+/// The `lo` value when no descriptors were written.
+const NO_LO: u32 = u32::MAX;
+
+/// Zeroes `0..hwm` and `lo..` of `data` (see `Buf`'s `hwm` and `lo`).
+fn wipe_marked(data: &mut [u8], hwm: u32, lo: u32) {
+    let n = (hwm as usize).min(data.len());
+    if n > 0 {
+        ibex_alloc::wipe(&mut data[..n]);
+    }
+    if (lo as usize) < data.len() {
+        ibex_alloc::wipe(&mut data[(lo as usize).max(n)..]);
+    }
+}
+
+/// An offset as kept in the high-water marks (4 bytes each, the buffers being far smaller):
+/// one that does not fit is `u32::MAX`, which zeroes to the end, never too little.
+fn to_mark(v: usize) -> u32 {
+    u32::try_from(v).unwrap_or(u32::MAX)
+}
+
 /// [`Buf::eoh`] not looked for since the bytes last changed.
 const EOH_UNKNOWN: u32 = 0;
 /// [`Buf::eoh`] looked for and not found. An end found has `e - 1` in the low two bits,
@@ -451,6 +471,13 @@ pub struct Buf {
     data: Box<[u8]>,
     head: usize,
     len: usize,
+    /// High-water mark: no byte at or past it was ever written, so releasing the buffer
+    /// zeroes `0..hwm` only (`tune.ibex.zero-buffers`, T437 5b). Raised by every method
+    /// that makes bytes readable; [`Self::raw_slice_mut`] raises it to the capacity.
+    hwm: u32,
+    /// The HTX layout keeps its block descriptors at the end of the memory: the lowest
+    /// offset written there (`usize::MAX`: none). Released, `lo..` is zeroed as well.
+    lo: u32,
     class: BufClass,
     /// [`crate::proxy::find_eoh`] of [`Self::readable`], once read: the head is looked up by
     /// several stages of a request and of a response (T433). Every `&mut self` method
@@ -465,6 +492,9 @@ impl Drop for Buf {
         if self.data.is_empty() {
             return;
         }
+        // The plaintext of this owner must not be what the next one reads (or what is left
+        // in the heap): zero what was written, before the box is pooled or freed.
+        self.wipe_used();
         match self.class {
             BufClass::Standard => {
                 let data = std::mem::replace(&mut self.data, Box::new([]));
@@ -546,6 +576,44 @@ impl Default for Buf {
 }
 
 impl Buf {
+    /// Zeroes the bytes that were written (`0..hwm`) when `tune.ibex.zero-buffers` is on.
+    #[inline]
+    fn wipe_used(&mut self) {
+        wipe_marked(&mut self.data, self.hwm, self.lo);
+        self.hwm = 0;
+        self.lo = NO_LO;
+    }
+
+    /// The memory for an HTX written by the caller, whose layout is `tail` bytes of data
+    /// from the front and descriptors from the end. Unlike [`Self::raw_slice_mut`] it does
+    /// not count the whole capacity as written: the caller says what it wrote with
+    /// [`Self::note_htx`], after each use, or the bytes stay when the buffer is released.
+    #[must_use]
+    pub fn htx_slice_mut(&mut self) -> &mut [u8] {
+        self.eoh.set(EOH_UNKNOWN);
+        self.alloc_if_needed();
+        &mut self.data
+    }
+
+    /// Records that an HTX of `tail` data bytes and `desc_bytes` of descriptors is in the
+    /// memory ([`Self::htx_slice_mut`]).
+    pub fn note_htx(&mut self, tail: usize, desc_bytes: usize) {
+        self.hwm = self.hwm.max(to_mark(tail.min(self.data.len())));
+        self.lo = self.lo.min(to_mark(self.data.len().saturating_sub(desc_bytes)));
+    }
+
+    /// Raises the high-water mark to the end of the data.
+    #[inline]
+    fn mark(&mut self) {
+        self.hwm = self.hwm.max(to_mark(self.head + self.len));
+    }
+
+    /// Puts `new` in place of the memory, zeroing what was written to the old one first.
+    fn replace_data(&mut self, new: Box<[u8]>) {
+        self.wipe_used();
+        self.data = new;
+    }
+
     /// Allocates a standard-size buffer from the thread-local pool.
     #[must_use]
     pub fn standard() -> Self {
@@ -553,6 +621,8 @@ impl Buf {
             data: alloc_standard(),
             head: 0,
             len: 0,
+            hwm: 0,
+            lo: NO_LO,
             class: BufClass::Standard,
 
             eoh: Cell::new(EOH_UNKNOWN),
@@ -566,6 +636,8 @@ impl Buf {
             data: alloc_small(),
             head: 0,
             len: 0,
+            hwm: 0,
+            lo: NO_LO,
             class: BufClass::Small,
 
             eoh: Cell::new(EOH_UNKNOWN),
@@ -579,6 +651,8 @@ impl Buf {
             data: alloc_large(),
             head: 0,
             len: 0,
+            hwm: 0,
+            lo: NO_LO,
             class: BufClass::Large,
 
             eoh: Cell::new(EOH_UNKNOWN),
@@ -599,6 +673,8 @@ impl Buf {
                 data: vec![0u8; cap].into_boxed_slice(),
                 head: 0,
                 len: 0,
+                hwm: 0,
+                lo: NO_LO,
                 class: BufClass::Custom,
 
                 eoh: Cell::new(EOH_UNKNOWN),
@@ -611,7 +687,7 @@ impl Buf {
     /// none.
     #[must_use]
     pub fn unallocated(class: BufClass) -> Self {
-        Buf { data: Box::new([]), head: 0, len: 0, class, eoh: Cell::new(EOH_UNKNOWN) }
+        Buf { data: Box::new([]), head: 0, len: 0, hwm: 0, lo: NO_LO, class, eoh: Cell::new(EOH_UNKNOWN) }
     }
 
     /// Whether the buffer holds memory now.
@@ -682,7 +758,10 @@ impl Buf {
             let valid = &self.data[self.head..self.head + self.len];
             new_data[..self.len].copy_from_slice(valid);
         }
-        let old_small = std::mem::replace(&mut self.data, new_data);
+        let mut old_small = std::mem::replace(&mut self.data, new_data);
+        wipe_marked(&mut old_small, self.hwm, self.lo);
+        self.lo = NO_LO;
+        self.hwm = to_mark(self.len);
         self.head = 0;
         self.class = BufClass::Standard;
 
@@ -725,6 +804,7 @@ impl Buf {
         let start = self.head + self.len;
         self.data[start..start + to_write].copy_from_slice(&bytes[..to_write]);
         self.len += to_write;
+        self.mark();
         to_write == bytes.len()
     }
 
@@ -769,6 +849,7 @@ impl Buf {
     pub fn raw_slice_mut(&mut self) -> &mut [u8] {
         self.eoh.set(EOH_UNKNOWN);
         self.alloc_if_needed();
+        self.hwm = to_mark(self.data.len());
         &mut self.data
     }
 
@@ -863,6 +944,7 @@ impl Buf {
             "commit({n}) past end of buffer"
         );
         self.len += n;
+        self.mark();
     }
 
     /// Discards `n` bytes from the front.
@@ -905,8 +987,9 @@ impl Buf {
         if min > self.data.len() {
             let mut bigger = vec![0u8; min].into_boxed_slice();
             bigger[..self.len].copy_from_slice(&self.data[self.head..self.head + self.len]);
-            self.data = bigger;
+            self.replace_data(bigger);
             self.head = 0;
+            self.hwm = to_mark(self.len);
         } else if self.head > 0 {
             self.data.copy_within(self.head..self.head + self.len, 0);
             self.head = 0;
@@ -930,13 +1013,14 @@ impl Buf {
             let mut bigger = vec![0u8; needed].into_boxed_slice();
             bigger[new_data.len()..].copy_from_slice(&self.data[rem_src..rem_src + rem_len]);
             bigger[..new_data.len()].copy_from_slice(new_data);
-            self.data = bigger;
+            self.replace_data(bigger);
         } else {
             self.data.copy_within(rem_src..rem_src + rem_len, new_data.len());
             self.data[..new_data.len()].copy_from_slice(new_data);
         }
         self.head = 0;
         self.len = needed;
+        self.mark();
     }
 
     /// Injects or updates an HTTP header in the readable portion of the buffer.
@@ -952,6 +1036,7 @@ impl Buf {
             ibex_proto::inject_http_header_with_len(&mut self.data, self.len, name, value)
         {
             self.len = new_len;
+            self.mark();
             true
         } else {
             false
