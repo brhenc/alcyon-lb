@@ -361,6 +361,10 @@ const FORMS: &[Row] = &[
     ("set-header", "query()", 0, ""),
     ("set-header", "ssl_f_s_dn(CN,1,xx)", 1, "invalid args in fetch method 'ssl_f_s_dn' : only rfc2253 or a blank value are currently supported as the format argument."),
     ("set-header", "ssl_f_s_dn(CN,1,rfc2253)", 0, ""),
+    // T430 row 22: an empty middle argument is refused, an explicit 0 is not.
+    ("set-header", "ssl_f_s_dn(,,rfc2253)", 1, "fetch method 'ssl_f_s_dn' : expected ')' before ',rfc2253)'"),
+    ("set-header", "ssl_f_s_dn(CN,,rfc2253)", 1, "fetch method 'ssl_f_s_dn' : expected ')' before ',rfc2253)'"),
+    ("set-header", "ssl_f_s_dn(,0,rfc2253)", 0, ""),
     ("set-header", "str(a),add_item(;,,)", 1, "invalid args in converter 'add_item' : one of the optional arguments has to be nonempty"),
     ("set-header", "str(a),be2hex(:,1,2)", 1, "invalid args in converter 'be2hex' : Unsupported truncate value (2)"),
     ("set-header", "str(a),when(acl)", 1, "invalid args in converter 'when' : 'acl' selector requires an extra argument with the ACL name"),
