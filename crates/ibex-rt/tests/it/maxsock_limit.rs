@@ -68,6 +68,15 @@ fn holding_backend() -> (SocketAddr, Arc<AtomicUsize>) {
 }
 
 fn spawn(h2: SocketAddr, h1: SocketAddr, be: SocketAddr) -> Ibex {
+    spawn_with(env!("CARGO_BIN_EXE_ibex"), false, h2, h1, be)
+}
+
+/// The descriptor a launcher leaves open, without CLOEXEC, in the tests that inherit one.
+const INHERITED_FD: usize = 2000;
+
+/// `bin` with `-f` on this file's config; `inherit` starts it from `bash` with `INHERITED_FD`
+/// open on /dev/null (what `dup2` in a pre_exec does; the crate forbids `unsafe`).
+fn spawn_with(bin: &str, inherit: bool, h2: SocketAddr, h1: SocketAddr, be: SocketAddr) -> Ibex {
     let dir = std::env::temp_dir().join(format!("ibex_maxsock_{}_{}", std::process::id(), h2.port()));
     std::fs::create_dir_all(&dir).expect("mkdir");
     let sock = dir.join("sock");
@@ -80,7 +89,14 @@ fn spawn(h2: SocketAddr, h1: SocketAddr, be: SocketAddr) -> Ibex {
         sock.display()
     );
     std::fs::write(dir.join("cfg"), cfg).expect("cfg");
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+    let mut cmd = if inherit {
+        let mut c = Command::new("bash");
+        c.arg("-c").arg(format!("exec {INHERITED_FD}</dev/null; exec \"$0\" \"$@\"")).arg(bin);
+        c
+    } else {
+        Command::new(bin)
+    };
+    let child = cmd
         .arg("-f")
         .arg(dir.join("cfg"))
         .stdout(Stdio::null())
@@ -227,4 +243,54 @@ fn a_client_past_maxsock_is_closed_and_served_once_descriptors_free_up() {
         after = h1_get(h1);
     }
     assert_eq!(after, "HTTP/1.1 200 OK", "not served within 20 s of the descriptors being released");
+}
+
+/// (`Maxsock`, `Ulimit-n`) from `show info` on the stats socket in `dir`.
+fn info_limits(dir: &std::path::Path) -> (String, String) {
+    use std::os::unix::net::UnixStream;
+    let mut s = UnixStream::connect(dir.join("sock")).expect("stats socket");
+    s.write_all(b"show info\n").expect("write");
+    let mut out = String::new();
+    s.read_to_string(&mut out).expect("read");
+    let field = |k: &str| out.lines().find_map(|l| l.strip_prefix(k)).unwrap_or("").trim().to_string();
+    (field("Maxsock:"), field("Ulimit-n:"))
+}
+
+/// What `bin` does with `INHERITED_FD` open at start: `(Maxsock, Ulimit-n, descriptors other than
+/// the inherited one, server connections, 503 seen)` with 100 held h2 streams.
+fn inherited_run(bin: &str) -> ((String, String), usize, usize, bool) {
+    let (h2, h1) = (common::reserve_addr(), common::reserve_addr());
+    let (be, accepted) = holding_backend();
+    let ibex = spawn_with(bin, true, h2, h1, be);
+    assert!(common::wait_listening(h2) && common::wait_listening(h1), "{bin} never listened");
+    let limits = info_limits(&ibex.dir);
+    let mut s = hold_streams(h2);
+    let (_, saw_503) = answers_until(&mut s, Duration::from_secs(30), 50);
+    let pid = ibex.child.id();
+    let open = std::fs::read_dir(format!("/proc/{pid}/fd")).expect("fd dir").flatten().filter(|e| e.file_name().to_str() != Some("2000")).count();
+    (limits, open, accepted.load(Ordering::SeqCst), saw_503)
+}
+
+/// `HAProxy`'s `maxsock` is what the configuration sizes, not what it found open: with a
+/// descriptor at 2000 inherited, `Maxsock` is still 46, the sockets stay under it and the
+/// streams that cannot connect get a 503 (measured on 3.5-dev8-885761-29, T438).
+#[test]
+fn an_inherited_high_descriptor_does_not_raise_the_ceiling() {
+    let ((maxsock, ulimit), open, servers, saw_503) = inherited_run(env!("CARGO_BIN_EXE_ibex"));
+    assert_eq!((maxsock.as_str(), ulimit.as_str()), ("46", "46"), "Maxsock / Ulimit-n");
+    assert!(open <= MAXSOCK, "{open} descriptors open besides the inherited one, maxsock {MAXSOCK}");
+    assert!(servers < MAXSOCK && saw_503, "{servers} server connections (503 seen: {saw_503})");
+}
+
+/// The oracle, started the same way: what the test above asserts of Ibex.
+#[test]
+fn oracle_with_an_inherited_high_descriptor_keeps_its_ceiling() {
+    let haproxy = "/home/bhenc/reference/haproxy/haproxy";
+    if !std::path::Path::new(haproxy).exists() {
+        return;
+    }
+    let ((maxsock, ulimit), open, servers, saw_503) = inherited_run(haproxy);
+    assert_eq!((maxsock.as_str(), ulimit.as_str()), ("46", "46"), "Maxsock / Ulimit-n");
+    assert!(open <= MAXSOCK, "{open} descriptors open besides the inherited one");
+    assert!(servers < MAXSOCK && saw_503, "{servers} server connections (503 seen: {saw_503})");
 }
