@@ -236,6 +236,13 @@ impl Slot {
     /// sample's own allocation becomes the buffer, and a borrowed one is copied after a
     /// `try_reserve` (on failure the variable becomes a `bool`).
     fn set(&mut self, v: In<'_>) {
+        // A text sample is copied in like a borrowed one, and its string given back for the
+        // next fetch (T437): the buffer keeps its capacity from one value to the next.
+        if let In::Owned(smp @ Sample::Str(_)) = v {
+            self.set(In::Ref(&smp));
+            crate::spare::give_sample(smp);
+            return;
+        }
         let (val, bytes): (Val, Bytes<'_>) = match v {
             In::Owned(s) => match s {
                 Sample::Bool(b) => (Val::Bool(b), Bytes::None),

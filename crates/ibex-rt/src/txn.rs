@@ -1293,21 +1293,30 @@ pub fn scan_connection(head: &[u8]) -> ConnScan {
 /// [`rewrite_response_connection`] on a list of headers.
 pub fn apply_response_connection(hdrs: &mut Vec<(String, String)>, rsp_http11: bool, close: bool, req_http11: bool, tunnel: bool) {
     let mut tokens = ConnTokens::default();
-    hdrs.retain_mut(|(k, v)| {
+    // A header that goes gives its strings back for reuse (T437).
+    let mut i = 0;
+    while i < hdrs.len() {
+        let (k, v) = &mut hdrs[i];
         if !k.eq_ignore_ascii_case("connection") {
-            return true;
+            i += 1;
+            continue;
         }
         match clean_connection_value(v, false, &mut tokens) {
             Some(c) => {
-                *v = c;
-                true
+                v.clear();
+                v.push_str(&c);
+                i += 1;
             }
-            None => false,
+            None => {
+                let (k, v) = hdrs.remove(i);
+                crate::reuse::give(k);
+                crate::reuse::give(v);
+            }
         }
-    });
+    }
     if !tunnel {
         if let Some(tok) = response_connection_token(close, rsp_http11, req_http11, tokens.upgrade) {
-            hdrs.push(("Connection".to_string(), tok.to_string()));
+            hdrs.push((crate::reuse::string_from("Connection"), crate::reuse::string_from(tok)));
         }
     }
 }

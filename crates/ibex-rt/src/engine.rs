@@ -10178,7 +10178,13 @@ impl EngineDispatcher<'_> {
             None => return,
         };
         let hdr_bytes = &entry.sess.rep.readable()[..total_hdr_len];
-        let hdr_str = ibex_regex::bytetext::bytes_to_text(hdr_bytes);
+        // The head as text, the status line's parts and the header list are per-thread strings
+        // given back at the end (T437).
+        let mut hdr_str = crate::reuse::PString::new();
+        match std::str::from_utf8(hdr_bytes) {
+            Ok(t) if !ibex_regex::bytetext::has_escapes(t) => hdr_str.push_str(t),
+            _ => hdr_str.push_str(&ibex_regex::bytetext::bytes_to_text(hdr_bytes)),
+        }
 
         // Bare-LF line ends are a head too (`find_eoh` accepts them, as HAProxy's parser
         // does); split only on CRLF, such a head skipped every rule.
@@ -10188,26 +10194,33 @@ impl EngineDispatcher<'_> {
         };
 
         let mut status: u16 = 200;
-        let mut proto_version = "HTTP/1.1".to_string();
-        let mut status_msg = "OK".to_string();
-        let parts: Vec<&str> = first_line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            proto_version = parts[0].to_string();
-            if let Ok(st) = parts[1].parse::<u16>() {
+        let mut proto_version = crate::reuse::PString::of("HTTP/1.1");
+        let mut status_msg = crate::reuse::PString::of("OK");
+        let mut parts = first_line.split_whitespace();
+        if let (Some(p0), Some(p1)) = (parts.next(), parts.next()) {
+            proto_version.clear();
+            proto_version.push_str(p0);
+            if let Ok(st) = p1.parse::<u16>() {
                 status = st;
             }
-            if parts.len() >= 3 {
-                status_msg = parts[2..].join(" ");
+            // The reason's words, one space between each.
+            if let Some(w) = parts.next() {
+                status_msg.clear();
+                status_msg.push_str(w);
+                for w in parts {
+                    status_msg.push(' ');
+                    status_msg.push_str(w);
+                }
             }
         }
 
-        let mut hdrs: Vec<(String, String)> = Vec::new();
+        let mut hdrs = crate::reuse::PPairs::new();
         for line in rest_headers.lines() {
             if line.is_empty() {
                 break;
             }
             if let Some((k, v)) = line.split_once(':') {
-                hdrs.push((k.trim().to_string(), v.trim().to_string()));
+                hdrs.push((crate::reuse::string_from(k.trim()), crate::reuse::string_from(v.trim())));
             }
         }
 
@@ -10216,7 +10229,7 @@ impl EngineDispatcher<'_> {
         // `t_data - t_connect` (`smp_fetch_reX_timers`).
         let tr = entry.sess.log.data.zip(entry.sess.log.connect).map(|(d, c)| d.saturating_duration_since(c).as_millis());
         CURRENT_RES_TR.set(tr.map_or(-1, |ms| i64::try_from(ms).unwrap_or(i64::MAX)));
-        CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+        CURRENT_RES_HEADERS.with(|h| crate::reuse::copy_pairs(&mut h.borrow_mut(), &hdrs));
         // `HAProxy` caps `tune.maxrewrite` at half the buffer (`src/haproxy.c`).
         let reserve = entry.sess.maxrewrite.min(entry.sess.bufsize / 2);
         let body_in_buf = entry.sess.rep.readable().len().saturating_sub(total_hdr_len);
@@ -10224,9 +10237,6 @@ impl EngineDispatcher<'_> {
 
         let registry = sample_registry();
 
-        let req_uri_clone = entry.sess.req_uri.as_deref().map(str::to_owned);
-        let req_method_clone = entry.sess.req_method.as_deref().map(str::to_owned);
-        let req_headers_clone = entry.sess.req_headers.clone();
         // The response capture slots the `http-response capture` rules write, and that the
         // context reads (as they were when the response came in).
         let mut res_caps = entry.sess.log.res_captures.clone();
@@ -10283,9 +10293,9 @@ impl EngineDispatcher<'_> {
             ssl_bc: entry.sess.srv_xprt.ssl_facts(),
             htx: None,
             htx_slice,
-            req_uri: req_uri_clone.as_deref(),
-            req_method: req_method_clone.as_deref(),
-            req_headers: req_headers_clone.as_deref(),
+            req_uri: entry.sess.req_uri.as_deref(),
+            req_method: entry.sess.req_method.as_deref(),
+            req_headers: entry.sess.req_headers.as_deref(),
             fe_name: Some(&proxies[fe_idx].name),
             fe_id: Some(proxies[fe_idx].ids.iid),
             be_name: Some(&proxies[be_idx].name),
@@ -10353,7 +10363,7 @@ impl EngineDispatcher<'_> {
             // as HTTP (`AN_RES_INSPECT` ahead of `AN_RES_WAIT_HTTP`), so its status and
             // headers are not there to fetch until they are done.
             CURRENT_RES_STATUS.set(0);
-            CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clear());
+            CURRENT_RES_HEADERS.with(|h| crate::reuse::clear_pairs(&mut h.borrow_mut()));
             let tcp_ctx = SampleContext { res_version: None, ..ctx.clone() };
             // `tcp-response inspect-delay` runs from the first pass over the head; with none,
             // the rules cannot wait (`tcp_inspect_response`).
@@ -10409,7 +10419,7 @@ impl EngineDispatcher<'_> {
                 }
             }
             CURRENT_RES_STATUS.set(status);
-            CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+            CURRENT_RES_HEADERS.with(|h| crate::reuse::copy_pairs(&mut h.borrow_mut(), &hdrs));
 
             // 1. The backend's `http-response` rules, then the frontend's when it is another
             // proxy; an `allow` ends only its own list.
@@ -10509,7 +10519,7 @@ impl EngineDispatcher<'_> {
                 if let Some(txn) = entry.sess.txn.as_mut() {
                     txn.ck.sck = sck;
                 }
-                CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = hdrs.clone());
+                CURRENT_RES_HEADERS.with(|h| crate::reuse::copy_pairs(&mut h.borrow_mut(), &hdrs));
             }
 
             // `option checkcache`: a response that may be stored by a cache and sets a cookie is
@@ -10608,7 +10618,7 @@ impl EngineDispatcher<'_> {
                     // The server's response is already truncated when the reply is built
                     // (`http_reply_message`): its status and headers fetch as nothing.
                     CURRENT_RES_STATUS.set(0);
-                    CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clear());
+                    CURRENT_RES_HEADERS.with(|h| crate::reuse::clear_pairs(&mut h.borrow_mut()));
                     let res_ctx = SampleContext { res_version: None, ..ctx.clone() };
                     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
                     let raw: Vec<u8> = match resolve_error_body(&proxies[be_idx], &proxies[entry.proxy_idx], status, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref()) {
@@ -10644,8 +10654,11 @@ impl EngineDispatcher<'_> {
         // The same `Connection` handling as without rules, on the headers the rules left.
         crate::txn::apply_response_connection(&mut hdrs, srv_http11, client_close, req_http11, tunnel || status < 100);
 
-        let mut new_hdr = format!("{proto_version} {status} {status_msg}\r\n");
-        for (k, v) in hdrs {
+        // The head written again into the string it was read from.
+        let mut new_hdr = hdr_str;
+        new_hdr.clear();
+        let _ = write!(new_hdr, "{} {status} {}\r\n", &*proto_version, &*status_msg);
+        for (k, v) in hdrs.iter() {
             let _ = write!(new_hdr, "{k}: {v}\r\n");
         }
         new_hdr.push_str("\r\n");
@@ -11393,13 +11406,16 @@ impl EngineDispatcher<'_> {
                         // reads `txn.sess_term_state` sees `LR`.
                         sess.log.term.get_or_insert(*b"LR");
                         let body = resolve_error_body(&proxies[pages_idx], &proxies[proxy_idx], *status, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref());
-                        let full_resp: Vec<u8> = match body {
-                            ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
-                            ResolvedErrorBody::Custom { content_type, lf_string } => {
-                                build_templated_error_response(*status, content_type, lf_string, &make_ctx!(sess), registry)
+                        // Built in a per-thread buffer that is reused (T437).
+                        crate::reuse::with_bytes(|full_resp| {
+                            match body {
+                                ResolvedErrorBody::Raw(bytes) => send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, bytes),
+                                ResolvedErrorBody::Custom { content_type, lf_string } => {
+                                    build_templated_error_response_into(full_resp, *status, content_type, lf_string, &make_ctx!(sess), registry);
+                                    send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, full_resp);
+                                }
                             }
-                        };
-                        send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &full_resp);
+                        });
                         return Ok(RuleFlow::Replied);
                     }
                     // `use-service prometheus-exporter`: the metrics page answers the request and
@@ -11826,14 +11842,21 @@ impl EngineDispatcher<'_> {
                     ibex_config::HttpReqAction::SetHeader { name, fmt } => {
                         // A header that does not fit fails the request in strict mode and is
                         // skipped otherwise (`fail_rewrite`).
-                        let val = format_http_string(fmt, &make_ctx!(sess), registry);
-                        if !req_rule_header(sess, name, &val, true) && STRICT_MODE.get() {
+                        // The value is rendered into a per-thread string (T437).
+                        let fits = crate::reuse::with_string(|val| {
+                            format_http_into(val, fmt, &make_ctx!(sess), registry);
+                            req_rule_header(sess, name, val, true)
+                        });
+                        if !fits && STRICT_MODE.get() {
                             return Err(500);
                         }
                     }
                     ibex_config::HttpReqAction::AddHeader { name, fmt } => {
-                        let val = format_http_string(fmt, &make_ctx!(sess), registry);
-                        if !req_rule_header(sess, name, &val, false) && STRICT_MODE.get() {
+                        let fits = crate::reuse::with_string(|val| {
+                            format_http_into(val, fmt, &make_ctx!(sess), registry);
+                            req_rule_header(sess, name, val, false)
+                        });
+                        if !fits && STRICT_MODE.get() {
                             return Err(500);
                         }
                     }
@@ -13017,61 +13040,111 @@ fn push_http_encoded(out: &mut String, v: &str) {
 }
 
 fn render_sample_format(fmt: &str, ctx: &SampleContext, registry: &Registry, http: bool) -> String {
-    let push = |out: &mut String, v: &str| if http { push_http_encoded(out, v) } else { out.push_str(v) };
     let mut out = String::with_capacity(fmt.len());
-    let mut chars = fmt.chars().peekable();
+    render_sample_format_into(&mut out, fmt, ctx, registry, http);
+    out
+}
 
-    while let Some(c) = chars.next() {
+/// [`format_http_string`] appended to `out`, which a caller reuses (T437: nothing allocated
+/// for a format whose samples are numbers, addresses or text).
+pub(crate) fn format_http_into(out: &mut String, fmt: &str, ctx: &SampleContext, registry: &Registry) {
+    render_sample_format_into(out, fmt, ctx, registry, true);
+}
+
+/// [`format_sample_string`] appended to `out`.
+pub(crate) fn format_sample_into(out: &mut String, fmt: &str, ctx: &SampleContext, registry: &Registry) {
+    render_sample_format_into(out, fmt, ctx, registry, false);
+}
+
+/// `smp` as [`sample_to_string`] writes it, appended to `out` through `push`, with no string
+/// of its own for a number, an address or a method.
+fn push_sample(out: &mut String, smp: &Sample, push: &dyn Fn(&mut String, &str)) {
+    use std::fmt::Write as _;
+    match smp {
+        Sample::Str(s) => push(out, s),
+        // Numbers, addresses and methods have no byte to encode.
+        Sample::Sint(n) => {
+            let _ = write!(out, "{n}");
+        }
+        Sample::Bool(b) => out.push(if *b { '1' } else { '0' }),
+        Sample::Ipv4(ip) => {
+            let _ = write!(out, "{ip}");
+        }
+        Sample::Ipv6(ip) => {
+            let _ = write!(out, "{ip}");
+        }
+        Sample::Meth(m) => out.push_str(m.as_str()),
+        Sample::Bin(b) => match std::str::from_utf8(b) {
+            Ok(t) if !ibex_regex::bytetext::has_escapes(t) => push(out, t),
+            _ => push(out, &ibex_regex::bytetext::bytes_to_text(b)),
+        },
+    }
+}
+
+fn render_sample_format_into(out: &mut String, fmt: &str, ctx: &SampleContext, registry: &Registry, http: bool) {
+    let push = |out: &mut String, v: &str| if http { push_http_encoded(out, v) } else { out.push_str(v) };
+    let mut chars = fmt.char_indices().peekable();
+
+    while let Some((_, c)) = chars.next() {
         if c == '%' {
-            if chars.peek() == Some(&'[') {
+            if chars.peek().map(|p| p.1) == Some('[') {
                 chars.next(); // consume '['
-                let mut expr_str = String::new();
+                // The expression is the text up to the matching `]`, borrowed from the format.
+                let start = chars.peek().map_or(fmt.len(), |p| p.0);
+                let mut end = fmt.len();
                 let mut depth = 1;
-                for ec in chars.by_ref() {
+                for (i, ec) in chars.by_ref() {
                     if ec == '[' {
                         depth += 1;
-                        expr_str.push(ec);
                     } else if ec == ']' {
                         depth -= 1;
                         if depth == 0 {
+                            end = i;
                             break;
                         }
-                        expr_str.push(ec);
-                    } else {
-                        expr_str.push(ec);
                     }
                 }
-                if let Ok(expr) = Expr::cached(&expr_str) {
+                let expr_str = &fmt[start..end];
+                if let Ok(expr) = Expr::cached(expr_str) {
                     if let Some(smp) = expr.eval_sample(registry, ctx) {
                         match &smp {
                             // Written as text, a binary is cast with `c_bin2str`: it ends at the
                             // first NUL.
                             Sample::Bin(b) => {
                                 let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
-                                push(&mut out, &ibex_regex::bytetext::bytes_to_text(&b[..end]));
+                                match std::str::from_utf8(&b[..end]) {
+                                    Ok(t) if !ibex_regex::bytetext::has_escapes(t) => push(out, t),
+                                    _ => push(out, &ibex_regex::bytetext::bytes_to_text(&b[..end])),
+                                }
                             }
-                            _ => push(&mut out, &sample_to_string(&smp)),
+                            _ => push_sample(out, &smp, &push),
                         }
+                        ibex_sample::spare::give_sample(smp);
                     }
                 }
-            } else if chars.peek() == Some(&'c') {
+            } else if chars.peek().map(|p| p.1) == Some('c') {
                 chars.next();
-                if chars.peek() == Some(&'i') {
+                if chars.peek().map(|p| p.1) == Some('i') {
                     chars.next();
-                    let ip = ctx.client_addr.map_or_else(|| "127.0.0.1".to_string(), |a| a.ip().to_string());
-                    out.push_str(&ip);
+                    match ctx.client_addr {
+                        Some(a) => {
+                            use std::fmt::Write as _;
+                            let _ = write!(out, "{}", a.ip());
+                        }
+                        None => out.push_str("127.0.0.1"),
+                    }
                 } else {
                     out.push_str("%c");
                 }
-            } else if chars.peek() == Some(&'T') {
+            } else if chars.peek().map(|p| p.1) == Some('T') {
                 chars.next();
-                if chars.peek() == Some(&'r') {
+                if chars.peek().map(|p| p.1) == Some('r') {
                     chars.next();
                     out.push_str("0ms");
                 } else {
                     out.push_str("%T");
                 }
-            } else if chars.peek() == Some(&'%') {
+            } else if chars.peek().map(|p| p.1) == Some('%') {
                 chars.next();
                 out.push('%');
             } else {
@@ -13081,7 +13154,6 @@ fn render_sample_format(fmt: &str, ctx: &SampleContext, registry: &Registry, htt
             out.push(c);
         }
     }
-    out
 }
 
 /// The wait of a `pause` rule, in ms: its fixed time, or what its expression gives (cast to
@@ -13446,10 +13518,19 @@ fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {
     sess.with_htx_mut(|htx| {
         let _ = htx.add_header(name, val);
     });
-    let mut hdrs = sess.req_headers.take().unwrap_or_default();
-    hdrs.push((name.to_string(), val.to_string()));
-    sess.req_headers = Some(hdrs);
+    if mirrors_req_headers(sess) {
+        let mut hdrs = sess.req_headers.take().unwrap_or_default();
+        hdrs.push((name.to_string(), val.to_string()));
+        sess.req_headers = Some(hdrs);
+    }
     rebuild_req_buffer(sess);
+}
+
+/// Whether the request's parsed header list (`req_headers`) follows its edits: when there is
+/// one (HTTP/2, or a rule that copied it out), or no HTX to edit. An HTTP/1 request that
+/// has its HTX is read and written from that alone, so its edits copy nothing (T437).
+fn mirrors_req_headers(sess: &TcpSession) -> bool {
+    sess.req_headers.is_some() || !sess.has_htx
 }
 
 /// What a pass over a list of `http-request` rules came to.
@@ -13562,19 +13643,24 @@ fn wait_for_request_body(
 
 fn del_req_header(sess: &mut TcpSession, name: &str) {
     // `-m beg|end|sub|reg` names a set of headers: remove each that matches.
-    let names: Vec<String> = if name.starts_with('\0') {
-        sess.htx_slice().map_or_else(Vec::new, |h| h.headers().map(|(k, _)| k.to_string()).filter(|k| header_name_matches(k, name)).collect())
+    if name.starts_with('\0') {
+        let names: Vec<String> =
+            sess.htx_slice().map_or_else(Vec::new, |h| h.headers().map(|(k, _)| k.to_string()).filter(|k| header_name_matches(k, name)).collect());
+        sess.with_htx_mut(|htx| {
+            for n in &names {
+                let _ = htx.remove_header(n);
+            }
+        });
     } else {
-        vec![name.to_string()]
-    };
-    sess.with_htx_mut(|htx| {
-        for n in &names {
-            let _ = htx.remove_header(n);
-        }
-    });
-    let mut hdrs = sess.req_headers.take().unwrap_or_default();
-    hdrs.retain(|(k, _)| !header_name_matches(k, name));
-    sess.req_headers = Some(hdrs);
+        sess.with_htx_mut(|htx| {
+            let _ = htx.remove_header(name);
+        });
+    }
+    if mirrors_req_headers(sess) {
+        let mut hdrs = sess.req_headers.take().unwrap_or_default();
+        hdrs.retain(|(k, _)| !header_name_matches(k, name));
+        sess.req_headers = Some(hdrs);
+    }
     rebuild_req_buffer(sess);
 }
 
@@ -14275,7 +14361,8 @@ fn res_action(
     // A rewrite that does not fit: the response fails in strict mode, and the rule is
     // skipped otherwise (`fail_rewrite`, `src/http_act.c`).
     let failed = || if STRICT_MODE.get() { Err(ResStop::Page(500)) } else { Ok(true) };
-    let publish = |hdrs: &Vec<(String, String)>| CURRENT_RES_HEADERS.with(|h| h.borrow_mut().clone_from(hdrs));
+    // The copy the fetches read follows the list, in the strings it has (T437).
+    let publish = |hdrs: &Vec<(String, String)>| CURRENT_RES_HEADERS.with(|h| crate::reuse::copy_pairs(&mut h.borrow_mut(), hdrs));
     let (act_name, act_fmt) = match op {
         ResOp::Return(status, content_type, lf_string, error_page) => {
             return Err(ResStop::Return {
@@ -14319,17 +14406,19 @@ fn res_action(
                 return Ok(true);
             }
             let freed: usize = hdrs.iter().filter(|(k, _)| header_name_matches(k, name)).map(|(k, v)| htx_hdr_size(k, v)).sum();
-            hdrs.retain(|(k, _)| !header_name_matches(k, name));
+            crate::reuse::retain_pairs(hdrs, |(k, _)| !header_name_matches(k, name));
             res_htx_resize(freed, 0);
             publish(hdrs);
             return Ok(true);
         }
         ResOp::Add(name, fmt) => {
-            let val = format_http_string(fmt, ctx, registry);
+            let mut val = crate::reuse::string();
+            format_http_into(&mut val, fmt, ctx, registry);
             if !htx_hdr_add(name, &val) {
+                crate::reuse::give(val);
                 return failed();
             }
-            hdrs.push((name.to_string(), val));
+            hdrs.push((crate::reuse::string_from(name), val));
             publish(hdrs);
             return Ok(true);
         }
@@ -14416,13 +14505,16 @@ fn res_action(
 
     // `set-header`: every occurrence goes, then one is added at the end
     // (`http_action_set_header`) -- the removal stays when the addition does not fit.
-    let val = format_http_string(act_fmt, ctx, registry);
+    let mut val = crate::reuse::string();
+    format_http_into(&mut val, act_fmt, ctx, registry);
     let freed: usize = hdrs.iter().filter(|(k, _)| k.eq_ignore_ascii_case(act_name)).map(|(k, v)| htx_hdr_size(k, v)).sum();
-    hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(act_name));
+    crate::reuse::retain_pairs(hdrs, |(k, _)| !k.eq_ignore_ascii_case(act_name));
     res_htx_resize(freed, 0);
     let fits = htx_hdr_add(act_name, &val);
     if fits {
-        hdrs.push((act_name.to_string(), val));
+        hdrs.push((crate::reuse::string_from(act_name), val));
+    } else {
+        crate::reuse::give(val);
     }
     publish(hdrs);
     if fits {
@@ -14683,8 +14775,9 @@ fn client_case_table(fe: &Proxy) -> Option<&std::collections::HashMap<String, St
 /// The reply the proxy generates as `HAProxy` sends it: header names in lower case, and the
 /// built-in 400 and 408 pages with `connection: close` after their other headers (a page
 /// from `errorfile` keeps the order of its file; the request-parsing path has its own).
-fn htx_reply(raw: &[u8]) -> Vec<u8> {
-    let mut out = raw.to_vec();
+/// Written into `out` (empty), which the caller reuses.
+fn htx_reply_into(raw: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(raw);
     let status = crate::txn::status_of(&String::from_utf8_lossy(&raw[..crate::proxy::find_eoh(raw).map_or(raw.len(), |(h, _)| h)]));
     if matches!(status, 400 | 408) && builtin_error_page(status) == Some(raw) {
         const CLOSE: &[u8] = b"Connection: close\r\n";
@@ -14696,14 +14789,18 @@ fn htx_reply(raw: &[u8]) -> Vec<u8> {
             out.splice(h..h, b"\r\nConnection: close".iter().copied());
         });
     }
-    lowercase_header_names(&mut out);
-    out
+    lowercase_header_names(out);
 }
 
 fn send_proxy_reply(sess: &mut TcpSession, proxies: &[Proxy], fe_idx: usize, be_idx: usize, raw: &[u8]) {
-    let mut raw = htx_reply(raw);
-    rewrite_header_names(&mut raw, client_case_table(&proxies[fe_idx]));
-    let raw = &raw[..];
+    // Written in a per-thread buffer, reused from one reply to the next (T437).
+    crate::reuse::with_bytes2(|buf| send_proxy_reply_in(sess, proxies, fe_idx, be_idx, raw, buf));
+}
+
+fn send_proxy_reply_in(sess: &mut TcpSession, proxies: &[Proxy], fe_idx: usize, be_idx: usize, raw: &[u8], buf: &mut Vec<u8>) {
+    htx_reply_into(raw, buf);
+    rewrite_header_names(buf, client_case_table(&proxies[fe_idx]));
+    let raw = &buf[..];
     if let Ok(out) = after_res_on_reply(sess, proxies, fe_idx, be_idx, raw) {
         sess.write_reply(&out);
         return;
@@ -14977,50 +15074,72 @@ fn build_templated_error_response(
     ctx: &SampleContext,
     registry: &Registry,
 ) -> Vec<u8> {
-    let mut custom_headers: Vec<(String, String)> = Vec::new();
-    let mut body_str = String::new();
+    let mut out = Vec::new();
+    build_templated_error_response_into(&mut out, status, content_type, lf_string, ctx, registry);
+    out
+}
 
-    if let Some(s) = lf_string {
-        let mut rest = s;
-        while let Some(stripped) = rest.strip_prefix("\0HDR:") {
-            if let Some((line, r)) = stripped.split_once('\n') {
-                if let Some((k, v)) = line.split_once(':') {
-                    let formatted_v = format_http_string(v, ctx, registry);
-                    custom_headers.push((k.to_string(), formatted_v));
-                }
+/// [`build_templated_error_response`] appended to `out`: the template is read where it is,
+/// and its formats rendered into per-thread scratch strings, so a reply built into a reused
+/// buffer allocates nothing (T437).
+fn build_templated_error_response_into(
+    out: &mut Vec<u8>,
+    status: u16,
+    content_type: Option<&str>,
+    lf_string: Option<&str>,
+    ctx: &SampleContext,
+    registry: &Registry,
+) {
+    use std::fmt::Write as _;
+    // The `hdr` lines as text (`name: value\r\n`, an empty value leaving its line out), then
+    // the body, in that order, as the formats are evaluated.
+    crate::reuse::with_string(|head| {
+        crate::reuse::with_string2(|body_str| {
+            let mut rest = lf_string.unwrap_or_default();
+            while let Some(stripped) = rest.strip_prefix("\0HDR:") {
+                let Some((line, r)) = stripped.split_once('\n') else { break };
                 rest = r;
-            } else {
-                break;
+                let Some((k, v)) = line.split_once(':') else { continue };
+                let mark = head.len();
+                head.push_str(k);
+                head.push_str(": ");
+                let at = head.len();
+                format_http_into(head, v, ctx, registry);
+                if head.len() == at {
+                    head.truncate(mark);
+                } else {
+                    head.push_str("\r\n");
+                }
             }
-        }
-        if let Some(b) = rest.strip_prefix("\0BODY:") {
-            body_str = format_sample_string(b, ctx, registry);
-        } else if !rest.starts_with('\0') {
-            body_str = format_sample_string(rest, ctx, registry);
-        }
-    }
-
-    // The config's escapes were decoded once, when it was read (`parse_line`); a second
-    // pass would turn a literal `\\n` into a newline, which `HAProxy` does not.
-    let body = ibex_regex::bytetext::text_to_bytes(&body_str);
-
-    let reason = status_reason(status);
-    let mut resp = format!("HTTP/1.1 {status} {reason}\r\n");
-    for (k, v) in custom_headers {
-        if !v.is_empty() {
-            let _ = write!(resp, "{k}: {v}\r\n");
-        }
-    }
-    // `content-length` before `content-type` (measured on 3.5-dev8), after the `hdr` lines.
-    let _ = write!(resp, "Content-Length: {}\r\n", body.len());
-    if let Some(ct) = content_type {
-        let _ = write!(resp, "Content-Type: {ct}\r\n");
-    }
-    resp.push_str("\r\n");
-
-    let mut full_resp = ibex_regex::bytetext::text_to_bytes(&resp).into_owned();
-    full_resp.extend_from_slice(&body);
-    full_resp
+            if lf_string.is_some() {
+                if let Some(b) = rest.strip_prefix("\0BODY:") {
+                    format_sample_into(body_str, b, ctx, registry);
+                } else if !rest.starts_with('\0') {
+                    format_sample_into(body_str, rest, ctx, registry);
+                }
+            }
+            // The config's escapes were decoded once, when it was read (`parse_line`); a second
+            // pass would turn a literal `\\n` into a newline, which `HAProxy` does not.
+            let body = ibex_regex::bytetext::text_to_bytes(body_str);
+            // The status line goes in front of the `hdr` lines: the head is written to `out`
+            // from text, in one piece.
+            let hdrs_len = head.len();
+            let _ = write!(head, "HTTP/1.1 {status} {}\r\n", status_reason(status));
+            let line = &head[hdrs_len..];
+            out.extend_from_slice(&ibex_regex::bytetext::text_to_bytes(line));
+            out.extend_from_slice(&ibex_regex::bytetext::text_to_bytes(&head[..hdrs_len]));
+            head.truncate(hdrs_len);
+            head.clear();
+            // `content-length` before `content-type` (measured on 3.5-dev8), after the `hdr` lines.
+            let _ = write!(head, "Content-Length: {}\r\n", body.len());
+            if let Some(ct) = content_type {
+                let _ = write!(head, "Content-Type: {ct}\r\n");
+            }
+            head.push_str("\r\n");
+            out.extend_from_slice(&ibex_regex::bytetext::text_to_bytes(head));
+            out.extend_from_slice(&body);
+        });
+    });
 }
 
 #[cfg(test)]

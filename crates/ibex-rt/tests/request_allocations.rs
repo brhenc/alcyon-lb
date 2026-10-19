@@ -723,7 +723,7 @@ fn set_var_on_a_keep_alive_request_allocates_nothing() {
 /// A keep-alive HTTP/1.1 server for `keepalive_proxied_allocations`: answers every head on every
 /// connection with a 2-byte body, from a fixed buffer, so the backend thread allocates nothing
 /// per request (the counter is process-wide).
-fn start_keepalive_backend(listener: TcpListener, running: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+fn start_keepalive_backend(listener: TcpListener, running: Arc<AtomicBool>, rsp: &'static [u8]) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         listener.set_nonblocking(true).expect("nonblocking");
         let mut conns: Vec<TcpStream> = Vec::with_capacity(8);
@@ -737,7 +737,7 @@ fn start_keepalive_backend(listener: TcpListener, running: Arc<AtomicBool>) -> t
                 // One head per read: the client sends the next request only after the response.
                 if let Ok(n) = s.read(&mut buf) {
                     if n > 0 && buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
-                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                        let _ = s.write_all(rsp);
                     }
                 }
             }
@@ -746,45 +746,60 @@ fn start_keepalive_backend(listener: TcpListener, running: Arc<AtomicBool>) -> t
     })
 }
 
-/// One request on the keep-alive `client`, the engine run until the response is back. Unlike
-/// `drive_keepalive_request` it does not idle the engine afterwards (each idle `run_once` sleeps
-/// up to 100 ms), and it reads into a fixed buffer: nothing here allocates.
-fn drive_proxied_request(client: &mut TcpStream, engine: &mut Engine) {
+/// One request on the keep-alive `client`, the engine run until a response starting with
+/// `status` and ending with `tail` is back. Unlike `drive_keepalive_request` it does not idle
+/// the engine afterwards (each idle `run_once` sleeps up to 100 ms), and it reads into a fixed
+/// buffer: nothing here allocates.
+fn drive_request_expecting(client: &mut TcpStream, engine: &mut Engine, status: &[u8], tail: &[u8]) {
     client.write_all(b"GET /api/test HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("write req");
     let start = Instant::now();
     let mut response = [0u8; 512];
     let mut len = 0;
-    while start.elapsed() < Duration::from_secs(2) && !response[..len].ends_with(b"\r\n\r\nok") {
+    while start.elapsed() < Duration::from_secs(2) && !response[..len].ends_with(tail) {
         let _ = engine.run_once();
         if let Ok(n) = client.read(&mut response[len..]) {
             len += n;
         }
     }
     let got = &response[..len];
-    assert!(got.starts_with(b"HTTP/1.1 200") && got.ends_with(b"\r\n\r\nok"), "response: {:?}", String::from_utf8_lossy(got));
+    assert!(got.starts_with(status) && got.ends_with(tail), "response: {:?}", String::from_utf8_lossy(got));
 }
 
 /// The allocations of `n` keep-alive requests on one client connection, proxied to a keep-alive
 /// server, after three warm-up requests.
 fn keepalive_proxied_allocations(n: usize) -> usize {
+    keepalive_allocations_with("", PLAIN_RSP, n, b"HTTP/1.1 200", b"\r\n\r\nok").0
+}
+
+/// The server's answer for most of these tests.
+const PLAIN_RSP: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+/// The answer of the server `measure-bench backend` (what the survey's load ran against), with a
+/// `Server` header for `del-header` to remove: its `Connection` is one the response rules take out.
+const BENCH_RSP: &[u8] = b"HTTP/1.1 200 OK\r\nServer: be\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+
+/// The allocations of `n` keep-alive requests on one client connection to a frontend with
+/// `fe_lines` (each line indented, newline-terminated) and a keep-alive server behind it, after
+/// three warm-up requests; every response must start with `status` and end with `tail`. The
+/// allocations, and the reallocations (a `malloc` too, to libc).
+fn keepalive_allocations_with(fe_lines: &str, rsp: &'static [u8], n: usize, status: &[u8], tail: &[u8]) -> (usize, usize) {
     let (srv, srv_addr) = loopback0();
     let (l, addr) = loopback0();
     drop(l);
     let running = Arc::new(AtomicBool::new(true));
-    let be = start_keepalive_backend(srv, Arc::clone(&running));
+    let be = start_keepalive_backend(srv, Arc::clone(&running), rsp);
     let cfg = format!(
         "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
-         frontend f\n  bind {addr}\n  default_backend b\nbackend b\n  server s1 {srv_addr}\n"
+         frontend f\n  bind {addr}\n{fe_lines}  default_backend b\nbackend b\n  server s1 {srv_addr}\n"
     );
     let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
     let mut client = TcpStream::connect(addr).expect("connect to frontend");
     client.set_nonblocking(true).expect("set_nonblocking");
     for _ in 0..3 {
-        drive_proxied_request(&mut client, &mut engine);
+        drive_request_expecting(&mut client, &mut engine, status, tail);
     }
     let before = ibex_alloc::alloc_counters();
     for _ in 0..n {
-        drive_proxied_request(&mut client, &mut engine);
+        drive_request_expecting(&mut client, &mut engine, status, tail);
     }
     let diff = before.diff(&ibex_alloc::alloc_counters());
     drop(client);
@@ -793,7 +808,7 @@ fn keepalive_proxied_allocations(n: usize) -> usize {
     }
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
-    diff.alloc_count
+    (diff.alloc_count, diff.realloc_count)
 }
 
 /// T436 A: a steady-state keep-alive request proxied to a server allocates nothing. Measured
@@ -807,4 +822,40 @@ fn a_proxied_keep_alive_request_allocates_nothing() {
     let many = keepalive_proxied_allocations(1100);
     println!("[MEASUREMENT T436 A] proxied keep-alive allocations: 100 requests {few}, 1100 requests {many}");
     assert_eq!(many, few, "1000 more keep-alive requests made {} more allocations", many as i64 - few as i64);
+}
+
+/// The ten request and response rules of the 2026-10-19 allocation survey (`rules.body` in
+/// `review/alloc-survey-2026-10-19`): header set/del/add, a `%[rand]` format, set-var, a
+/// `path_reg` and a `hdr` ACL, a deny that does not fire.
+const SURVEY_RULES: &str = "  acl api path_reg ^/(api|v[0-9]+)/\n  acl hosty hdr(host) -m sub local\n  \
+    http-request set-header X-Forwarded-Proto http\n  http-request del-header X-Junk\n  \
+    http-request add-header X-Id %[rand]\n  http-request set-var(txn.p) path\n  \
+    http-request deny if api !hosty\n  http-response set-header X-Served ibex\n  \
+    http-response del-header Server\n";
+
+/// T437 part 2: the survey's request and response rules allocate nothing per steady-state
+/// request. Measured before (2026-10-19, uprobe on malloc, main 2bec0ce1): 72.18 per request.
+#[test]
+fn request_and_response_rules_allocate_nothing_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let few = keepalive_allocations_with(SURVEY_RULES, BENCH_RSP, 100, b"HTTP/1.1 200", b"\r\n\r\nok");
+    let many = keepalive_allocations_with(SURVEY_RULES, BENCH_RSP, 1100, b"HTTP/1.1 200", b"\r\n\r\nok");
+    println!("[MEASUREMENT T437 rules] keep-alive (allocations, reallocations): 100 requests {few:?}, 1100 requests {many:?}");
+    // A reused string may still grow once while the strings settle into their roles (a
+    // reallocation in the first run, none in the next): what counts is that 1000 more requests
+    // add none.
+    assert!(many.0 == few.0 && many.1 <= few.1, "1000 more requests through the rules: (allocations, reallocations) {few:?} -> {many:?}");
+}
+
+/// T437 part 3: `http-request return` builds its reply without allocating per request.
+/// Measured before (2026-10-19, uprobe on malloc, main 2bec0ce1): 9.02 per request, 5 in
+/// `build_templated_error_response`.
+#[test]
+fn http_request_return_allocates_nothing_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let rules = "  option forwardfor\n  http-request return status 404 content-type text/plain string nope\n";
+    let few = keepalive_allocations_with(rules, PLAIN_RSP, 100, b"HTTP/1.1 404", b"\r\n\r\nnope");
+    let many = keepalive_allocations_with(rules, PLAIN_RSP, 1100, b"HTTP/1.1 404", b"\r\n\r\nnope");
+    println!("[MEASUREMENT T437 return] keep-alive (allocations, reallocations): 100 requests {few:?}, 1100 requests {many:?}");
+    assert!(many.0 == few.0 && many.1 <= few.1, "1000 more `return` replies: (allocations, reallocations) {few:?} -> {many:?}");
 }

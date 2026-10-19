@@ -332,25 +332,13 @@ impl Expr {
     /// Evaluates the expression against the sample context to produce a sample value.
     #[must_use]
     pub fn eval_sample(&self, registry: &Registry, ctx: &SampleContext) -> Option<Sample> {
-        let conv_refs: Vec<(&str, Vec<String>)> = self
-            .converters
-            .iter()
-            .map(|(name, args)| (name.as_str(), args.clone()))
-            .collect();
-
-        registry.eval(&self.fetch_name, &self.fetch_args, &conv_refs, ctx)
+        registry.eval_g(&self.fetch_name, &self.fetch_args, &self.converters, ctx)
     }
 
     /// Evaluates the expression against the sample context to produce all sample values.
     #[must_use]
     pub fn eval_all_samples(&self, registry: &Registry, ctx: &SampleContext) -> Vec<Sample> {
-        let conv_refs: Vec<(&str, Vec<String>)> = self
-            .converters
-            .iter()
-            .map(|(name, args)| (name.as_str(), args.clone()))
-            .collect();
-
-        registry.eval_all(&self.fetch_name, &self.fetch_args, &conv_refs, ctx)
+        registry.eval_all_g(&self.fetch_name, &self.fetch_args, &self.converters, ctx)
     }
 
     /// Evaluates the expression condition, returning `true` if the condition matches
@@ -361,20 +349,16 @@ impl Expr {
     }
 
     fn eval_line(&self, registry: &Registry, ctx: &SampleContext) -> bool {
-        let conv_refs: Vec<(&str, Vec<String>)> = self.converters.iter().map(|(name, args)| (name.as_str(), args.clone())).collect();
-        let samples = registry.eval_all_acl(&self.fetch_name, &self.fetch_args, &conv_refs, ctx);
-        if samples.is_empty() {
-            return false;
-        }
-        if let Some(ref matcher) = self.matcher {
-            samples.iter().any(|smp| matcher.matches(smp))
-        } else {
-            samples.iter().any(|smp| match smp {
+        // No list of the samples and no copy of the converters: each sample is matched as it
+        // comes (T437).
+        registry.any_acl(&self.fetch_name, &self.fetch_args, &self.converters, ctx, |smp| match self.matcher {
+            Some(ref matcher) => matcher.matches(smp),
+            None => match smp {
                 Sample::Bool(b) => *b,
                 Sample::Sint(i) => *i != 0,
                 _ => true,
-            })
-        }
+            },
+        })
     }
 }
 
