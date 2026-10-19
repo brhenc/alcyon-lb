@@ -223,6 +223,7 @@ mod logfmt;
 mod logfmt_unknown_fetch;
 mod log_format_arg_refusals;
 mod many_log_lines;
+mod missing_argument_texts;
 mod master_cli;
 mod maxconn_client_left;
 mod maxsock_limit;

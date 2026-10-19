@@ -414,7 +414,9 @@ impl Section<'_> {
                     } else {
                         e
                     };
-                    format!("error detected in {} while parsing '{kw} {action}' rule : {e}", self.what)
+                    // The `http-*` parsers end the text with a full stop (`memprintf("%s.")`).
+                    let stop = if kw.starts_with("http-") && !e.ends_with('.') { "." } else { "" };
+                    format!("error detected in {} while parsing '{kw} {action}' rule : {e}{stop}", self.what)
                 })?;
                 // A request rule has no response to read: its fetches would read the one of
                 // whatever stream ran last on the thread (T156); a response rule has no
