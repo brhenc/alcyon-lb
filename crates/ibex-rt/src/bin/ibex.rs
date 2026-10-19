@@ -574,6 +574,7 @@ enum Start {
 
 #[allow(clippy::too_many_lines)]
 fn main() {
+    ibex_rt::globalconn::record_inherited_fds();
     // A panic anywhere is a bug and takes the whole process down (T238).
     ibex_rt::crash::abort_on_panic();
     let raw_args: Vec<String> = env::args().collect();
