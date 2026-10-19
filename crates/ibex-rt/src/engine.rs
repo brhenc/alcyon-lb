@@ -600,10 +600,9 @@ impl IdlePool {
         };
         let Some(s) = pool.servers.get_mut(&srv) else { return false };
         let mut buf = [0u8; 4096];
-        if let Some(p) = s.conns.get_mut(pos) {
-            if matches!(p.conn.xprt.recv(p.conn.fd.as_fd(), &mut buf), Ok(raw::Io::WouldBlock)) {
-                return true;
-            }
+        let quiet = s.conns.get_mut(pos).is_some_and(|p| matches!(p.conn.xprt.recv(p.conn.fd.as_fd(), &mut buf), Ok(raw::Io::WouldBlock)));
+        if quiet {
+            return true;
         }
         let Some(p) = s.conns.remove(pos) else { return false };
         s.safe -= usize::from(p.safe);
@@ -15365,9 +15364,7 @@ mod idle_poll_tests {
                         got.extend_from_slice(&b[..n]);
                         while let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
                             got.drain(..end + 4);
-                            if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err() {
-                                return;
-                            }
+                            let Ok(()) = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") else { return };
                         }
                     }
                 });
@@ -15423,10 +15420,7 @@ mod idle_poll_tests {
 
     fn drive_until(e: &mut Engine, mut done: impl FnMut(&Engine) -> bool) -> bool {
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(5) {
-            if done(e) {
-                return true;
-            }
+        while !done(e) && start.elapsed() < Duration::from_secs(5) {
             let _ = e.run_once();
         }
         done(e)
@@ -15464,8 +15458,9 @@ mod idle_poll_tests {
     /// stayed until the 50 ms sweep peeked at it, or a request did.
     #[test]
     fn a_pooled_connection_its_server_closes_leaves_the_lists_at_the_event() {
-        let mut took = Vec::new();
-        for _ in 0..5 {
+        // Up to five tries, for a loaded host; the last one must see the close at once.
+        let mut took: Vec<Duration> = Vec::new();
+        while took.len() < 5 && took.last().is_none_or(|t| *t >= Duration::from_millis(30)) {
             let (srv, conns) = backend();
             let (mut e, fe) = engine(srv);
             let mut c = client(&mut e, fe);
@@ -15477,13 +15472,9 @@ mod idle_poll_tests {
             let closed = Instant::now();
             assert!(drive_until(&mut e, |e| e.idle_backend_pool.total() == 0), "never left the lists");
             assert_eq!(idle_count(&e.idle_backend_pool), 0, "the server's idle count");
-            let t = closed.elapsed();
-            if t < Duration::from_millis(30) {
-                return;
-            }
-            took.push(t);
+            took.push(closed.elapsed());
         }
-        panic!("the closed connection left the lists only after {took:?}, not at its event");
+        assert!(took.last().is_some_and(|t| *t < Duration::from_millis(30)), "the closed connection left the lists only after {took:?}, not at its event");
     }
 
     /// Nothing looks at the idle connections between their events: a worker holding one,
@@ -15542,6 +15533,30 @@ mod idle_poll_tests {
         assert!(drive_until(&mut b, |b| b.idle_backend_pool.total() == 1 && IdlePools::lock(&pools.slots[1]).conns == 1), "idle on worker 1");
         exchange(&mut b, &mut cb);
         assert!(conns.try_recv().is_err(), "still the one server connection");
+    }
+
+    /// A connection its owner's epoll set cannot be made to forget (`EPOLL_CTL_DEL` fails)
+    /// is closed, not used: the taker opens its own, and the closed one leaves the owner's
+    /// slot and its server's idle count.
+    #[test]
+    fn a_connection_that_cannot_leave_its_owners_epoll_is_closed_not_taken() {
+        let (srv, conns) = backend();
+        let pools = IdlePools::with(2, true);
+        let (mut a, fe_a) = engine_with(srv, Some(ibex_config::HttpReuse::Always));
+        let (mut b, fe_b) = engine_with(srv, Some(ibex_config::HttpReuse::Always));
+        a.share_idle_pools(&pools, 0);
+        b.share_idle_pools(&pools, 1);
+        let mut ca = client(&mut a, fe_a);
+        exchange(&mut a, &mut ca);
+        assert!(drive_until(&mut a, |a| a.idle_backend_pool.total() == 1), "idle on worker 0");
+        // Worker 0's slot names a descriptor that is not an epoll set.
+        let (not_epoll, _peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        IdlePools::lock(&pools.slots[0]).epfd = Some(Arc::new(OwnedFd::from(not_epoll)));
+        let mut cb = client(&mut b, fe_b);
+        exchange(&mut b, &mut cb);
+        assert!(conns.try_recv().is_ok() && conns.try_recv().is_ok(), "worker 1 opened its own server connection");
+        assert_eq!(IdlePools::lock(&pools.slots[0]).conns, 0, "the closed one left worker 0's slot");
+        assert!(drive_until(&mut b, |b| idle_count(&b.idle_backend_pool) == 1), "the server counts only worker 1's");
     }
 }
 

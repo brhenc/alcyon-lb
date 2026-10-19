@@ -77,14 +77,12 @@ impl Poller {
     /// not is taken out again.
     #[cfg(test)]
     pub(crate) fn is_registered(&self, fd: BorrowedFd<'_>) -> bool {
-        match epoll::add(self.epfd.as_fd(), fd, epoll::EventData::new_u64(0), epoll::EventFlags::empty()) {
-            Err(Errno::EXIST) => true,
-            Ok(()) => {
-                let _ = epoll::delete(self.epfd.as_fd(), fd);
-                false
-            }
-            Err(e) => panic!("epoll_ctl: {e}"),
+        let added = epoll::add(self.epfd.as_fd(), fd, epoll::EventData::new_u64(0), epoll::EventFlags::empty());
+        assert!(matches!(added, Ok(()) | Err(Errno::EXIST)), "epoll_ctl: {added:?}");
+        if added.is_ok() {
+            let _ = epoll::delete(self.epfd.as_fd(), fd);
         }
+        added.is_err()
     }
 
     fn flags(readable: bool, writable: bool) -> epoll::EventFlags {
@@ -256,6 +254,12 @@ mod tests {
         assert_eq!(poller.modify(fd, 1, true, false).unwrap_err().raw_os_error(), Some(Errno::PERM.raw_os_error()));
         assert_eq!(poller.modify(fd, 1, false, false).unwrap_err().raw_os_error(), Some(Errno::PERM.raw_os_error()));
         assert_eq!(poller.delete(fd).unwrap_err().raw_os_error(), Some(Errno::PERM.raw_os_error()));
+        let epfd = poller.shared_epfd();
+        assert_eq!(Poller::forget_in(epfd.as_fd(), fd).unwrap_err().raw_os_error(), Some(Errno::PERM.raw_os_error()));
+        // Another worker's epoll descriptor that is not one (T434: a steal whose DEL fails).
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert_eq!(Poller::forget_in(fd, a.as_fd()).unwrap_err().raw_os_error(), Some(Errno::INVAL.raw_os_error()));
+        Poller::forget_in(epfd.as_fd(), a.as_fd()).expect("not in the set is fine");
     }
 
     /// A descriptor that is not registered: waiting for nothing and deleting are no-ops,
