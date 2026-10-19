@@ -1321,6 +1321,86 @@ pub fn apply_response_connection(hdrs: &mut Vec<(String, String)>, rsp_http11: b
     }
 }
 
+/// What framed a message when `HAProxy` parsed it (T439): `H1_MF_CLEN`, a `Content-Length`
+/// and no `Transfer-Encoding`, and `H1_MF_CHNK`, a final `chunked`. It writes a framing
+/// header after the rules only if the message was framed by it (`h1_process_emit_headers`,
+/// `src/mux_h1.c`), and a message that has lost the one it was framed by is read again
+/// (`h1_make_eoh`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LenHdrs {
+    pub clen: bool,
+    pub chnk: bool,
+}
+
+impl LenHdrs {
+    /// What framed a response with headers `hdrs`, before its rules.
+    #[must_use]
+    pub fn of_response(hdrs: &[(String, String)]) -> Self {
+        match response_body_framing(hdrs.iter().map(|(k, v)| (k, v)), hdrs.iter().map(|(k, v)| (k, v))) {
+            Framing::Length(_) => LenHdrs { clen: true, chnk: false },
+            Framing::Chunked => LenHdrs { clen: false, chnk: true },
+            _ => LenHdrs::default(),
+        }
+    }
+}
+
+/// The `Connection` headers of a parsed message as `HAProxy` holds them for its rules: the
+/// `close` and `keep-alive` tokens taken out (`h1_parse_connection_header`), and a header
+/// left with nothing gone. A `close` in a `Connection` header after the rules is then one a
+/// rule wrote.
+pub fn strip_connection_tokens(hdrs: &mut Vec<(String, String)>) {
+    if !hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("connection")) {
+        return;
+    }
+    let mut tokens = ConnTokens::default();
+    // The strings of what goes are given back (T437), so a steady stream of responses with a
+    // `Connection` header allocates nothing here.
+    let mut i = 0;
+    while i < hdrs.len() {
+        if !hdrs[i].0.eq_ignore_ascii_case("connection") {
+            i += 1;
+            continue;
+        }
+        match clean_connection_value(&hdrs[i].1, false, &mut tokens) {
+            Some(c) => {
+                crate::reuse::give(std::mem::replace(&mut hdrs[i].1, c));
+                i += 1;
+            }
+            None => {
+                let (k, v) = hdrs.remove(i);
+                crate::reuse::give(k);
+                crate::reuse::give(v);
+            }
+        }
+    }
+}
+
+/// The response headers the rules left, read again as `HAProxy` writes them out
+/// (`h1_process_emit_headers`, `h1_make_eoh`, `h1_set_cli_conn_mode` in `src/mux_h1.c`): a
+/// `Transfer-Encoding` or `Content-Length` the response was not framed by (`was`) is not
+/// written, except a `Content-Length: 0` on a 1xx or a 204. True when the client connection
+/// is to close after it: the rules left it no length it had (`H1_MF_XFER_LEN` gone), or wrote
+/// a `close` (`H1_MF_CONN_CLO`).
+pub fn reread_response_after_rules(hdrs: &mut Vec<(String, String)>, was: LenHdrs, status: u16) -> bool {
+    let bodyless = status < 200 || status == 204;
+    let (mut cl, mut te, mut close) = (false, false, false);
+    hdrs.retain(|(k, v)| {
+        if k.eq_ignore_ascii_case("transfer-encoding") {
+            te |= was.chnk && !bodyless;
+            return was.chnk && !bodyless;
+        }
+        if k.eq_ignore_ascii_case("content-length") {
+            let keep = was.clen || (bodyless && v.trim() == "0");
+            cl |= keep;
+            return keep;
+        }
+        close |= k.eq_ignore_ascii_case("connection") && connection_has(v, "close");
+        true
+    });
+    let lost = (was.clen && !cl) || (was.chnk && !te && !cl);
+    close || lost
+}
+
 /// The head of a response with its `Connection` headers as `HAProxy` forwards them:
 /// `keep-alive` and `close` taken out of each, and the token the connection's state calls
 /// for ([`response_connection_token`]) added as a last header. `None` if the head stays as
@@ -1884,6 +1964,10 @@ pub struct HttpTxn {
     /// has been measured, or where it is not (an HTTP/2 client's request).
     pub req_htx: Option<u64>,
     pub rsp_htx: Option<u64>,
+    /// What framed the request and the response when they were parsed, read again after
+    /// their rules (T439); `None` for a request that did not come in HTTP/1.
+    pub req_len_hdrs: Option<LenHdrs>,
+    pub rsp_len_hdrs: LenHdrs,
     /// `http-request disable-l7-retry` ran for this request (`TX_D_L7_RETRY`).
     pub l7_off: bool,
     /// A retry on the server's answer (`retry-on <status>`): the request as it was sent.
@@ -1940,6 +2024,8 @@ impl HttpTxn {
             ck: crate::cookie::CookieTxn::default(),
             req_htx: None,
             rsp_htx: None,
+            req_len_hdrs: None,
+            rsp_len_hdrs: LenHdrs::default(),
             l7_off: false,
             l7: L7Retry::Off,
         }

@@ -35,6 +35,7 @@ pub mod spare;
 pub mod vars;
 
 pub use acls::Acls;
+pub use h1_clean::drop_items as h1_drop_items;
 pub use argspec::check_typed_expr;
 pub use auth::{set_userlists, AuthUser, AuthUserlist};
 pub use ibex_crypt::CryptHash;
