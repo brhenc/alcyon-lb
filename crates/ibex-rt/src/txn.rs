@@ -1383,21 +1383,40 @@ pub fn htx_response_head_cost(head: &[u8]) -> usize {
 }
 
 fn head_cost(head: &[u8], request: bool) -> usize {
-    head_cost_of(head, htx_head_size(head, request))
+    htx_head_cost_and_size_of(head, request).0
+}
+
+/// [`head_cost`] and [`htx_head_size`] of a head: an ASCII head in one walk over its lines
+/// (T433: the block count re-split every line the size had split), any other on its own.
+fn htx_head_cost_and_size_of(head: &[u8], request: bool) -> (usize, Option<u64>) {
+    if head.is_ascii() {
+        if let Some((size, headers)) = htx_head_size_and_headers_ascii(head, request) {
+            return (cost_of(usize::try_from(size).unwrap_or(usize::MAX), headers), Some(size));
+        }
+    }
+    let size = htx_head_size(head, request);
+    (head_cost_of(head, size), size)
+}
+
+/// The HTX cost of `data` bytes in `headers` header blocks, with the start line and the end
+/// of headers.
+fn cost_of(data: usize, headers: usize) -> usize {
+    data.saturating_add(40 + 8 * (2 + headers))
 }
 
 /// [`head_cost`] of a head whose [`htx_head_size`] is `size`.
+#[cold]
+#[inline(never)]
 fn head_cost_of(head: &[u8], size: Option<u64>) -> usize {
     // A `Connection` header left with no token is not in the HTX message at all, so it has
     // no block either (as `htx_head_size` leaves it out of the data).
-    let blocks = 2 + head
+    let headers = head
         .split(|&b| b == b'\n')
         .skip(1)
         .take_while(|l| !l.is_empty() && *l != b"\r")
         .filter(|l| !connection_emptied(l))
         .count();
-    let data = size.map_or(head.len(), |n| usize::try_from(n).unwrap_or(usize::MAX));
-    data.saturating_add(40 + 8 * blocks)
+    cost_of(size.map_or(head.len(), |n| usize::try_from(n).unwrap_or(usize::MAX)), headers)
 }
 
 /// Whether a header line is a `Connection` whose tokens are all ones HTX drops (`close`,
@@ -1435,8 +1454,13 @@ fn connection_emptied(line: &[u8]) -> bool {
 /// Returned with [`htx_head_size`] of the same head, read once.
 #[must_use]
 pub fn htx_head_cost_and_size(head: &[u8]) -> (usize, Option<u64>) {
-    let size = htx_head_size(head, true);
-    (head_cost_of(head, size), size)
+    htx_head_cost_and_size_of(head, true)
+}
+
+/// [`htx_response_head_cost`] and [`htx_head_size`] of a response head, read once.
+#[must_use]
+pub fn htx_response_head_cost_and_size(head: &[u8]) -> (usize, Option<u64>) {
+    htx_head_cost_and_size_of(head, false)
 }
 
 /// The size `HAProxy` gives a message head in its HTX representation, which is what `%U`
@@ -1459,6 +1483,13 @@ pub fn htx_head_size(head: &[u8], request: bool) -> Option<u64> {
 
 /// [`htx_head_size_general`] of an ASCII head, on its bytes.
 fn htx_head_size_ascii(head: &[u8], request: bool) -> Option<u64> {
+    htx_head_size_and_headers_ascii(head, request).map(|(size, _)| size)
+}
+
+/// [`htx_head_size_ascii`], with the number of header lines that keep a block in the HTX
+/// message: every line up to the blank one, but a `Connection` header left with no token
+/// (`connection_emptied`), which is gone from the message and from the data.
+fn htx_head_size_and_headers_ascii(head: &[u8], request: bool) -> Option<(u64, usize)> {
     let mut lines = head.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
     let first = lines.next()?;
     let strings = if request {
@@ -1473,10 +1504,12 @@ fn htx_head_size_ascii(head: &[u8], request: bool) -> Option<u64> {
         version.len() + status.len() + ascii_trim(reason).len()
     };
     let mut size = 20 + strings as u64 + 1;
+    let mut headers = 0;
     for line in lines {
         if line.is_empty() {
             break;
         }
+        headers += 1;
         let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
         let (name, value) = (ascii_trim_end(&line[..colon]), ascii_trim(&line[colon + 1..]));
         let len = if name.eq_ignore_ascii_case(b"connection") {
@@ -1495,6 +1528,7 @@ fn htx_head_size_ascii(head: &[u8], request: bool) -> Option<u64> {
             if !dropped {
                 value.len()
             } else if kept == 0 {
+                headers -= 1;
                 continue;
             } else {
                 chars + kept - 1
@@ -1504,7 +1538,7 @@ fn htx_head_size_ascii(head: &[u8], request: bool) -> Option<u64> {
         };
         size += (name.len() + len) as u64;
     }
-    Some(size)
+    Some((size, headers))
 }
 
 /// [`htx_head_size`] of any head.
@@ -2110,6 +2144,63 @@ mod tests {
         assert_eq!(response_framing(&h("Transfer-Encoding: gzip, chunked\r\n"), Some("GET"), 200), Framing::Chunked);
         assert_eq!(response_framing(&h("Transfer-Encoding: gzip\r\n"), Some("GET"), 200), Framing::UntilClose);
         assert_eq!(response_framing(&h(""), Some("GET"), 200), Framing::UntilClose);
+    }
+
+    /// The HTX cost of a head, as the separate size and block passes counted it before T433
+    /// fused them: the reference the one-pass accounting must keep giving.
+    fn reference_head_cost(head: &[u8], request: bool) -> usize {
+        fn emptied(line: &[u8]) -> bool {
+            let Some(colon) = line.iter().position(|&b| b == b':') else { return false };
+            if !ascii_trim_end(&line[..colon]).eq_ignore_ascii_case(b"connection") {
+                return false;
+            }
+            let mut any = false;
+            for t in line[colon + 1..].split(|&b| b == b',').map(ascii_trim).filter(|t| !t.is_empty()) {
+                if !(t.eq_ignore_ascii_case(b"close") || t.eq_ignore_ascii_case(b"keep-alive") || t.eq_ignore_ascii_case(b"upgrade")) {
+                    return false;
+                }
+                any = true;
+            }
+            any
+        }
+        let size = htx_head_size_general(head, request);
+        let blocks = 2 + head.split(|&b| b == b'\n').skip(1).take_while(|l| !l.is_empty() && *l != b"\r").filter(|l| !emptied(l)).count();
+        let data = size.map_or(head.len(), |n| usize::try_from(n).unwrap_or(usize::MAX));
+        data.saturating_add(40 + 8 * blocks)
+    }
+
+    /// T433: the HTX cost and size of request and response heads, read in one pass, are the
+    /// ones the separate passes gave, on ASCII, UTF-8 and non-UTF-8 heads.
+    #[test]
+    fn one_pass_head_cost_matches_the_separate_passes() {
+        let starts = [
+            "GET / HTTP/1.1", "GET /a%20b HTTP/1.0", "GET  /x  HTTP/1.1 ", "GET", "GET /", "\u{b}GET /\u{c} HTTP/1.0\u{b}",
+            "HTTP/1.1 200 OK", "HTTP/1.0 204", "HTTP/1.1  301 \u{b}Moved \t", "HTTP/1.1", "HTTP/1.1 2", "", "GET /\u{e9} HTTP/1.1",
+        ];
+        let lines = [
+            "", "Host: x\r\n", "Connection: close\r\n", "connection: Keep-Alive\r\n", "Connection :  te, close ,\r\n",
+            "Connection: upgrade, foo,, bar\r\n", "Connection: keep-alive, close\r\n", "\u{b}Connection\u{b}: close\u{c}\r\n",
+            "Connection: \r\n", "X-Connection: close\r\n", "Connection close\r\n", "Content-Length: 5\n", " folded: close\r\n",
+            "Connection: close\r\r\n", "Upgrade:websocket\r\n", "\r\nConnection: close\r\n", "\nX: 1\r\n", "\r\r\nX: 2\r\n",
+            "Connection:keep-alive\u{a0}\r\n", "Connection: \u{85}close\r\n", "X-\u{e9}: v\r\n", "CONNECTION:UPGRADE\r\n",
+            "Connection: ,\r\n", "c\r\n", "connection\r\n", "Connectionx: close\r\n", "nocolon\r\n", ":\r\n",
+        ];
+        let mut heads: Vec<Vec<u8>> = Vec::new();
+        for st in starts {
+            for a in lines {
+                for b in lines {
+                    heads.push(format!("{st}\r\n{a}{b}\r\n").into_bytes());
+                    heads.push(format!("{st}\n{a}{b}").into_bytes());
+                }
+            }
+        }
+        for h in [&b"GET / HTTP/1.1\r\nX: \xff\r\nConnection: close\r\n\r\n"[..], b"HTTP/1.1 200 OK\r\nConnection: close\xff\r\n\r\n", b"\xff\r\n\r\n"] {
+            heads.push(h.to_vec());
+        }
+        for h in &heads {
+            assert_eq!(htx_head_cost_and_size(h), (reference_head_cost(h, true), htx_head_size_general(h, true)), "{:?}", String::from_utf8_lossy(h));
+            assert_eq!(htx_response_head_cost(h), reference_head_cost(h, false), "{:?}", String::from_utf8_lossy(h));
+        }
     }
 
     /// The readings of an ASCII head on its bytes give what the readings of any head give.

@@ -9984,7 +9984,10 @@ impl EngineDispatcher<'_> {
         };
         // The head counts what its HTX holds (T265): the data, 40 bytes and 8 per block, not the
         // wire length.
-        if crate::txn::htx_response_head_cost(&entry.sess.rep.readable()[..total_hdr_len]) > threshold {
+        // Read with the HTX size of the head, which `%B` counts below: the head is not edited in
+        // between.
+        let (cost, rsp_htx) = crate::txn::htx_response_head_cost_and_size(&entry.sess.rep.readable()[..total_hdr_len]);
+        if cost > threshold {
             entry.sess.rep.clear();
             // A response that is not HTTP: `PH`, and nothing of it counts as sent.
             entry.sess.log.term.get_or_insert(*b"PH");
@@ -10036,7 +10039,7 @@ impl EngineDispatcher<'_> {
         if wait.is_none() {
             entry.sess.log.data = Some(crate::txnlog::loop_now());
             // What `%B` counts of this head: the message as the server sent it.
-            txn.rsp_htx = crate::txn::htx_head_size(held.as_deref().unwrap_or(&entry.sess.rep.readable()[..total_hdr_len]), false);
+            txn.rsp_htx = held.as_deref().map_or(rsp_htx, |h| crate::txn::htx_head_size(h, false));
         }
         let fe_caps = &proxies[fe_idx].res_capture_slots;
         if wait.is_none() && !fe_caps.is_empty() {
