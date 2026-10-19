@@ -89,16 +89,34 @@ pub fn past_maxsock(fd: std::os::fd::RawFd) -> bool {
     ceiling != 0 && u64::try_from(fd).is_ok_and(|fd| fd >= ceiling)
 }
 
+/// The descriptors open when the process started: whatever launched it left them.
+static INHERITED_FDS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+
+fn open_fds() -> Vec<u64> {
+    std::fs::read_dir("/proc/self/fd")
+        .map(|d| d.flatten().filter_map(|e| e.file_name().to_str()?.parse::<u64>().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Records the descriptors inherited from the launcher; call first thing in `main`.
+/// `settle_fd_ceiling` leaves them out: `HAProxy` ignores them too (its `maxsock` comes from
+/// the configuration; a descriptor inherited at 2000 stays open and changes neither `Maxsock`
+/// nor the sockets it accepts, T438).
+pub fn record_inherited_fds() {
+    let _ = INHERITED_FDS.set(open_fds());
+}
+
 /// Sets the ceiling [`past_maxsock`] enforces, once every worker is up and before any is
-/// released to accept: `maxsock`, or, when Ibex's own descriptors already take more of it
+/// released to accept: `maxsock` (`global.maxsock`, which `HAProxy` compares an accepted
+/// descriptor with, src/sock.c:110), or, when Ibex's own descriptors already take more of it
 /// than `HAProxy`'s estimate allows for (its workers hold four each where `HAProxy` counts
 /// three: 260 open at start against a `maxsock` of 216 with `maxconn 1` and 64 threads), the
-/// highest one open plus two per `maxconn` and `HAProxy`'s reserve of ten. Otherwise every
-/// connection would be refused.
+/// highest one of its own open plus two per `maxconn` and `HAProxy`'s reserve of ten.
+/// Otherwise every connection would be refused. Descriptors inherited at start are not
+/// Ibex's own and do not count.
 pub fn settle_fd_ceiling() {
-    let highest = std::fs::read_dir("/proc/self/fd")
-        .map(|d| d.flatten().filter_map(|e| e.file_name().to_str()?.parse::<u64>().ok()).max().unwrap_or(0))
-        .unwrap_or(0);
+    let inherited = INHERITED_FDS.get().map_or(&[][..], Vec::as_slice);
+    let highest = open_fds().into_iter().filter(|fd| !inherited.contains(fd) || *fd <= 2).max().unwrap_or(0);
     let own = highest + 1 + 2 * u64::from(hard()) + 10;
     FD_CEILING.store(MAXSOCK.load(Ordering::Relaxed).max(own), Ordering::Relaxed);
 }

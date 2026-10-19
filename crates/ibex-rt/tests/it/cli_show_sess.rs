@@ -128,9 +128,10 @@ fn clients(ibex: &Ibex, n: usize) -> Vec<TcpStream> {
             c
         })
         .collect();
-    // Every stream established before the test looks.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && srcs_listed(&cli(ibex, "show sess"), &v) < n {
+    // Every stream established, and its byte forwarded (`rq[...,i=0`, not yet `i=1`: on a
+    // loaded host the byte can still be in the request buffer), before the test looks.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !settled(&cli(ibex, "show sess"), &v) {
         std::thread::sleep(Duration::from_millis(20));
     }
     v
@@ -139,6 +140,10 @@ fn clients(ibex: &Ibex, n: usize) -> Vec<TcpStream> {
 fn line_for<'a>(out: &'a str, c: &TcpStream) -> Option<&'a str> {
     let needle = format!(" src={} fe=ft ", c.local_addr().expect("addr"));
     out.lines().find(|l| l.contains(&needle))
+}
+
+fn settled(out: &str, cs: &[TcpStream]) -> bool {
+    cs.iter().all(|c| line_for(out, c).is_some_and(|l| l.contains(" rq[f=000000h,i=0,")))
 }
 
 fn srcs_listed(out: &str, cs: &[TcpStream]) -> usize {

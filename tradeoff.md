@@ -544,3 +544,18 @@ knows many more short names; Ibex shows a missing attribute as dotted (`1.2.3.4`
 signature or key algorithm as `UNDEF`. DN values are copied as raw bytes (no charset conversion
 of BMPString/UniversalString) in the one-line form; `rfc2253` dumps non-text types as `#<hex>`.
 The `ssl_c_*` fetches (the peer's certificate) are not implemented here.
+
+### 6.20 rustls allocates 3 times per TLS request — **known M1 difference; fix is the rustls 0.24 port (T437 5a), waiting for 0.24.0**
+
+| | |
+|---|---|
+| **Gained** | `rustls 0.23.45` (pure Rust, memory-safe, `#![forbid(unsafe_code)]` in `ibex-tls`) with its buffered `ServerConnection`/`ClientConnection` API, which is the simple one to use. |
+| **Gave up** | Zero allocations per steady-state keep-alive TLS request. The allocation survey of 2026-10-19 (`~/ibex-worktrees/review/alloc-survey-2026-10-19/`, `asurv.sh`) counts **3 per request inside rustls**: `read_tls` filling rustls's own receive buffer, `take_received_plaintext` -> `into_vec`, and `encrypt` -> `PrefixedPayload::with_capacity` (one per outgoing record). Everything Ibex owns on that path is at 0. For scale, HAProxy with OpenSSL makes 13.2 mallocs per TLS keep-alive request with the same probe (8.6 from OpenSSL, 4.5 `posix_memalign` from its own pool refills: `hap-tls-h1s.txt`), so the gap is against Ibex's own goal of 0, not against the oracle. |
+| **Why not fixed now** | 0.23's `unbuffered` API removes the two receive-side allocations (decryption in place in our buffer) but keeps the one per record on send: `MessageEncrypter::encrypt` returns an owned `OutboundOpaqueMessage`, and it is a public trait, so the fix is a breaking change that cannot be backported to 0.23. The `unbuffered` module is removed in 0.24, so porting to it would gain 2 of 3 and then have to be redone. |
+| **Plan** | Upstream already has the fix: rustls#2940 (externalized input buffers, merged 2026-07-07) and rustls#3127 (caller-provided `MessageEncrypter` output, merged 2026-07-22), in `0.24.0-dev.1` (2026-07-23) and `0.24.0-dev.2` (2026-10-14). In 0.24, `Connection::read_tls(&mut dyn TlsInputBuffer, &mut Vec<u8>)` decrypts in place in a caller buffer and `write(plaintext, &mut Vec<u8>)` encrypts into a caller `Vec`: 0 allocations with a reused `Vec`. T437 part 5a ports `ibex-tls/src/transport.rs` and `ibex-rt/src/xprt.rs` (~35 call sites, frontend and backend; not QUIC) to it, backing the input with the pooled `Buf` and keeping a pooled, reused output `Vec` per connection. Prototype on `0.24.0-dev.*` in a branch; merge only once 0.24.0 is released. Notes: `upstream/rustls-caller-owned-buffers.md`. |
+| **Status** | **measured** 2026-10-19; not implemented, waiting on rustls 0.24.0. Nothing to file upstream (the change exists); once the port runs on a dev release, report on rustls#3068 or #3127 whether a proxy's steady state has 0 allocations per TLS record. |
+| **Revisit if** | rustls 0.24.0 is released (port, then the TLS keep-alive scenario of the allocation test goes to 0), or the 3 per request show up as a cost in a TLS soak before then. |
+
+Related and shipped (T437 5b): `tune.ibex.zero-buffers` (default on) zeroes the used part of a
+buffer when it is released, so decrypted plaintext does not outlive its owner in the pools. The
+rustls-owned buffers are not Ibex's to zero; rustls zeroizes its key material (the plaintext it holds internally is the 3-allocation gap above).
