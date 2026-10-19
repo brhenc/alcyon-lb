@@ -86,3 +86,18 @@ fn an_acl_is_known_only_after_its_line_and_only_in_its_own_section() {
     let (_, m) = err("backend b\n  server s 127.0.0.1:1\nfrontend f\n  bind :8080\n  acl fa path /x\nbackend c\n  http-request deny if fa\n");
     assert!(m.ends_with("no such ACL : 'fa'."), "{m}");
 }
+
+/// `stats http-request <action> if <cond>` is worded as the proxy's own `http-request` rule
+/// (3.5-dev8: "an 'http-request auth' condition"), `stats admin` as a 'stats admin' rule.
+#[test]
+fn stats_rules_refuse_an_unknown_acl_with_haproxys_text() {
+    let fe = "frontend f\n  bind :8080\n  stats uri /st\n";
+    for (rule, text) in [
+        ("stats http-request deny if nosuch", "error detected while parsing an 'http-request deny' condition : no such ACL : 'nosuch'."),
+        ("stats http-request auth if nosuch", "error detected while parsing an 'http-request auth' condition : no such ACL : 'nosuch'."),
+        ("stats http-request allow if nosuch", "error detected while parsing an 'http-request allow' condition : no such ACL : 'nosuch'."),
+        ("stats admin if nosuch", "error detected while parsing a 'stats admin' rule : no such ACL : 'nosuch'."),
+    ] {
+        assert_eq!(err(&format!("{fe}  {rule}\n")).1, text, "{rule}");
+    }
+}

@@ -107,6 +107,10 @@ pub(crate) fn check_term(name: &str, at: &Token) -> Result<(), ConfigError> {
             "http-request" | "http-response" | "http-after-response" => {
                 format!("error detected while parsing an '{} {}' condition : {no}.", w(0), w(1))
             }
+            // A stats rule is parsed as the proxy's own `http-request` rule, and worded so.
+            "stats" if w(1) == "http-request" => {
+                format!("error detected while parsing an 'http-request {}' condition : {no}.", w(2))
+            }
             "stats" => format!("error detected while parsing a 'stats {}' rule : {no}.", w(1)),
             "monitor" => format!("error detected while parsing a 'monitor fail' condition : {no}."),
             "stick" => format!("'stick': error detected while parsing sticking condition : {no}."),
