@@ -95,6 +95,17 @@ fn start(srv: SocketAddr) -> Ibex {
     while !ibex.sock.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
+    // The probe connection of `wait_listening` is a stream until the proxy has seen it close;
+    // on a loaded host that is after the first `show sess`, and would be counted with the
+    // test's own clients. The CLI's own stream in the answer shows it is the CLI that spoke.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = cli(&ibex, "show sess");
+        if (out.contains(" proto=unix_stream ") && !out.contains(" fe=ft ")) || Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     ibex
 }
 
