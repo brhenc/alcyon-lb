@@ -144,6 +144,25 @@ pub const CLF_HTTP_LOG_FORMAT: &str = "%{+Q}o %{-Q}ci - - [%trg] %r %ST %B \"\" 
 /// `option tcplog clf` (`clf_tcp_log_format`).
 pub const CLF_TCP_LOG_FORMAT: &str = "%{+Q}o %{-Q}ci - - [%T] \"TCP \" 000 %B \"\" \"\" %cp %ms %ft %b %s %Th %Tw %Tc %Tt %U %ts-- %ac %fc %bc %sc %rc %sq %bq \"\" \"\" ";
 
+/// `keylog_format_fc`: the frontend TLS key log lines (`tune.ssl.keylog`).
+pub const KEYLOG_FC_FORMAT: &str = "CLIENT_RANDOM %[ssl_fc_client_random,hex] %[ssl_fc_session_key,hex]\n\
+CLIENT_EARLY_TRAFFIC_SECRET %[ssl_fc_client_random,hex] %[ssl_fc_client_early_traffic_secret]\n\
+CLIENT_HANDSHAKE_TRAFFIC_SECRET %[ssl_fc_client_random,hex] %[ssl_fc_client_handshake_traffic_secret]\n\
+SERVER_HANDSHAKE_TRAFFIC_SECRET %[ssl_fc_client_random,hex] %[ssl_fc_server_handshake_traffic_secret]\n\
+CLIENT_TRAFFIC_SECRET_0 %[ssl_fc_client_random,hex] %[ssl_fc_client_traffic_secret_0]\n\
+SERVER_TRAFFIC_SECRET_0 %[ssl_fc_client_random,hex] %[ssl_fc_server_traffic_secret_0]\n\
+EXPORTER_SECRET %[ssl_fc_client_random,hex] %[ssl_fc_exporter_secret]\n\
+EARLY_EXPORTER_SECRET %[ssl_fc_client_random,hex] %[ssl_fc_early_exporter_secret]";
+/// `keylog_format_bc`: the backend ones. The two spaces on the first line are HAProxy's.
+pub const KEYLOG_BC_FORMAT: &str = "CLIENT_RANDOM %[ssl_bc_client_random,hex]  %[ssl_bc_session_key,hex]\n\
+CLIENT_EARLY_TRAFFIC_SECRET %[ssl_bc_client_random,hex] %[ssl_bc_client_early_traffic_secret]\n\
+CLIENT_HANDSHAKE_TRAFFIC_SECRET %[ssl_bc_client_random,hex] %[ssl_bc_client_handshake_traffic_secret]\n\
+SERVER_HANDSHAKE_TRAFFIC_SECRET %[ssl_bc_client_random,hex] %[ssl_bc_server_handshake_traffic_secret]\n\
+CLIENT_TRAFFIC_SECRET_0 %[ssl_bc_client_random,hex] %[ssl_bc_client_traffic_secret_0]\n\
+SERVER_TRAFFIC_SECRET_0 %[ssl_bc_client_random,hex] %[ssl_bc_server_traffic_secret_0]\n\
+EXPORTER_SECRET %[ssl_bc_client_random,hex] %[ssl_bc_exporter_secret]\n\
+EARLY_EXPORTER_SECRET %[ssl_bc_client_random,hex] %[ssl_bc_early_exporter_secret]";
+
 /// The format string a proxy's `log-format` or `option httplog`/`tcplog` stands for.
 /// `option httplog` on a TCP-mode proxy falls back to `tcplog`, as `HAProxy` does ("not
 /// usable with frontend ... Falling back to 'option tcplog'").

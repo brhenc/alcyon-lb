@@ -53,6 +53,7 @@ mod bufsize_h2_alpn;
 mod canonical_haproxy_35_e2e;
 mod capture_converters;
 mod capture_shared_slots;
+mod haproxy_env_vars;
 mod capture_slots;
 mod capture_ver;
 mod check_condition;
