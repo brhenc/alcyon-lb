@@ -1403,6 +1403,12 @@ fn head_cost_of(head: &[u8], size: Option<u64>) -> usize {
 /// Whether a header line is a `Connection` whose tokens are all ones HTX drops (`close`,
 /// `keep-alive`, `upgrade`), with at least one: the header is then gone from the message.
 fn connection_emptied(line: &[u8]) -> bool {
+    // Every header line of every head comes here: only a name starting with `c` can be
+    // `connection` (the name is trimmed at its end only), so the rest go without a colon
+    // search (T433: the search cost ~860 instructions per proxied request).
+    if line.len() < 11 || line[0] | 0x20 != b'c' {
+        return false;
+    }
     let Some(colon) = line.iter().position(|&b| b == b':') else { return false };
     if !ascii_trim_end(&line[..colon]).eq_ignore_ascii_case(b"connection") {
         return false;
@@ -1782,6 +1788,26 @@ pub fn version_digits(ver: &[u8]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_connection_header_of_dropped_tokens_is_emptied() {
+        for (line, emptied) in [
+            (&b"Connection: close\r"[..], true),
+            (b"connection:keep-alive, Upgrade", true),
+            (b"CONNECTION : close", true),
+            (b"Connection: close, x-foo", false),
+            (b"Connection:", false),
+            (b"Connection: , ", false),
+            (b"Connectio: close", false),
+            (b"Xconnection: close", false),
+            (b"Content-Length: 5\r", false),
+            (b"c", false),
+            (b"", false),
+            (b"Host: connection: close", false),
+        ] {
+            assert_eq!(connection_emptied(line), emptied, "{:?}", String::from_utf8_lossy(line));
+        }
+    }
 
     #[test]
     fn the_version_is_the_two_digits_around_the_dot() {
