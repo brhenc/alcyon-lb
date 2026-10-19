@@ -544,3 +544,13 @@ knows many more short names; Ibex shows a missing attribute as dotted (`1.2.3.4`
 signature or key algorithm as `UNDEF`. DN values are copied as raw bytes (no charset conversion
 of BMPString/UniversalString) in the one-line form; `rfc2253` dumps non-text types as `#<hex>`.
 The `ssl_c_*` fetches (the peer's certificate) are not implemented here.
+
+### 6.22 TCP TLS runs on a pre-release rustls, `=0.24.0-dev.2` (T440)
+
+| | |
+|---|---|
+| **What changed** | The TCP TLS path (`ibex_tls::tcp`, `ibex_tls::conn`, `ibex-rt/src/xprt.rs`, `srv_tls.rs`) uses rustls `=0.24.0-dev.2` with its `rustls-ring` provider, because 0.24 has caller-owned buffers: a steady-state keep-alive request over TLS makes 0 allocations (`tls_request_allocations`: TLS to plain 3 to 0 per request, TLS to TLS 13 to 0). 0.23 cannot do this. |
+| **Cost** | A pre-release pin: the API may change before 0.24.0, and a fix may land on 0.23.x first and reach 0.24 later. We pin exactly (`=`) so a build never moves under us; every bump is a manual port. Two rustls versions are in the tree: QUIC (quinn), the log forwarder, `ring.rs`, and the test clients stay on 0.23 (`rustls`), the TCP path is `rustls24`. Binary size (release, same tree otherwise): stripped 10 920 512 to 12 204 696 bytes (+1.2 MB, +11.8%); with `debug = true` as `[profile.release]` ships it, 183 079 104 to 206 240 360 bytes. |
+| **Why that is acceptable** | The zero-allocation request path is an M1 requirement; the dev pin is merged once gated green (user decision 2026-10-19). `ring` stays the crypto, so the memory-safety rule for dependencies holds. |
+| **Status** | Open. |
+| **Revisit** | Move to `0.24.0` when it is released (expected around Q1 2027; low confidence) and drop the duplicate rustls where QUIC can follow. |
