@@ -65,6 +65,17 @@ pub enum FdState {
     QuicBackend { listener: u32 },
     /// This worker's mailbox (`crate::mailbox`): another worker asked something.
     Mailbox,
+    /// An idle server connection in this worker's lists (`crate::engine::IdlePool`),
+    /// still registered for reads: an event on it is its server closing it, or sending
+    /// what nobody asked for (T434). Not counted in [`used`]: the lists count their own.
+    Idle,
+}
+
+impl FdState {
+    /// Whether an fd in this state counts as in use in the table (`live`, [`used`]).
+    const fn counted(self) -> bool {
+        !matches!(self, FdState::Closed | FdState::Idle)
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -140,7 +151,7 @@ impl FdTab {
     /// Claims an fd.
     pub fn insert(&mut self, fd: RawFd, state: FdState, interest: Interest) {
         let e = self.slot(fd);
-        if e.state == FdState::Closed {
+        if !e.state.counted() {
             self.live += 1;
             USED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -163,11 +174,22 @@ impl FdTab {
     /// Releases an fd.
     pub fn remove(&mut self, fd: RawFd) {
         let e = self.slot(fd);
-        if e.state != FdState::Closed {
+        if e.state.counted() {
             self.live -= 1;
             USED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
         *self.slot(fd) = Entry::EMPTY;
+    }
+
+    /// A server connection goes idle into this worker's lists, still registered for reads
+    /// ([`FdState::Idle`]): out of the count, which the lists keep for their own (T434).
+    pub fn set_idle(&mut self, fd: RawFd) {
+        let e = self.slot(fd);
+        if e.state.counted() {
+            self.live -= 1;
+            USED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        *self.slot(fd) = Entry { state: FdState::Idle, interest: Interest::READ, ready: Interest::NONE };
     }
 
     #[must_use]
@@ -231,6 +253,26 @@ mod tests {
         t.remove(5);
         assert_eq!(t.live(), 0);
         assert_eq!(t.state(5), FdState::Closed);
+    }
+
+    /// An idle server connection leaves the count and comes back into it when a request
+    /// takes it; an idle entry removed or overwritten counts nothing (T434).
+    #[test]
+    fn an_idle_entry_is_not_counted() {
+        let mut t = FdTab::with_capacity(64);
+        let conn = FdState::Conn { task: ibex_sched::TaskRef(1), conn: 1 };
+        t.insert(9, conn, Interest::BOTH);
+        assert_eq!(t.live(), 1);
+        t.set_idle(9);
+        assert_eq!((t.live(), t.state(9), t.interest(9)), (0, FdState::Idle, Interest::READ));
+        t.insert(9, conn, Interest::READ);
+        assert_eq!(t.live(), 1);
+        t.set_idle(9);
+        t.remove(9);
+        assert_eq!((t.live(), t.state(9)), (0, FdState::Closed));
+        t.set_idle(9);
+        t.set_idle(9);
+        assert_eq!(t.live(), 0);
     }
 
     #[test]

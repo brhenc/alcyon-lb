@@ -28,8 +28,15 @@ pub struct Event {
 /// discipline in `design/003-scheduler.md`, where a reader is *supposed* to stop early
 /// and let other work run.
 pub struct Poller {
-    epfd: OwnedFd,
+    /// Shared with this worker's idle-connection slot ([`Poller::shared_epfd`]).
+    epfd: std::sync::Arc<OwnedFd>,
     event_buf: epoll::EventVec,
+    /// The `epoll_ctl` calls made through this poller: what the idle-pool tests count (T434).
+    #[cfg(test)]
+    ctls: std::cell::Cell<u64>,
+    /// The `epoll_wait` calls (tests only).
+    #[cfg(test)]
+    waits: std::cell::Cell<u64>,
 }
 
 impl Poller {
@@ -38,9 +45,46 @@ impl Poller {
     pub fn new(capacity: usize) -> io::Result<Self> {
         let epfd = epoll::create(epoll::CreateFlags::CLOEXEC)?;
         Ok(Poller {
-            epfd,
+            epfd: std::sync::Arc::new(epfd),
             event_buf: epoll::EventVec::with_capacity(capacity),
+            #[cfg(test)]
+            ctls: std::cell::Cell::new(0),
+            #[cfg(test)]
+            waits: std::cell::Cell::new(0),
         })
+    }
+
+    /// Counts one `epoll_ctl` (tests only).
+    #[inline]
+    fn ctl(&self) {
+        #[cfg(test)]
+        self.ctls.set(self.ctls.get() + 1);
+    }
+
+    /// The `epoll_ctl` calls made so far.
+    #[cfg(test)]
+    pub(crate) fn ctl_calls(&self) -> u64 {
+        self.ctls.get()
+    }
+
+    /// The `epoll_wait` calls made so far.
+    #[cfg(test)]
+    pub(crate) fn wait_calls(&self) -> u64 {
+        self.waits.get()
+    }
+
+    /// Whether `fd` is in this epoll set (`EPOLL_CTL_ADD` answers `EEXIST`); one that was
+    /// not is taken out again.
+    #[cfg(test)]
+    pub(crate) fn is_registered(&self, fd: BorrowedFd<'_>) -> bool {
+        match epoll::add(self.epfd.as_fd(), fd, epoll::EventData::new_u64(0), epoll::EventFlags::empty()) {
+            Err(Errno::EXIST) => true,
+            Ok(()) => {
+                let _ = epoll::delete(self.epfd.as_fd(), fd);
+                false
+            }
+            Err(e) => panic!("epoll_ctl: {e}"),
+        }
     }
 
     fn flags(readable: bool, writable: bool) -> epoll::EventFlags {
@@ -71,6 +115,7 @@ impl Poller {
         readable: bool,
         writable: bool,
     ) -> io::Result<()> {
+        self.ctl();
         epoll::add(
             self.epfd.as_fd(),
             fd,
@@ -98,6 +143,7 @@ impl Poller {
         readable: bool,
         writable: bool,
     ) -> io::Result<()> {
+        self.ctl();
         if !readable && !writable {
             return match epoll::delete(self.epfd.as_fd(), fd) {
                 Ok(()) | Err(Errno::NOENT) => Ok(()),
@@ -108,6 +154,7 @@ impl Poller {
         match epoll::modify(self.epfd.as_fd(), fd, epoll::EventData::new_u64(data), flags) {
             Ok(()) => Ok(()),
             Err(Errno::NOENT) => {
+                self.ctl();
                 epoll::add(self.epfd.as_fd(), fd, epoll::EventData::new_u64(data), flags)?;
                 Ok(())
             }
@@ -121,7 +168,27 @@ impl Poller {
     /// Propagates `epoll_ctl` failure.
     /// One that waits for nothing is out of the set already ([`Self::modify`]).
     pub fn delete(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
+        self.ctl();
         match epoll::delete(self.epfd.as_fd(), fd) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// This poller's epoll descriptor, shared: what another worker that takes one of this
+    /// worker's idle server connections removes it from ([`Poller::forget_in`]).
+    #[must_use]
+    pub fn shared_epfd(&self) -> std::sync::Arc<OwnedFd> {
+        std::sync::Arc::clone(&self.epfd)
+    }
+
+    /// Takes `fd` out of the epoll set `epfd` (another worker's, from
+    /// [`Poller::shared_epfd`]): `epoll_ctl` is safe from any thread. Not in it is fine.
+    ///
+    /// # Errors
+    /// Propagates `epoll_ctl` failure other than `ENOENT`.
+    pub fn forget_in(epfd: BorrowedFd<'_>, fd: BorrowedFd<'_>) -> io::Result<()> {
+        match epoll::delete(epfd, fd) {
             Ok(()) | Err(Errno::NOENT) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -149,6 +216,8 @@ impl Poller {
             Some(d) => i32::try_from(d.as_millis()).unwrap_or(i32::MAX),
         };
 
+        #[cfg(test)]
+        self.waits.set(self.waits.get() + 1);
         match epoll::wait(self.epfd.as_fd(), &mut self.event_buf, ms) {
             Ok(()) => {}
             Err(Errno::INTR) => return Ok(0),
