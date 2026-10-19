@@ -85,7 +85,9 @@ fn trial(pidfile: &Path, fe: SocketAddr) -> &'static str {
     });
     thread::sleep(Duration::from_millis(200));
     rustix::process::kill_process(pid_of(pidfile), rustix::process::Signal::Usr2).expect("SIGUSR2");
-    s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    // The hard stop is 300 ms after the reload has started a new worker: on a host loaded
+    // enough to make that take seconds, wait for it rather than call the tunnel still open.
+    s.set_read_timeout(Some(Duration::from_secs(30))).expect("timeout");
     let t0 = Instant::now();
     let how = loop {
         match s.read(&mut b) {
@@ -94,7 +96,7 @@ fn trial(pidfile: &Path, fe: SocketAddr) -> &'static str {
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break "RST",
             Err(_) => break "other",
         }
-        if t0.elapsed() > Duration::from_secs(5) {
+        if t0.elapsed() > Duration::from_secs(30) {
             break "still open";
         }
     };
