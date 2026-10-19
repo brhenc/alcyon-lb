@@ -14650,7 +14650,8 @@ fn rewrite_header_names_before(buf: &mut [u8], eoh: Option<(usize, usize)>, tabl
         let folded = matches!(buf[at], b' ' | b'\t');
         let colon = buf[at..end].iter().position(|&b| b == b':').filter(|_| !folded).map_or(at, |i| at + i);
         buf[at..colon].make_ascii_lowercase();
-        if let Some(to) = std::str::from_utf8(&buf[at..colon]).ok().and_then(|n| table?.get(n)) {
+        // The name is read as text only when there is a table to look it up in (T433).
+        if let Some(to) = table.and_then(|t| t.get(std::str::from_utf8(&buf[at..colon]).ok()?)) {
             if to.len() == colon - at {
                 buf[at..colon].copy_from_slice(to.as_bytes());
             }

@@ -2357,16 +2357,19 @@ impl TcpSession {
                         let mut req_m = None;
                         let mut req_u = None;
                         let mut conn_close = false;
+                        // The values of the `Connection` headers, the names compared as bytes
+                        // (T433: `headers()` read every name and value as UTF-8, twice).
+                        let connection = || htx.header_blocks_where(|n| n.eq_ignore_ascii_case(b"connection")).map(|(_, _, v)| v);
                         if let Some(req) = htx.req_line() {
                             req_m = Some(req.method.to_string());
                             req_u = Some(req.uri.to_string());
                             if req.version == "HTTP/1.0"
-                                && !htx.headers().any(|(k, v)| k.eq_ignore_ascii_case("connection") && txn::connection_has(v, "keep-alive"))
+                                && !connection().any(|v| txn::connection_has(v, "keep-alive"))
                             {
                                 conn_close = true;
                             }
                         }
-                        if htx.headers().any(|(k, v)| k.eq_ignore_ascii_case("connection") && txn::connection_has(v, "close")) {
+                        if connection().any(|v| txn::connection_has(v, "close")) {
                             conn_close = true;
                         }
                         let wire_replacement = if self.htx_modified {
