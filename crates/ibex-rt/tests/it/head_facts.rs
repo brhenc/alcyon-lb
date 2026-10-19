@@ -250,3 +250,28 @@ fn an_obs_text_header_value_is_read_as_its_bytes() {
     );
     check("forwarded", "", obs, OK, &["GET / HTTP/1.1\r\nhost: a\r\nx-foo: \u{fffd}t\u{fffd}"], "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok", false);
 }
+
+/// More `Transfer-Encoding` lines than the scan keeps (four), and a response head with a byte
+/// that is not ASCII, are heads the facts are not read from: they take the general reading, and
+/// relay as it always did.
+#[test]
+fn heads_the_facts_are_not_read_from() {
+    check(
+        "five Transfer-Encoding lines",
+        "",
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        OK,
+        &[],
+        "HTTP/1.1 422 Unprocessable Content\r\ncontent-length: 116\r\ncache-control: no-cache\r\ncontent-type: text/html\r\n\r\n<html><body><h1>422 Unprocessable Content</h1>\nThe server cannot process the contained instructions.\n</body></html>\n",
+        true,
+    );
+    check(
+        "a response with obs-text",
+        "",
+        GET,
+        b"HTTP/1.1 200 OK\r\nX-Foo: \xe9\r\nContent-Length: 2\r\n\r\nok",
+        &["GET / HTTP/1.1\r\nhost: a"],
+        "HTTP/1.1 200 OK\r\nx-foo: \u{fffd}\r\ncontent-length: 2\r\n\r\nok",
+        false,
+    );
+}

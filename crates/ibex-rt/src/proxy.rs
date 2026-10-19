@@ -2442,49 +2442,6 @@ impl TcpSession {
                     if let Some(wire) = wire_replacement {
                         self.req.replace_prefix(total_hdr_len, &wire);
                     }
-                } else {
-                    let hdr_bytes = &self.req.readable()[..total_hdr_len];
-                    let hdr_str = String::from_utf8_lossy(hdr_bytes).to_string();
-                    let (first_line, rest_headers) =
-                        if let Some((fl, rest)) = hdr_str.split_once("\r\n") {
-                            (fl, rest)
-                        } else if let Some((fl, rest)) = hdr_str.split_once('\n') {
-                            (fl, rest)
-                        } else if let Some((fl, rest)) = hdr_str.split_once('\r') {
-                            (fl, rest)
-                        } else {
-                            (hdr_str.as_ref(), "")
-                        };
-
-                    let mut parts = first_line.split_whitespace();
-                    if let Some(m) = parts.next() {
-                        self.req_method.set(m);
-                    }
-                    if let Some(u) = parts.next() {
-                        self.req_uri.set(u);
-                    }
-                    let mut hdrs: Vec<(String, String)> = Vec::new();
-                    for line in rest_headers.lines() {
-                        let trimmed = line.trim_end_matches(['\r', '\n']);
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        if trimmed.starts_with(' ') || trimmed.starts_with('\t') {
-                            if let Some(last) = hdrs.last_mut() {
-                                last.1.push(' ');
-                                last.1.push_str(trimmed.trim());
-                            }
-                        } else if let Some((k, v)) = trimmed.split_once(':') {
-                            hdrs.push((k.trim().to_string(), v.trim().to_string()));
-                        }
-                    }
-                    if hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")) {
-                        close = true;
-                    }
-                    if first_line.contains("HTTP/1.0") && !hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("keep-alive")) {
-                        close = true;
-                    }
-                    self.req_headers = Some(hdrs);
                 }
 
                 // `txn->uri`: the request line once the parser has normalised the authority

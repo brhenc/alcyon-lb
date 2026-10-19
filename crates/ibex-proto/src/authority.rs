@@ -234,12 +234,10 @@ pub fn check_and_normalize_with(htx: &mut HtxSlice<'_>, accept_unsafe: bool, kno
     }
 
     // Origin-form (nearly every request) is done here, read as bytes.
-    if target.is_none_or(|t| t.origin) {
+    // (A head whose request line is not UTF-8 is refused by the parser before this, and
+    // `req_line` is `None` only for such a line.)
+    let Some((method, uri)) = target.filter(|t| !t.origin).and_then(|_| htx.req_line()).map(|r| (r.method.to_string(), r.uri.to_string())) else {
         return Ok(rewritten);
-    }
-    let (method, uri) = match htx.req_line() {
-        Some(r) => (r.method.to_string(), r.uri.to_string()),
-        None => return Ok(rewritten),
     };
     let host: Option<String> = match host_at {
         Some(i) => Some(
