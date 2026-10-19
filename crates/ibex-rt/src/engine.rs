@@ -162,6 +162,11 @@ struct WorkerPool {
     conns: usize,
     /// The earliest `purge_at` of all servers.
     next_purge: Option<Instant>,
+    /// The worker's epoll descriptor (a duplicate): its idle connections stay registered
+    /// there for reads, and another worker that takes one takes it out first (T434). None
+    /// for a worker that shares its pool with none ([`Engine::share_idle_pools`] sets it),
+    /// and in the pools of the unit tests below, whose connections are registered nowhere.
+    epfd: Option<OwnedFd>,
 }
 
 impl WorkerPool {
@@ -361,8 +366,9 @@ struct IdleSlot {
 
 /// The idle server connections of every worker. Each worker keeps its released connections
 /// in its own slot and purges them; one whose own slot holds nothing for a server takes
-/// another worker's (`conn_backend_get`), unless `tune.idle-pool.shared off`. The socket was
-/// taken off its worker's poller when it went idle and joins the taker's.
+/// another worker's (`conn_backend_get`), unless `tune.idle-pool.shared off`. The socket
+/// stays in its worker's epoll set while idle, for reads (`FdState::Idle`); a taker on
+/// another worker takes it out of that set under the slot's lock and adds it to its own.
 #[derive(Debug)]
 pub struct IdlePools {
     slots: Box<[IdleSlot]>,
@@ -600,7 +606,11 @@ impl IdlePool {
     /// with sharing on and unless the server keeps fewer idle connections than its
     /// `pool-low-conn` (`steal` false), every other worker's, from the one after the last
     /// taken from (waiting for a busy one, where `HAProxy` skips it: see below).
-    fn take(&mut self, key: &IdleKey, first_req: bool, mode: ibex_config::HttpReuse, steal: bool) -> Option<(IdleConn, bool)> {
+    ///
+    /// The third member says whether the connection is still registered in this worker's
+    /// epoll set, for reads: one of its own is; one taken from another worker has been taken
+    /// out of that worker's set, under its lock, and is registered nowhere (T434).
+    fn take(&mut self, key: &IdleKey, first_req: bool, mode: ibex_config::HttpReuse, steal: bool) -> Option<(IdleConn, bool, bool)> {
         let pools = &*self.pools;
         let own = &pools.slots[self.wid];
         if own.conns.load(Ordering::Relaxed) != 0 {
@@ -610,8 +620,8 @@ impl IdlePool {
             own.conns.store(pool.conns, Ordering::Relaxed);
             self.next_purge = pool.next_purge();
             pools.count_idle(key.srv, 0, before - pool.conns);
-            if found.is_some() {
-                return found;
+            if let Some((conn, safe)) = found {
+                return Some((conn, safe, true));
             }
         }
         let n = pools.slots.len();
@@ -634,6 +644,16 @@ impl IdlePool {
             let found = pool.take(key, first_req, mode);
             slot.conns.store(pool.conns, Ordering::Relaxed);
             let removed = before - pool.conns;
+            // `fd_takeover`: out of the owner's epoll set while its lock is held, so that
+            // the owner, which finds its idle connections' events under that lock, never
+            // sees this one again. One that cannot be taken out is closed, not used.
+            let found = found.and_then(|(conn, safe)| match pool.epfd.as_ref().map(|ep| Poller::forget_in(ep.as_fd(), conn.fd.as_fd())) {
+                Some(Err(_)) => {
+                    conn.close();
+                    None
+                }
+                _ => Some((conn, safe, false)),
+            });
             drop(pool);
             pools.count_idle(key.srv, 0, removed);
             if found.is_some() {
@@ -642,6 +662,43 @@ impl IdlePool {
             }
         }
         None
+    }
+
+    /// Gives this worker's slot its epoll descriptor (a duplicate of it), for the workers
+    /// that take its idle connections to take them out of it.
+    pub fn attach_poller(&mut self, epfd: OwnedFd) {
+        IdlePools::lock(self.slot()).epfd = Some(epfd);
+    }
+
+    /// An event on `fd`, one of this worker's idle connections ([`FdState::Idle`]): its
+    /// server closed or reset it, or sent something (`h1_io_cb` on an idle connection, then
+    /// `h1_process`). What is there is read; anything but nothing to read (`close_notify`,
+    /// EOF, an error, bytes nobody asked for) closes it and takes it out of the lists and
+    /// the server's count. A TLS record without data (a session ticket) leaves it idle.
+    /// Whether it is still idle here: false also when another worker took it after the
+    /// event was reported (it is no longer in this worker's epoll set).
+    pub fn idle_event(&mut self, fd: std::os::fd::RawFd) -> bool {
+        let slot = &self.pools.slots[self.wid];
+        let mut pool = IdlePools::lock(slot);
+        let Some((srv, pos)) = pool.servers.iter().find_map(|(&srv, s)| s.conns.iter().position(|p| p.conn.fd.as_raw_fd() == fd).map(|i| (srv, i))) else {
+            return false;
+        };
+        let Some(s) = pool.servers.get_mut(&srv) else { return false };
+        let mut buf = [0u8; 4096];
+        if let Some(p) = s.conns.get_mut(pos) {
+            if matches!(p.conn.xprt.recv(p.conn.fd.as_fd(), &mut buf), Ok(raw::Io::WouldBlock)) {
+                return true;
+            }
+        }
+        let Some(p) = s.conns.remove(pos) else { return false };
+        s.safe -= usize::from(p.safe);
+        pool.conns -= 1;
+        slot.conns.store(pool.conns, Ordering::Relaxed);
+        self.next_purge = pool.next_purge();
+        drop(pool);
+        p.conn.close();
+        self.pools.count_idle(srv, 0, 1);
+        false
     }
 
     /// Idle connections in every worker's slot.
@@ -4611,9 +4668,15 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
     /// Makes this engine worker `wid` of `pools`, the idle server connections all workers
     /// share (`tune.idle-pool.shared`). Called before the engine runs: a worker alone keeps
-    /// a pool of its own.
-    pub fn share_idle_pools(&mut self, pools: &Arc<IdlePools>, wid: usize) {
+    /// a pool of its own. Its slot holds a duplicate of its epoll descriptor, which a worker
+    /// that takes one of its idle connections takes it out of (T434).
+    ///
+    /// # Errors
+    /// `dup` failure.
+    pub fn share_idle_pools(&mut self, pools: &Arc<IdlePools>, wid: usize) -> io::Result<()> {
         self.idle_backend_pool = pools.worker(wid);
+        self.idle_backend_pool.attach_poller(self.poller.try_clone_epfd()?);
+        Ok(())
     }
 
     /// Makes this engine worker `wid` of `boxes`, the mailboxes every worker shares: `show
@@ -5123,6 +5186,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     quic_ready.push(q_idx as usize);
                 }
                 FdState::Mailbox => mail = true,
+                // One of this worker's idle server connections: its server closed it, or
+                // sent what nobody asked for (T434).
+                FdState::Idle => {
+                    if !self.idle_backend_pool.idle_event(ev.fd) {
+                        self.fdtab.remove(ev.fd);
+                    }
+                }
                 FdState::Closed => {}
             }
         }
@@ -7655,10 +7725,8 @@ fn release_server(
     let parked = entry.sess.srv_park_exp.is_set();
     let mut actconn_released = false;
     if let Some(srv_fd) = entry.sess.srv.take() {
-        let _ = poller.delete(srv_fd.as_fd());
-        if let Some(sfd) = entry.srv_raw_fd.take() {
-            fdtab.remove(sfd);
-        }
+        let sfd = srv_fd.as_raw_fd();
+        entry.srv_raw_fd = None;
         let reusable = reusable
             && matches!(entry.sess.srv_state, ScState::Ready | ScState::Established)
             // A connection that opened with a PROXY header speaks for this client only.
@@ -7688,10 +7756,25 @@ fn release_server(
             // next burst needed (T224). `used` above still counts it, as `HAProxy`'s does.
             release_server_actconn(entry, proxies, parked);
             actconn_released = true;
+            // Idle, it stays in this worker's epoll set, for reads only (`h1_detach`
+            // subscribing it `SUB_RETRY_RECV`): its server's close is an event on it
+            // (`IdlePool::idle_event`), and the request that takes it again from this
+            // worker's lists registers nothing (T434). After a response it waits for reads
+            // already: no `epoll_ctl`.
+            if entry.srv_interest != Interest::READ {
+                let _ = poller.modify(srv_fd.as_fd(), raw_fd_to_u64(sfd), true, false);
+            }
+            entry.srv_interest = Interest::NONE;
+            fdtab.set_idle(sfd);
             if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt }, entry.srv_served >= 2, cfg, used, Instant::now()) {
+                // Closing its only descriptor takes it out of the epoll set.
+                fdtab.remove(sfd);
                 conn.close();
             }
         } else {
+            let _ = poller.delete(srv_fd.as_fd());
+            fdtab.remove(sfd);
+            entry.srv_interest = Interest::NONE;
             let mut xprt = xprt;
             xprt.send_close_notify(srv_fd.as_fd());
         }
@@ -12332,9 +12415,9 @@ impl EngineDispatcher<'_> {
             let steal = key.as_ref().is_none_or(|k| idle_pool.may_steal(k.srv, low));
             let srv = key.as_ref().map(|k| k.srv);
             // Every stream of an HTTP/2 frontend is "not the first request" (`SE_FL_NOT_FIRST`, `mux_h2.c`).
-            if let Some((conn, safe)) = key.and_then(|k| idle_pool.take(&k, entry.sess.is_first_req && !entry.sess.is_h2_child(), proxies[be_idx].http_reuse, steal)) {
+            if let Some((conn, safe, registered)) = key.and_then(|k| idle_pool.take(&k, entry.sess.is_first_req && !entry.sess.is_h2_child(), proxies[be_idx].http_reuse, steal)) {
                 entry.srv_served = if safe { 2 } else { 1 };
-                reused = Some(conn);
+                reused = Some((conn, registered));
             }
             // `connect_server`: past `pool_high_count` fds, one of the server's idle
             // connections is closed, whether or not one was reused.
@@ -12353,13 +12436,21 @@ impl EngineDispatcher<'_> {
         }
 
         count_connect(proxies, be_idx, s_idx, reused.is_some());
-        if let Some(IdleConn { fd: srv_fd, xprt }) = reused {
+        if let Some((IdleConn { fd: srv_fd, xprt }, registered)) = reused {
             let sfd = srv_fd.as_raw_fd();
             entry.srv_raw_fd = Some(sfd);
             entry.sess.attach_server_with_xprt(srv_fd, xprt, now);
             entry.sess.server_connected(now);
             if let Some(txn) = entry.sess.txn.as_mut() {
                 txn.srv_reused = true;
+            }
+            if registered {
+                // From this worker's lists: still in its epoll set, for reads. The request
+                // is written without waiting for writability, and the pass's
+                // `update_interests` asks for it only if that write could not finish.
+                entry.srv_interest = Interest::READ;
+                fdtab.insert(sfd, FdState::Conn { task: entry.task, conn: 1 }, Interest::READ);
+                return None;
             }
             let (_, srv_want) = entry.sess.interests();
             let new_interest = Interest {
@@ -15303,6 +15394,195 @@ mod actconn_tests {
         entry.actconn_reclaimed = true;
         server_actconn_add(entry, proxies, true);
         assert_eq!(in_use(proxies), 0, "a reclaimed session adds nothing");
+    }
+}
+
+/// Idle server connections stay in their worker's epoll set, watched for reads (T434).
+#[cfg(test)]
+mod idle_poll_tests {
+    use super::*;
+    use ibex_config::ast::{BackendSection, Config, FrontendSection, Mode, Server};
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::mpsc;
+
+    /// A server that answers every request `200 ok` and hands the test each connection it
+    /// accepted, for the test to close.
+    fn backend() -> (SocketAddr, mpsc::Receiver<TcpStream>) {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = l.local_addr().expect("addr");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { continue };
+                let _ = tx.send(s.try_clone().expect("clone"));
+                std::thread::spawn(move || {
+                    let mut got = Vec::new();
+                    let mut b = [0u8; 1024];
+                    loop {
+                        let n = match s.read(&mut b) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        got.extend_from_slice(&b[..n]);
+                        while let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                            got.drain(..end + 4);
+                            if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    fn engine(srv: SocketAddr) -> (Engine, SocketAddr) {
+        engine_with(srv, None)
+    }
+
+    fn engine_with(srv: SocketAddr, http_reuse: Option<ibex_config::HttpReuse>) -> (Engine, SocketAddr) {
+        let fe = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+        let config = Config {
+            frontends: vec![FrontendSection { name: "fe".into(), bind: Some(fe), mode: Mode::Http, default_backend: Some("be".into()), ..Default::default() }],
+            backends: vec![BackendSection { name: "be".into(), mode: Mode::Http, servers: vec![Server::new("s1", srv)], http_reuse, ..Default::default() }],
+            ..Default::default()
+        };
+        (Engine::new(&config, 1024).expect("Engine::new"), fe)
+    }
+
+    fn client(e: &mut Engine, fe: SocketAddr) -> TcpStream {
+        let c = TcpStream::connect(fe).expect("connect");
+        c.set_nonblocking(true).expect("nonblocking");
+        let _ = e.run_once();
+        c
+    }
+
+    /// One request on each of `cs` at once, `e` run until every answer is in.
+    fn exchange_all(e: &mut Engine, cs: &mut [&mut TcpStream]) {
+        for c in cs.iter_mut() {
+            c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+        }
+        let start = Instant::now();
+        let mut got = vec![Vec::new(); cs.len()];
+        let mut buf = [0u8; 512];
+        while !got.iter().all(|g| g.ends_with(b"ok")) {
+            assert!(start.elapsed() < Duration::from_secs(5), "no answer: {got:?}");
+            let _ = e.run_once();
+            for (c, g) in cs.iter_mut().zip(got.iter_mut()) {
+                if let Ok(n) = c.read(&mut buf) {
+                    g.extend_from_slice(&buf[..n]);
+                }
+            }
+        }
+    }
+
+    /// One request on `c`, `e` run until its answer is in.
+    fn exchange(e: &mut Engine, c: &mut TcpStream) {
+        exchange_all(e, &mut [c]);
+    }
+
+    fn drive_until(e: &mut Engine, mut done: impl FnMut(&Engine) -> bool) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if done(e) {
+                return true;
+            }
+            let _ = e.run_once();
+        }
+        done(e)
+    }
+
+    fn idle_count(p: &IdlePool) -> usize {
+        p.pools.with_count((0, 0), |n| n.idle.load(Ordering::Relaxed))
+    }
+
+    /// A keep-alive client whose requests take a connection from the server's lists and
+    /// give it back makes no `epoll_ctl`: the connection stays registered for reads while
+    /// it is idle, and the request is written without asking for writability (`HAProxy`:
+    /// 0.008 `epoll_ctl` per request at 50 connections; Ibex before: 2, a DEL at the release
+    /// and an ADD at the reuse).
+    #[test]
+    fn a_connection_reused_from_the_lists_makes_no_epoll_ctl() {
+        let (srv, _conns) = backend();
+        let (mut e, fe) = engine(srv);
+        let (mut c1, mut c2) = (client(&mut e, fe), client(&mut e, fe));
+        // Two at once: the server is seen to need two, and the lists keep both
+        // (`srv_add_to_idle_list`), once they have been parked on their sessions.
+        exchange_all(&mut e, &mut [&mut c1, &mut c2]);
+        assert!(drive_until(&mut e, |e| e.idle_backend_pool.total() == 2), "two idle connections");
+        let before = e.poller.ctl_calls();
+        for _ in 0..10 {
+            exchange(&mut e, &mut c1);
+        }
+        assert_eq!(e.idle_backend_pool.total(), 2);
+        assert_eq!(e.poller.ctl_calls() - before, 0, "epoll_ctl calls for 10 requests through the lists");
+    }
+
+    /// A server that closes a connection while it is in its lists: the close is an event
+    /// on the connection, which leaves the lists and the server's idle count with it,
+    /// before any request could take it (`h1_io_cb` on an idle connection). Before, it
+    /// stayed until the 50 ms sweep peeked at it, or a request did.
+    #[test]
+    fn a_pooled_connection_its_server_closes_leaves_the_lists_at_the_event() {
+        let mut took = Vec::new();
+        for _ in 0..5 {
+            let (srv, conns) = backend();
+            let (mut e, fe) = engine(srv);
+            let mut c = client(&mut e, fe);
+            exchange(&mut e, &mut c);
+            assert!(drive_until(&mut e, |e| e.idle_backend_pool.total() == 1), "an idle connection");
+            assert_eq!(idle_count(&e.idle_backend_pool), 1);
+            let s = conns.recv_timeout(Duration::from_secs(1)).expect("the server's connection");
+            s.shutdown(std::net::Shutdown::Both).expect("shutdown");
+            let closed = Instant::now();
+            assert!(drive_until(&mut e, |e| e.idle_backend_pool.total() == 0), "never left the lists");
+            assert_eq!(idle_count(&e.idle_backend_pool), 0, "the server's idle count");
+            let t = closed.elapsed();
+            if t < Duration::from_millis(30) {
+                return;
+            }
+            took.push(t);
+        }
+        panic!("the closed connection left the lists only after {took:?}, not at its event");
+    }
+
+    /// A connection another worker takes leaves its owner's epoll set under the owner's
+    /// lock (`fd_takeover`): its events go to the taker, which answers with it; it goes back
+    /// to the taker's lists, and its server's close is the taker's event.
+    #[test]
+    fn a_connection_another_worker_takes_leaves_its_owners_epoll() {
+        let (srv, conns) = backend();
+        let pools = IdlePools::with(2, true);
+        // `always`: the other worker's client takes it with its first request.
+        let (mut a, fe_a) = engine_with(srv, Some(ibex_config::HttpReuse::Always));
+        let (mut b, fe_b) = engine_with(srv, Some(ibex_config::HttpReuse::Always));
+        a.share_idle_pools(&pools, 0).expect("share");
+        b.share_idle_pools(&pools, 1).expect("share");
+        let mut ca = client(&mut a, fe_a);
+        exchange(&mut a, &mut ca);
+        assert!(drive_until(&mut a, |a| a.idle_backend_pool.total() == 1), "idle on worker 0");
+        let raw = {
+            let pool = IdlePools::lock(&pools.slots[0]);
+            let p = pool.servers.values().find_map(|s| s.conns.front()).expect("the idle connection");
+            assert!(a.poller.is_registered(p.conn.fd.as_fd()), "an idle connection stays in its worker's epoll set");
+            p.conn.fd.as_raw_fd()
+        };
+        assert_eq!(a.fdtab.state(raw), FdState::Idle);
+        let mut cb = client(&mut b, fe_b);
+        exchange(&mut b, &mut cb);
+        assert!(conns.try_recv().is_ok() && conns.try_recv().is_err(), "one server connection, reused");
+        let (_, entry) = b.sessions.iter_mut().find(|(_, e)| e.sess.srv.is_some()).expect("worker 1 holds it");
+        let fd = entry.sess.srv.as_ref().expect("srv").as_fd();
+        assert_eq!(fd.as_raw_fd(), raw);
+        assert!(!a.poller.is_registered(fd), "still in its former owner's epoll set");
+        assert!(b.poller.is_registered(fd));
+        // The former owner runs on, its stale entry inert.
+        let _ = a.run_once();
+        assert!(drive_until(&mut b, |b| b.idle_backend_pool.total() == 1 && IdlePools::lock(&pools.slots[1]).conns == 1), "idle on worker 1");
+        exchange(&mut b, &mut cb);
+        assert!(conns.try_recv().is_err(), "still the one server connection");
     }
 }
 

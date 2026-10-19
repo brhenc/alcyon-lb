@@ -1128,6 +1128,7 @@ fn main() {
             let started = Engine::new_worker(&config_clone, capacity, worker_id, proxies_clone).and_then(|mut eng| {
                 let boxes = mailboxes.as_ref().map_err(|m| std::io::Error::other(m.clone()))?;
                 eng.share_mailboxes(boxes, worker_id)?;
+                eng.share_idle_pools(&idle_pools, worker_id)?;
                 Ok(eng)
             });
             // A worker that cannot start reports it and returns, dropping what it bound;
@@ -1140,7 +1141,6 @@ fn main() {
                     return;
                 }
             };
-            engine.share_idle_pools(&idle_pools, worker_id);
 
             if let Some(t) = stats_timeout {
                 engine.set_cli_timeout(t);
