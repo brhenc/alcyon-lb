@@ -143,6 +143,59 @@ pub struct H1Parser {
     pub header_lines: u16,
     /// The last header line was a `TE` that is not sent on (its continuation lines are not).
     last_dropped: bool,
+    /// The headers of the head so far that the end of the head reads again ([`SEEN_CL`] and
+    /// the others), noted as each line is parsed (T436), as `HAProxy` sets `h1m->flags` in
+    /// `h1_headers_to_hdr_list`: what the head lacks is not looked for in the HTX.
+    seen: u8,
+    /// `Host` lines of the head so far (counted to 2), and the block of the first.
+    hosts: u8,
+    host_at: usize,
+    /// What the end of the head reads of the request line, read as it was parsed.
+    line: Option<ParsedLine>,
+}
+
+/// What a request line said, kept by the parser for the end of the head (T436).
+#[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct ParsedLine {
+    target: crate::authority::Target,
+    http11: bool,
+    http10: bool,
+    /// `GET`, `HEAD` or `DELETE`.
+    bodiless: bool,
+    connect: bool,
+}
+
+impl ParsedLine {
+    fn of(method: &[u8], uri: &[u8], version: &[u8]) -> Self {
+        ParsedLine {
+            target: crate::authority::Target::of(uri),
+            http11: version_is_11(version),
+            http10: version == b"HTTP/1.0",
+            bodiless: [&b"GET"[..], b"HEAD", b"DELETE"].contains(&method),
+            connect: method.eq_ignore_ascii_case(b"CONNECT"),
+        }
+    }
+}
+
+/// A `Content-Length` header was parsed ([`H1Parser`]'s `seen`).
+const SEEN_CL: u8 = 1;
+/// A `Transfer-Encoding` header.
+const SEEN_TE: u8 = 2;
+/// A `Connection` header.
+const SEEN_CONN: u8 = 4;
+/// An `Upgrade` header.
+const SEEN_UPGRADE: u8 = 8;
+
+/// The [`H1Parser`] `seen` bit of a header name.
+fn seen_bit(name: &[u8]) -> u8 {
+    match name.len() {
+        7 if name.eq_ignore_ascii_case(b"upgrade") => SEEN_UPGRADE,
+        10 if name.eq_ignore_ascii_case(b"connection") => SEEN_CONN,
+        14 if name.eq_ignore_ascii_case(b"content-length") => SEEN_CL,
+        17 if name.eq_ignore_ascii_case(b"transfer-encoding") => SEEN_TE,
+        _ => 0,
+    }
 }
 
 /// Header lines a request or response head may carry: `HAProxy`'s `tune.http.maxhdr` (101)
@@ -181,6 +234,10 @@ impl H1Parser {
             accept_unsafe_request: false,
             header_lines: 0,
             last_dropped: false,
+            seen: 0,
+            hosts: 0,
+            host_at: 0,
+            line: None,
         }
     }
 
@@ -197,6 +254,15 @@ impl H1Parser {
         self.head_rewritten = false;
         self.header_lines = 0;
         self.last_dropped = false;
+        self.seen = 0;
+        self.hosts = 0;
+        self.line = None;
+    }
+
+    /// Whether the head had an `Upgrade` header (the parser may have taken it out since).
+    #[must_use]
+    pub fn saw_upgrade(&self) -> bool {
+        self.seen & SEEN_UPGRADE != 0
     }
 
     /// Finalizes parsing on connection close / EOF (for HTTP/1.0 close delimiter fallback).
@@ -394,6 +460,7 @@ impl H1Parser {
         check_request_target(method, uri)?;
         htx.push_req_line(method, uri, version)
             .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+        self.line = Some(ParsedLine::of(method.as_bytes(), uri.as_bytes(), version.as_bytes()));
         self.prev_delim_len = span.eol_len;
         self.head_rewritten |= span.eol_len == 1 || !span.canonical;
         self.phase = H1Phase::Headers;
@@ -470,6 +537,7 @@ impl H1Parser {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "too many header lines"));
             }
             htx.finalize_last_header();
+            self.seen |= seen_bit(name.as_bytes());
             // `TE` is hop-by-hop: `HAProxy` sends on `te: trailers` when a token of it is
             // exactly `trailers`, and nothing otherwise, so that a server that honours `TE`
             // does not compress or chunk for a client that never asked (T286).
@@ -491,6 +559,12 @@ impl H1Parser {
                 Err(_) => htx.push_header_latin1(name, value),
             }
             .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+            if name.len() == 4 && name.eq_ignore_ascii_case("host") {
+                if self.hosts == 0 {
+                    self.host_at = htx.num_blocks() - 1;
+                }
+                self.hosts = self.hosts.saturating_add(1).min(2);
+            }
             // Anything but `name: value` and CRLF is written again from the HTX, as
             // HAProxy writes it: one space after the colon, the value's blanks trimmed.
             // (`finalize_last_header` trims the value's trailing blanks in the HTX.)
@@ -552,7 +626,10 @@ impl H1Parser {
         if !self.is_response {
             // The authority against `Host`, as HAProxy checks it at the end of the head
             // (`h1_parse_msg_hdrs`) and normalises it (`http_scheme_based_normalize`).
-            match crate::authority::check_and_normalize(htx, self.accept_unsafe_request) {
+            // Where the one `Host` is, when there is at most one: not looked for again.
+            let one_host = (self.hosts <= 1).then(|| (self.hosts == 1).then_some(self.host_at));
+            let known = crate::authority::Known { one_host, target: self.line.map(|l| l.target) };
+            match crate::authority::check_and_normalize_with(htx, self.accept_unsafe_request, known) {
                 Ok(rewritten) => self.head_rewritten |= rewritten,
                 Err(e) => {
                     self.phase = H1Phase::Error;
@@ -560,10 +637,15 @@ impl H1Parser {
                 }
             }
         }
-        let last_start_line = (0..htx.num_blocks())
-            .rev()
-            .find(|&i| matches!(htx.block_type(i), Some(HtxBlockType::ReqLine | HtxBlockType::ResLine)))
-            .map_or(0, |i| i + 1);
+        // Without a `Content-Length` line the loop below has nothing to read.
+        let last_start_line = if self.seen & SEEN_CL == 0 {
+            htx.num_blocks()
+        } else {
+            (0..htx.num_blocks())
+                .rev()
+                .find(|&i| matches!(htx.block_type(i), Some(HtxBlockType::ReqLine | HtxBlockType::ResLine)))
+                .map_or(0, |i| i + 1)
+        };
 
         let mut seen_cl: Option<usize> = None;
         let mut first_cl_idx: Option<usize> = None;
@@ -679,10 +761,14 @@ impl H1Parser {
         // read the way HAProxy's `h1_parse_xfer_enc_header` reads it: reading only the
         // first line framed `gzip` + `chunked` on two lines as a request without a body,
         // while the next hop read a chunked one (tasks/T276, V&V VV-1).
-        let te = TransferCodings::of(
-            htx.as_ref().header_blocks_where(|n| n.eq_ignore_ascii_case(b"transfer-encoding")).map(|(_, n, v)| (n, v)),
-            self.is_response,
-        );
+        let te = if self.seen & SEEN_TE == 0 {
+            TransferCodings::default()
+        } else {
+            TransferCodings::of(
+                htx.as_ref().header_blocks_where(|n| n.eq_ignore_ascii_case(b"transfer-encoding")).map(|(_, n, v)| (n, v)),
+                self.is_response,
+            )
+        };
         if te.invalid {
             self.phase = H1Phase::Error;
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid Transfer-Encoding"));
@@ -709,11 +795,18 @@ impl H1Parser {
             self.connection_close = true;
         }
         // The start line, read once: what follows edits headers only.
-        let req_line = htx.req_line().map(|r| (r.version, ["GET", "HEAD", "DELETE"].contains(&r.method), r.method.eq_ignore_ascii_case("CONNECT")));
-        let res_version = htx.res_line().map(|r| r.version);
-        let is_http11 = req_line.map_or(res_version == Some("HTTP/1.1"), |(v, ..)| version_is_11(v.as_bytes()));
-        let is_http10 = req_line.is_some_and(|(v, ..)| v == "HTTP/1.0") || res_version == Some("HTTP/1.0");
-        let (bodiless_method, is_connect) = req_line.map_or((false, false), |(_, b, c)| (b, c));
+        // As bytes (T436): nothing here needs it as text.
+        // As the parser read it (T436); what follows the start line does not change it.
+        // (A request head's headers come after its line: `parse_request_line` set it.)
+        let req_line = if self.is_response { None } else { self.line };
+        debug_assert!(
+            req_line.is_none_or(|l| htx.as_ref().req_line_bytes().map(|r| ParsedLine::of(r.method, r.uri, r.version)).is_some_and(|h| (h.http11, h.http10, h.bodiless, h.connect) == (l.http11, l.http10, l.bodiless, l.connect))),
+            "the parser's request line"
+        );
+        let res_version = if self.is_response { htx.res_line().map(|r| r.version) } else { None };
+        let is_http11 = req_line.map_or(res_version == Some("HTTP/1.1"), |l| l.http11);
+        let is_http10 = req_line.is_some_and(|l| l.http10) || res_version == Some("HTTP/1.0");
+        let (bodiless_method, is_connect) = req_line.map_or((false, false), |l| (l.bodiless, l.connect));
         if te.present && !is_http11 {
             // T-E in HTTP/1.0: the connection closes after this message.
             self.connection_close = true;
@@ -740,14 +833,15 @@ impl H1Parser {
             }
         }
 
-        if !self.is_response {
+        // Without an `Upgrade` line there is nothing to check or clean.
+        if !self.is_response && self.seen & SEEN_UPGRADE != 0 {
             self.check_upgrade(htx)?;
         }
 
-        if let Some(conn) = htx.get_header("connection") {
-            if conn.eq_ignore_ascii_case("close") {
+        if let Some(conn) = (self.seen & SEEN_CONN != 0).then(|| htx.as_ref().get_header_bytes(b"connection")).flatten() {
+            if conn.eq_ignore_ascii_case(b"close") {
                 self.connection_close = true;
-            } else if conn.eq_ignore_ascii_case("keep-alive") {
+            } else if conn.eq_ignore_ascii_case(b"keep-alive") {
                 self.connection_close = false;
             }
         } else if is_http10 {
@@ -757,7 +851,7 @@ impl H1Parser {
         if is_connect {
             self.is_upgrade = true;
         }
-        if htx.get_header("upgrade").is_some() {
+        if self.seen & SEEN_UPGRADE != 0 && htx.as_ref().get_header_bytes(b"upgrade").is_some() {
             self.is_upgrade = true;
         }
 

@@ -4738,7 +4738,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 exp: exp.and_then(rel),
                 c_exp: rel(s.conn_exp),
                 retries: s.max_retries.saturating_sub(s.conn_retries),
-                uri: s.txn.as_ref().and(s.req_uri.clone()),
+                uri: s.txn.as_ref().and(s.req_uri.as_deref().map(str::to_owned)),
             });
         }
         for (aidx, a) in self.applets.iter() {
@@ -9963,17 +9963,31 @@ impl EngineDispatcher<'_> {
         }
         // Read in place: the head is borrowed from `rep` (no copy for a UTF-8 head, which is
         // every head on the fast path) and the borrow ends before `rep` is edited.
+        // One pass over the head for what follows reads of it (T436); a head the facts are not
+        // read from is read the old way, a pass for each.
+        let rsp_facts = crate::txn::HeadFacts::scan(&entry.sess.rep.readable()[..total_hdr_len], false);
         let (status, framing, srv_has_close, srv_http11) = {
-            let head = String::from_utf8_lossy(&entry.sess.rep.readable()[..total_hdr_len]);
-            let status = crate::txn::status_of(&head);
-            let framing = crate::txn::response_framing(&head, entry.sess.req_method.as_deref(), status);
-            (status, framing, crate::txn::head_wants_close(&head), ibex_proto::response_head::is_http11(head.as_bytes()))
+            let raw = &entry.sess.rep.readable()[..total_hdr_len];
+            let method = entry.sess.req_method.as_deref();
+            if let Some(f) = rsp_facts {
+                let status = crate::txn::status_of_line(&raw[..memchr::memchr(b'\n', raw).unwrap_or(raw.len())]);
+                let framing = f.response_framing(method, status).unwrap_or_else(|| crate::txn::response_framing(&String::from_utf8_lossy(raw), method, status));
+                (status, framing, f.wants_close(), ibex_proto::response_head::is_http11(raw))
+            } else {
+                let head = String::from_utf8_lossy(raw);
+                let status = crate::txn::status_of(&head);
+                let framing = crate::txn::response_framing(&head, method, status);
+                (status, framing, crate::txn::head_wants_close(&head), ibex_proto::response_head::is_http11(head.as_bytes()))
+            }
         };
         // The head counts what its HTX holds (T265): the data, 40 bytes and 8 per block, not the
         // wire length.
         // Read with the HTX size of the head, which `%B` counts below: the head is not edited in
         // between.
-        let (cost, rsp_htx) = crate::txn::htx_response_head_cost_and_size(&entry.sess.rep.readable()[..total_hdr_len]);
+        let (cost, rsp_htx) = match rsp_facts {
+            Some(f) => (f.cost(), Some(f.size)),
+            None => crate::txn::htx_response_head_cost_and_size(&entry.sess.rep.readable()[..total_hdr_len]),
+        };
         if cost > threshold {
             entry.sess.rep.clear();
             // A response that is not HTTP: `PH`, and nothing of it counts as sent.
@@ -10123,7 +10137,12 @@ impl EngineDispatcher<'_> {
             // `keep-alive` and `close` out of the server's `Connection`, the one this
             // connection's state calls for in (`h1_update_res_conn_value`).
             let (h, e) = entry.sess.rep.eoh().unwrap_or_default();
-            let scan = crate::txn::scan_connection(&entry.sess.rep.readable()[..h + e]);
+            // Without rules nothing has edited the head since its facts were read.
+            let scan = match rsp_facts {
+                Some(f) if h + e == total_hdr_len => f.conn,
+                _ => crate::txn::scan_connection(&entry.sess.rep.readable()[..h + e]),
+            };
+            debug_assert_eq!(scan, crate::txn::scan_connection(&entry.sess.rep.readable()[..h + e]), "stale response head facts");
             // Under 200, `HAProxy` writes no `Connection` (`H1S_F_HAVE_O_CONN`), also for a
             // final status under 100.
             let token = if tunnel || status < 100 {
@@ -10205,8 +10224,8 @@ impl EngineDispatcher<'_> {
 
         let registry = sample_registry();
 
-        let req_uri_clone = entry.sess.req_uri.clone();
-        let req_method_clone = entry.sess.req_method.clone();
+        let req_uri_clone = entry.sess.req_uri.as_deref().map(str::to_owned);
+        let req_method_clone = entry.sess.req_method.as_deref().map(str::to_owned);
         let req_headers_clone = entry.sess.req_headers.clone();
         // The response capture slots the `http-response capture` rules write, and that the
         // context reads (as they were when the response came in).
@@ -13605,7 +13624,7 @@ fn req_set_uri(sess: &mut TcpSession, uri: String) -> bool {
     sess.with_htx_mut(|htx| {
         let _ = htx.set_uri(&uri);
     });
-    sess.req_uri = Some(uri);
+    sess.req_uri.set(&uri);
     rebuild_req_buffer(sess);
     true
 }
@@ -13620,7 +13639,7 @@ fn req_set_method(sess: &mut TcpSession, method: String) -> bool {
     sess.with_htx_mut(|htx| {
         let _ = htx.set_method(&method);
     });
-    sess.req_method = Some(method);
+    sess.req_method.set(&method);
     rebuild_req_buffer(sess);
     true
 }
@@ -14643,7 +14662,7 @@ fn rewrite_header_names_before(buf: &mut [u8], eoh: Option<(usize, usize)>, tabl
         let end = memchr::memchr(b'\n', &buf[at..head]).map_or(head, |i| at + i + 1);
         // A folded line has no name of its own: nothing of it is lower-cased.
         let folded = matches!(buf[at], b' ' | b'\t');
-        let colon = buf[at..end].iter().position(|&b| b == b':').filter(|_| !folded).map_or(at, |i| at + i);
+        let colon = memchr::memchr(b':', &buf[at..end]).filter(|_| !folded).map_or(at, |i| at + i);
         buf[at..colon].make_ascii_lowercase();
         // The name is read as text only when there is a table to look it up in (T433).
         if let Some(to) = table.and_then(|t| t.get(std::str::from_utf8(&buf[at..colon]).ok()?)) {

@@ -259,6 +259,15 @@ pub struct RequestLineView<'a> {
     pub version: &'a str,
 }
 
+/// [`RequestLineView`] as the bytes the block holds (T436): what the proxy compares and
+/// searches needs no reading as UTF-8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestLineBytes<'a> {
+    pub method: &'a [u8],
+    pub uri: &'a [u8],
+    pub version: &'a [u8],
+}
+
 /// A response status line (e.g. `HTTP/1.1 200 OK`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseLine {
@@ -319,16 +328,25 @@ fn words3(raw: &str) -> [Option<&str>; 3] {
 
 /// [`words3`] of an ASCII string, on its bytes.
 fn ascii_words3(raw: &str) -> [Option<&str>; 3] {
+    // ASCII: every index is a character boundary.
+    ascii_word_spans(raw.as_bytes()).map(|w| w.map(|(start, end)| &raw[start..end]))
+}
+
+/// [`ascii_words3`] of ASCII bytes.
+fn ascii_words3_bytes(raw: &[u8]) -> [Option<&[u8]>; 3] {
+    ascii_word_spans(raw).map(|w| w.map(|(start, end)| &raw[start..end]))
+}
+
+/// Where the first three words of ASCII bytes are, as [`words3`] splits them.
+fn ascii_word_spans(b: &[u8]) -> [Option<(usize, usize)>; 3] {
     // What `char::is_whitespace` is true of in ASCII.
     let ws = |b: u8| matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b' ');
-    let b = raw.as_bytes();
     let mut out = [None; 3];
     let mut at = 0;
     for w in &mut out {
         let Some(start) = b[at..].iter().position(|&c| !ws(c)).map(|n| at + n) else { break };
         let end = b[start..].iter().position(|&c| ws(c)).map_or(b.len(), |n| start + n);
-        // ASCII: every index is a character boundary.
-        *w = Some(&raw[start..end]);
+        *w = Some((start, end));
         at = end;
     }
     out
@@ -795,6 +813,21 @@ impl<'a> HtxSliceRef<'a> {
         None
     }
 
+    /// [`Self::req_line`] as bytes: the same words, not read as UTF-8 when the line is
+    /// ASCII (every line the parser takes without `accept-unsafe-violations-in-http-request`).
+    #[must_use]
+    pub fn req_line_bytes(&self) -> Option<RequestLineBytes<'a>> {
+        let desc = (0..self.num_blocks).map(|i| self.read_desc(i)).find(|d| d.blk_type == HtxBlockType::ReqLine)?;
+        let start = desc.addr as usize;
+        let raw = &self.buf[start..start + desc.value_len as usize];
+        let [method, uri, version] = if raw.is_ascii() {
+            ascii_words3_bytes(raw)
+        } else {
+            words3(std::str::from_utf8(raw).ok()?).map(|w| w.map(str::as_bytes))
+        };
+        Some(RequestLineBytes { method: method?, uri: uri?, version: version.unwrap_or(b"HTTP/1.1") })
+    }
+
     #[must_use]
     pub fn res_line(&self) -> Option<ResponseLineView<'a>> {
         for i in 0..self.num_blocks {
@@ -817,22 +850,24 @@ impl<'a> HtxSliceRef<'a> {
         None
     }
 
+    /// The value of the first header named `name` (ASCII case aside), as text; `None` when
+    /// there is none, or when its value is not UTF-8 ([`Self::get_header_bytes`] reads it).
     #[must_use]
     pub fn get_header(&self, name: &str) -> Option<&'a str> {
-        for i in 0..self.num_blocks {
+        self.get_header_bytes(name.as_bytes()).and_then(|v| std::str::from_utf8(v).ok())
+    }
+
+    /// The value of the first header named `name` (ASCII case aside), as its bytes (T436:
+    /// the names are compared as bytes, and none is read as UTF-8).
+    #[must_use]
+    pub fn get_header_bytes(&self, name: &[u8]) -> Option<&'a [u8]> {
+        (0..self.num_blocks).find_map(|i| {
             let desc = self.read_desc(i);
-            if desc.blk_type == HtxBlockType::Header {
-                let name_start = desc.addr as usize;
-                let name_end = name_start + desc.name_len as usize;
-                let hdr_name = std::str::from_utf8(&self.buf[name_start..name_end]).ok()?;
-                if hdr_name.eq_ignore_ascii_case(name) {
-                    let val_start = name_end;
-                    let val_end = val_start + desc.value_len as usize;
-                    return std::str::from_utf8(&self.buf[val_start..val_end]).ok();
-                }
-            }
-        }
-        None
+            let name_start = desc.addr as usize;
+            let name_end = name_start + desc.name_len as usize;
+            (desc.blk_type == HtxBlockType::Header && self.buf[name_start..name_end].eq_ignore_ascii_case(name))
+                .then(|| &self.buf[name_end..name_end + desc.value_len as usize])
+        })
     }
 
     #[must_use]
@@ -2830,6 +2865,37 @@ pub fn pseudo_headers_to_htx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T436 C: the byte accessors read what the blocks hold, without reading it as UTF-8: a
+    /// value that is not UTF-8 (one a rule wrote as bytes) is found as its bytes, and does not
+    /// hide the headers after it. The `&str` accessors read through them.
+    #[test]
+    fn the_byte_accessors_read_bytes() {
+        let mut buf = [0u8; 1024];
+        let mut htx = HtxSlice::new(&mut buf);
+        htx.push_req_line("GET", "/a#b", "HTTP/1.0").unwrap();
+        htx.push_header("x-a", "a").unwrap();
+        htx.push_header("host", "h").unwrap();
+        htx.push_eoh().unwrap();
+        htx.replace_block_value(1, b"\xe9t\xe9").unwrap();
+        let r = htx.as_ref();
+        assert_eq!(r.get_header_bytes(b"X-A"), Some(&b"\xe9t\xe9"[..]));
+        assert_eq!(r.get_header("x-a"), None, "not text");
+        assert_eq!((r.get_header_bytes(b"host"), r.get_header("Host")), (Some(&b"h"[..]), Some("h")));
+        assert_eq!(r.get_header_bytes(b"x-b"), None);
+        let l = r.req_line_bytes().unwrap();
+        assert_eq!((l.method, l.uri, l.version), (&b"GET"[..], &b"/a#b"[..], &b"HTTP/1.0"[..]));
+        let v = r.req_line().unwrap();
+        assert_eq!((v.method, v.uri, v.version), ("GET", "/a#b", "HTTP/1.0"));
+        // A line that is not ASCII is split as `req_line` splits it (Unicode blanks too).
+        let mut buf = [0u8; 256];
+        let mut htx = HtxSlice::new(&mut buf);
+        htx.push_req_line("GET", "/caf\u{e9}\u{a0}x", "").unwrap();
+        let l = htx.as_ref().req_line_bytes().unwrap();
+        let v = htx.as_ref().req_line().unwrap();
+        assert_eq!((l.method, l.uri, l.version), (v.method.as_bytes(), v.uri.as_bytes(), v.version.as_bytes()));
+        assert_eq!((l.uri, l.version), ("/caf\u{e9}".as_bytes(), &b"x"[..]));
+    }
 
     /// A value holding an escaped byte goes out as that byte, whether it was Latin-1 before
     /// or not; any other text goes out as UTF-8 (T285, T286).

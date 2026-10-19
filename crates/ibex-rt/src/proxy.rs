@@ -461,6 +461,45 @@ pub fn reserve_scrape_boxes(n: usize) {
     });
 }
 
+/// The request's method or URI as the session keeps it between requests (T436): one `String`
+/// per session whose capacity survives `reset`, so a keep-alive request copies its line into
+/// memory it already has instead of allocating a new `String` per request.
+#[derive(Debug, Default)]
+pub struct ReqText {
+    buf: String,
+    set: bool,
+}
+
+impl ReqText {
+    /// The text, if this request has one.
+    pub fn as_deref(&self) -> Option<&str> {
+        self.set.then_some(self.buf.as_str())
+    }
+
+    /// Replaces the text with `s`, reusing the buffer (grown to fit, not doubled: a new
+    /// connection's first request allocates what `to_owned` did).
+    pub fn set(&mut self, s: &str) {
+        self.buf.clear();
+        self.buf.reserve_exact(s.len());
+        self.buf.push_str(s);
+        self.set = true;
+    }
+
+    /// Sets the text to `s`, or clears it when `s` is `None`.
+    pub fn set_opt(&mut self, s: Option<&str>) {
+        match s {
+            Some(s) => self.set(s),
+            None => self.reset(),
+        }
+    }
+
+    /// No text; the buffer keeps its capacity for the next request.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.set = false;
+    }
+}
+
 pub struct TcpSession {
     /// The client's socket, none for a stream of an HTTP/2 connection (T280). Outside this
     /// module it is reached through `cli_fd` only.
@@ -489,8 +528,8 @@ pub struct TcpSession {
     pub proxy_hdr_err: Option<ProxyHdrError>,
     pub cliexp: Vec<CompiledExp>,
     pub srvexp: Vec<CompiledExp>,
-    pub req_uri: Option<String>,
-    pub req_method: Option<String>,
+    pub req_uri: ReqText,
+    pub req_method: ReqText,
     /// Bytes of the request body the HTX message holds (block header included), fixed when
     /// the rules first size it: the body is read once, so a later rule list (the backend's)
     /// finds it as it was, less the room the rewrites before it took (`req_htx_init`).
@@ -1056,8 +1095,8 @@ impl TcpSession {
             proxy_hdr_err: None,
             cliexp,
             srvexp,
-            req_uri: None,
-            req_method: None,
+            req_uri: ReqText::default(),
+            req_method: ReqText::default(),
             req_body_htx: std::cell::Cell::new(None),
             req_headers: None,
             htx_buf: Buf::unallocated(crate::buf::BufClass::Standard),
@@ -1804,9 +1843,9 @@ impl TcpSession {
         self.stick_out_pending += self.log.bytes_from_server;
         self.log = crate::txnlog::StreamLog::start(self.bytes_in, self.bytes_out);
         self.txn = None;
-        self.req_method = None;
+        self.req_method.reset();
         self.req_body_htx.set(None);
-        self.req_uri = None;
+        self.req_uri.reset();
         self.set_scrape(None);
         self.req_headers = None;
         self.clear_htx();
@@ -1906,6 +1945,7 @@ impl TcpSession {
         let mut slice = ibex_proto::htx::HtxSlice::new(raw);
         stream.parse(&self.req.readable()[..head_len], &mut slice)?;
         let mut close = stream.connection_close();
+        let head_rewritten = stream.head_rewritten();
         // `Content-Length` beside `Transfer-Encoding`: forwarded as HAProxy does
         // (`src/h1.c`, `h1_parse_msg_hdrs`, "T-E + C-L: force close and remove C-L"). The
         // chunked encoding frames the body, the `Content-Length` is removed so no next hop
@@ -1919,10 +1959,15 @@ impl TcpSession {
         }
         // The websocket handshake, for the response (T281): a key written when the request
         // has none and the frontend accepts that (`h1_process_mux`).
-        let (ws, written) = crate::websocket::ReqWs::of(
-            slice.as_ref().header_blocks_where(crate::websocket::ReqWs::reads).map(|(_, n, v)| (n, v)),
-            self.accept_unsafe_request,
-        );
+        // Without an `Upgrade` line the request asks for nothing (T436: not looked for).
+        let (ws, written) = if h1_parser.saw_upgrade() {
+            crate::websocket::ReqWs::of(
+                slice.as_ref().header_blocks_where(crate::websocket::ReqWs::reads).map(|(_, n, v)| (n, v)),
+                self.accept_unsafe_request,
+            )
+        } else {
+            (crate::websocket::ReqWs::default(), None)
+        };
         let key_written = written.is_some_and(|k| slice.add_header("sec-websocket-key", &k).is_ok());
         self.req_ws = (ws != crate::websocket::ReqWs::default()).then(|| Box::new(ws));
         self.htx_tail = slice.tail_addr();
@@ -1930,7 +1975,7 @@ impl TcpSession {
         self.has_htx = true;
         // Modified, so the head forwarded is regenerated from the HTX, without it. So
         // too when the parser normalised the authority and `Host` (tasks/T93).
-        self.htx_modified = conflict || key_written || stream.head_rewritten();
+        self.htx_modified = conflict || key_written || head_rewritten;
         Ok(close)
     }
 
@@ -2314,7 +2359,12 @@ impl TcpSession {
                 // HAProxy answers 431 (tasks/T87; `txn::htx_head_cost_and_size`).
                 // What `%U` counts of this head: the message as received, whatever the
                 // rules make of it afterwards.
-                let (cost, req_htx) = txn::htx_head_cost_and_size(&self.req.readable()[..total_hdr_len]);
+                // Read once for what the proxy reads of this head before its rules run (T436).
+                let facts = txn::HeadFacts::scan(&self.req.readable()[..total_hdr_len], true);
+                let (cost, req_htx) = match facts {
+                    Some(f) => (f.cost(), Some(f.size)),
+                    None => txn::htx_head_cost_and_size(&self.req.readable()[..total_hdr_len]),
+                };
                 if cost > threshold {
                     self.fail_request(431);
                     return Ok(true);
@@ -2349,27 +2399,34 @@ impl TcpSession {
                     }
                 };
                 if self.has_htx {
-                    let (req_m, req_u, conn_close, wire_replacement) = {
+                    let (conn_close, wire_replacement) = {
                         let htx = ibex_proto::htx::HtxSliceRef::new(
                             self.htx_buf.raw_slice(),
                             self.htx_blocks,
                         );
-                        let mut req_m = None;
-                        let mut req_u = None;
                         let mut conn_close = false;
                         // The values of the `Connection` headers, the names compared as bytes
                         // (T433: `headers()` read every name and value as UTF-8, twice).
                         let connection = || htx.header_blocks_where(|n| n.eq_ignore_ascii_case(b"connection")).map(|(_, _, v)| v);
-                        if let Some(req) = htx.req_line() {
-                            req_m = Some(req.method.to_string());
-                            req_u = Some(req.uri.to_string());
-                            if req.version == "HTTP/1.0"
-                                && !connection().any(|v| txn::connection_has(v, "keep-alive"))
+                        // What the head's facts say of them, read before it was parsed: the
+                        // parser edits no `Connection` line of a head they are read from.
+                        let conn_tokens = facts.map(|f| (f.conn_close, f.conn_keep_alive));
+                        debug_assert!(conn_tokens.is_none_or(|t| t == (connection().any(|v| txn::connection_has(v, "close")), connection().any(|v| txn::connection_has(v, "keep-alive")))));
+                        // Read as bytes (T436); the method and the target are text (the HTX holds
+                        // UTF-8), and are read as text only when the whole line is.
+                        let line = htx.req_line_bytes().and_then(|r| Some((std::str::from_utf8(r.method).ok()?, std::str::from_utf8(r.uri).ok()?, r.version)));
+                        debug_assert_eq!(line, htx.req_line().map(|r| (r.method, r.uri, r.version.as_bytes())));
+                        if let Some((method, uri, version)) = line {
+                            // Copied into the session's own buffers: no allocation once warm.
+                            self.req_method.set(method);
+                            self.req_uri.set(uri);
+                            if version == b"HTTP/1.0"
+                                && !conn_tokens.map_or_else(|| connection().any(|v| txn::connection_has(v, "keep-alive")), |t| t.1)
                             {
                                 conn_close = true;
                             }
                         }
-                        if connection().any(|v| txn::connection_has(v, "close")) {
+                        if conn_tokens.map_or_else(|| connection().any(|v| txn::connection_has(v, "close")), |t| t.0) {
                             conn_close = true;
                         }
                         let wire_replacement = if self.htx_modified {
@@ -2378,62 +2435,13 @@ impl TcpSession {
                         } else {
                             None
                         };
-                        (req_m, req_u, conn_close, wire_replacement)
+                        (conn_close, wire_replacement)
                     };
-                    if let Some(m) = req_m {
-                        self.req_method = Some(m);
-                    }
-                    if let Some(u) = req_u {
-                        self.req_uri = Some(u);
-                    }
                     close |= conn_close;
                     // Only regenerate wire buffer if HTX was actually modified
                     if let Some(wire) = wire_replacement {
                         self.req.replace_prefix(total_hdr_len, &wire);
                     }
-                } else {
-                    let hdr_bytes = &self.req.readable()[..total_hdr_len];
-                    let hdr_str = String::from_utf8_lossy(hdr_bytes).to_string();
-                    let (first_line, rest_headers) =
-                        if let Some((fl, rest)) = hdr_str.split_once("\r\n") {
-                            (fl, rest)
-                        } else if let Some((fl, rest)) = hdr_str.split_once('\n') {
-                            (fl, rest)
-                        } else if let Some((fl, rest)) = hdr_str.split_once('\r') {
-                            (fl, rest)
-                        } else {
-                            (hdr_str.as_ref(), "")
-                        };
-
-                    let mut parts = first_line.split_whitespace();
-                    if let Some(m) = parts.next() {
-                        self.req_method = Some(m.to_string());
-                    }
-                    if let Some(u) = parts.next() {
-                        self.req_uri = Some(u.to_string());
-                    }
-                    let mut hdrs: Vec<(String, String)> = Vec::new();
-                    for line in rest_headers.lines() {
-                        let trimmed = line.trim_end_matches(['\r', '\n']);
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        if trimmed.starts_with(' ') || trimmed.starts_with('\t') {
-                            if let Some(last) = hdrs.last_mut() {
-                                last.1.push(' ');
-                                last.1.push_str(trimmed.trim());
-                            }
-                        } else if let Some((k, v)) = trimmed.split_once(':') {
-                            hdrs.push((k.trim().to_string(), v.trim().to_string()));
-                        }
-                    }
-                    if hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("close")) {
-                        close = true;
-                    }
-                    if first_line.contains("HTTP/1.0") && !hdrs.iter().any(|(k, v)| k.eq_ignore_ascii_case("connection") && v.eq_ignore_ascii_case("keep-alive")) {
-                        close = true;
-                    }
-                    self.req_headers = Some(hdrs);
                 }
 
                 // `txn->uri`: the request line once the parser has normalised the authority
@@ -2463,8 +2471,18 @@ impl TcpSession {
 
                 // The head may have been rewritten above; its framing is read from what
                 // will be forwarded.
-                let framing = self.req.eoh()
-                    .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e]));
+                // Its facts still answer when it was regenerated from the HTX: the parser keeps
+                // what frames the body (a `Content-Length` beside `Transfer-Encoding` goes, and
+                // the request is chunked either way). Not when `reqrep` rules rewrote it.
+                let framing = match facts.and_then(|f| f.framing) {
+                    Some(f) if self.cliexp.is_empty() => f,
+                    _ => self.req.eoh().map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e])),
+                };
+                debug_assert_eq!(
+                    framing,
+                    self.req.eoh().map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e])),
+                    "request framing from stale facts"
+                );
                 // The chunked body already received with the head is checked before any of
                 // the request is forwarded: HAProxy parses what is in its buffer into HTX
                 // first, and answers a malformed chunk with 400 without contacting the
@@ -3556,6 +3574,22 @@ fn h3_log_line(line: &str, host: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// T436: `ReqText` keeps its buffer across `reset`, so the next request's text fits without
+    /// a new allocation; `set_opt(None)` clears it as `reset` does.
+    #[test]
+    fn req_text_reuses_its_buffer() {
+        let mut t = super::ReqText::default();
+        assert_eq!(t.as_deref(), None);
+        t.set("/a/longer/path");
+        let cap = t.buf.capacity();
+        t.reset();
+        assert_eq!(t.as_deref(), None);
+        t.set_opt(Some("/short"));
+        assert_eq!((t.as_deref(), t.buf.capacity()), (Some("/short"), cap));
+        t.set_opt(None);
+        assert_eq!(t.as_deref(), None);
+    }
 
     /// `bc_err` builds the `bc_err`/`bc_err_str` pair the oracle prints for a plain
     /// (non-TLS) connection. Runtime call: the table in `proxy.rs` evaluates it at compile

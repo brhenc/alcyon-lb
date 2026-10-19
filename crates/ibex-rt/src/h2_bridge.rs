@@ -133,8 +133,8 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) {
         sess.has_htx = true;
         sess.htx_modified = false;
     }
-    sess.req_method = d.method;
-    sess.req_uri = d.uri;
+    sess.req_method.set_opt(d.method.as_deref());
+    sess.req_uri.set_opt(d.uri.as_deref());
     sess.req_headers = Some(d.headers);
     sess.req.clear();
     // The head waits here for a server connection (a stream held in the queue, or whose body
