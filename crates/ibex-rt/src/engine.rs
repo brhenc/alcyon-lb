@@ -10664,6 +10664,72 @@ impl EngineDispatcher<'_> {
         }
     }
 
+    /// `stats http-request` (and the rule `stats auth` became): the first rule whose condition
+    /// holds answers. `allow` serves the page, `deny` and `auth` reply and return true; no
+    /// rule matching serves it (`http_req_get_intercept_rule` over `uri_auth->http_req_rules`).
+    /// The condition sees the request line, headers and addresses of the stream.
+    fn stats_rules_reply(entry: &mut SessionEntry, proxies: &Proxies, serving: usize) -> bool {
+        let rules = proxies[serving].stats_config.http_req_rules();
+        if rules.is_empty() {
+            return false;
+        }
+        let registry = sample_registry();
+        let sess = &mut entry.sess;
+        let name = proxies[serving].name.as_str();
+        for rule in rules {
+            let matches = match &rule.cond {
+                None => true,
+                Some(cond) => {
+                    let ctx = SampleContext {
+                        proxies: Some(&ProxiesView(proxies)),
+                        client_addr: sess.client_addr,
+                        server_addr: sess.server_addr,
+                        fc_src: sess.fc_src,
+                        fc_dst: sess.fc_dst,
+                        is_first_req: sess.is_first_req,
+                        ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
+                        fc_http_major: sess.fc_http_major(),
+                        req_version: sess.client_version(),
+                        req_uri: sess.req_uri.as_deref(),
+                        req_method: sess.req_method.as_deref(),
+                        htx_slice: sess.htx_slice(),
+                        req_headers: sess.req_headers.as_deref(),
+                        fe_name: Some(name),
+                        fe_id: Some(proxies[serving].ids.iid),
+                        acls: Some(&proxies[serving].acls),
+                        ..Default::default()
+                    };
+                    eval_condition(cond, &ctx, &proxies[serving].acls, registry)
+                }
+            };
+            if !matches {
+                continue;
+            }
+            let (status, realm) = match &rule.action {
+                ibex_config::HttpReqAction::Deny { deny_status, .. } => {
+                    proxies[serving].counters().denied_req.fetch_add(1, Ordering::Relaxed);
+                    (deny_status.unwrap_or(403), None)
+                }
+                ibex_config::HttpReqAction::Auth { realm } => (401, Some(realm.as_deref().unwrap_or("HAProxy Statistics"))),
+                // `allow` (the parser lets nothing else in): the page follows.
+                _ => return false,
+            };
+            let mut resp: Vec<u8> = match resolve_error_body(&proxies[serving], &proxies[serving], status, Some(&ibex_config::ErrorPageSource::DefaultErrorfiles), None, None) {
+                ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
+                // An `http-error` template: its text does not look at the request here.
+                ResolvedErrorBody::Custom { content_type, lf_string } => {
+                    build_templated_error_response(status, content_type, lf_string, &SampleContext::default(), registry)
+                }
+            };
+            if let Some(realm) = realm {
+                resp = with_header_at_end_of_head(&resp, &format!("www-authenticate: Basic realm=\"{realm}\""));
+            }
+            send_proxy_reply(sess, &proxies[..], serving, serving, &resp);
+            return true;
+        }
+        false
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_stats_request(
         entry: &mut SessionEntry,
@@ -10674,6 +10740,9 @@ impl EngineDispatcher<'_> {
         serving: usize,
     ) -> Option<crate::stats_html::AdminAction> {
         entry.sess.log.applet = true;
+        if Self::stats_rules_reply(entry, proxies, serving) {
+            return None;
+        }
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
 
         // `stats refresh`: HAProxy sends `Refresh: <seconds, rounded up>` unless the URI carries
@@ -10941,29 +11010,6 @@ impl EngineDispatcher<'_> {
                     send_proxy_reply(&mut entry.sess, proxies, proxy_idx, proxy_idx, MONITOR_URI_RESPONSE);
                 }
                 return None;
-            }
-        }
-
-        // Serve the stats page before anything else routes this request.
-        //
-        // This dispatch was dropped when the action-rule engine was wired in, leaving
-        // `is_stats_request` and `handle_stats_request` orphaned -- clippy flagged both
-        // as never used. The effect was that every request to `stats uri` fell through
-        // to normal backend routing and returned 503, so the stats page and the whole
-        // web admin stopped working.
-        if resume.is_none()
-            && (proxies[proxy_idx].stats_config.enable
-                || proxies[proxy_idx].stats_config.uri.is_some()
-                || proxies[proxy_idx].stats_config.admin)
-        {
-            let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
-            let configured_uri = proxies[proxy_idx].stats_config.uri.as_deref();
-            if Self::is_stats_request(req_uri, configured_uri)
-                || (proxies[proxy_idx].servers.is_empty()
-                    && proxies[proxy_idx].default_backend.is_none()
-                    && proxies[proxy_idx].use_backends.is_empty())
-            {
-                return Self::handle_stats_request(entry, proxies, checks, pid, now, proxy_idx);
             }
         }
 
@@ -11709,6 +11755,27 @@ impl EngineDispatcher<'_> {
                 // Held for the body: back here when it is.
                 Ok(RuleFlow::Suspend) => return None,
                 Ok(RuleFlow::Next) => {}
+            }
+        }
+
+        // Serve the stats page once the frontend's `http-request` rules have accepted the
+        // request, as `http_process_req_common` does (a `deny` blocks the page, a `set-path`
+        // moves the request onto or off the stats URI); before any backend is chosen.
+        //
+        // This dispatch was dropped when the action-rule engine was wired in, leaving
+        // `is_stats_request` and `handle_stats_request` orphaned -- clippy flagged both
+        // as never used. The effect was that every request to `stats uri` fell through
+        // to normal backend routing and returned 503, so the stats page and the whole
+        // web admin stopped working.
+        if !resume_be
+            && (proxies[proxy_idx].stats_config.enable
+                || proxies[proxy_idx].stats_config.uri.is_some()
+                || proxies[proxy_idx].stats_config.admin)
+        {
+            let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
+            let configured_uri = proxies[proxy_idx].stats_config.uri.as_deref();
+            if Self::is_stats_request(req_uri, configured_uri) {
+                return Self::handle_stats_request(entry, proxies, checks, pid, now, proxy_idx);
             }
         }
 

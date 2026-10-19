@@ -78,6 +78,16 @@ fn credentials(ctx: &SampleContext) -> Option<Credentials> {
     }
 }
 
+/// Equality without an early exit on the first differing byte: the time depends on the
+/// longer length, not on where the two differ.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
+    }
+    diff == 0
+}
+
 /// The user of `userlist` the request authenticates as: it exists, has a password, and the
 /// request carries it.
 fn authenticated(ctx: &SampleContext, userlist: &str) -> Option<AuthUser> {
@@ -89,7 +99,7 @@ fn authenticated(ctx: &SampleContext, userlist: &str) -> Option<AuthUser> {
     // (it caches nothing).
     let ok = match &u.crypt {
         Some(hash) => hash.verify(pass.as_bytes()),
-        None => u.password.as_deref() == Some(pass.as_str()),
+        None => u.password.as_deref().is_some_and(|p| ct_eq(p.as_bytes(), pass.as_bytes())),
     };
     ok.then(|| u.clone())
 }
@@ -141,4 +151,19 @@ pub(crate) fn register(reg: &mut Registry) {
         out_type: SampleType::Str,
         func: |ctx, _| credentials(ctx).map(|c| Sample::Str(c.kind().to_string())),
     });
+}
+
+#[cfg(test)]
+mod ct_tests {
+    use super::ct_eq;
+
+    #[test]
+    fn compares_whole_values() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"secret", b"secret"));
+        assert!(!ct_eq(b"secret", b"secreT"));
+        assert!(!ct_eq(b"secret", b"secre"));
+        assert!(!ct_eq(b"", b"x"));
+        assert!(!ct_eq(b"a\0", b"a"));
+    }
 }

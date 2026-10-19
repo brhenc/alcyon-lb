@@ -412,6 +412,10 @@ pub struct StatsConfig {
     pub show_legends: bool,
     pub show_desc: Option<Box<str>>,
     pub show_node: Option<Box<str>>,
+    /// A `stats` line of the proxy's own has dropped what `defaults` set (see `detach`).
+    pub detached: bool,
+    /// `stats auth`, `realm`, `show-version` and `http-request`; boxed, as almost no proxy has them.
+    pub auth: Option<Box<StatsAuth>>,
     pub raw_timeouts: TimeoutConfig,
     pub forwardfor: Option<String>,
     /// `option forwardfor ... if-none` (without it, `HAProxy` adds the header always).
@@ -427,6 +431,59 @@ pub struct StatsConfig {
     /// `accept-invalid-http-response`): what `ibex_proto::response_head` lets through from a
     /// server under the option (T275).
     pub accept_unsafe_response: bool,
+}
+
+/// What `stats auth`, `stats realm`, `stats show-version` and `stats http-request` set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatsAuth {
+    /// `stats auth <user>:<password>`, in the order written (a repeated user is ignored).
+    pub users: Vec<(Box<str>, Box<str>)>,
+    /// `stats realm`.
+    pub realm: Option<Box<str>>,
+    /// `stats show-version` (and not `hide-version` after it): the page names the build.
+    pub show_version: bool,
+    /// `stats http-request`, then the rule `stats auth` becomes (see `finish_stats_auth`).
+    pub http_req_rules: Vec<HttpReqRule>,
+}
+
+impl StatsConfig {
+    /// The first `stats` line of a proxy drops everything `defaults` set for the stats page
+    /// (`stats_uri_auth_drop` in cfgparse-listen.c): not the uri alone, the auth and the
+    /// rest too. The fields that are not the page's stay.
+    pub fn detach(&mut self) {
+        if !self.detached {
+            self.detached = true;
+            self.enable = false;
+            self.uri = None;
+            self.refresh = None;
+            self.admin = false;
+            self.admin_cond = None;
+            self.show_legends = false;
+            self.show_desc = None;
+            self.show_node = None;
+            self.auth = None;
+        }
+    }
+
+    /// The `stats http-request` rules, `stats auth`'s included.
+    #[must_use]
+    pub fn http_req_rules(&self) -> &[HttpReqRule] {
+        self.auth.as_deref().map_or(&[], |a| &a.http_req_rules)
+    }
+
+    /// Whether the page names the build (`stats show-version`).
+    #[must_use]
+    pub fn show_version(&self) -> bool {
+        self.auth.as_deref().is_some_and(|a| a.show_version)
+    }
+
+    /// What a proxy takes from the `defaults` it follows. HAProxy shares the defaults' whole
+    /// stats page setup (uri, auth, realm, ...) with a proxy that has no `stats` line, and a
+    /// proxy with one starts from nothing (`detach`); measured on 3.5-dev8.
+    #[must_use]
+    pub fn inherited(&self) -> Self {
+        Self { detached: false, ..self.clone() }
+    }
 }
 
 impl Default for ListenSection {

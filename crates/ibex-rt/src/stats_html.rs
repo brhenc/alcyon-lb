@@ -66,6 +66,8 @@ pub fn render_stats_html_for(
         .as_deref()
         .map(|d| if d.is_empty() { crate::stats::description().unwrap_or_default() } else { d.to_string() })
         .map_or(String::new(), |d| format!(": {d}"));
+    // `stats show-version` names the build next to the title; the default hides it.
+    let version = if serving.show_version() { format!(" version {}", crate::version::VERSION) } else { String::new() };
     let heading = format!("Statistics Report for pid {pid}{on_node}{desc}");
     let mut out = String::with_capacity(32768);
 
@@ -329,7 +331,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
 <div class="container">
   <header>
     <div class="brand">
-      <h1>IBEX</h1>
+      <h1>IBEX{version}</h1>
       <span class="tag">Load Balancer &amp; Runtime</span>
       <span class="tag mono">PID: {pid}</span>
     </div>

@@ -97,10 +97,16 @@ User-visible ones; the full list is [differences.md](differences.md) and [../tra
 - Refused at load (the config fails, it does not run without it): `compression` (planned for M5),
   `cache`, `peers`, Lua, SPOE/`filter`, FastCGI, `resolvers` and `server-template` (no run-time
   DNS: use IP addresses or names resolved at start), OpenSSL-only keywords.
-- **Stats page:** no password protection yet. `stats auth`, `realm`, `scope`, `hide-version`,
-  `show-version`, `show-modules` and `stats http-request` are refused at load (before RC1 they were
-  accepted and ignored, so `stats auth` served the page to anyone). Bind the stats page to
-  127.0.0.1 or a private address, or use the `stats socket` CLI.
+- **Stats page:** `stats auth <user>:<password>` (repeatable), `stats realm`, `stats http-request
+  allow | deny [deny_status <n>] | auth [realm <r>] [if|unless <cond>]` and `stats show-version` /
+  `hide-version` work as in HAProxy (401 with `WWW-Authenticate`, also for the admin POST). Like
+  HAProxy, `stats auth`/`realm` and `stats http-request` cannot be mixed in one proxy. **Stats in
+  `defaults`:** a proxy with no `stats` line of its own uses the defaults' whole stats setup, auth
+  included; a proxy with any `stats` line (even `stats enable`) starts from an empty one, so it
+  needs its own `stats auth`. The stats page runs after the proxy's `http-request` rules, so an
+  `http-request deny` in front of it protects it. `stats scope`, `stats show-modules` and other
+  `stats http-request` actions are refused at load. Passwords in `stats auth` are plain text in the
+  config file: bind the page to a private address or use TLS on the bind.
 - TLS: ECDHE only, no finite-field DHE (`DHE-*` ciphers, `ssl-dh-param-file`; `tradeoff.md` 6.18).
   Every current browser does ECDHE. The `ssl_c_*` fetches (the client's certificate) are missing.
 - **Check your ACL names by hand** (T430 #1): a rule naming an ACL that does not exist

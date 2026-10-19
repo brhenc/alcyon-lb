@@ -341,6 +341,7 @@ mod startup_scaling;
 mod stat_econ;
 mod stat_wretr_wredis;
 mod stats_admin_sessions;
+mod stats_auth;
 mod stats_csv_schema;
 mod stats_global_keywords;
 mod stats_refresh;
