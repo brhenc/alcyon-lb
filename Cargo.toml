@@ -91,6 +91,16 @@ lto = "off"
 [profile.release]
 debug = true
 
+# Opt-in build for deployment and performance work: `cargo build --profile release-perf`
+# (output in target/release-perf/). Fat LTO over the whole crate graph and one codegen unit:
+# measured 2026-10-19 (T433) -9.1% user cycles and -5.1% CPU per proxied request against
+# `release`, and a stable code layout (16 codegen units moved CPU/request by +-3% between
+# near-identical builds). Costs a ~7 min cold build on 64 cores; `release` stays the default.
+[profile.release-perf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 # Debug builds (and the tests) keep line tables only: backtraces still name the function and
 # the line, but the ~350 test binaries are half the size and link several times faster
 # (measured 2026-10-10: 26 GB -> 13-14 GB per target; with mold, relinking every test after a
