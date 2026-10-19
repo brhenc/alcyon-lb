@@ -667,15 +667,18 @@ fn a_reload_that_cannot_start_a_worker_keeps_the_old_one() {
     std::fs::copy(env!("CARGO_BIN_EXE_ibex"), &bin).unwrap();
     let port = common::reserve_port();
     std::fs::write(&cfg, config(port, "v1")).unwrap();
-    let child = Command::new(&bin)
-        .args(["-W", "-S"])
-        .arg(&sock)
-        .arg("-f")
-        .arg(&cfg)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn");
+    // The copy was just written: a test that forks at that moment has the write descriptor
+    // until its exec, and executing a file open for writing is ETXTBSY. Wait it out.
+    let mut tries = 0;
+    let child = loop {
+        match Command::new(&bin).args(["-W", "-S"]).arg(&sock).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            Err(e) if e.raw_os_error() == Some(26) && tries < 200 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            other => break other.expect("spawn"),
+        }
+    };
     let _m = Master { child, dir: dir.clone() };
     wait_for_socket(&sock);
     assert!(common::wait_listening(std::net::SocketAddr::from(([127, 0, 0, 1], port))));
