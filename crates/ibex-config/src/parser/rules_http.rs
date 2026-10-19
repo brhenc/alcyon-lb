@@ -3,7 +3,7 @@
 
 use crate::HeadersBinOp;
 use super::{
-    find_cond_idx, join_tokens_until, parse_acl_condition_from_tokens, parse_error_body_args,
+    args_end, parse_acl_condition_from_tokens, parse_error_body_args,
     parse_rule_condition, parse_gpc_array_action, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
     AclCondition, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
     HttpResRule, RedirectCookie, RedirectKind, RedirectRule, RetriesValue, Token,
@@ -31,9 +31,11 @@ fn parse_one_expr_and_cond(
 /// (`http_parse_http_reply`): status, content type, formatted body, error page, condition.
 #[allow(clippy::type_complexity)]
 fn parse_return_action(
+    list: &str,
     tokens: &[Token],
+    act_token: &Token,
 ) -> Result<(u16, Option<String>, Option<String>, Option<ErrorPageSource>, Option<AclCondition>), ConfigError> {
-    let cond_idx = find_cond_idx(tokens, 2);
+    let cond_idx = args_end(tokens, 2);
     let limit = cond_idx.unwrap_or(tokens.len());
 
     // `errorfiles <name>` (if present) must pick a single status code out of a whole
@@ -47,7 +49,7 @@ fn parse_return_action(
         }
     }
 
-    let (content_type, lf_string, error_page) = parse_error_body_args(tokens, 2, limit, status)?;
+    let (content_type, lf_string, error_page) = parse_error_body_args(tokens, 2, limit, status, Some((list, act_token)))?;
 
     let cond = if let Some(idx) = cond_idx {
         parse_acl_condition_from_tokens(&tokens[idx..])?
@@ -79,6 +81,36 @@ fn set_status_reason(tokens: &[Token], what: &str) -> Result<Option<String>, Con
         }
     }
     Ok(reason)
+}
+
+/// `strict-mode on|off` and the condition after it (`http_parse_strict_mode`,
+/// `src/http_act.c`): exactly one value, `on` or `off`; any other value is refused, and so is
+/// a missing one.
+fn strict_mode_arg(list: &str, tokens: &[Token], act_token: &Token) -> Result<(bool, Option<AclCondition>), ConfigError> {
+    let refuse = |t: &Token, msg: String| {
+        ConfigError::new(t.line, t.col, format!("error detected while parsing '{list} strict-mode' rule : {msg}"))
+    };
+    let on = match tokens.get(2).map(|t| (t, t.text.as_str())) {
+        Some((_, "on")) => true,
+        Some((_, "off")) => false,
+        Some((t, other)) => return Err(refuse(t, format!("Unexpected value '{other}'. Only 'on' and 'off' are supported."))),
+        None => return Err(refuse(act_token, "expects exactly 1 arguments.".to_string())),
+    };
+    Ok((on, expect_cond_in(list, tokens, 3, act_token)?))
+}
+
+/// The condition after the one `<format>` argument of `set-path`, `set-pathq`, `set-query`,
+/// `set-uri` and `set-method`: another word is refused with `HAProxy`'s arity message
+/// (`parse_set_req_line`, `src/http_act.c`), not skipped.
+fn one_fmt_cond(tokens: &[Token], act_token: &Token) -> Result<Option<AclCondition>, ConfigError> {
+    if let Some(t) = tokens.get(3).filter(|t| t.text != "if" && t.text != "unless") {
+        return Err(ConfigError::new(
+            t.line,
+            t.col,
+            format!("error detected while parsing 'http-request {}' rule : expects exactly 1 argument <format>.", act_token.text),
+        ));
+    }
+    expect_cond_at(tokens, 3, act_token)
 }
 
 fn expect_cond_at(tokens: &[Token], at: usize, act_token: &Token) -> Result<Option<AclCondition>, ConfigError> {
@@ -388,21 +420,13 @@ fn parse_http_req_rule_at(
                 "<http-request track-sc*> expects sample expression.",
             ));
         }
-        let expr = tokens[2].text.clone();
-        let mut table = None;
-        let mut cond_start = None;
-        let mut i = 3;
-        while i < tokens.len() {
-            if tokens[i].text == "table" && i + 1 < tokens.len() {
-                table = Some(tokens[i + 1].text.clone());
-                i += 2;
-            } else if tokens[i].text == "if" || tokens[i].text == "unless" {
-                cond_start = Some(i);
-                break;
-            } else {
-                i += 1;
-            }
-        }
+        let (expr, table, cond_start) = super::rules_tcp::parse_track_sc_args(tokens, 2, &|t| {
+            ConfigError::new(
+                t.line,
+                t.col,
+                format!("'http-request {act_str}' expects either 'if' or 'unless' followed by a condition but found '{}'.", t.text),
+            )
+        })?;
         let cond = if let Some(idx) = cond_start {
             parse_acl_condition_from_tokens(&tokens[idx..])?
         } else {
@@ -415,34 +439,31 @@ fn parse_http_req_rule_at(
         };
         rules.push(HttpReqRule { action, cond, line: 0 });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc0", act_token)? {
-        let (_, cond) = parse_rule_condition(tokens, 2)?;
+        let cond = expect_cond_at(tokens, 2, act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc0 { sc }, cond, line: 0 });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc1", act_token)? {
-        let (_, cond) = parse_rule_condition(tokens, 2)?;
+        let cond = expect_cond_at(tokens, 2, act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc1 { sc }, cond, line: 0 });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_token)? {
-        let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-        let expr = join_tokens_until(tokens, 2, cond_idx);
+        let (expr, cond) = one_arg_and_cond(tokens, "http-request", act_token)?;
         // No value is 0, as `HAProxy` reads it (`strtol` stops at the end of the line).
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt0 { sc, expr }, cond, line: 0 });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-inc-gpc", act_token)? {
-        let (_, cond) = parse_rule_condition(tokens, 2)?;
+        let cond = expect_cond_at(tokens, 2, act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc { idx, sc }, cond, line: 0 });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-add-gpc", act_token)? {
-        let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-        let expr = join_tokens_until(tokens, 2, cond_idx);
+        let (expr, cond) = one_arg_and_cond(tokens, "http-request", act_token)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(HttpReqRule { action: HttpReqAction::ScAddGpc { idx, sc, expr }, cond, line: 0 });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-set-gpt", act_token)? {
-        let (cond_idx, cond) = parse_rule_condition(tokens, 3)?;
-        let expr = join_tokens_until(tokens, 2, cond_idx);
+        let (expr, cond) = one_arg_and_cond(tokens, "http-request", act_token)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt { idx, sc, expr }, cond, line: 0 });
     } else if act_str == "return" {
-        let (status, content_type, lf_string, error_page, cond) = parse_return_action(tokens)?;
+        let (status, content_type, lf_string, error_page, cond) = parse_return_action("http-request", tokens, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::Return { status, content_type, lf_string, error_page },
             cond,
@@ -451,7 +472,7 @@ fn parse_http_req_rule_at(
     } else if act_str == "deny" || act_str == "tarpit" {
         // `tarpit` takes the arguments of `deny`; its default status is 500, not 403.
         let default_status = if act_str == "tarpit" { 500 } else { 403 };
-        let cond_idx = find_cond_idx(tokens, 2);
+        let cond_idx = args_end(tokens, 2);
         let limit = cond_idx.unwrap_or(tokens.len());
 
         // `deny_status` is only accepted as the first argument; `status` anywhere, the last
@@ -480,7 +501,7 @@ fn parse_http_req_rule_at(
         }
 
         let (content_type, lf_string, mut error_page) =
-            parse_error_body_args(tokens, 2, limit, deny_status.unwrap_or(default_status))?;
+            parse_error_body_args(tokens, 2, limit, deny_status.unwrap_or(default_status), Some(("http-request", act_token)))?;
 
         // HAProxy: "for compatibility purposes, when no argument is defined, or only
         // 'deny_status', the argument 'default-errorfiles' is implied" -- i.e. a bare
@@ -524,15 +545,10 @@ fn parse_http_req_rule_at(
                 format!("error detected while parsing 'http-request use-service' rule : '{}' unknown service name..", name.text),
             ));
         }
-        let (_, cond) = parse_rule_condition(tokens, 3)?;
+        let cond = expect_cond_at(tokens, 3, act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::UseServicePrometheus, cond, line: 0 });
     } else if act_str == "allow" {
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-request", tokens, 2, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::Allow,
             cond,
@@ -548,12 +564,7 @@ fn parse_http_req_rule_at(
         }
         let name = tokens[2].text.clone();
         let fmt = tokens[3].text.clone();
-        let cond_idx = find_cond_idx(tokens, 4);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-request", tokens, 4, act_token)?;
         let action = if act_str == "set-header" {
             HttpReqAction::SetHeader { name, fmt }
         } else {
@@ -571,22 +582,18 @@ fn parse_http_req_rule_at(
         let name = tokens[2].text.clone();
         let mut method = None;
         let mut i = 3;
-        while i < tokens.len() {
-            if tokens[i].text == "-m" && i + 1 < tokens.len() {
-                method = Some(tokens[i + 1].text.clone());
-                i += 2;
-            } else if tokens[i].text == "if" || tokens[i].text == "unless" {
-                break;
-            } else {
-                i += 1;
-            }
+        while tokens.get(i).is_some_and(|t| t.text == "-m") {
+            let Some(m) = tokens.get(i + 1) else {
+                return Err(ConfigError::new(
+                    act_token.line,
+                    act_token.col,
+                    "error detected while parsing 'http-request del-header' rule : -m flag expects exactly 1 argument.",
+                ));
+            };
+            method = Some(m.text.clone());
+            i += 2;
         }
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-request", tokens, i, act_token)?;
         let encoded_name = match method.as_deref() {
             Some("str") | None => name,
             Some(m) => format!("\0m:{m}:{name}"),
@@ -613,12 +620,7 @@ fn parse_http_req_rule_at(
         let name = tokens[2].text.clone();
         let regex = tokens[3].text.clone();
         let repl = tokens[4].text.clone();
-        let cond_idx = find_cond_idx(tokens, 5);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-request", tokens, 5, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::ReplaceHeader { name, regex, repl },
             cond,
@@ -638,12 +640,7 @@ fn parse_http_req_rule_at(
         let name = tokens[2].text.clone();
         let regex = tokens[3].text.clone();
         let repl = tokens[4].text.clone();
-        let cond_idx = find_cond_idx(tokens, 5);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-request", tokens, 5, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::ReplaceValue { name, regex, repl },
             cond,
@@ -658,12 +655,7 @@ fn parse_http_req_rule_at(
             ));
         }
         let fmt = tokens[2].text.clone();
-        let cond_idx = find_cond_idx(tokens, 3);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = one_fmt_cond(tokens, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::SetPath { fmt },
             cond,
@@ -681,12 +673,7 @@ fn parse_http_req_rule_at(
             ));
         }
         let fmt = tokens[2].text.clone();
-        let cond_idx = find_cond_idx(tokens, 3);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = one_fmt_cond(tokens, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::SetPathq { fmt },
             cond,
@@ -707,12 +694,7 @@ fn parse_http_req_rule_at(
             ));
         }
         let fmt = tokens[2].text.clone();
-        let cond_idx = find_cond_idx(tokens, 3);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = one_fmt_cond(tokens, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::SetQuery { fmt },
             cond,
@@ -727,12 +709,7 @@ fn parse_http_req_rule_at(
             ));
         }
         let fmt = tokens[2].text.clone();
-        let cond_idx = find_cond_idx(tokens, 3);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = one_fmt_cond(tokens, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::SetUri { fmt },
             cond,
@@ -747,40 +724,25 @@ fn parse_http_req_rule_at(
             ));
         }
         let fmt = tokens[2].text.clone();
-        let cond_idx = find_cond_idx(tokens, 3);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = one_fmt_cond(tokens, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::SetMethod { fmt },
             cond,
             line: 0,
         });
     } else if act_str == "set-src" {
-        let cond_idx = find_cond_idx(tokens, 2);
-        let limit = cond_idx.unwrap_or(tokens.len());
-        let expr = tokens[2..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        // One sample expression (`parse_set_src_dst` takes `args[2]` only): a second word
+        // that is not `if`/`unless` is refused, not joined into the expression.
+        let (expr, cond) = one_arg_and_cond(tokens, "http-request", act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::SetSrc { expr },
             cond,
             line: 0,
         });
     } else if act_str == "set-dst" {
-        let cond_idx = find_cond_idx(tokens, 2);
-        let limit = cond_idx.unwrap_or(tokens.len());
-        let expr = tokens[2..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        // One sample expression (`parse_set_src_dst` takes `args[2]` only): a second word
+        // that is not `if`/`unless` is refused, not joined into the expression.
+        let (expr, cond) = one_arg_and_cond(tokens, "http-request", act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::SetDst { expr },
             cond,
@@ -841,24 +803,14 @@ fn parse_http_req_rule_at(
         let (rule, cond) = parse_req_redirect(tokens)?;
         rules.push(HttpReqRule { action: HttpReqAction::Redirect(rule), cond, line: 0 });
     } else if act_str == "strict-mode" {
-        let on = tokens.get(2).is_none_or(|t| t.text == "on");
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let (on, cond) = strict_mode_arg("http-request", tokens, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::StrictMode { on },
             cond,
             line: 0,
         });
     } else if act_str == "disable-l7-retry" {
-        let cond = if let Some(idx) = find_cond_idx(tokens, 2) {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_at(tokens, 2, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::DisableL7Retry,
             cond,
@@ -873,14 +825,7 @@ fn parse_http_req_rule_at(
             .trim_end_matches(')')
             .to_string();
         super::check_set_var_conds(act_token, &var_name)?;
-        let cond_idx = find_cond_idx(tokens, 2);
-        let limit = cond_idx.unwrap_or(tokens.len());
-        let expr = tokens[2..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let (expr, cond) = one_arg_and_cond(tokens, "http-request", act_token)?;
         let action = if is_fmt {
             HttpReqAction::SetVarFmt {
                 var_name,
@@ -896,12 +841,7 @@ fn parse_http_req_rule_at(
             .trim_start_matches("unset-var(")
             .trim_end_matches(')')
             .to_string();
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-request", tokens, 2, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::UnsetVar { var_name },
             cond,
@@ -944,7 +884,7 @@ fn parse_http_req_rule_at(
             "percent-to-uppercase" | "percent-decode-unreserved" => Some("strict"),
             _ => None,
         };
-        let cond_idx = find_cond_idx(tokens, 3);
+        let cond_idx = args_end(tokens, 3);
         let limit = cond_idx.unwrap_or(tokens.len());
         let mut next = 3;
         let mut flag = false;
@@ -1002,9 +942,10 @@ fn parse_http_req_rule_at(
                 ),
             ));
         }
-        let cond_idx = find_cond_idx(tokens, 3);
-        let limit = cond_idx.unwrap_or(tokens.len());
-        let timeout_val = tokens[3..limit].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+        // One value (`cfg_parse_rule_set_timeout` reads `args[3]` only); what follows it is
+        // the condition or nothing.
+        let timeout_val = tokens.get(3).filter(|t| t.text != "if" && t.text != "unless").map_or_else(String::new, |t| t.text.clone());
+        let cond_at = if timeout_val.is_empty() { 3 } else { 4 };
         if parse_time_ms(&timeout_val) == Ok(0) {
             return Err(ConfigError::new(
                 kw.line,
@@ -1012,11 +953,7 @@ fn parse_http_req_rule_at(
                 format!("error detected while parsing 'http-request set-timeout' rule : null value is not valid for a 'set-timeout {timeout_type}' rule."),
             ));
         }
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_at(tokens, cond_at, act_token)?;
         rules.push(HttpReqRule {
             action: HttpReqAction::SetTimeout {
                 timeout_type,
@@ -1158,12 +1095,7 @@ fn parse_http_res_rule_at(
         }
         let name = tokens[2].text.clone();
         let fmt = tokens[3].text.clone();
-        let cond_idx = find_cond_idx(tokens, 4);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-response", tokens, 4, act_token)?;
         let action = if act_str == "set-header" {
             HttpResAction::SetHeader { name, fmt }
         } else {
@@ -1181,22 +1113,18 @@ fn parse_http_res_rule_at(
         let name = tokens[2].text.clone();
         let mut method = None;
         let mut i = 3;
-        while i < tokens.len() {
-            if tokens[i].text == "-m" && i + 1 < tokens.len() {
-                method = Some(tokens[i + 1].text.clone());
-                i += 2;
-            } else if tokens[i].text == "if" || tokens[i].text == "unless" {
-                break;
-            } else {
-                i += 1;
-            }
+        while tokens.get(i).is_some_and(|t| t.text == "-m") {
+            let Some(m) = tokens.get(i + 1) else {
+                return Err(ConfigError::new(
+                    act_token.line,
+                    act_token.col,
+                    "error detected while parsing 'http-response del-header' rule : -m flag expects exactly 1 argument.",
+                ));
+            };
+            method = Some(m.text.clone());
+            i += 2;
         }
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-response", tokens, i, act_token)?;
         let encoded_name = match method.as_deref() {
             Some("str") | None => name,
             Some(m) => format!("\0m:{m}:{name}"),
@@ -1219,12 +1147,7 @@ fn parse_http_res_rule_at(
         }
         let status = parse_u16(&tokens[2], "set-status")?;
         let reason = set_status_reason(tokens, "http-response")?;
-        let cond_idx = find_cond_idx(tokens, if reason.is_some() { 5 } else { 3 });
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-response", tokens, if reason.is_some() { 5 } else { 3 }, act_token)?;
         rules.push(HttpResRule {
             action: HttpResAction::SetStatus { status, reason },
             cond,
@@ -1247,12 +1170,7 @@ fn parse_http_res_rule_at(
         let name = tokens[2].text.clone();
         let regex = tokens[3].text.clone();
         let repl = tokens[4].text.clone();
-        let cond_idx = find_cond_idx(tokens, 5);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-response", tokens, 5, act_token)?;
         rules.push(HttpResRule {
             action: HttpResAction::SetHeader {
                 name: format!("\0replace-header:{name}"),
@@ -1275,12 +1193,7 @@ fn parse_http_res_rule_at(
         let name = tokens[2].text.clone();
         let regex = tokens[3].text.clone();
         let repl = tokens[4].text.clone();
-        let cond_idx = find_cond_idx(tokens, 5);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-response", tokens, 5, act_token)?;
         rules.push(HttpResRule {
             action: HttpResAction::SetHeader {
                 name: format!("\0replace-value:{name}"),
@@ -1316,12 +1229,7 @@ fn parse_http_res_rule_at(
             .trim_start_matches("unset-var(")
             .trim_end_matches(')')
             .to_string();
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-response", tokens, 2, act_token)?;
         rules.push(HttpResRule {
             action: HttpResAction::DelHeader {
                 name: format!("\0unset-var:{var_name}"),
@@ -1330,13 +1238,7 @@ fn parse_http_res_rule_at(
             line: 0,
         });
     } else if act_str == "strict-mode" {
-        let on = tokens.get(2).is_none_or(|t| t.text == "on");
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let (on, cond) = strict_mode_arg("http-response", tokens, act_token)?;
         rules.push(HttpResRule {
             action: HttpResAction::SetHeader {
                 name: "\0strict-mode".to_string(),
@@ -1354,12 +1256,7 @@ fn parse_http_res_rule_at(
             line: 0,
         });
     } else if act_str == "allow" {
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-response", tokens, 2, act_token)?;
         rules.push(HttpResRule {
             action: HttpResAction::SetHeader {
                 name: "\0allow".to_string(),
@@ -1373,7 +1270,7 @@ fn parse_http_res_rule_at(
         // the reply is the proxy's page for the status (502 by default here) and the
         // status must have a built-in one; otherwise the words are an `http_reply`, here
         // only `status <code>`, and the reply is empty.
-        let cond_idx = find_cond_idx(tokens, 2);
+        let cond_idx = args_end(tokens, 2);
         let limit = cond_idx.unwrap_or(tokens.len());
         let fmt = if limit == 2 {
             String::new()
@@ -1400,14 +1297,18 @@ fn parse_http_res_rule_at(
                     // `errorfile`, ...). Ibex would drop it, so it is refused until it is
                     // implemented (AGENTS.md rule 5); an unknown word is refused by HAProxy
                     // too.
-                    return Err(ConfigError::new(
-                        tokens[i].line,
-                        tokens[i].col,
-                        format!(
-                            "'http-response deny' takes only 'status <code>' in Ibex; '{}' is not supported",
-                            tokens[i].text
-                        ),
-                    ));
+                    let word = tokens[i].text.as_str();
+                    let known = matches!(
+                        word,
+                        "status" | "deny_status" | "content-type" | "string" | "lf-string" | "file" | "lf-file" | "hdr" | "errorfile"
+                            | "errorfiles" | "default-errorfiles"
+                    );
+                    let msg = if known {
+                        format!("'http-response deny' takes only 'status <code>' in Ibex; '{word}' is not supported")
+                    } else {
+                        format!("'http-response deny' expects either 'if' or 'unless' followed by a condition but found '{word}'.")
+                    };
+                    return Err(ConfigError::new(tokens[i].line, tokens[i].col, msg));
                 }
             }
             format!("{status}:empty")
@@ -1429,7 +1330,7 @@ fn parse_http_res_rule_at(
         let (action, cond) = parse_res_redirect(tokens)?;
         rules.push(HttpResRule { action, cond, line: 0 });
     } else if act_str == "return" {
-        let (status, content_type, lf_string, error_page, cond) = parse_return_action(tokens)?;
+        let (status, content_type, lf_string, error_page, cond) = parse_return_action("http-response", tokens, act_token)?;
         rules.push(HttpResRule { action: HttpResAction::Return { status, content_type, lf_string, error_page }, cond, line: 0 });
     } else if act_str == "wait-for-body" {
         let (time_ms, at_least, cond) = parse_wait_for_body(tokens, "http-response", act_token)?;
@@ -1467,7 +1368,8 @@ fn parse_replace_uri(tokens: &[Token], name: &str) -> Result<(String, String, Op
             format!("error detected while parsing 'http-request {name}' rule : failed to parse the regex : regex '{}' is invalid ({e}).", tokens[2].text),
         ));
     }
-    let cond = find_cond_idx(tokens, 4).map(|idx| parse_acl_condition_from_tokens(&tokens[idx..])).transpose()?.flatten();
+    // `bad_count` above left nothing at 4 but `if`/`unless`.
+    let cond = if tokens.len() > 4 { parse_acl_condition_from_tokens(&tokens[4..])? } else { None };
     Ok((tokens[2].text.clone(), tokens[3].text.clone(), cond))
 }
 
@@ -1476,7 +1378,7 @@ fn parse_replace_uri(tokens: &[Token], name: &str) -> Result<(String, String, Op
 /// [ignore-empty] [if|unless <cond>]` (`http_parse_redirect_rule`, `src/http_act.c`). The
 /// last type on the line stands, as does the last cookie option.
 fn parse_req_redirect(tokens: &[Token]) -> Result<(RedirectRule, Option<AclCondition>), ConfigError> {
-    let cond_idx = find_cond_idx(tokens, 2);
+    let cond_idx = args_end(tokens, 2);
     let limit = cond_idx.unwrap_or(tokens.len());
     let mut rule = RedirectRule {
         kind: RedirectKind::Location,
@@ -1582,7 +1484,7 @@ fn parse_res_redirect(tokens: &[Token]) -> Result<(HttpResAction, Option<AclCond
         Location,
         Other,
     }
-    let cond_idx = find_cond_idx(tokens, 2);
+    let cond_idx = args_end(tokens, 2);
     let limit = cond_idx.unwrap_or(tokens.len());
     let (mut kind, mut location, mut code, mut cookie) = (None, String::new(), 302, None);
     let mut i = 2;
@@ -1684,12 +1586,7 @@ pub(crate) fn parse_http_after_res_rule(
         }
         let name = tokens[2].text.clone();
         let fmt = tokens[3].text.clone();
-        let cond_idx = find_cond_idx(tokens, 4);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-after-response", tokens, 4, act_token)?;
         let action = if act_str == "set-header" {
             HttpAfterResAction::SetHeader { name, fmt }
         } else {
@@ -1707,22 +1604,18 @@ pub(crate) fn parse_http_after_res_rule(
         let name = tokens[2].text.clone();
         let mut method = None;
         let mut i = 3;
-        while i < tokens.len() {
-            if tokens[i].text == "-m" && i + 1 < tokens.len() {
-                method = Some(tokens[i + 1].text.clone());
-                i += 2;
-            } else if tokens[i].text == "if" || tokens[i].text == "unless" {
-                break;
-            } else {
-                i += 1;
-            }
+        while tokens.get(i).is_some_and(|t| t.text == "-m") {
+            let Some(m) = tokens.get(i + 1) else {
+                return Err(ConfigError::new(
+                    act_token.line,
+                    act_token.col,
+                    "error detected while parsing 'http-after-response del-header' rule : -m flag expects exactly 1 argument.",
+                ));
+            };
+            method = Some(m.text.clone());
+            i += 2;
         }
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-after-response", tokens, i, act_token)?;
         let encoded_name = match method.as_deref() {
             Some("str") | None => name,
             Some(m) => format!("\0m:{m}:{name}"),
@@ -1744,12 +1637,7 @@ pub(crate) fn parse_http_after_res_rule(
         }
         let status = parse_u16(&tokens[2], "set-status")?;
         let reason = set_status_reason(tokens, "http-after-response")?;
-        let cond_idx = find_cond_idx(tokens, if reason.is_some() { 5 } else { 3 });
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-after-response", tokens, if reason.is_some() { 5 } else { 3 }, act_token)?;
         rules.push(HttpAfterResRule {
             action: HttpAfterResAction::SetHeader {
                 name: "\0set-status".to_string(),
@@ -1775,12 +1663,7 @@ pub(crate) fn parse_http_after_res_rule(
         let name = tokens[2].text.clone();
         let regex = tokens[3].text.clone();
         let repl = tokens[4].text.clone();
-        let cond_idx = find_cond_idx(tokens, 5);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-after-response", tokens, 5, act_token)?;
         rules.push(HttpAfterResRule {
             action: HttpAfterResAction::SetHeader {
                 name: format!("\0replace-header:{name}"),
@@ -1802,12 +1685,7 @@ pub(crate) fn parse_http_after_res_rule(
         let name = tokens[2].text.clone();
         let regex = tokens[3].text.clone();
         let repl = tokens[4].text.clone();
-        let cond_idx = find_cond_idx(tokens, 5);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-after-response", tokens, 5, act_token)?;
         rules.push(HttpAfterResRule {
             action: HttpAfterResAction::SetHeader {
                 name: format!("\0replace-value:{name}"),
@@ -1841,12 +1719,7 @@ pub(crate) fn parse_http_after_res_rule(
             .trim_start_matches("unset-var(")
             .trim_end_matches(')')
             .to_string();
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-after-response", tokens, 2, act_token)?;
         rules.push(HttpAfterResRule {
             action: HttpAfterResAction::DelHeader {
                 name: format!("\0unset-var:{var_name}"),
@@ -1854,13 +1727,7 @@ pub(crate) fn parse_http_after_res_rule(
             cond,
         });
     } else if act_str == "strict-mode" {
-        let on = tokens.get(2).is_none_or(|t| t.text == "on");
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let (on, cond) = strict_mode_arg("http-after-response", tokens, act_token)?;
         rules.push(HttpAfterResRule {
             action: HttpAfterResAction::SetHeader {
                 name: "\0strict-mode".to_string(),
@@ -1869,12 +1736,7 @@ pub(crate) fn parse_http_after_res_rule(
             cond,
         });
     } else if act_str == "allow" {
-        let cond_idx = find_cond_idx(tokens, 2);
-        let cond = if let Some(idx) = cond_idx {
-            parse_acl_condition_from_tokens(&tokens[idx..])?
-        } else {
-            None
-        };
+        let cond = expect_cond_in("http-after-response", tokens, 2, act_token)?;
         rules.push(HttpAfterResRule {
             action: HttpAfterResAction::SetHeader {
                 name: "\0allow".to_string(),

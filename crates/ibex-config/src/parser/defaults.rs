@@ -87,9 +87,9 @@ pub(crate) fn parse_defaults_directive(
                     kw.col,
                     format!("tcp-request {sub} is not allowed in anonymous 'defaults' sections"),
                 )),
-                "connection" => parse_tcp_req_connection(&mut defaults.tcp_req_conn_rules, tokens, kw),
-                "session" => parse_tcp_req_session(&mut defaults.tcp_req_session_rules, tokens, kw),
-                "content" => parse_tcp_req_content(&mut defaults.tcp_req_content_rules, tokens, kw),
+                "connection" => in_proxy(parse_tcp_req_connection(&mut defaults.tcp_req_conn_rules, tokens, kw), "defaults", defaults.name.as_deref().unwrap_or_default()),
+                "session" => in_proxy(parse_tcp_req_session(&mut defaults.tcp_req_session_rules, tokens, kw), "defaults", defaults.name.as_deref().unwrap_or_default()),
+                "content" => in_proxy(parse_tcp_req_content(&mut defaults.tcp_req_content_rules, tokens, kw), "defaults", defaults.name.as_deref().unwrap_or_default()),
                 other => Err(ConfigError::new(
                     tokens[1].line,
                     tokens[1].col,
@@ -122,7 +122,7 @@ pub(crate) fn parse_defaults_directive(
                     kw.col,
                     "tcp-response content is only allowed in 'backend' sections or 'defaults' section with a name",
                 )),
-                "content" => parse_tcp_res_content(&mut defaults.tcp_res_content_rules, tokens, kw),
+                "content" => in_proxy(parse_tcp_res_content(&mut defaults.tcp_res_content_rules, tokens, kw), "defaults", defaults.name.as_deref().unwrap_or_default()),
                 other => Err(ConfigError::new(
                     tokens[1].line,
                     tokens[1].col,

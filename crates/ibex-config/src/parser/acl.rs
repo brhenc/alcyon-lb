@@ -130,19 +130,61 @@ fn validate_acl_regexes(words: &[Token]) -> Result<(), ConfigError> {
     Ok(())
 }
 
-pub(crate) fn parse_rule_condition(
-    tokens: &[Token],
-    start: usize,
-) -> Result<(Option<usize>, Option<AclCondition>), ConfigError> {
-    let cond_idx = find_cond_idx(tokens, start);
-    let cond = match cond_idx {
-        Some(idx) => parse_acl_condition_from_tokens(&tokens[idx..])?,
-        None => None,
-    };
-    Ok((cond_idx, cond))
+/// The refusal for a word where `if`/`unless` (or the end of the line) should be, in a
+/// `tcp-request` / `tcp-response` rule: `'tcp-request content accept' only accepts 'if' or
+/// 'unless', in frontend 'f' (got 'x')` (`tcp_parse_tcp_req`, `src/tcp_rules.c`). The
+/// parser does not know which proxy it is in: `@PROXY@` stands for `frontend 'f'`, and
+/// [`in_proxy`] fills it in.
+pub(crate) fn tcp_trailing_word(tokens: &[Token], found: &Token) -> ConfigError {
+    let w = |i: usize| tokens.get(i).map_or("", |t| t.text.as_str());
+    ConfigError::new(
+        found.line,
+        found.col,
+        format!("'{} {} {}' only accepts 'if' or 'unless', in @PROXY@ (got '{}')", w(0), w(1), w(2), found.text),
+    )
 }
 
-pub(crate) fn find_cond_idx(tokens: &[Token], start: usize) -> Option<usize> {
+/// Say which proxy a `tcp-request` / `tcp-response` rule was in (`frontend 'f'`, `defaults
+/// 'd'`...), where [`tcp_trailing_word`] left `@PROXY@`.
+pub(crate) fn in_proxy(r: Result<(), ConfigError>, kind: &str, name: &str) -> Result<(), ConfigError> {
+    r.map_err(|mut e| {
+        if e.message.contains("@PROXY@") {
+            e.message = e.message.replace("@PROXY@", &format!("{kind} '{name}'"));
+        }
+        e
+    })
+}
+
+/// The condition of a `tcp-request` / `tcp-response` rule, which must start at `tokens[at]`:
+/// the action's own arguments end there. Anything else is refused ([`tcp_trailing_word`]);
+/// it is never skipped. Gives the index of the condition and the condition.
+pub(crate) fn parse_rule_condition(
+    tokens: &[Token],
+    at: usize,
+) -> Result<(Option<usize>, Option<AclCondition>), ConfigError> {
+    match tokens.get(at) {
+        None => Ok((None, None)),
+        Some(t) if t.text == "if" || t.text == "unless" => Ok((Some(at), parse_acl_condition_from_tokens(&tokens[at..])?)),
+        Some(t) => Err(tcp_trailing_word(tokens, t)),
+    }
+}
+
+/// An action with one argument at `tokens[at]` (a sample expression, a format) and then the
+/// condition: the argument is empty when the line ends or `if`/`unless` comes first, and a
+/// second word is refused.
+pub(crate) fn tcp_arg_and_cond(tokens: &[Token], at: usize) -> Result<(String, Option<AclCondition>), ConfigError> {
+    let arg = tokens.get(at).filter(|t| t.text != "if" && t.text != "unless");
+    let (_, cond) = parse_rule_condition(tokens, at + usize::from(arg.is_some()))?;
+    Ok((arg.map_or_else(String::new, |t| t.text.clone()), cond))
+}
+
+/// Where the arguments of a rule end for the actions whose grammar is a list of keywords
+/// (`return`, `deny`, `redirect`): the index of the first `if`/`unless` at or after `start`.
+/// The caller then walks `start..` up to it and refuses every word it does not know; nothing
+/// in between is skipped. An action with a fixed number of arguments does not use this: it
+/// asks for the condition at the index its last argument ends at (`expect_cond_in`,
+/// [`parse_rule_condition`]), so that a stray word is refused.
+pub(crate) fn args_end(tokens: &[Token], start: usize) -> Option<usize> {
     for (idx, tok) in tokens.iter().enumerate().skip(start) {
         if tok.text == "if" || tok.text == "unless" {
             return Some(idx);
