@@ -373,3 +373,129 @@ fn full_records_read_in_small_pieces_and_written_in_large_ones() {
     assert_eq!(out.len(), body.len(), "the whole response arrived");
     assert!(out == body, "the response arrived intact");
 }
+
+/// A server transport past its handshake, with the client side that did it.
+fn ready_pair() -> (ClientXprt, ClientConnection, TcpStream, TcpStream) {
+    let (cert, key) = test_certs();
+    let (mut cli_sock, srv_sock) = socket_pair();
+    let mut xprt = ibex_rt::accept_tls(&srv_sock, server_config(cert.clone(), key));
+    let name = ServerName::try_from("localhost").expect("name");
+    let mut client = ClientConnection::new(client_config(&cert), name).expect("client conn");
+    let mut buf = [0u8; 256];
+    for _ in 0..40 {
+        pump_client(&mut client, &mut cli_sock);
+        let _ = xprt.recv(srv_sock.as_fd(), &mut buf).expect("recv");
+        if xprt.is_ready() && !client.is_handshaking() {
+            break;
+        }
+    }
+    assert!(xprt.is_ready(), "handshake did not complete");
+    (xprt, client, cli_sock, srv_sock)
+}
+
+/// T440: a bad record that follows good data does not take the data with it: the data is
+/// delivered, the error comes with the next read. A read into no space reads nothing.
+#[test]
+fn a_bad_record_after_good_data_is_reported_by_the_next_read() {
+    let (mut xprt, mut client, mut cli_sock, srv_sock) = ready_pair();
+    let fd = srv_sock.as_fd();
+    // Nowhere to put a byte: not an error, not data.
+    assert!(matches!(xprt.recv(fd, &mut []).expect("empty dst"), Io::WouldBlock));
+
+    client.writer().write_all(b"hello").expect("write");
+    let mut one = Vec::new();
+    client.write_tls(&mut one).expect("record");
+    let mut junk = vec![0x17, 0x03, 0x03, 0x00, 0x20];
+    junk.extend_from_slice(&[0x55; 0x20]);
+    one.extend_from_slice(&junk);
+    cli_sock.write_all(&one).expect("record and junk");
+
+    let mut buf = [0u8; 64];
+    let mut got = Vec::new();
+    let mut err = None;
+    for _ in 0..50 {
+        match xprt.recv(fd, &mut buf) {
+            Ok(Io::Done(n)) => got.extend_from_slice(&buf[..n]),
+            Ok(_) => {}
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    assert_eq!(got, b"hello", "the good record is delivered first");
+    assert_eq!(err.expect("the bad record is an error").kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// T440: a send the output cannot take any of (the peer reads nothing) is `WouldBlock`.
+#[test]
+fn a_send_into_a_full_output_would_block() {
+    let (mut xprt, _client, _cli_sock, srv_sock) = ready_pair();
+    let fd = srv_sock.as_fd();
+    let chunk = vec![7u8; 65536];
+    let mut blocked = false;
+    for _ in 0..2000 {
+        if matches!(xprt.send(fd, &chunk).expect("send"), Io::WouldBlock) {
+            blocked = true;
+            break;
+        }
+    }
+    assert!(blocked, "the socket and the output buffer must fill");
+    assert!(xprt.wants_write());
+}
+
+/// T440: a hello that is not TLS fails the handshake; the dead session fails every later call
+/// the same way instead of pretending to be a connection.
+#[test]
+fn a_failed_handshake_stays_failed() {
+    let (mut cli_sock, srv_sock) = socket_pair();
+    let (cert, key) = test_certs();
+    let mut xprt = ibex_rt::accept_tls(&srv_sock, server_config(cert, key));
+    cli_sock.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("write");
+    let fd = srv_sock.as_fd();
+    let mut buf = [0u8; 64];
+    let mut first = None;
+    for _ in 0..20 {
+        match xprt.recv(fd, &mut buf) {
+            Err(e) => {
+                first = Some(e);
+                break;
+            }
+            Ok(_) => {}
+        }
+    }
+    assert!(first.is_some(), "a plaintext request is not a TLS hello");
+    let again = xprt.recv(fd, &mut buf).expect_err("the session is gone");
+    assert!(again.to_string().contains("handshake failed"), "{again}");
+}
+
+/// T440: a client that goes away in the middle of its hello ends the handshake with an EOF.
+#[test]
+fn a_peer_that_leaves_mid_hello_is_an_unexpected_eof() {
+    let (mut cli_sock, srv_sock) = socket_pair();
+    let (cert, key) = test_certs();
+    let mut xprt = ibex_rt::accept_tls(&srv_sock, server_config(cert.clone(), key));
+    let name = ServerName::try_from("localhost").expect("name");
+    let mut client = ClientConnection::new(client_config(&cert), name).expect("client conn");
+    let mut hello = Vec::new();
+    client.write_tls(&mut hello).expect("hello");
+    cli_sock.write_all(&hello[..hello.len() / 2]).expect("half");
+    drop(cli_sock);
+    let fd = srv_sock.as_fd();
+    let mut buf = [0u8; 64];
+    let mut verdict = None;
+    for _ in 0..20 {
+        match xprt.recv(fd, &mut buf) {
+            Err(e) => {
+                verdict = Some(e.kind());
+                break;
+            }
+            Ok(Io::Closed | Io::Eof) => {
+                verdict = Some(std::io::ErrorKind::UnexpectedEof);
+                break;
+            }
+            Ok(_) => {}
+        }
+    }
+    assert_eq!(verdict, Some(std::io::ErrorKind::UnexpectedEof));
+}

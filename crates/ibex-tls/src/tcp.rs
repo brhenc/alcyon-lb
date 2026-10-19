@@ -405,3 +405,33 @@ pub fn build_backend_client_config(options: &BackendTlsOptions) -> Result<Arc<Cl
     }
     Ok(Arc::new(config))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stamped(born: u64, v: &[u8]) -> Vec<u8> {
+        let mut s = born.to_be_bytes().to_vec();
+        s.extend_from_slice(v);
+        s
+    }
+
+    #[test]
+    fn a_cached_session_is_returned_until_it_is_older_than_its_lifetime() {
+        let now = unix_now();
+        assert_eq!(ExpiringSessions::fresh(Some(stamped(now, b"state"))), Some(b"state".to_vec()));
+        assert_eq!(ExpiringSessions::fresh(Some(stamped(now - u64::from(SESSION_LIFETIME) - 5, b"state"))), None);
+        // No entry, and an entry too short to hold its date.
+        assert_eq!(ExpiringSessions::fresh(None), None);
+        assert_eq!(ExpiringSessions::fresh(Some(vec![1, 2, 3])), None);
+    }
+
+    #[test]
+    fn the_ticket_hint_is_twice_the_rotation_period_and_tickets_round_trip() {
+        let hint = Hint(rustls24::TicketRotator::new(Duration::from_secs(u64::from(SESSION_LIFETIME / 2)), ticket_key).expect("rotator"));
+        assert_eq!(hint.lifetime(), Duration::from_secs(u64::from(SESSION_LIFETIME)));
+        assert!(ticket_key().expect("key").lifetime() > Duration::ZERO);
+        let ticket = hint.encrypt(b"resume me").expect("encrypt");
+        assert_eq!(hint.decrypt(&ticket).as_deref(), Some(&b"resume me"[..]));
+    }
+}

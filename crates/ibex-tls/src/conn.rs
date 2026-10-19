@@ -294,20 +294,14 @@ impl TlsCtx {
                 self.session = Some(Session::ServerHs(n));
                 Ok(true)
             }
-            ServerHandshake::VerifyClientIdentity(v) => {
-                let next = v.with_config(&mut self.tx)?;
-                self.server_next(next)?;
-                // The rest of the flight (`CertificateVerify`, `Finished`) is still in the
-                // input: rustls stopped at the identity to verify.
-                Ok(false)
-            }
             ServerHandshake::Complete(split) => {
                 let t = Traffic { send: Some(split.send), recv: Some(split.receive), outputs: split.outputs, side: split.side_outputs };
                 self.session = Some(Session::Server(t));
                 self.finish();
                 Ok(true)
             }
-            // A second ClientHello cannot be accepted: rustls never yields it.
+            // A second ClientHello cannot be accepted, and a bind asks no client for a certificate
+            // (`with_no_client_auth`): rustls never yields either.
             _ => Err(Error::General("unexpected server handshake state".into())),
         }
     }
