@@ -319,3 +319,85 @@ fn a_get_never_acts_and_a_cross_origin_api_post_changes_nothing() {
     assert!(r.starts_with("HTTP/1.1 200"), "{r}");
     assert_eq!(s.status("s1"), "MAINT");
 }
+
+/// A stats frontend that logs `%ts %ST %r` to the returned socket, with `timeout http-request 1s`.
+fn logged() -> (Stats, std::net::UdpSocket) {
+    let collector = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    collector.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+    let s = Stats::start_with(
+        "stats admin if TRUE",
+        &format!("timeout http-request 1s\n  log {} local0\n  log-format \"%ts %ST %r\"", collector.local_addr().unwrap()),
+        "server s1 127.0.0.1:1",
+    );
+    (s, collector)
+}
+
+fn log_of(c: &std::net::UdpSocket) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 2048];
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while out.is_empty() && std::time::Instant::now() < end {
+        while let Ok(n) = c.recv(&mut buf) {
+            let l = String::from_utf8_lossy(&buf[..n]).into_owned();
+            out.push(l[l.rfind(": ").map_or(0, |i| i + 2)..].trim_end().to_string());
+        }
+    }
+    out
+}
+
+fn raw_conversation(s: &Stats, parts: &[&str], then_close: bool) -> String {
+    let mut c = TcpStream::connect(s.addr).unwrap();
+    c.set_read_timeout(Some(std::time::Duration::from_secs(4))).unwrap();
+    for p in parts {
+        c.write_all(p.as_bytes()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    if then_close {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// Measured on the reference with the same configuration.
+#[test]
+fn stats_answers_are_logged_by_the_applet_and_a_body_that_is_not_one_is_cut_off() {
+    let (s, col) = logged();
+    let head = format!("POST /st HTTP/1.1\r\nHost: x\r\n{AUTH}");
+    // The listening probe of the harness is logged as a bad request: drop it.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut junk = [0u8; 2048];
+    while col.recv(&mut junk).is_ok() {}
+    // The page and the redirect: LR.
+    s.get("/st");
+    assert_eq!(log_of(&col), ["LR 200 GET /st HTTP/1.1"]);
+    assert_eq!(s.post("s=s1&action=ready&b=app"), see_other("DONE"));
+    assert_eq!(log_of(&col), ["LR 303 POST /st HTTP/1.1"]);
+    // A body that never comes: 408 after `timeout http-request`.
+    let r = raw_conversation(&s, &[&format!("{head}Content-Length: 10\r\nConnection: close\r\n\r\n")], false);
+    assert!(r.starts_with("HTTP/1.1 408 Request Time-out\r\n"), "{r}");
+    assert_eq!(log_of(&col), ["LR 408 POST /st HTTP/1.1"]);
+    // A client that leaves in the middle of the body: 400.
+    raw_conversation(&s, &[&format!("{head}Content-Length: 30\r\nConnection: close\r\n\r\ns=s1&ac")], true);
+    assert_eq!(log_of(&col), ["LR 400 POST /st HTTP/1.1"]);
+    // A chunked body that turns out not to be one once the head is in: cut off, no answer.
+    let r = raw_conversation(
+        &s,
+        &[&format!("{head}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"), "ZZ\r\nxx\r\n"],
+        false,
+    );
+    assert_eq!(r, "");
+    assert_eq!(log_of(&col), ["LR 400 POST /st HTTP/1.1"]);
+}
+
+#[test]
+fn a_percent_sign_before_a_plus_is_not_an_escape_and_ibex_only_verbs_still_work() {
+    let s = Stats::start("stats admin if TRUE");
+    // `%+1` is not `%XX` (reference: NONE, nothing altered).
+    assert_eq!(s.post("s=%+1&b=app&action=maint"), see_other("NONE"));
+    assert_eq!(s.status("s1"), "no check");
+    // A verb only the dashboard's API has, without any of its other keys: not the form's.
+    let r = s.post("action=clear_counters");
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+}
