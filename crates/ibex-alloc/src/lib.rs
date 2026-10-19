@@ -593,6 +593,33 @@ mod tests {
 
 static TRIM_DISABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// `tune.ibex.zero-buffers` (default on): whether a buffer given back to its pool, or dropped,
+/// is overwritten with zeros first. Set from the configuration each time an engine is built.
+static ZERO_BUFFERS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Sets `tune.ibex.zero-buffers`.
+pub fn set_zero_buffers(on: bool) {
+    ZERO_BUFFERS.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether released buffers are zeroed (`tune.ibex.zero-buffers`).
+#[must_use]
+#[inline]
+pub fn zero_buffers() -> bool {
+    ZERO_BUFFERS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Overwrites `bytes` with zeros in a way the compiler may not drop (the `zeroize` crate:
+/// volatile writes and a compiler fence), when `tune.ibex.zero-buffers` is on. Not inlined:
+/// it is compiled here, at this crate's optimisation level (`[profile.dev.package.ibex-alloc]`),
+/// not at the caller's, where a debug build ran 16 KB of volatile stores at opt-level 0.
+#[inline(never)]
+pub fn wipe(bytes: &mut [u8]) {
+    if zero_buffers() {
+        zeroize::Zeroize::zeroize(bytes);
+    }
+}
+
 /// `global no-memory-trimming`: when set, [`trim_heap`] does nothing. Set from the
 /// configuration each time an engine is built, so a reload follows the new file.
 pub fn set_trim_disabled(disabled: bool) {

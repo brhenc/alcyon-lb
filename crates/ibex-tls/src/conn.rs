@@ -126,17 +126,14 @@ impl Drop for TlsCtx {
     }
 }
 
-/// Zeroes all of `v`'s memory, written or not.
+/// Zeroes all of `v`'s memory, written or not, when `tune.ibex.zero-buffers` is on.
 pub(crate) fn wipe_vec(v: &mut Vec<u8>) {
+    if !ibex_alloc::zero_buffers() {
+        return;
+    }
     let cap = v.capacity();
     v.resize(cap, 0);
-    zeroize(v);
-}
-
-fn zeroize(bytes: &mut [u8]) {
-    // Replaced by `ibex_alloc::wipe` (T437 5b) once that branch is in.
-    bytes.fill(0);
-    std::hint::black_box(&*bytes);
+    ibex_alloc::wipe(v);
 }
 
 impl TlsCtx {
@@ -599,5 +596,36 @@ impl TlsInputBuffer for VecInput {
 impl TlsInput for VecInput {
     fn storage(&self) -> &[u8] {
         &self.buf
+    }
+}
+
+#[cfg(test)]
+mod wipe_tests {
+    use super::wipe_vec;
+    use std::sync::Mutex;
+
+    /// `tune.ibex.zero-buffers` is process-wide: the tests take turns.
+    static SETTING: Mutex<()> = Mutex::new(());
+
+    /// What `TlsCtx` (output buffer) and `VecInput` (input buffer, decrypted plaintext) run on
+    /// release: all of the capacity reads back zeros with the setting on, and is left alone
+    /// with it off (T437 5b, applied to the T440 buffers).
+    #[test]
+    fn released_tls_buffers_are_zeroed_only_when_the_setting_is_on() {
+        let _turn = SETTING.lock().unwrap();
+        let secret = b"decrypted-secret-0123456789";
+        for (on, expect_zero) in [(true, true), (false, false)] {
+            ibex_alloc::set_zero_buffers(on);
+            let mut v = Vec::with_capacity(256);
+            v.extend_from_slice(secret);
+            wipe_vec(&mut v);
+            if expect_zero {
+                assert_eq!(v.len(), 256, "the whole capacity is wiped");
+                assert!(v.iter().all(|&b| b == 0), "setting on: the plaintext is still there");
+            } else {
+                assert_eq!(&v[..], secret, "setting off: bytes are left alone");
+            }
+        }
+        ibex_alloc::set_zero_buffers(true);
     }
 }

@@ -727,7 +727,18 @@ fn consecutive_failed_reloads_report_failed_1_and_log_the_reload() {
             sig(mpid, rustix::process::Signal::Usr2);
             std::thread::sleep(Duration::from_millis(1500));
         } else {
-            assert!(master(&sock, "reload").starts_with("Success=0\n"));
+            // The first worker is listening before the master has registered it as loaded,
+            // and a `reload` then is refused ("Another reload is still in progress."), as
+            // HAProxy's is: ask again until one is actually attempted.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let out = master(&sock, "reload");
+                assert!(out.starts_with("Success=0\n"), "{out:?}");
+                if !out.contains("Another reload is still in progress") || Instant::now() > deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
         rows.push(show_proc(&master(&sock, "show proc")).0.reloads);
     }

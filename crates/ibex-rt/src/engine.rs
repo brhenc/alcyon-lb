@@ -4314,6 +4314,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         HTTP_ERR_CODES.set(config.global.as_ref().and_then(|g| g.http_err_codes).unwrap_or_else(ibex_config::StatusCodeSet::default_err));
         HTTP_FAIL_CODES.set(config.global.as_ref().and_then(|g| g.http_fail_codes).unwrap_or_else(ibex_config::StatusCodeSet::default_fail));
         ibex_alloc::set_trim_disabled(config.global.as_ref().is_some_and(|g| g.no_memory_trimming));
+        ibex_alloc::set_zero_buffers(config.global.as_ref().and_then(|g| g.zero_buffers).unwrap_or(true));
         let bufsize = config.global.as_ref().and_then(|g| g.bufsize).unwrap_or(16384);
         let bufsize_small = config.global.as_ref().and_then(|g| g.bufsize_small).unwrap_or(1024);
         let bufsize_large = config.global.as_ref().and_then(|g| g.bufsize_large);

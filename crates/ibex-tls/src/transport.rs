@@ -136,6 +136,20 @@ pub struct RustlsContext {
     pub hello_tap: Option<Box<crate::capture::HelloTap>>,
 }
 
+/// The wire bytes of a finished connection (the ones rustls decrypted from, and the ones it
+/// produced) must not stay in the heap for the next allocation to find: zeroed when the
+/// context goes, with `tune.ibex.zero-buffers` on. The whole capacity: `clear` leaves the
+/// old bytes in it.
+impl Drop for RustlsContext {
+    fn drop(&mut self) {
+        for v in [&mut self.rx_raw, &mut self.tx_raw] {
+            let cap = v.capacity();
+            v.resize(cap, 0);
+            ibex_alloc::wipe(v);
+        }
+    }
+}
+
 impl RustlsContext {
     /// Creates a new server-side TLS context.
     #[must_use]

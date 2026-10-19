@@ -577,6 +577,9 @@ dependencies = [
 [[package]]
 name = "ibex-alloc"
 version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "ibex-config"
@@ -727,6 +730,7 @@ name = "ibex-tls"
 version = "0.1.0"
 dependencies = [
  "ebtree",
+ "ibex-alloc",
  "ibex-config",
  "ibex-crypt",
  "ibex-proto",

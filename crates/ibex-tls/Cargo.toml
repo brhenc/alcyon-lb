@@ -8,6 +8,7 @@ description = "Pure memory-safe TLS transport and SNI resolver for Project Ibex"
 autotests = false
 
 [dependencies]
+ibex-alloc = { workspace = true }
 ibex-proto = { path = "../ibex-proto" }
 ibex-sched = { path = "../ibex-sched" }
 ebtree = { path = "../ebtree" }
