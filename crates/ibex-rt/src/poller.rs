@@ -33,6 +33,9 @@ pub struct Poller {
     /// The `epoll_ctl` calls made through this poller: what the idle-pool tests count (T434).
     #[cfg(test)]
     ctls: std::cell::Cell<u64>,
+    /// The `epoll_wait` calls (tests only).
+    #[cfg(test)]
+    waits: std::cell::Cell<u64>,
 }
 
 impl Poller {
@@ -45,6 +48,8 @@ impl Poller {
             event_buf: epoll::EventVec::with_capacity(capacity),
             #[cfg(test)]
             ctls: std::cell::Cell::new(0),
+            #[cfg(test)]
+            waits: std::cell::Cell::new(0),
         })
     }
 
@@ -59,6 +64,12 @@ impl Poller {
     #[cfg(test)]
     pub(crate) fn ctl_calls(&self) -> u64 {
         self.ctls.get()
+    }
+
+    /// The `epoll_wait` calls made so far.
+    #[cfg(test)]
+    pub(crate) fn wait_calls(&self) -> u64 {
+        self.waits.get()
     }
 
     /// Whether `fd` is in this epoll set (`EPOLL_CTL_ADD` answers `EEXIST`); one that was
@@ -206,6 +217,8 @@ impl Poller {
             Some(d) => i32::try_from(d.as_millis()).unwrap_or(i32::MAX),
         };
 
+        #[cfg(test)]
+        self.waits.set(self.waits.get() + 1);
         match epoll::wait(self.epfd.as_fd(), &mut self.event_buf, ms) {
             Ok(()) => {}
             Err(Errno::INTR) => return Ok(0),
