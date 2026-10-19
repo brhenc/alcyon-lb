@@ -200,6 +200,15 @@ impl FdTab {
             .map_or(FdState::Closed, |e| e.state)
     }
 
+    /// Whether no socket of this worker's holds `fd`'s slot: `Closed`, or `Idle` (an idle
+    /// server connection that left the lists without an event -- taken by another worker,
+    /// purged -- leaves its `Idle` entry behind, and a socket given that number next is not
+    /// in the epoll set; T434). What [`FdState::counted`] does not count.
+    #[must_use]
+    pub fn is_free(&self, fd: RawFd) -> bool {
+        !self.state(fd).counted()
+    }
+
     #[must_use]
     pub fn interest(&self, fd: RawFd) -> Interest {
         usize::try_from(fd)
@@ -265,8 +274,10 @@ mod tests {
         assert_eq!(t.live(), 1);
         t.set_idle(9);
         assert_eq!((t.live(), t.state(9), t.interest(9)), (0, FdState::Idle, Interest::READ));
+        assert!(t.is_free(9), "an idle entry holds no socket of the worker's");
         t.insert(9, conn, Interest::READ);
         assert_eq!(t.live(), 1);
+        assert!(!t.is_free(9));
         t.set_idle(9);
         t.remove(9);
         assert_eq!((t.live(), t.state(9)), (0, FdState::Closed));
