@@ -442,8 +442,14 @@ impl MsgState {
     /// Measures a head whose length is not known yet, once it is final, so the window is
     /// a subtraction from then on rather than a scan for the blank line on every query.
     pub fn measure_head(&mut self, data: &[u8]) {
+        self.measure_head_by(|| find_eoh(data));
+    }
+
+    /// [`Self::measure_head`] of a head whose end `eoh` finds: a buffer that knows it
+    /// (`Buf::eoh`) does not look for it again.
+    pub fn measure_head_by(&mut self, eoh: impl FnOnce() -> Option<(usize, usize)>) {
         if let MsgState::Head { left: 0, body } = *self {
-            if let Some((h, e)) = find_eoh(data) {
+            if let Some((h, e)) = eoh() {
                 *self = MsgState::Head { left: h + e, body };
             }
         }

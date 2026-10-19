@@ -2307,7 +2307,7 @@ impl TcpSession {
                 self.fail_request(414);
                 return Ok(true);
             }
-            if let Some((hdr_len, eoh_len)) = find_eoh(self.req.readable()) {
+            if let Some((hdr_len, eoh_len)) = self.req.eoh() {
                 let total_hdr_len = hdr_len + eoh_len;
 
                 // The head, parsed into HTX, has to fit in tune.bufsize - tune.maxrewrite:
@@ -2460,7 +2460,7 @@ impl TcpSession {
 
                 // The head may have been rewritten above; its framing is read from what
                 // will be forwarded.
-                let framing = find_eoh(self.req.readable())
+                let framing = self.req.eoh()
                     .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e]));
                 // The chunked body already received with the head is checked before any of
                 // the request is forwarded: HAProxy parses what is in its buffer into HTX

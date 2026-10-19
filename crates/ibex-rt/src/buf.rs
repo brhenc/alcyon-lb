@@ -15,7 +15,7 @@
 //! - **Large buffer** (`tune.bufsize.large`, optional, off by default): preallocated per thread
 //!   when enabled.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
 use ibex_alloc::{PoolHead, PoolReg};
@@ -413,6 +413,34 @@ fn alloc_large() -> Box<[u8]> {
     }
 }
 
+/// [`Buf::eoh`] not looked for since the bytes last changed.
+const EOH_UNKNOWN: u32 = 0;
+/// [`Buf::eoh`] looked for and not found. An end found has `e - 1` in the low two bits,
+/// never 0, so neither of these is one.
+const EOH_NONE: u32 = 4;
+
+/// [`Buf::eoh`] as kept: the end at `h` of length `e` (2, 3 or 4) as `h << 2 | (e - 1)`, or
+/// unknown when `h` does not fit (it is then looked for each time).
+fn eoh_pack(eoh: Option<(usize, usize)>) -> u32 {
+    match eoh {
+        None => EOH_NONE,
+        Some((h, e)) => match u32::try_from(h) {
+            Ok(h) if h < 1 << 30 && (2..=4).contains(&e) => h << 2 | (e as u32 - 1),
+            _ => EOH_UNKNOWN,
+        },
+    }
+}
+
+/// The [`Buf::eoh`] that [`eoh_pack`] kept, if one is.
+fn eoh_unpack(v: u32) -> Option<Option<(usize, usize)>> {
+    match v {
+        EOH_UNKNOWN => None,
+        EOH_NONE => Some(None),
+        v if v & 3 == 0 => None,
+        v => Some(Some(((v >> 2) as usize, (v & 3) as usize + 1))),
+    }
+}
+
 /// A fixed-capacity FIFO of bytes with size-class pooling.
 ///
 /// Data lives in `[head, head+len)`. Rather than a true ring, the buffer compacts when
@@ -424,6 +452,11 @@ pub struct Buf {
     head: usize,
     len: usize,
     class: BufClass,
+    /// [`crate::proxy::find_eoh`] of [`Self::readable`], once read: the head is looked up by
+    /// several stages of a request and of a response (T433). Every `&mut self` method
+    /// forgets it, so it can only be stale through a change this type does not make. Packed
+    /// in the padding after `class` (`EohMemo`): the session holds two of these.
+    eoh: Cell<u32>,
 }
 
 impl Drop for Buf {
@@ -521,6 +554,8 @@ impl Buf {
             head: 0,
             len: 0,
             class: BufClass::Standard,
+
+            eoh: Cell::new(EOH_UNKNOWN),
         }
     }
 
@@ -532,6 +567,8 @@ impl Buf {
             head: 0,
             len: 0,
             class: BufClass::Small,
+
+            eoh: Cell::new(EOH_UNKNOWN),
         }
     }
 
@@ -543,6 +580,8 @@ impl Buf {
             head: 0,
             len: 0,
             class: BufClass::Large,
+
+            eoh: Cell::new(EOH_UNKNOWN),
         }
     }
 
@@ -561,6 +600,8 @@ impl Buf {
                 head: 0,
                 len: 0,
                 class: BufClass::Custom,
+
+                eoh: Cell::new(EOH_UNKNOWN),
             }
         }
     }
@@ -570,7 +611,7 @@ impl Buf {
     /// none.
     #[must_use]
     pub fn unallocated(class: BufClass) -> Self {
-        Buf { data: Box::new([]), head: 0, len: 0, class }
+        Buf { data: Box::new([]), head: 0, len: 0, class, eoh: Cell::new(EOH_UNKNOWN) }
     }
 
     /// Whether the buffer holds memory now.
@@ -584,6 +625,7 @@ impl Buf {
     /// (`b_free` once a mux's buffer is drained); the next write takes one again. A buffer
     /// holding data, or of no pool class, is left alone.
     pub fn release(&mut self) {
+        self.eoh.set(EOH_UNKNOWN);
         if self.len == 0 && !self.data.is_empty() && self.class != BufClass::Custom {
             drop(std::mem::replace(self, Buf::unallocated(self.class)));
         }
@@ -601,6 +643,7 @@ impl Buf {
 
     #[inline]
     pub fn alloc_if_needed(&mut self) {
+        self.eoh.set(EOH_UNKNOWN);
         if self.data.is_empty() {
             self.data = match self.class {
                 BufClass::Standard => alloc_standard(),
@@ -625,6 +668,7 @@ impl Buf {
     /// to the thread-local small pool without data loss.
     /// Returns `true` if promoted, or `false` if already standard/large/custom.
     pub fn promote_to_standard(&mut self) -> bool {
+        self.eoh.set(EOH_UNKNOWN);
         if self.class != BufClass::Small {
             return false;
         }
@@ -668,6 +712,7 @@ impl Buf {
     /// Appends `bytes` to the buffer, automatically promoting from [`BufClass::Small`]
     /// to [`BufClass::Standard`] if needed to prevent truncation.
     pub fn put(&mut self, bytes: &[u8]) -> bool {
+        self.eoh.set(EOH_UNKNOWN);
         self.alloc_if_needed();
         if self.head > 0 && self.head + self.len + bytes.len() > self.data.len() {
             self.compact();
@@ -722,6 +767,7 @@ impl Buf {
     #[must_use]
     #[inline]
     pub fn raw_slice_mut(&mut self) -> &mut [u8] {
+        self.eoh.set(EOH_UNKNOWN);
         self.alloc_if_needed();
         &mut self.data
     }
@@ -733,15 +779,41 @@ impl Buf {
         &self.data[self.head..self.head + self.len]
     }
 
+    /// [`crate::proxy::find_eoh`] of [`Self::readable`]: the end of the message head at its
+    /// start, looked for once until the bytes change.
+    #[must_use]
+    #[inline]
+    pub fn eoh(&self) -> Option<(usize, usize)> {
+        if let Some(known) = eoh_unpack(self.eoh.get()) {
+            debug_assert_eq!(known, crate::proxy::find_eoh(self.readable()), "stale end of head");
+            return known;
+        }
+        let found = crate::proxy::find_eoh(self.readable());
+        self.eoh.set(eoh_pack(found));
+        found
+    }
+
     /// Bytes available to read, for changing them in place.
     #[must_use]
     #[inline]
     pub fn readable_mut(&mut self) -> &mut [u8] {
+        self.eoh.set(EOH_UNKNOWN);
         &mut self.data[self.head..self.head + self.len]
+    }
+
+    /// Lets `edit` change the readable bytes in place, given [`Self::eoh`] of them, on the
+    /// promise that it moves no line end (it changes the case of header names, say): the end
+    /// of the head stays known. Debug builds check the promise.
+    pub fn edit_keeping_lines(&mut self, edit: impl FnOnce(&mut [u8], Option<(usize, usize)>)) {
+        let eoh = self.eoh();
+        edit(&mut self.data[self.head..self.head + self.len], eoh);
+        debug_assert_eq!(eoh, crate::proxy::find_eoh(self.readable()), "an edit kept as in place moved the end of the head");
+        self.eoh.set(eoh_pack(eoh));
     }
 
     /// Moves readable data to index 0 so full remaining capacity is contiguous at the tail.
     pub fn compact(&mut self) {
+        self.eoh.set(EOH_UNKNOWN);
         if self.head > 0 {
             if self.len > 0 {
                 self.data.copy_within(self.head..self.head + self.len, 0);
@@ -752,6 +824,7 @@ impl Buf {
 
     /// Contiguous space available to write into, compacting or promoting if necessary.
     pub fn writable(&mut self) -> &mut [u8] {
+        self.eoh.set(EOH_UNKNOWN);
         self.alloc_if_needed();
         if self.head > 0 && self.head + self.len == self.data.len() {
             self.compact();
@@ -766,6 +839,7 @@ impl Buf {
     /// Ensures contiguous writable space of at least `needed` bytes exists,
     /// compacting and/or promoting a small buffer to standard if necessary.
     pub fn ensure_writable(&mut self, needed: usize) -> &mut [u8] {
+        self.eoh.set(EOH_UNKNOWN);
         self.alloc_if_needed();
         if self.head > 0 && self.data.len().saturating_sub(self.head + self.len) < needed {
             self.compact();
@@ -783,6 +857,7 @@ impl Buf {
     /// # Panics
     /// If `n` exceeds the space reported by the last `writable()` call.
     pub fn commit(&mut self, n: usize) {
+        self.eoh.set(EOH_UNKNOWN);
         assert!(
             self.head + self.len + n <= self.data.len(),
             "commit({n}) past end of buffer"
@@ -792,6 +867,7 @@ impl Buf {
 
     /// Discards `n` bytes from the front.
     pub fn consume(&mut self, n: usize) {
+        self.eoh.set(EOH_UNKNOWN);
         let n = n.min(self.len);
         self.head += n;
         self.len -= n;
@@ -801,6 +877,7 @@ impl Buf {
     }
 
     pub fn clear(&mut self) {
+        self.eoh.set(EOH_UNKNOWN);
         self.head = 0;
         self.len = 0;
     }
@@ -808,6 +885,7 @@ impl Buf {
     /// Makes room for at least `min` bytes in all: a message held whole until its end
     /// arrives, longer than the buffer (a chunked body's trailer section behind its head).
     pub fn grow_capacity(&mut self, min: usize) {
+        self.eoh.set(EOH_UNKNOWN);
         self.grow_to(min);
     }
 
@@ -819,6 +897,7 @@ impl Buf {
     /// grows by what the rewrite added. Later reads then see the extra room as ordinary
     /// space and the body behind the head stays intact.
     fn grow_to(&mut self, min: usize) {
+        self.eoh.set(EOH_UNKNOWN);
         self.alloc_if_needed();
         if self.class == BufClass::Small && min > self.data.len() {
             self.promote_to_standard();
@@ -837,6 +916,7 @@ impl Buf {
     /// Replaces the leading `old_len` bytes in the readable portion of the buffer
     /// with `new_data`. The remainder is never truncated: the buffer grows if needed.
     pub fn replace_prefix(&mut self, old_len: usize, new_data: &[u8]) {
+        self.eoh.set(EOH_UNKNOWN);
         self.alloc_if_needed();
         let old_len = old_len.min(self.len);
         let rem_len = self.len - old_len;
@@ -865,6 +945,7 @@ impl Buf {
     /// tail capacity is available.
     /// Returns `true` if successful, or `false` if buffer capacity was exceeded or malformed.
     pub fn inject_http_header(&mut self, name: &str, value: &str) -> bool {
+        self.eoh.set(EOH_UNKNOWN);
         let added_approx = name.len() + value.len() + 4;
         self.grow_to(self.len + added_approx);
         if let Some(new_len) =
@@ -879,6 +960,7 @@ impl Buf {
 
     /// Cuts `start..end` (offsets in the readable data) out of the buffer.
     pub fn cut(&mut self, start: usize, end: usize) {
+        self.eoh.set(EOH_UNKNOWN);
         let (a, b) = (self.head + start.min(self.len), self.head + end.min(self.len));
         self.data.copy_within(b..self.head + self.len, a);
         self.len -= b - a;
@@ -888,6 +970,7 @@ impl Buf {
     ///
     /// Returns `true` if successful, or `false` if the buffer is malformed.
     pub fn remove_http_header(&mut self, name: &str) -> bool {
+        self.eoh.set(EOH_UNKNOWN);
         self.alloc_if_needed();
         if self.head > 0 {
             self.data.copy_within(self.head..self.head + self.len, 0);
@@ -1012,6 +1095,64 @@ mod tests {
         // Shrink prefix
         b.replace_prefix(5, b"XYZ");
         assert_eq!(b.readable(), b"XYZrem");
+    }
+
+    #[test]
+    fn the_end_of_the_head_packs_and_unpacks() {
+        use super::{eoh_pack, eoh_unpack};
+        for eoh in [None, Some((0, 2)), Some((0, 3)), Some((0, 4)), Some((1, 2)), Some((14, 4)), Some((23, 3)), Some((1 << 29, 2)), Some(((1 << 30) - 1, 4))] {
+            assert_eq!(eoh_unpack(eoh_pack(eoh)), Some(eoh), "{eoh:?}");
+        }
+        for eoh in [Some((1 << 30, 4)), Some((usize::MAX, 2)), Some((5, 1)), Some((5, 5))] {
+            assert_eq!(eoh_unpack(eoh_pack(eoh)), None, "{eoh:?}");
+        }
+    }
+
+    /// T433: the end of the head a buffer remembers is the one of its bytes after every way
+    /// of changing them: read once, changed, read again.
+    #[test]
+    fn the_end_of_the_head_follows_every_change() {
+        use crate::proxy::find_eoh;
+        let req: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /2 HTTP/1.1\n\nrest";
+        let fresh = |b: &Buf| find_eoh(b.readable());
+        let filled = |cap: usize| {
+            let mut b = Buf::with_capacity(cap);
+            assert!(b.put(req));
+            assert_eq!(b.eoh(), Some((23, 4)));
+            b
+        };
+        let mut edits: Vec<(&str, Box<dyn Fn(&mut Buf)>)> = vec![
+            ("put", Box::new(|b| { b.clear(); b.put(b"A\r\n"); b.eoh(); b.put(b"\r\n"); })),
+            ("commit", Box::new(|b| { b.clear(); b.put(b"A\n"); b.eoh(); b.writable()[0] = b'\n'; b.commit(1); })),
+            ("ensure_writable", Box::new(|b| { b.clear(); b.put(b"A\n"); b.eoh(); b.ensure_writable(1)[0] = b'\n'; b.commit(1); })),
+            ("consume", Box::new(|b| b.consume(27))),
+            ("clear", Box::new(Buf::clear)),
+            ("readable_mut", Box::new(|b| b.readable_mut()[16..18].copy_from_slice(b"\r\n"))),
+            ("raw_slice_mut", Box::new(|b| b.raw_slice_mut()[16..18].copy_from_slice(b"\r\n"))),
+            ("replace_prefix", Box::new(|b| b.replace_prefix(27, b"GET / HTTP/1.1\r\n\r\n"))),
+            ("inject_http_header", Box::new(|b| assert!(b.inject_http_header("X-Added", "1")))),
+            ("remove_http_header", Box::new(|b| assert!(b.remove_http_header("Host")))),
+            ("cut", Box::new(|b| b.cut(16, 25))),
+            ("compact", Box::new(|b| { b.consume(3); b.eoh(); b.compact(); })),
+            ("grow_capacity", Box::new(|b| { b.consume(3); b.eoh(); b.grow_capacity(256); })),
+            ("release", Box::new(|b| { b.clear(); b.eoh(); b.release(); })),
+            ("edit_keeping_lines", Box::new(|b| b.edit_keeping_lines(|d, _| d[16..20].make_ascii_uppercase()))),
+        ];
+        edits.push(("promote_to_standard", Box::new(|b| { b.promote_to_standard(); })));
+        for (name, edit) in &edits {
+            for cap in [64, 4096] {
+                let mut b = filled(cap);
+                edit(&mut b);
+                let want = fresh(&b);
+                assert_eq!(b.eoh(), want, "{name}");
+                assert_eq!(b.eoh(), want, "{name}, read again");
+            }
+        }
+        let mut small = Buf::small();
+        assert!(small.put(b"GET / HTTP/1.1\r\n\r\n"));
+        assert_eq!(small.eoh(), Some((14, 4)));
+        assert!(small.promote_to_standard());
+        assert_eq!(small.eoh(), Some((14, 4)));
     }
 
     #[test]

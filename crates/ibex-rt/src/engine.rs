@@ -8325,7 +8325,7 @@ cache-control: no-cache\r\ncontent-type: text/html\r\n\r\n\
 /// Adds `Connection: <token>` as the last header of the head at the front of `buf`, with the
 /// line ends the head has. The head is copied through the stack (no allocation) when it fits.
 fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str) {
-    let Some((eoh_pos, eoh_len)) = crate::find_eoh(buf.readable()) else { return };
+    let Some((eoh_pos, eoh_len)) = buf.eoh() else { return };
     let crlf = buf.readable()[..eoh_pos + eoh_len].windows(2).any(|w| w == b"\r\n");
     // `token` is `close` or `keep-alive`: the line is 24 bytes at most.
     let mut line = [0u8; 40];
@@ -8682,7 +8682,7 @@ impl EngineDispatcher<'_> {
                     t.req_rules_done = false;
                 } else {
                     // The rules have had their way with the head; it is final now.
-                    t.req.measure_head(sess.req.readable());
+                    t.req.measure_head_by(|| sess.req.eoh());
                 }
             }
         }
@@ -9055,7 +9055,7 @@ impl EngineDispatcher<'_> {
         // Held means none of it has gone: the head is all still here.
         let unsent = match txn.rsp {
             MsgState::Head { left, body: crate::txn::Framing::Chunked } => {
-                crate::proxy::find_eoh(entry.sess.rep.readable()).is_some_and(|(h, e)| h + e == left)
+                entry.sess.rep.eoh().is_some_and(|(h, e)| h + e == left)
             }
             _ => false,
         };
@@ -9827,7 +9827,7 @@ impl EngineDispatcher<'_> {
         if retry_on & (ibex_config::RE_STATUS_MASK | ibex_config::RE_JUNK_RESPONSE) == 0 {
             return false;
         }
-        let Some((h, e)) = crate::proxy::find_eoh(entry.sess.rep.readable()) else {
+        let Some((h, e)) = entry.sess.rep.eoh() else {
             return false;
         };
         let status = crate::txn::status_of(&String::from_utf8_lossy(&entry.sess.rep.readable()[..h + e]));
@@ -9906,7 +9906,7 @@ impl EngineDispatcher<'_> {
             return;
         }
         let table = client_case_table(&proxies[entry.proxy_idx]);
-        rewrite_header_names(entry.sess.rep.readable_mut(), table);
+        entry.sess.rep.edit_keeping_lines(|head, eoh| rewrite_header_names_before(head, eoh, table));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -9918,7 +9918,7 @@ impl EngineDispatcher<'_> {
         if blank > 0 {
             entry.sess.rep.replace_prefix(blank, b"");
         }
-        let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(entry.sess.rep.readable()) else {
+        let Some((hdr_len, eoh_len)) = entry.sess.rep.eoh() else {
             // No end of head and no room for more: as for a request, from `bufsize - 56`
             // (T265).
             if entry.sess.rep.readable().len() > threshold || entry.sess.rep.readable().len() + 56 >= entry.sess.bufsize {
@@ -10097,7 +10097,7 @@ impl EngineDispatcher<'_> {
             let sess = &mut entry.sess;
             if let Some(txn) = sess.txn.as_mut() {
                 txn.rsp = MsgState::head(framing);
-                txn.rsp.measure_head(sess.rep.readable());
+                txn.rsp.measure_head_by(|| sess.rep.eoh());
                 if framing == crate::txn::Framing::Tunnel && txn.req.is_done() {
                     txn.req = MsgState::Tunnel;
                 }
@@ -10135,7 +10135,7 @@ impl EngineDispatcher<'_> {
         if !has_rules {
             // `keep-alive` and `close` out of the server's `Connection`, the one this
             // connection's state calls for in (`h1_update_res_conn_value`).
-            let (h, e) = crate::find_eoh(entry.sess.rep.readable()).unwrap_or_default();
+            let (h, e) = entry.sess.rep.eoh().unwrap_or_default();
             let scan = crate::txn::scan_connection(&entry.sess.rep.readable()[..h + e]);
             // Under 200, `HAProxy` writes no `Connection` (`H1S_F_HAVE_O_CONN`), also for a
             // final status under 100.
@@ -10167,7 +10167,7 @@ impl EngineDispatcher<'_> {
         // Replacing only up to the blank line left the old one in front of the body, so
         // every response through these rules arrived with four bytes more than its
         // `Content-Length`.
-        let total_hdr_len = match crate::find_eoh(entry.sess.rep.readable()) {
+        let total_hdr_len = match entry.sess.rep.eoh() {
             Some((h, e)) => h + e,
             None => return,
         };
@@ -10919,7 +10919,7 @@ impl EngineDispatcher<'_> {
                 Self::stats_redirect(entry, proxies, serving, crate::stats_post::StCode::Deny);
                 return None;
             }
-            let body = crate::proxy::find_eoh(entry.sess.req.readable())
+            let body = entry.sess.req.eoh()
                 .map(|(h, e)| String::from_utf8_lossy(entry.sess.req.readable().get(h + e..).unwrap_or(&[])).into_owned())
                 .unwrap_or_default();
             let legacy = body.trim().starts_with('{')
@@ -10936,7 +10936,7 @@ impl EngineDispatcher<'_> {
                 });
             if !legacy {
                 let code = {
-                    let head_len = crate::proxy::find_eoh(entry.sess.req.readable()).map_or(0, |(h, e)| h + e);
+                    let head_len = entry.sess.req.eoh().map_or(0, |(h, e)| h + e);
                     // The body that fits counts as the whole of it: what the client declares is the size.
                     let declared = hdrs
                         .iter()
@@ -10990,7 +10990,7 @@ impl EngineDispatcher<'_> {
 
         // 3. Admin mutations
         let body_str =
-            if let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(entry.sess.req.readable()) {
+            if let Some((hdr_len, eoh_len)) = entry.sess.req.eoh() {
                 let total = hdr_len + eoh_len;
                 if entry.sess.req.readable().len() > total {
                     String::from_utf8_lossy(&entry.sess.req.readable()[total..]).to_string()
@@ -12215,7 +12215,7 @@ impl EngineDispatcher<'_> {
         // The head is final: its header names go to the server in lower case, as `HAProxy`
         // writes them (HTX). The request line and the values are the client's.
         let srv_table = (proxies[be_idx].h1_adjust & ibex_config::H1_ADJ_SERVER != 0).then(|| &*proxies[be_idx].h1_case);
-        rewrite_header_names(entry.sess.req.readable_mut(), srv_table);
+        entry.sess.req.edit_keeping_lines(|head, eoh| rewrite_header_names_before(head, eoh, srv_table));
         Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, cookie_server)
     }
 
@@ -13358,11 +13358,11 @@ fn rewrite_request_connection(sess: &mut TcpSession, close: bool) {
     // `keep-alive` would be wrong for a message that ends with its connection (T430 row 2).
     let close = close
         || (!http11
-            && crate::find_eoh(sess.req.readable())
+            && sess.req.eoh()
                 .is_some_and(|(h, e)| crate::txn::request_framing(&sess.req.readable()[..h + e]) == crate::txn::Framing::Chunked));
     // One look at the head, no copy. The usual request has no `Connection`, or one that is
     // all `keep-alive` and `close` and goes whole, cut out of the head where it is.
-    let scan = crate::find_eoh(sess.req.readable()).map(|(h, e)| crate::txn::scan_connection(&sess.req.readable()[..h + e]));
+    let scan = sess.req.eoh().map(|(h, e)| crate::txn::scan_connection(&sess.req.readable()[..h + e]));
     let scan = scan.unwrap_or_default();
     if scan.count == 0 || (scan.count == 1 && scan.plain) {
         if scan.count == 1 {
@@ -13895,7 +13895,7 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
 }
 
 fn rebuild_req_buffer(sess: &mut TcpSession) {
-    let Some((hdr_len, eoh_len)) = crate::proxy::find_eoh(sess.req.readable()) else {
+    let Some((hdr_len, eoh_len)) = sess.req.eoh() else {
         return;
     };
     if let Some(htx) = sess.htx_slice() {
@@ -14635,7 +14635,14 @@ fn lowercase_header_names(buf: &mut [u8]) {
 /// [`lowercase_header_names`], and then each name found in `table` (`h1-case-adjust`) in the
 /// case the table gives. `from` and `to` differ in case only, so the head keeps its length.
 fn rewrite_header_names(buf: &mut [u8], table: Option<&std::collections::HashMap<String, String>>) {
-    let head = crate::proxy::find_eoh(buf).map_or(0, |(h, _)| h);
+    let eoh = crate::proxy::find_eoh(buf);
+    rewrite_header_names_before(buf, eoh, table);
+}
+
+/// [`rewrite_header_names`] of a head whose end is `eoh` (`find_eoh` of `buf`). Only the
+/// case of name bytes changes: no line end moves.
+fn rewrite_header_names_before(buf: &mut [u8], eoh: Option<(usize, usize)>, table: Option<&std::collections::HashMap<String, String>>) {
+    let head = eoh.map_or(0, |(h, _)| h);
     let mut at = buf[..head].iter().position(|&b| b == b'\n').map_or(head, |i| i + 1);
     while at < head {
         let end = buf[at..head].iter().position(|&b| b == b'\n').map_or(head, |i| at + i + 1);
