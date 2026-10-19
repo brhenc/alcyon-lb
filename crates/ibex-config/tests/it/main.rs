@@ -60,6 +60,7 @@ mod response_redirect;
 mod retry_on;
 mod ring_sections;
 mod sc_set_gpt0_default;
+mod sc_value_missing;
 mod server_keywords;
 mod server_tls;
 mod set_dst_port_retries;

@@ -168,6 +168,20 @@ pub(crate) fn parse_rst_ttl(tokens: &[Token], at: usize) -> Result<Option<(u8, u
 /// The one argument at `tokens[2]` (a `set-var` expression, a `set-var-fmt` format) and
 /// the optional condition after it: a second word that is not `if`/`unless` is refused,
 /// as `HAProxy` refuses it. Ibex joined the words and set the variable to something else.
+/// The value of `sc-set-gpt0`, `sc-set-gpt` and `sc-add-gpc` and the condition. HAProxy reads
+/// the next word as the value's sample fetch, so `if`/`unless` there is `unknown fetch
+/// method 'if'`; no word at all is accepted (the value is 0).
+fn sc_value_and_cond(tokens: &[Token], kw: &str, act_token: &Token) -> Result<(String, Option<AclCondition>), ConfigError> {
+    if let Some(t) = tokens.get(2).filter(|t| t.text == "if" || t.text == "unless") {
+        return Err(ConfigError::new(
+            t.line,
+            t.col,
+            format!("error detected while parsing '{kw} {}' rule : unknown fetch method '{}'.", act_token.text, t.text),
+        ));
+    }
+    one_arg_and_cond(tokens, kw, act_token)
+}
+
 fn one_arg_and_cond(tokens: &[Token], kw: &str, act_token: &Token) -> Result<(String, Option<AclCondition>), ConfigError> {
     let arg = tokens.get(2).filter(|t| t.text != "if" && t.text != "unless").map_or_else(String::new, |t| t.text.clone());
     let at = if arg.is_empty() { 2 } else { 3 };
@@ -445,7 +459,7 @@ fn parse_http_req_rule_at(
         let cond = expect_cond_at(tokens, 2, act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc1 { sc }, cond, line: 0 });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_token)? {
-        let (expr, cond) = one_arg_and_cond(tokens, "http-request", act_token)?;
+        let (expr, cond) = sc_value_and_cond(tokens, "http-request", act_token)?;
         // No value is 0, as `HAProxy` reads it (`strtol` stops at the end of the line).
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt0 { sc, expr }, cond, line: 0 });
@@ -453,12 +467,12 @@ fn parse_http_req_rule_at(
         let cond = expect_cond_at(tokens, 2, act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc { idx, sc }, cond, line: 0 });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-add-gpc", act_token)? {
-        let (expr, cond) = one_arg_and_cond(tokens, "http-request", act_token)?;
+        let (expr, cond) = sc_value_and_cond(tokens, "http-request", act_token)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(HttpReqRule { action: HttpReqAction::ScAddGpc { idx, sc, expr }, cond, line: 0 });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-set-gpt", act_token)? {
-        let (expr, cond) = one_arg_and_cond(tokens, "http-request", act_token)?;
+        let (expr, cond) = sc_value_and_cond(tokens, "http-request", act_token)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt { idx, sc, expr }, cond, line: 0 });

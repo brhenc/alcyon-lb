@@ -148,7 +148,7 @@ pub(crate) fn parse_tcp_req_session(
         let (_, cond) = parse_rule_condition(tokens, 3)?;
         rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScIncGpc1 { sc }, cond });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_tok)? {
-        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
+        let (expr, cond) = sc_value_and_cond(tokens)?;
         // No value is 0, as `HAProxy` reads it (`strtol` stops at the end of the line).
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScSetGpt0 { sc, expr }, cond });
@@ -156,12 +156,12 @@ pub(crate) fn parse_tcp_req_session(
         let (_, cond) = parse_rule_condition(tokens, 3)?;
         rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScIncGpc { idx, sc }, cond });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-add-gpc", act_tok)? {
-        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
+        let (expr, cond) = sc_value_and_cond(tokens)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScAddGpc { idx, sc, expr }, cond });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-set-gpt", act_tok)? {
-        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
+        let (expr, cond) = sc_value_and_cond(tokens)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqSessionRule { action: TcpReqSessionAction::ScSetGpt { idx, sc, expr }, cond });
@@ -413,7 +413,7 @@ fn parse_tcp_req_content_at(
         let (_, cond) = parse_rule_condition(tokens, 3)?;
         rules.push(TcpReqContentRule { action: TcpReqContentAction::ScIncGpc1 { sc }, cond, line: 0 });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_tok)? {
-        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
+        let (expr, cond) = sc_value_and_cond(tokens)?;
         // No value is 0, as `HAProxy` reads it (`strtol` stops at the end of the line).
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqContentRule { action: TcpReqContentAction::ScSetGpt0 { sc, expr }, cond, line: 0 });
@@ -421,12 +421,12 @@ fn parse_tcp_req_content_at(
         let (_, cond) = parse_rule_condition(tokens, 3)?;
         rules.push(TcpReqContentRule { action: TcpReqContentAction::ScIncGpc { idx, sc }, cond, line: 0 });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-add-gpc", act_tok)? {
-        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
+        let (expr, cond) = sc_value_and_cond(tokens)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqContentRule { action: TcpReqContentAction::ScAddGpc { idx, sc, expr }, cond, line: 0 });
     } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-set-gpt", act_tok)? {
-        let (expr, cond) = tcp_arg_and_cond(tokens, 3)?;
+        let (expr, cond) = sc_value_and_cond(tokens)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(TcpReqContentRule { action: TcpReqContentAction::ScSetGpt { idx, sc, expr }, cond, line: 0 });
@@ -777,4 +777,14 @@ pub(crate) fn parse_gpc_array_action(
             if prefix == "sc-set-gpt" { "" } else { " (tune.stick-counters)" }
         ))),
     }
+}
+
+/// The value of `sc-set-gpt0`, `sc-set-gpt` and `sc-add-gpc` and the condition. HAProxy reads
+/// the next word as the value's sample fetch, so `if`/`unless` there is `unknown fetch
+/// method 'if'`; no word at all is accepted (the value is 0).
+fn sc_value_and_cond(tokens: &[Token]) -> Result<(String, Option<AclCondition>), ConfigError> {
+    if let Some(t) = tokens.get(3).filter(|t| t.text == "if" || t.text == "unless") {
+        return Err(ConfigError::new(t.line, t.col, format!("unknown fetch method '{}'", t.text)));
+    }
+    tcp_arg_and_cond(tokens, 3)
 }
