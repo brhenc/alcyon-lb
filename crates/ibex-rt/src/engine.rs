@@ -5039,9 +5039,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 self.accept_limited = None;
             }
         }
-        if self.global_paused && self.accept_limited.is_none() && !crate::globalconn::full() {
-            self.resume_listeners_after_global();
-        }
+        self.resume_paused_listeners();
         let poll_timeout = match self.cli_accept_retry {
             Some(t) if t <= now_inst => {
                 self.cli_accept_retry = None;
@@ -5051,9 +5049,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             Some(t) => poll_timeout.min(t.saturating_duration_since(now_inst)),
             None => poll_timeout,
         };
-        if self.fe_paused && !self.global_paused {
-            self.resume_listeners_after_frontend_limit();
-        }
 
         // 3. Poll readiness events
         let mut events = std::mem::take(&mut self.events);
@@ -5460,15 +5455,33 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.fe_paused = still_full;
     }
 
+    /// Re-arms the listeners a limit stopped, once the limit has room again: `global maxconn`
+    /// ([`Self::resume_listeners_after_global`]) and a frontend's own `maxconn`
+    /// ([`Self::resume_listeners_after_frontend_limit`]). Called on every pass of `step`.
+    fn resume_paused_listeners(&mut self) {
+        if self.global_paused && self.accept_limited.is_none() && !crate::globalconn::full() {
+            self.resume_listeners_after_global();
+        }
+        if self.fe_paused && !self.global_paused {
+            self.resume_listeners_after_frontend_limit();
+        }
+    }
+
     /// Undoes [`Self::pause_listeners_for_global`] for the listeners that have room of
     /// their own.
     fn resume_listeners_after_global(&mut self) {
         self.global_paused = false;
         for l in &self.listeners {
             let lfd = l.raw_fd();
-            if !l.is_full() && self.fdtab.interest(lfd).is_none() {
-                let _ = self.poller.modify(l.borrowed_fd(), raw_fd_to_u64(lfd), true, false);
-                self.fdtab.set_interest(lfd, Interest::READ);
+            if self.fdtab.interest(lfd).is_none() {
+                if l.is_full() {
+                    // Still stopped, by its frontend's limit now: `fe_paused` is what makes
+                    // `step` look at that limit again (T430 row 33).
+                    self.fe_paused = true;
+                } else {
+                    let _ = self.poller.modify(l.borrowed_fd(), raw_fd_to_u64(lfd), true, false);
+                    self.fdtab.set_interest(lfd, Interest::READ);
+                }
             }
         }
     }
@@ -15325,5 +15338,38 @@ mod stats_req_headers_tests {
         assert!(EngineDispatcher::stats_req_headers(&s).is_empty());
         s.req_headers = Some(vec![("Origin".to_string(), "http://evil".to_string())]);
         assert_eq!(EngineDispatcher::stats_req_headers(&s), [("Origin", "http://evil")]);
+    }
+}
+
+#[cfg(test)]
+mod accept_pause_tests {
+    use super::*;
+
+    /// T430 row 33: a listener stopped for `global maxconn` while its frontend's `maxconn` is
+    /// reached too stayed stopped for good. A connection closes by releasing its global slot
+    /// and, later in the same function, its frontend's; a worker looking in between found the
+    /// global limit free and the frontend's still full, re-armed nothing, and cleared
+    /// `global_paused` without setting `fe_paused`, the flag that makes `step` look at the
+    /// frontend limit again. The connection waiting in the kernel's accept queue was never
+    /// accepted (about 1 run in 80 of `maxconn_client_left` under load).
+    #[test]
+    fn a_listener_stopped_by_both_limits_is_rearmed_when_the_frontend_has_room() {
+        let mut fe = ibex_config::ast::FrontendSection::default();
+        fe.bind = Some("127.0.0.1:0".parse().expect("addr"));
+        let config = Config { frontends: vec![fe], ..Default::default() };
+        let mut engine = Engine::new(&config, 64).expect("Engine::new");
+        let lfd = engine.listeners[0].raw_fd();
+        engine.listeners[0].maxconn.set(1);
+        engine.listeners[0].maxconn.inc();
+        // The worker is told the process is full: it stops its listeners.
+        engine.pause_listeners_for_global();
+        assert!(engine.fdtab.interest(lfd).is_none());
+        // The global slot is back, the frontend's is not yet: nothing to re-arm.
+        engine.resume_paused_listeners();
+        assert!(engine.fdtab.interest(lfd).is_none(), "the frontend is still full");
+        // The frontend's slot comes back: the next pass must re-arm the listener.
+        engine.listeners[0].maxconn.dec();
+        engine.resume_paused_listeners();
+        assert!(!engine.fdtab.interest(lfd).is_none(), "the listener must be polled again");
     }
 }
