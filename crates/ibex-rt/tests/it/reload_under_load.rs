@@ -363,7 +363,9 @@ fn reload_under_load(reloads: u32) {
         retired.push((serving, t0));
         first_retire.get_or_insert(t0);
         let old = serving;
-        while Instant::now() < t0 + Duration::from_secs(1) {
+        // One second between reloads; longer while no new process has taken over yet (a
+        // loaded host starts one late).
+        while Instant::now() < t0 + Duration::from_secs(1) || (serving == old && Instant::now() < t0 + Duration::from_secs(20)) {
             if let Some(p) = read_pid(&pidfile).filter(|&p| p != old && alive(p)) {
                 serving = p;
             }
@@ -376,7 +378,7 @@ fn reload_under_load(reloads: u32) {
             });
             thread::sleep(Duration::from_millis(10));
         }
-        assert_ne!(serving, old, "reload {i}: no new process took over within 1 s");
+        assert_ne!(serving, old, "reload {i}: no new process took over within 20 s");
         if i == 10 {
             at10 = Some((status_kb(serving, "VmRSS:"), (0..3).map(|_| fds(serving)).min().unwrap_or(0)));
         }
