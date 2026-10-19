@@ -1224,13 +1224,14 @@ impl TcpSession {
         let tail = self.htx_tail;
         let blocks = self.htx_blocks;
         let mut slice = ibex_proto::htx::HtxSlice::with_offsets(
-            self.htx_buf.raw_slice_mut(),
+            self.htx_buf.htx_slice_mut(),
             tail,
             blocks,
         );
         let res = f(&mut slice);
         self.htx_tail = slice.tail_addr();
         self.htx_blocks = slice.num_blocks();
+        self.htx_buf.note_htx(self.htx_tail, self.htx_blocks * ibex_proto::htx::HTX_DESC_SIZE);
         self.htx_modified = true;
         Some(res)
     }
@@ -1253,9 +1254,10 @@ impl TcpSession {
         let new_len = len + (needed - free) + 4096;
         let mut bigger = Buf::with_capacity(new_len);
         let old = self.htx_buf.raw_slice();
-        let new = bigger.raw_slice_mut();
+        let new = bigger.htx_slice_mut();
         new[..self.htx_tail].copy_from_slice(&old[..self.htx_tail]);
         new[new_len - descs..].copy_from_slice(&old[len - descs..]);
+        bigger.note_htx(self.htx_tail, descs);
         self.htx_buf = bigger;
     }
 
@@ -1994,9 +1996,14 @@ impl TcpSession {
         let lines = self.req.readable()[..head_len].iter().filter(|&&b| b == b'\n').count();
         // One more line for a `Sec-WebSocket-Key` the proxy may write.
         self.htx_reserve(head_len + 64 + ibex_proto::htx::HTX_DESC_SIZE * (lines + 3));
-        let raw = self.htx_buf.raw_slice_mut();
+        let raw = self.htx_buf.htx_slice_mut();
         let mut slice = ibex_proto::htx::HtxSlice::new(raw);
-        stream.parse(&self.req.readable()[..head_len], &mut slice)?;
+        if let Err(e) = stream.parse(&self.req.readable()[..head_len], &mut slice) {
+            // What a refused head wrote is zeroed on release like any other.
+            let (tail, blocks) = (slice.tail_addr(), slice.num_blocks());
+            self.htx_buf.note_htx(tail, blocks * ibex_proto::htx::HTX_DESC_SIZE);
+            return Err(e.into());
+        }
         let mut close = stream.connection_close();
         let head_rewritten = stream.head_rewritten();
         // `Content-Length` beside `Transfer-Encoding`: forwarded as HAProxy does
@@ -2025,6 +2032,7 @@ impl TcpSession {
         self.req_ws = (ws != crate::websocket::ReqWs::default()).then(|| Box::new(ws));
         self.htx_tail = slice.tail_addr();
         self.htx_blocks = slice.num_blocks();
+        self.htx_buf.note_htx(self.htx_tail, self.htx_blocks * ibex_proto::htx::HTX_DESC_SIZE);
         self.has_htx = true;
         // Modified, so the head forwarded is regenerated from the HTX, without it. So
         // too when the parser normalised the authority and `Host` (tasks/T93).

@@ -130,9 +130,91 @@ fn startup(n: usize) {
     drop(p);
 }
 
+/// A keep-alive server: answers every head on every connection with a 2-byte body.
+fn keepalive_backend(l: TcpListener, run: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    l.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        let mut conns: Vec<TcpStream> = Vec::new();
+        let mut b = [0u8; 4096];
+        while run.load(Ordering::Relaxed) {
+            if let Ok((s, _)) = l.accept() {
+                s.set_nonblocking(true).unwrap();
+                conns.push(s);
+            }
+            for s in &mut conns {
+                if let Ok(n) = s.read(&mut b) {
+                    if n > 0 && b[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                    }
+                }
+            }
+            thread::sleep(Duration::from_micros(200));
+        }
+    })
+}
+
+/// One keep-alive request on `c`, the engine run until a full head and `tail` are back.
+fn drive_ka(c: &mut TcpStream, e: &mut Engine, tail: &[u8]) {
+    c.write_all(b"GET /api/test HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    let st = Instant::now();
+    let mut r = [0u8; 1024];
+    let mut len = 0;
+    while st.elapsed() < Duration::from_secs(2) && !r[..len].ends_with(tail) {
+        let _ = e.run_once();
+        if let Ok(n) = c.read(&mut r[len..]) { len += n; }
+    }
+    assert!(r[..len].ends_with(tail), "the profiled request did not succeed: {:?}", String::from_utf8_lossy(&r[..len]));
+}
+
+/// `ALLOCPROFILE_FE=<file>`: the file's lines go into the frontend (indented), and the
+/// profiled request is the fourth on one keep-alive connection to a keep-alive server, so
+/// only per-request allocations show. `ALLOCPROFILE_TAIL` is the end of the expected
+/// response (default `ok`).
+fn keepalive_profile(fe_file: &str) {
+    let lines = std::fs::read_to_string(fe_file).unwrap();
+    let tail = std::env::var("ALLOCPROFILE_TAIL").unwrap_or_else(|_| "ok".into());
+    let (sl, sa) = loopback0();
+    let (fl, fa) = loopback0(); drop(fl);
+    let run = Arc::new(AtomicBool::new(true));
+    let h = keepalive_backend(sl, Arc::clone(&run));
+    let fe: String = lines.lines().map(|l| format!("  {}\n", l.trim())).collect();
+    let text = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend fe\n  bind {fa}\n{fe}  default_backend be\nbackend be\n  server s1 {sa}\n"
+    );
+    let cfg = ibex_config::parse_str(&text).unwrap();
+    let mut e = Engine::new(&cfg, 64).unwrap();
+    let mut c = TcpStream::connect(fa).unwrap();
+    c.set_nonblocking(true).unwrap();
+    for _ in 0..3 { drive_ka(&mut c, &mut e, tail.as_bytes()); }
+    SITES.with(|s| s.borrow_mut().clear());
+    ARMED.with(|a| a.set(true));
+    drive_ka(&mut c, &mut e, tail.as_bytes());
+    ARMED.with(|a| a.set(false));
+    print_sites();
+    run.store(false, Ordering::Relaxed); let _ = h.join();
+}
+
+fn print_sites() {
+    SITES.with(|s| {
+        let m = s.borrow();
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        let tot: usize = m.values().map(|x| x.0).sum();
+        let tb: usize = m.values().map(|x| x.1).sum();
+        println!("\n===== {tot} allocations, {tb} bytes, ranked by call site =====");
+        for (site, (n, bytes)) in v.iter().take(40) {
+            println!("{n:4}  {bytes:8}B  {site}");
+        }
+    });
+}
+
 fn main() {
     if let Some(n) = std::env::var("ALLOCPROFILE_BACKENDS").ok().and_then(|v| v.parse().ok()) {
         return startup(n);
+    }
+    if let Ok(f) = std::env::var("ALLOCPROFILE_FE") {
+        return keepalive_profile(&f);
     }
     let (sl, sa) = loopback0();
     let (fl, fa) = loopback0(); drop(fl);
@@ -184,16 +266,6 @@ fn main() {
     ARMED.with(|a| a.set(true));
     drive(fa, &mut e);
     ARMED.with(|a| a.set(false));
-    SITES.with(|s| {
-        let m = s.borrow();
-        let mut v: Vec<_> = m.iter().collect();
-        v.sort_by(|a, b| b.1.0.cmp(&a.1.0));
-        let tot: usize = m.values().map(|x| x.0).sum();
-        let tb: usize = m.values().map(|x| x.1).sum();
-        println!("\n===== {tot} allocations, {tb} bytes, ranked by call site =====");
-        for (site, (n, bytes)) in v.iter().take(20) {
-            println!("{n:4}  {bytes:8}B  {site}");
-        }
-    });
+    print_sites();
     run.store(false, Ordering::Relaxed); let _ = h.join();
 }

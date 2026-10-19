@@ -292,6 +292,19 @@ not have is the `bind` option `maxconn` (between the proxy's `backlog` and its `
 in HAProxy): `bind ... maxconn N` is refused at load, as before. A socket handed over by a
 reload keeps the backlog it was bound with, as in HAProxy.
 
+## `tune.ibex.zero-buffers on|off`: an Ibex-only global keyword (T437 5b)
+
+When a buffer goes back to its pool (or is freed), Ibex overwrites the bytes that were written to
+it (up to a per-buffer high-water mark, not the whole 16 KB) with zeros, so the plaintext of one
+connection is not what the next one is handed, and a core dump or a memory-disclosure bug finds
+less. The overwrite is a `zeroize` write the compiler may not remove. The same is done for the
+wire buffers (`rx_raw`/`tx_raw`) of a TLS connection when it ends. Default **on**; `off` skips the
+cost for an operator who measures it as one. HAProxy has no such setting (its pools keep stale
+bytes; `-dM` poisoning is a debug option) and refuses the keyword as unknown. It takes exactly
+`on` or `off`; anything else, or a missing argument, is a configuration error. Limits: bytes
+written through `Buf::writable()` and never committed are not tracked, and buffers owned by rustls
+itself are not Ibex's to overwrite.
+
 ## `ibex.watchdog-warn-only`: an Ibex-only global keyword (T361)
 
 HAProxy's watchdog warns about a thread that has stopped processing traffic and, once it has been stuck for a

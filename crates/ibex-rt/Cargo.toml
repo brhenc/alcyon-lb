@@ -141,3 +141,8 @@ path = "tests/worker_proxy_memory.rs"
 [[test]]
 name = "stats_auth_userlists"
 path = "tests/stats_auth_userlists.rs"
+
+# Own process: sets the process-global tune.ibex.zero-buffers and reads back pooled buffers
+[[test]]
+name = "zero_buffers"
+path = "tests/zero_buffers.rs"

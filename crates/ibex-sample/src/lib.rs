@@ -31,6 +31,7 @@ pub mod rawpayload;
 pub mod rfc7239;
 pub mod registry;
 pub mod sample;
+pub mod spare;
 pub mod vars;
 
 pub use acls::Acls;

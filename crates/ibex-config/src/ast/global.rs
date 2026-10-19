@@ -225,6 +225,8 @@ pub struct GlobalSection {
     pub pool_low_fd_ratio: Option<u8>,
     /// The `tune.vars.*` limits (T364 S5).
     pub vars_limits: VarsLimits,
+    /// `tune.ibex.zero-buffers on|off` (Ibex-only): zero a buffer's used bytes when it is released. On when unset.
+    pub zero_buffers: Option<bool>,
     /// Buffer size in bytes (`tune.bufsize`).
     pub bufsize: Option<usize>,
     /// Small buffer size in bytes (`tune.bufsize.small`).

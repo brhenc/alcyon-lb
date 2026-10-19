@@ -351,25 +351,25 @@ impl Matcher {
     pub fn matches(&self, sample: &Sample) -> bool {
         match self {
             Matcher::Found => true,
-            Matcher::Bool => matches!(cast(sample.clone(), SampleType::Sint), Some(Sample::Sint(v)) if v != 0),
+            Matcher::Bool => matches!(cast_ref(sample, SampleType::Sint).as_deref(), Some(&Sample::Sint(v)) if v != 0),
             Matcher::Any(list) => list.iter().any(|m| m.matches(sample)),
             Matcher::File(f) => f.matches(sample),
             Matcher::Word { pattern, delimiters, case_insensitive } => {
-                matches!(cast(sample.clone(), SampleType::Str),
+                matches!(cast_ref(sample, SampleType::Str).as_deref(),
                     Some(Sample::Str(s)) if match_word(s.as_bytes(), pattern, delimiters, *case_insensitive))
             }
             Matcher::IntRange(range) => {
-                matches!(cast(sample.clone(), SampleType::Sint), Some(Sample::Sint(v)) if range.contains(v))
+                matches!(cast_ref(sample, SampleType::Sint).as_deref(), Some(&Sample::Sint(v)) if range.contains(v))
             }
             Matcher::Str {
                 target,
                 case_insensitive,
             } => {
-                if let Some(Sample::Str(s)) = cast(sample.clone(), SampleType::Str) {
+                if let Some(Sample::Str(s)) = cast_ref(sample, SampleType::Str).as_deref() {
                     if *case_insensitive {
                         s.eq_ignore_ascii_case(target)
                     } else {
-                        s == *target
+                        *s == *target
                     }
                 } else {
                     false
@@ -379,7 +379,7 @@ impl Matcher {
                 prefix,
                 case_insensitive,
             } => {
-                if let Some(Sample::Str(s)) = cast(sample.clone(), SampleType::Str) {
+                if let Some(Sample::Str(s)) = cast_ref(sample, SampleType::Str).as_deref() {
                     if *case_insensitive {
                         s.to_lowercase().starts_with(prefix)
                     } else {
@@ -393,7 +393,7 @@ impl Matcher {
                 suffix,
                 case_insensitive,
             } => {
-                if let Some(Sample::Str(s)) = cast(sample.clone(), SampleType::Str) {
+                if let Some(Sample::Str(s)) = cast_ref(sample, SampleType::Str).as_deref() {
                     if *case_insensitive {
                         s.to_lowercase().ends_with(suffix)
                     } else {
@@ -407,7 +407,7 @@ impl Matcher {
                 sub,
                 case_insensitive,
             } => {
-                if let Some(Sample::Str(s)) = cast(sample.clone(), SampleType::Str) {
+                if let Some(Sample::Str(s)) = cast_ref(sample, SampleType::Str).as_deref() {
                     if *case_insensitive {
                         s.to_lowercase().contains(sub)
                     } else {
@@ -418,30 +418,25 @@ impl Matcher {
                 }
             }
             Matcher::Reg(regex) => {
-                if let Some(Sample::Str(s)) = cast(sample.clone(), SampleType::Str) {
-                    regex.is_match(&s)
+                if let Some(Sample::Str(s)) = cast_ref(sample, SampleType::Str).as_deref() {
+                    regex.is_match(s)
                 } else {
                     false
                 }
             }
             Matcher::Len(range) => {
-                if let Some(Sample::Str(s)) = cast(sample.clone(), SampleType::Str) {
+                if let Some(Sample::Str(s)) = cast_ref(sample, SampleType::Str).as_deref() {
                     i64::try_from(s.len()).is_ok_and(|n| range.contains(n))
                 } else {
                     false
                 }
             }
             Matcher::Bin(target) => {
-                if let Some(Sample::Bin(b)) = cast(sample.clone(), SampleType::Bin) {
-                    b == *target
-                } else if let Some(Sample::Str(s)) = cast(sample.clone(), SampleType::Str) {
-                    s.as_bytes() == target.as_slice()
-                } else {
-                    false
-                }
+                // Every type casts to binary (`c_*2bin`), so this is the only comparison.
+                matches!(cast_ref(sample, SampleType::Bin).as_deref(), Some(Sample::Bin(b)) if *b == *target)
             }
             Matcher::Int { op, value } => {
-                if let Some(Sample::Sint(val)) = cast(sample.clone(), SampleType::Sint) {
+                if let Some(&Sample::Sint(val)) = cast_ref(sample, SampleType::Sint).as_deref() {
                     match op {
                         IntOp::Eq => val == *value,
                         IntOp::Ne => val != *value,
@@ -456,14 +451,14 @@ impl Matcher {
             }
             Matcher::Ip(target_ip) => match target_ip {
                 IpAddr::V4(target_v4) => {
-                    if let Some(Sample::Ipv4(ip)) = cast(sample.clone(), SampleType::Ipv4) {
+                    if let Some(&Sample::Ipv4(ip)) = cast_ref(sample, SampleType::Ipv4).as_deref() {
                         ip == *target_v4
                     } else {
                         false
                     }
                 }
                 IpAddr::V6(target_v6) => {
-                    if let Some(Sample::Ipv6(ip)) = cast(sample.clone(), SampleType::Ipv6) {
+                    if let Some(&Sample::Ipv6(ip)) = cast_ref(sample, SampleType::Ipv6).as_deref() {
                         ip == *target_v6
                     } else {
                         false
@@ -471,14 +466,14 @@ impl Matcher {
                 }
             },
             Matcher::IpCidrV4 { network, mask } => {
-                if let Some(Sample::Ipv4(ip)) = cast(sample.clone(), SampleType::Ipv4) {
+                if let Some(&Sample::Ipv4(ip)) = cast_ref(sample, SampleType::Ipv4).as_deref() {
                     (u32::from(ip) & mask) == *network
                 } else {
                     false
                 }
             }
             Matcher::IpCidrV6 { network, mask } => {
-                if let Some(Sample::Ipv6(ip)) = cast(sample.clone(), SampleType::Ipv6) {
+                if let Some(&Sample::Ipv6(ip)) = cast_ref(sample, SampleType::Ipv6).as_deref() {
                     (u128::from(ip) & mask) == *network
                 } else {
                     false
@@ -488,9 +483,33 @@ impl Matcher {
     }
 }
 
+/// `sample` cast to `t` (`cast`), borrowed when it is of that type already: matching a sample
+/// copies nothing (T437).
+fn cast_ref(sample: &Sample, t: SampleType) -> Option<std::borrow::Cow<'_, Sample>> {
+    if sample.sample_type() == t {
+        Some(std::borrow::Cow::Borrowed(sample))
+    } else {
+        cast(sample.clone(), t).map(std::borrow::Cow::Owned)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-m bin` compares the bytes of the sample cast to binary (a text, an address). `-m ip` with an IPv6 pattern takes an
+    /// IPv6 sample as it is (T437: borrowed, not cast from a copy).
+    #[test]
+    fn bin_and_ipv6_matchers_read_the_sample_in_place() {
+        let bin = Matcher::compile("bin", "4142").unwrap();
+        assert!(bin.matches(&Sample::Bin(b"AB".to_vec())));
+        assert!(!bin.matches(&Sample::Bin(b"AC".to_vec())));
+        assert!(bin.matches(&Sample::Str("AB".into())));
+        assert!(Matcher::compile("bin", "7f000001").unwrap().matches(&Sample::Ipv4(std::net::Ipv4Addr::LOCALHOST)));
+        let ip6 = Matcher::compile("ip", "::1").unwrap();
+        assert!(ip6.matches(&Sample::Ipv6(std::net::Ipv6Addr::LOCALHOST)));
+        assert!(!ip6.matches(&Sample::Ipv6(std::net::Ipv6Addr::UNSPECIFIED)));
+    }
 
     #[test]
     fn test_matchers() {

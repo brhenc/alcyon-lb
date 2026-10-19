@@ -47,6 +47,7 @@ mod log_format_config;
 mod log_tag_sample;
 mod m1_scope_refusals;
 mod no_memory_trimming;
+mod zero_buffers;
 mod normalize_uri_experimental;
 mod node_description;
 mod pause_rule;
