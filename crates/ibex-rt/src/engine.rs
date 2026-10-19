@@ -14643,9 +14643,9 @@ fn rewrite_header_names(buf: &mut [u8], table: Option<&std::collections::HashMap
 /// case of name bytes changes: no line end moves.
 fn rewrite_header_names_before(buf: &mut [u8], eoh: Option<(usize, usize)>, table: Option<&std::collections::HashMap<String, String>>) {
     let head = eoh.map_or(0, |(h, _)| h);
-    let mut at = buf[..head].iter().position(|&b| b == b'\n').map_or(head, |i| i + 1);
+    let mut at = memchr::memchr(b'\n', &buf[..head]).map_or(head, |i| i + 1);
     while at < head {
-        let end = buf[at..head].iter().position(|&b| b == b'\n').map_or(head, |i| at + i + 1);
+        let end = memchr::memchr(b'\n', &buf[at..head]).map_or(head, |i| at + i + 1);
         // A folded line has no name of its own: nothing of it is lower-cased.
         let folded = matches!(buf[at], b' ' | b'\t');
         let colon = buf[at..end].iter().position(|&b| b == b':').filter(|_| !folded).map_or(at, |i| at + i);

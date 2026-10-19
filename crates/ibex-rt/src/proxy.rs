@@ -3187,7 +3187,7 @@ fn has_header(head: &str, name: &str) -> bool {
 pub fn find_eoh(buf: &[u8]) -> Option<(usize, usize)> {
     // Each end starts with a CR or an LF: the bytes before the next one are passed over.
     let mut i = 0;
-    while let Some(n) = buf[i..].iter().position(|&b| b == b'\r' || b == b'\n') {
+    while let Some(n) = memchr::memchr2(b'\r', b'\n', &buf[i..]) {
         i += n;
         let rest = &buf[i..];
         if rest.starts_with(b"\r\n\r\n") {
@@ -3577,6 +3577,36 @@ mod tests {
         assert!(matches!(side.recv(&mut x, &mut [0u8; 8]), Ok(super::Io::WouldBlock)));
         assert!(matches!(side.send(&mut x, b"x"), Ok(super::Io::WouldBlock)));
         side.shutdown_read();
+    }
+
+    /// T433: heads long enough for a vectorised search, with their line ends anywhere.
+    #[test]
+    fn find_eoh_finds_the_same_end_in_long_heads() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 200) as usize;
+            let rare = 1 + next() % 40;
+            let buf: Vec<u8> = (0..len)
+                .map(|_| match next() % (rare * 2 + 2) {
+                    0 => b'\r',
+                    1 => b'\n',
+                    _ => b"GET /x: Host\t"[(next() % 13) as usize],
+                })
+                .collect();
+            assert_eq!(super::find_eoh(&buf), super::find_eoh_bytewise(&buf), "{buf:?}");
+            for tail in [&b"\r\n\r\n"[..], b"\n\n", b"\n\r\n", b"\r\r", b"\r\n\r"] {
+                let mut b = buf.clone();
+                b.extend_from_slice(tail);
+                b.extend_from_slice(b"body body body body body body body");
+                assert_eq!(super::find_eoh(&b), super::find_eoh_bytewise(&b), "{b:?}");
+            }
+        }
     }
 
     /// Every string of up to eight bytes out of `a`, CR and LF.

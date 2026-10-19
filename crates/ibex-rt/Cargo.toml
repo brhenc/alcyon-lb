@@ -22,6 +22,7 @@ ctrlc = "3.5.2"
 nix = { version = "0.31", default-features = false, features = ["net", "user"] }
 ibex-regex = { workspace = true }
 signal-hook = "0.3"
+memchr = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

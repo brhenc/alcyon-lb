@@ -1030,6 +1030,21 @@ fn ascii_trim_end(s: &[u8]) -> &[u8] {
     &s[..s.iter().rposition(|&b| !ws(b)).map_or(0, |z| z + 1)]
 }
 
+/// `s.split(|&b| b == b'\n')`, the line ends found with `memchr` (T433).
+fn split_lf(s: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut rest = Some(s);
+    std::iter::from_fn(move || {
+        let r = rest?;
+        if let Some(i) = memchr::memchr(b'\n', r) {
+            rest = Some(&r[i + 1..]);
+            Some(&r[..i])
+        } else {
+            rest = None;
+            Some(r)
+        }
+    })
+}
+
 /// `str::trim` of ASCII bytes.
 fn ascii_trim(s: &[u8]) -> &[u8] {
     ascii_trim_end(ascii_trim_start(s))
@@ -1066,9 +1081,9 @@ fn framing_fields(head: &[u8]) -> Option<FramingFields<'_>> {
         std::str::from_utf8(ascii_trim(s)).unwrap_or_default()
     }
     let mut out = FramingFields { te: [""; 4], n_te: 0, cl: [""; 4], n_cl: 0 };
-    let mut at = head.iter().position(|&b| b == b'\n')? + 1;
+    let mut at = memchr::memchr(b'\n', head)? + 1;
     while at <= head.len() {
-        let end = head[at..].iter().position(|&b| b == b'\n').map_or(head.len(), |n| at + n);
+        let end = memchr::memchr(b'\n', &head[at..]).map_or(head.len(), |n| at + n);
         let raw = &head[at..end];
         at = end + 1;
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
@@ -1114,7 +1129,7 @@ pub fn head_wants_close(head: &str) -> bool {
 /// [`head_wants_close_general`] of an ASCII head, on its bytes, in one pass for both tokens.
 fn head_wants_close_ascii(head: &[u8]) -> bool {
     let (mut close, mut keep_alive) = (false, false);
-    let mut lines = head.split(|&b| b == b'\n');
+    let mut lines = split_lf(head);
     let first = lines.next().unwrap_or_default();
     for l in lines {
         let Some(colon) = l.iter().position(|&b| b == b':') else { continue };
@@ -1243,10 +1258,10 @@ pub struct ConnScan {
 pub fn scan_connection(head: &[u8]) -> ConnScan {
     const NAME: &[u8] = b"connection";
     let mut out = ConnScan { plain: true, ..ConnScan::default() };
-    let Some(first_eol) = head.iter().position(|&b| b == b'\n') else { return out };
+    let Some(first_eol) = memchr::memchr(b'\n', head) else { return out };
     let mut at = first_eol + 1;
     while at < head.len() {
-        let end = head[at..].iter().position(|&b| b == b'\n').map_or(head.len(), |n| at + n + 1);
+        let end = memchr::memchr(b'\n', &head[at..]).map_or(head.len(), |n| at + n + 1);
         let line = &head[at..end];
         if line.len() > NAME.len() && (line[0] | 0x20) == b'c' && line[..NAME.len()].eq_ignore_ascii_case(NAME) {
             let rest = line[NAME.len()..].trim_ascii_start();
@@ -1496,7 +1511,7 @@ fn htx_head_size_ascii(head: &[u8], request: bool) -> Option<u64> {
 /// message: every line up to the blank one, but a `Connection` header left with no token
 /// (`connection_emptied`), which is gone from the message and from the data.
 fn htx_head_size_and_headers_ascii(head: &[u8], request: bool) -> Option<(u64, usize)> {
-    let mut lines = head.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let mut lines = split_lf(head).map(|l| l.strip_suffix(b"\r").unwrap_or(l));
     let first = lines.next()?;
     let strings = if request {
         let sp = first.iter().position(|&b| b == b' ')?;
@@ -1828,6 +1843,13 @@ pub fn version_digits(ver: &[u8]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_lf_splits_as_split_does() {
+        for s in [&b""[..], b"\n", b"\n\n", b"a", b"a\n", b"\na", b"ab\ncd\n\nef", b"GET / HTTP/1.1\r\nHost: a-long-enough-host-name.example\r\nX-Forwarded-For: 192.0.2.1\r\n\r\n"] {
+            assert_eq!(split_lf(s).collect::<Vec<_>>(), s.split(|&b| b == b'\n').collect::<Vec<_>>(), "{s:?}");
+        }
+    }
 
     #[test]
     fn only_a_connection_header_of_dropped_tokens_is_emptied() {

@@ -322,7 +322,8 @@ impl H1Parser {
     }
 
     fn find_line_end(&mut self, buf: &[u8]) -> Option<(usize, usize)> {
-        for i in 0..buf.len() {
+        // The first CR or LF decides (T433: found with `memchr2`, not a byte at a time).
+        if let Some(i) = memchr::memchr2(b'\r', b'\n', buf) {
             if buf[i] == b'\r' {
                 if i + 1 < buf.len() {
                     if buf[i + 1] == b'\n' {
@@ -1208,9 +1209,7 @@ fn parse_header_field_borrowed(line: &str) -> io::Result<(&str, &str)> {
 /// The name and the value of a header line, the value without its leading blanks. The name
 /// is a token, so text; the value is bytes, any but NUL, CR and LF.
 fn parse_header_field(line: &[u8]) -> io::Result<(&str, &[u8])> {
-    let colon = line
-        .iter()
-        .position(|&b| b == b':')
+    let colon = memchr::memchr(b':', line)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Header missing colon"))?;
     let (name, val) = (&line[..colon], &line[colon + 1..]);
 
@@ -1232,7 +1231,7 @@ fn parse_header_field(line: &[u8]) -> io::Result<(&str, &[u8])> {
     let name = std::str::from_utf8(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid header field name"))?;
 
     // Field values may not carry NUL, CR or LF.
-    if val.iter().any(|&b| b == 0 || b == b'\r' || b == b'\n') {
+    if memchr::memchr3(0, b'\r', b'\n', val).is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid character in header field value",
@@ -1245,6 +1244,60 @@ fn parse_header_field(line: &[u8]) -> io::Result<(&str, &[u8])> {
 
 #[cfg(test)]
 mod tests {
+    /// T433: `find_line_end` with `memchr2` ends a line where the byte-at-a-time loop did,
+    /// with the same bare-CR state, on short strings of `a`, CR and LF and on long lines.
+    #[test]
+    fn find_line_end_ends_where_the_bytewise_loop_did() {
+        fn bytewise(saw_bare_cr: &mut bool, buf: &[u8]) -> Option<(usize, usize)> {
+            for i in 0..buf.len() {
+                if buf[i] == b'\r' {
+                    if i + 1 < buf.len() {
+                        if buf[i + 1] == b'\n' {
+                            return Some((i, 2));
+                        }
+                        *saw_bare_cr = true;
+                        return Some((i, 1));
+                    }
+                    if *saw_bare_cr {
+                        return Some((i, 1));
+                    }
+                    return None;
+                }
+                if buf[i] == b'\n' {
+                    return Some((i, 1));
+                }
+            }
+            None
+        }
+        let mut bufs: Vec<Vec<u8>> = Vec::new();
+        for len in 0..=6u32 {
+            for mut code in 0..3usize.pow(len) {
+                let mut b = Vec::new();
+                for _ in 0..len {
+                    b.push(b"a\r\n"[code % 3]);
+                    code /= 3;
+                }
+                bufs.push(b);
+            }
+        }
+        for n in [15, 16, 17, 31, 32, 33, 64, 100] {
+            for tail in [&b""[..], b"\r", b"\n", b"\r\n", b"\ra", b"\na"] {
+                let mut b = vec![b'x'; n];
+                b.extend_from_slice(tail);
+                bufs.push(b);
+            }
+        }
+        for b in &bufs {
+            for bare in [false, true] {
+                let mut p = H1Parser::new(false);
+                p.saw_bare_cr = bare;
+                let mut want_bare = bare;
+                assert_eq!(p.find_line_end(b), bytewise(&mut want_bare, b), "{b:?} {bare}");
+                assert_eq!(p.saw_bare_cr, want_bare, "{b:?} {bare}");
+            }
+        }
+    }
+
     /// A continuation line of a `TE` that is not sent on goes with it, not to the header
     /// before (T286).
     #[test]

@@ -9,6 +9,7 @@ autotests = false
 [dependencies]
 ibex-sched = { path = "../ibex-sched" }
 ibex-regex = { workspace = true }
+memchr = { workspace = true }
 ibex-h1-sys = { path = "../ibex-h1-sys", optional = true }
 
 [features]

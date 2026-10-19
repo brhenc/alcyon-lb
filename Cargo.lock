@@ -631,6 +631,7 @@ dependencies = [
  "ibex-regex",
  "ibex-sample",
  "ibex-sched",
+ "memchr",
  "proptest",
 ]
 
@@ -671,6 +672,7 @@ dependencies = [
  "ibex-sched",
  "ibex-stick-table",
  "ibex-tls",
+ "memchr",
  "nix",
  "rcgen",
  "rustix 0.38.44",
