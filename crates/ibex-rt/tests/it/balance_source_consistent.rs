@@ -34,7 +34,7 @@ fn backend(id: u8) -> u16 {
 }
 
 fn from(src: &str, port: u16) -> char {
-    let fd = rustix::net::socket(rustix::net::AddressFamily::INET, rustix::net::SocketType::STREAM, None).expect("socket");
+    let fd = rustix::net::socket_with(rustix::net::AddressFamily::INET, rustix::net::SocketType::STREAM, rustix::net::SocketFlags::CLOEXEC, None).expect("socket");
     rustix::net::bind(&fd, &format!("{src}:0").parse::<SocketAddr>().expect("addr")).expect("bind source");
     rustix::net::connect(&fd, &format!("127.0.0.1:{port}").parse::<SocketAddr>().expect("addr")).expect("connect");
     let mut s = TcpStream::from(fd);

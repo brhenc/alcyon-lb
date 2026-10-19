@@ -117,8 +117,10 @@ fn cli_abrt(sock: &PathBuf) -> (u64, u64) {
 
 /// A listener whose accept queue is full: a connect to it neither completes nor fails.
 fn full_listener() -> (rustix::fd::OwnedFd, SocketAddr, TcpStream) {
-    use rustix::net::{bind, listen, socket, AddressFamily, SocketType};
-    let fd = socket(AddressFamily::INET, SocketType::STREAM, None).expect("socket");
+    use rustix::net::{bind, listen, socket_with, AddressFamily, SocketFlags, SocketType};
+    // CLOEXEC: every ibex another test spawns would inherit a listener that stays open for the
+    // whole run, and its highest descriptor number moves `maxsock_limit`'s ceiling (T355).
+    let fd = socket_with(AddressFamily::INET, SocketType::STREAM, SocketFlags::CLOEXEC, None).expect("socket");
     let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
     bind(&fd, &any).expect("bind");
     listen(&fd, 0).expect("listen");

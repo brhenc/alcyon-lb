@@ -136,7 +136,7 @@ fn a_server_reset_behind_a_full_buffer_delivers_what_the_proxy_holds() {
     // The readiness probe's server connection waits too: let it go first.
     let _ = sent_rx.recv_timeout(Duration::from_secs(5));
     go_tx.send(()).ok();
-    let fd = rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).expect("socket");
+    let fd = rustix::net::socket_with(AddressFamily::INET, SocketType::STREAM, rustix::net::SocketFlags::CLOEXEC, None).expect("socket");
     rustix::net::sockopt::set_socket_recv_buffer_size(&fd, 4096).expect("SO_RCVBUF");
     let std::net::SocketAddr::V4(v4) = fe else { panic!("v4") };
     rustix::net::connect_v4(&fd, &v4).expect("connect");

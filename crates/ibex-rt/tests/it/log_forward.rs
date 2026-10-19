@@ -493,7 +493,9 @@ fn a_ring_whose_server_is_not_up_yet_delivers_when_it_is() {
     // The port is bound and not listening, so a connect is refused; holding it keeps another
     // test from taking it while we wait (a freed port was, in a parallel run).
     use rustix::net::{AddressFamily, SocketAddrAny, SocketType};
-    let sock = rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).expect("socket");
+    // CLOEXEC: an ibex another test spawns while this is open would inherit it, and a high inherited
+    // descriptor raises the ceiling `maxsock_limit` measures.
+    let sock = rustix::net::socket_with(AddressFamily::INET, SocketType::STREAM, rustix::net::SocketFlags::CLOEXEC, None).expect("socket");
     rustix::net::bind_v4(&sock, &std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
     let Ok(SocketAddrAny::V4(addr)) = rustix::net::getsockname(&sock) else { panic!("an IPv4 address") };
     let port = addr.port();

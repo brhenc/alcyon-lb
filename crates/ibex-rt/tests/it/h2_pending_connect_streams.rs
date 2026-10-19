@@ -68,8 +68,10 @@ fn hpack_post(len: usize) -> Vec<u8> {
 
 /// A listener whose accept queue is full: a connect to it neither completes nor fails.
 fn full_listener() -> (rustix::fd::OwnedFd, SocketAddr, TcpStream) {
-    use rustix::net::{bind, listen, socket, AddressFamily, SocketType};
-    let fd = socket(AddressFamily::INET, SocketType::STREAM, None).expect("socket");
+    use rustix::net::{bind, listen, socket_with, AddressFamily, SocketFlags, SocketType};
+    // CLOEXEC: every ibex another test spawns would inherit a listener that stays open for the
+    // whole run, and its highest descriptor number moves `maxsock_limit`'s ceiling (T355).
+    let fd = socket_with(AddressFamily::INET, SocketType::STREAM, SocketFlags::CLOEXEC, None).expect("socket");
     // A reserved port may still have connections of an earlier run in TIME_WAIT.
     rustix::net::sockopt::set_socket_reuseaddr(&fd, true).expect("SO_REUSEADDR");
     bind(&fd, &common::reserve_addr()).expect("bind");
