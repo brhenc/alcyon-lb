@@ -257,3 +257,25 @@ pub fn uses_ibex_keys(body: &str) -> bool {
         matches!(k, "backend" | "server" | "px" | "proxy" | "sv" | "srv" | "weight" | "w" | "maxconn" | "mc" | "state" | "status" | "act")
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_names_round_trip_through_the_uri() {
+        for c in [StCode::Deny, StCode::Done, StCode::Errp, StCode::Excd, StCode::None, StCode::Part, StCode::Ival] {
+            assert_eq!(StCode::from_uri(&format!(";st={}", c.name())), Some(c));
+        }
+        assert_eq!(StCode::Unkn.name(), "UNKN");
+        assert_eq!(StCode::from_uri(";st=UNKN"), Some(StCode::Unkn));
+        assert_eq!(StCode::from_uri(";st=XXXX"), Some(StCode::Unkn));
+        assert_eq!(StCode::from_uri(";st=DO"), None);
+    }
+
+    #[test]
+    fn a_page_without_the_container_is_left_as_it_is() {
+        assert_eq!(with_banner("<html></html>".to_string(), "<p>b"), "<html></html>");
+        assert_eq!(with_banner("<div class=\"container\">\nx".to_string(), "<p>b"), "<div class=\"container\">\n<p>bx");
+    }
+}
