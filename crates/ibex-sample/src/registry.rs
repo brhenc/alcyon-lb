@@ -8446,12 +8446,8 @@ mod tests {
     fn an_unknown_fetch_matches_nothing() {
         let reg = super::Registry::new();
         let none: &[(&str, Vec<String>)] = &[];
-        let mut seen = 0;
-        assert!(!reg.any_acl("no.such.fetch", &[], none, &super::SampleContext::default(), |_| {
-            seen += 1;
-            true
-        }));
-        assert_eq!(seen, 0);
+        // A matcher that would say yes: `false` means it was never asked.
+        assert!(!reg.any_acl("no.such.fetch", &[], none, &super::SampleContext::default(), |_| true));
     }
 
     /// `dump_var_value` escapes NUL as `\0` (as `chunk_escape_string` does). A NUL cannot be put in a
