@@ -931,11 +931,15 @@ impl MuxH2 {
         // value, a name or a pseudo-header written into the HTTP/1 head is a header, or a
         // request, the server trusts. Malformed is a stream error; a method or URI HAProxy
         // takes and then refuses is a 400.
-        // (A client connection's response is not checked: no server is spoken to in h2,
-        // `proto h2` on a server is refused by the parser.)
+        // A client connection's response gets the name and value checks of
+        // `h2_make_htx_response` (no runtime path speaks h2 to a server yet: `proto h2` on
+        // a server is refused by the parser).
+        let fields = decoded_headers.iter().map(|h| (h.name.as_str(), h.value.as_str()));
         let checked = if ctx.is_server {
-            crate::h2::check_request_fields(decoded_headers.iter().map(|h| (h.name.as_str(), h.value.as_str())))
-        } else { Ok(false) };
+            crate::h2::check_request_fields(fields)
+        } else {
+            crate::h2::check_response_fields(fields).map(|()| false)
+        };
         let abs_prefix = {
             let get = |n: &str| decoded_headers.iter().find(|h| h.name == n).map(|h| h.value.as_str());
             get(":scheme").zip(get(":authority")).map(|(s, a)| format!("{s}://{a}"))
@@ -1675,6 +1679,29 @@ mod tests {
         let wu = ctx.tx_buf[before..].windows(13).find(|w| w[3] == 8 && w[5..9] == [0, 0, 0, 0]).expect("WINDOW_UPDATE");
         let inc = u32::from_be_bytes([wu[9], wu[10], wu[11], wu[12]]);
         assert!(inc <= i32::MAX as u32 && inc > 0, "increment {inc:#x}");
+    }
+
+    /// T449: a response with a field the HTTP/1 head cannot carry is a stream error for a
+    /// client connection, as `h2_make_htx_response` makes it; a clean one is taken.
+    #[test]
+    fn a_response_field_with_crlf_resets_the_stream_on_a_client_connection() {
+        let response = |id: u32, name: &str, value: &str| {
+            let block = HpackEncoder::new().encode(&[
+                HeaderField { name: ":status".into(), value: "200".into() },
+                HeaderField { name: name.into(), value: value.into() },
+            ]);
+            Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: id, header_block: block }.encode()
+        };
+        let settings = Frame::Settings { flags: 0, settings: vec![] }.encode();
+        for (name, value, ok) in [("x-r", "a", true), ("x-r", "a\r\nx-injected: 1", false), ("x-r", "a\0b", false), ("X-R", "1", false)] {
+            let mut client = MuxH2.init(ConnId(2), false).expect("init");
+            MuxH2.parse(&mut client, &settings).expect("settings");
+            let before = client.tx_buf.len();
+            MuxH2.parse(&mut client, &response(1, name, value)).expect("a stream error is not a connection error");
+            let rst = client.tx_buf[before..].windows(13).any(|w| w[3] == 3 && w[5..9] == [0, 0, 0, 1] && w[9..13] == [0, 0, 0, 1]);
+            assert_eq!(!rst, ok, "{name}: {value:?}");
+            assert_eq!(client.streams.get(&1).is_some_and(|s| s.rx_htx.res_line().is_some()), ok, "{name}: {value:?}");
+        }
     }
 
     fn open_conn() -> (MuxH2, H2MuxContext) {

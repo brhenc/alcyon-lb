@@ -1579,6 +1579,20 @@ pub fn check_trailer_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a s
     Ok(())
 }
 
+/// The checks of `h2_make_htx_response` on each field of a response: a lowercase token
+/// name (a known pseudo-header from its second byte), a value without NUL, CR or LF.
+///
+/// # Errors
+/// [`MalformedFields`] for any other.
+pub fn check_response_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<(), MalformedFields> {
+    for (name, value) in fields {
+        if !name_ok(name) || !value_ok(value) {
+            return Err(MalformedFields);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
