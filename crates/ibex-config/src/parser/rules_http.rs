@@ -94,7 +94,7 @@ fn expect_cond_in(list: &str, tokens: &[Token], at: usize, act_token: &Token) ->
             t.line,
             t.col,
             format!(
-                "'{list} {}' expects either 'if' or 'unless' followed by a condition but found '{}'",
+                "'{list} {}' expects either 'if' or 'unless' followed by a condition but found '{}'.",
                 act_token.text, t.text
             ),
         )),
@@ -466,7 +466,7 @@ fn parse_http_req_rule_at(
                 return Err(ConfigError::new(
                     tokens[i].line,
                     tokens[i].col,
-                    format!("'http-request {act_str}' expects either 'if' or 'unless' followed by a condition but found 'deny_status'"),
+                    format!("'http-request {act_str}' expects either 'if' or 'unless' followed by a condition but found 'deny_status'."),
                 ));
             }
             if (word == "status" || word == "deny_status") && i + 1 < limit {

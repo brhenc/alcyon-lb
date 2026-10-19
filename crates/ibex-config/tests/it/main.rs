@@ -24,6 +24,7 @@ mod balance_options;
 mod bind_keywords;
 mod check_rules_parse;
 mod cond_enabled;
+mod cond_expected_message;
 mod connection_limits;
 mod cookie_config;
 mod differential;
