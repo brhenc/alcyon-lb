@@ -21,6 +21,10 @@ struct Stats {
 
 impl Stats {
     fn start(admin: &str) -> Stats {
+        Stats::start_with(admin, "", "server s1 127.0.0.1:1\n  server s2 127.0.0.1:1")
+    }
+
+    fn start_with(admin: &str, fe_extra: &str, servers: &str) -> Stats {
         let addr = common::reserve_addr();
         let dir = std::path::PathBuf::from(format!("/tmp/vv18-post-{}-{}", std::process::id(), addr.port()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -29,8 +33,8 @@ impl Stats {
             &cfg,
             format!(
                 "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 3s\n  timeout server 3s\n\
-                 frontend f\n  bind {addr}\n  stats enable\n  stats uri /st\n  stats auth u:p\n  {admin}\n  default_backend app\n\
-                 backend app\n  server s1 127.0.0.1:1\n  server s2 127.0.0.1:1\n"
+                 frontend f\n  bind {addr}\n  stats enable\n  stats uri /st\n  stats auth u:p\n  {fe_extra}\n  {admin}\n  default_backend app\n\
+                 backend app\n  {servers}\n"
             ),
         )
         .unwrap();
@@ -239,4 +243,79 @@ fn any_stats_admin_line_that_holds_allows_the_post() {
     assert!(common::wait_listening(addr));
     let s = Stats { addr, child };
     assert_eq!(s.post("s=s1&action=maint&b=app"), see_other("DONE"));
+}
+
+#[test]
+fn every_form_verb_answers_as_the_reference_does() {
+    // Measured on the reference with `s1` checked (and down), `s2` unchecked, `t1` tracking `s1`.
+    let s = Stats::start_with(
+        "stats admin if TRUE",
+        "stats refresh 9s",
+        "server s1 127.0.0.1:1 check inter 1h\n  server s2 127.0.0.1:1\n  server t1 127.0.0.1:1 track s1",
+    );
+    let steps = [
+        ("s=s1&b=app&action=dhlth", "DONE", ("s1", "DOWN")),
+        ("s=s1&b=app&action=ehlth", "DONE", ("s1", "DOWN")),
+        ("s=s2&b=app&action=dhlth", "NONE", ("s2", "no check")),
+        ("s=s2&b=app&action=ehlth", "NONE", ("s2", "no check")),
+        ("s=s1&b=app&action=hrunn", "DONE", ("s1", "UP")),
+        ("s=s1&b=app&action=hdown", "DONE", ("s1", "DOWN")),
+        ("s=t1&b=app&action=hrunn", "NONE", ("t1", "DOWN")),
+        ("s=t1&b=app&action=hdown", "NONE", ("t1", "DOWN")),
+        ("s=s2&b=app&action=hdown", "DONE", ("s2", "DOWN")),
+        ("s=s2&b=app&action=hrunn", "DONE", ("s2", "no check")),
+        ("s=s2&b=app&action=stop", "DONE", ("s2", "DRAIN")),
+        ("s=s2&b=app&action=stop", "NONE", ("s2", "DRAIN")),
+        ("s=s2&b=app&action=start", "DONE", ("s2", "no check")),
+        ("s=s2&b=app&action=start", "NONE", ("s2", "no check")),
+        ("s=s2&b=app&action=disable", "DONE", ("s2", "MAINT")),
+        ("s=s2&b=app&action=disable", "NONE", ("s2", "MAINT")),
+        ("s=s2&b=app&action=enable", "DONE", ("s2", "no check")),
+        ("s=s2&b=app&action=enable", "NONE", ("s2", "no check")),
+        ("s=s%32&b=app&action=drain", "DONE", ("s2", "DRAIN")),
+        ("s=s2&b=app&action=ready", "DONE", ("s2", "no check")),
+    ];
+    // The first check (a closed port) has to have failed.
+    for _ in 0..60 {
+        if s.status("s1") == "DOWN" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    for (body, code, (sv, status)) in steps {
+        assert_eq!(s.post(body), see_other(code), "body {body:?}");
+        assert_eq!(s.status(sv), status, "body {body:?}");
+    }
+    // `+` is a space: no server of that name.
+    assert_eq!(s.post("s=s2+x&b=app&action=ready"), see_other("ERRP"));
+    // With `stats refresh`, `;norefresh` and `;up` go on to the page they redirect to and its banner.
+    let r = s.post_with("/st;norefresh;up", "", "s=s2&b=app&action=ready");
+    assert!(r.contains("location: /st;st=DONE;up;norefresh\r\n"), "{r}");
+    let page = s.get("/st;st=DONE;norefresh;up");
+    assert!(page.contains("href=\"/st;up;norefresh\" title=\"Remove this message\""));
+}
+
+#[test]
+fn a_get_never_acts_and_a_cross_origin_api_post_changes_nothing() {
+    let s = Stats::start("stats admin if TRUE");
+    for req in [
+        "GET /st?b=app&s=s1&action=maint",
+        "GET /st?action=maint&backend=app&server=s1",
+        "HEAD /st?b=app&s=s1&action=maint",
+    ] {
+        let r = String::from_utf8_lossy(&s.send(format!("{req} HTTP/1.1\r\nHost: x\r\n{AUTH}Origin: http://evil.example\r\nConnection: close\r\n\r\n").as_bytes())).into_owned();
+        assert!(r.starts_with("HTTP/1.1 200"), "{req}: {r}");
+        assert_eq!(s.status("s1"), "no check", "{req}");
+    }
+    let json = r#"{"action":"maint","backend":"app","server":"s1"}"#;
+    let r = s.post_with("/st/api/admin", "Origin: http://evil.example\r\nAccept: application/json\r\n", json);
+    assert_eq!(r, see_other("DENY"));
+    assert_eq!(s.status("s1"), "no check");
+    let r = s.post_with("/st", "Origin: http://evil.example\r\n", "action=maint&backend=app&server=s1");
+    assert_eq!(r, see_other("DENY"));
+    assert_eq!(s.status("s1"), "no check");
+    // The same request from the page's own origin acts.
+    let r = s.post_with("/st", "Origin: http://x\r\n", "action=maint&backend=app&server=s1");
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    assert_eq!(s.status("s1"), "MAINT");
 }

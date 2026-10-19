@@ -289,8 +289,14 @@ fn test_stats_server_state_and_weight_mutations() {
     assert!(get_maint.contains("badge-maint"));
     assert!(get_maint.contains("MAINT"));
 
-    // 4. Mutate state back to READY (UP) via query string in GET
-    let ready_req = b"GET /stats?action=ready&backend=cluster_px&server=web1 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    // 4. A GET never acts (a page that embeds the URL must not alter servers).
+    let get_act = b"GET /stats?action=ready&backend=cluster_px&server=web1 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let _ = send_http_request(proxy_addr, &mut engine, get_act);
+    assert_eq!(engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Maint as u8);
+    // Back to READY (UP) via POST.
+    let ready_body = "action=ready&backend=cluster_px&server=web1";
+    let ready_req = format!("POST /stats HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{ready_body}", ready_body.len());
+    let ready_req = ready_req.as_bytes();
     let ready_resp = send_http_request(proxy_addr, &mut engine, ready_req);
     assert!(
         ready_resp.starts_with("HTTP/1.1 200 OK\r\n"),
@@ -371,8 +377,10 @@ fn test_stats_custom_uri_admin_stats() {
     );
     assert!(csv_resp.contains("admin_custom,srv_cust"));
 
-    // 3. Mutate server state via /admin?stats query string
-    let drain_req = b"GET /admin?stats&action=drain&backend=admin_custom&server=srv_cust HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    // 3. Mutate server state by POST to /admin?stats
+    let drain_body = "action=drain&backend=admin_custom&server=srv_cust";
+    let drain_req = format!("POST /admin?stats HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{drain_body}", drain_body.len());
+    let drain_req = drain_req.as_bytes();
     let drain_resp = send_http_request(proxy_addr, &mut engine, drain_req);
     assert!(
         drain_resp.starts_with("HTTP/1.1 200 OK\r\n"),
