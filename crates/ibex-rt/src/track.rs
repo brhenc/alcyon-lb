@@ -208,6 +208,11 @@ pub fn apply_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckSta
     }
 }
 
+/// Whether server `s` of proxy `p` tracks another one.
+pub fn is_tracking(proxies: &[Proxy], p: usize, s: usize) -> bool {
+    track_of(proxies, p, s).is_some()
+}
+
 /// `set server health up|down` on server `s` of proxy `p` (not a tracker: refused before):
 /// the operational state moves, the admin state stays.
 pub fn apply_health(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, up: bool) {

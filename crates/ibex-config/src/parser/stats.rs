@@ -52,7 +52,9 @@ pub(crate) fn parse_stats_directive(
             stats.admin = true;
             if tokens.len() >= 4 && (tokens[2].text == "if" || tokens[2].text == "unless") {
                 let cond = parse_acl_condition_from_tokens(&tokens[2..])?;
-                stats.admin_cond = cond;
+                stats.admin_rules.push(cond);
+            } else {
+                stats.admin_rules.push(None);
             }
             Ok(())
         }

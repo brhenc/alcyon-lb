@@ -408,7 +408,10 @@ pub struct StatsConfig {
     pub uri: Option<String>,
     pub refresh: Option<Duration>,
     pub admin: bool,
-    pub admin_cond: Option<AclCondition>,
+    /// One entry per `stats admin` line, in order: `None` for a line without a condition
+    /// (always), else its `if`/`unless` condition. The page is administrable when any entry
+    /// holds (`uri_auth->admin_rules`, `http_handle_stats`).
+    pub admin_rules: Vec<Option<AclCondition>>,
     pub show_legends: bool,
     pub show_desc: Option<Box<str>>,
     pub show_node: Option<Box<str>>,
@@ -457,7 +460,7 @@ impl StatsConfig {
             self.uri = None;
             self.refresh = None;
             self.admin = false;
-            self.admin_cond = None;
+            self.admin_rules.clear();
             self.show_legends = false;
             self.show_desc = None;
             self.show_node = None;

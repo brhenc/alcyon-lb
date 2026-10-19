@@ -347,6 +347,7 @@ mod stats_refresh;
 mod resolvers_refused;
 mod no_directive;
 mod stats_parity;
+mod stats_post_redirect;
 mod stats_pid_column;
 mod stats_show_desc_node;
 mod stats_socket_forms;
