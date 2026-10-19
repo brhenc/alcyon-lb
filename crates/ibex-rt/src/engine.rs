@@ -3390,7 +3390,26 @@ fn bind_tls(
     section: &str,
     binds: &[ibex_config::ast::BindConfig],
     addr: SocketAddr,
+) -> io::Result<Option<Arc<ibex_tls::tcp::BindTls>>> {
+    bind_tls_with(section, binds, addr, ibex_tls::tcp::from_bind_config)
+}
+
+/// [`bind_tls`] for a QUIC bind: its configuration on rustls 0.23, which `quinn-proto` needs
+/// (T440: TCP is on 0.24).
+fn bind_tls_quic(
+    section: &str,
+    binds: &[ibex_config::ast::BindConfig],
+    addr: SocketAddr,
 ) -> io::Result<Option<Arc<rustls::ServerConfig>>> {
+    bind_tls_with(section, binds, addr, ibex_tls::TlsConfig::from_bind_config)
+}
+
+fn bind_tls_with<T>(
+    section: &str,
+    binds: &[ibex_config::ast::BindConfig],
+    addr: SocketAddr,
+    build: fn(&ibex_config::ast::BindConfig) -> Result<T, String>,
+) -> io::Result<Option<T>> {
     let Some(bind) = binds.iter().find(|b| b.addr == addr && b.ssl) else {
         return Ok(None);
     };
@@ -3412,7 +3431,7 @@ fn bind_tls(
             ),
         ));
     }
-    let cfg = ibex_tls::TlsConfig::from_bind_config(bind).map_err(|e| {
+    let cfg = build(bind).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("'{section}': bind {addr} ssl: {e}"),
@@ -4359,7 +4378,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             for (bind_idx, b) in all_binds.iter().enumerate() {
                 let bind_addr = b.addr;
                 if b.quic {
-                    let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?.expect("QUIC requires TLS");
+                    let tls = bind_tls_quic(&frontend.name, &frontend.binds, bind_addr)?.expect("QUIC requires TLS");
 
                     // Each request is handed to this frontend's stream engine (T130). It
                     // used to go straight to the first server of the default backend, and
@@ -7171,7 +7190,7 @@ fn init_client_session(
     server_addr: SocketAddr,
     fc_src: SocketAddr,
     fc_dst: SocketAddr,
-    tls: Option<&Arc<rustls::ServerConfig>>,
+    tls: Option<&Arc<ibex_tls::tcp::BindTls>>,
     ssl_capture_size: usize,
     ssl_ja4_spec: bool,
     tracked_sc: [Option<(usize, StickKey)>; 3],

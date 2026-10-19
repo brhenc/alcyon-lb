@@ -12,12 +12,15 @@ use rustls::sign::CertifiedKey;
 use std::sync::Arc;
 
 /// Fast, memory-safe certificate resolver using `ebtree::EbMbTree`.
+///
+/// `K` is what a name resolves to: rustls 0.23's [`CertifiedKey`] (QUIC), or rustls 0.24's
+/// `Credentials` for the TCP binds ([`crate::tcp`]).
 #[derive(Clone, Debug)]
-pub struct IbexCertResolver {
-    certs: Vec<Arc<CertifiedKey>>,
+pub struct IbexCertResolver<K = CertifiedKey> {
+    certs: Vec<Arc<K>>,
     exact_tree: EbMbTree,
     wildcard_tree: EbMbTree,
-    default_cert: Option<Arc<CertifiedKey>>,
+    default_cert: Option<Arc<K>>,
 }
 
 impl Default for IbexCertResolver {
@@ -30,6 +33,14 @@ impl IbexCertResolver {
     /// Creates an empty certificate resolver.
     #[must_use]
     pub fn new() -> Self {
+        Self::empty()
+    }
+}
+
+impl<K> IbexCertResolver<K> {
+    /// Creates an empty certificate resolver for keys of type `K`.
+    #[must_use]
+    pub fn empty() -> Self {
         Self {
             certs: Vec::new(),
             exact_tree: EbMbTree::new_unique(),
@@ -39,18 +50,18 @@ impl IbexCertResolver {
     }
 
     /// Sets the default fallback certificate returned when SNI is absent or matches no entry.
-    pub fn set_default_cert(&mut self, cert: Arc<CertifiedKey>) {
+    pub fn set_default_cert(&mut self, cert: Arc<K>) {
         self.default_cert = Some(cert);
     }
 
     /// Returns the default fallback certificate, if configured.
     #[must_use]
-    pub fn default_cert(&self) -> Option<Arc<CertifiedKey>> {
+    pub fn default_cert(&self) -> Option<Arc<K>> {
         self.default_cert.clone()
     }
 
     /// Adds a certificate for an exact domain name (e.g. `"example.com"`, `"api.example.com"`).
-    pub fn add_exact(&mut self, domain: &str, cert: Arc<CertifiedKey>) {
+    pub fn add_exact(&mut self, domain: &str, cert: Arc<K>) {
         let cert_idx = u32::try_from(self.certs.len()).unwrap_or(u32::MAX);
         self.certs.push(cert);
         let domain_lower = domain.to_ascii_lowercase();
@@ -58,7 +69,7 @@ impl IbexCertResolver {
     }
 
     /// Adds a certificate for a wildcard domain pattern (e.g. `"*.example.com"` or `"example.com"`).
-    pub fn add_wildcard(&mut self, wildcard_domain: &str, cert: Arc<CertifiedKey>) {
+    pub fn add_wildcard(&mut self, wildcard_domain: &str, cert: Arc<K>) {
         let cert_idx = u32::try_from(self.certs.len()).unwrap_or(u32::MAX);
         self.certs.push(cert);
         let domain_lower = wildcard_domain.to_ascii_lowercase();
@@ -69,7 +80,7 @@ impl IbexCertResolver {
     /// Automatically registers a domain or wildcard certificate.
     /// If `domain_pattern` starts with `*.`, it is registered as a wildcard,
     /// otherwise as an exact match.
-    pub fn add_cert(&mut self, domain_pattern: &str, cert: Arc<CertifiedKey>) {
+    pub fn add_cert(&mut self, domain_pattern: &str, cert: Arc<K>) {
         if domain_pattern.starts_with("*.") {
             self.add_wildcard(domain_pattern, cert);
         } else {
@@ -77,9 +88,9 @@ impl IbexCertResolver {
         }
     }
 
-    /// Resolves a domain name directly to a [`CertifiedKey`].
+    /// Resolves a domain name directly to its key (or the default).
     #[must_use]
-    pub fn resolve_domain(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
+    pub fn resolve_domain(&self, sni: &str) -> Option<Arc<K>> {
         let sni_lower = sni.to_ascii_lowercase();
         let sni_bytes = sni_lower.as_bytes();
 

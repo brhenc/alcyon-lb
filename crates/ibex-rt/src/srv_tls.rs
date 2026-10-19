@@ -22,8 +22,8 @@
 use crate::xprt::{self, ServerXprt};
 use ibex_config::{Server, ServerSsl, SslVerify};
 use ibex_sample::{Expr, Registry, SampleContext};
-use rustls::pki_types::ServerName;
-use rustls::ClientConfig;
+use rustls24::pki_types::ServerName;
+use rustls24::ClientConfig;
 use std::io;
 use std::net::IpAddr;
 use std::os::fd::AsRawFd;
@@ -51,7 +51,7 @@ impl Configs {
             max_ver: ssl.max_ver,
             no_reuse: ssl.no_reuse,
         };
-        let with_sni = ibex_tls::build_backend_client_config(&opts)
+        let with_sni = ibex_tls::tcp::build_backend_client_config(&opts)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{who} : {e}")))?;
         let mut without = (*with_sni).clone();
         without.enable_sni = false;

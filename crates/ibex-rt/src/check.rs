@@ -2420,11 +2420,11 @@ fn drive_check_handshake(check: &mut ServerCheckState, fdtab: &mut FdTab, poller
         Err(e) => {
             // `HAProxy`'s `conn_err_code_str`: a certificate the name check refused is
             // reported apart from the other handshake failures.
-            let name_mismatch = e.get_ref().and_then(|i| i.downcast_ref::<rustls::Error>()).is_some_and(|e| {
+            let name_mismatch = e.get_ref().and_then(|i| i.downcast_ref::<rustls24::Error>()).is_some_and(|e| {
                 matches!(
                     e,
-                    rustls::Error::InvalidCertificate(
-                        rustls::CertificateError::NotValidForName | rustls::CertificateError::NotValidForNameContext { .. }
+                    rustls24::Error::InvalidCertificate(
+                        rustls24::error::CertificateError::NotValidForName | rustls24::error::CertificateError::NotValidForNameContext { .. }
                     )
                 )
             });

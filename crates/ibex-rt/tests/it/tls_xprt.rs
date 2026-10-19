@@ -25,13 +25,9 @@ fn test_certs() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     (der, key)
 }
 
-fn server_config(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> Arc<ServerConfig> {
-    Arc::new(
-        ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert], key)
-            .expect("server config"),
-    )
+/// The bind side, on the rustls Ibex serves TCP with (0.24); the client below is rustls 0.23.
+fn server_config(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> Arc<ibex_tls::tcp::BindTls> {
+    ibex_tls::tcp::BindTls::single(vec![cert], key, Vec::new()).expect("server config")
 }
 
 fn client_config(cert: &CertificateDer<'static>) -> Arc<ClientConfig> {
@@ -310,4 +306,70 @@ fn tls_asks_for_writability_during_the_handshake() {
         "the transport neither flushed nor asked to write"
     );
     let _ = srv_sock.as_raw_fd();
+}
+
+/// T440: full-size records (longer than the 16 KiB input buffer once encrypted), read through
+/// a buffer much smaller than a record, arrive whole and in order; and so do the ones sent.
+/// The plaintext the reader's buffer could not take stays in the input until it is read.
+#[test]
+fn full_records_read_in_small_pieces_and_written_in_large_ones() {
+    let (cert, key) = test_certs();
+    let (mut cli_sock, srv_sock) = socket_pair();
+    let mut xprt = ibex_rt::accept_tls(&srv_sock, server_config(cert.clone(), key));
+    let name = ServerName::try_from("localhost").expect("name");
+    let mut client = ClientConnection::new(client_config(&cert), name).expect("client conn");
+    let fd = srv_sock.as_fd();
+    let mut small = [0u8; 1000];
+    for _ in 0..40 {
+        pump_client(&mut client, &mut cli_sock);
+        let _ = xprt.recv(fd, &mut small).expect("server recv");
+        if xprt.is_ready() && !client.is_handshaking() {
+            break;
+        }
+    }
+    assert!(xprt.is_ready(), "server never finished the handshake");
+
+    let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let mut sent = 0;
+    let mut got = Vec::new();
+    for _ in 0..100_000 {
+        if sent < body.len() {
+            sent += client.writer().write(&body[sent..(sent + 40_000).min(body.len())]).expect("client write");
+        }
+        pump_client(&mut client, &mut cli_sock);
+        match xprt.recv(fd, &mut small).expect("server recv") {
+            Io::Done(n) => got.extend_from_slice(&small[..n]),
+            Io::WouldBlock => {}
+            other => panic!("server recv: {other:?}"),
+        }
+        if got.len() == body.len() {
+            break;
+        }
+    }
+    assert_eq!(got.len(), body.len(), "the whole body arrived");
+    assert!(got == body, "the body arrived intact");
+
+    // Server to client, in writes larger than a record.
+    let mut out = Vec::new();
+    let mut off = 0;
+    for _ in 0..100_000 {
+        if off < body.len() {
+            if let Io::Done(n) = xprt.send(fd, &body[off..(off + 50_000).min(body.len())]).expect("server send") {
+                off += n;
+            }
+        }
+        pump_client(&mut client, &mut cli_sock);
+        let mut b = [0u8; 65536];
+        while let Ok(n) = client.reader().read(&mut b) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&b[..n]);
+        }
+        if out.len() == body.len() {
+            break;
+        }
+    }
+    assert_eq!(out.len(), body.len(), "the whole response arrived");
+    assert!(out == body, "the response arrived intact");
 }

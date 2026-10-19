@@ -19,7 +19,8 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsFd;
 use std::sync::Arc;
 
-use ibex_tls::{build_backend_client_config, BackendTlsOptions};
+use ibex_tls::tcp::build_backend_client_config;
+use ibex_tls::BackendTlsOptions;
 
 fn test_certs(san: &str) -> (CertificateDer<'static>, PrivateKeyDer<'static>, String) {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -40,7 +41,7 @@ fn server_tls_config(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>)
     Arc::new(cfg)
 }
 
-fn backend_client_config_with_ca(ca_pem: &str) -> (Arc<ClientConfig>, tempfile::NamedTempFile) {
+fn backend_client_config_with_ca(ca_pem: &str) -> (Arc<rustls24::ClientConfig>, tempfile::NamedTempFile) {
     let mut temp = tempfile::NamedTempFile::new().expect("create temp ca file");
     temp.write_all(ca_pem.as_bytes()).expect("write ca pem");
     let opts = BackendTlsOptions {
@@ -54,7 +55,7 @@ fn backend_client_config_with_ca(ca_pem: &str) -> (Arc<ClientConfig>, tempfile::
 }
 
 /// `ca-file @system-ca`: the system's bundle, which does not know a test CA.
-fn backend_client_config_system_ca() -> Arc<ClientConfig> {
+fn backend_client_config_system_ca() -> Arc<rustls24::ClientConfig> {
     let opts = BackendTlsOptions {
         verify_required: true,
         ca_file: Some("@system-ca".into()),
@@ -64,7 +65,7 @@ fn backend_client_config_system_ca() -> Arc<ClientConfig> {
     build_backend_client_config(&opts).expect("build backend config")
 }
 
-fn backend_client_config_verify_none() -> Arc<ClientConfig> {
+fn backend_client_config_verify_none() -> Arc<rustls24::ClientConfig> {
     let opts = BackendTlsOptions {
         verify_required: false,
         alpn: vec![b"http/1.1".to_vec()],

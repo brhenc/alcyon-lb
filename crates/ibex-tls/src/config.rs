@@ -10,14 +10,14 @@ use std::sync::Arc;
 
 /// Sessions a server keeps for resumption by session ID: `HAProxy`'s default
 /// `tune.ssl.cachesize`.
-const SESSION_CACHE_SIZE: usize = 20000;
+pub(crate) const SESSION_CACHE_SIZE: usize = 20000;
 
 /// How long a session can be resumed, in seconds: OpenSSL's default session timeout,
 /// which `HAProxy` keeps unless `tune.ssl.lifetime` is set (Ibex refuses that keyword).
 /// Its NewSessionTicket advertises it as the lifetime hint.
-const SESSION_LIFETIME: u32 = 7200;
+pub(crate) const SESSION_LIFETIME: u32 = 7200;
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
@@ -418,7 +418,7 @@ pub fn versions_between(
 }
 
 /// What this build of rustls speaks, for the error when a server line allows none of it.
-fn spoken_versions() -> String {
+pub(crate) fn spoken_versions() -> String {
     rustls::DEFAULT_VERSIONS
         .iter()
         .map(|v| format!("{:?}", v.version))
@@ -439,7 +439,7 @@ pub fn load_server_ca(path: &std::path::Path) -> Result<RootCertStore, String> {
 }
 
 /// Loads the PEM-encoded CRLs of a `crl-file`.
-fn load_crl_file(path: &std::path::Path) -> Result<Vec<rustls::pki_types::CertificateRevocationListDer<'static>>, String> {
+pub(crate) fn load_crl_file(path: &std::path::Path) -> Result<Vec<rustls::pki_types::CertificateRevocationListDer<'static>>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("Couldn't open the crl-file '{}' ({e})", path.display()))?;
     let mut reader = std::io::BufReader::new(file);
     let mut crls = Vec::new();
@@ -488,7 +488,7 @@ pub fn hostcheck(pattern: &str, hostname: &str) -> bool {
 
 /// `ssl_sock_srv_verifycbk`'s name rule: `name` against the dNSName SANs, or against the
 /// subject CN when the certificate has no dNSName at all.
-fn cert_covers_name(der: &[u8], name: &str) -> bool {
+pub(crate) fn cert_covers_name(der: &[u8], name: &str) -> bool {
     let sans = extract_dns_sans(der);
     if !sans.is_empty() {
         return sans.iter().any(|san| hostcheck(san, name));
@@ -670,8 +670,41 @@ impl TlsConfig {
     }
 
     fn build_from_bind(bind: &BindConfig) -> Result<Arc<ServerConfig>, String> {
-        let mut config = TlsConfig::new();
+        let plan = BindPlan::of(bind)?;
+        let mut resolver = IbexCertResolver::new();
+        let mut is_first = true;
+        for (certs, key, file_path) in &plan.pairs {
+            let certified_key = Arc::new(create_certified_key(certs.clone(), key)?);
+            match certified_key.keys_match() {
+                Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
+                Err(rustls::Error::InconsistentKeys(_)) => return Err(key_mismatch(file_path)),
+                Err(_) => return Err(wrong_tag(file_path)),
+            }
+            if is_first {
+                resolver.set_default_cert(certified_key.clone());
+                is_first = false;
+            }
+            for domain in cert_names(certs) {
+                resolver.add_cert(&domain, certified_key.clone());
+            }
+        }
+        let config = TlsConfig::new()
+            .with_alpn(plan.alpn.clone())
+            .with_cert_resolver(Arc::new(resolver));
+        TlsConfig { versions: plan.versions(bind)?, ..config }.build_server_config()
+    }
+}
 
+/// What a `bind ... ssl` line asks for, whichever rustls builds it: the ALPN list it advertises
+/// and the certificates of its `crt` files, loaded. Shared by the QUIC build (rustls 0.23) and
+/// the TCP one ([`crate::tcp`], rustls 0.24).
+pub(crate) struct BindPlan {
+    pub(crate) alpn: Vec<Vec<u8>>,
+    pub(crate) pairs: Vec<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, std::path::PathBuf)>,
+}
+
+impl BindPlan {
+    pub(crate) fn of(bind: &BindConfig) -> Result<Self, String> {
         // Advertise only what the runtime can actually serve.
         //
         // `TlsConfig::default` offers `h2, http/1.1`, and curl duly negotiated h2 against
@@ -705,69 +738,52 @@ impl TlsConfig {
                 unsupported.join(", ")
             ));
         }
-        config = config.with_alpn(supported.iter().map(|s| s.as_bytes().to_vec()).collect());
-
-        let mut resolver = IbexCertResolver::new();
-        let mut is_first = true;
-
+        let mut pairs = Vec::new();
         for crt_path_str in &bind.crt {
-            let path = std::path::Path::new(crt_path_str);
-            let cert_key_pairs = load_certs_from_path(path)?;
-            for (certs, key, file_path) in cert_key_pairs {
-                let certified_key = Arc::new(create_certified_key(certs.clone(), &key)?);
-                match certified_key.keys_match() {
-                    Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
-                    Err(rustls::Error::InconsistentKeys(_)) => {
-                        return Err(format!(
-                            "inconsistencies between private key and certificate loaded '{}'.",
-                            file_path.display()
-                        ));
-                    }
-                    Err(_) => {
-                        return Err(format!(
-                            "unable to load certificate from file '{}': wrong tag.",
-                            file_path.display()
-                        ));
-                    }
-                }
-                if is_first {
-                    resolver.set_default_cert(certified_key.clone());
-                    is_first = false;
-                }
-                
-                if let Some(cert_der) = certs.first() {
-                    let mut names = extract_dns_sans(cert_der.as_ref());
-                    if names.is_empty() {
-                        if let Some(cn) = extract_subject_cn(cert_der.as_ref()) {
-                            names.push(cn);
-                        }
-                    }
-                    for domain in names {
-                        resolver.add_cert(&domain, certified_key.clone());
-                    }
-                }
-            }
+            pairs.extend(load_certs_from_path(std::path::Path::new(crt_path_str))?);
         }
-
-        if is_first {
+        if pairs.is_empty() {
             return Err("No certificates loaded for bind".to_string());
         }
+        Ok(Self { alpn: supported.iter().map(|s| s.as_bytes().to_vec()).collect(), pairs })
+    }
 
-        config = config.with_cert_resolver(Arc::new(resolver));
-        config = config.with_version_range(bind.min_ver, bind.max_ver);
+    /// The protocol versions the bind offers (rustls 0.23's names for them).
+    pub(crate) fn versions(&self, bind: &BindConfig) -> Result<Vec<&'static rustls::SupportedProtocolVersion>, String> {
+        let mut versions = versions_between(bind.min_ver, bind.max_ver);
         if bind.quic {
             // QUIC is TLS 1.3 by definition (RFC 9001): never offer 1.2 there, whatever
             // the TCP binds of the proxy do.
-            if config.versions.iter().all(|v| v.version != rustls::ProtocolVersion::TLSv1_3) {
+            if versions.iter().all(|v| v.version != rustls::ProtocolVersion::TLSv1_3) {
                 return Err(format!("bind {}: QUIC needs TLS 1.3, which 'ssl-max-ver' rules out", bind.addr));
             }
-            config.versions = vec![&rustls::version::TLS13];
+            versions = vec![&rustls::version::TLS13];
         }
-        if config.versions.is_empty() {
+        if versions.is_empty() {
             return Err(format!("all SSL/TLS versions are disabled for bind '{}'", bind.addr));
         }
-        config.build_server_config()
+        Ok(versions)
     }
+}
+
+pub(crate) fn key_mismatch(file_path: &std::path::Path) -> String {
+    format!("inconsistencies between private key and certificate loaded '{}'.", file_path.display())
+}
+
+pub(crate) fn wrong_tag(file_path: &std::path::Path) -> String {
+    format!("unable to load certificate from file '{}': wrong tag.", file_path.display())
+}
+
+/// The names a certificate is served for: its dNSName SANs, or its subject CN without any.
+pub(crate) fn cert_names(certs: &[CertificateDer<'static>]) -> Vec<String> {
+    let Some(cert_der) = certs.first() else { return Vec::new() };
+    let mut names = extract_dns_sans(cert_der.as_ref());
+    if names.is_empty() {
+        if let Some(cn) = extract_subject_cn(cert_der.as_ref()) {
+            names.push(cn);
+        }
+    }
+    names
 }
 
 type SharedCache = std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<ServerConfig>>>;
@@ -780,7 +796,7 @@ fn shared_cache() -> &'static SharedCache {
 /// Identity of the config a bind would build: its options and the size and mtime of every
 /// file it reads, so a renewed certificate is never served from a stale entry. `None`
 /// when a file cannot be inspected (the build then reports the real error).
-fn shared_key(bind: &BindConfig) -> Option<String> {
+pub(crate) fn shared_key(bind: &BindConfig) -> Option<String> {
     use std::fmt::Write as _;
     let mut k = format!("{:?}|{:?}|{}|{:?}|{:?}", bind.crt, bind.alpn, bind.quic, bind.min_ver, bind.max_ver);
     for c in &bind.crt {
