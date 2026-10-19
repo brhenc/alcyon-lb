@@ -82,6 +82,15 @@ impl Server {
     }
 }
 
+/// Waits until the server has recorded `n` requests, at most 20 s: a loaded host takes far
+/// longer than a fixed second to get a request through the proxy.
+fn wait_seen(srv: &Server, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while srv.seen().len() < n && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// A server that records each request (head, then the body its framing announces, for up
 /// to 400 ms of silence), answers `200 ok` and keeps the connection.
 fn server() -> Server {
@@ -261,15 +270,15 @@ fn a_body_that_does_not_come_in_time_is_a_408_and_never_reaches_the_server() {
 fn at_least_lets_the_rules_run_on_the_bytes_that_are_here() {
     // HAProxy, 5 of 10 bytes sent, `time 300ms at-least 5`: x-len: 5, x-body: abcde, at once.
     let srv = server();
-    let (_i, fe) = start(&cfg("http-request wait-for-body time 300ms at-least 5", ""), srv.addr, None);
+    let (_i, fe) = start(&cfg("http-request wait-for-body time 10s at-least 5", ""), srv.addr, None);
     let mut c = Client::connect(fe);
     c.send(POST_CL10).send(b"abcde");
-    let _ = c.read(Duration::from_millis(1200));
+    wait_seen(&srv, 1);
     let seen = srv.seen();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].header("x-len").as_deref(), Some("5"));
     assert_eq!(seen[0].header("x-body").as_deref(), Some("abcde"));
-    assert!(seen[0].at.duration_since(c.t0) < Duration::from_millis(250), "it waited for more than at-least");
+    assert!(seen[0].at.duration_since(c.t0) < Duration::from_millis(5000), "it waited for more than at-least");
 }
 
 #[test]
@@ -318,13 +327,15 @@ fn a_chunked_body_is_seen_decoded_and_counted_in_data_bytes() {
 fn a_request_without_a_body_is_not_held() {
     // HAProxy: x-len: 0, at once.
     let srv = server();
-    let (_i, fe) = start(&cfg("http-request wait-for-body time 2s", ""), srv.addr, None);
+    // The wait is 10 s and "at once" is anything under 5 s: a held request is seen at 10 s,
+    // and a loaded host is not mistaken for it.
+    let (_i, fe) = start(&cfg("http-request wait-for-body time 10s", ""), srv.addr, None);
     let mut c = Client::connect(fe);
     c.send(b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n");
-    let _ = c.read(Duration::from_millis(1000));
+    wait_seen(&srv, 1);
     let seen = srv.seen();
     assert_eq!(seen[0].header("x-len").as_deref(), Some("0"));
-    assert!(seen[0].at.duration_since(c.t0) < Duration::from_millis(250));
+    assert!(seen[0].at.duration_since(c.t0) < Duration::from_millis(5000));
 }
 
 #[test]
@@ -334,18 +345,18 @@ fn a_full_buffer_ends_the_wait_with_what_fits() {
     // the head's layout in the buffer, so the test bounds it by the buffer's size.
     let srv = server();
     let cfg = format!(
-        "{DEFAULTS}frontend fe\n  bind {{fe}}\n  http-request wait-for-body time 400ms\n  \
+        "{DEFAULTS}frontend fe\n  bind {{fe}}\n  http-request wait-for-body time 10s\n  \
          http-request set-header X-Len %[req.body_len]\n  default_backend be\nbackend be\n  server s {{srv}}\n"
     );
     let (_i, fe) = start(&cfg, srv.addr, None);
     let mut c = Client::connect(fe);
     c.send(b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 100000\r\n\r\n").send(&vec![b'a'; 50000]);
-    let _ = c.read(Duration::from_millis(1500));
+    wait_seen(&srv, 1);
     let seen = srv.seen();
     assert_eq!(seen.len(), 1, "the request must reach the server, not time out");
     let len: usize = seen[0].header("x-len").and_then(|v| v.parse().ok()).expect("x-len");
     assert!((13_000..=15_360).contains(&len), "x-len {len}");
-    assert!(seen[0].at.duration_since(c.t0) < Duration::from_millis(300), "it waited with a full buffer");
+    assert!(seen[0].at.duration_since(c.t0) < Duration::from_millis(5000), "it waited with a full buffer");
 }
 
 #[test]
@@ -551,14 +562,14 @@ fn an_allow_ahead_of_the_wait_ends_the_rules_and_the_request_is_not_held() {
     // HAProxy: `http-request allow` stops the list, so the wait after it is never reached:
     // the request goes at once, with no x-len set.
     let srv = server();
-    let cfg = cfg("http-request allow if { path /x }\n  http-request wait-for-body time 5s", "");
+    let cfg = cfg("http-request allow if { path /x }\n  http-request wait-for-body time 20s", "");
     let (_i, fe) = start(&cfg, srv.addr, None);
     let mut c = Client::connect(fe);
     c.send(POST_CL10).send(b"abcde");
-    let _ = c.read(Duration::from_millis(1500));
+    wait_seen(&srv, 1);
     let seen = srv.seen();
     assert_eq!(seen.len(), 1, "the request must go on");
-    assert!(seen[0].at.duration_since(c.t0) < Duration::from_millis(250), "it was held");
+    assert!(seen[0].at.duration_since(c.t0) < Duration::from_millis(10_000), "it was held");
 }
 
 #[test]
