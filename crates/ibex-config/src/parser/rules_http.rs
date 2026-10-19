@@ -18,7 +18,7 @@ fn parse_one_expr_and_cond(
 ) -> Result<(String, Option<AclCondition>), ConfigError> {
     let act = &act_token.text;
     let Some(expr) = tokens.get(2).filter(|t| !matches!(t.text.as_str(), "" | "if" | "unless")) else {
-        return Err(ConfigError::new(act_token.line, act_token.col, format!("<http-request {act}> missing fetch method")));
+        return Err(ConfigError::new(act_token.line, act_token.col, format!("error detected while parsing 'http-request {act}' rule : missing fetch method.")));
     };
     if !expr.text.starts_with(|c: char| c.is_ascii_alphabetic()) {
         return Err(ConfigError::new(expr.line, expr.col, format!("unknown fetch method '{}'", expr.text)));
@@ -168,6 +168,44 @@ pub(crate) fn parse_rst_ttl(tokens: &[Token], at: usize) -> Result<Option<(u8, u
 /// The one argument at `tokens[2]` (a `set-var` expression, a `set-var-fmt` format) and
 /// the optional condition after it: a second word that is not `if`/`unless` is refused,
 /// as `HAProxy` refuses it. Ibex joined the words and set the variable to something else.
+/// The value of `sc-set-gpt0`, `sc-set-gpt` and `sc-add-gpc` and the condition. HAProxy reads
+/// the next word as the value's sample fetch, so `if`/`unless` there is `unknown fetch
+/// method 'if'`; no word at all is accepted (the value is 0).
+fn sc_value_and_cond(tokens: &[Token], kw: &str, act_token: &Token) -> Result<(String, Option<AclCondition>), ConfigError> {
+    if let Some(t) = tokens.get(2).filter(|t| t.text == "if" || t.text == "unless") {
+        return Err(ConfigError::new(
+            t.line,
+            t.col,
+            format!("error detected while parsing '{kw} {}' rule : unknown fetch method '{}'.", act_token.text, t.text),
+        ));
+    }
+    one_arg_and_cond(tokens, kw, act_token)
+}
+
+/// `parse_gpc_array_action` with `http-request`'s wording: the rule is named and the text ends
+/// with a full stop.
+fn http_gpc_action(act_str: &str, prefix: &str, act_token: &Token) -> Result<Option<(usize, u8)>, ConfigError> {
+    parse_gpc_array_action(act_str, prefix, act_token).map_err(|mut e| {
+        e.message = format!("error detected while parsing 'http-request {act_str}' rule : {}.", e.message);
+        e
+    })
+}
+
+/// `set-var`, `set-var-fmt` and `unset-var` without their `(<var-name>)` (`parse_store`).
+fn refuse_bare_var_action(list: &str, act_token: &Token) -> Result<(), ConfigError> {
+    let act = act_token.text.as_str();
+    if matches!(act, "set-var" | "set-var-fmt" | "unset-var") {
+        return Err(ConfigError::new(
+            act_token.line,
+            act_token.col,
+            format!(
+                "error detected while parsing '{list} {act}' rule : invalid or incomplete action '{act}'. Expects 'set-var(<var-name>)', 'set-var-fmt(<var-name>)' or 'unset-var(<var-name>)'."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn one_arg_and_cond(tokens: &[Token], kw: &str, act_token: &Token) -> Result<(String, Option<AclCondition>), ConfigError> {
     let arg = tokens.get(2).filter(|t| t.text != "if" && t.text != "unless").map_or_else(String::new, |t| t.text.clone());
     let at = if arg.is_empty() { 2 } else { 3 };
@@ -333,7 +371,7 @@ fn parse_wait_for_body(
         i += 2;
     }
     let Some(time) = time else {
-        return Err(fail(act_token, "expects time <time> [ at-least <bytes> ].".to_string()));
+        return Err(fail(act_token, format!("error detected while parsing '{side} wait-for-body' rule : expects time <time> [ at-least <bytes> ].")));
     };
     let cond = match tokens.get(i) {
         None => None,
@@ -411,13 +449,14 @@ fn parse_http_req_rule_at(
 
     let act_token = &tokens[1];
     let act_str = act_token.text.as_str();
+    refuse_bare_var_action("http-request", act_token)?;
 
     if act_str == "track-sc0" || act_str == "track-sc1" || act_str == "track-sc2" {
         if tokens.len() < 3 {
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-request track-sc*> expects sample expression.",
+                format!("error detected while parsing 'http-request {act_str}' rule : missing fetch method."),
             ));
         }
         let (expr, table, cond_start) = super::rules_tcp::parse_track_sc_args(tokens, 2, &|t| {
@@ -445,20 +484,20 @@ fn parse_http_req_rule_at(
         let cond = expect_cond_at(tokens, 2, act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc1 { sc }, cond, line: 0 });
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-set-gpt0", act_token)? {
-        let (expr, cond) = one_arg_and_cond(tokens, "http-request", act_token)?;
+        let (expr, cond) = sc_value_and_cond(tokens, "http-request", act_token)?;
         // No value is 0, as `HAProxy` reads it (`strtol` stops at the end of the line).
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt0 { sc, expr }, cond, line: 0 });
-    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-inc-gpc", act_token)? {
+    } else if let Some((idx, sc)) = http_gpc_action(act_str, "sc-inc-gpc", act_token)? {
         let cond = expect_cond_at(tokens, 2, act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::ScIncGpc { idx, sc }, cond, line: 0 });
-    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-add-gpc", act_token)? {
-        let (expr, cond) = one_arg_and_cond(tokens, "http-request", act_token)?;
+    } else if let Some((idx, sc)) = http_gpc_action(act_str, "sc-add-gpc", act_token)? {
+        let (expr, cond) = sc_value_and_cond(tokens, "http-request", act_token)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(HttpReqRule { action: HttpReqAction::ScAddGpc { idx, sc, expr }, cond, line: 0 });
-    } else if let Some((idx, sc)) = parse_gpc_array_action(act_str, "sc-set-gpt", act_token)? {
-        let (expr, cond) = one_arg_and_cond(tokens, "http-request", act_token)?;
+    } else if let Some((idx, sc)) = http_gpc_action(act_str, "sc-set-gpt", act_token)? {
+        let (expr, cond) = sc_value_and_cond(tokens, "http-request", act_token)?;
         // No value is 0: `strtol` reads nothing and the end of the line is what it stopped at.
         let expr = if expr.is_empty() { "0".to_string() } else { expr };
         rules.push(HttpReqRule { action: HttpReqAction::ScSetGpt { idx, sc, expr }, cond, line: 0 });
@@ -559,7 +598,7 @@ fn parse_http_req_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-request set-header|add-header> expects <name> and <fmt>.",
+                format!("error detected while parsing 'http-request {act_str}' rule : expects exactly 2 arguments."),
             ));
         }
         let name = tokens[2].text.clone();
@@ -576,7 +615,7 @@ fn parse_http_req_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-request del-header> expects <name>.",
+                "error detected while parsing 'http-request del-header' rule : expects at least 1 argument.",
             ));
         }
         let name = tokens[2].text.clone();
@@ -611,7 +650,7 @@ fn parse_http_req_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-request replace-header> expects <name>, <regex>, <replace>.",
+                "error detected while parsing 'http-request replace-header' rule : expects exactly 3 arguments.",
             ));
         }
         // A regex that cannot be compiled would make the rule do nothing on every request;
@@ -631,7 +670,7 @@ fn parse_http_req_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-request replace-value> expects <name>, <regex>, <replace>.",
+                "error detected while parsing 'http-request replace-value' rule : expects exactly 3 arguments.",
             ));
         }
         // A regex that cannot be compiled would make the rule do nothing on every request;
@@ -651,7 +690,7 @@ fn parse_http_req_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-request set-path> expects <fmt>.",
+                "error detected while parsing 'http-request set-path' rule : expects exactly 1 argument <format>.",
             ));
         }
         let fmt = tokens[2].text.clone();
@@ -669,7 +708,7 @@ fn parse_http_req_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-request set-pathq> expects <fmt>.",
+                "error detected while parsing 'http-request set-pathq' rule : expects exactly 1 argument <format>.",
             ));
         }
         let fmt = tokens[2].text.clone();
@@ -690,7 +729,7 @@ fn parse_http_req_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-request set-query> expects <fmt>.",
+                "error detected while parsing 'http-request set-query' rule : expects exactly 1 argument <format>.",
             ));
         }
         let fmt = tokens[2].text.clone();
@@ -705,7 +744,7 @@ fn parse_http_req_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-request set-uri> expects <fmt>.",
+                "error detected while parsing 'http-request set-uri' rule : expects exactly 1 argument <format>.",
             ));
         }
         let fmt = tokens[2].text.clone();
@@ -720,7 +759,7 @@ fn parse_http_req_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-request set-method> expects <fmt>.",
+                "error detected while parsing 'http-request set-method' rule : expects exactly 1 argument <format>.",
             ));
         }
         let fmt = tokens[2].text.clone();
@@ -927,7 +966,7 @@ fn parse_http_req_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-request set-timeout> expects <type> and <value>.",
+                "error detected while parsing 'http-request set-timeout' rule : expects exactly 2 arguments.",
             ));
         }
         let timeout_type = tokens[2].text.clone();
@@ -1084,13 +1123,14 @@ fn parse_http_res_rule_at(
     }
     let act_token = &tokens[1];
     let act_str = act_token.text.as_str();
+    refuse_bare_var_action("http-response", act_token)?;
 
     if act_str == "set-header" || act_str == "add-header" {
         if tokens.len() < 4 {
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-response set-header|add-header> expects <name> and <fmt>.",
+                format!("error detected while parsing 'http-response {act_str}' rule : expects exactly 2 arguments."),
             ));
         }
         let name = tokens[2].text.clone();
@@ -1107,7 +1147,7 @@ fn parse_http_res_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-response del-header> expects <name>.",
+                "error detected while parsing 'http-response del-header' rule : expects at least 1 argument.",
             ));
         }
         let name = tokens[2].text.clone();
@@ -1142,7 +1182,7 @@ fn parse_http_res_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-response set-status> expects <status>.",
+                "error detected while parsing 'http-response set-status' rule : expects 1 argument: <status>; or 3 arguments: <status> reason <fmt>.",
             ));
         }
         let status = parse_u16(&tokens[2], "set-status")?;
@@ -1161,7 +1201,7 @@ fn parse_http_res_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-response replace-header> expects <name>, <regex>, <replace>.",
+                "error detected while parsing 'http-response replace-header' rule : expects exactly 3 arguments.",
             ));
         }
         // A regex that cannot be compiled would make the rule do nothing on every
@@ -1184,7 +1224,7 @@ fn parse_http_res_rule_at(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-response replace-value> expects <name>, <regex>, <replace>.",
+                "error detected while parsing 'http-response replace-value' rule : expects exactly 3 arguments.",
             ));
         }
         // A regex that cannot be compiled would make the rule do nothing on every
@@ -1467,7 +1507,11 @@ fn parse_req_redirect(tokens: &[Token]) -> Result<(RedirectRule, Option<AclCondi
     }
     if !have_kind {
         let at = tokens.get(1).unwrap_or(&tokens[0]);
-        return Err(ConfigError::new(at.line, at.col, "redirection type expected ('prefix', 'location', or 'scheme')."));
+        return Err(ConfigError::new(
+            at.line,
+            at.col,
+            format!("error detected while parsing '{} redirect' rule : redirection type expected ('prefix', 'location', or 'scheme').", tokens[0].text),
+        ));
     }
     let cond = cond_idx.map(|idx| parse_acl_condition_from_tokens(&tokens[idx..])).transpose()?.flatten();
     Ok((rule, cond))
@@ -1551,7 +1595,11 @@ fn parse_res_redirect(tokens: &[Token]) -> Result<(HttpResAction, Option<AclCond
     }
     let at = tokens.get(1).unwrap_or(&tokens[0]);
     match kind {
-        None => Err(ConfigError::new(at.line, at.col, "redirection type expected ('prefix', 'location', or 'scheme').")),
+        None => Err(ConfigError::new(
+            at.line,
+            at.col,
+            format!("error detected while parsing '{} redirect' rule : redirection type expected ('prefix', 'location', or 'scheme').", tokens[0].text),
+        )),
         Some(Kind::Other) => Err(ConfigError::new(at.line, at.col, "response only supports redirect type 'location'.")),
         Some(Kind::Location) => {
             let cond = cond_idx.map(|idx| parse_acl_condition_from_tokens(&tokens[idx..])).transpose()?.flatten();
@@ -1575,13 +1623,14 @@ pub(crate) fn parse_http_after_res_rule(
     }
     let act_token = &tokens[1];
     let act_str = act_token.text.as_str();
+    refuse_bare_var_action("http-after-response", act_token)?;
 
     if act_str == "set-header" || act_str == "add-header" {
         if tokens.len() < 4 {
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-after-response set-header|add-header> expects <name> and <fmt>.",
+                format!("error detected while parsing 'http-after-response {act_str}' rule : expects exactly 2 arguments."),
             ));
         }
         let name = tokens[2].text.clone();
@@ -1598,7 +1647,7 @@ pub(crate) fn parse_http_after_res_rule(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-after-response del-header> expects <name>.",
+                "error detected while parsing 'http-after-response del-header' rule : expects at least 1 argument.",
             ));
         }
         let name = tokens[2].text.clone();
@@ -1632,7 +1681,7 @@ pub(crate) fn parse_http_after_res_rule(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-after-response set-status> expects <status>.",
+                "error detected while parsing 'http-after-response set-status' rule : expects 1 argument: <status>; or 3 arguments: <status> reason <fmt>.",
             ));
         }
         let status = parse_u16(&tokens[2], "set-status")?;
@@ -1654,7 +1703,7 @@ pub(crate) fn parse_http_after_res_rule(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-after-response replace-header> expects <name>, <regex>, <replace>.",
+                "error detected while parsing 'http-after-response replace-header' rule : expects exactly 3 arguments.",
             ));
         }
         // A regex that cannot be compiled would make the rule do nothing on every
@@ -1676,7 +1725,7 @@ pub(crate) fn parse_http_after_res_rule(
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                "<http-after-response replace-value> expects <name>, <regex>, <replace>.",
+                "error detected while parsing 'http-after-response replace-value' rule : expects exactly 3 arguments.",
             ));
         }
         // A regex that cannot be compiled would make the rule do nothing on every

@@ -10648,6 +10648,12 @@ impl EngineDispatcher<'_> {
         set_rsp(entry);
     }
 
+    /// `stats_check_uri`: only GET, HEAD and POST reach the stats applet; any other method
+    /// is an ordinary request (a PUT to the stats URI goes to the backend).
+    fn stats_method_ok(sess: &TcpSession) -> bool {
+        matches!(sess.req_method.as_deref(), Some("GET" | "HEAD" | "POST"))
+    }
+
     fn is_stats_request(req_uri: &str, configured_uri: Option<&str>) -> bool {
         match configured_uri {
             Some(uri) => {
@@ -11965,7 +11971,7 @@ impl EngineDispatcher<'_> {
         {
             let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
             let configured_uri = proxies[proxy_idx].stats_config.uri.as_deref();
-            if Self::is_stats_request(req_uri, configured_uri) {
+            if Self::stats_method_ok(&entry.sess) && Self::is_stats_request(req_uri, configured_uri) {
                 // An admin POST is read whole before it acts (`AN_REQ_HTTP_BODY`): held here
                 // until its body is, then back past the rules that already ran.
                 if entry.sess.req_method.as_deref() == Some("POST") && Self::stats_admin_allowed(&entry.sess, proxies, proxy_idx) {
@@ -12130,6 +12136,7 @@ impl EngineDispatcher<'_> {
         // its URI after the backend's own rules (the frontend's was served above).
         if be_idx != proxy_idx
             && (proxies[be_idx].stats_config.enable || proxies[be_idx].stats_config.uri.is_some() || proxies[be_idx].stats_config.admin)
+            && Self::stats_method_ok(&entry.sess)
             && Self::is_stats_request(entry.sess.req_uri.as_deref().unwrap_or("/"), proxies[be_idx].stats_config.uri.as_deref())
         {
             return Self::handle_stats_request(entry, proxies, checks, pid, now, be_idx);
