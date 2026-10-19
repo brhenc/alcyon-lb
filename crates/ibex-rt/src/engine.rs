@@ -11187,6 +11187,9 @@ impl EngineDispatcher<'_> {
                         lf_string,
                         error_page,
                     } => {
+                        // The flags are set before the reply is formatted: a `hdr` of it that
+                        // reads `txn.sess_term_state` sees `LR`.
+                        sess.log.term.get_or_insert(*b"LR");
                         let body = resolve_error_body(&proxies[pages_idx], &proxies[proxy_idx], *status, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref());
                         let full_resp: Vec<u8> = match body {
                             ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
@@ -11219,6 +11222,9 @@ impl EngineDispatcher<'_> {
                         error_page,
                     } => {
                         let status_code = deny_status.unwrap_or(403);
+                        // Denied by the proxy: `PR`, not a rule's answer (`LR`). Set before the
+                        // reply is formatted, for a `hdr` that reads `txn.sess_term_state`.
+                        sess.log.term = Some(*b"PR");
                         let body = resolve_error_body(&proxies[pages_idx], &proxies[proxy_idx], status_code, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref());
                         let resp: Vec<u8> = match body {
                             ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
@@ -11226,8 +11232,6 @@ impl EngineDispatcher<'_> {
                                 build_templated_error_response(status_code, content_type, lf_string, &make_ctx!(sess), registry)
                             }
                         };
-                        // Denied by the proxy: `PR`, not a rule's answer (`LR`).
-                        sess.log.term = Some(*b"PR");
                         // `dreq` of the proxy whose rule denied (`http_req_get_intercept_rule`).
                         proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                         for_tracked(proxies, sess, |data| data.count_err());
@@ -11258,6 +11262,7 @@ impl EngineDispatcher<'_> {
                             t.body_wait = None;
                         }
                         let status_code = deny_status.unwrap_or(500);
+                        sess.log.term = Some(*b"PT");
                         let body = resolve_error_body(&proxies[pages_idx], &proxies[proxy_idx], status_code, error_page.as_ref(), content_type.as_ref(), lf_string.as_ref());
                         let resp: Vec<u8> = match body {
                             ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
@@ -11265,7 +11270,6 @@ impl EngineDispatcher<'_> {
                                 build_templated_error_response(status_code, content_type, lf_string, &make_ctx!(sess), registry)
                             }
                         };
-                        sess.log.term = Some(*b"PT");
                         for_tracked(proxies, sess, |data| data.count_err());
                         send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, &resp);
                         return Ok(RuleFlow::Replied);
