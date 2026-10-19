@@ -4875,7 +4875,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mut pinned_add: Vec<(usize, RawFd)> = Vec::new();
         for (idx, ql) in self.quic_listeners.iter().enumerate() {
             for b in ql.pinned_borrowed_fds() {
-                if matches!(self.fdtab.state(b.as_raw_fd()), FdState::Closed) {
+                if self.fdtab.is_free(b.as_raw_fd()) {
                     pinned_add.push((idx, b.as_raw_fd()));
                 }
             }
@@ -4883,27 +4883,14 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         for (idx, fd) in pinned_add {
             let Some(ql) = self.quic_listeners.get(idx) else { continue };
             let Some(b) = ql.pinned_borrowed_fds().into_iter().find(|b| b.as_raw_fd() == fd) else { continue };
-            self.fdtab.insert(
-                fd,
-                FdState::QuicBackend { listener: usize_to_u32(idx) },
-                Interest::READ,
-            );
-            let _ = self.poller.add(b, raw_fd_to_u64(fd), true, false);
+            sync_quic_fd(&mut self.fdtab, &self.poller, idx, b, Interest::READ, false);
         }
         // Backend legs and request relays, with the interest each one has now: write only
         // while it has bytes to write. Registering them all for writing made a slow leg
         // wake the loop on every pass until it answered (T108).
         for (idx, ql) in self.quic_listeners.iter().enumerate() {
             for (b, readable, writable) in ql.io_fds() {
-                let fd = b.as_raw_fd();
-                let want = Interest { readable, writable };
-                if matches!(self.fdtab.state(fd), FdState::Closed) {
-                    self.fdtab.insert(fd, FdState::QuicBackend { listener: usize_to_u32(idx) }, want);
-                    let _ = self.poller.add(b, raw_fd_to_u64(fd), readable, writable);
-                } else if self.fdtab.interest(fd) != want {
-                    self.fdtab.set_interest(fd, want);
-                    let _ = self.poller.modify(b, raw_fd_to_u64(fd), readable, writable);
-                }
+                sync_quic_fd(&mut self.fdtab, &self.poller, idx, b, Interest { readable, writable }, true);
             }
         }
     }
@@ -15158,6 +15145,19 @@ mod registry_tests {
     }
 }
 
+/// Registers backend socket `b` of QUIC listener `idx` for `want` when its slot is free
+/// ([`FdTab::is_free`]: an `Idle` entry at a live QUIC socket's number is stale); with `retune`, one already registered whose interest changed is modified.
+fn sync_quic_fd(fdtab: &mut FdTab, poller: &Poller, idx: usize, b: std::os::fd::BorrowedFd<'_>, want: Interest, retune: bool) {
+    let fd = b.as_raw_fd();
+    if fdtab.is_free(fd) {
+        fdtab.insert(fd, FdState::QuicBackend { listener: usize_to_u32(idx) }, want);
+        let _ = poller.add(b, raw_fd_to_u64(fd), want.readable, want.writable);
+    } else if retune && fdtab.interest(fd) != want {
+        fdtab.set_interest(fd, want);
+        let _ = poller.modify(b, raw_fd_to_u64(fd), want.readable, want.writable);
+    }
+}
+
 /// Takes the table slots of descriptors a QUIC listener closed. The listener reports them a
 /// pass after closing them, and the number may have been given to another socket in between
 /// (an accepted client, a server connection): that socket's slot is not ours to clear.
@@ -15183,6 +15183,26 @@ mod quic_fd_reuse_tests {
         assert!(matches!(t.state(40), FdState::Closed), "a QUIC leg's slot is cleared");
         assert!(matches!(t.state(41), FdState::Conn { .. }), "a slot another socket took over is kept");
         assert!(matches!(t.state(42), FdState::Closed));
+    }
+
+    /// A QUIC backend socket given the number of an idle server connection that left its
+    /// worker's lists without an event (taken by another worker, purged, closed over
+    /// `pool-high-conn`) is polled: the stale `Idle` entry at that number is a free slot,
+    /// like a `Closed` one (T434). Before, it read as registered and the leg waited for an
+    /// unrelated wakeup.
+    #[test]
+    fn a_quic_leg_on_a_stale_idle_slot_is_registered() {
+        let poller = Poller::new(16).expect("poller");
+        let mut t = FdTab::with_capacity(64);
+        for (want, retune) in [(Interest::READ, true), (Interest::WRITE, true), (Interest::READ, false)] {
+            let leg = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp");
+            t.set_idle(leg.as_raw_fd());
+            sync_quic_fd(&mut t, &poller, 0, leg.as_fd(), want, retune);
+            assert!(poller.is_registered(leg.as_fd()), "a leg for {want:?} on a stale idle slot is not polled");
+            assert!(matches!(t.state(leg.as_raw_fd()), FdState::QuicBackend { listener: 0 }));
+            assert_eq!(t.interest(leg.as_raw_fd()), want);
+            t.remove(leg.as_raw_fd());
+        }
     }
 }
 
