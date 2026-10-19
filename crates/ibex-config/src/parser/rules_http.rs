@@ -4,7 +4,7 @@
 use crate::HeadersBinOp;
 use super::{
     args_end, parse_acl_condition_from_tokens, parse_error_body_args,
-    parse_rule_condition, parse_gpc_array_action, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
+    parse_gpc_array_action, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
     AclCondition, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
     HttpResRule, RedirectCookie, RedirectKind, RedirectRule, RetriesValue, Token,
 };

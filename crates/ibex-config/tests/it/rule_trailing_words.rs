@@ -196,6 +196,11 @@ fn stray_words_after_options_and_in_other_sections() {
     for (rule, want) in [
         ("http-request del-header A -m str foo", "'http-request del-header' expects either 'if' or 'unless' followed by a condition but found 'foo'."),
         ("http-response del-header A -m str foo", "'http-response del-header' expects either 'if' or 'unless' followed by a condition but found 'foo'."),
+        ("http-after-response del-header A -m str foo", "'http-after-response del-header' expects either 'if' or 'unless' followed by a condition but found 'foo'."),
+        // `-m` without its method (HAProxy also names the proxy: "error detected in frontend 'f' while ...").
+        ("http-request del-header A -m", "while parsing 'http-request del-header' rule : -m flag expects exactly 1 argument."),
+        ("http-response del-header A -m", "while parsing 'http-response del-header' rule : -m flag expects exactly 1 argument."),
+        ("http-after-response del-header A -m", "while parsing 'http-after-response del-header' rule : -m flag expects exactly 1 argument."),
         ("http-request track-sc0 src table b foo", "'http-request track-sc0' expects either 'if' or 'unless' followed by a condition but found 'foo'."),
         ("http-request deny status 400 bar baz", "'http-request deny' expects either 'if' or 'unless' followed by a condition but found 'bar'."),
         ("http-request set-var-fmt(txn.x) a b", "'http-request set-var-fmt(txn.x)' expects either 'if' or 'unless' followed by a condition but found 'b'."),

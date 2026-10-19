@@ -193,15 +193,6 @@ pub(crate) fn args_end(tokens: &[Token], start: usize) -> Option<usize> {
     None
 }
 
-pub(crate) fn join_tokens_until(tokens: &[Token], start: usize, cond_idx: Option<usize>) -> String {
-    let limit = cond_idx.unwrap_or(tokens.len());
-    tokens[start..limit]
-        .iter()
-        .map(|t| t.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 
 /// One config word, as the sample-expression parser will split it back out of the joined
 /// text: quoted, with `\\` and `\"` escaped, when it holds what that parser splits on or
