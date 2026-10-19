@@ -108,3 +108,39 @@ fn no_option_checkcache_in_the_backend_turns_it_off() {
     let (_i, fe) = start("option checkcache\n  no option checkcache");
     assert_eq!(ask(fe, "GET", "Cache-Control: max-age=60"), (200, true));
 }
+
+/// T430 row 7: the block is also logged, at level alert (`<129>` for `local0`), to the
+/// backend's `log`, before the stream's own line, and the 502 is 87 bytes in `%B`. Measured on
+/// `HAProxy 3.5-dev8-885761-29` on 2026-10-19 (`<129>...: Blocking cacheable cookie in response
+/// from instance b, server s1.` then `<134>...: FE 87 502 PH`).
+#[test]
+fn the_block_is_logged_to_the_backends_log_at_alert_level() {
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp");
+    udp.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+    let log = udp.local_addr().expect("addr");
+    let fe = common::reserve_addr();
+    let text = format!(
+        "defaults\n  mode http\n  timeout connect 1s\n  timeout client 2s\n  timeout server 2s\n\
+         frontend f\n  bind {fe}\n  log {log} local0\n  log-format \"FE %B %ST %ts\"\n  default_backend b\n\
+         backend b\n  option checkcache\n  log {log} local0\n  server s1 {}\n",
+        server()
+    );
+    let mut f = NamedTempFile::new().expect("tmp");
+    f.write_all(text.as_bytes()).expect("write cfg");
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let _ibex = Ibex { child, _cfg: f };
+    assert!(common::wait_listening(fe), "ibex never listened:\n{text}");
+    assert_eq!(ask(fe, "GET", "Cache-Control: max-age=60"), (502, false));
+    let mut lines = Vec::new();
+    while lines.len() < 2 {
+        let mut buf = [0u8; 2048];
+        let n = udp.recv(&mut buf).expect("a log line");
+        let line = String::from_utf8_lossy(&buf[..n]).trim_end().to_string();
+        // The probe `wait_listening` makes is logged too (`FE 0 400 CR`).
+        if !line.ends_with("FE 0 400 CR") {
+            lines.push(line);
+        }
+    }
+    assert!(lines[0].starts_with("<129>") && lines[0].ends_with(": Blocking cacheable cookie in response from instance b, server s1."), "{lines:?}");
+    assert!(lines[1].starts_with("<134>") && lines[1].ends_with(": FE 87 502 PH"), "{lines:?}");
+}

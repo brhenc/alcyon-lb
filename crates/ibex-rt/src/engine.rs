@@ -9508,7 +9508,7 @@ impl EngineDispatcher<'_> {
         if is_h2_owner {
             self.h2_owner_pass(session_idx, now);
         }
-        let (is_done, pending_admin, log_line) = {
+        let (is_done, pending_admin, log_line, checkcache_alert) = {
             let Some(entry) = self.sessions.get_mut(session_idx) else { return Outcome::Done };
             // The glitches the HTTP/2 connection counted since the last pass go to the entries
             // its stream counters track (`glitch_cnt`, `glitch_rate`); while a stream is served,
@@ -9652,6 +9652,14 @@ impl EngineDispatcher<'_> {
             }
 
             let log_line = entry.log_line.take().filter(|_| embryonic_failure(&entry.sess).is_none()).map(|l| (l, entry.log_sd, entry.log_err));
+            // `option checkcache` blocked a response: the alert goes to the backend's loggers,
+            // before the stream's own line (rare: the message is built here, not on the path).
+            let checkcache_alert = std::mem::take(&mut entry.sess.log.checkcache_blocked).then(|| {
+                let srv_idx = entry.target_server_idx.or_else(|| entry.sess.log.server.map(|i| i.get() as usize - 1));
+                let srv = srv_idx.and_then(|i| self.proxies.get(entry.srv_backend_idx)?.server_ids.get(i)).map_or("<dispatch>", String::as_str);
+                let be = self.proxies.get(entry.backend_idx).map_or("", |p| p.name.as_str());
+                (entry.backend_idx, format!("Blocking cacheable cookie in response from instance {be}, server {srv}."))
+            });
 
             // Step 3.6: If in TCP mode and server not yet connected (e.g. deferred on accept-proxy or inspect), connect once ready
             if entry.sess.mode == Mode::Tcp
@@ -9713,11 +9721,14 @@ impl EngineDispatcher<'_> {
                 }
             }
 
-            (entry.sess.is_done(), pending_admin, log_line)
+            (entry.sess.is_done(), pending_admin, log_line, checkcache_alert)
         };
 
         if let Some((fe, line)) = connect_line {
             self.send_log_line(fe, line.as_bytes());
+        }
+        if let Some((be, msg)) = checkcache_alert {
+            self.send_log(be, LogLevel::Alert, b"", msg.as_bytes());
         }
         if let Some((line, sd, err)) = log_line {
             let fe = self.sessions.get(session_idx).map_or(0, |e| e.proxy_idx);
@@ -10495,6 +10506,7 @@ impl EngineDispatcher<'_> {
             {
                 let srv = ctx.srv_name.unwrap_or("<dispatch>");
                 crate::stderr_line!("[ALERT] Blocking cacheable cookie in response from instance {}, server {}.", proxies[be_idx].name, srv);
+                entry.sess.log.checkcache_blocked = true;
                 break 'rules Some(ResStop::Page(502));
             }
 

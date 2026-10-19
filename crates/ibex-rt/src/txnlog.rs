@@ -45,6 +45,9 @@ pub struct StreamLog {
     /// Bytes read from the server for this stream: `%B` counts these (`HAProxy` logs 0
     /// for a response the proxy produced itself).
     pub bytes_from_server: u64,
+    /// `option checkcache` blocked a response: the alert is still to be sent to the backend's
+    /// loggers (`http_process_res_common` logs it at level alert before the stream's line).
+    pub checkcache_blocked: bool,
     /// The request line as received, for `%r` and `%HU`..; set only for a request that
     /// parsed (`txn->uri`), so a refused one logs `<BADREQ>`.
     pub request_line: Option<String>,
@@ -119,6 +122,7 @@ impl StreamLog {
             bytes_in_at_start: bytes_in,
             bytes_out_at_start: bytes_out,
             bytes_from_server: 0,
+            checkcache_blocked: false,
             request_line: None,
             req_captures: Vec::new(),
             res_captures: Vec::new(),
