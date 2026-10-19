@@ -84,6 +84,10 @@ fn exchange(port: u16, data: &[u8]) {
     s.write_all(data).expect("write");
     let mut out = Vec::new();
     let _ = s.read_to_end(&mut out);
+    // The proxy takes a connection off its counts (`%ac`) after it has closed it, so the next
+    // connection can be counted with this one if it comes at once; on a loaded host that
+    // window is not microseconds.
+    thread::sleep(Duration::from_millis(150));
 }
 
 fn get(path: &str) -> Vec<u8> {
@@ -122,8 +126,14 @@ fn run(mode: &str, option_line: &str, traffic: impl FnOnce(u16)) -> Vec<Vec<u8>>
         .expect("spawn ibex");
     let _d = Daemon(child, path);
     assert!(common::wait_listening(format!("127.0.0.1:{port}").parse().expect("addr")), "the daemon never listened");
-    // `wait_listening` connects once: let that connection's line (if any) go, and drop it.
+    // `wait_listening` connects once: that connection's line comes late on a loaded host, so
+    // wait for it (not for a fixed time) and drop it. Some formats log nothing for it, which
+    // costs the whole wait: 3 s, ten times the quiet host's.
+    collector.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+    let _ = collector.recv(&mut [0u8; 65535]);
+    // The line is logged before the connection is taken off the counts (`%ac`): let it go.
     thread::sleep(Duration::from_millis(300));
+    collector.set_read_timeout(Some(Duration::from_millis(400))).expect("timeout");
     while collector.recv(&mut [0u8; 65535]).is_ok() {}
     traffic(port);
     thread::sleep(Duration::from_millis(300));
@@ -375,7 +385,13 @@ fn a_unix_socket_log_target_receives_the_line() {
     let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
     let _d = Daemon(child, path);
     assert!(common::wait_listening(format!("127.0.0.1:{port}").parse().expect("addr")), "the daemon never listened");
+    // The probe connection of `wait_listening` leaves a line of its own: wait for it (it comes
+    // late on a loaded host) so that it is not taken for the request's.
+    collector.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let _ = collector.recv(&mut [0u8; 65535]);
+    // The line is logged before the connection is taken off the counts (`%ac`): let it go.
     thread::sleep(Duration::from_millis(300));
+    collector.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
     while collector.set_nonblocking(true).is_ok() && collector.recv(&mut [0u8; 65535]).is_ok() {}
     collector.set_nonblocking(false).expect("blocking");
     exchange(port, &get("/a"));
@@ -408,7 +424,13 @@ fn an_abstract_unix_target_and_a_shared_one_receive_the_line() {
     let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
     let _d = Daemon(child, path);
     assert!(common::wait_listening(format!("127.0.0.1:{port}").parse().expect("addr")), "the daemon never listened");
+    // The probe connection of `wait_listening` leaves a line of its own: wait for it (it comes
+    // late on a loaded host) so that it is not taken for the request's.
+    collector.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let _ = collector.recv(&mut [0u8; 65535]);
+    // The line is logged before the connection is taken off the counts (`%ac`): let it go.
     thread::sleep(Duration::from_millis(300));
+    collector.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
     collector.set_nonblocking(true).expect("nonblocking");
     while collector.recv(&mut [0u8; 65535]).is_ok() {}
     collector.set_nonblocking(false).expect("blocking");
