@@ -143,6 +143,30 @@ pub struct H1Parser {
     pub header_lines: u16,
     /// The last header line was a `TE` that is not sent on (its continuation lines are not).
     last_dropped: bool,
+    /// The headers of the head so far that the end of the head reads again ([`SEEN_CL`] and
+    /// the others), noted as each line is parsed (T436), as `HAProxy` sets `h1m->flags` in
+    /// `h1_headers_to_hdr_list`: what the head lacks is not looked for in the HTX.
+    seen: u8,
+}
+
+/// A `Content-Length` header was parsed ([`H1Parser`]'s `seen`).
+const SEEN_CL: u8 = 1;
+/// A `Transfer-Encoding` header.
+const SEEN_TE: u8 = 2;
+/// A `Connection` header.
+const SEEN_CONN: u8 = 4;
+/// An `Upgrade` header.
+const SEEN_UPGRADE: u8 = 8;
+
+/// The [`H1Parser`] `seen` bit of a header name.
+fn seen_bit(name: &[u8]) -> u8 {
+    match name.len() {
+        7 if name.eq_ignore_ascii_case(b"upgrade") => SEEN_UPGRADE,
+        10 if name.eq_ignore_ascii_case(b"connection") => SEEN_CONN,
+        14 if name.eq_ignore_ascii_case(b"content-length") => SEEN_CL,
+        17 if name.eq_ignore_ascii_case(b"transfer-encoding") => SEEN_TE,
+        _ => 0,
+    }
 }
 
 /// Header lines a request or response head may carry: `HAProxy`'s `tune.http.maxhdr` (101)
@@ -181,6 +205,7 @@ impl H1Parser {
             accept_unsafe_request: false,
             header_lines: 0,
             last_dropped: false,
+            seen: 0,
         }
     }
 
@@ -197,6 +222,13 @@ impl H1Parser {
         self.head_rewritten = false;
         self.header_lines = 0;
         self.last_dropped = false;
+        self.seen = 0;
+    }
+
+    /// Whether the head had an `Upgrade` header (the parser may have taken it out since).
+    #[must_use]
+    pub fn saw_upgrade(&self) -> bool {
+        self.seen & SEEN_UPGRADE != 0
     }
 
     /// Finalizes parsing on connection close / EOF (for HTTP/1.0 close delimiter fallback).
@@ -470,6 +502,7 @@ impl H1Parser {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "too many header lines"));
             }
             htx.finalize_last_header();
+            self.seen |= seen_bit(name.as_bytes());
             // `TE` is hop-by-hop: `HAProxy` sends on `te: trailers` when a token of it is
             // exactly `trailers`, and nothing otherwise, so that a server that honours `TE`
             // does not compress or chunk for a client that never asked (T286).
@@ -560,10 +593,15 @@ impl H1Parser {
                 }
             }
         }
-        let last_start_line = (0..htx.num_blocks())
-            .rev()
-            .find(|&i| matches!(htx.block_type(i), Some(HtxBlockType::ReqLine | HtxBlockType::ResLine)))
-            .map_or(0, |i| i + 1);
+        // Without a `Content-Length` line the loop below has nothing to read.
+        let last_start_line = if self.seen & SEEN_CL == 0 {
+            htx.num_blocks()
+        } else {
+            (0..htx.num_blocks())
+                .rev()
+                .find(|&i| matches!(htx.block_type(i), Some(HtxBlockType::ReqLine | HtxBlockType::ResLine)))
+                .map_or(0, |i| i + 1)
+        };
 
         let mut seen_cl: Option<usize> = None;
         let mut first_cl_idx: Option<usize> = None;
@@ -679,10 +717,14 @@ impl H1Parser {
         // read the way HAProxy's `h1_parse_xfer_enc_header` reads it: reading only the
         // first line framed `gzip` + `chunked` on two lines as a request without a body,
         // while the next hop read a chunked one (tasks/T276, V&V VV-1).
-        let te = TransferCodings::of(
-            htx.as_ref().header_blocks_where(|n| n.eq_ignore_ascii_case(b"transfer-encoding")).map(|(_, n, v)| (n, v)),
-            self.is_response,
-        );
+        let te = if self.seen & SEEN_TE == 0 {
+            TransferCodings::default()
+        } else {
+            TransferCodings::of(
+                htx.as_ref().header_blocks_where(|n| n.eq_ignore_ascii_case(b"transfer-encoding")).map(|(_, n, v)| (n, v)),
+                self.is_response,
+            )
+        };
         if te.invalid {
             self.phase = H1Phase::Error;
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid Transfer-Encoding"));
@@ -740,11 +782,12 @@ impl H1Parser {
             }
         }
 
-        if !self.is_response {
+        // Without an `Upgrade` line there is nothing to check or clean.
+        if !self.is_response && self.seen & SEEN_UPGRADE != 0 {
             self.check_upgrade(htx)?;
         }
 
-        if let Some(conn) = htx.get_header("connection") {
+        if let Some(conn) = (self.seen & SEEN_CONN != 0).then(|| htx.get_header("connection")).flatten() {
             if conn.eq_ignore_ascii_case("close") {
                 self.connection_close = true;
             } else if conn.eq_ignore_ascii_case("keep-alive") {
@@ -757,7 +800,7 @@ impl H1Parser {
         if is_connect {
             self.is_upgrade = true;
         }
-        if htx.get_header("upgrade").is_some() {
+        if self.seen & SEEN_UPGRADE != 0 && htx.get_header("upgrade").is_some() {
             self.is_upgrade = true;
         }
 

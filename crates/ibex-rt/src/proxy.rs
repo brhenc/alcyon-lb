@@ -1945,6 +1945,7 @@ impl TcpSession {
         let mut slice = ibex_proto::htx::HtxSlice::new(raw);
         stream.parse(&self.req.readable()[..head_len], &mut slice)?;
         let mut close = stream.connection_close();
+        let head_rewritten = stream.head_rewritten();
         // `Content-Length` beside `Transfer-Encoding`: forwarded as HAProxy does
         // (`src/h1.c`, `h1_parse_msg_hdrs`, "T-E + C-L: force close and remove C-L"). The
         // chunked encoding frames the body, the `Content-Length` is removed so no next hop
@@ -1958,10 +1959,15 @@ impl TcpSession {
         }
         // The websocket handshake, for the response (T281): a key written when the request
         // has none and the frontend accepts that (`h1_process_mux`).
-        let (ws, written) = crate::websocket::ReqWs::of(
-            slice.as_ref().header_blocks_where(crate::websocket::ReqWs::reads).map(|(_, n, v)| (n, v)),
-            self.accept_unsafe_request,
-        );
+        // Without an `Upgrade` line the request asks for nothing (T436: not looked for).
+        let (ws, written) = if h1_parser.saw_upgrade() {
+            crate::websocket::ReqWs::of(
+                slice.as_ref().header_blocks_where(crate::websocket::ReqWs::reads).map(|(_, n, v)| (n, v)),
+                self.accept_unsafe_request,
+            )
+        } else {
+            (crate::websocket::ReqWs::default(), None)
+        };
         let key_written = written.is_some_and(|k| slice.add_header("sec-websocket-key", &k).is_ok());
         self.req_ws = (ws != crate::websocket::ReqWs::default()).then(|| Box::new(ws));
         self.htx_tail = slice.tail_addr();
@@ -1969,7 +1975,7 @@ impl TcpSession {
         self.has_htx = true;
         // Modified, so the head forwarded is regenerated from the HTX, without it. So
         // too when the parser normalised the authority and `Host` (tasks/T93).
-        self.htx_modified = conflict || key_written || stream.head_rewritten();
+        self.htx_modified = conflict || key_written || head_rewritten;
         Ok(close)
     }
 
@@ -2353,7 +2359,12 @@ impl TcpSession {
                 // HAProxy answers 431 (tasks/T87; `txn::htx_head_cost_and_size`).
                 // What `%U` counts of this head: the message as received, whatever the
                 // rules make of it afterwards.
-                let (cost, req_htx) = txn::htx_head_cost_and_size(&self.req.readable()[..total_hdr_len]);
+                // Read once for what the proxy reads of this head before its rules run (T436).
+                let facts = txn::HeadFacts::scan(&self.req.readable()[..total_hdr_len], true);
+                let (cost, req_htx) = match facts {
+                    Some(f) => (f.cost(), Some(f.size)),
+                    None => txn::htx_head_cost_and_size(&self.req.readable()[..total_hdr_len]),
+                };
                 if cost > threshold {
                     self.fail_request(431);
                     return Ok(true);
@@ -2397,17 +2408,21 @@ impl TcpSession {
                         // The values of the `Connection` headers, the names compared as bytes
                         // (T433: `headers()` read every name and value as UTF-8, twice).
                         let connection = || htx.header_blocks_where(|n| n.eq_ignore_ascii_case(b"connection")).map(|(_, _, v)| v);
+                        // What the head's facts say of them, read before it was parsed: the
+                        // parser edits no `Connection` line of a head they are read from.
+                        let conn_tokens = facts.map(|f| (f.conn_close, f.conn_keep_alive));
+                        debug_assert!(conn_tokens.is_none_or(|t| t == (connection().any(|v| txn::connection_has(v, "close")), connection().any(|v| txn::connection_has(v, "keep-alive")))));
                         if let Some(req) = htx.req_line() {
                             // Copied into the session's own buffers: no allocation once warm.
                             self.req_method.set(req.method);
                             self.req_uri.set(req.uri);
                             if req.version == "HTTP/1.0"
-                                && !connection().any(|v| txn::connection_has(v, "keep-alive"))
+                                && !conn_tokens.map_or_else(|| connection().any(|v| txn::connection_has(v, "keep-alive")), |t| t.1)
                             {
                                 conn_close = true;
                             }
                         }
-                        if connection().any(|v| txn::connection_has(v, "close")) {
+                        if conn_tokens.map_or_else(|| connection().any(|v| txn::connection_has(v, "close")), |t| t.0) {
                             conn_close = true;
                         }
                         let wire_replacement = if self.htx_modified {
@@ -2495,8 +2510,18 @@ impl TcpSession {
 
                 // The head may have been rewritten above; its framing is read from what
                 // will be forwarded.
-                let framing = self.req.eoh()
-                    .map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e]));
+                // Its facts still answer when it was regenerated from the HTX: the parser keeps
+                // what frames the body (a `Content-Length` beside `Transfer-Encoding` goes, and
+                // the request is chunked either way). Not when `reqrep` rules rewrote it.
+                let framing = match facts.and_then(|f| f.framing) {
+                    Some(f) if self.cliexp.is_empty() => f,
+                    _ => self.req.eoh().map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e])),
+                };
+                debug_assert_eq!(
+                    framing,
+                    self.req.eoh().map_or(txn::Framing::None, |(h, e)| txn::request_framing(&self.req.readable()[..h + e])),
+                    "request framing from stale facts"
+                );
                 // The chunked body already received with the head is checked before any of
                 // the request is forwarded: HAProxy parses what is in its buffer into HTX
                 // first, and answers a malformed chunk with 400 without contacting the

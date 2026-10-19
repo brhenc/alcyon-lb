@@ -981,17 +981,26 @@ fn request_framing_general(head: &[u8]) -> Framing {
 /// How a response body is framed, from its head and the request it answers.
 #[must_use]
 pub fn response_framing(head: &str, req_method: Option<&str>, status: u16) -> Framing {
-    let is = |m: &str| req_method.is_some_and(|r| r.eq_ignore_ascii_case(m));
-    if status == 101 || (is("CONNECT") && (200..300).contains(&status)) {
-        return Framing::Tunnel;
-    }
-    if is("HEAD") || (100..200).contains(&status) || status == 204 || status == 304 {
-        return Framing::None;
+    if let Some(f) = response_framing_before_fields(req_method, status) {
+        return f;
     }
     match framing_fields(head.as_bytes()) {
         Some(f) => response_body_framing(f.te(), f.cl()),
         None => response_framing_general(head),
     }
+}
+
+/// The framing of a response its status or its request's method settles, whatever its
+/// headers say.
+fn response_framing_before_fields(req_method: Option<&str>, status: u16) -> Option<Framing> {
+    let is = |m: &str| req_method.is_some_and(|r| r.eq_ignore_ascii_case(m));
+    if status == 101 || (is("CONNECT") && (200..300).contains(&status)) {
+        return Some(Framing::Tunnel);
+    }
+    if is("HEAD") || (100..200).contains(&status) || status == 204 || status == 304 {
+        return Some(Framing::None);
+    }
+    None
 }
 
 /// [`response_body_framing`] read through [`fields`], for any head.
@@ -1243,7 +1252,7 @@ pub fn connection_is_plain(value: &str) -> bool {
 }
 
 /// The `Connection` headers of a head, found without copying it.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ConnScan {
     /// How many there are.
     pub count: usize,
@@ -1407,9 +1416,193 @@ fn head_cost(head: &[u8], request: bool) -> usize {
     htx_head_cost_and_size_of(head, request).0
 }
 
+/// What the proxy needs to know of a message head, read in one walk over its lines (T436),
+/// the way `HAProxy`'s `h1_headers_to_hdr_list` records `h1m->flags` as it parses: every
+/// reading below gave its own pass over the head before (`htx_head_size`, `head_wants_close`,
+/// `request_framing` / `response_framing`, `scan_connection`), five in all with `find_eoh`.
+///
+/// Read only from an ASCII head whose lines are all plain `name: value` lines up to the blank
+/// line that ends it: no fold, no line without a colon, no blank around a name, nothing after
+/// the blank line. On such a head every one of those readings splits the lines the same way,
+/// so each fact here is what its own reading gives ([`HeadFacts::scan`] checks that in debug
+/// builds); any other head is `None`, and the caller reads it the old way.
+///
+/// The facts are of the head as scanned: a caller that edits the head (a rule, a rewrite)
+/// before it reads one of them reads the head again instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadFacts {
+    /// [`htx_head_size`].
+    pub size: u64,
+    /// The header blocks the head keeps in HTX (for [`htx_head_cost_and_size`]).
+    pub headers: usize,
+    /// A `Connection` header lists `close`.
+    pub conn_close: bool,
+    /// A `Connection` header lists `keep-alive`.
+    pub conn_keep_alive: bool,
+    /// The start line holds `HTTP/1.0` (what [`head_wants_close`] looks for).
+    pub http10: bool,
+    /// [`scan_connection`].
+    pub conn: ConnScan,
+    /// The body framing `Transfer-Encoding` and `Content-Length` give ([`request_framing`],
+    /// or [`response_framing`] past its status and method cases); `None` with more than four
+    /// lines of either, which the general reading takes.
+    pub framing: Option<Framing>,
+}
+
+impl HeadFacts {
+    /// The facts of `head` (start line through the blank line), a request head or a response
+    /// head; `None` for a head they are not read from (see [`HeadFacts`]).
+    #[must_use]
+    pub fn scan(head: &[u8], request: bool) -> Option<Self> {
+        let facts = Self::scan_plain(head, request);
+        #[cfg(debug_assertions)]
+        if let Some(f) = facts {
+            f.check(head, request);
+        }
+        facts
+    }
+
+    fn scan_plain(head: &[u8], request: bool) -> Option<Self> {
+        if !head.is_ascii() {
+            return None;
+        }
+        let nl = memchr::memchr(b'\n', head)?;
+        let first_raw = &head[..nl];
+        let first = first_raw.strip_suffix(b"\r").unwrap_or(first_raw);
+        let strings = if request {
+            let sp = first.iter().position(|&b| b == b' ')?;
+            let (method, rest) = (&first[..sp], &first[sp + 1..]);
+            let (target, version) = rest.iter().rposition(|&b| b == b' ').map_or((rest, &b""[..]), |v| (&rest[..v], &rest[v + 1..]));
+            method.len() + ascii_trim(target).len() + ascii_trim(version).len()
+        } else {
+            let (version, rest) = first.iter().position(|&b| b == b' ').map_or((first, &b""[..]), |sp| (&first[..sp], &first[sp + 1..]));
+            let rest = ascii_trim_start(rest);
+            let (status, reason) = rest.split_at(rest.len().min(3));
+            version.len() + status.len() + ascii_trim(reason).len()
+        };
+        let mut f = HeadFacts {
+            size: 20 + strings as u64 + 1,
+            headers: 0,
+            conn_close: false,
+            conn_keep_alive: false,
+            http10: first_raw.windows(8).any(|w| w == b"HTTP/1.0"),
+            conn: ConnScan { plain: true, ..ConnScan::default() },
+            framing: None,
+        };
+        let mut ff = FramingFields { te: [""; 4], n_te: 0, cl: [""; 4], n_cl: 0 };
+        let mut many = false;
+        let mut at = nl + 1;
+        loop {
+            let end = at + memchr::memchr(b'\n', &head[at..])?;
+            let raw = &head[at..end];
+            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+            let next = end + 1;
+            if line.is_empty() {
+                if next != head.len() {
+                    return None; // more after the blank line
+                }
+                break;
+            }
+            let colon = memchr::memchr(b':', line)?;
+            let name = &line[..colon];
+            if name.first().is_none_or(|&b| ws(b)) || name.last().is_some_and(|&b| ws(b)) {
+                return None; // a fold, or blanks around the name
+            }
+            let value = ascii_trim(&line[colon + 1..]);
+            f.headers += 1;
+            let mut len = value.len();
+            if name.len() == 10 && name.eq_ignore_ascii_case(b"connection") {
+                if f.conn.count == 0 {
+                    f.conn.first = (at, next);
+                }
+                f.conn.count += 1;
+                let (mut kept, mut chars, mut dropped) = (0, 0, false);
+                for t in value.split(|&b| b == b',').map(ascii_trim).filter(|t| !t.is_empty()) {
+                    let close = t.eq_ignore_ascii_case(b"close");
+                    let keep_alive = t.eq_ignore_ascii_case(b"keep-alive");
+                    f.conn_close |= close;
+                    f.conn_keep_alive |= keep_alive;
+                    f.conn.plain &= close || keep_alive;
+                    if close || keep_alive || t.eq_ignore_ascii_case(b"upgrade") {
+                        dropped = true;
+                    } else {
+                        kept += 1;
+                        chars += t.len();
+                    }
+                }
+                if dropped && kept == 0 {
+                    // Gone from the HTX message: no block, no data.
+                    f.headers -= 1;
+                    at = next;
+                    continue;
+                }
+                if dropped {
+                    len = chars + kept - 1;
+                }
+            } else if name.len() == 14 && name.eq_ignore_ascii_case(b"content-length") {
+                let v = std::str::from_utf8(value).unwrap_or_default();
+                match ff.cl.get_mut(ff.n_cl) {
+                    Some(slot) => *slot = v,
+                    None => many = true,
+                }
+                ff.n_cl += 1;
+            } else if name.len() == 17 && name.eq_ignore_ascii_case(b"transfer-encoding") {
+                let v = std::str::from_utf8(value).unwrap_or_default();
+                match ff.te.get_mut(ff.n_te) {
+                    Some(slot) => *slot = v,
+                    None => many = true,
+                }
+                ff.n_te += 1;
+            }
+            f.size += (name.len() + len) as u64;
+            at = next;
+        }
+        if !many {
+            f.framing = Some(if request { request_framing_of(ff.te(), ff.cl()) } else { response_body_framing(ff.te(), ff.cl()) });
+        }
+        Some(f)
+    }
+
+    /// The facts against the readings they stand for, each of which reads the head again.
+    #[cfg(debug_assertions)]
+    fn check(&self, head: &[u8], request: bool) {
+        let text = String::from_utf8_lossy(head);
+        debug_assert_eq!(Some(self.size), htx_head_size_general(head, request), "size of {text:?}");
+        debug_assert_eq!(self.cost(), head_cost_of(head, Some(self.size)), "cost of {text:?}");
+        debug_assert_eq!(self.wants_close(), head_wants_close_general(&text), "close of {text:?}");
+        debug_assert_eq!(self.conn, scan_connection(head), "Connection of {text:?}");
+        if let Some(framing) = self.framing {
+            let general = if request { request_framing_general(head) } else { response_framing_general(&text) };
+            debug_assert_eq!(framing, general, "framing of {text:?}");
+        }
+    }
+
+    /// What the head takes of the buffer once in HTX ([`htx_head_cost_and_size`]).
+    #[must_use]
+    pub fn cost(&self) -> usize {
+        cost_of(usize::try_from(self.size).unwrap_or(usize::MAX), self.headers)
+    }
+
+    /// [`head_wants_close`].
+    #[must_use]
+    pub fn wants_close(&self) -> bool {
+        self.conn_close || (self.http10 && !self.conn_keep_alive)
+    }
+
+    /// [`response_framing`] of the response head these are the facts of, `None` when the
+    /// general reading has to say.
+    #[must_use]
+    pub fn response_framing(&self, req_method: Option<&str>, status: u16) -> Option<Framing> {
+        response_framing_before_fields(req_method, status).or(self.framing)
+    }
+}
+
 /// [`head_cost`] and [`htx_head_size`] of a head: an ASCII head in one walk over its lines
 /// (T433: the block count re-split every line the size had split), any other on its own.
 fn htx_head_cost_and_size_of(head: &[u8], request: bool) -> (usize, Option<u64>) {
+    if let Some(f) = HeadFacts::scan(head, request) {
+        return (f.cost(), Some(f.size));
+    }
     if head.is_ascii() {
         if let Some((size, headers)) = htx_head_size_and_headers_ascii(head, request) {
             return (cost_of(usize::try_from(size).unwrap_or(usize::MAX), headers), Some(size));
@@ -2245,6 +2438,7 @@ mod tests {
             "Connection: close\r\r\n", "Upgrade:websocket\r\n", "\r\nConnection: close\r\n", "\nX: 1\r\n",
             "Connection:keep-alive\u{a0}\r\n", "Connection: \u{85}close\r\n", "X-\u{e9}: v\r\n",
         ];
+        let mut scanned = 0;
         for st in starts {
             for a in lines {
                 for b in lines {
@@ -2254,6 +2448,13 @@ mod tests {
                         assert_eq!(htx_head_size(h, request), htx_head_size_general(h, request), "{head:?} {request}");
                     }
                     assert_eq!(head_wants_close(&head), head_wants_close_general(&head), "{head:?}");
+                    // T436: the one-pass facts check themselves against these readings.
+                    for request in [true, false] {
+                        if let Some(f) = HeadFacts::scan(h, request) {
+                            assert_eq!(f.wants_close(), head_wants_close_general(&head), "{head:?}");
+                            scanned += 1;
+                        }
+                    }
                     for v in [a, b] {
                         let v = v.split_once(':').map_or(v, |(_, v)| v);
                         let general = v.split(',').map(str::trim).all(|t| t.is_empty() || t.eq_ignore_ascii_case("keep-alive") || t.eq_ignore_ascii_case("close"));
@@ -2262,6 +2463,7 @@ mod tests {
                 }
             }
         }
+        assert!(scanned > 1000, "the facts were read from {scanned} heads only");
     }
 
     /// The one-pass reading of the framing fields gives what the general one gives, on the
@@ -2285,6 +2487,13 @@ mod tests {
                 assert_eq!(request_framing(req.as_bytes()), request_framing_general(req.as_bytes()), "{req:?}");
                 let rsp = format!("HTTP/1.1 200 OK\r\n{a}{b}\r\n");
                 assert_eq!(response_framing(&rsp, Some("GET"), 200), response_body_framing(fields(&rsp), fields(&rsp)), "{rsp:?}");
+                if let Some(f) = HeadFacts::scan(req.as_bytes(), true) {
+                    assert_eq!(f.framing.unwrap_or_else(|| request_framing_general(req.as_bytes())), request_framing(req.as_bytes()), "{req:?}");
+                }
+                if let Some(f) = HeadFacts::scan(rsp.as_bytes(), false) {
+                    assert_eq!(f.response_framing(Some("GET"), 200).unwrap_or_else(|| response_framing_general(&rsp)), response_framing(&rsp, Some("GET"), 200), "{rsp:?}");
+                    assert_eq!(f.response_framing(Some("HEAD"), 200), Some(Framing::None));
+                }
             }
         }
         // Not UTF-8: read lossily, as before.
