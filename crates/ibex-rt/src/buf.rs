@@ -416,6 +416,17 @@ fn alloc_large() -> Box<[u8]> {
 /// The `lo` value when no descriptors were written.
 const NO_LO: u32 = u32::MAX;
 
+/// Zeroes `0..hwm` and `lo..` of `data` (see `Buf`'s `hwm` and `lo`).
+fn wipe_marked(data: &mut [u8], hwm: u32, lo: u32) {
+    let n = (hwm as usize).min(data.len());
+    if n > 0 {
+        ibex_alloc::wipe(&mut data[..n]);
+    }
+    if (lo as usize) < data.len() {
+        ibex_alloc::wipe(&mut data[(lo as usize).max(n)..]);
+    }
+}
+
 /// An offset as kept in the high-water marks (4 bytes each, the buffers being far smaller):
 /// one that does not fit is `u32::MAX`, which zeroes to the end, never too little.
 fn to_mark(v: usize) -> u32 {
@@ -568,13 +579,7 @@ impl Buf {
     /// Zeroes the bytes that were written (`0..hwm`) when `tune.ibex.zero-buffers` is on.
     #[inline]
     fn wipe_used(&mut self) {
-        let n = (self.hwm as usize).min(self.data.len());
-        if n > 0 {
-            ibex_alloc::wipe(&mut self.data[..n]);
-        }
-        if (self.lo as usize) < self.data.len() {
-            ibex_alloc::wipe(&mut self.data[(self.lo as usize).max(n)..]);
-        }
+        wipe_marked(&mut self.data, self.hwm, self.lo);
         self.hwm = 0;
         self.lo = NO_LO;
     }
@@ -754,11 +759,7 @@ impl Buf {
             new_data[..self.len].copy_from_slice(valid);
         }
         let mut old_small = std::mem::replace(&mut self.data, new_data);
-        let n = (self.hwm as usize).min(old_small.len());
-        ibex_alloc::wipe(&mut old_small[..n]);
-        if (self.lo as usize) < old_small.len() {
-            ibex_alloc::wipe(&mut old_small[(self.lo as usize).max(n)..]);
-        }
+        wipe_marked(&mut old_small, self.hwm, self.lo);
         self.lo = NO_LO;
         self.hwm = to_mark(self.len);
         self.head = 0;

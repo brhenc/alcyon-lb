@@ -110,3 +110,22 @@ fn an_htx_buffer_is_zeroed_at_both_ends_when_released() {
     assert_eq!(&b.raw_slice()[100..104], b"lost");
     ibex_alloc::set_zero_buffers(true);
 }
+
+/// A small buffer promoted to standard hands its memory to the small pool zeroed, the HTX
+/// descriptors at its end included.
+#[test]
+fn a_promoted_small_buffer_is_zeroed_before_it_is_pooled() {
+    let _turn = SETTING.lock().unwrap();
+    ibex_rt::buf::init_buffer_sizes(16_384, 1_024, None);
+    ibex_alloc::set_zero_buffers(true);
+    let mut b = Buf::small();
+    let cap = b.capacity();
+    let raw = b.htx_slice_mut();
+    raw[..6].copy_from_slice(b"secret");
+    raw[cap - 5..].copy_from_slice(b"desc!");
+    b.note_htx(6, 5);
+    assert!(b.put(b"x"));
+    assert!(b.promote_to_standard());
+    let small = Buf::small(); // the memory the promotion gave back
+    assert!(small.raw_slice().iter().all(|&x| x == 0));
+}
