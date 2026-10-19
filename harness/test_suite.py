@@ -80,6 +80,58 @@ test sixty ... FAILED
                           "request_allocations": {"sixty"}})
 
 
+class FailureText(unittest.TestCase):
+    """The assertion message of a failing test survives into the log, flaky or not."""
+
+    FAILED = ("running 1 test\ntest m::t ... FAILED\n\nfailures:\n\n---- m::t stdout ----\n"
+              "some output\nthread 'm::t' panicked at tests/it/m.rs:42:9:\n"
+              "assertion `left == right` failed: age grows\n  left: 1\n right: 2\n"
+              "note: run with `RUST_BACKTRACE=1`\n\nfailures:\n    m::t\n\n"
+              "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n")
+
+    def test_the_block_runs_from_the_header_to_the_panic_message(self):
+        ex = suite.failure_excerpt(self.FAILED)
+        self.assertIn("---- m::t stdout ----", ex)
+        self.assertIn("panicked at tests/it/m.rs:42:9", ex)
+        self.assertIn("age grows", ex)
+        self.assertNotIn("running 1 test", ex)
+
+    def test_a_long_block_keeps_its_last_lines(self):
+        out = "---- m::t stdout ----\n" + "".join(f"line {i}\n" for i in range(500)) + "panicked at x\n"
+        ex = suite.failure_excerpt(out, 60).splitlines()
+        self.assertLessEqual(len(ex), 61)
+        self.assertIn("panicked at x", ex[-1])
+        self.assertIn("line 499", ex[-2])
+
+    def test_output_without_a_block_keeps_its_tail(self):
+        self.assertIn("boom", suite.failure_excerpt("a\nb\nSIGSEGV boom\n"))
+
+    def test_a_flaky_verdict_is_followed_by_the_parallel_failure_text(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        job = ("ibex-rt", "lib", "m::t", ["/fake/bin"], "/", None)
+        out = io.StringIO()
+        with mock.patch.object(suite, "BASELINE", "/nonexistent.json"), \
+                mock.patch.object(suite, "instrument", return_value=None), \
+                mock.patch.object(suite, "run_parallel", return_value=([job], {"lib": {"m::t"}}, 10, 1)), \
+                mock.patch.dict(suite.FAILURE_TEXT, {"ibex-rt/lib::m::t": suite.failure_excerpt(self.FAILED)}, clear=True), \
+                mock.patch.object(suite, "confirm_cmd", return_value=(set(), 0)), \
+                mock.patch.dict(os.environ, {"SUITE_SERIAL": "0"}), redirect_stdout(out):
+            suite.main()
+        text = out.getvalue()
+        self.assertLess(text.index("passes alone"), text.index("age grows"))
+
+    def test_a_failing_rerun_attempt_prints_its_block(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        out = io.StringIO()
+        with mock.patch.object(suite, "run_bounded", return_value=(101, self.FAILED)), redirect_stdout(out):
+            suite.confirm_cmd(["/fake/bin"], 2, "/", None, "m::t")
+        self.assertEqual(out.getvalue().count("age grows"), 2, out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
 

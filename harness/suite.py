@@ -181,6 +181,31 @@ def listed_tests(listed: str, ignored: str) -> list[str]:
     return [n for n in names(listed) if n not in skip]
 
 
+EXCERPT_LINES = 60
+# The failure text of each test that failed in the parallel run, keyed `pkg/target::test`;
+# `main` prints it under the verdict, since a flaky verdict alone says nothing of what failed.
+FAILURE_TEXT: dict[str, str] = {}
+
+
+def failure_excerpt(out: str, limit: int = EXCERPT_LINES) -> str:
+    """The failure block of one test's output: libtest's `---- <test> stdout ----` section
+    (output, panic location, assertion message) up to the `failures:` summary, or the whole
+    output when there is no such section (a crash, a timeout). At most the last `limit` lines."""
+    lines = out.splitlines()
+    start = next((i for i, ln in enumerate(lines) if ln.startswith("---- ") and ln.endswith(" ----")), 0)
+    end = next((i for i in range(start + 1, len(lines)) if lines[i] == "failures:"), len(lines))
+    block = [ln for ln in lines[start:end]]
+    while block and not block[-1].strip():
+        block.pop()
+    if len(block) > limit:
+        block = [f"[... {len(block) - limit} earlier lines cut]"] + block[-limit:]
+    return "\n".join(block)
+
+
+def indented(text: str) -> str:
+    return "".join(f"\n      {ln[:300]}" for ln in text.splitlines())
+
+
 def test_verdict(rc: int, out: str) -> str:
     """One test's process: "ok", "failed", "hung" (killed after `TARGET_TIMEOUT`), or "not
     run" -- `--exact <name>` matching nothing runs nothing and exits 0, and counting that as a
@@ -381,6 +406,7 @@ def run_parallel(doc: bool = True) -> tuple[list[tuple], dict[str, set[str]], in
             continue
         failed_n += 1
         failing.append(job)
+        FAILURE_TEXT[key(job)] = failure_excerpt(out)
         if verdict != "failed":
             say(f"   {key(job)}: {verdict}")
         # `<hung>` beside the name: covercheck fails on a hung test (its profile is lost).
@@ -452,18 +478,14 @@ def confirm_cmd(cmd: list[str], runs: int, cwd: str = REPO, env: dict | None = N
     failing."""
     failed: set[str] = set()
     bad_runs = 0
-    for _ in range(runs):
+    for attempt in range(runs):
         rc, out = run_bounded(cmd, cwd, env)
         if test is not None:
             verdict = test_verdict(rc, out)
             if verdict != "ok":
                 bad_runs += 1
-                if test not in failed:
-                    # The first failure's message, so a red gate says what failed.
-                    why = [ln.strip() for ln in out.splitlines()
-                           if "panicked at" in ln or ln.lstrip().startswith(("left:", "right:"))
-                           or "assertion" in ln][:4]
-                    say(f"   {test}: {verdict} alone" + "".join(f"\n      {w[:300]}" for w in why))
+                # Every failing attempt's message, so a red or flaky gate says what failed.
+                say(f"   {test}: {verdict} alone (attempt {attempt + 1}/{runs})" + indented(failure_excerpt(out)))
                 failed.add(test)
             continue
         if rc == -9:
@@ -557,7 +579,7 @@ def main() -> int:
         for name in sorted(only_parallel):
             flaky[f"{pkg}/{target}::{name}"] = ""
             print(f"   {pkg}/{target}::{name}: failed in the parallel run, passes alone "
-                  f"{runs}/{runs} -- flaky")
+                  f"{runs}/{runs} -- flaky" + indented(FAILURE_TEXT.get(f"{pkg}/{target}::{name}", "")))
 
     new = sorted(k for k in confirmed if k not in base)
     new_flaky = sorted(k for k in flaky if k not in base_flaky and k not in base)
