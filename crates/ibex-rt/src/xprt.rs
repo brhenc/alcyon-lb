@@ -169,7 +169,7 @@ impl ibex_tls::conn::TlsInput for TlsRx {
 
 /// One read of the socket: what came, and whether the socket was left empty.
 enum Read1 {
-    Bytes(usize),
+    Bytes,
     WouldBlock,
     End,
 }
@@ -311,11 +311,10 @@ impl TlsConn {
     fn flush(&mut self, fd: BorrowedFd<'_>) -> io::Result<()> {
         while self.ctx.wants_write() {
             match raw::send(fd, self.ctx.pending_tx())? {
-                Io::Done(0) | Io::WouldBlock => return Ok(()),
+                // Nothing left to write to (`Closed`, `Eof`): the read side reports how the
+                // stream ended; failing here would mask a truncation behind a write error.
+                Io::Done(0) | Io::WouldBlock | Io::Closed | Io::Eof => return Ok(()),
                 Io::Done(n) => self.ctx.tx_done(n),
-                // Nothing left to write to. The read side reports how the stream ended;
-                // failing here would mask a truncation behind a write error.
-                Io::Closed | Io::Eof => return Ok(()),
             }
         }
         Ok(())
@@ -347,7 +346,7 @@ impl TlsConn {
                 self.rx.buf.commit(n);
                 self.rx_total += n;
                 self.sock_drained = n < room;
-                Read1::Bytes(n)
+                Read1::Bytes
             }
             Io::WouldBlock => {
                 self.sock_drained = true;
@@ -404,7 +403,7 @@ impl TlsConn {
                 return Ok(true);
             }
             match self.read_once(fd)? {
-                Read1::Bytes(_) => {
+                Read1::Bytes => {
                     if self.ctx.awaiting_hello() {
                         if let Some(e) = self.refuse_old_legacy_version(fd) {
                             return Err(e);
@@ -552,7 +551,7 @@ impl TlsConn {
                 return Ok(Io::WouldBlock);
             }
             match self.read_once(fd)? {
-                Read1::Bytes(_) => short = self.sock_drained,
+                Read1::Bytes => short = self.sock_drained,
                 Read1::WouldBlock => return Ok(Io::WouldBlock),
                 Read1::End => open = false,
             }
@@ -1021,6 +1020,8 @@ impl std::fmt::Debug for ServerXprt {
 /// to report here: a session that did not come up is a transport already marked failed,
 /// and the first handshake step reports it as every other handshake failure -- a connect
 /// failure that `HAProxy` retries and answers 503 `SC` for.
+// The config is only borrowed by the session setup, but every caller holds a clone to hand over.
+#[allow(clippy::needless_pass_by_value)]
 pub fn connect_tls(
     fd: &impl AsRawFd,
     config: std::sync::Arc<rustls24::ClientConfig>,

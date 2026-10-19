@@ -95,6 +95,7 @@ impl std::fmt::Debug for Session {
 }
 
 /// A TLS session over TCP and what it learned: the runtime's per-connection TLS state.
+#[allow(clippy::struct_excessive_bools)] // independent connection flags
 #[derive(Debug)]
 pub struct TlsCtx {
     /// `None` once the session failed or was closed.
