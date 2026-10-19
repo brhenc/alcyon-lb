@@ -129,7 +129,12 @@ fn run(reset: bool) -> (Vec<String>, Stats, Stats) {
     let ibex = Ibex { child, sock };
     assert!(common::wait_listening(fe), "ibex never listened");
     let _ = std::fs::remove_file(&path);
-    thread::sleep(Duration::from_millis(100));
+    // The probe is counted when the proxy has dealt with it, which it logs: wait for that line
+    // (on a loaded host it takes far longer than 100 ms) before the first snapshot.
+    let mut probe_line = [0u8; 2048];
+    collector.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let _ = collector.recv(&mut probe_line);
+    collector.set_read_timeout(Some(Duration::from_millis(100))).expect("timeout");
     let before = stats(&ibex.sock);
 
     let mut c = TcpStream::connect(fe).expect("connect");
