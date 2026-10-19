@@ -669,6 +669,10 @@ pub struct ConvDesc {
 }
 
 pub type MultiFetchFn = fn(&SampleContext, &[String]) -> Vec<Sample>;
+/// A [`MultiFetchFn`] that hands each sample to its caller as it is found, with no list: the
+/// caller returns false to stop (T437). Registered next to the list form for the fetches an
+/// ACL iterates on most (the headers).
+pub type VisitFetchFn = fn(&SampleContext, &[String], &mut dyn FnMut(Sample) -> bool);
 
 /// Central registry of sample fetches and converters.
 pub struct Registry {
@@ -676,6 +680,7 @@ pub struct Registry {
     converters: HashMap<&'static str, ConvDesc>,
     ctx_converters: HashMap<&'static str, CtxConvDesc>,
     multi_fetches: HashMap<&'static str, MultiFetchFn>,
+    multi_visits: HashMap<&'static str, VisitFetchFn>,
 }
 
 fn resolve_int_arg(arg: &str) -> Option<i64> {
@@ -1205,6 +1210,7 @@ impl Registry {
             converters: HashMap::new(),
             ctx_converters: HashMap::new(),
             multi_fetches: HashMap::new(),
+            multi_visits: HashMap::new(),
         };
         r.register_builtin_fetches();
         r.register_builtin_converters();
@@ -1645,7 +1651,7 @@ impl Registry {
                 // `http_parse_path`: a target that is neither an absolute path nor an
                 // absolute URI (`*`, `host:port`, what `replace-path a Y` leaves) has none.
                 let path = http_parse_path(get_context_uri(ctx)?, get_context_method(ctx) == Some("OPTIONS"))?;
-                Some(Sample::Str(path.split('?').next().unwrap_or_default().to_string()))
+                Some(Sample::Str(crate::spare::string_from(path.split('?').next().unwrap_or_default())))
             },
         });
 
@@ -1654,13 +1660,13 @@ impl Registry {
             out_type: SampleType::Str,
             func: |ctx, _args| {
                 let path = http_parse_path(get_context_uri(ctx)?, get_context_method(ctx) == Some("OPTIONS"))?;
-                Some(Sample::Str(path.to_string()))
+                Some(Sample::Str(crate::spare::string_from(path)))
             },
         });
 
         let url_fetch: FetchFn = |ctx, _args| {
             let uri = get_context_uri(ctx)?;
-            Some(Sample::Str(uri.to_string()))
+            Some(Sample::Str(crate::spare::string_from(uri)))
         };
         self.register_fetch(FetchDesc {
             name: "url",
@@ -1988,6 +1994,10 @@ impl Registry {
             |ctx, args| header_one(ctx, args, false, true).map(Sample::Str),
             |ctx, args| header_all(ctx, args, false, true).into_iter().map(Sample::Str).collect(),
         );
+        for name in ["req.hdr", "hdr"] {
+            self.multi_visits.insert(name, |ctx, args, f| header_visit(ctx, args, false, false, f));
+        }
+        self.multi_visits.insert("req.fhdr", |ctx, args, f| header_visit(ctx, args, false, true, f));
 
         // `http_auth_bearer([<header>])` (`smp_fetch_http_auth_bearer`): the token of a
         // `Bearer` credential in the first `<header>` (default `Authorization`). The scheme is
@@ -2022,6 +2032,10 @@ impl Registry {
             |ctx, args| header_one(ctx, args, true, true).map(Sample::Str),
             |ctx, args| header_all(ctx, args, true, true).into_iter().map(Sample::Str).collect(),
         );
+        for name in ["res.hdr", "shdr"] {
+            self.multi_visits.insert(name, |ctx, args, f| header_visit(ctx, args, true, false, f));
+        }
+        self.multi_visits.insert("res.fhdr", |ctx, args, f| header_visit(ctx, args, true, true, f));
 
         // T327: req.fhdr_cnt counts lines and req.hdr_cnt values, with or without a name, on
         // the headers as the oracle's H1 parser leaves them (`h1_cleaned_headers`).
@@ -2574,7 +2588,7 @@ impl Registry {
             out_type: SampleType::Str,
             func: |ctx, _args| {
                 let path = http_parse_path(get_context_uri(ctx)?, get_context_method(ctx) == Some("OPTIONS"))?;
-                Some(Sample::Str(path.to_string()))
+                Some(Sample::Str(crate::spare::string_from(path)))
             },
         });
 
@@ -6368,13 +6382,13 @@ impl Registry {
     }
 
     /// Applies a chain of converters to a sample value, with the runtime state the context
-    /// converters read.
-    #[must_use]
-    pub fn apply_converters_in(
+    /// converters read. The converters' names are of any string type (an
+    /// [`crate::expr::Expr`]'s own are passed with no copy of them).
+    pub(crate) fn apply_converters_g<S: AsRef<str>>(
         &self,
         ctx: &SampleContext,
         mut smp: Sample,
-        converters: &[(&str, Vec<String>)],
+        converters: &[(S, Vec<String>)],
     ) -> Option<Sample> {
         /// A converter, and whether it reads the context.
         enum Conv {
@@ -6382,6 +6396,7 @@ impl Registry {
             WithCtx(CtxConvFn),
         }
         for (c_name, c_args) in converters {
+            let c_name = c_name.as_ref();
             let (in_type, func) = if let Some(d) = self.get_converter(c_name) {
                 (d.in_type, Conv::Plain(d.func))
             } else {
@@ -6425,6 +6440,17 @@ impl Registry {
         self.eval_all_opt(fetch_name, fetch_args, converters, ctx, false)
     }
 
+    /// [`Self::eval_all`] for a list of converters of any string type.
+    pub(crate) fn eval_all_g<S: AsRef<str>>(
+        &self,
+        fetch_name: &str,
+        fetch_args: &[String],
+        converters: &[(S, Vec<String>)],
+        ctx: &SampleContext,
+    ) -> Vec<Sample> {
+        self.eval_all_opt(fetch_name, fetch_args, converters, ctx, false)
+    }
+
     /// `eval_all` for an ACL (`acl_exec_cond`): a converter that gives no sample for an occurrence
     /// ends the expression there (`continue` to the next line of the ACL), the later occurrences
     /// of the fetch are not tried.
@@ -6439,11 +6465,11 @@ impl Registry {
         self.eval_all_opt(fetch_name, fetch_args, converters, ctx, true)
     }
 
-    fn eval_all_opt(
+    fn eval_all_opt<S: AsRef<str>>(
         &self,
         fetch_name: &str,
         fetch_args: &[String],
-        converters: &[(&str, Vec<String>)],
+        converters: &[(S, Vec<String>)],
         ctx: &SampleContext,
         stop_at_failure: bool,
     ) -> Vec<Sample> {
@@ -6457,13 +6483,53 @@ impl Registry {
 
         let mut out = Vec::with_capacity(initial_samples.len());
         for smp in initial_samples {
-            match self.apply_converters_in(ctx, smp, converters) {
+            match self.apply_converters_g(ctx, smp, converters) {
                 Some(res) => out.push(res),
                 None if stop_at_failure => break,
                 None => {}
             }
         }
         out
+    }
+
+    /// [`Self::eval_all_acl`] with each sample handed to `f` instead of collected, and true
+    /// when `f` was true for one: every sample is still produced (a converter may store a
+    /// variable), but a fetch of one sample needs no list, and a text sample's string is
+    /// given back for reuse ([`crate::spare`]) once `f` has seen it (T437).
+    pub(crate) fn any_acl<S: AsRef<str>>(
+        &self,
+        fetch_name: &str,
+        fetch_args: &[String],
+        converters: &[(S, Vec<String>)],
+        ctx: &SampleContext,
+        mut f: impl FnMut(&Sample) -> bool,
+    ) -> bool {
+        let mut any = false;
+        let mut see = |smp: Sample| {
+            any |= f(&smp);
+            crate::spare::give_sample(smp);
+        };
+        if let Some(visit) = self.multi_visits.get(fetch_name) {
+            visit(ctx, fetch_args, &mut |smp| match self.apply_converters_g(ctx, smp, converters) {
+                Some(res) => {
+                    see(res);
+                    true
+                }
+                None => false,
+            });
+        } else if let Some(mf) = self.multi_fetches.get(fetch_name) {
+            for smp in mf(ctx, fetch_args) {
+                match self.apply_converters_g(ctx, smp, converters) {
+                    Some(res) => see(res),
+                    None => break,
+                }
+            }
+        } else if let Some(f_desc) = self.get_fetch(fetch_name) {
+            if let Some(res) = (f_desc.func)(ctx, fetch_args).and_then(|smp| self.apply_converters_g(ctx, smp, converters)) {
+                see(res);
+            }
+        }
+        any
     }
 
     /// Evaluates a fetch and a chain of converters against the given context.
@@ -6475,13 +6541,24 @@ impl Registry {
         converters: &[(&str, Vec<String>)],
         ctx: &SampleContext,
     ) -> Option<Sample> {
+        self.eval_g(fetch_name, fetch_args, converters, ctx)
+    }
+
+    /// [`Self::eval`] for a list of converters of any string type.
+    pub(crate) fn eval_g<S: AsRef<str>>(
+        &self,
+        fetch_name: &str,
+        fetch_args: &[String],
+        converters: &[(S, Vec<String>)],
+        ctx: &SampleContext,
+    ) -> Option<Sample> {
         // T337: a fetch that iterates in an ACL gives its own single sample here (the last
         // header value, the last cookie), not the first of the ACL's list.
         if let Some(f_desc) = self.get_fetch(fetch_name) {
             let smp = (f_desc.func)(ctx, fetch_args)?;
-            return self.apply_converters_in(ctx, smp, converters);
+            return self.apply_converters_g(ctx, smp, converters);
         }
-        self.eval_all(fetch_name, fetch_args, converters, ctx).into_iter().next()
+        self.eval_all_g(fetch_name, fetch_args, converters, ctx).into_iter().next()
     }
 }
 
@@ -6987,7 +7064,7 @@ fn header_one(ctx: &SampleContext, args: &[String], res: bool, full: bool) -> Op
     let (mut i, mut out): (u64, Option<String>) = (0, None);
     visit_header_values(ctx, name, res, full, &mut |v| {
         if i == target {
-            out = Some(v.to_string());
+            out = Some(crate::spare::string_from(v));
         }
         i += 1;
     });
@@ -6996,6 +7073,24 @@ fn header_one(ctx: &SampleContext, args: &[String], res: bool, full: bool) -> Op
 
 /// T337: the values of header `name` an ACL tries (`SMP_OPT_ITERATE`): every one, or only
 /// [`header_one`]'s when an `<occ>` other than 0 is given.
+/// [`header_all`], each value handed to `f` as it is found (in a [`crate::spare`] string)
+/// until `f` returns false.
+fn header_visit(ctx: &SampleContext, args: &[String], res: bool, full: bool, f: &mut dyn FnMut(Sample) -> bool) {
+    let Some(name) = args.first() else { return };
+    if args.get(1).and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0) != 0 {
+        if let Some(v) = header_one(ctx, args, res, full) {
+            f(Sample::Str(v));
+        }
+        return;
+    }
+    let mut go = true;
+    visit_header_values(ctx, name, res, full, &mut |v| {
+        if go {
+            go = f(Sample::Str(crate::spare::string_from(v)));
+        }
+    });
+}
+
 fn header_all(ctx: &SampleContext, args: &[String], res: bool, full: bool) -> Vec<String> {
     let Some(name) = args.first() else { return Vec::new() };
     if args.get(1).and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0) != 0 {
@@ -8345,6 +8440,16 @@ fn ip_header_length(b: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// An ACL line on a fetch the registry does not have matches nothing (`any_acl`, T437), as
+    /// the list it replaced was empty for one.
+    #[test]
+    fn an_unknown_fetch_matches_nothing() {
+        let reg = super::Registry::new();
+        let none: &[(&str, Vec<String>)] = &[];
+        // A matcher that would say yes: `false` means it was never asked.
+        assert!(!reg.any_acl("no.such.fetch", &[], none, &super::SampleContext::default(), |_| true));
+    }
+
     /// `dump_var_value` escapes NUL as `\0` (as `chunk_escape_string` does). A NUL cannot be put in a
     /// string variable from a configuration: HAProxy 3.5-dev8 drops the `url_dec` of `%00` altogether, and
     /// dumps a `bin` variable as hex, so no oracle column exists; this pins the code's own rule. Also the
