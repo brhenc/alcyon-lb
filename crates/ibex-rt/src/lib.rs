@@ -20,6 +20,10 @@ pub mod version {
     pub const COMMIT: &str = env!("IBEX_COMMIT");
     /// The commit's date, `2026/10/18`; empty without git.
     pub const DATE: &str = env!("IBEX_DATE");
+    /// The `HAProxy` branch Ibex follows (`PRODUCT_BRANCH` in HAProxy's version.h). A
+    /// configuration reads it as `HAPROXY_BRANCH` to tell which `HAProxy` syntax it can use, so
+    /// it names the `HAProxy` branch whose configuration language Ibex implements, not Ibex's own.
+    pub const HAPROXY_BRANCH: &str = "3.5";
 }
 
 pub mod applet;

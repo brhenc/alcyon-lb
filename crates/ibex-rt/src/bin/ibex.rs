@@ -647,11 +647,34 @@ fn main() {
     // 4. Read and concatenate all configuration files
     let (combined_config, config_starts) = load_and_merge_configs(&config_files);
 
+    // `HAProxy` (haproxy.c, read_cfg) exports these for the configuration to read, replacing
+    // inherited values: the default log formats, the branch and the whole file list, as
+    // given and joined by `;`. Only the five HTTP/TCP log format ones are unset after the
+    // parse, so that children do not inherit them. Still single-threaded here.
+    {
+        use ibex_rt::logfmt as lf;
+        let cfgfiles = config_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(";");
+        std::env::set_var("HAPROXY_HTTP_LOG_FMT", lf::DEFAULT_HTTP_LOG_FORMAT);
+        std::env::set_var("HAPROXY_HTTP_CLF_LOG_FMT", lf::CLF_HTTP_LOG_FORMAT);
+        std::env::set_var("HAPROXY_HTTPS_LOG_FMT", lf::DEFAULT_HTTPS_LOG_FORMAT);
+        std::env::set_var("HAPROXY_TCP_LOG_FMT", lf::DEFAULT_TCP_LOG_FORMAT);
+        std::env::set_var("HAPROXY_TCP_CLF_LOG_FMT", lf::CLF_TCP_LOG_FORMAT);
+        std::env::set_var("HAPROXY_KEYLOG_FC_LOG_FMT", lf::KEYLOG_FC_FORMAT);
+        std::env::set_var("HAPROXY_KEYLOG_BC_LOG_FMT", lf::KEYLOG_BC_FORMAT);
+        std::env::set_var("HAPROXY_BRANCH", ibex_rt::version::HAPROXY_BRANCH);
+        std::env::set_var("HAPROXY_STARTUP_VERSION", ibex_rt::version::VERSION);
+        std::env::set_var("HAPROXY_CFGFILES", cfgfiles);
+    }
+
     // 5. Parse unified configuration AST
     if config_files.len() == 1 {
         ibex_config::env::set_file(&config_files[0].display().to_string());
     }
-    let mut config = match ibex_config::parse_str(&combined_config) {
+    let parsed = ibex_config::parse_str(&combined_config);
+    for name in ["HAPROXY_HTTP_LOG_FMT", "HAPROXY_HTTP_CLF_LOG_FMT", "HAPROXY_HTTPS_LOG_FMT", "HAPROXY_TCP_LOG_FMT", "HAPROXY_TCP_CLF_LOG_FMT"] {
+        std::env::remove_var(name);
+    }
+    let mut config = match parsed {
         Ok(cfg) => cfg,
         Err(err) if !err.alerts.is_empty() => {
             // Checks that name their own place print as `HAProxy`'s do: one alert each, its
