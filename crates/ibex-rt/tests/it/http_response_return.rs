@@ -120,10 +120,14 @@ fn start(proto: &str, rules: &str) -> (Ibex, SocketAddr, UdpSocket, Arc<AtomicUs
         .expect("spawn ibex");
     let ibex = Ibex { child, _cfg: f, _dir: dir };
     assert!(common::wait_listening(fe), "ibex never listened on {fe} with:\n{text}");
-    // The probe connection of `wait_listening` leaves a line of its own.
-    thread::sleep(Duration::from_millis(100));
-    logs.set_nonblocking(true).ok();
+    // The probe connection of `wait_listening` leaves a line of its own: wait for it (on a
+    // loaded host it comes late) rather than for a fixed time, so it cannot be taken for the
+    // line of the first request.
+    logs.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut sink = [0u8; 2048];
+    let _ = logs.recv(&mut sink);
+    logs.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    logs.set_nonblocking(true).ok();
     while logs.recv(&mut sink).is_ok() {}
     logs.set_nonblocking(false).ok();
     (ibex, fe, logs, accepted)
