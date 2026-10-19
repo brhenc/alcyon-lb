@@ -302,13 +302,27 @@ fn memory_and_connection_metrics_move_with_a_burst() {
             s
         })
         .collect();
-    run.settle(Duration::from_secs(1));
-    let during = body_of(&run.get("/metrics"));
+    // The engine takes the 30 connections as its thread gets to them: scrape until they show
+    // (up to 20 s), not after a fixed second.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let during = loop {
+        run.settle(Duration::from_millis(250));
+        let b = body_of(&run.get("/metrics"));
+        if read(&b, "haproxy_process_current_connections") >= read(&before, "haproxy_process_current_connections") + 30.0 || Instant::now() > deadline {
+            break b;
+        }
+    };
     assert!(read(&during, "haproxy_process_current_connections") >= read(&before, "haproxy_process_current_connections") + 30.0, "connections: {} then {}", read(&before, "haproxy_process_current_connections"), read(&during, "haproxy_process_current_connections"));
     assert!(read(&during, "haproxy_process_pool_used_bytes") > read(&before, "haproxy_process_pool_used_bytes"), "pool use rises with the held sessions");
     drop(held);
-    run.settle(Duration::from_secs(1));
-    let after = body_of(&run.get("/metrics"));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let after = loop {
+        run.settle(Duration::from_millis(250));
+        let b = body_of(&run.get("/metrics"));
+        if read(&b, "haproxy_process_current_connections") <= read(&before, "haproxy_process_current_connections") + 1.0 || Instant::now() > deadline {
+            break b;
+        }
+    };
     assert!(read(&after, "haproxy_process_current_connections") <= read(&before, "haproxy_process_current_connections") + 1.0, "connections come back");
     assert!(read(&after, "haproxy_process_pool_used_bytes") <= read(&during, "haproxy_process_pool_used_bytes"), "pool use does not stay up");
     // `show info` reads the same sources.
