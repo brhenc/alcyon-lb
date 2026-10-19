@@ -340,10 +340,12 @@ fn test_rt_http2_socket_flow_control_window_update() {
     let open_frame = Frame::Headers {
         flags: frame_flags::END_HEADERS,
         stream_id: 1,
-        header_block: enc.encode(&[HeaderField {
-            name: ":path".into(),
-            value: "/data".into(),
-        }]),
+        // A whole request head: one without `:method` is reset (HAProxy 3.5-dev8, T437).
+        header_block: enc.encode(&[
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":scheme".into(), value: "http".into() },
+            HeaderField { name: ":path".into(), value: "/data".into() },
+        ]),
     };
     client_sock.write_all(&open_frame.encode()).unwrap();
     let on = server_sock.read(&mut buf).unwrap();
@@ -430,18 +432,22 @@ fn test_rt_http2_socket_stream_reset_and_goaway() {
     let s1 = Frame::Headers {
         flags: frame_flags::END_HEADERS,
         stream_id: 1,
-        header_block: enc.encode(&[HeaderField {
-            name: ":path".into(),
-            value: "/s1".into(),
-        }]),
+        // A whole request head: one without `:method` is reset (HAProxy 3.5-dev8, T437).
+        header_block: enc.encode(&[
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":scheme".into(), value: "http".into() },
+            HeaderField { name: ":path".into(), value: "/s1".into() },
+        ]),
     };
     let s3 = Frame::Headers {
         flags: frame_flags::END_HEADERS,
         stream_id: 3,
-        header_block: enc.encode(&[HeaderField {
-            name: ":path".into(),
-            value: "/s3".into(),
-        }]),
+        // A whole request head: one without `:method` is reset (HAProxy 3.5-dev8, T437).
+        header_block: enc.encode(&[
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":scheme".into(), value: "http".into() },
+            HeaderField { name: ":path".into(), value: "/s3".into() },
+        ]),
     };
     client_sock.write_all(&s1.encode()).unwrap();
     client_sock.write_all(&s3.encode()).unwrap();

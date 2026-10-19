@@ -46,7 +46,6 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
                 && st.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Eoh))
         })
     })?;
-    let spare = h2.spare_heads.pop();
     let stream = h2.streams.get_mut(&stream_id)?;
     stream.dispatched = true;
     // The head goes to the server as HTTP/1.1, and the body follows as the DATA frames
@@ -55,20 +54,8 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
     let has_data = stream.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Data(_) | HtxBlock::RawData(_) | HtxBlock::Trailer(_)));
     let chunked = stream.request_header("content-length").is_none() && (has_data || !stream.rx_htx.is_eom());
     let first_body = stream.rx_htx.blocks().iter().position(|b| matches!(b, HtxBlock::Eoh)).map_or(stream.rx_htx.blocks().len(), |i| i + 1);
-    // The head as the mux wrote it (T437), or, for a request kept as HTX blocks, as they
-    // write it, up to its blank line.
-    let (head, spare) = match stream.req_head.take() {
-        Some(h) => (h, spare),
-        None => {
-            let mut h = spare.unwrap_or_default();
-            let mut wire = stream.rx_htx.to_h1_wire();
-            if let Some((e, l)) = find_eoh(&wire) {
-                wire.truncate(e + l);
-            }
-            h.set_from_htx(&wire, &stream.rx_htx, stream.abs_prefix.as_deref());
-            (h, None)
-        }
-    };
+    // The head as the mux wrote it (T437); the stream keeps none past this.
+    let head = stream.req_head.take()?;
     // `%U`, and the line `%r` prints, are those of the message the client sent:
     // `transfer-encoding: chunked` is added on output only, so the rules do not see it
     // either (only the forwarded head has it). The chunked end the forwarded body is
@@ -77,9 +64,6 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
     let req_htx = h2_head_size(&head).saturating_sub(u64::from(chunked));
     let request_line = (keep_request_line && head.has_line)
         .then(|| format!("{} {}{} HTTP/2.0", head.method(), head.abs_prefix().unwrap_or(""), head.uri()));
-    if let Some(s) = spare {
-        h2.spare_heads.push(s);
-    }
     Some(H2Dispatch {
         stream: H2ActiveStream {
             id: stream_id,
@@ -375,9 +359,7 @@ pub fn abort_on_client_left(sess: &mut TcpSession) -> bool {
 /// line, its three strings -- the target is `scheme://authority` and the path when the
 /// request had both -- and each header's name and value, then the end of the headers).
 fn h2_head_size(head: &H2ReqHead) -> u64 {
-    if !head.has_line {
-        return 0;
-    }
+    // Every head dispatched has a start line: one without `:method` is reset (T437).
     20 + (head.method().len() + head.abs_prefix().map_or(0, str::len) + head.uri().len() + "HTTP/2.0".len()) as u64 + 1 + head.field_bytes as u64
 }
 

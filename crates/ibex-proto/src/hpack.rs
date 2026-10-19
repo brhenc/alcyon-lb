@@ -573,12 +573,9 @@ impl DynamicTable {
         }
         // The entries the new one evicts (RFC 7541 section 4.4), the oldest first: the same
         // as [`Self::insert`], which adds and then evicts, as the new entry fits alone.
+        // (An empty table has size 0, and the entry fits: the loop ends with entries.)
         let mut spare = None;
-        while self.size + entry_size > self.max_size {
-            let Some(evicted) = self.entries.pop_back() else {
-                self.size = 0;
-                break;
-            };
+        while let Some(evicted) = (self.size + entry_size > self.max_size).then(|| self.entries.pop_back()).flatten() {
             self.size = self.size.saturating_sub(evicted.size());
             spare = Some(evicted);
         }
@@ -852,13 +849,8 @@ impl DecodedFields {
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.spans.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.spans.is_empty()
     }
 
     /// The fields in order, as name and value.

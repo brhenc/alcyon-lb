@@ -609,18 +609,22 @@ fn test_stream_reset_rst_stream_handling_and_graceful_shutdown() {
     let s1_open = Frame::Headers {
         flags: frame_flags::END_HEADERS,
         stream_id: 1,
-        header_block: enc.encode(&[HeaderField {
-            name: ":path".into(),
-            value: "/s1".into(),
-        }]),
+        // A whole request head: one without `:method` is reset (HAProxy 3.5-dev8, T437).
+        header_block: enc.encode(&[
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":scheme".into(), value: "http".into() },
+            HeaderField { name: ":path".into(), value: "/s1".into() },
+        ]),
     };
     let s3_open = Frame::Headers {
         flags: frame_flags::END_HEADERS,
         stream_id: 3,
-        header_block: enc.encode(&[HeaderField {
-            name: ":path".into(),
-            value: "/s3".into(),
-        }]),
+        // A whole request head: one without `:method` is reset (HAProxy 3.5-dev8, T437).
+        header_block: enc.encode(&[
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":scheme".into(), value: "http".into() },
+            HeaderField { name: ":path".into(), value: "/s3".into() },
+        ]),
     };
     mux.parse(&mut ctx, &s1_open.encode()).expect("open 1");
     mux.parse(&mut ctx, &s3_open.encode()).expect("open 3");
