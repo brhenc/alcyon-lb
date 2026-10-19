@@ -133,6 +133,25 @@ fn sess_term_state_reads_the_state_of_the_stream_at_that_moment() {
     });
 }
 
+/// T430 row 6: the termination flags are set before the reply of `return`, `deny` or `tarpit`
+/// is formatted, so a `hdr` of it sees them. A `redirect` is not such a reply (measured on
+/// `HAProxy 3.5-dev8-885761-29` on 2026-10-19: `LR`, `PR`, `PT`, and `/--` in the location).
+#[test]
+fn sess_term_state_in_the_headers_of_a_generated_reply() {
+    let rules = "  http-request return status 200 hdr x-ts \"%[txn.sess_term_state]\" if { path /ret }\n  \
+                 http-request deny hdr x-ts \"%[txn.sess_term_state]\" if { path /deny }\n  \
+                 http-request tarpit hdr x-ts \"%[txn.sess_term_state]\" if { path /tar }\n  \
+                 http-request redirect location \"/%[txn.sess_term_state]\" if { path /redir }\n";
+    with_ibex(rules, |fe| {
+        for (path, want) in [("/ret", "LR"), ("/deny", "PR"), ("/tar", "PT")] {
+            let (_, resp) = get(fe, path, "");
+            assert_eq!(header(&resp, "x-ts"), Some(want), "{path}: {resp:?}");
+        }
+        let (_, resp) = get(fe, "/redir", "");
+        assert_eq!(header(&resp, "location"), Some("/--"), "{resp:?}");
+    });
+}
+
 /// `ibex -c` on a frontend carrying `rule`: (exit code, stdout + stderr).
 fn check(rule: &str) -> (Option<i32>, String) {
     let cfg = format!(

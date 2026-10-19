@@ -29,6 +29,8 @@ struct Scope {
     proxy: String,
     /// The words of the line being read.
     line: Vec<String>,
+    /// A `global` line above had `expose-experimental-directives`.
+    experimental: bool,
 }
 
 thread_local! {
@@ -38,6 +40,16 @@ thread_local! {
 /// Starts a parse: the scope is active and empty.
 pub(crate) fn begin() {
     SCOPE.with(|s| *s.borrow_mut() = Scope { active: true, ..Scope::default() });
+}
+
+/// `expose-experimental-directives` was read: the experimental actions that follow are allowed.
+pub(crate) fn allow_experimental() {
+    SCOPE.with(|s| s.borrow_mut().experimental = true);
+}
+
+/// Whether `expose-experimental-directives` has been read so far in this parse.
+pub(crate) fn experimental_allowed() -> bool {
+    SCOPE.with(|s| s.borrow().experimental)
 }
 
 /// Ends a parse.

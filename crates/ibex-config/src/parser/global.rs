@@ -835,6 +835,10 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        "expose-experimental-directives" => {
+            super::acl_scope::allow_experimental();
+            Ok(())
+        }
         other if IGNORED_GLOBAL_KEYWORDS.iter().any(|(k, _)| *k == other) => Ok(()),
         // The change itself was made while the lines were read (`crate::preproc`), for the
         // `${VAR}` below to see it, and is replayed on the process by the caller
