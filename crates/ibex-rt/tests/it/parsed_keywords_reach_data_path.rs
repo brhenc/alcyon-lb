@@ -126,7 +126,7 @@ fn strace_setsockopt(cfg: &str, probe: SocketAddr) -> String {
     f.write_all(cfg.as_bytes()).expect("cfg");
     let log = NamedTempFile::new().expect("tmp");
     let mut child = Command::new("strace")
-        .args(["-f", "-e", "trace=setsockopt", "-o"])
+        .args(["-f", "-e", "trace=setsockopt,connect", "-o"])
         .arg(log.path())
         .arg(env!("CARGO_BIN_EXE_ibex"))
         .arg("-f")
@@ -138,7 +138,13 @@ fn strace_setsockopt(cfg: &str, probe: SocketAddr) -> String {
     assert!(common::wait_listening(probe));
     if let Ok(mut c) = std::net::TcpStream::connect(probe) {
         let _ = c.write_all(b"x");
-        std::thread::sleep(Duration::from_millis(300));
+        // The options of the connecting socket are set before its `connect`: wait for the
+        // connect to the server to show in the log (strace writes as it goes), not for a
+        // fixed time that a loaded host overruns.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline && !std::fs::read_to_string(log.path()).unwrap_or_default().contains("connect(") {
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
     // SIGUSR1 goes to ibex, not strace: find it as strace's child.
     let kids = std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", child.id())).unwrap_or_default();
