@@ -28,7 +28,8 @@ pub struct Event {
 /// discipline in `design/003-scheduler.md`, where a reader is *supposed* to stop early
 /// and let other work run.
 pub struct Poller {
-    epfd: OwnedFd,
+    /// Shared with this worker's idle-connection slot ([`Poller::shared_epfd`]).
+    epfd: std::sync::Arc<OwnedFd>,
     event_buf: epoll::EventVec,
     /// The `epoll_ctl` calls made through this poller: what the idle-pool tests count (T434).
     #[cfg(test)]
@@ -44,7 +45,7 @@ impl Poller {
     pub fn new(capacity: usize) -> io::Result<Self> {
         let epfd = epoll::create(epoll::CreateFlags::CLOEXEC)?;
         Ok(Poller {
-            epfd,
+            epfd: std::sync::Arc::new(epfd),
             event_buf: epoll::EventVec::with_capacity(capacity),
             #[cfg(test)]
             ctls: std::cell::Cell::new(0),
@@ -174,17 +175,15 @@ impl Poller {
         }
     }
 
-    /// A duplicate of this poller's epoll descriptor: what another worker that takes one
-    /// of this worker's idle server connections removes it from ([`Poller::forget_in`]).
-    ///
-    /// # Errors
-    /// `dup` failure.
-    pub fn try_clone_epfd(&self) -> io::Result<OwnedFd> {
-        Ok(self.epfd.try_clone()?)
+    /// This poller's epoll descriptor, shared: what another worker that takes one of this
+    /// worker's idle server connections removes it from ([`Poller::forget_in`]).
+    #[must_use]
+    pub fn shared_epfd(&self) -> std::sync::Arc<OwnedFd> {
+        std::sync::Arc::clone(&self.epfd)
     }
 
     /// Takes `fd` out of the epoll set `epfd` (another worker's, from
-    /// [`Poller::try_clone_epfd`]): `epoll_ctl` is safe from any thread. Not in it is fine.
+    /// [`Poller::shared_epfd`]): `epoll_ctl` is safe from any thread. Not in it is fine.
     ///
     /// # Errors
     /// Propagates `epoll_ctl` failure other than `ENOENT`.

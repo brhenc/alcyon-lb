@@ -162,11 +162,11 @@ struct WorkerPool {
     conns: usize,
     /// The earliest `purge_at` of all servers.
     next_purge: Option<Instant>,
-    /// The worker's epoll descriptor (a duplicate): its idle connections stay registered
+    /// The worker's epoll descriptor (shared with its poller): its idle connections stay registered
     /// there for reads, and another worker that takes one takes it out first (T434). None
     /// for a worker that shares its pool with none ([`Engine::share_idle_pools`] sets it),
     /// and in the pools of the unit tests below, whose connections are registered nowhere.
-    epfd: Option<OwnedFd>,
+    epfd: Option<Arc<OwnedFd>>,
 }
 
 impl WorkerPool {
@@ -579,9 +579,9 @@ impl IdlePool {
         None
     }
 
-    /// Gives this worker's slot its epoll descriptor (a duplicate of it), for the workers
-    /// that take its idle connections to take them out of it.
-    pub fn attach_poller(&mut self, epfd: OwnedFd) {
+    /// Gives this worker's slot its epoll descriptor, for the workers that take its idle
+    /// connections to take them out of it.
+    pub fn attach_poller(&mut self, epfd: Arc<OwnedFd>) {
         IdlePools::lock(self.slot()).epfd = Some(epfd);
     }
 
@@ -4595,15 +4595,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
     /// Makes this engine worker `wid` of `pools`, the idle server connections all workers
     /// share (`tune.idle-pool.shared`). Called before the engine runs: a worker alone keeps
-    /// a pool of its own. Its slot holds a duplicate of its epoll descriptor, which a worker
-    /// that takes one of its idle connections takes it out of (T434).
-    ///
-    /// # Errors
-    /// `dup` failure.
-    pub fn share_idle_pools(&mut self, pools: &Arc<IdlePools>, wid: usize) -> io::Result<()> {
+    /// a pool of its own. Its slot shares its epoll descriptor, which a worker that takes
+    /// one of its idle connections takes it out of (T434).
+    pub fn share_idle_pools(&mut self, pools: &Arc<IdlePools>, wid: usize) {
         self.idle_backend_pool = pools.worker(wid);
-        self.idle_backend_pool.attach_poller(self.poller.try_clone_epfd()?);
-        Ok(())
+        self.idle_backend_pool.attach_poller(self.poller.shared_epfd());
     }
 
     /// Makes this engine worker `wid` of `boxes`, the mailboxes every worker shares: `show
@@ -15501,8 +15497,8 @@ mod idle_poll_tests {
         // `always`: the other worker's client takes it with its first request.
         let (mut a, fe_a) = engine_with(srv, Some(ibex_config::HttpReuse::Always));
         let (mut b, fe_b) = engine_with(srv, Some(ibex_config::HttpReuse::Always));
-        a.share_idle_pools(&pools, 0).expect("share");
-        b.share_idle_pools(&pools, 1).expect("share");
+        a.share_idle_pools(&pools, 0);
+        b.share_idle_pools(&pools, 1);
         let mut ca = client(&mut a, fe_a);
         exchange(&mut a, &mut ca);
         assert!(drive_until(&mut a, |a| a.idle_backend_pool.total() == 1), "idle on worker 0");
