@@ -908,6 +908,15 @@ fn parse_http_req_rule_at(
             line: 0,
         });
     } else if act_str == "normalize-uri" {
+        // An experimental action: `HAProxy` refuses it before it reads an argument, unless a
+        // `global` line above it was `expose-experimental-directives`.
+        if !super::acl_scope::experimental_allowed() {
+            return Err(ConfigError::new(
+                act_token.line,
+                act_token.col,
+                "'normalize-uri' action is experimental, must be allowed via a global 'expose-experimental-directives'",
+            ));
+        }
         if tokens.len() < 3 {
             return Err(ConfigError::new(
                 kw.line,
