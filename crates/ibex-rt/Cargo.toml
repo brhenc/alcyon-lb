@@ -123,6 +123,11 @@ path = "tests/promex.rs"
 name = "request_allocations"
 path = "tests/request_allocations.rs"
 
+# Own process: counts the engine thread's allocations (#[global_allocator])
+[[test]]
+name = "tls_request_allocations"
+path = "tests/tls_request_allocations.rs"
+
 # Own process: counts the test process's allocations (#[global_allocator])
 [[test]]
 name = "ring_log_allocations"
