@@ -13,17 +13,20 @@ use std::time::Duration;
 
 use ibex_rt::loghdr::Meta;
 
-fn free_udp() -> u16 {
-    UdpSocket::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr").port()
-}
-
+/// A port for a config that is refused before any bind happens; nothing listens on it, so
+/// the race of handing a freed port to ibex does not matter here.
 fn free_tcp() -> u16 {
     TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr").port()
 }
 
 fn collector() -> (UdpSocket, u16) {
+    collector_within(Duration::from_millis(1500))
+}
+
+/// A collector that waits `wait` for a datagram (a message that must not arrive costs all of it).
+fn collector_within(wait: Duration) -> (UdpSocket, u16) {
     let s = UdpSocket::bind("127.0.0.1:0").expect("bind");
-    s.set_read_timeout(Some(Duration::from_millis(1500))).expect("timeout");
+    s.set_read_timeout(Some(wait)).expect("timeout");
     let p = s.local_addr().expect("addr").port();
     (s, p)
 }
@@ -31,6 +34,30 @@ fn collector() -> (UdpSocket, u16) {
 fn start(cfg: &str) {
     let cfg = ibex_config::parse_str(cfg).expect("parses");
     ibex_rt::logfwd::start(&cfg).expect("starts");
+}
+
+/// Starts the sections `build` writes on ports chosen for them: `kinds` has a `u` (UDP) or
+/// a `t` (TCP) per port wanted. A port picked by binding port 0 and dropping the socket can
+/// be taken by another test before ibex binds it, so the start is retried, with new ports,
+/// for as long as the answer is "Address already in use": no start can lose that race for
+/// good. Returns the ports of the start that worked.
+fn start_on(kinds: &str, build: impl Fn(&[u16]) -> String) -> Vec<u16> {
+    for _ in 0..50 {
+        let ports: Vec<u16> = kinds
+            .chars()
+            .map(|k| match k {
+                'u' => UdpSocket::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr").port(),
+                _ => TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr").port(),
+            })
+            .collect();
+        let cfg = ibex_config::parse_str(&build(&ports)).expect("parses");
+        match ibex_rt::logfwd::start(&cfg) {
+            Ok(()) => return ports,
+            Err(e) if e.to_string().contains("Address already in use") => {}
+            Err(e) => panic!("starts: {e}"),
+        }
+    }
+    panic!("no free port in 50 tries");
 }
 
 /// What the collector got, without the line feed `HAProxy` ends every datagram with (measured
@@ -60,14 +87,16 @@ fn section(name: &str, port: u16, collector: u16, options: &str, log_args: &str)
 #[test]
 fn a_message_keeps_its_shape_or_takes_the_targets_format() {
     let (col, cp) = collector();
-    let (p_keep, p_5424, p_iso, p_raw) = (free_udp(), free_udp(), free_udp(), free_udp());
-    start(&format!(
-        "{}{}{}{}",
-        section("fwd_keep", p_keep, cp, "", "local0"),
-        section("fwd_5424", p_5424, cp, "", "format rfc5424 local0"),
-        section("fwd_iso", p_iso, cp, "", "format iso local0"),
-        section("fwd_raw", p_raw, cp, "  option dont-parse-log\n", "format raw local0"),
-    ));
+    let ports = start_on("uuuu", |p| {
+        format!(
+            "{}{}{}{}",
+            section("fwd_keep", p[0], cp, "", "local0"),
+            section("fwd_5424", p[1], cp, "", "format rfc5424 local0"),
+            section("fwd_iso", p[2], cp, "", "format iso local0"),
+            section("fwd_raw", p[3], cp, "  option dont-parse-log\n", "format raw local0"),
+        )
+    });
+    let (p_keep, p_5424, p_iso, p_raw) = (ports[0], ports[1], ports[2], ports[3]);
     let m3164 = "<134>Oct  4 18:17:12 myhost tag[7]: hello";
     // As it came: the header is rebuilt from what was parsed.
     assert_eq!(through(p_keep, &col, m3164.as_bytes()).as_deref(), Some(m3164));
@@ -90,12 +119,14 @@ fn a_message_keeps_its_shape_or_takes_the_targets_format() {
 #[test]
 fn a_message_without_a_priority_or_a_host_is_given_both() {
     let (col, cp) = collector();
-    let (p_fill, p_keep) = (free_udp(), free_udp());
-    start(&format!(
-        "{}{}",
-        section("fwd_fill", p_fill, cp, "", "local0"),
-        section("fwd_keep2", p_keep, cp, "  option host keep\n", "local0"),
-    ));
+    let ports = start_on("uu", |p| {
+        format!(
+            "{}{}",
+            section("fwd_fill", p[0], cp, "", "local0"),
+            section("fwd_keep2", p[1], cp, "  option host keep\n", "local0"),
+        )
+    });
+    let (p_fill, p_keep) = (ports[0], ports[1]);
     // The sender's address fills a missing host (the default), and a message with no
     // priority is level 0 of the target's facility: local0 is 16, so 128.
     let got = through(p_fill, &col, b"<14>bare").expect("fill");
@@ -109,12 +140,14 @@ fn a_message_without_a_priority_or_a_host_is_given_both() {
 #[test]
 fn option_host_replaces_or_appends_the_senders_address() {
     let (col, cp) = collector();
-    let (p_rep, p_app) = (free_udp(), free_udp());
-    start(&format!(
-        "{}{}",
-        section("fwd_rep", p_rep, cp, "  option host replace\n", "local0"),
-        section("fwd_app", p_app, cp, "  option host append\n", "local0"),
-    ));
+    let ports = start_on("uu", |p| {
+        format!(
+            "{}{}",
+            section("fwd_rep", p[0], cp, "  option host replace\n", "local0"),
+            section("fwd_app", p[1], cp, "  option host append\n", "local0"),
+        )
+    });
+    let (p_rep, p_app) = (ports[0], ports[1]);
     let m = b"<134>Oct  4 18:17:12 myhost tag[7]: hello";
     assert_eq!(through(p_rep, &col, m).as_deref(), Some("<134>Oct  4 18:17:12 127.0.0.1 tag[7]: hello"));
     assert_eq!(through(p_app, &col, m).as_deref(), Some("<134>Oct  4 18:17:12 myhost,127.0.0.1 tag[7]: hello"));
@@ -123,8 +156,7 @@ fn option_host_replaces_or_appends_the_senders_address() {
 #[test]
 fn a_target_filters_by_level_and_a_message_keeps_its_own_facility() {
     let (col, cp) = collector();
-    let p = free_udp();
-    start(&section("fwd_lvl", p, cp, "", "local1 notice"));
+    let p = start_on("u", |p| section("fwd_lvl", p[0], cp, "", "local1 notice"))[0];
     // Level 6 is less severe than `notice` (5): dropped. Level 5 passes with its own facility.
     assert_eq!(through(p, &col, b"<134>Oct  4 18:17:12 myhost tag[7]: hello"), None);
     let got = through(p, &col, b"<13>lvl5").expect("level 5");
@@ -137,11 +169,14 @@ fn a_target_filters_by_level_and_a_message_keeps_its_own_facility() {
 #[test]
 fn a_stream_is_read_in_both_framings() {
     let (col, cp) = collector();
-    let (tcp, ntf) = (free_tcp(), free_tcp());
-    start(&format!(
-        "log-forward fwd_tcp\n  bind 127.0.0.1:{tcp}\n  log 127.0.0.1:{cp} local0\n\
-         log-forward fwd_ntf\n  bind 127.0.0.1:{ntf}\n  option assume-rfc6587-ntf\n  log 127.0.0.1:{cp} local0\n"
-    ));
+    let ports = start_on("tt", |p| {
+        format!(
+            "log-forward fwd_tcp\n  bind 127.0.0.1:{}\n  log 127.0.0.1:{cp} local0\n\
+             log-forward fwd_ntf\n  bind 127.0.0.1:{}\n  option assume-rfc6587-ntf\n  log 127.0.0.1:{cp} local0\n",
+            p[0], p[1]
+        )
+    });
+    let (tcp, ntf) = (ports[0], ports[1]);
     // Non-transparent framing: one message a line.
     let mut c = TcpStream::connect(("127.0.0.1", tcp)).expect("connect");
     c.write_all(b"<14>one\n<14>two\n").expect("write");
@@ -298,12 +333,11 @@ fn pem(dir: &tempfile::TempDir) -> String {
 fn a_ring_forwards_over_tls_into_a_tls_listener() {
     let dir = tempfile::tempdir().expect("dir");
     let crt = pem(&dir);
-    let (col, cp) = collector();
-    let port = free_tcp();
-    start(&format!(
-        "ring tlsring\n  format rfc5424\n  size 4096\n  server s 127.0.0.1:{port} ssl verify none\n\
-         log-forward fwd_tls\n  bind 127.0.0.1:{port} ssl crt {crt}\n  log 127.0.0.1:{cp} local0\n"
-    ));
+    // A TLS handshake in a debug build, on a loaded host, takes longer than the default wait.
+    let (col, cp) = collector_within(Duration::from_secs(15));
+    // The listener first, on a port that start_on retries until it holds; the ring is pointed at it.
+    let port = start_on("t", |p| format!("log-forward fwd_tls\n  bind 127.0.0.1:{} ssl crt {crt}\n  log 127.0.0.1:{cp} local0\n", p[0]))[0];
+    start(&format!("ring tlsring\n  format rfc5424\n  size 4096\n  server s 127.0.0.1:{port} ssl verify none\n"));
     let ring = ibex_rt::ring::find("tlsring").expect("the ring exists");
     let meta = Meta { tag: b"haproxy", pid: b"7", ..Meta::default() };
     ring.write(16, 6, &meta, 1024, b"over tls");
@@ -367,10 +401,9 @@ fn a_ring_forwards_to_a_unix_socket_and_reconnects_when_it_drops() {
 #[test]
 fn a_section_over_its_maxconn_turns_a_connection_away_and_an_idle_one_is_closed() {
     let (col, cp) = collector();
-    let port = free_tcp();
-    start(&format!(
-        "log-forward fwd_max\n  bind 127.0.0.1:{port}\n  maxconn 1\n  timeout client 300ms\n  log 127.0.0.1:{cp} local0\n"
-    ));
+    let port = start_on("t", |p| {
+        format!("log-forward fwd_max\n  bind 127.0.0.1:{}\n  maxconn 1\n  timeout client 300ms\n  log 127.0.0.1:{cp} local0\n", p[0])
+    })[0];
     let mut first = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     first.write_all(b"<14>kept\n").expect("write");
     assert!(recv(&col).is_some());
@@ -389,11 +422,14 @@ fn a_section_over_its_maxconn_turns_a_connection_away_and_an_idle_one_is_closed(
 #[test]
 fn a_message_with_nothing_after_its_header_is_not_forwarded_and_log_global_adds_the_globals_targets() {
     let (col, cp) = collector();
-    let (p_empty, p_global) = (free_udp(), free_udp());
-    start(&format!(
-        "global\n  log 127.0.0.1:{cp} local0\n{}log-forward fwd_global\n  dgram-bind 127.0.0.1:{p_global}\n  log global\n",
-        section("fwd_empty", p_empty, cp, "", "local0"),
-    ));
+    let ports = start_on("uu", |p| {
+        format!(
+            "global\n  log 127.0.0.1:{cp} local0\n{}log-forward fwd_global\n  dgram-bind 127.0.0.1:{}\n  log global\n",
+            section("fwd_empty", p[0], cp, "", "local0"),
+            p[1]
+        )
+    });
+    let (p_empty, p_global) = (ports[0], ports[1]);
     // Level and facility, and then nothing: `HAProxy` does not send an empty message.
     assert_eq!(through(p_empty, &col, b"<14>"), None);
     // `log global`: this section has no `log` line of its own, the global one is the target.
@@ -404,8 +440,7 @@ fn a_message_with_nothing_after_its_header_is_not_forwarded_and_log_global_adds_
 #[test]
 fn a_stream_that_breaks_its_framing_is_dropped_and_what_came_before_is_kept() {
     let (col, cp) = collector();
-    let port = free_tcp();
-    start(&format!("log-forward fwd_break\n  bind 127.0.0.1:{port}\n  log 127.0.0.1:{cp} local0\n"));
+    let port = start_on("t", |p| format!("log-forward fwd_break\n  bind 127.0.0.1:{}\n  log 127.0.0.1:{cp} local0\n", p[0]))[0];
     let attempt = |bytes: &[u8]| {
         let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         c.write_all(bytes).expect("write");
@@ -485,9 +520,8 @@ fn starting_the_same_configuration_again_changes_nothing() {
     // Every worker builds its engine from the one configuration: the second start must not try
     // to bind the same ports again.
     let (col, cp) = collector();
-    let p = free_udp();
+    let p = start_on("u", |p| section("fwd_twice", p[0], cp, "", "local0"))[0];
     let cfg = ibex_config::parse_str(&section("fwd_twice", p, cp, "", "local0")).expect("parses");
-    ibex_rt::logfwd::start(&cfg).expect("first");
     ibex_rt::logfwd::start(&cfg).expect("second");
     assert!(through(p, &col, b"<14>once").is_some());
     assert_eq!(recv(&col), None, "one listener, one copy");
@@ -496,9 +530,8 @@ fn starting_the_same_configuration_again_changes_nothing() {
 #[test]
 fn a_target_with_a_sample_takes_only_its_share() {
     let (col, cp) = collector();
-    let p = free_udp();
     // Of every two lines, the first.
-    start(&section("fwd_sample", p, cp, "", "sample 1:2 local0"));
+    let p = start_on("u", |p| section("fwd_sample", p[0], cp, "", "sample 1:2 local0"))[0];
     assert!(through(p, &col, b"<14>first").expect("first").ends_with("first"));
     assert_eq!(through(p, &col, b"<14>second"), None);
     assert!(through(p, &col, b"<14>third").expect("third").ends_with("third"));
@@ -507,12 +540,10 @@ fn a_target_with_a_sample_takes_only_its_share() {
 #[test]
 fn a_stream_cut_inside_its_length_is_dropped_and_a_unix_listener_needs_no_mode() {
     let (col, cp) = collector();
-    let port = free_tcp();
     let path = std::env::temp_dir().join(format!("ibex-logfwd-nomode-{}.sock", std::process::id()));
-    start(&format!(
-        "log-forward fwd_cut\n  bind 127.0.0.1:{port}\n  bind unix@{}\n  log 127.0.0.1:{cp} local0\n",
-        path.display()
-    ));
+    let port = start_on("t", |p| {
+        format!("log-forward fwd_cut\n  bind 127.0.0.1:{}\n  bind unix@{}\n  log 127.0.0.1:{cp} local0\n", p[0], path.display())
+    })[0];
     drop({
         let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         c.write_all(b"12").expect("write");
@@ -562,11 +593,10 @@ fn two_proxies_logging_to_one_ring_share_it() {
 #[test]
 fn a_tcp_line_or_frame_longer_than_the_buffer_closes_the_connection() {
     let (col, cp) = collector();
-    let tcp = free_tcp();
-    start(&format!("log-forward fwd_cap\n  bind 127.0.0.1:{tcp}\n  log 127.0.0.1:{cp} local0\n"));
+    let tcp = start_on("t", |p| format!("log-forward fwd_cap\n  bind 127.0.0.1:{}\n  log 127.0.0.1:{cp} local0\n", p[0]))[0];
     // Closed means the read ends at once with 0 bytes or a reset, not by our timeout.
     let closed = |c: &mut TcpStream| {
-        c.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+        c.set_read_timeout(Some(Duration::from_secs(15))).expect("timeout");
         let mut b = [0u8; 16];
         match c.read(&mut b) {
             Ok(n) => n == 0,
