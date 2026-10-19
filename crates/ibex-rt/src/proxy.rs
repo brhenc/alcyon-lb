@@ -461,6 +461,45 @@ pub fn reserve_scrape_boxes(n: usize) {
     });
 }
 
+/// The request's method or URI as the session keeps it between requests (T436): one `String`
+/// per session whose capacity survives `reset`, so a keep-alive request copies its line into
+/// memory it already has instead of allocating a new `String` per request.
+#[derive(Debug, Default)]
+pub struct ReqText {
+    buf: String,
+    set: bool,
+}
+
+impl ReqText {
+    /// The text, if this request has one.
+    pub fn as_deref(&self) -> Option<&str> {
+        self.set.then_some(self.buf.as_str())
+    }
+
+    /// Replaces the text with `s`, reusing the buffer (grown to fit, not doubled: a new
+    /// connection's first request allocates what `to_owned` did).
+    pub fn set(&mut self, s: &str) {
+        self.buf.clear();
+        self.buf.reserve_exact(s.len());
+        self.buf.push_str(s);
+        self.set = true;
+    }
+
+    /// Sets the text to `s`, or clears it when `s` is `None`.
+    pub fn set_opt(&mut self, s: Option<&str>) {
+        match s {
+            Some(s) => self.set(s),
+            None => self.reset(),
+        }
+    }
+
+    /// No text; the buffer keeps its capacity for the next request.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+        self.set = false;
+    }
+}
+
 pub struct TcpSession {
     /// The client's socket, none for a stream of an HTTP/2 connection (T280). Outside this
     /// module it is reached through `cli_fd` only.
@@ -489,8 +528,8 @@ pub struct TcpSession {
     pub proxy_hdr_err: Option<ProxyHdrError>,
     pub cliexp: Vec<CompiledExp>,
     pub srvexp: Vec<CompiledExp>,
-    pub req_uri: Option<String>,
-    pub req_method: Option<String>,
+    pub req_uri: ReqText,
+    pub req_method: ReqText,
     /// Bytes of the request body the HTX message holds (block header included), fixed when
     /// the rules first size it: the body is read once, so a later rule list (the backend's)
     /// finds it as it was, less the room the rewrites before it took (`req_htx_init`).
@@ -1056,8 +1095,8 @@ impl TcpSession {
             proxy_hdr_err: None,
             cliexp,
             srvexp,
-            req_uri: None,
-            req_method: None,
+            req_uri: ReqText::default(),
+            req_method: ReqText::default(),
             req_body_htx: std::cell::Cell::new(None),
             req_headers: None,
             htx_buf: Buf::unallocated(crate::buf::BufClass::Standard),
@@ -1804,9 +1843,9 @@ impl TcpSession {
         self.stick_out_pending += self.log.bytes_from_server;
         self.log = crate::txnlog::StreamLog::start(self.bytes_in, self.bytes_out);
         self.txn = None;
-        self.req_method = None;
+        self.req_method.reset();
         self.req_body_htx.set(None);
-        self.req_uri = None;
+        self.req_uri.reset();
         self.set_scrape(None);
         self.req_headers = None;
         self.clear_htx();
@@ -2349,20 +2388,19 @@ impl TcpSession {
                     }
                 };
                 if self.has_htx {
-                    let (req_m, req_u, conn_close, wire_replacement) = {
+                    let (conn_close, wire_replacement) = {
                         let htx = ibex_proto::htx::HtxSliceRef::new(
                             self.htx_buf.raw_slice(),
                             self.htx_blocks,
                         );
-                        let mut req_m = None;
-                        let mut req_u = None;
                         let mut conn_close = false;
                         // The values of the `Connection` headers, the names compared as bytes
                         // (T433: `headers()` read every name and value as UTF-8, twice).
                         let connection = || htx.header_blocks_where(|n| n.eq_ignore_ascii_case(b"connection")).map(|(_, _, v)| v);
                         if let Some(req) = htx.req_line() {
-                            req_m = Some(req.method.to_string());
-                            req_u = Some(req.uri.to_string());
+                            // Copied into the session's own buffers: no allocation once warm.
+                            self.req_method.set(req.method);
+                            self.req_uri.set(req.uri);
                             if req.version == "HTTP/1.0"
                                 && !connection().any(|v| txn::connection_has(v, "keep-alive"))
                             {
@@ -2378,14 +2416,8 @@ impl TcpSession {
                         } else {
                             None
                         };
-                        (req_m, req_u, conn_close, wire_replacement)
+                        (conn_close, wire_replacement)
                     };
-                    if let Some(m) = req_m {
-                        self.req_method = Some(m);
-                    }
-                    if let Some(u) = req_u {
-                        self.req_uri = Some(u);
-                    }
                     close |= conn_close;
                     // Only regenerate wire buffer if HTX was actually modified
                     if let Some(wire) = wire_replacement {
@@ -2407,10 +2439,10 @@ impl TcpSession {
 
                     let mut parts = first_line.split_whitespace();
                     if let Some(m) = parts.next() {
-                        self.req_method = Some(m.to_string());
+                        self.req_method.set(m);
                     }
                     if let Some(u) = parts.next() {
-                        self.req_uri = Some(u.to_string());
+                        self.req_uri.set(u);
                     }
                     let mut hdrs: Vec<(String, String)> = Vec::new();
                     for line in rest_headers.lines() {
@@ -3556,6 +3588,22 @@ fn h3_log_line(line: &str, host: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// T436: `ReqText` keeps its buffer across `reset`, so the next request's text fits without
+    /// a new allocation; `set_opt(None)` clears it as `reset` does.
+    #[test]
+    fn req_text_reuses_its_buffer() {
+        let mut t = super::ReqText::default();
+        assert_eq!(t.as_deref(), None);
+        t.set("/a/longer/path");
+        let cap = t.buf.capacity();
+        t.reset();
+        assert_eq!(t.as_deref(), None);
+        t.set_opt(Some("/short"));
+        assert_eq!((t.as_deref(), t.buf.capacity()), (Some("/short"), cap));
+        t.set_opt(None);
+        assert_eq!(t.as_deref(), None);
+    }
 
     /// `bc_err` builds the `bc_err`/`bc_err_str` pair the oracle prints for a plain
     /// (non-TLS) connection. Runtime call: the table in `proxy.rs` evaluates it at compile

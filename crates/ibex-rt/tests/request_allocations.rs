@@ -719,3 +719,92 @@ fn set_var_on_a_keep_alive_request_allocates_nothing() {
         assert_eq!(n, none, "set-var ({name}) allocated {n} times on a keep-alive request, {none} without it");
     }
 }
+
+/// A keep-alive HTTP/1.1 server for `keepalive_proxied_allocations`: answers every head on every
+/// connection with a 2-byte body, from a fixed buffer, so the backend thread allocates nothing
+/// per request (the counter is process-wide).
+fn start_keepalive_backend(listener: TcpListener, running: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking");
+        let mut conns: Vec<TcpStream> = Vec::with_capacity(8);
+        let mut buf = [0u8; 4096];
+        while running.load(Ordering::Relaxed) {
+            if let Ok((s, _)) = listener.accept() {
+                s.set_nonblocking(true).expect("nonblocking");
+                conns.push(s);
+            }
+            for s in &mut conns {
+                // One head per read: the client sends the next request only after the response.
+                if let Ok(n) = s.read(&mut buf) {
+                    if n > 0 && buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                    }
+                }
+            }
+            thread::sleep(Duration::from_micros(200));
+        }
+    })
+}
+
+/// One request on the keep-alive `client`, the engine run until the response is back. Unlike
+/// `drive_keepalive_request` it does not idle the engine afterwards (each idle `run_once` sleeps
+/// up to 100 ms), and it reads into a fixed buffer: nothing here allocates.
+fn drive_proxied_request(client: &mut TcpStream, engine: &mut Engine) {
+    client.write_all(b"GET /api/test HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("write req");
+    let start = Instant::now();
+    let mut response = [0u8; 512];
+    let mut len = 0;
+    while start.elapsed() < Duration::from_secs(2) && !response[..len].ends_with(b"\r\n\r\nok") {
+        let _ = engine.run_once();
+        if let Ok(n) = client.read(&mut response[len..]) {
+            len += n;
+        }
+    }
+    let got = &response[..len];
+    assert!(got.starts_with(b"HTTP/1.1 200") && got.ends_with(b"\r\n\r\nok"), "response: {:?}", String::from_utf8_lossy(got));
+}
+
+/// The allocations of `n` keep-alive requests on one client connection, proxied to a keep-alive
+/// server, after three warm-up requests.
+fn keepalive_proxied_allocations(n: usize) -> usize {
+    let (srv, srv_addr) = loopback0();
+    let (l, addr) = loopback0();
+    drop(l);
+    let running = Arc::new(AtomicBool::new(true));
+    let be = start_keepalive_backend(srv, Arc::clone(&running));
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend f\n  bind {addr}\n  default_backend b\nbackend b\n  server s1 {srv_addr}\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = TcpStream::connect(addr).expect("connect to frontend");
+    client.set_nonblocking(true).expect("set_nonblocking");
+    for _ in 0..3 {
+        drive_proxied_request(&mut client, &mut engine);
+    }
+    let before = ibex_alloc::alloc_counters();
+    for _ in 0..n {
+        drive_proxied_request(&mut client, &mut engine);
+    }
+    let diff = before.diff(&ibex_alloc::alloc_counters());
+    drop(client);
+    for _ in 0..5 {
+        let _ = engine.run_once();
+    }
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+    diff.alloc_count
+}
+
+/// T436 A: a steady-state keep-alive request proxied to a server allocates nothing. Measured
+/// before (2026-10-19, uprobe on malloc under the pstat load): 2 per request, the method and the
+/// URI copied into `TcpSession::req_method` / `req_uri` as owned `String`s. The count for 1100
+/// requests must equal the count for 100: whatever is left is one-time, not per request.
+#[test]
+fn a_proxied_keep_alive_request_allocates_nothing() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let few = keepalive_proxied_allocations(100);
+    let many = keepalive_proxied_allocations(1100);
+    println!("[MEASUREMENT T436 A] proxied keep-alive allocations: 100 requests {few}, 1100 requests {many}");
+    assert_eq!(many, few, "1000 more keep-alive requests made {} more allocations", many as i64 - few as i64);
+}

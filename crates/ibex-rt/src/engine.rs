@@ -4738,7 +4738,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 exp: exp.and_then(rel),
                 c_exp: rel(s.conn_exp),
                 retries: s.max_retries.saturating_sub(s.conn_retries),
-                uri: s.txn.as_ref().and(s.req_uri.clone()),
+                uri: s.txn.as_ref().and(s.req_uri.as_deref().map(str::to_owned)),
             });
         }
         for (aidx, a) in self.applets.iter() {
@@ -10205,8 +10205,8 @@ impl EngineDispatcher<'_> {
 
         let registry = sample_registry();
 
-        let req_uri_clone = entry.sess.req_uri.clone();
-        let req_method_clone = entry.sess.req_method.clone();
+        let req_uri_clone = entry.sess.req_uri.as_deref().map(str::to_owned);
+        let req_method_clone = entry.sess.req_method.as_deref().map(str::to_owned);
         let req_headers_clone = entry.sess.req_headers.clone();
         // The response capture slots the `http-response capture` rules write, and that the
         // context reads (as they were when the response came in).
@@ -13605,7 +13605,7 @@ fn req_set_uri(sess: &mut TcpSession, uri: String) -> bool {
     sess.with_htx_mut(|htx| {
         let _ = htx.set_uri(&uri);
     });
-    sess.req_uri = Some(uri);
+    sess.req_uri.set(&uri);
     rebuild_req_buffer(sess);
     true
 }
@@ -13620,7 +13620,7 @@ fn req_set_method(sess: &mut TcpSession, method: String) -> bool {
     sess.with_htx_mut(|htx| {
         let _ = htx.set_method(&method);
     });
-    sess.req_method = Some(method);
+    sess.req_method.set(&method);
     rebuild_req_buffer(sess);
     true
 }
