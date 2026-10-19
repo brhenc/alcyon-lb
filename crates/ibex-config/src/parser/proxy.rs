@@ -769,7 +769,14 @@ pub(crate) fn parse_backend_directive(
         "capture" => parse_capture(&mut Vec::new(), &mut Vec::new(), 0, tokens, kw),
         // `HAProxy`: "'monitor' ignored because backend has no frontend capability" (a warning);
         // the line is checked, then dropped.
-        "monitor" => parse_monitor(&mut Vec::new(), tokens, kw),
+        "monitor" | "monitor-uri" => {
+            warn::push(kw.line, WarnStyle::Spaced, &format!("'{}' ignored because backend '{}' has no frontend capability.", kw.text, be.name));
+            if kw.text == "monitor" {
+                parse_monitor(&mut Vec::new(), tokens, kw)
+            } else {
+                parse_monitor_uri(&mut None, tokens, kw)
+            }
+        }
         other => Err(ConfigError::new(
             kw.line,
             kw.col,
