@@ -129,6 +129,12 @@ fn clear_counters_resets_the_maxima_all_resets_everything_and_the_rest_is_ignore
     // Plain, and with a word it ignores: the maxima only, in every proxy.
     for cmd in ["clear counters", "clear counters bl", "clear counters nosuch"] {
         traffic();
+        // The last request's session is taken off `scur` a moment after its client saw the
+        // answer; a clear before that would find it current. Wait for the proxy to be idle.
+        let idle_by = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < idle_by && (value(&sock, "scur", "f", "FRONTEND") != "0" || value(&sock, "scur", "bl", "BACKEND") != "0") {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(cli(&sock, cmd), "\n", "{cmd}");
         assert_eq!(smax("f", "FRONTEND"), "0", "{cmd}: smax of the frontend");
         assert_eq!(smax("bl", "BACKEND"), "0", "{cmd}: smax of the other backend, too");
