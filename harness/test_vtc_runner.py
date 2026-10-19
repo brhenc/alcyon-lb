@@ -336,3 +336,119 @@ class VtestHex(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NothingSurvivesTheRunner(unittest.TestCase):
+    """The runner must not leave the proxy (or its children) or a /tmp/vtc_ibex_* dir behind.
+
+    A board run left an `ibex -f /tmp/vtc_ibex_*/h1/cfg -d` alive for 9 h: a test that
+    raised, a timeout, or a SIGTERM of the runner skipped the cleanup. The "proxy" here is
+    a script that forks a child (as `-W` does), so only a process-group kill gets both.
+    """
+
+    FAKE = (
+        "#!/usr/bin/env python3\n"
+        "import os, time\n"
+        "if os.fork() == 0:\n"
+        "    time.sleep(300)\n"
+        "    os._exit(0)\n"
+        "time.sleep(300)\n"
+    )
+    VTC_START = 'varnishtest "leak"\nhaproxy h1 -conf {\n    global\n        daemon\n} -start\n'
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="leaktest_")
+        self.addCleanup(self._reap)
+        self.fake = os.path.join(self.root, "fakeibex")
+        with open(self.fake, "w") as f:
+            f.write(self.FAKE)
+        os.chmod(self.fake, 0o755)
+        self.runner_pid = -1
+        self.tmp = os.path.join(self.root, "tmp")
+        os.mkdir(self.tmp)
+
+    def _procs(self):
+        pids = []
+        for p in os.listdir("/proc"):
+            if not p.isdigit():
+                continue
+            try:
+                with open(f"/proc/{p}/cmdline", "rb") as f:
+                    cmd = f.read()
+                with open(f"/proc/{p}/stat") as f:
+                    state = f.read().rsplit(")", 1)[1].split()[0]
+            except OSError:
+                continue
+            if self.root.encode() in cmd and state != "Z" and int(p) != self.runner_pid:
+                pids.append(int(p))
+        return pids
+
+    def _reap(self):
+        import shutil
+        import signal
+        for pid in self._procs():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _start(self, vtc_text, timeout="5"):
+        vtc = os.path.join(self.root, "t.vtc")
+        with open(vtc, "w") as f:
+            f.write(vtc_text)
+        import subprocess
+        env = dict(os.environ, TMPDIR=self.tmp)
+        r = subprocess.Popen(
+            [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vtc_runner.py"),
+             "--binary", self.fake, "--timeout", timeout, vtc],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.runner_pid = r.pid
+        return r
+
+    def _wait_for_proxy(self):
+        import time
+        for _ in range(100):
+            if self._procs():
+                return
+            time.sleep(0.1)
+        self.fail("the fake proxy never started")
+
+    def _assert_clean(self):
+        import time
+        for _ in range(30):
+            if not self._procs():
+                break
+            time.sleep(0.1)
+        self.assertEqual(self._procs(), [], "a process of the test survived")
+        self.assertEqual(os.listdir(self.tmp), [], "the test's temp dir survived")
+
+    def test_a_test_that_raises_leaves_nothing(self):
+        r = self._start(self.VTC_START + "shell {\n    exit 1\n}\n")
+        r.wait(timeout=30)
+        self._assert_clean()
+
+    def test_a_timeout_with_a_proxy_that_never_exits_leaves_nothing(self):
+        r = self._start(self.VTC_START + "haproxy h1 -wait\n", timeout="2")
+        try:
+            r.wait(timeout=20)
+        except Exception:
+            r.kill()
+            self.fail("the runner hung: `haproxy -wait` blocks the event loop, so the timeout never fires")
+        self._assert_clean()
+
+    def test_sigterm_of_the_runner_leaves_nothing(self):
+        import signal
+        r = self._start(self.VTC_START + "delay 60\n", timeout="120")
+        self._wait_for_proxy()
+        r.send_signal(signal.SIGTERM)
+        r.wait(timeout=30)
+        self._assert_clean()
+
+    def test_sigint_of_the_runner_leaves_nothing(self):
+        import signal
+        r = self._start(self.VTC_START + "delay 60\n", timeout="120")
+        self._wait_for_proxy()
+        r.send_signal(signal.SIGINT)
+        r.wait(timeout=30)
+        self._assert_clean()

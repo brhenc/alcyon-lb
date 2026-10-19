@@ -10,6 +10,7 @@ dependencies (VTest/Varnish). Supports mock HTTP/TCP servers and clients, macro
 expansions, listening port rewriting, target proxy execution, and rich assertion reporting.
 """
 
+import atexit
 import argparse
 import asyncio
 import dataclasses
@@ -1757,6 +1758,90 @@ def vtest_builtin_macros() -> Dict[str, str]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Process hygiene: nothing the runner starts may outlive it
+# ---------------------------------------------------------------------------
+#
+# Every proxy and every shell command runs in its own session (so its own process group,
+# which also holds whatever it forks, e.g. the workers of `-W`).  The groups and the
+# per-test temp dirs are recorded here and removed by `cleanup_all()`, which runs when a
+# test ends (`VtcExecutor.cleanup`), at interpreter exit (`atexit`) and on SIGTERM/SIGHUP/
+# SIGINT of the runner.  A board run once left `ibex -f /tmp/vtc_ibex_*/h1/cfg -d` alive
+# for 9 hours because a test that raised, a timeout or a signal skipped the cleanup.
+
+_LIVE_GROUPS: set = set()
+_LIVE_DIRS: set = set()
+
+
+def kill_group(pgid: int, grace: float = 0.3) -> None:
+    """SIGTERM the process group, give its leader `grace` seconds, then SIGKILL the group."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        _LIVE_GROUPS.discard(pgid)
+        return
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        try:
+            done, _ = os.waitpid(pgid, os.WNOHANG)
+            if done:
+                break
+        except ChildProcessError:
+            break
+        time.sleep(0.01)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        os.waitpid(pgid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    _LIVE_GROUPS.discard(pgid)
+
+
+def cleanup_all() -> None:
+    for pgid in list(_LIVE_GROUPS):
+        kill_group(pgid)
+    for d in list(_LIVE_DIRS):
+        shutil.rmtree(d, ignore_errors=True)
+        _LIVE_DIRS.discard(d)
+
+
+def popen_tracked(cmd, **kw) -> "subprocess.Popen":
+    """Popen in a new session, recorded for cleanup_all()."""
+    proc = subprocess.Popen(cmd, start_new_session=True, **kw)
+    _LIVE_GROUPS.add(proc.pid)
+    return proc
+
+
+def run_tracked(cmd, timeout: Optional[float] = None, **kw) -> "subprocess.CompletedProcess":
+    """subprocess.run(capture_output=True) in its own group.  On a timeout the group is
+    killed and TimeoutError raised (the test fails; it does not hang the runner).  A shell
+    command that backgrounds something leaves it running until the test ends, as before."""
+    proc = popen_tracked(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_group(proc.pid)
+        raise TimeoutError(f"command timed out after {timeout}s: {cmd}")
+    except BaseException:
+        kill_group(proc.pid)
+        raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+def install_exit_handlers() -> None:
+    atexit.register(cleanup_all)
+
+    def on_signal(signum, _frame):
+        cleanup_all()
+        os._exit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, on_signal)
+
+
 class VtcExecutor:
     """Executes a parsed VTC test script against a target binary."""
 
@@ -1768,6 +1853,7 @@ class VtcExecutor:
 
         self.testdir = os.path.dirname(os.path.abspath(parser.filepath))
         self.tmpdir = tempfile.mkdtemp(prefix="vtc_ibex_")
+        _LIVE_DIRS.add(self.tmpdir)
         self.macro_engine = MacroEngine({
             "testdir": self.testdir,
             "tmpdir": self.tmpdir,
@@ -1781,6 +1867,7 @@ class VtcExecutor:
         self.clients: Dict[str, MockClientRunner] = {}
         self.proxies: Dict[str, subprocess.Popen] = {}
         self.temp_cfgs: List[str] = []
+        self.groups: List[int] = []  # process groups of shell blocks, killed at the end of the test
 
     def shell_env(self) -> Dict[str, str]:
         """Environment of `shell` blocks and `feature cmd`: vtest runs them with the
@@ -1789,28 +1876,28 @@ class VtcExecutor:
         env["HAPROXY_PROGRAM"] = self.target_binary
         return env
 
+    def run_cmd(self, cmd, **kw) -> "subprocess.CompletedProcess":
+        """A shell command or `-c` check, in its own group, bounded by the test timeout."""
+        before = set(_LIVE_GROUPS)
+        try:
+            return run_tracked(cmd, timeout=self.timeout, **kw)
+        finally:
+            # Whatever the command left running dies with the test, not before.
+            self.groups.extend(_LIVE_GROUPS - before)
+
     def cleanup(self) -> None:
         for p in self.proxies.values():
-            if p.poll() is None:
-                try:
-                    p.terminate()
-                    p.wait(timeout=0.5)
-                except Exception:
-                    try:
-                        p.kill()
-                    except Exception:
-                        pass
+            kill_group(p.pid)
+        for pgid in self.groups:
+            kill_group(pgid)
 
         for s in self.servers.values():
             s.stop()
         for sl in self.syslogs.values():
             sl.stop()
 
-        if os.path.exists(self.tmpdir):
-            try:
-                shutil.rmtree(self.tmpdir, ignore_errors=True)
-            except Exception:
-                pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        _LIVE_DIRS.discard(self.tmpdir)
 
     async def _cli_connect(self, cli_sock: str):
         for _ in range(50):
@@ -1919,8 +2006,7 @@ class VtcExecutor:
                         cmd_str = cmd_str[1:-1]
                     cmd_expanded = cmd_str.replace("$HAPROXY_PROGRAM", self.target_binary)
                     cmd_expanded = self.macro_engine.expand(cmd_expanded)
-                    res = subprocess.run(cmd_expanded, shell=True, capture_output=True,
-                                         env=self.shell_env())
+                    res = self.run_cmd(cmd_expanded, shell=True, env=self.shell_env())
                     if res.returncode != 0:
                         return TestResult(
                             test_name=test_title,
@@ -2037,8 +2123,7 @@ class VtcExecutor:
             elif cmd == "shell":
                 sh_cmd = block if block is not None else (args[0] if args else "")
                 sh_expanded = self.macro_engine.expand(sh_cmd)
-                res = subprocess.run(sh_expanded, shell=True, capture_output=True, text=True,
-                                     env=self.shell_env())
+                res = self.run_cmd(sh_expanded, shell=True, text=True, env=self.shell_env())
                 if res.returncode != 0:
                     raise RuntimeError(f"Shell command failed (exit code {res.returncode}):\n{res.stderr}")
                 # A shell block's exit status is vtest's assertion (default -expectexit 0),
@@ -2224,20 +2309,12 @@ class VtcExecutor:
                             print(f"       {Color.DIM}{_n:3d}| {_l}{Color.RESET}")
 
                     if conf_type == "-conf-OK":
-                        res = subprocess.run(
-                            [self.target_binary, "-c", "-f", cfg_path],
-                            capture_output=True,
-                            text=True,
-                        )
+                        res = self.run_cmd([self.target_binary, "-c", "-f", cfg_path], text=True)
                         if res.returncode != 0:
                             raise AssertionError(f"Config check failed (-conf-OK):\n{res.stderr}")
                         _note_assertion()
                     elif conf_type == "-conf-BAD":
-                        res = subprocess.run(
-                            [self.target_binary, "-c", "-f", cfg_path],
-                            capture_output=True,
-                            text=True,
-                        )
+                        res = self.run_cmd([self.target_binary, "-c", "-f", cfg_path], text=True)
                         if res.returncode == 0:
                             raise AssertionError(f"Config check unexpectedly succeeded (-conf-BAD) for {haproxy_id}")
                         want = (directive.expect_stderr or "").strip()
@@ -2251,7 +2328,7 @@ class VtcExecutor:
                             # The CLI is the config's `stats socket` (see the prelude above),
                             # in the foreground, as vtest runs it.
                             mw = [a for a in master_args if a in ("-W", "-Ws")]
-                            proc = subprocess.Popen(
+                            proc = popen_tracked(
                                 [self.target_binary, *master_args, "-f", cfg_path, "-d"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
@@ -2280,11 +2357,17 @@ class VtcExecutor:
                         p = self.proxies.get(haproxy_id)
                         if p and p.poll() is None:
                             p.terminate()
-                            p.wait(timeout=1.0)
+                            try:
+                                p.wait(timeout=1.0)
+                            except subprocess.TimeoutExpired:
+                                kill_group(p.pid)
+                                raise
                     elif "-wait" in opts:
                         p = self.proxies.get(haproxy_id)
-                        if p:
-                            p.wait()
+                        # Poll, do not block: a blocking wait() stops the event loop, so the
+                        # test timeout could never fire on a proxy that does not exit.
+                        while p and p.poll() is None:
+                            await asyncio.sleep(0.02)
 
             elif cmd == "client":
                 client_id = args[0]
@@ -2569,6 +2652,7 @@ def main() -> None:
     print(f"{Color.bold('Running Ibex VTC Runner')} on {len(vtc_files)} test file(s)...")
     print(f"Target Binary: {args.binary}\n")
 
+    install_exit_handlers()
     suite_start = time.monotonic()
     results = asyncio.run(
         run_suite(
