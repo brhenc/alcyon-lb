@@ -49,13 +49,13 @@ pub(crate) fn parse_stats_directive(
         "admin" if in_defaults => Err(ConfigError::new(kw.line, kw.col, "'stats admin' not allowed in 'defaults' section.")),
         "http-request" if in_defaults => Err(ConfigError::new(kw.line, kw.col, "'stats' not allowed in 'defaults' section.")),
         "admin" => {
-            stats.admin = true;
-            if tokens.len() >= 4 && (tokens[2].text == "if" || tokens[2].text == "unless") {
-                let cond = parse_acl_condition_from_tokens(&tokens[2..])?;
-                stats.admin_rules.push(cond);
-            } else {
-                stats.admin_rules.push(None);
+            // HAProxy: a rule needs its condition (a bare `stats admin` made the page admin for all).
+            if tokens.len() < 4 || (tokens[2].text != "if" && tokens[2].text != "unless") {
+                return Err(ConfigError::new(kw.line, kw.col, "'stats admin' requires either 'if' or 'unless' followed by a condition."));
             }
+            let cond = parse_acl_condition_from_tokens(&tokens[2..])?;
+            stats.admin = true;
+            stats.admin_rules.push(cond);
             Ok(())
         }
         "show-legends" => {

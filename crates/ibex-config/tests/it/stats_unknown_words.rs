@@ -88,3 +88,13 @@ fn stats_admin_and_http_request_are_refused_in_defaults() {
     assert!(d("stats admin if TRUE").contains("'stats admin' not allowed in 'defaults' section."));
     assert!(d("stats http-request deny").contains("'stats' not allowed in 'defaults' section."));
 }
+
+#[test]
+fn a_stats_admin_without_a_condition_is_refused() {
+    // Measured on 3.5-dev8: the line is an error, it does not make the page admin for everyone.
+    for line in ["stats admin", "stats admin foo", "stats admin if"] {
+        let e = cfg(line).expect_err(line).to_string();
+        assert!(e.contains("'stats admin' requires either 'if' or 'unless' followed by a condition."), "{line}: {e}");
+    }
+    cfg("stats admin unless FALSE").expect("unless with a condition loads");
+}
