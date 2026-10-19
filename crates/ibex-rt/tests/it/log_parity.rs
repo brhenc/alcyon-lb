@@ -95,8 +95,10 @@ fn get(path: &str) -> Vec<u8> {
 }
 
 /// Runs the daemon under `mode` and `option_line`, sends `traffic`, and returns the raw
-/// datagrams the collector got.
-fn run(mode: &str, option_line: &str, traffic: impl FnOnce(u16)) -> Vec<Vec<u8>> {
+/// datagrams the collector got: it waits (up to 20 s) for the `expect` the traffic must
+/// produce, and then 400 ms more for a surplus line, so that a loaded host that logs late
+/// loses nothing and a quiet one waits no longer than it did.
+fn run(mode: &str, option_line: &str, expect: usize, traffic: impl FnOnce(u16)) -> Vec<Vec<u8>> {
     let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
     collector.set_read_timeout(Some(Duration::from_millis(400))).expect("timeout");
     let log_port = collector.local_addr().expect("addr").port();
@@ -136,15 +138,24 @@ fn run(mode: &str, option_line: &str, traffic: impl FnOnce(u16)) -> Vec<Vec<u8>>
     collector.set_read_timeout(Some(Duration::from_millis(400))).expect("timeout");
     while collector.recv(&mut [0u8; 65535]).is_ok() {}
     traffic(port);
-    thread::sleep(Duration::from_millis(300));
     let mut got = Vec::new();
     let mut buf = vec![0u8; 65535];
-    let until = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < until {
+    let until = Instant::now() + Duration::from_secs(20);
+    while got.len() < expect {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        collector.set_read_timeout(Some(left)).expect("timeout");
         match collector.recv(&mut buf) {
             Ok(n) => got.push(buf[..n].to_vec()),
             Err(_) => break,
         }
+    }
+    // A line that should not be there shows up within a moment of the ones that should.
+    collector.set_read_timeout(Some(Duration::from_millis(400))).expect("timeout");
+    while let Ok(n) = collector.recv(&mut buf) {
+        got.push(buf[..n].to_vec());
     }
     got
 }
@@ -189,7 +200,7 @@ fn http_traffic(port: u16) {
 
 #[test]
 fn httplog_lines_equal_haproxys() {
-    let got = run("http", "option httplog", http_traffic);
+    let got = run("http", "option httplog", 9, http_traffic);
     let lines: Vec<String> = got.iter().map(|d| mask_timings(&normalise(d), 2)).collect();
     // `HAProxy`: the same lines, `%ac/%fc/%bc/%sc/%rc` as shown, `0/0` queues.
     let want = [
@@ -208,7 +219,7 @@ fn httplog_lines_equal_haproxys() {
 
 #[test]
 fn httpslog_adds_the_tls_fields_and_they_are_empty_without_tls() {
-    let got = run("http", "option httpslog", |port| {
+    let got = run("http", "option httpslog", 2, |port| {
         exchange(port, &get("/a"));
         exchange(port, &get("/404"));
     });
@@ -223,14 +234,14 @@ fn httpslog_adds_the_tls_fields_and_they_are_empty_without_tls() {
 #[test]
 fn tcplog_lines_equal_haproxys() {
     // The origin is an HTTP one that keeps the connection: `timeout server` ends it (`sD`).
-    let got = run("tcp", "option tcplog", |port| exchange(port, b"GET /ok HTTP/1.0\r\n\r\n"));
+    let got = run("tcp", "option tcplog", 1, |port| exchange(port, b"GET /ok HTTP/1.0\r\n\r\n"));
     let lines: Vec<String> = got.iter().map(|d| mask_timings(&normalise(d), 2)).collect();
     assert_eq!(lines, [r#"127.0.0.1 fe be/s1 N/N/N 60 sD 1/1/0/0/0 0/0"#.to_string()], "\n{lines:#?}");
 }
 
 #[test]
 fn default_format_logs_one_connect_line_per_connection() {
-    let got = run("http", "", |port| {
+    let got = run("http", "", 2, |port| {
         let mut keepalive = b"GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /b HTTP/1.1\r\nHost: h\r\n\r\n".to_vec();
         keepalive.extend(get("/c"));
         exchange(port, &keepalive);
@@ -253,7 +264,7 @@ fn default_format_logs_one_connect_line_per_connection() {
 #[test]
 fn an_empty_capture_takes_the_blank_after_it() {
     // `x %hr y` sent `x y` (a blank run is one blank, and an empty `%hr` writes no blank).
-    let got = run("http", "log-format \"[%hr] x %hr y %hs z  w\"", |port| exchange(port, &get("/a")));
+    let got = run("http", "log-format \"[%hr] x %hr y %hs z  w\"", 1, |port| exchange(port, &get("/a")));
     let line = String::from_utf8_lossy(&got[0]).into_owned();
     assert!(line.ends_with("[] x y z w\n"), "{line:?}");
 }
@@ -275,7 +286,7 @@ fn an_empty_field_takes_the_blank_after_it() {
         ("A %{+Q}HQ B", "A \"\" B\n"),
         ("A %[str()] %HQ B", "A - B\n"),
     ] {
-        let got = run("http", &format!("log-format \"{}\"", format.replace('"', "\\\"")), |port| exchange(port, &get("/a")));
+        let got = run("http", &format!("log-format \"{}\"", format.replace('"', "\\\"")), 1, |port| exchange(port, &get("/a")));
         let line = String::from_utf8_lossy(&got[0]).into_owned();
         assert!(line.ends_with(&format!("]: {expect}")), "{format:?}: {line:?}");
     }
