@@ -54,6 +54,7 @@ version = "0.1.0"
 dependencies = [
  "ibex-regex",
  "ibex-sched",
+ "memchr",
 ]
 
 [[package]]
