@@ -1923,9 +1923,9 @@ impl TcpSession {
     /// left in the head after the rules is one they wrote (T439). The client's tokens were
     /// read before. `conn` is the head's [`txn::ConnScan`] when it is known.
     fn strip_request_connection(&mut self, conn: Option<txn::ConnScan>) {
-        let Some((h, e)) = self.req.eoh() else {
-            return;
-        };
+        // The head has its end here (it was found to get this far, and the rules keep it), so
+        // there is always one; the empty default would count no `Connection` header anyway.
+        let (h, e) = self.req.eoh().unwrap_or_default();
         let conn = conn.unwrap_or_else(|| txn::scan_connection(&self.req.readable()[..h + e]));
         if conn.count == 0 {
             return;
@@ -2571,9 +2571,8 @@ impl TcpSession {
                 }
                 // Read above (and the body checked with the head as received): from here on a
                 // `close` in the head is one a rule wrote (T439).
-                if self.has_htx {
-                    self.strip_request_connection(conn_scan.filter(|_| self.cliexp.is_empty()));
-                }
+                // (`validate_request_head` leaves `has_htx` set on every `Ok`.)
+                self.strip_request_connection(conn_scan.filter(|_| self.cliexp.is_empty()));
                 let line = self.req.readable().split(|&b| b == b'\n').next().map_or(&[][..], <[u8]>::trim_ascii_end);
                 let ver = &line[line.len().saturating_sub(8)..];
                 // A chunked HTTP/1.0 request closes the connection after its response, whatever

@@ -13459,9 +13459,9 @@ fn reread_request_framing(sess: &mut TcpSession) {
         sess.with_htx_mut(|htx| {
             let _ = htx.remove_header(name);
         });
-        if let Some(hdrs) = sess.req_headers.as_mut() {
-            hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
-        }
+        // The copy of the headers, when the session keeps one (the rules that edit a header
+        // make it; a head nothing has edited does not have one).
+        sess.req_headers.as_mut().into_iter().for_each(|hdrs| hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name)));
         rebuild_req_buffer(sess);
     }
 }
