@@ -188,9 +188,9 @@ fn sigttou_flushes_the_caches() {
 
 #[test]
 fn sigusr1_flushes_the_caches_while_a_connection_holds_the_stop() {
-    // One thread: the CLI session and the held connection live on the same worker, which
-    // a stopping worker without sessions would otherwise leave.
-    let mut run = start("usr1", 1);
+    // Four threads: the CLI session and the held connection may be on different workers;
+    // the CLI's waits for its session (T456).
+    let mut run = start("usr1", 4);
     burst(run.addr);
     let mut held = TcpStream::connect_timeout(&run.addr, Duration::from_secs(2)).expect("connect");
     held.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap();

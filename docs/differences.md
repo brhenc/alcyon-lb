@@ -317,6 +317,44 @@ not left in memory. Default **off**: the wipe costs ~1k instructions per request
 benchmark, and HAProxy wipes nothing either. HAProxy refuses the keyword as unknown. It takes
 exactly `on` or `off`; anything else, or a missing argument, is a configuration error.
 
+## `tune.ibex.crypto-provider ring|ring-ibex`, `set ssl crypto-provider` and `show ssl crypto-provider`: Ibex-only (T460)
+
+The rustls crypto provider every TCP TLS configuration is built on: binds, server lines and
+their health checks, TLS 1.2 and 1.3. `ring` (the default) is upstream ring through
+`rustls-ring`; `ring-ibex` is the vendored ring fork that wipes key material when it is freed
+(`vendor/ringibex`, built with its `zeroize` feature on; what it wipes: `vendor/ringibex/ZEROIZE.md`,
+`tradeoff.md` 6.27). Exactly one argument, `ring` or `ring-ibex`; anything else is a configuration
+error. HAProxy refuses the keyword as unknown.
+
+QUIC, the TLS binds of a `log-forward` section and the TLS servers of a `ring` section are still on
+rustls 0.23, which only vanilla ring serves: `ring-ibex` with any of them is refused at startup
+(and by `-c`), naming the line, rather than letting that part run on vanilla ring unsaid.
+
+`show ssl crypto-provider` (CLI, admin level) prints the provider new handshakes use and the
+handshakes completed on each provider since start, front and back:
+
+    current ring
+    provider ring handshakes 12
+    provider ring-ibex handshakes 0
+
+`set ssl crypto-provider ring|ring-ibex` (CLI, admin level) changes the provider at run time, for
+the handshakes that start after it. Every TLS configuration (each `bind ... ssl`, each `server ...
+ssl` and its checks) is built again on the new provider, reading its certificate, CA and CRL files
+again; only once all of them are built is the new provider published, so a file that no longer
+loads leaves everything as it was and the answer says `Crypto provider unchanged ('ring'): <the
+error>`. A connection already open keeps the session and the provider it started with, and so does
+the server connection of its session. A configuration keeps both builds once it has them: swapping
+back reuses the configurations of startup. Session tickets and session IDs belong to one build (the
+ticket keys come from the provider), so a client resuming a session from before the swap gets a
+full handshake, not a failure. `ring-ibex` is refused at run time in the same cases as at startup
+(QUIC, log-forward or ring TLS). The swap lasts as long as the process: a reload starts the new
+process on the configured provider, and so does a restart. HAProxy has no such command (switching
+SSL libraries there means a new binary).
+
+HAProxy's `ssl-provider`, `ssl-provider-path` and `ssl-propquery` load OpenSSL 3 providers
+(additively, `configuration.txt` "ssl-provider"), which is not this: they stay refused as
+OpenSSL-only (table above).
+
 ## `ibex.watchdog-warn-only`: an Ibex-only global keyword (T361)
 
 HAProxy's watchdog warns about a thread that has stopped processing traffic and, once it has been stuck for a
@@ -429,10 +467,12 @@ polls for it. Two differences:
   process's one bind can race the successor's exit (0 losses in 30 on an idle host; the Ibex
   equivalent lost 1 in 3 under the gate's load). Ibex joins its workers, so every socket it bound
   is closed, before it signals.
-* `SIGTTOU` pauses every listener on HAProxy (`Paused frontend fe.` for each proxy; its TCP stats
-  socket refuses connections until `SIGTTIN`). Ibex pauses only the abstract stats sockets: the
-  others are `SO_REUSEPORT` and the successor binds beside them, and closing them would reset what
-  waits in their queues. Only `Paused frontend GLOBAL.` / `Resumed frontend GLOBAL.` are printed.
+* `SIGTTOU` pauses every listener on both since T456 (`Paused frontend fe.` for each proxy,
+  once a process; TCP frontends and TCP stats sockets refuse connections until `SIGTTIN`). Two
+  gaps: QUIC listeners are not paused (HAProxy connects the UDP socket to itself, and its
+  connections have sockets of their own; an Ibex QUIC connection lives on the listening socket,
+  which that would cut off), and a listener whose sockets `_getsocks` has handed to a successor
+  is only no longer polled, as HAProxy does for an inherited socket.
   A unix socket file is renamed over by the successor on both and is lost to the old process if
   the successor then fails (`Connection refused`, measured on both).
 

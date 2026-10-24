@@ -15,6 +15,7 @@ ebtree = { path = "../ebtree" }
 rustls = { workspace = true }
 rustls24 = { workspace = true }
 rustls24-ring = { workspace = true }
+rustls24-ringibex = { workspace = true }
 tracing = { workspace = true }
 rustix = { version = "0.38", features = ["event", "net", "std"] }
 rustls-pemfile = "2.2.0"
