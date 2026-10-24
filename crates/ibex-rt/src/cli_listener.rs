@@ -42,6 +42,29 @@ impl From<UnixStream> for CliStream {
 }
 
 impl CliListener {
+    /// Whether this is a TCP stats socket, which `SIGTTOU` pauses ([`Self::pause_tcp`]).
+    #[must_use]
+    pub const fn is_tcp(&self) -> bool {
+        matches!(self, Self::Tcp(_))
+    }
+
+    /// `SIGTTOU` on a TCP stats socket: out of the listening state, so a connect is refused
+    /// until [`Self::resume_tcp`] (`tcp_suspend_receiver`, measured on 3.5-dev8-885761-29).
+    ///
+    /// # Errors
+    /// What `connect(AF_UNSPEC)` reports.
+    pub fn pause_tcp(&self) -> io::Result<()> {
+        rustix::net::connect_unspec(self.as_fd()).map_err(Into::into)
+    }
+
+    /// `SIGTTIN`: listens again.
+    ///
+    /// # Errors
+    /// What `listen` reports.
+    pub fn resume_tcp(&self) -> io::Result<()> {
+        rustix::net::listen(self.as_fd(), TCP_BACKLOG).map_err(Into::into)
+    }
+
     /// Accepts one connection, non-blocking.
     ///
     /// # Errors

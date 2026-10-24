@@ -417,10 +417,12 @@ polls for it. Two differences:
   process's one bind can race the successor's exit (0 losses in 30 on an idle host; the Ibex
   equivalent lost 1 in 3 under the gate's load). Ibex joins its workers, so every socket it bound
   is closed, before it signals.
-* `SIGTTOU` pauses every listener on HAProxy (`Paused frontend fe.` for each proxy; its TCP stats
-  socket refuses connections until `SIGTTIN`). Ibex pauses only the abstract stats sockets: the
-  others are `SO_REUSEPORT` and the successor binds beside them, and closing them would reset what
-  waits in their queues. Only `Paused frontend GLOBAL.` / `Resumed frontend GLOBAL.` are printed.
+* `SIGTTOU` pauses every listener on both since T456 (`Paused frontend fe.` for each proxy,
+  once a process; TCP frontends and TCP stats sockets refuse connections until `SIGTTIN`). Two
+  gaps: QUIC listeners are not paused (HAProxy connects the UDP socket to itself, and its
+  connections have sockets of their own; an Ibex QUIC connection lives on the listening socket,
+  which that would cut off), and a listener whose sockets `_getsocks` has handed to a successor
+  is only no longer polled, as HAProxy does for an inherited socket.
   A unix socket file is renamed over by the successor on both and is lost to the old process if
   the successor then fails (`Connection refused`, measured on both).
 

@@ -59,7 +59,7 @@ impl Lifecycle {
         signal_hook::flag::register(signal_hook::consts::SIGUSR2, Arc::clone(&self.reload))?;
         // HAProxy's pause and resume (`src/haproxy.c`): a new process whose bind finds an
         // address in use sends SIGTTOU to the processes it replaces, and SIGTTIN if it then
-        // fails to start. Only the abstract stats sockets, which cannot be shared, react.
+        // fails to start. Every listener is paused (T456), QUIC ones excepted.
         // Plain flags: no thread and no self-pipe (a pipe or socketpair is a descriptor the
         // process would hold for nothing).
         signal_hook::flag::register(signal_hook::consts::SIGTTOU, Arc::clone(&self.ttou))?;

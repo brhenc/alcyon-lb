@@ -2153,7 +2153,12 @@ pub struct Engine {
     /// the name as bound. One a `SIGTTIN` could not bind back (still held) stays here for
     /// the next `SIGTTIN`.
     paused_abns: Vec<(Option<usize>, Vec<u8>)>,
-    abns_paused: bool,
+    /// The TCP stats sockets `SIGTTOU` took out of the listening state, out of the poller
+    /// until `SIGTTIN` (`None` the first).
+    paused_tcp_cli: Vec<(Option<usize>, crate::cli_listener::CliListener)>,
+    /// `SIGTTOU` paused the listeners and no `SIGTTIN` has resumed them yet: no limit
+    /// (`global maxconn`, a frontend's) re-arms them meanwhile.
+    sig_paused: bool,
     /// The listeners were stopped because `global maxconn` was reached (`globalconn`).
     global_paused: bool,
     /// `accept` failed for want of a resource (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`):
@@ -2255,11 +2260,106 @@ struct ExtraCli {
 }
 
 impl Engine {
-    /// `SIGTTOU` (T354): lets go of the abstract stats sockets, whose names a successor
-    /// started with `-sf` cannot share; it sends this when its bind finds one in use, as
-    /// `HAProxy`'s does. Connections already accepted go on. The other listeners stay: they
-    /// are `SO_REUSEPORT`, and closing them would reset what waits in their queues.
-    fn pause_abns_cli(&mut self) {
+    /// `SIGTTOU`: pauses every listener, as `HAProxy`'s `sig_pause` (`pause_proxies`):
+    /// a frontend's TCP sockets leave the listening state, so a connect is refused
+    /// ([`Listener::pause`]), unless `_getsocks` handed them to a successor, which serves
+    /// on them: those are only no longer polled. The stats sockets: an abstract one lets go
+    /// of its name (T354), a TCP one stops listening, a socket file is still served (all
+    /// measured on 3.5-dev8-885761-29). Connections already accepted go on. QUIC listeners
+    /// are not paused: an Ibex QUIC connection lives on the listening socket, which
+    /// `HAProxy`'s `udp_suspend_receiver` connects to itself (its connections have sockets
+    /// of their own); `docs/differences.md`.
+    fn pause_on_signal(&mut self) {
+        let shared = crate::handover::handed_over();
+        for l in &self.listeners {
+            if !shared {
+                if let Err(e) = l.pause() {
+                    crate::stderr_line!("[WARNING]  ({}) : cannot pause listener {}: {e}", self.pid, l.addr());
+                }
+            }
+            let lfd = l.raw_fd();
+            let _ = self.poller.modify(l.borrowed_fd(), raw_fd_to_u64(lfd), false, false);
+            self.fdtab.set_interest(lfd, Interest::NONE);
+        }
+        self.sig_paused = true;
+        self.pause_cli_on_signal();
+        self.log_pause_or_resume("Paused", true);
+    }
+
+    /// `SIGTTIN`: undoes [`Self::pause_on_signal`]. A listener a limit stops meanwhile
+    /// (`global maxconn`, its frontend's `maxconn`) is left to the limit's own resume.
+    fn resume_on_signal(&mut self) {
+        let shared = crate::handover::handed_over();
+        self.sig_paused = false;
+        let full = self.global_paused || self.accept_limited.is_some();
+        for l in &self.listeners {
+            if !shared {
+                if let Err(e) = l.resume() {
+                    crate::stderr_line!("[WARNING]  ({}) : cannot resume listener {}: {e}", self.pid, l.addr());
+                    continue;
+                }
+            }
+            if full {
+                continue;
+            }
+            if l.is_full() {
+                self.fe_paused = true;
+                continue;
+            }
+            let lfd = l.raw_fd();
+            let _ = self.poller.modify(l.borrowed_fd(), raw_fd_to_u64(lfd), true, false);
+            self.fdtab.set_interest(lfd, Interest::READ);
+        }
+        // Shared, they were only no longer polled: connections waited in their queues.
+        self.backlog_waits |= shared;
+        let refused = self.resume_cli_on_signal();
+        self.log_pause_or_resume("Resumed", !refused);
+        if refused {
+            Self::log_refused_resume(self.pid);
+        }
+    }
+
+    /// A `SIGTTIN` after one whose resume an abstract name refused (still held): that
+    /// name is tried again (T370), and only `GLOBAL` is reported.
+    fn resume_cli_again(&mut self) {
+        if self.resume_cli_on_signal() {
+            Self::log_refused_resume(self.pid);
+        } else if self.worker_id == 0 {
+            crate::stderr_line!("[WARNING]  ({}) : Resumed frontend GLOBAL.", self.pid);
+        }
+    }
+
+    /// `Paused frontend fe.` (`Paused proxy li.` for a `listen`), once a proxy with a
+    /// listener, in the order of the configuration, then `frontend GLOBAL` when there is a
+    /// stats socket: once a process (worker 0 says it), not once a thread (T456).
+    fn log_pause_or_resume(&self, what: &str, global: bool) {
+        if self.worker_id != 0 {
+            return;
+        }
+        let mut idx: Vec<usize> = self.listeners.iter().map(|l| l.proxy as usize).collect();
+        idx.sort_unstable_by_key(|&i| self.proxies[i].ids.decl);
+        idx.dedup();
+        for i in idx {
+            let p = &self.proxies[i];
+            let kind = if p.has_backend { "proxy" } else { "frontend" };
+            crate::stderr_line!("[WARNING]  ({}) : {what} {kind} {}.", self.pid, p.name);
+        }
+        if global && (self.cli_socket_name.is_some() || !self.extra_cli.is_empty()) {
+            crate::stderr_line!("[WARNING]  ({}) : {what} frontend GLOBAL.", self.pid);
+        }
+    }
+
+    fn log_refused_resume(pid: u32) {
+        crate::stderr_line!(
+            "[WARNING]  ({pid}) : Some proxies refused to resume, probably due to a conflict on a listening port. You may want to try again after the conflicting application is stopped, otherwise a restart might be needed to resume safe operations."
+        );
+    }
+
+    /// The stats sockets' part of [`Self::pause_on_signal`]: the abstract ones let go of
+    /// their names, whose successor started with `-sf` cannot share them; it sends this
+    /// when its bind finds one in use, as `HAProxy`'s does (T354). The TCP ones stop
+    /// listening (unless handed over). Both leave the poller until `SIGTTIN`.
+    fn pause_cli_on_signal(&mut self) {
         use std::os::linux::net::SocketAddrExt;
         let abstract_name = |l: &crate::cli_listener::CliListener| -> Option<Vec<u8>> {
             match l {
@@ -2269,24 +2369,51 @@ impl Engine {
                 crate::cli_listener::CliListener::Tcp(_) => None,
             }
         };
-        let mut released = false;
+        let shared = crate::handover::handed_over();
         let first = std::iter::once((None, &mut self.cli_listener));
         let extra = self.extra_cli.iter_mut().enumerate().map(|(i, x)| (Some(i), &mut x.listener));
         for (which, slot) in first.chain(extra) {
-            let Some((name, l)) = slot
-                .take_if(|l| abstract_name(l).is_some())
-                .map(|l| (abstract_name(&l).unwrap_or_default(), l))
-            else {
+            let Some(l) = slot.take_if(|l| abstract_name(l).is_some() || (l.is_tcp() && !shared)) else {
                 continue;
             };
-            self.paused_abns.push((which, name));
             self.fdtab.remove(l.as_raw_fd());
             let _ = self.poller.delete(l.as_fd());
-            released = true;
+            if let Some(name) = abstract_name(&l) {
+                self.paused_abns.push((which, name));
+            } else {
+                let _ = l.pause_tcp();
+                self.paused_tcp_cli.push((which, l));
+            }
         }
-        if released {
-            crate::stderr_line!("[WARNING]  ({}) : Paused frontend GLOBAL.", std::process::id());
+    }
+
+    /// Puts a stats socket back in the poller and in its slot.
+    fn rearm_cli(&mut self, which: Option<usize>, l: crate::cli_listener::CliListener) {
+        let fd = l.as_raw_fd();
+        let state = match which {
+            None => FdState::CliListener,
+            Some(i) => FdState::CliExtra(u32::try_from(i).unwrap_or(u32::MAX)),
+        };
+        let added = self.poller.add(l.as_fd(), raw_fd_to_u64(fd), !self.cli_paused, false).ok();
+        let _ = added.map(|()| {
+            self.fdtab.insert(fd, state, Interest::READ);
+            match which {
+                None => self.cli_listener = Some(l),
+                Some(i) => self.extra_cli[i].listener = Some(l),
+            }
+        });
+    }
+
+    /// The stats sockets' part of [`Self::resume_on_signal`]; whether an abstract name could
+    /// not be bound back.
+    fn resume_cli_on_signal(&mut self) -> bool {
+        for (which, l) in std::mem::take(&mut self.paused_tcp_cli) {
+            match l.resume_tcp() {
+                Ok(()) => self.rearm_cli(which, l),
+                Err(_) => self.paused_tcp_cli.push((which, l)),
+            }
         }
+        self.resume_abns_cli()
     }
 
     /// `SIGTTIN` (T354): the successor did not start; binds the names given up again, each
@@ -2299,7 +2426,7 @@ impl Engine {
     /// [ALERT]    (pid) : Resuming listener: protocol abns_stream: cannot bind UNIX socket (already in use) [abns@NAME].
     /// [WARNING]  (pid) : Some proxies refused to resume, probably due to a conflict on a listening port. You may want to try again after the conflicting application is stopped, otherwise a restart might be needed to resume safe operations.
     /// ```
-    fn resume_abns_cli(&mut self) {
+    fn resume_abns_cli(&mut self) -> bool {
         use std::os::linux::net::SocketAddrExt;
         let mut refused = false;
         for (which, bytes) in std::mem::take(&mut self.paused_abns) {
@@ -2322,29 +2449,9 @@ impl Engine {
                     continue;
                 }
             };
-            let l = crate::cli_listener::CliListener::from(l);
-            let fd = l.as_raw_fd();
-            let state = match which {
-                None => FdState::CliListener,
-                Some(i) => FdState::CliExtra(u32::try_from(i).unwrap_or(u32::MAX)),
-            };
-            let added = self.poller.add(l.as_fd(), raw_fd_to_u64(fd), !self.cli_paused, false).ok();
-            let _ = added.map(|()| {
-                self.fdtab.insert(fd, state, Interest::READ);
-                match which {
-                    None => self.cli_listener = Some(l),
-                    Some(i) => self.extra_cli[i].listener = Some(l),
-                }
-            });
+            self.rearm_cli(which, crate::cli_listener::CliListener::from(l));
         }
-        if refused {
-            crate::stderr_line!(
-                "[WARNING]  ({}) : Some proxies refused to resume, probably due to a conflict on a listening port. You may want to try again after the conflicting application is stopped, otherwise a restart might be needed to resume safe operations.",
-                std::process::id()
-            );
-        } else {
-            crate::stderr_line!("[WARNING]  ({}) : Resumed frontend GLOBAL.", std::process::id());
-        }
+        refused
     }
 
     /// The lines of `show cli sockets`: every CLI socket, in configuration order, with the
@@ -2400,7 +2507,12 @@ fn listeners_for(
     let mut out = Vec::new();
     for fd in crate::handover::take_inherited(worker_id, addr) {
         match Listener::adopt(fd, addr, proxy, tuning) {
-            Ok(l) => out.push(l),
+            // The backlog it keeps is its first process's; a resume after SIGTTOU
+            // `listen()`s with this configuration's, as `tcp_resume_receiver` does.
+            Ok(mut l) => {
+                l.backlog = backlog;
+                out.push(l);
+            }
             Err(e) => crate::stderr_line!("[WARNING] {e}; binding a fresh socket instead"),
         }
     }
@@ -4517,7 +4629,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             cli_socket_name: None,
             extra_cli: Vec::new(),
             paused_abns: Vec::new(),
-            abns_paused: false,
+            paused_tcp_cli: Vec::new(),
+            sig_paused: false,
             global_paused: false,
             accept_limited: None,
             fe_paused: false,
@@ -5536,6 +5649,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// ([`Self::resume_listeners_after_global`]) and a frontend's own `maxconn`
     /// ([`Self::resume_listeners_after_frontend_limit`]). Called on every pass of `step`.
     fn resume_paused_listeners(&mut self) {
+        // Paused by SIGTTOU: SIGTTIN re-arms them ([`Self::resume_on_signal`]).
+        if self.sig_paused {
+            return;
+        }
         if self.global_paused && self.accept_limited.is_none() && !crate::globalconn::full() {
             self.resume_listeners_after_global();
         }
@@ -5798,15 +5915,18 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             if self.lifecycle.as_ref().is_some_and(crate::lifecycle::Lifecycle::take_flush_request) {
                 crate::pool_gc::request();
             }
-            let want = self.lifecycle.as_ref().map_or(self.abns_paused, |lc| lc.pause_requested());
+            let want = self.lifecycle.as_ref().map_or(self.sig_paused, |lc| lc.pause_requested());
             // A SIGTTIN after a resume that was refused (the name still held) tries again.
             let again = !want && !self.paused_abns.is_empty() && self.lifecycle.as_ref().is_some_and(crate::lifecycle::Lifecycle::take_resume);
-            if (want != self.abns_paused || again) && !self.stopping {
-                self.abns_paused = want;
-                if want {
-                    self.pause_abns_cli();
-                } else {
-                    self.resume_abns_cli();
+            if !self.stopping {
+                if want != self.sig_paused {
+                    if want {
+                        self.pause_on_signal();
+                    } else {
+                        self.resume_on_signal();
+                    }
+                } else if again {
+                    self.resume_cli_again();
                 }
             }
             if self.stopping {
