@@ -584,7 +584,18 @@ capacity. That is what brings the survey's rules from 65 allocations per request
 | **Status** | Open. |
 | **Revisit** | Move to `0.24.0` when it is released (expected around Q1 2027; low confidence) and drop the duplicate rustls where QUIC can follow. |
 
-### 6.23 A panic in a stream's run closes that stream, not the process (T447) — **measured 2026-10-24**
+### 6.23 A failed allocation aborts the whole process; HAProxy fails one stream (T446) — **measured 2026-10-24; open, waiting on Rust and on our own `try_*` work**
+
+| | |
+|---|---|
+| **Difference** | In HAProxy, `malloc` returning NULL is checked: it gives memory back (`pool_gc`) and retries, fails that stream, or makes the buffer request wait (`b_alloc`). The process goes on. In Ibex, any infallible allocation (`Vec`, `Box`, `vec![]`, std, rustls, h2) that fails calls `handle_alloc_error`, which prints `memory allocation of N bytes failed` and **aborts**: every connection on every thread is lost. Stable Rust has no switch to change this. `-Z oom=panic` was removed upstream (rust-lang/rust#147725, 2025-12-10), and `set_alloc_error_hook` is unstable (#51245). Draft for upstream: `upstream/rust-recoverable-oom.md`. |
+| **Measured** (2026-10-24, main 2fe0db33 release, Fedora HAProxy 3.0.30, both `nbthread 4`, proxy to a local HAProxy backend, `h2load --h1`; script and logs in `/tmp/t446/`, `run.sh`) | Start-up size: Ibex VmSize 905 MB / VmData 564 MB; HAProxy 232 MB / 54 MB. **Unlimited, 20000 conns:** both 200000/200000 2xx. **HAProxy** under `RLIMIT_AS` 250-400 MB (5 runs), `-m 300` (= `RLIMIT_DATA`) and `RLIMIT_DATA` 100 MB: alive every time, 42552-191328 2xx, 1211-11341 5xx, the rest refused; `curl` afterwards gets 200. **Ibex**, 20000 conns: `RLIMIT_AS` 990 and 1100 MB, and `RLIMIT_DATA` 640 and 700 MB: **aborted every time** (2323-10544 2xx). The core shows a 16 KiB buffer `vec![0; n]` in `buf::alloc_standard` (`buf.rs:364`), from `TcpSession::process_cli_io`. Ibex, 5000 conns, `RLIMIT_AS` 900-960 MB (5 runs): served every request or nearly, then **aborted while freeing**. `SessionArena::trim_tail` (`engine.rs:2050`) makes a fresh `Vec::with_capacity` of 104333312 bytes to give the old one back, so for a moment it needs a second copy of the arena. At 990 MB/5000 it survived. A log line reading `1638416384 bytes` is two threads' `16384` interleaved. |
+| **`-m`** | HAProxy's `-m` sets `RLIMIT_DATA` (checked in `/proc/<pid>/limits`). Ibex's `-m` is only a `maxconn` budget (`engine::apply_memmax`) and sets no rlimit, so `ibex -m 64` never sees a failed allocation. Do **not** make Ibex's `-m` set the rlimit before the paths below are fallible: it would turn the budget into an abort. |
+| **T445 "GC and retry"** | Applies only where a failure can be seen: a `try_reserve`/`try_*` call that returns `Err`. On an infallible path there is nothing to retry, because the process is already in `abort`. |
+| **What would close it** | Upstream: a stable unwinding OOM hook or `-C oom=panic`, plus a per-stream `catch_unwind` in the loop. Ibex has no `catch_unwind` outside tests, so that would be new work: each stream's step would need to be unwind-safe and the stream torn down cleanly. Before upstream moves, Ibex's own large or per-connection allocations can be made fallible with stable `try_reserve`. That covers the shrink copy in `trim_tail` (on `Err`, keep the old buffer), the buffer pool (`alloc_standard`/`small`/`large`: refuse or queue the stream, T372 Q3), and arena growth on accept. Allocations inside rustls, h2 and std stay infallible. |
+| **Status** | Open. Not implemented here; the `try_reserve` work is a separate task. |
+
+### 6.26 A panic in a stream's run closes that stream, not the process (T447) — **measured 2026-10-24**
 
 `EngineDispatcher::run_task` runs each stream task under `crash::contain` (`catch_unwind`). A
 panic there is reported (the standard message and an `[ALERT]` line), the stream is closed
