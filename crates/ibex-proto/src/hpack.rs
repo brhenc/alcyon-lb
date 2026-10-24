@@ -777,7 +777,8 @@ fn huffman_len(input: &[u8]) -> usize {
 /// Decodes a string literal (RFC 7541 §5.2) from input slice at `*offset`.
 ///
 /// # Errors
-/// Returns `H2Error::CompressionError` if incomplete, invalid Huffman, or invalid UTF-8.
+/// Returns `H2Error::CompressionError` if incomplete or invalid Huffman. A byte that is not
+/// UTF-8 is decoded as a NUL ([`push_as_text`]).
 pub fn decode_string_literal(src: &[u8], offset: &mut usize) -> Result<String, H2Error> {
     if *offset >= src.len() {
         return Err(H2Error::CompressionError);
@@ -792,13 +793,15 @@ pub fn decode_string_literal(src: &[u8], offset: &mut usize) -> Result<String, H
     let raw = &src[*offset..*offset + len];
     *offset += len;
 
+    let mut out = String::new();
     if is_huffman {
-        decode_huffman(raw)
+        let mut huff = Vec::new();
+        decode_huffman_into(raw, &mut huff)?;
+        push_as_text(&mut out, &huff);
     } else {
-        std::str::from_utf8(raw)
-            .map(std::string::ToString::to_string)
-            .map_err(|_| H2Error::CompressionError)
+        push_as_text(&mut out, raw);
     }
+    Ok(out)
 }
 
 /// Appends a string literal (RFC 7541 section 5.2) at `*offset` of `src` to `out`, as
@@ -818,15 +821,27 @@ pub fn decode_string_literal_into(src: &[u8], offset: &mut usize, out: &mut Stri
     }
     let raw = &src[*offset..*offset + len];
     *offset += len;
-    let text = if is_huffman {
+    if is_huffman {
         huff.clear();
         decode_huffman_into(raw, huff)?;
-        std::str::from_utf8(huff)
+        push_as_text(out, huff);
     } else {
-        std::str::from_utf8(raw)
-    };
-    out.push_str(text.map_err(|_| H2Error::CompressionError)?);
+        push_as_text(out, raw);
+    }
     Ok(())
+}
+
+/// Appends `bytes` to `out`, each byte that is not part of a UTF-8 character as a NUL
+/// (T451). HPACK strings are octets: one that is not UTF-8 is no compression error, and the
+/// block it is in must be decoded on, or the dynamic table is no longer the peer's. A NUL is
+/// what every field check refuses (a name is no token, a value or a pseudo-header carries a
+/// byte `http_header_has_forbidden_char` refuses), so the stream is reset, as `HAProxy`
+/// resets it for such a name; and one byte for one keeps the table's sizes the peer's.
+fn push_as_text(out: &mut String, bytes: &[u8]) {
+    for chunk in bytes.utf8_chunks() {
+        out.push_str(chunk.valid());
+        out.extend(std::iter::repeat_n('\0', chunk.invalid().len()));
+    }
 }
 
 /// A decoded header block, in memory kept from one block to the next (T437): the names and
@@ -1087,6 +1102,24 @@ impl HpackEncoder {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// T451: a string that is not UTF-8 is no compression error. Each byte that is not
+    /// UTF-8 decodes as a NUL, so the table sizes stay the peer's and the field checks
+    /// refuse the field; the rest of the block is decoded.
+    #[test]
+    fn a_string_that_is_not_utf8_decodes_with_nuls_and_keeps_the_table() {
+        let mut block = vec![0x40, 4];
+        block.extend_from_slice(b"x-\xe9z");
+        block.extend_from_slice(&[2, 0xc3, 0xa9]);
+        let mut h = Vec::new();
+        encode_huffman(b"a\xffb", &mut h);
+        block.extend_from_slice(&[0x00, 1, b'v', 0x80 | u8::try_from(h.len()).unwrap()]);
+        block.extend_from_slice(&h);
+        let mut dec = HpackDecoder::new();
+        let f = dec.decode(&block).expect("decoded");
+        assert_eq!(f, vec![HeaderField { name: "x-\0z".into(), value: "\u{e9}".into() }, HeaderField { name: "v".into(), value: "a\0b".into() }]);
+        assert_eq!(dec.dynamic_table.size(), 4 + 2 + 32);
+    }
 
     #[test]
     fn test_static_table_lookup() {

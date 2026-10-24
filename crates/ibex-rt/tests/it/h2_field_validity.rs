@@ -54,6 +54,8 @@ enum Want {
     /// A trailer refused: `RST_STREAM` `PROTOCOL_ERROR`, the head and body forwarded but the
     /// message never ended (the server sees no last chunk).
     RstTrailer,
+    /// Forwarded, answered 200, and the server saw these bytes in the request.
+    Forwards(&'static [u8]),
 }
 
 struct Case {
@@ -167,6 +169,54 @@ fn cases() -> Vec<Case> {
     f.extend(frame(0, 0, 1, id.as_bytes()));
     f.extend(frame(1, 5, 1, &lit(b"x-t", b"1")));
     add(id, f, Want::Pass);
+    out.extend(normalisation_cases());
+    out
+}
+
+/// T451: what `HAProxy` normalises, and a name that is not UTF-8.
+fn normalisation_cases() -> Vec<Case> {
+    let mut out = Vec::new();
+    let mut add = |id: String, frames: Vec<u8>, want| out.push(Case { id, frames, want });
+    let one = |id: &str, m: &[u8], s: &[u8], p: &[u8], a: &[u8], x: &[(&[u8], &[u8])]| frame(1, 5, 1, &block(id, m, s, p, a, x));
+    // T451 row 1: a value's leading and trailing blanks (space, tab) are trimmed, as
+    // `h2_make_htx_request` trims them; a cookie's are not (`http_cookie_merge`).
+    let id = "trim-sp".to_string();
+    add(id.clone(), one(&id, b"GET", b"http", b"/", b"x", &[(b"x-a", b"   ok  ")]), Want::Forwards(b"\r\nx-a: ok\r\n"));
+    let id = "trim-tab".to_string();
+    add(id.clone(), one(&id, b"GET", b"http", b"/", b"x", &[(b"x-a", b"\t ok \t")]), Want::Forwards(b"\r\nx-a: ok\r\n"));
+    let id = "trim-cookie".to_string();
+    add(id.clone(), one(&id, b"GET", b"http", b"/", b"x", &[(b"cookie", b"  a=1  ")]), Want::Forwards(b"\r\ncookie:   a=1  \r\n"));
+    // T451 row 2: `:path *` with an `:authority` is the absolute form without a path,
+    // which goes as `/`, except for OPTIONS; without `:authority` it stays `*`.
+    let id = "star-get".to_string();
+    add(id.clone(), one(&id, b"GET", b"http", b"*", b"x", &[]), Want::Forwards(b"GET / HTTP/1.1\r\n"));
+    let id = "star-options".to_string();
+    add(id.clone(), one(&id, b"OPTIONS", b"http", b"*", b"x", &[]), Want::Forwards(b"OPTIONS * HTTP/1.1\r\n"));
+    let id = "star-host".to_string();
+    let mut b = lit(b":method", b"GET");
+    b.extend(lit(b":scheme", b"http"));
+    b.extend(lit(b":path", b"*"));
+    b.extend(lit(b"host", b"x"));
+    b.extend(lit(b"x-case", id.as_bytes()));
+    add(id.clone(), frame(1, 5, 1, &b), Want::Forwards(b"GET * HTTP/1.1\r\n"));
+    // T451 row 3: a name with a byte that is not UTF-8, plain or Huffman-coded, is a name
+    // that is not a token: the stream is reset, the connection stays.
+    let id = "name-e9".to_string();
+    add(id.clone(), one(&id, b"GET", b"http", b"/", b"x", &[(b"x-\xe9", b"1")]), Want::Rst);
+    let id = "name-e9-huff".to_string();
+    let mut b = block(&id, b"GET", b"http", b"/", b"x", &[]);
+    let mut h = Vec::new();
+    ibex_proto::hpack::encode_huffman(b"x-\xe9", &mut h);
+    b.extend([0x00, 0x80 | u8::try_from(h.len()).expect("short")]);
+    b.extend(&h);
+    b.extend([0x01, b'1']);
+    add(id.clone(), frame(1, 5, 1, &b), Want::Rst);
+    // The same byte in a value or `:path`: HAProxy forwards it; Ibex keeps fields as UTF-8
+    // text and resets the stream (tradeoff.md 6.23).
+    let id = "val-e9".to_string();
+    add(id.clone(), one(&id, b"GET", b"http", b"/", b"x", &[(b"x-a", b"\xe9")]), Want::Rst);
+    let id = "path-e9".to_string();
+    add(id.clone(), one(&id, b"GET", b"http", b"/a\xe9b", b"x", &[]), Want::Rst);
     out
 }
 
@@ -220,8 +270,8 @@ fn exchange(port: u16, frames: &[u8]) -> Got {
     Got::Nothing
 }
 
-#[test]
-fn an_h2_field_the_http1_head_cannot_carry_is_refused_before_the_server() {
+/// A server that answers 200 to anything, and what each of its connections carried.
+fn server() -> (std::net::SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
     let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let be = l.local_addr().unwrap();
@@ -246,20 +296,31 @@ fn an_h2_field_the_http1_head_cannot_carry_is_refused_before_the_server() {
             });
         }
     });
+    (be, seen)
+}
+
+/// An ibex with an h2 frontend (`fe_extra` added to it) in front of `be`, and its port.
+fn proxy(be: std::net::SocketAddr, fe_extra: &str) -> (std::process::Child, u16, std::path::PathBuf) {
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2field_{}_{port}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
         format!(
             "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 20s\n\ttimeout server 20s\n\
-             frontend fe\n\tbind 127.0.0.1:{port} proto h2\n\tdefault_backend be\n\
+             frontend fe\n\tbind 127.0.0.1:{port} proto h2\n{fe_extra}\tdefault_backend be\n\
              backend be\n\tserver s1 {be}\n"
         ),
     )
     .expect("write config");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
     assert!(common::wait_listening(([127, 0, 0, 1], port).into()), "never listened");
-    let all = cases();
+    (child, port, cfg)
+}
+
+/// Each case on a connection of its own; the cases that differ from what they want.
+fn run(fe_extra: &str, all: &[Case]) -> Vec<String> {
+    let (be, seen) = server();
+    let (mut child, port, cfg) = proxy(be, fe_extra);
     let answers: Vec<Got> = all
         .iter()
         .map(|c| {
@@ -286,11 +347,126 @@ fn an_h2_field_the_http1_head_cannot_carry_is_refused_before_the_server() {
             Want::BadRequest => got == Got::Status("400".into()) && fwd.is_empty(),
             Want::Pass => got == Got::Status("200".into()) && !fwd.is_empty(),
             Want::RstTrailer => got == Got::Rst(1) && !completed && !fwd.iter().any(|h| h.windows(10).any(|w| w == b"x-injected")),
+            Want::Forwards(b) => got == Got::Status("200".into()) && fwd.iter().any(|h| h.windows(b.len()).any(|w| w == b)),
         };
         if !ok {
             let shown: Vec<String> = fwd.iter().map(|h| h.escape_ascii().to_string()).collect();
             wrong.push(format!("{}: want {:?}, got {got:?}, server saw {shown:?}", c.id, c.want));
         }
     }
+    wrong
+}
+
+#[test]
+fn an_h2_field_the_http1_head_cannot_carry_is_refused_before_the_server() {
+    let all = cases();
+    let wrong = run("", &all);
     assert!(wrong.is_empty(), "{} of {} cases differ from HAProxy:\n{}", wrong.len(), all.len(), wrong.join("\n"));
+}
+
+/// T451 row 4: `option accept-unsafe-violations-in-http-request` relaxes the `:path` check
+/// as `h2_make_htx_request(.., relaxed)` does (measured on 3.5-dev8): a `#` is forwarded, a
+/// space, tab or control byte is a 400; a relative or empty `:path` is still refused.
+#[test]
+fn accept_unsafe_violations_relaxes_the_h2_path_check() {
+    let one = |id: &str, p: &[u8]| frame(1, 5, 1, &block(id, b"GET", b"http", p, b"x", &[]));
+    let all: Vec<Case> = [
+        ("u-hash", &b"/a#b"[..], Want::Forwards(b"GET /a#b HTTP/1.1\r\n")),
+        ("u-space", b"/a b", Want::BadRequest),
+        ("u-tab", b"/a\tb", Want::BadRequest),
+        ("u-ctl", b"/a\x01b", Want::BadRequest),
+        ("u-del", b"/a\x7fb", Want::BadRequest),
+        ("u-rel", b"a", Want::Rst),
+        ("u-empty", b"", Want::Rst),
+        ("u-nul", b"/a\0b", Want::Rst),
+    ]
+    .into_iter()
+    .map(|(id, p, want)| Case { id: id.to_string(), frames: one(id, p), want })
+    .collect();
+    let wrong = run("\toption accept-unsafe-violations-in-http-request\n", &all);
+    assert!(wrong.is_empty(), "{} of {} cases differ from HAProxy:\n{}", wrong.len(), all.len(), wrong.join("\n"));
+}
+
+/// What each stream of one connection got: the first `RST_STREAM` code or response
+/// status per stream id, and a GOAWAY code under id 0.
+fn exchange_streams(port: u16, frames: &[u8], want: usize) -> std::collections::BTreeMap<u32, Got> {
+    let mut conn = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    conn.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    conn.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
+    conn.write_all(&frame(4, 0, 0, &[])).unwrap();
+    conn.write_all(frames).unwrap();
+    let (mut buf, mut out) = (Vec::new(), std::collections::BTreeMap::new());
+    let mut dec = HpackDecoder::new();
+    let end = Instant::now() + Duration::from_secs(4);
+    let mut chunk = [0u8; 16384];
+    while Instant::now() < end && out.len() < want && !out.contains_key(&0) {
+        match conn.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => {}
+        }
+        let mut i = 0;
+        while i + 9 <= buf.len() {
+            let len = usize::from(buf[i]) << 16 | usize::from(buf[i + 1]) << 8 | usize::from(buf[i + 2]);
+            if i + 9 + len > buf.len() {
+                break;
+            }
+            let (ftype, sid, p) = (buf[i + 3], u32::from_be_bytes([buf[i + 5], buf[i + 6], buf[i + 7], buf[i + 8]]) & 0x7fff_ffff, &buf[i + 9..i + 9 + len]);
+            match ftype {
+                3 => {
+                    out.entry(sid).or_insert(Got::Rst(u32::from_be_bytes([p[0], p[1], p[2], p[3]])));
+                }
+                7 => {
+                    out.insert(0, Got::Goaway(u32::from_be_bytes([p[4], p[5], p[6], p[7]])));
+                }
+                1 => {
+                    let fields = dec.decode(p).expect("hpack");
+                    let st = fields.iter().find(|f| f.name == ":status").map(|f| f.value.clone()).unwrap_or_default();
+                    out.entry(sid).or_insert(Got::Status(st));
+                }
+                _ => {}
+            }
+            i += 9 + len;
+        }
+        buf.drain(..i);
+    }
+    out
+}
+
+/// T451 row 3: a name that is not UTF-8 resets its stream alone, and the block is decoded
+/// whole first, so the HPACK table stays the client's. Measured on 3.5-dev8: stream 1 adds
+/// `x-\xe9z: 1` to the table and is reset, stream 3 adds `x-b: 2` and is answered, stream
+/// 5 sends only index 62 (now `x-b: 2`) and the server sees `x-b: 2`. A stream that names
+/// the bad entry by its index is reset too.
+#[test]
+fn a_name_that_is_not_utf8_resets_its_stream_and_keeps_the_connection() {
+    let (be, seen) = server();
+    let (mut child, port, cfg) = proxy(be, "");
+    let lit_indexed = |n: &[u8], v: &[u8]| {
+        let mut b = vec![0x40, u8::try_from(n.len()).expect("short")];
+        b.extend_from_slice(n);
+        b.push(u8::try_from(v.len()).expect("short"));
+        b.extend_from_slice(v);
+        b
+    };
+    let base = |id: &str| block(id, b"GET", b"http", b"/", b"x", &[]);
+    let mut f = frame(1, 5, 1, &[base("sync-1"), lit_indexed(b"x-\xe9z", b"1")].concat());
+    f.extend(frame(1, 5, 3, &[base("sync-3"), lit_indexed(b"x-b", b"2")].concat()));
+    f.extend(frame(1, 5, 5, &[base("sync-5"), vec![0xbe] /* index 62 */].concat()));
+    // Index 63 is the bad name now.
+    f.extend(frame(1, 5, 7, &[base("sync-7"), vec![0xbf] /* index 63 */].concat()));
+    let got = exchange_streams(port, &f, 4);
+    thread::sleep(Duration::from_millis(1200));
+    common::stop(&mut child);
+    let _ = std::fs::remove_file(&cfg);
+    let want: std::collections::BTreeMap<u32, Got> =
+        [(1, Got::Rst(1)), (3, Got::Status("200".into())), (5, Got::Status("200".into())), (7, Got::Rst(1))].into_iter().collect();
+    assert_eq!(got, want);
+    let seen = seen.lock().unwrap();
+    let has = |id: &str, b: &[u8]| {
+        let m = format!("x-case: {id}\r\n");
+        seen.iter().any(|h| h.windows(m.len()).any(|w| w == m.as_bytes()) && (b.is_empty() || h.windows(b.len()).any(|w| w == b)))
+    };
+    assert!(has("sync-3", b"\r\nx-b: 2\r\n") && has("sync-5", b"\r\nx-b: 2\r\n"), "server saw {seen:?}");
+    assert!(!has("sync-1", b"") && !has("sync-7", b""), "a reset stream reached the server: {seen:?}");
 }
