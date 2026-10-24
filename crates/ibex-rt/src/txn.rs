@@ -81,6 +81,39 @@ pub enum Chunk {
 
 const CHUNK_START: Chunk = Chunk::Size { size: 0, digits: 0 };
 
+impl Chunk {
+    /// The position at the start of a chunked body.
+    pub const START: Chunk = CHUNK_START;
+}
+
+/// Takes the chunk framing off `data` in place, from position `c` of a chunked body: the
+/// chunk sizes, extensions and line ends, the last chunk and the trailer section go, the
+/// chunk data moves to the front (`HAProxy` writes a body it does not frame by
+/// `H1_MF_CHNK` as its HTX DATA blocks, T442). Returns how many bytes of data are now at
+/// the front, and `Some(n)` when the body ended after `n` bytes of `data` (the rest is not
+/// this message's). `Err` at a framing violation, with the data before it at the front.
+/// Every byte is read once, so a body cut anywhere, a size line too, comes out the same.
+pub fn dechunk(c: &mut Chunk, data: &mut [u8]) -> (usize, Result<Option<usize>, ()>) {
+    let (mut i, mut w) = (0, 0);
+    while i < data.len() {
+        if let Chunk::Data(n) = *c {
+            let take = usize::try_from(n).unwrap_or(usize::MAX).min(data.len() - i);
+            data.copy_within(i..i + take, w);
+            i += take;
+            w += take;
+            *c = if take as u64 == n { Chunk::DataCr } else { Chunk::Data(n - take as u64) };
+            continue;
+        }
+        match c.scan(&data[i..=i], &mut 0, false).1 {
+            Ok(Some(next)) => *c = next,
+            Ok(None) => return (w, Ok(Some(i + 1))),
+            Err(()) => return (w, Err(())),
+        }
+        i += 1;
+    }
+    (w, Ok(None))
+}
+
 /// The longest chunk extension accepted (the trailer section has its own cap,
 /// [`MAX_TRAILER_SECTION`]). `HAProxy` parses a chunk-size line only once it is all in the
 /// buffer: with the default `tune.bufsize` (16384), a 16300-byte extension passes and a
@@ -1393,24 +1426,29 @@ pub fn strip_connection_tokens(hdrs: &mut Vec<(String, String)>) {
 /// written, except a `Content-Length: 0` on a 1xx or a 204. True when the client connection
 /// is to close after it: the rules left it no length it had (`H1_MF_XFER_LEN` gone), or wrote
 /// a `close` (`H1_MF_CONN_CLO`).
-pub fn reread_response_after_rules(hdrs: &mut Vec<(String, String)>, was: LenHdrs, status: u16) -> bool {
+/// The second: a `keep-alive` a rule wrote (`H1_MF_CONN_KAL`).
+pub fn reread_response_after_rules(hdrs: &mut Vec<(String, String)>, was: LenHdrs, status: u16) -> (bool, bool) {
     let bodyless = status < 200 || status == 204;
-    let (mut cl, mut te, mut close) = (false, false, false);
+    let (mut cl, mut te, mut close, mut kal) = (false, false, false, false);
     hdrs.retain(|(k, v)| {
         if k.eq_ignore_ascii_case("transfer-encoding") {
             te |= was.chnk && !bodyless;
             return was.chnk && !bodyless;
         }
         if k.eq_ignore_ascii_case("content-length") {
-            let keep = was.clen || (bodyless && v.trim() == "0");
+            // The first only: a second one a rule added is not written (T442).
+            let keep = (was.clen || (bodyless && v.trim() == "0")) && !cl;
             cl |= keep;
             return keep;
         }
-        close |= k.eq_ignore_ascii_case("connection") && connection_has(v, "close");
+        if k.eq_ignore_ascii_case("connection") {
+            close |= connection_has(v, "close");
+            kal |= connection_has(v, "keep-alive");
+        }
         true
     });
     let lost = (was.clen && !cl) || (was.chnk && !te && !cl);
-    close || lost
+    (close || lost, kal)
 }
 
 /// The head of a response with its `Connection` headers as `HAProxy` forwards them:
@@ -1985,6 +2023,22 @@ pub struct HttpTxn {
     /// and dropped (`H1S_F_BODYLESS_REQ` in `h1_make_eoh`, T442). Forwarded, the server
     /// would read the body as the next request.
     pub req_body_dropped: bool,
+    /// The client connection closes after this response only for `option httpclose` (not
+    /// for the request's `close`, HTTP/1.0, a soft stop or the response's framing): a
+    /// `keep-alive` a response rule writes keeps it (`h1_set_cli_conn_mode`, T442).
+    pub close_opt: bool,
+    /// A request rule wrote `keep-alive`: the server connection `option http-server-close`
+    /// would close is kept (`h1_set_srv_conn_mode`, T442).
+    pub srv_kal_rule: bool,
+    /// The rules gave the request a `Content-Length` longer than its body: the server
+    /// connection is not used again, or the server reads the next request as the rest of the
+    /// body (`HAProxy` closes it, T442).
+    pub req_len_long: bool,
+    /// The chunked response body is forwarded without its framing, at this point of it: a
+    /// rule removed its `Transfer-Encoding` (`h1_process_emit_headers` writes no
+    /// `H1_MF_CHNK`, T442). Boxed: few responses have it, and a transaction is held per
+    /// connection.
+    pub rsp_dechunk: Option<Box<Chunk>>,
     /// `http-request disable-l7-retry` ran for this request (`TX_D_L7_RETRY`).
     pub l7_off: bool,
     /// A retry on the server's answer (`retry-on <status>`): the request as it was sent.
@@ -2044,6 +2098,10 @@ impl HttpTxn {
             req_len_hdrs: None,
             rsp_len_hdrs: LenHdrs::default(),
             req_body_dropped: false,
+            close_opt: false,
+            srv_kal_rule: false,
+            req_len_long: false,
+            rsp_dechunk: None,
             l7_off: false,
             l7: L7Retry::Off,
         }
@@ -2213,6 +2271,31 @@ mod tests {
         out.clear();
         assert_eq!(read_body(Framing::UntilClose, b"abc", &mut out), BodyProgress::Partial);
         assert_eq!(out, b"abc");
+    }
+
+    #[test]
+    fn dechunk_takes_the_framing_off_wherever_the_body_is_cut() {
+        let body: &[u8] = b"2\r\nok\r\n1\r\nx\r\n3;e=1\r\nabc\r\n0\r\nt: 1\r\n\r\nGET";
+        for cut in 0..=body.len() - 3 {
+            let mut c = Chunk::START;
+            let mut out = Vec::new();
+            let mut end = None;
+            for (from, part) in [(0, &body[..cut]), (cut, &body[cut..])] {
+                let mut d = part.to_vec();
+                let (n, r) = dechunk(&mut c, &mut d);
+                out.extend_from_slice(&d[..n]);
+                if let Ok(Some(at)) = r {
+                    end = Some(&body[from + at..]);
+                    break;
+                }
+                assert_eq!(r, Ok(None));
+            }
+            assert_eq!(out, b"okxabc", "cut at {cut}");
+            assert_eq!(end, Some(&b"GET"[..]), "cut at {cut}");
+        }
+        let mut d = b"2\r\nokX".to_vec();
+        let mut c = Chunk::START;
+        assert_eq!(dechunk(&mut c, &mut d), (2, Err(())));
     }
 
     #[test]

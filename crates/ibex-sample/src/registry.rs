@@ -2038,7 +2038,7 @@ impl Registry {
         self.multi_visits.insert("res.fhdr", |ctx, args, f| header_visit(ctx, args, true, true, f));
 
         // T327: req.fhdr_cnt counts lines and req.hdr_cnt values, with or without a name, on
-        // the headers as the oracle's H1 parser leaves them (`h1_cleaned_headers`).
+        // the headers as the oracle's H1 parser leaves them (`cleaned_for`).
         let req_hdr_cnt_fetch: FetchFn = |ctx, args| {
             let all = get_all_req_headers_all(ctx);
             let count = match args.first() {
@@ -2104,7 +2104,7 @@ impl Registry {
         });
 
         // T327: res.hdr_cnt counts values and res.fhdr_cnt lines, with or without a name, on the
-        // headers as the oracle's H1 parser leaves them (`h1_cleaned_headers`). shdr_cnt is the
+        // headers as the oracle's H1 parser leaves them (`cleaned_for`). shdr_cnt is the
         // same fetch as res.hdr_cnt on the oracle (`smp_fetch_hdr_cnt`): T326 registers it with
         // `res_hdr_cnt_f` too.
         let res_hdr_cnt_f: FetchFn = |ctx, args| {
@@ -7215,9 +7215,6 @@ fn strl2ic_sample(v: String) -> Sample {
 /// T327: `hdrs` as the oracle's H1 parser leaves them in HTX, for the header-count fetches:
 /// [`crate::h1_clean::h1_clean_headers`] (the one implementation of that cleaning, shared
 /// with `req.hdrs`/`res.hdrs` and the `*.hdr_names` fetches).
-fn h1_cleaned_headers(hdrs: Vec<(String, String)>, is_req: bool) -> Vec<(String, String)> {
-    crate::h1_clean::h1_clean_headers(hdrs.iter().map(|(n, v)| (n.as_str(), v.as_str())), is_req)
-}
 
 fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     let mut matches = Vec::new();
@@ -7294,7 +7291,7 @@ fn req_header_block(ctx: &SampleContext) -> Option<String> {
 }
 
 /// T327: all request header `(name, value)` pairs, in order, from the same sources as
-/// `get_all_req_headers`, as the oracle's H1 parser leaves them (`h1_cleaned_headers`).
+/// `get_all_req_headers`, as the oracle's H1 parser leaves them (`cleaned_for`).
 fn get_all_req_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
     let mut all = Vec::new();
     if let Some(htx) = ctx.htx_slice {
@@ -7308,7 +7305,16 @@ fn get_all_req_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
             all.extend(headers.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
     }
-    h1_cleaned_headers(all, true)
+    cleaned_for(&all, true)
+}
+
+/// The headers as the counting fetches read them: as `HAProxy`'s H1 parser leaves them, except
+/// that a `close` or `keep-alive` in `Connection` is a rule's (the message's own went before
+/// the rules) and is counted, as `hdr` reads it (T442). Only rules read them: a log format
+/// that names these fetches is refused, by `HAProxy` as by Ibex ("needs 'HTTP request
+/// headers'", `proxy_state.rs`), so the `close` an option adds after the rules is never read.
+fn cleaned_for(all: &[(String, String)], is_req: bool) -> Vec<(String, String)> {
+    crate::h1_clean::h1_clean_headers_kept_conn(all.iter().map(|(n, v)| (n.as_str(), v.as_str())), is_req)
 }
 
 /// The response's header `name`. Only the response is read: `ctx.htx_slice` holds the
@@ -7368,13 +7374,13 @@ fn get_all_res_header_names(ctx: &SampleContext) -> Vec<String> {
 
 
 /// T327: all response header `(name, value)` pairs, in order, from the same sources as
-/// `get_all_res_headers`, as the oracle's H1 parser leaves them (`h1_cleaned_headers`).
+/// `get_all_res_headers`, as the oracle's H1 parser leaves them (`cleaned_for`).
 fn get_all_res_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
     let mut all: Vec<(String, String)> = ctx.res_headers.map(<[_]>::to_vec).unwrap_or_default();
     if all.is_empty() {
         CURRENT_RES_HEADERS.with(|hdrs| all.extend(hdrs.borrow().iter().cloned()));
     }
-    h1_cleaned_headers(all, false)
+    cleaned_for(&all, false)
 }
 
 /// T327: whether the Set-Cookie value `seg` holds a cookie named `name` (any cookie when

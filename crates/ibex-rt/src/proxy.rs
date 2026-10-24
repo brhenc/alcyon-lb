@@ -592,6 +592,9 @@ pub struct TcpSession {
     pub keep_alive_ms: u32,
     /// `option httpclose` in the frontend: each response closes the client connection.
     pub close_client: bool,
+    /// The process is stopping: each response closes the client connection, whatever a
+    /// rule writes (`close_client` is set too).
+    pub stopping: bool,
     /// `option http-drop-request-trailers` of the stream's backend (set when it is chosen,
     /// false until then and for each new request): the request's trailer section is cut.
     pub drop_req_trailers: bool,
@@ -941,6 +944,7 @@ impl TcpSession {
         c.http_request_ms = owner.http_request_ms;
         c.keep_alive_ms = owner.keep_alive_ms;
         c.close_client = owner.close_client;
+        c.stopping = owner.stopping;
         c.drop_rsp_trailers = owner.drop_rsp_trailers;
         c.bytes_in = owner.bytes_in;
         c.bytes_out = owner.bytes_out;
@@ -1185,6 +1189,7 @@ impl TcpSession {
             http_request_ms: 0,
             keep_alive_ms: 0,
             close_client: false,
+            stopping: false,
             drop_req_trailers: false,
             drop_rsp_trailers: false,
             req_idle: false,
@@ -1696,6 +1701,47 @@ impl TcpSession {
         let Some(t) = &self.txn else { return };
         let n = t.rsp.canonical_chunk_lines(self.rep.readable_mut(), self.drop_rsp_trailers);
         self.rep.cut(n, self.rep.len());
+    }
+
+    /// The bytes of `rep` from `from` on, of a response whose rules removed its
+    /// `Transfer-Encoding` ([`HttpTxn::rsp_dechunk`]): their chunk framing is taken off
+    /// ([`txn::dechunk`]) and the body goes as it would until the close (T442). At its end the
+    /// message is what `rep` holds, and what follows it is dropped; at a framing violation
+    /// nothing of this read goes and the server connection is aborted, as when the framing
+    /// breaks in a body forwarded as it came.
+    pub fn dechunk_rep(&mut self, from: usize) {
+        let Some(t) = self.txn.as_mut() else { return };
+        let Some(c) = t.rsp_dechunk.as_deref_mut() else { return };
+        // A head that came alone leaves nothing after it (`from == len`): `dechunk` reads
+        // nothing, and the parser stays where it is.
+        let len = self.rep.len();
+        let (n, r) = txn::dechunk(c, &mut self.rep.readable_mut()[from..]);
+        match r {
+            Ok(None) => self.rep.cut(from + n, len),
+            Ok(Some(end)) => {
+                self.rep.cut(from + n, len);
+                t.rsp_dechunk = None;
+                t.srv_reusable &= from + end == len;
+                let total = self.rep.len();
+                // While the framing comes off, the response is its head (`set_rsp` sets it so)
+                // or, once that has gone, a body that lasts until the close.
+                t.rsp = match t.rsp {
+                    txn::MsgState::Head { left, .. } => txn::MsgState::Head { left, body: txn::Framing::Length((total - left) as u64) },
+                    _ if total == 0 => txn::MsgState::Done,
+                    _ => txn::MsgState::Body(txn::Body::Length(total as u64)),
+                };
+            }
+            Err(()) => {
+                self.rep.cut(from, len);
+                t.rsp_dechunk = None;
+                t.srv_reusable = false;
+                t.close_after = true;
+                t.aborted = true;
+                self.srv_state = ScState::Error;
+                self.ending.get_or_insert(Ending::ServerAbort);
+                self.log.term = Some(*b"PH");
+            }
+        }
     }
 
     /// The stream's backend is chosen: `drop` is its `option http-drop-request-trailers`. A
@@ -2653,6 +2699,7 @@ impl TcpSession {
                 // `Connection` says (`H1_MF_CONN_CLO`; measured on 3.5-dev8, T430 row 2).
                 let chunked10 = framing == txn::Framing::Chunked && !ibex_proto::h1::version_is_11(ver);
                 let mut txn = HttpTxn::new(framing, close || self.close_client || chunked10);
+                txn.close_opt = self.close_client && !self.stopping && !close && !chunked10;
                 txn.req_htx = req_htx;
                 txn.req_len_hdrs = Some(len_hdrs);
                 txn.req_http11 = ibex_proto::h1::version_is_11(ver);
@@ -2981,6 +3028,7 @@ impl TcpSession {
                 }
                 Io::Done(n) if n > 0 => {
                     self.rep.commit(n);
+                    self.dechunk_rep(self.rep.len() - n);
                     self.rewrite_rep_chunk_framing();
                     self.log.bytes_from_server += n as u64;
                     changed = true;

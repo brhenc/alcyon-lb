@@ -86,6 +86,11 @@ pub fn drop_items(value: &str, mut drop: impl FnMut(&str) -> bool) -> String {
 /// (trimmed, rewritten), or `None` when it takes the header out. `request` adds the
 /// request-only `Upgrade`/`Connection: upgrade` pairing.
 fn clean_values<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>, request: bool) -> Vec<(&'a str, Option<String>)> {
+    clean_values_with(headers, request, true)
+}
+
+/// [`clean_values`]; without `conn_tokens`, `close` and `keep-alive` stay in `Connection`.
+fn clean_values_with<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>, request: bool, conn_tokens: bool) -> Vec<(&'a str, Option<String>)> {
     let is = |w: &str, t: &str| w.eq_ignore_ascii_case(t);
     let (mut conn_upg, mut upg_hdr) = (false, false);
     let mut out: Vec<(&'a str, Option<String>)> = Vec::new();
@@ -94,7 +99,7 @@ fn clean_values<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>, request: 
         let left = if n.eq_ignore_ascii_case("connection") {
             drop_items(v, |w| {
                 conn_upg |= is(w, "upgrade");
-                is(w, "close") || is(w, "keep-alive")
+                conn_tokens && (is(w, "close") || is(w, "keep-alive"))
             })
         } else if n.eq_ignore_ascii_case("upgrade") {
             let left = drop_items(v, |w| is(w, "h2c") || is(w, "h2"));
@@ -136,6 +141,14 @@ pub fn kept_headers(headers: &[(&str, &str)], request: bool) -> Vec<bool> {
 /// says which stay): names lowercased, values trimmed and rewritten.
 pub(crate) fn h1_clean_headers<'a>(hdrs: impl Iterator<Item = (&'a str, &'a str)>, request: bool) -> Vec<(String, String)> {
     clean_values(hdrs, request).into_iter().filter_map(|(n, v)| Some((n.to_ascii_lowercase(), v?))).collect()
+}
+
+/// [`h1_clean_headers`] for a message whose own `close` and `keep-alive` the runtime has
+/// already taken out of `Connection` (before its rules run, T439): one left there is a
+/// rule's, and stays, as it does in `HAProxy`'s HTX (`req.hdr_cnt(connection)` counts the
+/// `close` that `set-header connection close` wrote, T442).
+pub(crate) fn h1_clean_headers_kept_conn<'a>(hdrs: impl Iterator<Item = (&'a str, &'a str)>, request: bool) -> Vec<(String, String)> {
+    clean_values_with(hdrs, request, false).into_iter().filter_map(|(n, v)| Some((n.to_ascii_lowercase(), v?))).collect()
 }
 
 /// The block `smp_fetch_hdrs` builds: each header `name: value\r\n`, then `\r\n` (the end of
