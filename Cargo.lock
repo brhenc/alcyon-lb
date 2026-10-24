@@ -713,6 +713,7 @@ name = "ibex-sched"
 version = "0.1.0"
 dependencies = [
  "ebtree",
+ "ibex-alloc",
  "proptest",
 ]
 

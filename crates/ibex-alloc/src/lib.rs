@@ -11,6 +11,8 @@
 //!   (`tune.memory.hot-size`), declared with [`declare_pool!`] (`docs/design/memory-2026-10-24.md`).
 //! - [`PoolRegistry`]: Registry for pool tracking and `HAProxy`-compatible `show pools` CLI dumps.
 
+pub mod arena;
+pub use arena::{Arena, ArenaStats};
 pub mod pool;
 pub use pool::{
     drain_local_pools, for_each_pool, hot_size, local_hot_bytes, set_hot_size, Pool, PoolBox, PoolDyn, PoolSpec, Poolable,

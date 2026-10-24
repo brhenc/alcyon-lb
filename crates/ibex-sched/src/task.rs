@@ -254,16 +254,73 @@ impl Task {
     }
 }
 
-/// Per-thread task storage.
+/// Slots of every worker's [`TaskArena`], for `show pools` (pool `task`).
+pub static TASK_POOL: ibex_alloc::ArenaStats = ibex_alloc::ArenaStats::new(
+    "task",
+    core::mem::size_of::<Task>(),
+    core::mem::align_of::<Task>(),
+    file!(),
+    line!(),
+);
+
+/// `show pools` provider for the `task` pool: the slots ever created, those in use.
+#[allow(clippy::unnecessary_wraps)]
+#[must_use]
+pub fn task_pool_stats() -> Option<ibex_alloc::PoolHead> {
+    Some(TASK_POOL.head())
+}
+
+/// Per-thread task storage: an [`ibex_alloc::Arena`] (design 3.7).
 ///
-/// Sized at boot and never grown on the data path; exhaustion is an error rather than a
-/// reallocation, because a `realloc` under load is exactly the latency spike the design
-/// exists to avoid.
+/// Sized at boot; growth past that is fallible (`alloc` returns `None`), and the capacity a
+/// burst made is given back only by [`ibex_alloc::Arena::compact`] (`pool_gc`).
 #[derive(Debug)]
 pub struct TaskArena {
     tasks: Vec<Task>,
     free: Vec<u32>,
     live: usize,
+    floor: usize,
+    peak: usize,
+    published: ibex_alloc::arena::Published,
+}
+
+impl Drop for TaskArena {
+    fn drop(&mut self) {
+        TASK_POOL.retire(&mut self.published);
+    }
+}
+
+impl ibex_alloc::Arena<Task> for TaskArena {
+    fn slots(&self) -> usize {
+        self.tasks.len()
+    }
+
+    fn live(&self) -> usize {
+        self.live
+    }
+
+    fn compact(&mut self) -> usize {
+        let before = self.tasks.len();
+        while self.tasks.last().is_some_and(Task::freed) {
+            self.tasks.pop();
+        }
+        let cut = before - self.tasks.len();
+        let len = self.tasks.len();
+        if self.live == 0 {
+            self.free.clear();
+        } else {
+            self.free.retain(|&i| (i as usize) < len);
+        }
+        let cap = self.floor.max(len);
+        if cap < self.tasks.capacity() || self.peak > len {
+            if ibex_alloc::arena::move_to_fresh(&mut self.tasks, cap) {
+                self.peak = len;
+            } else {
+                TASK_POOL.skipped();
+            }
+        }
+        cut
+    }
 }
 
 impl TaskArena {
@@ -271,9 +328,18 @@ impl TaskArena {
     pub fn with_capacity(cap: usize) -> Self {
         TaskArena {
             tasks: Vec::with_capacity(cap),
-            free: Vec::new(),
+            free: Vec::with_capacity(cap),
             live: 0,
+            floor: cap,
+            peak: 0,
+            published: ibex_alloc::arena::Published::default(),
         }
+    }
+
+    /// Adds this arena's change since the last pass to `show pools` (once per loop pass).
+    #[inline]
+    pub fn publish(&mut self) {
+        TASK_POOL.publish(&mut self.published, self.tasks.len(), self.live);
     }
 
     #[must_use]
@@ -306,11 +372,15 @@ impl TaskArena {
             return Some(TaskRef(i));
         }
         let i = u32::try_from(self.tasks.len()).ok()?;
-        if i == u32::MAX {
+        if i == u32::MAX || !ibex_alloc::arena::grow_for_one(&mut self.tasks, &mut self.free) {
+            if i != u32::MAX {
+                TASK_POOL.failed();
+            }
             self.live -= 1;
             return None;
         }
         self.tasks.push(Task::new(kind));
+        self.peak = self.peak.max(self.tasks.len());
         Some(TaskRef(i))
     }
 
@@ -380,6 +450,32 @@ mod tests {
     #[test]
     fn workkind_spans_the_sixty_thousand_backend_target() {
         const { assert!(MAX_KIND_INDEX > 60_000 * 100) };
+    }
+
+    /// A close keeps the burst's slots; `compact` (pool_gc) drops the free ones at the end, keeps
+    /// a live one and the free slots below it, and the creation capacity.
+    #[test]
+    fn compact_gives_back_the_tail_only_when_asked() {
+        use ibex_alloc::Arena;
+        let mut a = TaskArena::with_capacity(4);
+        let refs: Vec<TaskRef> = (0..40).map(|i| a.alloc(WorkKind::new(Kind::Synthetic, i)).expect("alloc")).collect();
+        for &r in refs.iter().skip(2).rev() {
+            a.free(r);
+        }
+        assert_eq!((a.slots(), a.live()), (40, 2), "a free keeps the peak");
+        assert!(a.capacity() >= 40);
+        a.publish();
+        assert_eq!(a.compact(), 38);
+        assert_eq!((a.slots(), a.live(), a.capacity()), (2, 2, 4), "back to the creation capacity");
+        assert!(a.is_live(refs[0]) && a.is_live(refs[1]) && !a.is_live(refs[5]));
+        let t = a.alloc(WorkKind::new(Kind::Synthetic, 9)).expect("alloc");
+        assert_eq!(t, TaskRef(2), "no stale free index survived");
+        a.free(refs[0]);
+        a.free(t);
+        assert_eq!(a.compact(), 1, "the free slot below the live one stays");
+        assert_eq!(a.slots(), 2);
+        a.publish();
+        assert!(task_pool_stats().is_some());
     }
 
     #[test]

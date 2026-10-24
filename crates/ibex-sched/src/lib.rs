@@ -33,5 +33,5 @@ pub mod task;
 pub mod tick;
 
 pub use sched::{Class, Dispatch, Outcome, Scheduler, RUNQUEUE_DEPTH};
-pub use task::{CallSite, Kind, NodeRef, Task, TaskArena, TaskRef, WorkKind};
+pub use task::{task_pool_stats, CallSite, Kind, NodeRef, Task, TaskArena, TaskRef, WorkKind, TASK_POOL};
 pub use tick::Tick;
