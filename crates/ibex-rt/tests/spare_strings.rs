@@ -40,8 +40,10 @@ fn freed_after(cap: usize, act: impl FnOnce(String)) -> Option<Vec<u8>> {
     ibex_alloc::freed_bytes()
 }
 
-fn zeros(b: Option<&Vec<u8>>) -> bool {
-    b.is_some_and(|b| !b.is_empty() && b.iter().all(|&x| x == 0))
+/// The block was freed and no part of the secret is left in it. Not "all zeros": the
+/// allocator (an instrumented build's especially) writes its own bookkeeping into a freed block.
+fn secret_gone(b: Option<&Vec<u8>>) -> bool {
+    b.is_some_and(|b| !b.is_empty() && !b.windows(8).any(|w| SECRET.as_bytes().windows(8).any(|s| s == w)))
 }
 
 fn secret(b: Option<&Vec<u8>>) -> bool {
@@ -60,7 +62,7 @@ fn a_spare_string_is_wiped_when_zero_spares_is_on() {
         ibex_alloc::set_zero_buffers(!on);
         let check = |what: &str, b: Option<Vec<u8>>| {
             if on {
-                assert!(zeros(b.as_ref()), "setting on, {what}: freed bytes {b:?}");
+                assert!(secret_gone(b.as_ref()), "setting on, {what}: freed bytes {b:?}");
             } else {
                 assert!(secret(b.as_ref()), "setting off, {what}: freed bytes {b:?}");
             }
@@ -109,7 +111,7 @@ fn the_configured_zero_spares_reaches_the_give() {
             drop(spare::string());
         });
         if wiped {
-            assert!(zeros(b.as_ref()), "zero-spares {text:?}: freed bytes {b:?}");
+            assert!(secret_gone(b.as_ref()), "zero-spares {text:?}: freed bytes {b:?}");
         } else {
             assert!(secret(b.as_ref()), "zero-spares {text:?}: freed bytes {b:?}");
         }

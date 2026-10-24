@@ -429,11 +429,9 @@ fn evict_across() {
                 }
             }
         });
-        let Some((p, _)) = best else { return };
-        // One at a time: the objects vary in size, and one may be most of the budget.
-        if p.evict_local(1) == 0 {
-            return;
-        }
+        // One at a time: the objects vary in size, and one may be most of the budget. Stops
+        // when nothing could be evicted (a cache borrowed further up the stack).
+        let Some(_) = best.filter(|(p, _)| p.evict_local(1) != 0) else { return };
     }
 }
 
@@ -650,10 +648,8 @@ impl<T: Poolable> Pool<T> {
             // A floor object is kept whatever the budget; the others only when they fit it.
             let counted = n >= spec.floor;
             let max_item = if counted && max < spec.max_item { max } else { spec.max_item };
-            if n >= spec.max_count || !v.keep(max_item) {
-                return Err(v);
-            }
-            if n == l.items.capacity() && !self.grow_items(&mut l) {
+            // Not kept, or no room and the `Vec` cannot grow (memory is short).
+            if n >= spec.max_count || !v.keep(max_item) || (n == l.items.capacity() && !self.grow_items(&mut l)) {
                 return Err(v);
             }
             l.items.push(v);
@@ -662,8 +658,9 @@ impl<T: Poolable> Pool<T> {
             }
             Ok(counted)
         });
-        match kept {
-            Ok(Ok(counted)) => {
+        // No cache (the thread is ending): `v` went with the closure; nothing to count.
+        match kept.unwrap_or(Ok(false)) {
+            Ok(counted) => {
                 let over = HOT
                     .try_with(|h| {
                         if !counted {
@@ -678,8 +675,7 @@ impl<T: Poolable> Pool<T> {
                     self.over_three_quarters();
                 }
             }
-            Ok(Err(v)) => self.free_given(v, boxed),
-            Err(_) => {}
+            Err(v) => self.free_given(v, boxed),
         }
     }
 
@@ -863,13 +859,15 @@ impl<T: Poolable> PoolDyn for Pool<T> {
     }
 
     fn drain_local(&self) -> usize {
-        let Ok((items, counted_bytes)) = self.cache.try_with(|c| {
-            let Ok(mut l) = c.inner.try_borrow_mut() else { return (Vec::new(), 0) };
-            let counted_bytes = l.items.iter().skip(self.spec.floor).map(T::footprint).sum::<usize>();
-            (std::mem::take(&mut l.items), counted_bytes)
-        }) else {
-            return 0;
-        };
+        // An ending thread (no cache any more) or a borrowed one has nothing to drain here.
+        let (items, counted_bytes) = self
+            .cache
+            .try_with(|c| {
+                let Ok(mut l) = c.inner.try_borrow_mut() else { return (Vec::new(), 0) };
+                let counted_bytes = l.items.iter().skip(self.spec.floor).map(T::footprint).sum::<usize>();
+                (std::mem::take(&mut l.items), counted_bytes)
+            })
+            .unwrap_or_default();
         let n = items.len();
         let _ = HOT.try_with(|h| h.bytes.set(h.bytes.get() - counted_bytes));
         if self.spec.limited {
@@ -933,6 +931,10 @@ pub struct PoolBox<T: Poolable> {
 
 impl<T: Poolable> PoolBox<T> {
     /// The object, out of the pool for good.
+    ///
+    /// # Panics
+    ///
+    /// Never: a box holds its object until it is dropped or this takes it.
     #[must_use]
     pub fn into_inner(mut self) -> T {
         let v = self.v.take();
@@ -940,10 +942,7 @@ impl<T: Poolable> PoolBox<T> {
         if self.pool.spec.limited {
             self.pool.shared.grown.fetch_sub(1, Ordering::Relaxed);
         }
-        match v {
-            Some(v) => v,
-            None => unreachable!("a PoolBox holds its object until it is dropped"),
-        }
+        v.expect("a PoolBox holds its object until it is dropped")
     }
 }
 
@@ -951,20 +950,14 @@ impl<T: Poolable> std::ops::Deref for PoolBox<T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
-        match &self.v {
-            Some(v) => v,
-            None => unreachable!("a PoolBox holds its object until it is dropped"),
-        }
+        self.v.as_ref().expect("a PoolBox holds its object until it is dropped")
     }
 }
 
 impl<T: Poolable> std::ops::DerefMut for PoolBox<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
-        match &mut self.v {
-            Some(v) => v,
-            None => unreachable!("a PoolBox holds its object until it is dropped"),
-        }
+        self.v.as_mut().expect("a PoolBox holds its object until it is dropped")
     }
 }
 
@@ -1011,6 +1004,31 @@ mod tests {
     crate::declare_pool!(static BYTES: Pool<Vec<u8>> = PoolSpec::new("t_bytes").max_count(1000););
     crate::declare_pool!(static FLOORED: Pool<Vec<u8>> = PoolSpec::new("t_floored").floor(2););
     crate::declare_pool!(static WIDE: Pool<String> = PoolSpec::new("t_wide").max_count(1000););
+    crate::declare_pool!(static COUNTED: Pool<Vec<u8>> = PoolSpec::new("t_counted").limited(););
+    crate::declare_pool!(static ONE: Pool<Vec<u8>> = PoolSpec::new("t_one").limited().max_count(1););
+    crate::declare_pool!(static FAILING: Pool<Vec<u8>> = PoolSpec::new("t_failing"););
+    crate::declare_pool!(static OVER: Pool<Vec<u8>> = PoolSpec::new("t_over"););
+    crate::declare_pool!(static BLOBS: Pool<Blob> = PoolSpec::new("t_blobs").max_item(100););
+    crate::declare_pool!(static PREFILLED: Pool<Blob> = PoolSpec::new("t_prefilled").limited(););
+
+    /// A pooled type that keeps the default [`Poolable::keep`] (footprint within the bound).
+    #[derive(Debug, Default)]
+    struct Blob(usize);
+
+    impl Poolable for Blob {
+        fn footprint(&self) -> usize {
+            self.0
+        }
+        fn reset(&mut self, _wipe: bool) {}
+        fn try_new() -> Option<Self> {
+            Some(Blob(10))
+        }
+    }
+
+    thread_local! {
+        static RUNTIME_CACHE: Cache<Vec<u8>> = const { Cache::new() };
+    }
+    static RUNTIME_SHARED: PoolShared = PoolShared::new();
 
     fn vec_of(cap: usize) -> Option<Vec<u8>> {
         let mut v = Vec::new();
@@ -1063,6 +1081,7 @@ mod tests {
     #[test]
     fn the_thread_keeps_no_more_than_hot_size() {
         set_hot_size(65_536);
+        assert_eq!(hot_size(), 65_536);
         let _ = drain_local_pools();
         for _ in 0..100 {
             BYTES.give(vec_of(4096).expect("vec"));
@@ -1101,5 +1120,127 @@ mod tests {
         let keep = v.clone();
         v.reset(false);
         assert!(v.is_empty() && v.capacity() >= keep.len());
+    }
+
+    /// A pool can be put together at run time (the builders and `new`s are `const` for
+    /// `declare_pool!`, which never runs them): the spec is what the builders said, the caches
+    /// and shared part start empty, and the pool hands back what it was given.
+    #[test]
+    fn a_pool_built_at_run_time_has_its_spec_and_works() {
+        let spec = PoolSpec::new("t_runtime").size(64).max_item(4096).max_count(3).floor(1).limited().spares().at("here.rs", 7);
+        assert_eq!((spec.name, spec.size, spec.max_item, spec.max_count, spec.floor), ("t_runtime", 64, 4096, 3, 1));
+        assert!(spec.limited && spec.spares);
+        assert_eq!((spec.file, spec.line), ("here.rs", 7));
+        assert!(Cache::<String>::default().inner.borrow().items.is_empty());
+        let shared = PoolShared::default();
+        assert!(!shared.registered.load(Ordering::Relaxed) && shared.failures.load(Ordering::Relaxed) == 0);
+        let pool: &'static Pool<Vec<u8>> = Box::leak(Box::new(Pool::new(spec, &RUNTIME_SHARED, &RUNTIME_CACHE)));
+        assert_eq!(pool.spec().name, "t_runtime");
+        assert_eq!(PoolDyn::name(pool), "t_runtime");
+        pool.give(vec_of(100).expect("vec"));
+        pool.give(vec_of(200).expect("vec"));
+        assert_eq!(pool.local_count(), 2);
+        assert_eq!(pool.take_raw(|| None).map(|v| v.capacity()), Some(200));
+    }
+
+    /// `take` makes a new object with `try_new` (String, Vec, a type with the default `keep`);
+    /// the box derefs to it, prints as `PoolBox(..)`, and `into_inner` takes it out of the
+    /// pool's accounting (the box count goes back down: nothing is in use).
+    #[test]
+    fn a_box_derefs_prints_and_gives_up_its_object() {
+        let mut s = WIDE.take().expect("string");
+        s.push_str("abc");
+        assert_eq!(s.as_str(), "abc");
+        assert_eq!(format!("{s:?}"), "PoolBox(Some(\"abc\"))");
+        assert_eq!(s.into_inner(), "abc");
+        let mut v = BYTES.take().expect("bytes");
+        v.push(7);
+        assert_eq!(&v[..], &[7]);
+        drop(v);
+        assert!(BYTES.local_count() >= 1, "the dropped box went back to the pool");
+        let one = COUNTED.take().expect("counted");
+        assert_eq!(COUNTED.shared.grown.load(Ordering::Relaxed), 1);
+        let _ = one.into_inner();
+        assert_eq!(COUNTED.shared.grown.load(Ordering::Relaxed), 0, "out of the limit's count");
+        // The default `keep`: within `max_item` kept, over it freed.
+        BLOBS.give(Blob(50));
+        BLOBS.give(Blob(500));
+        assert_eq!(BLOBS.local_count(), 1);
+        assert_eq!(BLOBS.take().map(|b| b.into_inner().0), Some(50));
+        assert_eq!(BLOBS.take().map(|b| b.into_inner().0), Some(10), "a new one from try_new");
+    }
+
+    /// A byte buffer's wipe zeroes its used bytes before it is emptied.
+    #[test]
+    fn a_wiped_byte_buffer_keeps_no_byte_of_what_it_held() {
+        let mut v = b"hunter2".to_vec();
+        v.reset(true);
+        assert!(v.is_empty());
+        // SAFETY: the 7 bytes were initialized (with the secret, then the wipe) and `u8` has no
+        // invalid values; this reads them back without writing.
+        unsafe { v.set_len(7) };
+        assert_eq!(&v[..], &[0; 7]);
+        let mut w = *b"secret!";
+        crate::wipe_bytes(&mut w);
+        assert_eq!(w, [0; 7]);
+    }
+
+    /// `prefill` makes objects ahead (counted for the limit); evicting and draining free them
+    /// and take them out of that count again; an `init` that fails is a failure.
+    #[test]
+    fn prefill_evict_drain_and_a_failed_init_are_counted() {
+        PREFILLED.prefill(3);
+        assert_eq!(PREFILLED.local_count(), 3);
+        assert_eq!(PREFILLED.shared.grown.load(Ordering::Relaxed), 3);
+        assert_eq!(PREFILLED.evict_local(1), 1);
+        assert_eq!(PREFILLED.shared.grown.load(Ordering::Relaxed), 2);
+        assert_eq!(PREFILLED.drain_local(), 2);
+        assert_eq!(PREFILLED.shared.grown.load(Ordering::Relaxed), 0);
+        assert!(FAILING.take_with(|| None).is_none());
+        assert_eq!(FAILING.failures(), 1);
+    }
+
+    /// A box given back to a full pool is freed and leaves the limit's count; eviction stops at
+    /// the floor.
+    #[test]
+    fn a_box_not_kept_is_uncounted_and_eviction_stops_at_the_floor() {
+        let a = ONE.take_with(|| vec_of(64)).expect("a");
+        let b = ONE.take_with(|| vec_of(64)).expect("b");
+        assert_eq!(ONE.shared.grown.load(Ordering::Relaxed), 2);
+        drop(a);
+        drop(b);
+        assert_eq!(ONE.local_count(), 1, "max_count 1");
+        assert_eq!(ONE.shared.grown.load(Ordering::Relaxed), 1, "the freed one is uncounted");
+        let _ = FLOORED.drain_local();
+        FLOORED.give(vec_of(64).expect("vec"));
+        FLOORED.give(vec_of(64).expect("vec"));
+        assert_eq!(FLOORED.evict_local(5), 0, "both are floor objects");
+        assert_eq!(FLOORED.local_count(), 2);
+        let hot = FLOORED.local_hot_bytes();
+        assert_eq!(hot, 0, "floor objects are not counted against the budget");
+        assert!(FLOORED.take_raw(|| None).is_some());
+        assert_eq!(FLOORED.local_hot_bytes(), 0, "taking a floor object uncounts nothing");
+    }
+
+    /// A thread past the slots publishes into the shared overflow slot, and takes its share
+    /// out again when it ends (it has no slot of its own to free).
+    #[test]
+    fn the_overflow_slot_is_emptied_by_the_thread_that_filled_it() {
+        let count = || OVER.shared.shown[MAX_THREADS].count.load(Ordering::Relaxed);
+        let bytes = || OVER.shared.shown[MAX_THREADS].bytes.load(Ordering::Relaxed);
+        std::thread::spawn(move || {
+            // What a thread past the first MAX_THREADS is given.
+            SLOT.with(|s| s.0.set(MAX_THREADS));
+            OVER.give(vec_of(100).expect("vec"));
+            OVER.give(vec_of(100).expect("vec"));
+            super::publish_local();
+            assert_eq!((count(), bytes()), (2, 200));
+            OVER.give(vec_of(100).expect("vec"));
+            super::publish_local();
+            assert_eq!((count(), bytes()), (3, 300), "the change since the last publish");
+        })
+        .join()
+        .expect("thread");
+        assert_eq!((count(), bytes()), (0, 0));
     }
 }
