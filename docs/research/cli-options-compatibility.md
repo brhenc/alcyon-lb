@@ -59,7 +59,7 @@ The following catalog categorizes every command-line option in HAProxy 3.5 as im
 | `-st` | `<pids...>` | Hard stop / immediate termination: sends `SIGTERM` to the listed PIDs after startup, terminating them immediately. | Parses variable-length PID list; calls `tell_old_pids(SIGTERM)`. |
 | `-n` | `<maxconn>` | Overrides the global total concurrent connection limit (`maxconn`). | Sets `cfg_maxconn`. Takes precedence over `global maxconn` directive. Adjusts file descriptor limits. |
 | `-N` | `<maxpconn>`| Overrides the default per-proxy concurrent connection limit (defaults to 2000). | Sets `cfg_maxpconn`. Takes precedence over proxy-level defaults. |
-| `-m` | `<megabytes>`| Enforces a strict virtual memory limit on the process using `setrlimit(RLIMIT_AS)`. | Sets `global.rlimit_memmax_all`. Applied separately to master and each forked worker. |
+| `-m` | `<megabytes>`| Sets `RLIMIT_DATA` (soft and hard) to the limit; its pools then fail allocations gracefully (measured on 3.5-dev8 by T453). | Sets `global.rlimit_memmax_all`. Applied separately to master and each forked worker. |
 
 ### 2.3 Socket, Security & OS Flags
 
@@ -126,7 +126,7 @@ The following catalog categorizes every command-line option in HAProxy 3.5 as im
 | `-st <pids...>` | Hard stop: send `SIGTERM` to old PIDs | Parses variable PID list; sends `Signal::Term` via `rustix::process::kill_process` | **Supported** | Pure safe Rust (`rustix`) |
 | `-n <maxconn>` | Global maxconn override | Clamps engine capacity and per-listener/proxy `maxconn` | **Supported** | Runtime capacity override |
 | `-N <maxsock>` | Per-proxy maxconn default override | Overrides default proxy maxconn bounds | **Supported** | Config AST override |
-| `-m <megs>` | Enforce virtual memory limit in MB | Sets memory bounds using `rustix::process::setrlimit(Resource::As)` | **Supported** | Pure safe Rust (`rustix`) |
+| `-m <megs>` | Memory limit in MB | Sizes the automatic `maxconn` only; sets no rlimit (tradeoff.md 6.24) | **Partial** | `RLIMIT_DATA` once T448 (fallible pools) merges |
 | `-S <bind>` | Master CLI socket | Binds CLI socket via `Engine::bind_cli_socket()` | **Supported** | Safe UNIX domain socket |
 | `-u`, `-g`, `-U`, `-G`, `-ch` | User, Group, UID, GID, Chroot | Parses and applies/logs security identity and chroot targets | **Supported** | Security context management |
 | `-dr` | Ignore server DNS failures | Logs diagnostic and activates non-failing address resolution | **Supported** | Diagnostic flag |
@@ -214,26 +214,12 @@ fn send_signals_to_pids(pids: &[u32], signal: Signal, quiet: bool) {
 
 This ensures zero unsafe code, correct handling of dead PIDs (`ESRCH`), and exact parity with HAProxy reload scripts.
 
-### 4.3 Virtual Memory Limit (`-m`)
+### 4.3 Memory limit (`-m`)
 
-Enforced safely through `rustix::process::setrlimit`:
-
-```rust
-if let Some(megs) = cli_opts.memory_limit_mb {
-    let bytes = (megs as u64).saturating_mul(1024 * 1024);
-    let rlim = Rlimit {
-        current: Some(bytes),
-        maximum: Some(bytes),
-    };
-    if let Err(err) = setrlimit(Resource::As, rlim) {
-        if !cli_opts.quiet {
-            eprintln!("[WARNING] Unable to enforce memory limit (-m {megs} MB): {err}");
-        }
-    }
-}
-```
-
----
+Not an rlimit yet. Ibex's `-m` sizes the automatic `maxconn` from the budget
+(`engine::apply_memmax`) and reports `Memmax_MB` in `show info`. HAProxy sets `RLIMIT_DATA`.
+Ibex sets it only once its pools fail one stream instead of aborting the process
+(T448); before that, a cap would only make it abort sooner. See tradeoff.md 6.24.
 
 ## 5. Integration Verification Matrix
 
