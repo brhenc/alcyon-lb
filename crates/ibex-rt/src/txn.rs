@@ -536,6 +536,18 @@ impl MsgState {
         *self == MsgState::Done
     }
 
+    /// How many bytes at the front of `data` are this message's head, still to forward:
+    /// none once the head has gone.
+    #[must_use]
+    pub fn head_window(&self, data: &[u8]) -> usize {
+        let mut s = *self;
+        s.measure_head(data);
+        match s {
+            MsgState::Head { left, .. } => left.min(data.len()),
+            _ => 0,
+        }
+    }
+
     /// Where in `data` -- which starts at this message's current position -- the first
     /// trailer line ended by a lone LF is, if any. `HAProxy` accepts such a line and
     /// forwards it ended by CRLF; the proxy rewrites it before forwarding, so the next hop
@@ -1968,6 +1980,11 @@ pub struct HttpTxn {
     /// their rules (T439); `None` for a request that did not come in HTTP/1.
     pub req_len_hdrs: Option<LenHdrs>,
     pub rsp_len_hdrs: LenHdrs,
+    /// The request's rules removed the header its body was framed by, and left none: it
+    /// went to the server with `content-length: 0`, and its body is read from the client
+    /// and dropped (`H1S_F_BODYLESS_REQ` in `h1_make_eoh`, T442). Forwarded, the server
+    /// would read the body as the next request.
+    pub req_body_dropped: bool,
     /// `http-request disable-l7-retry` ran for this request (`TX_D_L7_RETRY`).
     pub l7_off: bool,
     /// A retry on the server's answer (`retry-on <status>`): the request as it was sent.
@@ -2026,6 +2043,7 @@ impl HttpTxn {
             rsp_htx: None,
             req_len_hdrs: None,
             rsp_len_hdrs: LenHdrs::default(),
+            req_body_dropped: false,
             l7_off: false,
             l7: L7Retry::Off,
         }
