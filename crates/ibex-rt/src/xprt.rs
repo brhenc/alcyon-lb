@@ -824,6 +824,8 @@ pub fn accept_tls(fd: &impl AsRawFd, config: std::sync::Arc<ibex_tls::tcp::BindT
 #[must_use]
 pub fn accept_tls_capturing(fd: &impl AsRawFd, config: std::sync::Arc<ibex_tls::tcp::BindTls>, capture_size: usize, ja4_spec: bool) -> ClientXprt {
     let _ = fd.as_raw_fd();
+    // T460: the bind's build on the provider active now (`set ssl crypto-provider`).
+    let config = config.into_current();
     let provider = config.provider;
     let mut ctx = TlsCtx::accept(config);
     ctx.enable_capture(capture_size);

@@ -2,7 +2,8 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! T460: `tune.ibex.crypto-provider ring|ring-ibex` (Ibex-only) picks the rustls provider of
-//! every TCP TLS configuration, and `show ssl crypto-provider` reports the provider and the
+//! every TCP TLS configuration, `set ssl crypto-provider` changes it at run time for the
+//! handshakes that start after it, and `show ssl crypto-provider` reports the provider and the
 //! handshakes completed on each. `ring-ibex` with a TLS user still on rustls 0.23 (QUIC,
 //! log-forward TLS binds, ring TLS servers) is refused at startup: those would run on vanilla
 //! ring while the operator asked for the zeroizing fork.
@@ -104,7 +105,7 @@ fn start(tag: &str, provider: Option<&str>) -> (Ibex, String, [SocketAddr; 2], r
     let (f12, f13, origin) = (common::reserve_addr(), common::reserve_addr(), common::reserve_addr());
     let kw = provider.map(|p| format!("  tune.ibex.crypto-provider {p}\n")).unwrap_or_default();
     let cfg = format!(
-        "global\n  stats socket {sock} level admin\n{kw}\
+        "global\n  nbthread 2\n  stats socket {sock} level admin\n{kw}\
          defaults\n  mode http\n  http-reuse never\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
          frontend f12\n  bind {f12} ssl crt {pem} ssl-min-ver TLSv1.2 ssl-max-ver TLSv1.2\n  default_backend b12\n\
          frontend f13\n  bind {f13} ssl crt {pem} ssl-min-ver TLSv1.3\n  default_backend b13\n\
@@ -129,7 +130,7 @@ fn start(tag: &str, provider: Option<&str>) -> (Ibex, String, [SocketAddr; 2], r
 
 type Tls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 
-fn tls_connect(addr: SocketAddr, cert: &rustls::pki_types::CertificateDer<'static>, version: &'static rustls::SupportedProtocolVersion) -> Tls {
+fn client(cert: &rustls::pki_types::CertificateDer<'static>, version: &'static rustls::SupportedProtocolVersion) -> Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert.clone()).expect("root");
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -138,8 +139,17 @@ fn tls_connect(addr: SocketAddr, cert: &rustls::pki_types::CertificateDer<'stati
         .expect("versions")
         .with_root_certificates(roots)
         .with_no_client_auth();
+    Arc::new(cfg)
+}
+
+fn tls_connect(addr: SocketAddr, cert: &rustls::pki_types::CertificateDer<'static>, version: &'static rustls::SupportedProtocolVersion) -> Tls {
+    connect_with(addr, client(cert, version))
+}
+
+/// A connection of `cfg`, which keeps the sessions its connections were given (resumption).
+fn connect_with(addr: SocketAddr, cfg: Arc<rustls::ClientConfig>) -> Tls {
     let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-    let conn = rustls::ClientConnection::new(Arc::new(cfg), name).expect("client");
+    let conn = rustls::ClientConnection::new(cfg, name).expect("client");
     let tcp = TcpStream::connect(addr).expect("connect");
     tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     rustls::StreamOwned::new(conn, tcp)
@@ -193,4 +203,95 @@ fn each_provider_serves_tls12_and_tls13_front_and_back_and_counts_its_handshakes
         let want = if name == "ring" { (6, 0) } else { (0, 6) };
         assert_eq!(settle(&sock, want), (name.to_string(), want.0, want.1), "{provider:?} after two requests");
     }
+}
+
+/// `set ssl crypto-provider`: a connection open before the swap keeps serving on the provider it
+/// started with; handshakes after it run on the new one; a resumed session from before the swap
+/// becomes a full handshake (the ticket keys are the provider's), never a failed one; an unknown
+/// name, and a swap that cannot load a certificate, change nothing.
+#[test]
+fn a_swap_at_run_time_moves_new_handshakes_and_keeps_open_connections() {
+    let (_ibex, sock, [f12, f13], der) = start("swap", None);
+    let resuming = client(&der, &rustls::version::TLS13);
+    let mut first = connect_with(f13, Arc::clone(&resuming));
+    assert_eq!(request(&mut first, true), "TLSv1.3");
+    let mut again = connect_with(f13, Arc::clone(&resuming));
+    assert_eq!(request(&mut again, true), "TLSv1.3");
+    assert_eq!(again.conn.handshake_kind(), Some(rustls::HandshakeKind::Resumed), "resumption works before the swap");
+    let mut kept = tls_connect(f13, &der, &rustls::version::TLS13);
+    assert_eq!(request(&mut kept, false), "TLSv1.3");
+    assert_eq!(settle(&sock, (9, 0)), ("ring".to_string(), 9, 0), "three requests on ring");
+
+    for bad in ["openssl", "", "ring ring-ibex"] {
+        let out = cli(&sock, &format!("set ssl crypto-provider {bad}"));
+        assert!(out.contains("'set ssl crypto-provider' expects 'ring' or 'ring-ibex'"), "{bad:?}: {out:?}");
+    }
+    assert_eq!(shown(&sock), ("ring".to_string(), 9, 0), "an unknown name changes nothing");
+
+    let out = cli(&sock, "set ssl crypto-provider ring-ibex");
+    assert!(out.contains("now 'ring-ibex'"), "{out:?}");
+    assert_eq!(shown(&sock).0, "ring-ibex");
+    // The open connection keeps its session, and its server connection (the session's own,
+    // http-reuse never or not): no new handshake.
+    assert_eq!(request(&mut kept, false), "TLSv1.3", "the connection from before the swap");
+    assert_eq!(settle(&sock, (9, 0)), ("ring-ibex".to_string(), 9, 0));
+    let mut t = tls_connect(f12, &der, &rustls::version::TLS12);
+    assert_eq!(request(&mut t, true), "TLSv1.2");
+    let mut after = connect_with(f13, Arc::clone(&resuming));
+    assert_eq!(request(&mut after, true), "TLSv1.3", "a session from before the swap still connects");
+    assert_eq!(after.conn.handshake_kind(), Some(rustls::HandshakeKind::Full), "its ticket does not open under the new provider");
+    assert_eq!(settle(&sock, (9, 6)), ("ring-ibex".to_string(), 9, 6));
+
+    // Back again: the configurations built at startup serve.
+    let out = cli(&sock, "set ssl crypto-provider ring");
+    assert!(out.contains("now 'ring'"), "{out:?}");
+    let mut t = tls_connect(f12, &der, &rustls::version::TLS12);
+    assert_eq!(request(&mut t, true), "TLSv1.2");
+    assert_eq!(settle(&sock, (12, 6)), ("ring".to_string(), 12, 6));
+    // The swap to a provider already current is accepted and changes nothing.
+    assert!(cli(&sock, "set ssl crypto-provider ring").contains("now 'ring'"));
+    assert_eq!(shown(&sock), ("ring".to_string(), 12, 6));
+    assert_eq!(request(&mut kept, true), "TLSv1.3", "still serving after two swaps");
+}
+
+#[test]
+fn a_swap_that_cannot_build_every_configuration_changes_nothing() {
+    let (ibex, sock, [f12, _], der) = start("swapfail", Some("ring"));
+    let mut t = tls_connect(f12, &der, &rustls::version::TLS12);
+    assert_eq!(request(&mut t, true), "TLSv1.2");
+    // Every worker has loaded the certificate (each builds its listeners when it starts).
+    std::thread::sleep(Duration::from_millis(300));
+    // The certificate cannot be loaded again: the configurations of `ring-ibex` cannot be built.
+    std::fs::write(ibex.1.join("c.pem"), "not a certificate\n").unwrap();
+    let out = cli(&sock, "set ssl crypto-provider ring-ibex");
+    assert!(out.contains("unchanged") && out.contains("'ring'") && out.contains("c.pem"), "{out:?}");
+    assert_eq!(settle(&sock, (3, 0)), ("ring".to_string(), 3, 0));
+    let mut t = tls_connect(f12, &der, &rustls::version::TLS12);
+    assert_eq!(request(&mut t, true), "TLSv1.2");
+    assert_eq!(settle(&sock, (6, 0)), ("ring".to_string(), 6, 0), "ring still serves");
+}
+
+#[test]
+fn a_swap_to_ring_ibex_with_quic_is_refused_at_run_time() {
+    let d = dir("swapquic");
+    let (pem, _) = cert(&d);
+    let sock = d.join("cli.sock").display().to_string();
+    let (tcp, quic) = (common::reserve_addr(), common::reserve_addr());
+    let cfg = format!(
+        "global\n  stats socket {sock} level admin\n\
+         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind {tcp}\n  bind quic4@{quic} ssl crt {pem} alpn h3\n  http-request return status 200\n"
+    );
+    std::fs::write(d.join("c.cfg"), cfg).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(d.join("c.cfg")).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let _ibex = Ibex(child, d);
+    assert!(common::wait_listening(tcp));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::path::Path::new(&sock).exists() {
+        assert!(Instant::now() < deadline, "no stats socket");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = cli(&sock, "set ssl crypto-provider ring-ibex");
+    assert!(out.contains("unchanged") && out.contains("QUIC bind") && out.contains("rustls 0.23"), "{out:?}");
+    assert_eq!(shown(&sock).0, "ring");
 }

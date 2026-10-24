@@ -158,6 +158,43 @@ pub struct BindTls {
     pub resolver: Arc<CertResolver>,
     /// The crypto provider both configurations run on (T460).
     pub provider: TlsCryptoProvider,
+    /// The line it was built from, for a swap to build it again (`None`: built in memory).
+    source: Option<BindConfig>,
+    /// The same bind on the other provider, once a swap built it.
+    other: std::sync::OnceLock<Arc<BindTls>>,
+}
+
+impl BindTls {
+    /// A bind of these parts, which a swap does not build again.
+    #[must_use]
+    pub fn from_parts(config: Arc<ServerConfig>, no_alpn: Arc<ServerConfig>, resolver: Arc<CertResolver>, provider: TlsCryptoProvider) -> Self {
+        Self { config, no_alpn, resolver, provider, source: None, other: std::sync::OnceLock::new() }
+    }
+
+    /// What a handshake starting now uses: this bind, or its build on the provider a swap made
+    /// active (T460). One atomic load.
+    #[must_use]
+    pub fn into_current(self: Arc<Self>) -> Arc<Self> {
+        if provider::active() == self.provider {
+            return self;
+        }
+        match self.other.get() {
+            Some(other) => Arc::clone(other),
+            None => self,
+        }
+    }
+}
+
+impl provider::Rebuild for BindTls {
+    fn prepare(self: Arc<Self>, p: TlsCryptoProvider) -> Result<Option<provider::Publish>, String> {
+        let Some(source) = self.source.as_ref().filter(|_| p != self.provider && self.other.get().is_none()) else {
+            return Ok(None);
+        };
+        let built = Arc::new(build_bind(source, p).map_err(|e| format!("bind {} ssl: {e}", source.addr))?);
+        Ok(Some(Box::new(move || {
+            let _ = self.other.set(built);
+        })))
+    }
 }
 
 /// Builds the TCP configuration of a `bind ... ssl` line on the [`provider::active`] provider.
@@ -182,9 +219,12 @@ pub fn from_bind_config_with(bind: &BindConfig, kind: TlsCryptoProvider) -> Resu
     if let Some(live) = cache.get(&key).and_then(std::sync::Weak::upgrade) {
         return Ok(live);
     }
-    let built = Arc::new(build_bind(bind, kind)?);
+    let mut built = build_bind(bind, kind)?;
+    built.source = Some(bind.clone());
+    let built = Arc::new(built);
     cache.retain(|_, w| w.strong_count() > 0);
     cache.insert(key, Arc::downgrade(&built));
+    provider::register(Arc::downgrade(&built) as std::sync::Weak<dyn provider::Rebuild>);
     Ok(built)
 }
 
@@ -265,7 +305,7 @@ fn build(plan: &BindPlan, kind: TlsCryptoProvider, tls12: bool, tls13: bool) -> 
     )));
     let mut no_alpn = config.clone();
     no_alpn.alpn_protocols.clear();
-    Ok(BindTls { config: Arc::new(config), no_alpn: Arc::new(no_alpn), resolver, provider: kind })
+    Ok(BindTls::from_parts(Arc::new(config), Arc::new(no_alpn), resolver, kind))
 }
 
 /// `verify none`: no server authentication, signatures still checked.

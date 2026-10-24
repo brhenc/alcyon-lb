@@ -305,7 +305,7 @@ bytes; `-dM` poisoning is a debug option) and refuses the keyword as unknown. It
 written through `Buf::writable()` and never committed are not tracked, and buffers owned by rustls
 itself are not Ibex's to overwrite.
 
-## `tune.ibex.crypto-provider ring|ring-ibex` and `show ssl crypto-provider`: Ibex-only (T460)
+## `tune.ibex.crypto-provider ring|ring-ibex`, `set ssl crypto-provider` and `show ssl crypto-provider`: Ibex-only (T460)
 
 The rustls crypto provider every TCP TLS configuration is built on: binds, server lines and
 their health checks, TLS 1.2 and 1.3. `ring` (the default) is upstream ring through
@@ -324,6 +324,20 @@ handshakes completed on each provider since start, front and back:
     current ring
     provider ring handshakes 12
     provider ring-ibex handshakes 0
+
+`set ssl crypto-provider ring|ring-ibex` (CLI, admin level) changes the provider at run time, for
+the handshakes that start after it. Every TLS configuration (each `bind ... ssl`, each `server ...
+ssl` and its checks) is built again on the new provider, reading its certificate, CA and CRL files
+again; only once all of them are built is the new provider published, so a file that no longer
+loads leaves everything as it was and the answer says `Crypto provider unchanged ('ring'): <the
+error>`. A connection already open keeps the session and the provider it started with, and so does
+the server connection of its session. A configuration keeps both builds once it has them: swapping
+back reuses the configurations of startup. Session tickets and session IDs belong to one build (the
+ticket keys come from the provider), so a client resuming a session from before the swap gets a
+full handshake, not a failure. `ring-ibex` is refused at run time in the same cases as at startup
+(QUIC, log-forward or ring TLS). The swap lasts as long as the process: a reload starts the new
+process on the configured provider, and so does a restart. HAProxy has no such command (switching
+SSL libraries there means a new binary).
 
 HAProxy's `ssl-provider`, `ssl-provider-path` and `ssl-propquery` load OpenSSL 3 providers
 (additively, `configuration.txt` "ssl-provider"), which is not this: they stay refused as

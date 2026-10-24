@@ -10,6 +10,17 @@
 //! provider it was built on. [`active`] is the one new configurations are built on: set at
 //! startup from the configuration, before any is built.
 //!
+//! The swap at run time (`set ssl crypto-provider`, [`swap`]): every configuration built from
+//! the configuration file is [`register`]ed. A swap builds each of them again on the new
+//! provider (reading its certificate files again), and only when all of them are built does it
+//! publish them and make the new provider [`active`]: a failure changes nothing. A handshake
+//! reads [`active`] when it starts (an atomic load, the swap's only cost per connection) and
+//! takes its configuration's build for that provider; a connection already open keeps the one
+//! it started with. A configuration keeps both builds once it has them: swapping back reuses
+//! the first, and nothing is built twice. Session tickets and session IDs are per build (the
+//! ticket keys are the provider's): a session from before a swap resumes no more, and the
+//! client gets a full handshake instead.
+//!
 //! QUIC and the 0.23 configurations of [`crate::config`] (log-forward TLS binds, ring servers)
 //! are on rustls 0.23, which `rustls-ringibex` does not serve: the engine refuses `ring-ibex`
 //! with any of them instead of letting them run on vanilla ring unsaid.
@@ -18,7 +29,7 @@ use ibex_config::TlsCryptoProvider;
 use rustls24::crypto::CryptoProvider;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 static ACTIVE: AtomicU8 = AtomicU8::new(0);
 
@@ -75,6 +86,64 @@ pub fn of(p: TlsCryptoProvider, tls12: bool, tls13: bool) -> Arc<CryptoProvider>
         c.tls13_cipher_suites = Cow::Borrowed(&[]);
     }
     Arc::new(c)
+}
+
+/// What publishes a configuration built for a swap; run once every one is built.
+pub type Publish = Box<dyn FnOnce() + Send>;
+
+/// A TLS configuration a swap can build on another provider.
+pub trait Rebuild: Send + Sync {
+    /// Builds this configuration on `p`, unless it is built on `p` already (`Ok(None)`). It is
+    /// not used until the returned [`Publish`] runs.
+    ///
+    /// # Errors
+    /// What the configuration does not build with on `p`, naming it.
+    fn prepare(self: Arc<Self>, p: TlsCryptoProvider) -> Result<Option<Publish>, String>;
+}
+
+/// The configurations a swap builds again. Weak: a configuration dropped (a `-c` check's, a
+/// test's) is skipped and forgotten.
+struct Registry {
+    live: Vec<Weak<dyn Rebuild>>,
+    /// Entries after the last sweep of the dropped ones: sweeps when the list has doubled.
+    swept: usize,
+}
+
+static REGISTRY: Mutex<Registry> = Mutex::new(Registry { live: Vec::new(), swept: 0 });
+
+/// Registers a configuration built from the configuration file, for [`swap`].
+pub fn register(c: Weak<dyn Rebuild>) {
+    let mut r = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
+    if r.live.len() >= 2 * r.swept.max(32) {
+        r.live.retain(|w| w.strong_count() > 0);
+        r.swept = r.live.len();
+    }
+    r.live.push(c);
+}
+
+/// Makes `p` the provider of the handshakes that start from now on, after building every
+/// registered configuration on it. The number built.
+///
+/// # Errors
+/// The first configuration that does not build on `p`: then nothing is published and the
+/// provider is unchanged.
+pub fn swap(p: TlsCryptoProvider) -> Result<usize, String> {
+    // Held throughout: two swaps at once are one after the other.
+    let mut r = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
+    r.live.retain(|w| w.strong_count() > 0);
+    r.swept = r.live.len();
+    let mut publish = Vec::new();
+    for c in r.live.iter().filter_map(Weak::upgrade) {
+        if let Some(f) = c.prepare(p)? {
+            publish.push(f);
+        }
+    }
+    let built = publish.len();
+    for f in publish {
+        f();
+    }
+    set_active(p);
+    Ok(built)
 }
 
 /// The ticket-key factory of provider `p`: a session ticket is sealed by the provider of the

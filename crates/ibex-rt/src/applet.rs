@@ -677,6 +677,10 @@ impl CliApplet {
             self.handle_show_stat(cmd, ctx);
         } else if cmd == "show table" || cmd.starts_with("show table ") {
             self.handle_show_table(cmd, ctx);
+        } else if let Some(rest) = cmd.strip_prefix("set ssl crypto-provider").filter(|r| r.is_empty() || r.starts_with(' ')) {
+            // T460 (Ibex-only, admin): the provider of the handshakes from now on.
+            let msg = crate::crypto_provider::set(rest);
+            self.finish_msg(&msg);
         } else if cmd == "show ssl crypto-provider" {
             // T460 (Ibex-only): the provider and the handshakes of each.
             self.out_buf.extend_from_slice(crate::crypto_provider::show().as_bytes());
