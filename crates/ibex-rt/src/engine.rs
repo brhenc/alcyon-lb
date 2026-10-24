@@ -5915,7 +5915,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             if self.lifecycle.as_ref().is_some_and(crate::lifecycle::Lifecycle::take_flush_request) {
                 crate::pool_gc::request();
             }
-            let want = self.lifecycle.as_ref().map_or(self.sig_paused, |lc| lc.pause_requested());
+            let want = self.lifecycle.as_ref().map_or(self.sig_paused, crate::lifecycle::Lifecycle::pause_requested);
             // A SIGTTIN after a resume that was refused (the name still held) tries again.
             let again = !want && !self.paused_abns.is_empty() && self.lifecycle.as_ref().is_some_and(crate::lifecycle::Lifecycle::take_resume);
             if !self.stopping {
