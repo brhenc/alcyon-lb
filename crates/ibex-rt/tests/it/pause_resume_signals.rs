@@ -191,3 +191,52 @@ fn pause_and_resume_are_logged_once_per_process() {
     got.extend(run.lines("Resumed "));
     assert_eq!(got, want, "stderr:\n{}", run.err.lock().unwrap());
 }
+
+/// Row 4: a soft stop (SIGUSR1) with an interactive CLI session open and nothing else. On
+/// `HAProxy` (nbthread 4, plain and `-W`) the session goes on answering for as long as it
+/// stays open (3 s measured), and the process exits once it is closed. Ibex's worker 0,
+/// which serves the CLI, stopped as soon as it had no client session, and the CLI session
+/// went with it (a broken pipe on the next command).
+fn soft_stop_keeps_the_cli_session(tag: &str, args: &[&str]) {
+    let mut run = start(tag, 4, args);
+    let mut s = UnixStream::connect(&run.sock).expect("cli");
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let cmd = |s: &mut UnixStream, c: &str| -> String {
+        if s.write_all(format!("{c}\n").as_bytes()).is_err() {
+            return "<write failed>".into();
+        }
+        let mut out = Vec::new();
+        let mut b = [0u8; 8192];
+        while !out.ends_with(b"\n> ") {
+            match s.read(&mut b) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&b[..n]),
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    cmd(&mut s, "prompt");
+    run.signal(rustix::process::Signal::Usr1);
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(run.ibex.try_wait().unwrap().is_none(), "ibex exited with a CLI session open");
+        let info = cmd(&mut s, "show info");
+        assert!(info.contains("Name: "), "the CLI session during the soft stop: {info:?}");
+    }
+    drop(s);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while run.ibex.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "ibex did not exit once the CLI session closed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_soft_stop_keeps_an_open_cli_session() {
+    soft_stop_keeps_the_cli_session("usr1", &[]);
+}
+
+#[test]
+fn a_soft_stop_keeps_an_open_cli_session_under_w() {
+    soft_stop_keeps_the_cli_session("usr1w", &["-W"]);
+}

@@ -5933,8 +5933,19 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 if quiet {
                     self.close_idle_http_sessions();
                 }
-                if self.sessions.live() == 0 && !self.quic_listeners.iter().any(crate::quic_listener::QuicListener::is_busy) {
-                    break;
+                // A CLI session open is waited for too, as `HAProxy`'s stopping thread
+                // waits for its last stream, applets included (T456: worker 0, which
+                // serves the CLI, left as soon as it had no client session, and dropped
+                // the CLI sessions open on it).
+                if self.sessions.live() == 0
+                    && self.applets.live() == 0
+                    && !self.quic_listeners.iter().any(crate::quic_listener::QuicListener::is_busy)
+                {
+                    // Done; the workers leave together (`Mailboxes::all_done`).
+                    self.mailboxes.mark_done(self.mailbox_wid);
+                    if self.mailboxes.all_done() {
+                        break;
+                    }
                 }
                 if self.stop_deadline.is_some_and(|d| Instant::now() >= d) {
                     self.linger_close_sessions();

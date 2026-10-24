@@ -18,6 +18,7 @@
 use ibex_sched::task::TaskRef;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// What one worker asks of another.
@@ -109,6 +110,8 @@ struct Inbox {
 struct Mailbox {
     inbox: Mutex<Inbox>,
     efd: OwnedFd,
+    /// The worker is stopping and has nothing left to serve, or is gone ([`Mailboxes::all_done`]).
+    done: AtomicBool,
 }
 
 /// One mailbox per worker.
@@ -125,7 +128,7 @@ impl Mailboxes {
         let boxes = (0..workers.max(1))
             .map(|_| {
                 let efd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK)?;
-                Ok(Mailbox { inbox: Mutex::new(Inbox::default()), efd })
+                Ok(Mailbox { inbox: Mutex::new(Inbox::default()), efd, done: AtomicBool::new(false) })
             })
             .collect::<io::Result<Vec<_>>>()?;
         Ok(Arc::new(Self { boxes }))
@@ -183,11 +186,29 @@ impl Mailboxes {
         std::mem::take(&mut b.inbox.lock().unwrap_or_else(PoisonError::into_inner).msgs)
     }
 
+    /// A stopping worker `wid` has no session left: it goes on serving its mailbox until
+    /// every worker is done ([`Self::all_done`]).
+    pub fn mark_done(&self, wid: usize) {
+        if let Some(b) = self.boxes.get(wid) {
+            b.done.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Every worker is done with its soft stop, or gone: they may all leave. `HAProxy`'s
+    /// threads leave together (`run_poll_loop`, `stopping_thread_mask`), so that a thread
+    /// finished early is still there for the others: for a CLI session's `show sess`, and
+    /// to empty its pool cache on the soft stop's `pool_gc` (T456).
+    #[must_use]
+    pub fn all_done(&self) -> bool {
+        self.boxes.iter().all(|b| b.done.load(Ordering::Relaxed))
+    }
+
     /// Worker `wid` stops: what it was asked and anything asked later is answered empty.
     pub fn close(&self, wid: usize) {
         let Some(b) = self.boxes.get(wid) else {
             return;
         };
+        b.done.store(true, Ordering::Relaxed);
         let msgs = {
             let mut inbox = b.inbox.lock().unwrap_or_else(PoisonError::into_inner);
             inbox.closed = true;
