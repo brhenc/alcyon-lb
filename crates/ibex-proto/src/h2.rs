@@ -1545,7 +1545,11 @@ fn scheme_ok(s: &str) -> bool {
 ///
 /// # Errors
 /// [`MalformedFields`] as above.
-pub fn check_request_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<bool, MalformedFields> {
+///
+/// `relaxed` is `option accept-unsafe-violations-in-http-request`: a `:path` is then
+/// checked as any value (NUL / CR / LF refused), so a `#` passes and a blank or control
+/// byte is a 400.
+pub fn check_request_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a str)>, relaxed: bool) -> Result<bool, MalformedFields> {
     let mut bad_request = false;
     let lws_or_ctl = |s: &str| s.bytes().any(|b| b <= b' ' || b == 0x7f);
     for (name, value) in fields {
@@ -1553,7 +1557,7 @@ pub fn check_request_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a s
             return Err(MalformedFields);
         }
         let valid = match name {
-            ":path" => path_ok(value) && (value.is_empty() || value.starts_with('/') || value == "*"),
+            ":path" => (if relaxed { value_ok(value) } else { path_ok(value) }) && (value.is_empty() || value.starts_with('/') || value == "*"),
             ":authority" | "host" => value_ok(value) && !crate::authority::has_forbidden_char(value.as_bytes()),
             "connection" | "proxy-connection" | "keep-alive" | "upgrade" | "transfer-encoding" => false,
             "te" => value == "trailers",
@@ -1613,7 +1617,7 @@ mod tests {
     /// on HAProxy 3.5-dev8 (`h2_field_validity` drives them through a running proxy).
     #[test]
     fn request_and_trailer_fields_are_checked_as_haproxy_checks_them() {
-        let req = |f: &[(&'static str, &'static str)]| check_request_fields(f.iter().copied());
+        let req = |f: &[(&'static str, &'static str)]| check_request_fields(f.iter().copied(), false);
         let base = [(":method", "GET"), (":scheme", "https"), (":path", "/a?b"), (":authority", "[::1]:8443")];
         assert_eq!(req(&base), Ok(false));
         assert_eq!(req(&[(":path", "*"), ("te", "trailers"), ("x-a", "a\t\x01\x7fb")]), Ok(false));

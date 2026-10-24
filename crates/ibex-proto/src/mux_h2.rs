@@ -230,7 +230,14 @@ impl H2ReqHead {
         self.method_len = self.text.len();
         self.text.push(' ');
         let start = self.text.len();
-        self.text.push_str(path.unwrap_or("/"));
+        // `:path *` with an `:authority` is the absolute form without a path, which
+        // `HAProxy` writes as `/`, as `*` for OPTIONS (`h2_prepare_htx_reqline`; measured,
+        // T451).
+        let path = match path {
+            Some("*") if authority.is_some() && method != "OPTIONS" => "/",
+            p => p.unwrap_or("/"),
+        };
+        self.text.push_str(path);
         self.uri = (start, self.text.len());
         self.text.push_str(" HTTP/1.1\r\n");
         if let (Some(a), None) = (authority, host) {
@@ -244,6 +251,9 @@ impl H2ReqHead {
                 }
                 host_seen = true;
             }
+            // A value's leading and trailing blanks go, as `h2_make_htx_request` trims them
+            // (RFC 9113 section 8.2.1); a cookie's stay (`http_cookie_merge`, measured).
+            let v = if n == "cookie" { v } else { v.trim_matches([' ', '\t']) };
             self.push_field(n, v);
         }
         self.text.push_str("\r\n");
@@ -496,6 +506,9 @@ pub struct H2MuxContext {
     /// Payload length of the frame being handled, padding included: what flow control counts.
     pub rx_frame_len: u32,
     pub flood_config: H2FloodConfig,
+    /// The frontend's `option accept-unsafe-violations-in-http-request`: a request's
+    /// `:path` gets the relaxed check of `h2_make_htx_request(.., relaxed)` (T451).
+    pub relaxed_path: bool,
     pub total_streams: usize,
     pub glitch_count: usize,
     pub graceful_goaway_sent: bool,
@@ -582,6 +595,7 @@ impl H2MuxContext {
             continuation_count: 0,
             rx_frame_len: 0,
             flood_config: H2FloodConfig::default(),
+            relaxed_path: false,
             total_streams: 0,
             glitch_count: 0,
             graceful_goaway_sent: false,
@@ -1381,7 +1395,7 @@ impl MuxH2 {
         // a server is refused by the parser).
         let fields = decoded.iter();
         let checked = if ctx.is_server {
-            crate::h2::check_request_fields(fields)
+            crate::h2::check_request_fields(fields, ctx.relaxed_path)
         } else {
             crate::h2::check_response_fields(fields).map(|()| false)
         };

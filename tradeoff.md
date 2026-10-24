@@ -604,6 +604,17 @@ capacity. That is what brings the survey's rules from 65 allocations per request
 | **What would close it** | Upstream: a stable unwinding OOM hook or `-C oom=panic`, plus a per-stream `catch_unwind` in the loop. Ibex has no `catch_unwind` outside tests, so that would be new work: each stream's step would need to be unwind-safe and the stream torn down cleanly. Before upstream moves, Ibex's own large or per-connection allocations can be made fallible with stable `try_reserve`. That covers the shrink copy in `trim_tail` (on `Err`, keep the old buffer), the buffer pool (`alloc_standard`/`small`/`large`: refuse or queue the stream, T372 Q3), and arena growth on accept. Allocations inside rustls, h2 and std stay infallible. |
 | **Status** | Open. Not implemented here; the `try_reserve` work is a separate task. |
 
+### 6.24 HTTP/2 field bytes that are not UTF-8, and a trailer refused before the server is reached (T451)
+
+| | |
+|---|---|
+| **What changed** | HPACK strings are octets. Ibex keeps decoded fields as UTF-8 text (`DecodedFields`, `H2ReqHead`, the rules), so `hpack::push_as_text` decodes each byte that is not UTF-8 as a NUL: the block is decoded whole (the dynamic table stays the client's, sizes included) and the field checks refuse the field with `RST_STREAM` PROTOCOL_ERROR on that stream alone. It was a GOAWAY COMPRESSION_ERROR that closed every stream of the connection. For a **name** this is what HAProxy 3.5-dev8 does (measured: RST 1, the next stream answered). For a **value or `:path`** HAProxy forwards the byte as it is (measured: `x-a: \xe9`, `GET /a\xe9b`); Ibex resets the stream. Valid UTF-8 (`é` as `C3 A9`) is forwarded byte for byte, as HAProxy does. QPACK (HTTP/3) still refuses such a string as a decompression failure. |
+| **Also** | A request whose trailers are refused: HAProxy forwards the head and body, then resets the stream, the last chunk never sent (measured). Ibex resets the stream the same way and never sends the last chunk, but when the trailers arrive before the server connection is made it forwards nothing at all. Forwarding a request already known to be malformed would only be for parity; the server sees an unfinished request either way. |
+| **Cost** | A client that sends Latin-1 (or other non-UTF-8) bytes in an HTTP/2 header value or path gets its stream reset where HAProxy forwards it. HTTP/1 is not affected. |
+| **Why that is acceptable** | RFC 9110 section 5.5 makes such bytes obs-text, which a recipient may refuse; clients that send them are rare. Carrying fields as bytes would change every type from the decoder to the rules. |
+| **Status** | Open. |
+| **Revisit** | When the request head is carried as bytes end to end. |
+
 ### 6.26 A panic in a stream's run closes that stream, not the process (T447) — **measured 2026-10-24**
 
 `EngineDispatcher::run_task` runs each stream task under `crash::contain` (`catch_unwind`). A

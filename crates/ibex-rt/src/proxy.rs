@@ -2351,6 +2351,7 @@ impl TcpSession {
             if self.req.readable().starts_with(H2_CONN_PREFACE) {
                 let mut h2 = H2MuxContext::new(ibex_proto::conn::ConnId(0), true);
                 h2.flood_config = self.h2_flood_config;
+                h2.relaxed_path = self.accept_unsafe_request;
                 if let Some(m) = self.h2_flood_config.max_concurrent_streams {
                     h2.max_concurrent_streams = m;
                 }
