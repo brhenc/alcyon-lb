@@ -603,3 +603,20 @@ capacity. That is what brings the survey's rules from 65 allocations per request
 | **T445 "GC and retry"** | Applies only where a failure can be seen: a `try_reserve`/`try_*` call that returns `Err`. On an infallible path there is nothing to retry, because the process is already in `abort`. |
 | **What would close it** | Upstream: a stable unwinding OOM hook or `-C oom=panic`, plus a per-stream `catch_unwind` in the loop. Ibex has no `catch_unwind` outside tests, so that would be new work: each stream's step would need to be unwind-safe and the stream torn down cleanly. Before upstream moves, Ibex's own large or per-connection allocations can be made fallible with stable `try_reserve`. That covers the shrink copy in `trim_tail` (on `Err`, keep the old buffer), the buffer pool (`alloc_standard`/`small`/`large`: refuse or queue the stream, T372 Q3), and arena growth on accept. Allocations inside rustls, h2 and std stay infallible. |
 | **Status** | Open. Not implemented here; the `try_reserve` work is a separate task. |
+
+### 6.26 A panic in a stream's run closes that stream, not the process (T447) — **measured 2026-10-24**
+
+`EngineDispatcher::run_task` runs each stream task under `crash::contain` (`catch_unwind`). A
+panic there is reported (the standard message and an `[ALERT]` line), the stream is closed
+without an answer, logged with termination state `I` and its phase, and counted in `eint`
+(frontend, backend and server), and the worker serves on. Design and the unwind-safety audit:
+`tasks/T447-progress.md`; test: `crates/ibex-rt/tests/it/panic_contained.rs`.
+
+| | |
+|---|---|
+| **Contained** | Any panic in one stream's run: H1 (tested), and by construction H2 (an h2 stream's panic ends its whole h2 connection, not just the stream), H3 request streams and TCP mode, which run as the same task kind (not tested). That covers rules, fetches, converters, parsing, forwarding and the stream's own logging. |
+| **Still aborts** | A panic outside a stream's run (accept, poller loop, health checks, CLI applets, reload, master); a panic that leaves a shared lock poisoned (stick tables, load balancer state, idle server connections, rings, pattern references, variables, userlists): what it guards may be half-changed; a panic while closing the panicked stream; a panic during unwinding; and an allocation failure, which aborts before any unwinding (T446, T448). |
+| **Cost** | +55 `instructions:u` per request (51 820 to 51 875, +0.1%; 50 000 keep-alive requests, `ab -k -c 1`, `nbthread 1`, release builds of 2fe0db33 and this branch, 3 rounds, all identical to ±15). Two thread-local stores and the `catch_unwind` frame per stream run. |
+| **Differs from HAProxy** | HAProxy has no panic; an internal error answers 500 (`IR--`), Ibex sends nothing: after a panic the stream's buffers may be mid-update, so the connection is closed as on a failed `stream_new`. |
+| **Requires** | `panic = "unwind"`: `crash.rs` has `#[cfg(panic = "abort")] compile_error!`, so no profile, PGO build or `RUSTFLAGS` can turn it off silently. |
+| **Revisit if** | A panic is seen to recur on every request of some input (a contained panic per request is a slow DoS: fix the panic, which the alert names), or h2 needs per-stream containment (`RST_STREAM INTERNAL_ERROR` instead of closing the connection). |

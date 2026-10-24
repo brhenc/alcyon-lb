@@ -250,6 +250,7 @@ mod ocsp_check_err_str;
 mod ops_patref_cli;
 mod ops_t171;
 mod option_persist;
+mod panic_contained;
 mod parsed_keywords_reach_data_path;
 mod pcre_regex;
 mod poll_accept;
