@@ -10,7 +10,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from measure import check_regressions, MetricDelta, Verdict, reference_sha
+from measure import check_regressions, MetricDelta, Verdict, reference_sha, split_modes
 
 
 def _git(repo, *args):
@@ -172,6 +172,36 @@ class TestRegressionDetector(unittest.TestCase):
         deltas, verdict = check_regressions(current, previous)
         self.assertEqual(verdict, Verdict.BASELINE)
 
+
+
+class TestSplitModes(unittest.TestCase):
+    """The 1-conn samples fall in two clusters ~25% apart (T452). Both sides of an A/B are
+    split at one threshold, so the report can say how many samples each build had in each
+    mode: a median taken over a 3:1 mix and one over a 1:3 mix differ by the gap between
+    the modes, not by what the change did."""
+
+    def test_rc2_run_2_splits_at_one_threshold(self):
+        cand = [13335, 18664, 13151, 13404]
+        ref = [14558, 19050, 19032, 15342]
+        m = split_modes(cand, ref)
+        self.assertEqual(m["cand"], {"slow": 3, "fast": 1})
+        self.assertEqual(m["ref"], {"slow": 2, "fast": 2})
+        self.assertTrue(15342 < m["threshold"] < 18664)
+        # Within a mode the builds are compared like with like.
+        self.assertEqual(m["cand_slow_median"], 13335)
+        self.assertEqual(m["ref_slow_median"], (14558 + 15342) // 2)
+
+    def test_one_mode_has_no_threshold(self):
+        m = split_modes([15000, 15300, 14800, 15100], [15200, 14900, 15050, 15400])
+        self.assertIsNone(m["threshold"])
+        self.assertEqual(m["cand"], {"slow": 4, "fast": 0})
+        self.assertEqual(m["ref"], {"slow": 4, "fast": 0})
+
+    def test_a_lone_outlier_is_not_a_mode_of_its_own(self):
+        # rc3 gate: 11017 is one low sample, not a cluster; the gap rule alone would split it.
+        m = split_modes([12438, 14966, 15454, 13519], [15034, 11017, 18832, 13445])
+        self.assertEqual(m["cand"]["slow"] + m["cand"]["fast"], 4)
+        self.assertGreaterEqual(m["threshold"] or 0, 15454)
 
 if __name__ == "__main__":
     unittest.main()
