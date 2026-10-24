@@ -692,6 +692,19 @@ impl QuicTransport for QuicEndpoint {
         Ok(())
     }
 
+    fn reset_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId, error_code: u64) -> Result<()> {
+        let code = VarInt::from_u64(error_code).map_err(|e| QuicError::Transport(format!("error code: {e}")))?;
+        let handle = self.get_handle(&conn_id)?;
+        let conn = self
+            .connections
+            .get_mut(&handle)
+            .ok_or_else(|| QuicError::ConnectionNotFound(conn_id.to_string()))?;
+        // A half that is already closed is not an error: the stream is gone either way.
+        let _ = conn.send_stream(stream_id.into()).reset(code);
+        let _ = conn.recv_stream(stream_id.into()).stop(code);
+        Ok(())
+    }
+
     fn close_connection(&mut self, conn_id: ConnectionId, error_code: u64, reason: &[u8]) {
         if let Some(handle) = self.connection_table.lookup(&conn_id) {
             if let Some(conn) = self.connections.get_mut(&handle) {
