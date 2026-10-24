@@ -883,8 +883,8 @@ impl QuicListener {
         let known = if fin { crate::h3_relay::complete_body_len(&rest) } else { None };
         let head = match crate::h3_relay::request_head(&section, known) {
             Ok(h) => h,
-            Err(crate::h3_relay::HeadError::Status(status)) => {
-                self.respond(conn_id, stream_id, &mux_h3::encode_response(status, &[], b""));
+            Err(crate::h3_relay::HeadError::Decompression) => {
+                self.endpoint.close_connection(conn_id, H3Error::QpackDecompressionFailed as u64, b"");
                 return;
             }
             Err(crate::h3_relay::HeadError::Message) => {

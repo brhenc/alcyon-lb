@@ -448,3 +448,25 @@ fn valid_requests_with_unusual_fields_are_served() {
     }
     assert_eq!(heads.lock().unwrap().len(), cases.len());
 }
+
+/// A field section that does not decode (required insert count 1, no dynamic table) closes
+/// the connection with QPACK_DECOMPRESSION_FAILED (0x200), as `HAProxy` 3.5-dev7 +QUIC does
+/// (measured: connection close 0x200); and an empty `:path` is a stream reset 0x10e.
+#[test]
+fn an_undecodable_section_closes_the_connection_and_an_empty_path_resets_the_stream() {
+    let (be, _heads) = backend();
+    let ibex = ibex(be);
+    let mut cl = Client::connect(ibex.quic);
+    let mut b = vec![0x01, 0x00, 0xC0 | 17, 0xC0 | 23, 0xC0 | 1];
+    lit(&mut b, b":authority", b"localhost", false);
+    let mut frame = Vec::new();
+    ibex_proto::mux_h3::encode_frame(&mut frame, 0x01, &b);
+    let id = cl.open(&frame);
+    let o = cl.outcome(id);
+    let lost = o.lost.unwrap_or_default();
+    assert!(lost == "closed by peer: 512", "connection not closed with 0x200: {lost:?} {:?}", o.status);
+
+    let mut cl = Client::connect(ibex.quic);
+    let id = cl.open(&request_with(&[(b":path", b"")]));
+    assert_eq!(cl.outcome(id).reset, Some(MESSAGE_ERROR));
+}

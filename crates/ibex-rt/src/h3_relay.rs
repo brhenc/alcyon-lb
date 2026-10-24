@@ -74,8 +74,10 @@ pub enum ReqBody {
 /// Why a request has no HTTP/1 head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadError {
-    /// Answer with this status.
-    Status(u16),
+    /// The field section does not decode: close the connection with
+    /// `QPACK_DECOMPRESSION_FAILED` (RFC 9204 section 2.2.3), as `HAProxy` does (measured on
+    /// 3.5-dev7 +QUIC for a required insert count of 1, T454).
+    Decompression,
     /// The request is malformed (RFC 9114 section 4.1.2): reset the stream with
     /// `H3_MESSAGE_ERROR` and answer nothing, as `HAProxy`'s `h3_req_headers_to_htx` does.
     /// Includes a field with a byte that is not UTF-8 (T454; `qpack::text_of`).
@@ -94,10 +96,10 @@ pub struct RequestHead {
 /// rather than chunking, which is what a server that refuses chunked requests needs.
 ///
 /// # Errors
-/// [`HeadError`]: `Status(400)` for a field section that does not decode, `Message` for a
+/// [`HeadError`]: `Decompression` for a field section that does not decode, `Message` for a
 /// malformed request.
 pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<RequestHead, HeadError> {
-    let fields = qpack::decode_qpack_static(field_section).map_err(|_| HeadError::Status(400))?;
+    let fields = qpack::decode_qpack_static(field_section).map_err(|_| HeadError::Decompression)?;
     // The checks HTTP/2 makes (T449), on the fields as decoded: a name that is no lowercase
     // token, a value with CR, LF or NUL, `:path`, `:authority`, `host`, `:scheme` and
     // `:method` that `HAProxy` refuses, connection-specific fields. T454: a byte that is not
@@ -119,7 +121,8 @@ pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<Req
         match block {
             HtxBlock::ReqLine(rl) => {
                 let m = rl.method.as_str();
-                if !valid_token(m) || rl.uri.is_empty() || rl.uri.bytes().any(|b| b <= b' ' || b == 0x7f) {
+                // The method and the characters of the URI were checked above.
+                if rl.uri.is_empty() {
                     return Err(HeadError::Message);
                 }
                 method_head = m == "HEAD";
@@ -127,12 +130,6 @@ pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<Req
             }
             HtxBlock::Header(h) => {
                 let name = h.name.as_str();
-                if !valid_token(name) || name.bytes().any(|b| b.is_ascii_uppercase()) || !valid_value(&h.value) {
-                    return Err(HeadError::Message);
-                }
-                if HOP_BY_HOP.contains(&name) || (name == "te" && !h.value.eq_ignore_ascii_case("trailers")) {
-                    return Err(HeadError::Message);
-                }
                 if name == "content-length" {
                     let v = content_length_value(&h.value).ok_or(HeadError::Message)?;
                     if content_length.is_some_and(|c| c != v) {
@@ -197,15 +194,6 @@ fn content_length_value(v: &str) -> Option<u64> {
         len = Some(n);
     }
     len
-}
-
-fn valid_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
-}
-
-fn valid_value(s: &str) -> bool {
-    !s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
 }
 
 /// Total DATA payload in `buf` if it holds only complete frames, else `None`.
@@ -652,7 +640,7 @@ mod tests {
             (":path".into(), "/a b".into()),
         ]);
         assert_eq!(request_head(&bad_path, Some(0)).err(), Some(HeadError::Message));
-        assert_eq!(request_head(&[0xff], Some(0)).err(), Some(HeadError::Status(400)));
+        assert_eq!(request_head(&[0xff], Some(0)).err(), Some(HeadError::Decompression));
     }
 
     #[test]
