@@ -20,6 +20,7 @@ mod common;
 mod arena;
 mod cert_validation;
 mod config;
+mod crypto_provider;
 mod e2e_tls_nginx_proxy;
 mod handshake;
 mod resolver;

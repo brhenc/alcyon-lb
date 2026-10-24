@@ -35,6 +35,7 @@ pub mod check_reply;
 pub use ibex_config::cond;
 pub mod cookie;
 pub mod cpu;
+pub mod crypto_provider;
 pub mod globalconn;
 pub mod dgram;
 pub mod engine;

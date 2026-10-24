@@ -52,6 +52,9 @@ pub struct Listener {
     pub accept_proxy: bool,
     /// `accept-proxy-v2`: the header must be v2.
     pub accept_proxy_v2: bool,
+    /// The `listen()` backlog of the bind ([`listener_backlog`]), for the `listen()` that
+    /// resumes a paused listener ([`Listener::resume`]).
+    pub backlog: i32,
 }
 
 /// `tcp-ut` and `cc` of a `bind` line. A refusal by the kernel (an algorithm that is not
@@ -158,6 +161,7 @@ impl Listener {
             accept_proxy: false,
             accept_proxy_v2: false,
             luid: 0,
+            backlog,
         })
     }
 
@@ -211,7 +215,28 @@ impl Listener {
             accept_proxy: false,
             accept_proxy_v2: false,
             luid: 0,
+            backlog: 1024,
         })
+    }
+
+    /// `SIGTTOU`: takes the socket out of the listening state, so a new connection is
+    /// refused (or goes to another process's socket on the address) instead of waiting in
+    /// this one's queue, and the connections already queued are reset. `HAProxy`'s
+    /// `tcp_suspend_receiver` (`src/proto_tcp.c`): `connect(AF_UNSPEC)`, which on Linux
+    /// disconnects a listening socket and keeps its address. The caller stops polling it.
+    ///
+    /// # Errors
+    /// What `connect` reports.
+    pub fn pause(&self) -> io::Result<()> {
+        net::connect_unspec(&self.fd).map_err(Into::into)
+    }
+
+    /// `SIGTTIN`: listens again, with the bind's backlog (`tcp_resume_receiver`).
+    ///
+    /// # Errors
+    /// What `listen` reports.
+    pub fn resume(&self) -> io::Result<()> {
+        net::listen(&self.fd, self.backlog).map_err(Into::into)
     }
 
     /// Borrow the underlying descriptor, for registering with a [`crate::Poller`].

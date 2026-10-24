@@ -20,37 +20,30 @@ use crate::config::{
     cert_covers_name, cert_names, key_mismatch, load_crl_file, load_server_ca, shared_key, spoken_versions, unix_now,
     versions_between, wrong_tag, BackendTlsOptions, BindPlan, SESSION_CACHE_SIZE, SESSION_LIFETIME,
 };
+use crate::provider;
 use crate::resolver::IbexCertResolver;
+use crate::TlsCryptoProvider;
 use ibex_config::ast::BindConfig;
 use rustls24::crypto::{CryptoProvider, Credentials, Identity, SelectedCredential, TicketProducer};
 use rustls24::pki_types::ServerName;
 use rustls24::server::{ClientHello, ServerCredentialResolver, ServerSessionKey, StoresServerSessions};
 use rustls24::{ClientConfig, ServerConfig};
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
 pub use rustls24;
 
-/// The ring provider, speaking the versions `tls12` and `tls13` allow.
-fn provider(tls12: bool, tls13: bool) -> Arc<CryptoProvider> {
-    let mut p = rustls24_ring::DEFAULT_PROVIDER;
-    if !tls12 {
-        p.tls12_cipher_suites = Cow::Borrowed(&[]);
-    }
-    if !tls13 {
-        p.tls13_cipher_suites = Cow::Borrowed(&[]);
-    }
-    Arc::new(p)
-}
-
 /// The provider of a version range (`ssl-min-ver` / `ssl-max-ver`); `None` when it rules out
 /// every version this build speaks.
-fn provider_between(min: Option<ibex_config::TlsVersion>, max: Option<ibex_config::TlsVersion>) -> Option<Arc<CryptoProvider>> {
+fn provider_between(
+    kind: TlsCryptoProvider,
+    min: Option<ibex_config::TlsVersion>,
+    max: Option<ibex_config::TlsVersion>,
+) -> Option<Arc<CryptoProvider>> {
     let versions = versions_between(min, max);
     let tls12 = versions.iter().any(|v| v.version == rustls::ProtocolVersion::TLSv1_2);
     let tls13 = versions.iter().any(|v| v.version == rustls::ProtocolVersion::TLSv1_3);
-    (tls12 || tls13).then(|| provider(tls12, tls13))
+    (tls12 || tls13).then(|| provider::of(kind, tls12, tls13))
 }
 
 /// A ticket key made by the provider for one rotation period of the outer rotator.
@@ -69,8 +62,17 @@ impl TicketProducer for TicketKey {
     }
 }
 
-fn ticket_key() -> Result<Box<dyn TicketProducer>, rustls24::Error> {
-    Ok(Box::new(TicketKey(rustls24_ring::DEFAULT_PROVIDER.ticketer_factory.ticketer()?)))
+/// A ticket key of provider `IBEX` (`ring-ibex` when true): a function, as the rotator wants.
+fn ticket_key<const IBEX: bool>() -> Result<Box<dyn TicketProducer>, rustls24::Error> {
+    let kind = if IBEX { TlsCryptoProvider::RingIbex } else { TlsCryptoProvider::Ring };
+    Ok(Box::new(TicketKey(provider::ticketer(kind)?)))
+}
+
+fn ticket_key_of(kind: TlsCryptoProvider) -> fn() -> Result<Box<dyn TicketProducer>, rustls24::Error> {
+    match kind {
+        TlsCryptoProvider::Ring => ticket_key::<false>,
+        TlsCryptoProvider::RingIbex => ticket_key::<true>,
+    }
 }
 
 /// The rotator, advertising `SESSION_LIFETIME` as the ticket lifetime hint, as 0.23 did
@@ -154,33 +156,84 @@ pub struct BindTls {
     pub config: Arc<ServerConfig>,
     pub no_alpn: Arc<ServerConfig>,
     pub resolver: Arc<CertResolver>,
+    /// The crypto provider both configurations run on (T460).
+    pub provider: TlsCryptoProvider,
+    /// The line it was built from, for a swap to build it again (`None`: built in memory).
+    source: Option<BindConfig>,
+    /// The same bind on the other provider, once a swap built it.
+    other: std::sync::OnceLock<Arc<BindTls>>,
 }
 
-/// Builds the TCP configuration of a `bind ... ssl` line. Identical binds share one (as
-/// [`crate::TlsConfig::from_bind_config`] does for the QUIC one).
+impl BindTls {
+    /// A bind of these parts, which a swap does not build again.
+    #[must_use]
+    pub fn from_parts(config: Arc<ServerConfig>, no_alpn: Arc<ServerConfig>, resolver: Arc<CertResolver>, provider: TlsCryptoProvider) -> Self {
+        Self { config, no_alpn, resolver, provider, source: None, other: std::sync::OnceLock::new() }
+    }
+
+    /// What a handshake starting now uses: this bind, or its build on the provider a swap made
+    /// active (T460). One atomic load.
+    #[must_use]
+    pub fn into_current(self: Arc<Self>) -> Arc<Self> {
+        if provider::active() == self.provider {
+            return self;
+        }
+        match self.other.get() {
+            Some(other) => Arc::clone(other),
+            None => self,
+        }
+    }
+}
+
+impl provider::Rebuild for BindTls {
+    fn prepare(self: Arc<Self>, p: TlsCryptoProvider) -> Result<Option<provider::Publish>, String> {
+        let Some(source) = self.source.as_ref().filter(|_| p != self.provider && self.other.get().is_none()) else {
+            return Ok(None);
+        };
+        let built = Arc::new(build_bind(source, p).map_err(|e| format!("bind {} ssl: {e}", source.addr))?);
+        Ok(Some(Box::new(move || {
+            let _ = self.other.set(built);
+        })))
+    }
+}
+
+/// Builds the TCP configuration of a `bind ... ssl` line on the [`provider::active`] provider.
+/// Identical binds share one (as [`crate::TlsConfig::from_bind_config`] does for the QUIC one).
 ///
 /// # Errors
 /// As [`crate::TlsConfig::from_bind_config`].
 pub fn from_bind_config(bind: &BindConfig) -> Result<Arc<BindTls>, String> {
+    from_bind_config_with(bind, provider::active())
+}
+
+/// [`from_bind_config`] on provider `kind`.
+///
+/// # Errors
+/// As [`crate::TlsConfig::from_bind_config`].
+pub fn from_bind_config_with(bind: &BindConfig, kind: TlsCryptoProvider) -> Result<Arc<BindTls>, String> {
     type Cache = std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<BindTls>>>;
     static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
-    let key = shared_key(bind).unwrap_or_default();
+    // Binds alike on two providers are two configurations.
+    let key = format!("{}\0{}", kind.name(), shared_key(bind).unwrap_or_default());
     let mut cache = CACHE.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(live) = cache.get(&key).and_then(std::sync::Weak::upgrade) {
         return Ok(live);
     }
-    let built = Arc::new(build_bind(bind)?);
+    let mut built = build_bind(bind, kind)?;
+    built.source = Some(bind.clone());
+    let built = Arc::new(built);
     cache.retain(|_, w| w.strong_count() > 0);
     cache.insert(key, Arc::downgrade(&built));
+    provider::register(Arc::downgrade(&built) as std::sync::Weak<dyn provider::Rebuild>);
     Ok(built)
 }
 
-fn build_bind(bind: &BindConfig) -> Result<BindTls, String> {
+fn build_bind(bind: &BindConfig, kind: TlsCryptoProvider) -> Result<BindTls, String> {
     let plan = BindPlan::of(bind)?;
     let versions = plan.versions(bind)?;
     let tls12 = versions.iter().any(|v| v.version == rustls::ProtocolVersion::TLSv1_2);
     let tls13 = versions.iter().any(|v| v.version == rustls::ProtocolVersion::TLSv1_3);
-    build(&plan, tls12, tls13)
+    build(&plan, kind, tls12, tls13)
 }
 
 impl BindTls {
@@ -194,14 +247,28 @@ impl BindTls {
         key: rustls24::pki_types::PrivateKeyDer<'static>,
         alpn: Vec<Vec<u8>>,
     ) -> Result<Arc<Self>, String> {
+        Self::single_with(certs, key, alpn, provider::active())
+    }
+
+    /// [`Self::single`] on provider `kind`.
+    ///
+    /// # Errors
+    /// As [`Self::single`].
+    pub fn single_with(
+        certs: Vec<rustls24::pki_types::CertificateDer<'static>>,
+        key: rustls24::pki_types::PrivateKeyDer<'static>,
+        alpn: Vec<Vec<u8>>,
+        kind: TlsCryptoProvider,
+    ) -> Result<Arc<Self>, String> {
         let plan = BindPlan { alpn, pairs: vec![(certs, key, std::path::PathBuf::from("(memory)"))] };
-        build(&plan, true, true).map(Arc::new)
+        build(&plan, kind, true, true).map(Arc::new)
     }
 }
 
-fn build(plan: &BindPlan, tls12: bool, tls13: bool) -> Result<BindTls, String> {
-    // Any provider will do to load the keys: the key provider is the same whatever the suites.
-    let keys = provider(true, true);
+fn build(plan: &BindPlan, kind: TlsCryptoProvider, tls12: bool, tls13: bool) -> Result<BindTls, String> {
+    // The keys are loaded by the provider that signs with them; its key provider is the same
+    // whatever the suites.
+    let keys = provider::of(kind, true, true);
     let mut resolver = CertResolver::empty();
     let mut is_first = true;
     for (certs, key, file_path) in &plan.pairs {
@@ -224,7 +291,7 @@ fn build(plan: &BindPlan, tls12: bool, tls13: bool) -> Result<BindTls, String> {
         }
     }
     let resolver = Arc::new(resolver);
-    let mut config = ServerConfig::builder(provider(tls12, tls13))
+    let mut config = ServerConfig::builder(provider::of(kind, tls12, tls13))
         .with_no_client_auth()
         .with_server_credential_resolver(Arc::clone(&resolver) as Arc<dyn ServerCredentialResolver>)
         .map_err(|e| format!("Protocol version error: {e:?}"))?;
@@ -233,12 +300,12 @@ fn build(plan: &BindPlan, tls12: bool, tls13: bool) -> Result<BindTls, String> {
     // tickets, and a session-ID cache of `tune.ssl.cachesize` (20000) entries.
     config.session_storage = Arc::new(ExpiringSessions { inner: rustls24::server::ServerSessionMemoryCache::new(SESSION_CACHE_SIZE) });
     config.ticketer = Some(Arc::new(Hint(
-        rustls24::TicketRotator::new(Duration::from_secs(u64::from(SESSION_LIFETIME / 2)), ticket_key)
+        rustls24::TicketRotator::new(Duration::from_secs(u64::from(SESSION_LIFETIME / 2)), ticket_key_of(kind))
             .map_err(|e| format!("session ticket keys: {e}"))?,
     )));
     let mut no_alpn = config.clone();
     no_alpn.alpn_protocols.clear();
-    Ok(BindTls { config: Arc::new(config), no_alpn: Arc::new(no_alpn), resolver })
+    Ok(BindTls::from_parts(Arc::new(config), Arc::new(no_alpn), resolver, kind))
 }
 
 /// `verify none`: no server authentication, signatures still checked.
@@ -362,13 +429,21 @@ impl rustls24::client::danger::ServerVerifier for ServerVerifier {
     }
 }
 
-/// The [`ClientConfig`] of a server line, as [`crate::build_backend_client_config`] builds
-/// it for rustls 0.23.
+/// The [`ClientConfig`] of a server line (or its health check) on the [`provider::active`]
+/// provider, as [`crate::build_backend_client_config`] builds it for rustls 0.23.
 ///
 /// # Errors
 /// As [`crate::build_backend_client_config`].
 pub fn build_backend_client_config(options: &BackendTlsOptions) -> Result<Arc<ClientConfig>, String> {
-    let Some(provider) = provider_between(options.min_ver, options.max_ver) else {
+    build_backend_client_config_with(options, provider::active())
+}
+
+/// [`build_backend_client_config`] on provider `kind`.
+///
+/// # Errors
+/// As [`crate::build_backend_client_config`].
+pub fn build_backend_client_config_with(options: &BackendTlsOptions, kind: TlsCryptoProvider) -> Result<Arc<ClientConfig>, String> {
+    let Some(provider) = provider_between(kind, options.min_ver, options.max_ver) else {
         return Err(format!(
             "no TLS version is left between 'ssl-min-ver' and 'ssl-max-ver': this build speaks {}",
             spoken_versions()
@@ -415,11 +490,34 @@ mod tests {
         assert_eq!(ExpiringSessions::fresh(Some(vec![1, 2, 3])), None);
     }
 
+    /// The only lib test that changes the active provider (others read it through
+    /// `provider::active` only by building configurations, which no other lib test does).
+    #[test]
+    fn a_handshake_takes_the_build_of_the_active_provider_when_the_bind_has_one() {
+        use rustls24::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        assert_eq!(provider::active(), TlsCryptoProvider::Ring, "ring until set");
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let one = |kind| {
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(c.key_pair.serialize_der()));
+            BindTls::single_with(vec![CertificateDer::from(c.cert.der().to_vec())], key, vec![], kind).expect("bind")
+        };
+        let ring = one(TlsCryptoProvider::Ring);
+        assert!(Arc::ptr_eq(&Arc::clone(&ring).into_current(), &ring), "its own provider");
+        provider::set_active(TlsCryptoProvider::RingIbex);
+        // Built in memory, so no swap built it on ring-ibex: it serves on its own provider.
+        assert!(Arc::ptr_eq(&Arc::clone(&ring).into_current(), &ring), "no other build");
+        let ibex = one(TlsCryptoProvider::RingIbex);
+        ring.other.set(Arc::clone(&ibex)).expect("unset");
+        assert!(Arc::ptr_eq(&Arc::clone(&ring).into_current(), &ibex), "the other build");
+        provider::set_active(TlsCryptoProvider::Ring);
+        assert!(Arc::ptr_eq(&Arc::clone(&ring).into_current(), &ring), "back");
+    }
+
     #[test]
     fn the_ticket_hint_is_twice_the_rotation_period_and_tickets_round_trip() {
-        let hint = Hint(rustls24::TicketRotator::new(Duration::from_secs(u64::from(SESSION_LIFETIME / 2)), ticket_key).expect("rotator"));
+        let hint = Hint(rustls24::TicketRotator::new(Duration::from_secs(u64::from(SESSION_LIFETIME / 2)), ticket_key::<false>).expect("rotator"));
         assert_eq!(hint.lifetime(), Duration::from_secs(u64::from(SESSION_LIFETIME)));
-        assert!(ticket_key().expect("key").lifetime() > Duration::ZERO);
+        assert!(ticket_key::<true>().expect("key").lifetime() > Duration::ZERO);
         let ticket = hint.encrypt(b"resume me").expect("encrypt");
         assert_eq!(hint.decrypt(&ticket).as_deref(), Some(&b"resume me"[..]));
     }
