@@ -180,5 +180,8 @@ mod tests {
         }
         let r = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
         assert!(r.live.len() <= 64, "{} entries kept", r.live.len());
+        drop(r);
+        // A live one would have been asked to rebuild; `Gone` has nothing to publish.
+        assert!(Arc::new(Gone).prepare(TlsCryptoProvider::ALL[0]).unwrap().is_none());
     }
 }
