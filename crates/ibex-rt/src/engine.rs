@@ -1914,6 +1914,9 @@ pub struct SessionEntry {
     pub log_sd: u32,
 }
 
+/// Whether the soft stop has asked for its `pool_gc` (one request for every worker).
+static SOFT_STOP_GC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Slots of every worker's [`SessionArena`], for `show pools` (pool `session`).
 pub static SESSION_POOL: crate::buf::ArenaCounters = crate::buf::ArenaCounters::new();
 
@@ -4328,6 +4331,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         HTTP_FAIL_CODES.set(config.global.as_ref().and_then(|g| g.http_fail_codes).unwrap_or_else(ibex_config::StatusCodeSet::default_fail));
         ibex_alloc::set_trim_disabled(config.global.as_ref().is_some_and(|g| g.no_memory_trimming));
         ibex_alloc::set_zero_buffers(config.global.as_ref().and_then(|g| g.zero_buffers).unwrap_or(true));
+        // A variable whose memory is refused collects and retries once (T445).
+        ibex_sample::vars::set_alloc_failure_hook(crate::pool_gc::pool_gc);
         let bufsize = config.global.as_ref().and_then(|g| g.bufsize).unwrap_or(16384);
         let bufsize_small = config.global.as_ref().and_then(|g| g.bufsize_small).unwrap_or(1024);
         let bufsize_large = config.global.as_ref().and_then(|g| g.bufsize_large);
@@ -4975,10 +4980,15 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             return;
         }
         self.next_stick_purge = Some(now + STICK_PURGE);
+        let mut purged = 0;
         for p in self.proxies.iter() {
             if let Some(t) = p.stick_table.as_ref() {
-                let _ = t.purge_expired();
+                purged += t.purge_expired().unwrap_or(0);
             }
+        }
+        // A stopping process gives back what the purge freed at once (`src/proxy.c:3715`).
+        if self.stopping && purged > 0 {
+            crate::pool_gc::request();
         }
     }
 
@@ -5033,6 +5043,16 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         });
         crate::buf::trim_idle(now_inst);
         self.purge_stick_tables(now_inst);
+        // A `pool_gc` was asked for (a signal, the stop path, a failed allocation on any
+        // thread): this thread empties its caches, and the engine its own scratch lists.
+        if crate::pool_gc::poll() {
+            if self.wake_scratch.is_empty() {
+                self.wake_scratch = Vec::new();
+            }
+            if self.h2_spawn_scratch.is_empty() {
+                self.h2_spawn_scratch = Vec::new();
+            }
+        }
         let poll_timeout = self
             .idle_backend_pool
             .next_purge()
@@ -5733,6 +5753,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             {
                 self.begin_soft_stop();
             }
+            // SIGQUIT (`dump`): every worker empties its caches at its next pass (T445).
+            if self.lifecycle.as_ref().is_some_and(crate::lifecycle::Lifecycle::take_flush_request) {
+                crate::pool_gc::request();
+            }
             let want = self.lifecycle.as_ref().map_or(self.abns_paused, |lc| lc.pause_requested());
             // A SIGTTIN after a resume that was refused (the name still held) tries again.
             let again = !want && !self.paused_abns.is_empty() && self.lifecycle.as_ref().is_some_and(crate::lifecycle::Lifecycle::take_resume);
@@ -5781,6 +5805,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
         self.stopping = true;
         ibex_sample::STOPPING.store(true, Ordering::Relaxed);
+        // `sig_soft_stop` ends with `pool_gc(NULL)`: once for the process, not once a worker.
+        if !SOFT_STOP_GC.swap(true, Ordering::Relaxed) {
+            crate::pool_gc::request();
+        }
         self.stop_deadline = self.hard_stop_after.map(|d| Instant::now() + d);
         crate::systemd::notify_stopping_once();
 

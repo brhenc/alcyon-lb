@@ -36,6 +36,8 @@ pub struct Lifecycle {
     /// name was still held) and is tried again on the next signal, as `HAProxy`'s
     /// `protocol_resume_all` is (T370).
     resumed: Arc<AtomicBool>,
+    /// `SIGQUIT`: run `pool_gc` (`HAProxy`'s `dump`, `src/haproxy.c:951`), an edge.
+    flush: Arc<AtomicBool>,
 }
 
 impl Lifecycle {
@@ -62,6 +64,10 @@ impl Lifecycle {
         // process would hold for nothing).
         signal_hook::flag::register(signal_hook::consts::SIGTTOU, Arc::clone(&self.ttou))?;
         signal_hook::flag::register(signal_hook::consts::SIGTTIN, Arc::clone(&self.ttin))?;
+        // SIGQUIT flushes the pool caches and the process goes on (`HAProxy`'s `dump`; `show
+        // pools` says "Use SIGQUIT to flush them"). HAProxy's master ignores it and forwards
+        // nothing (measured): Ibex's master sets this flag and never reads it.
+        signal_hook::flag::register(signal_hook::consts::SIGQUIT, Arc::clone(&self.flush))?;
         Ok(())
     }
 
@@ -70,12 +76,20 @@ impl Lifecycle {
     pub fn pause_requested(&self) -> bool {
         if self.ttou.swap(false, Ordering::Relaxed) {
             self.paused.store(true, Ordering::Relaxed);
+            // `sig_pause` ends with `pool_gc(NULL)`.
+            crate::pool_gc::request();
         }
         if self.ttin.swap(false, Ordering::Relaxed) {
             self.paused.store(false, Ordering::Relaxed);
             self.resumed.store(true, Ordering::Relaxed);
         }
         self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Consumes a pending `SIGQUIT`, if there is one: the caller runs `pool_gc`.
+    #[must_use]
+    pub fn take_flush_request(&self) -> bool {
+        self.flush.swap(false, Ordering::Relaxed)
     }
 
     /// Whether a `SIGTTIN` arrived since the last call (after `pause_requested`, which

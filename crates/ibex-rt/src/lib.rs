@@ -74,6 +74,8 @@ pub mod stats_post;
 pub mod stats_typed;
 pub mod systemd;
 pub mod lifecycle;
+pub mod pool_gc;
+pub use pool_gc::pool_gc;
 pub mod handover;
 pub mod watchdog;
 

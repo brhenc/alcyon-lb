@@ -252,6 +252,7 @@ mod option_persist;
 mod parsed_keywords_reach_data_path;
 mod pcre_regex;
 mod poll_accept;
+mod pool_gc_signals;
 mod privilege_drop;
 mod proc_var_converters;
 mod process_fetches;

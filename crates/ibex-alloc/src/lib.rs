@@ -620,6 +620,16 @@ pub fn wipe(bytes: &mut [u8]) {
     }
 }
 
+/// [`wipe`] for a whole `Vec`: its bytes and its spare capacity, which holds what earlier
+/// contents left (a cleared `Vec` keeps them), then empties it. For a cache dropping what it
+/// held (`pool_gc`, T445).
+pub fn wipe_vec(v: &mut Vec<u8>) {
+    if zero_buffers() {
+        zeroize::Zeroize::zeroize(v);
+    }
+    v.clear();
+}
+
 /// `global no-memory-trimming`: when set, [`trim_heap`] does nothing. Set from the
 /// configuration each time an engine is built, so a reload follows the new file.
 pub fn set_trim_disabled(disabled: bool) {

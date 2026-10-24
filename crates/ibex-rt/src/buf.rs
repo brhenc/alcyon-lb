@@ -326,6 +326,27 @@ thread_local! {
     static THREAD_POOLS: RefCell<ThreadPools> = const { RefCell::new(ThreadPools::new()) };
 }
 
+/// `pool_gc` (T445): frees every buffer this thread's cache holds and takes them out of
+/// `show pools`. A cached buffer was wiped when it was released (`Buf`'s `Drop`). Returns
+/// how many were freed.
+#[must_use]
+pub fn drain_thread_cache() -> usize {
+    let taken = THREAD_POOLS.try_with(|pools| {
+        let Ok(mut p) = pools.try_borrow_mut() else { return ThreadPools::new() };
+        std::mem::replace(&mut *p, ThreadPools::new())
+    });
+    let Ok(taken) = taken else { return 0 };
+    let (s, m, l) = (taken.small.len(), taken.standard.len(), taken.large.len());
+    BUF_SMALL_CACHED.fetch_sub(s, Ordering::Relaxed);
+    BUF_SMALL_ALLOCATED.fetch_sub(s, Ordering::Relaxed);
+    BUF_STD_CACHED.fetch_sub(m, Ordering::Relaxed);
+    BUF_STD_ALLOCATED.fetch_sub(m, Ordering::Relaxed);
+    BUF_LARGE_CACHED.fetch_sub(l, Ordering::Relaxed);
+    BUF_LARGE_ALLOCATED.fetch_sub(l, Ordering::Relaxed);
+    drop(taken);
+    s + m + l
+}
+
 /// Preallocates three large buffers in the current thread's cache if large buffers are configured.
 pub fn preallocate_large_buffers() {
     if let Some(sz) = get_bufsize_large() {

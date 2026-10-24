@@ -136,6 +136,15 @@ one expensive computation is one unit of its budget.
 | **Status** | **reasoned** |
 | **Revisit if** | A must-have feature genuinely cannot be expressed in provider-neutral terms. Widening the trait is the correct response; reintroducing the escape hatch is not |
 
+### 3.4 `pool_gc`: caches emptied per thread, and almost no allocation failure to retry (T445)
+
+| | |
+|---|---|
+| **Gained** | `ibex_rt::pool_gc` runs where `HAProxy`'s does: SIGQUIT (the process goes on), SIGTTOU, SIGUSR1, the stop path after a stick-table purge, and a refused allocation. No thread is stopped: each worker empties its own `thread_local!` caches at its next loop pass (at most 100 ms later), where `HAProxy`'s `thread_isolate` stops them all. Ibex empties its caches completely: after a burst of 500 connections on 4 threads, SIGQUIT takes `show pools` `buffer` from 256 allocated (all cached) to 0, RSS 26.4 to 24.4 MB. `HAProxy`'s `pool_gc` frees only the shared free lists, not its per-thread caches: its counts stay at 112 allocated (~93 cached) and RSS goes 93.7 to 91.1 MB, the `malloc_trim` alone |
+| **Gave up** | **Retry after collection exists only where the failure is seen.** Rust's global allocator aborts the process when an allocation fails; nothing in rustls, ring, the H2 or HTX code, or `Vec::push` returns the failure. The one recoverable site is a variable's memory (`ibex_sample::vars::reserve_more`, `try_reserve`): it collects and retries once, as `ssl_sock.c:6074` retries `SSL_new`. `HAProxy` retries `SSL_new`/`BIO_new` and its pools count `failures`; Ibex has neither, and its `failures` column stays 0. **`-m` is not an rlimit**: `HAProxy` sets `RLIMIT_DATA`/`RLIMIT_AS` so its allocations really fail and `pool_gc` can save one; Ibex's `-m` only sizes `maxconn` (`engine::apply_memmax`), so a burst past it is refused at accept, never at allocation, and an operator's `ulimit -v` makes Ibex abort where `HAProxy` would collect and go on |
+| **Status** | **measured** — `show pools` and RSS before and after each signal on both (`tests/it/pool_gc_signals.rs` header) |
+| **Revisit if** | Fallible allocation on the request path (T448: buffers that can fail and a wait queue): every new fallible site calls `pool_gc()` once before it gives up |
+
 ---
 
 ## 4. Scope

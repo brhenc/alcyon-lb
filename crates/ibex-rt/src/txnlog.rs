@@ -92,6 +92,17 @@ thread_local! {
     static CAPTURE_SPARE: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// `pool_gc` (T445): frees the spare capture buffers, wiped first (they held captured headers).
+#[must_use]
+pub fn drain_capture_spares() -> usize {
+    let taken = CAPTURE_SPARE.try_with(|s| s.try_borrow_mut().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default()).unwrap_or_default();
+    let n = taken.len();
+    for mut b in taken {
+        ibex_alloc::wipe_vec(&mut b);
+    }
+    n
+}
+
 /// Puts `v` in the capture slot `slot`, in the memory it holds already or in a spare buffer.
 pub fn set_capture(slot: &mut Option<Vec<u8>>, v: &[u8]) {
     let buf = slot.get_or_insert_with(|| CAPTURE_SPARE.with(|s| s.borrow_mut().pop()).unwrap_or_default());

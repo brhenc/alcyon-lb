@@ -286,6 +286,12 @@ thread_local! {
     static IDLE_RUN: &'static CheckRun = Box::leak(Box::new(CheckRun::idle()));
 }
 
+/// `pool_gc` (T445): frees the runs of finished checks this thread keeps for the next ones.
+#[must_use]
+pub fn drain_run_pool() -> usize {
+    RUN_POOL.try_with(|p| p.try_borrow_mut().map_or(0, |mut p| std::mem::take(&mut *p).len())).unwrap_or(0)
+}
+
 /// A server's [`CheckRun`]: none between checks (T304: 60,000 servers paid ~170 bytes each
 /// for state that only the few checks in flight use). Reading it between checks reads an
 /// idle run; writing to it takes one from the pool.
