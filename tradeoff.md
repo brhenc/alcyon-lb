@@ -595,7 +595,7 @@ capacity. That is what brings the survey's rules from 65 allocations per request
 | **What would close it** | Upstream: a stable unwinding OOM hook or `-C oom=panic`, plus a per-stream `catch_unwind` in the loop. Ibex has no `catch_unwind` outside tests, so that would be new work: each stream's step would need to be unwind-safe and the stream torn down cleanly. Before upstream moves, Ibex's own large or per-connection allocations can be made fallible with stable `try_reserve`. That covers the shrink copy in `trim_tail` (on `Err`, keep the old buffer: done in T453, `engine::move_to_fresh`), the buffer pool (`alloc_standard`/`small`/`large`: refuse or queue the stream, T372 Q3), and arena growth on accept. Allocations inside rustls, h2 and std stay infallible. |
 | **Status** | Open. Not implemented here; the `try_reserve` work is a separate task. |
 
-### 6.24 `-m <megs>` sizes `maxconn` but sets no rlimit (T453) — **measured 2026-10-24 on 3.5-dev8; change when T448 (fallible pools) has merged**
+### 6.25 `-m <megs>` sizes `maxconn` but sets no rlimit (T453) — **measured 2026-10-24 on 3.5-dev8; change when T448 (fallible pools) has merged**
 
 | | |
 |---|---|

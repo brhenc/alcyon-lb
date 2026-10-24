@@ -76,7 +76,7 @@ fn print_help(program: &str) {
     println!("        -c check mode : only check config files and exit");
     println!("        -n sets the maximum total # of connections");
     println!("        -m limits the usable amount of memory (in MB)");
-    println!("           (Ibex: sizes maxconn only, sets no rlimit yet; see tradeoff.md 6.24)");
+    println!("           (Ibex: sizes maxconn only, sets no rlimit yet; see tradeoff.md 6.25)");
     println!("        -N sets the default, per-proxy maximum # of connections");
     println!("        -p writes pids of all children to this file");
     println!("        -de disables epoll() usage even when available");
@@ -856,7 +856,7 @@ fn main() {
 
     // 10. Enforce memory limits if requested (-m <megabytes>)
     //     A budget for `maxconn`, not an rlimit (see `engine::apply_memmax`): HAProxy sets
-    //     `RLIMIT_DATA`, Ibex does once its pools are fallible (T448, tradeoff.md 6.24).
+    //     `RLIMIT_DATA`, Ibex does once its pools are fallible (T448, tradeoff.md 6.25).
     if let Some(megs) = opts.memory_limit_mb {
         config.global.get_or_insert_with(Default::default).memmax_mb = Some(u32::try_from(megs).unwrap_or(u32::MAX));
     }

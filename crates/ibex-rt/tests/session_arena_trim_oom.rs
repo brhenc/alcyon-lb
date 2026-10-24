@@ -81,3 +81,18 @@ fn a_trim_whose_fresh_buffer_cannot_be_had_keeps_the_old_one() {
     assert_eq!(session_trims_skipped(), before, "a trim that can have its buffer is done");
     assert_eq!(arena.capacity(), FLOOR, "the fresh buffer keeps the creation capacity");
 }
+
+/// The switch fails growing reallocations too, not only fresh allocations: a `Vec` that
+/// already holds memory and asks for more past the limit gets an error, and gets it again
+/// once the limit is lifted.
+#[test]
+fn a_growing_realloc_past_the_limit_fails() {
+    let mut v: Vec<u8> = Vec::with_capacity(64);
+    v.push(1);
+    fail_thread_allocs_from(LIMIT);
+    let refused = v.try_reserve_exact(LIMIT);
+    fail_thread_allocs_from(usize::MAX);
+    assert!(refused.is_err(), "a growing realloc past the limit is refused");
+    assert_eq!(v, [1], "the vector is left as it was");
+    assert!(v.try_reserve_exact(LIMIT).is_ok(), "with the limit lifted it succeeds");
+}

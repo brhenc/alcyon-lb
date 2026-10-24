@@ -322,7 +322,7 @@ TLS costs when a `bind` or `server` uses `ssl`; a configured `maxconn` that leav
 TLS is refused, exit 1). Past the limit its pools fail allocations and the streams that needed
 them, and the process goes on. Ibex does the same sizing and reporting but **sets no rlimit**:
 past a limit `malloc` returns NULL and Rust aborts the whole process (exit 134), so until
-Ibex's pools are fallible (T448) a cap would only make it abort sooner (tradeoff.md 6.24).
+Ibex's pools are fallible (T448) a cap would only make it abort sooner (tradeoff.md 6.25).
 Differences left: Ibex's per-connection cost is a constant calibrated on
 HAProxy's results (`sizeof(struct stream)` has no Ibex counterpart), `maxsslconn` and
 `tune.ssl.cachesize` are not configurable, so `MaxSslConns` stays 0 and the
