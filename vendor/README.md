@@ -31,13 +31,13 @@ rustls 0.24 provider, a fork of `rustls-ring` 0.24.0-dev.2. What it wipes and wh
    prefix `ring_core_0_17_14_` renamed `ringibex_core_0_17_14_`. Without a `.git` directory
    ring's `build.rs` takes these pregenerated headers instead of generating them, and the stale
    prefix left every C and assembly symbol undefined at link time (in `~/ring-ibex` itself, which
-   has a `.git`, the headers are generated and the bug does not show). To report to ring-ibex.
+   has a `.git`, the headers are generated and the bug does not show). Ported back to ring-ibex as 3d454d8.
 2. `rustls-ringibex/Cargo.toml`: `ring = { package = "ringibex", path = "../ringibex" }` (was
    `".."`), and its `[workspace]` table removed, so that it builds as a dependency of Ibex's
    workspace rather than as a workspace of its own.
 3. `rustls-ringibex/src/lib.rs`: the provider's `Ring` value prints as `RingIbex` (`Debug`), so a
    `CryptoProvider` tells which of the two crates it comes from (`secure_random`); their
-   `DEFAULT_PROVIDER`s are otherwise alike, and a `const` has no address to tell them by.
+   `DEFAULT_PROVIDER`s are otherwise alike, and a `const` has no address to tell them by. Ported back to ring-ibex as bc75ed8 (with the licence files); only change 2 is vendor-specific.
 
 ### Running ring's own tests
 
