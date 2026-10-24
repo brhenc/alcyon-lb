@@ -21,14 +21,13 @@
 use crate::conn::ConnId;
 use crate::endpoint::{Endpoint, SeDesc};
 use crate::h2::{
-    frame_flags, Frame, FrameHeader, H2ConnState, H2Error, H2StreamState, SettingsParameter,
+    frame_flags, Frame, FrameHeader, FrameType, H2ConnState, H2Error, H2StreamState, SettingsParameter,
     DEFAULT_INITIAL_WINDOW_SIZE, DEFAULT_MAX_FRAME_SIZE, FRAME_HEADER_LEN, H2_CONN_PREFACE,
     MAX_MAX_FRAME_SIZE, MAX_WINDOW_SIZE, MIN_MAX_FRAME_SIZE,
 };
-use crate::hpack::{HpackDecoder, HpackEncoder};
+use crate::hpack::{DecodedFields, HpackDecoder, HpackEncoder};
 use crate::htx::{HeaderField, HttpVersion, Htx, HtxBlock};
 use crate::mux::{mux_flags, Mux, MuxFlags, MuxOps, ShutMode};
-use std::collections::BTreeMap;
 use std::io;
 
 /// Output waiting for the client past which the demux stops: what a client that reads
@@ -70,13 +69,342 @@ pub struct H2StreamCtx {
     /// stream holds at most this much (or the initial window) of DATA the data path has not
     /// taken ([`MuxH2::demux_blocked`]).
     pub rx_limit: usize,
-    /// `scheme://authority` of a request that carried both pseudo-headers: what `HAProxy`
-    /// puts before the path in the start line it logs and counts (`GET http://x/g HTTP/2.0`).
-    pub abs_prefix: Option<String>,
     /// The request is one `HAProxy` takes and answers 400 (`HTX_FL_PARSING_ERROR`): a
     /// method or scheme that is not a token, a URI with a control byte
     /// ([`crate::h2::check_request_fields`]). It is not forwarded.
     pub bad_request: bool,
+    /// The request head of a stream of a server connection, as HTTP/1.1 (T437): what the
+    /// data path forwards, written once from the decoded fields. `rx_htx` then holds no
+    /// start line nor headers, only the end of the head and what follows. `None` for a
+    /// head kept as HTX blocks ([`H2ReqHead`]).
+    pub req_head: Option<Box<H2ReqHead>>,
+    /// The request's first `content-length`, as a number, kept for the stream's window
+    /// (the head written as text is taken by the data path).
+    pub req_content_length: Option<usize>,
+}
+
+/// A request head as HTTP/1.1, from the fields of its HEADERS (T437): `METHOD PATH
+/// HTTP/1.1`, the host the authority makes when there is no `host` header, the other
+/// headers, the blank line, as [`Htx::to_h1_wire`] writes the blocks
+/// `pseudo_headers_to_htx` makes; then the `scheme://authority` prefix of the start line
+/// `HAProxy` logs, if the request had both. Kept from one stream of the connection to the
+/// next ([`H2MuxContext::spare_heads`]).
+#[derive(Debug, Clone, Default)]
+pub struct H2ReqHead {
+    /// The head, then the prefix.
+    pub text: String,
+    /// The end of the head (its blank line included) in `text`.
+    pub head_len: usize,
+    /// The method: `text[..method_len]`.
+    pub method_len: usize,
+    /// The path in `text`.
+    pub uri: (usize, usize),
+    /// The prefix in `text` (empty without one).
+    pub abs: (usize, usize),
+    /// The headers, as the HTX had them: name start, name end, value start, value end.
+    pub fields: Vec<(u32, u32, u32, u32)>,
+    /// The fields' names and values, in bytes (`%U` counts them).
+    pub field_bytes: usize,
+    /// The head has a start line (`method` and `uri` are its).
+    pub has_line: bool,
+}
+
+impl H2ReqHead {
+    /// No head; the memory is kept.
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.fields.clear();
+        (self.head_len, self.method_len, self.uri, self.abs, self.field_bytes, self.has_line) = (0, 0, (0, 0), (0, 0), 0, false);
+    }
+
+    /// A head of `wire` alone: no start line or field of its own (a head made elsewhere).
+    #[must_use]
+    pub fn from_wire(wire: &str) -> Self {
+        Self { text: wire.to_string(), head_len: wire.len(), ..Self::default() }
+    }
+
+    /// The head as HTTP/1.1, up to and with its blank line.
+    #[must_use]
+    pub fn wire(&self) -> &[u8] {
+        &self.text.as_bytes()[..self.head_len]
+    }
+
+    #[must_use]
+    pub fn method(&self) -> &str {
+        &self.text[..self.method_len]
+    }
+
+    #[must_use]
+    pub fn uri(&self) -> &str {
+        &self.text[self.uri.0..self.uri.1]
+    }
+
+    /// `scheme://authority`, when the request had both.
+    #[must_use]
+    pub fn abs_prefix(&self) -> Option<&str> {
+        (self.abs.1 > self.abs.0).then(|| &self.text[self.abs.0..self.abs.1])
+    }
+
+    /// The headers in order, as name and value.
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.fields.iter().map(|&(a, b, c, d)| (&self.text[a as usize..b as usize], &self.text[c as usize..d as usize]))
+    }
+
+    /// The first value of header `name` (ASCII case-insensitive), as `Htx::get_header`.
+    #[must_use]
+    pub fn get_header(&self, name: &str) -> Option<&str> {
+        self.headers().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v)
+    }
+
+    fn push_field(&mut self, name: &str, value: &str) {
+        let pos = |t: &String| u32::try_from(t.len()).unwrap_or(u32::MAX);
+        let a = pos(&self.text);
+        self.text.push_str(name);
+        let b = pos(&self.text);
+        self.text.push_str(": ");
+        let c = pos(&self.text);
+        self.text.push_str(value);
+        let d = pos(&self.text);
+        self.text.push_str("\r\n");
+        self.fields.push((a, b, c, d));
+        self.field_bytes += name.len() + value.len();
+    }
+
+    /// Writes the request of `fields`, checked as
+    /// `pseudo_headers_to_htx` checks it, and refused as `HAProxy` 3.5-dev8 refuses it
+    /// (measured, T437): without `:method`, with a `:status`, or with a `:protocol` outside
+    /// an extended CONNECT. A `host` after the first is dropped, as `HAProxy` drops it.
+    /// Every request of a server connection is written this way.
+    fn write(&mut self, fields: &DecodedFields) -> Result<(), &'static str> {
+        self.clear();
+        let (mut method, mut path, mut authority, mut host, mut scheme, mut protocol) = (None, None, None, None, false, false);
+        let mut seen_regular = false;
+        for (n, v) in fields.iter() {
+            if n.starts_with(':') {
+                if seen_regular {
+                    return Err("pseudo-header after regular header");
+                }
+                let slot = match n {
+                    ":method" => &mut method,
+                    ":path" => {
+                        if path.is_none() && v.is_empty() {
+                            return Err("empty :path");
+                        }
+                        &mut path
+                    }
+                    ":authority" => &mut authority,
+                    ":scheme" | ":protocol" => {
+                        let seen = if n == ":scheme" { &mut scheme } else { &mut protocol };
+                        if *seen {
+                            return Err("duplicate pseudo-header");
+                        }
+                        *seen = true;
+                        continue;
+                    }
+                    _ => return Err("unknown pseudo-header"),
+                };
+                if slot.is_some() {
+                    return Err("duplicate pseudo-header");
+                }
+                *slot = Some(v);
+            } else {
+                seen_regular = true;
+                if n.eq_ignore_ascii_case("host") && host.is_none() {
+                    host = Some(v);
+                }
+            }
+        }
+        if let (Some(a), Some(h)) = (authority, host) {
+            if !a.eq_ignore_ascii_case(h) {
+                return Err("authority and host mismatch");
+            }
+        }
+        let method = method.ok_or("no :method")?;
+        // `:protocol` is an extended CONNECT's (RFC 8441), consumed as the HTX conversion
+        // consumes it.
+        if protocol && method != "CONNECT" {
+            return Err(":protocol outside CONNECT");
+        }
+        self.has_line = true;
+        self.text.push_str(method);
+        self.method_len = self.text.len();
+        self.text.push(' ');
+        let start = self.text.len();
+        self.text.push_str(path.unwrap_or("/"));
+        self.uri = (start, self.text.len());
+        self.text.push_str(" HTTP/1.1\r\n");
+        if let (Some(a), None) = (authority, host) {
+            self.push_field("host", a);
+        }
+        let mut host_seen = false;
+        for (n, v) in fields.iter().filter(|(n, _)| !n.starts_with(':')) {
+            if n.eq_ignore_ascii_case("host") {
+                if host_seen {
+                    continue;
+                }
+                host_seen = true;
+            }
+            self.push_field(n, v);
+        }
+        self.text.push_str("\r\n");
+        self.head_len = self.text.len();
+        // `HAProxy`'s start line: the first `:scheme` and `:authority`.
+        if let (Some(sc), Some(a)) = (fields.get(":scheme"), fields.get(":authority")) {
+            let start = self.text.len();
+            self.text.push_str(sc);
+            self.text.push_str("://");
+            self.text.push_str(a);
+            self.abs = (start, self.text.len());
+        }
+        Ok(())
+    }
+}
+
+impl H2StreamCtx {
+    /// The request's method, until the data path takes the head.
+    #[must_use]
+    pub fn request_method(&self) -> Option<&str> {
+        self.req_head.as_ref().map(|h| h.method())
+    }
+
+    /// The request's path, until the data path takes the head.
+    #[must_use]
+    pub fn request_uri(&self) -> Option<&str> {
+        self.req_head.as_ref().map(|h| h.uri())
+    }
+
+    /// The first value of the request's header `name`, until the data path takes the head.
+    #[must_use]
+    pub fn request_header(&self, name: &str) -> Option<&str> {
+        self.req_head.as_ref().and_then(|h| h.get_header(name))
+    }
+
+    /// The request's `content-length`, as a number, even once the data path has taken the
+    /// head.
+    #[must_use]
+    pub fn request_content_length(&self) -> Option<usize> {
+        self.req_content_length
+    }
+}
+
+/// The streams of a connection by id, in id order, as a `BTreeMap` iterates them: a sorted
+/// `Vec` (T437), whose memory a connection serving one stream after another keeps, where
+/// the map allocated a node for its first stream and freed it with its last.
+#[derive(Debug, Clone, Default)]
+pub struct StreamMap {
+    v: Vec<(u32, H2StreamCtx)>,
+}
+
+/// Past this many slots, a map left empty gives its memory back.
+const STREAM_MAP_KEEP: usize = 16;
+
+impl StreamMap {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn pos(&self, id: u32) -> Result<usize, usize> {
+        self.v.binary_search_by_key(&id, |e| e.0)
+    }
+
+    #[must_use]
+    pub fn get(&self, id: &u32) -> Option<&H2StreamCtx> {
+        self.pos(*id).ok().map(|i| &self.v[i].1)
+    }
+
+    pub fn get_mut(&mut self, id: &u32) -> Option<&mut H2StreamCtx> {
+        self.pos(*id).ok().map(|i| &mut self.v[i].1)
+    }
+
+    #[must_use]
+    pub fn contains_key(&self, id: &u32) -> bool {
+        self.pos(*id).is_ok()
+    }
+
+    /// Inserts `s` as stream `id`: the stream it replaces, if there was one.
+    pub fn insert(&mut self, id: u32, s: H2StreamCtx) -> Option<H2StreamCtx> {
+        match self.pos(id) {
+            Ok(i) => Some(std::mem::replace(&mut self.v[i].1, s)),
+            Err(i) => {
+                self.v.insert(i, (id, s));
+                None
+            }
+        }
+    }
+
+    pub fn remove(&mut self, id: &u32) -> Option<H2StreamCtx> {
+        let i = self.pos(*id).ok()?;
+        let s = self.v.remove(i).1;
+        self.shrink();
+        Some(s)
+    }
+
+    /// Keeps the streams `f` says to keep.
+    pub fn retain(&mut self, mut f: impl FnMut(&u32, &mut H2StreamCtx) -> bool) {
+        self.v.retain_mut(|(id, s)| f(id, s));
+        self.shrink();
+    }
+
+    fn shrink(&mut self) {
+        if self.v.is_empty() && self.v.capacity() > STREAM_MAP_KEEP {
+            self.v = Vec::new();
+        }
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.v.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.v.is_empty()
+    }
+
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &u32> + Clone + '_ {
+        self.v.iter().map(|(id, _)| id)
+    }
+
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = &H2StreamCtx> + Clone + '_ {
+        self.v.iter().map(|(_, s)| s)
+    }
+
+    pub fn values_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut H2StreamCtx> + '_ {
+        self.v.iter_mut().map(|(_, s)| s)
+    }
+
+    /// The stream `id`, as `BTreeMap::entry` gives it.
+    pub fn entry(&mut self, id: u32) -> StreamEntry<'_> {
+        StreamEntry { map: self, id }
+    }
+}
+
+/// [`StreamMap::entry`].
+pub struct StreamEntry<'a> {
+    map: &'a mut StreamMap,
+    id: u32,
+}
+
+impl<'a> StreamEntry<'a> {
+    /// Runs `f` on the stream, if there is one.
+    pub fn and_modify(self, f: impl FnOnce(&mut H2StreamCtx)) {
+        if let Some(s) = self.map.get_mut(&self.id) {
+            f(s);
+        }
+    }
+
+    /// The stream, inserted from `f` if there was none.
+    pub fn or_insert_with(self, f: impl FnOnce() -> H2StreamCtx) -> &'a mut H2StreamCtx {
+        let i = match self.map.pos(self.id) {
+            Ok(i) => i,
+            Err(i) => {
+                self.map.v.insert(i, (self.id, f()));
+                i
+            }
+        };
+        &mut self.map.v[i].1
+    }
 }
 
 impl H2StreamCtx {
@@ -107,8 +435,9 @@ impl H2StreamCtx {
             rx_buffered: 0,
             rx_fill: 0,
             rx_limit: 0,
-            abs_prefix: None,
             bad_request: false,
+            req_head: None,
+            req_content_length: None,
         }
     }
 }
@@ -137,7 +466,7 @@ pub struct H2MuxContext {
     pub rx_buf: Vec<u8>,
     pub tx_buf: Vec<u8>,
     pub tx_consumed: usize,
-    pub streams: BTreeMap<u32, H2StreamCtx>,
+    pub streams: StreamMap,
     pub conn_send_window: i32,
     pub conn_recv_window: i32,
     /// The connection window has been opened wide ([`Self::rx_taken`]).
@@ -174,6 +503,44 @@ pub struct H2MuxContext {
     /// out of the map when its transaction ends; an id at or below this one and not in the
     /// map is a closed stream, not a new one.
     pub highest_opened: u32,
+    /// A response header's name lowercased ([`Self::send_headers_frame`]), kept for the next.
+    lower_name: String,
+    /// What the data path stages a response body in before it goes out as DATA frames,
+    /// kept from one to the next (T437).
+    pub body_scratch: Vec<u8>,
+    /// The fields of the header block being handled, decoded into memory kept for the next.
+    decoded: DecodedFields,
+    /// A HEADERS frame's block, copied out of `rx_buf` to be decoded.
+    block_scratch: Vec<u8>,
+    /// The memory of request heads the data path has taken ([`H2ReqHead`]), for the next.
+    pub spare_heads: Vec<Box<H2ReqHead>>,
+    /// The memory of the HTX of streams that are over, for the next (at most
+    /// [`SPARE_STREAMS`]).
+    pub spare_htx: Vec<Htx>,
+}
+
+/// How many spare heads and HTX a connection keeps while it serves streams; an idle one
+/// keeps [`IDLE_SPARES`] of each ([`H2MuxContext::trim_idle`]).
+pub const SPARE_STREAMS: usize = 4;
+
+/// The spares an idle connection keeps: two, as a client sending one request after the
+/// other has two streams at once for a moment (the next one opens before the last one's
+/// end has been seen); with one, every other stream allocated again.
+pub const IDLE_SPARES: usize = 2;
+
+/// `status` as its decimal digits in `buf`.
+fn status_text(status: u16, buf: &mut [u8; 5]) -> &str {
+    let mut n = status;
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&buf[i..]).unwrap_or("0")
 }
 
 impl H2MuxContext {
@@ -190,7 +557,7 @@ impl H2MuxContext {
             rx_buf: Vec::with_capacity(8192),
             tx_buf: Vec::with_capacity(8192),
             tx_consumed: 0,
-            streams: BTreeMap::new(),
+            streams: StreamMap::new(),
             conn_send_window: DEFAULT_INITIAL_WINDOW_SIZE,
             conn_recv_window: DEFAULT_INITIAL_WINDOW_SIZE,
             rx_window_opened: false,
@@ -219,17 +586,72 @@ impl H2MuxContext {
             glitch_count: 0,
             graceful_goaway_sent: false,
             highest_opened: 0,
+            lower_name: String::new(),
+            body_scratch: Vec::new(),
+            decoded: DecodedFields::default(),
+            block_scratch: Vec::new(),
+            spare_heads: Vec::new(),
+            spare_htx: Vec::new(),
         }
     }
 
     /// Appends a frame to `tx_buf` for transmission to transport.
     pub fn enqueue_frame(&mut self, frame: &Frame) {
+        self.tx_rewind();
+        frame.encode_into(&mut self.tx_buf);
+    }
+
+    /// A stream that is over gives its memory back for the next ones (T437).
+    pub fn recycle_stream(&mut self, s: &mut H2StreamCtx) {
+        // (Its head, if it had one, is the data path's: `dispatch_next` took it. A stream
+        // reset before that is let go by `stream_reset`, not here.)
+        if self.spare_htx.len() < SPARE_STREAMS {
+            let mut htx = std::mem::take(&mut s.rx_htx);
+            htx.clear();
+            self.spare_htx.push(htx);
+        }
+    }
+
+    /// The connection serves no stream: it keeps the memory a client sending one request
+    /// after the other needs, not what the busiest moment needed ([`IDLE_SPARES`], a small
+    /// body stage).
+    pub fn trim_idle(&mut self) {
+        self.spare_heads.truncate(IDLE_SPARES);
+        self.spare_htx.truncate(IDLE_SPARES);
+        if self.body_scratch.capacity() > 4096 {
+            self.body_scratch = Vec::new();
+        }
+    }
+
+    /// A request head the data path took ([`H2StreamCtx::req_head`]) is given back.
+    pub fn give_back_head(&mut self, mut h: Box<H2ReqHead>) {
+        if self.spare_heads.len() < SPARE_STREAMS {
+            h.clear();
+            self.spare_heads.push(h);
+        }
+    }
+
+    /// `tx_buf` starts over once all of it has been sent.
+    fn tx_rewind(&mut self) {
         if self.tx_consumed > 0 && self.tx_consumed >= self.tx_buf.len() {
             self.tx_buf.clear();
             self.tx_consumed = 0;
         }
-        let encoded = frame.encode();
-        self.tx_buf.extend_from_slice(&encoded);
+    }
+
+    /// Appends the header of a frame to `tx_buf` (the payload follows it, written by the
+    /// caller, then [`Self::end_frame`] sets its length): where it starts.
+    fn begin_frame(&mut self, frame_type: FrameType, flags: u8, stream_id: u32) -> usize {
+        self.tx_rewind();
+        let at = self.tx_buf.len();
+        self.tx_buf.extend_from_slice(&FrameHeader { length: 0, frame_type, flags, stream_id }.encode());
+        at
+    }
+
+    /// The frame begun at `at` ends with what `tx_buf` holds: its length is written.
+    fn end_frame(&mut self, at: usize) {
+        let len = u32::try_from(self.tx_buf.len() - at - FRAME_HEADER_LEN).unwrap_or(u32::MAX);
+        self.tx_buf[at..at + 3].copy_from_slice(&len.to_be_bytes()[1..]);
     }
 
     /// Sends a connection-level or stream-level GOAWAY frame and updates state.
@@ -338,7 +760,7 @@ impl H2MuxContext {
             return;
         }
         // A body that fits the window already is not worth more (`H2_SF_DATA_CLEN`).
-        if st.rx_htx.get_header("content-length").and_then(|v| v.trim().parse::<usize>().ok()).is_some_and(|l| l <= initial) {
+        if st.request_content_length().is_some_and(|l| l <= initial) {
             return;
         }
         let open = |s: &&H2StreamCtx| !matches!(s.state, H2StreamState::Closed | H2StreamState::Reset(_));
@@ -399,38 +821,29 @@ impl H2MuxContext {
     }
 
     /// Encodes and queues a HEADERS frame for a response, dropping the connection-specific
-    /// headers HTTP/2 forbids (RFC 7540 section 8.1.2.2).
-    fn send_headers_frame(&mut self, stream_id: u32, status: u16, headers: &[(String, String)], end_stream: bool) {
-        let mut hpack_headers = vec![HeaderField {
-            name: ":status".to_string(),
-            value: status.to_string(),
-        }];
-        for (name, val) in headers {
-            let lower = name.to_ascii_lowercase();
-            if lower == "connection"
-                || lower == "keep-alive"
-                || lower == "proxy-connection"
-                || lower == "transfer-encoding"
-                || lower == "upgrade"
-            {
-                continue;
-            }
-            hpack_headers.push(HeaderField {
-                name: lower,
-                value: val.clone(),
-            });
-        }
-        let header_block = self.encoder.encode(&hpack_headers);
+    /// headers HTTP/2 forbids (RFC 7540 section 8.1.2.2). Encoded straight into `tx_buf`,
+    /// the names lowercased in a buffer the connection keeps (T437).
+    fn send_headers_frame<'h>(&mut self, stream_id: u32, status: u16, headers: impl Iterator<Item = (&'h str, &'h str)>, end_stream: bool) {
         let flags = if end_stream {
             frame_flags::END_HEADERS | frame_flags::END_STREAM
         } else {
             frame_flags::END_HEADERS
         };
-        self.enqueue_frame(&Frame::Headers {
-            flags,
-            stream_id,
-            header_block,
-        });
+        let at = self.begin_frame(FrameType::Headers, flags, stream_id);
+        let mut digits = [0u8; 5];
+        self.encoder.encode_field(":status", status_text(status, &mut digits), &mut self.tx_buf);
+        let mut lower = std::mem::take(&mut self.lower_name);
+        for (name, val) in headers {
+            lower.clear();
+            lower.push_str(name);
+            lower.make_ascii_lowercase();
+            if matches!(lower.as_str(), "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade") {
+                continue;
+            }
+            self.encoder.encode_field(&lower, val, &mut self.tx_buf);
+        }
+        self.lower_name = lower;
+        self.end_frame(at);
     }
 
     /// Parses an HTTP/1 response head (status line and headers, with or without the
@@ -443,21 +856,14 @@ impl H2MuxContext {
         if self.streams.get(&stream_id).is_some_and(|s| matches!(s.state, H2StreamState::Reset(_))) {
             return true;
         }
+        // Borrowed unless the head is not UTF-8.
         let head_str = String::from_utf8_lossy(head);
         let mut lines = head_str.lines();
         let Some(status_line) = lines.next() else { return false };
-        let parts: Vec<&str> = status_line.split_whitespace().collect();
-        if parts.len() < 2 {
-            return false;
-        }
-        let Ok(status) = parts[1].parse::<u16>() else { return false };
-        let mut headers = Vec::new();
-        for line in lines {
-            if let Some((name, val)) = line.split_once(':') {
-                headers.push((name.trim().to_string(), val.trim().to_string()));
-            }
-        }
-        self.send_headers_frame(stream_id, status, &headers, end_stream);
+        let Some(code) = status_line.split_whitespace().nth(1) else { return false };
+        let Ok(status) = code.parse::<u16>() else { return false };
+        let headers = lines.filter_map(|line| line.split_once(':')).map(|(name, val)| (name.trim(), val.trim()));
+        self.send_headers_frame(stream_id, status, headers, end_stream);
         true
     }
 
@@ -504,11 +910,9 @@ impl H2MuxContext {
                 break;
             }
             let last = end_stream && sent + n == data.len();
-            self.enqueue_frame(&Frame::Data {
-                flags: if last { frame_flags::END_STREAM } else { 0 },
-                stream_id,
-                data: data[sent..sent + n].to_vec(),
-            });
+            let at = self.begin_frame(FrameType::Data, if last { frame_flags::END_STREAM } else { 0 }, stream_id);
+            self.tx_buf.extend_from_slice(&data[sent..sent + n]);
+            self.end_frame(at);
             self.conn_send_window -= n as i32;
             if let Some(s) = self.streams.get_mut(&stream_id) {
                 s.send_window -= n as i32;
@@ -516,7 +920,8 @@ impl H2MuxContext {
             sent += n;
         }
         if data.is_empty() && end_stream {
-            self.enqueue_frame(&Frame::Data { flags: frame_flags::END_STREAM, stream_id, data: Vec::new() });
+            let at = self.begin_frame(FrameType::Data, frame_flags::END_STREAM, stream_id);
+            self.end_frame(at);
         }
         if end_stream && sent == data.len() {
             self.local_end_stream(stream_id);
@@ -665,6 +1070,26 @@ impl Mux for MuxH2 {
             }
 
             let payload = &slice[FRAME_HEADER_LEN..total_frame_len];
+            if header.frame_type == FrameType::Headers {
+                // The block is decoded from a copy in memory the connection keeps, not a
+                // frame of its own (T437).
+                let mut block = std::mem::take(&mut ctx.block_scratch);
+                block.clear();
+                match Frame::headers_block(&header, payload) {
+                    Ok(b) => block.extend_from_slice(b),
+                    Err(e) => {
+                        let code = if e.kind() == io::ErrorKind::InvalidInput { H2Error::FrameSizeError } else { H2Error::ProtocolError };
+                        ctx.send_goaway(header.stream_id, code, b"frame decode error");
+                        return Err(e);
+                    }
+                }
+                consumed += total_frame_len;
+                ctx.rx_frame_len = header.length;
+                let r = Self::handle_headers(ctx, header.flags, header.stream_id, &block);
+                ctx.block_scratch = block;
+                r?;
+                continue;
+            }
             let frame = match Frame::decode(&header, payload) {
                 Ok(f) => f,
                 Err(e) => {
@@ -703,8 +1128,13 @@ impl Mux for MuxH2 {
             None => return Ok(0),
         };
 
-        // Export parsed HTX data to output buffer
-        let wire = stream.rx_htx.to_h1_wire();
+        // Export parsed HTX data to output buffer; a head kept as text goes before the
+        // blocks, which then start with its blank line.
+        let mut wire = stream.rx_htx.to_h1_wire();
+        if let Some(h) = &stream.req_head {
+            let head = h.wire();
+            wire.splice(..0, head[..head.len() - 2].iter().copied());
+        }
         if wire.is_empty() {
             return Ok(0);
         }
@@ -852,6 +1282,21 @@ impl MuxH2 {
         flags: u8,
         header_block: &[u8],
     ) -> io::Result<()> {
+        // The fields are decoded into memory the connection keeps (T437), taken out while
+        // the block is handled.
+        let mut decoded = std::mem::take(&mut ctx.decoded);
+        let r = Self::process_decoded_block(ctx, stream_id, flags, header_block, &mut decoded);
+        ctx.decoded = decoded;
+        r
+    }
+
+    fn process_decoded_block(
+        ctx: &mut H2MuxContext,
+        stream_id: u32,
+        flags: u8,
+        header_block: &[u8],
+        decoded: &mut DecodedFields,
+    ) -> io::Result<()> {
         if !ctx.streams.contains_key(&stream_id) && stream_id <= ctx.highest_opened {
             // HEADERS on a stream that is closed, or that was skipped and so can no longer
             // be opened: a connection error STREAM_CLOSED (RFC 9113 section 5.1.1; HAProxy
@@ -862,10 +1307,10 @@ impl MuxH2 {
         }
         // Decoded before anything may refuse the stream: the client's encoder has added
         // these fields to its table whatever becomes of the stream (T235).
-        let decoded_headers = ctx.decoder.decode(header_block).map_err(|e| {
+        if let Err(e) = ctx.decoder.decode_into(header_block, decoded) {
             ctx.send_goaway(stream_id, e, b"HPACK compression error");
-            io::Error::new(io::ErrorKind::InvalidData, "HPACK compression error")
-        })?;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "HPACK compression error"));
+        }
 
         if !ctx.streams.contains_key(&stream_id) {
             let active = ctx
@@ -892,19 +1337,19 @@ impl MuxH2 {
             }
             // Trailers get the room HAProxy's rx buffer gives them (T271): past it, a stream
             // error, so a client cannot park decoded trailers of any size in each stream.
-            let trailer_bytes: usize = decoded_headers.iter().map(|h| h.name.len() + h.value.len()).sum();
-            let too_big = decoded_headers.len() > MAX_REQUEST_TRAILERS
-                || trailer_bytes + TRAILER_BLOCK_OVERHEAD * decoded_headers.len() > MAX_REQUEST_TRAILER_ROOM;
+            let trailer_bytes: usize = decoded.iter().map(|(n, v)| n.len() + v.len()).sum();
+            let too_big = decoded.len() > MAX_REQUEST_TRAILERS
+                || trailer_bytes + TRAILER_BLOCK_OVERHEAD * decoded.len() > MAX_REQUEST_TRAILER_ROOM;
             // A trailer field is checked as `http_trailers_to_htx` checks it (T449): one
             // with CR or LF would end the chunked body early for the server.
-            let malformed = crate::h2::check_trailer_fields(decoded_headers.iter().map(|h| (h.name.as_str(), h.value.as_str()))).is_err();
-            if (flags & frame_flags::END_STREAM) == 0 || too_big || malformed {
+            let malformed = crate::h2::check_trailer_fields(decoded.iter()).is_err();
+            if (flags & frame_flags::END_STREAM) == 0 || too_big || malformed || decoded.iter().any(|(n, _)| n.starts_with(':')) {
                 ctx.send_rst_stream(stream_id, H2Error::ProtocolError);
                 return Ok(());
             }
             ctx.streams.entry(stream_id).and_modify(|stream| {
-                for h in decoded_headers {
-                    stream.rx_htx.push(HtxBlock::Trailer(h));
+                for (name, value) in decoded.iter() {
+                    stream.rx_htx.push(HtxBlock::Trailer(HeaderField { name: name.to_string(), value: value.to_string() }));
                 }
                 stream.rx_htx.push(HtxBlock::Eot);
                 stream.rx_htx.push(HtxBlock::Eom);
@@ -915,9 +1360,9 @@ impl MuxH2 {
 
         // HAProxy keeps at most tune.http.maxhdr - 1 (100) header fields in a request,
         // counting the host made from :authority; more is a stream error PROTOCOL_ERROR.
-        let regular = decoded_headers.iter().filter(|h| !h.name.starts_with(':')).count();
-        let host_from_authority = decoded_headers.iter().any(|h| h.name == ":authority")
-            && !decoded_headers.iter().any(|h| h.name == "host");
+        let regular = decoded.iter().filter(|(n, _)| !n.starts_with(':')).count();
+        let host_from_authority = decoded.iter().any(|(n, _)| n == ":authority")
+            && !decoded.iter().any(|(n, _)| n == "host");
         let too_many = ctx.is_server && regular + usize::from(host_from_authority) > MAX_REQUEST_HEADERS;
         // The decoded request must fit HAProxy's request buffer less its rewrite reserve
         // (tune.bufsize 16384 - tune.maxrewrite 1024): one-byte HPACK references to a large
@@ -925,7 +1370,7 @@ impl MuxH2 {
         // Measured: four 3800-byte fields pass, four 3850-byte fields are RST_STREAM
         // PROTOCOL_ERROR.
         let too_big = ctx.is_server
-            && decoded_headers.iter().map(|h| h.name.len() + h.value.len()).sum::<usize>() > MAX_REQUEST_HEAD_BYTES;
+            && decoded.iter().map(|(n, v)| n.len() + v.len()).sum::<usize>() > MAX_REQUEST_HEAD_BYTES;
 
         // Each field is checked before any head is written from it (T449): a CR LF in a
         // value, a name or a pseudo-header written into the HTTP/1 head is a header, or a
@@ -934,45 +1379,53 @@ impl MuxH2 {
         // A client connection's response gets the name and value checks of
         // `h2_make_htx_response` (no runtime path speaks h2 to a server yet: `proto h2` on
         // a server is refused by the parser).
-        let fields = decoded_headers.iter().map(|h| (h.name.as_str(), h.value.as_str()));
+        let fields = decoded.iter();
         let checked = if ctx.is_server {
             crate::h2::check_request_fields(fields)
         } else {
             crate::h2::check_response_fields(fields).map(|()| false)
         };
-        let abs_prefix = {
-            let get = |n: &str| decoded_headers.iter().find(|h| h.name == n).map(|h| h.value.as_str());
-            get(":scheme").zip(get(":authority")).map(|(s, a)| format!("{s}://{a}"))
-        };
+        // A server connection's request head is written as HTTP/1.1 text, in memory a
+        // stream before it used (T437); what that form does not take keeps the HTX blocks.
+        let as_text = ctx.is_server && !too_many && !too_big;
+        let spare_htx = ctx.spare_htx.pop();
         let stream = ctx.streams.entry(stream_id).or_insert_with(|| {
-            H2StreamCtx::new(
+            let mut s = H2StreamCtx::new(
                 stream_id,
                 ctx.remote_initial_window,
                 ctx.local_initial_window,
-            )
+            );
+            if let Some(htx) = spare_htx {
+                s.rx_htx = htx;
+            }
+            s
         });
 
         stream.state = H2StreamState::Open;
-        stream.abs_prefix = abs_prefix;
         ctx.highest_opened = ctx.highest_opened.max(stream_id);
 
         // Extract pseudo-headers and construct HTX blocks
         stream.bad_request = checked == Ok(true);
         let converted = if too_many || too_big || checked.is_err() {
             Err(())
+        } else if as_text {
+            let mut head = stream.req_head.take().or_else(|| ctx.spare_heads.pop()).unwrap_or_default();
+            if head.write(decoded).is_ok() {
+                stream.req_content_length = head.get_header("content-length").and_then(|v| v.trim().parse::<usize>().ok());
+                stream.req_head = Some(head);
+                stream.rx_htx.push(HtxBlock::Eoh);
+                Ok(())
+            } else {
+                ctx.spare_heads.push(head);
+                Err(())
+            }
         } else {
-            crate::htx::pseudo_headers_to_htx(decoded_headers, HttpVersion::Http20).map_err(|_| ())
+            // A response head (a client connection), as HTX blocks.
+            crate::htx::pseudo_headers_to_htx(decoded.to_fields(), HttpVersion::Http20).map(|blocks| blocks.into_iter().for_each(|b| stream.rx_htx.push(b))).map_err(|_| ())
         };
-        match converted {
-            Ok(blocks) => {
-                for b in blocks {
-                    stream.rx_htx.push(b);
-                }
-            }
-            Err(_) => {
-                ctx.send_rst_stream(stream_id, H2Error::ProtocolError);
-                return Ok(());
-            }
+        if converted.is_err() {
+            ctx.send_rst_stream(stream_id, H2Error::ProtocolError);
+            return Ok(());
         }
 
         if (flags & frame_flags::END_STREAM) != 0 {
@@ -981,6 +1434,64 @@ impl MuxH2 {
         }
 
         Ok(())
+    }
+
+    /// A HEADERS frame (`header_block` without its padding and priority fields).
+    fn handle_headers(ctx: &mut H2MuxContext, flags: u8, stream_id: u32, header_block: &[u8]) -> io::Result<()> {
+        if let Some(c_sid) = ctx.continuation_stream {
+            // As `handle_frame` answers any other frame where a CONTINUATION was due.
+            ctx.send_goaway(c_sid, H2Error::ProtocolError, b"expected CONTINUATION frame");
+            return Ok(());
+        }
+        if stream_id == 0 {
+            ctx.send_goaway(0, H2Error::ProtocolError, b"HEADERS on stream 0");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HEADERS on stream 0",
+            ));
+        }
+
+        // Verify client stream parity (client streams must be odd)
+        if ctx.is_server && stream_id.is_multiple_of(2) {
+            ctx.send_goaway(
+                stream_id,
+                H2Error::ProtocolError,
+                b"even stream id from client",
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Even stream ID received from client",
+            ));
+        }
+
+        if ctx.is_server && stream_id > ctx.last_client_stream_id {
+            ctx.last_client_stream_id = stream_id;
+        }
+
+        if ctx.is_server {
+            ctx.total_streams = ctx.total_streams.saturating_add(1);
+            if ctx.flood_config.max_total_streams > 0
+                && ctx.total_streams >= ctx.flood_config.max_total_streams
+            {
+                ctx.send_goaway(
+                    stream_id,
+                    H2Error::NoError,
+                    b"max-total-streams reached",
+                );
+                return Ok(());
+            }
+        }
+
+        // (A block cannot pass 65536 bytes here: `parse` refuses a frame past 16384.)
+        if (flags & frame_flags::END_HEADERS) == 0 {
+            ctx.continuation_stream = Some(stream_id);
+            ctx.continuation_flags = flags;
+            ctx.continuation_buf = header_block.to_vec();
+            ctx.continuation_count = 0;
+            return Ok(());
+        }
+
+        Self::process_headers_block(ctx, stream_id, flags, header_block)
     }
 
     fn handle_frame(ctx: &mut H2MuxContext, frame: Frame) -> io::Result<()> {
@@ -1114,64 +1625,6 @@ impl MuxH2 {
                 }
             }
 
-            Frame::Headers {
-                flags,
-                stream_id,
-                header_block,
-            } => {
-                if stream_id == 0 {
-                    ctx.send_goaway(0, H2Error::ProtocolError, b"HEADERS on stream 0");
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "HEADERS on stream 0",
-                    ));
-                }
-
-                // Verify client stream parity (client streams must be odd)
-                if ctx.is_server && (stream_id % 2 == 0) {
-                    ctx.send_goaway(
-                        stream_id,
-                        H2Error::ProtocolError,
-                        b"even stream id from client",
-                    );
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Even stream ID received from client",
-                    ));
-                }
-
-                if ctx.is_server && stream_id > ctx.last_client_stream_id {
-                    ctx.last_client_stream_id = stream_id;
-                }
-
-                if ctx.is_server {
-                    ctx.total_streams = ctx.total_streams.saturating_add(1);
-                    if ctx.flood_config.max_total_streams > 0
-                        && ctx.total_streams >= ctx.flood_config.max_total_streams
-                    {
-                        ctx.send_goaway(
-                            stream_id,
-                            H2Error::NoError,
-                            b"max-total-streams reached",
-                        );
-                        return Ok(());
-                    }
-                }
-
-                if (flags & frame_flags::END_HEADERS) == 0 {
-                    if header_block.len() > 65536 {
-                        ctx.send_goaway(stream_id, H2Error::EnhanceYourCalm, b"header block too large");
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "Header block too large"));
-                    }
-                    ctx.continuation_stream = Some(stream_id);
-                    ctx.continuation_flags = flags;
-                    ctx.continuation_buf = header_block;
-                    ctx.continuation_count = 0;
-                    return Ok(());
-                }
-
-                Self::process_headers_block(ctx, stream_id, flags, &header_block)?;
-            }
 
             Frame::Data {
                 flags,
@@ -1383,7 +1836,9 @@ impl MuxH2 {
                 ));
             }
 
-            Frame::Priority { .. }
+            // HEADERS do not come here: `parse` hands them to `handle_headers` (T437).
+            Frame::Headers { .. }
+            | Frame::Priority { .. }
             | Frame::PushPromise { .. }
             | Frame::Unknown { .. } => {}
         }
@@ -1489,11 +1944,11 @@ mod tests {
 
         assert_eq!(mux.used_streams(&ctx), 2);
         let s1 = ctx.streams.get(&1).unwrap();
-        assert_eq!(s1.rx_htx.req_line().unwrap().uri, "/stream1");
+        assert_eq!(s1.request_uri(), Some("/stream1"));
         assert_eq!(s1.state, H2StreamState::HalfClosedRemote);
 
         let s3 = ctx.streams.get(&3).unwrap();
-        assert_eq!(s3.rx_htx.req_line().unwrap().uri, "/stream3");
+        assert_eq!(s3.request_uri(), Some("/stream3"));
         assert_eq!(s3.rx_htx.body_bytes(), b"hello stream 3");
     }
 
@@ -1655,7 +2110,7 @@ mod tests {
         let (mux, mut ctx) = open_conn();
         ctx.streams.insert(1, H2StreamCtx::new(1, i32::MAX - 5, 100));
         mux.parse(&mut ctx, &wu(1, 5)).expect("exactly the maximum");
-        assert_eq!(ctx.streams[&1].send_window, i32::MAX);
+        assert_eq!(ctx.streams.get(&1).map(|s| s.send_window), Some(i32::MAX));
         let before = ctx.tx_buf.len();
         mux.parse(&mut ctx, &wu(1, 1)).expect("a stream error is not a connection error");
         assert!(ctx.tx_buf[before..].windows(9).any(|w| w[3] == 3 && w[5..9] == [0, 0, 0, 1]), "no RST_STREAM");
@@ -1977,7 +2432,7 @@ mod tests {
         assert_eq!(ctx.tx_buf[sent + 3], 0x3, "not refused with RST_STREAM");
         ctx.streams.remove(&1);
         mux.parse(&mut ctx, &get(203, "refused")).expect("the next request decodes");
-        let x = ctx.streams.get(&203).and_then(|s| s.rx_htx.get_header("x-extra").map(str::to_owned));
+        let x = ctx.streams.get(&203).and_then(|s| s.request_header("x-extra").map(str::to_owned));
         assert_eq!(x.as_deref(), Some("refused"));
     }
 
@@ -2057,7 +2512,9 @@ mod tests {
                 HtxBlock::Header(h) => h.name.len() + h.value.len(),
                 _ => 0,
             })
-            .sum();
+            .sum::<usize>()
+            // A head kept as text (T437) holds its fields there.
+            + ctx.streams.values().map(|s| s.req_head.as_ref().map_or(0, |h| h.field_bytes)).sum::<usize>();
         assert!(held >= 8000, "the control request is held: {held}");
         assert!(held <= 2 << 20, "{} streams hold {held} bytes of headers from {} bytes", ctx.streams.len(), wire.len());
     }
@@ -2147,5 +2604,130 @@ mod tests {
             assert_eq!(held, if refused { 0 } else { (refs + 1) * (len + 1) }, "trailer bytes kept for {case}");
             assert!(ctx.goaway_sent.is_none(), "{case}");
         }
+    }
+
+    /// A field literal without indexing, new name, no Huffman.
+    fn lit(name: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut v = vec![0, u8::try_from(name.len()).unwrap()];
+        v.extend_from_slice(name);
+        v.push(u8::try_from(value.len()).unwrap());
+        v.extend_from_slice(value);
+        v
+    }
+
+    /// What the connection sent after `from`, as (type, stream, error code) per frame (no
+    /// SETTINGS); for a GOAWAY, the last stream it names in place of its stream (0).
+    fn sent(ctx: &H2MuxContext, from: usize) -> Vec<(u8, u32, u32)> {
+        let (b, mut i, mut out) = (&ctx.tx_buf, from, Vec::new());
+        while i + 9 <= b.len() {
+            let len = (usize::from(b[i]) << 16) | (usize::from(b[i + 1]) << 8) | usize::from(b[i + 2]);
+            let sid = u32::from_be_bytes([b[i + 5], b[i + 6], b[i + 7], b[i + 8]]);
+            // An RST_STREAM carries its code at 9, a GOAWAY after the last stream id at 13;
+            // a frame with no such field (SETTINGS) has no code.
+            let at = if b[i + 3] == 7 { 13 } else { 9 };
+            let code = b.get(i + at..i + at + 4).map_or(0, |c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]));
+            let sid = if b[i + 3] == 7 { u32::from_be_bytes([b[i + 9], b[i + 10], b[i + 11], b[i + 12]]) } else { sid };
+            if b[i + 3] != 4 {
+                out.push((b[i + 3], sid, code));
+            }
+            i += 9 + len;
+        }
+        out
+    }
+
+    /// The frames sent for one connection's `wire` (after the handshake).
+    fn answer(wire: &[u8]) -> (H2MuxContext, Vec<(u8, u32, u32)>) {
+        let (mux, mut ctx) = open_conn();
+        let from = ctx.tx_buf.len();
+        let _ = mux.parse(&mut ctx, wire);
+        let s = sent(&ctx, from);
+        (ctx, s)
+    }
+
+    fn headers(flags: u8, id: u32, block: Vec<u8>) -> Vec<u8> {
+        Frame::Headers { flags, stream_id: id, header_block: block }.encode()
+    }
+
+    /// T437: requests HAProxy 3.5-dev8 refuses with RST_STREAM PROTOCOL_ERROR (measured
+    /// 2026-10-19, h2c, raw frames): no `:method`, a `:status`, `:protocol` on a GET, an
+    /// empty `:path`, two `:method`.
+    #[test]
+    fn malformed_request_heads_are_reset_as_haproxy_resets_them() {
+        let auth = lit(b":authority", b"a");
+        let cases: [(&str, Vec<u8>); 6] = [
+            ("no :method", [&[0x86u8, 0x84][..], &auth].concat()),
+            (":status", [&[0x82u8, 0x86, 0x84, 0x88][..], &auth].concat()),
+            (":status alone", [&[0x88u8][..], &auth].concat()),
+            (":protocol on a GET", [&[0x82u8, 0x86, 0x84][..], &auth, &lit(b":protocol", b"websocket")].concat()),
+            ("empty :path", [&[0x82u8, 0x86][..], &lit(b":path", b""), &auth].concat()),
+            ("two :method", [&[0x82u8, 0x82, 0x86, 0x84][..], &auth].concat()),
+        ];
+        for (what, block) in cases {
+            let (ctx, s) = answer(&headers(frame_flags::END_HEADERS | frame_flags::END_STREAM, 1, block));
+            assert_eq!(s, vec![(3, 1, 1)], "{what}: not RST_STREAM PROTOCOL_ERROR");
+            assert!(ctx.streams.get(&1).is_none_or(|st| st.req_head.is_none()), "{what}: a head was kept");
+        }
+    }
+
+    /// T437: a request with two `host` headers is taken, with the first (HAProxy 3.5-dev8,
+    /// measured: the server receives `GET / HTTP/1.1` and `host: a` alone).
+    #[test]
+    fn a_second_host_header_is_dropped_as_haproxy_drops_it() {
+        for block in [
+            [&[0x82u8, 0x86, 0x84][..], &lit(b"host", b"a"), &lit(b"host", b"b")].concat(),
+            [&[0x82u8, 0x86, 0x84][..], &lit(b":authority", b"a"), &lit(b"host", b"a"), &lit(b"host", b"b")].concat(),
+        ] {
+            let (ctx, s) = answer(&headers(frame_flags::END_HEADERS | frame_flags::END_STREAM, 1, block));
+            assert_eq!(s, vec![], "the request was refused");
+            let head = ctx.streams.get(&1).and_then(|st| st.req_head.as_ref()).expect("a head");
+            assert_eq!(head.wire(), b"GET / HTTP/1.1\r\nhost: a\r\n\r\n");
+        }
+    }
+
+    /// T437: connection errors HAProxy 3.5-dev8 answers with GOAWAY (measured): HEADERS on
+    /// stream 0 (PROTOCOL_ERROR, last stream 0), a field literal cut short (COMPRESSION_ERROR),
+    /// HEADERS while a CONTINUATION is expected (PROTOCOL_ERROR).
+    #[test]
+    fn broken_header_frames_are_connection_errors_as_haproxy_s() {
+        let req = vec![0x82, 0x86, 0x84];
+        let (_, s) = answer(&headers(frame_flags::END_HEADERS | frame_flags::END_STREAM, 0, req.clone()));
+        assert_eq!(s, vec![(7, 0, 1)], "HEADERS on stream 0");
+        for cut in [vec![0x82, 0x86, 0x84, 0x00, 0x03, b'a', b'b'], vec![0x82, 0x86, 0x84, 0x00, 0x01, b'a']] {
+            let (_, s) = answer(&headers(frame_flags::END_HEADERS | frame_flags::END_STREAM, 1, cut));
+            assert_eq!(s, vec![(7, 1, 9)], "a cut literal");
+        }
+        let wire = [headers(frame_flags::END_STREAM, 1, vec![0x82, 0x86]), headers(frame_flags::END_HEADERS | frame_flags::END_STREAM, 3, req)].concat();
+        let (_, s) = answer(&wire);
+        assert_eq!(s, vec![(7, 1, 1)], "HEADERS where a CONTINUATION was due");
+    }
+
+    /// T437: an extended CONNECT (`:protocol`, RFC 8441), which HAProxy 3.5-dev8 takes
+    /// (measured: answered 200), is taken; a second `:protocol` is reset (measured:
+    /// RST_STREAM PROTOCOL_ERROR).
+    #[test]
+    fn an_extended_connect_is_taken_and_a_second_protocol_reset() {
+        let block = [lit(b":method", b"CONNECT"), vec![0x86, 0x84], lit(b":authority", b"a"), lit(b":protocol", b"websocket"), lit(b"content-length", b"3")].concat();
+        let (ctx, s) = answer(&headers(frame_flags::END_HEADERS, 1, block.clone()));
+        assert_eq!(s, vec![]);
+        let st = ctx.streams.get(&1).expect("the stream");
+        assert_eq!((st.request_method(), st.request_uri(), st.request_header("Content-Length")), (Some("CONNECT"), Some("/"), Some("3")));
+        assert_eq!(st.request_content_length(), Some(3));
+        let twice = [block, lit(b":protocol", b"websocket")].concat();
+        let (_, s) = answer(&headers(frame_flags::END_HEADERS, 1, twice));
+        assert_eq!(s, vec![(3, 1, 1)]);
+    }
+
+    /// The stream map answers as the `BTreeMap` it replaced (T437): an insert over a stream
+    /// gives the old one back, `entry` finds the stream it has.
+    #[test]
+    fn the_stream_map_replaces_and_finds_as_a_btreemap() {
+        let mut m = StreamMap::new();
+        assert!(m.insert(3, H2StreamCtx::new(3, 1, 1)).is_none());
+        assert!(m.insert(1, H2StreamCtx::new(1, 1, 1)).is_none());
+        let old = m.insert(3, H2StreamCtx::new(3, 2, 2)).expect("the stream it replaced");
+        assert_eq!((old.send_window, m.len()), (1, 2));
+        m.entry(3).or_insert_with(|| H2StreamCtx::new(3, 9, 9)).recv_window = 7;
+        assert_eq!(m.get(&3).map(|s| (s.send_window, s.recv_window)), Some((2, 7)), "or_insert_with made a new stream");
+        assert_eq!(m.keys().copied().collect::<Vec<_>>(), vec![1, 3]);
     }
 }
