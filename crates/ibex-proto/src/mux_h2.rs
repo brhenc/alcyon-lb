@@ -2622,11 +2622,10 @@ mod tests {
         while i + 9 <= b.len() {
             let len = (usize::from(b[i]) << 16) | (usize::from(b[i + 1]) << 8) | usize::from(b[i + 2]);
             let sid = u32::from_be_bytes([b[i + 5], b[i + 6], b[i + 7], b[i + 8]]);
-            let code = match b[i + 3] {
-                3 => u32::from_be_bytes([b[i + 9], b[i + 10], b[i + 11], b[i + 12]]),
-                7 => u32::from_be_bytes([b[i + 13], b[i + 14], b[i + 15], b[i + 16]]),
-                _ => 0,
-            };
+            // An RST_STREAM carries its code at 9, a GOAWAY after the last stream id at 13;
+            // a frame with no such field (SETTINGS) has no code.
+            let at = if b[i + 3] == 7 { 13 } else { 9 };
+            let code = b.get(i + at..i + at + 4).map_or(0, |c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]));
             let sid = if b[i + 3] == 7 { u32::from_be_bytes([b[i + 9], b[i + 10], b[i + 11], b[i + 12]]) } else { sid };
             if b[i + 3] != 4 {
                 out.push((b[i + 3], sid, code));
