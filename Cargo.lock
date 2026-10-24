@@ -698,6 +698,7 @@ dependencies = [
  "ctr",
  "getrandom 0.2.17",
  "ghash",
+ "ibex-alloc",
  "ibex-crypt",
  "ibex-proto",
  "ibex-regex",

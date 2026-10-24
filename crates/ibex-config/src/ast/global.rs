@@ -238,8 +238,14 @@ pub struct GlobalSection {
     pub pool_low_fd_ratio: Option<u8>,
     /// The `tune.vars.*` limits (T364 S5).
     pub vars_limits: VarsLimits,
-    /// `tune.ibex.zero-buffers on|off` (Ibex-only): zero a buffer's used bytes when it is released. On when unset.
+    /// `tune.ibex.zero-buffers on|off` (Ibex-only): zero a buffer's used bytes when it is released. Off when unset.
     pub zero_buffers: Option<bool>,
+    /// `tune.ibex.zero-spares on|off` (Ibex-only): zero a spare string's or list's used bytes when
+    /// it is given back to its pool. Off when unset.
+    pub zero_spares: Option<bool>,
+    /// `tune.memory.hot-size <bytes>`: the most each thread keeps in its pools together
+    /// (`global.tune.pool_cache_size`, 524288 when unset).
+    pub hot_size: Option<usize>,
     /// `tune.ibex.crypto-provider ring|ring-ibex` (Ibex-only, T460): the rustls crypto provider
     /// of every TCP TLS configuration. Vanilla ring when unset.
     pub crypto_provider: Option<TlsCryptoProvider>,

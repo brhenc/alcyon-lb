@@ -66,13 +66,13 @@ fn a_release_after_a_compaction_and_a_grow_leaves_nothing_behind() {
 
 /// AGENTS.md 5: the keyword reaches the release path. `Engine::new` applies the global
 /// setting (`engine.rs`, next to `set_trim_disabled`), and `Buf`'s `Drop` reads it through
-/// `ibex_alloc::wipe`.
+/// `ibex_alloc::wipe`. Unset is off (the user, 2026-10-24: comparisons with HAProxy stay fair).
 #[test]
 fn the_configured_setting_reaches_the_buffer_release_path() {
     use ibex_config::ast::{Config, GlobalSection};
     use ibex_rt::engine::Engine;
     let _turn = SETTING.lock().unwrap();
-    for (zero_buffers, expect_zeros) in [(Some(false), false), (None, true), (Some(true), true)] {
+    for (zero_buffers, expect_zeros) in [(Some(false), false), (None, false), (Some(true), true)] {
         let config = Config {
             global: Some(GlobalSection { zero_buffers, ..Default::default() }),
             ..Default::default()

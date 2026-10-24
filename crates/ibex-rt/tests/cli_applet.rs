@@ -272,10 +272,13 @@ fn cli_applet_one_shot_non_interactive_command() {
     for _ in 0..20 {
         let _ = engine.step(tick);
         let mut buf = [0u8; 1024];
-        if let Ok(n) = client.read(&mut buf) {
-            if n > 0 {
-                resp.extend_from_slice(&buf[..n]);
+        // All that is there: the dump is longer than one read since the pools of
+        // `ibex_alloc::Pool` (S1) are listed too.
+        while let Ok(n) = client.read(&mut buf) {
+            if n == 0 {
+                break;
             }
+            resp.extend_from_slice(&buf[..n]);
         }
         if engine.applets.live() == 0 && !resp.is_empty() {
             break;
@@ -336,10 +339,13 @@ fn cli_applet_show_pools() {
     for _ in 0..20 {
         let _ = engine.step(tick);
         let mut buf = [0u8; 1024];
-        if let Ok(n) = client.read(&mut buf) {
-            if n > 0 {
-                resp.extend_from_slice(&buf[..n]);
+        // All that is there: the dump is longer than one read since the pools of
+        // `ibex_alloc::Pool` (S1) are listed too.
+        while let Ok(n) = client.read(&mut buf) {
+            if n == 0 {
+                break;
             }
+            resp.extend_from_slice(&buf[..n]);
         }
         if engine.applets.live() == 0 && !resp.is_empty() {
             break;
@@ -399,10 +405,13 @@ fn cli_applet_show_pools_configured_sizes() {
     for _ in 0..20 {
         let _ = engine.step(tick);
         let mut buf = [0u8; 1024];
-        if let Ok(n) = client.read(&mut buf) {
-            if n > 0 {
-                resp.extend_from_slice(&buf[..n]);
+        // All that is there: the dump is longer than one read since the pools of
+        // `ibex_alloc::Pool` (S1) are listed too.
+        while let Ok(n) = client.read(&mut buf) {
+            if n == 0 {
+                break;
             }
+            resp.extend_from_slice(&buf[..n]);
         }
         if engine.applets.live() == 0 && !resp.is_empty() {
             break;

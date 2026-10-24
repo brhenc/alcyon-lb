@@ -458,7 +458,7 @@ Status: **resolved and measured** — cached lookups verified in `crates/ibex-sa
 | | |
 |---|---|
 | **Gained** | Nothing yet: today's design is simpler code (owned `Vec`/`String`/`Box` values per request, freed on drop) and a small footprint (~10 MB RSS where HAProxy's pools hold ~90 MB in the same test). |
-| **Gave up** | HAProxy has 69 named pools (buffers, trash, sessions, streams, resolvers, ...) with a per-thread cache (`tune.memory.hot-size`, 512 KB) and makes **0 malloc calls per request** in steady state (LD_PRELOAD count, keep-alive and new connections, 1 and 4 threads). Ibex pools only the I/O buffers (`buffer`, `small_buffer`, `large_buffer`; up to 64 spares per thread) and the shipped binary makes **about 6 malloc/free pairs, 273 bytes per request** (sizes 1, 3, 10, 10, 56, 192; `tools/allocprofile`'s 4 allocations / 127 B counts only the in-process engine path of one `Connection: close` request). Not implemented either: `tune.buffers.limit`, `tune.buffers.reserve`, `tune.memory.hot-size` (refused as unknown), `-dM` pool debugging (refused since T351: no pools to poison), HAProxy's `show pools` detail (T352). |
+| **Gave up** | HAProxy has 69 named pools (buffers, trash, sessions, streams, resolvers, ...) with a per-thread cache (`tune.memory.hot-size`, 512 KB) and makes **0 malloc calls per request** in steady state (LD_PRELOAD count, keep-alive and new connections, 1 and 4 threads). Ibex pools only the I/O buffers (`buffer`, `small_buffer`, `large_buffer`; up to 64 spares per thread) and the shipped binary makes **about 6 malloc/free pairs, 273 bytes per request** (sizes 1, 3, 10, 10, 56, 192; `tools/allocprofile`'s 4 allocations / 127 B counts only the in-process engine path of one `Connection: close` request). Not implemented either: `tune.buffers.limit`, `tune.buffers.reserve`, `tune.memory.hot-size` (refused as unknown until S1, 6.28; it now bounds the `ibex_alloc::Pool`s only), `-dM` pool debugging (refused since T351: no pools to poison), HAProxy's `show pools` detail (T352). |
 | **Why it matters** | The user's requirement (2026-10-17): a request must not need a malloc. Every allocation a client can cause is one an attacker can make fail. In Rust a failed allocation does not return NULL to unchecked code (that C cascade cannot happen): the global allocator calls `handle_alloc_error`, which **aborts the worker** — every connection on it is lost, a denial of service instead of one failed request. HAProxy instead takes from a pool sized in advance and, when a pool is empty, fails only that stream (`tune.buffers.reserve` keeps buffers back for streams already running). |
 | **Status** | **measured** 2026-10-17 (`~/ibex-worktrees/review/pools-haproxy-vs-ibex-2026-10-17.md`). Planning of the pools (which objects, per-thread caches, a bounded and fallible take on the request path, what to do when a pool is empty, how to count and test "0 allocations per request" on the real binary) is set for the 2026-10-17 21:00 planning session (Fable), with T344. |
 | **Revisit if** | Done when the request path makes 0 allocations per request on the shipped binary (counted, pinned in a test), and an empty pool fails one stream, not the process. |
@@ -565,23 +565,32 @@ The `ssl_c_*` fetches (the peer's certificate) are not implemented here.
 | **Status** | **measured** 2026-10-19; superseded by 6.22 (T440 ported to the 0.24 dev release). Nothing to file upstream (the change exists); once the port runs on a dev release, report on rustls#3068 or #3127 whether a proxy's steady state has 0 allocations per TLS record. |
 | **Revisit if** | rustls 0.24.0 is released (port, then the TLS keep-alive scenario of the allocation test goes to 0), or the 3 per request show up as a cost in a TLS soak before then. |
 
-Related and shipped (T437 5b): `tune.ibex.zero-buffers` (default on) zeroes the used part of a
-buffer when it is released, so decrypted plaintext does not outlive its owner in the pools. The
+Related and shipped (T437 5b): `tune.ibex.zero-buffers` zeroes the used part of a
+buffer when it is released, so decrypted plaintext does not outlive its owner in the pools.
+Default **off** since S1 (user 2026-10-24: "to keep the benchmarks against haproxy fair ... it
+shows us where the performance gaps are"; HAProxy wipes nothing either; on the rules scenario,
+ab1, off saves ~840 instructions per request). With it off, request and response bytes of the
+plain I/O buffers stay in pooled or freed memory until overwritten. The TLS record buffers
+(`ibex-tls` `conn::wipe_vec`, `transport.rs`) no longer follow it: they are wiped always
+(`ibex_alloc::wipe_always`) until S2 gives them `tune.ibex.ssl-zero-buffers` (default on, 6.27). The
 rustls-owned buffers are not Ibex's to zero; rustls zeroizes its key material (the plaintext it holds internally is the 3-allocation gap above).
 
-### 6.21 Spare strings for the rules (T437) — **accepted for now; T444 bounds and wipes them**
+### 6.21 Spare strings for the rules (T437) — **bounded, counted and given back since S1 (6.28); wiped only with `tune.ibex.zero-spares on`**
 
 The header rules, formats, ACL fetches and `return` replies reuse per-thread strings
 (`ibex_sample::spare`, `ibex_rt::reuse`) instead of allocating each request: a string that leaves
 a header list or a sample goes back to its thread's spares, and the next one takes it with its
 capacity. That is what brings the survey's rules from 65 allocations per request to 0 (and
-`http-request return` from 4 to 0; `crates/ibex-rt/tests/request_allocations.rs`).
+`http-request return` from 4 to 0; `crates/ibex-rt/tests/request_allocations.rs`). Since S1 (as
+fix/t444 did) a new connection's method and URI (`ReqText`) come from the spares too.
 
 | | |
 |---|---|
-| **Cost** | Per thread, up to 512 spare strings of at most 16 KiB each (8 MiB worst case; in practice a few dozen of 64 bytes), plus 16 spare header lists and four scratch buffers. They are never given back to the allocator while the thread lives, and they do not show in `show pools`. |
-| **Security** | A spare is cleared (`String::clear`), not wiped: the bytes of an earlier request's header values or samples stay in its capacity until overwritten. Nothing reads past the length, but a memory disclosure elsewhere would find them. |
-| **Status** | **accepted** until T444 bounds them under the pool accounting and wipes them on release (as `tune.ibex.zero-buffers`, T437 part 5b, does for buffers). |
+| **Bound** | As `HAProxy`'s per-thread hot cache: since S1 the spare strings (`spare_str`), header lists (`spare_list`) and the scratch buffers (`scratch_str`, `scratch_bytes`) are `ibex_alloc::Pool`s, and their footprints together stay under `tune.memory.hot-size` (524288 when unset, parsed as `HAProxy` parses it): past 3/4 of it a pool evicts down while it holds more than its share, past the whole of it the largest pools are evicted across (`pool_put_to_cache` / `pool_evict_from_local_caches`). Also at most 512 strings of 16 KiB and 16 lists. Before S1: 512 × 16 KiB = 8 MiB per thread (`tests/spare_strings.rs` measured 7864320 bytes kept after 600 requests at once; under 524288 now). |
+| **Other caches** | `hot-size` reaches the `Pool`s only. The buffer pools (`buf.rs`) and the session/appctx arenas keep their own count limits until S2-S4 move them onto `Pool`s. |
+| **Shown** | `show pools` lists `spare_str`, `spare_list`, `scratch_str`, `scratch_bytes` from the start (6.28 for how fresh the counts are); the bytes count in `show info`'s pool figures. |
+| **Security** | `tune.ibex.zero-spares on` wipes a string's used bytes (each string's, for a list) when it is given back, whether it is kept or freed (`ibex_alloc::wipe_string`). **Default off** (user 2026-10-24: "it's one thing to wipe security-sensitive buffers, it's quite another for every request"; off keeps the comparison with HAProxy fair). With it off, header values (cookies, `Authorization`) and samples of an earlier request stay in a spare's capacity, or in freed memory, until reused or overwritten. Nothing reads past the length, but a memory disclosure elsewhere would find them. HAProxy does not wipe its pools either (`-dM` poisoning is a debug option). It costs ~1k instructions per request on the rules scenario (ab1), about 65 strings given back per request. |
+| **Given back** | `pool_gc` (T445) empties the thread's pools (`ibex_alloc::drain_local_pools`) along with the other caches. |
 
 ### 6.22 TCP TLS runs on a pre-release rustls, `=0.24.0-dev.2` (T440)
 
@@ -647,9 +656,24 @@ without an answer, logged with termination state `I` and its phase, and counted 
 | | |
 |---|---|
 | **What** | `ring` 0.17.14 (the crypto provider behind rustls for TLS over TCP and QUIC) frees its key material without wiping it. Its own comments say so: `src/agreement.rs` and `src/ec/suite_b/ecdh.rs`, at the ECDH shared secret, "a pretty liberal interpretation of the NIST's spec's 'Destroy' that doesn't meet the NSA requirement to 'zeroize'". Private keys, AEAD keys and the key-exchange shared secret can stay in freed memory until it is reused. |
-| **What is wiped** | rustls 0.24.0-dev.2 wipes its own secrets on drop with `zeroize`: the TLS 1.3 key schedule (`crypto/tls13.rs`), HMAC/HKDF buffers (`crypto/hmac.rs`), cipher key buffers (`crypto/cipher/mod.rs`), HPKE secrets. Since T440 the TLS record buffers (plaintext and ciphertext) are Ibex's own (`ibex-tls/src/conn.rs`), wiped by `wipe_vec` under the wipe setting: `tune.ibex.ssl-zero-buffers`, default **on** (user 2026-10-24: "tls keys are a real target. crypto buffers should be zeroed"), once S2 of `docs/design/memory-2026-10-24.md` splits it off. |
+| **What is wiped** | rustls 0.24.0-dev.2 wipes its own secrets on drop with `zeroize`: the TLS 1.3 key schedule (`crypto/tls13.rs`), HMAC/HKDF buffers (`crypto/hmac.rs`), cipher key buffers (`crypto/cipher/mod.rs`), HPKE secrets. Since T440 the TLS record buffers (plaintext and ciphertext) are Ibex's own (`ibex-tls/src/conn.rs`), wiped by `wipe_vec`: always since S1 (which made `tune.ibex.zero-buffers`, the plain I/O buffers' setting, default off), then under `tune.ibex.ssl-zero-buffers`, default **on** (user 2026-10-24: "tls keys are a real target. crypto buffers should be zeroed"), once S2 of `docs/design/memory-2026-10-24.md` splits it off. |
 | **Differs from HAProxy** | OpenSSL clears key material with `OPENSSL_cleanse` when it frees it. |
 | **Cost** | A memory disclosure (a core dump, a swapped page, a later read of freed memory by another bug) can expose keys that OpenSSL would have wiped. Rust's memory safety makes the "later read" path much less likely than in C, but core dumps and swap remain. |
 | **Mitigations today** | Disable core dumps for the service (`LimitCORE=0`), no swap or encrypted swap. These are ops settings, not Ibex code. |
 | **Plan** | Patch ring (or the rustls provider) to zeroize key material on drop: the ECDH/X25519 private and shared values, the AEAD key schedules, the RSA/ECDSA private keys. Ask upstream first whether such a patch would be taken; otherwise carry it as a vendored patch, or evaluate another memory-safe provider that wipes. aws-lc-rs stays excluded (C, see the memory-safety rule). |
 | **Status** | A choice since T460: `tune.ibex.crypto-provider ring-ibex` runs TLS over TCP on the vendored fork (`vendor/ringibex`, feature `zeroize`; ring-ibex 237a254). It wipes the ephemeral and shared ECDH/X25519 secrets, the AES/ChaCha/GHASH/Poly1305 key schedules, the HMAC/HKDF and digest states, the Ed25519 key pair, the ECDSA seed and the RSA private primes and exponents (inventory: `vendor/ringibex/ZEROIZE.md`). Not wiped even there: stack copies left by moves, registers, asm temporaries, the ECDSA per-signature nonce, the affine coordinates of the ECDH point (TODO in ZEROIZE.md). `ring` (vanilla upstream) wipes none of it and stays the **default**: operators are right to be wary of a forked crypto library, and an upstream ring fix reaches Ibex by a `cargo update`, a fork fix only by our re-vendoring. QUIC, log-forward TLS binds and ring TLS servers are on rustls 0.23 and refuse `ring-ibex`, so they keep vanilla ring's behaviour. |
+
+### 6.28 One pool type, `ibex_alloc::Pool` (S1 of `docs/design/memory-2026-10-24.md`) — **measured 2026-10-24**
+
+The spare strings and lists and the scratch buffers (6.21) are the first caches on
+`ibex_alloc::Pool<T>` (`declare_pool!`): a per-thread stack per pool, one per-thread byte budget
+across pools (`tune.memory.hot-size`), HAProxy's 3/4 and 7/8 eviction with per-pool floors, and a
+registry `show pools` and `pool_gc` walk. Where it differs from the design (§3) and from HAProxy:
+
+| | |
+|---|---|
+| **`show pools` staleness** | Accepted (user 2026-10-24). A thread publishes its counts from its loop pass at most every 10 ms (`PUBLISH_EVERY` in `pool.rs`), not on each take or give: publishing every pass cost ~300 instructions per request on the rules scenario (ab1, one request per pass), and the fast path writes nothing another thread reads (AGENTS.md §8). So `show pools` can lag a busy thread by up to 10 ms (an idle one by up to its poll timeout); the thread that runs `show pools` and `pool_gc` publishes its own counts first. HAProxy's per-thread cache counts are approximate too (`pool_cache_count` summed without locks, `needed_avg` a moving average). |
+| **Counts** | `allocated` is what the threads cache plus the `PoolBox`es alive, all counted thread-locally; an object taken with `take_raw` (a spare string that becomes a sample) leaves the accounting until it is given back. Only `.limited()` pools keep a shared `grown` counter, for `tune.buffers.limit`. Per-pool bytes are summed over the items when published or evicted, not kept on the fast path. `needed_avg` is 0. |
+| **Eviction** | One object at a time, newest first (the stack's top), largest pool first across pools; HAProxy evicts clusters of 8, oldest first, from a per-thread LRU across pools. Floor objects (`minavail`) are kept whatever `hot-size` is and do not count against it. |
+| **Limits** | 64 pools, 256 thread slots (+1 shared overflow slot) for `show pools`. Pools register on first use, or at start for the ones `show pools` must list from the start. |
+| **Wipe** | Per pool, from the thread's copy of the settings refreshed once per loop pass: the spare and scratch pools follow `tune.ibex.zero-spares` (default off, 6.21), any other pool `tune.ibex.zero-buffers` (default off, 6.20's note). |

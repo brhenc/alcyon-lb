@@ -212,7 +212,9 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
     // is derived from the stream's target now: 5 allocs, 170 bytes. Pinned there.
     // 2026-10-18 (Z2): the `Box<H1Parser>` made per request head (56 bytes) is a value on the
     // stack now: 4 allocs, 114 bytes.
-    let max_allowed_allocs: usize = 4;
+    // 2026-10-24 (S1, as fix/t444): the method and URI (`ReqText`, 3 + 9 bytes) of a new
+    // connection come from the spare strings the last connection gave back: 2 allocs, 102 bytes.
+    let max_allowed_allocs: usize = 2;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
         "a steady state HTTP request allocated {} times (> {}); diff: {:?}",
@@ -220,7 +222,7 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
         max_allowed_allocs,
         diff
     );
-    let max_allowed_bytes: usize = 114;
+    let max_allowed_bytes: usize = 102;
     assert!(
         diff.bytes_allocated <= max_allowed_bytes,
         "a steady state HTTP request allocated {} bytes (> {}); diff: {:?}",

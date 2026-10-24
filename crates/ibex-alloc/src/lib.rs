@@ -7,9 +7,15 @@
 //! - [`CountingAllocator`]: A global allocator wrapping [`std::alloc::System`] that
 //!   tracks allocations, reallocations, frees, and byte volumes for regression pinning.
 //! - [`alloc_counters`]: Snapshots allocation counters before and after request processing.
-//! - [`Pool`]: Fixed-size object pools with free lists based on index handles (derived from
-//!   `ebtree`'s index arena precedent) under `#![forbid(unsafe_code)]`.
+//! - [`Pool`] ([`pool`]): the one per-thread object cache, with one byte budget per thread
+//!   (`tune.memory.hot-size`), declared with [`declare_pool!`] (`docs/design/memory-2026-10-24.md`).
 //! - [`PoolRegistry`]: Registry for pool tracking and `HAProxy`-compatible `show pools` CLI dumps.
+
+pub mod pool;
+pub use pool::{
+    drain_local_pools, for_each_pool, hot_size, local_hot_bytes, set_hot_size, Pool, PoolBox, PoolDyn, PoolSpec, Poolable,
+    HOT_SIZE_DEFAULT,
+};
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write;
@@ -187,6 +193,16 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if layout.size() == WATCH_SIZE.load(Ordering::Relaxed) && layout.size() != 0 {
+            WATCH_SIZE.store(0, Ordering::Relaxed);
+            let n = layout.size().min(WATCH_LEN);
+            // SAFETY: `ptr` is a live block of `layout.size()` bytes until `System.dealloc` below.
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
+            for (slot, &b) in WATCHED.iter().zip(bytes) {
+                slot.store(b, Ordering::Relaxed);
+            }
+            WATCHED_LEN.store(n, Ordering::Release);
+        }
         System.dealloc(ptr, layout);
         let sz = layout.size();
         self.deallocs.fetch_add(1, Ordering::SeqCst);
@@ -221,6 +237,27 @@ unsafe impl GlobalAlloc for CountingAllocator {
         }
         new_ptr
     }
+}
+
+/// How many leading bytes of a watched block [`CountingAllocator`] copies when it is freed.
+const WATCH_LEN: usize = 64;
+static WATCH_SIZE: AtomicUsize = AtomicUsize::new(0);
+static WATCHED_LEN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static WATCHED: [core::sync::atomic::AtomicU8; WATCH_LEN] = [const { core::sync::atomic::AtomicU8::new(0) }; WATCH_LEN];
+
+/// For a test that installs [`CountingAllocator`]: the next block of exactly `size` bytes
+/// freed has its first bytes kept for [`freed_bytes`], so the test can see what a released
+/// object left in memory without reading freed memory itself (the wipe of a pooled string).
+pub fn watch_freed(size: usize) {
+    WATCHED_LEN.store(usize::MAX, Ordering::Release);
+    WATCH_SIZE.store(size, Ordering::Relaxed);
+}
+
+/// The first bytes (at most 64) of the block [`watch_freed`] waited for, once it was freed.
+#[must_use]
+pub fn freed_bytes() -> Option<Vec<u8>> {
+    let n = WATCHED_LEN.load(Ordering::Acquire);
+    (n != usize::MAX).then(|| WATCHED[..n].iter().map(|b| b.load(Ordering::Relaxed)).collect())
 }
 
 /// Takes a snapshot of the global allocation counters.
@@ -338,13 +375,24 @@ impl PoolRegistry {
     /// Calls `f` with the stats of every registered provider, without allocating (the
     /// Prometheus render must not).
     pub fn for_each(&self, mut f: impl FnMut(&PoolHead)) {
-        // A poisoned lock still holds a valid list: the stats are read, not the list changed.
-        let list = self.providers.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (_, provider) in list.iter() {
-            if let Some(p) = provider() {
-                f(&p);
+        {
+            // A poisoned lock still holds a valid list: the stats are read, not the list changed.
+            let list = self.providers.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (_, provider) in list.iter() {
+                if let Some(p) = provider() {
+                    f(&p);
+                }
             }
         }
+        if self.is_global() {
+            pool::publish_local();
+            pool::for_each_pool(|p| f(&p.head()));
+        }
+    }
+
+    /// The process's registry also lists every [`declare_pool!`] pool used so far.
+    fn is_global(&self) -> bool {
+        std::ptr::eq(self, &GLOBAL_REGISTRY)
     }
 
     /// Sum of the `failures` counters of every registered provider (`pool_total_failures()`,
@@ -403,6 +451,10 @@ impl PoolRegistry {
             .map(|list| list.iter().map(|(_, f)| *f).collect())
             .unwrap_or_default();
         let mut pools: Vec<PoolHead> = providers.into_iter().filter_map(|f| f()).collect();
+        if self.is_global() {
+            pool::publish_local();
+            pool::for_each_pool(|p| pools.push(p.head()));
+        }
         pools.retain(|p| !(by == 3 && p.allocated == 0) && prefix.is_none_or(|x| p.name.starts_with(x)));
         match by {
             1 => pools.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes())),
@@ -615,13 +667,32 @@ mod tests {
 
 static TRIM_DISABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// `tune.ibex.zero-buffers` (default on): whether a buffer given back to its pool, or dropped,
+/// `tune.ibex.zero-buffers` (default off): whether a buffer given back to its pool, or dropped,
 /// is overwritten with zeros first. Set from the configuration each time an engine is built.
-static ZERO_BUFFERS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+static ZERO_BUFFERS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `tune.ibex.zero-spares` (default off): whether a spare string or list given back to its
+/// pool (`ibex_sample::spare`, `ibex_rt::reuse`) is overwritten with zeros first. Read by the
+/// pools through their thread copy (`pool::HOT`), refreshed once per loop pass.
+static ZERO_SPARES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Sets `tune.ibex.zero-spares`.
+pub fn set_zero_spares(on: bool) {
+    ZERO_SPARES.store(on, core::sync::atomic::Ordering::Relaxed);
+    pool::settings_changed();
+}
+
+/// Whether spare strings and lists are zeroed when given back (`tune.ibex.zero-spares`).
+#[must_use]
+pub fn zero_spares() -> bool {
+    ZERO_SPARES.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Sets `tune.ibex.zero-buffers`.
 pub fn set_zero_buffers(on: bool) {
     ZERO_BUFFERS.store(on, core::sync::atomic::Ordering::Relaxed);
+    // The pools' copy (`pool::HOT`): this thread now, the others at their next loop pass.
+    pool::settings_changed();
 }
 
 /// Whether released buffers are zeroed (`tune.ibex.zero-buffers`).
@@ -642,6 +713,14 @@ pub fn wipe(bytes: &mut [u8]) {
     }
 }
 
+/// Overwrites `bytes` with zeros like [`wipe`], whatever `tune.ibex.zero-buffers` says. For
+/// the TLS record buffers (`ibex-tls`), which are wiped always until they get their own
+/// setting (`tune.ibex.ssl-zero-buffers`, S2).
+#[inline(never)]
+pub fn wipe_always(bytes: &mut [u8]) {
+    zeroize::Zeroize::zeroize(bytes);
+}
+
 /// [`wipe`] for a whole `Vec`: its bytes and its spare capacity, which holds what earlier
 /// contents left (a cleared `Vec` keeps them), then empties it. For a cache dropping what it
 /// held (`pool_gc`, T445).
@@ -650,6 +729,45 @@ pub fn wipe_vec(v: &mut Vec<u8>) {
         zeroize::Zeroize::zeroize(v);
     }
     v.clear();
+}
+
+/// Zeroes a pooled string's used bytes and empties it, keeping its capacity, whatever the
+/// setting (the pool decided from its thread's copy of `tune.ibex.zero-buffers`).
+///
+/// The used bytes are overwritten by copying zero bytes over them (a `memcpy`, safe: NUL is
+/// valid UTF-8 and the capacity is already there), not with `zeroize`'s byte-at-a-time
+/// volatile stores: the pools wipe every string they are given (about 65 per request on the
+/// rules scenario), and the volatile loop cost ~3 instructions a byte. The stores cannot be
+/// dropped as dead: the bytes are handed to `black_box` (an opaque read) before the string is
+/// kept or freed.
+#[inline(never)]
+pub fn wipe_string(s: &mut String) {
+    const ZEROS: &str = match std::str::from_utf8(&[0u8; 512]) {
+        Ok(z) => z,
+        Err(_) => "",
+    };
+    let mut n = s.len();
+    if n <= 16 {
+        // Short (most header values and samples): `zeroize`'s loop is cheaper than a call.
+        zeroize::Zeroize::zeroize(s.as_mut_str());
+        s.clear();
+        return;
+    }
+    s.clear();
+    while n > 0 {
+        let k = n.min(ZEROS.len());
+        s.push_str(&ZEROS[..k]);
+        n -= k;
+    }
+    std::hint::black_box(s.as_str());
+    s.clear();
+}
+
+/// [`wipe_string`] for a pooled byte buffer's used bytes (`0..len`).
+#[inline(never)]
+pub fn wipe_bytes(v: &mut [u8]) {
+    v.fill(0);
+    std::hint::black_box(&mut *v);
 }
 
 /// `global no-memory-trimming`: when set, [`trim_heap`] does nothing. Set from the

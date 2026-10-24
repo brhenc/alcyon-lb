@@ -4491,7 +4491,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         HTTP_ERR_CODES.set(config.global.as_ref().and_then(|g| g.http_err_codes).unwrap_or_else(ibex_config::StatusCodeSet::default_err));
         HTTP_FAIL_CODES.set(config.global.as_ref().and_then(|g| g.http_fail_codes).unwrap_or_else(ibex_config::StatusCodeSet::default_fail));
         ibex_alloc::set_trim_disabled(config.global.as_ref().is_some_and(|g| g.no_memory_trimming));
-        ibex_alloc::set_zero_buffers(config.global.as_ref().and_then(|g| g.zero_buffers).unwrap_or(true));
+        // Both off unless configured (the user, 2026-10-24: comparisons with HAProxy stay fair).
+        ibex_alloc::set_zero_buffers(config.global.as_ref().and_then(|g| g.zero_buffers).unwrap_or(false));
+        ibex_alloc::set_zero_spares(config.global.as_ref().and_then(|g| g.zero_spares).unwrap_or(false));
+        ibex_alloc::set_hot_size(config.global.as_ref().and_then(|g| g.hot_size).unwrap_or(ibex_alloc::HOT_SIZE_DEFAULT));
         // A variable whose memory is refused collects and retries once (T445).
         ibex_sample::vars::set_alloc_failure_hook(crate::pool_gc::pool_gc);
         let bufsize = config.global.as_ref().and_then(|g| g.bufsize).unwrap_or(16384);
@@ -5215,6 +5218,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 self.h2_spawn_scratch = Vec::new();
             }
         }
+        // The pools' per-pass work: this thread's settings copy and its `show pools` counts.
+        ibex_alloc::pool::pass(now_inst);
         let poll_timeout = self
             .idle_backend_pool
             .next_purge()

@@ -9,47 +9,35 @@
 //! steady stream of requests through the same rules allocates nothing. The strings are the
 //! sample engine's spares ([`ibex_sample::spare`], bounded), shared with the fetches.
 //!
-//! The scratch buffers ([`with_string`], [`with_bytes`]) are taken out of their slot for
-//! the call and put back after it, so a call made while one is out (a format rendered
-//! while a reply is built) gets a fresh one instead of a borrow error.
+//! The scratch buffers ([`with_string`], [`with_bytes`]) are taken from their pool for the
+//! call and given back after it (cleared, and wiped under `tune.ibex.zero-spares`), so a call
+//! made while one is out (a format rendered while a reply is built) gets another one instead
+//! of a borrow error. All of it is `ibex_alloc::Pool`s (`show pools` `spare_str`, `spare_list`,
+//! `scratch_str`, `scratch_bytes`), emptied by `pool_gc`'s walk of the thread's pools.
 
-use std::cell::{Cell, RefCell};
+use ibex_alloc::{declare_pool, PoolSpec};
 
-thread_local! {
-    static STR_SLOT: Cell<Option<String>> = const { Cell::new(None) };
-    static STR_SLOT2: Cell<Option<String>> = const { Cell::new(None) };
-    static BYTES_SLOT: Cell<Option<Vec<u8>>> = const { Cell::new(None) };
-    static BYTES_SLOT2: Cell<Option<Vec<u8>>> = const { Cell::new(None) };
-    static SPARE_LISTS: RefCell<Vec<Vec<(String, String)>>> = const { RefCell::new(Vec::new()) };
-}
+/// Calls nest a few deep at most (a format inside a reply inside a rule).
+const SCRATCH_MAX: usize = 4;
 
-/// `pool_gc` (T445): frees this thread's scratch strings and byte buffers (wiped first: they
-/// held request data) and its spare header lists (their strings go back to the spare
-/// strings, which the caller drains after this).
-#[must_use]
-pub fn drain_thread_spares() -> usize {
-    let mut n = 0;
-    for slot in [&STR_SLOT, &STR_SLOT2] {
-        if let Ok(Some(s)) = slot.try_with(Cell::take) {
-            ibex_alloc::wipe_vec(&mut s.into_bytes());
-            n += 1;
-        }
-    }
-    for slot in [&BYTES_SLOT, &BYTES_SLOT2] {
-        if let Ok(Some(mut b)) = slot.try_with(Cell::take) {
-            ibex_alloc::wipe_vec(&mut b);
-            n += 1;
-        }
-    }
-    let lists = SPARE_LISTS.try_with(|l| l.try_borrow_mut().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default()).unwrap_or_default();
-    n += lists.len();
-    for mut l in lists {
-        clear_pairs(&mut l);
-    }
-    n
-}
+declare_pool!(
+    /// `show pools` `scratch_str`: what [`with_string`] lends. Kept up to `tune.memory.hot-size`.
+    static SCRATCH_STR: Pool<String> = PoolSpec::new("scratch_str").max_count(SCRATCH_MAX).spares();
+);
+
+declare_pool!(
+    /// `show pools` `scratch_bytes`: what [`with_bytes`] lends.
+    static SCRATCH_BYTES: Pool<Vec<u8>> = PoolSpec::new("scratch_bytes").max_count(SCRATCH_MAX).spares();
+);
 
 pub use ibex_sample::spare::{give, string, string_from};
+
+/// Lists this module's pools (and the spare strings and lists) in `show pools` from the start.
+pub fn register_pools() {
+    ibex_sample::spare::register_pools();
+    SCRATCH_STR.register();
+    SCRATCH_BYTES.register();
+}
 
 /// Empties `v`, its strings given back; `v` keeps its capacity.
 pub fn clear_pairs(v: &mut Vec<(String, String)>) {
@@ -140,14 +128,11 @@ impl Drop for PString {
 #[derive(Debug, Default)]
 pub struct PPairs(Vec<(String, String)>);
 
-/// The spare lists kept per thread.
-const SPARE_LISTS_MAX: usize = 16;
-
 impl PPairs {
     /// An empty list, a spare one when there is one.
     #[must_use]
     pub fn new() -> Self {
-        PPairs(SPARE_LISTS.with(|s| s.borrow_mut().pop()).unwrap_or_default())
+        PPairs(ibex_sample::spare::list())
     }
 }
 
@@ -174,45 +159,61 @@ impl<'a> IntoIterator for &'a PPairs {
 
 impl Drop for PPairs {
     fn drop(&mut self) {
-        let mut v = std::mem::take(&mut self.0);
-        clear_pairs(&mut v);
-        if v.capacity() > 0 && v.capacity() <= 1024 {
-            SPARE_LISTS.with(|s| {
-                let mut s = s.borrow_mut();
-                if s.len() < SPARE_LISTS_MAX {
-                    s.push(v);
-                }
-            });
-        }
+        ibex_sample::spare::give_list(std::mem::take(&mut self.0));
     }
 }
 
-fn with_slot<T: Default, R>(slot: &'static std::thread::LocalKey<Cell<Option<T>>>, f: impl FnOnce(&mut T) -> R, clear: fn(&mut T)) -> R {
-    let mut buf = slot.with(Cell::take).unwrap_or_default();
-    clear(&mut buf);
-    let r = f(&mut buf);
-    slot.with(|s| s.set(Some(buf)));
-    r
+/// Runs `f` with an empty object of `pool`, given back after.
+/// Takes a scratch string from its pool, else a new empty one (and the same for bytes below). Not inlined, nor are the gives:
+/// each is instantiated once per pool with the pool a known static, so the pool's take and give
+/// are inlined with its thread-local cache reached directly. Generic code holding the pool as
+/// a value (a `with_pooled(pool, f)` inlined into each caller) reached the cache through an
+/// outlined call and read the pool's limits from memory: ~200 instructions per request on the
+/// rules scenario (ab1) for its two `with_string`s.
+#[inline(never)]
+fn take_str() -> String {
+    SCRATCH_STR.take_raw(|| Some(String::new())).unwrap_or_default()
+}
+
+#[inline(never)]
+fn give_str(s: String) {
+    SCRATCH_STR.give(s);
+}
+
+#[inline(never)]
+fn take_bytes() -> Vec<u8> {
+    SCRATCH_BYTES.take_raw(|| Some(Vec::new())).unwrap_or_default()
+}
+
+#[inline(never)]
+fn give_bytes(v: Vec<u8>) {
+    SCRATCH_BYTES.give(v);
 }
 
 /// Runs `f` with an empty per-thread string, kept for the next call.
 pub fn with_string<R>(f: impl FnOnce(&mut String) -> R) -> R {
-    with_slot(&STR_SLOT, f, String::clear)
+    let mut s = take_str();
+    let r = f(&mut s);
+    give_str(s);
+    r
 }
 
 /// A second [`with_string`], for a call that needs two at once.
 pub fn with_string2<R>(f: impl FnOnce(&mut String) -> R) -> R {
-    with_slot(&STR_SLOT2, f, String::clear)
+    with_string(f)
 }
 
 /// Runs `f` with an empty per-thread byte buffer, kept for the next call.
 pub fn with_bytes<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
-    with_slot(&BYTES_SLOT, f, Vec::clear)
+    let mut v = take_bytes();
+    let r = f(&mut v);
+    give_bytes(v);
+    r
 }
 
 /// A second [`with_bytes`], for a call that needs two at once.
 pub fn with_bytes2<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
-    with_slot(&BYTES_SLOT2, f, Vec::clear)
+    with_bytes(f)
 }
 
 #[cfg(test)]
@@ -267,17 +268,30 @@ mod tests {
     /// A list that never held anything, or one grown past what is kept, is not kept.
     #[test]
     fn an_empty_or_oversized_list_is_not_kept() {
-        while SPARE_LISTS.with(|s| s.borrow_mut().pop()).is_some() {}
+        use ibex_sample::spare::SPARE_LIST;
+        let _ = ibex_alloc::drain_local_pools();
         drop(PPairs::new());
-        assert_eq!(SPARE_LISTS.with(|s| s.borrow().len()), 0);
+        assert_eq!(SPARE_LIST.local_count(), 0);
         let mut big = PPairs::new();
         big.reserve(2000);
         drop(big);
-        assert_eq!(SPARE_LISTS.with(|s| s.borrow().len()), 0);
+        assert_eq!(SPARE_LIST.local_count(), 0);
         let mut one = PPairs::new();
         one.push((string_from("a"), string_from("b")));
         drop(one);
-        assert_eq!(SPARE_LISTS.with(|s| s.borrow().len()), 1);
+        assert_eq!(SPARE_LIST.local_count(), 1);
+    }
+
+    /// The thread's pool walk (`pool_gc`) frees the spares and the scratch buffers.
+    #[test]
+    fn the_pool_walk_frees_the_spares_and_the_scratch_buffers() {
+        give(String::with_capacity(500));
+        with_string(|s| s.reserve_exact(300));
+        with_bytes(|b| b.reserve_exact(200));
+        assert!(SCRATCH_STR.local_count() == 1 && SCRATCH_BYTES.local_count() == 1);
+        assert!(ibex_alloc::drain_local_pools() >= 3);
+        assert_eq!(ibex_alloc::local_hot_bytes(), 0);
+        with_string(|s| assert_eq!(s.capacity(), 0));
     }
 
     /// A scratch taken while another call has it is a fresh one.
