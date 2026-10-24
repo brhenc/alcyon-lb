@@ -10803,14 +10803,13 @@ impl EngineDispatcher<'_> {
         }
     }
 
-    /// Whether a `stats` rule's condition holds for the request (no condition: always). The
-    /// condition sees the request line, headers and addresses of the stream.
-    fn stats_cond_holds(sess: &crate::proxy::TcpSession, proxies: &Proxies, serving: usize, cond: Option<&ibex_config::AclCondition>) -> bool {
-        let registry = sample_registry();
+    /// What a `stats` rule's condition and its `http-error` template see of the stream: the
+    /// request line, headers, addresses, and the proxy as frontend and backend.
+    fn stats_ctx<'a>(sess: &'a crate::proxy::TcpSession, view: &'a ProxiesView<'a>, serving: usize) -> SampleContext<'a> {
+        let proxies = view.0;
         let name = proxies[serving].name.as_str();
-        let Some(cond) = cond else { return true };
-        let ctx = SampleContext {
-            proxies: Some(&ProxiesView(proxies)),
+        SampleContext {
+            proxies: Some(view),
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
             fc_src: sess.fc_src,
@@ -10825,9 +10824,20 @@ impl EngineDispatcher<'_> {
             req_headers: sess.req_headers.as_deref(),
             fe_name: Some(name),
             fe_id: Some(proxies[serving].ids.iid),
+            be_name: Some(name),
+            be_id: Some(proxies[serving].ids.iid),
             acls: Some(&proxies[serving].acls),
             ..Default::default()
-        };
+        }
+    }
+
+    /// Whether a `stats` rule's condition holds for the request (no condition: always). The
+    /// condition sees the request line, headers and addresses of the stream.
+    fn stats_cond_holds(sess: &crate::proxy::TcpSession, proxies: &Proxies, serving: usize, cond: Option<&ibex_config::AclCondition>) -> bool {
+        let registry = sample_registry();
+        let Some(cond) = cond else { return true };
+        let view = ProxiesView(proxies);
+        let ctx = Self::stats_ctx(sess, &view, serving);
         eval_condition(cond, &ctx, &proxies[serving].acls, registry)
     }
 
@@ -10858,9 +10868,9 @@ impl EngineDispatcher<'_> {
             };
             let mut resp: Vec<u8> = match resolve_error_body(&proxies[serving], &proxies[serving], status, Some(&ibex_config::ErrorPageSource::DefaultErrorfiles), None, None) {
                 ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
-                // An `http-error` template: its text does not look at the request here.
+                // An `http-error` template, rendered for the stream (T450).
                 ResolvedErrorBody::Custom { content_type, lf_string } => {
-                    build_templated_error_response(status, content_type, lf_string, &SampleContext::default(), registry)
+                    build_templated_error_response(status, content_type, lf_string, &Self::stats_ctx(sess, &ProxiesView(proxies), serving), registry)
                 }
             };
             if let Some(realm) = realm {
@@ -13175,6 +13185,41 @@ fn push_sample(out: &mut String, smp: &Sample, push: &dyn Fn(&mut String, &str))
     }
 }
 
+/// The alias `%<name>` of a format rendered without the access log's data, from what the
+/// stream gives `ctx`: its addresses and the names of its proxies and server. An address the
+/// stream has no connection for prints nothing (measured on `HAProxy` 3.5-dev8). An alias
+/// with nothing here to read stays text.
+fn push_alias(out: &mut String, name: &str, ctx: &SampleContext, push: &dyn Fn(&mut String, &str)) {
+    use std::fmt::Write as _;
+    let addr = |out: &mut String, a: Option<SocketAddr>| {
+        if let Some(a) = a {
+            let _ = write!(out, "{}", a.ip());
+        }
+    };
+    let port = |out: &mut String, a: Option<SocketAddr>| {
+        if let Some(a) = a {
+            let _ = write!(out, "{}", a.port());
+        }
+    };
+    match name {
+        "ci" => addr(out, ctx.client_addr),
+        "cp" => port(out, ctx.client_addr),
+        "fi" => addr(out, ctx.server_addr),
+        "fp" => port(out, ctx.server_addr),
+        "si" => addr(out, ctx.bc_dst),
+        "sp" => port(out, ctx.bc_dst),
+        "f" => push(out, ctx.fe_name.unwrap_or_default()),
+        // Until a backend is chosen the stream's backend is its frontend (`s->be`).
+        "b" => push(out, ctx.be_name.or(ctx.fe_name).unwrap_or_default()),
+        "s" => push(out, ctx.srv_name.unwrap_or("<NOSRV>")),
+        "Tr" => out.push_str("0ms"),
+        _ => {
+            out.push('%');
+            out.push_str(name);
+        }
+    }
+}
+
 fn render_sample_format_into(out: &mut String, fmt: &str, ctx: &SampleContext, registry: &Registry, http: bool) {
     let push = |out: &mut String, v: &str| if http { push_http_encoded(out, v) } else { out.push_str(v) };
     let mut chars = fmt.char_indices().peekable();
@@ -13205,28 +13250,18 @@ fn render_sample_format_into(out: &mut String, fmt: &str, ctx: &SampleContext, r
                         ibex_sample::spare::give_sample(smp);
                     }
                 }
-            } else if chars.peek().map(|p| p.1) == Some('c') {
-                chars.next();
-                if chars.peek().map(|p| p.1) == Some('i') {
-                    chars.next();
-                    match ctx.client_addr {
-                        Some(a) => {
-                            use std::fmt::Write as _;
-                            let _ = write!(out, "{}", a.ip());
-                        }
-                        None => out.push_str("127.0.0.1"),
+            } else if chars.peek().is_some_and(|p| p.1.is_ascii_alphanumeric()) {
+                // An alias: the name is the letters and digits that follow (`parse_logformat_string`).
+                let start = chars.peek().map_or(fmt.len(), |p| p.0);
+                let mut end = fmt.len();
+                while let Some(&(i, ac)) = chars.peek() {
+                    if !ac.is_ascii_alphanumeric() {
+                        end = i;
+                        break;
                     }
-                } else {
-                    out.push_str("%c");
-                }
-            } else if chars.peek().map(|p| p.1) == Some('T') {
-                chars.next();
-                if chars.peek().map(|p| p.1) == Some('r') {
                     chars.next();
-                    out.push_str("0ms");
-                } else {
-                    out.push_str("%T");
                 }
+                push_alias(out, &fmt[start..end], ctx, &push);
             } else if chars.peek().map(|p| p.1) == Some('%') {
                 chars.next();
                 out.push('%');
