@@ -136,6 +136,15 @@ one expensive computation is one unit of its budget.
 | **Status** | **reasoned** |
 | **Revisit if** | A must-have feature genuinely cannot be expressed in provider-neutral terms. Widening the trait is the correct response; reintroducing the escape hatch is not |
 
+### 3.4 `pool_gc`: caches emptied per thread, and almost no allocation failure to retry (T445)
+
+| | |
+|---|---|
+| **Gained** | `ibex_rt::pool_gc` runs where `HAProxy`'s does: SIGQUIT (the process goes on), SIGTTOU, SIGUSR1, the stop path after a stick-table purge, and a refused allocation. No thread is stopped: each worker empties its own `thread_local!` caches at its next loop pass (at most 100 ms later), where `HAProxy`'s `thread_isolate` stops them all. Ibex empties its caches completely: after a burst of 500 connections on 4 threads, SIGQUIT takes `show pools` `buffer` from 256 allocated (all cached) to 0, RSS 26.4 to 24.4 MB. `HAProxy`'s `pool_gc` frees only the shared free lists, not its per-thread caches: its counts stay at 112 allocated (~93 cached) and RSS goes 93.7 to 91.1 MB, the `malloc_trim` alone |
+| **Gave up** | **Retry after collection exists only where the failure is seen.** Rust's global allocator aborts the process when an allocation fails; nothing in rustls, ring, the H2 or HTX code, or `Vec::push` returns the failure. The one recoverable site is a variable's memory (`ibex_sample::vars::reserve_more`, `try_reserve`): it collects and retries once, as `ssl_sock.c:6074` retries `SSL_new`. `HAProxy` retries `SSL_new`/`BIO_new` and its pools count `failures`; Ibex has neither, and its `failures` column stays 0. **`-m` is not an rlimit**: `HAProxy` sets `RLIMIT_DATA`/`RLIMIT_AS` so its allocations really fail and `pool_gc` can save one; Ibex's `-m` only sizes `maxconn` (`engine::apply_memmax`), so a burst past it is refused at accept, never at allocation, and an operator's `ulimit -v` makes Ibex abort where `HAProxy` would collect and go on |
+| **Status** | **measured** — `show pools` and RSS before and after each signal on both (`tests/it/pool_gc_signals.rs` header) |
+| **Revisit if** | Fallible allocation on the request path (T448: buffers that can fail and a wait queue): every new fallible site calls `pool_gc()` once before it gives up |
+
 ---
 
 ## 4. Scope
@@ -595,6 +604,17 @@ capacity. That is what brings the survey's rules from 65 allocations per request
 | **What would close it** | Upstream: a stable unwinding OOM hook or `-C oom=panic`, plus a per-stream `catch_unwind` in the loop. Ibex has no `catch_unwind` outside tests, so that would be new work: each stream's step would need to be unwind-safe and the stream torn down cleanly. Before upstream moves, Ibex's own large or per-connection allocations can be made fallible with stable `try_reserve`. That covers the shrink copy in `trim_tail` (on `Err`, keep the old buffer: done in T453, `engine::move_to_fresh`), the buffer pool (`alloc_standard`/`small`/`large`: refuse or queue the stream, T372 Q3), and arena growth on accept. Allocations inside rustls, h2 and std stay infallible. |
 | **Status** | Open. Not implemented here; the `try_reserve` work is a separate task. |
 
+### 6.24 HTTP/2 field bytes that are not UTF-8, and a trailer refused before the server is reached (T451)
+
+| | |
+|---|---|
+| **What changed** | HPACK strings are octets. Ibex keeps decoded fields as UTF-8 text (`DecodedFields`, `H2ReqHead`, the rules), so `hpack::push_as_text` decodes each byte that is not UTF-8 as a NUL: the block is decoded whole (the dynamic table stays the client's, sizes included) and the field checks refuse the field with `RST_STREAM` PROTOCOL_ERROR on that stream alone. It was a GOAWAY COMPRESSION_ERROR that closed every stream of the connection. For a **name** this is what HAProxy 3.5-dev8 does (measured: RST 1, the next stream answered). For a **value or `:path`** HAProxy forwards the byte as it is (measured: `x-a: \xe9`, `GET /a\xe9b`); Ibex resets the stream. Valid UTF-8 (`é` as `C3 A9`) is forwarded byte for byte, as HAProxy does. QPACK (HTTP/3) still refuses such a string as a decompression failure. |
+| **Also** | A request whose trailers are refused: HAProxy forwards the head and body, then resets the stream, the last chunk never sent (measured). Ibex resets the stream the same way and never sends the last chunk, but when the trailers arrive before the server connection is made it forwards nothing at all. Forwarding a request already known to be malformed would only be for parity; the server sees an unfinished request either way. |
+| **Cost** | A client that sends Latin-1 (or other non-UTF-8) bytes in an HTTP/2 header value or path gets its stream reset where HAProxy forwards it. HTTP/1 is not affected. |
+| **Why that is acceptable** | RFC 9110 section 5.5 makes such bytes obs-text, which a recipient may refuse; clients that send them are rare. Carrying fields as bytes would change every type from the decoder to the rules. |
+| **Status** | Open. |
+| **Revisit** | When the request head is carried as bytes end to end. |
+
 ### 6.25 `-m <megs>` sizes `maxconn` but sets no rlimit (T453) — **measured 2026-10-24 on 3.5-dev8; change when T448 (fallible pools) has merged**
 
 | | |
@@ -603,3 +623,20 @@ capacity. That is what brings the survey's rules from 65 allocations per request
 | **Ibex today** | `-m N` is recorded for `show info` (`Memmax_MB`) and sizes `maxconn` the same way (`engine::apply_memmax`, called from `bin/ibex.rs` step 10); **no rlimit is set**. `ibex -m 64` therefore never sees a failed allocation, and an operator who expects a memory cap gets none. `-h` says so. |
 | **Why** | Most Ibex allocations are infallible: a failed one aborts the process (6.23), where HAProxy's pools fail one stream. Setting `RLIMIT_DATA` now would only make Ibex abort sooner, at the operator's cap instead of the system's. |
 | **Condition for changing** | T448 (fallible pools: buffers and arenas that return `Err` and fail or queue the stream) merged. Then `-m` sets `RLIMIT_DATA` as HAProxy does, with a test that reads `/proc/<pid>/limits` and one that fills the cap and checks the process lives. |
+
+### 6.26 A panic in a stream's run closes that stream, not the process (T447) — **measured 2026-10-24**
+
+`EngineDispatcher::run_task` runs each stream task under `crash::contain` (`catch_unwind`). A
+panic there is reported (the standard message and an `[ALERT]` line), the stream is closed
+without an answer, logged with termination state `I` and its phase, and counted in `eint`
+(frontend, backend and server), and the worker serves on. Design and the unwind-safety audit:
+`tasks/T447-progress.md`; test: `crates/ibex-rt/tests/it/panic_contained.rs`.
+
+| | |
+|---|---|
+| **Contained** | Any panic in one stream's run: H1 (tested), and by construction H2 (an h2 stream's panic ends its whole h2 connection, not just the stream), H3 request streams and TCP mode, which run as the same task kind (not tested). That covers rules, fetches, converters, parsing, forwarding and the stream's own logging. |
+| **Still aborts** | A panic outside a stream's run (accept, poller loop, health checks, CLI applets, reload, master); a panic that leaves a shared lock poisoned (stick tables, load balancer state, idle server connections, rings, pattern references, variables, userlists): what it guards may be half-changed; a panic while closing the panicked stream; a panic during unwinding; and an allocation failure, which aborts before any unwinding (T446, T448). |
+| **Cost** | +55 `instructions:u` per request (51 820 to 51 875, +0.1%; 50 000 keep-alive requests, `ab -k -c 1`, `nbthread 1`, release builds of 2fe0db33 and this branch, 3 rounds, all identical to ±15). Two thread-local stores and the `catch_unwind` frame per stream run. |
+| **Differs from HAProxy** | HAProxy has no panic; an internal error answers 500 (`IR--`), Ibex sends nothing: after a panic the stream's buffers may be mid-update, so the connection is closed as on a failed `stream_new`. |
+| **Requires** | `panic = "unwind"`: `crash.rs` has `#[cfg(panic = "abort")] compile_error!`, so no profile, PGO build or `RUSTFLAGS` can turn it off silently. |
+| **Revisit if** | A panic is seen to recur on every request of some input (a contained panic per request is a slow DoS: fix the panic, which the alert names), or h2 needs per-stream containment (`RST_STREAM INTERNAL_ERROR` instead of closing the connection). |

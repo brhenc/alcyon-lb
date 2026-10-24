@@ -23,6 +23,32 @@ thread_local! {
     static SPARE_LISTS: RefCell<Vec<Vec<(String, String)>>> = const { RefCell::new(Vec::new()) };
 }
 
+/// `pool_gc` (T445): frees this thread's scratch strings and byte buffers (wiped first: they
+/// held request data) and its spare header lists (their strings go back to the spare
+/// strings, which the caller drains after this).
+#[must_use]
+pub fn drain_thread_spares() -> usize {
+    let mut n = 0;
+    for slot in [&STR_SLOT, &STR_SLOT2] {
+        if let Ok(Some(s)) = slot.try_with(Cell::take) {
+            ibex_alloc::wipe_vec(&mut s.into_bytes());
+            n += 1;
+        }
+    }
+    for slot in [&BYTES_SLOT, &BYTES_SLOT2] {
+        if let Ok(Some(mut b)) = slot.try_with(Cell::take) {
+            ibex_alloc::wipe_vec(&mut b);
+            n += 1;
+        }
+    }
+    let lists = SPARE_LISTS.try_with(|l| l.try_borrow_mut().map(|mut l| std::mem::take(&mut *l)).unwrap_or_default()).unwrap_or_default();
+    n += lists.len();
+    for mut l in lists {
+        clear_pairs(&mut l);
+    }
+    n
+}
+
 pub use ibex_sample::spare::{give, string, string_from};
 
 /// Empties `v`, its strings given back; `v` keeps its capacity.

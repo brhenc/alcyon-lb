@@ -178,6 +178,13 @@ fn registry() -> &'static Registry {
     R.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Whether a panic unwound through a write to a ring or a change of their registry (T447):
+/// a ring's indexes may then be half-updated.
+pub(crate) fn poisoned() -> bool {
+    let reg = registry();
+    reg.is_poisoned() || reg.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|(_, r)| r.store.is_poisoned())
+}
+
 /// The built-in sinks `buf0` and `dpapi`: in-memory buffers that exist whatever the
 /// configuration says, and that `debug()` writes to by default. Their events carry the
 /// `timed` header (`<level>` and an ISO time), as `show events buf0` prints them.

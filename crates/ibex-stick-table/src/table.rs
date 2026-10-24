@@ -248,6 +248,13 @@ pub struct StickTable {
 }
 
 impl StickTable {
+    /// Whether a panic unwound through a change of the table: its lock is poisoned and its
+    /// tree may be half-updated (T447).
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.is_poisoned()
+    }
+
     /// Creates a new stick table with configuration.
     #[must_use]
     pub fn new(config: StickTableConfig) -> Self {
@@ -748,6 +755,20 @@ mod tests {
         assert!(dumped.is_empty() && next.is_none(), "{dumped:?}");
         assert_eq!(table.purge_expired().expect("purge"), 1);
         assert_eq!(table.len(), 0);
+    }
+
+    /// A panic inside a change of the table poisons it, and `is_poisoned` says so: a stream
+    /// that panicked there must not let the process go on with that table (T447).
+    #[test]
+    fn a_panic_inside_an_update_leaves_the_table_poisoned() {
+        let table = StickTable::new(StickTableConfig { key_type: KeyType::Ip, ..Default::default() });
+        let key = StickKey::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(!table.is_poisoned());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = table.update_entry(&key, |_| panic!("half-updated"));
+        }));
+        assert!(r.is_err());
+        assert!(table.is_poisoned());
     }
 
     /// A deleted entry leaves an empty slot; a dump passes over it and still gives the

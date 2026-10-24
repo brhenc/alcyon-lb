@@ -35,6 +35,16 @@ pub mod spare;
 pub mod vars;
 
 pub use acls::Acls;
+
+/// The shared state of this crate that a panic left half-changed, if any: a lock a panicking
+/// thread held is poisoned (T447). A stream's panic is contained only when this is `None`.
+#[must_use]
+pub fn shared_state_poisoned() -> Option<&'static str> {
+    patref::poisoned().then_some("pattern references")
+        .or_else(|| registry::map_refs_poisoned().then_some("map references"))
+        .or_else(|| vars::poisoned().then_some("variables"))
+        .or_else(|| auth::poisoned().then_some("userlists"))
+}
 pub use h1_clean::drop_items as h1_drop_items;
 pub use argspec::check_typed_expr;
 pub use auth::{set_userlists, AuthUser, AuthUserlist};

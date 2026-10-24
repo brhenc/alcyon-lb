@@ -696,7 +696,8 @@ fn a_reload_with_x_takes_over_the_log_forward_sockets() {
     let fe = common::reserve_addr();
     let udp = common::reserve_port();
     let tcp = common::reserve_port();
-    let udp6 = std::net::UdpSocket::bind("[::1]:0").expect("an ipv6 loopback").local_addr().expect("addr").port();
+    std::net::UdpSocket::bind("[::1]:0").expect("an ipv6 loopback");
+    let udp6 = common::reserve_port();
     let sink = std::net::UdpSocket::bind("127.0.0.1:0").expect("sink");
     let sock = short_sock("logfwd");
     let text = format!(

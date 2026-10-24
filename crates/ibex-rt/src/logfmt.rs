@@ -1179,6 +1179,17 @@ thread_local! {
     static LINE_SPARE: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// `pool_gc` (T445): frees the spare line buffers, wiped first (they held log lines).
+#[must_use]
+pub fn drain_spare_lines() -> usize {
+    let taken = LINE_SPARE.try_with(|s| s.try_borrow_mut().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default()).unwrap_or_default();
+    let n = taken.len();
+    for mut b in taken {
+        ibex_alloc::wipe_vec(&mut b);
+    }
+    n
+}
+
 /// A line [`LogFormat::render_line`] rendered has been sent: its buffer is the next line's.
 pub fn recycle_line(mut line: Vec<u8>) {
     line.clear();

@@ -849,6 +849,12 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        // A test-only fault (T447): a debug build panics in the stream's run, a release build
+        // refuses the keyword, so no deployed process can be made to.
+        "ibex.debug.panic" => {
+            global.debug_panic = Some(parse_debug_panic(tokens, kw, cfg!(debug_assertions))?);
+            Ok(())
+        }
         "expose-experimental-directives" => {
             super::acl_scope::allow_experimental();
             Ok(())
@@ -931,6 +937,24 @@ pub(crate) fn parse_global_directive(
 /// and `mptcp` are accepted by `HAProxy` and refused here, rather than bound as something
 /// else (AGENTS.md section 5).
 #[allow(clippy::too_many_lines)]
+/// `ibex.debug.panic <request|response|request-locked> <path-prefix>`, a test-only fault
+/// (T447). `allowed`: a debug build; a release build refuses it, so that no deployed process
+/// can be made to panic.
+fn parse_debug_panic(tokens: &[Token], kw: &Token, allowed: bool) -> Result<crate::ast::DebugPanic, ConfigError> {
+    let usage = || ConfigError::new(kw.line, kw.col, "'ibex.debug.panic' expects 'request', 'response' or 'request-locked' and a path prefix.");
+    if !allowed {
+        return Err(ConfigError::new(kw.line, kw.col, "'ibex.debug.panic' is only available in debug builds."));
+    }
+    let (at_response, under_lock) = match tokens.get(1).map(|t| t.text.as_str()) {
+        Some("request") => (false, false),
+        Some("response") => (true, false),
+        Some("request-locked") => (false, true),
+        _ => return Err(usage()),
+    };
+    let path = tokens.get(2).filter(|_| tokens.len() == 3).ok_or_else(usage)?;
+    Ok(crate::ast::DebugPanic { at_response, under_lock, path: path.text.clone() })
+}
+
 fn stats_socket_addr(tok: &Token) -> Result<crate::ast::StatsAddr, ConfigError> {
     use crate::ast::StatsAddr;
     use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -1266,4 +1290,29 @@ fn parse_time_ms_err(text: &str) -> Result<u32, TimeMsErr> {
     };
     let ms = value.saturating_mul(mul).saturating_add(div - 1) / div;
     u32::try_from(ms).ok().filter(|m| *m < 0x8000_0000).ok_or(TimeMsErr::Over)
+}
+
+#[cfg(test)]
+mod debug_panic_tests {
+    use super::parse_debug_panic;
+    use crate::lexer::Token;
+
+    fn toks(words: &[&str]) -> Vec<Token> {
+        words.iter().map(|w| Token { text: (*w).to_string(), line: 1, col: 1 }).collect()
+    }
+
+    #[test]
+    fn a_release_build_refuses_the_fault_and_a_debug_build_takes_it() {
+        let t = toks(&["ibex.debug.panic", "response", "/boom"]);
+        let e = parse_debug_panic(&t, &t[0], false).expect_err("release refuses");
+        assert!(e.to_string().contains("only available in debug builds"), "{e}");
+        let d = parse_debug_panic(&t, &t[0], true).expect("debug takes it");
+        assert!(d.at_response && !d.under_lock && d.path == "/boom");
+        let t = toks(&["ibex.debug.panic", "request-locked", "/x"]);
+        assert!(parse_debug_panic(&t, &t[0], true).expect("locked").under_lock);
+        for bad in [&["ibex.debug.panic"][..], &["ibex.debug.panic", "later", "/x"], &["ibex.debug.panic", "request"], &["ibex.debug.panic", "request", "/x", "more"]] {
+            let t = toks(bad);
+            assert!(parse_debug_panic(&t, &t[0], true).expect_err("usage").to_string().contains("expects"), "{bad:?}");
+        }
+    }
 }

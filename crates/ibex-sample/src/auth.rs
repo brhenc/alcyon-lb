@@ -34,6 +34,11 @@ pub struct AuthUserlist {
 
 static USERLISTS: RwLock<Vec<AuthUserlist>> = RwLock::new(Vec::new());
 
+/// Whether a panic unwound through a change of the userlists (T447).
+pub(crate) fn poisoned() -> bool {
+    USERLISTS.is_poisoned()
+}
+
 /// Installs the configuration's userlists, replacing those of a previous load.
 pub fn set_userlists(lists: Vec<AuthUserlist>) {
     if let Ok(mut all) = USERLISTS.write() {

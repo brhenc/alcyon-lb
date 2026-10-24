@@ -64,9 +64,11 @@ fn backend(bind: &str) -> SocketAddr {
     addr
 }
 
-/// A port nothing listens on.
+/// A port nothing listens on: reserved and never bound, so a connect to it is refused. A
+/// port taken by binding `:0` and dropping the listener is in the ephemeral range, where the
+/// kernel can hand it to another test's outgoing connection.
 fn closed_port() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+    common::reserve_addr()
 }
 
 /// Sends one keep-alive request on `c` and returns the `x-out` header of its 2-byte answer.

@@ -32,6 +32,17 @@ pub fn with_avoided<T>(proxy: &Proxy, avoid: Option<usize>, select: impl FnOnce(
     t
 }
 
+/// Forgets the server a selection avoided, after a panic cut [`with_avoided`] short (T447).
+pub(crate) fn clear_avoided() {
+    AVOID.with(|a| a.set(None));
+}
+
+/// Whether a lock of the balancing state of a backend was poisoned: a panic unwound
+/// through a change of it (T447).
+pub(crate) fn lb_poisoned(fwrr: &Fwrr, chash: &ChashRing) -> bool {
+    fwrr.0.is_poisoned() || chash.0.is_poisoned()
+}
+
 /// Determines whether a server at `idx` in `proxy` is eligible to receive traffic.
 #[inline]
 #[must_use]

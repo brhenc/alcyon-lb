@@ -7,16 +7,17 @@
 //! sent in each syslog shape. One difference is not copied: `HAProxy` ends every datagram
 //! with a line feed and Ibex does not (it never has, for any log line).
 
+use crate::common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::time::Duration;
 
 use ibex_rt::loghdr::Meta;
 
-/// A port for a config that is refused before any bind happens; nothing listens on it, so
-/// the race of handing a freed port to ibex does not matter here.
+/// A port for a config that is refused before any bind happens; nothing listens on it.
 fn free_tcp() -> u16 {
-    TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr").port()
+    common::reserve_port()
 }
 
 fn collector() -> (UdpSocket, u16) {
@@ -37,18 +38,15 @@ fn start(cfg: &str) {
 }
 
 /// Starts the sections `build` writes on ports chosen for them: `kinds` has a `u` (UDP) or
-/// a `t` (TCP) per port wanted. A port picked by binding port 0 and dropping the socket can
-/// be taken by another test before ibex binds it, so the start is retried, with new ports,
-/// for as long as the answer is "Address already in use": no start can lose that race for
-/// good. Returns the ports of the start that worked.
+/// a `t` (TCP) per port wanted. The ports are reserved (`common::reserve_port`), below the
+/// ephemeral range and locked against other tests; a process outside the tests can still
+/// take one before ibex binds it, so the start is retried, with new ports, for as long as
+/// the answer is "Address already in use". Returns the ports of the start that worked.
 fn start_on(kinds: &str, build: impl Fn(&[u16]) -> String) -> Vec<u16> {
     for _ in 0..50 {
         let ports: Vec<u16> = kinds
             .chars()
-            .map(|k| match k {
-                'u' => UdpSocket::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr").port(),
-                _ => TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr").port(),
-            })
+            .map(|_| common::reserve_port())
             .collect();
         let cfg = ibex_config::parse_str(&build(&ports)).expect("parses");
         match ibex_rt::logfwd::start(&cfg) {

@@ -49,21 +49,15 @@ fn find_free_port() -> u16 {
         .port()
 }
 
-fn find_free_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind tcp")
-        .local_addr()
-        .expect("local_addr")
-        .port()
-}
-
 fn curl_has_http3() -> bool {
     let out = Command::new("curl").arg("--version").output().expect("curl version");
     String::from_utf8_lossy(&out.stdout).contains("HTTP3")
 }
 
-fn spawn_echo_backend(stop: Arc<AtomicBool>, port: u16) {
-    let l = TcpListener::bind(format!("127.0.0.1:{port}")).expect("bind backend");
+/// Starts the backend on a port it binds itself (`:0`, kept bound), and returns that port.
+fn spawn_echo_backend(stop: Arc<AtomicBool>) -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let port = l.local_addr().expect("local_addr").port();
     l.set_nonblocking(true).expect("nonblocking");
     thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
@@ -87,6 +81,7 @@ fn spawn_echo_backend(stop: Arc<AtomicBool>, port: u16) {
             }
         }
     });
+    port
 }
 
 fn create_cert(dir: &std::path::Path) -> PathBuf {
@@ -115,7 +110,8 @@ fn quic4_bind_parses_and_serves_http3() {
     let temp_dir = std::env::temp_dir();
     let cert = create_cert(&temp_dir);
     let quic_port = find_free_port();
-    let backend_port = find_free_tcp_port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let backend_port = spawn_echo_backend(Arc::clone(&stop));
 
     let cfg_path = temp_dir.join(format!("ibex_{}_{}.cfg", std::process::id(), std::sync::atomic::AtomicUsize::new(0).fetch_add(1, std::sync::atomic::Ordering::SeqCst) + std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() as usize));
     let cfg = format!(
@@ -142,8 +138,6 @@ backend default
     );
     fs::write(&cfg_path, cfg).expect("write config");
 
-    let stop = Arc::new(AtomicBool::new(false));
-    spawn_echo_backend(Arc::clone(&stop), backend_port);
 
     let bin = ibex_bin();
     let mut ibex = Command::new(bin)
