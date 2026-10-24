@@ -29,17 +29,18 @@ use std::net::IpAddr;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
-/// The two [`ClientConfig`]s of one server line, which differ only in whether the DNS
-/// name they are opened with goes on the wire.
+/// The two [`ClientConfig`]s of one server line on one provider, which differ only in whether
+/// the DNS name they are opened with goes on the wire.
 #[derive(Debug)]
-struct Configs {
+struct Built {
     with_sni: Arc<ClientConfig>,
     without_sni: Arc<ClientConfig>,
-    verifyhost: Option<String>,
+    /// The crypto provider both run on (T460), counted when a handshake completes.
+    provider: ibex_tls::TlsCryptoProvider,
 }
 
-impl Configs {
-    fn build(ssl: &ServerSsl, alpn: &[String], who: &str) -> io::Result<Self> {
+impl Built {
+    fn build(ssl: &ServerSsl, alpn: &[String], who: &str, provider: ibex_tls::TlsCryptoProvider) -> io::Result<Self> {
         ibex_tls::install_default_crypto_provider();
         let opts = ibex_tls::BackendTlsOptions {
             verify_required: ssl.verify != Some(SslVerify::None),
@@ -51,28 +52,74 @@ impl Configs {
             max_ver: ssl.max_ver,
             no_reuse: ssl.no_reuse,
         };
-        let with_sni = ibex_tls::tcp::build_backend_client_config(&opts)
+        let with_sni = ibex_tls::tcp::build_backend_client_config_with(&opts, provider)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{who} : {e}")))?;
         let mut without = (*with_sni).clone();
         without.enable_sni = false;
-        Ok(Self {
-            with_sni,
-            without_sni: Arc::new(without),
-            verifyhost: ssl.verifyhost.clone(),
-        })
+        Ok(Self { with_sni, without_sni: Arc::new(without), provider })
+    }
+}
+
+/// A server line's configurations: the build of startup, and the build on the other provider
+/// once `set ssl crypto-provider` made one (T460), with what that build is made from.
+#[derive(Debug)]
+struct Builds {
+    home: Built,
+    other: std::sync::OnceLock<Built>,
+    ssl: ServerSsl,
+    alpn: Vec<String>,
+    who: String,
+}
+
+impl Builds {
+    /// The build a connection opened now uses: one atomic load.
+    fn current(&self) -> &Built {
+        if ibex_tls::provider::active() == self.home.provider {
+            return &self.home;
+        }
+        self.other.get().unwrap_or(&self.home)
+    }
+}
+
+impl ibex_tls::provider::Rebuild for Builds {
+    fn prepare(self: Arc<Self>, p: ibex_tls::TlsCryptoProvider) -> Result<Option<ibex_tls::provider::Publish>, String> {
+        if p == self.home.provider || self.other.get().is_some() {
+            return Ok(None);
+        }
+        let built = Built::build(&self.ssl, &self.alpn, &self.who, p).map_err(|e| e.to_string())?;
+        Ok(Some(Box::new(move || {
+            let _ = self.other.set(built);
+        })))
+    }
+}
+
+/// The configurations of one server line (or of its checks), and its `verifyhost`.
+#[derive(Debug)]
+struct Configs {
+    builds: Arc<Builds>,
+    verifyhost: Option<String>,
+}
+
+impl Configs {
+    fn build(ssl: &ServerSsl, alpn: &[String], who: &str) -> io::Result<Self> {
+        let home = Built::build(ssl, alpn, who, ibex_tls::provider::active())?;
+        let builds = Arc::new(Builds { home, other: std::sync::OnceLock::new(), ssl: ssl.clone(), alpn: alpn.to_vec(), who: who.to_string() });
+        ibex_tls::provider::register(Arc::downgrade(&builds) as std::sync::Weak<dyn ibex_tls::provider::Rebuild>);
+        Ok(Self { builds, verifyhost: ssl.verifyhost.clone() })
     }
 
     /// Opens the TLS transport over the connected `fd`: `sni` is sent and checked when
     /// given, else `verifyhost` is checked without being sent, else no name is checked.
     fn connect(&self, fd: &impl AsRawFd, sni: Option<&str>, server_ip: IpAddr) -> ServerXprt {
+        let b = self.builds.current();
         let dns = |name: &str| ServerName::try_from(name.to_string()).ok().filter(|n| matches!(n, ServerName::DnsName(_)));
         if let Some(name) = sni.filter(|s| !s.is_empty()).and_then(dns) {
-            return xprt::connect_tls(fd, Arc::clone(&self.with_sni), name);
+            return xprt::connect_tls_on(fd, Arc::clone(&b.with_sni), name, b.provider);
         }
         if let Some(name) = self.verifyhost.as_deref().and_then(dns) {
-            return xprt::connect_tls(fd, Arc::clone(&self.without_sni), name);
+            return xprt::connect_tls_on(fd, Arc::clone(&b.without_sni), name, b.provider);
         }
-        xprt::connect_tls(fd, Arc::clone(&self.without_sni), ServerName::IpAddress(server_ip.into()))
+        xprt::connect_tls_on(fd, Arc::clone(&b.without_sni), ServerName::IpAddress(server_ip.into()), b.provider)
     }
 }
 

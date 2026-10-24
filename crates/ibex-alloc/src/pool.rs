@@ -1080,6 +1080,50 @@ mod tests {
         }
     }
 
+    crate::declare_pool!(static SIZED: Pool<Sized4k> = PoolSpec::new("t_sized"););
+    crate::declare_pool!(static SPEC_SIZED: Pool<Vec<u8>> = PoolSpec::new("t_spec_sized").size(24););
+    crate::declare_pool!(static DISCARD: Pool<Vec<u8>> = PoolSpec::new("t_discard"););
+
+    /// A pooled type with a configured size, as the buffers have (`tune.bufsize`).
+    #[derive(Debug, Default)]
+    struct Sized4k;
+
+    impl Poolable for Sized4k {
+        fn footprint(&self) -> usize {
+            1
+        }
+        fn reset(&mut self, _wipe: bool) {}
+        fn try_new() -> Option<Self> {
+            Some(Sized4k)
+        }
+        fn nominal_size() -> usize {
+            4096
+        }
+    }
+
+    /// The builders run at run time (a `static`'s are evaluated by the compiler), and the
+    /// size and alignment `show pools` prints come from the spec or the type.
+    #[test]
+    fn the_spec_builders_and_the_shown_size_follow_the_spec_and_the_type() {
+        let spec = PoolSpec::new("t_rt").size(24).align(64).max_count(3).floor(1);
+        assert_eq!((spec.size, spec.align, spec.max_count, spec.floor), (24, 64, 3, 1));
+        drop(SIZED.take().unwrap());
+        let h = SIZED.head();
+        assert_eq!((h.size, h.align), (4096, 8), "the type's nominal size, the default alignment");
+        assert_eq!(SPEC_SIZED.head().size, 24, "the spec's size");
+    }
+
+    /// An object taken counted and discarded is freed and no longer in use.
+    #[test]
+    fn a_discarded_counted_object_is_freed_and_not_in_use() {
+        let v = DISCARD.take_counted(|| Some(vec![0u8; 8])).unwrap();
+        publish_local();
+        assert_eq!(DISCARD.head().used, 1);
+        DISCARD.discard_counted(v);
+        publish_local();
+        assert_eq!((DISCARD.head().used, DISCARD.local_count()), (0, 0));
+    }
+
     thread_local! {
         static RUNTIME_CACHE: Cache<Vec<u8>> = const { Cache::new() };
     }

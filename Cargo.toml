@@ -14,6 +14,9 @@ members = [
     "crates/ibex-alloc",
     "crates/ibex-h1-sys", "crates/slz", "crates/ibex-mmsg", "crates/ibex-dns", "crates/ibex-quic",
 ]
+# T460: the vendored ring fork and its rustls provider are dependencies, not members: `cargo test
+# --workspace` and clippy do not run ring's suite or lint upstream code (vendor/README.md).
+exclude = ["vendor/ringibex", "vendor/rustls-ringibex"]
 
 
 [workspace.package]
@@ -64,6 +67,9 @@ tokio-rustls = "0.26"
 # clients stay on 0.23 above. Pinned exactly: a pre-release (tradeoff.md 6.21).
 rustls24 = { package = "rustls", version = "=0.24.0-dev.2", default-features = false, features = ["webpki"] }
 rustls24-ring = { package = "rustls-ring", version = "=0.24.0-dev.2" }
+# T460: `tune.ibex.crypto-provider ring-ibex`: the zeroizing ring fork (vendor/README.md). Its own
+# `links` value and C symbol prefix, so it links next to upstream ring.
+rustls24-ringibex = { package = "rustls-ringibex", path = "vendor/rustls-ringibex" }
 
 # CLI & Logging
 tracing = "0.1"

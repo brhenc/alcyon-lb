@@ -54,6 +54,9 @@ const SEND_BUDGET: Duration = Duration::from_secs(1);
 
 static EXPOSE_ENABLED: AtomicBool = AtomicBool::new(false);
 static EXPOSED: Mutex<Vec<(Kind, SocketAddr, OwnedFd)>> = Mutex::new(Vec::new());
+/// `_getsocks` has sent this process's listeners to another process, which may serve on
+/// them now: they are shared, and a pause must not disconnect them ([`handed_over`]).
+static HANDED_OVER: AtomicBool = AtomicBool::new(false);
 /// The sockets handed to one worker, by kind and address.
 type PerWorker = HashMap<(Kind, SocketAddr), Vec<OwnedFd>>;
 static INHERITED: Mutex<Vec<PerWorker>> = Mutex::new(Vec::new());
@@ -151,7 +154,19 @@ pub fn serve_getsocks(stream: &UnixStream) -> io::Result<usize> {
     }
     let mut end = stream;
     end.write_all(b"END\n")?;
+    if !exposed.is_empty() {
+        HANDED_OVER.store(true, Ordering::Relaxed);
+    }
     Ok(exposed.len())
+}
+
+/// Whether `_getsocks` has handed this process's listeners to another process. A `SIGTTOU`
+/// then only stops polling them, as `HAProxy`'s `tcp_suspend_receiver` never disconnects a
+/// shared socket (`RX_F_INHERITED_SOCK`): disconnecting it would take it from the successor
+/// too.
+#[must_use]
+pub fn handed_over() -> bool {
+    HANDED_OVER.load(Ordering::Relaxed)
 }
 
 /// `sendmsg` the whole of `data`, with `control` attached to the first byte.
