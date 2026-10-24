@@ -195,6 +195,22 @@ impl Rig {
         (data, fin)
     }
 
+    /// The code `id` was reset with by the server, waiting for it.
+    fn reset_code(&mut self, id: StreamId) -> Option<u64> {
+        let mut code = None;
+        self.run_until(|r| {
+            let mut rs = r.conn.recv_stream(id);
+            if let Ok(mut chunks) = rs.read(true) {
+                if let Err(ibex_quic::quinn_proto::ReadError::Reset(c)) = chunks.next(usize::MAX) {
+                    code = Some(c.into_inner());
+                }
+                let _ = chunks.finalize();
+            }
+            code.is_some()
+        });
+        code
+    }
+
     /// The whole response on `id`, waiting for its end.
     fn response(&mut self, id: StreamId) -> Vec<u8> {
         let mut all = Vec::new();
@@ -326,7 +342,12 @@ fn malformed_requests_get_a_400() {
     let mut cut = headers(&[]);
     cut.extend_from_slice(&frame(0x00, b"abcdef")[..4]);
     let d = rig.open(&cut, true);
-    for (what, id) in [("DATA before HEADERS", a), ("connection field", b), ("body over its length", c), ("frame cut by the end", d)] {
+    // A connection-specific field is a message error: RESET_STREAM H3_MESSAGE_ERROR, no
+    // answer (measured on HAProxy 3.5-dev7 +QUIC, T454).
+    assert_eq!(rig.reset_code(b), Some(0x10e), "connection field");
+    // So is a body that is not the `content-length` (`h3_check_body_size`).
+    assert_eq!(rig.reset_code(c), Some(0x10e), "body over its length");
+    for (what, id) in [("DATA before HEADERS", a), ("frame cut by the end", d)] {
         let (resp, _) = { let r = rig.response(id); (r, ()) };
         assert_eq!(status(&resp), 400, "{what}");
     }

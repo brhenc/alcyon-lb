@@ -164,6 +164,7 @@ mod h2_stream_timers;
 mod h2_unread_output_timeout;
 mod h2_unread_response_memory;
 mod h3_end_to_end;
+mod h3_field_validity;
 mod h3_many_threads;
 mod h3_proxy_path;
 mod h3_request_framing_to_backend;

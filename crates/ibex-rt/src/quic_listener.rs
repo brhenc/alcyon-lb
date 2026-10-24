@@ -883,8 +883,15 @@ impl QuicListener {
         let known = if fin { crate::h3_relay::complete_body_len(&rest) } else { None };
         let head = match crate::h3_relay::request_head(&section, known) {
             Ok(h) => h,
-            Err(status) => {
-                self.respond(conn_id, stream_id, &mux_h3::encode_response(status, &[], b""));
+            Err(crate::h3_relay::HeadError::Decompression) => {
+                self.endpoint.close_connection(conn_id, H3Error::QpackDecompressionFailed as u64, b"");
+                return;
+            }
+            Err(crate::h3_relay::HeadError::Message) => {
+                // A malformed request is a stream error (RFC 9114 section 4.1.2): the
+                // stream is aborted and the connection and its other streams go on.
+                let _ = self.endpoint.reset_stream(conn_id, stream_id, H3Error::MessageError as u64);
+                self.outq.remove(&(conn_id, stream_id));
                 return;
             }
         };
