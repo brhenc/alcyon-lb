@@ -71,6 +71,17 @@ pub enum ReqBody {
     Chunked,
 }
 
+/// Why a request has no HTTP/1 head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadError {
+    /// Answer with this status.
+    Status(u16),
+    /// The request is malformed (RFC 9114 section 4.1.2): reset the stream with
+    /// `H3_MESSAGE_ERROR` and answer nothing, as `HAProxy`'s `h3_req_headers_to_htx` does.
+    /// Includes a field with a byte that is not UTF-8 (T454; `qpack::text_of`).
+    Message,
+}
+
 /// The HTTP/1 head of an HTTP/3 request.
 pub struct RequestHead {
     pub head: Vec<u8>,
@@ -83,10 +94,23 @@ pub struct RequestHead {
 /// rather than chunking, which is what a server that refuses chunked requests needs.
 ///
 /// # Errors
-/// The status to answer with: 400 for a malformed request.
-pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<RequestHead, u16> {
-    let fields = qpack::decode_qpack_static(field_section).map_err(|_| 400u16)?;
-    let blocks = ibex_proto::h3::headers_to_htx(fields).map_err(|_| 400u16)?;
+/// [`HeadError`]: `Status(400)` for a field section that does not decode, `Message` for a
+/// malformed request.
+pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<RequestHead, HeadError> {
+    let fields = qpack::decode_qpack_static(field_section).map_err(|_| HeadError::Status(400))?;
+    // The checks HTTP/2 makes (T449), on the fields as decoded: a name that is no lowercase
+    // token, a value with CR, LF or NUL, `:path`, `:authority`, `host`, `:scheme` and
+    // `:method` that `HAProxy` refuses, connection-specific fields. T454: a byte that is not
+    // UTF-8 is a NUL by now (`qpack::text_of`), so it ends here.
+    match ibex_proto::h2::check_request_fields(fields.iter().map(|f| (f.name.as_str(), f.value.as_str())), false) {
+        Ok(false) => {}
+        Ok(true) | Err(_) => return Err(HeadError::Message),
+    }
+    // RFC 9114 section 4.3.1: `:authority` or `host` is mandatory for http(s).
+    if !fields.iter().any(|f| f.name == ":authority" || f.name == "host") {
+        return Err(HeadError::Message);
+    }
+    let blocks = ibex_proto::h3::headers_to_htx(fields).map_err(|_| HeadError::Message)?;
     let mut head = Vec::with_capacity(256);
     let mut content_length: Option<u64> = None;
     let mut method_head = false;
@@ -96,7 +120,7 @@ pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<Req
             HtxBlock::ReqLine(rl) => {
                 let m = rl.method.as_str();
                 if !valid_token(m) || rl.uri.is_empty() || rl.uri.bytes().any(|b| b <= b' ' || b == 0x7f) {
-                    return Err(400);
+                    return Err(HeadError::Message);
                 }
                 method_head = m == "HEAD";
                 head.extend_from_slice(format!("{m} {} HTTP/1.1\r\n", rl.uri).as_bytes());
@@ -104,15 +128,15 @@ pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<Req
             HtxBlock::Header(h) => {
                 let name = h.name.as_str();
                 if !valid_token(name) || name.bytes().any(|b| b.is_ascii_uppercase()) || !valid_value(&h.value) {
-                    return Err(400);
+                    return Err(HeadError::Message);
                 }
                 if HOP_BY_HOP.contains(&name) || (name == "te" && !h.value.eq_ignore_ascii_case("trailers")) {
-                    return Err(400);
+                    return Err(HeadError::Message);
                 }
                 if name == "content-length" {
-                    let v = content_length_value(&h.value).ok_or(400u16)?;
+                    let v = content_length_value(&h.value).ok_or(HeadError::Message)?;
                     if content_length.is_some_and(|c| c != v) {
-                        return Err(400);
+                        return Err(HeadError::Message);
                     }
                     // Written once, as the number it stands for, after the other fields:
                     // the server reads the length the DATA frames are held to, not a
@@ -138,7 +162,7 @@ pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<Req
         head.extend_from_slice(format!("cookie: {}\r\n", cookies.join("; ")).as_bytes());
     }
     let body = match (content_length, known_body) {
-        (Some(cl), Some(n)) if cl != n => return Err(400),
+        (Some(cl), Some(n)) if cl != n => return Err(HeadError::Message),
         (Some(cl), _) => {
             head.extend_from_slice(format!("content-length: {cl}\r\n").as_bytes());
             ReqBody::Length(cl)
@@ -569,7 +593,7 @@ mod tests {
             ("x-a".to_string(), "a\r\nx-b: c".to_string()),
         ];
         let section = mux_h3::encode_field_section(&fields);
-        assert_eq!(request_head(&section, Some(0)).err(), Some(400));
+        assert_eq!(request_head(&section, Some(0)).err(), Some(HeadError::Message));
     }
 
     fn req(extra: &[(&str, &str)]) -> Vec<u8> {
@@ -581,7 +605,7 @@ mod tests {
         mux_h3::encode_field_section(&fields)
     }
 
-    fn head_of(extra: &[(&str, &str)], known: Option<u64>) -> Result<(String, ReqBody), u16> {
+    fn head_of(extra: &[(&str, &str)], known: Option<u64>) -> Result<(String, ReqBody), HeadError> {
         request_head(&req(extra), known).map(|h| (String::from_utf8(h.head).expect("utf8"), h.body))
     }
 
@@ -614,21 +638,21 @@ mod tests {
             &[("te", "gzip")],
             &[("bad name", "a")],
         ] {
-            assert_eq!(head_of(extra, None).err(), Some(400), "{extra:?}");
+            assert_eq!(head_of(extra, None).err(), Some(HeadError::Message), "{extra:?}");
         }
         // An upper-case name, as a literal (the encoder lower-cases what it is given).
         let mut upper = req(&[]);
         upper.extend_from_slice(&[0x24, b'X', b'-', b'U', b'p', 0x01, b'a']);
-        assert_eq!(request_head(&upper, Some(0)).err(), Some(400));
-        assert_eq!(head_of(&[("content-length", "3")], Some(4)).err(), Some(400));
+        assert_eq!(request_head(&upper, Some(0)).err(), Some(HeadError::Message));
+        assert_eq!(head_of(&[("content-length", "3")], Some(4)).err(), Some(HeadError::Message));
         let bad_path = mux_h3::encode_field_section(&[
             (":method".into(), "GET".into()),
             (":scheme".into(), "https".into()),
             (":authority".into(), "x".into()),
             (":path".into(), "/a b".into()),
         ]);
-        assert_eq!(request_head(&bad_path, Some(0)).err(), Some(400));
-        assert_eq!(request_head(&[0xff], Some(0)).err(), Some(400));
+        assert_eq!(request_head(&bad_path, Some(0)).err(), Some(HeadError::Message));
+        assert_eq!(request_head(&[0xff], Some(0)).err(), Some(HeadError::Status(400)));
     }
 
     #[test]

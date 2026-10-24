@@ -2,7 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 use crate::h3::H3Error;
-use crate::hpack::{decode_huffman, decode_integer};
+use crate::hpack::{decode_huffman_into, decode_integer, push_as_text};
 use crate::htx::HeaderField;
 
 pub const STATIC_TABLE: [(&str, &str); 99] = [
@@ -184,6 +184,22 @@ pub fn decode_qpack_static(block: &[u8]) -> Result<Vec<HeaderField>, H3Error> {
     Ok(headers)
 }
 
+/// `bytes` as text. A QPACK string is octets (RFC 9204 section 4.1.1): one that is not UTF-8
+/// is no decompression failure, which would be a connection error (RFC 9204 section 2.2.3)
+/// for a fault in one field of one stream (T454). Each byte that is not UTF-8 becomes a NUL
+/// ([`push_as_text`], as for HPACK, T451), which every field check refuses, so the request is a
+/// message error on its stream (`H3_MESSAGE_ERROR`), as `HAProxy` answers for a bad name.
+fn text_of(bytes: Vec<u8>) -> String {
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            let mut out = String::with_capacity(e.as_bytes().len());
+            push_as_text(&mut out, e.as_bytes());
+            out
+        }
+    }
+}
+
 fn decode_qpack_string(block: &[u8], offset: &mut usize) -> Result<String, H3Error> {
     if *offset >= block.len() { return Err(H3Error::QpackDecompressionFailed); }
     let is_huffman = (block[*offset] & 0x80) != 0;
@@ -193,9 +209,11 @@ fn decode_qpack_string(block: &[u8], offset: &mut usize) -> Result<String, H3Err
     *offset += len;
     
     if is_huffman {
-        decode_huffman(raw).map_err(|_| H3Error::QpackDecompressionFailed)
+        let mut out = Vec::with_capacity(raw.len());
+        decode_huffman_into(raw, &mut out).map_err(|_| H3Error::QpackDecompressionFailed)?;
+        Ok(text_of(out))
     } else {
-        std::str::from_utf8(raw).map(std::string::ToString::to_string).map_err(|_| H3Error::QpackDecompressionFailed)
+        Ok(std::str::from_utf8(raw).map_or_else(|_| text_of(raw.to_vec()), str::to_string))
     }
 }
 
@@ -208,8 +226,10 @@ fn decode_qpack_string_3bit(block: &[u8], offset: &mut usize) -> Result<String, 
     *offset += len;
     
     if is_huffman {
-        decode_huffman(raw).map_err(|_| H3Error::QpackDecompressionFailed)
+        let mut out = Vec::with_capacity(raw.len());
+        decode_huffman_into(raw, &mut out).map_err(|_| H3Error::QpackDecompressionFailed)?;
+        Ok(text_of(out))
     } else {
-        std::str::from_utf8(raw).map(std::string::ToString::to_string).map_err(|_| H3Error::QpackDecompressionFailed)
+        Ok(std::str::from_utf8(raw).map_or_else(|_| text_of(raw.to_vec()), str::to_string))
     }
 }
