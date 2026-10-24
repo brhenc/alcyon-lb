@@ -7303,7 +7303,19 @@ fn get_all_req_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
             all.extend(headers.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
     }
-    h1_cleaned_headers(all, true)
+    cleaned_for(ctx, all, true)
+}
+
+/// The headers as the counting fetches read them: as `HAProxy`'s H1 parser leaves them, except
+/// that, while rules run, a `close` or `keep-alive` in `Connection` is a rule's (the
+/// message's own went before the rules) and is counted, as `hdr` reads it (T442). The access
+/// log reads the request as it went out, with the `close` an option added in it.
+fn cleaned_for(ctx: &SampleContext, all: Vec<(String, String)>, is_req: bool) -> Vec<(String, String)> {
+    if ctx.at_log {
+        h1_cleaned_headers(all, is_req)
+    } else {
+        crate::h1_clean::h1_clean_headers_kept_conn(all.iter().map(|(n, v)| (n.as_str(), v.as_str())), is_req)
+    }
 }
 
 /// The response's header `name`. Only the response is read: `ctx.htx_slice` holds the
@@ -7369,7 +7381,7 @@ fn get_all_res_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
     if all.is_empty() {
         CURRENT_RES_HEADERS.with(|hdrs| all.extend(hdrs.borrow().iter().cloned()));
     }
-    h1_cleaned_headers(all, false)
+    cleaned_for(ctx, all, false)
 }
 
 /// T327: whether the Set-Cookie value `seg` holds a cookie named `name` (any cookie when

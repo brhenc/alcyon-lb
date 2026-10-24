@@ -18,6 +18,7 @@ use crate::common;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -167,16 +168,162 @@ const ROWS: &[Row] = &[
         false,
     ),
     ("http-response add-header content-length 2", GET, OK, SRV_GET, CLI_OK, false),
+    // T442 row 2: a chunked response whose `Transfer-Encoding` a rule removed goes with its
+    // chunk framing taken off (sizes, extensions, the last chunk and the trailers), and is
+    // closed after: nothing else tells the client where it ends.
+    ("http-response del-header transfer-encoding", GET, CHUNKED_OK, SRV_GET, CLI_RAW_OK, true),
+    (
+        "http-response del-header transfer-encoding",
+        GET,
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n1\r\nx\r\n3;e=1\r\nabc\r\n0\r\nt: 1\r\n\r\n",
+        SRV_GET,
+        b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nokxabc",
+        true,
+    ),
+    // The same when the body comes in pieces (`\0`: the server waits 150 ms), each cut
+    // inside the framing.
+    (
+        "http-response del-header transfer-encoding",
+        GET,
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n1\0\r\nx\r\n3;e=1\r\nab\0c\r\n0\r\nt: 1\r\n\0\r\n",
+        SRV_GET,
+        b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nokxabc",
+        true,
+    ),
+    // For an HTTP/1.0 client that asked to keep its connection, and with a length a rule
+    // wrote (not one the response was framed by, so not written).
+    (
+        "http-response del-header transfer-encoding",
+        b"GET / HTTP/1.0\r\nHost: a\r\nConnection: keep-alive\r\n\r\n",
+        CHUNKED_OK,
+        &["GET / HTTP/1.0\r\nhost: a\r\nconnection: keep-alive"],
+        CLI_RAW_OK,
+        true,
+    ),
+    ("http-response del-header transfer-encoding\nhttp-response set-header content-length 2", GET, CHUNKED_OK, SRV_GET, CLI_RAW_OK, true),
+    // A chunk that breaks its framing after the start: what came before it has gone, and the
+    // connection closes.
+    (
+        "http-response del-header transfer-encoding",
+        GET,
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n\0zz\r\n",
+        SRV_GET,
+        CLI_RAW_OK,
+        true,
+    ),
+    // A response to HEAD has no body to take the framing off.
+    (
+        "http-response del-header transfer-encoding",
+        b"HEAD / HTTP/1.1\r\nHost: a\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        &["HEAD / HTTP/1.1\r\nhost: a"],
+        b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n",
+        true,
+    ),
+    // T442 row 4a: a `keep-alive` a request rule writes keeps the server connection that
+    // `option http-server-close` would close (`h1_set_srv_conn_mode`: no `H1_MF_CONN_KAL`).
+    ("option http-server-close\nhttp-request set-header connection keep-alive", GET, OK, SRV_GET, CLI_OK, false),
+    // With a `close` beside it, the close wins.
+    (
+        "option http-server-close\nhttp-request set-header connection \"keep-alive, close\"",
+        GET,
+        OK,
+        &["GET / HTTP/1.1\r\nhost: a\r\nconnection: close"],
+        CLI_OK,
+        false,
+    ),
+    // An HTTP/1.0 request is sent with the `keep-alive` it then needs.
+    (
+        "option http-server-close\nhttp-request set-header connection keep-alive",
+        b"GET / HTTP/1.0\r\nHost: a\r\nConnection: keep-alive\r\n\r\n",
+        OK,
+        &["GET / HTTP/1.0\r\nhost: a\r\nconnection: keep-alive"],
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok",
+        false,
+    ),
+    // `option httpclose` in the frontend leaves the server connection alone; the client
+    // connection still closes for a request rule's `keep-alive`.
+    (
+        "option httpclose\nhttp-request set-header connection keep-alive",
+        GET,
+        OK,
+        SRV_GET,
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+        true,
+    ),
+    // A response rule's `keep-alive` keeps the client connection that `option httpclose`
+    // would close (`h1_set_cli_conn_mode`).
+    ("option httpclose\nhttp-response set-header connection keep-alive", GET, OK, SRV_GET, CLI_OK, false),
+    (
+        "option httpclose\nhttp-response set-header connection \"foo, keep-alive\"",
+        GET,
+        OK,
+        SRV_GET,
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: foo\r\n\r\nok",
+        false,
+    ),
+    // Not one the client closes: its own `close`, or HTTP/1.0 without `keep-alive`.
+    (
+        "option httpclose\nhttp-response set-header connection keep-alive",
+        b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        OK,
+        SRV_GET,
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+        true,
+    ),
+    (
+        "option httpclose\nhttp-response set-header connection keep-alive",
+        b"GET / HTTP/1.0\r\nHost: a\r\n\r\n",
+        OK,
+        &["GET / HTTP/1.0\r\nhost: a\r\nconnection: keep-alive"],
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+        true,
+    ),
+    // T442 row 5: a `Connection` a rule wrote is counted as `hdr` reads it, on both sides.
+    (
+        "http-request set-header connection close\nhttp-request set-header x-n \"%[req.hdr_cnt(connection)]/%[req.hdr(connection)]/%[req.fhdr_cnt(connection)]\"",
+        GET,
+        OK,
+        &["GET / HTTP/1.1\r\nhost: a\r\nx-n: 1/close/1\r\nconnection: close"],
+        CLI_OK,
+        false,
+    ),
+    (
+        "http-request set-header connection \"foo, keep-alive\"\nhttp-request set-header x-n \"%[req.hdr_cnt(connection)]/%[req.hdr(connection)]/%[req.fhdr_cnt(connection)]\"",
+        GET,
+        OK,
+        &["GET / HTTP/1.1\r\nhost: a\r\nconnection: foo\r\nx-n: 2/keep-alive/1"],
+        CLI_OK,
+        false,
+    ),
+    (
+        "http-response set-header connection close\nhttp-response set-header x-n \"%[res.hdr_cnt(connection)]/%[res.hdr(connection)]/%[res.fhdr_cnt(connection)]\"",
+        GET,
+        OK,
+        SRV_GET,
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nx-n: 1/close/1\r\nconnection: close\r\n\r\nok",
+        true,
+    ),
 ];
 
+const CHUNKED_OK: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n";
+const CLI_RAW_OK: &[u8] = b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nok";
+
 /// A server that records each request head it reads (and the two body bytes of one with
-/// `content-length: 2`), and answers each with `resp`.
+/// `content-length: 2`), and answers each with `resp` (in pieces 150 ms apart where it
+/// has a NUL byte).
 fn backend(resp: &'static [u8], got: Arc<Mutex<Vec<String>>>) -> SocketAddr {
+    backend_counted(resp, got, Arc::new(AtomicUsize::new(0)))
+}
+
+/// [`backend`], counting in `conns` the connections it accepts.
+fn backend_counted(resp: &'static [u8], got: Arc<Mutex<Vec<String>>>, conns: Arc<AtomicUsize>) -> SocketAddr {
     let ls = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let addr = ls.local_addr().expect("backend addr");
     thread::spawn(move || {
         for c in ls.incoming() {
             let Ok(mut c) = c else { return };
+            conns.fetch_add(1, Ordering::SeqCst);
             let got = Arc::clone(&got);
             thread::spawn(move || {
                 let mut buf = Vec::new();
@@ -199,8 +346,13 @@ fn backend(resp: &'static [u8], got: Arc<Mutex<Vec<String>>>) -> SocketAddr {
                             got.lock().unwrap().push(head);
                         }
                         buf = tail;
-                        if c.write_all(resp).is_err() {
-                            return;
+                        for (i, piece) in resp.split(|&b| b == 0).enumerate() {
+                            if i > 0 {
+                                thread::sleep(Duration::from_millis(150));
+                            }
+                            if c.write_all(piece).is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -218,8 +370,15 @@ fn run(rules: &str, req: &[u8], resp: &'static [u8]) -> (Vec<String>, Vec<u8>, b
 
 /// [`run`] for a request sent in `parts`, 200 ms apart.
 fn run_parts(rules: &str, parts: &[&[u8]], resp: &'static [u8]) -> (Vec<String>, Vec<u8>, bool) {
+    let (heads, out, closed, _) = run_counted(rules, parts, resp);
+    (heads, out, closed)
+}
+
+/// [`run_parts`], and how many connections the server accepted.
+fn run_counted(rules: &str, parts: &[&[u8]], resp: &'static [u8]) -> (Vec<String>, Vec<u8>, bool, usize) {
     let got = Arc::new(Mutex::new(Vec::new()));
-    let be = backend(resp, Arc::clone(&got));
+    let conns = Arc::new(AtomicUsize::new(0));
+    let be = backend_counted(resp, Arc::clone(&got), Arc::clone(&conns));
     let fe = common::reserve_addr();
     let rules: String = rules.lines().fold(String::new(), |mut out, l| {
         out.push_str("  ");
@@ -257,7 +416,7 @@ fn run_parts(rules: &str, parts: &[&[u8]], resp: &'static [u8]) -> (Vec<String>,
     }
     common::stop(&mut child);
     let heads = got.lock().unwrap().clone();
-    (heads, out, closed)
+    (heads, out, closed, conns.load(Ordering::SeqCst))
 }
 
 #[test]
@@ -421,4 +580,39 @@ fn a_request_length_a_rule_made_shorter_than_its_body_is_refused() {
         assert!(cli.starts_with(b"HTTP/1.1 500 "), "{rules}: client got {:?}", String::from_utf8_lossy(&cli));
         assert!(!closed, "{rules}: the client connection closed");
     }
+}
+
+/// T442 row 4a: the server and client connections a rule's `keep-alive` keeps are used
+/// again. Two requests, 200 ms apart, on one client connection; measured on 3.5-dev8
+/// (`/tmp/t442/p442c.py` cases `4f0`, `4f1`, `4f2`).
+#[test]
+fn a_keep_alive_a_rule_wrote_keeps_the_connection_an_option_would_close() {
+    let two: &[&[u8]] = &[GET, b"GET /2 HTTP/1.1\r\nHost: a\r\n\r\n"];
+    let both = [CLI_OK, CLI_OK].concat();
+    for (rules, heads, conns) in [
+        ("option http-server-close", ["GET / HTTP/1.1\r\nhost: a\r\nconnection: close", "GET /2 HTTP/1.1\r\nhost: a\r\nconnection: close"], 2),
+        ("option http-server-close\nhttp-request set-header connection keep-alive", ["GET / HTTP/1.1\r\nhost: a", "GET /2 HTTP/1.1\r\nhost: a"], 1),
+        ("option httpclose\nhttp-response set-header connection keep-alive", ["GET / HTTP/1.1\r\nhost: a", "GET /2 HTTP/1.1\r\nhost: a"], 1),
+    ] {
+        let (got_srv, got_cli, closed, got_conns) = run_counted(rules, two, OK);
+        assert_eq!(got_srv, heads, "{rules}");
+        assert_eq!(String::from_utf8_lossy(&got_cli), String::from_utf8_lossy(&both), "{rules}");
+        assert!(!closed, "{rules}: the client connection closed");
+        assert_eq!(got_conns, conns, "{rules}: server connections");
+    }
+}
+
+/// T442: a request whose rules gave it a length longer than the body it has. `HAProxy` sends
+/// it and closes the server connection after (measured on 3.5-dev8, `/tmp/t442/p442c.py`
+/// cases `m7`, `m7b`): used again, the next request would be read by the server as the rest
+/// of the body. (`HAProxy` then answers that next request 500 after sending part of its
+/// head; Ibex sends it whole on a new connection.)
+#[test]
+fn a_request_length_a_rule_made_longer_than_its_body_closes_the_server_connection() {
+    let parts: &[&[u8]] = &[b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello", b"GET /y HTTP/1.1\r\nHost: a\r\n\r\n"];
+    let (srv, cli, closed, conns) = run_counted("http-request set-header content-length 7", parts, OK);
+    assert_eq!(srv, ["POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 7", "GET /y HTTP/1.1\r\nhost: a"], "the server read the next request as the body");
+    assert_eq!(conns, 2, "server connections");
+    assert!(cli.starts_with(CLI_OK), "client got {:?}", String::from_utf8_lossy(&cli));
+    assert!(!closed, "the client connection closed");
 }

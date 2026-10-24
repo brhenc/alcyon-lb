@@ -76,8 +76,10 @@ fn htx_of(h: &[(String, String)]) -> Htx {
 fn request_cases() -> Vec<(Vec<(String, String)>, &'static str)> {
     vec![
         (
+            // The counts see the `close`: while rules run, one still in `Connection` is a rule's
+            // (the runtime takes the message's own out before them, T442).
             pairs(&[("Host", "a"), ("Upgrade", "\"x\\\"y\", h2c"), ("Connection", "close")]),
-            "04686F737401610000|686F73743A20610D0A0D0A|host|1|1",
+            "04686F737401610000|686F73743A20610D0A0D0A|host|2|2",
         ),
         (
             pairs(&[("Host", "a"), ("Connection", "\"q\\\"x,y\", upgrade"), ("X-A", "1")]),
@@ -118,6 +120,7 @@ fn request_headers_from_every_source_of_the_context() {
 #[test]
 fn response_headers_from_the_context() {
     let reg = Registry::new();
+    // (`res.hdr_cnt` counts the `close`, as while rules run it is a rule's, T442.)
     // A backend answering `Connection: "q\"x,y", close`, `Upgrade: "u\"v", h2c`, `X-A: 1` and an
     // empty body.
     let hdrs = pairs(&[
@@ -131,7 +134,7 @@ fn response_headers_from_the_context() {
         res_fetches(&reg, &ctx),
         "0A636F6E6E656374696F6E0822715C22782C792207757067726164650622755C22762203782D6101310E636F6E74656E742D6C656E67746801300000\
          |636F6E6E656374696F6E3A2022715C22782C79220D0A757067726164653A2022755C2276220D0A782D613A20310D0A636F6E74656E742D6C656E6774683A20300D0A0D0A\
-         |connection:upgrade:x-a:content-length|4|4"
+         |connection:upgrade:x-a:content-length|5|4"
     );
 }
 
