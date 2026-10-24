@@ -212,7 +212,7 @@ fn normalisation_cases() -> Vec<Case> {
     b.extend([0x01, b'1']);
     add(id.clone(), frame(1, 5, 1, &b), Want::Rst);
     // The same byte in a value or `:path`: HAProxy forwards it; Ibex keeps fields as UTF-8
-    // text and resets the stream (tradeoff.md 6.23).
+    // text and resets the stream (tradeoff.md 6.24).
     let id = "val-e9".to_string();
     add(id.clone(), one(&id, b"GET", b"http", b"/", b"x", &[(b"x-a", b"\xe9")]), Want::Rst);
     let id = "path-e9".to_string();
