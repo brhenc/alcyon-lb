@@ -14,6 +14,8 @@
 //! divided by `N`. A first batch fills the buffer caches so the measured batch sees only
 //! what each connection keeps.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -128,7 +130,7 @@ fn open_idle(engine: &mut Engine, fe: SocketAddr, n: usize, request: bool, keep:
 fn per_idle_conn(request: bool) -> usize {
     let running = Arc::new(AtomicBool::new(true));
     let srv = backend(Arc::clone(&running));
-    let fe = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+    let fe = common::reserve_addr();
     let mut engine = engine(srv, fe);
     let mut keep = Vec::new();
     open_idle(&mut engine, fe, 100, request, &mut keep);
@@ -199,7 +201,7 @@ fn a_slow_client_holds_no_buffer_for_a_forwarded_request() {
     const N: usize = 10;
     let running = Arc::new(AtomicBool::new(true));
     let srv = endless_backend(Arc::clone(&running));
-    let fe = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+    let fe = common::reserve_addr();
     let mut engine = engine(srv, fe);
     let used = || ibex_rt::buf::buffer_pool_stats().map_or(0, |p| p.used);
     for _ in 0..10 {
@@ -237,7 +239,7 @@ fn the_engine_gives_the_heap_back_after_a_burst_of_slow_clients() {
     const N: usize = 200;
     let running = Arc::new(AtomicBool::new(true));
     let srv = endless_backend(Arc::clone(&running));
-    let fe = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+    let fe = common::reserve_addr();
     let mut engine = engine(srv, fe);
     let before = ibex_rt::buf::heap_trims();
     let mut clients = Vec::new();
@@ -268,7 +270,7 @@ fn no_memory_trimming_keeps_the_engine_from_trimming() {
     const N: usize = 200;
     let running = Arc::new(AtomicBool::new(true));
     let srv = endless_backend(Arc::clone(&running));
-    let fe = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+    let fe = common::reserve_addr();
     let mut engine = engine_with(srv, fe, true);
     let before = ibex_rt::buf::heap_trims();
     let mut clients = Vec::new();
@@ -302,7 +304,7 @@ fn a_new_engine_without_the_keyword_trims_again() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let running = Arc::new(AtomicBool::new(true));
     let srv = endless_backend(Arc::clone(&running));
-    let fe = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+    let fe = common::reserve_addr();
     let off = engine_with(srv, fe, true);
     drop(off);
     let _on = engine(srv, fe);

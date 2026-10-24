@@ -11,6 +11,9 @@
 //! Counted on the thread that runs the engine: after a warm-up request, a second request
 //! parses no expression and compiles no regex.
 
+use crate::common;
+
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,9 +71,7 @@ fn measure_once(rules: &str, warm: (&str, &str), added: Option<&str>, (path, wan
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let sl = TcpListener::bind("127.0.0.1:0").expect("bind");
     let sa = sl.local_addr().expect("addr");
-    let fl = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let fa = fl.local_addr().expect("addr");
-    drop(fl);
+    let fa = common::reserve_addr();
     let run = Arc::new(AtomicBool::new(true));
     let run2 = Arc::clone(&run);
     sl.set_nonblocking(true).expect("nonblocking");

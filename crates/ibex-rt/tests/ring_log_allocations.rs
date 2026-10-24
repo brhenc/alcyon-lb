@@ -7,6 +7,9 @@
 //! the ring was made. Measured the way `capture_rule_allocations.rs` measures a request: one
 //! warm-up, then the allocations of the second.
 
+mod common;
+
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,9 +55,7 @@ fn drive(fe: SocketAddr, e: &mut Engine) {
 fn allocations_of_one_request(log: &str, ring: &str) -> usize {
     let sl = TcpListener::bind("127.0.0.1:0").expect("bind");
     let sa = sl.local_addr().expect("addr");
-    let fl = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let fa = fl.local_addr().expect("addr");
-    drop(fl);
+    let fa = common::reserve_addr();
     let run = Arc::new(AtomicBool::new(true));
     let run2 = Arc::clone(&run);
     sl.set_nonblocking(true).expect("nonblocking");

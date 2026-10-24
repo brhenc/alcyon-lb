@@ -9,6 +9,9 @@
 //!
 //! The test lowers this process's `RLIMIT_NOFILE`, so it is the only test in its binary.
 
+mod common;
+
+
 use rustix::net::{connect_unix, connect_v4, socket, AddressFamily, SocketAddrUnix, SocketType};
 use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
 use std::io::Write;
@@ -23,9 +26,7 @@ fn out_of_fds_a_log_forward_bind_takes_its_client_once_one_is_free() {
     let path = dir.path().join("lf.sock");
     let collect = UdpSocket::bind("127.0.0.1:0").expect("collector");
     collect.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
-    let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("port");
-    let port = tcp.local_addr().expect("addr").port();
-    drop(tcp);
+    let port = common::reserve_port();
     let cfg = ibex_config::parse_str(&format!(
         "log-forward lf_emfile\n  bind 127.0.0.1:{port}\n  bind unix@{}\n  log 127.0.0.1:{} format raw local0\n",
         path.display(),

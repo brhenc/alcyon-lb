@@ -16,6 +16,8 @@
 //! (`read_tls` into its own receive buffer, `take_received_plaintext`, one `PrefixedPayload`
 //! per record sent). See `tradeoff.md` 6.20 and `tasks/T440-rustls-0.24-caller-owned-buffers.md`.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -120,8 +122,7 @@ fn tls_keepalive_allocations(n: usize, backend_tls: bool) -> usize {
     std::fs::write(&crt, pem).expect("write crt");
 
     let (srv, srv_addr) = loopback0();
-    let (l, addr) = loopback0();
-    drop(l);
+    let addr = common::reserve_addr();
     let running = Arc::new(AtomicBool::new(true));
     let be_tls = backend_tls.then(|| {
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key.clone().into());

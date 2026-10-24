@@ -576,9 +576,7 @@ fn http_reuse_never_does_not_share_backend_connection() {
         }
     });
 
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy");
-    let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
-    drop(proxy_listener);
+    let proxy_addr = common::reserve_addr();
 
     let config = Config {
         listens: vec![ListenSection {

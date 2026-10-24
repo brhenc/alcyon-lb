@@ -8,6 +8,9 @@
 //! in `ibex_sample::expr::parse_call` / `split_call_chain`: the expression was parsed per
 //! request.
 
+mod common;
+
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,9 +55,7 @@ fn drive(fe: SocketAddr, e: &mut Engine) {
 fn allocations_of_one_request(rules: Vec<HttpReqRule>) -> usize {
     let sl = TcpListener::bind("127.0.0.1:0").expect("bind");
     let sa = sl.local_addr().expect("addr");
-    let fl = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let fa = fl.local_addr().expect("addr");
-    drop(fl);
+    let fa = common::reserve_addr();
     let run = Arc::new(AtomicBool::new(true));
     let run2 = Arc::clone(&run);
     sl.set_nonblocking(true).expect("nonblocking");
