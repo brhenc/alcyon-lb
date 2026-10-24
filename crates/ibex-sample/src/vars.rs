@@ -414,7 +414,7 @@ impl VarStore {
     /// An empty store, the slots and buffers of a spare one if this thread has one.
     #[must_use]
     pub fn new() -> Self {
-        Self { slots: VARS.take_raw(|| Some(SlotVec::default())).unwrap_or_default().0 }
+        Self { slots: VARS.take_raw(<SlotVec as ibex_alloc::Poolable>::try_new).unwrap_or_default().0 }
     }
 
     fn slot(&self, name: &str) -> Option<&Slot> {

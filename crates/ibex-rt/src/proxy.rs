@@ -3860,6 +3860,9 @@ fn h3_log_line(line: &str, host: Option<&str>) -> String {
         drop(slot);
         assert!(!QueueWait::any());
         assert_eq!(PENDCONN.local_count(), 1);
+        // A box that is in no queue (never used) is given back as it is: nothing to leave.
+        PENDCONN.give(QueueWait::blank());
+        assert_eq!(PENDCONN.local_count(), 2);
     }
 
 mod tests {
