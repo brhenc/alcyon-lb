@@ -1081,6 +1081,7 @@ mod tests {
     }
 
     crate::declare_pool!(static SIZED: Pool<Sized4k> = PoolSpec::new("t_sized"););
+    crate::declare_pool!(static SPEC_SIZED: Pool<Vec<u8>> = PoolSpec::new("t_spec_sized").size(24););
     crate::declare_pool!(static DISCARD: Pool<Vec<u8>> = PoolSpec::new("t_discard"););
 
     /// A pooled type with a configured size, as the buffers have (`tune.bufsize`).
@@ -1109,6 +1110,7 @@ mod tests {
         drop(SIZED.take().unwrap());
         let h = SIZED.head();
         assert_eq!((h.size, h.align), (4096, 8), "the type's nominal size, the default alignment");
+        assert_eq!(SPEC_SIZED.head().size, 24, "the spec's size");
     }
 
     /// An object taken counted and discarded is freed and no longer in use.
