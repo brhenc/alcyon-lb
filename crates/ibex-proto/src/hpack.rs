@@ -774,42 +774,13 @@ fn huffman_len(input: &[u8]) -> usize {
     bits.div_ceil(8)
 }
 
-/// Decodes a string literal (RFC 7541 §5.2) from input slice at `*offset`.
+/// Appends a string literal (RFC 7541 section 5.2) at `*offset` of `src` to `out`
+/// (T437: into memory the caller keeps). `huff` is where a Huffman string is decoded before
+/// it is checked as UTF-8.
 ///
 /// # Errors
 /// Returns `H2Error::CompressionError` if incomplete or invalid Huffman. A byte that is not
 /// UTF-8 is decoded as a NUL ([`push_as_text`]).
-pub fn decode_string_literal(src: &[u8], offset: &mut usize) -> Result<String, H2Error> {
-    if *offset >= src.len() {
-        return Err(H2Error::CompressionError);
-    }
-    let is_huffman = (src[*offset] & 0x80) != 0;
-    let len = decode_integer(7, src, offset)?;
-
-    if *offset + len > src.len() {
-        return Err(H2Error::CompressionError);
-    }
-
-    let raw = &src[*offset..*offset + len];
-    *offset += len;
-
-    let mut out = String::new();
-    if is_huffman {
-        let mut huff = Vec::new();
-        decode_huffman_into(raw, &mut huff)?;
-        push_as_text(&mut out, &huff);
-    } else {
-        push_as_text(&mut out, raw);
-    }
-    Ok(out)
-}
-
-/// Appends a string literal (RFC 7541 section 5.2) at `*offset` of `src` to `out`, as
-/// [`decode_string_literal`] decodes it (T437: into memory the caller keeps). `huff` is
-/// where a Huffman string is decoded before it is checked as UTF-8.
-///
-/// # Errors
-/// As [`decode_string_literal`].
 pub fn decode_string_literal_into(src: &[u8], offset: &mut usize, out: &mut String, huff: &mut Vec<u8>) -> Result<(), H2Error> {
     if *offset >= src.len() {
         return Err(H2Error::CompressionError);
