@@ -125,6 +125,11 @@ path = "tests/promex.rs"
 name = "request_allocations"
 path = "tests/request_allocations.rs"
 
+# Own process: fails large allocations on demand (#[global_allocator])
+[[test]]
+name = "session_arena_trim_oom"
+path = "tests/session_arena_trim_oom.rs"
+
 # Own process: counts the engine thread's allocations (#[global_allocator])
 [[test]]
 name = "tls_request_allocations"
