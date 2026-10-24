@@ -1023,6 +1023,22 @@ mod tests {
         assert_eq!(b.slots.as_ptr(), ptr);
         assert!(b.is_empty());
     }
+    /// T445: `pool_gc` frees the spare stores, each kept value buffer handed to the wipe
+    /// first, and leaves none for the next store.
+    #[test]
+    fn draining_the_spare_stores_wipes_each_kept_buffer() {
+        let _ = drain_spare(|_| {});
+        let mut a = VarStore::new();
+        a.insert("txn.t445", Sample::Str("secret".repeat(10)));
+        let ptr = a.slots.as_ptr();
+        drop(a);
+        let mut wiped = Vec::new();
+        assert_eq!(drain_spare(|b| wiped.push(b.capacity())), 1, "one spare store");
+        assert!(!wiped.is_empty() && wiped.iter().any(|&c| c >= 60), "the value's buffer was wiped: {wiped:?}");
+        assert_eq!(drain_spare(|_| {}), 0);
+        assert_ne!(VarStore::new().slots.as_ptr(), ptr, "the store was freed, not kept");
+    }
+
     /// T445: a reservation the allocator refuses runs the runtime's `pool_gc` and is tried
     /// once more, as `ssl_sock.c` retries `SSL_new` (the hook is process-wide: set once).
     #[test]

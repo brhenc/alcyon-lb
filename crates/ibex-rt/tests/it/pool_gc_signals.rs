@@ -45,6 +45,10 @@ impl Drop for Run {
 }
 
 fn start(tag: &str, nbthread: usize) -> Run {
+    start_with(tag, nbthread, "")
+}
+
+fn start_with(tag: &str, nbthread: usize, fe_extra: &str) -> Run {
     let addr = common::reserve_addr();
     let dir = std::env::temp_dir().join(format!("pgc-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -53,7 +57,7 @@ fn start(tag: &str, nbthread: usize) -> Run {
     let cfg = format!(
         "global\n  stats socket {sock} level admin\n  nbthread {nbthread}\n\
          defaults\n  mode http\n  timeout connect 1s\n  timeout client 30s\n  timeout server 30s\n\
-         frontend fe\n  bind {addr}\n  http-request return status 200 content-type text/plain string 0123456789\n"
+         frontend fe\n  bind {addr}\n{fe_extra}  http-request return status 200 content-type text/plain string 0123456789\n"
     );
     let path = dir.join("c.cfg");
     std::fs::write(&path, cfg).unwrap();
@@ -193,6 +197,47 @@ fn sigusr1_flushes_the_caches_while_a_connection_holds_the_stop() {
     let mut cli = Cli::open(&run.sock);
     std::thread::sleep(Duration::from_millis(100));
     caches_empty_after(&mut cli, &run.ibex, rustix::process::Signal::Usr1);
+    assert!(run.ibex.try_wait().unwrap().is_none(), "the held connection did not keep the soft stop open");
+    drop(held);
+}
+
+/// The stop path (`src/proxy.c:3715`): while stopping, a stick-table purge that freed
+/// entries runs `pool_gc` again. The soft stop's own collection empties the cache; a request
+/// finished afterwards caches its buffers again, and only the purge of the expired entry
+/// empties it a second time.
+#[test]
+fn a_purge_while_stopping_flushes_the_caches_again() {
+    let mut run = start_with(
+        "purge",
+        1,
+        "  stick-table type ip size 10 expire 500ms\n  http-request track-sc0 src\n",
+    );
+    let mut held = TcpStream::connect_timeout(&run.addr, Duration::from_secs(2)).expect("connect");
+    held.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap();
+    let mut late = TcpStream::connect_timeout(&run.addr, Duration::from_secs(2)).expect("connect");
+    late.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap();
+    burst(run.addr);
+    let mut cli = Cli::open(&run.sock);
+    std::thread::sleep(Duration::from_millis(100));
+    caches_empty_after(&mut cli, &run.ibex, rustix::process::Signal::Usr1);
+    // Finished now, its entry refreshed: its buffers go back to the cache.
+    late.write_all(b"Connection: close\r\n\r\n").unwrap();
+    late.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut out = Vec::new();
+    let _ = late.read_to_end(&mut out);
+    assert!(out.starts_with(b"HTTP/1.1 200"), "late answer {:?}", String::from_utf8_lossy(&out));
+    let (_, cached) = buffers(&cli.cmd("show pools"));
+    assert!(cached > 0, "the late request cached no buffer");
+    // The entry expires after 500 ms and is purged within 250 ms more.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let dump = cli.cmd("show pools");
+        if buffers(&dump).1 == 0 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the purge while stopping did not flush the cache:\n{dump}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert!(run.ibex.try_wait().unwrap().is_none(), "the held connection did not keep the soft stop open");
     drop(held);
 }
