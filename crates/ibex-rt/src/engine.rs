@@ -13615,9 +13615,9 @@ fn rewrite_request_connection(sess: &mut TcpSession, opt_close: bool) {
 /// the `Content-Length` it was, only the first (T442). False when that length is not a
 /// number or is shorter than the body: the request cannot be sent.
 fn reread_request_framing(sess: &mut TcpSession) -> bool {
-    let Some(was) = sess.txn.as_ref().and_then(|t| t.req_len_hdrs) else {
-        return true;
-    };
+    // Every request that reaches its rules has what it was framed by (`TcpSession` and
+    // `h2_bridge` set it); without it, both count as framed and nothing is dropped.
+    let was = sess.txn.as_ref().and_then(|t| t.req_len_hdrs).unwrap_or(crate::txn::LenHdrs { clen: true, chnk: true });
     for (name, framed) in [("content-length", was.clen), ("transfer-encoding", was.chnk)] {
         if framed || sess.htx_slice().and_then(|h| h.get_header_bytes(name.as_bytes())).is_none() {
             continue;

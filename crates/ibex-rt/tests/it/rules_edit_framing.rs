@@ -190,6 +190,15 @@ const ROWS: &[Row] = &[
         b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nokxabc",
         true,
     ),
+    // A head that comes alone, its body after it has gone.
+    (
+        "http-response del-header transfer-encoding",
+        GET,
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\x002\r\nok\r\n0\r\n\r\n",
+        SRV_GET,
+        CLI_RAW_OK,
+        true,
+    ),
     // For an HTTP/1.0 client that asked to keep its connection, and with a length a rule
     // wrote (not one the response was framed by, so not written).
     (

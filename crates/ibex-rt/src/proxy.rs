@@ -1712,10 +1712,9 @@ impl TcpSession {
     pub fn dechunk_rep(&mut self, from: usize) {
         let Some(t) = self.txn.as_mut() else { return };
         let Some(c) = t.rsp_dechunk.as_deref_mut() else { return };
+        // A head that came alone leaves nothing after it (`from == len`): `dechunk` reads
+        // nothing, and the parser stays where it is.
         let len = self.rep.len();
-        if from >= len {
-            return;
-        }
         let (n, r) = txn::dechunk(c, &mut self.rep.readable_mut()[from..]);
         match r {
             Ok(None) => self.rep.cut(from + n, len),
@@ -1724,11 +1723,12 @@ impl TcpSession {
                 t.rsp_dechunk = None;
                 t.srv_reusable &= from + end == len;
                 let total = self.rep.len();
+                // While the framing comes off, the response is its head (`set_rsp` sets it so)
+                // or, once that has gone, a body that lasts until the close.
                 t.rsp = match t.rsp {
                     txn::MsgState::Head { left, .. } => txn::MsgState::Head { left, body: txn::Framing::Length((total - left) as u64) },
-                    txn::MsgState::Body(txn::Body::UntilClose) if total == 0 => txn::MsgState::Done,
-                    txn::MsgState::Body(txn::Body::UntilClose) => txn::MsgState::Body(txn::Body::Length(total as u64)),
-                    other => other,
+                    _ if total == 0 => txn::MsgState::Done,
+                    _ => txn::MsgState::Body(txn::Body::Length(total as u64)),
                 };
             }
             Err(()) => {
