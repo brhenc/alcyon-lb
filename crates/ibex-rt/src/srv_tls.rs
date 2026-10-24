@@ -21,7 +21,7 @@
 
 use crate::xprt::{self, ServerXprt};
 use ibex_config::{Server, ServerSsl, SslVerify};
-use ibex_sample::{Expr, Registry, SampleContext};
+use ibex_sample::{Expr, Registry, Sample, SampleContext};
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use std::io;
@@ -119,12 +119,20 @@ impl ServerTls {
         Ok(Some(Self { configs, sni }))
     }
 
-    /// The name this connection sends in SNI, from the `sni` expression over the stream.
-    #[must_use]
-    pub fn sni(&self, registry: &Registry, ctx: &SampleContext<'_>) -> Option<String> {
-        let smp = self.sni.as_ref()?.eval_sample(registry, ctx)?;
-        let name = crate::engine::sample_to_string(&smp);
-        (!name.is_empty()).then_some(name)
+    /// `f` of the name this connection sends in SNI, from the `sni` expression over the
+    /// stream (`None`: no SNI). The name is evaluated for every request, which reads it
+    /// only, so a text sample is lent to `f` and its string given back to the sample
+    /// engine's spares afterwards: the automatic SNI allocates nothing per request.
+    pub fn with_sni<R>(&self, registry: &Registry, ctx: &SampleContext<'_>, f: impl FnOnce(Option<&str>) -> R) -> R {
+        let Some(smp) = self.sni.as_ref().and_then(|e| e.eval_sample(registry, ctx)) else {
+            return f(None);
+        };
+        let r = match &smp {
+            Sample::Str(s) => f(Some(s.as_str()).filter(|s| !s.is_empty())),
+            other => f(Some(crate::engine::sample_to_string(other).as_str()).filter(|s| !s.is_empty())),
+        };
+        ibex_sample::spare::give_sample(smp);
+        r
     }
 
     /// Opens the TLS transport over the connected `fd`.
@@ -181,7 +189,28 @@ fn strip_port(host: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_port;
+    use super::{strip_port, Configs, ServerTls};
+    use ibex_config::{ServerSsl, SslVerify};
+    use ibex_sample::{Expr, SampleContext};
+
+    /// The name `sni <expr>` gives over an empty stream.
+    fn sni_of(expr: &str) -> Option<String> {
+        let tls = ServerTls {
+            configs: Configs::build(&ServerSsl { verify: Some(SslVerify::None), ..ServerSsl::default() }, &[], "t").expect("configs"),
+            sni: Some(Expr::parse(expr).expect("parse")),
+        };
+        tls.with_sni(crate::engine::sample_registry(), &SampleContext::default(), |s| s.map(str::to_string))
+    }
+
+    /// `sample_fetch_as_type(..., SMP_T_STR)`: a sample of another type is sent as its text;
+    /// an empty name, or a request without Host under the automatic SNI, sends none.
+    #[test]
+    fn the_sni_is_the_text_of_the_sample_and_none_when_empty() {
+        assert_eq!(sni_of("int(7)").as_deref(), Some("7"));
+        assert_eq!(sni_of("str(a.example)").as_deref(), Some("a.example"));
+        assert_eq!(sni_of("str()"), None);
+        assert_eq!(sni_of("req.hdr(host),field(1,:)"), None);
+    }
 
     #[test]
     fn the_check_host_loses_its_port_as_haproxy_strips_it() {
