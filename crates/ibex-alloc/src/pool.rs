@@ -60,6 +60,11 @@ pub trait Poolable: Sized + 'static {
     }
     /// A new object for a cache miss, or `None` when memory is short (no abort).
     fn try_new() -> Option<Self>;
+    /// The size `show pools` prints for a pool whose objects have a configured size
+    /// (`tune.bufsize`), read when it is shown; 0: [`PoolSpec::size`], else the mean.
+    fn nominal_size() -> usize {
+        0
+    }
 }
 
 impl Poolable for String {
@@ -122,6 +127,8 @@ pub struct PoolSpec {
     /// Whether the give's wipe follows `tune.ibex.zero-spares` (spare strings and lists) instead
     /// of `tune.ibex.zero-buffers` (buffers). Both are read from the thread's copy.
     pub spares: bool,
+    /// Alignment `show pools` prints (`/8`); the buffers' is 64.
+    pub align: usize,
     pub file: &'static str,
     pub line: u32,
 }
@@ -129,7 +136,7 @@ pub struct PoolSpec {
 impl PoolSpec {
     #[must_use]
     pub const fn new(name: &'static str) -> Self {
-        PoolSpec { name, size: 0, max_item: usize::MAX, max_count: usize::MAX, floor: 0, limited: false, spares: false, file: "", line: 0 }
+        PoolSpec { name, size: 0, max_item: usize::MAX, max_count: usize::MAX, floor: 0, limited: false, spares: false, align: 8, file: "", line: 0 }
     }
     #[must_use]
     pub const fn size(mut self, n: usize) -> Self {
@@ -160,6 +167,11 @@ impl PoolSpec {
     #[must_use]
     pub const fn spares(mut self) -> Self {
         self.spares = true;
+        self
+    }
+    #[must_use]
+    pub const fn align(mut self, n: usize) -> Self {
+        self.align = n;
         self
     }
     #[must_use]
@@ -231,6 +243,8 @@ struct Hot {
     wipe: Cell<bool>,
     /// `tune.ibex.zero-spares`.
     wipe_spares: Cell<bool>,
+    /// `tune.ibex.ssl-zero-buffers` (default on).
+    wipe_ssl: Cell<bool>,
     /// The settings generation copied.
     gen: Cell<u64>,
     /// When [`pass`] publishes next (`None`: at the next pass).
@@ -247,6 +261,7 @@ thread_local! {
             three_q: Cell::new(HOT_SIZE_DEFAULT / 4 * 3),
             wipe: Cell::new(false),
             wipe_spares: Cell::new(false),
+            wipe_ssl: Cell::new(true),
             gen: Cell::new(0),
             next_publish: Cell::new(None),
             pools: [const { Cell::new(None) }; MAX_POOLS],
@@ -313,6 +328,12 @@ pub fn hot_size() -> usize {
     HOT_SIZE.load(Ordering::Relaxed)
 }
 
+/// This thread's copy of `tune.ibex.ssl-zero-buffers` (on when the thread is ending).
+#[inline]
+pub(crate) fn wipe_ssl_on() -> bool {
+    HOT.try_with(|h| h.wipe_ssl.get()).unwrap_or(true)
+}
+
 /// A setting the threads copy changed (`tune.memory.hot-size`, `tune.ibex.zero-buffers`,
 /// `tune.ibex.zero-spares`).
 pub(crate) fn settings_changed() {
@@ -329,6 +350,7 @@ fn refresh_local() {
             h.three_q.set(max / 4 * 3);
             h.wipe.set(crate::zero_buffers());
             h.wipe_spares.set(crate::zero_spares());
+            h.wipe_ssl.set(crate::ssl_zero_buffers());
             h.bytes.get() > max
         })
         .unwrap_or(false);
@@ -571,6 +593,31 @@ impl<T: Poolable> Pool<T> {
     #[allow(clippy::inline_always)]
     pub fn give(&'static self, v: T) {
         self.put(v, false);
+    }
+
+    /// [`Self::take_with`] for an owner that keeps the object itself (a `Buf` holds its memory
+    /// as a `Box<[u8]>`): the object counts as in use until [`Self::give_counted`] or
+    /// [`Self::discard_counted`].
+    #[inline(always)] // see `put`
+    #[allow(clippy::inline_always)]
+    pub fn take_counted(&'static self, init: impl FnOnce() -> Option<T>) -> Option<T> {
+        match self.pop(true) {
+            Some(v) => Some(v),
+            None => self.miss(true, init),
+        }
+    }
+
+    /// Gives back an object from [`Self::take_counted`] (what `PoolBox`'s drop does).
+    #[inline(always)] // see `put`
+    #[allow(clippy::inline_always)]
+    pub fn give_counted(&'static self, v: T) {
+        self.put(v, true);
+    }
+
+    /// An object from [`Self::take_counted`] that is not worth pooling (of another size than the
+    /// pool's now): freed, no longer in use.
+    pub fn discard_counted(&'static self, v: T) {
+        self.free_given(v, true);
     }
 
     /// Fills this thread's cache with `n` new objects (at start, before any request).
@@ -842,11 +889,19 @@ impl<T: Poolable> PoolDyn for Pool<T> {
             boxes = boxes.wrapping_add(s.boxes.load(Ordering::Relaxed));
         }
         let used = usize::try_from(boxes).unwrap_or(0);
-        let size = if self.spec.size != 0 { self.spec.size } else { bytes.checked_div(count).unwrap_or(0) };
+        let nominal = T::nominal_size();
+        let size = if self.spec.size != 0 {
+            self.spec.size
+        } else if nominal != 0 {
+            nominal
+        } else {
+            bytes.checked_div(count).unwrap_or(0)
+        };
+        let align = self.spec.align;
         PoolHead {
             name: self.spec.name,
             size,
-            align: 8,
+            align,
             allocated: count + used,
             alloc_bytes: bytes + used * size,
             used,
@@ -854,7 +909,7 @@ impl<T: Poolable> PoolDyn for Pool<T> {
             needed_avg: 0,
             failures: self.shared.failures.load(Ordering::Relaxed),
             users: 1,
-            reg: Some(PoolReg { name: self.spec.name, size, flags: 0, align: 8, file: self.spec.file, line: self.spec.line }),
+            reg: Some(PoolReg { name: self.spec.name, size, flags: 0, align, file: self.spec.file, line: self.spec.line }),
         }
     }
 
@@ -1023,6 +1078,50 @@ mod tests {
         fn try_new() -> Option<Self> {
             Some(Blob(10))
         }
+    }
+
+    crate::declare_pool!(static SIZED: Pool<Sized4k> = PoolSpec::new("t_sized"););
+    crate::declare_pool!(static SPEC_SIZED: Pool<Vec<u8>> = PoolSpec::new("t_spec_sized").size(24););
+    crate::declare_pool!(static DISCARD: Pool<Vec<u8>> = PoolSpec::new("t_discard"););
+
+    /// A pooled type with a configured size, as the buffers have (`tune.bufsize`).
+    #[derive(Debug, Default)]
+    struct Sized4k;
+
+    impl Poolable for Sized4k {
+        fn footprint(&self) -> usize {
+            1
+        }
+        fn reset(&mut self, _wipe: bool) {}
+        fn try_new() -> Option<Self> {
+            Some(Sized4k)
+        }
+        fn nominal_size() -> usize {
+            4096
+        }
+    }
+
+    /// The builders run at run time (a `static`'s are evaluated by the compiler), and the
+    /// size and alignment `show pools` prints come from the spec or the type.
+    #[test]
+    fn the_spec_builders_and_the_shown_size_follow_the_spec_and_the_type() {
+        let spec = PoolSpec::new("t_rt").size(24).align(64).max_count(3).floor(1);
+        assert_eq!((spec.size, spec.align, spec.max_count, spec.floor), (24, 64, 3, 1));
+        drop(SIZED.take().unwrap());
+        let h = SIZED.head();
+        assert_eq!((h.size, h.align), (4096, 8), "the type's nominal size, the default alignment");
+        assert_eq!(SPEC_SIZED.head().size, 24, "the spec's size");
+    }
+
+    /// An object taken counted and discarded is freed and no longer in use.
+    #[test]
+    fn a_discarded_counted_object_is_freed_and_not_in_use() {
+        let v = DISCARD.take_counted(|| Some(vec![0u8; 8])).unwrap();
+        publish_local();
+        assert_eq!(DISCARD.head().used, 1);
+        DISCARD.discard_counted(v);
+        publish_local();
+        assert_eq!((DISCARD.head().used, DISCARD.local_count()), (0, 0));
     }
 
     thread_local! {

@@ -21,7 +21,6 @@
 //! than being a single number.
 
 use ibex_config::{LogConfig, LogFacility, LogLevel, LogSample, LogTarget, RingFormat};
-use std::cell::RefCell;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::net::UnixDatagram;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,11 +29,6 @@ use std::sync::Arc;
 
 use crate::loghdr::{build_header, Meta};
 use crate::ring::Ring;
-
-thread_local! {
-    /// The line being built, reused so that sending one allocates nothing once warm.
-    static LINE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
 
 /// Lines that could not be written because the descriptor was full (`DroppedLogs`).
 static DROPPED_LOGS: AtomicU64 = AtomicU64::new(0);
@@ -348,10 +342,9 @@ impl SyslogTarget {
     /// Builds the line (header, then the message cut to `len`) in the per-thread buffer and
     /// hands it to `f`.
     fn with_line<R>(&self, level: u8, facility: u8, meta: &Meta, msg: &[u8], f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
-        LINE.with(|line| {
-            let mut line = line.borrow_mut();
-            line.clear();
-            build_header(&mut line, self.format, facility, level, meta);
+        // The line being built is a `scratch_bytes` buffer: sending one allocates nothing once warm.
+        crate::reuse::with_bytes(|line| {
+            build_header(line, self.format, facility, level, meta);
             line.extend_from_slice(msg);
             // The datagram or line ends with a line feed that `len` counts
             // (measured on 3.5-dev8-885761-29: `len 80` sends 79 bytes and `\n`).
@@ -359,7 +352,7 @@ impl SyslogTarget {
             // One line feed, not two for a forwarded message that came with its own (measured:
             // `HAProxy` forwards `hello` and `hello\n` alike as `hello\n`).
             if line.last() != Some(&b'\n') { line.push(b'\n'); }
-            f(&mut line)
+            f(line)
         })
     }
 

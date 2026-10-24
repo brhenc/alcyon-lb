@@ -120,19 +120,18 @@ pub struct TlsCtx {
 
 impl Drop for TlsCtx {
     /// The ciphertext this connection produced does not stay in the heap for the next
-    /// allocation to find (always, see [`wipe_vec`]): the whole capacity, `clear` keeps it.
+    /// allocation to find (`tune.ibex.ssl-zero-buffers`, see [`wipe_vec`]): the whole capacity, `clear` keeps it.
     fn drop(&mut self) {
         wipe_vec(&mut self.tx);
     }
 }
 
-/// Zeroes all of `v`'s memory, written or not. Always: `tune.ibex.zero-buffers` (default off)
-/// is the plain I/O buffers'; the TLS record buffers get their own setting in S2
-/// (`tune.ibex.ssl-zero-buffers`, default on).
+/// Zeroes all of `v`'s memory, written or not, under `tune.ibex.ssl-zero-buffers` (default on):
+/// `tune.ibex.zero-buffers` (default off) is the plain I/O buffers'.
 pub(crate) fn wipe_vec(v: &mut Vec<u8>) {
     let cap = v.capacity();
     v.resize(cap, 0);
-    ibex_alloc::wipe_always(v);
+    ibex_alloc::wipe_ssl(v);
 }
 
 impl TlsCtx {
@@ -623,22 +622,26 @@ mod wipe_tests {
     static SETTING: Mutex<()> = Mutex::new(());
 
     /// What `TlsCtx` (output buffer) and `VecInput` (input buffer, decrypted plaintext) run on
-    /// release: all of the capacity reads back zeros whatever `tune.ibex.zero-buffers` says
-    /// (T437 5b, applied to the T440 buffers). That setting is the plain I/O buffers' and is
-    /// off by default; the TLS record buffers keep being wiped until S2 gives them their own
-    /// `tune.ibex.ssl-zero-buffers` (default on, the user 2026-10-24).
+    /// release: with `tune.ibex.ssl-zero-buffers` on (the default) all of the capacity reads
+    /// back zeros whatever `tune.ibex.zero-buffers` (the plain I/O buffers', off by default)
+    /// says; with it off the secret is still in the freed memory.
     #[test]
-    fn released_tls_buffers_are_zeroed_whatever_zero_buffers_says() {
+    fn released_tls_buffers_follow_ssl_zero_buffers_and_not_zero_buffers() {
         let _turn = SETTING.lock().unwrap();
         let secret = b"decrypted-secret-0123456789";
-        for on in [true, false] {
-            ibex_alloc::set_zero_buffers(on);
-            let mut v = Vec::with_capacity(256);
-            v.extend_from_slice(secret);
-            wipe_vec(&mut v);
-            assert_eq!(v.len(), 256, "zero-buffers {on}: the whole capacity is wiped");
-            assert!(v.iter().all(|&b| b == 0), "zero-buffers {on}: the plaintext is still there");
+        for zero_buffers in [true, false] {
+            ibex_alloc::set_zero_buffers(zero_buffers);
+            for ssl in [true, false] {
+                ibex_alloc::set_ssl_zero_buffers(ssl);
+                let mut v = Vec::with_capacity(256);
+                v.extend_from_slice(secret);
+                wipe_vec(&mut v);
+                assert_eq!(v.len(), 256, "ssl {ssl}: the whole capacity is covered");
+                let kept = &v[..secret.len()] == secret;
+                assert_eq!(kept, !ssl, "zero-buffers {zero_buffers}, ssl-zero-buffers {ssl}: secret kept = {kept}");
+            }
         }
         ibex_alloc::set_zero_buffers(false);
+        ibex_alloc::set_ssl_zero_buffers(true);
     }
 }

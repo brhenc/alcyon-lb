@@ -15,10 +15,11 @@
 //! - **Large buffer** (`tune.bufsize.large`, optional, off by default): preallocated per thread
 //!   when enabled.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
-use ibex_alloc::{PoolHead, PoolReg};
+use ibex_alloc::pool::{Pool, PoolDyn, PoolSpec, Poolable};
+use ibex_alloc::{declare_pool, PoolHead, PoolReg};
 
 /// Configured buffer sizes (in bytes).
 static BUFSIZE_STANDARD: AtomicUsize = AtomicUsize::new(16_384);
@@ -52,90 +53,82 @@ pub fn get_bufsize_large() -> Option<usize> {
 }
 
 // Global atomic pool statistics counters
-/// Failed pool takes. Nothing increments it yet.
+/// Failed pool takes of the arenas. Nothing increments it yet.
 pub static POOL_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
-static BUF_STD_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 /// Standard buffers ever taken from the heap (never decremented): what `trim_idle` watches.
+/// Written on the miss path only.
 static BUF_STD_FRESH: AtomicUsize = AtomicUsize::new(0);
-static BUF_STD_USED: AtomicUsize = AtomicUsize::new(0);
-static BUF_STD_CACHED: AtomicUsize = AtomicUsize::new(0);
 
-static BUF_SMALL_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
-static BUF_SMALL_USED: AtomicUsize = AtomicUsize::new(0);
-static BUF_SMALL_CACHED: AtomicUsize = AtomicUsize::new(0);
+/// The memory of a buffer, as the pools hold it. `CLASS` is 0 for the standard size, 1 for the
+/// small and 2 for the large one; the size is read when a new one is made, so a pool never
+/// has to know it.
+pub struct Mem<const CLASS: u8>(Box<[u8]>);
 
-static BUF_LARGE_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
-static BUF_LARGE_USED: AtomicUsize = AtomicUsize::new(0);
-static BUF_LARGE_CACHED: AtomicUsize = AtomicUsize::new(0);
+impl<const CLASS: u8> Mem<CLASS> {
+    /// The size of this class now.
+    fn size() -> usize {
+        match CLASS {
+            0 => get_bufsize(),
+            1 => get_bufsize_small(),
+            _ => get_bufsize_large().unwrap_or(65536),
+        }
+    }
+}
 
-/// Decoupled provider for standard buffer pool metrics (`show pools`).
+impl<const CLASS: u8> Poolable for Mem<CLASS> {
+    #[inline]
+    fn footprint(&self) -> usize {
+        self.0.len()
+    }
+    /// Nothing: the owner (`Buf`'s drop) zeroed what was written before it gave the memory
+    /// back, and only what was written (`hwm`).
+    #[inline]
+    fn reset(&mut self, _wipe: bool) {}
+    /// Only memory of the size configured now is pooled: one grown by a head rewrite, or made
+    /// before the sizes were set, is freed.
+    #[inline]
+    fn keep(&self, max_footprint: usize) -> bool {
+        self.0.len() == Self::size() && self.0.len() <= max_footprint
+    }
+    fn nominal_size() -> usize {
+        Self::size()
+    }
+    fn try_new() -> Option<Self> {
+        if CLASS == 0 {
+            BUF_STD_FRESH.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(Mem(vec![0u8; Self::size()].into_boxed_slice()))
+    }
+}
+
+// Floor 64: what a thread has always kept, and what keeps the steady state at no malloc
+// (design 3.3). The floor objects are not counted against `tune.memory.hot-size`.
+declare_pool!(static BUF_STD: Pool<Mem<0>> = PoolSpec::new("buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64););
+declare_pool!(static BUF_SMALL: Pool<Mem<1>> = PoolSpec::new("small_buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64););
+declare_pool!(static BUF_LARGE: Pool<Mem<2>> = PoolSpec::new("large_buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64););
+
+/// One pool as `show pools` prints it; this thread's counts are published first, so that a
+/// caller reading its own buffers sees them at once.
+fn pool_head<const C: u8>(pool: &'static Pool<Mem<C>>) -> PoolHead {
+    ibex_alloc::pool::publish_local();
+    PoolDyn::head(pool)
+}
+
+/// Provider for the standard buffer pool (`show pools`).
 pub fn buffer_pool_stats() -> Option<PoolHead> {
-    let size = get_bufsize();
-    let allocated = BUF_STD_ALLOCATED.load(Ordering::Relaxed);
-    let used = BUF_STD_USED.load(Ordering::Relaxed);
-    let cached = BUF_STD_CACHED.load(Ordering::Relaxed);
-    Some(PoolHead {
-        name: "buffer",
-        size,
-        align: 64,
-        allocated,
-        alloc_bytes: allocated * size,
-        used,
-        cached,
-        // `needed_avg` is not tracked (always 0) and `failures` is never incremented: the
-        // fallible take that would count them is another slice. Nothing is made up here.
-        needed_avg: 0,
-        failures: POOL_FAILURES.load(Ordering::Relaxed),
-        users: 1,
-        reg: Some(PoolReg { name: "buffer", size, flags: 0, align: 64, file: file!(), line: line!() }),
-    })
+    Some(pool_head(&BUF_STD))
 }
 
-/// Decoupled provider for small buffer pool metrics (`show pools`).
+/// Provider for the small buffer pool (`show pools`).
 pub fn small_buffer_pool_stats() -> Option<PoolHead> {
-    let size = get_bufsize_small();
-    let allocated = BUF_SMALL_ALLOCATED.load(Ordering::Relaxed);
-    let used = BUF_SMALL_USED.load(Ordering::Relaxed);
-    let cached = BUF_SMALL_CACHED.load(Ordering::Relaxed);
-    Some(PoolHead {
-        name: "small_buffer",
-        size,
-        align: 64,
-        allocated,
-        alloc_bytes: allocated * size,
-        used,
-        cached,
-        // `needed_avg` is not tracked (always 0) and `failures` is never incremented: the
-        // fallible take that would count them is another slice. Nothing is made up here.
-        needed_avg: 0,
-        failures: POOL_FAILURES.load(Ordering::Relaxed),
-        users: 1,
-        reg: Some(PoolReg { name: "small_buffer", size, flags: 0, align: 64, file: file!(), line: line!() }),
-    })
+    Some(pool_head(&BUF_SMALL))
 }
 
-/// Decoupled provider for large buffer pool metrics (`show pools`).
+/// Provider for the large buffer pool (`show pools`); none when not configured.
 pub fn large_buffer_pool_stats() -> Option<PoolHead> {
-    let size = get_bufsize_large()?;
-    let allocated = BUF_LARGE_ALLOCATED.load(Ordering::Relaxed);
-    let used = BUF_LARGE_USED.load(Ordering::Relaxed);
-    let cached = BUF_LARGE_CACHED.load(Ordering::Relaxed);
-    Some(PoolHead {
-        name: "large_buffer",
-        size,
-        align: 64,
-        allocated,
-        alloc_bytes: allocated * size,
-        used,
-        cached,
-        // `needed_avg` is not tracked (always 0) and `failures` is never incremented: the
-        // fallible take that would count them is another slice. Nothing is made up here.
-        needed_avg: 0,
-        failures: POOL_FAILURES.load(Ordering::Relaxed),
-        users: 1,
-        reg: Some(PoolReg { name: "large_buffer", size, flags: 0, align: 64, file: file!(), line: line!() }),
-    })
+    get_bufsize_large()?;
+    Some(pool_head(&BUF_LARGE))
 }
 
 /// Counters of a per-thread arena (`SessionArena`, `AppletArena`), summed over every worker:
@@ -212,8 +205,8 @@ static INIT_REGISTRY: Once = Once::new();
 pub fn ensure_registered() {
     INIT_REGISTRY.call_once(|| {
         let reg = ibex_alloc::global_pool_registry();
-        reg.register_provider("buffer", buffer_pool_stats);
-        reg.register_provider("small_buffer", small_buffer_pool_stats);
+        BUF_STD.register();
+        BUF_SMALL.register();
         register_arena_pools(reg);
     });
 }
@@ -232,14 +225,13 @@ pub fn init_buffer_sizes(standard: usize, small: usize, large: Option<usize>) {
         BUFSIZE_LARGE.store(0, Ordering::SeqCst);
     }
 
-    let reg = ibex_alloc::global_pool_registry();
-    reg.register_provider("buffer", buffer_pool_stats);
-    reg.register_provider("small_buffer", small_buffer_pool_stats);
-    register_arena_pools(reg);
+    // Memory made for other sizes is of no use now.
+    let _ = (BUF_STD.drain_local(), BUF_SMALL.drain_local(), BUF_LARGE.drain_local());
+    BUF_STD.register();
+    BUF_SMALL.register();
+    register_arena_pools(ibex_alloc::global_pool_registry());
     if large.is_some() {
-        reg.register_provider("large_buffer", large_buffer_pool_stats);
-    } else {
-        reg.unregister_provider("large_buffer");
+        BUF_LARGE.register();
     }
 }
 
@@ -308,132 +300,41 @@ pub fn trim_idle(now: std::time::Instant) {
     }
 }
 
-struct ThreadPools {
-    small: Vec<Box<[u8]>>,
-    standard: Vec<Box<[u8]>>,
-    large: Vec<Box<[u8]>>,
-}
-
-impl ThreadPools {
-    const fn new() -> Self {
-        Self {
-            small: Vec::new(),
-            standard: Vec::new(),
-            large: Vec::new(),
-        }
-    }
-}
-
-thread_local! {
-    static THREAD_POOLS: RefCell<ThreadPools> = const { RefCell::new(ThreadPools::new()) };
-}
-
-/// `pool_gc` (T445): frees every buffer this thread's cache holds and takes them out of
-/// `show pools`. A cached buffer was wiped when it was released (`Buf`'s `Drop`). Returns
-/// how many were freed.
-#[must_use]
-pub fn drain_thread_cache() -> usize {
-    let taken = THREAD_POOLS.try_with(|pools| {
-        let Ok(mut p) = pools.try_borrow_mut() else { return ThreadPools::new() };
-        std::mem::replace(&mut *p, ThreadPools::new())
-    });
-    let Ok(taken) = taken else { return 0 };
-    let (s, m, l) = (taken.small.len(), taken.standard.len(), taken.large.len());
-    BUF_SMALL_CACHED.fetch_sub(s, Ordering::Relaxed);
-    BUF_SMALL_ALLOCATED.fetch_sub(s, Ordering::Relaxed);
-    BUF_STD_CACHED.fetch_sub(m, Ordering::Relaxed);
-    BUF_STD_ALLOCATED.fetch_sub(m, Ordering::Relaxed);
-    BUF_LARGE_CACHED.fetch_sub(l, Ordering::Relaxed);
-    BUF_LARGE_ALLOCATED.fetch_sub(l, Ordering::Relaxed);
-    drop(taken);
-    s + m + l
-}
-
+/// `pool_gc` (T445) empties these caches with the others (`ibex_alloc::drain_local_pools`).
 /// Preallocates three large buffers in the current thread's cache if large buffers are configured.
 pub fn preallocate_large_buffers() {
-    if let Some(sz) = get_bufsize_large() {
-        THREAD_POOLS.with(|pools| {
-            let mut p = pools.borrow_mut();
-            while p.large.len() < 3 {
-                p.large.push(vec![0u8; sz].into_boxed_slice());
-                BUF_LARGE_ALLOCATED.fetch_add(1, Ordering::Relaxed);
-                BUF_LARGE_CACHED.fetch_add(1, Ordering::Relaxed);
-            }
-        });
+    if get_bufsize_large().is_some() {
+        BUF_LARGE.prefill(3);
     }
+}
+
+/// A buffer's memory from the pool of its class, counted as in use. Not inlined into the many
+/// callers: the pool is a known static here.
+#[inline(never)]
+fn take_mem<const C: u8>(pool: &'static Pool<Mem<C>>) -> Box<[u8]> {
+    // `try_new` makes the memory with `vec!`, which aborts when there is none (as before S5).
+    pool.take_counted(Mem::<C>::try_new).map_or_else(|| std::alloc::handle_alloc_error(std::alloc::Layout::new::<u8>()), |m| m.0)
+}
+
+/// Gives a buffer's memory back to the pool of its class.
+#[inline(never)]
+fn give_mem<const C: u8>(pool: &'static Pool<Mem<C>>, data: Box<[u8]>) {
+    pool.give_counted(Mem(data));
 }
 
 fn alloc_standard() -> Box<[u8]> {
     ensure_registered();
-    let target_sz = get_bufsize();
-    let recycled = THREAD_POOLS.with(|pools| {
-        let mut p = pools.borrow_mut();
-        if let Some(buf) = p.standard.pop() {
-            if buf.len() == target_sz {
-                BUF_STD_CACHED.fetch_sub(1, Ordering::Relaxed);
-                BUF_STD_USED.fetch_add(1, Ordering::Relaxed);
-                return Some(buf);
-            }
-        }
-        None
-    });
-
-    if let Some(buf) = recycled {
-        buf
-    } else {
-        BUF_STD_ALLOCATED.fetch_add(1, Ordering::Relaxed);
-        BUF_STD_FRESH.fetch_add(1, Ordering::Relaxed);
-        BUF_STD_USED.fetch_add(1, Ordering::Relaxed);
-        vec![0u8; target_sz].into_boxed_slice()
-    }
+    take_mem(&BUF_STD)
 }
 
 fn alloc_small() -> Box<[u8]> {
     ensure_registered();
-    let target_sz = get_bufsize_small();
-    let recycled = THREAD_POOLS.with(|pools| {
-        let mut p = pools.borrow_mut();
-        if let Some(buf) = p.small.pop() {
-            if buf.len() == target_sz {
-                BUF_SMALL_CACHED.fetch_sub(1, Ordering::Relaxed);
-                BUF_SMALL_USED.fetch_add(1, Ordering::Relaxed);
-                return Some(buf);
-            }
-        }
-        None
-    });
-
-    if let Some(buf) = recycled {
-        buf
-    } else {
-        BUF_SMALL_ALLOCATED.fetch_add(1, Ordering::Relaxed);
-        BUF_SMALL_USED.fetch_add(1, Ordering::Relaxed);
-        vec![0u8; target_sz].into_boxed_slice()
-    }
+    take_mem(&BUF_SMALL)
 }
 
 fn alloc_large() -> Box<[u8]> {
     ensure_registered();
-    let target_sz = get_bufsize_large().unwrap_or(65536);
-    let recycled = THREAD_POOLS.with(|pools| {
-        let mut p = pools.borrow_mut();
-        if let Some(buf) = p.large.pop() {
-            if buf.len() == target_sz {
-                BUF_LARGE_CACHED.fetch_sub(1, Ordering::Relaxed);
-                BUF_LARGE_USED.fetch_add(1, Ordering::Relaxed);
-                return Some(buf);
-            }
-        }
-        None
-    });
-
-    if let Some(buf) = recycled {
-        buf
-    } else {
-        BUF_LARGE_ALLOCATED.fetch_add(1, Ordering::Relaxed);
-        BUF_LARGE_USED.fetch_add(1, Ordering::Relaxed);
-        vec![0u8; target_sz].into_boxed_slice()
-    }
+    take_mem(&BUF_LARGE)
 }
 
 /// The `lo` value when no descriptors were written.
@@ -518,75 +419,11 @@ impl Drop for Buf {
         // The plaintext of this owner must not be what the next one reads (or what is left
         // in the heap): zero what was written, before the box is pooled or freed.
         self.wipe_used();
+        let data = std::mem::replace(&mut self.data, Box::new([]));
         match self.class {
-            BufClass::Standard => {
-                let data = std::mem::replace(&mut self.data, Box::new([]));
-                let target_sz = get_bufsize();
-                if data.len() == target_sz {
-                    let pushed = THREAD_POOLS.with(|pools| {
-                        let mut p = pools.borrow_mut();
-                        if p.standard.len() < MAX_CACHED_PER_THREAD {
-                            p.standard.push(data);
-                            BUF_STD_USED.fetch_sub(1, Ordering::Relaxed);
-                            BUF_STD_CACHED.fetch_add(1, Ordering::Relaxed);
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                    if !pushed {
-                        BUF_STD_USED.fetch_sub(1, Ordering::Relaxed);
-                        BUF_STD_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
-                    }
-                } else {
-                    // Grown by a head rewrite: not poolable, but no longer in use.
-                    BUF_STD_USED.fetch_sub(1, Ordering::Relaxed);
-                    BUF_STD_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
-                }
-            }
-            BufClass::Small => {
-                let data = std::mem::replace(&mut self.data, Box::new([]));
-                let target_sz = get_bufsize_small();
-                if data.len() == target_sz {
-                    let pushed = THREAD_POOLS.with(|pools| {
-                        let mut p = pools.borrow_mut();
-                        if p.small.len() < MAX_CACHED_PER_THREAD {
-                            p.small.push(data);
-                            BUF_SMALL_USED.fetch_sub(1, Ordering::Relaxed);
-                            BUF_SMALL_CACHED.fetch_add(1, Ordering::Relaxed);
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                    if !pushed {
-                        BUF_SMALL_USED.fetch_sub(1, Ordering::Relaxed);
-                        BUF_SMALL_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
-                    }
-                }
-            }
-            BufClass::Large => {
-                let data = std::mem::replace(&mut self.data, Box::new([]));
-                if let Some(target_sz) = get_bufsize_large() {
-                    if data.len() == target_sz {
-                        let pushed = THREAD_POOLS.with(|pools| {
-                            let mut p = pools.borrow_mut();
-                            if p.large.len() < MAX_CACHED_PER_THREAD {
-                                p.large.push(data);
-                                BUF_LARGE_USED.fetch_sub(1, Ordering::Relaxed);
-                                BUF_LARGE_CACHED.fetch_add(1, Ordering::Relaxed);
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        if !pushed {
-                            BUF_LARGE_USED.fetch_sub(1, Ordering::Relaxed);
-                            BUF_LARGE_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
-                        }
-                    }
-                }
-            }
+            BufClass::Standard => give_mem(&BUF_STD, data),
+            BufClass::Small => give_mem(&BUF_SMALL, data),
+            BufClass::Large => give_mem(&BUF_LARGE, data),
             BufClass::Custom => {}
         }
     }
@@ -789,24 +626,7 @@ impl Buf {
         self.class = BufClass::Standard;
 
         // Recycle old small buffer back to thread cache
-        let target_sz = get_bufsize_small();
-        if old_small.len() == target_sz {
-            let pushed = THREAD_POOLS.with(|pools| {
-                let mut p = pools.borrow_mut();
-                if p.small.len() < MAX_CACHED_PER_THREAD {
-                    p.small.push(old_small);
-                    BUF_SMALL_USED.fetch_sub(1, Ordering::Relaxed);
-                    BUF_SMALL_CACHED.fetch_add(1, Ordering::Relaxed);
-                    true
-                } else {
-                    false
-                }
-            });
-            if !pushed {
-                BUF_SMALL_USED.fetch_sub(1, Ordering::Relaxed);
-                BUF_SMALL_ALLOCATED.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
+        give_mem(&BUF_SMALL, old_small);
 
         true
     }

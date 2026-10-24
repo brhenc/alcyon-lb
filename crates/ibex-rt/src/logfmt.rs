@@ -676,7 +676,7 @@ impl LogFormat {
     /// to the lines' size (T437).
     #[must_use]
     pub fn render_line(&self, d: &LogData, registry: &Registry, ctx: &SampleContext) -> Vec<u8> {
-        let mut buf = LINE_SPARE.with(|s| s.borrow_mut().pop()).unwrap_or_else(|| Vec::with_capacity(160));
+        let mut buf = LOGLINE.take_raw(|| Some(Vec::with_capacity(160))).unwrap_or_default();
         self.render_append(&mut buf, d, registry, ctx);
         buf
     }
@@ -1175,30 +1175,20 @@ fn path_only(target: &str) -> &str {
 /// Line buffers sent, kept per thread for the next lines: at most this many.
 const SPARE_LINES: usize = 64;
 
-thread_local! {
-    static LINE_SPARE: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
-}
+ibex_alloc::declare_pool!(
+    /// `show pools` `logline`: the buffers of log lines sent, for the next lines. They held
+    /// request data: wiped when given back under `tune.ibex.zero-spares`.
+    static LOGLINE: Pool<Vec<u8>> = ibex_alloc::PoolSpec::new("logline").max_count(SPARE_LINES).spares();
+);
 
-/// `pool_gc` (T445): frees the spare line buffers, wiped first (they held log lines).
-#[must_use]
-pub fn drain_spare_lines() -> usize {
-    let taken = LINE_SPARE.try_with(|s| s.try_borrow_mut().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default()).unwrap_or_default();
-    let n = taken.len();
-    for mut b in taken {
-        ibex_alloc::wipe_vec(&mut b);
-    }
-    n
+/// Lists the pool in `show pools` from the start.
+pub fn register_pools() {
+    LOGLINE.register();
 }
 
 /// A line [`LogFormat::render_line`] rendered has been sent: its buffer is the next line's.
-pub fn recycle_line(mut line: Vec<u8>) {
-    line.clear();
-    LINE_SPARE.with(|s| {
-        let mut s = s.borrow_mut();
-        if s.len() < SPARE_LINES {
-            s.push(line);
-        }
-    });
+pub fn recycle_line(line: Vec<u8>) {
+    LOGLINE.give(line);
 }
 
 #[allow(clippy::too_many_lines)]

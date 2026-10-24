@@ -276,20 +276,40 @@ impl CheckRun {
     }
 }
 
+ibex_alloc::declare_pool!(
+    /// `show pools` `check_run`: the runs of finished checks, for the next ones. A check takes
+    /// one when it starts and gives it back when it ends ([`cleanup_check_socket`]), so after
+    /// the first round a check allocates nothing for it, and only as many exist as checks ever
+    /// ran at once on this thread (`HAProxy` allocates a check's buffers when it runs, likewise).
+    static RUN_POOL: Pool<Box<CheckRun>> = ibex_alloc::PoolSpec::new("check_run");
+);
+
 thread_local! {
-    /// The runs of finished checks, for the next ones: a check takes one when it starts
-    /// and gives it back when it ends ([`cleanup_check_socket`]), so after the first round
-    /// a check allocates nothing for it, and only as many exist as checks ever ran at once
-    /// on this thread (`HAProxy` allocates a check's buffers when it runs, likewise).
-    static RUN_POOL: std::cell::RefCell<Vec<Box<CheckRun>>> = const { std::cell::RefCell::new(Vec::new()) };
     /// What a server reads of a check that is not running.
     static IDLE_RUN: &'static CheckRun = Box::leak(Box::new(CheckRun::idle()));
 }
 
-/// `pool_gc` (T445): frees the runs of finished checks this thread keeps for the next ones.
-#[must_use]
-pub fn drain_run_pool() -> usize {
-    RUN_POOL.try_with(|p| p.try_borrow_mut().map_or(0, |mut p| std::mem::take(&mut *p).len())).unwrap_or(0)
+/// Lists the pool in `show pools` from the start.
+pub fn register_pools() {
+    RUN_POOL.register();
+}
+
+impl ibex_alloc::Poolable for Box<CheckRun> {
+    fn footprint(&self) -> usize {
+        std::mem::size_of::<CheckRun>()
+    }
+
+    /// A finished check's state is dropped; its variables are emptied (their slots kept).
+    fn reset(&mut self, _wipe: bool) {
+        self.vars.clear();
+        self.sub_state = CheckSubState::Idle;
+        self.tcp_connect_step = None;
+        self.check_fd = None;
+    }
+
+    fn try_new() -> Option<Self> {
+        Some(Box::new(CheckRun::idle()))
+    }
 }
 
 /// A server's [`CheckRun`]: none between checks (T304: 60,000 servers paid ~170 bytes each
@@ -301,12 +321,8 @@ pub struct CheckRunSlot(Option<Box<CheckRun>>);
 impl CheckRunSlot {
     /// Ends the run: the state goes back to the pool, reset.
     fn release(&mut self) {
-        if let Some(mut run) = self.0.take() {
-            run.vars.clear();
-            run.sub_state = CheckSubState::Idle;
-            run.tcp_connect_step = None;
-            run.check_fd = None;
-            RUN_POOL.with(|p| p.borrow_mut().push(run));
+        if let Some(run) = self.0.take() {
+            RUN_POOL.give(run);
         }
     }
 
@@ -329,7 +345,7 @@ impl std::ops::Deref for CheckRunSlot {
 
 impl std::ops::DerefMut for CheckRunSlot {
     fn deref_mut(&mut self) -> &mut CheckRun {
-        self.0.get_or_insert_with(|| RUN_POOL.with(|p| p.borrow_mut().pop()).unwrap_or_else(|| Box::new(CheckRun::idle())))
+        self.0.get_or_insert_with(|| RUN_POOL.take_raw(<Box<CheckRun> as ibex_alloc::Poolable>::try_new).unwrap_or_else(|| Box::new(CheckRun::idle())))
     }
 }
 
@@ -3435,6 +3451,20 @@ fn progress_ssl_hello_check(
 }
 
 #[cfg(test)]
+    /// S3: a finished check's run goes to the `check_run` pool and the next check takes it.
+    #[test]
+    fn a_released_check_run_is_taken_again_by_the_next() {
+        use std::ops::DerefMut;
+        let mut slot = CheckRunSlot::default();
+        let ptr: *const CheckRun = slot.deref_mut();
+        assert!(slot.is_held());
+        slot.release();
+        assert!(!slot.is_held());
+        assert_eq!(RUN_POOL.local_count(), 1);
+        assert!(std::ptr::eq(slot.deref_mut(), ptr), "the same run came back");
+        assert_eq!(RUN_POOL.local_count(), 0);
+    }
+
 mod tests {
     use super::*;
 

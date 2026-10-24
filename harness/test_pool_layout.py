@@ -61,6 +61,7 @@ class PoolLayout(unittest.TestCase):
         self.assertEqual(pool_layout.violations(root), [])
         seen = {(h[0], h[2]) for h in pool_layout.scan(root)}
         self.assertEqual(sorted(set(pool_layout.ALLOWLIST) - seen), [])
+        self.assertEqual(sorted(set(pool_layout.NOT_CACHES) - seen), [])
 
 
 if __name__ == "__main__":

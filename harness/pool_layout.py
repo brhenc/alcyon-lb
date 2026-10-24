@@ -8,8 +8,9 @@ Greps crates/*/src (not crates/ibex-alloc, not tests/) for `thread_local!` block
 holds a cache-shaped type: RefCell<Vec<, RefCell<VecDeque<, Cell<Option<Vec<,
 Cell<Option<String> or Vec<Box<. A match not in ALLOWLIST fails, with file, line and the rule.
 
-ALLOWLIST is today's list (design 2.1). Each entry names the slice that removes it; S4 leaves
-it empty and deletes the mechanism. Keyed by (file, static name) so a line move does not
+ALLOWLIST is what is left of today's list (design 2.1) after S3: each entry names the slice that
+removes it; S4 leaves it empty and deletes the mechanism. NOT_CACHES is live state the pattern
+matches by shape. Keyed by (file, static name) so a line move does not
 break it; a new static in an allowlisted file is not allowlisted.
 
     python3 harness/pool_layout.py [repo-root]
@@ -26,24 +27,18 @@ PATTERNS = ("RefCell<Vec<", "RefCell<VecDeque<", "Cell<Option<Vec<", "Cell<Optio
 
 # (file under the repo root, static name) -> slice that removes it
 ALLOWLIST: dict[tuple[str, str], str] = {
-    # design 2.1: log lines, captures, variable stores, check runs, stats rows, scrape boxes,
-    # queue waits
-    ("crates/ibex-rt/src/logfmt.rs", "LINE_SPARE"): "S3",
-    ("crates/ibex-rt/src/txnlog.rs", "CAPTURE_SPARE"): "S3",
-    ("crates/ibex-sample/src/vars.rs", "SPARE"): "S3",
-    ("crates/ibex-rt/src/check.rs", "RUN_POOL"): "S3",
-    ("crates/ibex-rt/src/stats.rs", "ROW_POOL"): "S3",
-    ("crates/ibex-rt/src/proxy.rs", "SCRAPE_BOXES"): "S3",
-    ("crates/ibex-rt/src/proxy.rs", "QUEUED"): "S3",
-    # not in design 2.1 (found by this script on d8e1b801): per-thread scratch of the same
-    # shape; S3 puts them on Pool or shows they are not caches
-    ("crates/ibex-rt/src/ring.rs", "SCRATCH"): "S3",
-    ("crates/ibex-rt/src/syslog.rs", "LINE"): "S3",
-    ("crates/ibex-sample/src/registry.rs", "CURRENT_RES_HEADERS"): "S3",
     # not caches (parse-time and runtime-hand-off state); S4 decides: move out of the pattern
     # or delete the entry with the mechanism
     ("crates/ibex-config/src/ast/userlist.rs", "USERLISTS"): "S4",
     ("crates/ibex-sample/src/registry.rs", "DEBUG_DESTS"): "S4",
+}
+
+# (file, static name) -> why it is not a cache. Live state that happens to be a Vec/RefCell: a
+# list of what is waiting, a value a fetch reads. It holds no spare memory for a later owner,
+# so a pool (take, give, evict, drain) would be the wrong shape.
+NOT_CACHES: dict[tuple[str, str], str] = {
+    ("crates/ibex-rt/src/proxy.rs", "QUEUED"): "the requests waiting on this thread, oldest first (live queue state)",
+    ("crates/ibex-sample/src/registry.rs", "CURRENT_RES_HEADERS"): "the response headers a fetch reads during one run (its strings are spare_str)",
 }
 
 SKIP_CRATES = {"ibex-alloc"}
@@ -104,7 +99,7 @@ def scan(root: str):
 
 def violations(root: str, allowlist=None):
     allowlist = ALLOWLIST if allowlist is None else allowlist
-    return [h for h in scan(root) if (h[0], h[2]) not in allowlist]
+    return [h for h in scan(root) if (h[0], h[2]) not in allowlist and (h[0], h[2]) not in NOT_CACHES]
 
 
 def main(argv) -> int:
@@ -115,7 +110,7 @@ def main(argv) -> int:
     if bad:
         print(f"pool_layout: {len(bad)} hand-written per-thread cache(s) not on the allowlist")
         return 1
-    print(f"pool_layout: ok ({len(ALLOWLIST)} allowlisted)")
+    print(f"pool_layout: ok ({len(ALLOWLIST)} allowlisted, {len(NOT_CACHES)} not caches)")
     return 0
 
 

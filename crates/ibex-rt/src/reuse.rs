@@ -37,6 +37,11 @@ pub fn register_pools() {
     ibex_sample::spare::register_pools();
     SCRATCH_STR.register();
     SCRATCH_BYTES.register();
+    crate::logfmt::register_pools();
+    crate::txnlog::register_pools();
+    crate::check::register_pools();
+    crate::stats::register_pools();
+    crate::proxy::register_pools();
 }
 
 /// Empties `v`, its strings given back; `v` keeps its capacity.

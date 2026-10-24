@@ -120,6 +120,36 @@ fn the_configured_zero_spares_reaches_the_give() {
     ibex_alloc::set_zero_buffers(false);
 }
 
+/// AGENTS.md 5: `tune.ibex.ssl-zero-buffers` reaches the TLS record buffers' wipe
+/// (`ibex_alloc::wipe_ssl`, called by `ibex-tls` when a buffer is released): `Engine::new`
+/// applies the global setting and the thread's copy follows. Unset is on; `zero-buffers` (set
+/// the opposite way each time) does not decide.
+#[test]
+fn the_configured_ssl_zero_buffers_reaches_the_tls_buffer_wipe() {
+    let _turn = TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (text, wiped) in [("off", false), ("", true), ("on", true)] {
+        let mut global = format!("global\n    tune.ibex.zero-buffers {}\n", if wiped { "off" } else { "on" });
+        if !text.is_empty() {
+            global.push_str(&format!("    tune.ibex.ssl-zero-buffers {text}\n"));
+        }
+        let _engine = Engine::new(&ibex_config::parse_str(&global).expect("parse"), 64).expect("Engine::new");
+        let mut v = Vec::with_capacity(4000);
+        v.extend_from_slice(SECRET.as_bytes());
+        v.resize(4000, 0);
+        ibex_alloc::watch_freed(4000);
+        ibex_alloc::wipe_ssl(&mut v);
+        drop(v);
+        let b = ibex_alloc::freed_bytes();
+        if wiped {
+            assert!(secret_gone(b.as_ref()), "ssl-zero-buffers {text:?}: freed bytes {b:?}");
+        } else {
+            assert!(secret(b.as_ref()), "ssl-zero-buffers {text:?}: freed bytes {b:?}");
+        }
+    }
+    ibex_alloc::set_ssl_zero_buffers(true);
+    ibex_alloc::set_zero_buffers(false);
+}
+
 /// A server that answers no request before it has `n` of them (or 10 s went by), so that the
 /// `n` requests are in the proxy at once.
 fn held_backend(l: TcpListener, n: usize, run: Arc<AtomicBool>) -> thread::JoinHandle<()> {

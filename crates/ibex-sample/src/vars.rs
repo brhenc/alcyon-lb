@@ -30,7 +30,7 @@
 //! - **Spare stores** of ended sessions are kept per thread ([`VarStore::new`] takes one, `Drop`
 //!   gives it back), so a new connection reuses the slots and buffers of an old one. This is the
 //!   only cache of stores in the tree; T372 P0 replaces it with `ibex_alloc::Pool<T>`
-//!   (docs/design/pools-2026-10-18.md §4.1): see [`SPARE`].
+//!   (docs/design/pools-2026-10-18.md §4.1): see [`VARS`].
 //! - Reading a `str`/`bin` variable still copies it into an owned [`Sample`] (one allocation):
 //!   a borrowed sample in the evaluator is tradeoff.md §6.13 work, not this store's.
 //!
@@ -347,35 +347,61 @@ pub struct VarStore {
     slots: Vec<Slot>,
 }
 
-/// The spare stores of this thread (module doc), at most [`SPARE_MAX`].
-///
-/// T372 P0 slots in here: this list and [`VarStore::new`]/`Drop` become
-/// `declare_pool!(static VAR_STORES: Pool<Vec<Slot>>, "vars")`, `VarStore` a `PoolBox` of it and
-/// [`VarStore::recycle`] its `Reset`. Nothing else in the tree caches stores.
+/// The spare stores of this thread (module doc), at most [`SPARE_MAX`]: the `vars` pool
+/// (`HAProxy`'s name for the same objects), each a [`SlotVec`].
 const SPARE_MAX: usize = 256;
 /// The bytes of value buffers a spare store keeps; past it, its buffers are freed on return.
 const SPARE_KEEP_BYTES: usize = 4096;
 
+ibex_alloc::declare_pool!(
+    /// `show pools` `vars`. The values held request data: wiped when given back under
+    /// `tune.ibex.zero-spares`.
+    static VARS: Pool<SlotVec> = ibex_alloc::PoolSpec::new("vars").max_count(SPARE_MAX).spares();
+);
+
+/// Lists the pool in `show pools` from the start.
+pub fn register_pools() {
+    VARS.register();
+}
+
+/// The slots of a spare store, as the pool keeps them.
+#[derive(Debug, Default)]
+struct SlotVec(Vec<Slot>);
+
+impl ibex_alloc::Poolable for SlotVec {
+    fn footprint(&self) -> usize {
+        self.0.capacity() * std::mem::size_of::<Slot>() + self.0.iter().map(|s| s.buf.capacity()).sum::<usize>()
+    }
+
+    /// Values gone, buffers kept up to [`SPARE_KEEP_BYTES`] in all (the used bytes wiped first
+    /// when `wipe`).
+    fn reset(&mut self, wipe: bool) {
+        let mut kept = 0;
+        for s in &mut self.0 {
+            if wipe {
+                ibex_alloc::wipe_bytes(&mut s.buf);
+            }
+            s.clear();
+            kept += s.buf.capacity();
+            if kept > SPARE_KEEP_BYTES {
+                s.buf = Vec::new();
+            }
+        }
+    }
+
+    fn keep(&self, max_footprint: usize) -> bool {
+        self.0.capacity() != 0 && self.footprint() <= max_footprint
+    }
+
+    fn try_new() -> Option<Self> {
+        Some(SlotVec(Vec::new()))
+    }
+}
+
 thread_local! {
-    /// [`SPARE_MAX`] spare stores' slots.
-    static SPARE: RefCell<Vec<Vec<Slot>>> = const { RefCell::new(Vec::new()) };
     /// Whether a stream runs on this thread ([`enter`]/[`leave`]): its store is then in
     /// [`CURRENT_VARS`], and the session's own is empty.
     static RUNNING: Cell<bool> = const { Cell::new(false) };
-}
-
-/// `pool_gc` (T445): frees this thread's spare variable stores. `wipe` is given each value
-/// buffer first (the runtime's `tune.ibex.zero-buffers` wipe: this crate has no allocator
-/// policy of its own). Returns how many stores were freed.
-pub fn drain_spare(mut wipe: impl FnMut(&mut Vec<u8>)) -> usize {
-    let taken = SPARE.try_with(|s| s.try_borrow_mut().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default()).unwrap_or_default();
-    let n = taken.len();
-    for slots in taken {
-        for mut slot in slots {
-            wipe(&mut slot.buf);
-        }
-    }
-    n
 }
 
 impl VarStore {
@@ -388,21 +414,7 @@ impl VarStore {
     /// An empty store, the slots and buffers of a spare one if this thread has one.
     #[must_use]
     pub fn new() -> Self {
-        let slots = SPARE.try_with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.pop())).ok().flatten();
-        Self { slots: slots.unwrap_or_default() }
-    }
-
-    /// Empties the store for the spare list: values gone, buffers kept up to
-    /// [`SPARE_KEEP_BYTES`] in all.
-    fn recycle(slots: &mut [Slot]) {
-        let mut kept = 0;
-        for s in slots {
-            s.clear();
-            kept += s.buf.capacity();
-            if kept > SPARE_KEEP_BYTES {
-                s.buf = Vec::new();
-            }
-        }
+        Self { slots: VARS.take_raw(<SlotVec as ibex_alloc::Poolable>::try_new).unwrap_or_default().0 }
     }
 
     fn slot(&self, name: &str) -> Option<&Slot> {
@@ -573,18 +585,9 @@ impl Clone for VarStore {
 
 impl Drop for VarStore {
     fn drop(&mut self) {
-        if self.slots.capacity() == 0 {
-            return;
+        if self.slots.capacity() != 0 {
+            VARS.give(SlotVec(std::mem::take(&mut self.slots)));
         }
-        let mut slots = std::mem::take(&mut self.slots);
-        Self::recycle(&mut slots);
-        let _ = SPARE.try_with(|s| {
-            let Ok(mut s) = s.try_borrow_mut() else { return };
-            // The list is sized once, on the first return: no allocation after that.
-            if s.len() < SPARE_MAX && (s.len() < s.capacity() || s.try_reserve_exact(SPARE_MAX).is_ok()) {
-                s.push(slots);
-            }
-        });
     }
 }
 
@@ -1029,20 +1032,37 @@ mod tests {
         assert_eq!(b.slots.as_ptr(), ptr);
         assert!(b.is_empty());
     }
-    /// T445: `pool_gc` frees the spare stores, each kept value buffer handed to the wipe
-    /// first, and leaves none for the next store.
+    /// T445: `pool_gc` frees the spare stores and leaves none for the next store.
     #[test]
-    fn draining_the_spare_stores_wipes_each_kept_buffer() {
-        let _ = drain_spare(|_| {});
+    fn draining_the_spare_stores_frees_them() {
+        let _ = ibex_alloc::drain_local_pools();
         let mut a = VarStore::new();
         a.insert("txn.t445", Sample::Str("secret".repeat(10)));
         let ptr = a.slots.as_ptr();
         drop(a);
-        let mut wiped = Vec::new();
-        assert_eq!(drain_spare(|b| wiped.push(b.capacity())), 1, "one spare store");
-        assert!(!wiped.is_empty() && wiped.iter().any(|&c| c >= 60), "the value's buffer was wiped: {wiped:?}");
-        assert_eq!(drain_spare(|_| {}), 0);
+        assert!(ibex_alloc::drain_local_pools() >= 1, "the spare store (and the string behind its value)");
+        assert_eq!(ibex_alloc::drain_local_pools(), 0);
         assert_ne!(VarStore::new().slots.as_ptr(), ptr, "the store was freed, not kept");
+    }
+
+    /// S3: a store given back is emptied; its value bytes are wiped first when asked, and a
+    /// store holding more than [`SPARE_KEEP_BYTES`] of buffers keeps none of the surplus.
+    #[test]
+    fn a_reset_store_is_empty_and_wipes_on_request() {
+        use ibex_alloc::Poolable;
+        for wipe in [false, true] {
+            let mut v = SlotVec::default();
+            v.0.resize_with(3, Slot::default);
+            for s in &mut v.0 {
+                s.val = Val::Sint(1);
+                s.buf.resize(SPARE_KEEP_BYTES, 0xAA);
+            }
+            assert!(v.footprint() >= 3 * SPARE_KEEP_BYTES);
+            v.reset(wipe);
+            assert!(v.0.iter().all(|s| s.val == Val::Absent && s.buf.is_empty()));
+            assert_eq!(v.0.iter().map(|s| s.buf.capacity()).filter(|&c| c != 0).count(), 1, "only the first buffer fits the keep");
+            assert!(v.keep(usize::MAX) && !SlotVec::default().keep(usize::MAX));
+        }
     }
 
     /// T445: a reservation the allocator refuses runs the runtime's `pool_gc` and is tried

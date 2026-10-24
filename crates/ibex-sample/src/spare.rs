@@ -129,6 +129,7 @@ pub fn give_list(l: Vec<(String, String)>) {
 pub fn register_pools() {
     SPARE_STR.register();
     SPARE_LIST.register();
+    crate::vars::register_pools();
 }
 
 /// The bytes this thread keeps in spare strings and lists.

@@ -190,26 +190,93 @@ pub struct QueueWait {
     /// The backend's queue length, this request in it, for `%bq` in the log.
     pub pos: u32,
     task: ibex_sched::TaskRef,
-    stats: Arc<Vec<crate::engine::ProxyStats>>,
+    /// The backend's stats while the request waits; `None` in a spare (left already).
+    stats: Option<Arc<Vec<crate::engine::ProxyStats>>>,
     be_idx: usize,
+}
+
+ibex_alloc::declare_pool!(
+    /// `show pools` `pendconn` (`HAProxy`'s name): the boxes of requests that waited for a
+    /// slot, for the next ones.
+    static PENDCONN: Pool<Box<QueueWait>> = ibex_alloc::PoolSpec::new("pendconn").max_count(1024);
+);
+
+impl ibex_alloc::Poolable for Box<QueueWait> {
+    fn footprint(&self) -> usize {
+        std::mem::size_of::<QueueWait>()
+    }
+
+    /// Leaving the queue: the request is no longer counted, nor listed for a wake-up. Done
+    /// here, not in a `Drop`, because the box is not freed when it goes back to the pool.
+    fn reset(&mut self, _wipe: bool) {
+        if let Some(stats) = self.stats.take() {
+            stats[0].queue_cur.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            let (task, be) = (self.task, self.be_idx);
+            let _ = QUEUED.try_with(|q| q.borrow_mut().retain(|&(t, b)| !(t == task && b == be)));
+        }
+    }
+
+    fn try_new() -> Option<Self> {
+        Some(QueueWait::blank())
+    }
+}
+
+/// A session's place in a queue (none, most of the time): the pooled box, given back, and
+/// the queue left, when it is left or the session dropped. A pointer wide, where a `PoolBox` is
+/// two (`SessionEntry` is bounded in size).
+#[derive(Default)]
+pub struct QueueSlot(Option<Box<QueueWait>>);
+
+impl QueueSlot {
+    /// Whether the request waits.
+    #[must_use]
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// When `timeout queue` ends, for a request that waits.
+    #[must_use]
+    pub fn deadline(&self) -> Option<Tick> {
+        self.0.as_ref().map(|q| q.deadline)
+    }
+
+    /// Leaves the queue; whether the request waited.
+    pub fn leave(&mut self) -> bool {
+        self.0.take().map(|q| PENDCONN.give(q)).is_some()
+    }
+
+    /// Puts the request of `task` in the queue of backend `be_idx` (`stats` are the
+    /// backend's, where `qcur` and `qmax` are kept); returns its place in it, for `%bq`.
+    pub fn enter(&mut self, task: ibex_sched::TaskRef, be_idx: usize, stats: Arc<Vec<crate::engine::ProxyStats>>, deadline: Tick) -> u32 {
+        self.leave();
+        let mut q = PENDCONN.take_raw(<Box<QueueWait> as ibex_alloc::Poolable>::try_new).unwrap_or_else(QueueWait::blank);
+        let st = &stats[0];
+        let pos = st.queue_cur.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        st.queue_max.fetch_max(pos, std::sync::atomic::Ordering::Relaxed);
+        QUEUED.with(|l| l.borrow_mut().push((task, be_idx)));
+        *q = QueueWait { deadline, pos, task, stats: Some(stats), be_idx };
+        self.0 = Some(q);
+        pos
+    }
+}
+
+impl Drop for QueueSlot {
+    fn drop(&mut self) {
+        self.leave();
+    }
 }
 
 thread_local! {
     /// The requests queued on this thread, oldest first, with the backend each waits for:
-    /// what `Engine::wake_queued` hands slots to. (A session never leaves its thread.)
+    /// what `Engine::wake_queued` hands slots to. (A session never leaves its thread.) Live
+    /// state, not a cache: the boxes behind it are the `pendconn` pool.
     static QUEUED: std::cell::RefCell<Vec<(ibex_sched::TaskRef, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl QueueWait {
-    /// Puts the request of `task` in the queue of backend `be_idx`; `stats` are the
-    /// backend's, where `qcur` and `qmax` are kept.
-    #[must_use]
-    pub fn enter(task: ibex_sched::TaskRef, be_idx: usize, stats: Arc<Vec<crate::engine::ProxyStats>>, deadline: Tick) -> Box<QueueWait> {
-        let st = &stats[0];
-        let pos = st.queue_cur.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        st.queue_max.fetch_max(pos, std::sync::atomic::Ordering::Relaxed);
-        QUEUED.with(|q| q.borrow_mut().push((task, be_idx)));
-        Box::new(QueueWait { deadline, pos, task, stats, be_idx })
+    /// A box in no queue.
+    fn blank() -> Box<QueueWait> {
+        Box::new(QueueWait { deadline: Tick::ETERNITY, pos: 0, task: ibex_sched::TaskRef::NONE, stats: None, be_idx: 0 })
     }
 
     /// Whether anything is queued on this thread.
@@ -238,14 +305,6 @@ impl QueueWait {
             }
             due
         })
-    }
-}
-
-impl Drop for QueueWait {
-    fn drop(&mut self) {
-        self.stats[0].queue_cur.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        let (task, be) = (self.task, self.be_idx);
-        let _ = QUEUED.try_with(|q| q.borrow_mut().retain(|&(t, b)| !(t == task && b == be)));
     }
 }
 
@@ -459,20 +518,35 @@ impl PendingOut {
     }
 }
 
-thread_local! {
-    /// Boxes for [`PendingOut::Scrape`], made by `promex::prewarm`.
-    static SCRAPE_BOXES: std::cell::RefCell<Vec<Box<PendingOut>>> = const { std::cell::RefCell::new(Vec::new()) };
+ibex_alloc::declare_pool!(
+    /// `show pools` `scrape_box`: boxes for [`PendingOut::Scrape`], made by `promex::prewarm`.
+    static SCRAPE_BOXES: Pool<Box<PendingOut>> = ibex_alloc::PoolSpec::new("scrape_box").max_count(16).floor(16);
+);
+
+impl ibex_alloc::Poolable for Box<PendingOut> {
+    fn footprint(&self) -> usize {
+        std::mem::size_of::<PendingOut>()
+    }
+
+    /// Whatever the box held (a raw reply) is dropped.
+    fn reset(&mut self, _wipe: bool) {
+        **self = PendingOut::Scrape(crate::promex::Cursor::start());
+    }
+
+    fn try_new() -> Option<Self> {
+        Some(Box::new(PendingOut::Scrape(crate::promex::Cursor::start())))
+    }
 }
 
 /// Makes room for `n` scrape boxes on this thread (start-up, when the config has the rule).
 pub fn reserve_scrape_boxes(n: usize) {
-    SCRAPE_BOXES.with(|l| {
-        let mut l = l.borrow_mut();
-        l.reserve_exact(n);
-        while l.len() < n {
-            l.push(Box::new(PendingOut::Scrape(crate::promex::Cursor::start())));
-        }
-    });
+    SCRAPE_BOXES.prefill(n);
+}
+
+/// Lists the pools of this module in `show pools` from the start.
+pub fn register_pools() {
+    SCRAPE_BOXES.register();
+    PENDCONN.register();
 }
 
 /// The request's method or URI as the session keeps it between requests (T436): one `String`
@@ -588,7 +662,7 @@ pub struct TcpSession {
     pub be_tunnel_ms: u32,
     pub be_queue_ms: u32,
     /// The request waits for a server slot (`maxconn`): see [`QueueWait`].
-    pub queue: Option<Box<QueueWait>>,
+    pub queue: QueueSlot,
     /// Connect attempts left before giving up.
     pub conn_retries: u16,
     /// The retry budget this stream started with, `s->max_retries` in HAProxy: what
@@ -1189,7 +1263,7 @@ impl TcpSession {
             timeouts_set: None,
             be_tunnel_ms: 0,
             be_queue_ms: 0,
-            queue: None,
+            queue: QueueSlot::default(),
             conn_retries: retries,
             max_retries: retries,
             retry_after: Tick::ETERNITY,
@@ -1925,22 +1999,14 @@ impl TcpSession {
         match (c, self.pending_resp.as_deref_mut()) {
             (Some(c), Some(PendingOut::Scrape(slot))) => *slot = c,
             (Some(c), _) => {
-                let b = SCRAPE_BOXES.try_with(|l| l.borrow_mut().pop()).ok().flatten();
-                self.pending_resp = Some(match b {
-                    Some(mut b) => {
-                        *b = PendingOut::Scrape(c);
-                        b
-                    }
-                    None => Box::new(PendingOut::Scrape(c)),
-                });
+                let mut b = SCRAPE_BOXES.take_raw(<Box<PendingOut> as ibex_alloc::Poolable>::try_new).unwrap_or_else(|| Box::new(PendingOut::Scrape(c)));
+                *b = PendingOut::Scrape(c);
+                self.pending_resp = Some(b);
             }
             (None, Some(PendingOut::Scrape(_))) => {
-                let b = self.pending_resp.take();
-                let _ = SCRAPE_BOXES.try_with(|l| {
-                    let mut l = l.borrow_mut();
-                    let room = l.len() < l.capacity();
-                    b.filter(|_| room).into_iter().for_each(|b| l.push(b));
-                });
+                if let Some(b) = self.pending_resp.take() {
+                    SCRAPE_BOXES.give(b);
+                }
             }
             (None, _) => {}
         }
@@ -3318,8 +3384,8 @@ impl TcpSession {
     #[must_use]
     pub fn next_expiry(&self) -> Tick {
         let mut exp = self.cli_exp.earliest(self.req_exp).earliest(self.srv_exp).earliest(self.conn_exp).earliest(self.retry_after).earliest(self.srv_park_exp);
-        if let Some(q) = self.queue.as_ref() {
-            exp = exp.earliest(q.deadline);
+        if let Some(d) = self.queue.deadline() {
+            exp = exp.earliest(d);
         }
         if let Some(i_exp) = self.inspect_exp {
             if !self.tcp_inspect_done || self.be_inspect {
@@ -3774,6 +3840,31 @@ fn h3_log_line(line: &str, host: Option<&str>) -> String {
 }
 
 #[cfg(test)]
+    use super::*;
+
+    /// S3: a request that leaves the queue gives its box to the `pendconn` pool, the next one
+    /// takes it, and the thread's list of waiting requests follows.
+    #[test]
+    fn a_queue_slot_reuses_the_pooled_box_and_leaves_the_list() {
+        let stats = Arc::new(vec![crate::engine::ProxyStats::default()]);
+        let mut slot = QueueSlot::default();
+        assert!(!slot.leave() && slot.deadline().is_none() && !QueueWait::any());
+        assert_eq!(slot.enter(ibex_sched::TaskRef(1), 0, stats.clone(), Tick::ETERNITY), 1);
+        assert!(slot.is_some() && QueueWait::any());
+        assert_eq!(PENDCONN.local_count(), 0);
+        assert!(slot.leave());
+        assert!(!QueueWait::any());
+        assert_eq!(PENDCONN.local_count(), 1, "the box went back to the pool");
+        assert_eq!(slot.enter(ibex_sched::TaskRef(2), 0, stats.clone(), Tick::ETERNITY), 1, "the queue length went down with the first");
+        assert_eq!(PENDCONN.local_count(), 0, "the box came from the pool");
+        drop(slot);
+        assert!(!QueueWait::any());
+        assert_eq!(PENDCONN.local_count(), 1);
+        // A box that is in no queue (never used) is given back as it is: nothing to leave.
+        PENDCONN.give(QueueWait::blank());
+        assert_eq!(PENDCONN.local_count(), 2);
+    }
+
 mod tests {
 
     /// T436: `ReqText` keeps its buffer across `reset`, so the next request's text fits without

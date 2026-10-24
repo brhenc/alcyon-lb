@@ -243,6 +243,9 @@ pub struct GlobalSection {
     /// `tune.ibex.zero-spares on|off` (Ibex-only): zero a spare string's or list's used bytes when
     /// it is given back to its pool. Off when unset.
     pub zero_spares: Option<bool>,
+    /// `tune.ibex.ssl-zero-buffers on|off` (Ibex-only): zero the TLS record buffers (plaintext and
+    /// ciphertext) when they are released. On when unset.
+    pub ssl_zero_buffers: Option<bool>,
     /// `tune.memory.hot-size <bytes>`: the most each thread keeps in its pools together
     /// (`global.tune.pool_cache_size`, 524288 when unset).
     pub hot_size: Option<usize>,

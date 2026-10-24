@@ -688,6 +688,23 @@ pub fn zero_spares() -> bool {
     ZERO_SPARES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// `tune.ibex.ssl-zero-buffers` (default on): whether the TLS record buffers (the wire bytes
+/// rustls reads from and writes to, and the plaintext it decrypts) are overwritten with zeros
+/// when released. Read through the thread's copy (`pool::HOT`), refreshed once per loop pass.
+static SSL_ZERO_BUFFERS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Sets `tune.ibex.ssl-zero-buffers`.
+pub fn set_ssl_zero_buffers(on: bool) {
+    SSL_ZERO_BUFFERS.store(on, core::sync::atomic::Ordering::Relaxed);
+    pool::settings_changed();
+}
+
+/// Whether TLS record buffers are zeroed when released (`tune.ibex.ssl-zero-buffers`).
+#[must_use]
+pub fn ssl_zero_buffers() -> bool {
+    SSL_ZERO_BUFFERS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Sets `tune.ibex.zero-buffers`.
 pub fn set_zero_buffers(on: bool) {
     ZERO_BUFFERS.store(on, core::sync::atomic::Ordering::Relaxed);
@@ -713,12 +730,14 @@ pub fn wipe(bytes: &mut [u8]) {
     }
 }
 
-/// Overwrites `bytes` with zeros like [`wipe`], whatever `tune.ibex.zero-buffers` says. For
-/// the TLS record buffers (`ibex-tls`), which are wiped always until they get their own
-/// setting (`tune.ibex.ssl-zero-buffers`, S2).
+/// Overwrites `bytes` with zeros like [`wipe`], but under `tune.ibex.ssl-zero-buffers` (default
+/// on) instead of `tune.ibex.zero-buffers`: for the TLS record buffers (`ibex-tls`). The flag is
+/// the thread's copy, not a global load per record.
 #[inline(never)]
-pub fn wipe_always(bytes: &mut [u8]) {
-    zeroize::Zeroize::zeroize(bytes);
+pub fn wipe_ssl(bytes: &mut [u8]) {
+    if pool::wipe_ssl_on() {
+        zeroize::Zeroize::zeroize(bytes);
+    }
 }
 
 /// [`wipe`] for a whole `Vec`: its bytes and its spare capacity, which holds what earlier

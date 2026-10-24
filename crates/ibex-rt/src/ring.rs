@@ -14,7 +14,6 @@
 //! per-thread scratch buffer and the event is copied into storage reserved when the ring
 //! was created.
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::net::TcpStream;
@@ -47,11 +46,6 @@ pub struct Ring {
     news: Condvar,
 }
 
-thread_local! {
-    /// The header of the event being written: reused, so a write allocates nothing once warm.
-    static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
-
 impl Ring {
     fn new(section: &RingSection) -> Self {
         Ring {
@@ -77,11 +71,11 @@ impl Ring {
     /// line feed a forwarder adds (`__do_send_log`). The event is cut to the shorter of that
     /// and the ring's `maxlen`; one that cannot fit the ring at all is dropped.
     pub fn write(&self, facility: u8, level: u8, meta: &Meta, logger_maxlen: usize, text: &[u8]) {
-        SCRATCH.with(|scratch| {
-            let mut hdr = scratch.borrow_mut();
-            hdr.clear();
+        // The header of the event being written, in a `scratch_bytes` buffer: a write allocates
+        // nothing once warm.
+        crate::reuse::with_bytes(|hdr| {
             if self.format != RingFormat::Raw {
-                build_header(&mut hdr, Some(self.format), facility, level, meta);
+                build_header(hdr, Some(self.format), facility, level, meta);
             }
             let limit = self.maxlen.min(logger_maxlen.saturating_sub(1));
             let hlen = hdr.len().min(limit);

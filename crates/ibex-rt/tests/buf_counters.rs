@@ -79,3 +79,40 @@ fn arena_counters_follow_slots_and_give_them_back() {
     let h = c.head(reg());
     assert_eq!((h.allocated, h.used, h.cached), (0, 0, 0));
 }
+
+/// S2: a take and a give that hit the thread cache write nothing another thread reads (no
+/// atomic read-modify-write): `used` moves in the thread's own counters, another thread sees it
+/// only when the owner publishes (once per loop pass); `allocated` does not move at all.
+#[test]
+fn a_hit_take_and_give_write_no_shared_counter() {
+    use std::sync::mpsc::channel;
+    let _g = setup();
+    let (to_main, from_worker) = channel::<&'static str>();
+    let (to_worker, from_main) = channel::<()>();
+    let worker = std::thread::spawn(move || {
+        // warm the cache (miss path), then publish
+        drop((0..8).map(|_| Buf::standard()).collect::<Vec<_>>());
+        ibex_alloc::pool::publish_local();
+        to_main.send("warm").unwrap();
+        from_main.recv().unwrap();
+        // 4 takes on the hit path: nothing shared may move
+        let held: Vec<Buf> = (0..4).map(|_| Buf::standard()).collect();
+        to_main.send("held").unwrap();
+        from_main.recv().unwrap();
+        ibex_alloc::pool::publish_local();
+        to_main.send("published").unwrap();
+        from_main.recv().unwrap();
+        drop(held);
+    });
+    assert_eq!(from_worker.recv().unwrap(), "warm");
+    let (a0, u0, c0) = counts(buf::buffer_pool_stats());
+    assert_eq!((u0, c0), (0, 8), "eight warm buffers cached, none in use");
+    to_worker.send(()).unwrap();
+    assert_eq!(from_worker.recv().unwrap(), "held");
+    assert_eq!(counts(buf::buffer_pool_stats()), (a0, u0, c0), "a hit take wrote a shared counter");
+    to_worker.send(()).unwrap();
+    assert_eq!(from_worker.recv().unwrap(), "published");
+    assert_eq!(counts(buf::buffer_pool_stats()), (a0, u0 + 4, c0 - 4), "published once, allocated unchanged");
+    to_worker.send(()).unwrap();
+    worker.join().unwrap();
+}

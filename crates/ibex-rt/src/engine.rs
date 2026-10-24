@@ -4493,6 +4493,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         ibex_alloc::set_trim_disabled(config.global.as_ref().is_some_and(|g| g.no_memory_trimming));
         // Both off unless configured (the user, 2026-10-24: comparisons with HAProxy stay fair).
         ibex_alloc::set_zero_buffers(config.global.as_ref().and_then(|g| g.zero_buffers).unwrap_or(false));
+        ibex_alloc::set_ssl_zero_buffers(config.global.as_ref().and_then(|g| g.ssl_zero_buffers).unwrap_or(true));
         ibex_alloc::set_zero_spares(config.global.as_ref().and_then(|g| g.zero_spares).unwrap_or(false));
         ibex_alloc::set_hot_size(config.global.as_ref().and_then(|g| g.hot_size).unwrap_or(ibex_alloc::HOT_SIZE_DEFAULT));
         // A variable whose memory is refused collects and retries once (T445).
@@ -9089,7 +9090,7 @@ impl EngineDispatcher<'_> {
             if !matches!(txn.req, MsgState::Head { body: crate::txn::Framing::None, .. }) {
                 return false;
             }
-            let queued = entry.sess.queue.take().is_some();
+            let queued = entry.sess.queue.leave();
             if queued {
                 entry.sess.log.queue.get_or_insert_with(crate::txnlog::loop_now);
             }
@@ -12719,7 +12720,7 @@ impl EngineDispatcher<'_> {
             return None;
         };
         // Given a slot: out of the queue.
-        entry.sess.queue = None;
+        entry.sess.queue.leave();
         count_server_session(proxies, be_idx, target_addr);
 
         // The connection kept from this session's last transaction, if this request goes
@@ -12907,9 +12908,9 @@ impl EngineDispatcher<'_> {
     /// The request found every server full: it waits for a slot, or, once there, gives up
     /// when `timeout queue` is over (`503`, `sQ`; `econ` counts it, as for a failed connect).
     fn wait_in_queue(entry: &mut SessionEntry, proxies: &Proxies, now: Tick, be_idx: usize) -> Option<crate::stats_html::AdminAction> {
-        if let Some(q) = entry.sess.queue.as_ref() {
-            if q.deadline.is_expired(now) {
-                entry.sess.queue = None;
+        if let Some(deadline) = entry.sess.queue.deadline() {
+            if deadline.is_expired(now) {
+                entry.sess.queue.leave();
                 proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
                 entry.sess.log.term = Some(*b"sQ");
                 entry.sess.log.queue.get_or_insert_with(crate::txnlog::loop_now);
@@ -12919,9 +12920,7 @@ impl EngineDispatcher<'_> {
         }
         let ms = entry.sess.queue_ms();
         let deadline = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
-        let q = crate::proxy::QueueWait::enter(entry.task, be_idx, proxies[be_idx].stats.clone(), deadline);
-        entry.sess.log.be_queue = u64::from(q.pos);
-        entry.sess.queue = Some(q);
+        entry.sess.log.be_queue = u64::from(entry.sess.queue.enter(entry.task, be_idx, proxies[be_idx].stats.clone(), deadline));
         None
     }
 
