@@ -333,3 +333,14 @@ fn a_bad_log_format_is_refused_without_a_log_address_too() {
         ibex_rt::Engine::new(&cfg, 4).expect("a good format loads without a log address");
     }
 }
+
+/// `%ft` of a TLS frontend is its name and `~` (`HAProxy` 3.5-dev8), whatever the name's
+/// length (T437: a name too long for the stack buffer takes the other path).
+#[test]
+fn ft_of_a_tls_frontend_ends_in_a_tilde_at_any_length() {
+    let long = "f".repeat(300);
+    for name in ["fe", long.as_str()] {
+        let d = LogData { frontend: name, frontend_ssl: true, ..base(&[], &[]) };
+        assert_eq!(render("%ft %{+Q}ft", &d), format!("{name}~ \"{name}~\""));
+    }
+}

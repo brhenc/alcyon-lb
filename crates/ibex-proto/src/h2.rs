@@ -342,9 +342,15 @@ fn strip_padding(flags: u8, payload: &[u8], fixed: usize) -> io::Result<&[u8]> {
 impl Frame {
     /// Encodes the complete frame (header + payload) into wire bytes.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// Appends the complete frame (header + payload) to `out`, in the memory it has (T437).
+    #[allow(clippy::too_many_lines)]
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
         match self {
             Frame::Data {
                 flags,
@@ -501,7 +507,31 @@ impl Frame {
                 out.extend_from_slice(payload);
             }
         }
-        out
+    }
+
+    /// The header block of a HEADERS frame's payload, as [`Self::decode`] takes it, without
+    /// a copy (T437): the padding and the priority fields are left out.
+    ///
+    /// # Errors
+    /// As [`Self::decode`] for a HEADERS frame.
+    pub fn headers_block<'p>(header: &FrameHeader, payload: &'p [u8]) -> io::Result<&'p [u8]> {
+        // RFC 9113 section 6.2: [pad length] [E + stream dependency + weight] block [padding].
+        let mut body = strip_padding(header.flags, payload, if (header.flags & frame_flags::PRIORITY) != 0 { 5 } else { 0 })?;
+        if (header.flags & frame_flags::PRIORITY) != 0 {
+            if body.len() < 5 {
+                return Err(frame_size_error("HEADERS priority field truncated"));
+            }
+            let dep = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) & 0x7fff_ffff;
+            if dep == header.stream_id {
+                // Measured on HAProxy 3.5-dev8: GOAWAY PROTOCOL_ERROR.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HEADERS stream depends on itself",
+                ));
+            }
+            body = &body[5..];
+        }
+        Ok(body)
     }
 
     /// Decodes a complete frame given its header and payload bytes.
@@ -527,29 +557,11 @@ impl Frame {
                 stream_id: header.stream_id,
                 data: strip_padding(header.flags, payload, 0)?.to_vec(),
             }),
-            FrameType::Headers => {
-                // RFC 9113 section 6.2: [pad length] [E + stream dependency + weight] block [padding].
-                let mut body = strip_padding(header.flags, payload, if (header.flags & frame_flags::PRIORITY) != 0 { 5 } else { 0 })?;
-                if (header.flags & frame_flags::PRIORITY) != 0 {
-                    if body.len() < 5 {
-                        return Err(frame_size_error("HEADERS priority field truncated"));
-                    }
-                    let dep = u32::from_be_bytes([body[0], body[1], body[2], body[3]]) & 0x7fff_ffff;
-                    if dep == header.stream_id {
-                        // Measured on HAProxy 3.5-dev8: GOAWAY PROTOCOL_ERROR.
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "HEADERS stream depends on itself",
-                        ));
-                    }
-                    body = &body[5..];
-                }
-                Ok(Frame::Headers {
-                    flags: header.flags,
-                    stream_id: header.stream_id,
-                    header_block: body.to_vec(),
-                })
-            }
+            FrameType::Headers => Ok(Frame::Headers {
+                flags: header.flags,
+                stream_id: header.stream_id,
+                header_block: Self::headers_block(header, payload)?.to_vec(),
+            }),
             FrameType::Priority => {
                 if payload.len() != 5 {
                     return Err(io::Error::new(
