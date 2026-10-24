@@ -61,7 +61,9 @@ AB_MAX_DROP_PCT = 10.0
 INS_MAX_RISE_PCT = 1.0
 INS_SCENARIOS = ("keepalive", "rules")
 INS_ROUNDS = 5
-INS_REQUESTS = 60000
+# (insreq.sh client, requests per round). ab1 is judged: identical builds differ by ~0.15%
+# (design/memory 9); mb50 moves 36181-38525 between rounds of one build (epoll batching).
+INS_CLIENTS = (("ab1", 30000), ("mb50", 60000))
 
 
 class Verdict(Enum):
@@ -624,22 +626,25 @@ def min_ins_per_req(counts: List[int], n: int) -> int:
 
 
 def measure_ins_per_req(cand_bin: Path, ref_bin: Path, target_dir: Path,
-                        rounds: int = INS_ROUNDS, n: int = INS_REQUESTS) -> Dict[str, int]:
-    """Min over `rounds` of instructions per request, per scenario and per build, by running
+                        rounds: int = INS_ROUNDS) -> Dict[str, List[int]]:
+    """Instructions per request of every round, keyed "<scenario>_<client>_<side>", by running
     tools/measure/insreq.sh (one implementation of the measurement; pinned by it the way
-    measure_ab pins: IBEX_MEASURE_CPUS). Needs perf to count the user's own processes."""
+    measure_ab pins: IBEX_MEASURE_CPUS). The judged client is ab1 (one connection: the count
+    does not depend on how many requests an epoll pass batches); mb50 is reported only.
+    Needs perf to count the user's own processes."""
     bench_bin = ensure_parity_bench_binary(target_dir)
     insreq = REPO_ROOT / "tools" / "measure" / "insreq.sh"
     env = dict(os.environ, MEASURE_BENCH=str(bench_bin))
-    res: Dict[str, int] = {}
+    res: Dict[str, List[int]] = {}
     with tempfile.TemporaryDirectory(prefix="insreq-") as out:
-        for sc in INS_SCENARIOS:
-            body = REPO_ROOT / "tools" / "measure" / "scenarios" / f"{sc}.body"
-            for side, binary in (("cand", cand_bin), ("ref", ref_bin)):
-                p = subprocess.run(["bash", str(insreq), f"{sc}-{side}", str(binary), str(body),
-                                    "mb50", str(n), str(rounds), out],
-                                   capture_output=True, text=True, env=env)
-                res[f"{sc}_{side}"] = min_ins_per_req(parse_insreq(p.stdout + p.stderr), n)
+        for client, n in INS_CLIENTS:
+            for sc in INS_SCENARIOS:
+                body = REPO_ROOT / "tools" / "measure" / "scenarios" / f"{sc}.body"
+                for side, binary in (("cand", cand_bin), ("ref", ref_bin)):
+                    p = subprocess.run(["bash", str(insreq), f"{sc}-{client}-{side}", str(binary),
+                                        str(body), client, str(n), str(rounds), out],
+                                       capture_output=True, text=True, env=env)
+                    res[f"{sc}_{client}_{side}"] = [c // n for c in parse_insreq(p.stdout + p.stderr)]
     return res
 
 
@@ -942,7 +947,7 @@ def check_regressions(
             if is_reg:
                 has_regression = True
             status = f"FAIL (>{INS_MAX_RISE_PCT:g}% above ref)" if is_reg else "PASS"
-            deltas.append(MetricDelta(key, f"Instructions / req ({sc})", f"{c:,}", f"{p:,} (ref)",
+            deltas.append(MetricDelta(key, f"Instructions / req ({sc}, ab1)", f"{c:,}", f"{p:,} (ref)",
                                       f"{pct_diff:+.1f}%", status, is_reg, "ins"))
 
     # 4. 50-conn Throughput
@@ -1185,10 +1190,15 @@ def main() -> int:
 
     ins = measure_ins_per_req(ibex_bin, ref_bin, target_dir)
     for sc in INS_SCENARIOS:
-        record[f"ins_per_req_{sc}"] = ins[f"{sc}_cand"]
-        record[f"ins_per_req_{sc}_ref"] = ins[f"{sc}_ref"]
-        print(f"      instructions/req {sc} (min of {INS_ROUNDS}): this build {ins[sc + '_cand']:,}; "
-              f"reference {ins[sc + '_ref']:,}")
+        record[f"ins_per_req_{sc}"] = min(ins[f"{sc}_ab1_cand"])
+        record[f"ins_per_req_{sc}_ref"] = min(ins[f"{sc}_ab1_ref"])
+        record[f"ins_per_req_{sc}_samples"] = ins[f"{sc}_ab1_cand"]
+        record[f"ins_per_req_{sc}_ref_samples"] = ins[f"{sc}_ab1_ref"]
+        record[f"ins_per_req_{sc}_mb50"] = min(ins[f"{sc}_mb50_cand"])  # reported, not judged
+        record[f"ins_per_req_{sc}_mb50_ref"] = min(ins[f"{sc}_mb50_ref"])
+        print(f"      instructions/req {sc}, ab1 (judged, min of {INS_ROUNDS}): this build "
+              f"{ins[sc + '_ab1_cand']}; reference {ins[sc + '_ab1_ref']}; "
+              f"mb50 (reported): {record[f'ins_per_req_{sc}_mb50']:,} vs {record[f'ins_per_req_{sc}_mb50_ref']:,}")
 
     # Record system metrics
     record["load_1min"] = sys_info["load_1min"]
