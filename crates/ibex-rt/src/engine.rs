@@ -1990,7 +1990,9 @@ impl SessionArena {
     /// Adds this arena's change since the last pass to `show pools` (once per loop pass).
     #[inline]
     pub fn publish(&mut self) {
-        SESSION_POOL.publish(&mut self.published, self.entries.len(), self.live);
+        let mut last = self.published;
+        SESSION_POOL.publish_arena::<SessionEntry>(&mut last, self);
+        self.published = last;
     }
 
     /// A slot for `entry`, or `None` (the entry is dropped) when the arena is full and the
@@ -2050,12 +2052,6 @@ impl SessionArena {
     #[must_use]
     pub const fn live(&self) -> usize {
         self.live
-    }
-
-    /// Slots that exist, in use or free.
-    #[must_use]
-    pub fn slots(&self) -> usize {
-        self.entries.len()
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (u32, &mut SessionEntry)> {

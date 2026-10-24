@@ -339,7 +339,9 @@ impl TaskArena {
     /// Adds this arena's change since the last pass to `show pools` (once per loop pass).
     #[inline]
     pub fn publish(&mut self) {
-        TASK_POOL.publish(&mut self.published, self.tasks.len(), self.live);
+        let mut last = self.published;
+        TASK_POOL.publish_arena::<Task>(&mut last, self);
+        self.published = last;
     }
 
     #[must_use]

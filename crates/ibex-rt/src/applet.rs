@@ -1908,7 +1908,9 @@ impl AppletArena {
     /// Adds this arena's change since the last pass to `show pools` (once per loop pass).
     #[inline]
     pub fn publish(&mut self) {
-        APPCTX_POOL.publish(&mut self.published, self.entries.len(), self.live);
+        let mut last = self.published;
+        APPCTX_POOL.publish_arena::<CliApplet>(&mut last, self);
+        self.published = last;
     }
 
     /// A slot for `entry`, or `None` when the arena is full and cannot grow: the CLI

@@ -78,6 +78,12 @@ impl ArenaStats {
         *last = Published { slots, live };
     }
 
+    /// [`Self::publish`] with the figures of an [`Arena`].
+    #[inline]
+    pub fn publish_arena<T>(&self, last: &mut Published, arena: &impl Arena<T>) {
+        self.publish(last, arena.slots(), arena.live());
+    }
+
     /// The arena goes away: takes its published share back.
     pub fn retire(&self, last: &mut Published) {
         self.publish(last, 0, 0);

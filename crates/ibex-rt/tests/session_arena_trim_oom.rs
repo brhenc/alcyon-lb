@@ -157,6 +157,25 @@ fn a_task_past_the_presize_that_cannot_be_had_is_refused() {
     assert!(tasks.alloc(WorkKind::new(Kind::Synthetic, 64)).is_some());
 }
 
+/// `pool_gc` on the task arena while the fresh buffer cannot be had: the tail goes, the buffer
+/// stays, the skip is counted.
+#[test]
+fn a_task_compaction_whose_fresh_buffer_cannot_be_had_keeps_the_old_one() {
+    use ibex_sched::{Kind, TaskArena, WorkKind, TASK_POOL};
+    let mut tasks = TaskArena::with_capacity(8);
+    let refs: Vec<_> = (0..200).map(|i| tasks.alloc(WorkKind::new(Kind::Synthetic, i)).expect("slot")).collect();
+    for &r in &refs {
+        tasks.free(r);
+    }
+    let skipped = TASK_POOL.compactions_skipped();
+    fail_thread_allocs_from(200); // the fresh 8 x 32 bytes is refused
+    let released = tasks.compact();
+    fail_thread_allocs_from(usize::MAX);
+    assert_eq!(released, 200);
+    assert!(tasks.capacity() >= 200, "the old buffer is kept");
+    assert_eq!(TASK_POOL.compactions_skipped(), skipped + 1);
+}
+
 /// The switch fails growing reallocations too, not only fresh allocations: a `Vec` that
 /// already holds memory and asks for more past the limit gets an error, and gets it again
 /// once the limit is lifted.
