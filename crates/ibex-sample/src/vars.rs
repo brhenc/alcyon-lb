@@ -140,9 +140,23 @@ fn grow_to(slots: &mut Vec<Slot>, len: usize) -> Option<()> {
     Some(())
 }
 
+/// What runs when a reservation is refused, before it is tried once more: the runtime's
+/// `pool_gc` (T445), which empties the caches and trims the heap.
+static ALLOC_FAILURE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Sets the collector a refused reservation runs before its one retry (the first call wins).
+pub fn set_alloc_failure_hook(f: fn()) {
+    let _ = ALLOC_FAILURE_HOOK.set(f);
+}
+
 /// Room for `extra` more elements in `v`; `None` when the memory is not there (the allocator
-/// refuses, or the size cannot be addressed).
+/// refuses, or the size cannot be addressed). A refusal runs the collector and is tried once
+/// more, as `HAProxy` retries `SSL_new` after `pool_gc` (`src/ssl_sock.c:6074`).
 fn reserve_more<T>(v: &mut Vec<T>, extra: usize) -> Option<()> {
+    if v.try_reserve(extra).is_ok() {
+        return Some(());
+    }
+    (ALLOC_FAILURE_HOOK.get()?)();
     v.try_reserve(extra).ok()
 }
 
@@ -348,6 +362,20 @@ thread_local! {
     /// Whether a stream runs on this thread ([`enter`]/[`leave`]): its store is then in
     /// [`CURRENT_VARS`], and the session's own is empty.
     static RUNNING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `pool_gc` (T445): frees this thread's spare variable stores. `wipe` is given each value
+/// buffer first (the runtime's `tune.ibex.zero-buffers` wipe: this crate has no allocator
+/// policy of its own). Returns how many stores were freed.
+pub fn drain_spare(mut wipe: impl FnMut(&mut Vec<u8>)) -> usize {
+    let taken = SPARE.try_with(|s| s.try_borrow_mut().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default()).unwrap_or_default();
+    let n = taken.len();
+    for slots in taken {
+        for mut slot in slots {
+            wipe(&mut slot.buf);
+        }
+    }
+    n
 }
 
 impl VarStore {
@@ -995,6 +1023,41 @@ mod tests {
         assert_eq!(b.slots.as_ptr(), ptr);
         assert!(b.is_empty());
     }
+    /// T445: `pool_gc` frees the spare stores, each kept value buffer handed to the wipe
+    /// first, and leaves none for the next store.
+    #[test]
+    fn draining_the_spare_stores_wipes_each_kept_buffer() {
+        let _ = drain_spare(|_| {});
+        let mut a = VarStore::new();
+        a.insert("txn.t445", Sample::Str("secret".repeat(10)));
+        let ptr = a.slots.as_ptr();
+        drop(a);
+        let mut wiped = Vec::new();
+        assert_eq!(drain_spare(|b| wiped.push(b.capacity())), 1, "one spare store");
+        assert!(!wiped.is_empty() && wiped.iter().any(|&c| c >= 60), "the value's buffer was wiped: {wiped:?}");
+        assert_eq!(drain_spare(|_| {}), 0);
+        assert_ne!(VarStore::new().slots.as_ptr(), ptr, "the store was freed, not kept");
+    }
+
+    /// T445: a reservation the allocator refuses runs the runtime's `pool_gc` and is tried
+    /// once more, as `ssl_sock.c` retries `SSL_new` (the hook is process-wide: set once).
+    #[test]
+    fn a_refused_reservation_collects_and_retries_once() {
+        // Counted per thread: another test's refusals run the same hook on its own thread.
+        thread_local! {
+            static RUNS: Cell<u32> = const { Cell::new(0) };
+        }
+        fn hook() {
+            RUNS.with(|r| r.set(r.get() + 1));
+        }
+        set_alloc_failure_hook(hook);
+        let mut v: Vec<u8> = Vec::new();
+        assert_eq!(reserve_more(&mut v, usize::MAX), None);
+        assert_eq!(RUNS.with(Cell::get), 1, "one collection for one failure");
+        assert_eq!(reserve_more(&mut v, 8), Some(()));
+        assert_eq!(RUNS.with(Cell::get), 1, "no collection when it succeeds");
+    }
+
     /// The paths of the stores that cannot grow: no memory, or a size nothing can address.
     #[test]
     fn a_store_that_cannot_grow_is_left_as_it_is() {

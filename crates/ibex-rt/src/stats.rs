@@ -214,6 +214,12 @@ thread_local! {
     static ROW_POOL: std::cell::RefCell<Vec<Vec<String>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// `pool_gc` (T445): frees the rows this thread keeps for the next `show stat` or scrape.
+#[must_use]
+pub fn drain_row_pool() -> usize {
+    ROW_POOL.try_with(|p| p.try_borrow_mut().map_or(0, |mut p| std::mem::take(&mut *p).len())).unwrap_or(0)
+}
+
 const ROW_FIELD_CAP: usize = 24;
 
 /// Puts one `show stat` row, its strings sized for long values, into this thread's pool.
