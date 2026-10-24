@@ -48,6 +48,11 @@ os.environ["PATH"] = f"{Path.home()}/.cargo/bin:{os.environ.get('PATH', '')}"
 # the same run. Measured between identical builds (A/A, 2026-10-02): ibex CPU per request
 # at 50 connections within 0.3% (samples 2%), 1-conn requests/s within 3% (samples 10%:
 # mostly wake-up latency of three processes).
+# T452 (2026-10-24): on CPUs 4;5;6 the 1-conn samples of either build fall in two modes,
+# ~15k and ~19k req/s, and a median over four samples measured the mix of modes: rc2's
+# gate runs read -10% to -22% that way. The report now prints how many samples of each
+# build fell in each mode (`split_modes`). What picks the mode is being measured by
+# tools/measure/t452_night.sh; the pinning and the round count follow from its data.
 AB_MAX_CPU_RISE_PCT = 4.0
 AB_MAX_DROP_PCT = 10.0
 
@@ -477,6 +482,43 @@ def _wait_listening(port: int, proc: subprocess.Popen, timeout: float = 5.0) -> 
     raise RuntimeError(f"proxy did not listen on {port} within {timeout}s")
 
 
+# The 1-conn samples of one build fall in two modes about 25% apart (~15k and ~19k req/s on
+# the gate's CPUs 4;5;6, T452). Within a mode the spread is about 10%, so a step of more than
+# MODE_GAP_PCT between two neighbouring samples is the gap between the modes.
+MODE_GAP_PCT = 12.0
+
+
+def _median(xs: List[int]) -> int:
+    ys = sorted(xs)
+    n = len(ys)
+    return ys[n // 2] if n % 2 else (ys[n // 2 - 1] + ys[n // 2]) // 2
+
+
+def split_modes(cand: List[int], ref: List[int], gap_pct: float = MODE_GAP_PCT) -> Dict[str, Any]:
+    """Splits both sides' 1-conn samples at one threshold: the widest step between
+    neighbouring samples of the pooled, sorted list, if it is wider than `gap_pct`.
+
+    Returns the threshold (None: one mode), how many samples of each side are slow and
+    fast, and each side's median within each mode. A median over a 3:1 mix of the modes
+    and one over a 1:3 mix differ by the gap between the modes, whatever the change did:
+    T452's rc2 runs showed -10% to -22% that way."""
+    pooled = sorted(cand + ref)
+    threshold = None
+    best = 0.0
+    for lo, hi in zip(pooled, pooled[1:]):
+        step = (hi - lo) * 100.0 / lo if lo > 0 else 0.0
+        if step > gap_pct and step > best:
+            best, threshold = step, (lo + hi) / 2
+    out: Dict[str, Any] = {"threshold": threshold}
+    for side, xs in (("cand", cand), ("ref", ref)):
+        slow = [x for x in xs if threshold is None or x < threshold]
+        fast = [x for x in xs if threshold is not None and x >= threshold]
+        out[side] = {"slow": len(slow), "fast": len(fast)}
+        out[f"{side}_slow_median"] = _median(slow) if slow else None
+        out[f"{side}_fast_median"] = _median(fast) if fast else None
+    return out
+
+
 def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
                latency_requests: int = 30000, load_conns: int = 50,
                load_requests: int = 100000) -> Dict[str, Any]:
@@ -554,13 +596,10 @@ def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
             be.kill()
         os.remove(cfg_path)
 
-    def median(xs: List[int]) -> int:
-        ys = sorted(xs)
-        n = len(ys)
-        return ys[n // 2] if n % 2 else (ys[n // 2 - 1] + ys[n // 2]) // 2
-
+    median = _median
     return {"cand": median(rps["cand"]), "ref": median(rps["ref"]),
             "cand_samples": rps["cand"], "ref_samples": rps["ref"],
+            "modes": split_modes(rps["cand"], rps["ref"]),
             "cand_ns": median(cpu["cand"]), "ref_ns": median(cpu["ref"]),
             "cand_ns_samples": cpu["cand"], "ref_ns_samples": cpu["ref"]}
 
@@ -1074,6 +1113,21 @@ def main() -> int:
     record["cpu_ns_per_req_50conn_ref"] = ab["ref_ns"]
     print(f"      this build {ab['cand_samples']} median {ab['cand']:,}; "
           f"reference {ab['ref_samples']} median {ab['ref']:,}")
+    modes = ab["modes"]
+    record["rps_1conn_modes"] = modes
+    if modes["threshold"] is None:
+        print("      1-conn modes: one (no step wider than "
+              f"{MODE_GAP_PCT:g}% between samples)")
+    else:
+        def mode_line(side: str) -> str:
+            n, s_med, f_med = modes[side], modes[f"{side}_slow_median"], modes[f"{side}_fast_median"]
+            return (f"{n['slow']} slow (median {s_med:,})" if s_med else "0 slow") + ", " + \
+                   (f"{n['fast']} fast (median {f_med:,})" if f_med else "0 fast")
+        print(f"      1-conn modes split at {modes['threshold']:,.0f}: this build {mode_line('cand')}; "
+              f"reference {mode_line('ref')}")
+        if modes["cand"] != modes["ref"]:
+            print("      the builds landed in the modes in different proportions: the medians "
+                  "compare the mix, not the builds (T452)")
     print(f"      ibex CPU ns/req at 50 conns: this build {ab['cand_ns_samples']} median {ab['cand_ns']:,}; "
           f"reference {ab['ref_ns_samples']} median {ab['ref_ns']:,}")
 
