@@ -146,6 +146,27 @@ const ROWS: &[Row] = &[
     ),
     // Nor a `Transfer-Encoding` added to a request without a body.
     ("http-request set-header transfer-encoding chunked", GET, OK, SRV_GET, CLI_OK, false),
+    // T442 row 3: a length a rule gives a request that had none to send (`Content-Length:
+    // 0`) closes the server connection after it (`h1_make_eoh`: "C-L without data"). The
+    // server reads no body bytes after the head (the second entry).
+    (
+        "http-request set-header content-length 2",
+        b"GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n",
+        OK,
+        &["GET / HTTP/1.1\r\nhost: a\r\ncontent-length: 2\r\nconnection: close", ""],
+        CLI_OK,
+        false,
+    ),
+    // T442 row 4b: a second `Content-Length` a rule adds is not written, on either side.
+    (
+        "http-request add-header content-length 5",
+        b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello",
+        OK,
+        &["POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 5"],
+        CLI_OK,
+        false,
+    ),
+    ("http-response add-header content-length 2", GET, OK, SRV_GET, CLI_OK, false),
 ];
 
 /// A server that records each request head it reads (and the two body bytes of one with
@@ -347,13 +368,14 @@ fn h2_block(list: &[(&str, &str)]) -> Vec<u8> {
 /// to the server with `content-length: 0` and no body, as `HAProxy` sends it (measured on
 /// 3.5-dev8 with `curl --http2-prior-knowledge -d`, `/tmp/t442/h2probe.sh`). The body comes
 /// in two DATA frames, the second after the head has gone.
-#[test]
-fn an_h2_request_whose_rules_removed_its_length_goes_with_no_body() {
+/// The heads the server saw of one HTTP/2 POST to a `proto h2` frontend with `rules`, a
+/// `content-length: 28` and its body in two DATA frames, the second 300 ms after the first.
+fn h2_post(rules: &str) -> Vec<String> {
     let got = Arc::new(Mutex::new(Vec::new()));
     let be = backend(OK, Arc::clone(&got));
     let fe = common::reserve_addr();
     let cfg = format!(
-        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\nfrontend f\n  bind {fe} proto h2\n  http-request del-header content-length\n  default_backend b\nbackend b\n  server s1 {be}\n"
+        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\nfrontend f\n  bind {fe} proto h2\n  {rules}\n  default_backend b\nbackend b\n  server s1 {be}\n"
     );
     let mut f = NamedTempFile::new().expect("config");
     f.write_all(cfg.as_bytes()).expect("write config");
@@ -369,12 +391,34 @@ fn an_h2_request_whose_rules_removed_its_length_goes_with_no_body() {
     c.write_all(&h2_frame(0, 0, 1, b"GET /x HTTP/1.1\r\n")).unwrap();
     thread::sleep(Duration::from_millis(300));
     c.write_all(&h2_frame(0, 1, 1, b"Host: a\r\n\r\n")).unwrap();
-    let mut out = Vec::new();
     let mut chunk = [0u8; 16384];
-    while let Ok(n @ 1..) = c.read(&mut chunk) {
-        out.extend_from_slice(&chunk[..n]);
-    }
+    while let Ok(1..) = c.read(&mut chunk) {}
     common::stop(&mut child);
     let heads = got.lock().unwrap().clone();
-    assert_eq!(heads, vec![SRV_POST0.to_string()], "the server saw the body as a request");
+    heads
+}
+
+#[test]
+fn an_h2_request_whose_rules_removed_its_length_goes_with_no_body() {
+    assert_eq!(h2_post("http-request del-header content-length"), vec![SRV_POST0.to_string()], "the server saw the body as a request");
+    // And a second length a rule adds is not written (T442 row 4b over HTTP/2: the request
+    // keeps a copy of its headers, which loses it too).
+    let heads = h2_post("http-request add-header content-length 28");
+    assert_eq!(heads.first().map(String::as_str), Some("POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 28"), "{heads:?}");
+}
+
+/// T442: a request whose rules gave it a length shorter than the body it has. `HAProxy`
+/// answers 500 (`IH` in the log) and keeps the client connection; forwarded, the rest of the
+/// body is read by the server as the next request. Measured on 3.5-dev8 (`/tmp/t442`,
+/// `p442b.py` cases `1v`, `m0`, `p442log.py` `s3`). `HAProxy` has sent the head to the server
+/// before it fails; Ibex answers before it sends anything.
+#[test]
+fn a_request_length_a_rule_made_shorter_than_its_body_is_refused() {
+    let req: &[u8] = b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 28\r\n\r\nGET /x HTTP/1.1\r\nHost: a\r\n\r\n";
+    for rules in ["http-request set-header content-length 3", "http-request set-header content-length 0", "http-request set-header content-length x"] {
+        let (srv, cli, closed) = run(rules, req, OK);
+        assert!(srv.iter().all(|h| h.starts_with("POST / HTTP/1.1")), "{rules}: the server read the body as a request: {srv:?}");
+        assert!(cli.starts_with(b"HTTP/1.1 500 "), "{rules}: client got {:?}", String::from_utf8_lossy(&cli));
+        assert!(!closed, "{rules}: the client connection closed");
+    }
 }

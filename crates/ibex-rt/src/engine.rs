@@ -12258,8 +12258,12 @@ impl EngineDispatcher<'_> {
         // `option http-server-close` (frontend or backend): this request has the server
         // connection to itself, and the server is asked to close it. A request that asks
         // for an upgrade keeps its `Connection` header.
-        if !proxies[proxy_idx].http_req_rules.is_empty() || !proxies[be_idx].http_req_rules.is_empty() {
-            reread_request_framing(&mut entry.sess);
+        if (!proxies[proxy_idx].http_req_rules.is_empty() || !proxies[be_idx].http_req_rules.is_empty()) && !reread_request_framing(&mut entry.sess) {
+            // A length the rules made shorter than the body: `HAProxy`'s mux fails the
+            // request (500, `IH`) rather than send the rest as the next request (T442).
+            entry.sess.log.term = Some(*b"IH");
+            reply_error(entry, proxies, 500);
+            return None;
         }
         rewrite_request_connection(&mut entry.sess, server_close(proxies, proxy_idx, be_idx));
 
@@ -13515,10 +13519,12 @@ fn rewrite_request_connection(sess: &mut TcpSession, close: bool) {
 
 /// The request's `Content-Length` and `Transfer-Encoding` after its rules, as `HAProxy`
 /// writes them out (`h1_process_emit_headers`, `src/mux_h1.c`, T439): one the request was
-/// not framed by when it was parsed (`H1_MF_CLEN`, `H1_MF_CHNK`) is not written.
-fn reread_request_framing(sess: &mut TcpSession) {
+/// not framed by when it was parsed (`H1_MF_CLEN`, `H1_MF_CHNK`) is not written, and of
+/// the `Content-Length` it was, only the first (T442). False when that length is not a
+/// number or is shorter than the body: the request cannot be sent.
+fn reread_request_framing(sess: &mut TcpSession) -> bool {
     let Some(was) = sess.txn.as_ref().and_then(|t| t.req_len_hdrs) else {
-        return;
+        return true;
     };
     for (name, framed) in [("content-length", was.clen), ("transfer-encoding", was.chnk)] {
         if framed || sess.htx_slice().and_then(|h| h.get_header_bytes(name.as_bytes())).is_none() {
@@ -13541,7 +13547,47 @@ fn reread_request_framing(sess: &mut TcpSession) {
         if let Some(t) = sess.txn.as_mut() {
             t.req_body_dropped = true;
         }
+        return true;
     }
+    if was.clen {
+        return reread_request_length(sess);
+    }
+    true
+}
+
+/// The `Content-Length` a request framed by its length has after its rules, as
+/// `h1_process_emit_headers` and `h1_make_eoh` write it (T442): the first only; a length
+/// given to a request with no body closes the server connection after it ("C-L without
+/// data"); false for one that is not a number or is shorter than the body.
+fn reread_request_length(sess: &mut TcpSession) -> bool {
+    let body = match sess.txn.as_ref().map(|t| t.req) {
+        Some(crate::txn::MsgState::Head { body: crate::txn::Framing::Length(n), .. }) => n,
+        _ => 0,
+    };
+    let (mut count, mut first) = (0usize, None);
+    for (_, v) in sess.htx_slice().into_iter().flat_map(|h| h.headers()).filter(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+        count += 1;
+        first = first.or(Some(v.trim().parse::<u64>().ok()));
+    }
+    let Some(len) = first else { return true };
+    let Some(len) = len.filter(|&l| body == 0 || l >= body) else {
+        return false;
+    };
+    if count > 1 {
+        let value = sess.htx_slice().and_then(|h| h.get_header_bytes(b"content-length")).map(|v| String::from_utf8_lossy(v).into_owned()).unwrap_or_default();
+        sess.with_htx_mut(|htx| {
+            let _ = htx.set_header("content-length", &value);
+        });
+        if let Some(hdrs) = sess.req_headers.as_mut() {
+            let mut seen = false;
+            hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length") || !std::mem::replace(&mut seen, true));
+        }
+        rebuild_req_buffer(sess);
+    }
+    if body == 0 && len > 0 {
+        add_req_header(sess, "Connection", "close");
+    }
+    true
 }
 
 fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {

@@ -1402,7 +1402,8 @@ pub fn reread_response_after_rules(hdrs: &mut Vec<(String, String)>, was: LenHdr
             return was.chnk && !bodyless;
         }
         if k.eq_ignore_ascii_case("content-length") {
-            let keep = was.clen || (bodyless && v.trim() == "0");
+            // The first only: a second one a rule added is not written (T442).
+            let keep = (was.clen || (bodyless && v.trim() == "0")) && !cl;
             cl |= keep;
             return keep;
         }
