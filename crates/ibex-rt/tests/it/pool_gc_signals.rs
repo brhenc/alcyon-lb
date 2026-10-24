@@ -241,3 +241,56 @@ fn a_purge_while_stopping_flushes_the_caches_again() {
     assert!(run.ibex.try_wait().unwrap().is_none(), "the held connection did not keep the soft stop open");
     drop(held);
 }
+
+// ---------------------------------------------------------------------------------------------
+// S3: the registry is the only list of caches (docs/design/memory-2026-10-24.md section 3.4).
+
+/// Fills the box caches this thread owns: a log line, a capture, a variable store, a `show stat` row.
+fn fill_box_caches() {
+    ibex_rt::logfmt::recycle_line(b"a log line".to_vec());
+    let mut slot = None;
+    ibex_rt::txnlog::set_capture(&mut slot, b"a captured header");
+    ibex_rt::txnlog::clear_capture(&mut slot);
+    let mut vars = ibex_sample::VarStore::new();
+    vars.insert("txn.s3", ibex_sample::Sample::Sint(1));
+    drop(vars);
+    drop(ibex_rt::stats::StatRow::new());
+}
+
+thread_local! {
+    /// A cache nobody declared with `declare_pool!`: the registry cannot know it.
+    static STRAY: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The walk of the registry is the whole drain: every box cache of the thread is a registered
+/// pool, so `ibex_alloc::drain_local_pools` alone empties them; a cache added without
+/// `declare_pool!` is not drained, and so cannot be left out by accident.
+#[test]
+fn the_registry_walk_alone_drains_every_box_cache() {
+    // The thread starts with whatever an earlier test cached.
+    let _ = ibex_rt::pool_gc::drain_thread_caches();
+    fill_box_caches();
+    STRAY.with(|s| s.borrow_mut().push(vec![1, 2, 3]));
+    let walked = ibex_alloc::drain_local_pools();
+    assert!(walked >= 4, "the registry walk freed {walked} objects; a line, a capture, a store and a row were cached");
+    assert_eq!(ibex_alloc::drain_local_pools(), 0, "a second walk found more");
+    assert_eq!(STRAY.with(|s| s.borrow().len()), 1, "a cache outside the registry was drained: something enumerates caches by hand");
+    // And `drain_thread_caches` is that walk: nothing more to find after it.
+    fill_box_caches();
+    assert!(ibex_rt::pool_gc::drain_thread_caches() >= 4);
+    assert_eq!(ibex_alloc::drain_local_pools(), 0);
+    STRAY.with(|s| s.borrow_mut().clear());
+}
+
+/// `show pools` lists the box pools from the start, under `HAProxy`'s names where the object
+/// corresponds (`vars`, `caphdr`, `pendconn`; measured on 3.5-dev8-885761-29) and Ibex's
+/// where there is none.
+#[test]
+fn show_pools_lists_the_box_caches() {
+    let run = start("s3pools", 1);
+    let mut cli = Cli::open(&run.sock);
+    let dump = cli.cmd("show pools");
+    for name in ["logline", "caphdr", "vars", "check_run", "stat_row", "scrape_box", "pendconn"] {
+        assert!(dump.lines().any(|l| l.contains(&format!("Pool {name} "))), "no `{name}` pool in:\n{dump}");
+    }
+}

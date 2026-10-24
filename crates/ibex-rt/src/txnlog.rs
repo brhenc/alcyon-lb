@@ -86,40 +86,30 @@ pub struct StreamLog {
 /// Capture buffers let go of, at most this many kept per thread for the next captures.
 const SPARE_CAPTURES: usize = 64;
 
-thread_local! {
-    /// The buffers of capture values that ended with their stream, for the next ones (T437):
-    /// a capture of a kept-alive request reuses one instead of allocating.
-    static CAPTURE_SPARE: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
-}
+ibex_alloc::declare_pool!(
+    /// `show pools` `caphdr` (`HAProxy`'s name for the same objects): the buffers of capture
+    /// values that ended with their stream, for the next ones (T437): a capture of a kept-alive
+    /// request reuses one instead of allocating. They held captured headers: wiped when given
+    /// back under `tune.ibex.zero-spares`.
+    static CAPHDR: Pool<Vec<u8>> = ibex_alloc::PoolSpec::new("caphdr").max_count(SPARE_CAPTURES).spares();
+);
 
-/// `pool_gc` (T445): frees the spare capture buffers, wiped first (they held captured headers).
-#[must_use]
-pub fn drain_capture_spares() -> usize {
-    let taken = CAPTURE_SPARE.try_with(|s| s.try_borrow_mut().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default()).unwrap_or_default();
-    let n = taken.len();
-    for mut b in taken {
-        ibex_alloc::wipe_vec(&mut b);
-    }
-    n
+/// Lists the pool in `show pools` from the start.
+pub fn register_pools() {
+    CAPHDR.register();
 }
 
 /// Puts `v` in the capture slot `slot`, in the memory it holds already or in a spare buffer.
 pub fn set_capture(slot: &mut Option<Vec<u8>>, v: &[u8]) {
-    let buf = slot.get_or_insert_with(|| CAPTURE_SPARE.with(|s| s.borrow_mut().pop()).unwrap_or_default());
+    let buf = slot.get_or_insert_with(|| CAPHDR.take_raw(|| Some(Vec::new())).unwrap_or_default());
     buf.clear();
     buf.extend_from_slice(v);
 }
 
 /// Empties the capture slot `slot`, its buffer kept for a later capture.
 pub fn clear_capture(slot: &mut Option<Vec<u8>>) {
-    if let Some(mut b) = slot.take() {
-        b.clear();
-        CAPTURE_SPARE.with(|s| {
-            let mut s = s.borrow_mut();
-            if s.len() < SPARE_CAPTURES {
-                s.push(b);
-            }
-        });
+    if let Some(b) = slot.take() {
+        CAPHDR.give(b);
     }
 }
 

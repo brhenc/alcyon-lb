@@ -15,16 +15,17 @@
 //! 100 ms, apart) and empties its own when the generation moved. No thread waits for another,
 //! where `thread_isolate` stops them all.
 //!
-//! What is emptied ([`drain_thread_caches`]): the buffer pools (`show pools` `buffer`,
-//! `small_buffer`, `large_buffer`), the spare log lines, capture buffers, variable stores,
-//! check runs and stats rows, and every `ibex_alloc::Pool` the thread used (spare strings and
-//! header lists, scratch buffers: `ibex_alloc::drain_local_pools`). Kept: the one scratch buffer a
-//! thread formats into (log ring, syslog line, the Prometheus exporter's prewarmed scrape
-//! state, like `HAProxy`'s trash, which `pool_gc` does not free either), and the compiled
-//! regex and expression caches, which are configuration. The session and applet arenas
-//! give back their burst capacity as connections close, so they hold nothing to empty.
-//! What held request or log data is wiped first when `tune.ibex.zero-buffers` is on (cached
-//! buffers were wiped when released).
+//! What is emptied ([`drain_thread_caches`]): every `ibex_alloc::Pool` the thread used, found by
+//! the registry walk (`ibex_alloc::drain_local_pools`) and not by a list kept here: the buffers
+//! (`buffer`, `small_buffer`, `large_buffer`), spare strings and header lists, scratch buffers,
+//! log lines (`logline`), captures (`caphdr`), variable stores (`vars`), check runs, stats rows,
+//! scrape boxes and queue waits (`pendconn`). A cache that is not a `declare_pool!` is not
+//! drained, and `harness/pool_layout.py` refuses to build one. Kept: the Prometheus exporter's
+//! prewarmed scrape state (like `HAProxy`'s trash, which `pool_gc` does not free either), and
+//! the compiled regex and expression caches, which are configuration. The session and applet
+//! arenas give back their burst capacity as connections close, so they hold nothing to empty
+//! (S4 moves that under this walk). What held request or log data was wiped when it was given
+//! back (`tune.ibex.zero-spares`, `tune.ibex.zero-buffers`).
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -81,14 +82,9 @@ pub fn drains() -> usize {
 
 /// Empties every cache of the calling thread; returns how many objects were freed.
 pub fn drain_thread_caches() -> usize {
-    let mut n = crate::logfmt::drain_spare_lines();
-    n += crate::txnlog::drain_capture_spares();
-    n += crate::check::drain_run_pool();
-    n += crate::stats::drain_row_pool();
-    n += ibex_sample::vars::drain_spare(ibex_alloc::wipe_vec);
-    // Every `ibex_alloc::Pool` this thread used (S1: spare strings and lists, scratch
-    // buffers), found by the registry walk rather than listed here.
-    n += ibex_alloc::drain_local_pools();
+    // Every `ibex_alloc::Pool` this thread used, found by the registry walk: a cache that is
+    // not declared with `declare_pool!` is not drained, and `harness/pool_layout.py` refuses it.
+    let n = ibex_alloc::drain_local_pools();
     DRAINS.fetch_add(1, Ordering::Relaxed);
     n
 }

@@ -208,16 +208,42 @@ pub struct StatRow {
 static FIELD_INDEX: std::sync::LazyLock<std::collections::HashMap<&'static str, usize>> =
     std::sync::LazyLock::new(|| STAT_FIELDS.iter().enumerate().map(|(i, n)| (*n, i)).collect());
 
-thread_local! {
-    /// Rows given back by [`StatRow`]'s `Drop`, with the capacity their strings grew to: the
-    /// next row of this thread starts from them, so a scrape allocates no row after the first.
-    static ROW_POOL: std::cell::RefCell<Vec<Vec<String>>> = const { std::cell::RefCell::new(Vec::new()) };
+/// The strings of a `show stat` row, as the pool keeps them.
+#[derive(Debug, Default)]
+struct RowFields(Vec<String>);
+
+impl ibex_alloc::Poolable for RowFields {
+    fn footprint(&self) -> usize {
+        self.0.capacity() * std::mem::size_of::<String>() + self.0.iter().map(String::capacity).sum::<usize>()
+    }
+
+    /// The values are statistics, not request data: no wipe.
+    fn reset(&mut self, _wipe: bool) {
+        for f in &mut self.0 {
+            f.clear();
+        }
+    }
+
+    /// Only a whole row: one emptied by `mem::take` is not worth keeping.
+    fn keep(&self, max_footprint: usize) -> bool {
+        self.0.len() == STAT_FIELD_COUNT && self.footprint() <= max_footprint
+    }
+
+    fn try_new() -> Option<Self> {
+        Some(RowFields((0..STAT_FIELD_COUNT).map(|_| String::with_capacity(ROW_FIELD_CAP)).collect()))
+    }
 }
 
-/// `pool_gc` (T445): frees the rows this thread keeps for the next `show stat` or scrape.
-#[must_use]
-pub fn drain_row_pool() -> usize {
-    ROW_POOL.try_with(|p| p.try_borrow_mut().map_or(0, |mut p| std::mem::take(&mut *p).len())).unwrap_or(0)
+ibex_alloc::declare_pool!(
+    /// `show pools` `stat_row`: rows given back by [`StatRow`]'s `Drop`, with the capacity
+    /// their strings grew to: the next row of this thread starts from them, so a scrape
+    /// allocates no row after the first.
+    static ROW_POOL: Pool<RowFields> = ibex_alloc::PoolSpec::new("stat_row").max_count(8);
+);
+
+/// Lists the pool in `show pools` from the start.
+pub fn register_pools() {
+    ROW_POOL.register();
 }
 
 const ROW_FIELD_CAP: usize = 24;
@@ -229,21 +255,12 @@ pub fn reserve_row_pool() {
     std::sync::LazyLock::force(&EMPTY);
     let _ = PROCESS_START.get_or_init(Instant::now);
     let fields: Vec<String> = (0..STAT_FIELD_COUNT).map(|_| String::with_capacity(64)).collect();
-    let _ = ROW_POOL.try_with(|p| p.borrow_mut().push(fields));
+    ROW_POOL.give(RowFields(fields));
 }
 
 impl Drop for StatRow {
     fn drop(&mut self) {
-        let mut fields = std::mem::take(&mut self.fields);
-        for f in &mut fields {
-            f.clear();
-        }
-        // A thread that is going away has no pool left to give back to.
-        let _ = ROW_POOL.try_with(|p| {
-            if let Some(mut p) = p.try_borrow_mut().ok().filter(|p| p.len() < 8) {
-                p.push(fields);
-            }
-        });
+        ROW_POOL.give(RowFields(std::mem::take(&mut self.fields)));
     }
 }
 
@@ -256,8 +273,7 @@ impl Default for StatRow {
 impl StatRow {
     #[must_use]
     pub fn new() -> Self {
-        let pooled = ROW_POOL.try_with(|p| p.try_borrow_mut().ok().and_then(|mut p| p.pop())).ok().flatten();
-        let mut fields = pooled.unwrap_or_else(|| (0..STAT_FIELD_COUNT).map(|_| String::with_capacity(ROW_FIELD_CAP)).collect());
+        let mut fields = ROW_POOL.take_raw(<RowFields as ibex_alloc::Poolable>::try_new).map_or_else(|| (0..STAT_FIELD_COUNT).map(|_| String::with_capacity(ROW_FIELD_CAP)).collect(), |r| r.0);
         fields[119].push('-');
         StatRow { fields }
     }
@@ -1133,6 +1149,20 @@ pub fn format_show_stat_as(
 }
 
 #[cfg(test)]
+    /// S3: a dropped row goes to the `stat_row` pool and the next row takes it, emptied.
+    #[test]
+    fn a_dropped_stat_row_is_taken_again_by_the_next() {
+        let mut row = StatRow::new();
+        row.set("pxname", "fe");
+        let ptr = row.fields.as_ptr();
+        drop(row);
+        assert_eq!(ROW_POOL.local_count(), 1);
+        let again = StatRow::new();
+        assert_eq!(again.fields.as_ptr(), ptr, "the same strings came back");
+        assert!(again.fields[0].is_empty());
+        assert_eq!(ROW_POOL.local_count(), 0);
+    }
+
 mod tests {
     use super::*;
 

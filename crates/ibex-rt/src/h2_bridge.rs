@@ -320,7 +320,7 @@ pub fn abort_reset_stream(sess: &mut TcpSession) -> bool {
         if let Some(srv) = sess.srv.as_ref() {
             raw::abort_with_rst(srv.as_fd());
         }
-        if sess.queue.take().is_some() {
+        if sess.queue.leave() {
             sess.log.queue.get_or_insert_with(crate::txnlog::loop_now);
             sess.log.term = Some(*b"CQ");
         } else if txn.local {
