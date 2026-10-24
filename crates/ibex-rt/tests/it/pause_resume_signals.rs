@@ -240,3 +240,14 @@ fn a_soft_stop_keeps_an_open_cli_session() {
 fn a_soft_stop_keeps_an_open_cli_session_under_w() {
     soft_stop_keeps_the_cli_session("usr1w", &["-W"]);
 }
+
+/// Row 3: under `-W -S` the master runs the worker as a process of its own, and relays
+/// SIGTTOU and SIGTTIN to it as `HAProxy`'s does (measured: TTOU to the master refuses
+/// connections, TTIN serves them again; the worker logs it).
+#[test]
+fn the_master_relays_sigttou_and_sigttin_to_the_workers() {
+    let master_sock = std::env::temp_dir().join(format!("t456-master-{}.sock", std::process::id()));
+    let ms = master_sock.display().to_string();
+    pause_and_resume("master", &["-W", "-S", &ms]);
+    let _ = std::fs::remove_file(&master_sock);
+}

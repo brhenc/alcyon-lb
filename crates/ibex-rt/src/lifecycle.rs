@@ -86,6 +86,13 @@ impl Lifecycle {
         self.paused.load(Ordering::Relaxed)
     }
 
+    /// The master's view of `SIGTTOU` and `SIGTTIN`: whether each arrived since the last
+    /// call, to relay to the workers (T456). The master pauses nothing of its own.
+    #[must_use]
+    pub fn take_pause_signals(&self) -> (bool, bool) {
+        (self.ttou.swap(false, Ordering::Relaxed), self.ttin.swap(false, Ordering::Relaxed))
+    }
+
     /// Consumes a pending `SIGQUIT`, if there is one: the caller runs `pool_gc`.
     #[must_use]
     pub fn take_flush_request(&self) -> bool {
