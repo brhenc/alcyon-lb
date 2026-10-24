@@ -667,9 +667,26 @@ mod tests {
 
 static TRIM_DISABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// `tune.ibex.zero-buffers` (default on): whether a buffer given back to its pool, or dropped,
+/// `tune.ibex.zero-buffers` (default off): whether a buffer given back to its pool, or dropped,
 /// is overwritten with zeros first. Set from the configuration each time an engine is built.
-static ZERO_BUFFERS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+static ZERO_BUFFERS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `tune.ibex.zero-spares` (default off): whether a spare string or list given back to its
+/// pool (`ibex_sample::spare`, `ibex_rt::reuse`) is overwritten with zeros first. Read by the
+/// pools through their thread copy (`pool::HOT`), refreshed once per loop pass.
+static ZERO_SPARES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Sets `tune.ibex.zero-spares`.
+pub fn set_zero_spares(on: bool) {
+    ZERO_SPARES.store(on, core::sync::atomic::Ordering::Relaxed);
+    pool::settings_changed();
+}
+
+/// Whether spare strings and lists are zeroed when given back (`tune.ibex.zero-spares`).
+#[must_use]
+pub fn zero_spares() -> bool {
+    ZERO_SPARES.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 /// Sets `tune.ibex.zero-buffers`.
 pub fn set_zero_buffers(on: bool) {
@@ -694,6 +711,14 @@ pub fn wipe(bytes: &mut [u8]) {
     if zero_buffers() {
         zeroize::Zeroize::zeroize(bytes);
     }
+}
+
+/// Overwrites `bytes` with zeros like [`wipe`], whatever `tune.ibex.zero-buffers` says. For
+/// the TLS record buffers (`ibex-tls`), which are wiped always until they get their own
+/// setting (`tune.ibex.ssl-zero-buffers`, S2).
+#[inline(never)]
+pub fn wipe_always(bytes: &mut [u8]) {
+    zeroize::Zeroize::zeroize(bytes);
 }
 
 /// [`wipe`] for a whole `Vec`: its bytes and its spare capacity, which holds what earlier

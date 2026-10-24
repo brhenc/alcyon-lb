@@ -297,13 +297,25 @@ reload keeps the backlog it was bound with, as in HAProxy.
 When a buffer goes back to its pool (or is freed), Ibex overwrites the bytes that were written to
 it (up to a per-buffer high-water mark, not the whole 16 KB) with zeros, so the plaintext of one
 connection is not what the next one is handed, and a core dump or a memory-disclosure bug finds
-less. The overwrite is a `zeroize` write the compiler may not remove. The same is done for the
-wire buffers (`rx_raw`/`tx_raw`) of a TLS connection when it ends. Default **on**; `off` skips the
-cost for an operator who measures it as one. HAProxy has no such setting (its pools keep stale
-bytes; `-dM` poisoning is a debug option) and refuses the keyword as unknown. It takes exactly
-`on` or `off`; anything else, or a missing argument, is a configuration error. Limits: bytes
-written through `Buf::writable()` and never committed are not tracked, and buffers owned by rustls
-itself are not Ibex's to overwrite.
+less. The overwrite is a `zeroize` write the compiler may not remove. Default **off** (since S1,
+2026-10-24: Ibex's per-request safety extras stay off while it is compared with HAProxy; `on`
+costs ~840 instructions per request on a rules benchmark). HAProxy has no such setting (its pools
+keep stale bytes; `-dM` poisoning is a debug option) and refuses the keyword as unknown. It takes
+exactly `on` or `off`; anything else, or a missing argument, is a configuration error. Limits:
+bytes written through `Buf::writable()` and never committed are not tracked, and buffers owned by
+rustls itself are not Ibex's to overwrite. The TLS record buffers (plaintext and ciphertext,
+`rx_raw`/`tx_raw` included) are not covered by this setting: they are wiped always when a TLS
+connection ends, until they get their own `tune.ibex.ssl-zero-buffers` (default on).
+
+## `tune.ibex.zero-spares on|off`: an Ibex-only global keyword (S1)
+
+The header rules, samples and formats reuse per-thread spare strings and header lists (`show
+pools` `spare_str`, `spare_list`, `scratch_str`, `scratch_bytes`). With `on`, a string's used
+bytes (each string's, for a list) are overwritten with zeros when it is given back to its pool,
+whether the pool keeps it or frees it, so an earlier request's cookie or `Authorization` value is
+not left in memory. Default **off**: the wipe costs ~1k instructions per request on a rules
+benchmark, and HAProxy wipes nothing either. HAProxy refuses the keyword as unknown. It takes
+exactly `on` or `off`; anything else, or a missing argument, is a configuration error.
 
 ## `ibex.watchdog-warn-only`: an Ibex-only global keyword (T361)
 

@@ -292,6 +292,20 @@ pub(crate) fn parse_global_directive(
             });
             Ok(())
         }
+        "tune.ibex.zero-spares" => {
+            let Some(arg) = tokens.get(1) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.ibex.zero-spares' expects 'on' or 'off'."));
+            };
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'tune.ibex.zero-spares' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            global.zero_spares = Some(match arg.text.as_str() {
+                "on" => true,
+                "off" => false,
+                other => return Err(ConfigError::new(arg.line, arg.col, format!("'tune.ibex.zero-spares' expects 'on' or 'off', got '{other}'."))),
+            });
+            Ok(())
+        }
         "tune.maxrewrite" => {
             if tokens.len() < 2 {
                 return Err(ConfigError::new(kw.line, kw.col, "'tune.maxrewrite' expects an integer argument."));

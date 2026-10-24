@@ -48,6 +48,7 @@ mod log_tag_sample;
 mod m1_scope_refusals;
 mod no_memory_trimming;
 mod zero_buffers;
+mod zero_spares;
 mod hot_size;
 mod normalize_uri_experimental;
 mod node_description;

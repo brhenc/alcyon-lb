@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 // Own binary (AGENTS.md rule 6): sets the process-wide `tune.memory.hot-size` and
-// `tune.ibex.zero-buffers`, and installs a #[global_allocator] to see what a freed spare left
+// `tune.ibex.zero-spares`, and installs a #[global_allocator] to see what a freed spare left
 // in memory; any other test in a shared binary would change both under it.
 
 //! S1 (design/memory-2026-10-24.md, ported from fix/t444's test): the spare strings and lists
 //! each thread keeps (`ibex_sample::spare`, `ibex_alloc::Pool`s) are bounded by
 //! `tune.memory.hot-size` as `HAProxy`'s per-thread hot cache is, listed in `show pools`,
-//! freed by the thread's pool walk (`pool_gc`), and wiped when `tune.ibex.zero-buffers` is on.
+//! freed by the thread's pool walk (`pool_gc`), and wiped when `tune.ibex.zero-spares` is on
+//! (whatever `tune.ibex.zero-buffers` says: that one is the I/O buffers').
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -49,13 +50,14 @@ fn secret(b: Option<&Vec<u8>>) -> bool {
 
 /// A string given back is wiped before it is kept, and before it is freed for being over a
 /// limit; a scratch string is wiped when it goes back to its pool. With the setting off the
-/// old bytes stay.
+/// old bytes stay. `tune.ibex.zero-buffers` is set the other way each time: it does not decide.
 #[test]
-fn a_spare_string_is_wiped_when_zero_buffers_is_on() {
+fn a_spare_string_is_wiped_when_zero_spares_is_on() {
     let _turn = TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     ibex_alloc::set_hot_size(ibex_alloc::HOT_SIZE_DEFAULT);
     for on in [true, false] {
-        ibex_alloc::set_zero_buffers(on);
+        ibex_alloc::set_zero_spares(on);
+        ibex_alloc::set_zero_buffers(!on);
         let check = |what: &str, b: Option<Vec<u8>>| {
             if on {
                 assert!(zeros(b.as_ref()), "setting on, {what}: freed bytes {b:?}");
@@ -83,7 +85,37 @@ fn a_spare_string_is_wiped_when_zero_buffers_is_on() {
             let _ = ibex_alloc::drain_local_pools();
         }));
     }
-    ibex_alloc::set_zero_buffers(true);
+    ibex_alloc::set_zero_spares(false);
+    ibex_alloc::set_zero_buffers(false);
+}
+
+/// AGENTS.md 5: `tune.ibex.zero-spares` reaches the give. `Engine::new` applies the global
+/// setting (`ibex_alloc::set_zero_spares`), the pools' thread copy follows, and the give wipes
+/// from it. Unset is off.
+#[test]
+fn the_configured_zero_spares_reaches_the_give() {
+    let _turn = TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    ibex_alloc::set_hot_size(ibex_alloc::HOT_SIZE_DEFAULT);
+    for (text, wiped) in [("on", true), ("", false), ("off", false)] {
+        // The opposite of what zero-spares asks: the buffer setting must not decide.
+        let mut global = format!("global\n    tune.ibex.zero-buffers {}\n", if wiped { "off" } else { "on" });
+        if !text.is_empty() {
+            global.push_str(&format!("    tune.ibex.zero-spares {text}\n"));
+        }
+        let _engine = Engine::new(&ibex_config::parse_str(&global).expect("parse"), 64).expect("Engine::new");
+        let _ = ibex_alloc::drain_local_pools();
+        let b = freed_after(4000, |s| {
+            spare::give(s);
+            drop(spare::string());
+        });
+        if wiped {
+            assert!(zeros(b.as_ref()), "zero-spares {text:?}: freed bytes {b:?}");
+        } else {
+            assert!(secret(b.as_ref()), "zero-spares {text:?}: freed bytes {b:?}");
+        }
+    }
+    ibex_alloc::set_zero_spares(false);
+    ibex_alloc::set_zero_buffers(false);
 }
 
 /// A server that answers no request before it has `n` of them (or 10 s went by), so that the

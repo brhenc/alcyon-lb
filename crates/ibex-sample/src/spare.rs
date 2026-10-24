@@ -8,12 +8,12 @@
 //!
 //! Both are `ibex_alloc::Pool`s (`show pools` `spare_str`, `spare_list`): bounded by the
 //! thread's `tune.memory.hot-size` budget together with every other pool, wiped when given
-//! back under `tune.ibex.zero-buffers`, emptied by `pool_gc`. At most [`SPARE_MAX`] strings
+//! back under `tune.ibex.zero-spares`, emptied by `pool_gc`. At most [`SPARE_MAX`] strings
 //! of at most [`KEEP_MAX`] bytes, and [`LISTS_MAX`] lists of at most [`LIST_KEEP_MAX`] entries.
 //! The strings are handed out as plain `String`s ([`ibex_alloc::Pool::take_raw`]): they live
 //! in samples, and leave the pool's count until they are given back.
 
-use ibex_alloc::{declare_pool, Pool, PoolSpec, Poolable};
+use ibex_alloc::{declare_pool, PoolSpec, Poolable};
 
 use crate::sample::Sample;
 
@@ -32,12 +32,12 @@ const PAIR: usize = std::mem::size_of::<(String, String)>();
 
 declare_pool!(
     /// `show pools` `spare_str`.
-    pub static SPARE_STR: Pool<String> = PoolSpec::new("spare_str").max_item(KEEP_MAX).max_count(SPARE_MAX);
+    pub static SPARE_STR: Pool<String> = PoolSpec::new("spare_str").max_item(KEEP_MAX).max_count(SPARE_MAX).spares();
 );
 
 declare_pool!(
     /// `show pools` `spare_list`.
-    pub static SPARE_LIST: Pool<PairList> = PoolSpec::new("spare_list").max_item(LIST_KEEP_MAX * PAIR).max_count(LISTS_MAX);
+    pub static SPARE_LIST: Pool<PairList> = PoolSpec::new("spare_list").max_item(LIST_KEEP_MAX * PAIR).max_count(LISTS_MAX).spares();
 );
 
 /// A header list as the pool keeps it; its strings go back to [`SPARE_STR`] when it is.
@@ -74,8 +74,13 @@ fn new_string() -> Option<String> {
 
 /// An empty string, a spare one when there is one (an empty one with no capacity when memory
 /// is short).
+///
+/// Not inlined, nor is [`give`]: the pool's take and give are inlined here, where the pool is
+/// a known static and its thread-local cache is reached directly (an inlined copy at each
+/// caller is code size; a call into a non-inlined `Pool` method reached the cache through
+/// the `LocalKey`'s function pointer, ~800 instructions per request on the rules scenario).
 #[must_use]
-#[inline]
+#[inline(never)]
 pub fn string() -> String {
     SPARE_STR.take_raw(new_string).unwrap_or_default()
 }
@@ -88,9 +93,9 @@ pub fn string_from(src: &str) -> String {
     s
 }
 
-/// Gives `s` back for a later [`string`]: wiped when `tune.ibex.zero-buffers` is on, whether
+/// Gives `s` back for a later [`string`]: wiped when `tune.ibex.zero-spares` is on, whether
 /// it is kept or freed.
-#[inline]
+#[inline(never)]
 pub fn give(s: String) {
     // An empty one (a `mem::take`n field) has nothing to give: not even the pool's checks.
     if s.capacity() != 0 {
@@ -146,6 +151,19 @@ mod tests {
         let t = string();
         assert_eq!(t.len(), 0);
         assert_eq!(t.capacity(), cap);
+    }
+
+    /// The give's fast path (the cache's `Vec` has room) empties the string as the slow one
+    /// does: a run of gives, then as many takes, all come back empty.
+    #[test]
+    fn strings_given_in_a_run_come_back_empty() {
+        let _ = ibex_alloc::drain_local_pools();
+        for i in 0..8 {
+            give(string_from(&format!("value-{i}")));
+        }
+        for _ in 0..8 {
+            assert_eq!(string(), "");
+        }
     }
 
     /// A list given back keeps its capacity, its strings go to the spare strings.

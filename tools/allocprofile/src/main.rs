@@ -46,6 +46,8 @@ unsafe impl GlobalAlloc for Attributing {
                 }
             }
             if !found.is_empty() { site = found.join(" <- "); }
+            // `ALLOCPROFILE_RAW`: an allocation with no ibex frame is named by its whole backtrace.
+            else if std::env::var_os("ALLOCPROFILE_RAW").is_some() { site = format!("<no ibex frame>\n{bt}"); }
             let _ = SITES.try_with(|s| {
                 let mut m = s.borrow_mut();
                 let e = m.entry(site).or_insert((0, 0));
@@ -86,15 +88,17 @@ fn drive(fe: SocketAddr, e: &mut Engine) {
     let mut c = TcpStream::connect(fe).unwrap();
     c.set_nonblocking(true).unwrap();
     c.write_all(b"GET /api/test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
-    let st = Instant::now(); let mut r = Vec::new(); let mut b = [0u8; 512];
-    while st.elapsed() < Duration::from_secs(2) {
+    // The response goes into a stack buffer: a `Vec` here was the one allocation per request
+    // with no ibex frame (59 B, the client's own), counted as if Ibex made it.
+    let st = Instant::now(); let mut r = [0u8; 2048]; let mut len = 0;
+    while st.elapsed() < Duration::from_secs(2) && len < r.len() {
         let _ = e.run_once();
-        if let Ok(n) = c.read(&mut b) { if n > 0 { r.extend_from_slice(&b[..n]);
-            if r.windows(4).any(|w| w == b"\r\n\r\n") { break; } } }
+        if let Ok(n) = c.read(&mut r[len..]) { if n > 0 { len += n;
+            if r[..len].windows(4).any(|w| w == b"\r\n\r\n") { break; } } }
         thread::sleep(Duration::from_millis(1));
     }
     for _ in 0..5 { let _ = e.run_once(); thread::sleep(Duration::from_millis(1)); }
-    let text = String::from_utf8_lossy(&r);
+    let text = String::from_utf8_lossy(&r[..len]);
     assert!(
         text.starts_with("HTTP/1.1 200"),
         "the profiled request did not succeed, so the allocation count below is \

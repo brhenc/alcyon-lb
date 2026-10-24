@@ -119,6 +119,9 @@ pub struct PoolSpec {
     /// Whether [`Pool::take`] counts the objects it makes, for [`Pool::set_limit`]
     /// (`tune.buffers.limit`). Only for pools used through [`PoolBox`].
     pub limited: bool,
+    /// Whether the give's wipe follows `tune.ibex.zero-spares` (spare strings and lists) instead
+    /// of `tune.ibex.zero-buffers` (buffers). Both are read from the thread's copy.
+    pub spares: bool,
     pub file: &'static str,
     pub line: u32,
 }
@@ -126,7 +129,7 @@ pub struct PoolSpec {
 impl PoolSpec {
     #[must_use]
     pub const fn new(name: &'static str) -> Self {
-        PoolSpec { name, size: 0, max_item: usize::MAX, max_count: usize::MAX, floor: 0, limited: false, file: "", line: 0 }
+        PoolSpec { name, size: 0, max_item: usize::MAX, max_count: usize::MAX, floor: 0, limited: false, spares: false, file: "", line: 0 }
     }
     #[must_use]
     pub const fn size(mut self, n: usize) -> Self {
@@ -151,6 +154,12 @@ impl PoolSpec {
     #[must_use]
     pub const fn limited(mut self) -> Self {
         self.limited = true;
+        self
+    }
+    /// The give wipes under `tune.ibex.zero-spares` (the spare strings and lists).
+    #[must_use]
+    pub const fn spares(mut self) -> Self {
+        self.spares = true;
         self
     }
     #[must_use]
@@ -220,10 +229,12 @@ struct Hot {
     three_q: Cell<usize>,
     /// `tune.ibex.zero-buffers`.
     wipe: Cell<bool>,
+    /// `tune.ibex.zero-spares`.
+    wipe_spares: Cell<bool>,
     /// The settings generation copied.
     gen: Cell<u64>,
-    /// When [`pass`] last published.
-    published: Cell<Option<Instant>>,
+    /// When [`pass`] publishes next (`None`: at the next pass).
+    next_publish: Cell<Option<Instant>>,
     pools: [Cell<Option<&'static dyn PoolDyn>>; MAX_POOLS],
     npools: Cell<usize>,
 }
@@ -234,9 +245,10 @@ thread_local! {
             bytes: Cell::new(0),
             max: Cell::new(HOT_SIZE_DEFAULT),
             three_q: Cell::new(HOT_SIZE_DEFAULT / 4 * 3),
-            wipe: Cell::new(true),
+            wipe: Cell::new(false),
+            wipe_spares: Cell::new(false),
             gen: Cell::new(0),
-            published: Cell::new(None),
+            next_publish: Cell::new(None),
             pools: [const { Cell::new(None) }; MAX_POOLS],
             npools: Cell::new(0),
         }
@@ -301,7 +313,8 @@ pub fn hot_size() -> usize {
     HOT_SIZE.load(Ordering::Relaxed)
 }
 
-/// A setting the threads copy changed (`tune.memory.hot-size`, `tune.ibex.zero-buffers`).
+/// A setting the threads copy changed (`tune.memory.hot-size`, `tune.ibex.zero-buffers`,
+/// `tune.ibex.zero-spares`).
 pub(crate) fn settings_changed() {
     SETTINGS_GEN.fetch_add(1, Ordering::Release);
     refresh_local();
@@ -315,6 +328,7 @@ fn refresh_local() {
             h.max.set(max);
             h.three_q.set(max / 4 * 3);
             h.wipe.set(crate::zero_buffers());
+            h.wipe_spares.set(crate::zero_spares());
             h.bytes.get() > max
         })
         .unwrap_or(false);
@@ -331,16 +345,30 @@ const PUBLISH_EVERY: Duration = Duration::from_millis(10);
 /// Once per loop pass of every engine thread (`now` is the pass's clock): copies changed
 /// settings, and publishes this thread's counts of every pool it used for `show pools`, at
 /// most every [`PUBLISH_EVERY`] (no dirty flag on the fast path). An idle thread passes at
-/// least every poll timeout.
+/// least every poll timeout. Inlined into the loop: a load and two compares when there is
+/// nothing to do (a call that also did the `Instant` arithmetic every pass cost ~200
+/// instructions per request on the rules scenario, ab1).
+#[inline]
 pub fn pass(now: Instant) {
+    let due = HOT
+        .try_with(|h| h.gen.get() != SETTINGS_GEN.load(Ordering::Relaxed) || h.next_publish.get().is_none_or(|t| now >= t))
+        .unwrap_or(false);
+    if due {
+        pass_due(now);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn pass_due(now: Instant) {
     let (stale, publish) = HOT
         .try_with(|h| {
             let stale = h.gen.get() != SETTINGS_GEN.load(Ordering::Relaxed);
-            let publish = h.npools.get() != 0 && h.published.get().is_none_or(|t| now.saturating_duration_since(t) >= PUBLISH_EVERY);
+            let publish = h.next_publish.get().is_none_or(|t| now >= t);
             if publish {
-                h.published.set(Some(now));
+                h.next_publish.set(now.checked_add(PUBLISH_EVERY));
             }
-            (stale, publish)
+            (stale, publish && h.npools.get() != 0)
         })
         .unwrap_or((false, false));
     if stale {
@@ -517,7 +545,8 @@ impl<T: Poolable> Pool<T> {
     }
 
     /// [`Self::take`] with `init` making the object on a miss.
-    #[inline]
+    #[inline(always)] // see `put`
+    #[allow(clippy::inline_always)]
     pub fn take_with(&'static self, init: impl FnOnce() -> Option<T>) -> Option<PoolBox<T>> {
         let v = match self.pop(true) {
             Some(v) => v,
@@ -528,7 +557,8 @@ impl<T: Poolable> Pool<T> {
 
     /// A cached object, else `init()`, taken out of the pool's accounting: it is the caller's
     /// until it is given back with [`Self::give`], if ever. `None` only when `init` fails.
-    #[inline]
+    #[inline(always)] // see `put`
+    #[allow(clippy::inline_always)]
     pub fn take_raw(&'static self, init: impl FnOnce() -> Option<T>) -> Option<T> {
         match self.pop(false) {
             Some(v) => Some(v),
@@ -536,10 +566,11 @@ impl<T: Poolable> Pool<T> {
         }
     }
 
-    /// Gives `v` back: reset (and wiped under `tune.ibex.zero-buffers`), then kept for the next
+    /// Gives `v` back: reset (and wiped under `tune.ibex.zero-buffers`, or `tune.ibex.zero-spares` for a [`PoolSpec::spares`] pool), then kept for the next
     /// take, or freed when it is too large, the thread keeps enough of them, or the budget
     /// says so.
-    #[inline]
+    #[inline(always)] // see `put`
+    #[allow(clippy::inline_always)]
     pub fn give(&'static self, v: T) {
         self.put(v, false);
     }
@@ -579,7 +610,8 @@ impl<T: Poolable> Pool<T> {
         self.cache.try_with(|c| c.inner.try_borrow().map_or(0, |l| l.items.iter().map(T::footprint).sum())).unwrap_or(0)
     }
 
-    #[inline]
+    #[inline(always)] // see `put`
+    #[allow(clippy::inline_always)]
     fn pop(&'static self, boxed: bool) -> Option<T> {
         let floor = self.spec.floor;
         self.cache
@@ -598,9 +630,17 @@ impl<T: Poolable> Pool<T> {
             .unwrap_or(None)
     }
 
-    #[inline]
+    /// Inlined, as are the takes, so that a caller with the pool as a known static (a
+    /// `declare_pool!`'s non-inlined wrapper, `ibex_sample::spare::give`) reaches the cache's
+    /// thread-local directly and folds the spec: not inlined, the cache was reached through
+    /// the stored `LocalKey`'s function pointer (~450 instructions per request, rules, ab1).
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
     fn put(&'static self, mut v: T, boxed: bool) {
-        let (wipe, max) = HOT.try_with(|h| (h.wipe.get(), h.max.get())).unwrap_or((true, 0));
+        let spares = self.spec.spares;
+        let (wipe, max) = HOT
+            .try_with(|h| (if spares { h.wipe_spares.get() } else { h.wipe.get() }, h.max.get()))
+            .unwrap_or((true, 0));
         v.reset(wipe);
         let fp = v.footprint();
         let spec = &self.spec;

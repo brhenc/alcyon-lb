@@ -10,24 +10,24 @@
 //! sample engine's spares ([`ibex_sample::spare`], bounded), shared with the fetches.
 //!
 //! The scratch buffers ([`with_string`], [`with_bytes`]) are taken from their pool for the
-//! call and given back after it (cleared, and wiped under `tune.ibex.zero-buffers`), so a call
+//! call and given back after it (cleared, and wiped under `tune.ibex.zero-spares`), so a call
 //! made while one is out (a format rendered while a reply is built) gets another one instead
 //! of a borrow error. All of it is `ibex_alloc::Pool`s (`show pools` `spare_str`, `spare_list`,
 //! `scratch_str`, `scratch_bytes`), emptied by `pool_gc`'s walk of the thread's pools.
 
-use ibex_alloc::{declare_pool, Pool, PoolSpec, Poolable};
+use ibex_alloc::{declare_pool, PoolSpec};
 
 /// Calls nest a few deep at most (a format inside a reply inside a rule).
 const SCRATCH_MAX: usize = 4;
 
 declare_pool!(
     /// `show pools` `scratch_str`: what [`with_string`] lends. Kept up to `tune.memory.hot-size`.
-    static SCRATCH_STR: Pool<String> = PoolSpec::new("scratch_str").max_count(SCRATCH_MAX);
+    static SCRATCH_STR: Pool<String> = PoolSpec::new("scratch_str").max_count(SCRATCH_MAX).spares();
 );
 
 declare_pool!(
     /// `show pools` `scratch_bytes`: what [`with_bytes`] lends.
-    static SCRATCH_BYTES: Pool<Vec<u8>> = PoolSpec::new("scratch_bytes").max_count(SCRATCH_MAX);
+    static SCRATCH_BYTES: Pool<Vec<u8>> = PoolSpec::new("scratch_bytes").max_count(SCRATCH_MAX).spares();
 );
 
 pub use ibex_sample::spare::{give, string, string_from};
@@ -164,32 +164,56 @@ impl Drop for PPairs {
 }
 
 /// Runs `f` with an empty object of `pool`, given back after.
-#[inline]
-fn with_pooled<T: Poolable + Default, R>(pool: &'static Pool<T>, f: impl FnOnce(&mut T) -> R) -> R {
-    let mut buf = pool.take_raw(|| Some(T::default())).unwrap_or_default();
-    let r = f(&mut buf);
-    pool.give(buf);
-    r
+/// Takes a scratch string from its pool, else a new empty one (and the same for bytes below). Not inlined, nor are the gives:
+/// each is instantiated once per pool with the pool a known static, so the pool's take and give
+/// are inlined with its thread-local cache reached directly. Generic code holding the pool as
+/// a value (a `with_pooled(pool, f)` inlined into each caller) reached the cache through an
+/// outlined call and read the pool's limits from memory: ~200 instructions per request on the
+/// rules scenario (ab1) for its two `with_string`s.
+#[inline(never)]
+fn take_str() -> String {
+    SCRATCH_STR.take_raw(|| Some(String::new())).unwrap_or_default()
+}
+
+#[inline(never)]
+fn give_str(s: String) {
+    SCRATCH_STR.give(s);
+}
+
+#[inline(never)]
+fn take_bytes() -> Vec<u8> {
+    SCRATCH_BYTES.take_raw(|| Some(Vec::new())).unwrap_or_default()
+}
+
+#[inline(never)]
+fn give_bytes(v: Vec<u8>) {
+    SCRATCH_BYTES.give(v);
 }
 
 /// Runs `f` with an empty per-thread string, kept for the next call.
 pub fn with_string<R>(f: impl FnOnce(&mut String) -> R) -> R {
-    with_pooled(&SCRATCH_STR, f)
+    let mut s = take_str();
+    let r = f(&mut s);
+    give_str(s);
+    r
 }
 
 /// A second [`with_string`], for a call that needs two at once.
 pub fn with_string2<R>(f: impl FnOnce(&mut String) -> R) -> R {
-    with_pooled(&SCRATCH_STR, f)
+    with_string(f)
 }
 
 /// Runs `f` with an empty per-thread byte buffer, kept for the next call.
 pub fn with_bytes<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
-    with_pooled(&SCRATCH_BYTES, f)
+    let mut v = take_bytes();
+    let r = f(&mut v);
+    give_bytes(v);
+    r
 }
 
 /// A second [`with_bytes`], for a call that needs two at once.
 pub fn with_bytes2<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
-    with_pooled(&SCRATCH_BYTES, f)
+    with_bytes(f)
 }
 
 #[cfg(test)]
