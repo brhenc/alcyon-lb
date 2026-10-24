@@ -59,6 +59,11 @@ ibex-regex = { path = "crates/ibex-regex" }
 # TLS & Cryptography
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio-rustls = "0.26"
+# T440: the TCP TLS path (ibex-tls transport, ibex-rt xprt) on the 0.24 pre-release, whose
+# connections decrypt and encrypt in buffers the caller owns. QUIC (quinn-proto 0.11) and the test
+# clients stay on 0.23 above. Pinned exactly: a pre-release (tradeoff.md 6.21).
+rustls24 = { package = "rustls", version = "=0.24.0-dev.2", default-features = false, features = ["webpki"] }
+rustls24-ring = { package = "rustls-ring", version = "=0.24.0-dev.2" }
 
 # CLI & Logging
 tracing = "0.1"
