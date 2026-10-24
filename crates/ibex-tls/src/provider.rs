@@ -157,10 +157,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ring_is_active_until_set_and_each_index_names_its_provider() {
+    fn each_index_names_its_provider() {
         for p in TlsCryptoProvider::ALL {
             assert_eq!(TlsCryptoProvider::ALL[usize::from(index(p))], p);
         }
-        assert_eq!(active(), TlsCryptoProvider::Ring);
+    }
+
+    struct Gone;
+
+    impl Rebuild for Gone {
+        fn prepare(self: Arc<Self>, _: TlsCryptoProvider) -> Result<Option<Publish>, String> {
+            Ok(None)
+        }
+    }
+
+    /// Configurations dropped (a `-c` check's) do not pile up: the list is swept of them once it
+    /// has doubled since the last sweep.
+    #[test]
+    fn dropped_configurations_are_swept_from_the_registry() {
+        for _ in 0..200 {
+            register(Weak::<Gone>::new());
+        }
+        let r = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(r.live.len() <= 64, "{} entries kept", r.live.len());
     }
 }

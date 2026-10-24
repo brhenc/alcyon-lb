@@ -105,10 +105,9 @@ pub fn set(args: &str) -> String {
 #[must_use]
 pub fn show() -> String {
     use std::fmt::Write;
-    let mut out = format!("current {}\n", ibex_tls::provider::active().name());
+    let mut out = format!("current {}", ibex_tls::provider::active().name());
     for p in TlsCryptoProvider::ALL {
-        let _ = writeln!(out, "provider {} handshakes {}", p.name(), ibex_tls::provider::handshakes(p));
+        let _ = write!(out, "\nprovider {} handshakes {}", p.name(), ibex_tls::provider::handshakes(p));
     }
-    out.push('\n');
     out
 }

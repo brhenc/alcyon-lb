@@ -490,6 +490,29 @@ mod tests {
         assert_eq!(ExpiringSessions::fresh(Some(vec![1, 2, 3])), None);
     }
 
+    /// The only lib test that changes the active provider (others read it through
+    /// `provider::active` only by building configurations, which no other lib test does).
+    #[test]
+    fn a_handshake_takes_the_build_of_the_active_provider_when_the_bind_has_one() {
+        use rustls24::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        assert_eq!(provider::active(), TlsCryptoProvider::Ring, "ring until set");
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let one = |kind| {
+            let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(c.key_pair.serialize_der()));
+            BindTls::single_with(vec![CertificateDer::from(c.cert.der().to_vec())], key, vec![], kind).expect("bind")
+        };
+        let ring = one(TlsCryptoProvider::Ring);
+        assert!(Arc::ptr_eq(&Arc::clone(&ring).into_current(), &ring), "its own provider");
+        provider::set_active(TlsCryptoProvider::RingIbex);
+        // Built in memory, so no swap built it on ring-ibex: it serves on its own provider.
+        assert!(Arc::ptr_eq(&Arc::clone(&ring).into_current(), &ring), "no other build");
+        let ibex = one(TlsCryptoProvider::RingIbex);
+        ring.other.set(Arc::clone(&ibex)).expect("unset");
+        assert!(Arc::ptr_eq(&Arc::clone(&ring).into_current(), &ibex), "the other build");
+        provider::set_active(TlsCryptoProvider::Ring);
+        assert!(Arc::ptr_eq(&Arc::clone(&ring).into_current(), &ring), "back");
+    }
+
     #[test]
     fn the_ticket_hint_is_twice_the_rotation_period_and_tickets_round_trip() {
         let hint = Hint(rustls24::TicketRotator::new(Duration::from_secs(u64::from(SESSION_LIFETIME / 2)), ticket_key::<false>).expect("rotator"));

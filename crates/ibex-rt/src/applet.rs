@@ -682,13 +682,8 @@ impl CliApplet {
             let msg = crate::crypto_provider::set(rest);
             self.finish_msg(&msg);
         } else if cmd == "show ssl crypto-provider" {
-            // T460 (Ibex-only): the provider and the handshakes of each.
-            self.out_buf.extend_from_slice(crate::crypto_provider::show().as_bytes());
-            if self.interactive {
-                self.out_buf.extend_from_slice(b"> ");
-            } else {
-                self.is_done = true;
-            }
+            // T460 (Ibex-only): the provider and the handshakes of each, then the empty line.
+            self.finish_msg(&crate::crypto_provider::show());
         } else if cmd == "show pools" || cmd.starts_with("show pools ") {
             let args: Vec<&str> = cmd["show pools".len()..].split_whitespace().collect();
             // The answer ends with the empty line already, also when it is the error.
