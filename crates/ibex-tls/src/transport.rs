@@ -136,15 +136,14 @@ pub struct RustlsContext {
 
 /// The wire bytes of a finished connection (the ones rustls decrypted from, and the ones it
 /// produced) must not stay in the heap for the next allocation to find: zeroed when the
-/// context goes, always (`conn::wipe_vec`: not `tune.ibex.zero-buffers`, which is the plain I/O
-/// buffers'; S2 gives these their own setting). The whole capacity: `clear` leaves the
-/// old bytes in it.
+/// context goes, under `tune.ibex.ssl-zero-buffers` (default on; not `tune.ibex.zero-buffers`,
+/// which is the plain I/O buffers'). The whole capacity: `clear` leaves the old bytes in it.
 impl Drop for RustlsContext {
     fn drop(&mut self) {
         for v in [&mut self.rx_raw, &mut self.tx_raw] {
             let cap = v.capacity();
             v.resize(cap, 0);
-            ibex_alloc::wipe_always(v);
+            ibex_alloc::wipe_ssl(v);
         }
     }
 }

@@ -81,8 +81,7 @@ pub fn drains() -> usize {
 
 /// Empties every cache of the calling thread; returns how many objects were freed.
 pub fn drain_thread_caches() -> usize {
-    let mut n = crate::buf::drain_thread_cache();
-    n += crate::logfmt::drain_spare_lines();
+    let mut n = crate::logfmt::drain_spare_lines();
     n += crate::txnlog::drain_capture_spares();
     n += crate::check::drain_run_pool();
     n += crate::stats::drain_row_pool();
