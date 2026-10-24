@@ -296,6 +296,15 @@ pub fn run(sock: Option<&MasterSocket>, args: &[String], start_dir: Option<PathB
                 signal(*pid, Signal::Usr1);
             }
         }
+        // SIGTTOU and SIGTTIN go to every worker, as HAProxy's master relays them
+        // (`mworker_broadcast_signal`, measured on 3.5-dev8-885761-29: TTOU to the master
+        // pauses the worker's listeners, TTIN resumes them; T456).
+        let (ttou, ttin) = lifecycle.take_pause_signals();
+        for (yes, sig) in [(ttou, Signal::Ttou), (ttin, Signal::Ttin)] {
+            if yes {
+                m.children.keys().for_each(|p| signal(*p, sig));
+            }
+        }
         if lifecycle.take_reload_request() {
             let mut st = shared.lock();
             if st.requested.is_none() {

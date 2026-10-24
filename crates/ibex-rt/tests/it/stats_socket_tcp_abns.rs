@@ -525,9 +525,8 @@ fn an_abns_name_still_held_when_sigttin_arrives_is_reported_and_taken_back_on_th
 /// T354. SIGTTOU and SIGTTIN sent straight to a process with several stats sockets: every
 /// abns@ one (the first and an extra) lets go of its name and takes it back, as HAProxy
 /// 3.5-dev8-885761-29 does (measured: `kill -TTOU` frees both abstract names, `kill -TTIN`
-/// binds them again, `show cli sockets` lists all three afterwards). Known gap: `HAProxy` also
-/// pauses its TCP stats socket (connection refused until SIGTTIN); Ibex leaves it open, so
-/// its queued connections are not reset, and this test does not assert on it.
+/// binds them again, `show cli sockets` lists all three afterwards). The TCP stats socket is
+/// paused too: a connect is refused until SIGTTIN (T456, measured the same).
 #[test]
 fn sigttou_and_sigttin_release_and_rebind_every_abns_stats_socket() {
     let abns = format!("ibex-t354-sig-{}", std::process::id());
@@ -543,13 +542,16 @@ fn sigttou_and_sigttin_release_and_rebind_every_abns_stats_socket() {
     drop(wait("abns@y", || abstract_stream(&y, true)));
     sig("TTOU");
     wait("both names released", || (abstract_stream(&x, true).is_none() && abstract_stream(&y, true).is_none()).then_some(()));
-    // the TCP socket still answers and lists all three sockets
+    wait("tcp cli refused", || {
+        matches!(TcpStream::connect(tcp_addr), Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused).then_some(())
+    });
+    sig("TTIN");
+    // the TCP socket answers again and lists all three sockets
     let listing = wait("tcp cli", || {
         let s = TcpStream::connect(tcp_addr).ok()?;
         Some(ask(s, "show cli sockets"))
     });
     assert!(listing.contains(&format!("abns@{x} admin all")) && listing.contains(&format!("abns@{y} user all")), "{listing}");
-    sig("TTIN");
     let sy = wait("abns@y again", || abstract_stream(&y, true));
     assert!(ask(sy, "show cli level").contains("user"));
     let sx = wait("abns@x again", || abstract_stream(&x, true));
