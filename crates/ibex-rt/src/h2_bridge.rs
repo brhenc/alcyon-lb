@@ -154,6 +154,10 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     let framing = find_eoh(wire_req).map_or(txn::Framing::None, |(h, e)| txn::request_framing(&wire_req[..h + e]));
     let mut txn = HttpTxn::new(framing, false);
     txn.req_htx = Some(d.req_htx);
+    // Framed by the client's length, read again after the rules (T442): one a rule removed
+    // goes as `content-length: 0` with no body. A body sent chunked has its
+    // `transfer-encoding` on output only, which no rule sees.
+    txn.req_len_hdrs = Some(txn::LenHdrs { clen: matches!(framing, txn::Framing::Length(_)), chnk: false });
     sess.txn = Some(txn);
     sess.cli_state = ScState::Established;
     if d.bad_request {

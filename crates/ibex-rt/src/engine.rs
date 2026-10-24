@@ -7792,6 +7792,8 @@ fn h2_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     if moved && matches!(os.cli_state, ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW) {
         cs.arm_client(now);
     }
+    // A body the rules left without framing is dropped as it comes (T442).
+    cs.drain_request();
     moved
 }
 
@@ -13558,6 +13560,16 @@ fn reread_request_framing(sess: &mut TcpSession) {
         // make it; a head nothing has edited does not have one).
         sess.req_headers.as_mut().into_iter().for_each(|hdrs| hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name)));
         rebuild_req_buffer(sess);
+    }
+    // Framed when it was parsed and by nothing now (a rule removed the header): `HAProxy`
+    // writes `content-length: 0` and skips the payload (`h1_make_eoh`, T442). With no
+    // length, the server would read the body as the next request.
+    let framed_now = sess.htx_slice().map(|h| ["content-length", "transfer-encoding"].iter().any(|n| h.get_header_bytes(n.as_bytes()).is_some()));
+    if (was.clen || was.chnk) && framed_now == Some(false) {
+        add_req_header(sess, "content-length", "0");
+        if let Some(t) = sess.txn.as_mut() {
+            t.req_body_dropped = true;
+        }
     }
 }
 
