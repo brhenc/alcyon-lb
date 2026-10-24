@@ -1,0 +1,21 @@
+global
+    nbthread 1
+defaults
+    mode http
+    timeout client 10s
+    timeout server 10s
+    timeout connect 5s
+frontend fe
+    bind 127.0.0.1:@FE@
+    acl api path_reg ^/(api|v[0-9]+)/
+    acl hosty hdr(host) -m sub local
+    http-request set-header X-Forwarded-Proto http
+    http-request del-header X-Junk
+    http-request add-header X-Id %[rand]
+    http-request set-var(txn.p) path
+    http-request deny if api !hosty
+    http-response set-header X-Served ibex
+    http-response del-header Server
+    default_backend be
+backend be
+    server s1 127.0.0.1:@BE@
