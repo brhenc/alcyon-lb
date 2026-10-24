@@ -192,6 +192,11 @@ fn backend(resp: &'static [u8], got: Arc<Mutex<Vec<String>>>) -> SocketAddr {
 /// What `row` gives through ibex: the heads the server saw, the bytes the client got, and
 /// whether the client connection closed.
 fn run(rules: &str, req: &[u8], resp: &'static [u8]) -> (Vec<String>, Vec<u8>, bool) {
+    run_parts(rules, &[req], resp)
+}
+
+/// [`run`] for a request sent in `parts`, 200 ms apart.
+fn run_parts(rules: &str, parts: &[&[u8]], resp: &'static [u8]) -> (Vec<String>, Vec<u8>, bool) {
     let got = Arc::new(Mutex::new(Vec::new()));
     let be = backend(resp, Arc::clone(&got));
     let fe = common::reserve_addr();
@@ -210,7 +215,12 @@ fn run(rules: &str, req: &[u8], resp: &'static [u8]) -> (Vec<String>, Vec<u8>, b
     assert!(common::wait_listening(fe), "ibex did not listen");
     let mut c = TcpStream::connect(fe).expect("connect");
     c.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-    c.write_all(req).expect("send");
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            thread::sleep(Duration::from_millis(200));
+        }
+        c.write_all(part).expect("send");
+    }
     let mut out = Vec::new();
     let mut closed = false;
     let mut chunk = [0u8; 16384];
@@ -245,4 +255,126 @@ fn rules_that_edit_framing_or_connection_are_read_again_as_haproxy_does() {
         }
     }
     assert!(bad.is_empty(), "{} of {} rows differ from HAProxy:\n{}", bad.len(), ROWS.len(), bad.join("\n"));
+}
+
+/// `(rules, request in parts, heads the server saw, what the client got)`: the client
+/// connection stays open on each.
+type BodyRow = (&'static str, &'static [&'static [u8]], &'static [&'static str], &'static [u8]);
+
+const SRV_POST0: &str = "POST / HTTP/1.1\r\nhost: a\r\ncontent-length: 0";
+
+/// T442 row 1: a request whose rules removed the header its body was framed by. `HAProxy`
+/// writes `content-length: 0` and drops the body (`h1_make_eoh`, `H1S_F_BODYLESS_REQ`):
+/// forwarded with no length, the body is read by the server as the next request (request
+/// smuggling). Measured on 3.5-dev8 (`/tmp/t442/p442b.py`, T442).
+const BODY_ROWS: &[BodyRow] = &[
+    (
+        "http-request del-header content-length",
+        &[b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 28\r\n\r\nGET /x HTTP/1.1\r\nHost: a\r\n\r\n"],
+        &[SRV_POST0],
+        CLI_OK,
+    ),
+    (
+        "http-request del-header transfer-encoding",
+        &[b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n1c\r\nGET /x HTTP/1.1\r\nHost: a\r\n\r\n\r\n0\r\n\r\n"],
+        &[SRV_POST0],
+        CLI_OK,
+    ),
+    // An empty body too: the length is written.
+    ("http-request del-header content-length", &[b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n"], &[SRV_POST0], CLI_OK),
+    // The connection is kept: the request after the dropped body is the next one.
+    (
+        "http-request del-header content-length",
+        &[b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhelloGET /y HTTP/1.1\r\nHost: a\r\n\r\n"],
+        &[SRV_POST0, "GET /y HTTP/1.1\r\nhost: a"],
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nokHTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+    ),
+    // Also when the body arrives after the head has gone, in pieces.
+    (
+        "http-request del-header content-length",
+        &[b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 28\r\n\r\nGET /x", b" HTTP/1.1\r\nHost: a\r\n\r\n", b"GET /y HTTP/1.1\r\nHost: a\r\n\r\n"],
+        &[SRV_POST0, "GET /y HTTP/1.1\r\nhost: a"],
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nokHTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+    ),
+    (
+        "http-request del-header transfer-encoding",
+        &[b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n", b"1c\r\nGET /x HTTP/1.1\r\nHost: a\r\n\r\n\r\n", b"0\r\n\r\nGET /y HTTP/1.1\r\nHost: a\r\n\r\n"],
+        &[SRV_POST0, "GET /y HTTP/1.1\r\nhost: a"],
+        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nokHTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+    ),
+];
+
+#[test]
+fn a_request_whose_rules_removed_its_framing_goes_with_no_body_as_haproxy_sends_it() {
+    let mut bad = Vec::new();
+    for &(rules, parts, srv, cli) in BODY_ROWS {
+        let (got_srv, got_cli, got_closed) = run_parts(rules, parts, OK);
+        let want_srv: Vec<String> = srv.iter().map(|s| (*s).to_string()).collect();
+        if got_srv != want_srv || got_cli != cli || got_closed {
+            bad.push(format!(
+                "{rules:?} on {:?}:\n  server saw {got_srv:?}, want {want_srv:?}\n  client got {:?}, want {:?}\n  closed {got_closed}, want false",
+                String::from_utf8_lossy(&parts.concat()),
+                String::from_utf8_lossy(&got_cli),
+                String::from_utf8_lossy(cli)
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{} of {} rows differ from HAProxy:\n{}", bad.len(), BODY_ROWS.len(), bad.join("\n"));
+}
+
+fn h2_frame(kind: u8, flags: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(payload.len()).expect("frame length");
+    let mut f = len.to_be_bytes()[1..].to_vec();
+    f.extend_from_slice(&[kind, flags]);
+    f.extend_from_slice(&sid.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// Literal header fields without indexing, new names.
+fn h2_block(list: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (n, v) in list {
+        out.extend_from_slice(&[0, u8::try_from(n.len()).expect("name")]);
+        out.extend_from_slice(n.as_bytes());
+        out.push(u8::try_from(v.len()).expect("value"));
+        out.extend_from_slice(v.as_bytes());
+    }
+    out
+}
+
+/// T442 row 1 over HTTP/2: the client's `content-length` removed by a rule, the request goes
+/// to the server with `content-length: 0` and no body, as `HAProxy` sends it (measured on
+/// 3.5-dev8 with `curl --http2-prior-knowledge -d`, `/tmp/t442/h2probe.sh`). The body comes
+/// in two DATA frames, the second after the head has gone.
+#[test]
+fn an_h2_request_whose_rules_removed_its_length_goes_with_no_body() {
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let be = backend(OK, Arc::clone(&got));
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\nfrontend f\n  bind {fe} proto h2\n  http-request del-header content-length\n  default_backend b\nbackend b\n  server s1 {be}\n"
+    );
+    let mut f = NamedTempFile::new().expect("config");
+    f.write_all(cfg.as_bytes()).expect("write config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
+    assert!(common::wait_listening(fe), "ibex did not listen");
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    c.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
+    c.write_all(&h2_frame(4, 0, 0, &[])).unwrap();
+    c.write_all(&h2_frame(4, 1, 0, &[])).unwrap();
+    let head = h2_block(&[(":method", "POST"), (":scheme", "http"), (":authority", "a"), (":path", "/"), ("content-length", "28")]);
+    c.write_all(&h2_frame(1, 4, 1, &head)).unwrap();
+    c.write_all(&h2_frame(0, 0, 1, b"GET /x HTTP/1.1\r\n")).unwrap();
+    thread::sleep(Duration::from_millis(300));
+    c.write_all(&h2_frame(0, 1, 1, b"Host: a\r\n\r\n")).unwrap();
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 16384];
+    while let Ok(n @ 1..) = c.read(&mut chunk) {
+        out.extend_from_slice(&chunk[..n]);
+    }
+    common::stop(&mut child);
+    let heads = got.lock().unwrap().clone();
+    assert_eq!(heads, vec![SRV_POST0.to_string()], "the server saw the body as a request");
 }

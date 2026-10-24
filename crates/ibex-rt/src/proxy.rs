@@ -1678,6 +1678,8 @@ impl TcpSession {
             // transaction is ready to take bytes the moment a head is parsed, and the
             // request would reach it unfiltered and unrewritten.
             Some(t) if t.req.holds_trailer(data, self.bufsize) => 0,
+            // A body the rules left without framing goes nowhere: the head alone (T442).
+            Some(t) if t.req_rules_done && !t.local && t.error.is_none() && t.req_body_dropped => t.req.head_window(data),
             Some(t) if t.req_rules_done && !t.local && t.error.is_none() => t.req.window(data),
             _ => 0,
         }
@@ -1899,9 +1901,11 @@ impl TcpSession {
     }
 
     /// Discards the body of a request the proxy has already answered, as it arrives, up
-    /// to its end; what follows it is the next request.
-    fn drain_request(&mut self) {
-        if let Some(t) = self.txn.as_mut().filter(|t| t.local && !t.req.is_done() && !t.close_after) {
+    /// to its end; what follows it is the next request. Also the body of one whose head
+    /// went to the server without it (`HttpTxn::req_body_dropped`), once the head has gone.
+    pub(crate) fn drain_request(&mut self) {
+        let dropped = |t: &HttpTxn| t.req_body_dropped && !matches!(t.req, txn::MsgState::Head { .. });
+        if let Some(t) = self.txn.as_mut().filter(|t| ((t.local && !t.close_after) || dropped(t)) && !t.req.is_done()) {
             let data = self.req.readable();
             let n = t.req.window(data);
             t.request_consumed(data, n);
@@ -2860,6 +2864,7 @@ impl TcpSession {
                     self.req.consume(n);
                     if head_gone {
                         self.release_forwarded_head();
+                        self.drain_request();
                     }
                     changed = true;
                 }
