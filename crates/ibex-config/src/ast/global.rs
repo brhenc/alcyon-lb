@@ -240,6 +240,9 @@ pub struct GlobalSection {
     pub vars_limits: VarsLimits,
     /// `tune.ibex.zero-buffers on|off` (Ibex-only): zero a buffer's used bytes when it is released. On when unset.
     pub zero_buffers: Option<bool>,
+    /// `tune.ibex.crypto-provider ring|ring-ibex` (Ibex-only, T460): the rustls crypto provider
+    /// of every TCP TLS configuration. Vanilla ring when unset.
+    pub crypto_provider: Option<TlsCryptoProvider>,
     /// Buffer size in bytes (`tune.bufsize`).
     pub bufsize: Option<usize>,
     /// Small buffer size in bytes (`tune.bufsize.small`).
@@ -369,4 +372,39 @@ pub enum WarnStyle {
     Tight,
     /// `config : [file:line] : text`
     At,
+}
+
+/// The rustls crypto provider TLS over TCP runs on (`tune.ibex.crypto-provider`, T460).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum TlsCryptoProvider {
+    /// Upstream ring (`rustls-ring`): the default.
+    #[default]
+    Ring,
+    /// The ring fork that wipes key material when it is freed (`vendor/ringibex`, feature
+    /// `zeroize`, through `vendor/rustls-ringibex`).
+    RingIbex,
+}
+
+impl TlsCryptoProvider {
+    /// Every provider, in the order `show ssl crypto-provider` lists them.
+    pub const ALL: [Self; 2] = [Self::Ring, Self::RingIbex];
+
+    /// The provider a configuration or CLI name means.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "ring" => Some(Self::Ring),
+            "ring-ibex" => Some(Self::RingIbex),
+            _ => None,
+        }
+    }
+
+    /// The name the configuration and the CLI use.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ring => "ring",
+            Self::RingIbex => "ring-ibex",
+        }
+    }
 }
