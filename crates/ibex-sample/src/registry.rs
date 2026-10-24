@@ -3885,11 +3885,12 @@ impl Registry {
                     return None;
                 }
                 let count = args.get(2).map_or(1i32, |c| parse_count(c));
-                let Sample::Str(s) = smp else { return None };
+                let Sample::Str(mut s) = smp else { return None };
                 let bytes = s.as_bytes();
                 let len = bytes.len();
                 let seps = seps_str.as_bytes();
-                if idx < 0 {
+                // The field is cut out of the input's own string, which allocates nothing.
+                let (start, end) = if idx < 0 {
                     let mut field = -1i64;
                     let mut start = len;
                     let mut end = len;
@@ -3916,8 +3917,7 @@ impl Registry {
                     if !found && field != idx {
                         return None;
                     }
-                    let slice = s.get(start..end)?;
-                    Some(Sample::Str(slice.to_string()))
+                    (start, end)
                 } else {
                     let mut field = 1i64;
                     let mut start = 0usize;
@@ -3944,9 +3944,12 @@ impl Registry {
                     if !found && field != idx {
                         return None;
                     }
-                    let slice = s.get(start..end)?;
-                    Some(Sample::Str(slice.to_string()))
-                }
+                    (start, end)
+                };
+                s.get(start..end)?;
+                s.truncate(end);
+                s.replace_range(..start, "");
+                Some(Sample::Str(s))
             },
         });
 

@@ -1115,3 +1115,59 @@ fn an_h2c_request_allocates_nothing() {
     // buffer of the connection grows once, at a moment the timing decides, not per request.
     assert!(many <= few + 1, "1000 more h2c requests made {} more allocations", many.abs_diff(few));
 }
+
+/// The allocations of `n` keep-alive requests (`Host: localhost`) on one client connection,
+/// proxied to a TLS server (`ssl verify none`, then `server_opts`) after three warm-up
+/// requests. The TLS server is a second frontend of the same engine (`bind ... ssl crt`),
+/// answering `ok` itself, so nothing outside the engine allocates.
+fn tls_backend_allocations(server_opts: &str, n: usize) -> usize {
+    let (l, addr) = loopback0();
+    drop(l);
+    let (l, tls_addr) = loopback0();
+    drop(l);
+    let pem = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/ssl_f_common.pem");
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend f\n  bind {addr}\n  default_backend b\n\
+         frontend t\n  bind {tls_addr} ssl crt {pem}\n  http-request return status 200 content-type text/plain string ok\n\
+         backend b\n  server s1 {tls_addr} ssl verify none{server_opts}\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = TcpStream::connect(addr).expect("connect to frontend");
+    client.set_nonblocking(true).expect("set_nonblocking");
+    for _ in 0..3 {
+        drive_request_expecting(&mut client, &mut engine, b"HTTP/1.1 200", b"\r\n\r\nok");
+    }
+    let before = ibex_alloc::alloc_counters();
+    for _ in 0..n {
+        drive_request_expecting(&mut client, &mut engine, b"HTTP/1.1 200", b"\r\n\r\nok");
+    }
+    let diff = before.diff(&ibex_alloc::alloc_counters());
+    drop(client);
+    for _ in 0..5 {
+        let _ = engine.run_once();
+    }
+    diff.alloc_count
+}
+
+/// The automatic SNI of a TLS server in `mode http` (`srv_configure_auto_sni`:
+/// `req.hdr(host),field(1,:)`) allocates nothing per request. The kept server connection is
+/// reused, but the name is evaluated for every request, to check that the connection was
+/// opened for it (`HAProxy` hashes the SNI into the connection's reuse key per stream). The
+/// TLS layer allocates on its own, so what is compared is the growth from 100 to 1100
+/// requests, with and without `no-sni-auto`. Measured before (2026-10-24, main 6579719c, rustls
+/// 0.23, debug): 9000 against 6000, 3 allocations per request for the name (the `field` copy,
+/// the sample's string copied out, the header string never given back).
+#[test]
+fn the_automatic_sni_allocates_nothing_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let growth = |opts: &str| {
+        let count = |n| i64::try_from(tls_backend_allocations(opts, n)).expect("count");
+        count(1100) - count(100)
+    };
+    let auto = growth("");
+    let none = growth(" no-sni-auto");
+    println!("[MEASUREMENT sni-alloc] allocations for 1000 more TLS-backend requests: automatic SNI {auto}, no-sni-auto {none}");
+    assert_eq!(auto, none, "1000 more requests with the automatic SNI: {auto} allocations, {none} with no-sni-auto");
+}
