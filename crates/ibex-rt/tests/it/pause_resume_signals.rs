@@ -52,22 +52,30 @@ impl Run {
 }
 
 /// `frontend fe`, `listen li`, a `backend`, `frontend fe2` with two binds; a stats socket file.
+const RET: &str = "  http-request return status 200 content-type text/plain string ok\n";
+const DEFAULTS: &str = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 30s\n  timeout server 30s\n";
+
 fn start(tag: &str, nbthread: usize, args: &[&str]) -> Run {
-    let addrs: Vec<SocketAddr> = (0..4).map(|_| common::reserve_addr()).collect();
+    start_cfg(tag, 4, args, |sock, a| {
+        format!(
+            "global\n  stats socket {sock} level admin\n  nbthread {nbthread}\n{DEFAULTS}\
+             frontend fe\n  bind {}\n{RET}\
+             listen li\n  bind {}\n{RET}\
+             backend be\n  server s 127.0.0.1:1\n\
+             frontend fe2\n  bind {}\n  bind {}\n{RET}",
+            a[0], a[1], a[2], a[3]
+        )
+    })
+}
+
+/// Starts ibex on the configuration `cfg` makes from the stats socket file and `n` addresses.
+fn start_cfg(tag: &str, n: usize, args: &[&str], cfg: impl Fn(&str, &[SocketAddr]) -> String) -> Run {
+    let addrs: Vec<SocketAddr> = (0..n).map(|_| common::reserve_addr()).collect();
     let dir = std::env::temp_dir().join(format!("t456-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let sock = dir.join("cli.sock").display().to_string();
-    let ret = "  http-request return status 200 content-type text/plain string ok\n";
-    let cfg = format!(
-        "global\n  stats socket {sock} level admin\n  nbthread {nbthread}\n\
-         defaults\n  mode http\n  timeout connect 1s\n  timeout client 30s\n  timeout server 30s\n\
-         frontend fe\n  bind {}\n{ret}\
-         listen li\n  bind {}\n{ret}\
-         backend be\n  server s 127.0.0.1:1\n\
-         frontend fe2\n  bind {}\n  bind {}\n{ret}",
-        addrs[0], addrs[1], addrs[2], addrs[3]
-    );
+    let cfg = cfg(&sock, &addrs);
     let path = dir.join("c.cfg");
     std::fs::write(&path, cfg).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_ibex"))
@@ -250,4 +258,115 @@ fn the_master_relays_sigttou_and_sigttin_to_the_workers() {
     let ms = master_sock.display().to_string();
     pause_and_resume("master", &["-W", "-S", &ms]);
     let _ = std::fs::remove_file(&master_sock);
+}
+
+/// One request on `s`, its answer awaited `wait`: the first bytes, or `TIMEOUT` / `RESET`.
+fn answer(s: &mut TcpStream, wait: Duration) -> String {
+    s.set_read_timeout(Some(wait)).unwrap();
+    let mut b = [0u8; 12];
+    match s.read(&mut b) {
+        Ok(n) => String::from_utf8_lossy(&b[..n]).into_owned(),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => "RESET".into(),
+        Err(_) => "TIMEOUT".into(),
+    }
+}
+
+/// SIGTTIN while a `maxconn` holds the listener full: it stays stopped until the limit has
+/// room. `HAProxy` 3.5-dev8-885761-29 (nbthread 1, `maxconn 1` in `global` with `maxconn 10`
+/// in the frontend, or `maxconn 1` in the frontend; one connection held with half a request, a second one queued, SIGTTOU, SIGTTIN):
+/// the queued one is reset by the pause, a third one opened after SIGTTIN is not answered
+/// while the first is held (0.7 s) and is answered 200 once it closes.
+fn sigttin_leaves_a_full_listener_to_its_limit(tag: &str, global: &str, frontend: &str) {
+    let run = start_cfg(tag, 1, &[], |sock, a| {
+        format!("global\n  stats socket {sock} level admin\n  nbthread 1\n{global}{DEFAULTS}frontend fe\n  bind {}\n{frontend}{RET}", a[0])
+    });
+    let req = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+    let connect = || TcpStream::connect_timeout(&run.addrs[0], Duration::from_secs(1)).expect("connect");
+    let mut held = connect();
+    held.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let mut queued = connect();
+    queued.write_all(req).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    run.signal(rustix::process::Signal::Ttou);
+    std::thread::sleep(Duration::from_millis(400));
+    run.signal(rustix::process::Signal::Ttin);
+    std::thread::sleep(Duration::from_millis(400));
+    let mut third = connect();
+    third.write_all(req).unwrap();
+    assert_eq!(answer(&mut third, Duration::from_millis(700)), "TIMEOUT", "answered while the limit is reached");
+    drop(held);
+    assert_eq!(answer(&mut third, Duration::from_secs(2)), "HTTP/1.1 200", "once the held connection closed");
+    assert_eq!(answer(&mut queued, Duration::from_secs(1)), "RESET", "the connection queued before SIGTTOU");
+}
+
+#[test]
+fn sigttin_leaves_a_listener_full_at_global_maxconn_stopped() {
+    // The frontend's own limit above the global one: unset, it is the global one, and
+    // the listener would be full by its frontend's limit instead.
+    sigttin_leaves_a_full_listener_to_its_limit("gmax", "  maxconn 1\n", "  maxconn 10\n");
+}
+
+#[test]
+fn sigttin_leaves_a_listener_full_at_frontend_maxconn_stopped() {
+    sigttin_leaves_a_full_listener_to_its_limit("fmax", "", "  maxconn 1\n");
+}
+
+/// An abstract stats socket whose name something else holds at SIGTTIN, and still holds at
+/// the next one. `HAProxy` 3.5-dev8-885761-29 (nbthread 4; SIGTTOU, the name bound from
+/// outside, SIGTTIN, SIGTTIN, the name freed, SIGTTIN) logs the frontend resumed first, then
+/// the refusal at each SIGTTIN the name is held, then `GLOBAL` resumed. It also prints
+/// `Resuming listener: protocol abns_stream: receiving socket not bound for [abns@NAME].`
+/// after each `cannot bind` line; Ibex does not (T370), and this test leaves it out.
+#[test]
+fn an_abns_name_held_at_two_sigttins_is_refused_twice_then_resumed() {
+    use rustix::process::Signal;
+    use std::os::linux::net::SocketAddrExt;
+    let name = format!("t456-held-{}", std::process::id());
+    let run = start_cfg("abns2", 1, &[], |sock, a| {
+        format!("global\n  stats socket {sock} level admin\n  stats socket abns@{name} level admin\n  nbthread 4\n{DEFAULTS}frontend fe\n  bind {}\n{RET}", a[0])
+    });
+    let mut bytes = name.as_bytes().to_vec();
+    bytes.resize(107, 0);
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(&bytes).unwrap();
+    run.signal(Signal::Ttou);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let hold = loop {
+        if let Ok(h) = std::os::unix::net::UnixListener::bind_addr(&addr) {
+            break h;
+        }
+        assert!(Instant::now() < deadline, "the name was not released");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let refused = || run.lines("refused to resume").len();
+    for n in 1..=2 {
+        run.signal(Signal::Ttin);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while refused() < n {
+            assert!(Instant::now() < deadline, "SIGTTIN {n}: no refusal:\n{}", run.err.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    drop(hold);
+    run.signal(Signal::Ttin);
+    all(&run, true);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while run.lines("Resumed frontend GLOBAL.").is_empty() {
+        assert!(Instant::now() < deadline, "GLOBAL not resumed:\n{}", run.err.lock().unwrap());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let cannot = format!("Resuming listener: protocol abns_stream: cannot bind UNIX socket (already in use) [abns@{name}].");
+    let warn = "Some proxies refused to resume, probably due to a conflict on a listening port. You may want to try again after the conflicting application is stopped, otherwise a restart might be needed to resume safe operations.";
+    let got: Vec<String> = run.lines("").into_iter().filter(|l| l.contains("Paused") || l.contains("Resum") || l.contains("refused")).collect();
+    let want = [
+        "Paused frontend fe.",
+        "Paused frontend GLOBAL.",
+        "Resumed frontend fe.",
+        &cannot,
+        warn,
+        &cannot,
+        warn,
+        "Resumed frontend GLOBAL.",
+    ];
+    assert_eq!(got, want);
 }

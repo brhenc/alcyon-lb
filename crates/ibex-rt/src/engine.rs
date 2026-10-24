@@ -2272,10 +2272,10 @@ impl Engine {
     fn pause_on_signal(&mut self) {
         let shared = crate::handover::handed_over();
         for l in &self.listeners {
+            // One that cannot be disconnected (it cannot fail on a listening socket) is
+            // still no longer polled, as a shared one.
             if !shared {
-                if let Err(e) = l.pause() {
-                    crate::stderr_line!("[WARNING]  ({}) : cannot pause listener {}: {e}", self.pid, l.addr());
-                }
+                let _ = l.pause();
             }
             let lfd = l.raw_fd();
             let _ = self.poller.modify(l.borrowed_fd(), raw_fd_to_u64(lfd), false, false);
@@ -2293,13 +2293,10 @@ impl Engine {
         self.sig_paused = false;
         let full = self.global_paused || self.accept_limited.is_some();
         for l in &self.listeners {
-            if !shared {
-                if let Err(e) = l.resume() {
-                    crate::stderr_line!("[WARNING]  ({}) : cannot resume listener {}: {e}", self.pid, l.addr());
-                    continue;
-                }
-            }
-            if full {
+            // One that cannot listen again is not polled: a socket that is not listening
+            // would be reported ready for ever.
+            let listening = shared || l.resume().is_ok();
+            if !listening || full {
                 continue;
             }
             if l.is_full() {
@@ -2312,20 +2309,20 @@ impl Engine {
         }
         // Shared, they were only no longer polled: connections waited in their queues.
         self.backlog_waits |= shared;
-        let refused = self.resume_cli_on_signal();
-        self.log_pause_or_resume("Resumed", !refused);
-        if refused {
-            Self::log_refused_resume(self.pid);
-        }
+        // The proxies are reported before the stats sockets are bound back, so a name
+        // refused is reported after them, as on `HAProxy` (measured).
+        self.log_pause_or_resume("Resumed", false);
+        self.resume_cli_again();
     }
 
-    /// A `SIGTTIN` after one whose resume an abstract name refused (still held): that
-    /// name is tried again (T370), and only `GLOBAL` is reported.
+    /// The stats sockets' part of a `SIGTTIN`, and all of one after a resume an abstract
+    /// name refused (still held): that name is tried again (T370), and only `GLOBAL` is
+    /// reported.
     fn resume_cli_again(&mut self) {
         if self.resume_cli_on_signal() {
             Self::log_refused_resume(self.pid);
-        } else if self.worker_id == 0 {
-            crate::stderr_line!("[WARNING]  ({}) : Resumed frontend GLOBAL.", self.pid);
+        } else {
+            self.log_global("Resumed");
         }
     }
 
@@ -2344,7 +2341,14 @@ impl Engine {
             let kind = if p.has_backend { "proxy" } else { "frontend" };
             crate::stderr_line!("[WARNING]  ({}) : {what} {kind} {}.", self.pid, p.name);
         }
-        if global && (self.cli_socket_name.is_some() || !self.extra_cli.is_empty()) {
+        if global {
+            self.log_global(what);
+        }
+    }
+
+    /// `Paused frontend GLOBAL.` (`Resumed`), from worker 0, when there is a stats socket.
+    fn log_global(&self, what: &str) {
+        if self.worker_id == 0 && (self.cli_socket_name.is_some() || !self.extra_cli.is_empty()) {
             crate::stderr_line!("[WARNING]  ({}) : {what} frontend GLOBAL.", self.pid);
         }
     }
@@ -2407,11 +2411,12 @@ impl Engine {
     /// The stats sockets' part of [`Self::resume_on_signal`]; whether an abstract name could
     /// not be bound back.
     fn resume_cli_on_signal(&mut self) -> bool {
-        for (which, l) in std::mem::take(&mut self.paused_tcp_cli) {
-            match l.resume_tcp() {
-                Ok(()) => self.rearm_cli(which, l),
-                Err(_) => self.paused_tcp_cli.push((which, l)),
-            }
+        // One that cannot listen again stays out of the poller, for the next `SIGTTIN`.
+        let (back, still): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.paused_tcp_cli).into_iter().partition(|(_, l)| l.resume_tcp().is_ok());
+        self.paused_tcp_cli = still;
+        for (which, l) in back {
+            self.rearm_cli(which, l);
         }
         self.resume_abns_cli()
     }
