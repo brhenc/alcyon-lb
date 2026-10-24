@@ -1485,9 +1485,142 @@ impl H2Multiplexer {
     }
 }
 
+/// A request's fields as HTTP/2 decoded them that are malformed (RFC 9113 section 8.2):
+/// the stream is reset PROTOCOL_ERROR and nothing reaches the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedFields;
+
+/// The pseudo-headers `h2_str_to_phdr` knows: their name is checked from the second byte.
+fn known_pseudo(name: &str) -> bool {
+    matches!(name, ":method" | ":scheme" | ":authority" | ":path" | ":protocol" | ":status")
+}
+
+/// The name a field may have (`h2_make_htx_request`): tokens without uppercase, the colon
+/// of a known pseudo-header excepted.
+fn name_ok(name: &str) -> bool {
+    let skip = usize::from(known_pseudo(name));
+    !name.is_empty() && name.bytes().skip(skip).all(|b| !b.is_ascii_uppercase() && crate::h1::is_tchar(b))
+}
+
+/// `http_header_has_forbidden_char`: NUL, CR and LF are refused in any value, since an
+/// HTTP/1 head written from it would carry them as line ends (RFC 9113 section 8.2.1).
+fn value_ok(value: &str) -> bool {
+    !value.bytes().any(|b| matches!(b, 0 | b'\r' | b'\n'))
+}
+
+/// `http_path_has_forbidden_char`: a `:path` takes no control byte, space or `#`.
+fn path_ok(value: &str) -> bool {
+    !value.bytes().any(|b| b <= b' ' || b == b'#')
+}
+
+/// `http_validate_scheme`: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) (RFC 3986 3.1).
+fn scheme_ok(s: &str) -> bool {
+    let mut b = s.bytes();
+    b.next().is_some_and(|c| c.is_ascii_alphabetic()) && b.all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'))
+}
+
+/// The checks `HAProxy` makes of each field of a decoded HTTP/2 request
+/// (`h2_make_htx_request`, `h2_prepare_htx_reqline`), before anything writes them into a
+/// head: they hold for the HTX blocks and for a head written as HTTP/1.1 text alike.
+///
+/// `Err` is a malformed request (`RST_STREAM` PROTOCOL_ERROR): a name that is not a
+/// lowercase token, NUL / CR / LF in a value, a `:path` with a control byte, space or `#`
+/// or that is neither absolute nor `*`, an `:authority` or `host` that
+/// `http_authority_has_forbidden_char` refuses, a connection-specific header, `te` other
+/// than `trailers`. `Ok(true)` is a request `HAProxy` takes and answers 400
+/// (`HTX_FL_PARSING_ERROR`): a method that is not a token, a scheme that is not one, a URI
+/// with a blank or a control byte (DEL).
+///
+/// # Errors
+/// [`MalformedFields`] as above.
+pub fn check_request_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<bool, MalformedFields> {
+    let mut bad_request = false;
+    let lws_or_ctl = |s: &str| s.bytes().any(|b| b <= b' ' || b == 0x7f);
+    for (name, value) in fields {
+        if !name_ok(name) {
+            return Err(MalformedFields);
+        }
+        let valid = match name {
+            ":path" => path_ok(value) && (value.is_empty() || value.starts_with('/') || value == "*"),
+            ":authority" | "host" => value_ok(value) && !crate::authority::has_forbidden_char(value.as_bytes()),
+            "connection" | "proxy-connection" | "keep-alive" | "upgrade" | "transfer-encoding" => false,
+            "te" => value == "trailers",
+            _ => value_ok(value),
+        };
+        if !valid {
+            return Err(MalformedFields);
+        }
+        bad_request |= match name {
+            ":method" => value.is_empty() || !value.bytes().all(crate::h1::is_tchar),
+            ":scheme" => !scheme_ok(value),
+            ":path" => lws_or_ctl(value),
+            _ => false,
+        };
+    }
+    Ok(bad_request)
+}
+
+/// The checks of `http_trailers_to_htx` on trailers: a name that is a lowercase token, not
+/// a pseudo-header nor one of the fields a trailer may not carry, a value without NUL, CR or
+/// LF.
+///
+/// # Errors
+/// [`MalformedFields`] for any other.
+pub fn check_trailer_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<(), MalformedFields> {
+    for (name, value) in fields {
+        let forbidden = matches!(
+            name,
+            "host" | "content-length" | "connection" | "proxy-connection" | "keep-alive" | "upgrade" | "te" | "transfer-encoding"
+        );
+        if name.starts_with(':') || !name_ok(name) || forbidden || !value_ok(value) {
+            return Err(MalformedFields);
+        }
+    }
+    Ok(())
+}
+
+/// The checks of `h2_make_htx_response` on each field of a response: a lowercase token
+/// name (a known pseudo-header from its second byte), a value without NUL, CR or LF.
+///
+/// # Errors
+/// [`MalformedFields`] for any other.
+pub fn check_response_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<(), MalformedFields> {
+    for (name, value) in fields {
+        if !name_ok(name) || !value_ok(value) {
+            return Err(MalformedFields);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T449: the field checks of `h2_make_htx_request` / `http_trailers_to_htx`, as measured
+    /// on HAProxy 3.5-dev8 (`h2_field_validity` drives them through a running proxy).
+    #[test]
+    fn request_and_trailer_fields_are_checked_as_haproxy_checks_them() {
+        let req = |f: &[(&'static str, &'static str)]| check_request_fields(f.iter().copied());
+        let base = [(":method", "GET"), (":scheme", "https"), (":path", "/a?b"), (":authority", "[::1]:8443")];
+        assert_eq!(req(&base), Ok(false));
+        assert_eq!(req(&[(":path", "*"), ("te", "trailers"), ("x-a", "a\t\x01\x7fb")]), Ok(false));
+        for bad in [
+            ("x-a", "b\r\nx-injected: 1"), ("x-a", "b\0"), ("x-a\r", "1"), ("X-a", "1"), ("", "1"), (":x", "1"),
+            (":path", "/a b"), (":path", "/a#b"), (":path", "a"), (":authority", "u@x"), ("host", "x,y"),
+            (":method", "GET\n"), ("connection", "close"), ("te", "gzip"), ("transfer-encoding", "chunked"),
+        ] {
+            assert_eq!(req(&[bad]), Err(MalformedFields), "{bad:?}");
+        }
+        for bad_request in [(":method", "GE T"), (":method", ""), (":scheme", "1http"), (":path", "/a\x7f")] {
+            assert_eq!(req(&[bad_request]), Ok(true), "{bad_request:?}");
+        }
+        let trl = |f: &[(&'static str, &'static str)]| check_trailer_fields(f.iter().copied());
+        assert_eq!(trl(&[("x-t", "1"), ("grpc-status", "0")]), Ok(()));
+        for bad in [(":path", "/"), ("X-t", "1"), ("content-length", "1"), ("host", "x"), ("x-t", "a\rb")] {
+            assert_eq!(trl(&[bad]), Err(MalformedFields), "{bad:?}");
+        }
+    }
     use proptest::prelude::*;
 
     #[test]
