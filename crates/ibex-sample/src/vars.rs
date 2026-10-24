@@ -572,6 +572,12 @@ thread_local! {
 /// The `proc.` variables, shared by every thread.
 pub static GLOBAL_PROC_VARS: LazyLock<RwLock<VarStore>> = LazyLock::new(|| RwLock::new(VarStore::empty()));
 
+/// Whether a panic unwound through a change of the variable names or the `proc.` variables
+/// (T447).
+pub(crate) fn poisoned() -> bool {
+    NAMES.is_poisoned() || GLOBAL_PROC_VARS.is_poisoned()
+}
+
 /// A stream's run starts: its store `vars` becomes the thread's (a swap), and `vars` holds the
 /// thread's empty one until [`leave`].
 pub fn enter(vars: &mut VarStore) {

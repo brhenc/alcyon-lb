@@ -6704,6 +6704,11 @@ pub enum MapMatchType {
 /// takes this read lock, then the reference's.
 static MAP_REFS: RwLock<Option<HashMap<String, Arc<crate::patref::PatRef>>>> = RwLock::new(None);
 
+/// Whether a panic unwound through a change of the map references by path (T447).
+pub(crate) fn map_refs_poisoned() -> bool {
+    MAP_REFS.is_poisoned()
+}
+
 /// The reference of map file `path`, read from disk on first use (when the configuration
 /// scan did not register it).
 fn map_ref(path: &str) -> Option<Arc<crate::patref::PatRef>> {

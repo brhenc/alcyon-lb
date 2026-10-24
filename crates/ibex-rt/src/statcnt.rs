@@ -74,6 +74,8 @@ pub struct TxnCounters {
     pub eresp: AtomicU64,
     /// Requests the frontend could not parse (`ereq`).
     pub ereq: AtomicU64,
+    /// Internal errors (`eint`): streams a panic ended (T447).
+    pub eint: AtomicU64,
     /// When a stream last ended on it, in [`now_ms`] (0: never).
     pub last_sess: AtomicU64,
     pub qtime: TimeStat,
@@ -156,7 +158,7 @@ impl TxnCounters {
         for h in &self.hrsp {
             h.store(0, Ordering::Relaxed);
         }
-        for c in [&self.req_tot, &self.stot, &self.lbtot, &self.connect, &self.reuse, &self.bin, &self.bout, &self.cli_abrt, &self.srv_abrt, &self.eresp, &self.ereq] {
+        for c in [&self.req_tot, &self.stot, &self.lbtot, &self.connect, &self.reuse, &self.bin, &self.bout, &self.cli_abrt, &self.srv_abrt, &self.eresp, &self.ereq, &self.eint] {
             c.store(0, Ordering::Relaxed);
         }
         for t in [&self.qtime, &self.ctime, &self.rtime, &self.ttime] {

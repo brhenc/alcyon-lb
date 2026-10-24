@@ -248,6 +248,13 @@ pub struct StickTable {
 }
 
 impl StickTable {
+    /// Whether a panic unwound through a change of the table: its lock is poisoned and its
+    /// tree may be half-updated (T447).
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.is_poisoned()
+    }
+
     /// Creates a new stick table with configuration.
     #[must_use]
     pub fn new(config: StickTableConfig) -> Self {

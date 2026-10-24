@@ -776,8 +776,8 @@ fn fill_counters(r: &mut StatRow, c: &crate::statcnt::TxnCounters, http: bool, t
         r.set("rtime_max", c.rtime.max());
         r.set("ttime_max", c.ttime.max());
         r.set("wrew", 0);
-        r.set("eint", 0);
     }
+    r.set("eint", ld(&c.eint));
 }
 
 /// `algo`: the balance algorithm as `HAProxy` names it. `random` and the default
@@ -841,7 +841,6 @@ pub(crate) fn write_frontend_row(out: &mut String, fmt: StatFormat, proxy: &Prox
         r.set("cache_hits", 0);
     }
     fill_counters(&mut r, c, http, false);
-    r.set("eint", 0);
     r.set("dses", 0);
     r.set("wrew", 0);
     r.default_untracked('F', http, "");

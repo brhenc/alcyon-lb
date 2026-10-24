@@ -458,6 +458,14 @@ pub struct IdlePool {
     next_purge: Option<Instant>,
 }
 
+impl IdlePool {
+    /// Whether a panic unwound through a change of the idle connection lists of any worker
+    /// (T447).
+    fn poisoned(&self) -> bool {
+        self.pools.srv_idle.is_poisoned() || self.pools.slots.iter().any(|s| s.pool.is_poisoned())
+    }
+}
+
 impl Default for IdlePool {
     /// A worker alone.
     fn default() -> Self {
@@ -4239,6 +4247,7 @@ impl Engine {
     // `global` `set-var` lines: once per process, before any worker serves. Run again in each
     // worker, a `set-var-fmt` reading its own variable saw what the others had appended.
     init_global_vars(config.global.as_ref());
+    crate::crash::set_fault(config.global.as_ref().and_then(|g| g.debug_panic.clone()));
     // An action naming a fetch or converter the registry lacks would load and then do
     // nothing on every request; `HAProxy` refuses the configuration instead.
     crate::rule_exprs::validate_config(config)
@@ -9544,6 +9553,8 @@ impl EngineDispatcher<'_> {
             if !entry.sess.is_done() {
                 entry.sess.advance(now);
             }
+            #[cfg(debug_assertions)]
+            crate::crash::fault_point(false, entry.sess.req_uri.as_deref().filter(|_| entry.sess.txn.is_some()));
         }
         // Step 3.05: an HTTP/2 connection's streams, each served by an entry of its own: the
         // next ones dispatched, their request bodies and responses moved (T280).
@@ -9796,57 +9807,130 @@ impl EngineDispatcher<'_> {
 
         // Step 6: Completion cleanup
         if is_done {
-            // A TCP connection's line, and an HTTP transaction's that ended with the
-            // connection rather than through `end_txn` (aborted, timed out).
-            let line = self.sessions.get_mut(session_idx).and_then(|e| {
-                // A refused PROXY header has its own line, never the frontend's format.
-                if embryonic_failure(&e.sess).is_some() {
-                    e.log_line = None;
-                    if e.sess.hs_fail().is_some() {
-                        // `HAProxy` builds the session after the handshake: this connection
-                        // is a `conn_tot` and a `ssl_failed_handshake`, not an `stot` or a `rate`.
-                        let c = self.proxies[e.proxy_idx].counters();
-                        c.ssl_failed_hs.fetch_add(1, Ordering::Relaxed);
-                        c.fe_sess_rate.untick();
-                    }
-                    // `session_kill_embryonic`: `err` with `log-separate-errors`, else `info`.
-                    let err = self.proxies[e.proxy_idx].log_opts & ibex_config::LOG_OPT_SEPARATE_ERRORS != 0;
-                    return proxy_header_error_line(e, self.proxies, self.pid).map(|(l, sd)| (e.proxy_idx, l, sd, err));
-                }
-                if e.sess.mode == Mode::Tcp || e.sess.txn.is_some() {
-                    account_stream(e, self.proxies);
-                }
-                let queued = e.log_line.take().map(|l| (l, e.log_sd, e.log_err));
-                queued
-                    .or_else(|| (e.sess.mode == Mode::Tcp || e.sess.txn.is_some()).then(|| stream_log_line(e, self.proxies, self.pid)).flatten())
-                    .map(|(l, sd, err)| (e.proxy_idx, l, sd, err))
-            });
-            if let Some((fe, line, sd, err)) = line {
-                self.send_stream_log(fe, err, &line, sd);
-                crate::logfmt::recycle_line(line);
-            }
-            if let Some(mut entry) = self.sessions.free(session_idx) {
-                if entry.sess.is_h2_child() {
-                    // The stream is freed in its own run: its variables are in the run's map
-                    // until they go back to it here, for its connection's.
-                    stream_vars_leave(Some(&mut entry.sess));
-                    self.h2_child_released(&mut entry, now);
-                } else if entry.sess.h2_owner().is_some_and(|o| !o.children.is_empty()) {
-                    self.h2_owner_released(&mut entry);
-                }
-                entry.sess.close_notify_both();
-                cleanup_done(
-                    &entry,
-                    self.proxies,
-                    self.fdtab,
-                    self.poller,
-                    self.listeners,
-                );
-            }
+            self.end_stream(session_idx, now, true);
             Outcome::Done
         } else {
             Outcome::Keep
         }
+    }
+
+    /// A stream that ended: its log line, then its entry freed and everything it held
+    /// released (`close_notify`: a TLS client is told, which a stream a panic ended skips:
+    /// its TLS state may be mid-record).
+    fn end_stream(&mut self, session_idx: u32, now: Tick, close_notify: bool) {
+        // A TCP connection's line, and an HTTP transaction's that ended with the
+        // connection rather than through `end_txn` (aborted, timed out).
+        let line = self.sessions.get_mut(session_idx).and_then(|e| {
+            // A refused PROXY header has its own line, never the frontend's format.
+            if embryonic_failure(&e.sess).is_some() {
+                e.log_line = None;
+                if e.sess.hs_fail().is_some() {
+                    // `HAProxy` builds the session after the handshake: this connection
+                    // is a `conn_tot` and a `ssl_failed_handshake`, not an `stot` or a `rate`.
+                    let c = self.proxies[e.proxy_idx].counters();
+                    c.ssl_failed_hs.fetch_add(1, Ordering::Relaxed);
+                    c.fe_sess_rate.untick();
+                }
+                // `session_kill_embryonic`: `err` with `log-separate-errors`, else `info`.
+                let err = self.proxies[e.proxy_idx].log_opts & ibex_config::LOG_OPT_SEPARATE_ERRORS != 0;
+                return proxy_header_error_line(e, self.proxies, self.pid).map(|(l, sd)| (e.proxy_idx, l, sd, err));
+            }
+            if e.sess.mode == Mode::Tcp || e.sess.txn.is_some() {
+                account_stream(e, self.proxies);
+            }
+            let queued = e.log_line.take().map(|l| (l, e.log_sd, e.log_err));
+            queued
+                .or_else(|| (e.sess.mode == Mode::Tcp || e.sess.txn.is_some()).then(|| stream_log_line(e, self.proxies, self.pid)).flatten())
+                .map(|(l, sd, err)| (e.proxy_idx, l, sd, err))
+        });
+        if let Some((fe, line, sd, err)) = line {
+            self.send_stream_log(fe, err, &line, sd);
+            crate::logfmt::recycle_line(line);
+        }
+        if let Some(mut entry) = self.sessions.free(session_idx) {
+            if entry.sess.is_h2_child() {
+                // The stream is freed in its own run: its variables are in the run's map
+                // until they go back to it here, for its connection's.
+                stream_vars_leave(Some(&mut entry.sess));
+                self.h2_child_released(&mut entry, now);
+            } else if entry.sess.h2_owner().is_some_and(|o| !o.children.is_empty()) {
+                self.h2_owner_released(&mut entry);
+            }
+            if close_notify {
+                entry.sess.close_notify_both();
+            }
+            cleanup_done(
+                &entry,
+                self.proxies,
+                self.fdtab,
+                self.poller,
+                self.listeners,
+            );
+        }
+    }
+
+    /// A stream's run panicked ([`crate::crash::contain`], T447): the stream is closed as one
+    /// that met an internal error (`%ts` `I`, `eint`), without an answer, as `HAProxy` closes a
+    /// connection whose stream it could not allocate, and the worker serves on. Unless the
+    /// panic left shared state half-changed, or this panics too: then the process aborts, as
+    /// for any other panic. Design and the state it resets: `tasks/T447-progress.md`.
+    #[cold]
+    #[inline(never)]
+    fn stream_panicked(&mut self, session_idx: u32) -> Outcome {
+        // What the run had put in the thread's context, as `step_stream` takes it back. The
+        // variables are dropped: no other stream may see them.
+        stream_vars_leave(None);
+        CURRENT_TIMEOUTS.set(None);
+        crate::lb::clear_avoided();
+        if let Some(what) = self.shared_state_poisoned() {
+            crate::crash::abort_uncontained(&format!("left {what} half-changed"));
+        }
+        let now = self.now;
+        let ended = crate::crash::contain(|| {
+            let Some(entry) = self.sessions.get_mut(session_idx) else { return };
+            // The task is destroyed when this returns: nothing queued during the pass may
+            // name it any more (T100).
+            let task = entry.task;
+            self.timer_updates.retain(|(t, _)| *t != task);
+            self.wake_queue.retain(|t| *t != task);
+            self.heavy.retain(|t| *t != task);
+            self.h2_spawn.retain(|(idx, _)| *idx != session_idx);
+            entry.sess.ending = Some(crate::proxy::Ending::Error);
+            // An HTTP stream that has no server yet failed in its request (`IR`, as
+            // `HAProxy`'s `return_int_err` sets `SF_FINST_R`); otherwise the phase it reached.
+            let in_request = entry.sess.mode == Mode::Http && entry.target_server_idx.is_none() && entry.srv_raw_fd.is_none();
+            entry.sess.log.term = in_request.then_some(*b"IR");
+            let fe = &self.proxies[entry.proxy_idx];
+            fe.txn_counters().fe.eint.fetch_add(1, Ordering::Relaxed);
+            // The backend once the stream has one (`SF_BE_ASSIGNED`), as `HAProxy` counts.
+            if let Some(be) = counted_backend(entry).and_then(|i| self.proxies.get(i)) {
+                be.txn_counters().be.eint.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(srv) = entry.target_server_idx.and_then(|i| self.proxies.get(entry.srv_backend_idx)?.txn_counters().srv.get(i)) {
+                srv.eint.fetch_add(1, Ordering::Relaxed);
+            }
+            let client = entry.sess.client_addr.map_or_else(String::new, |a| format!(", client {a}"));
+            crate::stderr_line!("[ALERT] ibex: a stream of frontend '{}'{client} panicked; it was closed, the process serves on", fe.name);
+            self.end_stream(session_idx, now, false);
+        });
+        if ended.is_err() { crate::crash::abort_uncontained("closing it panicked too") }
+        Outcome::Done
+    }
+
+    /// The shared state a panic can have left half-changed, if any (T447): a lock the
+    /// panicking thread held is poisoned. Every lock a stream's run takes on structured data
+    /// is here; the others hold rate estimates only (`tasks/T447-progress.md`).
+    fn shared_state_poisoned(&self) -> Option<&'static str> {
+        let per_proxy = self.proxies.iter().find_map(|p| {
+            p.stick_table.as_ref().is_some_and(|t| t.is_poisoned()).then_some("a stick table")
+                .or_else(|| crate::lb::lb_poisoned(&p.fwrr, &p.chash).then_some("a load balancer"))
+                .or_else(|| p.server_retr.is_poisoned().then_some("server retry counters"))
+        });
+        per_proxy
+            .or_else(|| self.idle_backend_pool.poisoned().then_some("the idle server connections"))
+            .or_else(|| crate::ring::poisoned().then_some("a ring"))
+            .or_else(|| crate::crash::fault_poisoned().then_some("the ibex.debug.panic lock"))
+            .or_else(ibex_sample::shared_state_poisoned)
     }
 
     /// `retry-on <status>` and `junk-response`: the server's final answer carries a status
@@ -9948,6 +10032,10 @@ impl EngineDispatcher<'_> {
         let blank = leading_empty_lines(entry.sess.rep.readable());
         if blank > 0 {
             entry.sess.rep.replace_prefix(blank, b"");
+        }
+        #[cfg(debug_assertions)]
+        if entry.sess.rep.eoh().is_some() {
+            crate::crash::fault_point(true, entry.sess.req_uri.as_deref());
         }
         let Some((hdr_len, eoh_len)) = entry.sess.rep.eoh() else {
             // No end of head and no room for more: as for a request, from `bufsize - 56`
@@ -12921,7 +13009,8 @@ impl EngineDispatcher<'_> {
         match kind.kind() {
             Some(Kind::Stream) => {
                 let session_idx = kind.index();
-                self.step_stream(session_idx)
+                // A panic in the run closes this stream, not the process (T447).
+                crate::crash::contain(|| self.step_stream(session_idx)).unwrap_or_else(|()| self.stream_panicked(session_idx))
             }
             Some(Kind::Check) => {
                 let check_idx = kind.index() as usize;

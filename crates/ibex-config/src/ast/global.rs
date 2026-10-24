@@ -125,6 +125,16 @@ pub struct VarsLimits {
     pub from_map_max: u32,
 }
 
+/// Where `ibex.debug.panic` makes a stream's run panic (T447): when a request whose path
+/// starts with `path` has its head parsed, or, with `at_response`, has its response head;
+/// `under_lock`: while holding a shared lock, which the panic poisons.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DebugPanic {
+    pub at_response: bool,
+    pub under_lock: bool,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StatsSocket {
     /// The unix socket path; for the other forms, [`StatsAddr::name`].
@@ -205,6 +215,9 @@ pub struct GlobalSection {
     pub extra_stats_sockets: Vec<StatsSocket>,
     /// Maximum rewrite size in bytes.
     pub maxrewrite: Option<usize>,
+    /// `ibex.debug.panic <request|response> <path-prefix>`: a test-only fault (T447), accepted
+    /// only in builds with `debug_assertions`.
+    pub debug_panic: Option<DebugPanic>,
     /// `tune.maxaccept`: how many connections one listener wakeup accepts in a row before
     /// the thread goes back to its other work; `-1` (any negative) is no limit, `0` the
     /// default (`HAProxy`'s `MAX_ACCEPT`, 4; Ibex: no limit, `docs/differences.md`). The

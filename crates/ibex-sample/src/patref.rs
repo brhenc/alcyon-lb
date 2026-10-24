@@ -136,6 +136,13 @@ fn write<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 static REFS: Mutex<Vec<Arc<PatRef>>> = Mutex::new(Vec::new());
 static NEXT_ENTRY: AtomicU64 = AtomicU64::new(0x5581_0000);
 
+/// Whether a panic unwound through a change of a pattern reference (T447): its registry, or
+/// a reference's entries, keys, values, users or stamp.
+pub(crate) fn poisoned() -> bool {
+    // One line: a closure that runs only with references loaded still counts as executed.
+    REFS.is_poisoned() || lock(&REFS).iter().any(|r| r.entries.is_poisoned() || r.map_keys.is_poisoned() || r.map_vals.is_poisoned() || r.users.is_poisoned() || r.stamp.is_poisoned())
+}
+
 fn table_of(pairs: Vec<(String, String)>) -> PatTable {
     let mut t = PatTable::new();
     for (key, val) in pairs {
