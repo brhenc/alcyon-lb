@@ -55,6 +55,13 @@ os.environ["PATH"] = f"{Path.home()}/.cargo/bin:{os.environ.get('PATH', '')}"
 # tools/measure/t452_night.sh; the pinning and the round count follow from its data.
 AB_MAX_CPU_RISE_PCT = 4.0
 AB_MAX_DROP_PCT = 10.0
+# Instructions per request (perf stat instructions:u of the proxy, tools/measure/insreq.sh):
+# deterministic to ~0.3% per build, so +1% against the ref is a regression (design/memory
+# 2026-10-24 7c). The CPU-ns metric above, at 4%, cannot see +3.6k of 76k.
+INS_MAX_RISE_PCT = 1.0
+INS_SCENARIOS = ("keepalive", "rules")
+INS_ROUNDS = 5
+INS_REQUESTS = 60000
 
 
 class Verdict(Enum):
@@ -604,6 +611,38 @@ def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
             "cand_ns_samples": cpu["cand"], "ref_ns_samples": cpu["ref"]}
 
 
+def parse_insreq(out: str) -> List[int]:
+    """The per-round instruction counts in insreq.sh's output."""
+    counts = [int(m.group(1)) for m in re.finditer(r"round \d+: (\d+) instructions", out)]
+    if not counts:
+        raise RuntimeError(f"insreq.sh printed no counts: {out!r}")
+    return counts
+
+
+def min_ins_per_req(counts: List[int], n: int) -> int:
+    return min(counts) // n
+
+
+def measure_ins_per_req(cand_bin: Path, ref_bin: Path, target_dir: Path,
+                        rounds: int = INS_ROUNDS, n: int = INS_REQUESTS) -> Dict[str, int]:
+    """Min over `rounds` of instructions per request, per scenario and per build, by running
+    tools/measure/insreq.sh (one implementation of the measurement; pinned by it the way
+    measure_ab pins: IBEX_MEASURE_CPUS). Needs perf to count the user's own processes."""
+    bench_bin = ensure_parity_bench_binary(target_dir)
+    insreq = REPO_ROOT / "tools" / "measure" / "insreq.sh"
+    env = dict(os.environ, MEASURE_BENCH=str(bench_bin))
+    res: Dict[str, int] = {}
+    with tempfile.TemporaryDirectory(prefix="insreq-") as out:
+        for sc in INS_SCENARIOS:
+            body = REPO_ROOT / "tools" / "measure" / "scenarios" / f"{sc}.body"
+            for side, binary in (("cand", cand_bin), ("ref", ref_bin)):
+                p = subprocess.run(["bash", str(insreq), f"{sc}-{side}", str(binary), str(body),
+                                    "mb50", str(n), str(rounds), out],
+                                   capture_output=True, text=True, env=env)
+                res[f"{sc}_{side}"] = min_ins_per_req(parse_insreq(p.stdout + p.stderr), n)
+    return res
+
+
 def measure_60k_backends_memory(target_dir: Path) -> float:
     """Run request_allocations 60k backends test and return memory in MB."""
     env = os.environ.copy()
@@ -893,6 +932,19 @@ def check_regressions(
         deltas.append(MetricDelta("cpu_ns_per_req_50conn", "50-conn ibex CPU / req", f"{c:,}",
                                   f"{p:,} (ref)", f"{pct_diff:+.1f}%", status, is_reg, "ns"))
 
+    # 3c. Instructions per request, A/B only, +1%.
+    for sc in INS_SCENARIOS:
+        key = f"ins_per_req_{sc}"
+        if current.get(key) is not None and current.get(key + "_ref"):
+            c, p = current[key], current[key + "_ref"]
+            pct_diff = ((c - p) / p) * 100.0
+            is_reg = pct_diff > INS_MAX_RISE_PCT
+            if is_reg:
+                has_regression = True
+            status = f"FAIL (>{INS_MAX_RISE_PCT:g}% above ref)" if is_reg else "PASS"
+            deltas.append(MetricDelta(key, f"Instructions / req ({sc})", f"{c:,}", f"{p:,} (ref)",
+                                      f"{pct_diff:+.1f}%", status, is_reg, "ins"))
+
     # 4. 50-conn Throughput
     if "rps_50conn" in current and current["rps_50conn"] is not None:
         c = current["rps_50conn"]
@@ -1130,6 +1182,13 @@ def main() -> int:
                   "compare the mix, not the builds (T452)")
     print(f"      ibex CPU ns/req at 50 conns: this build {ab['cand_ns_samples']} median {ab['cand_ns']:,}; "
           f"reference {ab['ref_ns_samples']} median {ab['ref_ns']:,}")
+
+    ins = measure_ins_per_req(ibex_bin, ref_bin, target_dir)
+    for sc in INS_SCENARIOS:
+        record[f"ins_per_req_{sc}"] = ins[f"{sc}_cand"]
+        record[f"ins_per_req_{sc}_ref"] = ins[f"{sc}_ref"]
+        print(f"      instructions/req {sc} (min of {INS_ROUNDS}): this build {ins[sc + '_cand']:,}; "
+              f"reference {ins[sc + '_ref']:,}")
 
     # Record system metrics
     record["load_1min"] = sys_info["load_1min"]

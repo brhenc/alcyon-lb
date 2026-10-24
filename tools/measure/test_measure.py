@@ -10,7 +10,8 @@ import os
 import subprocess
 import tempfile
 import unittest
-from measure import check_regressions, MetricDelta, Verdict, reference_sha, split_modes
+from measure import (check_regressions, MetricDelta, Verdict, reference_sha, split_modes,
+                     parse_insreq, min_ins_per_req)
 
 
 def _git(repo, *args):
@@ -152,6 +153,30 @@ class TestRegressionDetector(unittest.TestCase):
         current = {"cpu_ns_per_req_50conn": 41000, "cpu_ns_per_req_50conn_ref": 40000}
         deltas, verdict = check_regressions(current, {"cpu_ns_per_req_50conn": 1})
         self.assertEqual(verdict, Verdict.PASS)
+
+    def test_instructions_per_request_fail_at_one_percent_over_the_ref(self):
+        # instructions:u are deterministic to ~0.3% per build (design/memory 7c): +1% is a
+        # regression for both scenarios, +0.8% is not.
+        for sc in ("keepalive", "rules"):
+            current = {f"ins_per_req_{sc}": 101200, f"ins_per_req_{sc}_ref": 100000}
+            deltas, verdict = check_regressions(current, {})
+            self.assertEqual(verdict, Verdict.FAIL, sc)
+            d = next(d for d in deltas if d.name == f"ins_per_req_{sc}")
+            self.assertTrue(d.is_regression)
+            current = {f"ins_per_req_{sc}": 100800, f"ins_per_req_{sc}_ref": 100000}
+            deltas, verdict = check_regressions(current, {})
+            self.assertEqual(verdict, Verdict.PASS, sc)
+            d = next(d for d in deltas if d.name == f"ins_per_req_{sc}")
+            self.assertFalse(d.is_regression)
+
+    def test_insreq_output_is_parsed_and_the_min_of_the_rounds_is_taken(self):
+        out = ("x round 1: 2200000000 instructions, 36666 ins/req\n"
+               "x round 2: 2100000000 instructions, 35000 ins/req\n"
+               "x round 3: 2150000000 instructions, 35833 ins/req\n"
+               "x done (proxy pid 1 and backend pid 2 stopped)\n")
+        self.assertEqual(parse_insreq(out), [2200000000, 2100000000, 2150000000])
+        self.assertEqual(min_ins_per_req(parse_insreq(out), 60000), 35000)
+        self.assertRaises(RuntimeError, parse_insreq, "perf: not permitted\n")
 
     def test_binary_size_threshold(self):
         # <= 5% increase is PASS
