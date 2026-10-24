@@ -132,12 +132,8 @@ impl CertResolver {
     /// The certificate a `ClientHello` gets: by its SNI, else the default.
     #[must_use]
     pub fn credentials_for(&self, hello: &ClientHello<'_>) -> Option<Arc<Credentials>> {
-        if let Some(name) = hello.server_name() {
-            if let Some(c) = self.resolve_domain(name.as_ref()) {
-                return Some(c);
-            }
-        }
-        self.default_cert()
+        // `resolve_domain` falls back to the default itself.
+        hello.server_name().map_or_else(|| self.default_cert(), |name| self.resolve_domain(name.as_ref()))
     }
 }
 
@@ -211,16 +207,13 @@ fn build(plan: &BindPlan, tls12: bool, tls13: bool) -> Result<BindTls, String> {
     for (certs, key, file_path) in &plan.pairs {
         let identity = Arc::new(Identity::from_cert_chain(certs.clone()).map_err(|_| wrong_tag(file_path))?);
         let signing = keys.key_provider.load_private_key(key.clone_key()).map_err(|e| format!("Invalid private key: {e:?}"))?;
-        let creds = match Credentials::new(Arc::clone(&identity), signing) {
-            Ok(c) => c,
-            // A key whose public half rustls cannot work out: 0.23 let it through as well.
-            Err(rustls24::Error::InconsistentKeys(rustls24::crypto::InconsistentKeys::Unknown)) => {
-                let signing = keys.key_provider.load_private_key(key.clone_key()).map_err(|e| format!("Invalid private key: {e:?}"))?;
-                Credentials::new_unchecked(identity, signing)
-            }
-            Err(rustls24::Error::InconsistentKeys(_)) => return Err(key_mismatch(file_path)),
-            Err(_) => return Err(wrong_tag(file_path)),
-        };
+        // rustls-ring's three signing keys (RSA, ECDSA, Ed25519) all know their public half, so
+        // the inconsistency is always a mismatch (never `InconsistentKeys::Unknown`); any other
+        // error is a leaf that does not parse as a certificate.
+        let creds = Credentials::new(Arc::clone(&identity), signing).map_err(|e| match e {
+            rustls24::Error::InconsistentKeys(_) => key_mismatch(file_path),
+            _ => wrong_tag(file_path),
+        })?;
         let creds = Arc::new(creds);
         if is_first {
             resolver.set_default_cert(Arc::clone(&creds));
@@ -325,20 +318,16 @@ impl rustls24::client::danger::ServerVerifier for ServerVerifier {
             // is good and only HAProxy's name rule is left to apply.
             Err(Error::InvalidCertificate(CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. })) => {
                 let ok = || Ok(rustls24::crypto::VerifiedIdentity::assertion(identity.identity.clone()));
-                match identity.server_name {
-                    ServerName::IpAddress(_) => ok(),
-                    ServerName::DnsName(name) => {
-                        let leaf = match identity.identity {
-                            Identity::X509(c) => c.end_entity.as_ref(),
-                            _ => &[],
-                        };
-                        if cert_covers_name(leaf, name.as_ref()) {
-                            ok()
-                        } else {
-                            Err(Error::InvalidCertificate(CertificateError::NotValidForName))
-                        }
-                    }
-                    _ => Err(Error::InvalidCertificate(CertificateError::NotValidForName)),
+                // An IP address passes as before. `ServerName` is `non_exhaustive`: a kind of name
+                // that is neither checks as the empty name, which no certificate covers. A raw
+                // public key needs the client to offer it (it does not): no name either.
+                let is_ip = matches!(identity.server_name, ServerName::IpAddress(_));
+                let name = if let ServerName::DnsName(n) = identity.server_name { n.as_ref() } else { "" };
+                let leaf: &[u8] = if let Identity::X509(c) = identity.identity { c.end_entity.as_ref() } else { &[] };
+                if is_ip || cert_covers_name(leaf, name) {
+                    ok()
+                } else {
+                    Err(Error::InvalidCertificate(CertificateError::NotValidForName))
                 }
             }
             other => other,

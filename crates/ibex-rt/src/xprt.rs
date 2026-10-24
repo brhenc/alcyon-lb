@@ -327,9 +327,10 @@ impl TlsConn {
         if self.rx.buf.ensure_writable(4096).is_empty() {
             // Full of a record or a handshake message not complete yet.
             let len = self.rx.buf.len();
-            if len >= MAX_INPUT {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS message too large"));
-            }
+            // Not reached with rustls 0.24.0-dev.2: it refuses a handshake message over 0xffff
+            // as soon as its header is in, and takes every complete record, so the input holds
+            // at most one message and one record, under MAX_INPUT. Kept as the memory bound.
+            if len >= MAX_INPUT { return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS message too large")); }
             self.rx.buf.grow_capacity((len + 16_384 + 2048 + 5).min(MAX_INPUT));
         }
         let w = self.rx.buf.ensure_writable(1);
@@ -486,10 +487,9 @@ impl TlsConn {
         r
     }
 
+    /// Never without a session: every way it goes (`connect_tls` without one, a refused
+    /// legacy version, a failed handshake) sets `failed`, which [`Self::handshake`] checks first.
     fn handshake_step(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
-        if self.ctx.session.is_none() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS session not initialized"));
-        }
         // Flush first: a client's ClientHello is queued from the start, and a server may
         // have answered bytes it was given already.
         self.flush(fd)?;
@@ -508,11 +508,9 @@ impl TlsConn {
 
     /// Reads plaintext, mirroring [`raw::recv`].
     fn recv(&mut self, fd: BorrowedFd<'_>, dst: &mut [u8]) -> io::Result<Io> {
+        // Past the handshake the session stays (only a failed handshake loses it).
         if !self.handshake(fd)? {
             return Ok(Io::WouldBlock);
-        }
-        if self.ctx.session.is_none() {
-            return Ok(Io::Closed);
         }
         if dst.is_empty() {
             // Nowhere to put a byte: decrypting a record now would only leave it pending.
@@ -522,7 +520,7 @@ impl TlsConn {
         if let Some(e) = self.rx_err.take() {
             return Err(e);
         }
-        let mut open = !self.rx.eof;
+        let mut open = !rustls24::TlsInputBuffer::has_seen_eof(&self.rx);
         let mut short = false;
         loop {
             let got = self.read_records(dst);

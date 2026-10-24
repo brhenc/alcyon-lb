@@ -49,10 +49,8 @@ impl LocalCert {
     pub fn leaf(&self) -> Option<&[u8]> {
         match self {
             Self::Legacy(k) => k.cert.first().map(AsRef::as_ref),
-            Self::Tcp(c) => match &*c.identity {
-                rustls24::crypto::Identity::X509(x) => Some(x.end_entity.as_ref()),
-                _ => None,
-            },
+            // A bind's identities are X.509 (`Identity::from_cert_chain`): never a raw key.
+            Self::Tcp(c) => if let rustls24::crypto::Identity::X509(x) = &*c.identity { Some(x.end_entity.as_ref()) } else { None },
         }
     }
 }

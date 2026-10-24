@@ -474,3 +474,108 @@ fn an_empty_record_does_not_hide_the_records_after_it() {
     assert_eq!(end, Plain::More);
     assert!(sin.is_empty(), "every record was consumed");
 }
+
+/// An input whose memory stops holding the plaintext a short read left behind (a caller
+/// that added bytes to it, against the [`ibex_tls::conn::TlsInput`] contract).
+struct Losing {
+    inner: VecInput,
+    lose: bool,
+}
+
+impl rustls24::TlsInputBuffer for Losing {
+    fn slice_mut(&mut self) -> &mut [u8] {
+        self.inner.slice_mut()
+    }
+    fn discard(&mut self, n: usize) {
+        self.inner.discard(n);
+    }
+    fn received_close_notify(&mut self) {
+        self.inner.received_close_notify();
+    }
+    fn has_seen_eof(&self) -> bool {
+        self.inner.has_seen_eof()
+    }
+}
+
+impl ibex_tls::conn::TlsInput for Losing {
+    fn storage(&self) -> &[u8] {
+        if self.lose { &[] } else { self.inner.storage() }
+    }
+}
+
+/// Plaintext left in an input that no longer holds it is an error, not stale bytes.
+#[test]
+fn plaintext_the_input_lost_is_an_error() {
+    use ibex_tls::conn::TlsInput;
+    let id = ident("localhost");
+    let mut p = Pair::new(bind(&id, vec![]), &none());
+    let (s, c) = p.handshake();
+    s.expect("server");
+    c.expect("client");
+    assert_eq!(p.cli.write_plain(&[7u8; 100]).expect("write"), 100);
+    let out = p.cli.pending_tx().to_vec();
+    p.cli.tx_done(out.len());
+    let mut input = Losing { inner: std::mem::take(&mut p.sin), lose: false };
+    input.inner.extend(&out, &p.srv);
+    let mut dst = [0u8; 10];
+    assert_eq!(p.srv.read_plain(&mut input, &mut dst).expect("read"), Plain::Data(10));
+    assert!(p.srv.has_plain());
+    assert_ne!(input.storage(), b"");
+    input.lose = true;
+    let e = p.srv.read_plain(&mut input, &mut dst).expect_err("lost");
+    assert!(e.to_string().contains("lost plaintext"), "{e}");
+    assert!(!p.srv.has_plain());
+}
+
+/// TLS 1.3 resumption without a ticketer: rustls keeps the session in the bind's store and
+/// takes it back (single use) when the ticket comes back.
+#[test]
+fn a_bind_without_a_ticketer_resumes_from_its_session_store_once_per_ticket() {
+    let id = ident("localhost");
+    let b = bind(&id, vec![]);
+    let mut cfg = (*b.config).clone();
+    cfg.ticketer = None;
+    let cfg = Arc::new(cfg);
+    let b = Arc::new(BindTls { config: Arc::clone(&cfg), no_alpn: cfg, resolver: Arc::clone(&b.resolver) });
+    let ca = tmp("ca3.pem", &id.pem);
+    let opts = BackendTlsOptions { verify_required: true, ca_file: Some(ca.clone()), ..Default::default() };
+    let client = build_backend_client_config(&opts).expect("cfg");
+    let _ = std::fs::remove_file(ca);
+    let mut c = (*client).clone();
+    c.resumption = rustls24::client::Resumption::in_memory_sessions(8);
+    let client = Arc::new(c);
+    for round in 0..2 {
+        let mut p = Pair::with(Arc::clone(&b), &client);
+        let (s, c) = p.handshake();
+        s.expect("server");
+        c.expect("client");
+        assert_eq!(p.srv.tls_info.protocol_version.as_deref(), Some("TLSv1.3"));
+        assert_eq!(p.srv.tls_info.session_resumed, round == 1, "round {round}");
+        // The client takes the tickets the server sent after its Finished.
+        p.shuttle();
+        let _ = read_all(&mut p.cli, &mut p.cin, 64);
+    }
+}
+
+/// A name no certificate of the bind covers gets the default one.
+#[test]
+fn an_sni_no_certificate_matches_gets_the_default() {
+    let id = ident("localhost");
+    let cfg = build_backend_client_config(&none()).expect("client config");
+    let cli = TlsCtx::connect(&cfg, ServerName::try_from("other.example").unwrap(), Some("other.example".into()));
+    let mut p = Pair { srv: TlsCtx::accept(bind(&id, vec![])), sin: VecInput::default(), cli, cin: VecInput::default() };
+    let (s, c) = p.handshake();
+    s.expect("server");
+    c.expect("client");
+    assert_eq!(p.srv.tls_info.sni.as_deref(), Some("other.example"));
+    assert_eq!(p.srv.tls_info.local_cert.as_ref().and_then(|l| l.leaf()), Some(id.der.as_ref()));
+}
+
+/// A leaf that is not a certificate is refused when the bind is built.
+#[test]
+fn a_bind_whose_leaf_does_not_parse_is_refused() {
+    let id = ident("localhost");
+    let junk = CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00]);
+    let e = BindTls::single(vec![junk], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(id.key.clone())), vec![]).unwrap_err();
+    assert!(e.contains("wrong tag"), "{e}");
+}

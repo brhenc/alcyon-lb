@@ -66,16 +66,14 @@ pub enum Plain {
 pub struct Traffic<S: rustls24::SideData> {
     send: Option<SendTraffic>,
     recv: Option<ReceiveTraffic<S>>,
-    outputs: ConnectionOutputs,
-    side: S,
 }
 
 /// Where a session is.
 pub enum Session {
     /// A server waiting for the `ClientHello`, with what it may answer with.
     Hello(rustls24::NeedsInput<ServerSide>, Arc<BindTls>),
-    /// A server handshake past the `ClientHello`.
-    ServerHs(NeedsInput<ServerSide>),
+    /// A server handshake past the `ClientHello` (the bind is kept for the one code path).
+    ServerHs(NeedsInput<ServerSide>, Arc<BindTls>),
     /// A client handshake.
     ClientHs(NeedsInput<ClientSide>),
     Server(Traffic<ServerSide>),
@@ -86,7 +84,7 @@ impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Hello(..) => "Session::Hello",
-            Self::ServerHs(_) => "Session::ServerHs",
+            Self::ServerHs(..) => "Session::ServerHs",
             Self::ClientHs(_) => "Session::ClientHs",
             Self::Server(_) => "Session::Server",
             Self::Client(_) => "Session::Client",
@@ -116,6 +114,8 @@ pub struct TlsCtx {
     /// The version the server chose is TLS 1.2 (read off its `ServerHello`): the tap stops at
     /// the client's `ChangeCipherSpec` then. rustls's handshake does not tell it.
     tls12: bool,
+    /// The server accepted the `ClientHello` (the session no longer waits for it).
+    hello_seen: bool,
 }
 
 impl Drop for TlsCtx {
@@ -150,6 +150,7 @@ impl TlsCtx {
             peer_closed: false,
             hello_tap: None,
             tls12: false,
+            hello_seen: false,
         }
     }
 
@@ -225,7 +226,7 @@ impl TlsCtx {
     /// Whether the handshake is still running (or never started: no session).
     #[must_use]
     pub fn is_handshaking(&self) -> bool {
-        matches!(self.session, Some(Session::Hello(..) | Session::ServerHs(_) | Session::ClientHs(_)))
+        matches!(self.session, Some(Session::Hello(..) | Session::ServerHs(..) | Session::ClientHs(_)))
     }
 
     /// Whether the session waits for the `ClientHello`.
@@ -243,32 +244,9 @@ impl TlsCtx {
         loop {
             let Some(session) = self.session.take() else { return Ok(()) };
             match session {
-                Session::Hello(n, bind) => match n.process(input, &mut self.tx)? {
-                    ServerHandshake::NeedsInput(n) => {
-                        self.session = Some(Session::Hello(n, bind));
-                        return Ok(());
-                    }
-                    ServerHandshake::Accepted(accepted) => {
-                        let hello = accepted.client_hello();
-                        // The certificate this ClientHello gets, for `ssl_f_*`: the resolver
-                        // answers the same way when rustls asks it.
-                        self.tls_info.local_cert = bind.resolver.credentials_for(&hello).map(crate::transport::LocalCert::Tcp);
-                        let ours = &bind.config.alpn_protocols;
-                        let disjoint = !ours.is_empty()
-                            && hello.alpn().is_some_and(|mut theirs| theirs.all(|t| !ours.iter().any(|o| o.as_ref() == t)));
-                        let config = Arc::clone(if disjoint { &bind.no_alpn } else { &bind.config });
-                        let start = self.tx.len();
-                        let next = accepted.choose_config(config, &mut self.tx);
-                        self.tls12 = server_hello_is_tls12(&self.tx[start..]);
-                        self.server_next(next?)?;
-                    }
-                    other => {
-                        self.server_next(other)?;
-                    }
-                },
-                Session::ServerHs(n) => {
+                Session::Hello(n, bind) | Session::ServerHs(n, bind) => {
                     let next = n.process(input, &mut self.tx)?;
-                    if self.server_next(next)? {
+                    if self.server_next(next, bind)? {
                         return Ok(());
                     }
                 }
@@ -288,70 +266,71 @@ impl TlsCtx {
 
     /// Takes the server handshake's next state. `Ok(true)`: wait for more input; `Ok(false)`:
     /// process what the input holds again.
-    fn server_next(&mut self, next: ServerHandshake) -> Result<bool, Error> {
-        match next {
-            ServerHandshake::NeedsInput(n) => {
-                self.session = Some(Session::ServerHs(n));
+    fn server_next(&mut self, next: ServerHandshake, bind: Arc<BindTls>) -> Result<bool, Error> {
+        match srv_state(next)? {
+            Srv::Wait(n) => {
+                self.session = Some(if self.hello_seen { Session::ServerHs(n, bind) } else { Session::Hello(n, bind) });
                 Ok(true)
             }
-            ServerHandshake::Complete(split) => {
-                let t = Traffic { send: Some(split.send), recv: Some(split.receive), outputs: split.outputs, side: split.side_outputs };
+            Srv::Hello(accepted) => {
+                self.hello_seen = true;
+                let hello = accepted.client_hello();
+                // The certificate this ClientHello gets, for `ssl_f_*`: the resolver
+                // answers the same way when rustls asks it.
+                self.tls_info.local_cert = bind.resolver.credentials_for(&hello).map(crate::transport::LocalCert::Tcp);
+                let ours = &bind.config.alpn_protocols;
+                let disjoint = !ours.is_empty()
+                    && hello.alpn().is_some_and(|mut theirs| theirs.all(|t| !ours.iter().any(|o| o.as_ref() == t)));
+                let config = Arc::clone(if disjoint { &bind.no_alpn } else { &bind.config });
+                let start = self.tx.len();
+                let next = accepted.choose_config(config, &mut self.tx);
+                self.tls12 = server_hello_is_tls12(&self.tx[start..]);
+                self.server_next(next?, bind)?;
+                // The rest of the input may hold more of the client's flight.
+                Ok(false)
+            }
+            Srv::Done(split) => {
+                self.finish(&split.outputs, split.side_outputs.server_name().map(|n| n.as_ref().to_string()));
+                let t = Traffic { send: Some(split.send), recv: Some(split.receive) };
                 self.session = Some(Session::Server(t));
-                self.finish();
                 Ok(true)
             }
-            // A second ClientHello cannot be accepted, and a bind asks no client for a certificate
-            // (`with_no_client_auth`): rustls never yields either.
-            _ => Err(Error::General("unexpected server handshake state".into())),
         }
     }
 
     /// Takes the client handshake's next state. `Ok(true)`: wait for more input; `Ok(false)`:
     /// process what the input holds again.
     fn client_next(&mut self, next: ClientHandshake) -> Result<bool, Error> {
-        match next {
-            ClientHandshake::NeedsInput(n) => {
+        match cli_state(next)? {
+            Cli::Wait(n) => {
                 self.session = Some(Session::ClientHs(n));
                 Ok(true)
             }
-            ClientHandshake::VerifyServerIdentity(v) => {
+            Cli::Verify(v) => {
                 let next = v.with_config(&mut self.tx)?;
                 self.client_next(next)?;
                 // The rest of the flight (`CertificateVerify`, `Finished`) is still in the
                 // input: rustls stopped at the identity to verify.
                 Ok(false)
             }
-            ClientHandshake::Complete(split) => {
-                let t = Traffic { send: Some(split.send), recv: Some(split.receive), outputs: split.outputs, side: split.side_outputs };
+            Cli::Done(split) => {
+                self.finish(&split.outputs, self.client_sni.clone());
+                let t = Traffic { send: Some(split.send), recv: Some(split.receive) };
                 self.session = Some(Session::Client(t));
-                self.finish();
                 Ok(true)
             }
-            _ => Err(Error::General("unexpected client handshake state".into())),
         }
     }
 
     /// The handshake is done: what it settled, for the logs and the `ssl_*` fetches.
-    fn finish(&mut self) {
+    fn finish(&mut self, outputs: &ConnectionOutputs, sni: Option<String>) {
         self.handshake_done = true;
         let info = &mut self.tls_info;
-        let outputs = match &self.session {
-            Some(Session::Server(t)) => {
-                info.sni = t.side.server_name().map(|n| n.as_ref().to_string());
-                &t.outputs
-            }
-            Some(Session::Client(t)) => {
-                info.sni.clone_from(&self.client_sni);
-                &t.outputs
-            }
-            _ => return,
-        };
+        info.sni = sni;
         info.cipher = outputs.negotiated_cipher_suite().map(|cs| format!("{:?}", cs.suite()));
-        info.protocol_version = outputs.protocol_version().map(|pv| match pv {
-            ProtocolVersion::TLSv1_3 => "TLSv1.3".to_string(),
-            ProtocolVersion::TLSv1_2 => "TLSv1.2".to_string(),
-            _ => format!("{pv:?}"),
-        });
+        // rustls 0.24 implements TLS 1.2 and 1.3 only: a session is one or the other.
+        info.protocol_version =
+            outputs.protocol_version().map(|pv| if pv == ProtocolVersion::TLSv1_3 { "TLSv1.3" } else { "TLSv1.2" }.to_string());
         self.tls12 = outputs.protocol_version() == Some(ProtocolVersion::TLSv1_2);
         info.alpn = outputs.alpn_protocol().map(|p| p.as_ref().to_vec());
         info.session_resumed =
@@ -453,6 +432,39 @@ impl TlsCtx {
     }
 }
 
+/// The server handshake states Ibex takes.
+enum Srv {
+    Wait(NeedsInput<ServerSide>),
+    Hello(rustls24::server::Accepted<rustls24::Tcp>),
+    Done(rustls24::split::SplitConnection<ServerSide>),
+}
+
+/// rustls yields `VerifyClientIdentity` only to a config with a client verifier, and a bind
+/// has none (`with_no_client_auth`); the enum is `non_exhaustive`. Either is a failure.
+fn srv_state(s: ServerHandshake) -> Result<Srv, Error> {
+    Ok(match s {
+        ServerHandshake::NeedsInput(n) => Srv::Wait(n),
+        ServerHandshake::Accepted(a) => Srv::Hello(a),
+        ServerHandshake::Complete(c) => Srv::Done(c), _ => return Err(Error::General("unexpected server handshake state".into())),
+    })
+}
+
+/// The client handshake states.
+enum Cli {
+    Wait(NeedsInput<ClientSide>),
+    Verify(rustls24::VerifyPeerIdentity<ClientSide, rustls24::Tcp>),
+    Done(rustls24::split::SplitConnection<ClientSide>),
+}
+
+/// rustls 0.24.0-dev.2 has these three client states; the enum is `non_exhaustive`.
+fn cli_state(s: ClientHandshake) -> Result<Cli, Error> {
+    Ok(match s {
+        ClientHandshake::NeedsInput(n) => Cli::Wait(n),
+        ClientHandshake::VerifyServerIdentity(v) => Cli::Verify(v),
+        ClientHandshake::Complete(c) => Cli::Done(c), _ => return Err(Error::General("unexpected client handshake state".into())),
+    })
+}
+
 /// One read of the receive side of `t`: the plaintext copied into `dst`, where in the
 /// input's storage the rest of the record is (empty when it all fit), and whether the record
 /// read was an empty one. A receive side that is gone (`close_notify` seen) reads as closed.
@@ -504,16 +516,17 @@ fn read_traffic<S: rustls24::SideData, I: TlsInput>(
                 t.recv = Some(r);
                 break;
             }
-            ReceiveTrafficState::CloseNotify => {
+            // Only `read` yields data: rustls's `into_next` (of `FlushSender` and of
+            // `ReceivedApplicationData`) returns `FlushSender`, `ReadMore` or `CloseNotify`, so
+            // this is `CloseNotify`.
+            end @ (ReceiveTrafficState::CloseNotify | ReceiveTrafficState::Available(_)) => {
+                debug_assert!(matches!(end, ReceiveTrafficState::CloseNotify));
                 // With data in this same read, the next read reports the close.
                 if out.0 == Plain::More {
                     out.0 = Plain::Closed;
                 }
                 break;
             }
-            // Only `read` yields data: rustls's `into_next` (of `FlushSender` and of
-            // `ReceivedApplicationData`) returns `FlushSender`, `ReadMore` or `CloseNotify`.
-            ReceiveTrafficState::Available(_) => unreachable!("into_next yielded application data"),
         };
     }
     if flush {
