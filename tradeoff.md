@@ -640,3 +640,15 @@ without an answer, logged with termination state `I` and its phase, and counted 
 | **Differs from HAProxy** | HAProxy has no panic; an internal error answers 500 (`IR--`), Ibex sends nothing: after a panic the stream's buffers may be mid-update, so the connection is closed as on a failed `stream_new`. |
 | **Requires** | `panic = "unwind"`: `crash.rs` has `#[cfg(panic = "abort")] compile_error!`, so no profile, PGO build or `RUSTFLAGS` can turn it off silently. |
 | **Revisit if** | A panic is seen to recur on every request of some input (a contained panic per request is a slow DoS: fix the panic, which the alert names), or h2 needs per-stream containment (`RST_STREAM INTERNAL_ERROR` instead of closing the connection). |
+
+### 6.27 ring does not zeroize key material — **found 2026-10-24; open, a target for a patch later**
+
+| | |
+|---|---|
+| **What** | `ring` 0.17.14 (the crypto provider behind rustls for TLS over TCP and QUIC) frees its key material without wiping it. Its own comments say so: `src/agreement.rs` and `src/ec/suite_b/ecdh.rs`, at the ECDH shared secret, "a pretty liberal interpretation of the NIST's spec's 'Destroy' that doesn't meet the NSA requirement to 'zeroize'". Private keys, AEAD keys and the key-exchange shared secret can stay in freed memory until it is reused. |
+| **What is wiped** | rustls 0.24.0-dev.2 wipes its own secrets on drop with `zeroize`: the TLS 1.3 key schedule (`crypto/tls13.rs`), HMAC/HKDF buffers (`crypto/hmac.rs`), cipher key buffers (`crypto/cipher/mod.rs`), HPKE secrets. Since T440 the TLS record buffers (plaintext and ciphertext) are Ibex's own (`ibex-tls/src/conn.rs`), wiped by `wipe_vec` under the wipe setting: `tune.ibex.ssl-zero-buffers`, default **on** (user 2026-10-24: "tls keys are a real target. crypto buffers should be zeroed"), once S2 of `docs/design/memory-2026-10-24.md` splits it off. |
+| **Differs from HAProxy** | OpenSSL clears key material with `OPENSSL_cleanse` when it frees it. |
+| **Cost** | A memory disclosure (a core dump, a swapped page, a later read of freed memory by another bug) can expose keys that OpenSSL would have wiped. Rust's memory safety makes the "later read" path much less likely than in C, but core dumps and swap remain. |
+| **Mitigations today** | Disable core dumps for the service (`LimitCORE=0`), no swap or encrypted swap. These are ops settings, not Ibex code. |
+| **Plan** | Patch ring (or the rustls provider) to zeroize key material on drop: the ECDH/X25519 private and shared values, the AEAD key schedules, the RSA/ECDSA private keys. Ask upstream first whether such a patch would be taken; otherwise carry it as a vendored patch, or evaluate another memory-safe provider that wipes. aws-lc-rs stays excluded (C, see the memory-safety rule). |
+| **Status** | Open. Not started. |

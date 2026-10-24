@@ -5888,7 +5888,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             if e.sess.mode == Mode::Http {
                 if let Some(t) = e.sess.txn.as_mut() {
                     t.close_after = true;
+                    t.close_opt = false;
                 }
+                e.sess.stopping = true;
                 // And so does every transaction it starts from here on: a request read
                 // after the stop is answered with `Connection: close`, as HAProxy switches
                 // a keep-alive stream to close mode once its frontend is stopping
@@ -10289,17 +10291,20 @@ impl EngineDispatcher<'_> {
         txn.srv_reusable = (resume.is_none() || txn.srv_reusable)
             && !srv_has_close
             && !close_server
-            && !server_close(proxies, entry.proxy_idx, entry.backend_idx)
+            && (txn.srv_kal_rule || !server_close(proxies, entry.proxy_idx, entry.backend_idx))
+            && !txn.req_len_long
             && !matches!(framing, crate::txn::Framing::UntilClose | crate::txn::Framing::Tunnel);
         if framing == crate::txn::Framing::UntilClose {
             // The server's close is the only end the client can see.
             txn.close_after = true;
+            txn.close_opt = false;
         }
         // `Transfer-Encoding` in an HTTP/1.0 response ends the message there (`H1_MF_CONN_CLO`,
         // whatever `Connection` says): the client connection too, with no `Connection` header
         // for it (measured on 3.5-dev8; T296).
         if close_server && !srv_http11 {
             txn.close_after = true;
+            txn.close_opt = false;
         }
         let client_close = txn.close_after;
         let req_http11 = txn.req_http11;
@@ -10320,13 +10325,20 @@ impl EngineDispatcher<'_> {
         let tunnel = framing == crate::txn::Framing::Tunnel;
         let set_rsp = |entry: &mut SessionEntry| {
             let sess = &mut entry.sess;
+            let mut head_left = 0;
             if let Some(txn) = sess.txn.as_mut() {
-                txn.rsp = MsgState::head(framing);
+                // One whose chunk framing comes off goes as a body that lasts until the close
+                // until its end is seen (`TcpSession::dechunk_rep`).
+                txn.rsp = MsgState::head(if txn.rsp_dechunk.is_some() { crate::txn::Framing::UntilClose } else { framing });
                 txn.rsp.measure_head_by(|| sess.rep.eoh());
+                if let MsgState::Head { left, .. } = txn.rsp {
+                    head_left = left;
+                }
                 if framing == crate::txn::Framing::Tunnel && txn.req.is_done() {
                     txn.req = MsgState::Tunnel;
                 }
             }
+            sess.dechunk_rep(head_left);
             // The body that came with the head: its chunk lines as HAProxy writes them.
             sess.rewrite_rep_chunk_framing();
             // `option logasap`: the line goes out with the response head (`http_process_res_common`),
@@ -10888,14 +10900,29 @@ impl EngineDispatcher<'_> {
         // it when it writes the head out (`h1_make_eoh`, `src/mux_h1.c`; T439): a response
         // left with no length, or a `close` a rule wrote, closes the client connection.
         let was = entry.sess.txn.as_ref().map_or_else(Default::default, |t| t.rsp_len_hdrs);
-        let client_close = if crate::txn::reread_response_after_rules(&mut hdrs, was, status) && !tunnel {
+        // A `keep-alive` a rule wrote keeps the connection `option httpclose` alone would close
+        // (`h1_set_cli_conn_mode`, T442).
+        let (rule_close, rule_kal) = crate::txn::reread_response_after_rules(&mut hdrs, was, status);
+        let client_close = if rule_close && !tunnel {
             if let Some(t) = entry.sess.txn.as_mut() {
                 t.close_after = true;
             }
             true
+        } else if rule_kal && !tunnel && entry.sess.txn.as_ref().is_some_and(|t| t.close_opt) {
+            if let Some(t) = entry.sess.txn.as_mut() {
+                t.close_after = false;
+            }
+            false
         } else {
             client_close
         };
+        // A chunked body whose `Transfer-Encoding` the rules removed goes without its chunk
+        // framing, until the end of the message (`h1_process_emit_headers`, T442).
+        if framing == crate::txn::Framing::Chunked && was.chnk && !hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding")) {
+            if let Some(t) = entry.sess.txn.as_mut() {
+                t.rsp_dechunk = Some(Box::new(crate::txn::Chunk::START));
+            }
+        }
         // The same `Connection` handling as without rules, on the headers the rules left.
         crate::txn::apply_response_connection(&mut hdrs, srv_http11, client_close, req_http11, tunnel || status < 100);
 
@@ -12486,8 +12513,12 @@ impl EngineDispatcher<'_> {
         // `option http-server-close` (frontend or backend): this request has the server
         // connection to itself, and the server is asked to close it. A request that asks
         // for an upgrade keeps its `Connection` header.
-        if !proxies[proxy_idx].http_req_rules.is_empty() || !proxies[be_idx].http_req_rules.is_empty() {
-            reread_request_framing(&mut entry.sess);
+        if (!proxies[proxy_idx].http_req_rules.is_empty() || !proxies[be_idx].http_req_rules.is_empty()) && !reread_request_framing(&mut entry.sess) {
+            // A length the rules made shorter than the body: `HAProxy`'s mux fails the
+            // request (500, `IH`) rather than send the rest as the next request (T442).
+            entry.sess.log.term = Some(*b"IH");
+            reply_error(entry, proxies, 500);
+            return None;
         }
         rewrite_request_connection(&mut entry.sess, server_close(proxies, proxy_idx, be_idx));
 
@@ -13716,14 +13747,23 @@ fn client_close(proxies: &[Proxy], fe_idx: usize) -> bool {
 /// and `close` taken out, an `upgrade` too when there is no `Upgrade` header, and the token
 /// the server connection's state calls for added (`close` when it is not to be reused,
 /// `keep-alive` for an HTTP/1.0 request that keeps it; [`crate::txn::request_connection_token`]).
-fn rewrite_request_connection(sess: &mut TcpSession, close: bool) {
+///
+/// `opt_close` is the option's (`server_close`): a `keep-alive` a rule wrote, without a
+/// `close`, cancels it, and the server connection is kept (`h1_set_srv_conn_mode`: no
+/// `H1_MF_CONN_KAL`, T442; [`crate::txn::HttpTxn::srv_kal_rule`]).
+fn rewrite_request_connection(sess: &mut TcpSession, opt_close: bool) {
     let http11 = sess.txn.as_ref().is_none_or(|t| t.req_http11);
     // An HTTP/1.0 request with a chunked body is sent without a `Connection` token at all:
     // `keep-alive` would be wrong for a message that ends with its connection (T430 row 2).
-    let mut close = close
-        || (!http11
-            && sess.req.eoh()
-                .is_some_and(|(h, e)| crate::txn::request_framing(&sess.req.readable()[..h + e]) == crate::txn::Framing::Chunked));
+    let forced = !http11
+        && sess.req.eoh().is_some_and(|(h, e)| crate::txn::request_framing(&sess.req.readable()[..h + e]) == crate::txn::Framing::Chunked);
+    let kept = |sess: &mut TcpSession, rule_close: bool, rule_kal: bool| {
+        let kal = opt_close && rule_kal && !rule_close && !forced;
+        if let Some(t) = sess.txn.as_mut() {
+            t.srv_kal_rule = kal;
+        }
+        forced || rule_close || (opt_close && !kal)
+    };
     // One look at the head, no copy. The usual request has no `Connection`, or one that is
     // all `keep-alive` and `close` and goes whole, cut out of the head where it is.
     let scan = sess.req.eoh().map(|(h, e)| crate::txn::scan_connection(&sess.req.readable()[..h + e]));
@@ -13732,7 +13772,9 @@ fn rewrite_request_connection(sess: &mut TcpSession, close: bool) {
         if scan.count == 1 {
             // The client's `close` went before the rules (`strip_request_connection`): one
             // here is a rule's, and the server is asked to close (`h1_set_srv_conn_mode`, T439).
-            close |= sess.htx_slice().and_then(|h| h.get_header("connection")).is_some_and(|v| crate::txn::connection_has(v, "close"));
+            let v = sess.htx_slice().and_then(|h| h.get_header("connection"));
+            let (rule_close, rule_kal) = (v.is_some_and(|v| crate::txn::connection_has(v, "close")), v.is_some_and(|v| crate::txn::connection_has(v, "keep-alive")));
+            let close = kept(sess, rule_close, rule_kal);
             sess.with_htx_mut(|htx| {
                 let _ = htx.remove_header("connection");
             });
@@ -13740,7 +13782,12 @@ fn rewrite_request_connection(sess: &mut TcpSession, close: bool) {
                 hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("connection"));
             }
             sess.req.cut(scan.first.0, scan.first.1);
+            if let Some(tok) = crate::txn::request_connection_token(close, http11, false) {
+                add_req_header(sess, "Connection", tok);
+            }
+            return;
         }
+        let close = kept(sess, false, false);
         if let Some(tok) = crate::txn::request_connection_token(close, http11, false) {
             add_req_header(sess, "Connection", tok);
         }
@@ -13763,18 +13810,21 @@ fn rewrite_request_connection(sess: &mut TcpSession, close: bool) {
             }
         }
     }
-    if let Some(tok) = crate::txn::request_connection_token(close || tokens.close, http11, tokens.upgrade) {
+    let close = kept(sess, tokens.close, tokens.keep_alive);
+    if let Some(tok) = crate::txn::request_connection_token(close, http11, tokens.upgrade) {
         add_req_header(sess, "Connection", tok);
     }
 }
 
 /// The request's `Content-Length` and `Transfer-Encoding` after its rules, as `HAProxy`
 /// writes them out (`h1_process_emit_headers`, `src/mux_h1.c`, T439): one the request was
-/// not framed by when it was parsed (`H1_MF_CLEN`, `H1_MF_CHNK`) is not written.
-fn reread_request_framing(sess: &mut TcpSession) {
-    let Some(was) = sess.txn.as_ref().and_then(|t| t.req_len_hdrs) else {
-        return;
-    };
+/// not framed by when it was parsed (`H1_MF_CLEN`, `H1_MF_CHNK`) is not written, and of
+/// the `Content-Length` it was, only the first (T442). False when that length is not a
+/// number or is shorter than the body: the request cannot be sent.
+fn reread_request_framing(sess: &mut TcpSession) -> bool {
+    // Every request that reaches its rules has what it was framed by (`TcpSession` and
+    // `h2_bridge` set it); without it, both count as framed and nothing is dropped.
+    let was = sess.txn.as_ref().and_then(|t| t.req_len_hdrs).unwrap_or(crate::txn::LenHdrs { clen: true, chnk: true });
     for (name, framed) in [("content-length", was.clen), ("transfer-encoding", was.chnk)] {
         if framed || sess.htx_slice().and_then(|h| h.get_header_bytes(name.as_bytes())).is_none() {
             continue;
@@ -13796,7 +13846,52 @@ fn reread_request_framing(sess: &mut TcpSession) {
         if let Some(t) = sess.txn.as_mut() {
             t.req_body_dropped = true;
         }
+        return true;
     }
+    if was.clen {
+        return reread_request_length(sess);
+    }
+    true
+}
+
+/// The `Content-Length` a request framed by its length has after its rules, as
+/// `h1_process_emit_headers` and `h1_make_eoh` write it (T442): the first only; a length
+/// given to a request with no body closes the server connection after it ("C-L without
+/// data"); false for one that is not a number or is shorter than the body.
+fn reread_request_length(sess: &mut TcpSession) -> bool {
+    let body = match sess.txn.as_ref().map(|t| t.req) {
+        Some(crate::txn::MsgState::Head { body: crate::txn::Framing::Length(n), .. }) => n,
+        _ => 0,
+    };
+    let (mut count, mut first) = (0usize, None);
+    for (_, v) in sess.htx_slice().into_iter().flat_map(|h| h.headers()).filter(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+        count += 1;
+        first = first.or(Some(v.trim().parse::<u64>().ok()));
+    }
+    let Some(len) = first else { return true };
+    let Some(len) = len.filter(|&l| body == 0 || l >= body) else {
+        return false;
+    };
+    if count > 1 {
+        let value = sess.htx_slice().and_then(|h| h.get_header_bytes(b"content-length")).map(|v| String::from_utf8_lossy(v).into_owned()).unwrap_or_default();
+        sess.with_htx_mut(|htx| {
+            let _ = htx.set_header("content-length", &value);
+        });
+        if let Some(hdrs) = sess.req_headers.as_mut() {
+            let mut seen = false;
+            hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length") || !std::mem::replace(&mut seen, true));
+        }
+        rebuild_req_buffer(sess);
+    }
+    if len > body {
+        if let Some(t) = sess.txn.as_mut() {
+            t.req_len_long = true;
+        }
+    }
+    if body == 0 && len > 0 {
+        add_req_header(sess, "Connection", "close");
+    }
+    true
 }
 
 fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
