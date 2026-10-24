@@ -10,7 +10,8 @@ import os
 import subprocess
 import tempfile
 import unittest
-from measure import check_regressions, MetricDelta, Verdict, reference_sha
+from measure import (check_regressions, MetricDelta, Verdict, reference_sha, split_modes,
+                     parse_insreq, min_ins_per_req)
 
 
 def _git(repo, *args):
@@ -153,6 +154,30 @@ class TestRegressionDetector(unittest.TestCase):
         deltas, verdict = check_regressions(current, {"cpu_ns_per_req_50conn": 1})
         self.assertEqual(verdict, Verdict.PASS)
 
+    def test_instructions_per_request_fail_at_one_percent_over_the_ref(self):
+        # instructions:u are deterministic to ~0.3% per build (design/memory 7c): +1% is a
+        # regression for both scenarios, +0.8% is not.
+        for sc in ("keepalive", "rules"):
+            current = {f"ins_per_req_{sc}": 101200, f"ins_per_req_{sc}_ref": 100000}
+            deltas, verdict = check_regressions(current, {})
+            self.assertEqual(verdict, Verdict.FAIL, sc)
+            d = next(d for d in deltas if d.name == f"ins_per_req_{sc}")
+            self.assertTrue(d.is_regression)
+            current = {f"ins_per_req_{sc}": 100800, f"ins_per_req_{sc}_ref": 100000}
+            deltas, verdict = check_regressions(current, {})
+            self.assertEqual(verdict, Verdict.PASS, sc)
+            d = next(d for d in deltas if d.name == f"ins_per_req_{sc}")
+            self.assertFalse(d.is_regression)
+
+    def test_insreq_output_is_parsed_and_the_min_of_the_rounds_is_taken(self):
+        out = ("x round 1: 2200000000 instructions, 36666 ins/req\n"
+               "x round 2: 2100000000 instructions, 35000 ins/req\n"
+               "x round 3: 2150000000 instructions, 35833 ins/req\n"
+               "x done (proxy pid 1 and backend pid 2 stopped)\n")
+        self.assertEqual(parse_insreq(out), [2200000000, 2100000000, 2150000000])
+        self.assertEqual(min_ins_per_req(parse_insreq(out), 60000), 35000)
+        self.assertRaises(RuntimeError, parse_insreq, "perf: not permitted\n")
+
     def test_binary_size_threshold(self):
         # <= 5% increase is PASS
         current = {"binary_bytes": 105000000}
@@ -172,6 +197,36 @@ class TestRegressionDetector(unittest.TestCase):
         deltas, verdict = check_regressions(current, previous)
         self.assertEqual(verdict, Verdict.BASELINE)
 
+
+
+class TestSplitModes(unittest.TestCase):
+    """The 1-conn samples fall in two clusters ~25% apart (T452). Both sides of an A/B are
+    split at one threshold, so the report can say how many samples each build had in each
+    mode: a median taken over a 3:1 mix and one over a 1:3 mix differ by the gap between
+    the modes, not by what the change did."""
+
+    def test_rc2_run_2_splits_at_one_threshold(self):
+        cand = [13335, 18664, 13151, 13404]
+        ref = [14558, 19050, 19032, 15342]
+        m = split_modes(cand, ref)
+        self.assertEqual(m["cand"], {"slow": 3, "fast": 1})
+        self.assertEqual(m["ref"], {"slow": 2, "fast": 2})
+        self.assertTrue(15342 < m["threshold"] < 18664)
+        # Within a mode the builds are compared like with like.
+        self.assertEqual(m["cand_slow_median"], 13335)
+        self.assertEqual(m["ref_slow_median"], (14558 + 15342) // 2)
+
+    def test_one_mode_has_no_threshold(self):
+        m = split_modes([15000, 15300, 14800, 15100], [15200, 14900, 15050, 15400])
+        self.assertIsNone(m["threshold"])
+        self.assertEqual(m["cand"], {"slow": 4, "fast": 0})
+        self.assertEqual(m["ref"], {"slow": 4, "fast": 0})
+
+    def test_a_lone_outlier_is_not_a_mode_of_its_own(self):
+        # rc3 gate: 11017 is one low sample, not a cluster; the gap rule alone would split it.
+        m = split_modes([12438, 14966, 15454, 13519], [15034, 11017, 18832, 13445])
+        self.assertEqual(m["cand"]["slow"] + m["cand"]["fast"], 4)
+        self.assertGreaterEqual(m["threshold"] or 0, 15454)
 
 if __name__ == "__main__":
     unittest.main()
