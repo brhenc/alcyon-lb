@@ -1969,12 +1969,65 @@ impl TcpSession {
 
     /// The request cannot be parsed. It is answered with `status` -- by the engine, which
     /// has the error pages -- and the connection closes; nothing more is read from it.
-    fn fail_request(&mut self, status: u16) {
+    pub(crate) fn fail_request(&mut self, status: u16) {
         self.log.term = Some(*b"PR");
         self.req.clear();
         self.txn = Some(HttpTxn::failed(status));
         self.cli_state = ScState::ShutR;
         self.ending.get_or_insert(Ending::Error);
+    }
+
+    /// The client's `close` and `keep-alive` taken out of the request's `Connection` headers,
+    /// and a header left with nothing removed, as `HAProxy`'s parser does
+    /// (`h1_parse_connection_header`, `src/h1.c`): the rules do not see them, and a `close`
+    /// left in the head after the rules is one they wrote (T439). The client's tokens were
+    /// read before. `conn` is the head's [`txn::ConnScan`] when it is known.
+    fn strip_request_connection(&mut self, conn: Option<txn::ConnScan>) {
+        // The head has its end here (it was found to get this far, and the rules keep it), so
+        // there is always one; the empty default would count no `Connection` header anyway.
+        let (h, e) = self.req.eoh().unwrap_or_default();
+        let conn = conn.unwrap_or_else(|| txn::scan_connection(&self.req.readable()[..h + e]));
+        if conn.count == 0 {
+            return;
+        }
+        let ka = |w: &str| w.eq_ignore_ascii_case("close") || w.eq_ignore_ascii_case("keep-alive");
+        // The usual one: all of it goes (with no allocation), cut out of the head where it is.
+        if conn.count == 1
+            && conn.plain
+            && self.htx_slice().and_then(|htx| htx.get_header("connection")).is_some_and(|v| ibex_sample::h1_drop_items(v, ka).is_empty())
+        {
+            self.with_htx_mut(|htx| {
+                let _ = htx.remove_header("connection");
+            });
+            self.req.cut(conn.first.0, conn.first.1);
+            return;
+        }
+        // Each value rewritten where it is, as `h1_parse_connection_header` rewrites it.
+        let edits: Vec<(usize, String)> = self.htx_slice().map_or_else(Vec::new, |htx| {
+            htx.header_blocks_where(|n| n.eq_ignore_ascii_case(b"connection"))
+                .filter_map(|(i, _, v)| {
+                    let left = ibex_sample::h1_drop_items(v, ka);
+                    // Not a value the fetches would read differently once rewritten (they
+                    // rewrite what they read again: `,  , close` is `,  `, and `,  ` is gone).
+                    (left != v && ibex_sample::h1_drop_items(&left, ka) == left).then_some((i, left))
+                })
+                .collect()
+        });
+        if edits.is_empty() {
+            return;
+        }
+        self.with_htx_mut(|htx| {
+            for (i, left) in &edits {
+                if left.is_empty() {
+                    htx.remove_block(*i);
+                } else {
+                    let _ = htx.replace_block_value(*i, left.as_bytes());
+                }
+            }
+        });
+        if let Some(wire) = self.htx_slice().map(|htx| htx.write_h1_wire_vec()) {
+            self.req.replace_prefix(h + e, &wire);
+        }
     }
 
     /// Runs the configured parser over a complete request head.
@@ -1983,7 +2036,7 @@ impl TcpSession {
     /// A framing violation: a malformed `Content-Length` / `Transfer-Encoding`, a bare CR as a line terminator, an invalid header name, or a
     /// malformed chunk size. Each of these is a way for two intermediaries to read the
     /// same bytes as different requests.
-    fn validate_request_head(&mut self, head_len: usize) -> io::Result<bool> {
+    fn validate_request_head(&mut self, head_len: usize) -> io::Result<(bool, txn::LenHdrs)> {
         // The built-in parser is a value on this frame: a `Box<dyn HttpStream>` per request
         // head was an allocation per request (Z2, 56 bytes). Nothing sets `parser_kind` to
         // another parser (the other kinds are not built into this crate: `build` refuses them,
@@ -2042,7 +2095,9 @@ impl TcpSession {
         // Modified, so the head forwarded is regenerated from the HTX, without it. So
         // too when the parser normalised the authority and `Host` (tasks/T93).
         self.htx_modified = conflict || key_written || head_rewritten;
-        Ok(close)
+        // What frames the request as parsed (`H1_MF_CLEN`, `H1_MF_CHNK`), for after its rules (T439).
+        let len_hdrs = txn::LenHdrs { clen: h1_parser.content_length.is_some() && !h1_parser.is_chunked, chnk: h1_parser.is_chunked };
+        Ok((close, len_hdrs))
     }
 
     #[must_use]
@@ -2451,8 +2506,8 @@ impl TcpSession {
                 // stream needs no state across calls. One allocation per request head
                 // for the trait object; it buys the framing rules and the seam that lets
                 // the parser be swapped.
-                let mut close = match self.validate_request_head(total_hdr_len) {
-                    Ok(close) => close,
+                let (mut close, len_hdrs) = match self.validate_request_head(total_hdr_len) {
+                    Ok(v) => v,
                     Err(e) => {
                         // 400, or the 413 / 422 HAProxy answers to some heads (T276).
                         self.fail_request(ibex_proto::h1::Refusal::status_of(&e));
@@ -2464,6 +2519,8 @@ impl TcpSession {
                         return Ok(true);
                     }
                 };
+                // Where the head's `Connection` headers are, while the facts still say (T439).
+                let mut conn_scan = None;
                 if self.has_htx {
                     let (conn_close, wire_replacement) = {
                         let htx = ibex_proto::htx::HtxSliceRef::new(
@@ -2505,9 +2562,11 @@ impl TcpSession {
                     };
                     close |= conn_close;
                     // Only regenerate wire buffer if HTX was actually modified
+                    let regenerated = wire_replacement.is_some();
                     if let Some(wire) = wire_replacement {
                         self.req.replace_prefix(total_hdr_len, &wire);
                     }
+                    conn_scan = facts.filter(|_| !regenerated).map(|f| f.conn);
                 }
 
                 // `txn->uri`: the request line once the parser has normalised the authority
@@ -2579,6 +2638,10 @@ impl TcpSession {
                         txn::BodyCheck::Fine | txn::BodyCheck::Held { .. } => {}
                     }
                 }
+                // Read above (and the body checked with the head as received): from here on a
+                // `close` in the head is one a rule wrote (T439).
+                // (`validate_request_head` leaves `has_htx` set on every `Ok`.)
+                self.strip_request_connection(conn_scan.filter(|_| self.cliexp.is_empty()));
                 let line = self.req.readable().split(|&b| b == b'\n').next().map_or(&[][..], <[u8]>::trim_ascii_end);
                 let ver = &line[line.len().saturating_sub(8)..];
                 // A chunked HTTP/1.0 request closes the connection after its response, whatever
@@ -2586,6 +2649,7 @@ impl TcpSession {
                 let chunked10 = framing == txn::Framing::Chunked && !ibex_proto::h1::version_is_11(ver);
                 let mut txn = HttpTxn::new(framing, close || self.close_client || chunked10);
                 txn.req_htx = req_htx;
+                txn.req_len_hdrs = Some(len_hdrs);
                 txn.req_http11 = ibex_proto::h1::version_is_11(ver);
                 txn.req_version = txn::version_digits(ver).unwrap_or(txn.req_version);
                 // The client's own method: rules that rewrite it have not run yet.

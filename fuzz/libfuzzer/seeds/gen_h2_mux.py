@@ -76,6 +76,16 @@ for k in range(40):  # random mixes of valid frames
         elif t == SET: body += settings((random.choice([1, 3, 4, 5, 6]), random.choice([0, 1, 100, 16384, 65535])))
         else: body += fr(CONT, EH, sid, lit(b"x", b"y"))
     add(f"mix{k}", body, sels=(random.randrange(256),))
+# T449: fields the HTTP/1 head cannot carry (CR LF in a value, a pseudo-header, a trailer, a
+# value split by CONTINUATION, a name with uppercase): each is a stream error.
+for k, v in [(b"crlf", b"b\r\nx-injected: 1"), (b"nul", b"b\0e")]:
+    add("bad-value-" + k.decode(), pre + fr(H, EH | ES, 1, req(extra=[(b"x-a", v)])))
+    add("bad-path-" + k.decode(), pre + fr(H, EH | ES, 1, req(path=b"/" + v)))
+    add("bad-trailer-" + k.decode(), pre + fr(H, EH, 1, req(b"POST")) + fr(D, 0, 1, b"abc") + fr(H, EH | ES, 1, lit(b"x-t", v)))
+    blk = req(extra=[(b"x-a", v)])
+    add("bad-cont-" + k.decode(), pre + fr(H, 0, 1, blk[:-len(v) + 1]) + fr(CONT, EH | ES, 1, blk[-len(v) + 1:]))
+add("bad-name-upper", pre + fr(H, EH | ES, 1, req(extra=[(b"X-a", b"1")])))
+add("bad-method-space", pre + fr(H, EH | ES, 1, req(b"GE T")))
 os.makedirs(out, exist_ok=True)
 for name, data in seeds.items():
     open(os.path.join(out, hashlib.sha1(data).hexdigest()), "wb").write(data)

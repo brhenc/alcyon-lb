@@ -69,6 +69,10 @@ pub struct H2StreamCtx {
     /// stream holds at most this much (or the initial window) of DATA the data path has not
     /// taken ([`MuxH2::demux_blocked`]).
     pub rx_limit: usize,
+    /// The request is one `HAProxy` takes and answers 400 (`HTX_FL_PARSING_ERROR`): a
+    /// method or scheme that is not a token, a URI with a control byte
+    /// ([`crate::h2::check_request_fields`]). It is not forwarded.
+    pub bad_request: bool,
     /// The request head of a stream of a server connection, as HTTP/1.1 (T437): what the
     /// data path forwards, written once from the decoded fields. `rx_htx` then holds no
     /// start line nor headers, only the end of the head and what follows. `None` for a
@@ -431,6 +435,7 @@ impl H2StreamCtx {
             rx_buffered: 0,
             rx_fill: 0,
             rx_limit: 0,
+            bad_request: false,
             req_head: None,
             req_content_length: None,
         }
@@ -1335,7 +1340,10 @@ impl MuxH2 {
             let trailer_bytes: usize = decoded.iter().map(|(n, v)| n.len() + v.len()).sum();
             let too_big = decoded.len() > MAX_REQUEST_TRAILERS
                 || trailer_bytes + TRAILER_BLOCK_OVERHEAD * decoded.len() > MAX_REQUEST_TRAILER_ROOM;
-            if (flags & frame_flags::END_STREAM) == 0 || too_big || decoded.iter().any(|(n, _)| n.starts_with(':')) {
+            // A trailer field is checked as `http_trailers_to_htx` checks it (T449): one
+            // with CR or LF would end the chunked body early for the server.
+            let malformed = crate::h2::check_trailer_fields(decoded.iter()).is_err();
+            if (flags & frame_flags::END_STREAM) == 0 || too_big || malformed || decoded.iter().any(|(n, _)| n.starts_with(':')) {
                 ctx.send_rst_stream(stream_id, H2Error::ProtocolError);
                 return Ok(());
             }
@@ -1364,6 +1372,19 @@ impl MuxH2 {
         let too_big = ctx.is_server
             && decoded.iter().map(|(n, v)| n.len() + v.len()).sum::<usize>() > MAX_REQUEST_HEAD_BYTES;
 
+        // Each field is checked before any head is written from it (T449): a CR LF in a
+        // value, a name or a pseudo-header written into the HTTP/1 head is a header, or a
+        // request, the server trusts. Malformed is a stream error; a method or URI HAProxy
+        // takes and then refuses is a 400.
+        // A client connection's response gets the name and value checks of
+        // `h2_make_htx_response` (no runtime path speaks h2 to a server yet: `proto h2` on
+        // a server is refused by the parser).
+        let fields = decoded.iter();
+        let checked = if ctx.is_server {
+            crate::h2::check_request_fields(fields)
+        } else {
+            crate::h2::check_response_fields(fields).map(|()| false)
+        };
         // A server connection's request head is written as HTTP/1.1 text, in memory a
         // stream before it used (T437); what that form does not take keeps the HTX blocks.
         let as_text = ctx.is_server && !too_many && !too_big;
@@ -1384,7 +1405,8 @@ impl MuxH2 {
         ctx.highest_opened = ctx.highest_opened.max(stream_id);
 
         // Extract pseudo-headers and construct HTX blocks
-        let converted = if too_many || too_big {
+        stream.bad_request = checked == Ok(true);
+        let converted = if too_many || too_big || checked.is_err() {
             Err(())
         } else if as_text {
             let mut head = stream.req_head.take().or_else(|| ctx.spare_heads.pop()).unwrap_or_default();
@@ -2112,6 +2134,29 @@ mod tests {
         let wu = ctx.tx_buf[before..].windows(13).find(|w| w[3] == 8 && w[5..9] == [0, 0, 0, 0]).expect("WINDOW_UPDATE");
         let inc = u32::from_be_bytes([wu[9], wu[10], wu[11], wu[12]]);
         assert!(inc <= i32::MAX as u32 && inc > 0, "increment {inc:#x}");
+    }
+
+    /// T449: a response with a field the HTTP/1 head cannot carry is a stream error for a
+    /// client connection, as `h2_make_htx_response` makes it; a clean one is taken.
+    #[test]
+    fn a_response_field_with_crlf_resets_the_stream_on_a_client_connection() {
+        let response = |id: u32, name: &str, value: &str| {
+            let block = HpackEncoder::new().encode(&[
+                HeaderField { name: ":status".into(), value: "200".into() },
+                HeaderField { name: name.into(), value: value.into() },
+            ]);
+            Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: id, header_block: block }.encode()
+        };
+        let settings = Frame::Settings { flags: 0, settings: vec![] }.encode();
+        for (name, value, ok) in [("x-r", "a", true), ("x-r", "a\r\nx-injected: 1", false), ("x-r", "a\0b", false), ("X-R", "1", false)] {
+            let mut client = MuxH2.init(ConnId(2), false).expect("init");
+            MuxH2.parse(&mut client, &settings).expect("settings");
+            let before = client.tx_buf.len();
+            MuxH2.parse(&mut client, &response(1, name, value)).expect("a stream error is not a connection error");
+            let rst = client.tx_buf[before..].windows(13).any(|w| w[3] == 3 && w[5..9] == [0, 0, 0, 1] && w[9..13] == [0, 0, 0, 1]);
+            assert_eq!(!rst, ok, "{name}: {value:?}");
+            assert_eq!(client.streams.get(&1).is_some_and(|s| s.rx_htx.res_line().is_some()), ok, "{name}: {value:?}");
+        }
     }
 
     fn open_conn() -> (MuxH2, H2MuxContext) {

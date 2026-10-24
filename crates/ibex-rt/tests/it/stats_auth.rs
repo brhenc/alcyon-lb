@@ -172,6 +172,15 @@ fn error_pages_of_the_proxy_answer_a_stats_deny_and_auth() {
     );
 }
 
+/// An `http-error` lf-string template answering a stats deny renders its `%ci` (T437; the
+/// template is rendered without the stream's context there). Measured on 3.5-dev8 from
+/// 127.0.0.1: `ci=127.0.0.1 end`, content-length 16.
+#[test]
+fn a_stats_deny_template_renders_the_client_address() {
+    let r = get("", "  http-error status 403 content-type text/plain lf-string \"ci=%ci end\"\n  stats http-request deny\n", None);
+    assert!(r.starts_with("HTTP/1.1 403 Forbidden\r\n") && r.contains("content-length: 16\r\n") && r.ends_with("\r\n\r\nci=127.0.0.1 end"), "{r}");
+}
+
 #[test]
 fn a_realm_without_accounts_protects_nothing() {
     // Measured: `stats realm` alone leaves the page open.

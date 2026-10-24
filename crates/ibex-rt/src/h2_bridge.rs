@@ -33,6 +33,9 @@ pub struct H2Dispatch {
     pub req_htx: u64,
     /// The line `%r` prints, when the frontend keeps it.
     pub request_line: Option<String>,
+    /// A request `HAProxy` answers 400 without contacting a server
+    /// ([`ibex_proto::H2StreamCtx::bad_request`]).
+    pub bad_request: bool,
 }
 
 /// Takes the lowest stream of the connection that has its whole request head and has not
@@ -73,6 +76,7 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
         head,
         req_htx,
         request_line,
+        bad_request: stream.bad_request,
     })
 }
 
@@ -152,6 +156,9 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     txn.req_htx = Some(d.req_htx);
     sess.txn = Some(txn);
     sess.cli_state = ScState::Established;
+    if d.bad_request {
+        sess.fail_request(400);
+    }
     d.head
 }
 
@@ -496,6 +503,7 @@ mod tests {
             head: Box::new(H2ReqHead::from_wire(std::str::from_utf8(head).expect("text"))),
             req_htx: 7,
             request_line: None,
+            bad_request: false,
         }
     }
 
