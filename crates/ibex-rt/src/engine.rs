@@ -1115,9 +1115,10 @@ fn attach_server_to(
     };
     let (fe, be) = (&proxies[fe_idx], &proxies[be_idx]);
     let stick = StickView::new(proxies, &sess.tracked_sc);
-    let sni = tls.sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies), &stick));
     let ip = s_idx.and_then(|i| be.servers.get(i)).map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |a| a.ip());
-    let mut xprt = tls.connect(&srv_fd, sni.as_deref(), ip);
+    let mut xprt = tls.with_sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies), &stick), |sni| {
+        tls.connect(&srv_fd, sni, ip)
+    });
     // A PROXY header (`send-proxy*`) was put at the head of the request; to a TLS
     // server it goes on the wire in plaintext, before the ClientHello, as
     // HAProxy's xprt_handshake layer sends it and the peer's `accept-proxy`
@@ -1141,9 +1142,24 @@ fn attach_server_to(
 /// The SNI a request on `sess` would send to `proxies[be_idx].servers.at(s_idx)`, for the
 /// idle pool's key and for deciding whether the connection in hand can carry it.
 fn server_sni(sess: &TcpSession, proxies: &[Proxy], fe_idx: usize, be_idx: usize, s_idx: Option<usize>) -> Option<String> {
-    let tls = s_idx.and_then(|i| proxies.get(be_idx).and_then(|p| p.server_tls.get(i)).and_then(Option::as_ref))?;
+    with_server_sni(sess, proxies, fe_idx, be_idx, s_idx, |sni| sni.map(str::to_string))
+}
+
+/// `f` of [`server_sni`], the name lent rather than copied: what the check of the kept
+/// connection, made for every request, uses (T440: 3 allocations per request otherwise).
+fn with_server_sni<R>(
+    sess: &TcpSession,
+    proxies: &[Proxy],
+    fe_idx: usize,
+    be_idx: usize,
+    s_idx: Option<usize>,
+    f: impl FnOnce(Option<&str>) -> R,
+) -> R {
+    let Some(tls) = s_idx.and_then(|i| proxies.get(be_idx).and_then(|p| p.server_tls.get(i)).and_then(Option::as_ref)) else {
+        return f(None);
+    };
     let stick = StickView::new(proxies, &sess.tracked_sc);
-    tls.sni(sample_registry(), &stream_sample_ctx(sess, &proxies[fe_idx], &proxies[be_idx], &ProxiesView(proxies), &stick))
+    tls.with_sni(sample_registry(), &stream_sample_ctx(sess, &proxies[fe_idx], &proxies[be_idx], &ProxiesView(proxies), &stick), f)
 }
 
 /// The pool key of a connection to `addr` for server `s_idx` of backend `be_idx`, opened
@@ -12344,8 +12360,9 @@ impl EngineDispatcher<'_> {
                 // A TLS connection carries the name it was opened with; a request whose
                 // SNI differs (another Host, under the automatic SNI) needs its own.
                 && (!entry.sess.srv_xprt.is_tls()
-                    || server_sni(&entry.sess, proxies, entry.proxy_idx, be_idx, entry.target_server_idx).as_deref()
-                        == entry.sess.srv_xprt.sni())
+                    || with_server_sni(&entry.sess, proxies, entry.proxy_idx, be_idx, entry.target_server_idx, |sni| {
+                        sni == entry.sess.srv_xprt.sni()
+                    }))
                 // A connection opened with a PROXY header carries only requests that would
                 // send that same header: HAProxy hashes it into the reuse key, so a
                 // per-request unique-id TLV gets a connection of its own.
