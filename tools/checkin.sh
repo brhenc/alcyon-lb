@@ -200,6 +200,9 @@ stage_tripwire() {
     sha256sum -c "$MANIFEST" 2>&1 | grep -v ': OK$'
     note_fail "tripwire: spec tests modified"
   fi
+  # AGENTS.md section 8: no new hand-written per-thread cache (allowlist shrinks S1-S4).
+  python3 harness/pool_layout.py
+  check "$?" "pool_layout (no hand-written thread_local cache)"
 }
 
 stage_harness-tests() {
