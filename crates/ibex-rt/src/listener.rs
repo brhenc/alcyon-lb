@@ -42,7 +42,7 @@ pub struct Listener {
     /// Per listener rather than per proxy because that is how `HAProxy` scopes it: one
     /// frontend commonly carries `bind :80` beside `bind :443 ssl crt`, and the two must
     /// not share a transport. `None` is plaintext.
-    pub tls: Option<Arc<rustls::ServerConfig>>,
+    pub tls: Option<Arc<ibex_tls::tcp::BindTls>>,
     /// `bind ... name <n>`, what `so_name` reads.
     pub name: Option<Arc<str>>,
     /// The listener's numeric id (`luid`), what `so_id` reads; 0 until the engine sets it.

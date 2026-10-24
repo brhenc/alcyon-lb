@@ -19,8 +19,10 @@ pub mod arena;
 pub mod capture;
 pub mod cipher_names;
 pub mod config;
+pub mod conn;
 pub mod ja4;
 pub mod resolver;
+pub mod tcp;
 pub mod transport;
 pub mod x509;
 
@@ -35,4 +37,4 @@ pub use config::{
 pub use ja4::Ja4Parts;
 pub use capture::{exclude_tls_grease, HelloTap, SslCapture};
 pub use resolver::IbexCertResolver;
-pub use transport::{RustlsContext, RustlsTlsInfo, RustlsTransport};
+pub use transport::{LocalCert, RustlsContext, RustlsTlsInfo, RustlsTransport};

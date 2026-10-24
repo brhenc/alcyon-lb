@@ -23,4 +23,5 @@ mod config;
 mod e2e_tls_nginx_proxy;
 mod handshake;
 mod resolver;
+mod tcp_ctx;
 mod tokio_integration;

@@ -733,14 +733,21 @@ fn start_keepalive_backend(listener: TcpListener, running: Arc<AtomicBool>, rsp:
                 s.set_nonblocking(true).expect("nonblocking");
                 conns.push(s);
             }
-            for s in &mut conns {
+            // A closed connection is dropped, so that the list never grows (and reallocates)
+            // past what is open.
+            conns.retain_mut(|s| {
                 // One head per read: the client sends the next request only after the response.
-                if let Ok(n) = s.read(&mut buf) {
-                    if n > 0 && buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
-                        let _ = s.write_all(rsp);
+                match s.read(&mut buf) {
+                    Ok(0) => false,
+                    Ok(n) => {
+                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            let _ = s.write_all(rsp);
+                        }
+                        true
                     }
+                    Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
                 }
-            }
+            });
             thread::sleep(Duration::from_micros(200));
         }
     })
@@ -858,4 +865,309 @@ fn http_request_return_allocates_nothing_per_request() {
     let many = keepalive_allocations_with(rules, PLAIN_RSP, 1100, b"HTTP/1.1 404", b"\r\n\r\nnope");
     println!("[MEASUREMENT T437 return] keep-alive (allocations, reallocations): 100 requests {few:?}, 1100 requests {many:?}");
     assert!(many.0 == few.0 && many.1 <= few.1, "1000 more `return` replies: (allocations, reallocations) {few:?} -> {many:?}");
+}
+
+/// One request with a `User-Agent` (what a capture reads) on the keep-alive `client`; as
+/// `drive_proxied_request`.
+fn drive_proxied_request_ua(client: &mut TcpStream, engine: &mut Engine) {
+    client.write_all(b"GET /api/test?q=1 HTTP/1.1\r\nHost: localhost\r\nUser-Agent: alloc-test/1.0\r\n\r\n").expect("write req");
+    let start = Instant::now();
+    let mut response = [0u8; 512];
+    let mut len = 0;
+    while start.elapsed() < Duration::from_secs(2) && !response[..len].ends_with(b"\r\n\r\nok") {
+        let _ = engine.run_once();
+        if let Ok(n) = client.read(&mut response[len..]) {
+            len += n;
+        }
+    }
+    let got = &response[..len];
+    assert!(got.starts_with(b"HTTP/1.1 200") && got.ends_with(b"\r\n\r\nok"), "response: {:?}", String::from_utf8_lossy(got));
+}
+
+/// The allocations of `n` keep-alive requests proxied by a frontend with `fe_lines` and a
+/// `log` target (a UDP socket held open, never read: the lines are sent and dropped), after
+/// three warm-up requests. Also the number of log datagrams that arrived, to show the
+/// frontend logged.
+fn logged_proxied_allocations(n: usize, fe_lines: &str) -> (usize, usize) {
+    let (srv, srv_addr) = loopback0();
+    let (l, addr) = loopback0();
+    drop(l);
+    let log = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind log socket");
+    let log_addr = log.local_addr().expect("log addr");
+    let running = Arc::new(AtomicBool::new(true));
+    let be = start_keepalive_backend(srv, Arc::clone(&running), b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n  log {log_addr} local0\n\
+         frontend f\n  bind {addr}\n  log global\n{fe_lines}  default_backend b\nbackend b\n  server s1 {srv_addr}\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = TcpStream::connect(addr).expect("connect to frontend");
+    client.set_nonblocking(true).expect("set_nonblocking");
+    for _ in 0..3 {
+        drive_proxied_request_ua(&mut client, &mut engine);
+    }
+    let before = ibex_alloc::alloc_counters();
+    for _ in 0..n {
+        drive_proxied_request_ua(&mut client, &mut engine);
+    }
+    let diff = before.diff(&ibex_alloc::alloc_counters());
+    drop(client);
+    for _ in 0..5 {
+        let _ = engine.run_once();
+    }
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+    log.set_nonblocking(true).expect("nonblocking log");
+    let mut lines = 0;
+    let mut buf = [0u8; 2048];
+    while log.recv(&mut buf).is_ok() {
+        lines += 1;
+    }
+    (diff.alloc_count, lines)
+}
+
+/// T437 part 1: a request logged with `option httplog` allocates nothing. Measured before
+/// (2026-10-19, uprobe on malloc, main 5bcdce4b): 3 per request, the request line kept for `%r`
+/// (`keep_request_line`), the rendered line (`render_bytes`) and `logfmt::alias`.
+#[test]
+fn a_request_logged_with_httplog_allocates_nothing() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (few, lines) = logged_proxied_allocations(100, "  option httplog\n");
+    let (many, _) = logged_proxied_allocations(1100, "  option httplog\n");
+    println!("[MEASUREMENT T437 1] httplog allocations: 100 requests {few}, 1100 requests {many}");
+    assert!(lines > 0, "no log line arrived");
+    assert_eq!(many, few, "1000 more logged requests made {} more allocations", many.abs_diff(few));
+}
+
+/// T437 part 1: a custom `log-format` with `%{+Q}r`, `%HU`.. and header captures allocates
+/// nothing. Measured before (2026-10-19, this test on main 5bcdce4b): 18 per request (the
+/// request line, the line, `%ft`, `%HM`.. each a `String`, and the captures: the headers
+/// collected, the values, the slots, request and response).
+#[test]
+fn a_request_logged_with_a_capture_allocates_nothing() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fe = "  log-format \"%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %{+Q}r %HM %HU %HP %HPO %HQ %HV %hr %hs %{+Q}hrl\"\n  \
+              capture request header User-Agent len 64\n  capture request header Host len 32\n  \
+              capture response header Content-Length len 8\n";
+    let (few, lines) = logged_proxied_allocations(100, fe);
+    let (many, _) = logged_proxied_allocations(1100, fe);
+    println!("[MEASUREMENT T437 1] log-format + header capture allocations: 100 requests {few}, 1100 requests {many}");
+    assert!(lines > 0, "no log line arrived");
+    assert_eq!(many, few, "1000 more logged requests made {} more allocations", many.abs_diff(few));
+}
+
+/// The survey's `log-format` scenario (T437): `http-request capture` and `%[capture.req.hdr(0)]`.
+/// What is left is the sample engine's, not the log's: the rule's fetch and its value as a
+/// `String` (`sample_to_string`), and the log expression's fetch (T437 part 2, rules and
+/// samples into a reused scratch). Measured 2026-10-19 (this test): 10 per request on main
+/// 5bcdce4b, 3 after part 1. The bound holds part 1's result; part 2 brings it to 0.
+#[test]
+fn a_request_logged_with_a_capture_rule_allocates_only_in_the_samples() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fe = "  log-format \"%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %{+Q}r %[capture.req.hdr(0)]\"\n  \
+              http-request capture req.hdr(user-agent) len 64\n";
+    let (few, lines) = logged_proxied_allocations(100, fe);
+    let (many, _) = logged_proxied_allocations(1100, fe);
+    println!("[MEASUREMENT T437 1] log-format + capture rule allocations: 100 requests {few}, 1100 requests {many}");
+    assert!(lines > 0, "no log line arrived");
+    assert!(many.saturating_sub(few) <= 3 * 1000, "1000 more logged requests made {} more allocations (bound 3 per request)", many.abs_diff(few));
+}
+
+/// A minimal h2c client on one connection: requests on streams 1, 3, 5.., from fixed
+/// buffers, so that nothing on the client side allocates (the counter is process-wide).
+struct H2cClient {
+    sock: TcpStream,
+    rx: [u8; 16384],
+    rx_len: usize,
+    next_stream: u32,
+    /// The request's header block: `GET`, `http`, `/api/test?q=1` from the static table, the
+    /// authority and a user agent with incremental indexing (h2load's choice: literals the
+    /// first time, indexed after), and a never-indexed Huffman literal, decoded every time.
+    block: [u8; 128],
+    block_len: usize,
+}
+
+impl H2cClient {
+    fn connect(addr: SocketAddr) -> H2cClient {
+        let mut sock = TcpStream::connect(addr).expect("connect to frontend");
+        sock.set_nonblocking(true).expect("set_nonblocking");
+        sock.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00").expect("write preface");
+        let mut v = vec![0x82, 0x86];
+        v.push(0x04); // :path, literal without indexing, indexed name
+        ibex_proto::hpack::encode_string_literal("/api/test?q=1", true, &mut v);
+        v.push(0x41); // :authority, incremental indexing
+        ibex_proto::hpack::encode_string_literal("localhost", true, &mut v);
+        v.push(0x40 | 0x3a); // user-agent, static index 58
+        ibex_proto::hpack::encode_string_literal("alloc-test/1.0", true, &mut v);
+        v.push(0x10); // never indexed, new name
+        ibex_proto::hpack::encode_string_literal("x-trace", true, &mut v);
+        ibex_proto::hpack::encode_string_literal("abcdef0123456789", true, &mut v);
+        let mut block = [0u8; 128];
+        block[..v.len()].copy_from_slice(&v);
+        H2cClient { sock, rx: [0; 16384], rx_len: 0, next_stream: 1, block, block_len: v.len() }
+    }
+
+    /// The second request on: what the encoder's table now holds is referenced.
+    fn index_after_first(&mut self) {
+        let mut v = vec![0x82, 0x86, 0x04];
+        ibex_proto::hpack::encode_string_literal("/api/test?q=1", true, &mut v);
+        v.extend_from_slice(&[0xbf, 0xbe]); // localhost (62+1), user-agent (62)
+        v.push(0x10);
+        ibex_proto::hpack::encode_string_literal("x-trace", true, &mut v);
+        ibex_proto::hpack::encode_string_literal("abcdef0123456789", true, &mut v);
+        self.block[..v.len()].copy_from_slice(&v);
+        self.block_len = v.len();
+    }
+
+    /// Sends one GET and runs the engine until its response has ended (END_STREAM).
+    fn request(&mut self, engine: &mut Engine) {
+        let id = self.next_stream;
+        self.next_stream += 2;
+        let mut frame = [0u8; 9 + 128];
+        let len = self.block_len;
+        frame[..3].copy_from_slice(&u32::try_from(len).unwrap().to_be_bytes()[1..]);
+        frame[3] = 0x1; // HEADERS
+        frame[4] = 0x5; // END_STREAM | END_HEADERS
+        frame[5..9].copy_from_slice(&id.to_be_bytes());
+        frame[9..9 + len].copy_from_slice(&self.block[..len]);
+        self.sock.write_all(&frame[..9 + len]).expect("write HEADERS");
+        let start = Instant::now();
+        let (mut status_seen, mut ended) = (false, false);
+        while !ended {
+            assert!(start.elapsed() < Duration::from_secs(2), "no response on stream {id}");
+            let _ = engine.run_once();
+            if let Ok(n) = self.sock.read(&mut self.rx[self.rx_len..]) {
+                assert!(n > 0, "the connection closed");
+                self.rx_len += n;
+            }
+            while self.rx_len >= 9 {
+                let flen = (usize::from(self.rx[0]) << 16) | (usize::from(self.rx[1]) << 8) | usize::from(self.rx[2]);
+                if self.rx_len < 9 + flen {
+                    break;
+                }
+                let (ty, flags) = (self.rx[3], self.rx[4]);
+                let sid = u32::from_be_bytes([self.rx[5], self.rx[6], self.rx[7], self.rx[8]]) & 0x7fff_ffff;
+                match ty {
+                    0x4 if flags & 1 == 0 => self.sock.write_all(b"\x00\x00\x00\x04\x01\x00\x00\x00\x00").expect("SETTINGS ACK"),
+                    0x1 if sid == id => {
+                        // `:status: 200`, indexed (0x88), first.
+                        assert_eq!(self.rx.get(9), Some(&0x88), "response HEADERS do not start with :status 200");
+                        status_seen = true;
+                        ended |= flags & 1 != 0;
+                    }
+                    0x0 if sid == id => ended |= flags & 1 != 0,
+                    0x3 | 0x7 => panic!("stream {id}: RST_STREAM or GOAWAY (type {ty})"),
+                    _ => {}
+                }
+                self.rx.copy_within(9 + flen..self.rx_len, 0);
+                self.rx_len -= 9 + flen;
+            }
+        }
+        assert!(status_seen, "stream {id} ended without a response head");
+    }
+}
+
+/// The allocations of `n` requests on one h2c connection, each proxied to a keep-alive
+/// HTTP/1.1 server, after three warm-up requests.
+fn h2c_proxied_allocations(n: usize) -> usize {
+    let (srv, srv_addr) = loopback0();
+    let (l, addr) = loopback0();
+    drop(l);
+    let running = Arc::new(AtomicBool::new(true));
+    let be = start_keepalive_backend(srv, Arc::clone(&running), b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend f\n  bind {addr} proto h2\n  default_backend b\nbackend b\n  server s1 {srv_addr}\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = H2cClient::connect(addr);
+    client.request(&mut engine);
+    client.index_after_first();
+    for _ in 0..2 {
+        client.request(&mut engine);
+    }
+    let before = ibex_alloc::alloc_counters();
+    for _ in 0..n {
+        client.request(&mut engine);
+    }
+    let diff = before.diff(&ibex_alloc::alloc_counters());
+    drop(client);
+    for _ in 0..5 {
+        let _ = engine.run_once();
+    }
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+    diff.alloc_count
+}
+
+/// T437 part 4: a steady-state h2c request proxied to an HTTP/1.1 server allocates nothing.
+/// Measured before (2026-10-19, main 5bcdce4b): 49.7 per request (uprobe on malloc under
+/// h2load), 53 in this test: HPACK decode (a `String` per name and value), the HTX of owned
+/// blocks, the bridge's owned copies of the head, the response encoded into new `Vec`s, the
+/// stream's session and the engine's per-pass queues.
+#[test]
+fn an_h2c_request_allocates_nothing() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let few = h2c_proxied_allocations(100);
+    let many = h2c_proxied_allocations(1100);
+    println!("[MEASUREMENT T437 4] h2c allocations: 100 requests {few}, 1100 requests {many}");
+    // Measured after (2026-10-19): 0 and 0 or 1, and 1 for 2100, 4100 and 8100 requests: a
+    // buffer of the connection grows once, at a moment the timing decides, not per request.
+    assert!(many <= few + 1, "1000 more h2c requests made {} more allocations", many.abs_diff(few));
+}
+
+/// The allocations of `n` keep-alive requests (`Host: localhost`) on one client connection,
+/// proxied to a TLS server (`ssl verify none`, then `server_opts`) after three warm-up
+/// requests. The TLS server is a second frontend of the same engine (`bind ... ssl crt`),
+/// answering `ok` itself, so nothing outside the engine allocates.
+fn tls_backend_allocations(server_opts: &str, n: usize) -> usize {
+    let (l, addr) = loopback0();
+    drop(l);
+    let (l, tls_addr) = loopback0();
+    drop(l);
+    let pem = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/ssl_f_common.pem");
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend f\n  bind {addr}\n  default_backend b\n\
+         frontend t\n  bind {tls_addr} ssl crt {pem}\n  http-request return status 200 content-type text/plain string ok\n\
+         backend b\n  server s1 {tls_addr} ssl verify none{server_opts}\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = TcpStream::connect(addr).expect("connect to frontend");
+    client.set_nonblocking(true).expect("set_nonblocking");
+    for _ in 0..3 {
+        drive_request_expecting(&mut client, &mut engine, b"HTTP/1.1 200", b"\r\n\r\nok");
+    }
+    let before = ibex_alloc::alloc_counters();
+    for _ in 0..n {
+        drive_request_expecting(&mut client, &mut engine, b"HTTP/1.1 200", b"\r\n\r\nok");
+    }
+    let diff = before.diff(&ibex_alloc::alloc_counters());
+    drop(client);
+    for _ in 0..5 {
+        let _ = engine.run_once();
+    }
+    diff.alloc_count
+}
+
+/// The automatic SNI of a TLS server in `mode http` (`srv_configure_auto_sni`:
+/// `req.hdr(host),field(1,:)`) allocates nothing per request. The kept server connection is
+/// reused, but the name is evaluated for every request, to check that the connection was
+/// opened for it (`HAProxy` hashes the SNI into the connection's reuse key per stream). The
+/// TLS layer allocates on its own, so what is compared is the growth from 100 to 1100
+/// requests, with and without `no-sni-auto`. Measured before (2026-10-24, main 6579719c, rustls
+/// 0.23, debug): 9000 against 6000, 3 allocations per request for the name (the `field` copy,
+/// the sample's string copied out, the header string never given back).
+#[test]
+fn the_automatic_sni_allocates_nothing_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let growth = |opts: &str| {
+        let count = |n| i64::try_from(tls_backend_allocations(opts, n)).expect("count");
+        count(1100) - count(100)
+    };
+    let auto = growth("");
+    let none = growth(" no-sni-auto");
+    println!("[MEASUREMENT sni-alloc] allocations for 1000 more TLS-backend requests: automatic SNI {auto}, no-sni-auto {none}");
+    assert_eq!(auto, none, "1000 more requests with the automatic SNI: {auto} allocations, {none} with no-sni-auto");
 }

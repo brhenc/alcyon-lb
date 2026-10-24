@@ -7,7 +7,8 @@
 //! socket will take, and a peer that leaves while it is being written.
 
 use ibex_rt::{raw, Io, ServerXprt};
-use ibex_tls::{build_backend_client_config, BackendTlsOptions};
+use ibex_tls::tcp::build_backend_client_config;
+use ibex_tls::BackendTlsOptions;
 use rustls::pki_types::ServerName;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsFd;

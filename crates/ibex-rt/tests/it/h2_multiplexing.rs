@@ -916,9 +916,27 @@ fn pseudo_header_after_regular_header_is_rejected_with_rst_stream() {
 /// Duplicate pseudo-header (e.g. duplicate :method) is rejected with `RST_STREAM` (RFC 9113 §8.3).
 #[test]
 fn duplicate_pseudo_header_is_rejected_with_rst_stream() {
+    a_request_is_reset(&hpack_get_duplicate_pseudo("/dup"), "dup_pseudo");
+}
+
+/// A second `:scheme` is refused the same way (T437: Ibex keeps `:scheme` out of the head
+/// and counts it). `HAProxy` 3.5-dev8 measured: RST_STREAM PROTOCOL_ERROR on stream 1.
+#[test]
+fn duplicate_scheme_is_rejected_with_rst_stream() {
+    // :method GET, :scheme http, :scheme http, :path /dup, :authority localhost
+    let mut v = vec![0x82, 0x86, 0x86, 0x04, 4];
+    v.extend_from_slice(b"/dup");
+    v.extend_from_slice(&[0x01, 9]);
+    v.extend_from_slice(b"localhost");
+    a_request_is_reset(&v, "dup_scheme");
+}
+
+/// Sends `payload` as the header block of stream 1 and expects `RST_STREAM`
+/// PROTOCOL_ERROR on it and nothing at the backend.
+fn a_request_is_reset(payload: &[u8], tag: &str) {
     let (backend_port, seen) = spawn_backend_full();
     let port = common::reserve_port();
-    let cfg = std::env::temp_dir().join(format!("ibex_h2dup_pseudo_{}.cfg", std::process::id()));
+    let cfg = std::env::temp_dir().join(format!("ibex_h2{tag}_{}.cfg", std::process::id()));
     std::fs::write(
         &cfg,
         format!(
@@ -945,8 +963,7 @@ fn duplicate_pseudo_header_is_rejected_with_rst_stream() {
     s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
     s.write_all(&frame(0x04, 0, 0, &[])).expect("settings");
 
-    let payload = hpack_get_duplicate_pseudo("/dup");
-    s.write_all(&frame(0x01, 0x05, 1, &payload)).expect("headers");
+    s.write_all(&frame(0x01, 0x05, 1, payload)).expect("headers");
     s.flush().ok();
 
     let frames = recv_h2_frames(&mut s, Duration::from_secs(1));

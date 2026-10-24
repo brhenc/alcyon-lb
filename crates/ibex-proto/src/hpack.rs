@@ -429,8 +429,17 @@ pub static HUFFMAN_TREE: [HuffmanNode; 513] = build_huffman_tree();
 /// Returns `H2Error::CompressionError` if bitstream contains invalid prefixes, the EOS symbol,
 /// or padding longer than 7 bits or not composed entirely of 1s.
 pub fn decode_huffman(data: &[u8]) -> Result<String, H2Error> {
-    let mut node_idx = 0usize;
     let mut out = Vec::with_capacity(data.len());
+    decode_huffman_into(data, &mut out)?;
+    String::from_utf8(out).map_err(|_| H2Error::CompressionError)
+}
+
+/// [`decode_huffman`] appending the bytes to `out` (T437), not checked as UTF-8.
+///
+/// # Errors
+/// As [`decode_huffman`], but for UTF-8.
+pub fn decode_huffman_into(data: &[u8], out: &mut Vec<u8>) -> Result<(), H2Error> {
+    let mut node_idx = 0usize;
     let mut rem_bits = 0usize;
 
     for &byte in data {
@@ -476,8 +485,7 @@ pub fn decode_huffman(data: &[u8]) -> Result<String, H2Error> {
             return Err(H2Error::CompressionError);
         }
     }
-
-    String::from_utf8(out).map_err(|_| H2Error::CompressionError)
+    Ok(())
 }
 
 /// Encodes a raw byte slice into canonical Huffman representation per RFC 7541 Appendix B.
@@ -553,6 +561,36 @@ impl DynamicTable {
     pub fn set_max_size(&mut self, new_max: usize) {
         self.max_size = new_max;
         self.evict_to_fit();
+    }
+
+    /// [`Self::insert`] of a copy of `name` and `value`, in the memory of an entry it evicts
+    /// when there is one (T437): a table that turns over costs no allocation per entry.
+    pub fn insert_copy(&mut self, name: &str, value: &str) {
+        let entry_size = name.len() + value.len() + 32;
+        if entry_size > self.max_size {
+            self.clear();
+            return;
+        }
+        // The entries the new one evicts (RFC 7541 section 4.4), the oldest first: the same
+        // as [`Self::insert`], which adds and then evicts, as the new entry fits alone.
+        // (An empty table has size 0, and the entry fits: the loop ends with entries.)
+        let mut spare = None;
+        while let Some(evicted) = (self.size + entry_size > self.max_size).then(|| self.entries.pop_back()).flatten() {
+            self.size = self.size.saturating_sub(evicted.size());
+            spare = Some(evicted);
+        }
+        let entry = match spare {
+            Some(mut e) => {
+                e.name.clear();
+                e.name.push_str(name);
+                e.value.clear();
+                e.value.push_str(value);
+                e
+            }
+            None => TableEntry::new(name, value),
+        };
+        self.size += entry_size;
+        self.entries.push_front(entry);
     }
 
     /// Inserts a new entry at the head (index 0 of dynamic table / index 62 in combined table).
@@ -718,16 +756,22 @@ pub fn decode_integer(prefix_bits: u8, src: &[u8], offset: &mut usize) -> Result
 pub fn encode_string_literal(s: &str, use_huffman: bool, dst: &mut Vec<u8>) {
     let bytes = s.as_bytes();
     if use_huffman {
-        let mut huff = Vec::with_capacity(bytes.len());
-        encode_huffman(bytes, &mut huff);
-        if huff.len() < bytes.len() {
-            encode_integer(huff.len(), 7, 0x80, dst);
-            dst.extend_from_slice(&huff);
+        let huff_len = huffman_len(bytes);
+        if huff_len < bytes.len() {
+            // Written in place, after its length (T437: no buffer of its own).
+            encode_integer(huff_len, 7, 0x80, dst);
+            encode_huffman(bytes, dst);
             return;
         }
     }
     encode_integer(bytes.len(), 7, 0x00, dst);
     dst.extend_from_slice(bytes);
+}
+
+/// The length of `input` Huffman-encoded ([`encode_huffman`]), padding included.
+fn huffman_len(input: &[u8]) -> usize {
+    let bits: usize = input.iter().map(|&b| usize::from(HUFFMAN_CODES[b as usize].1)).sum();
+    bits.div_ceil(8)
 }
 
 /// Decodes a string literal (RFC 7541 §5.2) from input slice at `*offset`.
@@ -754,6 +798,80 @@ pub fn decode_string_literal(src: &[u8], offset: &mut usize) -> Result<String, H
         std::str::from_utf8(raw)
             .map(std::string::ToString::to_string)
             .map_err(|_| H2Error::CompressionError)
+    }
+}
+
+/// Appends a string literal (RFC 7541 section 5.2) at `*offset` of `src` to `out`, as
+/// [`decode_string_literal`] decodes it (T437: into memory the caller keeps). `huff` is
+/// where a Huffman string is decoded before it is checked as UTF-8.
+///
+/// # Errors
+/// As [`decode_string_literal`].
+pub fn decode_string_literal_into(src: &[u8], offset: &mut usize, out: &mut String, huff: &mut Vec<u8>) -> Result<(), H2Error> {
+    if *offset >= src.len() {
+        return Err(H2Error::CompressionError);
+    }
+    let is_huffman = (src[*offset] & 0x80) != 0;
+    let len = decode_integer(7, src, offset)?;
+    if *offset + len > src.len() {
+        return Err(H2Error::CompressionError);
+    }
+    let raw = &src[*offset..*offset + len];
+    *offset += len;
+    let text = if is_huffman {
+        huff.clear();
+        decode_huffman_into(raw, huff)?;
+        std::str::from_utf8(huff)
+    } else {
+        std::str::from_utf8(raw)
+    };
+    out.push_str(text.map_err(|_| H2Error::CompressionError)?);
+    Ok(())
+}
+
+/// A decoded header block, in memory kept from one block to the next (T437): the names and
+/// values one after the other in one `String`, and where each field is in it.
+#[derive(Debug, Default, Clone)]
+pub struct DecodedFields {
+    text: String,
+    /// Per field: the start of its name, the end of its name (the start of its value), the
+    /// end of its value.
+    spans: Vec<(u32, u32, u32)>,
+    /// A Huffman string before it is checked as UTF-8.
+    huff: Vec<u8>,
+}
+
+impl DecodedFields {
+    /// No field; the memory is kept.
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.spans.clear();
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// The fields in order, as name and value.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> + Clone + '_ {
+        self.spans.iter().map(|&(n, v, e)| (&self.text[n as usize..v as usize], &self.text[v as usize..e as usize]))
+    }
+
+    /// The first value of the field `name`.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
+    }
+
+    /// The fields as [`HeaderField`]s (what [`HpackDecoder::decode`] returns).
+    #[must_use]
+    pub fn to_fields(&self) -> Vec<HeaderField> {
+        self.iter().map(|(n, v)| HeaderField { name: n.to_string(), value: v.to_string() }).collect()
+    }
+
+    fn pos(&self) -> u32 {
+        u32::try_from(self.text.len()).unwrap_or(u32::MAX)
     }
 }
 
@@ -799,12 +917,23 @@ impl HpackDecoder {
     /// # Errors
     /// Returns `H2Error::CompressionError` if decoding encounters malformed syntax.
     pub fn decode(&mut self, block: &[u8]) -> Result<Vec<HeaderField>, H2Error> {
+        let mut out = DecodedFields::default();
+        self.decode_into(block, &mut out)?;
+        Ok(out.to_fields())
+    }
+
+    /// Decodes an HPACK-encoded header block into `out` (emptied first), in the memory it
+    /// holds already (T437): no allocation per field once it has grown to the blocks' size.
+    ///
+    /// # Errors
+    /// Returns `H2Error::CompressionError` if decoding encounters malformed syntax.
+    pub fn decode_into(&mut self, block: &[u8], out: &mut DecodedFields) -> Result<(), H2Error> {
+        out.clear();
         let mut offset = 0;
-        let mut headers = Vec::new();
         let mut allowed_table_size_update = true;
 
         while offset < block.len() {
-            if headers.len() >= MAX_DECODED_FIELDS {
+            if out.spans.len() >= MAX_DECODED_FIELDS {
                 return Err(H2Error::CompressionError);
             }
             let b = block[offset];
@@ -813,28 +942,31 @@ impl HpackDecoder {
                 // 1. Indexed Header Field Representation: 1xxxxxxx (RFC 7541 §6.1)
                 allowed_table_size_update = false;
                 let idx = decode_integer(7, block, &mut offset)?;
-                if let Some((n, v)) = lookup_table(idx, &self.dynamic_table) {
-                    headers.push(HeaderField {
-                        name: n.to_string(),
-                        value: v.to_string(),
-                    });
-                } else {
+                let Some((n, v)) = lookup_table(idx, &self.dynamic_table) else {
                     return Err(H2Error::CompressionError);
-                }
+                };
+                let start = out.pos();
+                out.text.push_str(n);
+                let mid = out.pos();
+                out.text.push_str(v);
+                out.spans.push((start, mid, out.pos()));
             } else if (b & 0x40) != 0 {
                 // 2. Literal Header Field with Incremental Indexing: 01xxxxxx (RFC 7541 §6.2.1)
                 allowed_table_size_update = false;
                 let idx = decode_integer(6, block, &mut offset)?;
-                let name = if idx == 0 {
-                    decode_string_literal(block, &mut offset)?
+                let start = out.pos();
+                if idx == 0 {
+                    decode_string_literal_into(block, &mut offset, &mut out.text, &mut out.huff)?;
                 } else if let Some((n, _)) = lookup_table(idx, &self.dynamic_table) {
-                    n.to_string()
+                    out.text.push_str(n);
                 } else {
                     return Err(H2Error::CompressionError);
-                };
-                let value = decode_string_literal(block, &mut offset)?;
-                self.dynamic_table.insert(name.clone(), value.clone());
-                headers.push(HeaderField { name, value });
+                }
+                let mid = out.pos();
+                decode_string_literal_into(block, &mut offset, &mut out.text, &mut out.huff)?;
+                let end = out.pos();
+                self.dynamic_table.insert_copy(&out.text[start as usize..mid as usize], &out.text[mid as usize..end as usize]);
+                out.spans.push((start, mid, end));
             } else if (b & 0x20) != 0 {
                 // 5. Dynamic Table Size Update: 001xxxxx (RFC 7541 §6.3)
                 if !allowed_table_size_update {
@@ -850,19 +982,21 @@ impl HpackDecoder {
                 // 4. Literal Header Field Never Indexed:    0001xxxx (RFC 7541 §6.2.3)
                 allowed_table_size_update = false;
                 let idx = decode_integer(4, block, &mut offset)?;
-                let name = if idx == 0 {
-                    decode_string_literal(block, &mut offset)?
+                let start = out.pos();
+                if idx == 0 {
+                    decode_string_literal_into(block, &mut offset, &mut out.text, &mut out.huff)?;
                 } else if let Some((n, _)) = lookup_table(idx, &self.dynamic_table) {
-                    n.to_string()
+                    out.text.push_str(n);
                 } else {
                     return Err(H2Error::CompressionError);
-                };
-                let value = decode_string_literal(block, &mut offset)?;
-                headers.push(HeaderField { name, value });
+                }
+                let mid = out.pos();
+                decode_string_literal_into(block, &mut offset, &mut out.text, &mut out.huff)?;
+                out.spans.push((start, mid, out.pos()));
             }
         }
 
-        Ok(headers)
+        Ok(())
     }
 }
 
@@ -906,28 +1040,31 @@ impl HpackEncoder {
     #[must_use]
     pub fn encode(&mut self, headers: &[HeaderField]) -> Vec<u8> {
         let mut out = Vec::new();
-
         for h in headers {
-            if let Some((idx, exact)) = find_table_entry(&h.name, &h.value, &self.dynamic_table) {
-                if exact {
-                    // Indexed Header Field: 1xxxxxxx (7-bit prefix)
-                    encode_integer(idx, 7, 0x80, &mut out);
-                } else {
-                    // Literal with Incremental Indexing - Indexed Name: 01xxxxxx (6-bit prefix)
-                    encode_integer(idx, 6, 0x40, &mut out);
-                    encode_string_literal(&h.value, self.use_huffman, &mut out);
-                    self.dynamic_table.insert(h.name.clone(), h.value.clone());
-                }
-            } else {
-                // Literal with Incremental Indexing - New Name: 01000000
-                out.push(0x40);
-                encode_string_literal(&h.name, self.use_huffman, &mut out);
-                encode_string_literal(&h.value, self.use_huffman, &mut out);
-                self.dynamic_table.insert(h.name.clone(), h.value.clone());
-            }
+            self.encode_field(&h.name, &h.value, &mut out);
         }
-
         out
+    }
+
+    /// Appends one field to `out`, as [`Self::encode`] encodes each of its list.
+    pub fn encode_field(&mut self, name: &str, value: &str, out: &mut Vec<u8>) {
+        if let Some((idx, exact)) = find_table_entry(name, value, &self.dynamic_table) {
+            if exact {
+                // Indexed Header Field: 1xxxxxxx (7-bit prefix)
+                encode_integer(idx, 7, 0x80, out);
+            } else {
+                // Literal with Incremental Indexing - Indexed Name: 01xxxxxx (6-bit prefix)
+                encode_integer(idx, 6, 0x40, out);
+                encode_string_literal(value, self.use_huffman, out);
+                self.dynamic_table.insert_copy(name, value);
+            }
+        } else {
+            // Literal with Incremental Indexing - New Name: 01000000
+            out.push(0x40);
+            encode_string_literal(name, self.use_huffman, out);
+            encode_string_literal(value, self.use_huffman, out);
+            self.dynamic_table.insert_copy(name, value);
+        }
     }
 
     /// Encodes an iterator of `(&str, &str)` pairs.

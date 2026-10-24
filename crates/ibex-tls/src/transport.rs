@@ -29,10 +29,30 @@ pub struct RustlsTlsInfo {
     pub peer_has_cert: bool,
     /// The certificate this side presented (server side: the one the resolver picked for the
     /// `ClientHello`), for the `ssl_f_*` fetches. A shared handle: nothing is copied per connection.
-    pub local_cert: Option<std::sync::Arc<rustls::sign::CertifiedKey>>,
+    pub local_cert: Option<LocalCert>,
     /// The `ClientHello` as `tune.ssl.capture-buffer-size` keeps it (server side only); `None`
     /// when the size is 0 or the hello was too short to reach its cipher suites.
     pub capture: Option<crate::capture::SslCapture>,
+}
+
+/// The certificate a connection presented: a shared handle into its bind's resolver, from
+/// rustls 0.23 (this module's sessions) or 0.24 (TCP, [`crate::conn`]).
+#[derive(Clone, Debug)]
+pub enum LocalCert {
+    Legacy(std::sync::Arc<rustls::sign::CertifiedKey>),
+    Tcp(std::sync::Arc<rustls24::crypto::Credentials>),
+}
+
+impl LocalCert {
+    /// The DER of the leaf certificate.
+    #[must_use]
+    pub fn leaf(&self) -> Option<&[u8]> {
+        match self {
+            Self::Legacy(k) => k.cert.first().map(AsRef::as_ref),
+            // A bind's identities are X.509 (`Identity::from_cert_chain`): never a raw key.
+            Self::Tcp(c) => if let rustls24::crypto::Identity::X509(x) = &*c.identity { Some(x.end_entity.as_ref()) } else { None },
+        }
+    }
 }
 
 impl Default for RustlsTlsInfo {

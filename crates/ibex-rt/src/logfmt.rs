@@ -671,6 +671,16 @@ impl LogFormat {
         out.0
     }
 
+    /// Renders the line into a buffer of the thread's that an earlier line was sent from
+    /// ([`recycle_line`]), so that a line costs no allocation once the buffers have grown
+    /// to the lines' size (T437).
+    #[must_use]
+    pub fn render_line(&self, d: &LogData, registry: &Registry, ctx: &SampleContext) -> Vec<u8> {
+        let mut buf = LINE_SPARE.with(|s| s.borrow_mut().pop()).unwrap_or_else(|| Vec::with_capacity(160));
+        self.render_append(&mut buf, d, registry, ctx);
+        buf
+    }
+
     /// Renders the line after what `buf` holds: a `log-format-sd` and its line share one
     /// buffer.
     pub fn render_append(&self, buf: &mut Vec<u8>, d: &LogData, registry: &Registry, ctx: &SampleContext) {
@@ -751,13 +761,17 @@ impl LogFormat {
                     Some(Sample::Str(v)) if !log && v.is_empty() && !o.quote && !o.encoded() => {}
                     Some(Sample::Bin(v)) if !log && v.is_empty() && !o.quote && !o.encoded() => {}
                     Some(s) if self.http && !o.encoded() => {
-                        let mut plain = Out(Vec::new());
-                        sample(&mut plain, &s, o, Cast::Same, !e.converters.is_empty());
-                        for &c in &plain.0 {
-                            if crate::engine::http_encoded(c) {
-                                let _ = write!(out, "%{c:02X}");
-                            } else {
-                                out.0.push(c);
+                        // Written in place, then escaped: a copy only when a byte needs it.
+                        let start = out.0.len();
+                        sample(out, &s, o, Cast::Same, !e.converters.is_empty());
+                        if out.0[start..].iter().any(|&c| crate::engine::http_encoded(c)) {
+                            let plain = out.0.split_off(start);
+                            for &c in &plain {
+                                if crate::engine::http_encoded(c) {
+                                    let _ = write!(out, "%{c:02X}");
+                                } else {
+                                    out.0.push(c);
+                                }
                             }
                         }
                     }
@@ -1158,13 +1172,31 @@ fn path_only(target: &str) -> &str {
     }
 }
 
+/// Line buffers sent, kept per thread for the next lines: at most this many.
+const SPARE_LINES: usize = 64;
+
+thread_local! {
+    static LINE_SPARE: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A line [`LogFormat::render_line`] rendered has been sent: its buffer is the next line's.
+pub fn recycle_line(mut line: Vec<u8>) {
+    line.clear();
+    LINE_SPARE.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.len() < SPARE_LINES {
+            s.push(line);
+        }
+    });
+}
+
 #[allow(clippy::too_many_lines)]
 fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
     let int = |out: &mut Out, v: i64| {
         let _ = write!(out, "{v}");
     };
     let t_request = d.t_request;
-    let badreq = || "<BADREQ>".to_string();
+    let badreq = "<BADREQ>";
     if d.plus && matches!(a, Alias::Bytes | Alias::TActive | Alias::TTotal | Alias::TUser) {
         out.push('+');
     }
@@ -1249,8 +1281,18 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
         Alias::Backend => text(out, Some(d.backend), o),
         Alias::Frontend => text(out, Some(d.frontend), o),
         Alias::FrontendXprt => {
-            let name = if d.frontend_ssl { format!("{}~", d.frontend) } else { d.frontend.to_string() };
-            text(out, Some(&name), o);
+            // `name~` for a TLS frontend, on the stack when it fits.
+            let mut stack = [0u8; 128];
+            let n = d.frontend.len();
+            if !d.frontend_ssl {
+                text(out, Some(d.frontend), o);
+            } else if n < stack.len() {
+                stack[..n].copy_from_slice(d.frontend.as_bytes());
+                stack[n] = b'~';
+                text(out, Some(&stack[..=n]), o);
+            } else {
+                text(out, Some(&format!("{}~", d.frontend)), o);
+            }
         }
         Alias::Server => text(out, Some(d.server.unwrap_or("<NOSRV>")), o),
         Alias::ClientIp => ip(out, d.client, o),
@@ -1303,23 +1345,23 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
         Alias::Req => encoded(out, d.request_line.unwrap_or("<BADREQ>").as_bytes(), url_escaped, o),
         Alias::HttpMethod | Alias::HttpUri | Alias::HttpPath | Alias::HttpPathOnly | Alias::HttpVersion => {
             let value = match d.request_line.and_then(line_parts) {
-                None => badreq(),
+                None => badreq,
                 Some((m, t, v)) => match a {
-                    Alias::HttpMethod => m.to_string(),
-                    Alias::HttpUri => t.to_string(),
-                    Alias::HttpPath => t.split('?').next().unwrap_or("").to_string(),
-                    Alias::HttpPathOnly => path_only(t).split('?').next().unwrap_or("").to_string(),
-                    _ => v.to_string(),
+                    Alias::HttpMethod => m,
+                    Alias::HttpUri => t,
+                    Alias::HttpPath => t.split('?').next().unwrap_or(""),
+                    Alias::HttpPathOnly => path_only(t).split('?').next().unwrap_or(""),
+                    _ => v,
                 },
             };
             encoded(out, value.as_bytes(), url_escaped, o);
         }
         Alias::HttpQuery => {
             let value = match d.request_line {
-                None => badreq(),
+                None => badreq,
                 Some(line) => {
                     let q = line.find('?').map_or("", |p| &line[p..]);
-                    q.split([' ', '\t']).next().unwrap_or("").to_string()
+                    q.split([' ', '\t']).next().unwrap_or("")
                 }
             };
             encoded(out, value.as_bytes(), url_escaped, o);
