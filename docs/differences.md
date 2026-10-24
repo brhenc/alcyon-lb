@@ -305,6 +305,30 @@ bytes; `-dM` poisoning is a debug option) and refuses the keyword as unknown. It
 written through `Buf::writable()` and never committed are not tracked, and buffers owned by rustls
 itself are not Ibex's to overwrite.
 
+## `tune.ibex.crypto-provider ring|ring-ibex` and `show ssl crypto-provider`: Ibex-only (T460)
+
+The rustls crypto provider every TCP TLS configuration is built on: binds, server lines and
+their health checks, TLS 1.2 and 1.3. `ring` (the default) is upstream ring through
+`rustls-ring`; `ring-ibex` is the vendored ring fork that wipes key material when it is freed
+(`vendor/ringibex`, built with its `zeroize` feature on; what it wipes: `vendor/ringibex/ZEROIZE.md`,
+`tradeoff.md` 6.27). Exactly one argument, `ring` or `ring-ibex`; anything else is a configuration
+error. HAProxy refuses the keyword as unknown.
+
+QUIC, the TLS binds of a `log-forward` section and the TLS servers of a `ring` section are still on
+rustls 0.23, which only vanilla ring serves: `ring-ibex` with any of them is refused at startup
+(and by `-c`), naming the line, rather than letting that part run on vanilla ring unsaid.
+
+`show ssl crypto-provider` (CLI, admin level) prints the provider new handshakes use and the
+handshakes completed on each provider since start, front and back:
+
+    current ring
+    provider ring handshakes 12
+    provider ring-ibex handshakes 0
+
+HAProxy's `ssl-provider`, `ssl-provider-path` and `ssl-propquery` load OpenSSL 3 providers
+(additively, `configuration.txt` "ssl-provider"), which is not this: they stay refused as
+OpenSSL-only (table above).
+
 ## `ibex.watchdog-warn-only`: an Ibex-only global keyword (T361)
 
 HAProxy's watchdog warns about a thread that has stopped processing traffic and, once it has been stuck for a

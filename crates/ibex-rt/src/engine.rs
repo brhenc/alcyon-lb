@@ -3397,6 +3397,7 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
 /// named.
 pub fn validate_tls(config: &Config) -> io::Result<()> {
     crate::logfwd::check_debug_sinks(config)?;
+    crate::crypto_provider::apply(config)?;
     for fe in &config.frontends {
         if fe.disabled {
             continue;
@@ -4274,6 +4275,8 @@ impl Engine {
     /// ([`crate::rule_exprs::validate_rule_exprs`]).
     #[allow(clippy::too_many_lines)]
     pub fn build_shared_state(config: &Config) -> io::Result<Proxies> {
+    // T460: before any TLS configuration (server lines here, binds in `new_worker`) is built.
+    crate::crypto_provider::apply(config)?;
     // Expressions and ACL files compiled for a previous configuration are not reused.
     ibex_sample::expr::new_generation();
     // The clock of `lastchg` and `lastsess` (`show stat`) starts with the proxies.

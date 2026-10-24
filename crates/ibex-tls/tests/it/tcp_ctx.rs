@@ -536,7 +536,7 @@ fn a_bind_without_a_ticketer_resumes_from_its_session_store_once_per_ticket() {
     let mut cfg = (*b.config).clone();
     cfg.ticketer = None;
     let cfg = Arc::new(cfg);
-    let b = Arc::new(BindTls { config: Arc::clone(&cfg), no_alpn: cfg, resolver: Arc::clone(&b.resolver) });
+    let b = Arc::new(BindTls { config: Arc::clone(&cfg), no_alpn: cfg, resolver: Arc::clone(&b.resolver), provider: b.provider });
     let ca = tmp("ca3.pem", &id.pem);
     let opts = BackendTlsOptions { verify_required: true, ca_file: Some(ca.clone()), ..Default::default() };
     let client = build_backend_client_config(&opts).expect("cfg");

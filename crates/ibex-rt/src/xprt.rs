@@ -181,6 +181,9 @@ pub struct TlsConn {
     rx: TlsRx,
     /// T320: this connection in `CurrSslConns` and `CumSslConns` while it exists.
     _counted: crate::stats::SslConnCount,
+    /// T460: the crypto provider of the configuration this connection started with, whose
+    /// handshake count (`show ssl crypto-provider`) it adds to once complete.
+    provider: ibex_tls::TlsCryptoProvider,
     /// The socket hit EOF while the TLS stream was still open.
     ///
     /// This is a truncation attack unless `close_notify` arrived first: an attacker who
@@ -227,11 +230,12 @@ pub struct TlsConn {
 
 impl TlsConn {
     #[must_use]
-    fn new(ctx: TlsCtx) -> Self {
+    fn new(ctx: TlsCtx, provider: ibex_tls::TlsCryptoProvider) -> Self {
         Self {
             ctx,
             rx: TlsRx { buf: Buf::standard(), eof: false, closed: false },
             _counted: crate::stats::SslConnCount::new(),
+            provider,
             truncated: false,
             failed: false,
             fail: None,
@@ -496,6 +500,8 @@ impl TlsConn {
         let open = self.fill_handshake(fd)?;
         self.flush(fd)?;
         if self.ctx.handshake_done {
+            // Once: `handshake` returns before this step from now on.
+            ibex_tls::provider::count_handshake(self.provider);
             return Ok(true);
         }
         if !open {
@@ -818,10 +824,11 @@ pub fn accept_tls(fd: &impl AsRawFd, config: std::sync::Arc<ibex_tls::tcp::BindT
 #[must_use]
 pub fn accept_tls_capturing(fd: &impl AsRawFd, config: std::sync::Arc<ibex_tls::tcp::BindTls>, capture_size: usize, ja4_spec: bool) -> ClientXprt {
     let _ = fd.as_raw_fd();
+    let provider = config.provider;
     let mut ctx = TlsCtx::accept(config);
     ctx.enable_capture(capture_size);
     ctx.set_ja4_spec(ja4_spec);
-    ClientXprt::Tls(Box::new(TlsConn::new(ctx)))
+    ClientXprt::Tls(Box::new(TlsConn::new(ctx, provider)))
 }
 
 #[cfg(test)]
@@ -1025,12 +1032,24 @@ pub fn connect_tls(
     config: std::sync::Arc<rustls24::ClientConfig>,
     server_name: rustls24::pki_types::ServerName<'static>,
 ) -> ServerXprt {
+    connect_tls_on(fd, config, server_name, ibex_tls::provider::active())
+}
+
+/// [`connect_tls`] for a `config` built on `provider`, which its handshake is counted under.
+#[must_use]
+#[allow(clippy::needless_pass_by_value)] // as `connect_tls`
+pub fn connect_tls_on(
+    fd: &impl AsRawFd,
+    config: std::sync::Arc<rustls24::ClientConfig>,
+    server_name: rustls24::pki_types::ServerName<'static>,
+    provider: ibex_tls::TlsCryptoProvider,
+) -> ServerXprt {
     let _ = fd.as_raw_fd();
     let sni_str = match &server_name {
         rustls24::pki_types::ServerName::DnsName(dns) if config.enable_sni => Some(dns.as_ref().to_string()),
         _ => None,
     };
-    let mut tls = TlsConn::new(TlsCtx::connect(&config, server_name, sni_str));
+    let mut tls = TlsConn::new(TlsCtx::connect(&config, server_name, sni_str), provider);
     tls.failed = tls.ctx.session.is_none();
     ServerXprt::Tls(Box::new(tls))
 }

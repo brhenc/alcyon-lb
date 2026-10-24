@@ -279,6 +279,20 @@ pub(crate) fn parse_global_directive(
             });
             Ok(())
         }
+        "tune.ibex.crypto-provider" => {
+            const WANT: &str = "'tune.ibex.crypto-provider' expects 'ring' or 'ring-ibex'";
+            let Some(arg) = tokens.get(1) else {
+                return Err(ConfigError::new(kw.line, kw.col, format!("{WANT}.")));
+            };
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'tune.ibex.crypto-provider' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            let Some(p) = crate::ast::TlsCryptoProvider::from_name(&arg.text) else {
+                return Err(ConfigError::new(arg.line, arg.col, format!("{WANT}, got '{}'.", arg.text)));
+            };
+            global.crypto_provider = Some(p);
+            Ok(())
+        }
         "tune.maxrewrite" => {
             if tokens.len() < 2 {
                 return Err(ConfigError::new(kw.line, kw.col, "'tune.maxrewrite' expects an integer argument."));

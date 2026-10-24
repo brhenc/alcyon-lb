@@ -26,6 +26,7 @@ mod acl_bin_patterns;
 mod acl_conditions;
 mod acl_match_type;
 mod acl_multivalue_converter_failure;
+mod crypto_provider;
 mod return_header_spaces;
 mod prometheus_exporter;
 mod acl_keyword_families;

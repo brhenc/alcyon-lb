@@ -36,6 +36,8 @@ struct Configs {
     with_sni: Arc<ClientConfig>,
     without_sni: Arc<ClientConfig>,
     verifyhost: Option<String>,
+    /// The crypto provider both run on (T460), counted when a handshake completes.
+    provider: ibex_tls::TlsCryptoProvider,
 }
 
 impl Configs {
@@ -51,7 +53,8 @@ impl Configs {
             max_ver: ssl.max_ver,
             no_reuse: ssl.no_reuse,
         };
-        let with_sni = ibex_tls::tcp::build_backend_client_config(&opts)
+        let provider = ibex_tls::provider::active();
+        let with_sni = ibex_tls::tcp::build_backend_client_config_with(&opts, provider)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{who} : {e}")))?;
         let mut without = (*with_sni).clone();
         without.enable_sni = false;
@@ -59,6 +62,7 @@ impl Configs {
             with_sni,
             without_sni: Arc::new(without),
             verifyhost: ssl.verifyhost.clone(),
+            provider,
         })
     }
 
@@ -67,12 +71,12 @@ impl Configs {
     fn connect(&self, fd: &impl AsRawFd, sni: Option<&str>, server_ip: IpAddr) -> ServerXprt {
         let dns = |name: &str| ServerName::try_from(name.to_string()).ok().filter(|n| matches!(n, ServerName::DnsName(_)));
         if let Some(name) = sni.filter(|s| !s.is_empty()).and_then(dns) {
-            return xprt::connect_tls(fd, Arc::clone(&self.with_sni), name);
+            return xprt::connect_tls_on(fd, Arc::clone(&self.with_sni), name, self.provider);
         }
         if let Some(name) = self.verifyhost.as_deref().and_then(dns) {
-            return xprt::connect_tls(fd, Arc::clone(&self.without_sni), name);
+            return xprt::connect_tls_on(fd, Arc::clone(&self.without_sni), name, self.provider);
         }
-        xprt::connect_tls(fd, Arc::clone(&self.without_sni), ServerName::IpAddress(server_ip.into()))
+        xprt::connect_tls_on(fd, Arc::clone(&self.without_sni), ServerName::IpAddress(server_ip.into()), self.provider)
     }
 }
 

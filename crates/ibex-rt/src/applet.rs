@@ -677,6 +677,14 @@ impl CliApplet {
             self.handle_show_stat(cmd, ctx);
         } else if cmd == "show table" || cmd.starts_with("show table ") {
             self.handle_show_table(cmd, ctx);
+        } else if cmd == "show ssl crypto-provider" {
+            // T460 (Ibex-only): the provider and the handshakes of each.
+            self.out_buf.extend_from_slice(crate::crypto_provider::show().as_bytes());
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"> ");
+            } else {
+                self.is_done = true;
+            }
         } else if cmd == "show pools" || cmd.starts_with("show pools ") {
             let args: Vec<&str> = cmd["show pools".len()..].split_whitespace().collect();
             // The answer ends with the empty line already, also when it is the error.

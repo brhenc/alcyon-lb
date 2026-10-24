@@ -641,7 +641,7 @@ without an answer, logged with termination state `I` and its phase, and counted 
 | **Requires** | `panic = "unwind"`: `crash.rs` has `#[cfg(panic = "abort")] compile_error!`, so no profile, PGO build or `RUSTFLAGS` can turn it off silently. |
 | **Revisit if** | A panic is seen to recur on every request of some input (a contained panic per request is a slow DoS: fix the panic, which the alert names), or h2 needs per-stream containment (`RST_STREAM INTERNAL_ERROR` instead of closing the connection). |
 
-### 6.27 ring does not zeroize key material — **found 2026-10-24; open, a target for a patch later**
+### 6.27 ring does not zeroize key material — **found 2026-10-24; `ring-ibex` opt-in since T460**
 
 | | |
 |---|---|
@@ -651,4 +651,4 @@ without an answer, logged with termination state `I` and its phase, and counted 
 | **Cost** | A memory disclosure (a core dump, a swapped page, a later read of freed memory by another bug) can expose keys that OpenSSL would have wiped. Rust's memory safety makes the "later read" path much less likely than in C, but core dumps and swap remain. |
 | **Mitigations today** | Disable core dumps for the service (`LimitCORE=0`), no swap or encrypted swap. These are ops settings, not Ibex code. |
 | **Plan** | Patch ring (or the rustls provider) to zeroize key material on drop: the ECDH/X25519 private and shared values, the AEAD key schedules, the RSA/ECDSA private keys. Ask upstream first whether such a patch would be taken; otherwise carry it as a vendored patch, or evaluate another memory-safe provider that wipes. aws-lc-rs stays excluded (C, see the memory-safety rule). |
-| **Status** | Open. Not started. |
+| **Status** | A choice since T460: `tune.ibex.crypto-provider ring-ibex` runs TLS over TCP on the vendored fork (`vendor/ringibex`, feature `zeroize`; ring-ibex 237a254). It wipes the ephemeral and shared ECDH/X25519 secrets, the AES/ChaCha/GHASH/Poly1305 key schedules, the HMAC/HKDF and digest states, the Ed25519 key pair, the ECDSA seed and the RSA private primes and exponents (inventory: `vendor/ringibex/ZEROIZE.md`). Not wiped even there: stack copies left by moves, registers, asm temporaries, the ECDSA per-signature nonce, the affine coordinates of the ECDH point (TODO in ZEROIZE.md). `ring` (vanilla upstream) wipes none of it and stays the **default**: operators are right to be wary of a forked crypto library, and an upstream ring fix reaches Ibex by a `cargo update`, a fork fix only by our re-vendoring. QUIC, log-forward TLS binds and ring TLS servers are on rustls 0.23 and refuse `ring-ibex`, so they keep vanilla ring's behaviour. |
