@@ -18,22 +18,21 @@ use crate::raw;
 use crate::txn::{self, HttpTxn, MsgState};
 use ibex_proto::endpoint::ScState;
 use ibex_proto::htx::HtxBlock;
-use ibex_proto::mux_h2::H2MuxContext;
+use ibex_proto::mux_h2::{H2MuxContext, H2ReqHead};
 use std::os::fd::AsFd;
 
 /// A stream taken from the mux to be served: everything its transaction starts from.
 pub struct H2Dispatch {
     pub stream: H2ActiveStream,
     /// The request head as HTTP/1.1, as the client sent it (without the
-    /// `transfer-encoding: chunked` a request with no length goes out with).
-    pub head: Vec<u8>,
+    /// `transfer-encoding: chunked` a request with no length goes out with), with its start
+    /// line and headers: memory of the connection's, given back once the transaction has
+    /// started ([`start_request`], T437).
+    pub head: Box<H2ReqHead>,
     /// What `%U` counts of the head.
     pub req_htx: u64,
     /// The line `%r` prints, when the frontend keeps it.
     pub request_line: Option<String>,
-    pub method: Option<String>,
-    pub uri: Option<String>,
-    pub headers: Vec<(String, String)>,
     /// A request `HAProxy` answers 400 without contacting a server
     /// ([`ibex_proto::H2StreamCtx::bad_request`]).
     pub bad_request: bool,
@@ -56,23 +55,18 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
     // come (`pump_request_body`): with the length the client gave, else chunked, as
     // `HAProxy` writes it.
     let has_data = stream.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Data(_) | HtxBlock::RawData(_) | HtxBlock::Trailer(_)));
-    let chunked = stream.rx_htx.get_header("content-length").is_none() && (has_data || !stream.rx_htx.is_eom());
+    let chunked = stream.request_header("content-length").is_none() && (has_data || !stream.rx_htx.is_eom());
     let first_body = stream.rx_htx.blocks().iter().position(|b| matches!(b, HtxBlock::Eoh)).map_or(stream.rx_htx.blocks().len(), |i| i + 1);
+    // The head as the mux wrote it (T437); the stream keeps none past this.
+    let head = stream.req_head.take()?;
     // `%U`, and the line `%r` prints, are those of the message the client sent:
     // `transfer-encoding: chunked` is added on output only, so the rules do not see it
     // either (only the forwarded head has it). The chunked end the forwarded body is
     // counted with (+1 when it is consumed) is not in `HAProxy`'s message unless trailers
     // precede it.
-    let req_htx = h2_head_size(&stream.rx_htx, stream.abs_prefix.as_deref()).saturating_sub(u64::from(chunked));
-    let request_line = if keep_request_line {
-        stream.rx_htx.req_line().map(|r| format!("{} {}{} HTTP/2.0", r.method.as_str(), stream.abs_prefix.as_deref().unwrap_or(""), r.uri))
-    } else {
-        None
-    };
-    let mut head = stream.rx_htx.to_h1_wire();
-    if let Some((h, e)) = find_eoh(&head) {
-        head.truncate(h + e);
-    }
+    let req_htx = h2_head_size(&head).saturating_sub(u64::from(chunked));
+    let request_line = (keep_request_line && head.has_line)
+        .then(|| format!("{} {}{} HTTP/2.0", head.method(), head.abs_prefix().unwrap_or(""), head.uri()));
     Some(H2Dispatch {
         stream: H2ActiveStream {
             id: stream_id,
@@ -82,9 +76,6 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
         head,
         req_htx,
         request_line,
-        method: stream.rx_htx.req_line().map(|r| r.method.as_str().to_string()),
-        uri: stream.rx_htx.req_line().map(|r| r.uri.clone()),
-        headers: stream.rx_htx.headers().map(|h| (h.name.clone(), h.value.clone())).collect(),
         bad_request: stream.bad_request,
     })
 }
@@ -101,37 +92,39 @@ pub fn chunked_head(head: &[u8], at: usize) -> Vec<u8> {
 
 /// The start of a stream's transaction in the session that serves it, a child of the
 /// connection's owner (T280): its head in `req` (and parsed, for the rules), the request's
-/// log fields, and the transaction.
-pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) {
+/// log fields, and the transaction. The head's memory is given back, for the connection's
+/// next streams ([`H2MuxContext::give_back_head`]).
+pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     let chunked = d.stream.chunk_out;
     if let Some(c) = sess.h2_child_mut() {
         c.stream = d.stream;
     }
     if sess.keep_request_line {
-        sess.log.request_line = d.request_line;
+        sess.log.request_line.set_opt(d.request_line.as_deref());
     }
     sess.log.request = Some(crate::txnlog::loop_now());
+    let head = d.head.wire();
     let wire_req_buf: Vec<u8>;
     let wire_req: &[u8] = if chunked {
-        let at = find_eoh(&d.head).map_or(d.head.len(), |(h, _)| h);
-        wire_req_buf = chunked_head(&d.head, at);
+        let at = find_eoh(head).map_or(head.len(), |(h, _)| h);
+        wire_req_buf = chunked_head(head, at);
         &wire_req_buf
     } else {
-        &d.head
+        head
     };
-    // The built-in HTTP/1 parser (`parser::build(ParserKind::H1)`, which cannot fail).
-    let mut p_stream = ibex_proto::parser::HttpParser::stream(&ibex_proto::parser::H1, false);
+    // The built-in HTTP/1 parser (what `parser::build(ParserKind::H1)` boxes), on the stack.
+    let mut p_stream = ibex_proto::H1Parser::new(false);
     // A head of a few hundred bytes takes a small buffer, not a pooled 16 KB one that a held
     // stream would keep for its whole life (T312; `HAProxy` holds no buffer for one). A
     // rewrite that needs more makes room (`htx_reserve`), as for any HTX.
-    let lines = d.head.iter().filter(|&&b| b == b'\n').count();
-    let need = d.head.len() + 64 + ibex_proto::htx::HTX_DESC_SIZE * (lines + 3);
+    let lines = head.iter().filter(|&&b| b == b'\n').count();
+    let need = head.len() + 64 + ibex_proto::htx::HTX_DESC_SIZE * (lines + 3);
     if need * 2 <= crate::buf::get_bufsize_small() && sess.htx_buf.raw_slice().is_empty() {
         sess.htx_buf = Buf::unallocated(crate::buf::BufClass::Small);
     }
     let raw = sess.htx_buf.htx_slice_mut();
     let mut slice = ibex_proto::htx::HtxSlice::new(raw);
-    let parsed = p_stream.parse(&d.head, &mut slice).is_ok();
+    let parsed = p_stream.parse(head, &mut slice).is_ok();
     let (tail, blocks) = (slice.tail_addr(), slice.num_blocks());
     // What a refused head wrote is zeroed on release like the rest (`tune.ibex.zero-buffers`).
     sess.htx_buf.note_htx(tail, blocks * ibex_proto::htx::HTX_DESC_SIZE);
@@ -141,9 +134,13 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) {
         sess.has_htx = true;
         sess.htx_modified = false;
     }
-    sess.req_method.set_opt(d.method.as_deref());
-    sess.req_uri.set_opt(d.uri.as_deref());
-    sess.req_headers = Some(d.headers);
+    let line = d.head.has_line;
+    sess.req_method.set_opt(line.then(|| d.head.method()));
+    sess.req_uri.set_opt(line.then(|| d.head.uri()));
+    // The list the samples read once the HTX is let go, in the memory of the session's
+    // (or, for a new stream, its connection's) previous list.
+    let hdrs = sess.req_headers.get_or_insert_with(Vec::new);
+    copy_headers(hdrs, d.head.headers());
     sess.req.clear();
     // The head waits here for a server connection (a stream held in the queue, or whose body
     // never comes, keeps it): a small buffer for a small head, which grows with the body.
@@ -162,6 +159,24 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) {
     if d.bad_request {
         sess.fail_request(400);
     }
+    d.head
+}
+
+/// `hdrs` as a copy of `from`, the `String`s it has reused (T437).
+fn copy_headers<'a>(hdrs: &mut Vec<(String, String)>, from: impl Iterator<Item = (&'a str, &'a str)>) {
+    let mut n = 0;
+    for (k, v) in from {
+        if let Some((hk, hv)) = hdrs.get_mut(n) {
+            hk.clear();
+            hk.push_str(k);
+            hv.clear();
+            hv.push_str(v);
+        } else {
+            hdrs.push((k.to_string(), v.to_string()));
+        }
+        n += 1;
+    }
+    hdrs.truncate(n);
 }
 
 /// The DATA frames of a stream being served that have come since: moved into `req` as far
@@ -237,7 +252,9 @@ pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn
         txn.rsp = MsgState::Done;
         return false;
     }
-    let mut out = Vec::new();
+    // Staged in the connection's buffer, kept from one response to the next (T437).
+    let mut out = std::mem::take(&mut h2.body_scratch);
+    out.clear();
     let mut state = txn.rsp;
     let used = state.take_body(data, h2.data_budget(stream_id), &mut out);
     let end = state.is_done();
@@ -248,6 +265,10 @@ pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn
     }
     if !out.is_empty() || end {
         h2.send_data(stream_id, &out, end);
+    }
+    // Not past one frame's worth (and less once the connection is idle, `trim_idle`).
+    if out.capacity() <= 16384 {
+        h2.body_scratch = out;
     }
     if used > 0 || end {
         txn.rsp = state;
@@ -344,13 +365,9 @@ pub fn abort_on_client_left(sess: &mut TcpSession) -> bool {
 /// What `%U` counts of an HTTP/2 request's head (`HAProxy`'s HTX: 20 bytes for the start
 /// line, its three strings -- the target is `scheme://authority` and the path when the
 /// request had both -- and each header's name and value, then the end of the headers).
-fn h2_head_size(msg: &ibex_proto::htx::Htx, abs_prefix: Option<&str>) -> u64 {
-    let Some(r) = msg.req_line() else { return 0 };
-    let mut size = 20 + (r.method.as_str().len() + abs_prefix.map_or(0, str::len) + r.uri.len() + "HTTP/2.0".len()) as u64 + 1;
-    for h in msg.headers() {
-        size += (h.name.len() + h.value.len()) as u64;
-    }
-    size
+fn h2_head_size(head: &H2ReqHead) -> u64 {
+    // Every head dispatched has a start line: one without `:method` is reset (T437).
+    20 + (head.method().len() + head.abs_prefix().map_or(0, str::len) + head.uri().len() + "HTTP/2.0".len()) as u64 + 1 + head.field_bytes as u64
 }
 
 /// Writes what has come of an HTTP/2 request's body into `req`, as much as there is room
@@ -483,12 +500,9 @@ mod tests {
     fn dispatch(head: &[u8]) -> H2Dispatch {
         H2Dispatch {
             stream: H2ActiveStream { id: 1, body: H2ReqBody::default(), chunk_out: false },
-            head: head.to_vec(),
+            head: Box::new(H2ReqHead::from_wire(std::str::from_utf8(head).expect("text"))),
             req_htx: 7,
             request_line: None,
-            method: None,
-            uri: None,
-            headers: Vec::new(),
             bad_request: false,
         }
     }

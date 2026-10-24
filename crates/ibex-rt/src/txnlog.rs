@@ -49,8 +49,9 @@ pub struct StreamLog {
     /// loggers (`http_process_res_common` logs it at level alert before the stream's line).
     pub checkcache_blocked: bool,
     /// The request line as received, for `%r` and `%HU`..; set only for a request that
-    /// parsed (`txn->uri`), so a refused one logs `<BADREQ>`.
-    pub request_line: Option<String>,
+    /// parsed (`txn->uri`), so a refused one logs `<BADREQ>`. Its buffer is kept from one
+    /// stream of a connection to the next ([`StreamLog::restart`], T437).
+    pub request_line: crate::proxy::ReqText,
     /// Header capture slots: request (`capture request header`, `http-request capture`)
     /// and response.
     pub req_captures: Vec<Option<Vec<u8>>>,
@@ -80,6 +81,49 @@ pub struct StreamLog {
     pub be_queue: u64,
     /// `option logasap`: the line went out with the response head; none follows.
     pub asap_done: bool,
+}
+
+/// Capture buffers let go of, at most this many kept per thread for the next captures.
+const SPARE_CAPTURES: usize = 64;
+
+thread_local! {
+    /// The buffers of capture values that ended with their stream, for the next ones (T437):
+    /// a capture of a kept-alive request reuses one instead of allocating.
+    static CAPTURE_SPARE: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Puts `v` in the capture slot `slot`, in the memory it holds already or in a spare buffer.
+pub fn set_capture(slot: &mut Option<Vec<u8>>, v: &[u8]) {
+    let buf = slot.get_or_insert_with(|| CAPTURE_SPARE.with(|s| s.borrow_mut().pop()).unwrap_or_default());
+    buf.clear();
+    buf.extend_from_slice(v);
+}
+
+/// Empties the capture slot `slot`, its buffer kept for a later capture.
+pub fn clear_capture(slot: &mut Option<Vec<u8>>) {
+    if let Some(mut b) = slot.take() {
+        b.clear();
+        CAPTURE_SPARE.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.len() < SPARE_CAPTURES {
+                s.push(b);
+            }
+        });
+    }
+}
+
+/// Empties every slot of `caps` and the list itself (its capacity kept).
+pub fn release_captures(caps: &mut Vec<Option<Vec<u8>>>) {
+    for c in caps.iter_mut() {
+        clear_capture(c);
+    }
+    caps.clear();
+}
+
+/// `caps` as `n` empty slots, from the memory it and its values hold.
+pub fn reset_captures(caps: &mut Vec<Option<Vec<u8>>>, n: usize) {
+    release_captures(caps);
+    caps.resize(n, None);
 }
 
 /// A server index as `StreamLog::server` holds it (index + 1); `None` past `u32::MAX - 1`.
@@ -123,7 +167,7 @@ impl StreamLog {
             bytes_out_at_start: bytes_out,
             bytes_from_server: 0,
             checkcache_blocked: false,
-            request_line: None,
+            request_line: crate::proxy::ReqText::default(),
             req_captures: Vec::new(),
             res_captures: Vec::new(),
             unique_id: None,
@@ -138,6 +182,22 @@ impl StreamLog {
             asap_done: false,
             be_queue: 0,
         }
+    }
+
+    /// The next stream of the connection starts now: as [`StreamLog::start`], but the
+    /// buffers of the one that ended (the request line, the capture slots) are kept for it,
+    /// emptied, so that a kept-alive request does not allocate them again (T437).
+    pub fn restart(&mut self, bytes_in: u64, bytes_out: u64) {
+        let mut request_line = std::mem::take(&mut self.request_line);
+        request_line.reset();
+        let mut request_slots = std::mem::take(&mut self.req_captures);
+        release_captures(&mut request_slots);
+        let mut response_slots = std::mem::take(&mut self.res_captures);
+        release_captures(&mut response_slots);
+        *self = StreamLog::start(bytes_in, bytes_out);
+        self.request_line = request_line;
+        self.req_captures = request_slots;
+        self.res_captures = response_slots;
     }
 
     /// Milliseconds from the stream's start to `t`, -1 if it never happened.
