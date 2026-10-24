@@ -265,6 +265,19 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        "tune.memory.hot-size" => {
+            // `mem_parse_global_hot_size` (src/pool.c): `too_many_args(1)`, then `atol` must be > 0.
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'tune.memory.hot-size' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            let n = tokens.get(1).map_or(0, |t| super::server_keywords::atol(&t.text));
+            if n <= 0 {
+                let at = tokens.get(1).unwrap_or(kw);
+                return Err(ConfigError::new(at.line, at.col, "'tune.memory.hot-size' expects a strictly positive value."));
+            }
+            global.hot_size = Some(usize::try_from(n).unwrap_or(usize::MAX));
+            Ok(())
+        }
         "tune.ibex.zero-buffers" => {
             let Some(arg) = tokens.get(1) else {
                 return Err(ConfigError::new(kw.line, kw.col, "'tune.ibex.zero-buffers' expects 'on' or 'off'."));

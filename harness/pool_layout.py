@@ -26,13 +26,6 @@ PATTERNS = ("RefCell<Vec<", "RefCell<VecDeque<", "Cell<Option<Vec<", "Cell<Optio
 
 # (file under the repo root, static name) -> slice that removes it
 ALLOWLIST: dict[tuple[str, str], str] = {
-    # design 2.1: spare strings, scratch strings/bytes and header lists
-    ("crates/ibex-sample/src/spare.rs", "SPARE"): "S1",
-    ("crates/ibex-rt/src/reuse.rs", "STR_SLOT"): "S1",
-    ("crates/ibex-rt/src/reuse.rs", "STR_SLOT2"): "S1",
-    ("crates/ibex-rt/src/reuse.rs", "BYTES_SLOT"): "S1",
-    ("crates/ibex-rt/src/reuse.rs", "BYTES_SLOT2"): "S1",
-    ("crates/ibex-rt/src/reuse.rs", "SPARE_LISTS"): "S1",
     # design 2.1: log lines, captures, variable stores, check runs, stats rows, scrape boxes,
     # queue waits
     ("crates/ibex-rt/src/logfmt.rs", "LINE_SPARE"): "S3",

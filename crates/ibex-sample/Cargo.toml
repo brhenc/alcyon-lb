@@ -7,6 +7,7 @@ description = "Ibex Sample / Converter / Matcher lattice (design/007-sample-latt
 autotests = false
 
 [dependencies]
+ibex-alloc = { workspace = true }
 ibex-crypt = { path = "../ibex-crypt" }
 ibex-proto = { path = "../ibex-proto" }
 ibex-tls = { path = "../ibex-tls" }

@@ -158,3 +158,9 @@ path = "tests/stats_auth_userlists.rs"
 [[test]]
 name = "zero_buffers"
 path = "tests/zero_buffers.rs"
+
+# Own process: sets the process-wide tune.memory.hot-size and tune.ibex.zero-buffers, and
+# installs a #[global_allocator] that sees what a freed spare string left in memory
+[[test]]
+name = "spare_strings"
+path = "tests/spare_strings.rs"

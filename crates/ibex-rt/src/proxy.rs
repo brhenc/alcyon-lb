@@ -490,9 +490,13 @@ impl ReqText {
         self.set.then_some(self.buf.as_str())
     }
 
-    /// Replaces the text with `s`, reusing the buffer (grown to fit, not doubled: a new
-    /// connection's first request allocates what `to_owned` did).
+    /// Replaces the text with `s`, reusing the buffer (grown to fit, not doubled). A new
+    /// connection's first request takes a spare string (as fix/t444), the one an earlier
+    /// session gave back when it ended, rather than allocating.
     pub fn set(&mut self, s: &str) {
+        if self.buf.capacity() == 0 {
+            self.buf = crate::reuse::string();
+        }
         self.buf.clear();
         self.buf.reserve_exact(s.len());
         self.buf.push_str(s);
@@ -511,6 +515,16 @@ impl ReqText {
     pub fn reset(&mut self) {
         self.buf.clear();
         self.set = false;
+    }
+}
+
+/// The buffer goes back to the spare strings for the next session's [`ReqText::set`].
+impl Drop for ReqText {
+    fn drop(&mut self) {
+        // Most drops are of an empty one (`mem::take` and a reset struct): nothing to give.
+        if self.buf.capacity() != 0 {
+            crate::reuse::give(std::mem::take(&mut self.buf));
+        }
     }
 }
 

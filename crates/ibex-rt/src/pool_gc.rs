@@ -16,8 +16,9 @@
 //! where `thread_isolate` stops them all.
 //!
 //! What is emptied ([`drain_thread_caches`]): the buffer pools (`show pools` `buffer`,
-//! `small_buffer`, `large_buffer`), the spare log lines, capture buffers, scratch strings and
-//! header lists, variable stores, check runs and stats rows. Kept: the one scratch buffer a
+//! `small_buffer`, `large_buffer`), the spare log lines, capture buffers, variable stores,
+//! check runs and stats rows, and every `ibex_alloc::Pool` the thread used (spare strings and
+//! header lists, scratch buffers: `ibex_alloc::drain_local_pools`). Kept: the one scratch buffer a
 //! thread formats into (log ring, syslog line, the Prometheus exporter's prewarmed scrape
 //! state, like `HAProxy`'s trash, which `pool_gc` does not free either), and the compiled
 //! regex and expression caches, which are configuration. The session and applet arenas
@@ -85,12 +86,10 @@ pub fn drain_thread_caches() -> usize {
     n += crate::txnlog::drain_capture_spares();
     n += crate::check::drain_run_pool();
     n += crate::stats::drain_row_pool();
-    // The header lists give their strings back to the spare strings: before those go.
-    n += crate::reuse::drain_thread_spares();
     n += ibex_sample::vars::drain_spare(ibex_alloc::wipe_vec);
-    // TODO(T444): the spare strings (`ibex_sample::spare`) are emptied here, by the function
-    // T444 adds to drop (and wipe) a thread's spare strings; the supervisor joins it at merge:
-    //     n += ibex_sample::spare::<T444's drain>();
+    // Every `ibex_alloc::Pool` this thread used (S1: spare strings and lists, scratch
+    // buffers), found by the registry walk rather than listed here.
+    n += ibex_alloc::drain_local_pools();
     DRAINS.fetch_add(1, Ordering::Relaxed);
     n
 }

@@ -240,6 +240,9 @@ pub struct GlobalSection {
     pub vars_limits: VarsLimits,
     /// `tune.ibex.zero-buffers on|off` (Ibex-only): zero a buffer's used bytes when it is released. On when unset.
     pub zero_buffers: Option<bool>,
+    /// `tune.memory.hot-size <bytes>`: the most each thread keeps in its pools together
+    /// (`global.tune.pool_cache_size`, 524288 when unset).
+    pub hot_size: Option<usize>,
     /// Buffer size in bytes (`tune.bufsize`).
     pub bufsize: Option<usize>,
     /// Small buffer size in bytes (`tune.bufsize.small`).
