@@ -1917,6 +1917,17 @@ pub struct SessionEntry {
 /// Slots of every worker's [`SessionArena`], for `show pools` (pool `session`).
 pub static SESSION_POOL: crate::buf::ArenaCounters = crate::buf::ArenaCounters::new();
 
+/// Trims of a [`SessionArena`] skipped because the fresh buffer could not be had: the arena
+/// keeps the one it has (resident, as before the trim) rather than abort while giving
+/// memory back (T453).
+static SESSION_TRIMS_SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Trims of every worker's session arena skipped for want of memory (T453).
+#[must_use]
+pub fn session_trims_skipped() -> usize {
+    SESSION_TRIMS_SKIPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `show pools` provider for the `session` pool: the slots ever created, those in use.
 #[allow(clippy::unnecessary_wraps)]
 pub fn session_pool_stats() -> Option<ibex_alloc::PoolHead> {
@@ -1930,13 +1941,29 @@ pub fn session_pool_stats() -> Option<ibex_alloc::PoolHead> {
     }))
 }
 
-/// Gives back capacity that a burst past the creation one left behind: when it is above
-/// four times what is still needed (the live length or `floor`), down to twice that.
-fn shrink_burst_capacity<T>(entries: &mut Vec<T>, floor: usize) {
-    let keep = entries.len().max(floor);
-    if entries.capacity() > 4 * keep {
-        entries.shrink_to(2 * keep);
+/// The capacity a trimmed arena keeps: what it has, unless a burst past the creation one left
+/// it above four times what is still needed (the live length or `floor`), then twice that.
+fn trimmed_capacity(len: usize, capacity: usize, floor: usize) -> usize {
+    let keep = len.max(floor);
+    if capacity > 4 * keep {
+        2 * keep
+    } else {
+        capacity
     }
+}
+
+/// Moves `entries` to a fresh buffer of `cap` slots and frees the old one; `false`, leaving
+/// `entries` as it was, when the fresh buffer cannot be had. Giving memory back must not
+/// cost the process: `Vec::with_capacity` aborts on a failed allocation, `try_reserve_exact`
+/// on an empty `Vec` reports it (T453).
+fn move_to_fresh<T>(entries: &mut Vec<T>, cap: usize) -> bool {
+    let mut fresh = Vec::new();
+    if fresh.try_reserve_exact(cap.max(entries.len())).is_err() {
+        return false;
+    }
+    fresh.append(entries);
+    *entries = fresh;
+    true
 }
 
 /// Per-thread storage for active sessions.
@@ -2038,19 +2065,23 @@ impl SessionArena {
         let cut = before - self.entries.len();
         if cut > 0 {
             SESSION_POOL.slots_trimmed(cut);
-            // Only capacity above the creation one (a burst past the pre-size) is given back.
-            shrink_burst_capacity(&mut self.entries, self.floor);
             if self.live == 0 {
                 self.free.clear();
             }
-            // The slots a burst wrote stay resident when only the length goes down: once the
-            // arena is a fraction of its peak, its live slots move to a fresh buffer of the same
-            // capacity (untouched, so not resident) and the old one goes back to the system.
-            if self.peak >= 256 + 8 * self.entries.len() {
-                let mut fresh = Vec::with_capacity(self.entries.capacity());
-                fresh.append(&mut self.entries);
-                self.entries = fresh;
-                self.peak = self.entries.len();
+            // Capacity above the creation one (a burst past the pre-size) is given back, and
+            // so are the slots a burst wrote, which stay resident when only the length goes
+            // down: once the arena is a fraction of its peak, its live slots move to a fresh
+            // buffer (untouched, so not resident) and the old one goes back to the system.
+            // The fresh buffer is a second allocation while the first is still held: when it
+            // cannot be had, the arena keeps the old one (resident, as before the trim) and
+            // counts the trim it skipped, rather than abort while giving memory back (T453).
+            let cap = trimmed_capacity(self.entries.len(), self.entries.capacity(), self.floor);
+            if cap < self.entries.capacity() || self.peak >= 256 + 8 * self.entries.len() {
+                if move_to_fresh(&mut self.entries, cap) {
+                    self.peak = self.entries.len();
+                } else {
+                    SESSION_TRIMS_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
@@ -3506,8 +3537,9 @@ pub fn prebind_quic(config: &Config, workers: usize) -> io::Result<()> {
 /// `-m <megs>` as `HAProxy` applies it (`compute_ideal_maxconn`, src/limits.c): the budget
 /// is recorded for `show info` and `/metrics`, and sizes `global maxconn` when the
 /// configuration has none; a configured one that leaves no room for TLS is refused.
-/// Nothing is limited at the system level: past the budget `malloc` would fail and Rust
-/// aborts the process, where `HAProxy` just refuses connections (docs/differences.md).
+/// Nothing is limited at the system level, where `HAProxy` also sets `RLIMIT_DATA`: past it
+/// `malloc` would fail and Rust aborts the process, where `HAProxy`'s pools fail one stream.
+/// Ibex sets it once its pools are fallible (T448, tradeoff.md 6.24, docs/differences.md).
 ///
 /// # Errors
 /// The alert text `HAProxy` exits 1 with.
@@ -15249,20 +15281,19 @@ fn build_templated_error_response_into(
 
 #[cfg(test)]
 mod arena_tests {
-    use super::{shrink_burst_capacity, SessionArena};
+    use super::{move_to_fresh, trimmed_capacity, SessionArena};
 
     /// Capacity above four times what is needed comes back to twice that; the creation
     /// capacity (`floor`) and a modest burst are kept (gate 48, covercheck).
     #[test]
     fn a_burst_past_four_times_the_need_is_given_back_but_not_the_floor() {
+        assert_eq!(trimmed_capacity(1, 1000, 100), 200);
+        assert_eq!(trimmed_capacity(1, 1000, 250), 1000, "1000 is not above 4 x 250");
         let mut v: Vec<Option<u32>> = Vec::with_capacity(1000);
         v.push(Some(1));
-        shrink_burst_capacity(&mut v, 100);
+        assert!(move_to_fresh(&mut v, 200));
+        assert_eq!((v.len(), v[0]), (1, Some(1)));
         assert!(v.capacity() >= 200 && v.capacity() < 1000, "{}", v.capacity());
-        let mut w: Vec<Option<u32>> = Vec::with_capacity(1000);
-        w.push(Some(1));
-        shrink_burst_capacity(&mut w, 250);
-        assert_eq!(w.capacity(), 1000, "1000 is not above 4 x 250");
     }
 
     /// Two entries at once are two distinct, live ones (T280): the same index twice, or one

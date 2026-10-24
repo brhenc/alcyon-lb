@@ -94,6 +94,22 @@ thread_local! {
     };
 }
 
+thread_local! {
+    /// Allocations of at least this many bytes fail on this thread ([`fail_thread_allocs_from`]).
+    static FAIL_FROM: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Makes [`CountingAllocator`] fail, on the calling thread, every allocation (and every growing
+/// reallocation) of at least `min` bytes; `usize::MAX` turns it off. For tests of what code does
+/// when memory runs out (T453); a shrink is never failed, as the C library gives it back in place.
+pub fn fail_thread_allocs_from(min: usize) {
+    FAIL_FROM.with(|f| f.set(min));
+}
+
+fn failing(size: usize) -> bool {
+    FAIL_FROM.try_with(std::cell::Cell::get).is_ok_and(|min| size >= min)
+}
+
 /// Adds to this thread's counters. `try_with`: during thread teardown the slot may be gone
 /// while the thread still frees memory.
 fn count_thread(i: usize, n: usize) {
@@ -154,6 +170,9 @@ impl CountingAllocator {
 #[allow(unsafe_code)]
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if failing(layout.size()) {
+            return std::ptr::null_mut();
+        }
         let ptr = System.alloc(layout);
         if !ptr.is_null() {
             let sz = layout.size();
@@ -179,6 +198,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if new_size > layout.size() && failing(new_size) {
+            return std::ptr::null_mut();
+        }
         let new_ptr = System.realloc(ptr, layout, new_size);
         if !new_ptr.is_null() {
             let old_size = layout.size();
