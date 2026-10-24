@@ -250,10 +250,11 @@ fn an_unmapped_server_socket_error_ends_the_server_side() {
     cli.set_nonblocking(true).unwrap();
     // A port nothing listens on: the datagram draws ICMP port unreachable, which the next
     // read on the socket returns as `ECONNREFUSED`.
-    let closed = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // Reserved and never bound: a port bound at `:0` and dropped is in the ephemeral range,
+    // where another test's socket can be given it and answer.
+    let closed = common::reserve_addr();
     let srv = UdpSocket::bind("127.0.0.1:0").unwrap();
-    srv.connect(closed.local_addr().unwrap()).unwrap();
-    drop(closed);
+    srv.connect(closed).unwrap();
     srv.send(b"x").unwrap();
     thread::sleep(Duration::from_millis(50));
     srv.set_nonblocking(true).unwrap();

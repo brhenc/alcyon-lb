@@ -5825,7 +5825,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 e.sess.close_client = true;
                 if let Some(ref mut h2_ctx) = e.sess.h2_ctx {
                     h2_ctx.send_graceful_goaway();
-                    // Wake up the task so the mux can flush the frame.
+                    // Wake up the task so the mux can flush the frame. No liveness check:
+                    // a task is freed only when its run returns `Outcome::Done`, and that
+                    // run frees its session first (`self.sessions.free`), so a session still
+                    // in the table names a live task, and no task runs during this loop.
+                    debug_assert!(self.scheduler.is_live(e.task), "a session in the table names a freed task");
                     self.scheduler
                         .tasklet_wakeup(e.task, Class::Urgent, state::WOKEN_IO);
                 }
@@ -5933,7 +5937,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 }
             }
         }
+        // No liveness check: every task in `wake` was taken from a session in the table just
+        // above, and a task is freed only when its run returns `Outcome::Done`, which frees
+        // its session first. Nothing between the loop and here runs a task.
         for task in wake {
+            debug_assert!(self.scheduler.is_live(task), "a session in the table names a freed task");
             self.scheduler.tasklet_wakeup(task, Class::Urgent, state::WOKEN_IO);
         }
     }

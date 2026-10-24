@@ -27,7 +27,7 @@
 use crate::common;
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -125,7 +125,7 @@ fn the_forms_haproxy_accepts_load_and_the_edges_it_refuses_do_not() {
 /// know with sha256.
 #[test]
 fn operator_and_digest_arguments_give_haproxys_values() {
-    let bind = free_addr(46150..46198);
+    let bind = common::reserve_addr();
     let cfg = format!(
         "global\n    nbthread 1\ndefaults\n    mode http\n    timeout client 1s\n    timeout server 1s\n    timeout connect 1s\n\
          frontend f\n    bind {bind}\n    http-request return status 200 content-type text/plain lf-string \
@@ -147,7 +147,7 @@ fn operator_and_digest_arguments_give_haproxys_values() {
 /// "10.0.0.0" with "10.0.0.0/8".
 #[test]
 fn an_acl_after_ipmask_matches_addresses() {
-    let bind = free_addr(46050..46100);
+    let bind = common::reserve_addr();
     let cfg = format!(
         "global\n    nbthread 1\ndefaults\n    mode http\n    timeout client 1s\n    timeout server 1s\n    timeout connect 1s\n\
          frontend f\n    bind {bind}\n    http-request deny if {{ str(10.1.2.3),ipmask(8) 10.0.0.0/8 }}\n\
@@ -202,17 +202,11 @@ fn the_vv14_deny_with_a_mistyped_mask_is_refused() {
     );
 }
 
-/// A free port in `ports`, of the range this task may listen on; each test has its own, as
-/// they run at the same time.
-fn free_addr(ports: std::ops::Range<u16>) -> SocketAddr {
-    ports.map(|p| SocketAddr::from(([127, 0, 0, 1], p))).find(|a| TcpListener::bind(a).is_ok()).expect("a free port")
-}
-
 /// Its fixed form loads, and a GET from 127.0.0.1 is denied: 403 on both (`HAProxy` measured
 /// with curl, same date).
 #[test]
 fn the_vv14_deny_with_the_mask_fixed_denies_with_403() {
-    let bind = free_addr(46100..46150);
+    let bind = common::reserve_addr();
     let resp = get(bind, &vv14("255.255.255.0", bind), "vv14ok");
     assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
 }

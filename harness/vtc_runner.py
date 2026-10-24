@@ -25,6 +25,9 @@ import signal
 import socket
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ports  # noqa: E402
 import tempfile
 import time
 import traceback
@@ -82,11 +85,10 @@ def vtest_hex(text):
     return bytes.fromhex(digits)
 
 def get_free_port() -> int:
-    """Allocate an ephemeral port on loopback."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """A loopback port below the ephemeral range, locked against other tests (`ports.py`).
+    A port bound at `:0` and closed is ephemeral: the kernel can give it to another test's
+    outgoing connection before the proxy binds it."""
+    return ports.reserve_port()
 
 
 # ---------------------------------------------------------------------------

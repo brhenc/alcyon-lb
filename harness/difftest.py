@@ -22,6 +22,9 @@ import socket
 import struct
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ports  # noqa: E402
 import threading
 import time
 import uuid
@@ -33,11 +36,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 def get_free_port() -> int:
-    """Bind to port 0 on loopback to find an available dynamic port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    """A loopback port below the ephemeral range, locked against other tests (`ports.py`).
+    A port bound at `:0` and closed is ephemeral: the kernel can give it to another test's
+    outgoing connection before the proxy binds it."""
+    return ports.reserve_port()
 
 
 def bucket_duration_ms(ms: float) -> str:

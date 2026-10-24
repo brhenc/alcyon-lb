@@ -8,6 +8,8 @@
 //! The work done per request must be bounded and predictable. Ibex tracks global
 //! and scoped allocations to pin steady-state requests and drive allocation counts down.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -156,8 +158,7 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let (srv_listener, srv_addr) = loopback0();
-    let (fe_listener, fe_addr) = loopback0();
-    drop(fe_listener);
+    let fe_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let be = start_dummy_http_backend(srv_listener, Arc::clone(&running));
@@ -266,8 +267,7 @@ fn a_steady_state_tcp_connection_allocates_no_more_than_n_times() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let (srv_listener, srv_addr) = loopback0();
-    let (fe_listener, fe_addr) = loopback0();
-    drop(fe_listener);
+    let fe_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let be = start_dummy_tcp_backend(srv_listener, Arc::clone(&running));
@@ -348,8 +348,7 @@ fn a_request_with_acl_and_log_format_allocates_no_more_than_n_times() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let (srv_listener, srv_addr) = loopback0();
-    let (fe_listener, fe_addr) = loopback0();
-    drop(fe_listener);
+    let fe_addr = common::reserve_addr();
 
     let running = Arc::new(AtomicBool::new(true));
     let be = start_dummy_http_backend(srv_listener, Arc::clone(&running));
@@ -666,8 +665,7 @@ fn drive_keepalive_request(client: &mut TcpStream, engine: &mut Engine) {
 /// The allocations of the third request on one keep-alive connection to a frontend running
 /// `rules` (then `http-request return`).
 fn keepalive_request_allocations(rules: &str) -> usize {
-    let (l, addr) = loopback0();
-    drop(l);
+    let addr = common::reserve_addr();
     let cfg = format!(
         "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
          frontend f\n  bind {addr}\n{rules}  http-request return status 200 content-type text/plain string ok\n"
@@ -790,8 +788,7 @@ const BENCH_RSP: &[u8] = b"HTTP/1.1 200 OK\r\nServer: be\r\nContent-Length: 2\r\
 /// allocations, and the reallocations (a `malloc` too, to libc).
 fn keepalive_allocations_with(fe_lines: &str, rsp: &'static [u8], n: usize, status: &[u8], tail: &[u8]) -> (usize, usize) {
     let (srv, srv_addr) = loopback0();
-    let (l, addr) = loopback0();
-    drop(l);
+    let addr = common::reserve_addr();
     let running = Arc::new(AtomicBool::new(true));
     let be = start_keepalive_backend(srv, Arc::clone(&running), rsp);
     let cfg = format!(
@@ -890,8 +887,7 @@ fn drive_proxied_request_ua(client: &mut TcpStream, engine: &mut Engine) {
 /// frontend logged.
 fn logged_proxied_allocations(n: usize, fe_lines: &str) -> (usize, usize) {
     let (srv, srv_addr) = loopback0();
-    let (l, addr) = loopback0();
-    drop(l);
+    let addr = common::reserve_addr();
     let log = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind log socket");
     let log_addr = log.local_addr().expect("log addr");
     let running = Arc::new(AtomicBool::new(true));
@@ -1071,8 +1067,7 @@ impl H2cClient {
 /// HTTP/1.1 server, after three warm-up requests.
 fn h2c_proxied_allocations(n: usize) -> usize {
     let (srv, srv_addr) = loopback0();
-    let (l, addr) = loopback0();
-    drop(l);
+    let addr = common::reserve_addr();
     let running = Arc::new(AtomicBool::new(true));
     let be = start_keepalive_backend(srv, Arc::clone(&running), b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let cfg = format!(
@@ -1121,10 +1116,8 @@ fn an_h2c_request_allocates_nothing() {
 /// requests. The TLS server is a second frontend of the same engine (`bind ... ssl crt`),
 /// answering `ok` itself, so nothing outside the engine allocates.
 fn tls_backend_allocations(server_opts: &str, n: usize) -> usize {
-    let (l, addr) = loopback0();
-    drop(l);
-    let (l, tls_addr) = loopback0();
-    drop(l);
+    let addr = common::reserve_addr();
+    let tls_addr = common::reserve_addr();
     let pem = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/ssl_f_common.pem");
     let cfg = format!(
         "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
