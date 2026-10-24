@@ -7977,6 +7977,11 @@ fn server_connect_failed(
     mut wait: bool,
 ) {
     loop {
+        // The failed socket leaves the poller and the fd table before `server_failed`
+        // closes it, as `HAProxy`'s `fd_delete` does (T443). A close takes it out of the
+        // epoll set only if it was the last reference (a `fork` in progress holds one), and
+        // the entry left behind woke this task's slot once it was freed.
+        release_failed_server(entry, fdtab, poller);
         if !entry.sess.server_failed() {
             let be = &proxies[entry.srv_backend_idx];
             be.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
@@ -7993,6 +7998,15 @@ fn server_connect_failed(
             return;
         }
         wait = false;
+    }
+}
+
+/// Takes a failed server connection out of the poller and the fd table, its socket kept
+/// for the caller to close: an fd-table entry must not outlive the socket it names (T443).
+fn release_failed_server(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &mut Poller) {
+    if let (Some(srv_fd), Some(sfd)) = (entry.sess.srv.as_ref(), entry.srv_raw_fd.take()) {
+        let _ = poller.delete(srv_fd.as_fd());
+        fdtab.remove(sfd);
     }
 }
 
@@ -8016,10 +8030,8 @@ fn retry_server_connect(
     now: Tick,
     wait: bool,
 ) -> bool {
-    if let (Some(srv_fd), Some(sfd)) = (entry.sess.srv.take(), entry.srv_raw_fd.take()) {
-        let _ = poller.delete(srv_fd.as_fd());
-        fdtab.remove(sfd);
-    }
+    release_failed_server(entry, fdtab, poller);
+    entry.sess.srv = None;
 
     let old_idx = entry.target_server_idx.take();
     if let Some(old_idx) = old_idx {

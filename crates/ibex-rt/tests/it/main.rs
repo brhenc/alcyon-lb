@@ -95,6 +95,7 @@ mod config_message_directives;
 mod config_warnings_text;
 mod conn_counters;
 mod conn_fetches;
+mod connect_retry_fd_release;
 mod connection_tokens;
 mod content_switching;
 mod converter_aes_language;
