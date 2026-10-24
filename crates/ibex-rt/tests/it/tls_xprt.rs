@@ -499,3 +499,49 @@ fn a_peer_that_leaves_mid_hello_is_an_unexpected_eof() {
     }
     assert_eq!(verdict, Some(std::io::ErrorKind::UnexpectedEof));
 }
+
+/// T440: a TLS 1.3 KeyUpdate from the client (update_requested) over a socket: the server
+/// reads the data around it, answers with its own KeyUpdate, and what it sends afterwards
+/// decrypts at the client -- several times over (RFC 8446 4.6.3).
+#[test]
+fn data_sent_after_a_client_key_update_reaches_the_client() {
+    let (mut xprt, mut client, mut cli_sock, srv_sock) = ready_pair();
+    // As every accepted socket (listener.rs, HAProxy's session_accept_fd). Without it Nagle
+    // holds the data record behind the unacknowledged KeyUpdate record until the client's
+    // delayed ACK, longer than this loop runs: that looked like lost data once.
+    srv_sock.set_nodelay(true).expect("nodelay");
+    let fd = srv_sock.as_fd();
+    let mut buf = [0u8; 256];
+    for round in 0..3 {
+        client.writer().write_all(b"ping").expect("client write");
+        client.refresh_traffic_keys().expect("client key update");
+        client.writer().write_all(b"after").expect("client write");
+        pump_client(&mut client, &mut cli_sock);
+        let mut got = Vec::new();
+        for _ in 0..20 {
+            if let Io::Done(n) = xprt.recv(fd, &mut buf).expect("server recv") {
+                got.extend_from_slice(&buf[..n]);
+            }
+            if got == b"pingafter" {
+                break;
+            }
+            pump_client(&mut client, &mut cli_sock);
+        }
+        assert_eq!(got, b"pingafter", "round {round}: the server reads across the client's key update");
+
+        let msg = format!("hello {round}");
+        assert!(matches!(xprt.send(fd, msg.as_bytes()).expect("server send"), Io::Done(n) if n == msg.len()));
+        let mut out = Vec::new();
+        for _ in 0..20 {
+            pump_client(&mut client, &mut cli_sock);
+            let mut b = [0u8; 64];
+            if let Ok(n) = client.reader().read(&mut b) {
+                out.extend_from_slice(&b[..n]);
+            }
+            if out == msg.as_bytes() {
+                break;
+            }
+        }
+        assert_eq!(out, msg.as_bytes(), "round {round}: the client reads what the server sent after the key update");
+    }
+}

@@ -320,3 +320,89 @@ fn the_certificate_a_legacy_context_serves_names_its_leaf() {
     let local = ibex_tls::LocalCert::Legacy(key);
     assert_eq!(local.leaf(), Some(der.as_ref()));
 }
+
+/// A rustls 0.23 client (an implementation independent of the server's split API) for `id`.
+fn client23(id: &Ident) -> rustls::ClientConnection {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(rustls::pki_types::CertificateDer::from(id.der.to_vec())).expect("root");
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    rustls::ClientConnection::new(Arc::new(cfg), rustls::pki_types::ServerName::try_from("localhost").unwrap())
+        .expect("client")
+}
+
+/// Moves the 0.23 client's output to the server and the server's to the client.
+fn shuttle23(cli: &mut rustls::ClientConnection, srv: &mut TlsCtx, sin: &mut VecInput) -> bool {
+    let mut moved = false;
+    let mut out = Vec::new();
+    while cli.wants_write() {
+        cli.write_tls(&mut out).expect("client write_tls");
+    }
+    if !out.is_empty() {
+        sin.extend(&out, srv);
+        moved = true;
+    }
+    let out = srv.pending_tx().to_vec();
+    if !out.is_empty() {
+        srv.tx_done(out.len());
+        let mut rd = &out[..];
+        while !rd.is_empty() {
+            cli.read_tls(&mut rd).expect("client read_tls");
+            cli.process_new_packets().expect("client process");
+        }
+        moved = true;
+    }
+    moved
+}
+
+fn client_plain(cli: &mut rustls::ClientConnection) -> Vec<u8> {
+    use std::io::Read;
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        match cli.reader().read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("client read: {e}"),
+        }
+    }
+    got
+}
+
+/// TLS 1.3 KeyUpdate from the peer with `update_requested`: the server answers with its own
+/// KeyUpdate under the old keys, switches its write keys, and what it sends afterwards
+/// decrypts at the client (RFC 8446 4.6.3) -- before and after the key change, more than once.
+#[test]
+fn data_after_a_peer_key_update_reaches_the_peer() {
+    use std::io::Write;
+    let id = ident("localhost");
+    let mut srv = TlsCtx::accept(bind(&id, vec![]));
+    let mut sin = VecInput::default();
+    let mut cli = client23(&id);
+    for _ in 0..30 {
+        srv.handshake(&mut sin).expect("server handshake");
+        if !shuttle23(&mut cli, &mut srv, &mut sin) && !srv.is_handshaking() && !cli.is_handshaking() {
+            break;
+        }
+    }
+    assert!(!srv.is_handshaking() && !cli.is_handshaking());
+
+    for round in 0..3 {
+        cli.writer().write_all(b"ping").expect("client write");
+        cli.refresh_traffic_keys().expect("client key update");
+        cli.writer().write_all(b"after").expect("client write");
+        shuttle23(&mut cli, &mut srv, &mut sin);
+        let (got, end) = read_all(&mut srv, &mut sin, 64);
+        assert_eq!(got, b"pingafter", "round {round}: server reads the client's data across its key update");
+        assert_eq!(end, Plain::More);
+
+        let msg = format!("hello {round}");
+        assert_eq!(srv.write_plain(msg.as_bytes()).expect("server write"), msg.len());
+        shuttle23(&mut cli, &mut srv, &mut sin);
+        assert_eq!(client_plain(&mut cli), msg.as_bytes(), "round {round}: the client reads what the server sent after the key update");
+    }
+}
