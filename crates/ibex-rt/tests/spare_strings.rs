@@ -141,7 +141,7 @@ fn the_configured_ssl_zero_buffers_reaches_the_tls_buffer_wipe() {
         drop(v);
         let b = ibex_alloc::freed_bytes();
         if wiped {
-            assert!(zeros(b.as_ref()), "ssl-zero-buffers {text:?}: freed bytes {b:?}");
+            assert!(secret_gone(b.as_ref()), "ssl-zero-buffers {text:?}: freed bytes {b:?}");
         } else {
             assert!(secret(b.as_ref()), "ssl-zero-buffers {text:?}: freed bytes {b:?}");
         }
