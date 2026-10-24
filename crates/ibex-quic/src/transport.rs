@@ -229,6 +229,14 @@ pub trait QuicTransport {
     /// Returns an error if the connection or stream does not exist.
     fn finish_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) -> Result<()>;
 
+    /// Abort a stream in both directions with an application error code: `RESET_STREAM` for
+    /// what we send and `STOP_SENDING` for what the peer sends (RFC 9114 section 8.1,
+    /// `HAProxy`'s `qcc_abort_stream_read` and `qcc_reset_stream`).
+    ///
+    /// # Errors
+    /// Returns an error if the connection does not exist or the code is not a QUIC varint.
+    fn reset_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId, error_code: u64) -> Result<()>;
+
     /// Close a connection with an application error code and reason phrase.
     fn close_connection(&mut self, conn_id: ConnectionId, error_code: u64, reason: &[u8]);
 

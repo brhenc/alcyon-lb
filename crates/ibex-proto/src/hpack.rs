@@ -808,7 +808,7 @@ pub fn decode_string_literal_into(src: &[u8], offset: &mut usize, out: &mut Stri
 /// what every field check refuses (a name is no token, a value or a pseudo-header carries a
 /// byte `http_header_has_forbidden_char` refuses), so the stream is reset, as `HAProxy`
 /// resets it for such a name; and one byte for one keeps the table's sizes the peer's.
-fn push_as_text(out: &mut String, bytes: &[u8]) {
+pub fn push_as_text(out: &mut String, bytes: &[u8]) {
     for chunk in bytes.utf8_chunks() {
         out.push_str(chunk.valid());
         out.extend(std::iter::repeat_n('\0', chunk.invalid().len()));

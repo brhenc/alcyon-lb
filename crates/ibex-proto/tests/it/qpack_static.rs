@@ -84,3 +84,24 @@ fn test_qpack_malformed_string_length() {
     let res = decode_qpack_static(&data);
     assert!(res.is_err());
 }
+
+/// T454: a string with a byte that is not UTF-8 decodes (each such byte as a NUL, the field
+/// checks then refuse it on its stream) instead of failing the decompression, which is a
+/// connection error.
+#[test]
+fn a_byte_that_is_not_utf8_is_a_nul_not_a_decompression_failure() {
+    // Required Insert Count 0, Base 0, then a literal field line with a literal name `x-\xe9`
+    // and value `a\xe9b`.
+    let data = vec![0x00, 0x00, 0x23, b'x', b'-', 0xe9, 0x03, b'a', 0xe9, b'b'];
+    let res = decode_qpack_static(&data).expect("decodes");
+    assert_eq!((res[0].name.as_str(), res[0].value.as_str()), ("x-\0", "a\0b"));
+    // The same name, Huffman-coded.
+    let mut name = Vec::new();
+    ibex_proto::hpack::encode_huffman(b"x-\xe9", &mut name);
+    let mut data = vec![0x00, 0x00, 0x28 | u8::try_from(name.len()).expect("short")];
+    data[2] |= 0x20;
+    data.extend_from_slice(&name);
+    data.extend_from_slice(&[0x01, b'v']);
+    let res = decode_qpack_static(&data).expect("decodes");
+    assert_eq!(res[0].name, "x-\0");
+}
