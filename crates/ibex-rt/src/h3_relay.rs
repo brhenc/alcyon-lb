@@ -121,10 +121,7 @@ pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<Req
         match block {
             HtxBlock::ReqLine(rl) => {
                 let m = rl.method.as_str();
-                // The method and the characters of the URI were checked above.
-                if rl.uri.is_empty() {
-                    return Err(HeadError::Message);
-                }
+                // The method and the URI (an empty `:path` too) were checked above.
                 method_head = m == "HEAD";
                 head.extend_from_slice(format!("{m} {} HTTP/1.1\r\n", rl.uri).as_bytes());
             }
