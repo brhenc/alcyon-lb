@@ -387,10 +387,18 @@ impl TlsCtx {
             self.plain.0 += n;
             return Ok(Plain::Data(n));
         }
-        let r = match &mut self.session {
-            Some(Session::Server(t)) => read_traffic(t, input, dst, &mut self.tx),
-            Some(Session::Client(t)) => read_traffic(t, input, dst, &mut self.tx),
-            _ => return Ok(Plain::More),
+        let r = loop {
+            let r = match &mut self.session {
+                Some(Session::Server(t)) => read_traffic(t, input, dst, &mut self.tx),
+                Some(Session::Client(t)) => read_traffic(t, input, dst, &mut self.tx),
+                _ => return Ok(Plain::More),
+            };
+            // An empty record was all this read found: the next complete one may follow it
+            // in the input already, and `More` would send the caller to an empty socket.
+            // Each turn consumes a record, so this ends with the input.
+            if !matches!(r, Ok((Plain::More, _, true))) {
+                break r.map(|(p, rest, _)| (p, rest));
+            }
         };
         match r {
             Ok((Plain::Data(n), rest)) => {
@@ -445,19 +453,20 @@ impl TlsCtx {
     }
 }
 
-/// One read of the receive side of `t`: the plaintext copied into `dst`, and where in the
-/// input's storage the rest of the record is (empty when it all fit). A receive side that
-/// is gone (`close_notify` seen) reads as closed.
+/// One read of the receive side of `t`: the plaintext copied into `dst`, where in the
+/// input's storage the rest of the record is (empty when it all fit), and whether the record
+/// read was an empty one. A receive side that is gone (`close_notify` seen) reads as closed.
 fn read_traffic<S: rustls24::SideData, I: TlsInput>(
     t: &mut Traffic<S>,
     input: &mut I,
     dst: &mut [u8],
     tx: &mut Vec<u8>,
-) -> Result<(Plain, (usize, usize)), Error> {
-    let Some(recv) = t.recv.take() else { return Ok((Plain::Closed, (0, 0))) };
+) -> Result<(Plain, (usize, usize), bool), Error> {
+    let Some(recv) = t.recv.take() else { return Ok((Plain::Closed, (0, 0), false)) };
     let base = input.storage().as_ptr() as usize;
     let mut out = (Plain::More, (0, 0));
     let mut flush = false;
+    let mut empty = false;
     // rustls processes every message up to the next application data record (or the end of
     // the complete records) in one call: no data and `ReadMore` means read the socket.
     let first = match recv.read(input) {
@@ -471,18 +480,17 @@ fn read_traffic<S: rustls24::SideData, I: TlsInput>(
     let mut state = match first {
         ReceiveTrafficState::Available(mut data) => {
             let bytes = data.data();
-            if !bytes.is_empty() {
-                let n = bytes.len().min(dst.len());
-                dst[..n].copy_from_slice(&bytes[..n]);
-                let at = (bytes.as_ptr() as usize).wrapping_sub(base);
-                out = (Plain::Data(n), if n < bytes.len() { (at + n, at + bytes.len()) } else { (0, 0) });
-            }
+            // An empty record (a peer may send one) copies nothing; the caller reads on.
+            empty = bytes.is_empty();
+            let n = bytes.len().min(dst.len());
+            dst[..n].copy_from_slice(&bytes[..n]);
+            let at = (bytes.as_ptr() as usize).wrapping_sub(base);
+            let rest = if n < bytes.len() { (at + n, at + bytes.len()) } else { (0, 0) };
+            out = (if n > 0 { Plain::Data(n) } else { Plain::More }, rest);
             data.into_next()
         }
-        ReceiveTrafficState::FlushSender(f) => {
-            flush = true;
-            f.into_next()
-        }
+        // The same states, re-typed: `first` borrows `input`, the loop's states do not.
+        ReceiveTrafficState::FlushSender(f) => ReceiveTrafficState::FlushSender(f),
         ReceiveTrafficState::ReadMore(r) => ReceiveTrafficState::ReadMore(r),
         ReceiveTrafficState::CloseNotify => ReceiveTrafficState::CloseNotify,
     };
@@ -503,14 +511,15 @@ fn read_traffic<S: rustls24::SideData, I: TlsInput>(
                 }
                 break;
             }
-            // Only a read yields data; the states after it are the three above.
-            ReceiveTrafficState::Available(data) => data.into_next(),
+            // Only `read` yields data: rustls's `into_next` (of `FlushSender` and of
+            // `ReceivedApplicationData`) returns `FlushSender`, `ReadMore` or `CloseNotify`.
+            ReceiveTrafficState::Available(_) => unreachable!("into_next yielded application data"),
         };
     }
     if flush {
         pump(t, tx);
     }
-    Ok(out)
+    Ok((out.0, out.1, empty))
 }
 
 /// Moves what the receive side queued for the peer into `tx`.

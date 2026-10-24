@@ -373,8 +373,8 @@ fn client_plain(cli: &mut rustls::ClientConnection) -> Vec<u8> {
     got
 }
 
-/// TLS 1.3 KeyUpdate from the peer with `update_requested`: the server answers with its own
-/// KeyUpdate under the old keys, switches its write keys, and what it sends afterwards
+/// TLS 1.3 `KeyUpdate` from the peer with `update_requested`: the server answers with its own
+/// `KeyUpdate` under the old keys, switches its write keys, and what it sends afterwards
 /// decrypts at the client (RFC 8446 4.6.3) -- before and after the key change, more than once.
 #[test]
 fn data_after_a_peer_key_update_reaches_the_peer() {
@@ -405,4 +405,72 @@ fn data_after_a_peer_key_update_reaches_the_peer() {
         shuttle23(&mut cli, &mut srv, &mut sin);
         assert_eq!(client_plain(&mut cli), msg.as_bytes(), "round {round}: the client reads what the server sent after the key update");
     }
+
+    // A KeyUpdate with nothing after it: no data, the answer is queued all the same.
+    cli.refresh_traffic_keys().expect("client key update");
+    shuttle23(&mut cli, &mut srv, &mut sin);
+    let (got, end) = read_all(&mut srv, &mut sin, 64);
+    assert_eq!(got, b"");
+    assert_eq!(end, Plain::More);
+    assert!(srv.wants_write(), "the server's KeyUpdate is queued");
+    assert_eq!(srv.write_plain(b"last").expect("server write"), 4);
+    shuttle23(&mut cli, &mut srv, &mut sin);
+    assert_eq!(client_plain(&mut cli), b"last");
+}
+
+/// Application-data records encrypted by hand under the 0.23 client's extracted TLS 1.3 keys
+/// (rustls's own writer never sends an empty record; other peers may: RFC 8446 5.4).
+fn hand_records(id: &Ident, srv: &mut TlsCtx, sin: &mut VecInput, payloads: &[&[u8]]) -> Vec<u8> {
+    use rustls::crypto::cipher::{OutboundChunks, OutboundPlainMessage};
+    let suite = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256;
+    let provider = rustls::crypto::CryptoProvider {
+        cipher_suites: vec![suite],
+        ..rustls::crypto::ring::default_provider()
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(rustls::pki_types::CertificateDer::from(id.der.to_vec())).expect("root");
+    let mut cfg = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.enable_secret_extraction = true;
+    let mut cli = rustls::ClientConnection::new(Arc::new(cfg), rustls::pki_types::ServerName::try_from("localhost").unwrap())
+        .expect("client");
+    for _ in 0..30 {
+        srv.handshake(sin).expect("server handshake");
+        if !shuttle23(&mut cli, srv, sin) && !srv.is_handshaking() && !cli.is_handshaking() {
+            break;
+        }
+    }
+    let (mut seq, secrets) = cli.dangerous_extract_secrets().expect("secrets").tx;
+    let rustls::ConnectionTrafficSecrets::Aes128Gcm { key, iv } = secrets else { panic!("suite") };
+    let mut enc = suite.tls13().expect("1.3").aead_alg.encrypter(key, iv);
+    let mut wire = Vec::new();
+    for p in payloads {
+        let msg = OutboundPlainMessage {
+            typ: rustls::ContentType::ApplicationData,
+            version: rustls::ProtocolVersion::TLSv1_2,
+            payload: OutboundChunks::Single(p),
+        };
+        wire.extend_from_slice(&enc.encrypt(msg, seq).expect("encrypt").encode());
+        seq += 1;
+    }
+    wire
+}
+
+/// An empty application-data record is skipped, not taken for the end of the input: the
+/// records after it in the same input are read without more ciphertext arriving (else a
+/// socket reader waits on a socket that has nothing more to give).
+#[test]
+fn an_empty_record_does_not_hide_the_records_after_it() {
+    let id = ident("localhost");
+    let mut srv = TlsCtx::accept(bind(&id, vec![]));
+    let mut sin = VecInput::default();
+    let wire = hand_records(&id, &mut srv, &mut sin, &[b"", b"one", b"", b"", b"two"]);
+    sin.extend(&wire, &srv);
+    let (got, end) = read_all(&mut srv, &mut sin, 64);
+    assert_eq!(got, b"onetwo");
+    assert_eq!(end, Plain::More);
+    assert!(sin.is_empty(), "every record was consumed");
 }

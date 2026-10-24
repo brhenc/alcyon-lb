@@ -500,8 +500,8 @@ fn a_peer_that_leaves_mid_hello_is_an_unexpected_eof() {
     assert_eq!(verdict, Some(std::io::ErrorKind::UnexpectedEof));
 }
 
-/// T440: a TLS 1.3 KeyUpdate from the client (update_requested) over a socket: the server
-/// reads the data around it, answers with its own KeyUpdate, and what it sends afterwards
+/// T440: a TLS 1.3 `KeyUpdate` from the client (`update_requested`) over a socket: the server
+/// reads the data around it, answers with its own `KeyUpdate`, and what it sends afterwards
 /// decrypts at the client -- several times over (RFC 8446 4.6.3).
 #[test]
 fn data_sent_after_a_client_key_update_reaches_the_client() {
