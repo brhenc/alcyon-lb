@@ -7432,6 +7432,7 @@ pub(crate) fn connect_addr(server: SocketAddr, dst: Option<SocketAddr>) -> Socke
 /// `bc_dst` the one the socket connects to.
 fn set_target(entry: &mut SessionEntry, target: SocketAddr) {
     entry.sess.target_addr = Some(target);
+    entry.sess.bc_idle = false;
 }
 
 fn maybe_prepend_send_proxy(fe: &Proxy, proxy: &Proxy, proxies: &[Proxy], sess: &mut TcpSession, target_addr: SocketAddr) {
@@ -12910,6 +12911,7 @@ impl EngineDispatcher<'_> {
                     server_actconn_add(entry, proxies, true);
                 }
                 entry.sess.server_connected(now);
+                entry.sess.bc_idle = false;
                 if let Some(txn) = entry.sess.txn.as_mut() {
                     txn.srv_reused = true;
                 }
