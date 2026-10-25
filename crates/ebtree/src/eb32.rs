@@ -150,10 +150,17 @@ impl Eb32Tree {
         self.nodes.capacity()
     }
 
+    /// Whether the next insert needs no allocation, making room for one more node (fallibly)
+    /// when it would: `false` when that memory cannot be had.
+    #[inline]
+    pub fn try_room_for_one(&mut self) -> bool {
+        self.free != NO_FREE || self.nodes.len() < self.nodes.capacity() || self.nodes.try_reserve(1).is_ok()
+    }
+
     /// Makes room for `total` nodes in all, `false` (the tree unchanged) when the memory cannot
     /// be had. A caller that does this before it needs a node never has an insert allocate.
     pub fn try_reserve_total(&mut self, total: usize) -> bool {
-        self.nodes.try_reserve(total.saturating_sub(self.nodes.len())).is_ok()
+        self.nodes.try_reserve_exact(total.saturating_sub(self.nodes.len())).is_ok()
     }
 
     fn alloc(&mut self, key: u32, data: u32) -> u32 {

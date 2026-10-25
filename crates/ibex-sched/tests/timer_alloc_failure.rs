@@ -97,3 +97,40 @@ fn tasks_reserved_at_boot_are_destroyed_while_allocations_fail() {
     assert_eq!(s.tasks.live(), 0);
     assert!(s.create(synth(0)).is_some());
 }
+
+/// Records what ran.
+#[derive(Default)]
+struct Recorder {
+    ran: Vec<WorkKind>,
+}
+
+impl ibex_sched::Dispatch for Recorder {
+    fn run(&mut self, kind: WorkKind, _state: u32) -> ibex_sched::Outcome {
+        self.ran.push(kind);
+        ibex_sched::Outcome::Done
+    }
+}
+
+/// The run queue grows on a wakeup; when it cannot, the task is queued for its run all the same.
+#[test]
+fn tasks_woken_while_the_run_queue_cannot_grow_all_run() {
+    let mut s = Scheduler::with_capacity(4);
+    let tasks: Vec<_> = (0..40).map(|i| s.create(synth(i)).expect("create")).collect();
+    with_allocations_failing(|| {
+        for &t in &tasks {
+            s.wakeup(t, state::WOKEN_MSG, CallSite::UNKNOWN);
+        }
+    });
+    assert_eq!(s.run_queue_len(), 40);
+    let mut d = Recorder::default();
+    for _ in 0..100 {
+        if d.ran.len() == 40 {
+            break;
+        }
+        s.process_runnable_tasks(&mut d);
+    }
+    let mut ran: Vec<_> = d.ran.iter().map(|k| k.index()).collect();
+    ran.sort_unstable();
+    assert_eq!(ran, (0..40).collect::<Vec<_>>());
+    assert_eq!(s.tasks.live(), 0);
+}

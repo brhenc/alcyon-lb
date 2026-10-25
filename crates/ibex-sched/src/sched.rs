@@ -358,25 +358,27 @@ impl Scheduler {
     /// doubling (T304: 60,000 health checks grew both to 65,536 slots).
     pub fn reserve(&mut self, additional: usize) {
         self.tasks.reserve(additional);
-        self.timers.reserve(additional);
+        // As large as the arena, so that `create` finds it so (fallible: `create` tries again).
+        let _ = self.timers.try_reserve_total(self.tasks.capacity());
     }
 
-    /// Allocates a task. `None` when its slot, or its room in the run queue and the timer
-    /// tree, cannot be had: each task holds at most one node of each tree, so trees as large
-    /// as the task arena never grow on an insert (T465).
+    /// Allocates a task. `None` when its slot, or its room in the timer tree, cannot be had:
+    /// each task holds at most one timer node, so a tree as large as the task arena never
+    /// grows on an insert (T465). The run queue grows on a wakeup, fallibly
+    /// ([`Self::wakeup`]): reserving it here too would cost every task its node up front.
     pub fn create(&mut self, kind: WorkKind) -> Option<TaskRef> {
         let r = self.tasks.alloc(kind)?;
         let cap = self.tasks.capacity();
-        if self.timers.capacity() < cap || self.rqueue.capacity() < cap {
-            return self.reserve_queues(r, cap);
+        if self.timers.capacity() < cap {
+            return self.reserve_timer(r, cap);
         }
         Some(r)
     }
 
     #[cold]
     #[inline(never)]
-    fn reserve_queues(&mut self, r: TaskRef, cap: usize) -> Option<TaskRef> {
-        if self.timers.try_reserve_total(cap) && self.rqueue.try_reserve_total(cap) {
+    fn reserve_timer(&mut self, r: TaskRef, cap: usize) -> Option<TaskRef> {
+        if self.timers.try_reserve_total(cap) {
             return Some(r);
         }
         crate::task::TASK_POOL.failed();
@@ -424,6 +426,13 @@ impl Scheduler {
             }
             t.state |= state::QUEUED | reason;
             t.caller = caller;
+        }
+
+        if !self.rqueue.try_room_for_one() {
+            // No memory for its node: the task goes to the Normal list, where the run queue
+            // would have moved it, without its place in the order (T465).
+            self.push_tasklet(Class::Normal, r);
+            return;
         }
 
         self.rqueue_ticks = self.rqueue_ticks.wrapping_add(1);
