@@ -288,3 +288,36 @@ fn the_process_allocator_applies_the_setting_and_retries_after_emptying_the_quar
     zof::set_zero_on_free(ZeroOnFree::Off);
     let _ = zof::drain_local();
 }
+
+/// (blocks, bytes, users) of `show pools`' `zero_quarantine` line.
+fn quarantine_line(dump: &str) -> Option<(usize, usize, usize)> {
+    let l = dump.lines().find(|l| l.starts_with("  - Pool zero_quarantine "))?;
+    let num = |after: &str, before: &str| l.split_once(after)?.1.split(before).next()?.trim().parse().ok();
+    Some((num(": ", " allocated")?, num("allocated (", " bytes)")?, num("failures, ", " users")?))
+}
+
+#[test]
+fn show_pools_counts_the_quarantine_in_its_line_and_in_total() {
+    let _t = turn(ZeroOnFree::Soft);
+    // A pass with a budget of 0 frees nothing younger than the age bound, so the block is held
+    // while the pass publishes: no race with a drain.
+    zof::set_pass_budget(0);
+    free_secret();
+    std::thread::sleep(Duration::from_millis(15)); // the publish interval is 10 ms
+    zof::pass(Instant::now(), false);
+    let dump = ibex_alloc::global_pool_registry().show_pools(&[]);
+    let (blocks, bytes, users) = quarantine_line(&dump).unwrap_or_else(|| panic!("no quarantine line:\n{dump}"));
+    assert!(blocks >= 1 && bytes >= SIZE && users == 1, "{dump}");
+    let total: usize = dump.lines().find(|l| l.starts_with("Total: ")).and_then(|l| l.split(", ").nth(1)?.split(' ').next()?.parse().ok()).expect("Total");
+    assert!(total >= bytes, "Total ({total}) leaves out the quarantine ({bytes}):\n{dump}");
+    // Idle: empty, and published as such.
+    zof::set_pass_budget(zof::PASS_BUDGET_DEFAULT);
+    std::thread::sleep(Duration::from_millis(15));
+    zof::pass(Instant::now(), true);
+    let (blocks, bytes, _) = quarantine_line(&ibex_alloc::global_pool_registry().show_pools(&[])).expect("soft keeps the line");
+    assert_eq!((blocks, bytes), (0, 0));
+    // Not listed with the other modes.
+    zof::set_zero_on_free(ZeroOnFree::Hard);
+    assert_eq!(quarantine_line(&ibex_alloc::global_pool_registry().show_pools(&[])), None);
+    zof::set_zero_on_free(ZeroOnFree::Off);
+}
