@@ -63,7 +63,7 @@ fn ibex(global: &str, bind_opts: &str) -> Ibex {
     let mut cfg = NamedTempFile::new().expect("cfg");
     write!(
         cfg,
-        "global\n    nbthread 1\n{global}defaults\n    mode http\n    timeout client 10s\n    timeout server 3s\n    \
+        "global\n    nbthread 1\n    hard-stop-after 300ms\n{global}defaults\n    mode http\n    timeout client 10s\n    timeout server 3s\n    \
          timeout connect 1s\nfrontend f\n    bind {tcp}\n    bind quic4@{quic} ssl crt {crt} alpn h3{bind_opts}\n    \
          http-request return status 200\n"
     )
@@ -201,4 +201,17 @@ fn under_the_default_threshold_there_is_no_retry() {
     let mut c = Client::new(ibex.quic);
     assert_eq!(c.first_flight().first(), Some(&"Initial"));
     assert!(c.handshake());
+}
+
+/// T492 oracle row `retry-threshold 2`, one quiet client: no Retry; with `1` the second
+/// half-open client is the first one over the threshold. The value comes from the config
+/// into the listener (engine.rs, `qc.retry_threshold`).
+#[test]
+fn retry_threshold_one_retries_the_second_half_open_client() {
+    let ibex = ibex("    tune.quic.fe.sec.retry-threshold 1\n", "");
+    let mut first = Client::new(ibex.quic);
+    assert_eq!(first.first_flight().first(), Some(&"Initial"), "under the threshold, served");
+    let mut second = Client::new(ibex.quic);
+    assert_eq!(second.first_flight(), ["Retry"]);
+    assert!(second.handshake(), "the client that answered the Retry connects");
 }

@@ -262,3 +262,21 @@ fn a_tiny_m_serves_or_refuses_cleanly() {
         }
     }
 }
+
+/// A worker thread that cannot be created (`RLIMIT_NPROC` 1: the user already runs more than
+/// one task, so every `clone` fails with EAGAIN, whatever the host's memory) fails the start
+/// with the alert and exit 1, never a panic (T508; the path `-m` only reaches by chance).
+#[test]
+fn a_thread_that_cannot_be_created_fails_the_start_cleanly() {
+    let port = common::reserve_port();
+    let (cfg, _sock) = config("nproc", port, false, "");
+    let out = Command::new("sh")
+        .args(["-c", "ulimit -u 1 && exec \"$0\" -f \"$1\"", env!("CARGO_BIN_EXE_ibex"), &cfg])
+        .stdout(Stdio::null())
+        .output()
+        .expect("run ibex");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {err}");
+    assert!(err.contains("[ALERT]") && err.contains("Failed to create thread 0"), "stderr: {err}");
+    assert!(!err.contains("panicked"), "stderr: {err}");
+}

@@ -9,8 +9,7 @@
 //! [`note`]; the engine writes what was noted once per scheduler pass ([`drain`]), because the
 //! log targets belong to it and a CLI or stats-page handler cannot reach them.
 
-use std::cell::RefCell;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::check::{ServerCheckState, ServerStatus, DRAIN_DOWN};
 use crate::engine::Proxy;
@@ -46,6 +45,7 @@ pub enum Kind {
 }
 
 /// One line to write.
+#[derive(Debug)]
 pub struct Event {
     /// Index of the proxy whose `log` targets get it.
     pub proxy: usize,
@@ -59,8 +59,29 @@ pub struct Event {
     pub log: String,
 }
 
-thread_local! {
-    static PENDING: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
+/// Events noted and not yet written, over every proxy: the scheduler pass reads it and skips
+/// the proxies entirely when it is zero.
+static PENDING: AtomicUsize = AtomicUsize::new(0);
+/// Orders the events of different proxies as they were noted.
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The events of one proxy that are waiting to be written; the queue is a field of the proxy's
+/// counters, which every worker shares ([`note`] pushes, [`drain`] takes).
+#[derive(Debug, Default)]
+pub struct Queue(std::sync::Mutex<Vec<(u64, Event)>>);
+
+impl Queue {
+    fn push(&self, e: Event) {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((seq, e));
+        PENDING.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// True when some event waits to be written.
+#[must_use]
+pub fn pending() -> bool {
+    PENDING.load(Ordering::Acquire) != 0
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -185,33 +206,34 @@ pub fn describe(px: &Proxy, s: usize, before: u8, after: u8, kind: Kind, cause: 
 pub fn note(proxies: &[Proxy], p: usize, s: usize, before: u8, after: u8, kind: Kind, cause: Cause<'_>, be_went_down: bool) {
     let Some(px) = proxies.get(p) else { return };
     if let Some((level, text)) = describe(px, s, before, after, kind, cause) {
-        PENDING.with(|q| q.borrow_mut().push(Event { proxy: p, level, alert: false, stderr: text.clone(), log: format!("{text}.") }));
+        px.txn_counters().srv_events.push(Event { proxy: p, level, alert: false, stderr: text.clone(), log: format!("{text}.") });
     }
     if be_went_down {
         let what = if px.has_frontend && px.has_backend { "proxy" } else { "backend" };
-        PENDING.with(|q| {
-            q.borrow_mut().push(Event {
-                proxy: p,
-                level: LogLevel::Emerg,
-                alert: true,
-                stderr: format!("{what} '{}' has no server available!", px.name),
-                log: format!("{what} {} has no server available!", px.name),
-            });
+        px.txn_counters().srv_events.push(Event {
+            proxy: p,
+            level: LogLevel::Emerg,
+            alert: true,
+            stderr: format!("{what} '{}' has no server available!", px.name),
+            log: format!("{what} {} has no server available!", px.name),
         });
     }
 }
 
-/// Writes the lines noted since the last call, through `send` (the log targets of the proxy).
-/// Every line goes to stderr too.
-pub fn drain(mut send: impl FnMut(usize, LogLevel, &str)) {
-    let events = PENDING.with(|q| {
-        let mut q = q.borrow_mut();
-        if q.is_empty() {
-            return Vec::new();
+/// Writes the lines noted since the last call on `proxies`, in the order they were noted,
+/// through `send` (the log targets of the proxy). Every line goes to stderr too.
+pub fn drain(proxies: &[Proxy], mut send: impl FnMut(usize, LogLevel, &str)) {
+    let mut events = Vec::new();
+    for px in proxies {
+        let Some(tc) = px.ids.tc.get() else { continue };
+        let mut q = tc.srv_events.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !q.is_empty() {
+            PENDING.fetch_sub(q.len(), Ordering::Release);
+            events.append(&mut q);
         }
-        std::mem::take(&mut *q)
-    });
-    for e in events {
+    }
+    events.sort_by_key(|&(seq, _)| seq);
+    for (_, e) in events {
         stderr(e.alert, &e.stderr);
         send(e.proxy, e.level, &e.log);
     }

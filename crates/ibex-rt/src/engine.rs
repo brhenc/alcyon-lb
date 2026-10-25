@@ -5829,7 +5829,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
         let tasks_run = self.scheduler.process_runnable_tasks(&mut dispatcher);
         // The server state changes the pass made (a check, the CLI, the stats page).
-        crate::srvlog::drain(|proxy, level, msg| dispatcher.send_log(proxy, level, b"", msg.as_bytes()));
+        if crate::srvlog::pending() {
+            let proxies = dispatcher.proxies.clone();
+            crate::srvlog::drain(&proxies, |proxy, level, msg| dispatcher.send_log(proxy, level, b"", msg.as_bytes()));
+        }
         // A task recorded here may have ended later in the same pass (a session shut down
         // by the CLI, then run to `Outcome::Done`), and the scheduler has freed it. Its
         // slot must not be queued: it is handed to the next connection, and the stale
