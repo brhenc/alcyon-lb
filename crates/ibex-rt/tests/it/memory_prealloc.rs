@@ -202,3 +202,45 @@ fn show_pools_shows_the_presize_at_start_and_after_a_burst_of_maxconn() {
     assert_eq!(pool(&sock, "buffer"), (2 * MAXCONN, 0), "standard buffers after the burst");
     assert_eq!(pool(&sock, "session").0, MAXCONN, "session slots after the burst");
 }
+
+/// T475: `nbthread 2`, `maxconn 100`: the limit is 200 buffers, each thread's cache is filled
+/// with 100. All connections land on thread 1 (`bind ... thread 1`): 80 held connections need
+/// 160 buffers, more than thread 1's 100, while thread 2 holds 100 idle ones. None of the 80 may
+/// be refused (the process is at 80 of 100 connections) and the pool does not grow past 200.
+#[test]
+#[ignore = "T475: a thread out of its share cannot use the buffers another thread holds yet (design in tasks/T475-progress.md)"]
+fn a_thread_out_of_its_share_uses_the_buffers_other_threads_hold() {
+    const HELD: usize = 80;
+    let be = flood();
+    let fe = common::reserve_addr();
+    let d = dir("shared");
+    let sock = d.join("cli.sock").display().to_string();
+    let cfg = format!(
+        "global\n    nbthread 2\n    maxconn 100\n    tune.memory.prealloc on\n    stats socket {sock} level admin\n{DEFAULTS}\
+         frontend f\n    bind {fe} thread 1\n    default_backend b\nbackend b\n    server s {be}\n"
+    );
+    let path = d.join("c.cfg");
+    std::fs::write(&path, cfg).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let _ibex = Ibex(child, d);
+    assert!(common::wait_listening(fe), "ibex did not listen");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::path::Path::new(&sock).exists() {
+        assert!(Instant::now() < deadline, "no stats socket");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(pool(&sock, "buffer"), (200, 0), "standard buffers right after start");
+
+    let mut clients = Vec::new();
+    for _ in 0..HELD {
+        let mut c = TcpStream::connect(fe).unwrap();
+        c.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+        clients.push(c);
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    let held = in_use(&sock, "buffer");
+    assert_eq!(pool(&sock, "buffer"), (200, 0), "standard buffers during the burst ({held} held)");
+    assert!(held >= 2 * HELD, "the {HELD} connections hold {held} buffers: some were refused or wait");
+    drop(clients);
+}
