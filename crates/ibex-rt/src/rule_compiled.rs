@@ -14,7 +14,7 @@ use ibex_config::{AclCondition, HttpAfterResAction, HttpReqAction, HttpResAction
 use ibex_sample::acls::AclRef;
 use ibex_sample::{Acls, Expr, Registry, SampleContext};
 
-use crate::logfmt::{LogData, LogFormat};
+use crate::logfmt::{LogData, LogFormat, Part};
 use crate::proxy::AclEvalResult;
 
 /// One term of a [`Cond`].
@@ -100,6 +100,23 @@ impl Cond {
 #[derive(Debug, Clone, Default)]
 pub struct Format {
     lf: Option<LogFormat>,
+    /// The whole format when it is only text: written as it is.
+    literal: Option<String>,
+    /// The pieces of a format that is text and plain samples: rendered without the line
+    /// renderer, as `HAProxy` does a header value (a sample written `%XX`-encoded when `http`).
+    parts: Option<Vec<Part>>,
+    http: bool,
+    /// It has an alias, so it reads the context's names and addresses at least.
+    alias: bool,
+    /// It reads the stream's measures ([`LogFormat::needs_stream`]) / the request line.
+    stream: bool,
+    line: bool,
+}
+
+/// What a format with only text and samples is given in place of the stream's data.
+fn no_data() -> &'static LogData<'static> {
+    static EMPTY: std::sync::LazyLock<LogData<'static>> = std::sync::LazyLock::new(LogData::default);
+    &EMPTY
 }
 
 impl Format {
@@ -108,30 +125,56 @@ impl Format {
     /// load refused it before.
     #[must_use]
     pub fn compile(fmt: &str, http: bool) -> Self {
-        Self { lf: LogFormat::compile_rule(fmt, crate::engine::sample_registry(), http).ok() }
+        let lf = LogFormat::compile_rule(fmt, crate::engine::sample_registry(), http).ok();
+        let literal = lf.as_ref().and_then(LogFormat::literal);
+        let alias = lf.as_ref().is_some_and(LogFormat::has_alias);
+        let stream = lf.as_ref().is_some_and(LogFormat::needs_stream);
+        let line = lf.as_ref().is_some_and(LogFormat::uses_request_line);
+        let parts = lf.as_ref().and_then(LogFormat::parts).filter(|_| literal.is_none());
+        Self { lf, literal, parts, http, alias, stream, line }
     }
 
     /// Rendered and appended to `out`. `data` is what the caller knows of the stream; without
     /// it a format that reads nothing of the stream but `ctx`'s names and addresses is rendered
     /// from `ctx` alone, and any other from what a stream that has just begun measured.
     pub fn render_into(&self, out: &mut String, ctx: &SampleContext, registry: &Registry, data: Option<&LogData>) {
+        if let Some(text) = &self.literal {
+            out.push_str(text);
+            return;
+        }
+        if let (Some(parts), None) = (&self.parts, data) {
+            let push = |out: &mut String, v: &str| if self.http { crate::engine::push_http_encoded(out, v) } else { out.push_str(v) };
+            for part in parts {
+                match part {
+                    Part::Text(t) => out.push_str(t),
+                    Part::Sample(e) => {
+                        if let Some(smp) = e.eval_sample(registry, ctx) {
+                            crate::engine::push_sample(out, &smp, &push);
+                            ibex_sample::spare::give_sample(smp);
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let Some(lf) = &self.lf else { return };
         match data {
             Some(d) => lf.render_value_into(out, d, registry, ctx),
-            None => lf.render_value_into(out, &LogData::of_context(ctx), registry, ctx),
+            None if self.alias => lf.render_value_into(out, &LogData::of_context(ctx), registry, ctx),
+            None => lf.render_value_into(out, no_data(), registry, ctx),
         }
     }
 
     /// Whether the format reads the request line ([`LogFormat::uses_request_line`]).
     #[must_use]
     pub fn uses_request_line(&self) -> bool {
-        self.lf.as_ref().is_some_and(LogFormat::uses_request_line)
+        self.line
     }
 
     /// Whether the format reads the stream's measures ([`LogFormat::needs_stream`]).
     #[must_use]
     pub fn needs_stream(&self) -> bool {
-        self.lf.as_ref().is_some_and(LogFormat::needs_stream)
+        self.stream
     }
 }
 
@@ -250,6 +293,21 @@ pub struct Rules {
     pub stick: Vec<Rule>,
     /// The `http-error` / `errorfiles` templates of `Proxy::error_replies`, by status.
     pub reply_pages: std::collections::HashMap<u16, std::sync::Arc<Reply>>,
+    /// Some response rule's format reads the stream's measures: the response context then
+    /// carries the timers.
+    pub res_stream: bool,
+}
+
+impl Rules {
+    /// The rules with `res_stream` worked out from the response rules' formats.
+    #[must_use]
+    pub fn finish(mut self) -> Self {
+        let reads = |r: &Rule| {
+            r.fmt.iter().chain(r.fmt2.iter()).any(Format::needs_stream) || r.reply.iter().chain(r.page.iter()).any(|p| p.needs_stream())
+        };
+        self.res_stream = self.http_res.iter().chain(&self.http_after_res).any(reads) || self.reply_pages.values().any(|p| p.needs_stream());
+        self
+    }
 }
 
 /// What one rule has compiled: its condition, its expression, its format.
@@ -539,6 +597,38 @@ mod tests {
                 let mut compiled = String::new();
                 Format::compile(fmt, http).render_into(&mut compiled, &ctx, registry, None);
                 assert_eq!(compiled, text, "{fmt:?} (http {http})");
+            }
+        }
+    }
+
+    /// A format of text and plain samples is rendered by its own pieces; the line renderer gives
+    /// the same text for it, whichever way the sample is written (T455).
+    #[test]
+    fn the_piecewise_renderer_writes_what_the_line_renderer_does() {
+        let registry = crate::engine::sample_registry();
+        let ctx = SampleContext::default();
+        let formats = [
+            "x%[str(a)]y",
+            "%[str(a b)]",
+            "%[int(5)]-%[int(-3)]",
+            "%[str(caf\u{e9})]",
+            "%[str(a%b)]",
+            "%[str(abc),upper]%[str()]z",
+            "%[str(a),hex]",
+            "%[bool(true)]",
+            "%[ipv4(1.2.3.4)] %[ipv6(::1)]",
+            "100%%",
+            "%[str(a)]%%[b]",
+        ];
+        for http in [false, true] {
+            for fmt in formats {
+                let piecewise = Format::compile(fmt, http);
+                assert!(piecewise.parts.is_some() || piecewise.literal.is_some(), "{fmt:?} is not piecewise");
+                let mut fast = String::new();
+                piecewise.render_into(&mut fast, &ctx, registry, None);
+                let mut line = String::new();
+                LogFormat::compile_rule(fmt, registry, http).expect("compiles").render_value_into(&mut line, &LogData::default(), registry, &ctx);
+                assert_eq!(fast, line, "{fmt:?} (http {http})");
             }
         }
     }

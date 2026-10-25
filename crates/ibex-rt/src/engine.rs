@@ -2821,7 +2821,7 @@ fn note_last_rule(sess: &mut TcpSession, line: u32) {
 /// connection attempt, once made, counts as forwarded. A connection retry (`retried`) is an
 /// error too (`conn_retries` with no error flag); a redispatch is one retry, so it is
 /// covered.
-fn stream_facts(sess: &TcpSession, status: Option<u16>) -> ibex_sample::StreamFacts {
+fn stream_facts(sess: &TcpSession, status: Option<u16>, timers: bool) -> ibex_sample::StreamFacts {
     let log = &sess.log;
     let used = sess.max_retries.saturating_sub(sess.conn_retries);
     ibex_sample::StreamFacts {
@@ -2830,7 +2830,8 @@ fn stream_facts(sess: &TcpSession, status: Option<u16>) -> ibex_sample::StreamFa
         toapplet: log.applet,
         retries: u32::from(used),
         redispatched: sess.redispatched,
-        timers: Some([log.ms(log.first_byte), log.ms(log.request), log.ms(log.queue), log.ms(log.connect), log.ms(log.data)]),
+        // Only for a rule whose format prints them: five clock reads are not free (T455).
+        timers: timers.then(|| [log.ms(log.first_byte), log.ms(log.request), log.ms(log.queue), log.ms(log.connect), log.ms(log.data)]),
     }
 }
 
@@ -3869,7 +3870,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         tcp_res_content: crate::rule_compiled::tcp_res_content(&listen.tcp_res_content_rules, &acls),
         stick: crate::rule_compiled::stick(&listen.stick_rules, &acls),
         reply_pages: crate::rule_compiled::reply_pages(&listen.error_replies),
-    });
+        res_stream: false,
+    }.finish());
     Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
@@ -4013,7 +4015,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         tcp_res_content: crate::rule_compiled::tcp_res_content(&[], &acls),
         stick: crate::rule_compiled::stick(&fe.stick_rules, &acls),
         reply_pages: crate::rule_compiled::reply_pages(&fe.error_replies),
-    });
+        res_stream: false,
+    }.finish());
     Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
@@ -4154,7 +4157,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         tcp_res_content: crate::rule_compiled::tcp_res_content(&be.tcp_res_content_rules, &acls),
         stick: crate::rule_compiled::stick(&be.stick_rules, &acls),
         reply_pages: crate::rule_compiled::reply_pages(&be.error_replies),
-    });
+        res_stream: false,
+    }.finish());
     Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
@@ -10745,7 +10749,7 @@ impl EngineDispatcher<'_> {
             res_body: has_wait.then_some(res_body.as_slice()),
             unique_id: entry.sess.log.unique_id.as_deref(),
             accept_date: Some(entry.sess.log.date),
-            stream: Some(stream_facts(&entry.sess, Some(status))),
+            stream: Some(stream_facts(&entry.sess, Some(status), order.iter().any(|&px| proxies[px].rules.res_stream))),
             bc_err: entry.sess.bc_err.copied(),
             bc_reused: Some(entry.sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
             term_state: Some(sess_term_state(&entry.sess)),
@@ -15600,7 +15604,7 @@ fn after_res_on_reply<'r>(
             res_version: Some(&version),
             unique_id: sess.log.unique_id.as_deref(),
             accept_date: Some(sess.log.date),
-            stream: Some(stream_facts(sess, Some(status))),
+            stream: Some(stream_facts(sess, Some(status), true)),
             captures_req_hdr: Some(&sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
             bc_err: sess.bc_err.copied(),

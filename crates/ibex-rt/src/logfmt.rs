@@ -401,6 +401,13 @@ enum Node {
     Expr(Box<Expr>, Opts, Option<Box<Named>>),
 }
 
+/// A piece of a format that is text and plain samples ([`LogFormat::parts`]).
+#[derive(Clone, Debug)]
+pub enum Part {
+    Text(String),
+    Sample(Expr),
+}
+
 /// A compiled log-format string.
 #[derive(Clone, Debug)]
 pub struct LogFormat {
@@ -535,18 +542,70 @@ impl LogFormat {
         })
     }
 
-    /// [`LogFormat::render_value`] appended to `out`, through a buffer of the thread's, so that
-    /// a value that is plain text costs no allocation (T455).
-    pub fn render_value_into(&self, out: &mut String, d: &LogData, registry: &Registry, ctx: &SampleContext) {
-        let mut buf = LOGLINE.take_raw(|| Some(Vec::with_capacity(160))).unwrap_or_default();
-        buf.clear();
-        let mut line = Out(buf);
-        self.render_into(&mut line, d, registry, ctx, false);
-        match std::str::from_utf8(&line.0) {
-            Ok(t) if !ibex_regex::bytetext::has_escapes(t) => out.push_str(t),
-            _ => out.push_str(&ibex_regex::bytetext::bytes_to_text(&line.0)),
+    /// The text of a format that is only text (`set-header x-proto http`), which needs no
+    /// rendering; `None` for one with a sample, an alias or an encoding.
+    #[must_use]
+    pub fn literal(&self) -> Option<String> {
+        if self.global.encoded() {
+            return None;
         }
-        LOGLINE.give(line.0);
+        let mut text = String::new();
+        for n in &self.nodes {
+            match n {
+                Node::Text(t) => text.push_str(t),
+                _ => return None,
+            }
+        }
+        Some(text)
+    }
+
+    /// The pieces of a format that is only text and plain samples (no alias, no option, no
+    /// name): what a rule's format mostly is (`%[req.hdr(x)]`, `%[rand]`). A caller renders
+    /// them without the general line renderer.
+    #[must_use]
+    pub fn parts(&self) -> Option<Vec<Part>> {
+        if self.global.encoded() {
+            return None;
+        }
+        self.nodes
+            .iter()
+            .map(|n| match n {
+                Node::Text(t) => Some(Part::Text(t.clone())),
+                Node::Expr(e, o, None) if !(o.quote || o.hex || o.esc || o.json || o.cbor || o.bin || o.utf8) => Some(Part::Sample((**e).clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether the format has an alias (`%ci`, `%ST`, ...) and not only text and samples.
+    #[must_use]
+    pub fn has_alias(&self) -> bool {
+        self.nodes.iter().any(|n| matches!(n, Node::Alias(..)))
+    }
+
+    /// [`LogFormat::render_value`] appended to `out`, in `out`'s own buffer when what is
+    /// written is plain text, so that it costs no allocation and no copy (T455).
+    pub fn render_value_into(&self, out: &mut String, d: &LogData, registry: &Registry, ctx: &SampleContext) {
+        let start = out.len();
+        let mut line = Out(std::mem::take(out).into_bytes());
+        self.render_into(&mut line, d, registry, ctx, false);
+        match String::from_utf8(line.0) {
+            Ok(mut s) => {
+                if ibex_regex::bytetext::has_escapes(&s[start..]) {
+                    let tail = ibex_regex::bytetext::bytes_to_text(s[start..].as_bytes());
+                    s.truncate(start);
+                    s.push_str(&tail);
+                }
+                *out = s;
+            }
+            Err(e) => {
+                let mut bytes = e.into_bytes();
+                let tail = ibex_regex::bytetext::bytes_to_text(&bytes[start..]);
+                bytes.truncate(start);
+                *out = String::from_utf8(bytes).unwrap_or_default();
+                out.push_str(&tail);
+            }
+        }
     }
 
     /// `%(name[:type])`, at `i` (the `(`): the name and cast, and where they end.
