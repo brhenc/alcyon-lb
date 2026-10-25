@@ -214,6 +214,21 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        // `cfg_parse_quic_tune_setting` (src/cfgparse-quic.c, QUIC oracle 3.5-dev7): one
+        // argument, `atoi` into an `unsigned int`, at least 1. So `-1` is 4294967295 and
+        // `abc` is refused. Reaches `QuicEndpoint`'s Retry policy through `QuicConfig`.
+        "tune.quic.fe.sec.retry-threshold" => {
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text)));
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let n = tokens.get(1).map_or(0, |t| c_atoi(&t.text) as u32);
+            if n < 1 {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' expects a positive integer.", kw.text)));
+            }
+            global.quic_retry_threshold = Some(u64::from(n));
+            Ok(())
+        }
         "tune.maxaccept" => {
             // `cfgparse-global.c`: `atol`, so `abc` is 0 (the default); only a value over
             // INT_MAX is refused (`max < -1` is commented out there); a second one is a

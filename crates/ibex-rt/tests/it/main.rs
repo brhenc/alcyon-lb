@@ -172,6 +172,7 @@ mod h2_unread_response_memory;
 mod duress_target;
 mod h3_end_to_end;
 mod h3_field_validity;
+mod quic_retry;
 mod h3_many_threads;
 mod h3_proxy_path;
 mod h3_same_port;

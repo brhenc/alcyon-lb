@@ -4787,7 +4787,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     // Each request is handed to this frontend's stream engine (T130). It
                     // used to go straight to the first server of the default backend, and
                     // no rule, `use_backend`, balancing or log line ever saw it.
-                    let mut ql = crate::quic_listener::QuicListener::bind_for_worker(bind_addr, &tls, None, Some(worker_id))?;
+                    // `quic-force-retry` and `tune.quic.fe.sec.retry-threshold` (T492).
+                    let mut qc = ibex_quic::QuicConfig::new();
+                    qc.require_retry = b.sock.as_ref().is_some_and(|s| s.quic_force_retry);
+                    if let Some(n) = config.global.as_ref().and_then(|g| g.quic_retry_threshold) {
+                        qc.retry_threshold = n;
+                    }
+                    let mut ql = crate::quic_listener::QuicListener::bind_for_worker(bind_addr, &tls, Some(qc), Some(worker_id))?;
                     ql.set_frontend(proxy_idx);
 
                     let l_idx = quic_listeners.len();
