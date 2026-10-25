@@ -317,6 +317,90 @@ pub fn set_buffers_limit(n: usize) {
     let _ = n != 0 && BUF_STD.reserve_shelf();
 }
 
+// `tune.buffers.reserve` (S6b, `HAProxy`'s `th_ctx->emergency_bufs`, `src/dynbuf.c`): each
+// thread makes this many standard buffers at start and keeps them aside. A take the pool refuses
+// may have one, by its class (`b_may_alloc_for_crit`: `left * 3 >= q * reserve`, so a client's
+// first receive buffer only while the reserve is full, a local reply down to the last); a
+// buffer given back refills the reserve before the pool.
+
+/// `tune.buffers.reserve`.
+static RESERVE: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// This thread's emergency buffers, room for the reserve made at start.
+    static EMERGENCY: std::cell::RefCell<Vec<Box<[u8]>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// How many the reserve lacks: a give looks at this before the pool.
+    static LACK: Cell<u32> = const { Cell::new(0) };
+}
+
+/// `tune.buffers.limit` `limit` with `tune.buffers.reserve` `reserve` on `nbthread` threads:
+/// the limit each emergency buffer raises by one (`dynbuf.c:285`), none without a limit.
+#[must_use]
+pub fn limit_with_reserve(limit: usize, reserve: usize, nbthread: usize) -> usize {
+    if limit == 0 { 0 } else { limit.saturating_add(reserve.saturating_mul(nbthread.max(1))) }
+}
+
+/// Makes this thread's `reserve` emergency buffers (at start, after [`init_buffer_sizes`] and
+/// [`set_buffers_limit`] with [`limit_with_reserve`]). False when memory is short.
+#[must_use]
+pub fn fill_emergency(reserve: usize) -> bool {
+    RESERVE.store(reserve, Ordering::Relaxed);
+    ensure_registered();
+    EMERGENCY.with(|e| {
+        let mut e = e.borrow_mut();
+        let more = reserve.saturating_sub(e.len());
+        if e.try_reserve_exact(more).is_err() {
+            return false;
+        }
+        while e.len() < reserve {
+            let Some(d) = take_mem(&BUF_STD) else { return false };
+            e.push(d);
+        }
+        true
+    })
+}
+
+/// An emergency buffer for a take of queue `q` the pool refused, if the reserve allows it.
+#[cold]
+#[inline(never)]
+fn take_emergency(q: usize) -> Option<Box<[u8]>> {
+    let reserve = RESERVE.load(Ordering::Relaxed);
+    EMERGENCY.with(|e| {
+        let mut e = e.borrow_mut();
+        if e.is_empty() || e.len() * 3 < q * reserve {
+            return None;
+        }
+        let d = e.pop()?;
+        LACK.set(LACK.get() + 1);
+        Some(d)
+    })
+}
+
+/// A standard buffer given back: into the reserve if it lacks one (`__b_free`), else back.
+#[inline(always)]
+#[allow(clippy::inline_always)] // one thread-local read on the give path
+fn refill_emergency(data: Box<[u8]>) -> Option<Box<[u8]>> {
+    if LACK.get() == 0 { Some(data) } else { refill_slow(data) }
+}
+
+#[cold]
+#[inline(never)]
+fn refill_slow(data: Box<[u8]>) -> Option<Box<[u8]>> {
+    // A buffer of another size (`tune.bufsize` changed) is not an emergency one.
+    if data.len() != get_bufsize() {
+        return Some(data);
+    }
+    EMERGENCY.with(|e| {
+        let mut e = e.borrow_mut();
+        if e.len() == e.capacity() {
+            return Some(data);
+        }
+        e.push(data);
+        LACK.set(LACK.get() - 1);
+        None
+    })
+}
+
 /// Puts this thread's cached standard buffers on the pool's shelf for another thread's waiters
 /// (S6b); how many.
 #[must_use]
@@ -451,7 +535,9 @@ impl Drop for Buf {
         let data = std::mem::replace(&mut self.data, Box::new([]));
         match self.class {
             BufClass::Standard => {
-                give_mem(&BUF_STD, data);
+                if let Some(data) = refill_emergency(data) {
+                    give_mem(&BUF_STD, data);
+                }
                 crate::buf_wait::offer();
             }
             BufClass::Small => give_mem(&BUF_SMALL, data),
@@ -595,6 +681,25 @@ impl Buf {
     pub fn alloc_if_needed(&mut self) -> bool {
         self.eoh.set(EOH_UNKNOWN);
         !self.data.is_empty() || self.alloc_now()
+    }
+
+    /// [`Self::alloc_if_needed`], or for a standard buffer the pool refused, one of the thread's
+    /// emergency buffers if the reserve allows a take of queue `class` (`tune.buffers.reserve`, S6b).
+    #[inline]
+    pub fn alloc_for(&mut self, class: crate::buf_wait::Class) -> bool {
+        self.alloc_if_needed() || self.alloc_emergency(class)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_emergency(&mut self, class: crate::buf_wait::Class) -> bool {
+        if self.class != BufClass::Standard {
+            return false;
+        }
+        let Some(data) = take_emergency(class as usize) else { return false };
+        self.data = data;
+        self.head = 0;
+        true
     }
 
     #[cold]

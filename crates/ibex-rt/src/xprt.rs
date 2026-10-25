@@ -330,7 +330,7 @@ impl TlsConn {
     /// still in it (the buffer may move its bytes to make room).
     fn read_once(&mut self, fd: BorrowedFd<'_>) -> io::Result<Read1> {
         debug_assert!(!self.ctx.has_plain());
-        if !self.rx.buf.alloc_if_needed() {
+        if !self.rx.buf.alloc_for(crate::buf_wait::Class::MuxRx) {
             return Err(crate::buf::oom());
         }
         if self.rx.buf.ensure_writable(4096).is_empty() {

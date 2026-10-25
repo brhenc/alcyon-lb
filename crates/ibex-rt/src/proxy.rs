@@ -2011,7 +2011,7 @@ impl TcpSession {
             txn::MsgState::Body(txn::Body::Length(raw.len() as u64))
         };
         self.rep.clear();
-        if !self.rep.alloc_if_needed() {
+        if !self.rep.alloc_for(crate::buf_wait::Class::MuxTx) {
             // At `tune.buffers.limit` the reply waits for a buffer (S6b, `DB_MUX_TX`, the most
             // critical queue), kept whole until then (`process_cli_io` copies it in).
             if self.wait_for_buffer(crate::buf_wait::Class::MuxTx).is_ok() {
@@ -2163,7 +2163,7 @@ impl TcpSession {
     /// client not read; `Err` (out of memory) when the refusal is not the limit's, as in S5.
     #[inline]
     fn alloc_or_wait_req(&mut self) -> io::Result<bool> {
-        if self.req.alloc_if_needed() {
+        if self.req.alloc_for(crate::buf_wait::Class::MuxRx) {
             return Ok(true);
         }
         self.wait_for_buffer(crate::buf_wait::Class::MuxRx)
@@ -2173,7 +2173,7 @@ impl TcpSession {
     /// [`Self::alloc_or_wait_req`]; `DB_SE_RX`, served before new connections).
     #[inline]
     fn alloc_or_wait_rep(&mut self) -> io::Result<bool> {
-        if self.rep.alloc_if_needed() {
+        if self.rep.alloc_for(crate::buf_wait::Class::SeRx) {
             return Ok(true);
         }
         self.wait_for_buffer(crate::buf_wait::Class::SeRx)
@@ -2961,7 +2961,7 @@ impl TcpSession {
         }
 
         // Drain pending synthetic response into rep if space is available
-        if matches!(self.pending_resp.as_deref(), Some(PendingOut::Raw(..))) && !self.rep.is_allocated() && !self.rep.alloc_if_needed() {
+        if matches!(self.pending_resp.as_deref(), Some(PendingOut::Raw(..))) && !self.rep.is_allocated() && !self.rep.alloc_for(crate::buf_wait::Class::MuxTx) {
             // A reply waiting for a buffer (S6b, `write_reply_with`), refused again.
             return self.wait_for_buffer(crate::buf_wait::Class::MuxTx).map(|_| changed);
         }

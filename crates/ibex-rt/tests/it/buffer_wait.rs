@@ -115,6 +115,11 @@ impl Proxy {
 /// The proxy, `nbthread 1`, with `tune.buffers.limit 3` and this `timeout client` (frontend
 /// `fe2`: 2 s). `fe` answers `GET /r` itself (`hello`) and has a TLS bind too.
 fn start(timeout_client: &str) -> Proxy {
+    start_with(timeout_client, "")
+}
+
+/// [`start`] with more `global` lines.
+fn start_with(timeout_client: &str, global: &str) -> Proxy {
     let be = backend();
     let dir = tempfile::TempDir::new().expect("dir");
     let cfg = dir.path().join("c.cfg");
@@ -128,7 +133,7 @@ fn start(timeout_client: &str) -> Proxy {
     std::fs::write(
         &cfg,
         format!(
-            "global\n\tnbthread 1\n\ttune.buffers.limit 3\n\tstats socket {} level admin\n\
+            "global\n\tnbthread 1\n\ttune.buffers.limit 3\n{global}\tstats socket {} level admin\n\
              defaults\n\tmode http\n\tlog stderr format raw local0\n\toption httplog\n\
              \ttimeout connect 3s\n\ttimeout client {timeout_client}\n\ttimeout server 5s\n\n\
              frontend fe\n\tbind 127.0.0.1:{port}\n\tbind 127.0.0.1:{tls_port} ssl crt {}\n\
@@ -530,4 +535,50 @@ fn a_tls_connection_past_the_limit_waits_for_a_buffer() {
     drop(held);
     let got = waiter.join().expect("waiter");
     assert!(got.starts_with("HTTP/1.1 200") && got.contains("hello"), "not served once buffers were free: {got:?}\n{}", p.log());
+}
+
+// -----------------------------------------------------------------------------
+// S6b §1: tune.buffers.reserve
+// -----------------------------------------------------------------------------
+
+/// `tune.buffers.limit 3`, `tune.buffers.reserve 2`, `nbthread 1`: the thread's two emergency
+/// buffers are made at start and raise the limit by two (`dynbuf.c`
+/// `alloc_emergency_buffers_per_thread`). Measured on `HAProxy` 3.5-dev8 with five holders of a
+/// partial head: `5 allocated (81920 bytes), 5 used` (the limit plus the reserve; with
+/// `tune.buffers.limit 8`, `nbthread 2`: 8 / 12 / 40 allocated at reserve 0 / 2 / 16, Q3 doc
+/// 1.1). Holders past the limit wait as before and are served once the others leave.
+#[test]
+fn the_reserve_raises_the_limit_by_its_emergency_buffers() {
+    let p = start_with("10s", "\ttune.buffers.reserve 2\n");
+    let allocated = |p: &Proxy| -> usize {
+        let out = p.cli("show pools");
+        let line = out.lines().find(|l| l.contains("Pool buffer ")).unwrap_or_else(|| panic!("{out}"));
+        line.split(" : ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{line}"))
+    };
+    let (used, cached) = p.buffers();
+    assert_eq!(used - cached, 2, "the reserve, made at start:\n{}", p.cli("show pools"));
+    // Partial heads of requests the frontend answers itself: completed, each is a local reply
+    // (`DB_MUX_TX`, which may take the reserve's last buffer; a server's response, `DB_SE_RX`,
+    // may not take past two thirds of it).
+    let mut held: Vec<TcpStream> = (0..6)
+        .map(|_| {
+            let mut c = TcpStream::connect(("127.0.0.1", p.port)).expect("connect");
+            c.write_all(b"GET /r HTTP/1.1\r\nHost: x\r\n").expect("partial head");
+            c
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(allocated(&p), 5, "the limit and the reserve:\n{}", p.cli("show pools"));
+    let (used, cached) = p.buffers();
+    // Three from the pool and one from the reserve (a client's first buffer only while the
+    // reserve is full), one left in it; the fifth and sixth wait.
+    assert_eq!(used - cached, 5, "four holders and one emergency buffer:\n{}", p.cli("show pools"));
+    // Each holder completes its request in turn and is answered: the waiters too.
+    for c in &mut held {
+        c.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        c.write_all(b"Connection: close\r\n\r\n").expect("rest of the head");
+        let mut got = Vec::new();
+        let _ = c.read_to_end(&mut got);
+        assert!(got.starts_with(b"HTTP/1.1 200") && got.ends_with(b"hello"), "{:?}\n{}", String::from_utf8_lossy(&got), p.log());
+    }
 }

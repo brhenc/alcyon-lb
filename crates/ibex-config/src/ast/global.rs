@@ -270,6 +270,9 @@ pub struct GlobalSection {
     /// `tune.buffers.limit <n>`: the most standard buffers held at once (0: none; 1 and 2 are 3,
     /// as `HAProxy` makes them).
     pub buffers_limit: Option<usize>,
+    /// `tune.buffers.reserve <n>`: emergency standard buffers per thread, made at start, which
+    /// raise the limit by as many (S6b; `None`: Ibex's 0, `HAProxy`'s 4: see differences.md).
+    pub buffers_reserve: Option<usize>,
     /// `tune.memory.prealloc on|off` (Ibex-only, T468): fill the standard buffer pool and the
     /// session arenas to what `maxconn` implies at start, and keep the buffer pool there. Needs
     /// an explicit `maxconn` or `-m` (checked at load). Off when unset.
