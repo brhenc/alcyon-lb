@@ -36,7 +36,7 @@ day                  vv-soak          vv-probe           redteam    fuzz-libfuzz
 method               hours  last finding     runs
 vv-battery             1.8  never            6
 vv-soak                7.0  2026-10-12 14:38 2
-vv-probe               0.0  2026-10-25 19:23 1
+vv-probe               0.0  2026-10-25 19:23 2
 vv-recheck             1.0  never            7
 redteam                5.6  2026-10-12 12:31 37
 fuzz-libfuzzer         3.0  2026-10-10 22:18 4
