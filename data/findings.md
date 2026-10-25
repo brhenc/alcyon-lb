@@ -15,26 +15,26 @@ needs `fixed_on`; `fixed` (time) feeds the mean time to fix. Check with
 never an open finding. Then `python3 tools/findings.py --md` and commit the CSVs and this file.
 
 ```
-== (a) open findings: 12 of 79
+== (a) open findings: 13 of 80
 severity        dos      leak    parity      perf     flaky  total
 critical          0         0         0         0         0      0
 high              0         0         0         0         0      0
 medium            0         0         1         0         0      1
-low               4         1         4         1         1     11
+low               4         1         5         1         1     12
 
 == (b) new findings per method per day
-day                  vv-soak          vv-probe           redteam    fuzz-libfuzzer fuzz-differential            review              gate
-2026-10-10                 0                 4                 0                 1                 0                31                 1
-2026-10-11                 0                 6                 6                 0                 7                 5                 2
-2026-10-12                 1                 0                 3                 0                 0                 0                 0
-2026-10-17                 0                 3                 0                 0                 0                 0                 0
-2026-10-18                 0                 3                 0                 0                 0                 0                 0
-2026-10-19                 0                 2                 0                 0                 0                 1                 0
-2026-10-25                 0                 3                 0                 0                 0                 0                 0
+day               vv-battery           vv-soak          vv-probe           redteam    fuzz-libfuzzer fuzz-differential            review              gate
+2026-10-10                 0                 0                 4                 0                 1                 0                31                 1
+2026-10-11                 0                 0                 6                 6                 0                 7                 5                 2
+2026-10-12                 0                 1                 0                 3                 0                 0                 0                 0
+2026-10-17                 0                 0                 3                 0                 0                 0                 0                 0
+2026-10-18                 0                 0                 3                 0                 0                 0                 0                 0
+2026-10-19                 0                 0                 2                 0                 0                 0                 1                 0
+2026-10-25                 1                 0                 3                 0                 0                 0                 0                 0
 
 == (c) clean hours since the method's last new finding (runs on the main lineage)
 method               hours  last finding     runs
-vv-battery             1.8  never            6
+vv-battery             0.0  2026-10-25 20:08 0
 vv-soak                7.0  2026-10-12 14:38 2
 vv-probe               0.0  2026-10-25 19:23 2
 vv-recheck             1.0  never            7
