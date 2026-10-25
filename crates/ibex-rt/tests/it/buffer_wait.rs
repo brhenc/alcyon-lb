@@ -10,8 +10,8 @@
 //! waits and is served `200` once buffers are given back (drain shape, Q3 doc 1.2); a connection
 //! still waiting when `timeout client` fires is answered `408` and logged
 //! `fe/<NOSRV> -1/-1/-1/-1/<timeout> 408 0 - - cR-- ... "<BADREQ>"`. `HAProxy`'s cap is the limit
-//! plus `nbthread` x `tune.buffers.reserve` (4); Ibex has no reserve yet, its cap is the limit, so
-//! the number of holders here is Ibex's.
+//! plus `nbthread` x `tune.buffers.reserve` (default 4), as Ibex's since S6b; the shapes here set
+//! `tune.buffers.reserve 0` so that the cap is the limit, except the S6b §1 tests at the end.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -114,8 +114,9 @@ impl Proxy {
 
 /// The proxy, `nbthread 1`, with `tune.buffers.limit 3` and this `timeout client` (frontend
 /// `fe2`: 2 s). `fe` answers `GET /r` itself (`hello`) and has a TLS bind too.
+/// No reserve (`tune.buffers.reserve 0`): the cap is the limit, the shapes below hold it.
 fn start(timeout_client: &str) -> Proxy {
-    start_with(timeout_client, "")
+    start_with(timeout_client, "\ttune.buffers.reserve 0\n")
 }
 
 /// [`start`] with more `global` lines.
@@ -305,7 +306,7 @@ fn a_waiting_connection_is_not_run_again_until_a_buffer_frees() {
 // S6b §4: buffers another thread's cache holds
 // -----------------------------------------------------------------------------
 
-/// `nbthread 2`, `tune.buffers.limit 8`, no `tune.memory.prealloc`; `GET /t` answers
+/// `nbthread 2`, `tune.buffers.limit 8`, `tune.buffers.reserve 0`, no `tune.memory.prealloc`; `GET /t` answers
 /// `%[thread]` (Ibex has no `bind ... thread N`: each worker has its own `SO_REUSEPORT` socket,
 /// so a test finds which thread serves a connection by asking it, as `memory_prealloc.rs`).
 fn start_two_threads() -> Proxy {
@@ -318,7 +319,7 @@ fn start_two_threads() -> Proxy {
     std::fs::write(
         &cfg,
         format!(
-            "global\n\tnbthread 2\n\ttune.buffers.limit 8\n\tstats socket {} level admin\n\
+            "global\n\tnbthread 2\n\ttune.buffers.limit 8\n\ttune.buffers.reserve 0\n\tstats socket {} level admin\n\
              defaults\n\tmode http\n\tlog stderr format raw local0\n\toption httplog\n\
              \ttimeout connect 3s\n\ttimeout client 4s\n\ttimeout server 5s\n\n\
              frontend fe\n\tbind 127.0.0.1:{port}\n\
@@ -591,4 +592,28 @@ fn the_reserve_raises_the_limit_by_its_emergency_buffers() {
         let _ = c.read_to_end(&mut got);
         assert!(got.starts_with(b"HTTP/1.1 200") && got.ends_with(b"hello"), "{:?}\n{}", String::from_utf8_lossy(&got), p.log());
     }
+}
+
+/// No `tune.buffers.reserve` line: the reserve is HAProxy's default, 4 (`RESERVED_BUFS`).
+/// Measured on `HAProxy` 3.5-dev8, `tune.buffers.limit 3`, `nbthread 1`: `7 allocated` from the
+/// start, and still 7 with nine holders (it also makes the pool's `minavail` 3 at start, which
+/// Ibex does not: its start shows the 4 of the reserve). Here: the four at start, at most seven
+/// with nine holders (three from the pool, four's worth of reserve), the others waiting.
+#[test]
+fn without_a_reserve_line_the_reserve_is_four() {
+    let p = start_with("10s", "");
+    let (used, cached) = p.buffers();
+    assert_eq!(used - cached, 4, "the default reserve, made at start:\n{}", p.cli("show pools"));
+    let _held: Vec<TcpStream> = (0..9)
+        .map(|_| {
+            let mut c = TcpStream::connect(("127.0.0.1", p.port)).expect("connect");
+            c.write_all(b"GET /r HTTP/1.1\r\nHost: x\r\n").expect("partial head");
+            c
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(400));
+    let out = p.cli("show pools");
+    let line = out.lines().find(|l| l.contains("Pool buffer ")).unwrap_or_else(|| panic!("{out}"));
+    let allocated: usize = line.split(" : ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{line}"));
+    assert_eq!(allocated, 7, "the limit and the default reserve:\n{out}");
 }

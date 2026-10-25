@@ -326,6 +326,9 @@ pub fn set_buffers_limit(n: usize) {
 /// `tune.buffers.reserve`.
 static RESERVE: AtomicUsize = AtomicUsize::new(0);
 
+/// `tune.buffers.reserve` when it is not set (`RESERVED_BUFS`, include/haproxy/defaults.h).
+pub const RESERVED_BUFS: usize = 4;
+
 thread_local! {
     /// This thread's emergency buffers, room for the reserve made at start.
     static EMERGENCY: std::cell::RefCell<Vec<Box<[u8]>>> = const { std::cell::RefCell::new(Vec::new()) };

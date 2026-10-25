@@ -452,9 +452,11 @@ as HAProxy. Differences that remain:
 - `tune.buffers.reserve <n>` (S6b) makes `n` emergency buffers per thread at start and raises
   the limit by `nbthread` x `n`, as HAProxy; a take the pool refuses may have one by its class
   (`left * 3 >= q * n`: a local reply down to the last, a client's first buffer only while the
-  reserve is full), and a buffer given back refills the reserve first. **Ibex's default is 0**,
-  HAProxy's 4: without the keyword Ibex's cap is the limit, as before S6b (HAProxy shows 11
-  allocated at start with `limit 8`, `nbthread 2`). Ibex gates only the emergency take on the
+  reserve is full), and a buffer given back refills the reserve first. The default is HAProxy's
+  4, but Ibex makes the reserve only when `tune.buffers.limit` is set (without a limit its pool
+  refuses only when memory is short, where the stream fails as in S5; HAProxy makes the 4 per
+  thread always). At start HAProxy also fills the pool to its `minavail` (3): `limit 3` shows 7
+  allocated from the start on HAProxy, 4 on Ibex; both reach 7. Ibex gates only the emergency take on the
   reserve; HAProxy also refuses a pool take of queues 1-3 while its reserve is not full enough.
 - A thread's cache does not keep free buffers while another thread's streams wait: they go to
   the pool's shelf and the waiting thread is woken (S6b; HAProxy wakes waiters on the freeing

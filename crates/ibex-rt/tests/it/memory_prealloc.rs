@@ -153,7 +153,7 @@ fn start(tag: &str, global: &str) -> (Ibex, String) {
 /// A `tune.buffers.limit` below `2 * maxconn` is the pool's size: 10 buffers, not 100.
 #[test]
 fn a_smaller_buffers_limit_sizes_the_buffer_pool() {
-    let (_ibex, sock) = start("limit", "    nbthread 1\n    maxconn 50\n    tune.buffers.limit 10\n    tune.memory.prealloc on\n");
+    let (_ibex, sock) = start("limit", "    nbthread 1\n    maxconn 50\n    tune.buffers.limit 10\n    tune.buffers.reserve 0\n    tune.memory.prealloc on\n");
     assert_eq!(pool(&sock, "buffer"), (10, 0));
     assert_eq!(pool(&sock, "session").0, 50);
 }

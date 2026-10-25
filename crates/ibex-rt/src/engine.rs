@@ -4670,10 +4670,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         ibex_alloc::set_hot_size(config.global.as_ref().and_then(|g| g.hot_size).unwrap_or(ibex_alloc::HOT_SIZE_DEFAULT));
         // `tune.buffers.limit`, `tune.fail-alloc` under `-dMfail` (S5): read by the pools' miss
         // paths (`buf::take_mem`, `Pool::miss`) and the accept (`register_new_session`).
-        // `tune.buffers.reserve` (S6b): each thread's emergency buffers raise the limit.
-        let reserve = config.global.as_ref().and_then(|g| g.buffers_reserve).unwrap_or(0);
+        // `tune.buffers.reserve` (S6b): each thread's emergency buffers raise the limit. Default
+        // `RESERVED_BUFS` (4), as HAProxy, but only with a limit: without one the pool refuses
+        // only when memory is short, where Ibex fails the stream (S5).
+        let limit = config.global.as_ref().and_then(|g| g.buffers_limit).unwrap_or(0);
+        let reserve = config.global.as_ref().and_then(|g| g.buffers_reserve).unwrap_or(if limit == 0 { 0 } else { crate::buf::RESERVED_BUFS });
         let nbthread = crate::stats::NBTHREAD.load(Ordering::Relaxed) as usize;
-        crate::buf::set_buffers_limit(crate::buf::limit_with_reserve(config.global.as_ref().and_then(|g| g.buffers_limit).unwrap_or(0), reserve, nbthread));
+        crate::buf::set_buffers_limit(crate::buf::limit_with_reserve(limit, reserve, nbthread));
         ibex_alloc::pool::set_fail_alloc(ibex_alloc::pool::effective_fail_alloc(config.global.as_ref().and_then(|g| g.fail_alloc)));
         // A variable whose memory is refused collects and retries once (T445).
         ibex_sample::vars::set_alloc_failure_hook(crate::pool_gc::pool_gc);
