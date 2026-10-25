@@ -2882,8 +2882,8 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         stick: Some(stick),
         client_addr: s.client_addr,
         server_addr: s.server_addr,
-        fc_src: s.fc_src,
-        fc_dst: s.fc_dst,
+        fc_src: s.fc_src(),
+        fc_dst: s.fc_dst(),
         is_first_req: s.is_first_req,
         proxy_tlvs: s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&s.cli_xprt, s.h2_role.as_deref()),
@@ -2912,6 +2912,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         bc_reused: Some(s.txn.as_ref().is_some_and(|t| t.srv_reused)),
         term_state: Some(sess_term_state(s)),
         bc_dst: s.bc_dst(),
+        bc_src: s.bc_src(),
         ..Default::default()
     }
 }
@@ -2934,6 +2935,7 @@ fn stream_log_data<'a>(entry: &'a SessionEntry, proxies: &'a [Proxy], proxy_idx:
     let be = proxies.get(entry.backend_idx).filter(|_| proxies.len() > 1).unwrap_or(fe);
     crate::logfmt::LogData {
         server_addr: entry.sess.bc_dst(),
+        backend_addr: entry.sess.bc_src(),
         server: entry
             .target_server_idx
             .or_else(|| entry.sess.log.server.map(|i| i.get() as usize - 1))
@@ -4407,9 +4409,9 @@ fn forwarded_element(fwd: &ibex_config::Forwarded, sess: &TcpSession, ctx: &Samp
         }
     }
     // The address of the stream (`set-src`/`set-dst` change it), and the port of the connection.
-    let src = sess.client_addr.map(|a| (a.ip(), if a.port() == 0 { sess.fc_src.map_or(0, |c| c.port()) } else { a.port() }));
-    let dst_port = sess.fc_dst.map_or(0, |c| c.port());
-    let dst = sess.server_addr.map(|a| a.ip()).or(sess.fc_dst.map(|a| a.ip())).map(|ip| (ip, dst_port));
+    let src = sess.client_addr.map(|a| (a.ip(), if a.port() == 0 { sess.fc_src().map_or(0, |c| c.port()) } else { a.port() }));
+    let dst_port = sess.fc_dst().map_or(0, |c| c.port());
+    let dst = sess.server_addr.map(|a| a.ip()).or(sess.fc_dst().map(|a| a.ip())).map(|ip| (ip, dst_port));
     for (name, node, port, addr) in [("by", &fwd.by, &fwd.by_port, dst), ("for", &fwd.for_, &fwd.for_port, src)] {
         if *node == Off {
             continue;
@@ -6405,7 +6407,7 @@ fn run_deferred_session_rules(proxy_idx: usize, proxies: &[Proxy], sess: &mut Tc
         SessionEvalOutcome::Accept => return,
         SessionEvalOutcome::Reject => sess.abort_client(),
         SessionEvalOutcome::SilentDrop(ttl) => {
-            let is_ipv6 = sess.fc_src.or(sess.client_addr).is_some_and(|a| a.is_ipv6());
+            let is_ipv6 = sess.fc_src().or(sess.client_addr).is_some_and(|a| a.is_ipv6());
             sess.silent_drop_client(is_ipv6, ttl);
         }
     }
@@ -6527,11 +6529,11 @@ fn eval_tcp_req_session_rules(
         stick: Some(&stick),
         client_addr: sess.client_addr,
         server_addr: sess.server_addr,
-        fc_src: sess.fc_src,
+        fc_src: sess.fc_src(),
         so_name: sess.so_name.as_deref(),
         so_id: sess.so_id,
         fe_id: Some(proxy.ids.iid),
-        fc_dst: sess.fc_dst,
+        fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
         req_version: sess.client_version(),
@@ -6739,10 +6741,10 @@ fn eval_tcp_req_content_rules(
         stick: Some(&stick),
         client_addr: sess.client_addr,
         server_addr: sess.server_addr,
-        fc_src: sess.fc_src,
+        fc_src: sess.fc_src(),
         so_name: sess.so_name.as_deref(),
         so_id: sess.so_id,
-        fc_dst: sess.fc_dst,
+        fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
         fc_http_major: sess.fc_http_major(),
@@ -7001,10 +7003,10 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         stick: Some(&stick),
         client_addr: sess.client_addr,
         server_addr: sess.server_addr,
-        fc_src: sess.fc_src,
+        fc_src: sess.fc_src(),
         so_name: sess.so_name.as_deref(),
         so_id: sess.so_id,
-        fc_dst: sess.fc_dst,
+        fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
         fc_http_major: sess.fc_http_major(),
@@ -7022,6 +7024,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         bc_reused: Some(sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
         term_state: Some(sess_term_state(sess)),
         bc_dst: sess.bc_dst(),
+        bc_src: sess.bc_src(),
         ..Default::default()
     };
     for (rule, rc) in proxy.tcp_res_content_rules.iter().zip(&proxy.rules.tcp_res_content) {
@@ -7541,8 +7544,8 @@ fn init_client_session(
     );
     sess.client_addr = Some(client_addr);
     sess.server_addr = Some(server_addr);
-    sess.fc_src = Some(fc_src);
-    sess.fc_dst = Some(fc_dst);
+    sess.fc_src = Some(crate::proxy::PackedAddr::new(fc_src));
+    sess.fc_dst = Some(crate::proxy::PackedAddr::new(fc_dst));
     sess.tracked_sc = tracked_sc;
     sess.h2_flood_config = global_h2_flood_config;
     let fe = &proxies[proxy_idx];
@@ -8031,6 +8034,7 @@ fn release_server(
     }
     entry.target_server_idx = None;
     entry.sess.target_addr = None;
+    entry.sess.bc_src = None;
     entry.sess.bc_err = None;
     entry.srv_served = 0;
     entry.sess.srv_state = ScState::Init;
@@ -8069,6 +8073,7 @@ fn move_server(from: &mut SessionEntry, to: &mut SessionEntry, fdtab: &mut FdTab
     t.send_proxy_prepended = std::mem::take(&mut f.send_proxy_prepended);
     t.send_proxy_header = std::mem::take(&mut f.send_proxy_header);
     t.target_addr = f.target_addr.take();
+    t.bc_src = f.bc_src.take();
     t.bc_err = f.bc_err.take();
     to.srv_raw_fd = from.srv_raw_fd.take();
     to.srv_interest = std::mem::replace(&mut from.srv_interest, Interest::NONE);
@@ -8708,10 +8713,10 @@ impl EngineDispatcher<'_> {
             stick: Some(stick),
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
-            fc_src: sess.fc_src,
+            fc_src: sess.fc_src(),
             so_name: sess.so_name.as_deref(),
             so_id: sess.so_id,
-            fc_dst: sess.fc_dst,
+            fc_dst: sess.fc_dst(),
             is_first_req: sess.is_first_req,
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
@@ -10769,10 +10774,10 @@ impl EngineDispatcher<'_> {
             stick: Some(&stick),
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
-            fc_src: entry.sess.fc_src,
+            fc_src: entry.sess.fc_src(),
             so_name: entry.sess.so_name.as_deref(),
             so_id: entry.sess.so_id,
-            fc_dst: entry.sess.fc_dst,
+            fc_dst: entry.sess.fc_dst(),
             is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             ssl_fc: crate::proxy::ssl_fc(&entry.sess.cli_xprt, entry.sess.h2_role.as_deref()),
@@ -10800,6 +10805,7 @@ impl EngineDispatcher<'_> {
             bc_reused: Some(entry.sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
             term_state: Some(sess_term_state(&entry.sess)),
             bc_dst: entry.sess.bc_dst(),
+            bc_src: entry.sess.bc_src(),
             last_rule: last_rule_at(entry.sess.log.last_rule),
             prio: (entry.sess.log.prio_class, entry.sess.log.prio_offset),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
@@ -11244,8 +11250,8 @@ impl EngineDispatcher<'_> {
             proxies: Some(view),
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
-            fc_src: sess.fc_src,
-            fc_dst: sess.fc_dst,
+            fc_src: sess.fc_src(),
+            fc_dst: sess.fc_dst(),
             is_first_req: sess.is_first_req,
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
             fc_http_major: sess.fc_http_major(),
@@ -11770,10 +11776,10 @@ impl EngineDispatcher<'_> {
             proxies: Some(&ProxiesView(proxies)),
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
-            fc_src: entry.sess.fc_src,
+            fc_src: entry.sess.fc_src(),
             so_name: entry.sess.so_name.as_deref(),
             so_id: entry.sess.so_id,
-            fc_dst: entry.sess.fc_dst,
+            fc_dst: entry.sess.fc_dst(),
             is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             ssl_fc: crate::proxy::ssl_fc(&entry.sess.cli_xprt, entry.sess.h2_role.as_deref()),
@@ -11864,10 +11870,10 @@ impl EngineDispatcher<'_> {
                         proxies: Some(&ProxiesView(proxies)),
                         client_addr: $s.client_addr,
                         server_addr: $s.server_addr,
-                        fc_src: $s.fc_src,
+                        fc_src: $s.fc_src(),
                         so_name: $s.so_name.as_deref(),
                         so_id: $s.so_id,
-                        fc_dst: $s.fc_dst,
+                        fc_dst: $s.fc_dst(),
                         is_first_req: $s.is_first_req,
                         proxy_tlvs: $s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
                         ssl_fc: crate::proxy::ssl_fc(&$s.cli_xprt, $s.h2_role.as_deref()),
@@ -15650,10 +15656,10 @@ fn after_res_on_reply<'r>(
             prio: (sess.log.prio_class, sess.log.prio_offset),
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
-            fc_src: sess.fc_src,
+            fc_src: sess.fc_src(),
             so_name: sess.so_name.as_deref(),
             so_id: sess.so_id,
-            fc_dst: sess.fc_dst,
+            fc_dst: sess.fc_dst(),
             is_first_req: sess.is_first_req,
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
@@ -15681,6 +15687,7 @@ fn after_res_on_reply<'r>(
             bc_reused: Some(sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
             term_state: Some(sess_term_state(sess)),
             bc_dst: sess.bc_dst(),
+            bc_src: sess.bc_src(),
             ..Default::default()
         };
         eval_after_res_rules(
@@ -15723,11 +15730,11 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Pr
                 let ctx = SampleContext {
                     proxies: Some(&ProxiesView(proxies)),
                     client_addr: sess.client_addr,
-                    fc_src: sess.fc_src,
+                    fc_src: sess.fc_src(),
                     proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
                     so_name: sess.so_name.as_deref(),
                     so_id: sess.so_id,
-                    fc_dst: sess.fc_dst,
+                    fc_dst: sess.fc_dst(),
                     is_first_req: sess.is_first_req,
                     ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
                     fc_http_major: sess.fc_http_major(),

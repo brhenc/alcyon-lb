@@ -32,6 +32,8 @@ pub struct LogData<'a> {
     pub frontend_addr: Option<SocketAddr>,
     /// The server connection's destination.
     pub server_addr: Option<SocketAddr>,
+    /// The server connection's local address (`%bi`, `%bp`).
+    pub backend_addr: Option<SocketAddr>,
     pub frontend: &'a str,
     /// The frontend accepted over TLS (`%ft` appends `~`).
     pub frontend_ssl: bool,
@@ -99,6 +101,7 @@ impl<'a> LogData<'a> {
             client: ctx.client_addr,
             frontend_addr: ctx.server_addr,
             server_addr: ctx.bc_dst,
+            backend_addr: ctx.bc_src,
             frontend: ctx.fe_name.unwrap_or_default(),
             backend: ctx.be_name.or(ctx.fe_name).unwrap_or_default(),
             server: ctx.srv_name,
@@ -124,6 +127,7 @@ impl Default for LogData<'_> {
             client: None,
             frontend_addr: None,
             server_addr: None,
+            backend_addr: None,
             frontend: "",
             frontend_ssl: false,
             ssl_cipher: None,
@@ -296,6 +300,8 @@ enum Alias {
     SrvConn,
     ServerIp,
     ServerPort,
+    BackendIp,
+    BackendPort,
     SrvQueue,
     Date,
     ReqDate,
@@ -334,8 +340,8 @@ const ALIASES: &[(&str, Option<Alias>)] = &[
     ("ac", Some(Alias::ActConn)),
     ("b", Some(Alias::Backend)),
     ("bc", Some(Alias::BeConn)),
-    ("bi", None),
-    ("bp", None),
+    ("bi", Some(Alias::BackendIp)),
+    ("bp", Some(Alias::BackendPort)),
     ("bq", Some(Alias::BeQueue)),
     ("ci", Some(Alias::ClientIp)),
     ("cp", Some(Alias::ClientPort)),
@@ -491,6 +497,7 @@ const NUMERIC: &[Alias] = &[
     Alias::Counter,
     Alias::SrvConn,
     Alias::ServerPort,
+    Alias::BackendPort,
     Alias::SrvQueue,
 ];
 
@@ -569,7 +576,7 @@ impl LogFormat {
                 Node::Text(_)
                     | Node::Expr(..)
                     | Node::Alias(
-                        Alias::ClientIp | Alias::ClientPort | Alias::FrontendIp | Alias::FrontendPort | Alias::ServerIp | Alias::ServerPort | Alias::Frontend | Alias::Backend | Alias::Server,
+                        Alias::ClientIp | Alias::ClientPort | Alias::FrontendIp | Alias::FrontendPort | Alias::ServerIp | Alias::ServerPort | Alias::BackendIp | Alias::BackendPort | Alias::Frontend | Alias::Backend | Alias::Server,
                         ..
                     )
             )
@@ -1479,6 +1486,8 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
         Alias::FrontendPort => port(out, d.frontend_addr, o),
         Alias::ServerIp => ip(out, d.server_addr, o),
         Alias::ServerPort => port(out, d.server_addr, o),
+        Alias::BackendIp => ip(out, d.backend_addr, o),
+        Alias::BackendPort => port(out, d.backend_addr, o),
         Alias::TermState => {
             out.push(char::from(d.term_state[0]));
             out.push(char::from(d.term_state[1]));

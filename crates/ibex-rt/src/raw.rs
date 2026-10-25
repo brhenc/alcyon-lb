@@ -251,6 +251,17 @@ pub fn connect_opts(addr: SocketAddr, tfo: bool) -> io::Result<(OwnedFd, bool)> 
     }
 }
 
+/// The local address of a connected, or connecting, IP socket (`getsockname`): for a server
+/// connection, what `%bi` and `%bp` print. `None` for a socket that is not an IP one.
+#[must_use]
+pub fn local_addr(fd: BorrowedFd<'_>) -> Option<SocketAddr> {
+    match net::getsockname(fd).ok()? {
+        SocketAddrAny::V4(a) => Some(SocketAddr::V4(a)),
+        SocketAddrAny::V6(a) => Some(SocketAddr::V6(std::net::SocketAddrV6::new(*a.ip(), a.port(), 0, 0))),
+        _ => None,
+    }
+}
+
 /// Checks the connection status of a non-blocking connecting socket.
 ///
 /// Returns `Ok(None)` if connected successfully, or `Ok(Some(err))` if connection failed with a socket error.
