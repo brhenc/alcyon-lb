@@ -678,6 +678,11 @@ impl CliApplet {
         } else if cmd == "show ssl crypto-provider" {
             // T460 (Ibex-only): the provider and the handshakes of each, then the empty line.
             self.finish_msg(&crate::crypto_provider::show());
+        } else if cmd == "show resolvers" || cmd.starts_with("show resolvers ") {
+            // The section counters worker 0's resolver tasks publish (`crate::resolvers`).
+            let id = cmd["show resolvers".len()..].split_whitespace().next();
+            let out = crate::resolvers::show(id);
+            self.finish_msg(out.trim_end_matches('\n'));
         } else if cmd == "show pools" || cmd.starts_with("show pools ") {
             let args: Vec<&str> = cmd["show pools".len()..].split_whitespace().collect();
             // The answer ends with the empty line already, also when it is the error.

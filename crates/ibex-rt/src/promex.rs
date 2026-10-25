@@ -33,7 +33,7 @@ pub const SCOPE_BACK: u8 = 4;
 pub const SCOPE_SERVER: u8 = 8;
 /// Accepted (`scope=listener`), nothing in it: Ibex has no per-listener stats.
 pub const SCOPE_LISTENER: u8 = 16;
-/// `scope=resolvers`: accepted, nothing in it: Ibex has no resolvers section to count.
+/// `scope=resolver` (`HAProxy`'s module name; anything starting with it): `haproxy_resolver_*`.
 pub const SCOPE_RESOLVERS: u8 = 32;
 pub const SCOPE_ALL: u8 = 63;
 
@@ -121,7 +121,8 @@ pub fn parse_query(uri: &str) -> Option<Query<'_>> {
                     "backend" => q.scopes |= SCOPE_BACK,
                     "frontend" => q.scopes |= SCOPE_FRONT,
                     "listener" => q.scopes |= SCOPE_LISTENER,
-                    "resolvers" => q.scopes |= SCOPE_RESOLVERS,
+                    // A module is named by its prefix (`strncmp(value, mod->name, len)`).
+                    v if v.starts_with("resolver") => q.scopes |= SCOPE_RESOLVERS,
                     _ => return None,
                 }
             }
@@ -202,7 +203,8 @@ const PH_PROCESS: u8 = 0;
 const PH_FRONT: u8 = 1;
 const PH_BACK: u8 = 2;
 const PH_SERVER: u8 = 3;
-const PH_DONE: u8 = 4;
+const PH_RESOLVERS: u8 = 4;
+const PH_DONE: u8 = 5;
 
 /// Where a scrape stands: a few integers, kept in the session between two fills of its
 /// response buffer (HAProxy keeps the same in the applet's context).
@@ -362,9 +364,45 @@ fn produce(cur: &mut Cursor, c: &Ctx<'_>, q: &Query<'_>, info: &crate::stats::In
                     return true;
                 }
             }
+            PH_RESOLVERS => {
+                if q.scopes & SCOPE_RESOLVERS == 0 || crate::resolvers::COUNTERS.get(cur.m as usize).is_none() {
+                    cur.next_phase();
+                    continue;
+                }
+                let idx = cur.m as usize;
+                cur.next_metric();
+                if resolver_unit(q, idx, out) {
+                    return true;
+                }
+            }
             _ => return false,
         }
     }
+}
+
+/// `rslv_promex_*`: counter `idx` as one gauge per nameserver, labelled by section, with its
+/// HELP and TYPE lines first. False when `metrics=` refuses it or there is no nameserver.
+fn resolver_unit(q: &Query<'_>, idx: usize, out: &mut String) -> bool {
+    let (_, pname, desc) = crate::resolvers::COUNTERS[idx];
+    let start = out.len();
+    let _ = write!(out, "haproxy_resolver_{pname}");
+    let refused = q.refuses(&out[start..]);
+    out.truncate(start);
+    if refused {
+        return false;
+    }
+    crate::resolvers::with_stats(|all| {
+        let mut first = true;
+        for sec in all {
+            for (ns, counts) in &sec.nameservers {
+                if std::mem::take(&mut first) {
+                    let _ = write!(out, "# HELP haproxy_resolver_{pname} {desc}\n# TYPE haproxy_resolver_{pname} gauge\n");
+                }
+                let _ = writeln!(out, "haproxy_resolver_{pname}{{resolver=\"{}\",nameserver=\"{ns}\"}} {}", sec.name, counts[idx]);
+            }
+        }
+    });
+    out.len() > start
 }
 
 fn process_unit(idx: usize, q: &Query<'_>, info: &crate::stats::InfoPairs, out: &mut String) {
