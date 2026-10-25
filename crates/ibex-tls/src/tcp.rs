@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! The configurations of TLS over TCP, on rustls 0.24 (T440).
+//! The TLS configurations of `bind ... ssl` and `server ... ssl` lines, on rustls 0.24 (T440;
+//! QUIC too since T461, and the only rustls the binary links since T479).
 //!
 //! rustls 0.24 decrypts and encrypts in buffers its caller owns, which is what lets a
-//! steady-state request over TLS allocate nothing. QUIC stays on rustls 0.23 (`quinn-proto`
-//! 0.11 needs it), so a `bind ... ssl` line builds its configuration once per rustls: the
-//! QUIC one in [`crate::config`], the TCP one here, both from the same [`BindPlan`] so they
-//! cannot disagree on certificates, names or ALPN.
+//! steady-state request over TLS allocate nothing. A bind is built from its [`BindPlan`]
+//! (certificates, names, ALPN, versions).
 //!
-//! What differs from 0.23, and how it is kept the same on the wire:
+//! What differs from rustls 0.23 (which Ibex used before), and how it is kept the same on the
+//! wire:
 //! - The protocol versions are the provider's cipher suite lists: a provider with no TLS 1.2
 //!   suites speaks TLS 1.3 only (there is no `with_protocol_versions`).
 //! - ring's ticket key type is private; [`rustls24::TicketRotator`] rotates keys made by the
@@ -40,10 +40,8 @@ fn provider_between(
     min: Option<ibex_config::TlsVersion>,
     max: Option<ibex_config::TlsVersion>,
 ) -> Option<Arc<CryptoProvider>> {
-    let versions = versions_between(min, max);
-    let tls12 = versions.iter().any(|v| v.version == rustls::ProtocolVersion::TLSv1_2);
-    let tls13 = versions.iter().any(|v| v.version == rustls::ProtocolVersion::TLSv1_3);
-    (tls12 || tls13).then(|| provider::of(kind, tls12, tls13))
+    let v = versions_between(min, max);
+    (!v.is_empty()).then(|| provider::of(kind, v.tls12, v.tls13))
 }
 
 /// A ticket key made by the provider for one rotation period of the outer rotator.
@@ -92,7 +90,7 @@ impl TicketProducer for Hint {
     }
 }
 
-/// The session-ID cache, entries refused once `SESSION_LIFETIME` old (as in [`crate::config`]).
+/// The session-ID cache, entries refused once `SESSION_LIFETIME` old (rustls's memory cache only evicts by size).
 #[derive(Debug)]
 struct ExpiringSessions {
     inner: Arc<rustls24::server::ServerSessionMemoryCache>,
@@ -198,10 +196,12 @@ impl provider::Rebuild for BindTls {
 }
 
 /// Builds the TCP configuration of a `bind ... ssl` line on the [`provider::active`] provider.
-/// Identical binds share one (as [`crate::TlsConfig::from_bind_config`] does for the QUIC one).
+/// Identical binds share one: a large `crt` directory is held in memory once, not once per
+/// thread per bind.
 ///
 /// # Errors
-/// As [`crate::TlsConfig::from_bind_config`].
+/// A certificate that cannot be loaded, a missing private key, a key that does not match its
+/// certificate, an ALPN list with nothing servable, or a version range with nothing in it.
 pub fn from_bind_config(bind: &BindConfig) -> Result<Arc<BindTls>, String> {
     from_bind_config_with(bind, provider::active())
 }
@@ -209,7 +209,7 @@ pub fn from_bind_config(bind: &BindConfig) -> Result<Arc<BindTls>, String> {
 /// [`from_bind_config`] on provider `kind`.
 ///
 /// # Errors
-/// As [`crate::TlsConfig::from_bind_config`].
+/// As [`from_bind_config`].
 pub fn from_bind_config_with(bind: &BindConfig, kind: TlsCryptoProvider) -> Result<Arc<BindTls>, String> {
     type Cache = std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<BindTls>>>;
     static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
@@ -230,10 +230,8 @@ pub fn from_bind_config_with(bind: &BindConfig, kind: TlsCryptoProvider) -> Resu
 
 fn build_bind(bind: &BindConfig, kind: TlsCryptoProvider) -> Result<BindTls, String> {
     let plan = BindPlan::of(bind)?;
-    let versions = plan.versions(bind)?;
-    let tls12 = versions.iter().any(|v| v.version == rustls::ProtocolVersion::TLSv1_2);
-    let tls13 = versions.iter().any(|v| v.version == rustls::ProtocolVersion::TLSv1_3);
-    build(&plan, kind, tls12, tls13)
+    let v = plan.versions(bind)?;
+    build(&plan, kind, v.tls12, v.tls13)
 }
 
 impl BindTls {
@@ -310,7 +308,7 @@ fn build(plan: &BindPlan, kind: TlsCryptoProvider, tls12: bool, tls13: bool) -> 
         .with_server_credential_resolver(Arc::clone(&resolver) as Arc<dyn ServerCredentialResolver>)
         .map_err(|e| format!("Protocol version error: {e:?}"))?;
     config.alpn_protocols = plan.alpn.iter().map(|p| p.clone().into()).collect();
-    // Session resumption as in `crate::config::TlsConfig::build_server_config`: stateless
+    // Session resumption as `HAProxy` has it by default: stateless
     // tickets, and a session-ID cache of `tune.ssl.cachesize` (20000) entries.
     config.session_storage = Arc::new(ExpiringSessions { inner: rustls24::server::ServerSessionMemoryCache::new(SESSION_CACHE_SIZE) });
     config.ticketer = Some(Arc::new(Hint(
@@ -364,15 +362,28 @@ impl rustls24::client::danger::ServerVerifier for NoServerAuth {
     }
 }
 
-/// `verify required`, with `HAProxy`'s name rule: see [`crate::ServerVerifier`].
+/// The server certificate check of a `verify required` server line, with `HAProxy`'s
+/// rules (`ssl_sock_srv_verifycbk`, `src/ssl_sock.c`) rather than webpki's.
+///
+/// The chain is verified by webpki against the `ca-file` anchors (and `crl-file`). The
+/// name is where the two differ: `HAProxy` checks it only against the SNI it sent or, when
+/// it sent none, against `verifyhost`, and not at all when neither is set; and it falls
+/// back to the subject CN when the certificate has no dNSName, which webpki never does.
+/// The engine encodes that in the [`ServerName`] it connects with: a DNS name is the name
+/// to check (and send, unless the config's `enable_sni` is off), the server's IP address
+/// means "no name to check". Measured on 3.5-dev8: a CN-only certificate passes a matching
+/// `verifyhost`, and with neither SNI nor `verifyhost` any name passes.
 #[derive(Debug)]
 pub struct ServerVerifier {
     inner: rustls24::client::WebPkiServerVerifier,
 }
 
 impl ServerVerifier {
+    /// Builds the verifier of a server line.
+    ///
     /// # Errors
-    /// As [`crate::ServerVerifier::from_options`].
+    /// No `ca-file` (`HAProxy`: "verify is enabled but no CA file specified"), or one
+    /// that cannot be loaded, or a `crl-file` that cannot.
     pub fn from_options(options: &BackendTlsOptions, provider: &CryptoProvider) -> Result<Arc<Self>, String> {
         let Some(ca_path) = options.ca_file.as_deref() else {
             return Err("verify is enabled but no CA file specified".to_string());
@@ -444,10 +455,12 @@ impl rustls24::client::danger::ServerVerifier for ServerVerifier {
 }
 
 /// The [`ClientConfig`] of a server line (or its health check) on the [`provider::active`]
-/// provider, as [`crate::build_backend_client_config`] builds it for rustls 0.23.
+/// provider. `enable_sni` is on; the engine clones it off for a connection that verifies
+/// against `verifyhost` without sending a name.
 ///
 /// # Errors
-/// As [`crate::build_backend_client_config`].
+/// `verify required` without a loadable `ca-file`, a `crl-file` or `crt` that cannot be
+/// loaded, or a version range with nothing in it.
 pub fn build_backend_client_config(options: &BackendTlsOptions) -> Result<Arc<ClientConfig>, String> {
     build_backend_client_config_with(options, provider::active())
 }
@@ -455,7 +468,7 @@ pub fn build_backend_client_config(options: &BackendTlsOptions) -> Result<Arc<Cl
 /// [`build_backend_client_config`] on provider `kind`.
 ///
 /// # Errors
-/// As [`crate::build_backend_client_config`].
+/// As [`build_backend_client_config`].
 pub fn build_backend_client_config_with(options: &BackendTlsOptions, kind: TlsCryptoProvider) -> Result<Arc<ClientConfig>, String> {
     let Some(provider) = provider_between(kind, options.min_ver, options.max_ver) else {
         return Err(format!(

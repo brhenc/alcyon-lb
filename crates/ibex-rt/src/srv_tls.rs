@@ -17,7 +17,7 @@
 //! rustls takes the name as the [`ServerName`] a connection is opened with, so the three
 //! cases become: a DNS name on a config that sends SNI; a DNS name on a config that does
 //! not (`enable_sni` off); the server's IP address, which rustls never sends and which
-//! [`ibex_tls::ServerVerifier`] reads as "no name to check".
+//! [`ibex_tls::tcp::ServerVerifier`] reads as "no name to check".
 
 use crate::xprt::{self, ServerXprt};
 use ibex_config::{Server, ServerSsl, SslVerify};

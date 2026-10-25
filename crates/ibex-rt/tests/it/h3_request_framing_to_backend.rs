@@ -142,7 +142,7 @@ struct Client {
 
 impl Client {
     fn connect(server: SocketAddr) -> Self {
-        ibex_tls::config::install_default_crypto_provider();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut ctls = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(Any)).with_no_client_auth();
         ctls.alpn_protocols = vec![b"h3".to_vec()];
         let client_cfg = ClientConfig::new(Arc::new(QuicClientConfig::try_from(ctls).expect("client config")));

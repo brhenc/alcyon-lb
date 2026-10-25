@@ -24,7 +24,6 @@ fn main() {
     let cert = std::env::args()
         .nth(3)
         .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem").to_string());
-    ibex_tls::config::install_default_crypto_provider();
 
     // The listener comes from the configuration, as it does in a deployed Ibex: the engine
     // builds it, hands every request to the frontend's stream engine and drives it.

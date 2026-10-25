@@ -75,7 +75,7 @@ fn start() -> Fixture {
 
 /// A TLS client offering `alpn`; the handshake is completed and the negotiated ALPN returned.
 fn connect(f: &Fixture, alpn: &[&str]) -> StreamOwned<ClientConnection, TcpStream> {
-    ibex_tls::install_default_crypto_provider();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(f.der.clone())).expect("root");
     let mut cfg = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();

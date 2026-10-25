@@ -17,14 +17,15 @@
 #[path = "../common/mod.rs"]
 mod common;
 
-mod arena;
 mod blocking;
 mod cert_validation;
 mod config;
 mod crypto_provider;
+mod dependency_graph;
 mod e2e_tls_nginx_proxy;
 mod handshake;
 mod resolver;
+mod server_verify;
 mod stack_scrub;
 mod tcp_ctx;
 mod tokio_integration;

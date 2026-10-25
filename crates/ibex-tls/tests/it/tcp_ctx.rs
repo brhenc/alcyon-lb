@@ -315,9 +315,9 @@ fn the_input_reports_what_it_holds_and_the_eof() {
 }
 
 #[test]
-fn the_certificate_a_legacy_context_serves_names_its_leaf() {
+fn the_certificate_a_context_serves_names_its_leaf() {
     let (key, der) = crate::common::generate_test_cert(vec!["localhost".into()]);
-    let local = ibex_tls::LocalCert::Legacy(key);
+    let local = ibex_tls::LocalCert::Tcp(key);
     assert_eq!(local.leaf(), Some(der.as_ref()));
 }
 

@@ -5,33 +5,33 @@
 //! terminating TLS on a frontend port, reverse proxying traffic to an upstream Nginx server,
 //! and verifying the transaction with an actual `curl https://localhost:...` command.
 
-use crate::common;
+//!
+//! On the binary's TLS ([`ibex_tls::blocking::BlockingTls`] serving a [`BindTls`], rustls
+//! 0.24) and threads since T479; it ran on tokio-rustls (rustls 0.23).
 
-use common::generate_test_cert_with_pem;
+use crate::common::TestCert;
 use ibex_config::parse_str;
-use ibex_tls::{IbexCertResolver, TlsConfig};
-use std::io::Write;
+use ibex_tls::blocking::BlockingTls;
+use ibex_tls::tcp::BindTls;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::TlsAcceptor;
 
 /// Upstream Nginx server mock.
-async fn run_mock_nginx(listener: TcpListener) {
-    loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
+fn run_mock_nginx(listener: &TcpListener) {
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else {
             break;
         };
 
-        tokio::spawn(async move {
+        std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let n = stream.read(&mut buf).unwrap_or(0);
             if n == 0 {
                 return;
             }
 
-            let _req_str = String::from_utf8_lossy(&buf[..n]);
             let body = "<h1>Welcome to nginx proxied by Ibex!</h1>\n";
             let response = format!(
                 "HTTP/1.1 200 OK\r\n\
@@ -45,79 +45,96 @@ async fn run_mock_nginx(listener: TcpListener) {
                 body
             );
 
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.shutdown(std::net::Shutdown::Write);
         });
     }
 }
 
 /// Ibex TLS Reverse Proxy daemon task.
-async fn run_ibex_tls_proxy(
-    frontend_listener: TcpListener,
-    backend_addr: std::net::SocketAddr,
-    acceptor: TlsAcceptor,
-) {
-    loop {
-        let Ok((tcp_stream, _peer_addr)) = frontend_listener.accept().await else {
+fn run_ibex_tls_proxy(frontend_listener: &TcpListener, backend_addr: std::net::SocketAddr, bind: &Arc<BindTls>) {
+    for tcp_stream in frontend_listener.incoming() {
+        let Ok(tcp_stream) = tcp_stream else {
             break;
         };
 
-        let acceptor = acceptor.clone();
-        tokio::spawn(async move {
-            // 1. Terminate TLS handshake with the client
-            let mut tls_stream = match acceptor.accept(tcp_stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Ibex TLS handshake error: {e}");
-                    return;
-                }
-            };
+        let bind = Arc::clone(bind);
+        std::thread::spawn(move || {
+            // 1. Terminate TLS with the client (the handshake runs on the first read)
+            let mut tls_stream = BlockingTls::accept(&bind, tcp_stream);
 
             // 2. Read client HTTP request from TLS stream
             let mut client_req_buf = vec![0u8; 8192];
-            let n = match tls_stream.read(&mut client_req_buf).await {
+            let n = match tls_stream.read(&mut client_req_buf) {
                 Ok(n) if n > 0 => n,
-                _ => return,
+                Ok(_) => return,
+                Err(e) => {
+                    eprintln!("Ibex TLS handshake or read error: {e}");
+                    return;
+                }
             };
             client_req_buf.truncate(n);
 
             // 3. Connect to upstream Nginx backend
-            let mut srv_stream = match TcpStream::connect(backend_addr).await {
+            let mut srv_stream = match TcpStream::connect(backend_addr) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Failed to connect to backend {backend_addr}: {e}");
                     let err_resp = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
-                    let _ = tls_stream.write_all(err_resp).await;
+                    let _ = tls_stream.write_all(err_resp);
                     return;
                 }
             };
 
             // 4. Forward HTTP request to backend
-            if let Err(e) = srv_stream.write_all(&client_req_buf).await {
+            if let Err(e) = srv_stream.write_all(&client_req_buf) {
                 eprintln!("Failed to write request to backend: {e}");
                 return;
             }
 
             // 5. Read HTTP response from backend
             let mut srv_resp_buf = Vec::new();
-            if let Err(e) = srv_stream.read_to_end(&mut srv_resp_buf).await {
+            if let Err(e) = srv_stream.read_to_end(&mut srv_resp_buf) {
                 eprintln!("Failed to read response from backend: {e}");
                 return;
             }
 
             // 6. Return response to client encrypted over TLS
-            let _ = tls_stream.write_all(&srv_resp_buf).await;
-            let _ = tls_stream.shutdown().await;
+            let _ = tls_stream.write_all(&srv_resp_buf);
+            let _ = tls_stream.flush();
         });
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// The frontend's bind: the certificate for `localhost` and `127.0.0.1`, offering HTTP/1.1.
+fn frontend_bind(cert: &TestCert) -> Arc<BindTls> {
+    cert.bind(vec![b"http/1.1".to_vec()])
+}
+
+/// `curl` against `https://localhost:<port>/`, trusting `ca`.
+fn curl(frontend_port: u16, ca: &std::path::Path) -> std::process::Output {
+    let url = format!("https://localhost:{frontend_port}/");
+    println!("Executing curl command: curl -4 -vk --cacert {} {}", ca.display(), url);
+    Command::new("curl")
+        .arg("-4")
+        .arg("-vk")
+        .arg("--connect-timeout")
+        .arg("5")
+        .arg("--cacert")
+        .arg(ca)
+        .arg("--resolve")
+        .arg(format!("localhost:{frontend_port}:127.0.0.1"))
+        .arg(&url)
+        .output()
+        .expect("Failed to execute curl")
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
-async fn test_e2e_haproxy_cfg_tls_frontend_proxy_to_nginx_with_curl() {
+fn test_e2e_haproxy_cfg_tls_frontend_proxy_to_nginx_with_curl() {
     // 1. Generate test certificate & key for localhost and 127.0.0.1
-    let (cert, _cert_der, cert_pem) =
-        generate_test_cert_with_pem(vec!["localhost".to_string(), "127.0.0.1".to_string()]);
+    let cert = TestCert::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]);
+    let cert_pem = &cert.cert_pem;
 
     // Write CA cert to a temporary file for curl --cacert
     let mut cert_file = tempfile::NamedTempFile::new().expect("Create temp cert file");
@@ -128,17 +145,13 @@ async fn test_e2e_haproxy_cfg_tls_frontend_proxy_to_nginx_with_curl() {
     let cert_file_path = cert_file.path().to_path_buf();
 
     // 2. Start upstream Nginx mock server
-    let nginx_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Bind mock nginx");
+    let nginx_listener = TcpListener::bind("127.0.0.1:0").expect("Bind mock nginx");
     let nginx_addr = nginx_listener.local_addr().expect("Get mock nginx addr");
     let nginx_port = nginx_addr.port();
-    tokio::spawn(run_mock_nginx(nginx_listener));
+    std::thread::spawn(move || run_mock_nginx(&nginx_listener));
 
     // 3. Bind Ibex TLS frontend listener
-    let frontend_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Bind frontend");
+    let frontend_listener = TcpListener::bind("127.0.0.1:0").expect("Bind frontend");
     let frontend_addr = frontend_listener.local_addr().expect("Get frontend addr");
     let frontend_port = frontend_addr.port();
 
@@ -164,56 +177,16 @@ listen nginx_https_proxy
     assert_eq!(listen.servers.len(), 1);
     assert_eq!(listen.servers[0].addr.port(), nginx_port);
 
-    // 5. Build Ibex TLS engine configuration with SNI resolver
-    let mut resolver = IbexCertResolver::new();
-    resolver.set_default_cert(cert.clone());
-    resolver.add_exact("localhost", cert.clone());
-    resolver.add_exact("127.0.0.1", cert);
-
-    let tls_config = TlsConfig::new()
-        .with_cert_resolver(Arc::new(resolver))
-        .with_alpn(vec![b"http/1.1".to_vec()]);
-    let server_config = tls_config
-        .build_server_config()
-        .expect("Build TLS server config");
-    let acceptor = TlsAcceptor::from(server_config);
+    // 5. Build Ibex TLS engine configuration (its resolver serves the certificate for
+    // both names, and by default)
+    let bind = frontend_bind(&cert);
 
     // 6. Start Ibex TLS Reverse Proxy
-    tokio::spawn(run_ibex_tls_proxy(
-        frontend_listener,
-        listen.servers[0].addr,
-        acceptor,
-    ));
-
-    // Give the listener a moment to settle
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let backend = listen.servers[0].addr;
+    std::thread::spawn(move || run_ibex_tls_proxy(&frontend_listener, backend, &bind));
 
     // 7. Execute actual `curl` command against https://localhost:{frontend_port}/
-    let url = format!("https://localhost:{frontend_port}/");
-    println!(
-        "Executing curl command: curl -4 -vk --cacert {} {}",
-        cert_file_path.display(),
-        url
-    );
-
-    let cert_path_clone = cert_file_path.clone();
-    let url_clone = url.clone();
-    let curl_output = tokio::task::spawn_blocking(move || {
-        Command::new("curl")
-            .arg("-4")
-            .arg("-vk")
-            .arg("--connect-timeout")
-            .arg("5")
-            .arg("--cacert")
-            .arg(&cert_path_clone)
-            .arg("--resolve")
-            .arg(format!("localhost:{frontend_port}:127.0.0.1"))
-            .arg(&url_clone)
-            .output()
-            .expect("Failed to execute curl")
-    })
-    .await
-    .expect("Curl task panicked");
+    let curl_output = curl(frontend_port, &cert_file_path);
 
     let stdout = String::from_utf8_lossy(&curl_output.stdout);
     let stderr = String::from_utf8_lossy(&curl_output.stderr);
@@ -248,11 +221,11 @@ listen nginx_https_proxy
     println!("SUCCESS: End-to-end TLS termination and Nginx proxying verified with curl!");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_e2e_frontend_backend_syntax_tls_proxy_with_curl() {
+#[test]
+fn test_e2e_frontend_backend_syntax_tls_proxy_with_curl() {
     // 1. Generate test certificate & key for localhost and 127.0.0.1
-    let (cert, _cert_der, cert_pem) =
-        generate_test_cert_with_pem(vec!["localhost".to_string(), "127.0.0.1".to_string()]);
+    let cert = TestCert::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]);
+    let cert_pem = &cert.cert_pem;
 
     let mut cert_file = tempfile::NamedTempFile::new().expect("Create temp cert file");
     cert_file
@@ -262,17 +235,13 @@ async fn test_e2e_frontend_backend_syntax_tls_proxy_with_curl() {
     let cert_file_path = cert_file.path().to_path_buf();
 
     // 2. Start upstream Nginx mock server
-    let nginx_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Bind mock nginx");
+    let nginx_listener = TcpListener::bind("127.0.0.1:0").expect("Bind mock nginx");
     let nginx_addr = nginx_listener.local_addr().expect("Get mock nginx addr");
     let nginx_port = nginx_addr.port();
-    tokio::spawn(run_mock_nginx(nginx_listener));
+    std::thread::spawn(move || run_mock_nginx(&nginx_listener));
 
     // 3. Bind Ibex TLS frontend listener
-    let frontend_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Bind frontend");
+    let frontend_listener = TcpListener::bind("127.0.0.1:0").expect("Bind frontend");
     let frontend_addr = frontend_listener.local_addr().expect("Get frontend addr");
     let frontend_port = frontend_addr.port();
 
@@ -304,49 +273,16 @@ backend be_test
     assert_eq!(be.name, "be_test");
     assert_eq!(be.servers[0].addr.port(), nginx_port);
 
-    // 5. Build Ibex TLS engine configuration with SNI resolver
-    let mut resolver = IbexCertResolver::new();
-    resolver.set_default_cert(cert.clone());
-    resolver.add_exact("localhost", cert.clone());
-    resolver.add_exact("127.0.0.1", cert);
-
-    let tls_config = TlsConfig::new()
-        .with_cert_resolver(Arc::new(resolver))
-        .with_alpn(vec![b"http/1.1".to_vec()]);
-    let server_config = tls_config
-        .build_server_config()
-        .expect("Build TLS server config");
-    let acceptor = TlsAcceptor::from(server_config);
+    // 5. Build Ibex TLS engine configuration (its resolver serves the certificate for
+    // both names, and by default)
+    let bind = frontend_bind(&cert);
 
     // 6. Start Ibex TLS Reverse Proxy
-    tokio::spawn(run_ibex_tls_proxy(
-        frontend_listener,
-        be.servers[0].addr,
-        acceptor,
-    ));
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let backend = be.servers[0].addr;
+    std::thread::spawn(move || run_ibex_tls_proxy(&frontend_listener, backend, &bind));
 
     // 7. Execute curl command against https://localhost:{frontend_port}/
-    let url = format!("https://localhost:{frontend_port}/");
-    let cert_path_clone = cert_file_path.clone();
-    let url_clone = url.clone();
-    let curl_output = tokio::task::spawn_blocking(move || {
-        Command::new("curl")
-            .arg("-4")
-            .arg("-vk")
-            .arg("--connect-timeout")
-            .arg("5")
-            .arg("--cacert")
-            .arg(&cert_path_clone)
-            .arg("--resolve")
-            .arg(format!("localhost:{frontend_port}:127.0.0.1"))
-            .arg(&url_clone)
-            .output()
-            .expect("Failed to execute curl")
-    })
-    .await
-    .expect("Curl task panicked");
+    let curl_output = curl(frontend_port, &cert_file_path);
 
     let stdout = String::from_utf8_lossy(&curl_output.stdout);
     let stderr = String::from_utf8_lossy(&curl_output.stderr);

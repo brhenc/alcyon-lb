@@ -2,66 +2,55 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! Real TCP loopback integration test verifying TLS 1.3 handshake, SNI resolution,
-//! ALPN negotiation, and HTTP transactions over network sockets.
+//! ALPN negotiation, and HTTP transactions over network sockets. On the binary's TLS
+//! ([`ibex_tls::blocking::BlockingTls`], rustls 0.24) since T479; it ran on tokio-rustls
+//! (rustls 0.23), which has no rustls 0.24 version. The file keeps its name.
 
-use crate::common;
+use crate::common::{client_trusting, TestCert};
+use ibex_tls::blocking::BlockingTls;
+use ibex_tls::tcp::rustls24::pki_types::ServerName;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 
-use common::{build_root_store, generate_test_cert};
-use ibex_tls::{IbexCertResolver, TlsConfig};
-use rustls::pki_types::ServerName;
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+#[test]
+fn test_tokio_tcp_loopback_tls() {
+    let cert = TestCert::new(vec!["localhost".to_string()]);
+    let bind = cert.bind(vec![b"http/1.1".to_vec()]);
 
-#[tokio::test]
-async fn test_tokio_tcp_loopback_tls() {
-    let (cert, cert_der) = generate_test_cert(vec!["localhost".to_string()]);
-    let mut resolver = IbexCertResolver::new();
-    resolver.add_exact("localhost", cert);
-
-    let server_tls_cfg = TlsConfig::new()
-        .with_cert_resolver(Arc::new(resolver))
-        .with_alpn(vec![b"http/1.1".to_vec()]);
-    let server_config = server_tls_cfg.build_server_config().unwrap();
-    let acceptor = TlsAcceptor::from(server_config);
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let server_task = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut tls_stream = acceptor.accept(stream).await.unwrap();
+    let server_task = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut tls_stream = BlockingTls::accept(&bind, stream);
 
         let mut buf = [0u8; 1024];
-        let n = tls_stream.read(&mut buf).await.unwrap();
+        let n = tls_stream.read(&mut buf).unwrap();
         assert!(n > 0);
         let req = String::from_utf8_lossy(&buf[..n]);
         assert!(req.contains("GET / HTTP/1.1"));
 
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nIbex!\n";
-        tls_stream.write_all(response).await.unwrap();
-        tls_stream.shutdown().await.unwrap();
+        tls_stream.write_all(response).unwrap();
+        tls_stream.flush().unwrap();
+        // Dropped: the connection closes, which the client reads as the end.
     });
 
-    let root_store = build_root_store(std::slice::from_ref(&cert_der));
-    let client_tls_cfg = TlsConfig::new().with_alpn(vec![b"http/1.1".to_vec()]);
-    let client_config = client_tls_cfg.build_client_config(root_store).unwrap();
-    let connector = TlsConnector::from(client_config);
-
-    let client_stream = TcpStream::connect(addr).await.unwrap();
+    let client_config = client_trusting(&cert.cert_pem, vec![b"http/1.1".to_vec()]);
+    let client_stream = TcpStream::connect(addr).unwrap();
     let server_name = ServerName::try_from("localhost").unwrap();
-    let mut client_tls = connector.connect(server_name, client_stream).await.unwrap();
+    let mut client_tls =
+        BlockingTls::connect(&client_config, ibex_tls::provider::active(), server_name, client_stream).unwrap();
 
     let request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    client_tls.write_all(request).await.unwrap();
+    client_tls.write_all(request).unwrap();
 
     let mut resp_buf = Vec::new();
-    client_tls.read_to_end(&mut resp_buf).await.unwrap();
+    client_tls.read_to_end(&mut resp_buf).unwrap();
 
     let resp_str = String::from_utf8_lossy(&resp_buf);
     assert!(resp_str.contains("HTTP/1.1 200 OK"));
     assert!(resp_str.contains("Ibex!"));
 
-    server_task.await.unwrap();
+    server_task.join().unwrap();
 }

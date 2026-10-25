@@ -3,41 +3,37 @@
 
 //! Server certificate resolver backed by `EbMbTree` (`IbexCertResolver`).
 //!
-//! Implements `rustls::server::ResolvesServerCert` with $O(k)$ exact domain
-//! and wildcard SNI lookup without dynamic hash collisions or regex matching.
+//! $O(k)$ exact domain and wildcard SNI lookup without dynamic hash collisions or regex
+//! matching; [`crate::tcp::CertResolver`] serves rustls 0.24 from it.
 
 use ebtree::EbMbTree;
-use rustls::server::{ClientHello, ResolvesServerCert};
-use rustls::sign::CertifiedKey;
 use std::sync::Arc;
 
 /// Fast, memory-safe certificate resolver using `ebtree::EbMbTree`.
 ///
-/// `K` is what a name resolves to: rustls 0.23's [`CertifiedKey`] (QUIC), or rustls 0.24's
-/// `Credentials` for the TCP binds ([`crate::tcp`]).
+/// `K` is what a name resolves to: rustls 0.24's `Credentials` for a bind ([`crate::tcp`]).
 #[derive(Clone, Debug)]
-pub struct IbexCertResolver<K = CertifiedKey> {
+pub struct IbexCertResolver<K> {
     certs: Vec<Arc<K>>,
     exact_tree: EbMbTree,
     wildcard_tree: EbMbTree,
     default_cert: Option<Arc<K>>,
 }
 
-impl Default for IbexCertResolver {
+impl<K> Default for IbexCertResolver<K> {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl IbexCertResolver {
-    /// Creates an empty certificate resolver.
-    #[must_use]
-    pub fn new() -> Self {
         Self::empty()
     }
 }
 
 impl<K> IbexCertResolver<K> {
+    /// Creates an empty certificate resolver.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::empty()
+    }
+
+
     /// Creates an empty certificate resolver for keys of type `K`.
     #[must_use]
     pub fn empty() -> Self {
@@ -108,17 +104,6 @@ impl<K> IbexCertResolver<K> {
         }
 
         // 3. Fallback to default cert
-        self.default_cert.clone()
-    }
-}
-
-impl ResolvesServerCert for IbexCertResolver {
-    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        if let Some(server_name) = client_hello.server_name() {
-            if let Some(cert) = self.resolve_domain(server_name) {
-                return Some(cert);
-            }
-        }
         self.default_cert.clone()
     }
 }

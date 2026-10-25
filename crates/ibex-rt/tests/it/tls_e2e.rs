@@ -118,7 +118,7 @@ fn https_is_served_end_to_end() {
 
     // Same reason as the runtime: pick the provider rather than let feature unification
     // decide whether this test can construct a TLS client.
-    ibex_tls::install_default_crypto_provider();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut roots = RootCertStore::empty();
     roots
@@ -366,7 +366,7 @@ fn h2_is_served_over_tls_end_to_end() {
     let Some(_daemon) = start(&cfg) else { return };
     assert!(wait_for_port(port), "the daemon never listened on {port}");
 
-    ibex_tls::install_default_crypto_provider();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut roots = RootCertStore::empty();
     roots
