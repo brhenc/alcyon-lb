@@ -209,12 +209,12 @@ pub fn apply_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckSta
     if proxies.get(p).is_some_and(|px| px.server_rmaint(s)) {
         return;
     }
-    set_admin(proxies, checks, p, s, to);
+    set_admin(proxies, checks, p, s, to, cause);
 }
 
 /// [`apply_admin`] without the `SRV_ADMF_RMAINT` guard: the resolver taking a server into
 /// maintenance, or giving it back the admin state it had (`crate::resolvers`).
-pub fn set_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus) {
+pub fn set_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus, cause: Cause<'_>) {
     let check = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s);
     if track_of(proxies, p, s).is_some() {
         set_status(proxies, p, s, to, Kind::Admin, cause);

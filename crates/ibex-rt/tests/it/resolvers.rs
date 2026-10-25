@@ -488,6 +488,22 @@ fn t4_nx_is_held_then_takes_the_server_down() {
     assert_eq!(n, 2, "{:?}", ibex.log());
 }
 
+/// The server-state log (T404) does not write a second line for what the resolver already
+/// reports: one "going DOWN for maintenance" on the log and on stderr, with the DNS cause.
+#[test]
+fn t4c_nx_maintenance_is_logged_once() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, &format!("{FAST}  hold nx 500ms\n"), "  server s1 a1.test:80 resolvers r\n", "");
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    dns.set("a1.test", Zone::Nx);
+    ibex.wait_state("s1", "- 0 32", 4);
+    ibex.wait_log(&format!("Server l/s1 is going DOWN for maintenance (DNS NX status). {LEFT}"), 2);
+    thread::sleep(Duration::from_millis(500));
+    let n = |v: Vec<String>| v.iter().filter(|l| l.contains("going DOWN for maintenance")).count();
+    assert_eq!(n(ibex.log()), 1, "{:?}", ibex.log());
+    assert_eq!(n(ibex.stderr()), 1, "{:?}", ibex.stderr());
+}
+
 /// A.t4b: a name never valid stays in maintenance; its errors are not logged as a change.
 #[test]
 fn t4b_a_name_never_valid_stays_in_maintenance() {

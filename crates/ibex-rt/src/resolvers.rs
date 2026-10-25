@@ -745,7 +745,7 @@ fn enter_rmaint(req: &Req, cause: Cause, proxies: &[Proxy], checks: &mut [Server
     let px = &proxies[p];
     let before = status_of(px, s);
     px.set_server_rmaint(s, true);
-    crate::track::set_admin(proxies, checks, p, s, ServerStatus::Maint);
+    crate::track::set_admin(proxies, checks, p, s, ServerStatus::Maint, crate::srvlog::Cause::Dns);
     let srv = &px.server_ids[s];
     let backup = if px.server_backups.get(s).copied().unwrap_or(false) { "Backup " } else { "" };
     let msg = match ServerStatus::from(before) {
@@ -787,7 +787,7 @@ fn leave_rmaint(req: &Req, fqdn: &str, proxies: &[Proxy], checks: &mut [ServerCh
     let (p, s) = (req.proxy as usize, req.server as usize);
     let px = &proxies[p];
     px.set_server_rmaint(s, false);
-    crate::track::set_admin(proxies, checks, p, s, req.saved);
+    crate::track::set_admin(proxies, checks, p, s, req.saved, crate::srvlog::Cause::Dns);
     let srv = &px.server_ids[s];
     let backup = if px.server_backups.get(s).copied().unwrap_or(false) { "Backup " } else { "" };
     let after = status_of(px, s);

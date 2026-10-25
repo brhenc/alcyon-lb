@@ -31,6 +31,9 @@ pub enum Cause<'a> {
     WebDisable,
     /// The stats page's `stop` (`'stop' on stats page`).
     WebStop,
+    /// The resolver: a name that does not resolve, or resolves again. It writes its own
+    /// lines (`crate::resolvers`, `srv_adm_st_chg_cause`), so [`describe`] says nothing.
+    Dns,
 }
 
 /// What `_srv_update_status_op` or `_srv_update_status_adm` looks at.
@@ -113,6 +116,9 @@ fn more(px: &Proxy, s: usize, going_down: bool, out: &mut String) {
 #[must_use]
 pub fn describe(px: &Proxy, s: usize, before: u8, after: u8, kind: Kind, cause: Cause<'_>) -> Option<(LogLevel, String)> {
     use std::fmt::Write as _;
+    if matches!(cause, Cause::Dns) {
+        return None;
+    }
     let name = px.server_ids.get(s)?;
     let backup = if px.server_backups.get(s).copied().unwrap_or(false) { "Backup " } else { "" };
     let head = format!("{backup}Server {}/{name}", px.name);
@@ -132,6 +138,7 @@ pub fn describe(px: &Proxy, s: usize, before: u8, after: u8, kind: Kind, cause: 
                 Cause::Cli => out.push_str(", changed from CLI"),
                 Cause::StateFile => out.push_str(", changed from server-state after a reload"),
                 Cause::Web | Cause::WebDisable | Cause::WebStop => out.push_str(", changed from Web interface"),
+                Cause::Dns => {}
             }
             more(px, s, down, &mut out);
             Some((if down && !was_stopping { LogLevel::Alert } else { LogLevel::Notice }, out))
