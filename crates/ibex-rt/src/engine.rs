@@ -5670,6 +5670,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             // A server connection the last stream kept goes to this one, as the session
             // kept it for its next request.
             move_server(owner, child, &mut self.fdtab);
+            // It is not this stream's until a request takes it (`bc_idle`, T491).
+            child.sess.bc_idle = child.sess.srv.is_some();
             let head = crate::h2_bridge::start_request(&mut child.sess, d);
             if let Some(h2) = owner.sess.h2_ctx.as_deref_mut() {
                 h2.give_back_head(head);
@@ -9643,9 +9645,14 @@ impl EngineDispatcher<'_> {
         // header (it names this client's addresses), which the pool does not key by.
         let private = entry.sess.send_proxy_prepended
             || proxies.get(entry.srv_backend_idx).is_some_and(|p| p.http_reuse == ibex_config::HttpReuse::Never);
-        if !reusable {
+        // A request the proxy answered itself never took the connection attached to the
+        // session (`bc_idle`, set at the previous transaction's end and cleared where a request
+        // connects or takes it back): HAProxy leaves it where it is, parked or in the idle
+        // lists, for the next request (T491).
+        let untouched = txn.local && entry.sess.bc_idle && entry.sess.srv.is_some();
+        if !untouched && !reusable {
             release_server(entry, proxies, fdtab, poller, idle_pool, false);
-        } else if entry.sess.req.is_empty() && !private {
+        } else if !untouched && entry.sess.req.is_empty() && !private {
             let keeps = entry.target_server_idx.is_some_and(|i| proxies.get(entry.srv_backend_idx).is_some_and(|p| p.ids.server_pool(i).keeps_any()));
             if keeps && idle_pool.total() == 0 && entry.sess.srv.is_some() {
                 entry.sess.srv_park_exp = now.add(SRV_PARK_MS);

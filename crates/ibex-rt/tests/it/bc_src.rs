@@ -214,7 +214,7 @@ fn deny_on_a_reused_connection_has_no_server_address() {
     assert_eq!(line(&collector), format!("LOG 127.0.0.1|{ip}|{port}"));
     assert_eq!(line(&collector), "LOG -|-|-");
     // The next request that goes to the server prints its connection again. (The oracle also
-    // reuses the same connection here; Ibex opens a new one: T474b found-not-fixed.)
+    // reuses the same connection here, as Ibex does since T491.)
     let h = get(&mut c, "/");
     assert_eq!(header(&h, "x-aft"), format!("127.0.0.1|{ip}|{}", header(&h, "x-peer").split_once('|').unwrap().1));
 }
