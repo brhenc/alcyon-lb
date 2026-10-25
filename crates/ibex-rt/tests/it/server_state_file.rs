@@ -519,7 +519,7 @@ fn starting_and_stopping_servers() {
     );
 }
 
-/// The `show servers state` columns that differed from HAProxy's before T490.
+/// The `show servers state` columns that differed from `HAProxy`'s before T490.
 #[test]
 fn show_servers_state_columns_match_haproxy() {
     let cfg = format!(
@@ -547,11 +547,11 @@ fn show_servers_state_columns_match_haproxy() {
 }
 
 /// A drain on a stopped server, a `disabled` server with a check that the file had enabled,
-/// and the columns Ibex cannot apply. HAProxy (same file): s1 `0 8 1 1 0 0` DOWN, s2 `2 4`
+/// and the columns Ibex cannot apply. `HAProxy` (same file): s1 `0 8 1 1 0 0` DOWN, s2 `2 4`
 /// UP, s3 "partially applied ..., health checks are not enabled on this server" (no check),
 /// s4 the check port 19805 applied. Ibex has no `set server check-port`, no agent checks and
 /// no `set server ssl`, so it keeps the configuration's and says so (texts in Ibex's words
-/// but the two HAProxy has).
+/// but the two `HAProxy` has).
 #[test]
 fn columns_ibex_cannot_apply_are_named() {
     let cfg = format!(
@@ -587,7 +587,7 @@ fn columns_ibex_cannot_apply_are_named() {
     );
 }
 
-/// HAProxy: `config: Can't open global server state file '<f>': Permission denied`, a
+/// `HAProxy`: `config: Can't open global server state file '<f>': Permission denied`, a
 /// warning (a missing file is a notice).
 #[test]
 fn an_unreadable_file_is_a_warning() {
