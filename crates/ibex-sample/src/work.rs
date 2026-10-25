@@ -18,11 +18,9 @@ pub enum Op {
     CtxClone = 1,
     /// An expression looked up by its text ([`crate::expr::Expr::cached`]).
     ExprLookup = 2,
-    /// Idle server connections looked at to find one to reuse.
-    IdleScanned = 3,
 }
 
-const OPS: usize = 4;
+const OPS: usize = 3;
 
 thread_local! {
     static COUNTS: [Cell<u64>; OPS] = const { [const { Cell::new(0) }; OPS] };

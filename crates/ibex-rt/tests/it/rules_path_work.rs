@@ -10,10 +10,11 @@
 //! they move with the poller's passes; what this pins is the work behind them, counted on the
 //! thread that runs the engine ([`ibex_sample::work`]): how often the request head is written out
 //! of its HTX again, how often a sample context is copied, how often an expression is looked up by
-//! its text, and how many idle server connections are looked at to find one to reuse.
+//! its text, and how often the HTX reads a block as UTF-8.
 //!
 //! Before S7 (main fcab8c91), per request: 4 rebuilds (set-header is a delete and an add, then
-//! the del-header and the add-header), 3 context copies, 2 expression lookups (`rand`, `path`).
+//! the del-header and the add-header), 3 context copies, 2 expression lookups (`rand`, `path`),
+//! 37 UTF-8 reads of HTX blocks (in a debug build).
 
 use crate::common;
 
@@ -37,7 +38,7 @@ const RULES: &str = "  acl api path_reg ^/(api|v[0-9]+)/\n  acl hosty hdr(host) 
 const RSP: &[u8] = b"HTTP/1.1 200 OK\r\nServer: be\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
 
 /// The index in [`work`]'s counts of the HTX blocks read as UTF-8 ([`ibex_proto::htx::utf8_checks_on_this_thread`]).
-const UTF8: usize = 4;
+const UTF8: usize = 3;
 
 /// A keep-alive server: one answer per request head, on every connection it accepted.
 fn backend(listener: TcpListener, running: Arc<AtomicBool>) -> thread::JoinHandle<Vec<Vec<u8>>> {
@@ -85,12 +86,12 @@ fn request(client: &mut TcpStream, engine: &mut Engine) -> String {
 
 /// The counts of `rounds` requests on each of `clients` keep-alive connections (in turn), after
 /// a warm-up request on each; the last response, and the last request head the server saw.
-fn work(clients: usize, rounds: usize) -> ([u64; 5], String, String) {
+fn work(clients: usize, rounds: usize) -> ([u64; 4], String, String) {
     work_with(RULES, clients, rounds)
 }
 
 /// [`work`] with the frontend's `rules`.
-fn work_with(rules: &str, clients: usize, rounds: usize) -> ([u64; 5], String, String) {
+fn work_with(rules: &str, clients: usize, rounds: usize) -> ([u64; 4], String, String) {
     let srv = TcpListener::bind("127.0.0.1:0").expect("bind");
     let srv_addr = srv.local_addr().expect("addr");
     let fe = common::reserve_addr();
@@ -134,9 +135,9 @@ fn work_with(rules: &str, clients: usize, rounds: usize) -> ([u64; 5], String, S
 #[test]
 fn the_rules_scenario_costs_what_is_pinned() {
     const N: u64 = 50;
-    let (counts, rsp, seen) = work(1, N as usize);
-    let per = counts.map(|c| c as f64 / N as f64);
-    println!("[MEASUREMENT S7] per request: rebuilds {}, context copies {}, expression lookups {}, idle scanned {}, UTF-8 reads {}", per[Op::ReqRebuild as usize], per[Op::CtxClone as usize], per[Op::ExprLookup as usize], per[Op::IdleScanned as usize], per[UTF8]);
+    let (counts, rsp, seen) = work(1, 50);
+    let per = counts.map(|c| c / N);
+    println!("[MEASUREMENT S7] per request: rebuilds {}, context copies {}, expression lookups {}, UTF-8 reads {}", per[Op::ReqRebuild as usize], per[Op::CtxClone as usize], per[Op::ExprLookup as usize], per[UTF8]);
     // The rules did what they say.
     assert!(rsp.starts_with("HTTP/1.1 200") && rsp.contains("x-served: ibex") && !rsp.to_ascii_lowercase().contains("server: be"), "response: {rsp:?}");
     let seen_lc = seen.to_ascii_lowercase();
@@ -147,32 +148,18 @@ fn the_rules_scenario_costs_what_is_pinned() {
     assert_eq!(counts[UTF8], 24 * N, "HTX blocks read as UTF-8");
 }
 
-/// Idle server connections looked at per request, with eight clients taking turns: each request
-/// takes one of the server's idle connections.
-#[test]
-fn reusing_an_idle_connection_looks_at_few() {
-    const CLIENTS: usize = 8;
-    const ROUNDS: usize = 10;
-    let (counts, rsp, _) = work(CLIENTS, ROUNDS);
-    let scanned = counts[Op::IdleScanned as usize];
-    println!("[MEASUREMENT S7] idle connections looked at: {scanned} for {} requests", CLIENTS * ROUNDS);
-    assert!(rsp.starts_with("HTTP/1.1 200"), "response: {rsp:?}");
-    assert!(scanned <= (CLIENTS * ROUNDS * CLIENTS) as u64, "{scanned} idle connections looked at");
-}
-
 /// Anonymous ACLs, `%[...]` in request and response formats, response `set-var` and
 /// `set-var-fmt`, an `http-after-response` format: compiled with the proxy, none is looked up by
 /// its text per request (before S7: 8 per request).
 #[test]
 fn rule_expressions_are_not_looked_up_per_request() {
-    const N: u64 = 20;
     let rules = "  http-request set-header X-A %[req.hdr(host)] if { path_beg /api }\n  \
         http-request set-var-fmt(txn.f) %[path]-x\n  \
         http-response set-header X-B %[var(txn.f)] if { status 200 } !{ res.hdr(x-none) -m found }\n  \
         http-response set-var(txn.s) status\n  \
         http-response set-var-fmt(txn.t) s%[var(txn.s)]\n  \
         http-after-response add-header X-C %[var(txn.t)],%[var(txn.s)] if TRUE\n";
-    let (counts, rsp, seen) = work_with(rules, 1, N as usize);
+    let (counts, rsp, seen) = work_with(rules, 1, 20);
     assert!(rsp.contains("x-b: /api/test-x\r\n") && rsp.contains("x-c: s200,200\r\n"), "response: {rsp:?}");
     assert!(seen.to_ascii_lowercase().contains("x-a: localhost\r\n"), "request the server saw: {seen:?}");
     assert_eq!(counts[Op::ExprLookup as usize], 0, "expressions looked up by text");

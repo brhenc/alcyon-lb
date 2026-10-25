@@ -24,7 +24,7 @@ enum Term {
     /// One of the proxy's ACLs.
     Acl(AclRef),
     /// An anonymous ACL (`{ path_beg /x }`) or a bare expression.
-    Expr(Expr),
+    Expr(Box<Expr>),
 }
 
 /// A rule's condition, its terms resolved against the proxy's ACLs.
@@ -44,7 +44,7 @@ impl Cond {
         let term = |name: &str| match name {
             "always_true" => Term::Const(true),
             "always_false" => Term::Const(false),
-            name => acls.resolve(name).map_or_else(|| Expr::parse(name).map_or(Term::Const(false), Term::Expr), Term::Acl),
+            name => acls.resolve(name).map_or_else(|| Expr::parse(name).map_or(Term::Const(false), |e| Term::Expr(Box::new(e))), Term::Acl),
         };
         let suites = cond.suites().map(|s| s.iter().map(|t| (t.negated, term(&t.name))).collect()).collect();
         Self { is_if: cond.is_if, suites }
@@ -75,7 +75,7 @@ enum Seg {
     Lit(String),
     /// A `%[...]`: its sample, encoded as the format's context wants; nothing for one that does
     /// not parse.
-    Sample(Option<Expr>),
+    Sample(Option<Box<Expr>>),
     /// A `%<alias>`.
     Alias(String),
 }
@@ -116,7 +116,7 @@ impl Format {
                         }
                     }
                     flush(&mut segs, &mut lit);
-                    segs.push(Seg::Sample(Expr::parse(&fmt[start..end]).ok()));
+                    segs.push(Seg::Sample(Expr::parse(&fmt[start..end]).ok().map(Box::new)));
                 }
                 Some(a) if a.is_ascii_alphanumeric() => {
                     let start = chars.peek().map_or(fmt.len(), |p| p.0);

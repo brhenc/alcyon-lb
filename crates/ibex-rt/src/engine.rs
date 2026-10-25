@@ -245,9 +245,7 @@ impl WorkerPool {
             (true, Always) => &[true, false],
         };
         for &safe in order {
-            let found = s.conns.iter().position(|p| p.safe == safe && p.addr == key.addr && p.name == key.name);
-            ibex_sample::work::note(ibex_sample::work::Op::IdleScanned, found.map_or(s.conns.len(), |pos| pos + 1) as u64);
-            if let Some(pos) = found {
+            if let Some(pos) = s.conns.iter().position(|p| p.safe == safe && p.addr == key.addr && p.name == key.name) {
                 let p = s.conns.remove(pos)?;
                 s.safe -= usize::from(safe);
                 self.conns -= 1;
@@ -15153,6 +15151,9 @@ fn res_action(
     }
 }
 
+/// The response capture slots a rule list writes, with their lengths ([`run_res_rules`]).
+type ResCaps<'x> = Option<(&'x mut Vec<Option<Vec<u8>>>, &'x [(String, usize)])>;
+
 /// Runs one rule list (`http_res_get_intercept_rule`): each rule whose condition holds,
 /// until `allow` ends the list or an action stops the response. Every list starts in
 /// strict mode, and a `strict-mode off` in it lasts to its end only.
@@ -15169,7 +15170,7 @@ fn run_res_rules<'a, 'c>(
     acls: &'c ibex_sample::Acls,
     head: (&mut Vec<(String, String)>, &mut u16, &mut String),
     ctx: &mut SampleContext<'c>,
-    caps: Option<(&mut Vec<Option<Vec<u8>>>, &[(String, usize)])>,
+    caps: ResCaps<'_>,
     registry: &Registry,
     vars: &mut VarStore,
     wait: Option<ResWait<'_>>,
@@ -15187,7 +15188,7 @@ fn run_res_rules_in<'a>(
     acls: &ibex_sample::Acls,
     head: (&mut Vec<(String, String)>, &mut u16, &mut String),
     ctx: &SampleContext,
-    mut caps: Option<(&mut Vec<Option<Vec<u8>>>, &[(String, usize)])>,
+    mut caps: ResCaps<'_>,
     registry: &Registry,
     vars: &mut VarStore,
     mut wait: Option<ResWait<'_>>,

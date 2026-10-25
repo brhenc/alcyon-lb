@@ -19,8 +19,6 @@
 use std::fmt;
 use std::io::Write;
 
-/// Maximum length of header / trailer name in bytes.
-
 thread_local! {
     static UTF8_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -39,6 +37,7 @@ fn utf8(b: &[u8]) -> Result<&str, std::str::Utf8Error> {
     std::str::from_utf8(b)
 }
 
+/// Maximum length of header / trailer name in bytes.
 pub const HTX_HDR_NAME_MAX_LEN: usize = 255;
 /// Maximum length of header / trailer value in bytes (1 MB).
 pub const HTX_HDR_VALUE_MAX_LEN: usize = 1_048_575;

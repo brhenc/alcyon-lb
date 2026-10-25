@@ -81,12 +81,11 @@ impl Acls {
         let mut exprs: Vec<Expr> = Vec::new();
         for (name, text) in lines {
             let Ok(expr) = Expr::parse(text) else { continue };
-            match own.get(name) {
-                Some(&first) => exprs[first].alternates.push(expr),
-                None => {
-                    own.insert(name.to_string(), exprs.len());
-                    exprs.push(expr);
-                }
+            if let Some(&first) = own.get(name) {
+                exprs[first].alternates.push(expr);
+            } else {
+                own.insert(name.to_string(), exprs.len());
+                exprs.push(expr);
             }
         }
         Self { own, exprs: exprs.into_boxed_slice() }
