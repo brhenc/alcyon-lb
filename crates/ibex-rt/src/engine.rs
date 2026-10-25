@@ -2912,6 +2912,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         bc_reused: Some(s.txn.as_ref().is_some_and(|t| t.srv_reused)),
         term_state: Some(sess_term_state(s)),
         bc_dst: s.bc_dst(),
+        bc_src: s.bc_src(),
         ..Default::default()
     }
 }
@@ -2934,6 +2935,7 @@ fn stream_log_data<'a>(entry: &'a SessionEntry, proxies: &'a [Proxy], proxy_idx:
     let be = proxies.get(entry.backend_idx).filter(|_| proxies.len() > 1).unwrap_or(fe);
     crate::logfmt::LogData {
         server_addr: entry.sess.bc_dst(),
+        backend_addr: entry.sess.bc_src(),
         server: entry
             .target_server_idx
             .or_else(|| entry.sess.log.server.map(|i| i.get() as usize - 1))
@@ -7030,6 +7032,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         bc_reused: Some(sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
         term_state: Some(sess_term_state(sess)),
         bc_dst: sess.bc_dst(),
+        bc_src: sess.bc_src(),
         ..Default::default()
     };
     for (rule, rc) in proxy.tcp_res_content_rules.iter().zip(&proxy.rules.tcp_res_content) {
@@ -8039,6 +8042,7 @@ fn release_server(
     }
     entry.target_server_idx = None;
     entry.sess.target_addr = None;
+    entry.sess.bc_src = crate::proxy::LocalAddr::NONE;
     entry.sess.bc_err = None;
     entry.srv_served = 0;
     entry.sess.srv_state = ScState::Init;
@@ -8077,6 +8081,7 @@ fn move_server(from: &mut SessionEntry, to: &mut SessionEntry, fdtab: &mut FdTab
     t.send_proxy_prepended = std::mem::take(&mut f.send_proxy_prepended);
     t.send_proxy_header = std::mem::take(&mut f.send_proxy_header);
     t.target_addr = f.target_addr.take();
+    t.bc_src = std::mem::replace(&mut f.bc_src, crate::proxy::LocalAddr::NONE);
     t.bc_err = f.bc_err.take();
     to.srv_raw_fd = from.srv_raw_fd.take();
     to.srv_interest = std::mem::replace(&mut from.srv_interest, Interest::NONE);
@@ -10808,6 +10813,7 @@ impl EngineDispatcher<'_> {
             bc_reused: Some(entry.sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
             term_state: Some(sess_term_state(&entry.sess)),
             bc_dst: entry.sess.bc_dst(),
+            bc_src: entry.sess.bc_src(),
             last_rule: last_rule_at(entry.sess.log.last_rule),
             prio: (entry.sess.log.prio_class, entry.sess.log.prio_offset),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
@@ -13680,6 +13686,8 @@ pub(crate) fn push_alias(out: &mut String, name: &str, ctx: &SampleContext, push
         "fp" => port(out, ctx.server_addr),
         "si" => addr(out, ctx.bc_dst),
         "sp" => port(out, ctx.bc_dst),
+        "bi" => addr(out, ctx.bc_src),
+        "bp" => port(out, ctx.bc_src),
         "f" => push(out, ctx.fe_name.unwrap_or_default()),
         // Until a backend is chosen the stream's backend is its frontend (`s->be`).
         "b" => push(out, ctx.be_name.or(ctx.fe_name).unwrap_or_default()),
@@ -15672,6 +15680,7 @@ fn after_res_on_reply<'r>(
             bc_reused: Some(sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
             term_state: Some(sess_term_state(sess)),
             bc_dst: sess.bc_dst(),
+            bc_src: sess.bc_src(),
             ..Default::default()
         };
         eval_after_res_rules(

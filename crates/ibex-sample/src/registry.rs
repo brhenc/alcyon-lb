@@ -262,6 +262,9 @@ pub struct SampleContext<'a> {
     /// `None` without one. What `bc_dst` and `bc_dst_port` read; `server_addr` is the
     /// frontend's.
     pub bc_dst: Option<SocketAddr>,
+    /// The local address of the backend connection, `None` before the stream has one or
+    /// where a request rule runs. What `%bi` and `%bp` print.
+    pub bc_src: Option<SocketAddr>,
     /// Capture slots: `None` where nothing was captured (a header that was absent).
     pub captures_req_hdr: Option<&'a [Option<Vec<u8>>]>,
     pub captures_res_hdr: Option<&'a [Option<Vec<u8>>]>,

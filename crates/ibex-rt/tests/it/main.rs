@@ -41,6 +41,7 @@ mod backup_servers;
 mod base32_sdbm;
 mod binary_var_bytes;
 mod bc_info;
+mod bc_src;
 mod balance_roundrobin_changes;
 mod balance_roundrobin_weights;
 mod balance_source_consistent;
