@@ -96,3 +96,37 @@ fn be_name_in_a_frontend_rule_format_is_refused() {
     let want = "error detected in frontend 'f' while parsing 'http-request set-header' rule : sample fetch <be_name> may not be reliably used here because it needs 'backend' which is not available here.";
     assert!(!ok && err.contains(want), "{err}");
 }
+
+fn check_cfg(cfg: &str) -> (bool, String) {
+    let mut f = NamedTempFile::new().expect("tmp");
+    f.write_all(cfg.as_bytes()).expect("write cfg");
+    let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(f.path()).output().expect("run");
+    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// The message names the section the rule is in, as `HAProxy`'s does (measured on 3.5-dev8 on
+/// 2026-10-25): `backend 'b'`, `proxy 'l'` for a listen, `defaults 'd'`.
+#[test]
+fn the_refusal_names_the_section_kind() {
+    const D: &str = "  mode http\n  timeout client 5s\n  timeout connect 5s\n  timeout server 5s\n";
+    let rule = "  http-request set-header x-a \"%zz\"\n";
+    for (cfg, place) in [
+        (format!("defaults\n{D}backend b\n{rule}  server s 127.0.0.1:1\n"), "backend 'b'"),
+        (format!("defaults\n{D}listen l\n  bind 127.0.0.1:1\n{rule}  server s 127.0.0.1:1\n"), "proxy 'l'"),
+        (format!("defaults d\n{D}{rule}frontend f from d\n  bind 127.0.0.1:1\n"), "defaults 'd'"),
+    ] {
+        let (ok, err) = check_cfg(&cfg);
+        let want = format!("error detected in {place} while parsing 'http-request set-header' rule : {NO_ALIAS}");
+        assert!(!ok && err.contains(&want), "{place}: {err}");
+    }
+}
+
+/// A format whose sample does not parse is refused once, by the sample's own check, not again
+/// as a format (measured on 3.5-dev8: `failed to parse sample expression <nosuchfetch]> :
+/// unknown fetch method 'nosuchfetch'.`).
+#[test]
+fn a_format_with_a_bad_sample_is_refused_by_the_sample_check() {
+    let (ok, err) = check("http-request set-header x-a \"%[nosuchfetch]\"");
+    assert!(!ok && err.contains("unknown fetch method 'nosuchfetch'"), "{err}");
+    assert_eq!(err.lines().filter(|l| l.contains("nosuchfetch")).count(), 1, "refused once: {err}");
+}

@@ -71,7 +71,7 @@ impl Cond {
 
 impl Cond {
     /// [`Cond::eval`] for a `tcp-request content` rule, which may wait for more data
-    /// ([`crate::proxy::eval_acl_condition_extended`]).
+    /// (the payload-aware evaluation, `proxy::eval_expr_extended`).
     #[must_use]
     pub fn eval_extended(&self, ctx: &SampleContext, acls: &Acls, registry: &Registry, req_bytes: &[u8], can_wait: bool) -> AclEvalResult {
         self.eval_terms(acls, |e, negated| crate::proxy::eval_expr_extended(e, negated, registry, ctx, req_bytes, can_wait))
@@ -185,8 +185,6 @@ impl Format {
 pub struct Reply {
     hdrs: Vec<(String, Format)>,
     body: Option<Format>,
-    /// There was a template at all: a reply with none has an empty body.
-    present: bool,
 }
 
 /// Two replies are equal when they are the same one (a stop reason carries the rule's).
@@ -202,7 +200,7 @@ impl Reply {
     /// `lf_string` cut into its pieces, each format compiled.
     #[must_use]
     pub fn compile(lf_string: Option<&str>) -> Self {
-        let mut reply = Self { present: lf_string.is_some(), ..Self::default() };
+        let mut reply = Self::default();
         let mut rest = lf_string.unwrap_or_default();
         while let Some(stripped) = rest.strip_prefix("\0HDR:") {
             let Some((line, r)) = stripped.split_once('\n') else { break };
@@ -254,12 +252,6 @@ impl Reply {
         if let Some(b) = &self.body {
             b.render_into(body, ctx, registry, Some(data));
         }
-    }
-
-    /// Whether the reply has a template (an `lf-string` or `string`).
-    #[must_use]
-    pub fn is_present(&self) -> bool {
-        self.present
     }
 }
 
@@ -526,7 +518,6 @@ pub fn tcp_req_session(rules: &[ibex_config::TcpReqSessionRule], acls: &Acls) ->
                 | TcpReqSessionAction::SetDst { expr }
                 | TcpReqSessionAction::SetSrcPort { expr }
                 | TcpReqSessionAction::SetDstPort { expr }
-                | TcpReqSessionAction::Capture { expr, .. }
                 | TcpReqSessionAction::ScSetGpt0 { expr, .. }
                 | TcpReqSessionAction::ScAddGpc { expr, .. }
                 | TcpReqSessionAction::ScSetGpt { expr, .. } => (Some(expr.as_str()), None),
@@ -611,6 +602,40 @@ mod tests {
                 assert_eq!(Cond::compile(&cond, &acls).eval(&ctx, &acls, registry), text, "{cond:?}");
             }
         }
+    }
+
+    /// A constant term (`always_true`, `always_false`) is decided without the judge, the way
+    /// [`Cond::eval`] decides it; an expression term goes to the judge with its negation.
+    #[test]
+    fn eval_terms_decides_constant_terms_itself() {
+        let acls = Acls::compile([]);
+        let cases: &[(&[(bool, &str)], AclEvalResult)] = &[
+            (&[(false, "always_true")], AclEvalResult::Matched),
+            (&[(true, "always_true")], AclEvalResult::NotMatched),
+            (&[(false, "always_false")], AclEvalResult::NotMatched),
+            (&[(true, "always_false")], AclEvalResult::Matched),
+        ];
+        for &(terms, want) in cases {
+            let cond = AclCondition { is_if: true, terms: terms.iter().map(|&(negated, name)| AclTerm { negated, name: name.to_string() }).collect() };
+            let got = Cond::compile(&cond, &acls).eval_terms(&acls, |_, _| panic!("a constant needs no judge"));
+            assert_eq!(got, want, "{terms:?}");
+        }
+        let cond = AclCondition { is_if: true, terms: vec![AclTerm { negated: true, name: "src 1.2.3.4".to_string() }] };
+        let mut seen = None;
+        let got = Cond::compile(&cond, &acls).eval_terms(&acls, |_, negated| {
+            seen = Some(negated);
+            AclEvalResult::MissingData
+        });
+        assert_eq!((got, seen), (AclEvalResult::MissingData, Some(true)));
+    }
+
+    /// Two replies are equal only when they are the same reply.
+    #[test]
+    fn a_reply_equals_only_itself() {
+        let a = Reply::compile(Some("x"));
+        let b = Reply::compile(Some("x"));
+        assert!(a == a);
+        assert!(a != b);
     }
 
     /// A compiled format renders what the old text renderer did, for the formats that

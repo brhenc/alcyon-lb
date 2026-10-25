@@ -13492,20 +13492,11 @@ pub(crate) fn resolve_gpt0_val(
     0
 }
 
-/// The stick-table key `expr_str` stands for, converted to the type of the table `table`
+/// The stick-table key `expr` stands for, converted to the type of the table `table`
 /// that will hold it ([`ibex_stick_table::StickTable::coerce_key`]); `None` where the
 /// expression yields nothing to track, or something the table's key type cannot be made
 /// of. Tracking and lookups (`in_table`, `src_*`) build their keys the same way.
-pub(crate) fn resolve_sample_stick_key(
-    expr_str: &str,
-    registry: &Registry,
-    ctx: &SampleContext,
-    table: Option<&Arc<ibex_stick_table::StickTable>>,
-) -> Option<StickKey> {
-    resolve_stick_key(Expr::cached(expr_str).ok().as_deref(), registry, ctx, table)
-}
-
-/// [`resolve_sample_stick_key`] of an expression compiled at load (T455).
+/// The expression is compiled at load (T455).
 pub(crate) fn resolve_stick_key(
     expr: Option<&Expr>,
     registry: &Registry,

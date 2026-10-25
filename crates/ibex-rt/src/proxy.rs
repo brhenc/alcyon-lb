@@ -3769,33 +3769,7 @@ pub enum AclEvalResult {
     MissingData,
 }
 
-#[must_use]
-pub fn eval_acl_term_extended(
-    term: &ibex_config::AclTerm,
-    acls: &ibex_sample::Acls,
-    registry: &Registry,
-    ctx: &SampleContext,
-    req_bytes: &[u8],
-    can_wait: bool,
-) -> AclEvalResult {
-    let expr_opt = acls.get(&term.name);
-    let parsed_expr;
-    let expr = if let Some(e) = expr_opt {
-        e
-    } else if let Ok(e) = Expr::cached(&term.name) {
-        parsed_expr = e;
-        &*parsed_expr
-    } else {
-        return if term.negated {
-            AclEvalResult::Matched
-        } else {
-            AclEvalResult::NotMatched
-        };
-    };
-    eval_expr_extended(expr, term.negated, registry, ctx, req_bytes, can_wait)
-}
-
-/// [`eval_acl_term_extended`] of a term already resolved to its expression (a condition
+/// A payload-aware ACL term already resolved to its expression (a condition
 /// compiled at load, [`crate::rule_compiled::Cond::eval_extended`]).
 pub(crate) fn eval_expr_extended(expr: &Expr, negated: bool, registry: &Registry, ctx: &SampleContext, req_bytes: &[u8], can_wait: bool) -> AclEvalResult {
     if can_wait {
@@ -3860,18 +3834,6 @@ pub(crate) fn eval_expr_extended(expr: &Expr, negated: bool, registry: &Registry
     } else {
         AclEvalResult::NotMatched
     }
-}
-
-#[must_use]
-pub fn eval_acl_condition_extended(
-    cond: &ibex_config::AclCondition,
-    acls: &ibex_sample::Acls,
-    registry: &Registry,
-    ctx: &SampleContext,
-    req_bytes: &[u8],
-    can_wait: bool,
-) -> AclEvalResult {
-    combine_condition(cond, |term| eval_acl_term_extended(term, acls, registry, ctx, req_bytes, can_wait))
 }
 
 /// `acl_exec_cond` (src/acl.c): within an alternative a failing term fails it and a

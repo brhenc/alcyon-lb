@@ -149,16 +149,17 @@ pub fn take_want() -> Option<Class> {
 pub fn enter(task: TaskRef, slot: u32, class: Class, front: bool) -> bool {
     QUEUES.with(|q| {
         let q = &mut q.borrow_mut()[class as usize];
-        if q.try_reserve(1).is_err() {
-            return false;
+        // A queue that cannot grow leaves the stream out (the caller fails it, as in S5).
+        let room = q.try_reserve(1).is_ok();
+        if room {
+            if front {
+                q.push_front((task, slot));
+            } else {
+                q.push_back((task, slot));
+            }
+            MAP.set(MAP.get() | (1 << class as u8));
         }
-        if front {
-            q.push_front((task, slot));
-        } else {
-            q.push_back((task, slot));
-        }
-        MAP.set(MAP.get() | (1 << class as u8));
-        true
+        room
     })
 }
 
@@ -270,5 +271,41 @@ mod tests {
         assert_eq!(waiting(), [0; 4]);
         offer();
         assert!(!pending(), "the queue is empty again: nothing to offer");
+    }
+
+    /// Only a wait to read mutes a side: one for a local reply or the stream's HTX mutes none.
+    #[test]
+    fn a_wait_mutes_the_side_it_would_read() {
+        for (class, cli, srv) in [(Class::MuxRx, true, false), (Class::SeRx, false, true), (Class::MuxTx, false, false), (Class::Channel, false, false)] {
+            let mut w = WaitState::default();
+            w.enqueued(class);
+            assert_eq!((w.queued(), w.mutes_cli(), w.mutes_srv()), (true, cli, srv), "{class:?}");
+            w.dequeued();
+            assert_eq!((w.queued(), w.mutes_cli(), w.mutes_srv()), (false, false, false), "{class:?}");
+        }
+    }
+
+    /// The class a stream was refused is handed to the engine once, whichever it was.
+    #[test]
+    fn the_wanted_class_is_taken_once() {
+        assert_eq!(take_want(), None);
+        for class in [Class::MuxTx, Class::Channel, Class::SeRx, Class::MuxRx] {
+            want(class);
+            assert!(wanted());
+            assert_eq!(take_want(), Some(class));
+            assert!(!wanted());
+            assert_eq!(take_want(), None);
+        }
+    }
+
+    /// A buffer offered to a waiter that had gone goes to the next one.
+    #[test]
+    fn a_reoffered_buffer_goes_to_the_next_waiter() {
+        assert!(enter(TaskRef(5), 5, Class::SeRx, false));
+        assert!(!pending());
+        reoffer();
+        assert!(pending());
+        assert_eq!(next_offered(), Some((TaskRef(5), 5)));
+        assert!(!pending());
     }
 }

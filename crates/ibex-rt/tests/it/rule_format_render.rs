@@ -117,3 +117,45 @@ fn a_response_replacement_is_a_format() {
     );
     assert_eq!(header(&r, "x-b"), Some("abc-zz"), "{r}");
 }
+
+/// Request rules that render the stream's measures (`set-var-fmt`, `set-header`, `add-header`):
+/// before the request is counted, `%ST` and `%Tq` are -1, `%U` is 0 and `%ts` is `--`. Measured
+/// on 3.5-dev8-885761-29 on 2026-10-25 with the same configuration:
+/// `v=ST=-1 U=0 ts=-- Tq=-1 r=GET /r HTTP/1.1|s=ft=fe ST=-1|a=U=0`.
+#[test]
+fn request_rules_print_the_stream_before_it_is_counted() {
+    let r = exchange(
+        &format!(
+            "{DEFAULTS}frontend fe\n  bind ADDR\n  http-request set-var-fmt(txn.t) \"ST=%ST U=%U ts=%ts Tq=%Tq r=%r\"\n  http-request set-header x-s \"ft=%ft ST=%ST\"\n  http-request add-header x-a \"U=%U\"\n  http-request return status 200 content-type text/plain lf-string \"v=%[var(txn.t)]|s=%[req.hdr(x-s)]|a=%[req.hdr(x-a)]\"\n"
+        ),
+        GET,
+    );
+    assert_eq!(body(&r), "v=ST=-1 U=0 ts=-- Tq=-1 r=GET /r HTTP/1.1|s=ft=fe ST=-1|a=U=0", "{r}");
+}
+
+/// A replacement with an alias, `%ft` (measured on 3.5-dev8 on 2026-10-25: `abc-fe`). The
+/// same rule with `%{+Q}[...]` or a `%{+json}o` format differs from `HAProxy` (T471).
+#[test]
+fn a_replacement_with_an_alias_prints_it() {
+    let r = exchange(
+        &format!(
+            "{DEFAULTS}frontend fe\n  bind ADDR\n  http-request set-header x-in abc\n  http-request replace-header x-in ^(.*)$ \"\\1-%ft\"\n  http-request return status 200 content-type text/plain lf-string \"%[req.hdr(x-in)]\"\n"
+        ),
+        GET,
+    );
+    assert_eq!(body(&r), "abc-fe", "{r}");
+}
+
+/// `set-timeout` from a string sample (T455 compiles its expression at load): measured on
+/// 3.5-dev8 on 2026-10-25, `str(9000)` gives a client timeout of 9000. (`str(7s)` gives 7 on
+/// `HAProxy`, which casts the string to an integer, and 7000 on Ibex: T472.)
+#[test]
+fn set_timeout_takes_a_string_sample() {
+    let r = exchange(
+        &format!(
+            "{DEFAULTS}listen fe\n  bind ADDR\n  http-request set-timeout client str(9000)\n  http-request return status 200 content-type text/plain lf-string \"c=%[cur_client_timeout]\"\n  server s SRV\n"
+        ),
+        GET,
+    );
+    assert_eq!(body(&r), "c=9000", "{r}");
+}
