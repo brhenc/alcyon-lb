@@ -324,7 +324,9 @@ fn memory_and_connection_metrics_move_with_a_burst() {
         }
     };
     assert!(read(&after, "haproxy_process_current_connections") <= read(&before, "haproxy_process_current_connections") + 1.0, "connections come back");
-    assert!(read(&after, "haproxy_process_pool_used_bytes") <= read(&during, "haproxy_process_pool_used_bytes"), "pool use does not stay up");
+    // Q2 (S4): the burst's slots are kept, as `HAProxy` keeps its pools, and only `pool_gc` gives
+    // them back; the use must not grow past the peak (a scrape or two may take a slot more).
+    assert!(read(&after, "haproxy_process_pool_used_bytes") <= read(&during, "haproxy_process_pool_used_bytes") + 16384.0, "pool use grows after the burst: {} then {} then {}", read(&before, "haproxy_process_pool_used_bytes"), read(&during, "haproxy_process_pool_used_bytes"), read(&after, "haproxy_process_pool_used_bytes"));
     // `show info` reads the same sources.
     let mut pairs = ibex_rt::stats::InfoPairs::default();
     ibex_rt::stats::process_info_pairs(&mut pairs, &run.engine.proxies);

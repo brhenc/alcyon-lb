@@ -19,7 +19,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
 use ibex_alloc::pool::{Pool, PoolDyn, PoolSpec, Poolable};
-use ibex_alloc::{declare_pool, PoolHead, PoolReg};
+use ibex_alloc::{declare_pool, PoolHead};
 
 /// Configured buffer sizes (in bytes).
 static BUFSIZE_STANDARD: AtomicUsize = AtomicUsize::new(16_384);
@@ -52,9 +52,6 @@ pub fn get_bufsize_large() -> Option<usize> {
     }
 }
 
-// Global atomic pool statistics counters
-/// Failed pool takes of the arenas. Nothing increments it yet.
-pub static POOL_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
 /// Standard buffers ever taken from the heap (never decremented): what `trim_idle` watches.
 /// Written on the miss path only.
@@ -131,70 +128,10 @@ pub fn large_buffer_pool_stats() -> Option<PoolHead> {
     Some(pool_head(&BUF_LARGE))
 }
 
-/// Counters of a per-thread arena (`SessionArena`, `AppletArena`), summed over every worker:
-/// each arena adds to these process-wide atomics as it creates a slot (`allocated`) and as a
-/// slot goes in and out of use (`used`), and takes its share back when it is dropped.
-/// `show pools` reads them; the arenas never read them.
-#[derive(Default)]
-pub struct ArenaCounters {
-    allocated: AtomicUsize,
-    used: AtomicUsize,
-}
-
-impl ArenaCounters {
-    #[must_use]
-    pub const fn new() -> Self {
-        Self { allocated: AtomicUsize::new(0), used: AtomicUsize::new(0) }
-    }
-
-    pub fn slot_created(&self) {
-        self.allocated.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn slot_used(&self) {
-        self.used.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn slot_released(&self) {
-        self.used.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    /// `n` empty slots at the end of an arena were given back.
-    pub fn slots_trimmed(&self, n: usize) {
-        self.allocated.fetch_sub(n, Ordering::Relaxed);
-    }
-
-    /// An arena holding `slots` slots, `live` of them in use, goes away.
-    pub fn arena_dropped(&self, slots: usize, live: usize) {
-        self.allocated.fetch_sub(slots, Ordering::Relaxed);
-        self.used.fetch_sub(live, Ordering::Relaxed);
-    }
-
-    /// The pool as `show pools` prints it. The slots that exist and are not in use are the
-    /// arena's free list, which is what `HAProxy` calls the thread cache.
-    #[must_use]
-    pub fn head(&self, reg: PoolReg) -> PoolHead {
-        let allocated = self.allocated.load(Ordering::Relaxed);
-        let live = self.used.load(Ordering::Relaxed).min(allocated);
-        PoolHead {
-            name: reg.name,
-            size: reg.size,
-            align: reg.align,
-            allocated,
-            alloc_bytes: allocated * reg.size,
-            used: live,
-            cached: allocated - live,
-            needed_avg: 0,
-            failures: POOL_FAILURES.load(Ordering::Relaxed),
-            users: 1,
-            reg: Some(reg),
-        }
-    }
-}
-
 fn register_arena_pools(reg: &ibex_alloc::PoolRegistry) {
     reg.register_provider("session", crate::engine::session_pool_stats);
     reg.register_provider("appctx", crate::applet::appctx_pool_stats);
+    reg.register_provider("task", ibex_sched::task_pool_stats);
     // The `ibex_alloc::Pool`s list themselves when first used; these are listed from the start.
     crate::reuse::register_pools();
 }

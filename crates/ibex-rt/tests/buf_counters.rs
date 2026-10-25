@@ -59,27 +59,6 @@ fn a_small_buffer_replaced_by_a_promotion_beyond_the_cache_is_no_longer_allocate
     .unwrap();
 }
 
-/// The counters of an arena, read through the pool head `show pools` prints.
-#[test]
-fn arena_counters_follow_slots_and_give_them_back() {
-    let c = buf::ArenaCounters::new();
-    let reg = || ibex_alloc::PoolReg { name: "t", size: 10, flags: 0, align: 8, file: "t.rs", line: 1 };
-    for _ in 0..3 {
-        c.slot_created();
-    }
-    c.slot_used();
-    c.slot_used();
-    let h = c.head(reg());
-    assert_eq!((h.allocated, h.alloc_bytes, h.used, h.cached), (3, 30, 2, 1));
-    c.slot_released();
-    c.slots_trimmed(1);
-    let h = c.head(reg());
-    assert_eq!((h.allocated, h.used, h.cached), (2, 1, 1));
-    c.arena_dropped(2, 1);
-    let h = c.head(reg());
-    assert_eq!((h.allocated, h.used, h.cached), (0, 0, 0));
-}
-
 /// S2: a take and a give that hit the thread cache write nothing another thread reads (no
 /// atomic read-modify-write): `used` moves in the thread's own counters, another thread sees it
 /// only when the owner publishes (once per loop pass); `allocated` does not move at all.

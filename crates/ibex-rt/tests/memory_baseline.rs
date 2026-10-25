@@ -3,7 +3,7 @@
 // Own binary (AGENTS.md rule 6): reads the child's /proc/<pid>/status VmRSS and times idle
 // periods (the buffer pool trims after 500 ms of quiet), process-wide state.
 
-//! The first-time-user leak test: mixed traffic, then a return to baseline (M3).
+//! The first-time-user leak test: mixed traffic, then no growth after the first burst (M3, Q2).
 //!
 //! One Ibex process (`nbthread 1`, a stats socket, `option httplog` to a UDP socket the
 //! test owns) is warmed up with 50 requests of every shape, left idle 1.5 s, and its
@@ -16,11 +16,12 @@
 //!   blocks are inside `used`; plain `used` when the build prints `used` without them) are
 //!   the baseline's;
 //! * `allocated` of every pool and `PoolAlloc_bytes` are what they were after the first
-//!   phase (pools grow once to the working set, then stay). The burst of 200 connections
-//!   is the one phase allowed to raise them (the working set is 200 sessions, not 1); it
-//!   runs twice, and the second run must leave them where the first did;
+//!   phase (pools grow once to the working set, then stay: Q2, the peak is kept as `HAProxy`
+//!   keeps it, and only `pool_gc` gives it back). The two phases that pile connections up
+//!   (client-abort, accepted in batches, and the burst of 200 connections) are allowed to
+//!   raise them; the burst runs twice, and the second run must leave them where the first did;
 //! * `CurrConns` is 0 and `show sess` lists only the CLI session;
-//! * VmRSS is within 2 MiB of the baseline.
+//! * VmRSS is within 2 MiB of what it was after the last phase that raised the pools.
 //!
 //! Counters read: `show pools` lines (`N allocated`, `N used (~M by thread caches)`),
 //! `show info` fields `PoolAlloc_bytes` `PoolUsed_bytes` `CurrConns` `CumConns`,
@@ -518,6 +519,7 @@ fn run(p: &Proc, check: bool) -> Vec<String> {
     );
     let mut fails = Vec::new();
     let mut reference: Option<Snap> = None;
+    let mut ref_rss = base.rss_kb;
     let mut seq: Vec<(&str, usize, fn(&Env, usize))> = PHASES.iter().map(|x| (x.name, x.n, x.run)).collect();
     seq.push(("burst-200-again", 200, burst));
     for (i, (name, n, f)) in seq.iter().enumerate() {
@@ -540,8 +542,20 @@ fn run(p: &Proc, check: bool) -> Vec<String> {
                 bad(format!("pool {k} blocks in use {} (baseline {want}); allocated {} used {} cached {}", in_use(pl, inside), pl.alloc, pl.used, pl.cached));
             }
         }
-        // the first phase sets the reference; the first burst resets it (200 sessions at once)
-        if i == 0 || *name == "burst-200" {
+        // Q2 (design/memory-2026-10-24.md 8): the peak is kept, as `HAProxy` keeps it. The
+        // first burst raises the session arena to 200 slots and nothing gives them back
+        // until `pool_gc`; the second burst must then not move it (checked below).
+        if *name == "burst-200" {
+            let slots = s.pools.get("session").map_or(0, |x| x.alloc);
+            if slots < 200 {
+                bad(format!("pool session allocated {slots} after 200 sessions at once: the burst capacity was given back, not kept"));
+            }
+        }
+        // The first phase sets the reference; the two phases that make connections pile up
+        // (2000 aborts accepted in batches, then 200 sessions at once) reset it: Ibex, like
+        // `HAProxy`, grows to the peak concurrency once. After them nothing may grow.
+        if i == 0 || *name == "client-abort" || *name == "burst-200" {
+            ref_rss = s.rss_kb;
             reference = Some(Snap { pools: s.pools.clone(), pool_alloc: s.pool_alloc, ..s_empty() });
         } else if let Some(r) = &reference {
             if s.pool_alloc != r.pool_alloc {
@@ -560,8 +574,8 @@ fn run(p: &Proc, check: bool) -> Vec<String> {
         if s.sess != 1 {
             bad(format!("show sess lists {} sessions (the CLI one is the only expected)", s.sess));
         }
-        if s.rss_kb - base.rss_kb > RSS_SLACK_KB {
-            bad(format!("VmRSS {} kB is {} kB over the baseline {} kB", s.rss_kb, s.rss_kb - base.rss_kb, base.rss_kb));
+        if s.rss_kb - ref_rss > RSS_SLACK_KB {
+            bad(format!("VmRSS {} kB is {} kB over the reference {} kB", s.rss_kb, s.rss_kb - ref_rss, ref_rss));
         }
     }
     println!("[MEASUREMENT 2026-10-17] who={} total_secs={:.1}", p.who, t0.elapsed().as_secs_f32());
@@ -573,7 +587,7 @@ fn s_empty() -> Snap {
 }
 
 #[test]
-fn mixed_traffic_returns_to_baseline() {
+fn mixed_traffic_no_growth_after_the_first_burst() {
     backend();
     let logged = log_sink();
     let p = Proc::start("ibex", env!("CARGO_BIN_EXE_ibex"));
@@ -581,7 +595,7 @@ fn mixed_traffic_returns_to_baseline() {
     let n = logged.load(Ordering::Relaxed);
     println!("[MEASUREMENT 2026-10-17] log datagrams received: {n}; /down answered 502 instead of 503 {} times", STATUS_502.load(Ordering::Relaxed));
     assert!(n > 5000, "option httplog reached the UDP socket for only {n} requests");
-    assert!(fails.is_empty(), "no return to baseline:\n{}", fails.join("\n"));
+    assert!(fails.is_empty(), "growth after the first burst:\n{}", fails.join("\n"));
 }
 
 #[test]
