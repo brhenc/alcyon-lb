@@ -4,8 +4,8 @@
 //! The `resolvers` section (`cfg_parse_resolvers`, `src/resolvers.c`), with `HAProxy`'s
 //! messages (measured on 3.5-dev8-885761-29, `docs/design/dns-2026-10-25.md` appendix A).
 //!
-//! Where it goes: `Config::resolvers`, which nothing reads until a server may name a
-//! section (T484); that keyword is refused until then. What Ibex cannot do yet is refused
+//! Where it goes: `Config::resolvers`, which `ibex_rt::resolvers::build` reads for the
+//! sections a server names (T484). What Ibex cannot do yet is refused
 //! here: `parse-resolv-conf` (T489) and the `tcp@` / `udp@` nameservers (T488).
 
 use super::{address, server_keywords, ConfigError, Duration, IpAddr, SocketAddr, Token};

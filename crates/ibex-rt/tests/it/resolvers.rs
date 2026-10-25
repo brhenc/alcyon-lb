@@ -72,6 +72,7 @@ fn base_zone() -> HashMap<String, Zone> {
 }
 
 impl FakeDns {
+    #[allow(clippy::many_single_char_names)]
     fn start() -> Self {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("bind the fake nameserver");
         sock.set_read_timeout(Some(Duration::from_millis(50))).expect("timeout");
@@ -263,7 +264,7 @@ impl Ibex {
             thread::sleep(Duration::from_millis(20));
         }
         let warn = format!("[WARNING]  ({}) : {line}", self.child.id());
-        assert!(self.stderr().iter().any(|l| *l == warn), "no {warn:?} in {:?}", self.stderr());
+        assert!(self.stderr().contains(&warn), "no {warn:?} in {:?}", self.stderr());
     }
 }
 
@@ -596,7 +597,7 @@ fn t19_resolve_net_picks_the_network_and_the_current_address_stays() {
     assert_eq!(ibex.log().iter().filter(|l| l.starts_with("l/s2: IP changed")).count(), 1, "{:?}", ibex.log());
 }
 
-/// A.t18 and §2.8.2: `dns-accept-family auto`. On a host with no IPv6 route (HAProxy's probe,
+/// A.t18 and §2.8.2: `dns-accept-family auto`. On a host with no IPv6 route (`HAProxy`'s probe,
 /// a UDP `connect` to `2001::`), only A is asked, whatever `resolve-prefer` says.
 #[test]
 fn t18_auto_families_ask_aaaa_only_with_an_ipv6_route() {
@@ -644,7 +645,7 @@ fn check(cfg: &str) -> (bool, String) {
     (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
-/// The parser: an unknown section is HAProxy's alert; `default-server resolvers` is
+/// The parser: an unknown section is `HAProxy`'s alert; `default-server resolvers` is
 /// inherited; a SRV name stays refused (T487).
 #[test]
 fn the_server_keyword_is_checked() {

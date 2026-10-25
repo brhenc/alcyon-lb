@@ -346,8 +346,8 @@ pub struct ServerName {
     /// Its `init-addr`, the `default-server`'s if it has none.
     pub init_addr: InitAddr,
     /// The name did not resolve and `init-addr none` let the server start without an
-    /// address: in maintenance (`SRV_ADMF_RMAINT`, `MAINT (resolution)`) for good until
-    /// run-time resolution exists (T484). `addr` is then the unspecified address.
+    /// address: in maintenance (`SRV_ADMF_RMAINT`, `MAINT (resolution)`) until its resolvers
+    /// give it one, for good without `resolvers`. `addr` is then the unspecified address.
     pub unresolved: bool,
     /// `resolvers <section>`: the section that resolves the name at run time (T484).
     pub resolvers: Option<Box<str>>,

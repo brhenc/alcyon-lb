@@ -69,6 +69,7 @@ pub fn note_l4_timeout() {
 }
 
 /// Whether a check ended in a layer-4 timeout since the last call.
+#[must_use]
 pub fn take_l4_timeout() -> bool {
     L4_TIMEOUT.replace(false)
 }
@@ -110,13 +111,50 @@ enum Status {
 }
 
 /// One address of the last answers (`struct resolv_answer_item`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AnswerItem {
     /// `XXH32(rdata, type)`: `HAProxy` keeps the items in a tree on it, which is the order
     /// [`pick`] reads them in.
     key: u32,
     ip: IpAddr,
     last_seen: Instant,
+    /// How many servers of each proxy took their address from it (`attached_servers`), as
+    /// (proxy, count): what makes the "+2 not used by another server" of [`pick`] one look.
+    users: Vec<(u32, u32)>,
+}
+
+impl AnswerItem {
+    fn users_in(&self, proxy: u32) -> u32 {
+        self.users.iter().find(|u| u.0 == proxy).map_or(0, |u| u.1)
+    }
+}
+
+/// The index of the item for `ip`: they are sorted by key.
+fn find_item(items: &[AnswerItem], ip: IpAddr) -> Option<usize> {
+    let key = item_key(ip);
+    let from = items.partition_point(|i| i.key < key);
+    items[from..].iter().take_while(|i| i.key == key).position(|i| i.ip == ip).map(|j| from + j)
+}
+
+/// Moves requester `k` onto the item for `to` (`LIST_DEL_INIT` / `LIST_APPEND` on
+/// `ip_rec_item`), keeping the items' counts.
+fn set_attached(r: &mut Resolution, k: usize, to: Option<IpAddr>) {
+    let (old, px) = (r.reqs[k].attached, r.reqs[k].proxy);
+    if old == to {
+        return;
+    }
+    if let Some(i) = old.and_then(|ip| find_item(&r.items, ip)) {
+        if let Some(u) = r.items[i].users.iter_mut().find(|u| u.0 == px) {
+            u.1 = u.1.saturating_sub(1);
+        }
+    }
+    if let Some(i) = to.and_then(|ip| find_item(&r.items, ip)) {
+        match r.items[i].users.iter_mut().find(|u| u.0 == px) {
+            Some(u) => u.1 += 1,
+            None => r.items[i].users.push((px, 1)),
+        }
+    }
+    r.reqs[k].attached = to;
 }
 
 /// The tree key of an answer item (`resolv_validate_dns_response`).
@@ -153,11 +191,11 @@ pub struct Resolution {
     /// name spread over its addresses.
     cursor: usize,
     in_flight: Option<QueryId>,
-    /// When the next resolution starts (`last_resolution + timeout resolve`).
+    /// When the next resolution starts (`ended_at + timeout resolve`).
     next_at: Instant,
     last_valid: Option<Instant>,
     /// When the last resolution ended (`last_resolution`).
-    last_resolution: Option<Instant>,
+    ended_at: Option<Instant>,
     status: Status,
 }
 
@@ -185,6 +223,8 @@ pub struct Section {
     nameservers: Vec<Nameserver>,
     dns: ibex_dns::Resolver,
     holds: Holds,
+    // Boxed: the pool's objects (`RESOLUTION_POOL`).
+    #[allow(clippy::vec_box)]
     resolutions: Vec<Box<Resolution>>,
     /// The read buffer, the task's own (64 KiB: a datagram never needs more).
     buf: Box<[u8]>,
@@ -224,6 +264,9 @@ fn active_families(now: Instant) -> Families {
 ///
 /// # Errors
 /// A nameserver socket that cannot be made.
+///
+/// # Panics
+/// Never: a resolution is made by its pool's `init`, which always gives one.
 pub fn build(
     config: &ibex_config::Config,
     proxies: &[Proxy],
@@ -253,12 +296,11 @@ pub fn build(
             if servers.get(s_idx).is_none() {
                 continue;
             }
-            let sec_idx = match out.iter().position(|s| *s.name == *sec_name) {
-                Some(i) => i,
-                None => {
-                    out.push(Section::new(cfg, usize_to_u32(out.len()), scheduler, fdtab, poller, now)?);
-                    out.len() - 1
-                }
+            let sec_idx = if let Some(i) = out.iter().position(|s| *s.name == *sec_name) {
+                i
+            } else {
+                out.push(Section::new(cfg, usize_to_u32(out.len()), scheduler, fdtab, poller, now)?);
+                out.len() - 1
             };
             // `resolv_link_resolution`: the type asked first, fixed now (A.t18).
             let prefer = if !families.ipv6 || n.resolve.prefer_ipv4 { TYPE_A } else { TYPE_AAAA };
@@ -280,7 +322,7 @@ pub fn build(
                             in_flight: None,
                             next_at: t0,
                             last_valid: None,
-                            last_resolution: None,
+                            ended_at: None,
                             status: Status::None,
                         }))
                     })
@@ -425,7 +467,7 @@ impl Section {
             if r.in_flight.is_some() || !r.reqs.iter().any(|q| q.proxy as usize == p && q.server as usize == s) {
                 continue;
             }
-            if r.status != Status::Valid || r.last_resolution.is_none_or(|t| now >= t + self.holds.valid) {
+            if r.status != Status::Valid || r.ended_at.is_none_or(|t| now >= t + self.holds.valid) {
                 r.next_at = now;
                 due = true;
             }
@@ -439,7 +481,7 @@ impl Section {
             let Some(r) = self.resolutions.iter_mut().find(|r| r.in_flight == Some(qid)) else { continue };
             r.in_flight = None;
             r.next_at = now + self.holds.timeout_resolve;
-            r.last_resolution = Some(now);
+            r.ended_at = Some(now);
             match res {
                 Ok(answers) => {
                     let by = ns.map(|i| format!("{}/{}", self.name, self.nameservers[i].name));
@@ -482,20 +524,22 @@ fn refresh_items(r: &mut Resolution, answers: &[Answer], fam: Families, obsolete
             Rdata::Aaaa(v6) if fam.ipv6 => v6.into(),
             _ => continue,
         };
-        match r.items.iter_mut().find(|i| i.ip == ip) {
-            Some(i) => i.last_seen = now,
-            None => {
-                let key = item_key(ip);
-                let at = r.items.partition_point(|i| i.key <= key);
-                r.items.insert(at, AnswerItem { key, ip, last_seen: now });
-            }
+        if let Some(i) = find_item(&r.items, ip) {
+            r.items[i].last_seen = now;
+        } else {
+            let key = item_key(ip);
+            let at = r.items.partition_point(|i| i.key <= key);
+            r.items.insert(at, AnswerItem { key, ip, last_seen: now, users: Vec::new() });
         }
     }
+    let before = r.items.len();
     r.items.retain(|i| i.last_seen + obsolete >= now);
-    let items = &r.items;
-    for req in &mut r.reqs {
-        if req.attached.is_some_and(|ip| !items.iter().any(|i| i.ip == ip)) {
-            req.attached = None;
+    if r.items.len() != before {
+        let items = &r.items;
+        for req in &mut r.reqs {
+            if req.attached.is_some_and(|ip| find_item(items, ip).is_none()) {
+                req.attached = None;
+            }
         }
     }
 }
@@ -543,7 +587,7 @@ fn server_answer(r: &mut Resolution, k: usize, by: &str, holds: &Holds, now: Ins
 fn pick(r: &mut Resolution, k: usize, cur: Option<IpAddr>, fam: Families) -> Pick {
     let req = &r.reqs[k];
     // The server is on an item still in the answer.
-    if req.attached.is_some_and(|ip| r.items.iter().any(|i| i.ip == ip)) {
+    if req.attached.is_some_and(|ip| find_item(&r.items, ip).is_some()) {
         return Pick::No;
     }
     let n = r.items.len();
@@ -575,7 +619,8 @@ fn pick(r: &mut Resolution, k: usize, cur: Option<IpAddr>, fam: Families) -> Pic
                 break;
             }
         }
-        let used = r.reqs.iter().enumerate().any(|(j, o)| j != k && o.proxy == req.proxy && o.attached == Some(ip));
+        // The owner is on no live item (checked above), so every user is another server.
+        let used = r.items[idx].users_in(req.proxy) > 0;
         if used {
             if !req.opts.allow_dup_ip {
                 continue;
@@ -593,7 +638,7 @@ fn pick(r: &mut Resolution, k: usize, cur: Option<IpAddr>, fam: Families) -> Pic
             found = Some(ip);
             cur_found = sel;
             if score == 15 {
-                r.reqs[k].attached = Some(ip);
+                set_attached(r, k, Some(ip));
                 return Pick::No;
             }
             max = score;
@@ -601,7 +646,7 @@ fn pick(r: &mut Resolution, k: usize, cur: Option<IpAddr>, fam: Families) -> Pic
     }
     let chosen = if prefer_v4 { best4.or(best6) } else { best6.or(best4) };
     let Some(chosen) = chosen else { return Pick::NoIp };
-    r.reqs[k].attached = found;
+    set_attached(r, k, found);
     if cur_found { Pick::No } else { Pick::New(chosen) }
 }
 
@@ -636,7 +681,7 @@ fn on_error(r: &mut Resolution, e: &DnsError, holds: &Holds, now: Instant, proxi
             if let Some(px) = proxies.get(p) {
                 clear_addr(px, s);
             }
-            r.reqs[k].attached = None;
+            set_attached(r, k, None);
         } else {
             keep = true;
         }
@@ -651,6 +696,7 @@ fn on_error(r: &mut Resolution, e: &DnsError, holds: &Holds, now: Instant, proxi
 
 /// `snr_set_srv_down`: whether requester `k`'s server went into `SRV_ADMF_RMAINT` now (the
 /// hold of the status ran out since the last valid answer, or there never was one, F5).
+#[allow(clippy::many_single_char_names)] // HAProxy's names: r(esolution), k, p(roxy), s(erver)
 fn set_srv_down(r: &Resolution, k: usize, holds: &Holds, now: Instant, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) -> bool {
     let req = &r.reqs[k];
     let (p, s) = (req.proxy as usize, req.server as usize);
@@ -761,12 +807,19 @@ mod tests {
             name: "x.test".into(),
             prefer: TYPE_A,
             reqs,
-            items: ips.iter().map(|i| AnswerItem { key: 0, ip: i.parse().expect("ip"), last_seen: now }).collect(),
+            items: {
+                let mut v: Vec<AnswerItem> = ips.iter().map(|i| {
+                    let ip: IpAddr = i.parse().expect("ip");
+                    AnswerItem { key: item_key(ip), ip, last_seen: now, users: Vec::new() }
+                }).collect();
+                v.sort_by_key(|i| i.key);
+                v
+            },
             cursor: 0,
             in_flight: None,
             next_at: now,
             last_valid: None,
-            last_resolution: None,
+            ended_at: None,
             status: Status::None,
         }
     }
@@ -839,8 +892,18 @@ mod tests {
     fn servers_spread_over_the_items() {
         let o = ResolveOpts { prefer_ipv4: true, ..ResolveOpts::default() };
         let mut r = res(&["10.0.0.1", "10.0.0.2"], vec![req(0, 0, o.clone()), req(0, 1, o)]);
-        assert_eq!(pick(&mut r, 0, None, Families::IPV4), Pick::New(ip("10.0.0.1")));
-        assert_eq!(pick(&mut r, 1, None, Families::IPV4), Pick::New(ip("10.0.0.2")));
-        assert_eq!(pick(&mut r, 0, Some(ip("10.0.0.1")), Families::IPV4), Pick::No);
+        let Pick::New(a) = pick(&mut r, 0, None, Families::IPV4) else { panic!("no address") };
+        let Pick::New(b) = pick(&mut r, 1, None, Families::IPV4) else { panic!("no address") };
+        assert_ne!(a, b);
+        assert_eq!(pick(&mut r, 0, Some(a), Families::IPV4), Pick::No);
+        // Without allow-dup-ip a third server finds both taken.
+        r.reqs.push(req(0, 2, ResolveOpts::default()));
+        assert_eq!(pick(&mut r, 2, None, Families::IPV4), Pick::NoIp);
+        // Another proxy's server may share one.
+        r.reqs.push(req(1, 0, ResolveOpts::default()));
+        assert!(matches!(pick(&mut r, 3, None, Families::IPV4), Pick::New(_)));
+        // The first leaves its item: the third can have it.
+        set_attached(&mut r, 0, None);
+        assert_eq!(pick(&mut r, 2, None, Families::IPV4), Pick::New(a));
     }
 }
