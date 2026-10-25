@@ -405,7 +405,7 @@ pub enum ConnEnd {
     ShutBoth,
     /// `abort_with_rst`.
     Abort,
-    /// `silent_drop`: IPv6 or not, and the TTL of the RST.
+    /// `silent_drop`: IPv6 or not, and the TTL of the RST (0: `TCP_REPAIR` first, then TTL 1).
     SilentDrop(bool, u8),
 }
 
@@ -1019,8 +1019,14 @@ impl TcpSession {
     pub fn refuse_request(&mut self, silent: bool, is_ipv6: bool, ttl: u8) {
         use ibex_proto::h2::H2Error;
         if let Some(c) = self.h2_child_mut() {
-            c.rst = Some(if silent { H2Error::RefusedStream } else { H2Error::EnhanceYourCalm });
-            c.goaway = (!silent).then_some(H2Error::EnhanceYourCalm);
+            if silent && ttl == 0 && raw::can_tcp_repair() {
+                // Plain `silent-drop` with `TCP_REPAIR` available (measured on `HAProxy` as root): no
+                // frame at all, the connection goes quiet when its owner closes it.
+                c.end_conn(ConnEnd::SilentDrop(is_ipv6, 0));
+            } else {
+                c.rst = Some(if silent { H2Error::RefusedStream } else { H2Error::EnhanceYourCalm });
+                c.goaway = (!silent).then_some(H2Error::EnhanceYourCalm);
+            }
             c.finished = true;
         } else if silent {
             self.silent_drop_client(is_ipv6, ttl);

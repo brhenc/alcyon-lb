@@ -72,6 +72,7 @@ mod chunk_extensions;
 mod head_facts;
 mod host_authority_sync;
 mod http_reject_silent_drop;
+mod silent_drop_repair;
 mod http_reply_refusals;
 mod chunked_body_errors;
 mod cli_answer_delivery;

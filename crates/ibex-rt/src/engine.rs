@@ -6454,7 +6454,7 @@ enum ConnEvalOutcome {
     /// Client, server, `fc_src`, `fc_dst`, and whether `expect-proxy` matched.
     Accept(SocketAddr, SocketAddr, SocketAddr, SocketAddr, bool),
     Reject,
-    /// `silent-drop`; the TTL of the RST (`rst-ttl`, 1 without it).
+    /// `silent-drop`; the TTL of the RST (`rst-ttl`, 0 without it: `TCP_REPAIR` first, then 1).
     SilentDrop(u8),
 }
 
@@ -6525,7 +6525,7 @@ fn eval_tcp_req_conn_rules(
         }
         match &rule.action {
             ibex_config::TcpReqConnAction::SilentDrop => {
-                return ConnEvalOutcome::SilentDrop(1);
+                return ConnEvalOutcome::SilentDrop(0);
             }
             ibex_config::TcpReqConnAction::SilentDropTtl(ttl) => {
                 return ConnEvalOutcome::SilentDrop(*ttl);
@@ -6626,7 +6626,7 @@ fn eval_tcp_req_session_rules(
         }
         match &rule.action {
             ibex_config::TcpReqSessionAction::SilentDrop => {
-                return SessionEvalOutcome::SilentDrop(1);
+                return SessionEvalOutcome::SilentDrop(0);
             }
             ibex_config::TcpReqSessionAction::SilentDropTtl(ttl) => {
                 return SessionEvalOutcome::SilentDrop(*ttl);
@@ -6859,7 +6859,7 @@ fn eval_tcp_req_content_rules(
         match &rule.action {
             ibex_config::TcpReqContentAction::SilentDrop => {
                 note_last_rule(sess, rule.line);
-                return ContentEvalResult::SilentDrop(1);
+                return ContentEvalResult::SilentDrop(0);
             }
             ibex_config::TcpReqContentAction::SilentDropTtl(ttl) => {
                 note_last_rule(sess, rule.line);
@@ -7133,7 +7133,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
             }
             ibex_config::TcpResAction::SilentDrop => {
                 note_last_rule(sess, rule.line);
-                return ContentEvalResult::SilentDrop(1);
+                return ContentEvalResult::SilentDrop(0);
             }
             ibex_config::TcpResAction::SetVar { var_name, expr: _ } => {
                 set_var_from(&mut sess.vars, var_name, rc.expr.as_ref(), &ctx, registry);
@@ -11215,7 +11215,7 @@ impl EngineDispatcher<'_> {
                     proxies[entry.proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     proxies[entry.backend_idx.min(proxies.len() - 1)].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                    entry.sess.refuse_request(true, is_ipv6, 1);
+                    entry.sess.refuse_request(true, is_ipv6, 0);
                     if let Some(txn) = entry.sess.txn.as_mut() {
                         txn.close_after = true;
                         txn.aborted = true;
@@ -12149,7 +12149,7 @@ impl EngineDispatcher<'_> {
                         for_tracked(proxies, sess, |data| data.count_err());
                         let is_ipv6 = sess.client_addr.is_some_and(|a| a.is_ipv6());
                         let (silent, ttl) = match rule.action {
-                            ibex_config::HttpReqAction::SilentDrop => (true, 1),
+                            ibex_config::HttpReqAction::SilentDrop => (true, 0),
                             ibex_config::HttpReqAction::SilentDropTtl(ttl) => (true, ttl),
                             _ => (false, 1),
                         };
