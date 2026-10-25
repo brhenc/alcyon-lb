@@ -27,6 +27,8 @@ ibex-crypt = { path = "../ibex-crypt" }
 rustls = { workspace = true }
 rcgen = "0.13"
 tempfile = "3"
+# T507: RLIMIT_DATA for tests/mem_limit.rs.
+rustix = { version = "0.38", features = ["process"] }
 # T462: `ibex_alloc::stack_probe` for the stack scrub test (reads below the stack pointer).
 ibex-alloc = { workspace = true, features = ["test-probe"] }
 
@@ -42,3 +44,8 @@ pedantic = { level = "warn", priority = -1 }
 [[test]]
 name = "it"
 path = "tests/it/main.rs"
+
+# Its own process: it lowers RLIMIT_DATA, which is process-wide and cannot be undone for the other tests (AGENTS.md section 6).
+[[test]]
+name = "mem_limit"
+path = "tests/mem_limit.rs"
