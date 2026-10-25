@@ -56,6 +56,7 @@ pub mod poller;
 pub mod proxy;
 pub mod proxy_state;
 pub mod track;
+pub mod server_state;
 pub mod txn;
 pub mod txnlog;
 pub mod websocket;

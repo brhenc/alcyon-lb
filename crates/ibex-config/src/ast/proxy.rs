@@ -19,6 +19,19 @@ pub enum HttpMode {
     Close,
 }
 
+/// `load-server-state-from-file` (T490): which server-state file a backend reads at start,
+/// before its servers take traffic (`apply_server_state`, src/server_state.c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoadServerState {
+    /// `none`, and what a backend has when nothing says otherwise.
+    #[default]
+    None,
+    /// The `global` `server-state-file`.
+    Global,
+    /// `server-state-file-name`, or else the backend's name, under `server-state-base`.
+    Local,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DefaultsSection {
     /// Operating mode (tcp, http).
@@ -31,6 +44,8 @@ pub struct DefaultsSection {
     pub retry_on: Option<u32>,
     /// Default redispatch flag.
     pub redisp: bool,
+    /// `load-server-state-from-file` (T490); `server-state-file-name` is not inherited.
+    pub load_server_state: Option<LoadServerState>,
     /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
     /// negative counts back from the last retry, the default `-1` redispatches on it.
     pub redisp_after: i32,
@@ -255,6 +270,11 @@ pub struct ListenSection {
     pub retry_on: u32,
     /// Whether reconnection to dispatch address is enabled on error.
     pub redisp: bool,
+    /// `load-server-state-from-file` (T490), from `defaults` unless the section has its own.
+    pub load_server_state: LoadServerState,
+    /// `server-state-file-name` (T490): the file `load-server-state-from-file local` reads,
+    /// relative to `server-state-base`; `None` is the section's name.
+    pub server_state_file_name: Option<String>,
     /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
     /// negative counts back from the last retry, the default `-1` redispatches on it.
     pub redisp_after: i32,
@@ -507,6 +527,8 @@ impl Default for ListenSection {
             retries: 3,
             retry_on: RE_CONN_FAILED,
             redisp: false,
+            load_server_state: LoadServerState::None,
+            server_state_file_name: None,
             redisp_after: -1,
             maxconn: 0,
             backlog: 0,
@@ -810,6 +832,11 @@ pub struct BackendSection {
     pub retry_on: u32,
     /// Whether reconnection to dispatch address is enabled on error.
     pub redisp: bool,
+    /// `load-server-state-from-file` (T490), from `defaults` unless the section has its own.
+    pub load_server_state: LoadServerState,
+    /// `server-state-file-name` (T490): the file `load-server-state-from-file local` reads,
+    /// relative to `server-state-base`; `None` is the section's name.
+    pub server_state_file_name: Option<String>,
     /// `option redispatch <interval>`: retries between redispatches (`redispatch_after`);
     /// negative counts back from the last retry, the default `-1` redispatches on it.
     pub redisp_after: i32,
@@ -911,6 +938,8 @@ impl Default for BackendSection {
             retries: 3,
             retry_on: RE_CONN_FAILED,
             redisp: false,
+            load_server_state: LoadServerState::None,
+            server_state_file_name: None,
             redisp_after: -1,
             dispatch: None,
             default_server: None,

@@ -317,6 +317,12 @@ pub struct GlobalSection {
     pub load_warnings: Vec<LoadWarning>,
     /// Pidfile path.
     pub pidfile: Option<String>,
+    /// `server-state-file` (T490): the file `load-server-state-from-file global` reads;
+    /// relative to `server-state-base`, or else to the working directory.
+    pub server_state_file: Option<String>,
+    /// `server-state-base` (T490): the directory of the server-state files whose name does
+    /// not start with `/`.
+    pub server_state_base: Option<String>,
     /// Hard stop timeout on reload/exit.
     pub hard_stop_after: Option<Duration>,
     /// `warn-blocked-traffic-after`: the watchdog's tick and warning delay, 1 to 1000 ms.

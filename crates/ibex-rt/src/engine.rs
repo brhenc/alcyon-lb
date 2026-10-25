@@ -1482,9 +1482,26 @@ pub struct ProxyIdInfo {
     pub checkcache: bool,
     /// `retry-on`, as the `ibex_config::RE_*` bits: what a failed attempt is retried on.
     pub retry_on: u32,
+    /// What the server-state file gave each server (T490, [`crate::server_state`]): read
+    /// by `init_checks` and by the `lastchg` columns; empty when no file was applied.
+    pub server_restored: Vec<Option<crate::server_state::Restored>>,
 }
 
 impl ProxyIdInfo {
+    /// What the server-state file gave server `i`, if anything.
+    #[must_use]
+    pub fn restored(&self, i: usize) -> Option<&crate::server_state::Restored> {
+        self.server_restored.get(i).and_then(Option::as_ref)
+    }
+
+    /// Seconds since server `i` last changed state (`lastchg`, `srv_time_since_last_change`):
+    /// from its last change, or else from the start plus the age the server-state file gave.
+    #[must_use]
+    pub fn server_lastchg(&self, i: usize, last_chg: u64) -> u64 {
+        crate::statcnt::TxnCounters::since_secs(last_chg)
+            .unwrap_or_else(|| crate::statcnt::now_ms() / 1000 + self.restored(i).map_or(0, |r| r.age_s))
+    }
+
     /// The idle connection settings of server `i`.
     #[must_use]
     pub fn server_pool(&self, i: usize) -> SrvPoolCfg {
@@ -4385,8 +4402,19 @@ fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<S
             };
             let mut check = ServerCheckState::new(proxy_idx, server_idx, srv_addr, check_cfg, now);
             check.tls = proxy.server_check_tls.get(server_idx).cloned().flatten();
-            // A `disabled` server stays in maintenance whatever its checks find.
-            if proxy.server_statuses.get(server_idx).is_some_and(|s| s.load(Ordering::Relaxed) == ServerStatus::Maint as u8) {
+            if let Some(r) = proxy.ids.restored(server_idx) {
+                // What the server-state file said (T490), already in `server_statuses`.
+                let published = proxy.server_statuses.get(server_idx).map_or(0, |s| s.load(Ordering::Relaxed));
+                check.status = if published == crate::check::DRAIN_DOWN { ServerStatus::Down } else { ServerStatus::from(published) };
+                check.admin = r.admin;
+                check.health = r.health;
+                check.enabled = !r.check_disabled;
+                if let Some((code, desc)) = r.check_code {
+                    check.last_status_code = code;
+                    check.last_status_desc = desc;
+                }
+            } else if proxy.server_statuses.get(server_idx).is_some_and(|s| s.load(Ordering::Relaxed) == ServerStatus::Maint as u8) {
+                // A `disabled` server stays in maintenance whatever its checks find.
                 check.set_admin_status(ServerStatus::Maint);
             }
             let check_idx = usize_to_u32(checks.len());
@@ -4591,6 +4619,8 @@ impl Engine {
     for (i, frontend) in config.frontends.iter().enumerate() {
         if !frontend.disabled { proxies.push(init_proxy_from_frontend(proxies.len(), ids.frontends[i], frontend)); }
     }
+    // T490: the servers start where the server-state file says, before any check or request.
+    crate::server_state::apply(config, &mut proxies);
     let disabled: Arc<Vec<String>> = Arc::new(
         config.listens.iter().map(|l| (l.disabled, &l.name))
             .chain(config.backends.iter().map(|b| (b.disabled, &b.name)))
