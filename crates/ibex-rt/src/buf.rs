@@ -323,18 +323,9 @@ pub fn set_buffers_limit(n: usize) {
 // first receive buffer only while the reserve is full, a local reply down to the last); a
 // buffer given back refills the reserve before the pool.
 
-/// `tune.buffers.reserve`.
-static RESERVE: AtomicUsize = AtomicUsize::new(0);
-
 /// `tune.buffers.reserve` when it is not set (`RESERVED_BUFS`, include/haproxy/defaults.h).
 pub const RESERVED_BUFS: usize = 4;
 
-thread_local! {
-    /// This thread's emergency buffers, room for the reserve made at start.
-    static EMERGENCY: std::cell::RefCell<Vec<Box<[u8]>>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// How many the reserve lacks: a give looks at this before the pool.
-    static LACK: Cell<u32> = const { Cell::new(0) };
-}
 
 /// `tune.buffers.limit` `limit` with `tune.buffers.reserve` `reserve` on `nbthread` threads:
 /// the limit each emergency buffer raises by one (`dynbuf.c:285`), none without a limit.
@@ -347,43 +338,20 @@ pub fn limit_with_reserve(limit: usize, reserve: usize, nbthread: usize) -> usiz
 /// [`set_buffers_limit`] with [`limit_with_reserve`]). False when memory is short.
 #[must_use]
 pub fn fill_emergency(reserve: usize) -> bool {
-    RESERVE.store(reserve, Ordering::Relaxed);
     ensure_registered();
-    EMERGENCY.with(|e| {
-        let mut e = e.borrow_mut();
-        let more = reserve.saturating_sub(e.len());
-        if e.try_reserve_exact(more).is_err() {
-            return false;
-        }
-        while e.len() < reserve {
-            let Some(d) = take_mem(&BUF_STD) else { return false };
-            e.push(d);
-        }
-        true
-    })
+    BUF_STD.fill_reserve(reserve, || take_mem(&BUF_STD).map(Mem))
 }
 
 /// An emergency buffer for a take of queue `q` the pool refused, if the reserve allows it.
-#[cold]
-#[inline(never)]
 fn take_emergency(q: usize) -> Option<Box<[u8]>> {
-    let reserve = RESERVE.load(Ordering::Relaxed);
-    EMERGENCY.with(|e| {
-        let mut e = e.borrow_mut();
-        if e.is_empty() || e.len() * 3 < q * reserve {
-            return None;
-        }
-        let d = e.pop()?;
-        LACK.set(LACK.get() + 1);
-        Some(d)
-    })
+    BUF_STD.take_reserve(q).map(|m| m.0)
 }
 
 /// A standard buffer given back: into the reserve if it lacks one (`__b_free`), else back.
 #[inline(always)]
 #[allow(clippy::inline_always)] // one thread-local read on the give path
 fn refill_emergency(data: Box<[u8]>) -> Option<Box<[u8]>> {
-    if LACK.get() == 0 { Some(data) } else { refill_slow(data) }
+    if BUF_STD.reserve_lacks() { refill_slow(data) } else { Some(data) }
 }
 
 #[cold]
@@ -393,15 +361,7 @@ fn refill_slow(data: Box<[u8]>) -> Option<Box<[u8]>> {
     if data.len() != get_bufsize() {
         return Some(data);
     }
-    EMERGENCY.with(|e| {
-        let mut e = e.borrow_mut();
-        if e.len() == e.capacity() {
-            return Some(data);
-        }
-        e.push(data);
-        LACK.set(LACK.get() - 1);
-        None
-    })
+    BUF_STD.refill_reserve(Mem(data)).map(|m| m.0)
 }
 
 /// Puts this thread's cached standard buffers on the pool's shelf for another thread's waiters

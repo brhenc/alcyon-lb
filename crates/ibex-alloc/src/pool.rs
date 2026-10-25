@@ -206,6 +206,12 @@ impl PoolSpec {
 /// One thread's cache of one pool. Public for [`declare_pool!`] only.
 pub struct Cache<T> {
     inner: RefCell<Local<T>>,
+    /// [`Pool::fill_reserve`]'s per-thread reserve (S6b), kept aside from the cache's objects.
+    reserve: RefCell<Vec<T>>,
+    /// How many the reserve lacks, read by every give ([`Pool::reserve_lacks`]).
+    lack: Cell<u32>,
+    /// The reserve's size, as asked.
+    reserve_cap: Cell<usize>,
 }
 
 struct Local<T> {
@@ -226,7 +232,12 @@ struct Local<T> {
 impl<T> Cache<T> {
     #[must_use]
     pub const fn new() -> Self {
-        Cache { inner: RefCell::new(Local { items: Vec::new(), boxes: 0, touched: false, over: (0, 0, 0), shared: None, pre: 0 }) }
+        Cache {
+            inner: RefCell::new(Local { items: Vec::new(), boxes: 0, touched: false, over: (0, 0, 0), shared: None, pre: 0 }),
+            reserve: RefCell::new(Vec::new()),
+            lack: Cell::new(0),
+            reserve_cap: Cell::new(0),
+        }
     }
 }
 
@@ -917,6 +928,78 @@ impl<T: Poolable> Pool<T> {
         self.cache.try_with(|c| c.inner.try_borrow().map_or(0, |l| l.items.len())).unwrap_or(0)
     }
 
+    /// Makes this thread's reserve `n` objects, each from `init` (the caller's counted take), and
+    /// keeps them aside: only [`Self::take_reserve`] hands them out (`tune.buffers.reserve`,
+    /// `HAProxy`'s `th_ctx->emergency_bufs`). False when `init` or memory refuses; what was made stays.
+    #[must_use]
+    pub fn fill_reserve(&self, n: usize, mut init: impl FnMut() -> Option<T>) -> bool {
+        self.cache
+            .try_with(|c| {
+                let Ok(mut r) = c.reserve.try_borrow_mut() else { return false };
+                c.reserve_cap.set(n);
+                let more = n.saturating_sub(r.len());
+                if r.try_reserve_exact(more).is_err() {
+                    return false;
+                }
+                while r.len() < n {
+                    let Some(v) = init() else { return false };
+                    r.push(v);
+                }
+                c.lack.set(0);
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    /// An object of this thread's reserve for a take of queue `q` that the pool refused, if the
+    /// reserve allows it (`left * 3 >= q * reserve`: queue 3 only while it is full, queue 0 down
+    /// to the last). The reserve then lacks one.
+    #[cold]
+    #[inline(never)]
+    pub fn take_reserve(&self, q: usize) -> Option<T> {
+        self.cache
+            .try_with(|c| {
+                let mut r = c.reserve.try_borrow_mut().ok()?;
+                if r.is_empty() || r.len() * 3 < q * c.reserve_cap.get() {
+                    return None;
+                }
+                let v = r.pop()?;
+                c.lack.set(c.lack.get() + 1);
+                Some(v)
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Whether this thread's reserve lacks an object: a give looks at this before the pool.
+    #[inline(always)] // one thread-local read on the give path
+    #[allow(clippy::inline_always)]
+    pub fn reserve_lacks(&self) -> bool {
+        self.cache.try_with(|c| c.lack.get() != 0).unwrap_or(false)
+    }
+
+    /// Puts a given object into the reserve if it lacks one; handed back when it is full.
+    #[cold]
+    #[inline(never)]
+    pub fn refill_reserve(&self, v: T) -> Option<T> {
+        let r = self.cache.try_with(|c| {
+            let Ok(mut r) = c.reserve.try_borrow_mut() else { return Some(v) };
+            if r.len() >= c.reserve_cap.get() || r.len() == r.capacity() {
+                return Some(v);
+            }
+            r.push(v);
+            c.lack.set(c.lack.get().saturating_sub(1));
+            None
+        });
+        r.unwrap_or(None)
+    }
+
+    /// Objects in this thread's reserve.
+    #[must_use]
+    pub fn reserve_len(&self) -> usize {
+        self.cache.try_with(|c| c.reserve.try_borrow().map_or(0, |r| r.len())).unwrap_or(0)
+    }
+
     /// Footprints of this thread's cache.
     #[must_use]
     pub fn local_bytes(&self) -> usize {
@@ -1409,6 +1492,38 @@ macro_rules! declare_pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    crate::declare_pool!(static RSV: Pool<Vec<u8>> = PoolSpec::new("t_reserve"););
+
+    /// S6b: the per-thread reserve is taken only by a class the gate allows (`left*3 >= q*reserve`),
+    /// each take leaves the reserve lacking one, and a give refills it before anything else.
+    #[test]
+    fn reserve_gate_and_refill() {
+        let mut made = 0;
+        assert!(RSV.fill_reserve(3, || {
+            made += 1;
+            Some(vec![0u8; 8])
+        }));
+        assert_eq!((made, RSV.reserve_len()), (3, 3));
+        assert!(!RSV.reserve_lacks());
+        // q=3 needs the reserve full: 3*3 >= 3*3
+        assert!(RSV.take_reserve(3).is_some());
+        assert!(RSV.reserve_lacks());
+        // full is gone: q=3 refused (2*3 < 3*3), q=2 allowed (6 >= 6), q=0 down to the last
+        assert!(RSV.take_reserve(3).is_none());
+        assert!(RSV.take_reserve(2).is_some());
+        assert!(RSV.take_reserve(0).is_some());
+        assert!(RSV.take_reserve(0).is_none(), "empty");
+        // gives refill the reserve, and only it, until it is full again
+        assert!(RSV.refill_reserve(vec![1]).is_none());
+        assert_eq!(RSV.reserve_len(), 1);
+        assert!(RSV.refill_reserve(vec![1]).is_none());
+        assert!(RSV.refill_reserve(vec![1]).is_none());
+        assert!(!RSV.reserve_lacks());
+        assert_eq!(RSV.refill_reserve(vec![9]).map(|v| v[0]), Some(9), "full: handed back");
+        // another thread has its own, empty reserve
+        std::thread::spawn(|| assert!(!RSV.reserve_lacks() && RSV.take_reserve(0).is_none())).join().unwrap();
+    }
 
     crate::declare_pool!(static LIMITED: Pool<Vec<u8>> = PoolSpec::new("t_limited").limited(););
     crate::declare_pool!(static BYTES: Pool<Vec<u8>> = PoolSpec::new("t_bytes").max_count(1000););
