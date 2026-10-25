@@ -503,6 +503,13 @@ HAProxy's results (`sizeof(struct stream)` has no Ibex counterpart), `maxsslconn
 `tune.ssl.cachesize` are not configurable, so `MaxSslConns` stays 0 and the
 `Automatically setting global.maxconn ...` notice is not printed.
 
+A budget too small for the threads themselves (T508) differs: HAProxy serves at every `-m` from 1
+to 8 (its `VmData` is already 43 MB), but Ibex's worker and watchdog threads each need a stack
+under `RLIMIT_DATA`. When one cannot be created, Ibex refuses the start with an
+`[ALERT] ... Failed to create thread N` or `Failed to start the watchdog thread` line and exit 1,
+instead of a panic or running without lockup detection. Measured here: `-m 1` and `-m 2`
+refuse (worker), `-m 3` refuses (watchdog), `-m 4` and up serve (`nbthread 1`).
+
 ## `tune.memory.prealloc on|off`: an Ibex-only global keyword (T468)
 
 HAProxy 3.5-dev8 refuses it as unknown (`did you mean 'prealloc-fd' maybe ?`), and nothing in
