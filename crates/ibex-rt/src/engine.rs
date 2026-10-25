@@ -15879,6 +15879,21 @@ fn build_templated_error_response_into(
 mod arena_tests {
     use super::SessionArena;
 
+    /// T468: `tune.memory.prealloc`'s slots are made at start and `pool_gc` does not compact
+    /// them; a size the allocator cannot reserve is refused and leaves the arena as it was.
+    #[test]
+    fn a_presized_session_arena_keeps_its_slots_and_refuses_what_cannot_be_reserved() {
+        use ibex_alloc::Arena;
+        let mut a = SessionArena::with_capacity(0);
+        assert!(a.prealloc(8));
+        assert_eq!((a.slots(), a.live()), (8, 0));
+        assert_eq!(a.compact(), 0, "no slot released");
+        assert_eq!(a.slots(), 8);
+        let mut b = SessionArena::with_capacity(0);
+        assert!(!b.prealloc(usize::MAX), "a reservation past the address space");
+        assert_eq!(b.slots(), 0);
+    }
+
     /// Two entries at once are two distinct, live ones (T280): the same index twice, or one
     /// past the end, is none.
     #[test]

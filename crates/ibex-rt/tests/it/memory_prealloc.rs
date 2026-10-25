@@ -51,6 +51,9 @@ fn prealloc_needs_maxconn_or_m_and_fits_m() {
     assert!(err.contains("'tune.memory.prealloc' needs an explicit global 'maxconn' or '-m' to size the pools."), "{err}");
     assert_eq!(check("maxconn", "    maxconn 100\n    tune.memory.prealloc on\n", &[]).0, 0);
     assert_eq!(check("m", "    tune.memory.prealloc on\n", &["-m", "100"]).0, 0);
+    // 100 connections at 2 x 16 KiB and a session slot are ~3.3 MB: within `-m 100`.
+    let (code, err) = check("fits", "    maxconn 100\n    tune.memory.prealloc on\n", &["-m", "100"]);
+    assert_eq!(code, 0, "refused within -m: {err}");
     assert_eq!(check("off", "    tune.memory.prealloc off\n", &[]).0, 0);
     // 10000 connections at 2 x 16 KiB are 312 MiB and more, past `-m 64`.
     let (code, err) = check("toobig", "    maxconn 10000\n    tune.memory.prealloc on\n", &["-m", "64"]);
@@ -104,6 +107,55 @@ fn flood() -> SocketAddr {
         }
     });
     addr
+}
+
+/// A worker that cannot make what `maxconn` implies does not start: `maxconn 10000` needs ~330 MB
+/// of buffers, `RLIMIT_DATA` is 150 MB (`prlimit`, so the check against `-m` does not refuse it
+/// first). The process exits 1 and says what it could not allocate.
+#[test]
+fn a_worker_that_cannot_presize_refuses_to_start() {
+    let d = dir("oom");
+    let path = d.join("c.cfg");
+    std::fs::write(&path, format!("global\n    nbthread 1\n    maxconn 10000\n    tune.memory.prealloc on\n{DEFAULTS}frontend f\n    bind 127.0.0.1:{}\n", common::reserve_port())).unwrap();
+    let out = Command::new("prlimit")
+        .arg(format!("--data={}", 150 * 1_048_576))
+        .arg("--")
+        .arg(env!("CARGO_BIN_EXE_ibex"))
+        .arg("-f")
+        .arg(&path)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("Failed to initialize Ibex engine (worker 0): tune.memory.prealloc: cannot allocate 20000 buffers and 10000 session slots"), "{err}");
+}
+
+/// `ibex -f` on `global` and a frontend; waits for the stats socket and the first publication.
+fn start(tag: &str, global: &str) -> (Ibex, String) {
+    let fe = common::reserve_addr();
+    let d = dir(tag);
+    let sock = d.join("cli.sock").display().to_string();
+    let path = d.join("c.cfg");
+    std::fs::write(&path, format!("global\n{global}    stats socket {sock} level admin\n{DEFAULTS}frontend f\n    bind {fe}\n")).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let ibex = Ibex(child, d);
+    assert!(common::wait_listening(fe), "ibex did not listen");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::path::Path::new(&sock).exists() {
+        assert!(Instant::now() < deadline, "no stats socket");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    (ibex, sock)
+}
+
+/// A `tune.buffers.limit` below `2 * maxconn` is the pool's size: 10 buffers, not 100.
+#[test]
+fn a_smaller_buffers_limit_sizes_the_buffer_pool() {
+    let (_ibex, sock) = start("limit", "    nbthread 1\n    maxconn 50\n    tune.buffers.limit 10\n    tune.memory.prealloc on\n");
+    assert_eq!(pool(&sock, "buffer"), (10, 0));
+    assert_eq!(pool(&sock, "session").0, 50);
 }
 
 const MAXCONN: usize = 50;

@@ -1464,6 +1464,13 @@ mod tests {
         assert_eq!(FAILING.failures(), 1);
     }
 
+    /// T468: only a pool built with `presized()` reads the per-thread size.
+    #[test]
+    fn presized_is_off_unless_asked() {
+        assert!(!PoolSpec::new("t_plain").presized);
+        assert!(PoolSpec::new("t_sized_rt").presized().presized);
+    }
+
     /// T468: `prealloc(n)` fills the thread's cache to `n` past the spec's `max_count`, the
     /// objects are floor objects (no budget, no eviction) and `pool_gc` (`drain_local`) keeps
     /// them; at the limit a take past them is refused.
