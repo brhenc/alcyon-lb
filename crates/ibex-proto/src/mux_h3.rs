@@ -1354,7 +1354,7 @@ mod tests {
         Poolable::reset(&mut st, true);
         assert_eq!((st.id, st.dispatched, st.rx.len(), st.tx.len()), (0, false, 0, 0));
         assert_eq!(st.rx.capacity(), cap, "the buffer is kept for the next stream");
-        assert!(st.rx_htx.blocks().is_empty());
+        assert_eq!(st.rx_htx.blocks(), &[] as &[HtxBlock]);
         assert!(st.req_head.as_ref().is_some_and(|h| h.text.is_empty()));
         Poolable::reset(&mut st, false);
         assert!(st.footprint() >= std::mem::size_of::<H3StreamCtx>());
