@@ -183,3 +183,38 @@ fn access_log_prints_the_address() {
     let rest = l.strip_prefix("LOG 503 bi=127.0.0.1 bp=").unwrap_or_else(|| panic!("{l}"));
     assert!(rest.parse::<u16>().unwrap() > 0, "{l}");
 }
+
+/// T474b: a request denied on a keep-alive connection whose server connection is still attached
+/// has no server connection of its own. Oracle (same configuration, `GET /` then `GET /deny` on
+/// one connection): `http-after-response` of the first `127.0.0.1|127.0.0.1|<port>`, of the
+/// denied one `||`; the access log `LOG 127.0.0.1|127.0.0.1|<port>` then `LOG -|-|-`.
+#[test]
+fn deny_on_a_reused_connection_has_no_server_address() {
+    let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+    collector.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let log = collector.local_addr().unwrap();
+    let (be, a) = (backend("127.0.0.1:0"), common::reserve_addr());
+    let cfg = format!(
+        "frontend fe\n  bind {a}\n  log {log} local0\n  option dontlognull\n  log-format \"LOG %si|%bi|%bp\"\n  acl lr path /deny\n  http-request deny if lr\n  \
+         http-after-response set-header x-aft \"%si|%bi|%bp\"\n  default_backend b\nbackend b\n  server s {be}\n"
+    );
+    let _ibex = start("reused-deny", &cfg, &[a]);
+    let line = |collector: &UdpSocket| {
+        let mut buf = [0u8; 2048];
+        let n = collector.recv(&mut buf).expect("a log line");
+        let l = String::from_utf8_lossy(&buf[..n]).into_owned();
+        l[l.find("LOG ").unwrap()..].trim_end().to_string()
+    };
+    let mut c = connect(a);
+    let h = get(&mut c, "/");
+    let (ip, port) = header(&h, "x-peer").split_once('|').map(|(i, p)| (i.to_string(), p.to_string())).unwrap();
+    assert_eq!(header(&h, "x-aft"), format!("127.0.0.1|{ip}|{port}"));
+    let h = get(&mut c, "/deny");
+    assert_eq!(header(&h, "x-aft"), "||");
+    assert_eq!(line(&collector), format!("LOG 127.0.0.1|{ip}|{port}"));
+    assert_eq!(line(&collector), "LOG -|-|-");
+    // The next request that goes to the server prints its connection again. (The oracle also
+    // reuses the same connection here; Ibex opens a new one: T474b found-not-fixed.)
+    let h = get(&mut c, "/");
+    assert_eq!(header(&h, "x-aft"), format!("127.0.0.1|{ip}|{}", header(&h, "x-peer").split_once('|').unwrap().1));
+}
