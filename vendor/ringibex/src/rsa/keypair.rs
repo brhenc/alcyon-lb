@@ -538,6 +538,8 @@ impl KeyPair {
         signature: &mut [u8],
     ) -> Result<(), error::Unspecified> {
         let cpu_features = cpu::features();
+        // ring-ibex: the modular exponentiation's registers (ZEROIZE.md section 2).
+        let _clear = crate::vregs::ClearOnDrop(cpu_features);
 
         if signature.len() != self.public().modulus_len() {
             return Err(error::Unspecified);

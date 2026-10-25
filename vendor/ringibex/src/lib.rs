@@ -153,6 +153,8 @@ pub mod signature;
 #[cfg(all(test, feature = "zeroize"))]
 mod zeroize_testutil;
 
+mod vregs;
+
 #[cfg(test)]
 mod tests;
 

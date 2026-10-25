@@ -199,6 +199,8 @@ impl Ed25519KeyPair {
     /// Returns the signature of the message `msg`.
     pub fn sign(&self, msg: &[u8]) -> signature::Signature {
         let cpu_features = cpu::features();
+        // ring-ibex: the scalar multiplication's registers (ZEROIZE.md section 2).
+        let _clear = crate::vregs::ClearOnDrop(cpu_features);
         signature::Signature::new(|signature_bytes| {
             prefixed_extern! {
                 fn x25519_sc_muladd(

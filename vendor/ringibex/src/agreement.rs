@@ -113,7 +113,9 @@ impl EphemeralPrivateKey {
         //
         // This only handles the key generation part of step 1. The rest of
         // step one is done by `compute_public_key()`.
-        let private_key = ec::Seed::generate(alg.curve, rng, cpu_features)?;
+        let private_key = ec::Seed::generate(alg.curve, rng, cpu_features);
+        crate::vregs::clear_if_zeroize(cpu_features);
+        let private_key = private_key?;
         Ok(Self {
             private_key,
             algorithm: alg,
@@ -128,8 +130,11 @@ impl EphemeralPrivateKey {
         // Obviously, this only handles the part of Step 1 between the private
         // key generation and the sending of the public key to the peer. `out`
         // is what should be sent to the peer.
-        self.private_key
-            .compute_public_key(cpu::features())
+        let cpu_features = cpu::features();
+        let public_key = self.private_key.compute_public_key(cpu_features);
+        // ring-ibex: the scalar multiplication's registers (ZEROIZE.md section 2).
+        crate::vregs::clear_if_zeroize(cpu_features);
+        public_key
             .map(|public_key| PublicKey {
                 algorithm: self.algorithm,
                 bytes: public_key,
@@ -302,6 +307,8 @@ fn agree_ephemeral_<R>(
         untrusted::Input::from(peer_public_key.bytes),
         cpu,
     );
+    // ring-ibex: the scalar multiplication's registers (ZEROIZE.md section 2).
+    crate::vregs::clear_if_zeroize(cpu);
     // ring-ibex: wipe the shared secret on every exit path.
     #[cfg(feature = "zeroize")]
     let mut shared_key = WipeOnDrop(shared_key);
@@ -313,7 +320,10 @@ fn agree_ephemeral_<R>(
     //
     // Again, we have a pretty liberal interpretation of the NIST's spec's
     // "Destroy" that doesn't meet the NSA requirement to "zeroize."
-    Ok(kdf(shared_key))
+    let r = kdf(shared_key);
+    // ring-ibex: the caller's KDF (an HKDF-extract, in rustls) ran on the secret.
+    crate::vregs::clear_if_zeroize(cpu);
+    Ok(r)
 }
 
 // ring-ibex: wipes the borrowed secret when it goes out of scope.

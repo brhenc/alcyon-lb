@@ -64,6 +64,8 @@ impl HeaderProtectionKey {
         let sample = <&[u8; SAMPLE_LEN]>::try_from(sample)?;
 
         let out = (self.algorithm.new_mask)(&self.inner, *sample);
+        // ring-ibex: the header protection key's registers (ZEROIZE.md section 2).
+        crate::vregs::clear_if_zeroize(cpu::features());
         Ok(out)
     }
 
