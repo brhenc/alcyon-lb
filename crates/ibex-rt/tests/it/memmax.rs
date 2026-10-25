@@ -168,7 +168,7 @@ fn explicit_maxconn_too_high_for_tls_is_refused() {
 
 /// `-m 8` used to be `setrlimit(RLIMIT_AS, 8 MB)`: the worker died of `memory allocation of
 /// N bytes failed` (exit 134) under 200 connections. `HAProxy` sets `RLIMIT_DATA` to 8 MiB (its
-/// VmData is already 43 MB then); its `maxconn` is 220 and it serves all 200 (measured 2026-10-25).
+/// `VmData` is already 43 MB then); its `maxconn` is 220 and it serves all 200 (measured 2026-10-25).
 /// Ibex does the same, under the same limit.
 #[test]
 fn m8_with_200_keepalive_connections_does_not_abort() {
