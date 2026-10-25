@@ -4929,14 +4929,17 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     // Each request is handed to this frontend's stream engine (T130). It
                     // used to go straight to the first server of the default backend, and
                     // no rule, `use_backend`, balancing or log line ever saw it.
-                    // `quic-force-retry` and `tune.quic.fe.sec.retry-threshold` (T492).
-                    let mut qc = ibex_quic::QuicConfig::new();
+                    // `quic-force-retry` and `tune.quic.fe.sec.retry-threshold` (T492); windows from
+                    // `tune.bufsize`, as HAProxy's (h3-engine design 2.3): 100 streams of `bufsize - 4`,
+                    // 90 % of it for one (T504).
+                    let mut qc = ibex_quic::QuicConfig::new().with_flow_windows(bufsize, 100, 90);
                     qc.require_retry = b.sock.as_ref().is_some_and(|s| s.quic_force_retry);
                     if let Some(n) = config.global.as_ref().and_then(|g| g.quic_retry_threshold) {
                         qc.retry_threshold = n;
                     }
                     let mut ql = crate::quic_listener::QuicListener::bind_for_worker(bind_addr, &tls, Some(qc), Some(worker_id))?;
                     ql.set_frontend(proxy_idx);
+                    ql.gate_connections();
 
                     let l_idx = quic_listeners.len();
                     let lfd = ql.raw_fd();
@@ -5388,7 +5391,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     #[must_use]
     pub fn format_stats_info(&self) -> String {
         let pid = std::process::id();
-        let active_conns: u32 = self.proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(Ordering::Relaxed)).sum::<u32>()).sum();
+        // `actconn`: the QUIC connections `maxconn` holds are in it, not in any `scur` (T504).
+        let active_conns = crate::globalconn::current();
         let max_conns: u32 = self.proxies.iter().map(|p| p.maxconn.get()).sum();
         let cum_conns: u64 = self.proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(Ordering::Relaxed)).sum::<u64>()).sum();
         let cum_reqs: u64 = self.proxies.iter().filter_map(|p| p.ids.tc.get()).map(|c| c.fe.req_tot.load(Ordering::Relaxed)).sum();
@@ -5459,6 +5463,53 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         for (idx, ql) in self.quic_listeners.iter().enumerate() {
             for (b, readable, writable) in ql.io_fds() {
                 sync_quic_fd(&mut self.fdtab, &self.poller, idx, b, Interest { readable, writable }, true);
+            }
+        }
+    }
+
+    /// A QUIC connection is a session of its frontend (T504; HAProxy's `quic_accept_push_qc` ->
+    /// `listener_accept` -> `session_new`). At its handshake it is a connection (`CurrConns`,
+    /// `CurrSslConns`/`CumSslConns`, held by `global maxconn` as every connection is); once
+    /// the frontend's `maxconn` has room it is a session (`scur`, `stot`, `conn_tot`,
+    /// `CumConns`), served, oldest first. Its request streams count in `req_tot` only.
+    fn admit_quic_connections(&mut self) {
+        for q_idx in 0..self.quic_listeners.len() {
+            let Some(proxy_idx) = self.quic_listeners[q_idx].frontend() else { continue };
+            let ql = &mut self.quic_listeners[q_idx];
+            for (_, admitted) in ql.take_closed() {
+                crate::globalconn::release();
+                crate::stats::SSL_CURR.fetch_sub(1, Ordering::Relaxed);
+                if admitted {
+                    let proxy = &self.proxies[proxy_idx];
+                    proxy.counters().act_conn.fetch_sub(1, Ordering::Relaxed);
+                    proxy.maxconn.dec();
+                }
+            }
+            for conn_id in ql.take_handshaken() {
+                // `global maxconn` is reached: HAProxy's listener does not accept it, and it
+                // is in no counter.
+                if !crate::globalconn::try_acquire() {
+                    ql.refuse(conn_id);
+                    continue;
+                }
+                crate::stats::SSL_CURR.fetch_add(1, Ordering::Relaxed);
+                crate::stats::SSL_CUM.fetch_add(1, Ordering::Relaxed);
+            }
+            while ql.has_waiting() {
+                let proxy = &self.proxies[proxy_idx];
+                if !proxy.maxconn.try_inc() {
+                    break;
+                }
+                let c = proxy.counters();
+                c.cum_conn.fetch_add(1, Ordering::Relaxed);
+                c.fe_sess_rate.tick();
+                c.fe_conn_rate.tick();
+                count_global_sess();
+                let conn_rate = c.fe_conn_rate.rate();
+                proxy.txn_counters().fe.conn_rate_max.fetch_max(u32::try_from(conn_rate).unwrap_or(u32::MAX), Ordering::Relaxed);
+                let act = c.act_conn.fetch_add(1, Ordering::Relaxed) + 1;
+                c.max_conn.fetch_max(act, Ordering::Relaxed);
+                ql.admit_next();
             }
         }
     }
@@ -5738,6 +5789,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let _ = ql.pump(inst);
             }
         }
+        self.admit_quic_connections();
         self.adopt_quic_streams();
         self.sync_quic_backend_fds();
 
@@ -6246,25 +6298,28 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             };
 
             let proxy = &self.proxies[proxy_idx];
-            proxy.counters().cum_conn.fetch_add(1, Ordering::Relaxed);
-            proxy.counters().fe_sess_rate.tick();
-            proxy.counters().fe_conn_rate.tick();
+            // An HTTP/3 request stream (`l_idx` is `None`) is a stream of its QUIC connection,
+            // which `admit_quic_connections` counted as the session: no connection counter.
+            if l_idx.is_some() {
+                proxy.counters().cum_conn.fetch_add(1, Ordering::Relaxed);
+                proxy.counters().fe_sess_rate.tick();
+                proxy.counters().fe_conn_rate.tick();
+            }
             // Once per TCP connection; a QUIC connection is counted by the QUIC listener,
             // not per HTTP/3 request stream (`l_idx` is `None` for those).
             if l_idx.is_some() {
                 count_global_sess();
             }
             // `rate_max` counts sessions: it is raised once the TLS handshake is done, not here.
-            let conn_rate = proxy.counters().fe_conn_rate.rate();
-            proxy.txn_counters().fe.conn_rate_max.fetch_max(u32::try_from(conn_rate).unwrap_or(u32::MAX), Ordering::Relaxed);
-            proxy.counters().act_conn.fetch_add(1, Ordering::Relaxed);
-            // From the accept loop the slot is already taken (`try_acquire`); an HTTP/3
-            // request stream arrives without one.
-            if l_idx.is_none() {
-                crate::globalconn::acquire();
-            }
-            if proxy.counters().act_conn.load(Ordering::Relaxed) > proxy.counters().max_conn.load(Ordering::Relaxed) {
-                proxy.counters().max_conn.store(proxy.counters().act_conn.load(Ordering::Relaxed), Ordering::Relaxed);
+            // An HTTP/3 request stream takes no connection slot (`admit_quic_connections`).
+            if l_idx.is_some() {
+                let conn_rate = proxy.counters().fe_conn_rate.rate();
+                proxy.txn_counters().fe.conn_rate_max.fetch_max(u32::try_from(conn_rate).unwrap_or(u32::MAX), Ordering::Relaxed);
+                proxy.counters().act_conn.fetch_add(1, Ordering::Relaxed);
+                // From the accept loop the slot of `global maxconn` is already taken (`try_acquire`).
+                if proxy.counters().act_conn.load(Ordering::Relaxed) > proxy.counters().max_conn.load(Ordering::Relaxed) {
+                    proxy.counters().max_conn.store(proxy.counters().act_conn.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
             }
 
             if let Some(l_idx) = l_idx.filter(|&i| self.listeners[i].is_full()) {
@@ -7971,7 +8026,8 @@ pub fn shutdown_session_entry(
         entry.actconn_reclaimed = true;
         let proxy_idx = entry.proxy_idx;
         // A stream of an HTTP/2 connection holds no connection slot (T280).
-        if proxy_idx < proxies.len() && !entry.sess.is_h2_child() {
+        // ... nor does an HTTP/3 request stream (T504): its connection does.
+        if proxy_idx < proxies.len() && !entry.sess.is_h2_child() && !entry.sess.h3 {
             proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
             crate::globalconn::release();
         }
@@ -8914,7 +8970,7 @@ fn cleanup_done(
     let proxy_idx = entry.proxy_idx;
     proxies[proxy_idx].counters().bytes_in.fetch_add(entry.sess.bytes_in, Ordering::Relaxed);
     proxies[proxy_idx].counters().bytes_out.fetch_add(entry.sess.bytes_out, Ordering::Relaxed);
-    if !entry.actconn_reclaimed {
+    if !entry.actconn_reclaimed && !entry.sess.h3 {
         proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
         crate::globalconn::release();
 

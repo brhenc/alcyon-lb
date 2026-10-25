@@ -908,7 +908,8 @@ impl CliApplet {
             self.finish_msg(&format!("'show info {a}' is not supported by Ibex."));
             return;
         }
-        let active_conns: u32 = ctx.proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
+        // `actconn`: includes the QUIC connections `maxconn` holds (T504).
+        let active_conns = crate::globalconn::current();
         let max_conns: u32 = ctx.proxies.iter().map(|p| p.maxconn.get()).sum();
         let cum_conns: u64 = ctx.proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
         let cum_reqs: u64 = ctx.proxies.iter().filter_map(|p| p.ids.tc.get()).map(|c| c.fe.req_tot.load(std::sync::atomic::Ordering::Relaxed)).sum();

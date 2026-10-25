@@ -564,13 +564,13 @@ pub fn note_sched(tasks: usize, run_queue: usize) {
 /// numbers agree.
 pub fn process_info_pairs(p: &mut InfoPairs, proxies: &[Proxy]) {
     use std::sync::atomic::Ordering::Relaxed;
-    let (mut active_conns, mut max_conns, mut cum_conns, mut cum_reqs) = (0u32, 0u32, 0u64, 0u64);
+    let (mut max_conns, mut cum_conns, mut cum_reqs) = (0u32, 0u64, 0u64);
     for px in proxies {
-        active_conns += px.stats.iter().map(|s| s.act_conn.load(Relaxed)).sum::<u32>();
         max_conns += px.maxconn.get();
         cum_conns += px.stats.iter().map(|s| s.cum_conn.load(Relaxed)).sum::<u64>();
         cum_reqs += px.ids.tc.get().map_or(0, |c| c.fe.req_tot.load(Relaxed));
     }
+    let active_conns = crate::globalconn::current();
     p.n = 0;
     fill_info_pairs(
         p,

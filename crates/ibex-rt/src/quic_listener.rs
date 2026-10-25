@@ -9,7 +9,7 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::dgram::{DgramBuf, DgramOut, DgramSocket};
 use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
@@ -96,6 +96,22 @@ pub struct QuicListener {
     /// forget: the number is free for the kernel to hand out again, and a stale table entry
     /// under it would keep the next socket to get it out of the poller.
     released: Vec<RawFd>,
+    /// Set by the engine (T504): an HTTP/3 connection is admitted to its frontend as a session
+    /// before it is served. Without it (a listener driven alone) every connection is served
+    /// at once.
+    gated: bool,
+    /// Connections whose handshake completed since the engine last counted them.
+    handshaken: Vec<ConnectionId>,
+    /// Counted by the engine, held by `maxconn` until it admits them, oldest first.
+    waiting: VecDeque<ConnectionId>,
+    /// `handshaken` and `waiting`: connections not served yet.
+    pending: HashSet<ConnectionId>,
+    /// Connections admitted as sessions.
+    admitted: HashSet<ConnectionId>,
+    /// Stream events of a connection that was not admitted yet, replayed when it is.
+    held: HashMap<ConnectionId, Vec<(StreamId, bool)>>,
+    /// Connections that ended since the engine last looked, and whether each was admitted.
+    closed: Vec<(ConnectionId, bool)>,
 }
 
 /// A request stream handed to the stream engine over a socket pair (see `h3_relay`).
@@ -225,6 +241,13 @@ impl QuicListener {
             peers: HashMap::new(),
             pinned: Vec::new(),
             released: Vec::new(),
+            gated: false,
+            handshaken: Vec::new(),
+            waiting: VecDeque::new(),
+            pending: HashSet::new(),
+            admitted: HashSet::new(),
+            held: HashMap::new(),
+            closed: Vec::new(),
         }
     }
 
@@ -246,6 +269,57 @@ impl QuicListener {
     #[must_use]
     pub fn pending_request_bytes(&self) -> usize {
         self.h3.values().flat_map(|st| st.req.values()).map(Vec::len).sum()
+    }
+
+    /// Makes the engine decide, per connection, when it is served (T504): a connection that
+    /// completes its HTTP/3 handshake waits until [`QuicListener::admit_next`] says so.
+    pub fn gate_connections(&mut self) {
+        self.gated = true;
+    }
+
+    /// Connections that completed their handshake since the last call, now waiting for
+    /// admission, for the engine to count (or [`QuicListener::refuse`]).
+    pub fn take_handshaken(&mut self) -> Vec<ConnectionId> {
+        let new = std::mem::take(&mut self.handshaken);
+        self.waiting.extend(new.iter().copied());
+        new
+    }
+
+    /// Closes a connection the engine will not count (`global maxconn` is reached, as
+    /// `HAProxy`'s listener refuses it).
+    pub fn refuse(&mut self, conn_id: ConnectionId) {
+        self.pending.remove(&conn_id);
+        self.held.remove(&conn_id);
+        self.waiting.retain(|c| *c != conn_id);
+        self.endpoint.close_connection(conn_id, H3_NO_ERROR, b"");
+    }
+
+    /// Whether a connection waits for admission.
+    #[must_use]
+    pub fn has_waiting(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
+    /// Serves the oldest waiting connection: its control stream, and the streams it opened
+    /// while it waited.
+    pub fn admit_next(&mut self) {
+        let Some(conn_id) = self.waiting.pop_front() else { return };
+        self.pending.remove(&conn_id);
+        self.admitted.insert(conn_id);
+        self.open_control_stream(conn_id);
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.resize(64 * 1024, 0);
+        for (stream_id, opened) in self.held.remove(&conn_id).unwrap_or_default() {
+            self.stream_event(conn_id, stream_id, opened, &mut scratch);
+        }
+        self.scratch = scratch;
+        self.flush_out();
+        let _ = self.send_batch(Instant::now());
+    }
+
+    /// Connections that ended since the last call, with whether each had been admitted.
+    pub fn take_closed(&mut self) -> Vec<(ConnectionId, bool)> {
+        std::mem::take(&mut self.closed)
     }
 
     /// The request streams created since the last call, for the engine to adopt.
@@ -426,27 +500,23 @@ impl QuicListener {
                         // (`quic_accept_push_qc` -> `listener_accept`): one connection and
                         // one session however many request streams it carries.
                         crate::engine::count_global_conn();
-                        crate::engine::count_global_sess();
-                        self.open_control_stream(conn_id);
+                        if self.gated {
+                            self.handshaken.push(conn_id);
+                            self.pending.insert(conn_id);
+                        } else {
+                            crate::engine::count_global_sess();
+                            self.open_control_stream(conn_id);
+                        }
                     }
                 }
                 TransportEvent::NewConnection { conn_id, remote } => {
                     self.peers.insert(conn_id, remote);
                 }
                 TransportEvent::StreamOpened { conn_id, stream_id, dir } => {
-                    if dir == StreamDirection::Bidirectional {
-                        let st = self.h3.entry(conn_id).or_default();
-                        st.req.entry(stream_id).or_default();
-                        st.next_request = st.next_request.max(stream_id.0 + 4);
-                    }
-                    // A stream whose first flight already carries the whole request is
-                    // opened and readable at once, and quinn-proto raises no separate
-                    // `Readable` for data that arrived before the stream was accepted.
-                    // Waiting for one left such a request unanswered for ever.
-                    self.on_readable(conn_id, stream_id, &mut scratch);
+                    self.stream_event(conn_id, stream_id, dir == StreamDirection::Bidirectional, &mut scratch);
                 }
                 TransportEvent::StreamReadable { conn_id, stream_id } => {
-                    self.on_readable(conn_id, stream_id, &mut scratch);
+                    self.stream_event(conn_id, stream_id, false, &mut scratch);
                 }
                 // A finished stream and a reset stream are both done with; the difference
                 // matters to the peer, not to our buffer bookkeeping.
@@ -462,6 +532,17 @@ impl QuicListener {
                     self.abandon_stream(conn_id, stream_id);
                 }
                 TransportEvent::ConnectionClosed { conn_id, .. } => {
+                    if self.admitted.remove(&conn_id) {
+                        self.closed.push((conn_id, true));
+                    } else if self.pending.remove(&conn_id) {
+                        self.held.remove(&conn_id);
+                        if let Some(i) = self.waiting.iter().position(|c| *c == conn_id) {
+                            self.waiting.remove(i);
+                            self.closed.push((conn_id, false));
+                        } else {
+                            self.handshaken.retain(|c| *c != conn_id);
+                        }
+                    }
                     self.h3.remove(&conn_id);
                     self.peers.remove(&conn_id);
                     for r in &mut self.relays {
@@ -634,6 +715,25 @@ impl QuicListener {
         self.h3.entry(conn_id).or_default().control = Some(sid);
         let bytes = mux_h3::encode_control_stream_open();
         let _ = self.endpoint.write_stream(conn_id, sid, &bytes, false);
+    }
+
+    /// A stream opened (`opened`) or became readable. On a connection the engine has not
+    /// admitted yet it is kept until it is: nothing is read, so the client's flow control
+    /// holds the request back.
+    fn stream_event(&mut self, conn_id: ConnectionId, stream_id: StreamId, opened: bool, scratch: &mut [u8]) {
+        if self.pending.contains(&conn_id) {
+            self.held.entry(conn_id).or_default().push((stream_id, opened));
+            return;
+        }
+        if opened {
+            let st = self.h3.entry(conn_id).or_default();
+            st.req.entry(stream_id).or_default();
+            st.next_request = st.next_request.max(stream_id.0 + 4);
+        }
+        // A stream whose first flight already carries the whole request is opened and readable
+        // at once, and quinn-proto raises no separate `Readable` for data that arrived before
+        // the stream was accepted. Waiting for one left such a request unanswered for ever.
+        self.on_readable(conn_id, stream_id, scratch);
     }
 
     /// Reads whatever is available on a stream and, on a request stream, answers it.
