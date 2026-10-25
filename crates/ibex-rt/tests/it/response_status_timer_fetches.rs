@@ -179,3 +179,90 @@ fn h2_streams_keep_their_own_status_and_timer() {
     assert_eq!(ld, "0 -1", "log deny");
     assert!(lf.starts_with("201 ") && (0..150).contains(&lf[4..].parse::<i64>().unwrap()), "log fast {lf}");
 }
+
+/// T467, h2: a stream answered by a rule logs `%[server_status]` 0 and `%Tr` -1 (HAProxy), also when
+/// it ends after a sibling stream's server answer arrived. The client opens `/deny` and `/fast`
+/// with a stream window of 0, so no body goes out and neither stream ends; once the 201 head of
+/// `/fast` is read it opens the window of `/deny`, which ends and logs after that 201.
+#[test]
+fn h2_denied_stream_ending_after_a_server_answer_logs_no_server_status() {
+    fn frame(t: u8, fl: u8, sid: u32, p: &[u8]) -> Vec<u8> {
+        let n = p.len();
+        let mut f = vec![(n >> 16) as u8, (n >> 8) as u8, n as u8, t, fl];
+        f.extend_from_slice(&sid.to_be_bytes());
+        f.extend_from_slice(p);
+        f
+    }
+    fn get(sid: u32, path: &str) -> Vec<u8> {
+        let mut b = vec![0x82, 0x86, 0x04, path.len() as u8];
+        b.extend_from_slice(path.as_bytes());
+        b.extend_from_slice(&[0x01, 1, b'x']);
+        frame(1, 0x5, sid, &b)
+    }
+    let a = common::reserve_addr();
+    let be = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for c in l.incoming() {
+                let Ok(mut c) = c else { continue };
+                std::thread::spawn(move || {
+                    let mut b = [0u8; 4096];
+                    let _ = c.read(&mut b);
+                    let _ = c.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                });
+            }
+        });
+        addr
+    };
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let dir = std::env::temp_dir().join(format!("t467-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.cfg");
+    std::fs::write(
+        &path,
+        format!(
+            "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+             frontend fe\n  bind {a} proto h2\n  log {} format raw local0\n  log-format \"L %HP %[server_status] %Tr\"\n  \
+             http-request deny if {{ path /deny }}\n  default_backend b\n  \
+             http-after-response set-header x-out \"[%[server_status]]\"\n\
+             backend b\n  server s {be}\n",
+            udp.local_addr().unwrap()
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    assert!(common::wait_listening(a), "ibex did not listen");
+    let mut c = std::net::TcpStream::connect(a).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut out = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    out.extend(frame(4, 0, 0, &[0, 4, 0, 0, 0, 0])); // SETTINGS_INITIAL_WINDOW_SIZE = 0
+    out.extend(get(1, "/deny"));
+    out.extend(get(3, "/fast"));
+    c.write_all(&out).unwrap();
+    // Read frames until the HEADERS of stream 3: the server's 201 has arrived.
+    let mut seen3 = false;
+    while !seen3 {
+        let mut h = [0u8; 9];
+        c.read_exact(&mut h).unwrap();
+        let n = (usize::from(h[0]) << 16) | (usize::from(h[1]) << 8) | usize::from(h[2]);
+        let mut p = vec![0u8; n];
+        c.read_exact(&mut p).unwrap();
+        seen3 = h[3] == 1 && u32::from_be_bytes([h[5], h[6], h[7], h[8]]) == 3;
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    c.write_all(&frame(8, 0, 1, &[0, 0, 0xff, 0xff])).unwrap();
+    c.write_all(&frame(8, 0, 3, &[0, 0, 0xff, 0xff])).unwrap();
+    let mut logs = Vec::new();
+    let mut buf = [0u8; 1024];
+    while logs.len() < 3 {
+        let Ok(n) = udp.recv(&mut buf) else { break };
+        logs.push(String::from_utf8_lossy(&buf[..n]).trim().to_string());
+    }
+    common::stop(&mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+    let log = |p: &str| logs.iter().find(|l| l.contains(p)).unwrap_or_else(|| panic!("no log for {p}: {logs:?}")).split(' ').skip(2).collect::<Vec<_>>().join(" ");
+    assert_eq!(log("/deny"), "0 -1", "{logs:?}");
+    assert!(log("/fast").starts_with("201 "), "{logs:?}");
+}
