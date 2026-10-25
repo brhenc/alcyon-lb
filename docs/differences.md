@@ -354,16 +354,6 @@ follow `tune.ibex.zero-buffers` (default off) instead. HAProxy 3.5-dev8 refuses 
 unknown. It takes exactly `on` or `off`; anything else, or a missing argument, is a
 configuration error. Limits: key material inside rustls/ring is not covered (`tradeoff.md` 6.27).
 
-## `tune.ibex.h3-path relay|mux`: an Ibex-only global keyword (T509, temporary)
-
-Which path an HTTP/3 request stream takes into the stream engine while the h3 mux is being
-brought in (`docs/design/h3-engine-2026-10-26.md`, slices H3a to H5): `relay` (the default) is
-the HTTP/1 relay over a socket pair; `mux` makes each QUIC connection an owner session whose
-request streams are children served through the same bridge as HTTP/2 streams. Unset, the
-environment variable `IBEX_H3_PATH` (`mux` or `relay`) decides, so the h3 tests run on either
-path. HAProxy refuses the keyword as unknown. It takes exactly `relay` or `mux`. The keyword is
-deleted with the relay (slice H5).
-
 ## `tune.ibex.zero-spares on|off`: an Ibex-only global keyword (S1)
 
 The header rules, samples and formats reuse per-thread spare strings and header lists (`show
