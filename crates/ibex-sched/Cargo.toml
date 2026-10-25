@@ -8,6 +8,7 @@ autotests = false
 
 [dependencies]
 ebtree = { path = "../ebtree" }
+ibex-alloc = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.5"

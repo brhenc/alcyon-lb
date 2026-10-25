@@ -42,6 +42,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ibex-alloc"
+version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "ibex-fuzz"
 version = "0.1.0"
 dependencies = [
@@ -70,6 +77,7 @@ name = "ibex-sched"
 version = "0.1.0"
 dependencies = [
  "ebtree",
+ "ibex-alloc",
 ]
 
 [[package]]
@@ -106,3 +114,9 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "zeroize"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"

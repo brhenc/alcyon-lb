@@ -294,3 +294,35 @@ fn show_pools_lists_the_box_caches() {
         assert!(dump.lines().any(|l| l.contains(&format!("Pool {name} "))), "no `{name}` pool in:\n{dump}");
     }
 }
+
+/// `(allocated, cached)` of the pool `name` in a `show pools` dump.
+fn pool_counts(dump: &str, name: &str) -> (usize, usize) {
+    let line = dump.lines().find(|l| l.contains(&format!("Pool {name} "))).unwrap_or_else(|| panic!("no {name} pool in {dump:?}"));
+    let num = |after: &str, before: &str| -> usize {
+        let rest = &line[line.find(after).unwrap() + after.len()..];
+        rest[..rest.find(before).unwrap()].trim().parse().unwrap()
+    };
+    (num(" : ", " allocated"), num("(~", " by thread caches"))
+}
+
+/// S4 (design 3.7, Q2): the session arena keeps the slots a burst made, as `HAProxy` keeps its
+/// `session` pool; they show as cached, and `pool_gc` (SIGQUIT) is what gives them back.
+#[test]
+fn sigquit_drops_the_session_arena_burst_capacity() {
+    let run = start("s4quit", 1);
+    burst(run.addr);
+    let mut cli = Cli::open(&run.sock);
+    let (alloc, cached) = pool_counts(&cli.cmd("show pools"), "session");
+    assert!(cached >= 400 && alloc >= cached, "the burst left {cached} cached of {alloc} session slots; the peak is kept");
+    let pid = rustix::process::Pid::from_raw(i32::try_from(run.ibex.id()).unwrap()).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::Quit).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let (a, c) = pool_counts(&cli.cmd("show pools"), "session");
+        if c == 0 && a < alloc {
+            return;
+        }
+        assert!(Instant::now() < deadline, "SIGQUIT: {c} session slots still cached of {a} allocated, was {cached} of {alloc}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

@@ -22,10 +22,11 @@
 //! scrape boxes and queue waits (`pendconn`). A cache that is not a `declare_pool!` is not
 //! drained, and `harness/pool_layout.py` refuses to build one. Kept: the Prometheus exporter's
 //! prewarmed scrape state (like `HAProxy`'s trash, which `pool_gc` does not free either), and
-//! the compiled regex and expression caches, which are configuration. The session and applet
-//! arenas give back their burst capacity as connections close, so they hold nothing to empty
-//! (S4 moves that under this walk). What held request or log data was wiped when it was given
-//! back (`tune.ibex.zero-spares`, `tune.ibex.zero-buffers`).
+//! the compiled regex and expression caches, which are configuration. The session, applet and task
+//! arenas are owned by the engine thread, not by a `thread_local!`: after [`poll`] sees a request
+//! the engine calls their `ibex_alloc::Arena::compact` (`Engine::compact_arenas`), which gives
+//! back the burst capacity. A close never does (Q2: the peak is kept, as `HAProxy`).
+//! What held request or log data was wiped when it was given back (`tune.ibex.zero-spares`, `tune.ibex.zero-buffers`).
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

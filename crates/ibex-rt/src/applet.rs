@@ -1863,32 +1863,34 @@ impl CliApplet {
 }
 
 /// Slots of every worker's [`AppletArena`], for `show pools` (pool `appctx`).
-pub static APPCTX_POOL: crate::buf::ArenaCounters = crate::buf::ArenaCounters::new();
+pub static APPCTX_POOL: ibex_alloc::ArenaStats = ibex_alloc::ArenaStats::new(
+    "appctx",
+    std::mem::size_of::<Option<CliApplet>>(),
+    std::mem::align_of::<Option<CliApplet>>(),
+    file!(),
+    line!(),
+);
 
 /// `show pools` provider for the `appctx` pool: the slots ever created, those in use.
 #[allow(clippy::unnecessary_wraps)]
 pub fn appctx_pool_stats() -> Option<ibex_alloc::PoolHead> {
-    Some(APPCTX_POOL.head(ibex_alloc::PoolReg {
-        name: "appctx",
-        size: std::mem::size_of::<Option<CliApplet>>(),
-        flags: 0,
-        align: std::mem::align_of::<Option<CliApplet>>(),
-        file: file!(),
-        line: line!(),
-    }))
+    Some(APPCTX_POOL.head())
 }
 
 impl Drop for AppletArena {
     fn drop(&mut self) {
-        APPCTX_POOL.arena_dropped(self.entries.len(), self.live);
+        APPCTX_POOL.retire(&mut self.published);
     }
 }
 
-/// Per-thread storage for active CLI applet sessions.
+/// Per-thread storage for active CLI applet sessions: an [`ibex_alloc::Arena`] (design 3.7).
 pub struct AppletArena {
     entries: Vec<Option<CliApplet>>,
     free: Vec<u32>,
     live: usize,
+    floor: usize,
+    peak: usize,
+    published: ibex_alloc::arena::Published,
 }
 
 impl AppletArena {
@@ -1896,23 +1898,45 @@ impl AppletArena {
     pub fn with_capacity(cap: usize) -> Self {
         AppletArena {
             entries: Vec::with_capacity(cap),
-            free: Vec::new(),
+            free: Vec::with_capacity(cap),
             live: 0,
+            floor: cap,
+            peak: 0,
+            published: ibex_alloc::arena::Published::default(),
         }
     }
 
+    /// Slots the arena can hold before it grows.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
+    /// Adds this arena's change since the last pass to `show pools` (once per loop pass).
+    #[inline]
+    pub fn publish(&mut self) {
+        let mut last = self.published;
+        APPCTX_POOL.publish_arena::<CliApplet>(&mut last, self);
+        self.published = last;
+    }
+
+    /// A slot for `entry`, or `None` when the arena is full and cannot grow: the CLI
+    /// connection is refused.
     pub fn alloc(&mut self, entry: CliApplet) -> Option<u32> {
-        self.live += 1;
-        APPCTX_POOL.slot_used();
         if let Some(idx) = self.free.pop() {
             self.entries[idx as usize] = Some(entry);
-            Some(idx)
-        } else {
-            let idx = u32::try_from(self.entries.len()).ok()?;
-            self.entries.push(Some(entry));
-            APPCTX_POOL.slot_created();
-            Some(idx)
+            self.live += 1;
+            return Some(idx);
         }
+        let idx = u32::try_from(self.entries.len()).ok()?;
+        if !ibex_alloc::arena::grow_for_one(&mut self.entries, &mut self.free) {
+            APPCTX_POOL.failed();
+            return None;
+        }
+        self.live += 1;
+        self.entries.push(Some(entry));
+        self.peak = self.peak.max(self.entries.len());
+        Some(idx)
     }
 
     #[must_use]
@@ -1928,7 +1952,6 @@ impl AppletArena {
         let entry = self.entries.get_mut(idx as usize)?.take();
         if entry.is_some() {
             self.live -= 1;
-            APPCTX_POOL.slot_released();
             self.free.push(idx);
         }
         entry
@@ -1941,6 +1964,20 @@ impl AppletArena {
 
     pub fn iter(&self) -> impl Iterator<Item = (u32, &CliApplet)> {
         self.entries.iter().enumerate().filter_map(|(i, a)| Some((u32::try_from(i).ok()?, a.as_ref()?)))
+    }
+}
+
+impl ibex_alloc::Arena<CliApplet> for AppletArena {
+    fn slots(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn live(&self) -> usize {
+        self.live
+    }
+
+    fn compact(&mut self) -> usize {
+        ibex_alloc::arena::compact_slots(&mut self.entries, &mut self.free, self.live, self.floor, &mut self.peak, &APPCTX_POOL)
     }
 }
 

@@ -1932,58 +1932,29 @@ pub struct SessionEntry {
 static SOFT_STOP_GC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Slots of every worker's [`SessionArena`], for `show pools` (pool `session`).
-pub static SESSION_POOL: crate::buf::ArenaCounters = crate::buf::ArenaCounters::new();
+pub static SESSION_POOL: ibex_alloc::ArenaStats = ibex_alloc::ArenaStats::new(
+    "session",
+    std::mem::size_of::<Option<SessionEntry>>(),
+    std::mem::align_of::<Option<SessionEntry>>(),
+    file!(),
+    line!(),
+);
 
-/// Trims of a [`SessionArena`] skipped because the fresh buffer could not be had: the arena
-/// keeps the one it has (resident, as before the trim) rather than abort while giving
-/// memory back (T453).
-static SESSION_TRIMS_SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Trims of every worker's session arena skipped for want of memory (T453).
+/// Compactions of every worker's session arena skipped for want of memory (T453).
 #[must_use]
 pub fn session_trims_skipped() -> usize {
-    SESSION_TRIMS_SKIPPED.load(std::sync::atomic::Ordering::Relaxed)
+    SESSION_POOL.compactions_skipped()
 }
 
 /// `show pools` provider for the `session` pool: the slots ever created, those in use.
 #[allow(clippy::unnecessary_wraps)]
 pub fn session_pool_stats() -> Option<ibex_alloc::PoolHead> {
-    Some(SESSION_POOL.head(ibex_alloc::PoolReg {
-        name: "session",
-        size: std::mem::size_of::<Option<SessionEntry>>(),
-        flags: 0,
-        align: std::mem::align_of::<Option<SessionEntry>>(),
-        file: file!(),
-        line: line!(),
-    }))
+    Some(SESSION_POOL.head())
 }
 
-/// The capacity a trimmed arena keeps: what it has, unless a burst past the creation one left
-/// it above four times what is still needed (the live length or `floor`), then twice that.
-fn trimmed_capacity(len: usize, capacity: usize, floor: usize) -> usize {
-    let keep = len.max(floor);
-    if capacity > 4 * keep {
-        2 * keep
-    } else {
-        capacity
-    }
-}
-
-/// Moves `entries` to a fresh buffer of `cap` slots and frees the old one; `false`, leaving
-/// `entries` as it was, when the fresh buffer cannot be had. Giving memory back must not
-/// cost the process: `Vec::with_capacity` aborts on a failed allocation, `try_reserve_exact`
-/// on an empty `Vec` reports it (T453).
-fn move_to_fresh<T>(entries: &mut Vec<T>, cap: usize) -> bool {
-    let mut fresh = Vec::new();
-    if fresh.try_reserve_exact(cap.max(entries.len())).is_err() {
-        return false;
-    }
-    fresh.append(entries);
-    *entries = fresh;
-    true
-}
-
-/// Per-thread storage for active sessions.
+/// Per-thread storage for active sessions: an [`ibex_alloc::Arena`] (design 3.7). A close
+/// frees the slot and nothing more; the burst capacity goes back only in `pool_gc`
+/// ([`Arena::compact`](ibex_alloc::Arena::compact)).
 pub struct SessionArena {
     entries: Vec<Option<SessionEntry>>,
     free: Vec<u32>,
@@ -1994,11 +1965,12 @@ pub struct SessionArena {
     floor: usize,
     /// The most slots it has held since its memory was last made fresh.
     peak: usize,
+    published: ibex_alloc::arena::Published,
 }
 
 impl Drop for SessionArena {
     fn drop(&mut self) {
-        SESSION_POOL.arena_dropped(self.entries.len(), self.live);
+        SESSION_POOL.retire(&mut self.published);
     }
 }
 
@@ -2011,6 +1983,7 @@ impl SessionArena {
             live: 0,
             floor: cap,
             peak: 0,
+            published: ibex_alloc::arena::Published::default(),
         }
     }
 
@@ -2020,21 +1993,34 @@ impl SessionArena {
         self.entries.capacity()
     }
 
+    /// Adds this arena's change since the last pass to `show pools` (once per loop pass).
+    #[inline]
+    pub fn publish(&mut self) {
+        let mut last = self.published;
+        SESSION_POOL.publish_arena::<SessionEntry>(&mut last, self);
+        self.published = last;
+    }
+
+    /// A slot for `entry`, or `None` (the entry is dropped) when the arena is full and the
+    /// allocator refuses to grow it: the caller refuses the connection (`session.c`).
     pub fn alloc(&mut self, entry: SessionEntry) -> Option<u32> {
-        self.live += 1;
-        SESSION_POOL.slot_used();
         // A trimmed tail leaves stale indices in `free`, and a regrown slot can be listed twice:
         // only a slot that exists and is empty is reused.
         while let Some(idx) = self.free.pop() {
             if let Some(slot @ None) = self.entries.get_mut(idx as usize) {
                 *slot = Some(entry);
+                self.live += 1;
                 return Some(idx);
             }
         }
         let idx = u32::try_from(self.entries.len()).ok()?;
+        if !ibex_alloc::arena::grow_for_one(&mut self.entries, &mut self.free) {
+            SESSION_POOL.failed();
+            return None;
+        }
+        self.live += 1;
         self.entries.push(Some(entry));
         self.peak = self.peak.max(self.entries.len());
-        SESSION_POOL.slot_created();
         Some(idx)
     }
 
@@ -2064,43 +2050,9 @@ impl SessionArena {
         let entry = self.entries.get_mut(idx as usize)?.take();
         if entry.is_some() {
             self.live -= 1;
-            SESSION_POOL.slot_released();
             self.free.push(idx);
-            self.trim_tail();
         }
         entry
-    }
-
-    /// Gives back the empty slots at the end, so a burst of connections does not leave its
-    /// peak in memory (and in `show pools`) for good; `HAProxy` keeps the peak, this is
-    /// the safer side for an operator watching for a leak.
-    fn trim_tail(&mut self) {
-        let before = self.entries.len();
-        while matches!(self.entries.last(), Some(None)) {
-            self.entries.pop();
-        }
-        let cut = before - self.entries.len();
-        if cut > 0 {
-            SESSION_POOL.slots_trimmed(cut);
-            if self.live == 0 {
-                self.free.clear();
-            }
-            // Capacity above the creation one (a burst past the pre-size) is given back, and
-            // so are the slots a burst wrote, which stay resident when only the length goes
-            // down: once the arena is a fraction of its peak, its live slots move to a fresh
-            // buffer (untouched, so not resident) and the old one goes back to the system.
-            // The fresh buffer is a second allocation while the first is still held: when it
-            // cannot be had, the arena keeps the old one (resident, as before the trim) and
-            // counts the trim it skipped, rather than abort while giving memory back (T453).
-            let cap = trimmed_capacity(self.entries.len(), self.entries.capacity(), self.floor);
-            if cap < self.entries.capacity() || self.peak >= 256 + 8 * self.entries.len() {
-                if move_to_fresh(&mut self.entries, cap) {
-                    self.peak = self.entries.len();
-                } else {
-                    SESSION_TRIMS_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }
     }
 
     #[must_use]
@@ -2126,6 +2078,33 @@ impl SessionArena {
                 let id = u32::try_from(idx).ok()?;
                 opt.as_ref().map(|entry| (id, entry))
             })
+    }
+}
+
+impl Engine {
+    /// The arenas' part of `pool_gc` (design 3.4, 3.7): the session, applet and task arenas
+    /// give back the burst capacity (the free slots after the last one in use, the capacity
+    /// above the pre-size). A close never does; only this does.
+    fn compact_arenas(&mut self) {
+        use ibex_alloc::Arena;
+        let released = self.sessions.compact() + self.applets.compact() + self.scheduler.tasks.compact();
+        if released > 0 {
+            let _ = ibex_alloc::trim_heap();
+        }
+    }
+}
+
+impl ibex_alloc::Arena<SessionEntry> for SessionArena {
+    fn slots(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn live(&self) -> usize {
+        self.live
+    }
+
+    fn compact(&mut self) -> usize {
+        ibex_alloc::arena::compact_slots(&mut self.entries, &mut self.free, self.live, self.floor, &mut self.peak, &SESSION_POOL)
     }
 }
 
@@ -5226,6 +5205,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // A `pool_gc` was asked for (a signal, the stop path, a failed allocation on any
         // thread): this thread empties its caches, and the engine its own scratch lists.
         if crate::pool_gc::poll() {
+            self.compact_arenas();
             if self.wake_scratch.is_empty() {
                 self.wake_scratch = Vec::new();
             }
@@ -5235,6 +5215,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
         // The pools' per-pass work: this thread's settings copy and its `show pools` counts.
         ibex_alloc::pool::pass(now_inst);
+        self.sessions.publish();
+        self.applets.publish();
+        self.scheduler.tasks.publish();
         let poll_timeout = self
             .idle_backend_pool
             .next_purge()
@@ -15798,20 +15781,7 @@ fn build_templated_error_response_into(
 
 #[cfg(test)]
 mod arena_tests {
-    use super::{move_to_fresh, trimmed_capacity, SessionArena};
-
-    /// Capacity above four times what is needed comes back to twice that; the creation
-    /// capacity (`floor`) and a modest burst are kept (gate 48, covercheck).
-    #[test]
-    fn a_burst_past_four_times_the_need_is_given_back_but_not_the_floor() {
-        assert_eq!(trimmed_capacity(1, 1000, 100), 200);
-        assert_eq!(trimmed_capacity(1, 1000, 250), 1000, "1000 is not above 4 x 250");
-        let mut v: Vec<Option<u32>> = Vec::with_capacity(1000);
-        v.push(Some(1));
-        assert!(move_to_fresh(&mut v, 200));
-        assert_eq!((v.len(), v[0]), (1, Some(1)));
-        assert!(v.capacity() >= 200 && v.capacity() < 1000, "{}", v.capacity());
-    }
+    use super::SessionArena;
 
     /// Two entries at once are two distinct, live ones (T280): the same index twice, or one
     /// past the end, is none.

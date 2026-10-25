@@ -8,9 +8,9 @@ Greps crates/*/src (not crates/ibex-alloc, not tests/) for `thread_local!` block
 holds a cache-shaped type: RefCell<Vec<, RefCell<VecDeque<, Cell<Option<Vec<,
 Cell<Option<String> or Vec<Box<. A match not in ALLOWLIST fails, with file, line and the rule.
 
-ALLOWLIST is what is left of today's list (design 2.1) after S3: each entry names the slice that
-removes it; S4 leaves it empty and deletes the mechanism. NOT_CACHES is live state the pattern
-matches by shape. Keyed by (file, static name) so a line move does not
+ALLOWLIST is what is left of today's list (design 2.1): each entry names the slice that removes
+it. It is empty after S4 (the mechanism stays, so a future exception is explicit). NOT_CACHES is
+live state or configuration the pattern matches by shape. Keyed by (file, static name) so a line move does not
 break it; a new static in an allowlisted file is not allowlisted.
 
     python3 harness/pool_layout.py [repo-root]
@@ -26,18 +26,15 @@ PATTERNS = ("RefCell<Vec<", "RefCell<VecDeque<", "Cell<Option<Vec<", "Cell<Optio
             "Vec<Box<")
 
 # (file under the repo root, static name) -> slice that removes it
-ALLOWLIST: dict[tuple[str, str], str] = {
-    # not caches (parse-time and runtime-hand-off state); S4 decides: move out of the pattern
-    # or delete the entry with the mechanism
-    ("crates/ibex-config/src/ast/userlist.rs", "USERLISTS"): "S4",
-    ("crates/ibex-sample/src/registry.rs", "DEBUG_DESTS"): "S4",
-}
+ALLOWLIST: dict[tuple[str, str], str] = {}
 
 # (file, static name) -> why it is not a cache. Live state that happens to be a Vec/RefCell: a
 # list of what is waiting, a value a fetch reads. It holds no spare memory for a later owner,
 # so a pool (take, give, evict, drain) would be the wrong shape.
 NOT_CACHES: dict[tuple[str, str], str] = {
     ("crates/ibex-rt/src/proxy.rs", "QUEUED"): "the requests waiting on this thread, oldest first (live queue state)",
+    ("crates/ibex-config/src/ast/userlist.rs", "USERLISTS"): "the userlist sections of the parse in progress, handed to the config by `take_userlists` (configuration, built once at start-up; no spare memory is kept for a later owner)",
+    ("crates/ibex-sample/src/registry.rs", "DEBUG_DESTS"): "the `debug()` destinations named while a config was checked, handed to the runtime once by `take_debug_destinations` (configuration)",
     ("crates/ibex-sample/src/registry.rs", "CURRENT_RES_HEADERS"): "the response headers a fetch reads during one run (its strings are spare_str)",
 }
 
