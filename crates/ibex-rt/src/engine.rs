@@ -13686,8 +13686,6 @@ pub(crate) fn push_alias(out: &mut String, name: &str, ctx: &SampleContext, push
         "fp" => port(out, ctx.server_addr),
         "si" => addr(out, ctx.bc_dst),
         "sp" => port(out, ctx.bc_dst),
-        "bi" => addr(out, ctx.bc_src),
-        "bp" => port(out, ctx.bc_src),
         "f" => push(out, ctx.fe_name.unwrap_or_default()),
         // Until a backend is chosen the stream's backend is its frontend (`s->be`).
         "b" => push(out, ctx.be_name.or(ctx.fe_name).unwrap_or_default()),
