@@ -171,41 +171,43 @@ fn test_truncation_fallback_to_tcp() {
     assert_eq!(res.1.unwrap(), vec![Answer::A(Ipv4Addr::new(1, 2, 3, 4))]);
 }
 
+// Measured on HAProxy 3.5-dev8 (two silent nameservers, resolve_retries 2, timeout retry 500ms):
+// every try goes to every nameserver at the same instant (ns1 then ns2), and the initial send
+// counts as a try, so 2 tries = sends at t=0 and t=0.5s, then the resolution times out.
 #[test]
 fn test_retry_and_failover() {
     let ns1: SocketAddr = "127.0.0.1:53".parse().unwrap();
     let ns2: SocketAddr = "127.0.0.1:54".parse().unwrap();
     let mut cfg = ResolverConfig::default();
     cfg.nameservers = vec![ns1, ns2];
-    cfg.resolve_retries = 2; // initial + 2 retries = 3 tries per nameserver
-    cfg.timeout_retry = Duration::from_secs(1);
+    cfg.resolve_retries = 2;
+    cfg.timeout_retry = Duration::from_millis(500);
     cfg.timeout_resolve = Duration::from_secs(10);
     let mut resolver = Resolver::new(cfg);
 
     let mut now = Instant::now();
     resolver.query(now, "example.com", RecordKind::A);
 
-    // Initial transmit
-    let tx1 = resolver.poll_transmit(now).unwrap();
-    assert_eq!(tx1.0, ns1, "first transmit should go to ns1");
+    // Try 1: ns1 then ns2, nothing else yet.
+    assert_eq!(resolver.poll_transmit(now).unwrap().0, ns1);
+    assert_eq!(resolver.poll_transmit(now).unwrap().0, ns2);
+    assert!(resolver.poll_transmit(now).is_none());
 
-    // Retry 1
-    now += Duration::from_secs(1);
-    let tx2 = resolver.poll_transmit(now).unwrap();
-    // TODO(T45): Code defect in resolver.rs: the resolver round-robins across nameservers
-    // on every retry rather than retrying `resolve_retries` times on the same nameserver
-    // before failing over. Leaving this assertion failing to track the defect.
-    assert_eq!(tx2.0, ns1, "first retry should go to ns1");
+    // Not yet time to retry.
+    now += Duration::from_millis(499);
+    assert!(resolver.poll_transmit(now).is_none());
 
-    // Retry 2
-    now += Duration::from_secs(1);
-    let tx3 = resolver.poll_transmit(now).unwrap();
-    assert_eq!(tx3.0, ns1, "second retry should go to ns1");
+    // Try 2 (the one retry): again both, in order.
+    now += Duration::from_millis(1);
+    assert_eq!(resolver.poll_transmit(now).unwrap().0, ns1);
+    assert_eq!(resolver.poll_transmit(now).unwrap().0, ns2);
+    assert!(resolver.poll_transmit(now).is_none());
 
-    // Failover
-    now += Duration::from_secs(1);
-    let tx4 = resolver.poll_transmit(now).unwrap();
-    assert_eq!(tx4.0, ns2, "failover should go to ns2");
+    // Tries exhausted: no third send, the query times out.
+    now += Duration::from_millis(500);
+    assert!(resolver.poll_transmit(now).is_none());
+    let res = resolver.poll_result().unwrap();
+    assert!(res.1.is_err());
 }
 
 fn assert_hold_timer(
