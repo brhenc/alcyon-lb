@@ -288,8 +288,16 @@ fn the_file_restores_weight_admin_state_health_and_disabled_checks() {
     let since: u64 = run.field("b", "s1", 9).parse().expect("seconds");
     assert!((100..110).contains(&since), "srv_time_since_last_change {since}");
     assert_eq!((run.field("b", "s6", 10).as_str(), run.field("b", "s6", 11).as_str()), ("8", "2"));
-    // Nothing is said about a line the configuration has no server for (global file).
-    assert_eq!(run.messages(), Vec::<String>::new());
+    // Nothing is said about a line the configuration has no server for (global file); the
+    // stopped servers and the one the file takes out of maintenance are (measured on HAProxy).
+    assert_eq!(
+        run.messages(),
+        [
+            "WARNING Server b/s2 is DOWN, changed from server-state after a reload. 6 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.",
+            "WARNING Server b/s6 is DOWN, changed from server-state after a reload. 4 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.",
+            "WARNING Server b/s8 is UP/READY (leaving forced maintenance)."
+        ]
+    );
 }
 
 #[test]
@@ -316,7 +324,7 @@ fn a_server_stopped_in_the_file_starts_down_even_without_a_check() {
     let run = Run::start(&cfg, &[("st", &file)]);
     assert_eq!(run.rows(), ["b/s1 0 0 9 5 0 0", "b/s2 2 0 3 1 4 0", "c/x1 2 0 1 1 0 0"]);
     assert_eq!(run.statuses(), ["b/s1 DOWN 9", "b/s2 no check 3", "c/x1 no check 1"]);
-    assert_eq!(run.messages(), Vec::<String>::new());
+    assert_eq!(run.messages(), ["WARNING Server b/s1 is DOWN, changed from server-state after a reload. 1 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue."]);
 }
 
 #[test]
@@ -515,7 +523,10 @@ fn starting_and_stopping_servers() {
     assert_eq!(run.rows(), ["b/s3 2 0 1 1 1 0", "b/s4 2 0 1 1 2 0", "b/s7 2 0 1 1 1 6", "b/s8 0 0 1 1 0 6"]);
     assert_eq!(
         run.messages(),
-        ["WARNING server-state partially applied for server 'b/s4', srv_op_state 3 (stopping, NOLB) is not implemented in Ibex: the server runs"]
+        [
+            "WARNING server-state partially applied for server 'b/s4', srv_op_state 3 (stopping, NOLB) is not implemented in Ibex: the server runs",
+            "WARNING Server b/s8 is DOWN, changed from server-state after a reload. 3 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue."
+        ]
     );
 }
 
@@ -579,6 +590,8 @@ fn columns_ibex_cannot_apply_are_named() {
         run.messages(),
         [
             "WARNING Proxy 'b': 'server-state-file-name' is ignored without 'load-server-state-from-file local'.",
+            "WARNING Server b/s1 is DOWN, changed from server-state after a reload. 4 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.",
+            "WARNING Server b/s2 is UP/READY (leaving forced maintenance).",
             "WARNING server-state partially applied for server 'b/s3', health checks are not enabled on this server",
             "WARNING server-state partially applied for server 'b/s4', srv_check_port/srv_check_addr are not applied: Ibex has no 'set server check-port/check-addr'",
             "WARNING server-state partially applied for server 'b/s5', srv_use_ssl 0 is not applied: Ibex has no 'set server ssl'",

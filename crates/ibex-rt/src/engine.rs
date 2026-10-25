@@ -5586,6 +5586,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         };
 
         let tasks_run = self.scheduler.process_runnable_tasks(&mut dispatcher);
+        // The server state changes the pass made (a check, the CLI, the stats page).
+        crate::srvlog::drain(|proxy, level, msg| dispatcher.send_log(proxy, level, b"", msg.as_bytes()));
         // A task recorded here may have ended later in the same pass (a session shut down
         // by the CLI, then run to `Outcome::Done`), and the scheduler has freed it. Its
         // slot must not be queued: it is handed to the next connection, and the stale
@@ -11476,27 +11478,28 @@ impl EngineDispatcher<'_> {
             let cur = proxies[p].server_statuses.get(s).map_or(0, |a| a.load(Ordering::Relaxed));
             let maint = ServerStatus::from(cur) == ServerStatus::Maint;
             let drain = cur == check::DRAIN_DOWN || cur == ServerStatus::Drain as u8;
-            let set = |to: ServerStatus, checks: &mut [ServerCheckState]| {
-                crate::track::apply_admin(proxies, checks, p, s, to);
+            let set = |to: ServerStatus, cause: crate::srvlog::Cause<'_>, checks: &mut [ServerCheckState]| {
+                crate::track::apply_admin(proxies, checks, p, s, to, cause);
                 true
             };
+            use crate::srvlog::Cause as C;
             Some(match verb {
-                Verb::Ready => set(ServerStatus::Up, checks),
-                Verb::Drain => set(ServerStatus::Drain, checks),
-                Verb::Maint => set(ServerStatus::Maint, checks),
-                Verb::Disable => !maint && set(ServerStatus::Maint, checks),
-                Verb::Enable => maint && set(ServerStatus::Up, checks),
+                Verb::Ready => set(ServerStatus::Up, C::Web, checks),
+                Verb::Drain => set(ServerStatus::Drain, C::Web, checks),
+                Verb::Maint => set(ServerStatus::Maint, C::Web, checks),
+                Verb::Disable => !maint && set(ServerStatus::Maint, C::WebDisable, checks),
+                Verb::Enable => maint && set(ServerStatus::Up, C::Web, checks),
                 // A server in maintenance keeps its state: Ibex has one admin state, HAProxy
                 // two flags (the drain flag is set under the maintenance one).
-                Verb::Stop => !drain && (maint || set(ServerStatus::Drain, checks)),
-                Verb::Start => drain && set(ServerStatus::Up, checks),
+                Verb::Stop => !drain && (maint || set(ServerStatus::Drain, C::WebStop, checks)),
+                Verb::Start => drain && set(ServerStatus::Up, C::Web, checks),
                 Verb::Dhlth => set_health_check_enabled(checks, proxies, &proxies[p].name, name, false, now),
                 Verb::Ehlth => set_health_check_enabled(checks, proxies, &proxies[p].name, name, true, now),
                 Verb::Hrunn | Verb::Hdown => {
                     if crate::track::is_tracking(proxies, p, s) {
                         false
                     } else {
-                        crate::track::apply_health(proxies, checks, p, s, verb == Verb::Hrunn);
+                        crate::track::apply_health(proxies, checks, p, s, verb == Verb::Hrunn, C::Web);
                         true
                     }
                 }
@@ -11703,7 +11706,7 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     for (p_idx, s_idx, st) in status_changes {
-                        crate::track::apply_admin(proxies, checks, p_idx, s_idx, st);
+                        crate::track::apply_admin(proxies, checks, p_idx, s_idx, st, crate::srvlog::Cause::Web);
                     }
                 }
             }
@@ -13283,7 +13286,7 @@ impl EngineDispatcher<'_> {
                 && proxy_idx < self.proxies.len()
                 && server_idx < self.proxies[proxy_idx].server_statuses.len()
             {
-                crate::track::set_raw(self.proxies, proxy_idx, server_idx, check.published());
+                crate::track::set_raw(self.proxies, proxy_idx, server_idx, check.published(), crate::srvlog::Kind::Op, crate::srvlog::Cause::Check(check));
             }
 
             // The message is built while `check` is still borrowed, then the borrow ends
@@ -13297,11 +13300,12 @@ impl EngineDispatcher<'_> {
             );
             let log = step.ok().and_then(|s| s.event).and_then(|event| {
                 let proxy = self.proxies.get(proxy_idx)?;
-                // HAProxy logs an UP/DOWN transition always, and every other check result
-                // only under `option log-health-checks` (src/check.c, PR_O2_LOGHCHKS).
+                // HAProxy logs "Health check for server ..." only under `option
+                // log-health-checks` (src/check.c, PR_O2_LOGHCHKS), a transition too; the
+                // transition has its own line, "Server ... is DOWN" (`crate::srvlog`).
                 // Without that gate a one-second check interval fills a collector with a
                 // line per server per second.
-                if !event.is_transition() && !proxy.log_health_checks {
+                if !proxy.log_health_checks {
                     return None;
                 }
                 let server = proxy

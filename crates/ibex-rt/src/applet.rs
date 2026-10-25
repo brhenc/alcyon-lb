@@ -1537,7 +1537,7 @@ impl CliApplet {
             }
         }
         for (p_idx, s_idx, st) in track_changes {
-            crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, st);
+            crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, st, crate::srvlog::Cause::Cli);
         }
         // `HAProxy` ends every answer, an empty one too, with an empty line.
         self.finish_msg(if !found_px {
@@ -1569,7 +1569,7 @@ impl CliApplet {
             }
         }
         for (p_idx, s_idx, st) in track_changes {
-            crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, st);
+            crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, st, crate::srvlog::Cause::Cli);
         }
         // `HAProxy` ends every answer, an empty one too, with an empty line.
         self.finish_msg(if !found_px {
@@ -1705,7 +1705,7 @@ impl CliApplet {
                         return;
                     }
                 };
-                crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, status);
+                crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, status, crate::srvlog::Cause::Cli);
                 self.finish_msg("");
             }
             Some("weight") => self.apply_weight(ctx, loc, parts.get(2).copied()),
@@ -1730,7 +1730,7 @@ impl CliApplet {
                 };
                 // The operator's maintenance or drain is kept: the operational state moves
                 // under it (`DRAIN` becomes `DOWN`, `MAINT` keeps only the counter).
-                crate::track::apply_health(ctx.proxies, ctx.checks, p_idx, s_idx, up);
+                crate::track::apply_health(ctx.proxies, ctx.checks, p_idx, s_idx, up, crate::srvlog::Cause::Cli);
                 self.finish_msg("");
             }
             Some("addr") => {

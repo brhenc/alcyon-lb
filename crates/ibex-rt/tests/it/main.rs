@@ -61,6 +61,7 @@ mod capture_slots;
 mod capture_ver;
 mod check_condition;
 mod check_malformed_replies;
+mod server_state_log;
 mod check_reply_buffer_bound;
 mod check_rules;
 mod check_stats_columns;
