@@ -806,6 +806,18 @@ fn leave_rmaint(req: &Req, fqdn: &str, proxies: &[Proxy], checks: &mut [ServerCh
 mod tests {
     use super::*;
 
+    /// The pool never gets a resolution back, so only this reaches the `Poolable` impl.
+    #[test]
+    fn a_resolution_is_a_poolable_object() {
+        use ibex_alloc::Poolable;
+        let mut r = Box::new(res(&["192.0.2.1", "192.0.2.2"], Vec::new()));
+        let with_items = r.footprint();
+        assert!(with_items >= std::mem::size_of::<Resolution>() + 2 * std::mem::size_of::<AnswerItem>());
+        r.reset(false);
+        assert!(r.items.is_empty() && r.reqs.is_empty());
+        assert!(<Box<Resolution> as Poolable>::try_new().is_none());
+    }
+
     fn res(ips: &[&str], reqs: Vec<Req>) -> Resolution {
         let now = Instant::now();
         Resolution {
