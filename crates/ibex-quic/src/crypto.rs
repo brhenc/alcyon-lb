@@ -239,6 +239,20 @@ impl TlsSession {
     }
 
     /// Runs the handshake on what `self.input` holds.
+    /// [`Self::advance`], then what rustls and ring left on the stack below this frame (moved-from
+    /// keys, `Copy` HMAC outputs, the ECDH point) goes, as `TlsCtx::handshake` does on TCP: on every
+    /// exit of a step taken while the handshake was not complete, which includes the step that
+    /// completes it, and not after it (T480, `tune.ibex.ssl-zero-buffers`). Not inlined: its frame
+    /// must not hold the scrubbed region.
+    #[inline(never)]
+    fn advance_scrubbed(&mut self, was_handshaking: bool) -> Result<(), rustls24::Error> {
+        let r = self.advance();
+        if was_handshaking {
+            ibex_alloc::scrub_stack();
+        }
+        r
+    }
+
     fn advance(&mut self) -> Result<(), rustls24::Error> {
         let mut out = Vec::new();
         let result = self.advance_into(&mut out);
@@ -329,7 +343,9 @@ impl qc::Session for TlsSession {
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
         self.input.push(buf);
-        self.advance().map_err(|e| match AlertDescription::try_from(&e) {
+        let was_handshaking = self.is_handshaking();
+        let advanced = self.advance_scrubbed(was_handshaking);
+        advanced.map_err(|e| match AlertDescription::try_from(&e) {
             Ok(alert) => TransportError {
                 code: TransportErrorCode::crypto(u8::from(alert)),
                 frame: None,

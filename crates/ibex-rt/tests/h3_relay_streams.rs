@@ -70,7 +70,7 @@ impl Rig {
     }
 
     fn build(setup: impl FnOnce(&mut QuicListener), guard: Option<std::sync::RwLockReadGuard<'static, ()>>) -> Self {
-        ibex_tls::config::install_default_crypto_provider();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let crt = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem"));
         let (certs, key) = ibex_tls::config::load_cert_file(crt).expect("cert");
         let tls = ibex_tls::tcp::BindTls::single_tls13(certs, key, vec![b"h3".to_vec()]).expect("tls");
@@ -612,7 +612,7 @@ fn a_headers_frame_just_under_the_cap_still_works() {
 /// canned response.
 #[test]
 fn a_listener_without_a_frontend_refuses_to_run() {
-    ibex_tls::config::install_default_crypto_provider();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let crt = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem"));
     let (certs, key) = ibex_tls::config::load_cert_file(crt).expect("cert");
     let tls = ibex_tls::tcp::BindTls::single_tls13(certs, key, vec![b"h3".to_vec()]).expect("tls");

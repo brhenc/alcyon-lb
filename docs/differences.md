@@ -183,9 +183,23 @@ Not refused, on purpose:
 - QUIC / HTTP/3 (`quic4@`, `quic6@`, `proto quic`, `alpn h3`): Ibex has a QUIC listener
   (`ibex-quic`, exercised by `crates/ibex-config/tests/it/quic_bind.rs`); it is experimental.
   The reference HAProxy binary here is built without QUIC and refuses these.
-- `resolvers` sections (and `resolvers` in `defaults`): refused with a message naming the keyword, as
-  are a server's `resolvers` keyword and `server-template` (see `server_keywords.rs`): Ibex does no
-  DNS resolution at run time (out of M1 scope, docs/milestones.md). HAProxy accepts them (T358 #4).
+- `resolvers` sections: parsed and checked as HAProxy does (T483, `parser/resolvers.rs`);
+  run-time resolution: T484. Until then a server's (or `default-server`'s) `resolvers` keyword is
+  refused, as are `server-template` (T486), SRV names `_...` on a server line (T487),
+  `parse-resolv-conf` (T489), `tcp@` / `udp@` nameservers (T488) and any other address prefix on a
+  `nameserver` (HAProxy takes `ipv4@`, `unix@`...). `resolve-prefer`, `resolve-net` and
+  `resolve-opts` are checked as HAProxy checks them and then do nothing, as in HAProxy without
+  `resolvers` (Ibex warns that it ignores them). HAProxy also creates an implicit `default` section
+  (from `/etc/resolv.conf`, used by its httpclient); Ibex has no httpclient and does not (user,
+  2026-10-25; `show resolvers` is T485).
+- A name on a `server` line is resolved by libc while the configuration loads, as HAProxy does
+  (`localhost` is the first answer of `getaddrinfo`, `::1` on most hosts, no longer `127.0.0.1`),
+  and `init-addr libc|none|<ip>` is applied in order. `init-addr last` is refused: Ibex has no
+  `server-state-file` to read the last address from (user, 2026-10-25; T490). The default
+  `last,libc` is therefore `libc`. A server that starts without an address (`init-addr none`)
+  shows `srv_admin_state 32`; after `disable server` HAProxy shows 33 and Ibex still 32 (Ibex keeps
+  one admin state per server, not HAProxy's flags), and in both it stays in `MAINT (resolution)`.
+  `-dr` appends `none`, as in HAProxy.
 
 ## Logs and `show stat` (T165)
 

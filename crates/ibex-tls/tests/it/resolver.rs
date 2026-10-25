@@ -106,3 +106,11 @@ fn test_default_cert_fallback() {
         .expect("Fallback to default");
     assert!(Arc::ptr_eq(&res_other, &cert_default));
 }
+
+/// A default resolver is an empty one, whatever it resolves to.
+#[test]
+fn a_default_resolver_is_empty() {
+    let resolver: IbexCertResolver<String> = IbexCertResolver::default();
+    assert!(resolver.default_cert().is_none());
+    assert!(resolver.resolve_domain("example.com").is_none());
+}

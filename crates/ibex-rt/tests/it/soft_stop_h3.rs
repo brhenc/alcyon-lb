@@ -251,7 +251,7 @@ impl IdleClient {
                     .unwrap_or_default()
             }
         }
-        ibex_tls::install_default_crypto_provider();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let mut tls = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(Any)).with_no_client_auth();
         tls.alpn_protocols = vec![b"h3".to_vec()];
         let client_cfg = ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).expect("quic client config")));

@@ -54,6 +54,7 @@ pub use ast::{
 };
 pub use error::ConfigError;
 pub use parser::parse_str;
+pub use parser::set_resolve_dontfail;
 pub use parser::parse_str as parse_config;
 
 

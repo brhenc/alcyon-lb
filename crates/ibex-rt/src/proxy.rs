@@ -721,6 +721,11 @@ pub struct TcpSession {
     /// attached (T474). Cleared and moved with `target_addr`. Packed, where a `SocketAddr`
     /// would grow every session by 32 bytes.
     pub bc_src: Option<PackedAddr>,
+    /// The kept server connection belongs to no stream yet: the transaction that used it is
+    /// over and the next request has not taken it (T474b). `%si`, `%bi`, `%bp` and `bc_dst`
+    /// print nothing meanwhile, as a `HAProxy` stream with no backend connection does.
+    /// Set by `reset_for_next_request`, cleared where a request takes the connection.
+    pub bc_idle: bool,
     /// The server connection's `conn->err_code`: [`BC_CONNECTED`] once connected, the
     /// failure of a connect, `None` while there is none or it is connecting: `bc_err`.
     pub bc_err: Option<&'static ibex_sample::ConnErr<'static>>,
@@ -913,7 +918,7 @@ impl TcpSession {
     /// `%bi` and `%bp`: the local address of the server connection.
     #[must_use]
     pub fn bc_src(&self) -> Option<SocketAddr> {
-        self.bc_src.map(PackedAddr::get)
+        self.bc_src.filter(|_| !self.bc_idle).map(PackedAddr::get)
     }
 
     /// `bc_dst`: where the server connection was made, or is being made, to -- the
@@ -927,7 +932,7 @@ impl TcpSession {
     /// connection with the new destination.
     #[must_use]
     pub fn bc_dst(&self) -> Option<SocketAddr> {
-        self.target_addr.map(|t| crate::engine::connect_addr(t, self.server_addr))
+        self.target_addr.filter(|_| !self.bc_idle).map(|t| crate::engine::connect_addr(t, self.server_addr))
     }
 
     /// Whether the session is a stream of an HTTP/2 connection (T280).
@@ -1299,6 +1304,7 @@ impl TcpSession {
             redispatched: false,
             target_addr: None,
             bc_src: None,
+            bc_idle: false,
             bc_err: None,
             lb_picked: false,
             cli_exp: Tick::ETERNITY,
@@ -2098,6 +2104,7 @@ impl TcpSession {
         // connects left `ConnectFailed`, and the next request's client leaving was then
         // taken for a stream already over, not aborted (T227, devtest7).
         self.ending = None;
+        self.bc_idle = true;
         self.cli_state = ScState::Ready;
         self.release_idle_buffers();
     }

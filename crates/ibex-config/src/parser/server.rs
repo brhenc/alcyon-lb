@@ -20,11 +20,25 @@ pub(crate) fn parse_server(
     }
     // No port is port 0: the server connects to the stream's destination port
     // (`SRV_F_MAPPORTS`; see `connect_addr` in ibex-rt).
-    let (addr, is_quic) = parse_socket_addr(&tokens[2], Some(0))?;
+    let (addr, is_quic, fqdn) = parse_server_addr(&tokens[2], Some(0))?;
     if is_quic {
         return Err(ConfigError::new(kw.line, kw.col, "QUIC not supported for backend servers".to_string()));
     }
     let who = Some(tokens[1].text.as_str());
+    if let Some(name) = &fqdn {
+        let prefix = server_keywords::server_prefix(who);
+        if name.starts_with('_') {
+            return Err(ConfigError::new(
+                tokens[2].line,
+                tokens[2].col,
+                format!("{prefix}'{name}' is a DNS SRV record name, which is not supported yet (T487): Ibex resolves A and AAAA names only"),
+            ));
+        }
+        if !address::dn_label_ok(name) {
+            return Err(ConfigError::new(tokens[2].line, tokens[2].col, format!("{prefix}Can't create DNS resolution for server '{}'", tokens[1].text)));
+        }
+    }
+    let mut init_addr = default_server.and_then(|d| d.init_addr).unwrap_or_default();
     let mut check = default_server.is_some_and(|d| d.check);
     let mut inter = default_server.and_then(|d| d.inter);
     let mut fastinter = default_server.and_then(|d| d.fastinter);
@@ -173,6 +187,17 @@ pub(crate) fn parse_server(
                 track = Some(server_kw_arg(tokens, i, who, "expects [<proxy>/]<server> as argument.")?.text.as_str().into());
                 i += 1;
             }
+            "init-addr" => {
+                init_addr = parse_init_addr(tokens, i, who)?;
+                i += 1;
+            }
+            "resolve-prefer" | "resolve-net" | "resolve-opts" => {
+                check_resolve_keyword(tokens, i, who)?;
+                // `resolve-opts` alone is accepted and changes nothing.
+                if tokens.get(i + 1).is_some_and(|t| !t.text.is_empty()) {
+                    i = unimplemented_server_keyword(tokens, i, who)?;
+                }
+            }
             // What these turn on, Ibex never does: they leave the server as Ibex runs it.
             "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
             | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}
@@ -199,6 +224,15 @@ pub(crate) fn parse_server(
     }
     if track.is_some() {
         extras.track_line.push((index, u32::try_from(kw.line).unwrap_or(u32::MAX)));
+    }
+    if let Some(name) = fqdn {
+        extras.names.push(crate::ast::ServerName {
+            index,
+            line: u32::try_from(kw.line).unwrap_or(u32::MAX),
+            fqdn: name.into_boxed_str(),
+            init_addr,
+            unresolved: false,
+        });
     }
     servers.push(Server {
         check_port,
@@ -234,6 +268,98 @@ pub(crate) fn parse_server(
         track,
     });
     Ok(())
+}
+
+/// `init-addr <method>[,...]` (`srv_parse_init_addr`). A missing argument is an empty
+/// list, as in `HAProxy`: the default methods then apply.
+fn parse_init_addr(tokens: &[Token], i: usize, who: Option<&str>) -> Result<crate::ast::InitAddr, ConfigError> {
+    use crate::ast::InitAddrMethod as M;
+    let prefix = server_keywords::server_prefix(who);
+    let tok = &tokens[i];
+    let fail = |msg: String| ConfigError::new(tok.line, tok.col, format!("{prefix}'init-addr' : {msg}"));
+    let mut out = crate::ast::InitAddr::default();
+    let list = tokens.get(i + 1).map_or("", |t| t.text.as_str());
+    for p in list.split(',').filter(|p| !p.is_empty()) {
+        let m = match p {
+            "libc" => M::Libc,
+            "none" => M::None,
+            "last" => {
+                return Err(fail(
+                    "method 'last' is not supported: Ibex has no 'server-state-file' to read the last address from yet (T490); use 'libc', 'none' or an address".to_string(),
+                ))
+            }
+            _ => match p.parse::<std::net::IpAddr>() {
+                Ok(ip) => {
+                    if out.ip.is_some() {
+                        return Err(fail(format!("initial address already specified, cannot add '{p}'..")));
+                    }
+                    out.ip = Some(ip);
+                    M::Ip
+                }
+                Err(_) => {
+                    return Err(fail(format!("unknown init-addr method '{p}', supported methods are 'libc', 'last', 'none'..")));
+                }
+            },
+        };
+        if !out.push(m) {
+            return Err(fail(format!("too many init-addr methods when trying to add '{p}'.")));
+        }
+    }
+    Ok(out)
+}
+
+/// The arguments of `resolve-prefer`, `resolve-net` and `resolve-opts`, checked as
+/// `HAProxy` checks them (`srv_parse_resolve_*`). They only act with a server's
+/// `resolvers`, which is refused until T484, so nothing keeps them.
+fn check_resolve_keyword(tokens: &[Token], i: usize, who: Option<&str>) -> Result<(), ConfigError> {
+    let prefix = server_keywords::server_prefix(who);
+    let tok = &tokens[i];
+    let kw = tok.text.as_str();
+    let fail = |msg: String| ConfigError::new(tok.line, tok.col, format!("{prefix}'{kw}' {msg}"));
+    let a = tokens.get(i + 1).map_or("", |t| t.text.as_str());
+    match kw {
+        "resolve-prefer" => {
+            if a != "ipv4" && a != "ipv6" {
+                return Err(fail("expects either ipv4 or ipv6 as argument..".to_string()));
+            }
+        }
+        "resolve-net" => {
+            if a.is_empty() {
+                return Err(fail("expects a list of networks..".to_string()));
+            }
+            for (n, net) in a.split(',').filter(|p| !p.is_empty()).enumerate() {
+                if n >= 5 {
+                    return Err(fail("exceed 5 networks..".to_string()));
+                }
+                if !is_network(net) {
+                    return Err(fail(format!("invalid network '{net}'..")));
+                }
+            }
+        }
+        _ => {
+            for p in a.split(',').filter(|p| !p.is_empty()) {
+                if !matches!(p, "allow-dup-ip" | "ignore-weight" | "prevent-dup-ip") {
+                    return Err(fail(format!(
+                        ": unknown resolve-opts option '{p}', supported methods are 'allow-dup-ip', 'ignore-weight', and 'prevent-dup-ip'.."
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `str2net` (an IPv4 address, a `/bits` or dotted mask optional) or `str62net` (an IPv6
+/// address, `/0` to `/128` optional).
+fn is_network(net: &str) -> bool {
+    let (addr, mask) = match net.rsplit_once('/') {
+        Some((a, m)) => (a, Some(m)),
+        None => (net, None),
+    };
+    if addr.parse::<std::net::Ipv4Addr>().is_ok() {
+        return mask.is_none_or(|m| m.parse::<u8>().is_ok_and(|b| b <= 32) || m.parse::<std::net::Ipv4Addr>().is_ok());
+    }
+    addr.parse::<std::net::Ipv6Addr>().is_ok() && mask.is_none_or(|m| m.parse::<u8>().is_ok_and(|b| b <= 128))
 }
 
 /// The TLS keywords of a server line (`src/cfgparse-ssl.c`). `Ok(Some(last))` when
@@ -624,6 +750,17 @@ pub(crate) fn parse_default_server(
             "track" => {
                 cfg.track = Some(server_kw_arg(tokens, i, None, "expects [<proxy>/]<server> as argument.")?.text.as_str().into());
                 i += 1;
+            }
+            "init-addr" => {
+                cfg.init_addr = Some(parse_init_addr(tokens, i, None)?);
+                i += 1;
+            }
+            "resolve-prefer" | "resolve-net" | "resolve-opts" => {
+                check_resolve_keyword(tokens, i, None)?;
+                // `resolve-opts` alone is accepted and changes nothing.
+                if tokens.get(i + 1).is_some_and(|t| !t.text.is_empty()) {
+                    i = unimplemented_server_keyword(tokens, i, None)?;
+                }
             }
             "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
             | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}

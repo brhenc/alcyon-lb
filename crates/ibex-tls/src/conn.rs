@@ -574,7 +574,7 @@ fn server_hello_is_tls12(out: &[u8]) -> bool {
     out.get(44 + usize::from(sid)).is_some_and(|&hi| hi != 0x13)
 }
 
-/// A server's input, owned (tests, and [`crate::transport::RustlsTransport`]-style callers).
+/// A session's input, owned (tests, and callers that hold their ciphertext in a `Vec`).
 #[derive(Debug, Default)]
 pub struct VecInput {
     buf: Vec<u8>,

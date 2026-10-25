@@ -88,8 +88,9 @@ impl Backend {
                         _ => break,
                     }
                 }
-                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                // Recorded before the answer: the test reads `requests()` as soon as it has the 200.
                 sink.lock().expect("lock").push(String::from_utf8_lossy(&buf).into_owned());
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
             }
         });
         Self { port, seen }
