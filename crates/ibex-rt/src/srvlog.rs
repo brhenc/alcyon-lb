@@ -223,9 +223,6 @@ pub fn note(proxies: &[Proxy], p: usize, s: usize, before: u8, after: u8, kind: 
 /// Writes the lines noted since the last call on `proxies`, in the order they were noted,
 /// through `send` (the log targets of the proxy). Every line goes to stderr too.
 pub fn drain(proxies: &[Proxy], mut send: impl FnMut(usize, LogLevel, &str)) {
-    if !pending() {
-        return;
-    }
     let mut events = Vec::new();
     for px in proxies {
         let Some(tc) = px.ids.tc.get() else { continue };
