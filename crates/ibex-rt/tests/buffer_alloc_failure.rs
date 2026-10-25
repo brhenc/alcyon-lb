@@ -454,11 +454,14 @@ fn h2_get(id: u8) -> [u8; 15] {
     [0, 0, 6, 1, 5, 0, 0, 0, id, 0x82, 0x86, 0x84, 0x41, 0x01, b'x']
 }
 
-/// An HTTP/2 stream whose buffers (small ones, for a small head) cannot be had: its connection
-/// is closed, as for a stream that panicked (`tradeoff.md` 6.26), and the next connection is
-/// served. Each of the stream's two buffers in turn: its HTX, its request.
+/// An HTTP/2 stream whose buffer cannot be had is answered `500` on that stream, and the
+/// connection goes on: the next stream on it is served (T464). `HAProxy` 3.5-dev8 under `-dMfail`
+/// with `tune.fail-alloc 3`, `nghttp` sending four `GET`s on one connection (measured): the failed
+/// stream gets HEADERS `:status 500` (`content-length: 97`, the error page as DATA) or, when its
+/// mux stream cannot be made, `RST_STREAM` `REFUSED_STREAM`; the other streams complete (`200`)
+/// and the connection ends with an idle `GOAWAY NO_ERROR`, never because of the failure.
 #[test]
-fn an_h2_stream_whose_buffer_cannot_be_had_closes_its_connection_only() {
+fn an_h2_stream_whose_buffer_cannot_be_had_is_answered_500_and_its_connection_goes_on() {
     const SMALL: usize = 1536;
     let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     for skip in 0..2 {
@@ -469,13 +472,12 @@ fn an_h2_stream_whose_buffer_cannot_be_had_closes_its_connection_only() {
         let mut sock = h2_connect(addr);
         refuse_allocs_of(SMALL, skip, 2);
         sock.write_all(&h2_get(1)).expect("HEADERS 1");
-        let first = h2_status(&mut engine, &mut sock, 1);
+        let failed = h2_status(&mut engine, &mut sock, 1);
         assert_eq!(refusals_left(), 0, "skip {skip}: the stream's buffer was asked for");
         refuse_allocs_of(SMALL, 0, 0);
-        assert_eq!(first, None, "skip {skip}: the connection is closed");
-        let mut next = h2_connect(addr);
-        next.write_all(&h2_get(1)).expect("HEADERS");
-        assert_eq!(h2_status(&mut engine, &mut next, 1), Some(0x88), "skip {skip}: the next connection");
+        assert_eq!(failed, Some(0x8e), "skip {skip}: the failed stream gets :status 500");
+        sock.write_all(&h2_get(3)).expect("HEADERS 3");
+        assert_eq!(h2_status(&mut engine, &mut sock, 3), Some(0x88), "skip {skip}: the next stream, same connection");
     }
 }
 

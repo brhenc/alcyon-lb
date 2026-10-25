@@ -2121,7 +2121,11 @@ impl TcpSession {
         self.log.term = Some(*b"PR");
         self.req.clear();
         self.txn = Some(HttpTxn::failed(status));
-        self.cli_state = ScState::ShutR;
+        // A stream of an HTTP/2 connection fails alone: its answer goes out as HEADERS and the
+        // connection and its other streams go on (T464), so its state is not the connection's.
+        if self.h2_child_mut().is_none() {
+            self.cli_state = ScState::ShutR;
+        }
         self.ending.get_or_insert(Ending::Error);
     }
 
@@ -2134,12 +2138,24 @@ impl TcpSession {
     #[inline(never)]
     pub(crate) fn fail_alloc(&mut self) {
         self.ending = Some(Ending::Error);
-        if self.mode == Mode::Http && self.bytes_out == self.log.bytes_out_at_start && self.rep.is_empty() {
+        // A stream's `bytes_out` is its connection's, which has written before it (SETTINGS,
+        // the other streams' frames): its own response has started when its transaction says so.
+        let nothing_sent = match self.h2_child_mut() {
+            Some(_) => self.txn.as_ref().is_none_or(|t| t.rsp == txn::MsgState::Waiting),
+            None => self.bytes_out == self.log.bytes_out_at_start,
+        };
+        if self.mode == Mode::Http && nothing_sent && self.rep.is_empty() {
             self.req.clear();
             self.txn = Some(HttpTxn::failed(500));
-            if !matches!(self.cli_state, ScState::Closed | ScState::Error) {
+            // On HTTP/2 the failure stays on the stream (T464): see `fail_request`.
+            if self.h2_child_mut().is_none() && !matches!(self.cli_state, ScState::Closed | ScState::Error) {
                 self.cli_state = ScState::ShutR;
             }
+        } else if let Some(c) = self.h2_child_mut() {
+            // Part of the response is out: the stream is reset, the connection goes on.
+            c.rst = Some(ibex_proto::h2::H2Error::InternalError);
+            c.finished = true;
+            self.cli_state = ScState::Closed;
         } else if !matches!(self.cli_state, ScState::Closed | ScState::Error) {
             self.cli_state = ScState::Closed;
         }
