@@ -9846,7 +9846,9 @@ impl EngineDispatcher<'_> {
         if crate::buf_wait::wanted() {
             match self.sessions.get_mut(session_idx) {
                 Some(entry) => {
-                    buf_wait_enter(entry, session_idx);
+                    if buf_wait_enter(entry, session_idx) {
+                        self.wake_queue.push(entry.task);
+                    }
                     update_interests(entry, self.fdtab, self.poller);
                 }
                 None => drop(crate::buf_wait::take_want()),
@@ -16650,14 +16652,15 @@ mod stats_req_headers_tests {
 
 /// Puts a stream refused a buffer at `tune.buffers.limit` in its class's wait queue (S6,
 /// [`crate::buf_wait`]); a stream woken for a buffer and refused again goes back to the front.
-/// The queue cannot grow: the stream fails, as in S5.
+/// The queue cannot grow: the stream fails, as in S5, and `true` says it must run again (its
+/// failure's answer is written in its next run; nothing else would wake it: T473).
 #[cold]
 #[inline(never)]
-fn buf_wait_enter(entry: &mut SessionEntry, session_idx: u32) {
-    let Some(class) = crate::buf_wait::take_want() else { return };
+fn buf_wait_enter(entry: &mut SessionEntry, session_idx: u32) -> bool {
+    let Some(class) = crate::buf_wait::take_want() else { return false };
     let front = entry.buf_wait.take_offered();
     if entry.buf_wait.queued() {
-        return;
+        return false;
     }
     if crate::buf_wait::enter(entry.task, session_idx, class, front) {
         entry.buf_wait.enqueued(class);
@@ -16667,7 +16670,9 @@ fn buf_wait_enter(entry: &mut SessionEntry, session_idx: u32) {
         if crate::buf::cached_standard() > 0 {
             crate::buf_wait::reoffer();
         }
+        false
     } else {
         entry.sess.fail_alloc();
+        true
     }
 }
