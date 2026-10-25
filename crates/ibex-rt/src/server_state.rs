@@ -311,8 +311,25 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &ibex_config::Server, f: &[&str; M
         cur = if cur == ServerStatus::Down as u8 { DRAIN_DOWN } else { ServerStatus::Drain as u8 };
         admin = ServerStatus::Drain;
     }
-    if let Some(slot) = p.server_statuses.get(i) {
-        slot.store(cur, Ordering::Relaxed);
+    let before = p.server_statuses.get(i).map_or(cur, |slot| slot.swap(cur, Ordering::Relaxed));
+    // `srv_set_stopped` from the file: written on stderr only, the log is not up yet.
+    // (The administrative changes are not: `_srv_update_status_adm` keeps quiet while
+    // `MODE_STARTING`.)
+    // The file's operational state is applied before its administrative one, so a server
+    // stopped and in maintenance says it went DOWN; one the configuration disabled does not
+    // (`srv_set_stopped` ignores a server in maintenance).
+    if stopped && !cfg_cmaint {
+        let down = ServerStatus::Down as u8;
+        if let Some((_, text)) = crate::srvlog::describe(p, i, before, down, crate::srvlog::Kind::Op, crate::srvlog::Cause::StateFile) {
+            crate::srvlog::stderr(false, &text);
+        }
+    }
+    // A server the configuration disabled and the file enables says so; going into
+    // maintenance is not said at start.
+    if before == ServerStatus::Maint as u8 && cur != before {
+        if let Some((_, text)) = crate::srvlog::describe(p, i, before, cur, crate::srvlog::Kind::Admin, crate::srvlog::Cause::StateFile) {
+            crate::srvlog::stderr(false, &text);
+        }
     }
     // The CLI's weight is kept unless the configuration's changed.
     if v.iweight == cfg_iweight {

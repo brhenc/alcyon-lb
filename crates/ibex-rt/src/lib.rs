@@ -55,6 +55,7 @@ pub mod syslog;
 pub mod poller;
 pub mod proxy;
 pub mod proxy_state;
+pub mod srvlog;
 pub mod track;
 pub mod server_state;
 pub mod txn;
