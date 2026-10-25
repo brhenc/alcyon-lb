@@ -397,6 +397,44 @@ default. `ibex.watchdog-warn-only` (global, no argument; HAProxy refuses it as a
 warnings and `BlockedTrafficWarnings` and never aborts, for an operator who prefers a slow process to a restart.
 The `ibex.` prefix keeps it from clashing with a future HAProxy keyword.
 
+## `tune.memory.hot-size`: the buffer floor is an Ibex extension (S1, S2)
+
+`tune.memory.hot-size <bytes>` (default 524288) parses as HAProxy parses it (`mem_parse_global_hot_size`:
+one argument, `atol`, strictly positive) and bounds what each thread keeps in its pools together,
+with HAProxy's rule: past 3/4 of it a pool evicts down while it holds more than its share, past
+the whole of it the largest pools are evicted across (`pool_put_to_cache`,
+`pool_evict_from_local_caches`). Two differences. **Floors**: each Ibex pool declares a per-thread
+floor that eviction never goes under, and floor objects do not count against `hot-size`; the three
+buffer pools (`buffer`, `small_buffer`, `large_buffer`) have a floor of 64 per thread
+(`crates/ibex-rt/src/buf.rs`), where HAProxy's `minavail` is 2. The reason is measured:
+at HAProxy's default, with 50 keep-alive connections of 16 KiB buffers on a thread, the budget
+holds fewer buffers than the connections need and HAProxy mallocs about 0.5 buffer per request;
+Ibex with the floor makes none (`docs/design/memory-2026-10-24.md` 1.3, 3.3). Only `pool_gc`
+(SIGQUIT, SIGTTOU, SIGUSR1, the stop path, a refused allocation) goes below a floor. **Eviction
+order**: one object at a time, newest first, largest pool first across pools; HAProxy evicts
+clusters of 8 oldest first from a per-thread LRU (`tradeoff.md` 6.28). `show pools` counts can lag
+a busy thread by up to 10 ms (`tradeoff.md` 6.28).
+
+## `tune.buffers.limit`, `tune.fail-alloc` and `-dMfail` / `-dMno-fail` (S5)
+
+`tune.buffers.limit <n>` (parsed as HAProxy: one argument, `atoi`, not negative; 1 and 2 become 3,
+0 is no limit) caps the standard buffers the process holds at once, cached ones included. A
+stream that would pass it fails: 500 with termination state `IR--` (request buffer) or `IH--`
+(response buffer), or a close once its response began; where HAProxy puts it on its buffer wait
+queue until one frees (that queue is open work, S6, `tradeoff.md` 6.13). An HTTP/2 stream whose
+buffer cannot be had closes its connection. **`tune.buffers.reserve` is refused at load** (it
+reserves buffers for that wait queue; accepting it would promise what is not there, AGENTS.md 5).
+
+`tune.fail-alloc <0..100>` refuses that percentage of pool allocations at random, and, as on
+HAProxy, counts only under `-dMfail` (`-dMfail` alone is a rate of 1). Ibex honours exactly the
+`-dM` forms `fail` and `no-fail` (comma-separated lists of only these are accepted); every other
+form (`-dM`, `-dM<byte>`, `integrity`, `uaf`, `no-merge`, `cold-first`, ...) is refused at start
+with `... -dM (memory pool debugging) is not supported, except -dMfail and -dMno-fail` and exit 1,
+because Ibex's pools are not malloc-per-object chunks to poison, tag or unmap
+(`crates/ibex-rt/src/bin/ibex.rs`). Measured on 3.5-dev8 (400 requests, rate 5): a request gets
+`200`, `500` with `IR--` or `IC--`, or a closed connection; Ibex gives the same three (`IH--`
+where HAProxy's refusal is of its server connection, `IC--`).
+
 ## `-m <megs>`: a connection budget and an rlimit, as on HAProxy
 
 HAProxy's `-m` sets `RLIMIT_DATA` to `<megs>` MiB (soft and hard, `/proc/<pid>/limits`;
