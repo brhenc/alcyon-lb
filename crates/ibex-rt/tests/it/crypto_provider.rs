@@ -339,7 +339,7 @@ fn start_quic(tag: &str, provider: Option<&str>) -> (Ibex, String, SocketAddr) {
 /// HTTP/3 request completes, its handshake on `ring-ibex`.
 #[test]
 fn ring_ibex_with_a_quic_bind_starts_and_serves_http3_on_it() {
-    let (ok, out) = check("quicchk", &format!("global\n  tune.ibex.crypto-provider ring-ibex\nfrontend fe\n  bind quic4@127.0.0.1:{} ssl crt {{pem}} alpn h3\n", port()));
+    let (ok, out) = check("quicchk", &format!("global\n  tune.ibex.crypto-provider ring-ibex\nfrontend fe\n  mode http\n  bind quic4@127.0.0.1:{} ssl crt {{pem}} alpn h3\n", port()));
     assert!(ok, "ring-ibex with a QUIC bind refused: {out}");
     let (_ibex, sock, quic) = start_quic("quicibex", Some("ring-ibex"));
     assert_eq!(h3_status(quic), "200 3");

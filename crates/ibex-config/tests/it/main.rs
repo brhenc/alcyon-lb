@@ -61,6 +61,7 @@ mod preproc;
 mod proxy_ids;
 mod proxy_options;
 mod quic_bind;
+mod quic_bind_mode;
 mod redispatch_option;
 mod response_deny;
 mod response_redirect;

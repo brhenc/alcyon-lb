@@ -3608,7 +3608,11 @@ pub fn validate_tls(config: &Config) -> io::Result<()> {
             continue;
         }
         for bind in fe.binds.iter().filter(|b| b.ssl) {
-            bind_tls(&fe.name, &fe.binds, bind.addr)?;
+            if bind.quic {
+                bind_tls_quic(&fe.name, &fe.binds, bind.addr)?;
+            } else {
+                bind_tls(&fe.name, &fe.binds, bind.addr)?;
+            }
         }
     }
     // A `disabled` listen is checked too: `HAProxy` loads its certificates at parse time.
@@ -3652,7 +3656,7 @@ fn bind_tls(
     binds: &[ibex_config::ast::BindConfig],
     addr: SocketAddr,
 ) -> io::Result<Option<Arc<ibex_tls::tcp::BindTls>>> {
-    bind_tls_with(section, binds, addr, ibex_tls::tcp::from_bind_config)
+    bind_tls_with(section, binds, addr, false, ibex_tls::tcp::from_bind_config)
 }
 
 /// [`bind_tls`] for a QUIC bind: the same rustls 0.24 configuration as TCP's, TLS 1.3 only
@@ -3662,16 +3666,19 @@ fn bind_tls_quic(
     binds: &[ibex_config::ast::BindConfig],
     addr: SocketAddr,
 ) -> io::Result<Option<Arc<ibex_tls::tcp::BindTls>>> {
-    bind_tls_with(section, binds, addr, ibex_tls::tcp::from_bind_config)
+    bind_tls_with(section, binds, addr, true, ibex_tls::tcp::from_bind_config)
 }
 
+/// The `ssl` bind at `addr` of the given transport: a TCP and a `quic` bind may share an
+/// ip:port, each with its own certificates, ALPN and TLS versions (T494).
 fn bind_tls_with<T>(
     section: &str,
     binds: &[ibex_config::ast::BindConfig],
     addr: SocketAddr,
+    quic: bool,
     build: fn(&ibex_config::ast::BindConfig) -> Result<T, String>,
 ) -> io::Result<Option<T>> {
-    let Some(bind) = binds.iter().find(|b| b.addr == addr && b.ssl) else {
+    let Some(bind) = binds.iter().find(|b| b.addr == addr && b.ssl && b.quic == quic) else {
         return Ok(None);
     };
 

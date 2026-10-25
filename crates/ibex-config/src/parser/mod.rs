@@ -1477,6 +1477,20 @@ pub(crate) fn validate_config(
     frontends: &[FrontendSection],
     backends: &[BackendSection],
 ) -> Result<(), ConfigError> {
+    // `quic` is a mux for HTTP: `src/cfgparse-listen.c` refuses it on a TCP-mode frontend.
+    let mut quic_alerts = Vec::new();
+    for f in frontends.iter().filter(|f| f.mode != Mode::Http) {
+        for b in f.binds.iter().filter(|b| b.quic) {
+            let family = if b.addr.is_ipv6() { "quic6" } else { "quic4" };
+            quic_alerts.push((
+                b.line,
+                format!("frontend '{}' : MUX protocol 'quic' is not usable for 'bind {family}@{}' at {{at}}.", f.name, b.addr),
+            ));
+        }
+    }
+    if !quic_alerts.is_empty() {
+        return Err(ConfigError::alerts(quic_alerts));
+    }
     let bufsize = global.and_then(|g| g.bufsize).unwrap_or(16384);
     if bufsize < 16384 {
         // `src/proxy.c`: an HTTP proxy (frontend or listen) whose `bind` offers `h2` by ALPN
