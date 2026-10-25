@@ -68,7 +68,7 @@ pub enum InitAddrMethod {
     None = 1,
     /// `libc`: `getaddrinfo` while the configuration loads.
     Libc = 2,
-    /// `last`: the server-state file's address; refused until Ibex has one (T490).
+    /// `last`: the address the server-state file has for the server ([`ServerName::last_addr`]).
     Last = 3,
     /// `<ip>`: [`InitAddr::ip`].
     Ip = 4,
@@ -352,6 +352,13 @@ pub struct ServerName {
     /// `resolvers <section>`: the section that resolves the name at run time (T484).
     pub resolvers: Option<Box<str>>,
     pub resolve: ResolveOpts,
+    /// `srv_addr` of the server's line in the server-state file, as written
+    /// (`srv->lastaddr`): what `init-addr last` gives it (T490).
+    pub last_addr: Option<Box<str>>,
+    /// `SRV_ADMF_FQDN_CHANGED`: the server-state file had `srv_fqdn` set from the CLI and it
+    /// differs from the configuration's name (`srv_state_srv_update`); `show servers state`
+    /// keeps the flag in `srv_admin_state`. With `resolvers`, `fqdn` is then the file's.
+    pub fqdn_changed: bool,
 }
 
 /// A TLS server line that needs a CA file it has not got; see [`ServerExtras::no_ca`].

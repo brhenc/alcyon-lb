@@ -127,3 +127,142 @@ fn server_state_file_name_in_defaults_warns_that_it_does_nothing() {
         [(6, "'server-state-file-name' is ignored in a 'defaults' section (as HAProxy does): set it in the backend.")]
     );
 }
+
+/// A server-state file with `lines` (after the version and the header) in a fresh
+/// directory, and the configuration that reads it as the global file, `servers` in
+/// backend `b`.
+struct StateFile {
+    dir: std::path::PathBuf,
+}
+
+impl StateFile {
+    fn new(lines: &[&str]) -> Self {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ibex-t490b-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let mut text = String::from("1\n# be_id be_name srv_id srv_name srv_addr ...\n");
+        for l in lines {
+            text.push_str(l);
+            text.push('\n');
+        }
+        std::fs::write(dir.join("st"), text).expect("write");
+        StateFile { dir }
+    }
+
+    fn cfg(&self, servers: &str) -> String {
+        format!(
+            "global\n  server-state-file {}/st\nresolvers r\n  nameserver ns1 127.0.0.1:53\n{D}  load-server-state-from-file global\nbackend b\n{servers}",
+            self.dir.display()
+        )
+    }
+}
+
+impl Drop for StateFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A file line for `b/<srv>` with `addr`, `admin` and `fqdn`.
+fn line(srv: &str, addr: &str, admin: u32, fqdn: &str) -> String {
+    format!("3 b 1 {srv} {addr} 2 {admin} 1 1 50 1 0 0 0 0 0 0 {fqdn} 80 - 0 0 - - 0")
+}
+
+fn addr(cfg: &Config, i: usize) -> String {
+    cfg.backends[0].servers[i].addr.ip().to_string()
+}
+
+/// `init-addr last` and the default `last,libc`: the file's `srv_addr` for a server written
+/// as a name (`srv->lastaddr`, `srv_apply_lastaddr`). `HAProxy` 3.5-dev8, same file: s1
+/// `10.0.0.7` (`localhost`, `init-addr last`), s2 `10.0.0.8` (no `init-addr`: `last` first),
+/// s3 `10.1.1.1` with the notice (the file's `foo` is no address), s4 `-` in maintenance
+/// (`-` in the file: `last` skipped, then `none`), s5 the configuration's address (written as
+/// one: the file's is not read).
+#[test]
+fn init_addr_last_takes_the_files_address() {
+    let f = StateFile::new(&[
+        &line("s1", "10.0.0.7", 0, "localhost"),
+        &line("s2", "10.0.0.8", 0, "nosuch.invalid"),
+        &line("s3", "foo", 0, "nosuch.invalid"),
+        &line("s4", "-", 0, "nosuch.invalid"),
+        &line("s5", "10.0.0.9", 0, "-"),
+    ]);
+    let cfg = ok(&f.cfg(
+        "  server s1 localhost:80 init-addr last\n  server s2 nosuch.invalid:80\n  server s3 nosuch.invalid:80 init-addr last,10.1.1.1\n\
+         \x20 server s4 nosuch.invalid:80 init-addr last,none\n  server s5 127.0.0.1:80\n",
+    ));
+    assert_eq!([addr(&cfg, 0), addr(&cfg, 1), addr(&cfg, 2), addr(&cfg, 4)], ["10.0.0.7", "10.0.0.8", "10.1.1.1", "127.0.0.1"]);
+    let extras = &cfg.backends[0].server_extras;
+    assert_eq!((extras.unresolved(1), extras.unresolved(3)), (false, true));
+    let notices: Vec<&str> = cfg.proxy_warnings.iter().map(|w| w.text.as_str()).collect();
+    assert_eq!(notices, ["{at} : 'server b/s3' : could not resolve address 'nosuch.invalid', falling back to configured address."]);
+}
+
+/// `HAProxy`: an address `last` cannot parse is an error of that method, so with nothing
+/// after it the load fails with "could not resolve" (not "no method found").
+#[test]
+fn a_file_address_that_is_no_address_fails_last() {
+    let f = StateFile::new(&[&line("s1", "foo", 0, "nosuch.invalid")]);
+    let e = parse_str(&f.cfg("  server s1 nosuch.invalid:80 init-addr last\n")).expect_err("refused");
+    let alerts: Vec<&str> = e.alerts.iter().map(|(_, t)| t.as_str()).collect();
+    assert_eq!(alerts, ["{at} : 'server b/s1' : could not resolve address 'nosuch.invalid'.", "Failed to initialize server(s) addr."]);
+}
+
+/// Only a line that is applied gives its address: the first line of the server, with valid
+/// values, in a file whose every line has the right shape, of the backend's own file.
+#[test]
+fn only_an_applied_line_gives_its_address() {
+    let last = |lines: &[&str], extra: &str| {
+        let f = StateFile::new(lines);
+        let cfg = ok(&f.cfg(&format!("{extra}  server s1 nosuch.invalid:80 init-addr last,10.1.1.1\n")));
+        addr(&cfg, 0)
+    };
+    let good = line("s1", "10.0.0.7", 0, "nosuch.invalid");
+    assert_eq!(last(&[&good], ""), "10.0.0.7");
+    // The first line wins, also when it is the bad one.
+    assert_eq!(last(&[&good, &line("s1", "10.0.0.8", 0, "x")], ""), "10.0.0.7");
+    assert_eq!(last(&[&line("s1", "10.0.0.8", 9, "x"), &good], ""), "10.1.1.1");
+    // A bad value voids the line; a line of the wrong shape voids the file.
+    assert_eq!(last(&[&good.replace(" 50 ", " x ")], ""), "10.1.1.1");
+    assert_eq!(last(&[&good, "1 2 3"], ""), "10.1.1.1");
+    // Another backend's line, a file of another version, a missing file, no file read.
+    assert_eq!(last(&[&good.replace(" b ", " c ")], ""), "10.1.1.1");
+    let f = StateFile::new(&[&good]);
+    std::fs::write(f.dir.join("st"), format!("2\n{good}\n")).expect("write");
+    assert_eq!(addr(&ok(&f.cfg("  server s1 nosuch.invalid:80 init-addr last,10.1.1.1\n")), 0), "10.1.1.1");
+    std::fs::remove_file(f.dir.join("st")).expect("rm");
+    assert_eq!(addr(&ok(&f.cfg("  server s1 nosuch.invalid:80 init-addr last,10.1.1.1\n")), 0), "10.1.1.1");
+    assert_eq!(last(&[&good], "  load-server-state-from-file none\n"), "10.1.1.1");
+    // A local file: `<base>/<backend>`, its lines naming the backend.
+    let f = StateFile::new(&[&good]);
+    std::fs::rename(f.dir.join("st"), f.dir.join("b")).expect("rename");
+    let local = f.cfg("  load-server-state-from-file local\n  server s1 nosuch.invalid:80 init-addr last,10.1.1.1\n");
+    let local = local.replace("server-state-file ", &format!("server-state-base {}\n  server-state-file ", f.dir.display()));
+    assert_eq!(addr(&ok(&local), 0), "10.0.0.7");
+    std::fs::write(f.dir.join("b"), format!("1\n{}\n", good.replace(" b ", " c "))).expect("write");
+    assert_eq!(addr(&ok(&local), 0), "10.1.1.1");
+    std::fs::remove_file(f.dir.join("b")).expect("rm");
+    assert_eq!(addr(&ok(&local), 0), "10.1.1.1");
+}
+
+/// `srv_fqdn` with `SRV_ADMF_FQDN_CHANGED` (64): `HAProxy` keeps the flag when the file's
+/// name differs from the configuration's, and resolves the file's name when the server has
+/// `resolvers` (`srv_set_fqdn` needs them); the same name or no flag: nothing. Measured:
+/// `localhost` + file `other.invalid` 64 -> `localhost`, admin 64; file `localhost` 64 ->
+/// admin 0; with `resolvers r`, `a1.test` + file `a2.test` 64 -> `a2.test` (resolved).
+#[test]
+fn a_changed_fqdn_is_kept_with_resolvers() {
+    let f = StateFile::new(&[
+        &line("s1", "10.0.0.7", 64, "other.invalid"),
+        &line("s2", "10.0.0.7", 0, "other.invalid"),
+        &line("s3", "10.0.0.7", 64, "localhost"),
+        &line("s4", "10.0.0.7", 64, "a2.test"),
+    ]);
+    let cfg = ok(&f.cfg(
+        "  server s1 localhost:80\n  server s2 localhost:80\n  server s3 localhost:80\n  server s4 a1.test:80 resolvers r\n",
+    ));
+    let names: Vec<(&str, bool)> = cfg.backends[0].server_extras.names.iter().map(|n| (&*n.fqdn, n.fqdn_changed)).collect();
+    assert_eq!(names, [("localhost", true), ("localhost", false), ("localhost", false), ("a2.test", true)]);
+    assert_eq!(addr(&cfg, 3), "10.0.0.7");
+}

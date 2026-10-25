@@ -242,6 +242,8 @@ pub(crate) fn parse_server(
             unresolved: false,
             resolvers,
             resolve,
+            last_addr: None,
+            fqdn_changed: false,
         });
     }
     servers.push(Server {
@@ -293,11 +295,7 @@ fn parse_init_addr(tokens: &[Token], i: usize, who: Option<&str>) -> Result<crat
         let m = match p {
             "libc" => M::Libc,
             "none" => M::None,
-            "last" => {
-                return Err(fail(
-                    "method 'last' is not supported: Ibex has no 'server-state-file' to read the last address from yet (T490); use 'libc', 'none' or an address".to_string(),
-                ))
-            }
+            "last" => M::Last,
             _ => match p.parse::<std::net::IpAddr>() {
                 Ok(ip) => {
                     if out.ip.is_some() {

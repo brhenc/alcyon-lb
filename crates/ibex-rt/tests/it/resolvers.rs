@@ -697,3 +697,29 @@ fn a_layer4_timeout_triggers_a_resolution_after_hold_valid() {
     assert_eq!(run("10s"), 1);
     assert!(run("100ms") >= 3, "the timeouts asked for no resolution");
 }
+
+/// T490: a reload keeps the address the resolver gave. The old process's `show servers
+/// state` is the new one's server-state file; the server's default `init-addr` is
+/// `last,libc,none`, so it starts on the old address, up, instead of in maintenance until
+/// the first answer, and moves when an answer differs. `HAProxy` 3.5-dev8, same file:
+/// `10.0.0.9 2 0` at start with the nameserver silent or answering NX (held), and
+/// `b/s1: IP changed from '10.0.0.9' to '10.0.0.2' by 'r/ns1'.` once it answers 10.0.0.2.
+#[test]
+fn a_reload_keeps_the_resolved_address() {
+    let dns = FakeDns::start();
+    let servers = "  server s1 a1.test:80 resolvers r\n";
+    let old = start(dns.addr, "", servers, "");
+    old.wait_state("s1", "10.0.0.1 2 0", 3);
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let file = dir.path().join("state");
+    std::fs::write(&file, old.cli("show servers state")).expect("write the state file");
+    drop(old);
+    dns.set("a1.test", Zone::Silent);
+    let global = format!("  server-state-file {}\n", file.display());
+    let new = start(dns.addr, "", &format!("  load-server-state-from-file global\n{servers}"), &global);
+    assert_eq!(new.state("s1"), ("10.0.0.1 2 0".to_string(), "a1.test".to_string()));
+    assert!(!new.stderr().iter().any(|l| l.contains("could not resolve")), "{:?}", new.stderr());
+    dns.set("a1.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 2)]));
+    new.wait_state("s1", "10.0.0.2 2 0", 5);
+    new.wait_log("l/s1: IP changed from '10.0.0.1' to '10.0.0.2' by 'r/ns1'.", 2);
+}

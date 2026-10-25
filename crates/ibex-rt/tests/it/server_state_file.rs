@@ -560,7 +560,7 @@ fn show_servers_state_columns_match_haproxy() {
 /// A drain on a stopped server, a `disabled` server with a check that the file had enabled,
 /// and the columns Ibex cannot apply. `HAProxy` (same file): s1 `0 8 1 1 0 0` DOWN, s2 `2 4`
 /// UP, s3 "partially applied ..., health checks are not enabled on this server" (no check),
-/// s4 the check port 19805 applied. Ibex has no `set server check-port`, no agent checks and
+/// s4 the check port 19805 applied (T490 part 2: Ibex too). Ibex has no agent checks and
 /// no `set server ssl`, so it keeps the configuration's and says so (texts in Ibex's words
 /// but the two `HAProxy` has).
 #[test]
@@ -586,6 +586,7 @@ fn columns_ibex_cannot_apply_are_named() {
     assert_eq!(&rows[1..], ["b/s2 2 4 1 1 4 6", "b/s3 2 0 1 1 4 0", "b/s4 2 0 1 1 4 6", "b/s5 2 0 1 1 4 0", "b/s6 2 0 1 1 4 0"]);
     let st = run.statuses();
     assert_eq!((st[0].as_str(), st[1].as_str()), ("b/s1 DOWN 1", "b/s2 UP 1"));
+    assert_eq!((run.field("b", "s4", 21).as_str(), run.field("b", "s4", 24).as_str()), ("19805", "0"));
     assert_eq!(
         run.messages(),
         [
@@ -593,7 +594,6 @@ fn columns_ibex_cannot_apply_are_named() {
             "WARNING Server b/s1 is DOWN, changed from server-state after a reload. 4 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.",
             "WARNING Server b/s2 is UP/READY (leaving forced maintenance).",
             "WARNING server-state partially applied for server 'b/s3', health checks are not enabled on this server",
-            "WARNING server-state partially applied for server 'b/s4', srv_check_port/srv_check_addr are not applied: Ibex has no 'set server check-port/check-addr'",
             "WARNING server-state partially applied for server 'b/s5', srv_use_ssl 0 is not applied: Ibex has no 'set server ssl'",
             "WARNING server-state partially applied for server 'b/s6', agent checks are not enabled on this server",
         ]
@@ -618,5 +618,104 @@ fn an_unreadable_file_is_a_warning() {
     assert_eq!(
         run.messages(),
         [format!("WARNING config: Can't open global server state file '{}': Permission denied", path.display())]
+    );
+}
+
+/// `init-addr last` (T490 part 2): a server written as a name takes the file's `srv_addr`
+/// (`srv->lastaddr`), and the traffic goes there; the default `last,libc` does the same.
+/// `HAProxy` 3.5-dev8, same file: s1 `127.0.0.1` port `{live}` answers, s2 `10.0.0.8` (its
+/// name does not resolve: `last` first), s3 `- 0 32` (no address in the file, `none`: in
+/// maintenance whatever the file's state, `SRV_ADMF_RMAINT` being set after the file).
+#[test]
+fn init_addr_last_sends_the_traffic_to_the_files_address() {
+    let cfg = format!(
+        "global\n  stats socket {{sock}} mode 600 level admin\n  server-state-file {{dir}}/st\n{DEFAULTS}{LOAD_GLOBAL}\
+         frontend f\n  bind {{fe}}\n  default_backend b\nbackend b\n  server s1 nosuch.invalid:{{dead}} init-addr last\n\
+         backend c\n  server s2 nosuch.invalid:80\n  server s3 nosuch.invalid:80 init-addr last,none\n"
+    );
+    let file = state(&[
+        "3 b 1 s1 127.0.0.1 2 0 1 1 100 1 0 0 0 0 0 0 nosuch.invalid {live} - 0 0 - - 0",
+        "4 c 1 s2 10.0.0.8 2 0 1 1 100 1 0 0 0 0 0 0 nosuch.invalid 80 - 0 0 - - 0",
+        "4 c 2 s3 - 2 0 1 1 100 1 0 0 0 0 0 0 nosuch.invalid 80 - 0 0 - - 0",
+    ]);
+    let run = Run::start(&cfg, &[("st", &file)]);
+    assert_eq!(run.get(), "live");
+    assert_eq!((run.field("b", "s1", 4).as_str(), run.field("b", "s1", 17).as_str()), ("127.0.0.1", "nosuch.invalid"));
+    assert_eq!(run.field("c", "s2", 4), "10.0.0.8");
+    assert_eq!([4, 5, 6].map(|n| run.field("c", "s3", n)).join(" "), "- 0 32");
+    assert_eq!(run.statuses()[2], "c/s3 MAINT (resolution) 1");
+    assert_eq!(run.messages(), Vec::<String>::new());
+}
+
+/// `srv_fqdn` set from the CLI before the reload (`SRV_ADMF_FQDN_CHANGED`, 64): `HAProxy`
+/// keeps the flag in `srv_admin_state` when the file's name differs from the
+/// configuration's, and with `resolvers` the server takes the file's name. Measured: s1 (no
+/// resolvers) `localhost` admin 64, s2 (the same name) admin 0, s3 (`resolvers`) `a2.test`
+/// admin 64, its address the file's until the resolver answers (here never: the
+/// nameserver is a dead port).
+#[test]
+fn a_changed_fqdn_is_restored() {
+    let cfg = format!(
+        "global\n  stats socket {{sock}} mode 600 level admin\n  server-state-file {{dir}}/st\nresolvers r\n  nameserver ns1 127.0.0.1:{{dead}}\n\
+         {DEFAULTS}{LOAD_GLOBAL}frontend f\n  bind {{fe}}\n  default_backend b\nbackend b\n\
+         \x20 server s1 localhost:{{live}}\n  server s2 localhost:{{live}}\n  server s3 a1.test:{{live}} resolvers r\n"
+    );
+    let file = state(&[
+        "3 b 1 s1 127.0.0.1 2 64 1 1 100 1 0 0 0 0 0 0 other.invalid {live} - 0 0 - - 0",
+        "3 b 2 s2 127.0.0.1 2 64 1 1 100 1 0 0 0 0 0 0 localhost {live} - 0 0 - - 0",
+        "3 b 3 s3 10.0.0.9 2 64 1 1 100 1 0 0 0 0 0 0 a2.test {live} - 0 0 - - 0",
+    ]);
+    let run = Run::start(&cfg, &[("st", &file)]);
+    let col = |sv: &str| [4, 6, 17].map(|n| run.field("b", sv, n)).join(" ");
+    assert_eq!([col("s1"), col("s2"), col("s3")], ["127.0.0.1 64 localhost", "127.0.0.1 0 localhost", "10.0.0.9 64 a2.test"]);
+}
+
+/// `srv_check_port` (`check.port`) and `srv_agent_port`: the `port` keyword sets both (on a
+/// server with or without `check`, from `default-server` too); the file's check port is
+/// applied to a server whose checks are enabled, and its checks then connect there.
+/// `HAProxy` 3.5-dev8: `check port 81` -> `81 - - 81`, `port 82` -> `82 - - 82`,
+/// `default-server port 85` -> `85 - - 85`, `check` alone -> `0 - - 0`; a file check port 86
+/// on a `check` server -> `86 - - 0`, `x` and 99999999999 -> "provided port is not an
+/// integer", 70000 -> "provided port is invalid". A check address (s7) `HAProxy` applies; Ibex
+/// refuses `addr` and says it does not.
+#[test]
+fn the_check_port_is_shown_and_restored() {
+    let cfg = format!(
+        "global\n  stats socket {{sock}} mode 600 level admin\n  server-state-file {{dir}}/st\n{DEFAULTS}{LOAD_GLOBAL}\
+         frontend f\n  bind {{fe}}\n  default_backend b\nbackend b\n\
+         \x20 server s1 127.0.0.1:{{live}} check port 81 inter 30s\n  server s2 127.0.0.1:{{live}} check inter 100ms fall 1\n\
+         \x20 server s3 127.0.0.1:{{live}} port 82\n  server s4 127.0.0.1:{{live}} check inter 30s\n  server s5 127.0.0.1:{{live}} check inter 30s\n\
+         \x20 server s6 127.0.0.1:{{live}} check inter 30s\n  server s7 127.0.0.1:{{live}} check inter 30s\n\
+         backend c\n  default-server port 85\n  server x1 127.0.0.1:{{live}}\n"
+    );
+    let file = state(&[
+        "3 b 2 s2 127.0.0.1 2 0 1 1 100 1 0 0 6 0 0 0 - {live} - 0 {dead} - - 0",
+        "3 b 4 s4 127.0.0.1 2 0 1 1 100 1 0 0 6 0 0 0 - {live} - 0 x - - 0",
+        "3 b 5 s5 127.0.0.1 2 0 1 1 100 1 0 0 6 0 0 0 - {live} - 0 70000 - - 0",
+        "3 b 6 s6 127.0.0.1 2 0 1 1 100 1 0 0 6 0 0 0 - {live} - 0 99999999999 - - 0",
+        "3 b 7 s7 127.0.0.1 2 0 1 1 100 1 0 0 6 0 0 0 - {live} - 0 0 127.0.0.3 - 0",
+    ]);
+    let run = Run::start(&cfg, &[("st", &file)]);
+    let ports = |px: &str, sv: &str| [21, 22, 23, 24].map(|n| run.field(px, sv, n)).join(" ");
+    let dead = run.field("b", "s2", 21);
+    assert_ne!(dead, "0");
+    assert_eq!(
+        [ports("b", "s1"), ports("b", "s2"), ports("b", "s3"), ports("b", "s4"), ports("c", "x1")],
+        ["81 - - 81".to_string(), format!("{dead} - - 0"), "82 - - 82".into(), "0 - - 0".into(), "85 - - 85".into()]
+    );
+    // s2's checks go to the file's port, where nothing listens.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !run.statuses().iter().any(|s| s.starts_with("b/s2 DOWN")) {
+        assert!(std::time::Instant::now() < deadline, "b/s2 never went DOWN: {:?}", run.statuses());
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        run.messages(),
+        [
+            "WARNING server-state partially applied for server 'b/s4', provided port is not an integer",
+            "WARNING server-state partially applied for server 'b/s5', provided port is invalid",
+            "WARNING server-state partially applied for server 'b/s6', provided port is not an integer",
+            "WARNING server-state partially applied for server 'b/s7', srv_check_addr is not applied: Ibex refuses the server keyword 'addr'",
+        ]
     );
 }

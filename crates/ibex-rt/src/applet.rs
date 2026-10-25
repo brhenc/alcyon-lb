@@ -615,6 +615,11 @@ impl CliApplet {
                     } | if p.server_cmaint(s_idx) { 4 } else { 0 };
                     // No address: SRV_ADMF_RMAINT (32) is the maintenance, not the operator's.
                     let admin_state = if rmaint { (admin_state & !1) | 32 } else { admin_state };
+                    let admin_state = admin_state | if p.server_fqdn_changed(s_idx) { 64 } else { 0 };
+                    // `check.port` (the file may have changed it), and `agent.port`, which the
+                    // `port` keyword sets too.
+                    let agent_port = p.server_check_port(s_idx);
+                    let mut check_port = agent_port;
                     let uweight = p.server_weights.get(s_idx).unwrap_or(1);
                     let iweight = p.initial_weight(s_idx);
                     
@@ -625,6 +630,7 @@ impl CliApplet {
                     
                     if let Some(check) = ctx.checks.iter().find(|c| c.proxy() == p_idx && c.server() == s_idx) {
                         check_health = check.health;
+                        check_port = check.config.check_port.unwrap_or(0);
                         check_state = 2; // CHK_ST_CONFIGURED
                         if check.enabled {
                             check_state |= 4; // CHK_ST_ENABLED
@@ -655,9 +661,9 @@ impl CliApplet {
                     let srv_forced = u8::from(p.server_forced_id(s_idx));
                     self.out_buf.extend_from_slice(
                         format!(
-                            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} 0 {} {} {} {} - {} 0 - - 0\n",
+                            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} 0 {} {} {} {} - {} {} - - {}\n",
                             p.ids.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, lastchg, check_status, check_result, check_health, check_state, bk_forced, srv_forced,
-                            p.server_fqdn(s_idx).unwrap_or("-"), port, use_ssl
+                            p.server_fqdn(s_idx).unwrap_or("-"), port, use_ssl, check_port, agent_port
                         ).as_bytes()
                     );
                 }

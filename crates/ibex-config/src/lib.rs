@@ -18,6 +18,7 @@ pub mod error;
 pub mod lexer;
 pub mod preproc;
 pub mod parser;
+pub mod server_state_file;
 
 use std::fs;
 use std::path::Path;
