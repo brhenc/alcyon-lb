@@ -36,14 +36,6 @@ impl Families {
     pub const IPV4: Self = Self { ipv4: true, ipv6: false };
     pub const IPV6: Self = Self { ipv4: false, ipv6: true };
     pub const BOTH: Self = Self { ipv4: true, ipv6: true };
-
-    #[must_use]
-    pub fn accepts(self, f: Family) -> bool {
-        match f {
-            Family::Ipv4 => self.ipv4,
-            Family::Ipv6 => self.ipv6,
-        }
-    }
 }
 
 /// What a resolution asks for.
