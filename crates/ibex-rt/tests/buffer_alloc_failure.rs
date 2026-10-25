@@ -542,6 +542,61 @@ fn a_response_cut_short_by_a_buffer_that_cannot_be_had_closes_the_connection() {
     assert!(after.starts_with("HTTP/1.1 200") && after.ends_with("abcd"), "after: {after:?}");
 }
 
+/// An HTTP/2 stream whose response has begun when the next buffer for it cannot be had is reset
+/// `INTERNAL_ERROR` (a `500` can no longer be sent) and its connection goes on: the next stream on
+/// it is served (T464). `HAProxy` cannot be driven to this case with `-dMfail`: its refusals are
+/// random, and the one that lands after the HEADERS cannot be aimed.
+#[test]
+fn an_h2_response_cut_short_by_a_buffer_that_cannot_be_had_resets_its_stream_only() {
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let srv = split_backend();
+    let (mut engine, addr) = engine_with("", &format!("  default_backend b\nbackend b\n  server s1 {srv}\n"));
+    let mut sock = h2_connect(addr);
+    sock.write_all(&h2_get(1)).expect("HEADERS 1");
+    let (mut rx, mut buf) = (Vec::new(), [0u8; 4096]);
+    let (mut refused, mut rst) = (false, None);
+    let start = Instant::now();
+    while rst.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(3), "no RST_STREAM on stream 1 (refused: {refused}, left {})", refusals_left());
+        let _ = engine.run_once();
+        match sock.read(&mut buf) {
+            Ok(0) => panic!("the connection was closed (refused: {refused})"),
+            Ok(n) => rx.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("read: {e}"),
+        }
+        while rx.len() >= 9 {
+            let len = (usize::from(rx[0]) << 16) | (usize::from(rx[1]) << 8) | usize::from(rx[2]);
+            if rx.len() < 9 + len {
+                break;
+            }
+            let sid = u32::from_be_bytes([rx[5], rx[6], rx[7], rx[8]]) & 0x7fff_ffff;
+            match rx[3] {
+                0x4 if rx[4] & 1 == 0 => sock.write_all(b"\x00\x00\x00\x04\x01\x00\x00\x00\x00").expect("SETTINGS ACK"),
+                0x0 if sid == 1 && !refused => {
+                    // The response has begun and its first bytes are out, its buffer given back;
+                    // the buffer for the rest is refused (after the stream has let its own go).
+                    for _ in 0..2 {
+                        let _ = engine.run_once();
+                    }
+                    ibex_alloc::drain_local_pools();
+                    refuse_allocs_of(BUFSIZE, 0, 2);
+                    refused = true;
+                }
+                0x3 if sid == 1 => rst = Some(u32::from_be_bytes([rx[9], rx[10], rx[11], rx[12]])),
+                _ => {}
+            }
+            rx.drain(..9 + len);
+        }
+    }
+    let left = refusals_left();
+    refuse_allocs_of(BUFSIZE, 0, 0);
+    assert_eq!(left, 0, "the buffer for the rest was asked for");
+    assert_eq!(rst, Some(2), "RST_STREAM INTERNAL_ERROR on stream 1");
+    sock.write_all(&h2_get(3)).expect("HEADERS 3");
+    assert_eq!(h2_status(&mut engine, &mut sock, 3), Some(0x88), "the next stream, same connection");
+}
+
 /// The request's target cannot be copied into the session (`ReqText::set`, where T446's run
 /// under `RLIMIT_DATA` aborted once the buffers were fallible): that stream is answered `500`.
 #[test]
