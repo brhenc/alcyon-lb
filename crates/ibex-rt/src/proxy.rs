@@ -810,6 +810,12 @@ pub struct TcpSession {
     pub h2_ctx: Option<Box<H2MuxContext>>,
     /// The first GOAWAY of an HTTP/2 `timeout client` has gone: the next expiry closes.
     pub h2_idle_goaway: bool,
+    /// The 400 for a stalled upload went out and the transaction is over, but the connection
+    /// is held for one more `timeout client` (T501): what the client sends is dropped and
+    /// restarts the wait, its FIN or the timeout closes.
+    pub cli_linger: bool,
+    /// The bind is `proto h2`: the connection is the h2 mux's from the first byte.
+    pub proto_h2: bool,
     /// `idle_start` of an HTTP/2 connection (`struct h2c`): when it last went idle (no
     /// stream, nothing to send), or when the request now being received began. The idle
     /// timeouts count from here, not from the last byte.
@@ -1355,6 +1361,8 @@ impl TcpSession {
             stick_stores: Vec::new(),
             h2_ctx: None,
             h2_idle_goaway: false,
+            cli_linger: false,
+            proto_h2: false,
             h2_idle_start: now,
             h2_out_waited: false,
             h2_head_partial: false,
@@ -2393,7 +2401,7 @@ impl TcpSession {
     /// connection is `HAProxy`'s h2 mux's, waiting for the preface, not an HTTP/1 one.
     #[must_use]
     pub fn h2_preface_pending(&self) -> bool {
-        self.h2_ctx.is_none() && self.cli_xprt.alpn() == Some(b"h2".as_slice())
+        self.h2_ctx.is_none() && (self.proto_h2 || self.cli_xprt.alpn() == Some(b"h2".as_slice()))
     }
 
     /// The client connection failed: it is closed, as one the client reset.
@@ -2584,6 +2592,10 @@ impl TcpSession {
                         self.ending.get_or_insert(Ending::ClientAbort);
                         changed = true;
                     }
+                    Io::Done(n) if n > 0 && self.cli_linger => {
+                        self.bytes_in += n as u64;
+                        changed = true;
+                    }
                     Io::Done(n) if n > 0 => {
                         self.req.commit(n);
                         self.rewrite_req_chunk_framing();
@@ -2609,6 +2621,7 @@ impl TcpSession {
                 let _ = MuxH2.parse(&mut h2, &to_parse).map_err(|_| h2.ensure_goaway());
                 self.req.clear();
                 self.h2_ctx = Some(Box::new(h2));
+                self.h2_idle_goaway = false;
                 changed = true;
             } else if self.h2_preface_pending() && !self.req.is_empty() && !H2_CONN_PREFACE.starts_with(self.req.readable()) {
                 // ALPN `h2` and not the preface: `HAProxy`'s h2 mux fails the connection
@@ -3421,6 +3434,15 @@ impl TcpSession {
                     self.ending.get_or_insert(Ending::Timeout(Which::Client));
                     return true;
                 }
+                // An h2 mux still waiting for the preface times out silently once, and closes
+                // at the end of the next `timeout client` (measured on HAProxy 3.5-dev8: no
+                // byte at T, close at 2T; T501, VV-5).
+                if self.h2_preface_pending() && !self.h2_idle_goaway {
+                    self.h2_idle_goaway = true;
+                    self.cli_exp = Tick::ETERNITY;
+                    self.arm_client(now);
+                    return false;
+                }
                 self.cli_state = ScState::Error;
                 self.ending.get_or_insert(Ending::Timeout(Which::Client));
                 return true;
@@ -3446,7 +3468,7 @@ impl TcpSession {
     fn expire_request(&mut self) -> bool {
         self.req_exp = Tick::ETERNITY;
         // Armed before the connection was known to be HTTP/2: its waits are its own now.
-        if self.h2_ctx.is_some() {
+        if self.h2_ctx.is_some() || self.h2_preface_pending() {
             return false;
         }
         let live = (self.head_pending() || self.idle_wait()) && self.cli_timer_live();
@@ -3494,7 +3516,20 @@ impl TcpSession {
         let head_only = self.mode == Mode::Http
             && self.txn.as_ref().is_some_and(|t| matches!(t.req, txn::MsgState::Head { body: txn::Framing::None, .. }) && !t.local && t.error.is_none())
             && !self.has_pending_output();
-        let awaiting_server = awaiting_server || head_only;
+        // So is one whose `Content-Length` body is all in the buffer, only waiting for the
+        // server connection to forward it (T501; HAProxy: a complete POST to an unreachable
+        // server is `sC--` at the connect timeout, not `cC--` at the client's).
+        let body_buffered = self.mode == Mode::Http
+            && !self.has_pending_output()
+            && self.txn.as_ref().is_some_and(|t| {
+                if t.local || t.error.is_some() {
+                    return false;
+                }
+                let txn::MsgState::Head { body: txn::Framing::Length(n), .. } = t.req else { return false };
+                let data = self.req.readable();
+                find_eoh(data).is_some_and(|(h, e)| (data.len() - (h + e)) as u64 >= n)
+            });
+        let awaiting_server = awaiting_server || head_only || body_buffered;
         // So is the turnaround before a retry (`SC_ST_TAR`).
         !awaiting_server
             && !self.retry_after.is_set()

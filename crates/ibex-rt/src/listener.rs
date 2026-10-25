@@ -52,6 +52,8 @@ pub struct Listener {
     pub accept_proxy: bool,
     /// `accept-proxy-v2`: the header must be v2.
     pub accept_proxy_v2: bool,
+    /// `bind ... proto h2`: connections start as HTTP/2 (the preface is expected).
+    pub proto_h2: bool,
     /// The `listen()` backlog of the bind ([`listener_backlog`]), for the `listen()` that
     /// resumes a paused listener ([`Listener::resume`]).
     pub backlog: i32,
@@ -160,6 +162,7 @@ impl Listener {
             name: None,
             accept_proxy: false,
             accept_proxy_v2: false,
+            proto_h2: false,
             luid: 0,
             backlog,
         })
@@ -214,6 +217,7 @@ impl Listener {
             name: None,
             accept_proxy: false,
             accept_proxy_v2: false,
+            proto_h2: false,
             luid: 0,
             backlog: 1024,
         })
