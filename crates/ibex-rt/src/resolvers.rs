@@ -19,14 +19,15 @@
 //! `Proxy::server_statuses`, and `SRV_ADMF_RMAINT` in `Proxy::server_rmaint`.
 
 use std::collections::HashMap;
-use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 use ibex_config::ast::ResolveOpts;
 use ibex_config::LogLevel;
-use ibex_dns::{Answer, DnsError, Families, Family, Protocol, QueryId, Question, Rdata, Requester};
+use ibex_dns::{Answer, DnsError, Families, Family, NsTransport, Protocol, QueryId, Question, Rdata, Requester};
 
 use crate::check::{ServerCheckState, ServerStatus, DRAIN_DOWN};
 use crate::engine::Proxy;
@@ -111,9 +112,9 @@ const C_OTHER: usize = 10;
 const C_INVALID: usize = 11;
 const C_TOO_BIG: usize = 12;
 const C_TRUNCATED: usize = 13;
+const C_TCP_FALLBACK: usize = 14;
 const C_OUTDATED: usize = 15;
-// `cname` and `timeout` are never counted by HAProxy either (A.t5: `timeout 0` after a timeout);
-// `tcp_fallback` waits for T488.
+// `cname` and `timeout` are never counted by HAProxy either (A.t5: `timeout 0` after a timeout).
 
 /// One `resolvers` section's nameservers and their counters, as `show resolvers` and the
 /// exporter read them.
@@ -282,10 +283,36 @@ pub struct Resolution {
     status: Status,
 }
 
+/// A nameserver's TCP connection (`dns_stream_*`, `dns.c`): opened by the first query that
+/// needs it, closed after [`TCP_IDLE`] without one or at the first error.
+struct TcpConn {
+    stream: TcpStream,
+    /// The connect finished.
+    up: bool,
+    /// Framed queries not written yet.
+    out: Vec<u8>,
+    /// Bytes read, a partial reply at the end.
+    inb: Vec<u8>,
+    /// Queries sent and not answered (`DNS_STREAM_MAX_PIPELINED_REQ` at most).
+    pending: usize,
+    /// The last query sent or reply read.
+    last_use: Instant,
+}
+
+/// `DNS_STREAM_MAX_PIPELINED_REQ`.
+const TCP_PIPELINED: usize = 4;
+/// `tcp_idle` of the stream server (doc §5.3.2): the connection is closed after this.
+const TCP_IDLE: Duration = Duration::from_secs(5);
+
 struct Nameserver {
     name: Box<str>,
     addr: SocketAddr,
-    sock: UdpSocket,
+    transport: NsTransport,
+    /// None for `tcp@`: nothing is sent or read over UDP.
+    sock: Option<UdpSocket>,
+    tcp: Option<TcpConn>,
+    /// Queries waiting for the connection or for a free slot among the pipelined ones.
+    queue: VecDeque<Vec<u8>>,
     /// `ns->counters`, in the order of [`COUNTERS`]; this worker alone writes them.
     counts: [u64; 16],
 }
@@ -305,6 +332,8 @@ struct Holds {
 pub struct Section {
     name: Box<str>,
     pub task: ibex_sched::task::TaskRef,
+    /// The index in the engine's list: the `FdState::Resolver` of its descriptors.
+    idx: u32,
     nameservers: Vec<Nameserver>,
     dns: ibex_dns::Resolver,
     holds: Holds,
@@ -440,6 +469,18 @@ pub fn build(
     Ok(out)
 }
 
+/// A non-blocking connect to a nameserver: the result is known when the socket is writable.
+fn tcp_open(addr: SocketAddr) -> io::Result<TcpStream> {
+    use rustix::net::{AddressFamily, SocketFlags, SocketType};
+    let family = if addr.is_ipv4() { AddressFamily::INET } else { AddressFamily::INET6 };
+    let fd = rustix::net::socket_with(family, SocketType::STREAM, SocketFlags::NONBLOCK | SocketFlags::CLOEXEC, None)?;
+    match rustix::net::connect(&fd, &addr) {
+        Ok(()) | Err(rustix::io::Errno::INPROGRESS) => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(TcpStream::from(fd))
+}
+
 fn usize_to_u32(v: usize) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
 }
@@ -455,14 +496,24 @@ impl Section {
     ) -> io::Result<Self> {
         let mut nameservers = Vec::with_capacity(cfg.nameservers.len());
         for ns in &cfg.nameservers {
-            let local: SocketAddr = if ns.addr.is_ipv4() { (Ipv4Addr::UNSPECIFIED, 0).into() } else { "[::]:0".parse().expect("addr") };
-            let sock = UdpSocket::bind(local)?;
-            sock.connect(ns.addr)?;
-            sock.set_nonblocking(true)?;
-            let fd = sock.as_raw_fd();
-            fdtab.insert(fd, crate::fdtab::FdState::Resolver { section: idx }, crate::fdtab::Interest::READ);
-            poller.add(std::os::fd::AsFd::as_fd(&sock), u64::try_from(fd).unwrap_or(0), true, false)?;
-            nameservers.push(Nameserver { name: ns.name.as_str().into(), addr: ns.addr, sock, counts: [0; 16] });
+            let transport = match ns.transport {
+                ibex_config::ast::NsTransport::Default => NsTransport::Auto,
+                ibex_config::ast::NsTransport::Udp => NsTransport::Udp,
+                ibex_config::ast::NsTransport::Tcp => NsTransport::Tcp,
+            };
+            let sock = if transport == NsTransport::Tcp {
+                None
+            } else {
+                let local: SocketAddr = if ns.addr.is_ipv4() { (Ipv4Addr::UNSPECIFIED, 0).into() } else { "[::]:0".parse().expect("addr") };
+                let sock = UdpSocket::bind(local)?;
+                sock.connect(ns.addr)?;
+                sock.set_nonblocking(true)?;
+                let fd = sock.as_raw_fd();
+                fdtab.insert(fd, crate::fdtab::FdState::Resolver { section: idx }, crate::fdtab::Interest::READ);
+                poller.add(std::os::fd::AsFd::as_fd(&sock), u64::try_from(fd).unwrap_or(0), true, false)?;
+                Some(sock)
+            };
+            nameservers.push(Nameserver { name: ns.name.as_str().into(), addr: ns.addr, transport, sock, tcp: None, queue: VecDeque::new(), counts: [0; 16] });
         }
         let h = &cfg.hold;
         let dns = ibex_dns::Resolver::new(ibex_dns::ResolverConfig {
@@ -479,8 +530,8 @@ impl Section {
             accepted_payload_size: cfg.accepted_payload_size,
             // The crate's ids: SipHash under the OS-seeded keys of the standard library, not
             // the load balancer's xorshift, whose seed is the clock.
-            // No TCP until T488: a truncated answer is an error (`Other`).
-            tcp_fallback: false,
+            tcp_fallback: true,
+            transports: nameservers.iter().map(|n| n.transport).collect(),
             ..ibex_dns::ResolverConfig::default()
         });
         let task = scheduler.create(ibex_sched::task::WorkKind::new(ibex_sched::task::Kind::Resolver, idx)).ok_or_else(|| io::Error::other("no task for a resolvers section"))?;
@@ -488,6 +539,7 @@ impl Section {
         Ok(Self {
             name: cfg.name.as_str().into(),
             task,
+            idx,
             nameservers,
             dns,
             holds: Holds {
@@ -508,12 +560,19 @@ impl Section {
 
     /// Runs the section: reads every datagram, starts the resolutions that are due, sends,
     /// and applies every result to its servers. Returns when it wants to run again.
-    pub fn step(&mut self, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) -> Duration {
+    pub fn step(
+        &mut self,
+        proxies: &[Proxy],
+        checks: &mut [ServerCheckState],
+        log: &mut LogFn<'_>,
+        fdtab: &mut crate::fdtab::FdTab,
+        poller: &crate::poller::Poller,
+    ) -> Duration {
         let now = Instant::now();
         // Replies: every nameserver's socket until it is empty.
         for ns_idx in 0..self.nameservers.len() {
-            loop {
-                let n = match self.nameservers[ns_idx].sock.recv(&mut self.buf) {
+            while let Some(sock) = &self.nameservers[ns_idx].sock {
+                let n = match sock.recv(&mut self.buf) {
                     Ok(n) => n,
                     // An ICMP unreachable is reported on the next read: the nameserver is
                     // silent, which the retry timer turns into a timeout (A.t7).
@@ -525,6 +584,7 @@ impl Section {
                 self.count(ns_idx, received_counter(got));
                 self.drain_results(now, Some(ns_idx), proxies, checks, log);
             }
+            self.tcp_service(ns_idx, now, proxies, checks, log, fdtab, poller);
         }
         // Resolutions due: one query each, to every nameserver (A.t2).
         let families = active_families(now);
@@ -543,17 +603,26 @@ impl Section {
         self.drain_results(now, None, proxies, checks, log);
         // Sends, and the retry timer (which may end resolutions in a timeout).
         while let Some((to, proto, bytes)) = self.dns.poll_transmit(now) {
-            if proto == Protocol::Udp {
-                if let Some(i) = self.nameservers.iter().position(|n| n.addr == to) {
-                    // A failed send is `snd_error`; the retry timer sends again. A full socket
-                    // buffer is neither (`dns.c:165`: HAProxy queues the datagram).
-                    match self.nameservers[i].sock.send(&bytes) {
-                        Ok(_) => self.count(i, C_SENT),
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                        Err(_) => self.count(i, C_SND_ERROR),
-                    }
+            let Some(i) = self.nameservers.iter().position(|n| n.addr == to) else { continue };
+            if proto == Protocol::Tcp {
+                // A.t9: on a nameserver that also speaks UDP, a TCP query is the fallback
+                // (`resolv_send_tcp_fallback`).
+                if self.nameservers[i].transport == NsTransport::Auto {
+                    self.count(i, C_TCP_FALLBACK);
+                }
+                self.nameservers[i].queue.push_back(bytes);
+            } else if let Some(sock) = &self.nameservers[i].sock {
+                // A failed send is `snd_error`; the retry timer sends again. A full socket
+                // buffer is neither (`dns.c:165`: HAProxy queues the datagram).
+                match sock.send(&bytes) {
+                    Ok(_) => self.count(i, C_SENT),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => self.count(i, C_SND_ERROR),
                 }
             }
+        }
+        for i in 0..self.nameservers.len() {
+            self.tcp_service(i, now, proxies, checks, log, fdtab, poller);
         }
         self.drain_results(now, None, proxies, checks, log);
         self.publish();
@@ -563,6 +632,7 @@ impl Section {
             .filter(|r| r.in_flight.is_none())
             .map(|r| r.next_at)
             .chain(self.dns.poll_timeout())
+            .chain(self.nameservers.iter().filter_map(|n| n.tcp.as_ref().filter(|c| c.up && c.pending == 0).map(|c| c.last_use + TCP_IDLE)))
             .min()
             .unwrap_or(now + self.holds.timeout_resolve);
         next.saturating_duration_since(Instant::now())
@@ -584,6 +654,138 @@ impl Section {
             }
         }
         due
+    }
+
+    /// Closes nameserver `i`'s TCP connection; the queries it carried are left to the retry
+    /// timer, as a silent nameserver's are.
+    fn tcp_close(&mut self, i: usize, fdtab: &mut crate::fdtab::FdTab, poller: &crate::poller::Poller) {
+        let ns = &mut self.nameservers[i];
+        if let Some(c) = ns.tcp.take() {
+            let _ = poller.delete(std::os::fd::AsFd::as_fd(&c.stream));
+            fdtab.remove(c.stream.as_raw_fd());
+        }
+    }
+
+    /// One nameserver's TCP connection: opens it for a queued query, frames and writes the
+    /// queries (four in flight at most), reads and applies the replies, closes it when idle
+    /// or broken. A query that cannot be sent is not an error: `HAProxy` counts it `sent`
+    /// and the resolution times out (measured with the port closed).
+    #[allow(clippy::too_many_arguments)]
+    fn tcp_service(
+        &mut self,
+        i: usize,
+        now: Instant,
+        proxies: &[Proxy],
+        checks: &mut [ServerCheckState],
+        log: &mut LogFn<'_>,
+        fdtab: &mut crate::fdtab::FdTab,
+        poller: &crate::poller::Poller,
+    ) {
+        if self.nameservers[i].tcp.is_none() {
+            if self.nameservers[i].queue.is_empty() {
+                return;
+            }
+            let Ok(stream) = tcp_open(self.nameservers[i].addr) else {
+                self.drop_queued(i);
+                return;
+            };
+            let fd = stream.as_raw_fd();
+            fdtab.insert(fd, crate::fdtab::FdState::Resolver { section: self.idx }, crate::fdtab::Interest::READ);
+            if poller.add(std::os::fd::AsFd::as_fd(&stream), u64::try_from(fd).unwrap_or(0), true, true).is_err() {
+                fdtab.remove(fd);
+                self.drop_queued(i);
+                return;
+            }
+            self.nameservers[i].tcp = Some(TcpConn { stream, up: false, out: Vec::new(), inb: Vec::new(), pending: 0, last_use: now });
+        }
+        let ns = &mut self.nameservers[i];
+        let Some(c) = ns.tcp.as_mut() else { return };
+        let mut broken = false;
+        if !c.up {
+            match c.stream.take_error() {
+                Ok(None) if c.stream.peer_addr().is_ok() => c.up = true,
+                Ok(None) => return,
+                _ => broken = true,
+            }
+        }
+        if !broken && c.up && c.pending == 0 && ns.queue.is_empty() && now >= c.last_use + TCP_IDLE {
+            broken = true;
+        }
+        let mut sent = 0;
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        if !broken && c.up {
+            while c.pending < TCP_PIPELINED {
+                let Some(q) = ns.queue.pop_front() else { break };
+                c.out.extend_from_slice(&u16::try_from(q.len()).unwrap_or(u16::MAX).to_be_bytes());
+                c.out.extend_from_slice(&q);
+                c.pending += 1;
+                c.last_use = now;
+                sent += 1;
+            }
+            while !c.out.is_empty() {
+                match c.stream.write(&c.out) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        c.out.drain(..n);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        broken = true;
+                        break;
+                    }
+                }
+            }
+            while !broken {
+                match c.stream.read(&mut self.buf) {
+                    Ok(0) => broken = true,
+                    Ok(n) => c.inb.extend_from_slice(&self.buf[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => broken = true,
+                }
+            }
+            // Whole replies (2-byte length, then the message) in the bytes read.
+            while c.inb.len() >= 2 {
+                let len = usize::from(u16::from_be_bytes([c.inb[0], c.inb[1]]));
+                if c.inb.len() < 2 + len {
+                    break;
+                }
+                frames.push(c.inb[2..2 + len].to_vec());
+                c.inb.drain(..2 + len);
+                c.pending = c.pending.saturating_sub(1);
+                c.last_use = now;
+            }
+        }
+        let more = !ns.queue.is_empty() && !broken;
+        for _ in 0..sent {
+            self.count(i, C_SENT);
+        }
+        let from = self.nameservers[i].addr;
+        for f in &frames {
+            let got = self.dns.handle_response(now, from, Protocol::Tcp, f);
+            self.count(i, received_counter(got));
+            self.drain_results(now, Some(i), proxies, checks, log);
+        }
+        if broken {
+            self.tcp_close(i, fdtab, poller);
+            // Queries that waited for a slot go with the connection (retry timer).
+            self.drop_queued(i);
+        } else if more && !frames.is_empty() {
+            // Replies freed slots: send what waited.
+            self.tcp_service(i, now, proxies, checks, log, fdtab, poller);
+        }
+    }
+
+    /// The queries waiting for a connection that is not coming are dropped; the retry timer
+    /// sends them again.
+    fn drop_queued(&mut self, i: usize) {
+        let n = self.nameservers[i].queue.len();
+        self.nameservers[i].queue.clear();
+        // `HAProxy` counts a query it queued as sent whether or not the connection came up.
+        for _ in 0..n {
+            self.count(i, C_SENT);
+        }
     }
 
     /// Applies the results the crate has. A valid answer read from `ns` names it in the log.

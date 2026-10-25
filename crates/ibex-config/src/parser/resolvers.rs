@@ -6,10 +6,10 @@
 //!
 //! Where it goes: `Config::resolvers`, which `ibex_rt::resolvers::build` reads for the
 //! sections a server names (T484). What Ibex cannot do yet is refused
-//! here: `parse-resolv-conf` (T489) and the `tcp@` / `udp@` nameservers (T488).
+//! here: `parse-resolv-conf` (T489) (T489).
 
 use super::{address, server_keywords, ConfigError, Duration, IpAddr, SocketAddr, Token};
-use crate::ast::{Nameserver, ResolversSection};
+use crate::ast::{Nameserver, NsTransport, ResolversSection};
 
 /// `invalid_char`: a name is letters, digits and `_ - . :`.
 fn invalid_char(name: &str) -> Option<char> {
@@ -154,6 +154,29 @@ fn warn_if_small(kw: &Token, what: &str, time: &str) {
     }
 }
 
+/// The transport and family (`4` or `6`) a `nameserver` address prefix names, and the rest.
+fn split_prefix(text: &str) -> (Option<NsTransport>, Option<u8>, &str) {
+    const PREFIXES: [(&str, NsTransport, Option<u8>); 11] = [
+        ("tcp@", NsTransport::Tcp, None),
+        ("tcp4@", NsTransport::Tcp, Some(4)),
+        ("tcp6@", NsTransport::Tcp, Some(6)),
+        ("stream+", NsTransport::Tcp, None),
+        ("udp@", NsTransport::Udp, None),
+        ("udp4@", NsTransport::Udp, Some(4)),
+        ("udp6@", NsTransport::Udp, Some(6)),
+        ("dgram+", NsTransport::Udp, None),
+        ("ipv4@", NsTransport::Default, Some(4)),
+        ("ipv6@", NsTransport::Default, Some(6)),
+        ("ip@", NsTransport::Default, None),
+    ];
+    for (p, t, f) in PREFIXES {
+        if let Some(rest) = text.strip_prefix(p) {
+            return (Some(t), f, rest);
+        }
+    }
+    (None, None, text)
+}
+
 fn parse_nameserver(r: &ResolversSection, tokens: &[Token], kw: &Token) -> Result<Nameserver, ConfigError> {
     let (name, text) = (arg(tokens, 1), arg(tokens, 2));
     if text.is_empty() {
@@ -166,16 +189,19 @@ fn parse_nameserver(r: &ResolversSection, tokens: &[Token], kw: &Token) -> Resul
         return Err(err(kw, format!("nameserver '{name}' has same name as another nameserver (declared at line {}).", other.line)));
     }
     let fail = |msg: String| err(kw, format!("'nameserver {name}' : {msg}"));
-    for prefix in ["tcp@", "udp@"] {
-        if text.starts_with(prefix) {
-            return Err(fail(format!("address prefix '{prefix}' is not supported yet: nameservers are queried over UDP with no TCP fallback until T488")));
+    // The prefix (`str2sa_range`): the transport and, for the `4`/`6` forms, the family.
+    let (transport, fam, rest) = split_prefix(text);
+    if transport.is_none() {
+        if let Some(at) = text.find('@') {
+            return Err(fail(format!("address prefix '{}' is not implemented", &text[..=at])));
         }
     }
-    if let Some(at) = text.find('@') {
-        return Err(fail(format!("address prefix '{}' is not implemented", &text[..=at])));
-    }
+    let transport = transport.unwrap_or_default();
+    let text_full = text;
+    let text = rest;
     // `str2sa_range(.., PA_O_RESOLVE | PA_O_PORT_MAND)`: the port is after the last colon,
     // or after the brackets of an IPv6 address.
+    let bracketed = text.strip_prefix('[').and_then(|rest| rest.split_once(']')).is_some();
     let (host, port) = match text.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
         Some((h, p)) => (h, p.strip_prefix(':')),
         None => match text.rfind(':') {
@@ -184,25 +210,29 @@ fn parse_nameserver(r: &ResolversSection, tokens: &[Token], kw: &Token) -> Resul
         },
     };
     let Some(port) = port.filter(|p| !p.is_empty()) else {
-        return Err(fail(format!("missing port specification in '{text}'")));
+        return Err(fail(format!("missing port specification in '{text_full}'")));
     };
     if port.starts_with('+') || port.starts_with('-') {
-        return Err(fail(format!("port offset not permitted here in '{text}'")));
+        return Err(fail(format!("port offset not permitted here in '{text_full}'")));
     }
     if port.contains('-') {
-        return Err(fail(format!("port range not permitted here in '{text}'")));
+        return Err(fail(format!("port range not permitted here in '{text_full}'")));
     }
     if let Some(c) = port.chars().find(|c| !c.is_ascii_digit()) {
-        return Err(fail(format!("invalid character '{c}' in port number '{port}' in '{text}'")));
+        return Err(fail(format!("invalid character '{c}' in port number '{port}' in '{text_full}'")));
     }
     let Some(port) = port.parse::<u16>().ok().filter(|p| *p != 0) else {
         return Err(fail(format!("invalid port '{port}'")));
     };
+    let shown = if bracketed { format!("[{host}]") } else { host.to_string() };
     let ip = match host.parse::<IpAddr>() {
         Ok(ip) => ip,
-        Err(_) => address::libc_resolve(host).ok_or_else(|| fail(format!("invalid address: '{host}' in '{text}'")))?,
+        Err(_) => address::libc_resolve(host).ok_or_else(|| fail(format!("invalid address: '{shown}' in '{text_full}'")))?,
     };
-    Ok(Nameserver { name: name.to_string(), addr: SocketAddr::new(ip, port), line: kw.line })
+    if (fam == Some(4) && !ip.is_ipv4()) || (fam == Some(6) && !ip.is_ipv6()) {
+        return Err(fail(format!("invalid address: '{shown}' in '{text_full}'")));
+    }
+    Ok(Nameserver { transport, name: name.to_string(), addr: SocketAddr::new(ip, port), line: kw.line })
 }
 
 /// `cfg_post_check_resolvers`: a section without a nameserver draws a warning.

@@ -13,7 +13,7 @@ use hickory_proto::op::{Message, MessageType, Query, ResponseCode};
 use hickory_proto::rr::rdata::{AAAA, CNAME, SRV};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 
-use ibex_dns::{
+use ibex_dns::{NsTransport, 
     Answer, DnsError, Families, Family, Protocol, QueryError, QueryId, Question, Rdata, Received,
     Requester, Resolver, ResolverConfig,
 };
@@ -718,7 +718,7 @@ fn a_truncated_tcp_answer_is_other() {
     assert_eq!(r.poll_result().unwrap().1, Err(DnsError::Other));
 }
 
-// T484: with `tcp_fallback` off (Ibex until T488), a truncated UDP answer is an error like a
+// T484: with `tcp_fallback` off, a truncated UDP answer is an error like a
 // truncated TCP one: counted `truncated`, no TCP query, the resolution ends `Other`.
 #[test]
 fn without_tcp_fallback_a_truncated_udp_answer_is_other() {
@@ -735,6 +735,24 @@ fn without_tcp_fallback_a_truncated_udp_answer_is_other() {
     assert!(sends(&mut r, t0).is_empty(), "no TCP query");
     sends(&mut r, ms(t0, 1000));
     assert_eq!(r.poll_result().unwrap().1, Err(DnsError::Other));
+}
+
+// T488: `tcp@` sends the query over TCP (to that nameserver only), and a nameserver with
+// `udp@` has no fallback although `tcp_fallback` is on.
+#[test]
+fn transports_choose_the_protocol_and_the_fallback() {
+    let mut c = cfg(&[NS1, NS2]);
+    c.resolve_retries = 1;
+    c.transports = vec![NsTransport::Tcp, NsTransport::Udp];
+    let mut r = Resolver::new(c);
+    let t0 = Instant::now();
+    q4(&mut r, t0, "tc.test");
+    let s = sends(&mut r, t0);
+    assert_eq!(s.iter().map(|x| (x.0, x.1)).collect::<Vec<_>>(), vec![(ns(NS1), Protocol::Tcp), (ns(NS2), Protocol::Udp)]);
+    let mut tc = Message::from_vec(&a_response(s[1].2, "tc.test", Ipv4Addr::new(10, 0, 0, 7), 60)).unwrap();
+    tc.set_truncated(true);
+    assert_eq!(r.handle_response(t0, ns(NS2), Protocol::Udp, &tc.to_vec().unwrap()), Received::Truncated);
+    assert!(sends(&mut r, t0).is_empty(), "no fallback on udp@");
 }
 
 // Item 4, at the retry timer (resolvers.c:2631-2640): both families, an error from one of two
