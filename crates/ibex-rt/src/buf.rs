@@ -31,15 +31,17 @@ pub const BUFSIZE: usize = 16_384;
 
 /// The error a stream's I/O returns when a buffer it needs cannot be had (S5): the stream is
 /// failed as `HAProxy` fails one whose allocation failed (`500`, `%ts` `I`), not the process.
+/// `ENOMEM` as an OS error: it allocates nothing, and it is told apart from the parser's
+/// "no room in the HTX" errors, which have the same kind (`OutOfMemory`) and are a `400`.
 #[must_use]
 pub fn oom() -> std::io::Error {
-    std::io::ErrorKind::OutOfMemory.into()
+    std::io::Error::from_raw_os_error(nix::libc::ENOMEM)
 }
 
-/// Whether `e` is [`oom`].
+/// Whether `e` is [`oom`] (not any error of kind `OutOfMemory`).
 #[must_use]
 pub fn is_oom(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::OutOfMemory
+    e.raw_os_error() == Some(nix::libc::ENOMEM)
 }
 
 /// Returns current configured standard buffer size (`tune.bufsize`).

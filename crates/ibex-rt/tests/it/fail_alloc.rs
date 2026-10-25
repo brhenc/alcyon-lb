@@ -192,3 +192,19 @@ fn past_tune_buffers_limit_a_stream_fails_and_the_next_one_is_served() {
     assert_eq!(get(p.port), 200, "a buffer is free again");
     assert!(p.child.try_wait().expect("try_wait").is_none());
 }
+
+/// A header name over the HTX's 255 bytes is a bad request (`400`), not a failed allocation:
+/// the parser's "no room in the HTX" is not a refused allocation (diff-fuzz 7f9a994e3567d3fa,
+/// `oversized_header_name_300b`; `HAProxy` 3.5-dev8 answers `400`).
+#[test]
+fn a_header_name_too_long_for_the_htx_is_400_not_500() {
+    let p = start("", &[]);
+    let mut c = TcpStream::connect(("127.0.0.1", p.port)).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let req = format!("GET /long-hdr HTTP/1.1\r\nHost: example.com\r\nX-{}: test\r\n\r\n", "a".repeat(300));
+    c.write_all(req.as_bytes()).expect("write");
+    let mut got = Vec::new();
+    let _ = c.read_to_end(&mut got);
+    let got = String::from_utf8_lossy(&got);
+    assert!(got.starts_with("HTTP/1.1 400"), "{}", &got[..got.len().min(80)]);
+}
