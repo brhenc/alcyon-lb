@@ -88,3 +88,48 @@ fn a_redirect_location_ignores_encoding_options() {
     let r = get("/r");
     assert_eq!(header(&r, "location"), "/a-", "{r}");
 }
+
+// T471b: `+M` on a missing or empty sample. Measured on 3.5-dev8-885761-29: set-var-fmt and
+// lf-string print `-`, set-header and redirect print nothing.
+const CFG_M: &str = "defaults\n  mode http\n  timeout client 5s\n  timeout connect 5s\n  timeout server 5s\n\
+frontend fe\n  bind ADDR\n\
+  http-request set-header x-h \"[%{+M}[req.hdr(nope)]]\"\n\
+  http-request set-header x-h2 \"%{+M}[str(a),field(2,x)]-\"\n\
+  http-request set-var-fmt(txn.v) \"[%{+M}[req.hdr(nope)]]\"\n\
+  http-request set-var-fmt(txn.w) \"%{+M}[str(a),field(2,x)]-\"\n\
+  http-request set-var-fmt(txn.e) \"[%{+M}[str()]]\"\n\
+  http-request set-var-fmt(txn.n) \"[%[req.hdr(nope)]]\"\n\
+  http-request redirect location \"/%{+M}[req.hdr(nope)]-\" if { path /r }\n\
+  http-request return status 200 content-type text/plain hdr x-h \"%[req.fhdr(x-h)]\" hdr x-h2 \"%[req.fhdr(x-h2)]\" hdr x-v \"%[var(txn.v)]\" hdr x-w \"%[var(txn.w)]\" hdr x-e \"%[var(txn.e)]\" hdr x-n \"%[var(txn.n)]\" lf-string \"<%{+M}[req.hdr(nope)]><%{+M}[str(a),field(2,x)]->\"\n";
+
+#[test]
+fn plus_m_prints_a_dash_for_a_missing_sample_in_a_variable_or_payload() {
+    let addr = common::reserve_addr();
+    let cfg = parse_str(&CFG_M.replace("ADDR", &addr.to_string())).expect("parse");
+    let mut engine = Engine::new(&cfg, 64).expect("engine");
+    let mut run = |path: &str| {
+        let mut c = TcpStream::connect(addr).expect("connect");
+        c.set_nonblocking(true).unwrap();
+        c.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+        let (mut out, mut buf, t) = (Vec::new(), vec![0u8; 65536], Instant::now());
+        while t.elapsed() < Duration::from_secs(3) {
+            let _ = engine.run_once().expect("step");
+            match c.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let r = run("/");
+    assert_eq!(header(&r, "x-h"), "[]", "{r}");
+    assert_eq!(header(&r, "x-h2"), "-", "{r}");
+    assert_eq!(header(&r, "x-v"), "[-]", "{r}");
+    assert_eq!(header(&r, "x-w"), "--", "{r}");
+    assert_eq!(header(&r, "x-e"), "[-]", "{r}");
+    assert_eq!(header(&r, "x-n"), "[]", "{r}");
+    assert!(r.ends_with("<-><-->"), "{r}");
+    let r = run("/r");
+    assert_eq!(header(&r, "location"), "/-", "{r}");
+}

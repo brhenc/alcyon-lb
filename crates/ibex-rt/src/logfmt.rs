@@ -418,6 +418,9 @@ pub struct LogFormat {
     /// `LOG_OPT_HTTP`: the value goes into an HTTP header, so each sample has the bytes of
     /// `http_encode_map` written `%XX` (`lf_encode_chunk`).
     http: bool,
+    /// A rule's non-HTTP format (`set-var-fmt`, `lf-string`): `+M` prints `-` for a missing or
+    /// empty sample there too (T471b).
+    dash_m: bool,
 }
 
 /// Applies `%{+Q,-X,...}` to `opts` (`parse_logformat_node_args`). Unknown names are
@@ -523,6 +526,7 @@ impl LogFormat {
     pub fn compile_rule(fmt: &str, registry: &Registry, http: bool) -> Result<Self, String> {
         let mut f = Self::compile_with(fmt, registry, false)?;
         f.http = http;
+        f.dash_m = !http;
         if http {
             f.drop_http_incompatible();
         }
@@ -601,7 +605,7 @@ impl LogFormat {
             .iter()
             .map(|n| match n {
                 Node::Text(t) => Some(Part::Text(t.clone())),
-                Node::Expr(e, o, None) if !(o.quote || o.hex || o.esc || o.json || o.cbor || o.bin || o.utf8) => Some(Part::Sample((**e).clone())),
+                Node::Expr(e, o, None) if !(o.quote || o.hex || o.esc || o.json || o.cbor || o.bin || o.utf8 || (self.dash_m && o.mandatory)) => Some(Part::Sample((**e).clone())),
                 _ => None,
             })
             .collect()
@@ -794,7 +798,7 @@ impl LogFormat {
                 Node::Text(_) => {}
             }
         }
-        Ok(LogFormat { nodes: nodes.into_boxed_slice(), global, http: false })
+        Ok(LogFormat { nodes: nodes.into_boxed_slice(), global, http: false, dash_m: false })
     }
 
     /// Whether the format reads the request line (`%r`, `%HM`, `%HU`, ...): `HAProxy`
@@ -921,8 +925,8 @@ impl LogFormat {
             match value {
                 Value::Expr(e) => match e.eval_sample(registry, ctx) {
                     // Outside a log line an empty value writes nothing, not `-`.
-                    Some(Sample::Str(v)) if !log && v.is_empty() && !o.quote && !o.encoded() => {}
-                    Some(Sample::Bin(v)) if !log && v.is_empty() && !o.quote && !o.encoded() => {}
+                    Some(Sample::Str(v)) if !log && (!self.dash_m || !o.mandatory) && v.is_empty() && !o.quote && !o.encoded() => {}
+                    Some(Sample::Bin(v)) if !log && (!self.dash_m || !o.mandatory) && v.is_empty() && !o.quote && !o.encoded() => {}
                     Some(s) if self.http && !o.encoded() => {
                         // Written in place, then escaped: a copy only when a byte needs it.
                         let start = out.0.len();
@@ -939,7 +943,8 @@ impl LogFormat {
                         }
                     }
                     Some(s) => sample(out, &s, o, named.as_ref().map_or(Cast::Same, |n| n.cast), !e.converters.is_empty()),
-                    None => missing(out, o, log),
+                    // `+M` prints `-` in a log line and in a rule's non-HTTP format.
+                    None => missing(out, o, log || self.dash_m),
                 },
                 Value::Alias(a) => {
                     if o.encoded() {
