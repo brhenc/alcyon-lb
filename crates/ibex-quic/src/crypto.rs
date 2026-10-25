@@ -137,11 +137,17 @@ impl qc::ServerConfig for QuicServerConfig {
     }
 
     fn start_session(self: Arc<Self>, version: u32, params: &TransportParameters) -> Box<dyn qc::Session> {
+        Box::new(self.session(version, params))
+    }
+}
+
+impl QuicServerConfig {
+    fn session(&self, version: u32, params: &TransportParameters) -> TlsSession {
         let version = interpret_version(version).unwrap_or(Version::V1);
         let bind = self.current();
         let mut tp = Vec::new();
         params.write(&mut tp);
-        Box::new(TlsSession {
+        TlsSession {
             version,
             got_handshake_data: false,
             next_secrets: None,
@@ -154,7 +160,7 @@ impl qc::ServerConfig for QuicServerConfig {
             input: Input::default(),
             server_name: None,
             exporter: None,
-        })
+        }
     }
 }
 
@@ -257,21 +263,18 @@ impl TlsSession {
                             self.server_name = a.client_hello().server_name().map(|d| d.as_ref().to_owned());
                             let after = a.choose_config(Arc::clone(&self.config), self.params.clone(), out)?;
                             // The rest of the input may hold more of the client's flight.
-                            next = match after {
-                                ServerHandshake::NeedsInput(n) => n.process(&mut self.input, out)?,
-                                other => other,
-                            };
+                            next = if let ServerHandshake::NeedsInput(n) = after { n.process(&mut self.input, out)? } else { after };
                         }
-                        ServerHandshake::Complete(mut c) => {
+                        // A bind has no client verifier (`with_no_client_auth`), and the enum
+                        // is `non_exhaustive`: any other state is a failure.
+                        other => {
+                            let ServerHandshake::Complete(mut c) = other else { return Err(rustls24::Error::General("unexpected QUIC server handshake state".into())) };
                             out.extend(c.events());
                             self.exporter = c.exporter().ok();
                             provider::count_handshake(self.provider);
                             self.state = State::Done(c);
                             return Ok(());
                         }
-                        // A bind has no client verifier (`with_no_client_auth`), and the enum
-                        // is `non_exhaustive`: either is a failure.
-                        _ => return Err(rustls24::Error::General("unexpected QUIC server handshake state".into())),
                     }
                 }
             }
@@ -312,8 +315,8 @@ impl qc::Session for TlsSession {
             State::Hs(n) => n.zero_rtt_keys(),
             State::Done(c) => c.zero_rtt_keys(),
             State::Failed => None,
-        }?;
-        Some((Box::new(HeaderKey(keys.header)), Box::new(PacketKey(keys.packet))))
+        };
+        keys.map(|k| (Box::new(HeaderKey(k.header)) as Box<dyn qc::HeaderKey>, Box::new(PacketKey(k.packet)) as Box<dyn qc::PacketKey>))
     }
 
     fn early_data_accepted(&self) -> Option<bool> {
@@ -371,8 +374,7 @@ impl qc::Session for TlsSession {
                     buf.extend_from_slice(&m);
                     continue;
                 }
-                QuicEvent::KeyChange(k) => k,
-                _ => continue,
+                QuicEvent::KeyChange(k) => k, _ => continue, // `QuicEvent` is non_exhaustive
             };
             let keys = match change {
                 KeyChange::Handshake { keys } => keys,
@@ -614,5 +616,282 @@ impl qc::AeadKey for TokenAead {
     fn open<'a>(&self, data: &'a mut [u8], additional_data: &[u8]) -> Result<&'a mut [u8], CryptoError> {
         let n = self.0.decrypt_in_place(0, additional_data, data, None).map_err(|_| CryptoError)?.len();
         Ok(&mut data[..n])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qc::ServerConfig as _;
+
+    fn bind() -> Arc<BindTls> {
+        bind_with(Vec::new())
+    }
+
+    fn bind_with(alpn: Vec<Vec<u8>>) -> Arc<BindTls> {
+        bind_and_cert(alpn).0
+    }
+
+    fn bind_and_cert(alpn: Vec<Vec<u8>>) -> (Arc<BindTls>, rustls::pki_types::CertificateDer<'static>) {
+        use ibex_tls::tcp::rustls24::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(c.key_pair.serialize_der()));
+        let der = CertificateDer::from(c.cert.der().to_vec());
+        let bind = BindTls::single_tls13(vec![der.clone()], key, alpn).expect("bind");
+        (bind, rustls::pki_types::CertificateDer::from(der.to_vec()))
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
+    }
+
+    /// RFC 9001 A.4: the Retry packet sent for a client Initial whose destination connection
+    /// ID was 0x8394c8f03e515708 ends in this integrity tag.
+    #[test]
+    fn the_retry_tag_is_the_one_of_rfc_9001_a4() {
+        let cfg = QuicServerConfig::new(bind()).expect("config");
+        let odcid = ConnectionId::new(&hex("8394c8f03e515708"));
+        let packet = hex("ff000000010008f067a5502a4262b5746f6b656e");
+        assert_eq!(cfg.retry_tag(1, &odcid, &packet).to_vec(), hex("04a265ba2eff4d829058fb3f0f2496ba"));
+        let mut other = packet.clone();
+        other[0] ^= 1;
+        assert_ne!(cfg.retry_tag(1, &odcid, &other).to_vec(), hex("04a265ba2eff4d829058fb3f0f2496ba"));
+    }
+
+    #[test]
+    fn early_data_of_a_size_other_than_0_or_max_is_refused() {
+        let mut b = bind();
+        let inner = Arc::get_mut(&mut b).expect("unshared");
+        Arc::make_mut(&mut inner.config).max_early_data_size = 1000;
+        let e = QuicServerConfig::new(b).err().expect("refused");
+        assert_eq!(e, "QUIC requires max_early_data_size of 0 or u32::MAX");
+    }
+
+    #[test]
+    fn initial_keys_are_refused_for_a_version_that_is_not_v1() {
+        let cfg = QuicServerConfig::new(bind()).expect("config");
+        let cid = ConnectionId::new(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(cfg.initial_keys(0x1a2a_3a4a, &cid).is_err());
+        assert!(cfg.initial_keys(1, &cid).is_ok());
+    }
+
+    fn pair() -> (Keys, Keys) {
+        let cid = ConnectionId::new(&hex("8394c8f03e515708"));
+        let suite = initial_suite(provider::active());
+        (initial_keys(Version::V1, cid, Side::Client, &suite), initial_keys(Version::V1, cid, Side::Server, &suite))
+    }
+
+    #[test]
+    fn a_packet_the_client_seals_opens_on_the_server_and_nowhere_else() {
+        let (c, s) = pair();
+        let header = [0xc3u8, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 7];
+        let payload: Vec<u8> = (0..40u8).collect();
+        let mut buf = header.to_vec();
+        buf.extend_from_slice(&payload);
+        buf.extend_from_slice(&[0; 16]);
+        assert_eq!(c.packet.local.tag_len(), 16);
+        c.packet.local.encrypt(7, &mut buf, header.len());
+        assert_ne!(&buf[header.len()..header.len() + 40], payload.as_slice());
+
+        // Header protection: the first byte and the packet number change, and come back.
+        let sealed = buf.clone();
+        c.header.local.encrypt(16, &mut buf);
+        assert_ne!(&buf[..header.len()], &header[..], "the header is protected");
+        assert_eq!(&buf[20..], &sealed[20..], "the payload is left alone");
+        assert_eq!(c.header.local.sample_size(), 16);
+        s.header.remote.decrypt(16, &mut buf);
+        assert_eq!(buf, sealed);
+
+        let mut ok = BytesMut::from(&buf[header.len()..]);
+        s.packet.remote.decrypt(7, &header, &mut ok).expect("opens");
+        assert_eq!(&ok[..], payload.as_slice());
+        // Another packet number, a changed header, a changed tag, the wrong side's key: no.
+        assert!(s.packet.remote.decrypt(8, &header, &mut BytesMut::from(&buf[header.len()..])).is_err());
+        let mut other = header;
+        other[0] ^= 1;
+        assert!(s.packet.remote.decrypt(7, &other, &mut BytesMut::from(&buf[header.len()..])).is_err());
+        let mut torn = BytesMut::from(&buf[header.len()..]);
+        let last = torn.len() - 1;
+        torn[last] ^= 1;
+        assert!(s.packet.remote.decrypt(7, &header, &mut torn).is_err());
+        assert!(c.packet.remote.decrypt(7, &header, &mut BytesMut::from(&buf[header.len()..])).is_err());
+
+        assert!(c.packet.local.confidentiality_limit() > 0);
+        assert!(c.packet.local.integrity_limit() > 0);
+    }
+
+    #[test]
+    fn the_crypto_input_hands_out_what_it_was_given_until_it_is_taken() {
+        let mut i = Input::default();
+        i.push(b"abcdef");
+        assert_eq!(i.slice_mut(), b"abcdef");
+        i.discard(2);
+        assert_eq!(i.slice_mut(), b"cdef");
+        i.push(b"gh");
+        assert_eq!(i.slice_mut(), b"cdefgh");
+        i.discard(100);
+        assert!(i.slice_mut().is_empty());
+        i.push(b"z");
+        assert_eq!(i.slice_mut(), b"z", "a fully consumed buffer starts over");
+        i.received_close_notify();
+        assert!(!i.has_seen_eof());
+    }
+
+    #[test]
+    fn reset_tokens_verify_only_for_their_connection_id() {
+        let k = ResetKey::new().expect("key");
+        assert_eq!(qc::HmacKey::signature_len(&k), 32);
+        let mut sig = [0u8; 32];
+        qc::HmacKey::sign(&k, b"cid-1", &mut sig);
+        assert!(qc::HmacKey::verify(&k, b"cid-1", &sig).is_ok());
+        assert!(qc::HmacKey::verify(&k, b"cid-2", &sig).is_err());
+        assert!(qc::HmacKey::verify(&k, b"cid-1", &sig[..16]).is_err(), "a short signature is not a prefix match");
+        let mut flipped = sig;
+        flipped[31] ^= 1;
+        assert!(qc::HmacKey::verify(&k, b"cid-1", &flipped).is_err());
+        let mut short = [0u8; 16];
+        qc::HmacKey::sign(&k, b"cid-1", &mut short);
+        assert_eq!(short, sig[..16]);
+        // Another key signs differently.
+        let mut other = [0u8; 32];
+        qc::HmacKey::sign(&ResetKey::new().expect("key"), b"cid-1", &mut other);
+        assert_ne!(other, sig);
+    }
+
+    #[test]
+    fn a_token_opens_with_its_key_bytes_and_its_additional_data_only() {
+        use qc::HandshakeTokenKey as _;
+        let k = TokenKey::new().expect("key");
+        let aead = k.aead_from_hkdf(b"random-1");
+        let mut data = b"address validation".to_vec();
+        aead.seal(&mut data, b"ad").expect("seal");
+        assert_eq!(data.len(), 18 + 16);
+        let sealed = data.clone();
+        assert_eq!(aead.open(&mut data, b"ad").expect("open"), b"address validation");
+        let mut wrong_ad = sealed.clone();
+        assert!(aead.open(&mut wrong_ad, b"other").is_err());
+        let mut wrong_key = sealed.clone();
+        assert!(k.aead_from_hkdf(b"random-2").open(&mut wrong_key, b"ad").is_err());
+        let mut torn = sealed;
+        torn[0] ^= 1;
+        assert!(aead.open(&mut torn, b"ad").is_err());
+        // The same bytes derive the same key.
+        let mut again = b"x".to_vec();
+        k.aead_from_hkdf(b"random-1").seal(&mut again, b"").expect("seal");
+        assert_eq!(k.aead_from_hkdf(b"random-1").open(&mut again, b"").expect("open"), b"x");
+    }
+
+    #[test]
+    fn a_session_before_its_handshake_has_nothing_to_give_and_a_bad_flight_fails_it() {
+        use qc::Session as _;
+        let cfg = Arc::new(QuicServerConfig::new(bind()).expect("config"));
+        let mut s = cfg.start_session(1, &params());
+        assert!(s.is_handshaking());
+        assert!(s.handshake_data().is_none());
+        assert!(s.peer_identity().is_none());
+        assert!(s.early_crypto().is_none());
+        assert_eq!(s.early_data_accepted(), None);
+        assert!(s.next_1rtt_keys().is_none());
+        assert!(!s.is_valid_retry(&ConnectionId::new(&[1; 8]), b"", b""));
+        assert!(s.export_keying_material(&mut [0u8; 8], b"label", b"ctx").is_err());
+        // A ClientHello with a body of two bytes: the session fails, and stays failed.
+        let first = s.read_handshake(&[1, 0, 0, 2, 0xff, 0xff]).expect_err("bad hello");
+        assert!(!first.reason.is_empty());
+        assert!(s.read_handshake(&[]).is_err());
+        assert!(s.handshake_data().is_none());
+        assert!(s.early_crypto().is_none());
+        assert!(s.transport_parameters().expect("none, not an error").is_none());
+        assert!(s.write_handshake(&mut Vec::new()).is_none());
+    }
+
+    fn params() -> TransportParameters {
+        TransportParameters::read(Side::Client, &mut io::Cursor::new(Vec::<u8>::new())).expect("empty parameters")
+    }
+
+    /// A server session that has completed its handshake against quinn's client session
+    /// (rustls 0.23), the CRYPTO bytes carried across with their levels ignored.
+    fn established() -> TlsSession {
+        use qc::ClientConfig as _;
+        use qc::Session as _;
+        let (server_bind, cert) = bind_and_cert(vec![b"h3".to_vec()]);
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("trust the test certificate");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut cc = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        cc.alpn_protocols = vec![b"h3".to_vec()];
+        let cc = Arc::new(quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(cc)).expect("client config"));
+        let mut client = cc.start_session(1, "localhost", &params()).expect("client session");
+        let server_cfg = QuicServerConfig::new(server_bind).expect("config");
+        let mut server = server_cfg.session(1, &params());
+        let mut done = false;
+        for _ in 0..8 {
+            // Each level's bytes go over on their own, as quinn sends them.
+            loop {
+                let mut flight = Vec::new();
+                let more = client.write_handshake(&mut flight).is_some();
+                if !flight.is_empty() {
+                    server.read_handshake(&flight).expect("server reads the client flight");
+                }
+                if !more {
+                    break;
+                }
+            }
+            loop {
+                let mut flight = Vec::new();
+                let more = server.write_handshake(&mut flight).is_some();
+                if !flight.is_empty() {
+                    client.read_handshake(&flight).expect("client reads the server flight");
+                }
+                if !more {
+                    break;
+                }
+            }
+            if !server.is_handshaking() && !client.is_handshaking() {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "the handshake completes");
+        server
+    }
+
+    #[test]
+    fn a_completed_session_answers_from_its_handshake() {
+        use qc::Session as _;
+        let mut s = established();
+        let hd = s.handshake_data().expect("data");
+        let hd = hd.downcast_ref::<HandshakeData>().expect("ours");
+        assert_eq!(hd.protocol.as_deref(), Some(&b"h3"[..]));
+        assert_eq!(hd.server_name.as_deref(), Some("localhost"));
+        assert!(s.transport_parameters().is_ok());
+        assert!(s.early_crypto().is_none(), "no early data was offered");
+        let mut out = [0u8; 16];
+        s.export_keying_material(&mut out, b"EXPERIMENTAL ibex", b"ctx").expect("exporter");
+        let mut again = [0u8; 16];
+        s.export_keying_material(&mut again, b"EXPERIMENTAL ibex", b"ctx").expect("exporter");
+        assert_eq!(out, again);
+        assert_ne!(out, [0u8; 16]);
+        // A handshake message after the handshake: rustls refuses what it does not expect.
+        assert!(s.read_handshake(&[0x0b, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn a_failed_session_has_no_outputs() {
+        use qc::Session as _;
+        let mut s = QuicServerConfig::new(bind()).expect("config").session(1, &params());
+        s.read_handshake(&[1, 0, 0, 2, 0xff, 0xff]).expect_err("bad hello");
+        s.got_handshake_data = true;
+        let hd = s.handshake_data().expect("data");
+        assert_eq!(hd.downcast_ref::<HandshakeData>().expect("ours").protocol, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "without a QUIC algorithm")]
+    fn a_suite_without_a_quic_algorithm_is_a_bug() {
+        let _ = unreachable_suite();
     }
 }

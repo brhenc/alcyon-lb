@@ -44,9 +44,8 @@ impl<S: Read + Write> BlockingTls<S> {
     /// rustls refuses to start a session on `config`.
     pub fn connect(config: &Arc<ClientConfig>, provider: TlsCryptoProvider, name: ServerName<'static>, sock: S) -> io::Result<Self> {
         let ctx = TlsCtx::connect(config, name, None);
-        if !ctx.is_handshaking() {
-            return Err(io::Error::other("TLS client session refused"));
-        }
+        // A session rustls refused to start is not handshaking: no ClientHello to send.
+        ctx.is_handshaking().then_some(()).ok_or_else(|| io::Error::other("TLS client session refused"))?;
         Ok(Self { ctx, input: VecInput::default(), sock, provider, counted: false })
     }
 
@@ -119,13 +118,10 @@ impl<S: Read + Write> Write for BlockingTls<S> {
             return Ok(0);
         }
         self.handshake()?;
-        loop {
-            let n = self.ctx.write_plain(src).map_err(tls_error)?;
-            self.flush_tx()?;
-            if n > 0 {
-                return Ok(n);
-            }
-        }
+        // `flush_tx` leaves the send buffer empty, so `write_plain` takes at least one byte.
+        let n = self.ctx.write_plain(src).map_err(tls_error)?;
+        self.flush_tx()?;
+        Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {

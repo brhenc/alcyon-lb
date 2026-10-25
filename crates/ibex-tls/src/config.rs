@@ -338,14 +338,19 @@ const STANDARD_CA_PATHS: &[&str] = &[
 /// Loads the default system root CA certificate store.
 #[must_use]
 pub fn load_system_ca_roots() -> rustls24::RootCertStore {
-    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
-        if let Ok(store) = load_ca_file(std::path::Path::new(&path)) {
+    roots_from(std::env::var("SSL_CERT_FILE").ok().as_deref(), STANDARD_CA_PATHS)
+}
+
+/// The first non-empty CA bundle among `env_file` and then `standard`; no roots if none.
+fn roots_from(env_file: Option<&str>, standard: &[&str]) -> rustls24::RootCertStore {
+    if let Some(path) = env_file {
+        if let Ok(store) = load_ca_file(std::path::Path::new(path)) {
             if !store.is_empty() {
                 return store;
             }
         }
     }
-    for path_str in STANDARD_CA_PATHS {
+    for path_str in standard {
         let p = std::path::Path::new(path_str);
         if p.exists() {
             if let Ok(store) = load_ca_file(p) {
@@ -1119,5 +1124,27 @@ mod ticket_keys {
         let built = cfg.build_server_config().expect("build");
         assert!(!built.ticketer.enabled());
         assert_eq!(built.send_tls13_tickets, 0);
+    }
+}
+
+#[cfg(test)]
+mod ca_roots {
+    use super::roots_from;
+
+    #[test]
+    fn no_bundle_anywhere_is_no_roots() {
+        assert!(roots_from(Some("/nonexistent/ibex-ca.pem"), &["/nonexistent/other.pem"]).is_empty());
+        assert!(roots_from(None, &[]).is_empty());
+    }
+
+    #[test]
+    fn the_environment_bundle_wins_over_the_standard_ones() {
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let path = std::env::temp_dir().join(format!("ibex-ca-roots-{}.pem", std::process::id()));
+        std::fs::write(&path, c.cert.pem()).expect("write");
+        let p = path.to_str().expect("utf8");
+        assert_eq!(roots_from(Some(p), &[]).len(), 1);
+        assert_eq!(roots_from(Some("/nonexistent/ibex-ca.pem"), &[p]).len(), 1);
+        std::fs::remove_file(&path).ok();
     }
 }

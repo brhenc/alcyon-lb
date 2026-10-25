@@ -193,6 +193,16 @@ mod tests {
         }
     }
 
+    /// The QUIC suites of each provider: AES-128-GCM for Initial packets and Retry tags,
+    /// AES-256-GCM for address validation tokens.
+    #[test]
+    fn each_provider_names_its_quic_suites() {
+        for p in TlsCryptoProvider::ALL {
+            assert_eq!(quic_initial_suite(p).common.suite, rustls24::crypto::CipherSuite::TLS13_AES_128_GCM_SHA256, "{p:?}");
+            assert_eq!(quic_token_suite(p).common.suite, rustls24::crypto::CipherSuite::TLS13_AES_256_GCM_SHA384, "{p:?}");
+        }
+    }
+
     struct Gone;
 
     impl Rebuild for Gone {

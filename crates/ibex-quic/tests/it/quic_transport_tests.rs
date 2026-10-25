@@ -172,11 +172,14 @@ fn test_quic_handshake_completion_alpn_h3() {
         // Process server events
         while let Some(evt) = server.poll_event() {
             if let TransportEvent::HandshakeComplete {
-                conn_id: _,
+                conn_id,
                 alpn,
                 server_name,
             } = evt
             {
+                // The transport answers the same from the connection's handshake data.
+                assert_eq!(server.alpn(conn_id).as_deref(), alpn.as_deref());
+                assert_eq!(server.server_name(conn_id), server_name);
                 server_connected = true;
                 negotiated_alpn = alpn;
                 negotiated_server_name = server_name;

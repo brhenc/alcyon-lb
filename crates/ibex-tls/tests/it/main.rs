@@ -18,6 +18,7 @@
 mod common;
 
 mod arena;
+mod blocking;
 mod cert_validation;
 mod config;
 mod crypto_provider;
