@@ -19,6 +19,7 @@ mod common;
 
 mod aborted_client_waiting_for_server;
 mod abortonclose;
+mod client_timeout_connect;
 mod absolute_uri;
 mod access_log;
 mod access_log_states;

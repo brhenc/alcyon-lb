@@ -9938,6 +9938,11 @@ impl EngineDispatcher<'_> {
             {
                 entry.sess.ending = None;
                 server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, false);
+                // The last attempt ran out of time, not out of luck: a server-side timeout
+                // (`sC--`), where a refusal is `SC--` (T496, VV-23).
+                if entry.sess.ending == Some(crate::proxy::Ending::ConnectFailed) {
+                    entry.sess.ending = Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Connect));
+                }
             }
             // A retry that waited out its turnaround connects now.
             if entry.sess.retry_after.is_set() && entry.sess.retry_after.is_expired(now) && !entry.sess.is_done() {
