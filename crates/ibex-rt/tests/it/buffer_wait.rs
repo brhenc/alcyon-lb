@@ -90,6 +90,13 @@ impl Proxy {
         out
     }
 
+    /// `show pools`' standard buffer line: refused takes.
+    fn buffer_failures(&self) -> usize {
+        let out = self.cli("show pools");
+        let line = out.lines().find(|l| l.contains("Pool buffer ")).unwrap_or_else(|| panic!("no buffer pool line in {out}"));
+        line.split(" failures").next().and_then(|h| h.rsplit(' ').next()).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{line}"))
+    }
+
     /// `show pools`' standard buffer line: (used, of them in thread caches).
     fn buffers(&self) -> (usize, usize) {
         let out = self.cli("show pools");
@@ -258,4 +265,19 @@ fn slow_readers_past_the_limit_each_get_the_whole_body() {
         .collect();
     assert!(got.iter().all(|&n| n == BIG), "bodies {got:?} of {BIG}:\n{}", p.log());
     assert!(!p.log().contains(" ID-- ") && !p.log().contains("IR--"), "a stream failed for want of a buffer:\n{}", p.log());
+}
+
+/// A waiting connection does not spin: its client socket, with its request unread, is not
+/// polled until a buffer is given back (the poller is level-triggered). Before, the stream ran
+/// on every loop and was refused each time: ~300000 refused takes a second, 150 % CPU.
+#[test]
+fn a_waiting_connection_is_not_run_again_until_a_buffer_frees() {
+    let p = start("10s");
+    let _held = hold(p.port);
+    let _waiter = get_in_thread(p.port);
+    thread::sleep(Duration::from_millis(300));
+    let before = p.buffer_failures();
+    thread::sleep(Duration::from_secs(1));
+    let after = p.buffer_failures();
+    assert!(after - before < 50, "refused takes in one second of waiting: {}", after - before);
 }

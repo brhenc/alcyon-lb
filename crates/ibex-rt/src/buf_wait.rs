@@ -40,6 +40,35 @@ pub struct WaitState(u8);
 impl WaitState {
     const QUEUED: u8 = 0x01;
     const OFFERED: u8 = 0x02;
+    /// Queued for a buffer to read the client into: the client socket is not polled for
+    /// reading meanwhile (the poller is level-triggered: unread bytes would wake it at once).
+    const CLI: u8 = 0x04;
+    /// The same for the server socket.
+    const SRV: u8 = 0x08;
+
+    /// Queued for `class`: the side it would read is not polled until it is woken.
+    pub fn enqueued(&mut self, class: Class) {
+        let side = match class {
+            Class::MuxRx => Self::CLI,
+            Class::SeRx => Self::SRV,
+            Class::MuxTx | Class::Channel => 0,
+        };
+        self.0 = (self.0 & !(Self::CLI | Self::SRV)) | Self::QUEUED | side;
+    }
+
+    /// Whether it waits to read the client.
+    #[must_use]
+    #[inline]
+    pub fn mutes_cli(self) -> bool {
+        self.0 & Self::CLI != 0
+    }
+
+    /// Whether it waits to read the server.
+    #[must_use]
+    #[inline]
+    pub fn mutes_srv(self) -> bool {
+        self.0 & Self::SRV != 0
+    }
 
     #[must_use]
     #[inline]
@@ -47,8 +76,9 @@ impl WaitState {
         self.0 & Self::QUEUED != 0
     }
 
-    pub fn set_queued(&mut self, on: bool) {
-        self.0 = if on { self.0 | Self::QUEUED } else { self.0 & !Self::QUEUED };
+    /// Out of the queue (woken): both sides polled again.
+    pub fn dequeued(&mut self) {
+        self.0 &= !(Self::QUEUED | Self::CLI | Self::SRV);
     }
 
     pub fn set_offered(&mut self, on: bool) {

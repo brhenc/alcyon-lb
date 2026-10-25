@@ -5190,7 +5190,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         while let Some((task, idx)) = crate::buf_wait::next_offered() {
             match self.sessions.get_mut(idx) {
                 Some(e) if e.task == task && e.buf_wait.queued() && self.scheduler.is_live(task) => {
-                    e.buf_wait.set_queued(false);
+                    e.buf_wait.dequeued();
                     e.buf_wait.set_offered(true);
                     self.scheduler.tasklet_wakeup(task, Class::Urgent, state::WOKEN_IO);
                 }
@@ -8551,7 +8551,13 @@ fn check_srv_connect(
 }
 
 fn update_interests(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &mut Poller) {
-    let (cli_want, srv_want) = entry.sess.interests();
+    let (mut cli_want, mut srv_want) = entry.sess.interests();
+    // Waiting for a buffer to read into (S6): that side is not polled for reading until the
+    // stream is woken, or its unread bytes would wake it on every loop.
+    if entry.buf_wait.queued() {
+        cli_want.read &= !entry.buf_wait.mutes_cli();
+        srv_want.read &= !entry.buf_wait.mutes_srv();
+    }
     let new_cli_interest = Interest {
         readable: cli_want.read,
         writable: cli_want.write,
@@ -9760,7 +9766,10 @@ impl EngineDispatcher<'_> {
         // Refused a buffer at `tune.buffers.limit` in this run: it waits for one (S6).
         if crate::buf_wait::wanted() {
             match self.sessions.get_mut(session_idx) {
-                Some(entry) => buf_wait_enter(entry, session_idx),
+                Some(entry) => {
+                    buf_wait_enter(entry, session_idx);
+                    update_interests(entry, self.fdtab, self.poller);
+                }
                 None => drop(crate::buf_wait::take_want()),
             }
         }
@@ -16539,7 +16548,7 @@ fn buf_wait_enter(entry: &mut SessionEntry, session_idx: u32) {
         return;
     }
     if crate::buf_wait::enter(entry.task, session_idx, class, front) {
-        entry.buf_wait.set_queued(true);
+        entry.buf_wait.enqueued(class);
     } else {
         entry.sess.fail_alloc();
     }
