@@ -3206,6 +3206,11 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
         data.srvconn = data.srvconn.saturating_sub(1);
     }
     let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &entry.sess.tracked_sc));
+    // The thread-locals hold whatever response this thread handled last, a sibling stream's
+    // included (T467): this stream's own status and Tr are the ones the fetches give.
+    CURRENT_SRV_STATUS.set(entry.sess.log.srv_status);
+    let tr = entry.sess.log.data.zip(entry.sess.log.connect).map(|(d, c)| d.saturating_duration_since(c).as_millis());
+    CURRENT_RES_TR.set(tr.map_or(-1, |ms| i64::try_from(ms).unwrap_or(i64::MAX)));
     let ctx = SampleContext { at_log: true, res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick) };
     let (line, sd) = with_sd(fe.log_format_sd(), fmt, &data, &ctx);
     fe.log_count.fetch_add(1, Ordering::Relaxed);
@@ -10657,6 +10662,7 @@ impl EngineDispatcher<'_> {
 
         CURRENT_RES_STATUS.set(status);
         CURRENT_SRV_STATUS.set(status);
+        entry.sess.log.srv_status = status;
         // `t_data - t_connect` (`smp_fetch_reX_timers`).
         let tr = entry.sess.log.data.zip(entry.sess.log.connect).map(|(d, c)| d.saturating_duration_since(c).as_millis());
         CURRENT_RES_TR.set(tr.map_or(-1, |ms| i64::try_from(ms).unwrap_or(i64::MAX)));

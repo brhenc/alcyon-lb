@@ -81,6 +81,9 @@ pub struct StreamLog {
     pub be_queue: u64,
     /// `option logasap`: the line went out with the response head; none follows.
     pub asap_done: bool,
+    /// The status of the response a server sent for this stream (`txn->server_status`), 0 when
+    /// none did: what `%[server_status]` reads at the end of the stream (T467).
+    pub srv_status: u16,
 }
 
 /// Capture buffers let go of, at most this many kept per thread for the next captures.
@@ -181,6 +184,7 @@ impl StreamLog {
             redispatched: false,
             applet: false,
             asap_done: false,
+            srv_status: 0,
             be_queue: 0,
         }
     }
