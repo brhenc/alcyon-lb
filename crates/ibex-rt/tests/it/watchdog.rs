@@ -253,8 +253,22 @@ fn warn_blocked_traffic_after_is_checked() {
 #[test]
 fn warn_blocked_traffic_after_moves_the_warning() {
     let mut ibex = start_with("kw20", "  warn-blocked-traffic-after 20\n");
-    assert_eq!(ibex.cli("expert-mode on; debug dev loop 80"), "\n\n");
-    assert!(blocked_warnings(&ibex) >= 1, "{}", ibex.stderr());
+    // A report needs two looks of the monitor (every 20 ms) inside the stall, with 10 ms of the
+    // worker's CPU time between them (the watchdog counts CPU time, not wall time). On a loaded
+    // host the monitor can sleep through an 80 ms loop, or the worker get too little CPU in it,
+    // so that loop goes unreported. The keyword is what makes a report possible at all (the
+    // sibling test shows that 80 ms is never reported at the default, on an idle host): try the
+    // 80 ms loop first, then longer ones (still under the 1 s of CPU that aborts the process),
+    // and fail if none of them is reported.
+    let mut n = 0;
+    for ms in [80, 80, 160, 160, 320, 320, 640, 640] {
+        assert_eq!(ibex.cli(&format!("expert-mode on; debug dev loop {ms}")), "\n\n");
+        n = blocked_warnings(&ibex);
+        if n >= 1 {
+            break;
+        }
+    }
+    assert!(n >= 1, "{}", ibex.stderr());
     common::stop(&mut ibex.child);
     assert!(ibex.stderr().contains("WARNING! thread 1 has stopped processing traffic for "));
 }
