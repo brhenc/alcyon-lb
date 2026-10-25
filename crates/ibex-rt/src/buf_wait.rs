@@ -100,6 +100,7 @@ pub fn wanted() -> bool {
 }
 
 /// The class the stream that just ran was refused, once.
+#[must_use]
 pub fn take_want() -> Option<Class> {
     let c = match WANT.replace(0) {
         1 => Class::MuxTx,
@@ -114,6 +115,7 @@ pub fn take_want() -> Option<Class> {
 /// Puts the stream of `task` (session slot `slot`) in queue `class`: at the back, or at the
 /// front when it was just woken and refused again (it keeps its place). `false` when the queue
 /// cannot grow (the caller fails the stream instead).
+#[must_use]
 pub fn enter(task: TaskRef, slot: u32, class: Class, front: bool) -> bool {
     QUEUES.with(|q| {
         let q = &mut q.borrow_mut()[class as usize];
@@ -175,6 +177,7 @@ pub fn pending() -> bool {
 /// The next waiter to hand a given-back buffer to, most critical queue first, oldest first
 /// (one per buffer, `__offer_buffers`' `count`); `None` when the buffers given back are all
 /// handed out or nobody waits.
+#[must_use]
 pub fn next_offered() -> Option<Waiter> {
     let n = OFFERED.get();
     if n == 0 {
