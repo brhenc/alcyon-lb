@@ -76,7 +76,7 @@ fn frame(t: u8, fl: u8, sid: u32, p: &[u8]) -> Vec<u8> {
 /// `(GOAWAY, close)` instants, the first GOAWAY seen and the end of the connection.
 /// `timeouts` are config lines (`client 1500ms`), `request` whether to send a GET,
 /// `ping_every` a PING cadence, `delay` how long the backend takes.
-fn run(timeouts: &[&str], request: bool, ping_every: Option<Duration>, delay: Duration) -> (Option<Duration>, Duration) {
+fn run(timeouts: &[&str], request: bool, ping_every: Option<Duration>, delay: Duration) -> (Option<Duration>, Duration, Option<Duration>) {
     let be = backend(delay);
     let fe = common::reserve_addr();
     let mut text = format!("defaults\n  mode http\n  timeout connect 5s\n  timeout server 10s\n");
@@ -101,6 +101,7 @@ fn run(timeouts: &[&str], request: bool, ping_every: Option<Duration>, delay: Du
     c.write_all(&hello).expect("send");
     let mut buf: Vec<u8> = Vec::new();
     let mut goaway = None;
+    let mut ended = None;
     let mut next_ping = Duration::ZERO;
     let mut chunk = [0u8; 4096];
     while t0.elapsed() < Duration::from_secs(10) {
@@ -121,13 +122,17 @@ fn run(timeouts: &[&str], request: bool, ping_every: Option<Duration>, delay: Du
             if buf.len() < 9 + len {
                 break;
             }
+            // The end of stream 1 (HEADERS or DATA with END_STREAM) is the server's `idle_start`.
+            if (buf[3] == 0 || buf[3] == 1) && buf[4] & 1 != 0 && buf[5..9] == [0, 0, 0, 1] && ended.is_none() {
+                ended = Some(t0.elapsed());
+            }
             if buf[3] == 7 && goaway.is_none() {
                 goaway = Some(t0.elapsed());
             }
             buf.drain(..9 + len);
         }
     }
-    (goaway, t0.elapsed())
+    (goaway, t0.elapsed(), ended)
 }
 
 fn near(what: &str, got: Duration, want_ms: u64) {
@@ -136,9 +141,13 @@ fn near(what: &str, got: Duration, want_ms: u64) {
 }
 
 fn check(timeouts: &[&str], request: bool, ping: Option<Duration>, delay: Duration, goaway_ms: u64, close_ms: u64) {
-    let (g, close) = run(timeouts, request, ping, delay);
-    near("first GOAWAY", g.expect("a GOAWAY"), goaway_ms);
-    near("close", close, close_ms);
+    let (g, close, ended) = run(timeouts, request, ping, delay);
+    // The table counts from the end of the last stream, which is `delay` after the request on an
+    // idle host. A loaded host (a backend thread that wakes late) ends it later and everything
+    // after it moves with it, so the expected instants are shifted by the lateness this client saw.
+    let late = ended.map_or(0, |e| u64::try_from(e.as_millis()).unwrap_or(0).saturating_sub(u64::try_from(delay.as_millis()).unwrap_or(0)));
+    near("first GOAWAY", g.expect("a GOAWAY"), goaway_ms + late);
+    near("close", close, close_ms + late);
 }
 
 const NO: Duration = Duration::ZERO;

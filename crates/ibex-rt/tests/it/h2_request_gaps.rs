@@ -67,7 +67,10 @@ fn server() -> (SocketAddr, Receiver<Vec<u8>>) {
                     }
                 }
                 let _ = tx.send(got);
-                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                // This thread ends right after, so the connection is closed: say so, or the proxy may
+                // reuse it for the next request of the test and get the reset that follows
+                // (`abort_keep_alive`: a REFUSED_STREAM on that stream) when it is quick enough.
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
             });
         }
     });
@@ -283,7 +286,8 @@ fn log_counts_of_an_h2_request_are_the_htx_message() {
     assert_eq!(log_line(&log), "B=51 U=51 te=- tr=- r=POST http://x/n HTTP/2.0");
     s.write_all(&frame(1, 4, 5, &head("PUT", "/x", &[("expect", "100-continue"), ("content-length", "6")]))).expect("head");
     s.write_all(&frame(0, 1, 5, b"hello\n")).expect("data");
-    assert!(is_200(&read_until_end(&mut s, 5)));
+    let frames = read_until_end(&mut s, 5);
+    assert!(is_200(&frames), "{frames:?}");
     assert_eq!(log_line(&log), "B=51 U=86 te=- tr=- r=PUT http://x/x HTTP/2.0");
 }
 
