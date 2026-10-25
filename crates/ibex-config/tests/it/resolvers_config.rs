@@ -258,10 +258,51 @@ fn resolvers_section_refusals_are_haproxys() {
         "'resolution_pool_size' directive is not supported anymore (it never appeared in a stable release)."
     );
     assert_eq!(refused(&with_resolvers("  foo bar")), "unknown keyword 'foo' in 'resolvers' section");
-    // Refused until built: `parse-resolv-conf` (T489), `tcp@` / `udp@` (T488).
+    // Refused until built: `parse-resolv-conf` (T489).
     assert!(refused(&with_resolvers("  parse-resolv-conf")).contains("'parse-resolv-conf' is not supported"));
-    assert!(refused(&with_resolvers("  nameserver ns2 tcp@127.0.0.1:53")).contains("'tcp@'"));
-    assert!(refused(&with_resolvers("  nameserver ns2 udp@127.0.0.1:53")).contains("'udp@'"));
+}
+
+/// T488, measured with `haproxy -c`: the address prefixes of `nameserver` choose the transport
+/// (`tcp@`, `tcp4@`, `tcp6@`, `stream+`: TCP; `udp@`, `udp4@`, `udp6@`, `dgram+`: UDP, no
+/// fallback; `ip@`, `ipv4@`, `ipv6@` and none: UDP with the fallback); a `4`/`6` form refuses
+/// the other family; any other prefix is refused here (`mptcp@`, `unix@`...: not implemented).
+#[test]
+fn nameserver_prefixes_choose_the_transport() {
+    use ibex_config::ast::NsTransport::{Default, Tcp, Udp};
+    let transport = |addr: &str| {
+        let cfg = parse_str(&with_resolvers(&format!("  nameserver ns2 {addr}"))).expect("accepted");
+        let ns = cfg.resolvers[0].nameservers[1].clone();
+        (ns.transport, ns.addr.to_string())
+    };
+    for (addr, want, shown) in [
+        ("tcp@127.0.0.1:53", Tcp, "127.0.0.1:53"),
+        ("tcp4@127.0.0.1:54", Tcp, "127.0.0.1:54"),
+        ("tcp6@[::1]:53", Tcp, "[::1]:53"),
+        ("stream+127.0.0.1:53", Tcp, "127.0.0.1:53"),
+        ("udp@127.0.0.1:53", Udp, "127.0.0.1:53"),
+        ("udp4@127.0.0.1:53", Udp, "127.0.0.1:53"),
+        ("udp6@[::1]:53", Udp, "[::1]:53"),
+        ("dgram+127.0.0.1:53", Udp, "127.0.0.1:53"),
+        ("ip@127.0.0.1:53", Default, "127.0.0.1:53"),
+        ("ipv4@127.0.0.1:53", Default, "127.0.0.1:53"),
+        ("ipv6@[::1]:53", Default, "[::1]:53"),
+        ("127.0.0.1:53", Default, "127.0.0.1:53"),
+    ] {
+        assert_eq!(transport(addr), (want, shown.to_string()), "{addr}");
+    }
+    for (addr, host) in [
+        ("tcp4@[::1]:53", "[::1]"),
+        ("udp4@[::1]:53", "[::1]"),
+        ("ipv4@[::1]:53", "[::1]"),
+        ("ipv6@127.0.0.1:53", "127.0.0.1"),
+        ("tcp6@127.0.0.1:53", "127.0.0.1"),
+        ("udp6@127.0.0.1:53", "127.0.0.1"),
+    ] {
+        assert_eq!(refused(&with_resolvers(&format!("  nameserver ns2 {addr}"))), format!("'nameserver ns2' : invalid address: '{host}' in '{addr}'"), "{addr}");
+    }
+    assert_eq!(refused(&with_resolvers("  nameserver ns2 tcp@127.0.0.1")), "'nameserver ns2' : missing port specification in 'tcp@127.0.0.1'");
+    assert_eq!(refused(&with_resolvers("  nameserver ns2 tcp@53")), "'nameserver ns2' : missing port specification in 'tcp@53'");
+    assert!(refused(&with_resolvers("  nameserver ns2 mptcp@127.0.0.1:53")).contains("'mptcp@' is not implemented"));
 }
 
 #[test]
@@ -287,7 +328,7 @@ fn resolvers_section_names_and_nameservers_are_checked() {
     assert_eq!(ns("nameserver ns2 [::1"), "'nameserver ns2' : invalid address: '[:' in '[::1'");
     assert_eq!(ns("nameserver ns2 [::1]"), "'nameserver ns2' : missing port specification in '[::1]'");
     // n3: HAProxy takes `ipv4@`; Ibex refuses every prefix but none.
-    assert_eq!(ns("nameserver ns2 ipv4@127.0.0.1:53"), "'nameserver ns2' : address prefix 'ipv4@' is not implemented");
+    assert_eq!(ns("nameserver ns2 mptcp@127.0.0.1:53"), "'nameserver ns2' : address prefix 'mptcp@' is not implemented");
     assert_eq!(
         ns("nameserver ns2 nosuch.invalid:53"),
         "'nameserver ns2' : invalid address: 'nosuch.invalid' in 'nosuch.invalid:53'"

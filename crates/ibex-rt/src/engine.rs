@@ -13646,7 +13646,7 @@ impl EngineDispatcher<'_> {
         let Some(sec) = self.resolvers.get_mut(idx) else { return Outcome::Done };
         // Lines are rare (a change of a server's address or state): a `Vec` per change.
         let mut lines: Vec<(usize, LogLevel, String)> = Vec::new();
-        let wait = sec.step(self.proxies, self.checks, &mut |p, level, msg| lines.push((p, level, msg.to_string())));
+        let wait = sec.step(self.proxies, self.checks, &mut |p, level, msg| lines.push((p, level, msg.to_string())), &mut self.fdtab, &self.poller);
         let task = sec.task;
         for (p, level, msg) in lines {
             crate::stderr_line!("[WARNING]  ({}) : {msg}", self.pid);

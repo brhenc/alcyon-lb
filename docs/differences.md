@@ -193,9 +193,14 @@ Not refused, on purpose:
   health checks; HAProxy spreads them over threads); a forged or malformed reply never ends a
   resolution early (the honest answer is still taken); only a layer-4 timeout of a check, not a
   refused connect, triggers a resolution. `server-template <prefix> <n|lo-hi> <name>[:port]` expands to servers `<prefix><n>` that share one resolution (T486); `from none` is accepted, `from be:`/`from srv:` are refused, and a parameter error names `server <slot>` where HAProxy says `server-template <px>/<prefix>`. Still refused: SRV names
-  (`_...`, T487), TCP (`tcp@` nameservers and the fallback on a truncated answer, which is an error
-  until T488), `do-resolve`, `parse-resolv-conf` and `dns-accept-family` (T489), any other address
-  prefix on a `nameserver`. HAProxy also
+  (`_...`, T487), `do-resolve`, `parse-resolv-conf` and `dns-accept-family` (T489), and the address
+  prefixes `mptcp@`, `unix@`, `abns@`, `quic4@`... on a `nameserver`. TCP is done (T488): a
+  truncated UDP answer is asked again over TCP to the same nameserver at once (one connection per
+  nameserver, opened by the first query, four queries in flight, closed after 5 s idle); `tcp@`,
+  `tcp4@`, `tcp6@`, `stream+` send everything over TCP; `udp@`, `udp4@`, `udp6@`, `dgram+` are UDP
+  without fallback. HAProxy numbers the queries of a TCP stream 1, 2, 3; Ibex keeps random ids. A
+  TCP port nobody listens on is not a `snd_error` (measured: the queries count `sent`, the
+  resolution times out), as in HAProxy. HAProxy also
   creates an implicit `default` section (from `/etc/resolv.conf`, used by its httpclient); Ibex has
   no httpclient and does not (user, 2026-10-25). `show resolvers` (T485) therefore lacks the block
   HAProxy 3.5-dev8 ends with, even for a configuration with no `resolvers` section at all:
@@ -206,7 +211,7 @@ Not refused, on purpose:
   also readable as `haproxy_resolver_<counter>{resolver=,nameserver=}` (the name `send_error` for
   `snd_error`; scrape with `scope=resolver`; the reference binary here has no exporter, so the
   names come from `resolvers.c:104`). `cname` and `timeout` stay 0 (HAProxy never bumps them
-  either), `tcp_fallback` waits for T488. Not done: `show stat domain resolvers` (typed rows) and
+  either), `tcp_fallback` counts the TCP queries sent after a truncated UDP answer (T488). Not done: `show stat domain resolvers` (typed rows) and
   `show resolvers` in `help`.
 - A name on a `server` line is resolved by libc while the configuration loads, as HAProxy does
   (`localhost` is the first answer of `getaddrinfo`, `::1` on most hosts, no longer `127.0.0.1`),
@@ -348,6 +353,16 @@ and plaintext are a real target); `off` leaves them as HAProxy does. The plain I
 follow `tune.ibex.zero-buffers` (default off) instead. HAProxy 3.5-dev8 refuses the keyword as
 unknown. It takes exactly `on` or `off`; anything else, or a missing argument, is a
 configuration error. Limits: key material inside rustls/ring is not covered (`tradeoff.md` 6.27).
+
+## `tune.ibex.h3-path relay|mux`: an Ibex-only global keyword (T509, temporary)
+
+Which path an HTTP/3 request stream takes into the stream engine while the h3 mux is being
+brought in (`docs/design/h3-engine-2026-10-26.md`, slices H3a to H5): `relay` (the default) is
+the HTTP/1 relay over a socket pair; `mux` makes each QUIC connection an owner session whose
+request streams are children served through the same bridge as HTTP/2 streams. Unset, the
+environment variable `IBEX_H3_PATH` (`mux` or `relay`) decides, so the h3 tests run on either
+path. HAProxy refuses the keyword as unknown. It takes exactly `relay` or `mux`. The keyword is
+deleted with the relay (slice H5).
 
 ## `tune.ibex.zero-spares on|off`: an Ibex-only global keyword (S1)
 

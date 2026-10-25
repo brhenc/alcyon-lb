@@ -10,10 +10,25 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// The transport a `nameserver` address asks for (`str2sa_range` with `PA_O_DEFAULT_DGRAM`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NsTransport {
+    /// No explicit type (`ip:port`, `ipv4@`, `ipv6@`, `ip@`): UDP, and a truncated answer is
+    /// asked again over TCP.
+    #[default]
+    Default,
+    /// `udp@`, `udp4@`, `udp6@`, `dgram+`: UDP only, no TCP fallback.
+    Udp,
+    /// `tcp@`, `tcp4@`, `tcp6@`, `stream+`: every query goes over TCP.
+    Tcp,
+}
+
 /// A `nameserver <name> <addr>:<port>` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nameserver {
     pub name: String,
+    /// How it is reached (the address prefix).
+    pub transport: NsTransport,
     /// The address, a name in it resolved by libc while the configuration loads.
     pub addr: SocketAddr,
     /// The line it is on, for the duplicate-name alert.
