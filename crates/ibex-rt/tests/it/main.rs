@@ -294,6 +294,7 @@ mod request_framing_smuggling;
 mod request_head_limit;
 mod request_line_414;
 mod rules_edit_framing;
+mod rules_path_work;
 mod rule_format_aliases;
 mod content_length_early_reject;
 mod request_line_validation;
