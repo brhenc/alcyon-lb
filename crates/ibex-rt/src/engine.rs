@@ -4861,6 +4861,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     listener.name = b.name.as_deref().map(Into::into);
                     listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
                     listener.accept_proxy_v2 = b.accept_proxy_v2;
+                    listener.proto_h2 = b.proto.as_deref() == Some("h2");
                     listener.tls.clone_from(&tls);
                     let l_idx = listeners.len();
                     let lfd = listener.raw_fd();
@@ -4906,6 +4907,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         listener.name = b.name.as_deref().map(Into::into);
                     listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
                     listener.accept_proxy_v2 = b.accept_proxy_v2;
+                    listener.proto_h2 = b.proto.as_deref() == Some("h2");
                         listener.tls.clone_from(&tls);
                         let l_idx = listeners.len();
                         let lfd = listener.raw_fd();
@@ -7481,6 +7483,7 @@ fn register_new_session(
     // Without a listener, the client is an HTTP/3 request stream (`adopt_quic_streams`).
     sess.reset_with_request = reset_pending;
     sess.h3 = listener_idx.is_none();
+    sess.proto_h2 = listener_idx.and_then(|i| engine.listeners.get(i)).is_some_and(|l| l.proto_h2);
     sess.so_name = listener_idx.and_then(|i| engine.listeners.get(i)).and_then(|l| l.name.clone());
     sess.so_id = listener_idx.and_then(|i| engine.listeners.get(i)).map(|l| l.luid).filter(|&id| id != 0);
 
@@ -9560,7 +9563,9 @@ impl EngineDispatcher<'_> {
         let Some(txn) = entry.sess.txn.as_mut() else { return };
         if !txn.req.is_done() && !txn.local && txn.rsp == MsgState::Waiting && txn.body_wait.is_none() && entry.sess.rep.is_empty() {
             txn.srv_reusable = false;
-            entry.sess.log.term = Some(*b"cH");
+            // The server connection still being made: the client gave up during the connect
+            // (`cC--`), not while the server waited for the rest of the body (`cH--`).
+            entry.sess.log.term = Some(if entry.sess.srv_state == ScState::Connecting { *b"cC" } else { *b"cH" });
             entry.sess.log.status = Some(400);
             if child {
                 entry.sess.cli_state = cli_before;
@@ -9578,6 +9583,22 @@ impl EngineDispatcher<'_> {
             let mut page = proxy_error_response(&entry.sess, be, fe, proxies, 400);
             rewrite_header_names(&mut page, client_case_table(fe));
             entry.sess.send_before_close(&page);
+            // The connection is not closed with the page: the client side waits one more
+            // `timeout client`, whatever arrives restarting it, and a FIN ends it (T501,
+            // VV-9; measured on HAProxy 3.5-dev8: 400 at T, close at 2T). The stream is over
+            // and logged now; the server side is let go.
+            if entry.sess.timeouts.client != 0 && entry.sess.cli_state == ScState::Error {
+                set_stream_log(entry, proxies, std::process::id());
+                release_server(entry, proxies, fdtab, poller, idle_pool, false);
+                entry.sess.txn = None;
+                entry.sess.srv_state = ScState::Closed;
+                entry.sess.cli_state = ScState::Ready;
+                entry.sess.ending = None;
+                entry.sess.cli_linger = true;
+                entry.sess.req.clear();
+                entry.sess.arm_client(now);
+                return;
+            }
             close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
             return;
         }
