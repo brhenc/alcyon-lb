@@ -18,6 +18,7 @@ use crate::raw;
 use crate::txn::{self, HttpTxn, MsgState};
 use ibex_proto::endpoint::ScState;
 use ibex_proto::htx::HtxBlock;
+use ibex_proto::htx_mux::{HtxMux, HtxStream, MuxReset};
 use ibex_proto::mux_h2::{H2MuxContext, H2ReqHead};
 use std::os::fd::AsFd;
 
@@ -36,6 +37,12 @@ pub struct H2Dispatch {
     /// A request `HAProxy` answers 400 without contacting a server
     /// ([`ibex_proto::H2StreamCtx::bad_request`]).
     pub bad_request: bool,
+    /// The `content-length` the forwarded head gets in place of any the client wrote: a
+    /// request whose whole body came with its head and that gave none
+    /// ([`ibex_proto::HtxStream::known_body`]), or one whose length was not written once in
+    /// its canonical form (`5, 5`, `005`, twice: `HAProxy` 3.5-dev7 forwards
+    /// `content-length: 5`, T509).
+    pub add_len: Option<u64>,
 }
 
 /// Takes the lowest stream of the connection that has its whole request head and has not
@@ -77,6 +84,57 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
         req_htx,
         request_line,
         bad_request: stream.bad_request,
+        add_len: None,
+    })
+}
+
+/// [`dispatch_next`] for any mux the bridge drives (T509): the stream the mux says may be
+/// served next, marked served. `version` is what `%r` prints after the target. A stream id
+/// past `u32` (2^30 requests on one connection) is refused, as the stream entries count
+/// in `u32`.
+pub fn dispatch_mux<M: HtxMux>(mux: &mut M, keep_request_line: bool, version: &str) -> Option<H2Dispatch> {
+    let id = mux.next_dispatch()?;
+    let Ok(id32) = u32::try_from(id) else {
+        mux.reset(id, MuxReset::Refused);
+        return None;
+    };
+    let stream = mux.stream_mut(id)?;
+    stream.set_dispatched();
+    let blocks = stream.rx_htx().blocks();
+    let has_data = blocks.iter().any(|b| matches!(b, HtxBlock::Data(_) | HtxBlock::RawData(_) | HtxBlock::Trailer(_)));
+    let first_body = blocks.iter().position(|b| matches!(b, HtxBlock::Eoh)).map_or(blocks.len(), |i| i + 1);
+    let eom = stream.rx_htx().is_eom();
+    let known = stream.known_body();
+    let cl = stream.content_length();
+    let bad_request = stream.bad_request();
+    let head = stream.take_req_head()?;
+    let has_len = cl.is_some();
+    let canonical = {
+        let mut lens = head.headers().filter(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+        match (cl, lens.next(), lens.next()) {
+            (Some(n), Some((_, v)), None) => (v.parse::<u64>().ok() == Some(n) && !v.starts_with('0')) || v == "0",
+            (None, None, _) => true,
+            _ => false,
+        }
+    };
+    // A body all in with the head goes with its length, as `HAProxy`'s h1 side writes it
+    // (`HTX_SL_F_XFER_LEN` and a known size); one still coming goes chunked.
+    let add_len = if canonical { known.filter(|&n| n > 0 && !has_len) } else { cl };
+    let chunked = !has_len && add_len.is_none() && (has_data || !eom);
+    let req_htx = h2_head_size(&head).saturating_sub(u64::from(chunked));
+    let request_line = (keep_request_line && head.has_line)
+        .then(|| format!("{} {}{} {version}", head.method(), head.abs_prefix().unwrap_or(""), head.uri()));
+    Some(H2Dispatch {
+        stream: H2ActiveStream {
+            id: id32,
+            body: H2ReqBody { cursor: first_body, off: 0, chunked, ..H2ReqBody::default() },
+            chunk_out: chunked,
+        },
+        head,
+        req_htx,
+        request_line,
+        bad_request,
+        add_len,
     })
 }
 
@@ -108,6 +166,25 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     let wire_req: &[u8] = if chunked {
         let at = find_eoh(head).map_or(head.len(), |(h, _)| h);
         wire_req_buf = chunked_head(head, at);
+        &wire_req_buf
+    } else if let Some(n) = d.add_len {
+        let at = find_eoh(head).map_or(head.len(), |(h, _)| h);
+        // The client's own `content-length` lines are left out.
+        let mut v = Vec::with_capacity(at + 40);
+        for (i, line) in head[..at].split(|&b| b == b'\n').enumerate() {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if i > 0 && line.len() >= 15 && line[..15].eq_ignore_ascii_case(b"content-length:") {
+                continue;
+            }
+            if i > 0 {
+                v.extend_from_slice(b"\r\n");
+            }
+            v.extend_from_slice(line);
+        }
+        v.extend_from_slice(b"\r\ncontent-length: ");
+        v.extend_from_slice(n.to_string().as_bytes());
+        v.extend_from_slice(&head[at..]);
+        wire_req_buf = v;
         &wire_req_buf
     } else {
         head
@@ -219,6 +296,85 @@ pub fn pump_request_body(h2: &mut H2MuxContext, active: &mut H2ActiveStream, req
         changed = true;
     }
     (changed, body.trailer_bytes - before)
+}
+
+/// [`pump_request_body`] for any mux the bridge drives (T509): the stream's DATA into `req`
+/// as far as it has room, the mux told what was taken (h3: quinn credits the client's
+/// window as the owner reads, so there is no window to grant here).
+pub fn pump_request_body_mux<M: HtxMux>(mux: &mut M, active: &mut H2ActiveStream, req: &mut Buf) -> (bool, u64) {
+    let id = u64::from(active.id);
+    let Some(stream) = mux.stream_mut(id) else {
+        return (false, 0);
+    };
+    let body = &mut active.body;
+    let (before, was_done, taken) = (body.trailer_bytes, body.done, body.consumed);
+    let changed = pump_h2_body(stream.rx_htx_mut(), body, req) || body.done != was_done;
+    let taken = usize::try_from(body.consumed - taken).unwrap_or(usize::MAX);
+    if taken > 0 {
+        mux.rx_taken(id, taken);
+    }
+    (changed, body.trailer_bytes - before)
+}
+
+/// [`forward_response`] for any mux the bridge drives (T509), the DATA staged in `scratch`.
+pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, scratch: &mut Vec<u8>) -> bool {
+    let id = u64::from(stream_id);
+    if txn.rsp == MsgState::Waiting || txn.rsp.is_done() {
+        return false;
+    }
+    let data = rep.readable();
+    let win = txn.rsp.window(data);
+    if txn.rsp_interim {
+        // Interim responses are dropped as on h2 (they go out in slice H3b).
+        txn.response_sent(data, win);
+        rep.consume(win);
+        return false;
+    }
+    if let MsgState::Head { body, .. } = txn.rsp {
+        let Some((h, e)) = find_eoh(data) else { return false };
+        let end_stream = matches!(body, txn::Framing::None | txn::Framing::Length(0));
+        if mux.send_head(id, &data[..h], end_stream) {
+            txn.rsp.consume(data, h + e);
+            rep.consume(h + e);
+            if !end_stream {
+                return forward_response_mux(mux, stream_id, txn, rep, srv_gone, scratch);
+            }
+        }
+        return false;
+    }
+    if !matches!(txn.rsp, MsgState::Body(_)) {
+        mux.reset(id, MuxReset::Internal);
+        txn.srv_reusable = false;
+        txn.rsp = MsgState::Done;
+        return false;
+    }
+    scratch.clear();
+    let mut state = txn.rsp;
+    let used = state.take_body(data, mux.data_budget(id), scratch);
+    let end = state.is_done();
+    if let Some(t) = txn.rsp_htx.as_mut().filter(|_| !txn.local) {
+        *t += scratch.len() as u64 + u64::from(end && matches!(txn.rsp, MsgState::Body(txn::Body::Chunked(_))));
+    }
+    if !scratch.is_empty() || end {
+        mux.send_data(id, scratch, end);
+    }
+    if used > 0 || end {
+        txn.rsp = state;
+        rep.consume(used);
+    }
+    if txn.rsp.is_done() || !srv_gone || !rep.is_empty() {
+        return false;
+    }
+    txn.srv_reusable = false;
+    let cut_short = if matches!(txn.rsp, MsgState::Body(txn::Body::UntilClose)) {
+        mux.send_data(id, &[], true);
+        false
+    } else {
+        mux.reset(id, MuxReset::Cancel);
+        true
+    };
+    txn.rsp = MsgState::Done;
+    cut_short
 }
 
 /// The response of a stream, as HEADERS then DATA frames, as much as the client's
@@ -513,6 +669,7 @@ mod tests {
             req_htx: 7,
             request_line: None,
             bad_request: false,
+            add_len: None,
         }
     }
 

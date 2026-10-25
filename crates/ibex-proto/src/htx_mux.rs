@@ -40,6 +40,16 @@ pub trait HtxStream {
     fn take_req_head(&mut self) -> Option<Box<H2ReqHead>>;
     /// A request `HAProxy` takes and answers 400.
     fn bad_request(&self) -> bool;
+    /// The body's length when the whole request came with its head (h3: FIN in the read of
+    /// its HEADERS): forwarded with that `content-length`, not chunked (T509).
+    fn known_body(&self) -> Option<u64> {
+        None
+    }
+    /// The request's `content-length`, as the mux read it (one value, however the client
+    /// wrote it): the forwarded head carries it once, in its canonical form (T509).
+    fn content_length(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A multiplexed client connection, as the bridge drives it. Stream ids are the protocol's

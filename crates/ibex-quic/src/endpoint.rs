@@ -209,6 +209,17 @@ impl QuicEndpoint {
         self.refusing_new = true;
     }
 
+    /// Asks the peer to stop sending on a stream (`STOP_SENDING`, `HAProxy`'s
+    /// `qcc_abort_stream_read`), the sending half left as it is. A stream or connection that
+    /// is gone, or a code that is no varint, is nothing to do.
+    pub fn stop_sending(&mut self, conn_id: ConnectionId, stream_id: StreamId, error_code: u64) {
+        let Ok(code) = VarInt::from_u64(error_code) else { return };
+        let Some(handle) = self.connection_table.lookup(&conn_id) else { return };
+        if let Some(conn) = self.connections.get_mut(&handle) {
+            let _ = conn.recv_stream(stream_id.into()).stop(code);
+        }
+    }
+
     /// Creates a `QuicEndpoint` from an already configured `quinn_proto::ServerConfig`.
     ///
     /// # Errors
