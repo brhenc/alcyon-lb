@@ -183,15 +183,21 @@ Not refused, on purpose:
 - QUIC / HTTP/3 (`quic4@`, `quic6@`, `proto quic`, `alpn h3`): Ibex has a QUIC listener
   (`ibex-quic`, exercised by `crates/ibex-config/tests/it/quic_bind.rs`); it is experimental.
   The reference HAProxy binary here is built without QUIC and refuses these.
-- `resolvers` sections: parsed and checked as HAProxy does (T483, `parser/resolvers.rs`);
-  run-time resolution: T484. Until then a server's (or `default-server`'s) `resolvers` keyword is
-  refused, as are `server-template` (T486), SRV names `_...` on a server line (T487),
-  `parse-resolv-conf` (T489), `tcp@` / `udp@` nameservers (T488) and any other address prefix on a
-  `nameserver` (HAProxy takes `ipv4@`, `unix@`...). `resolve-prefer`, `resolve-net` and
-  `resolve-opts` are checked as HAProxy checks them and then do nothing, as in HAProxy without
-  `resolvers` (Ibex warns that it ignores them). HAProxy also creates an implicit `default` section
-  (from `/etc/resolv.conf`, used by its httpclient); Ibex has no httpclient and does not (user,
-  2026-10-25; `show resolvers` is T485).
+- `resolvers` sections: parsed and checked as HAProxy does (T483), and a server whose address is a
+  name and that has `resolvers` (or inherits it from `default-server`) is re-resolved at run time
+  as HAProxy does it (T484): one query every `timeout resolve` whatever the TTL, retries, the
+  `hold` timers, `MAINT (resolution)`, the address swaps and their log lines, `resolve-prefer`,
+  `resolve-net`, `resolve-opts allow-dup-ip|prevent-dup-ip`, a layer-4 check timeout asking for a
+  resolution. Families are HAProxy's default `dns-accept-family auto` (AAAA only while the host
+  has an IPv6 route, re-probed every 30 s). Differences: every section runs on worker 0 (with the
+  health checks; HAProxy spreads them over threads); a forged or malformed reply never ends a
+  resolution early (the honest answer is still taken); only a layer-4 timeout of a check, not a
+  refused connect, triggers a resolution. Still refused: `server-template` (T486), SRV names
+  (`_...`, T487), TCP (`tcp@` nameservers and the fallback on a truncated answer, which is an error
+  until T488), `do-resolve`, `parse-resolv-conf` and `dns-accept-family` (T489), `init-addr last`
+  (T490), any other address prefix on a `nameserver`. `show resolvers` is T485. HAProxy also
+  creates an implicit `default` section (from `/etc/resolv.conf`, used by its httpclient); Ibex has
+  no httpclient and does not (user, 2026-10-25).
 - A name on a `server` line is resolved by libc while the configuration loads, as HAProxy does
   (`localhost` is the first answer of `getaddrinfo`, `::1` on most hosts, no longer `127.0.0.1`),
   and `init-addr libc|none|<ip>` is applied in order. `init-addr last` is refused: Ibex has no

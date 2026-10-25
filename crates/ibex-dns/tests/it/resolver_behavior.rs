@@ -718,6 +718,25 @@ fn a_truncated_tcp_answer_is_other() {
     assert_eq!(r.poll_result().unwrap().1, Err(DnsError::Other));
 }
 
+// T484: with `tcp_fallback` off (Ibex until T488), a truncated UDP answer is an error like a
+// truncated TCP one: counted `truncated`, no TCP query, the resolution ends `Other`.
+#[test]
+fn without_tcp_fallback_a_truncated_udp_answer_is_other() {
+    let mut c = cfg(&[NS1]);
+    c.resolve_retries = 1;
+    c.tcp_fallback = false;
+    let mut r = Resolver::new(c);
+    let t0 = Instant::now();
+    q4(&mut r, t0, "tc.test");
+    let id = sends(&mut r, t0)[0].2;
+    let mut tc = Message::from_vec(&a_response(id, "tc.test", Ipv4Addr::new(10, 0, 0, 7), 60)).unwrap();
+    tc.set_truncated(true);
+    assert_eq!(r.handle_response(t0, ns(NS1), Protocol::Udp, &tc.to_vec().unwrap()), Received::Truncated);
+    assert!(sends(&mut r, t0).is_empty(), "no TCP query");
+    sends(&mut r, ms(t0, 1000));
+    assert_eq!(r.poll_result().unwrap().1, Err(DnsError::Other));
+}
+
 // Item 4, at the retry timer (resolvers.c:2631-2640): both families, an error from one of two
 // nameservers and silence from the other: the next try is of the other type, no try used.
 #[test]

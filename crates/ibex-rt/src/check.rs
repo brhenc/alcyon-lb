@@ -1455,6 +1455,11 @@ pub fn step_check(
             };
 
             cleanup_check_socket(check, fdtab, poller);
+            if code == "L4TOUT" {
+                // "might be due to a server IP change" (`check.c:946`): the engine asks the
+                // server's resolvers (`resolvers::Section::trigger`).
+                crate::resolvers::note_l4_timeout();
+            }
             let event = check.on_failure_full(code, desc, duration, None, info);
             let next = check.schedule_next(now);
             check.next_check = next;
@@ -1707,7 +1712,11 @@ pub fn step_check(
             }
         }
     } else {
-        // Start a brand new check
+        // Start a brand new check, at the server's address now: `set server addr` or a
+        // resolver may have moved it since the last one (T484).
+        if let Some(a) = proxies.get(check.proxy()).and_then(|px| px.servers.get(check.server())) {
+            check.addr = a;
+        }
         check.run.start_tick = now;
         check.http_code = None;
         check.last_status_info = None;

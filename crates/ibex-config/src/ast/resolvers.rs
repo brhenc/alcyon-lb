@@ -3,10 +3,9 @@
 
 //! `resolvers` sections (`cfg_parse_resolvers`, `src/resolvers.c`).
 //!
-//! Parsed and checked as `HAProxy` checks them. Nothing reads them yet: a server's
-//! `resolvers` keyword, the only thing that would, is refused until run-time resolution
-//! exists (T484, `docs/design/dns-2026-10-25.md` §2.7). A section no server uses does
-//! nothing observable in `HAProxy` either, except in `show resolvers` (T485).
+//! Parsed and checked as `HAProxy` checks them; a section a server names runs at run time
+//! (`ibex_rt::resolvers`, T484). A section no server uses does nothing observable in
+//! `HAProxy` either, except in `show resolvers` (T485).
 
 use std::net::SocketAddr;
 use std::time::Duration;

@@ -1459,7 +1459,7 @@ pub struct ProxyIdInfo {
     /// Which servers started without an address (`init-addr none` after a name did not
     /// resolve: `SRV_ADMF_RMAINT`, 32 in `show servers state`, `MAINT (resolution)`); empty
     /// when none (see [`Proxy::server_rmaint`]).
-    pub server_rmaint: Vec<bool>,
+    pub server_rmaint: Arc<Vec<std::sync::atomic::AtomicBool>>,
     /// The name each server's address was written as (`srv_fqdn`); empty when no server's
     /// was (see [`Proxy::server_fqdn`]).
     pub server_fqdns: Vec<Option<Box<str>>>,
@@ -1759,10 +1759,18 @@ impl Proxy {
     }
 
     /// Whether the server at `idx` has no address (`SRV_ADMF_RMAINT`): it stays in
-    /// maintenance whatever the CLI asks, as nothing can give it one before T484.
+    /// maintenance whatever the CLI asks, until its resolver gives it one (`crate::resolvers`).
     #[must_use]
     pub fn server_rmaint(&self, idx: usize) -> bool {
-        self.ids.server_rmaint.get(idx).copied().unwrap_or(false)
+        self.ids.server_rmaint.get(idx).is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
+    /// Sets or clears `SRV_ADMF_RMAINT` on the server at `idx` (a server whose address is a
+    /// name: the others have no flag).
+    pub fn set_server_rmaint(&self, idx: usize, on: bool) {
+        if let Some(f) = self.ids.server_rmaint.get(idx) {
+            f.store(on, Ordering::Relaxed);
+        }
     }
 
     /// The name the address of the server at `idx` was written as, if it was one.
@@ -2205,6 +2213,9 @@ pub struct Engine {
     /// inside each `Proxy` (T177).
     pub proxies: Proxies,
     pub checks: Vec<ServerCheckState>,
+    /// The `resolvers` sections the servers use, on worker 0 with the checks they change
+    /// (`crate::resolvers`); empty elsewhere.
+    resolvers: Vec<crate::resolvers::Section>,
     pub sessions: SessionArena,
     pub applets: AppletArena,
     pub cli_listener: Option<crate::cli_listener::CliListener>,
@@ -3885,9 +3896,14 @@ fn server_cmaint(servers: &[ibex_config::Server]) -> Vec<bool> {
     if servers.iter().any(|s| s.disabled) { servers.iter().map(|s| s.disabled).collect() } else { Vec::new() }
 }
 
-/// The flags for [`Proxy::server_rmaint`]: empty when every server has an address.
-fn server_rmaint(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<bool> {
-    if extras.names.iter().any(|n| n.unresolved) { (0..count).map(|i| extras.unresolved(i)).collect() } else { Vec::new() }
+/// The flags for [`Proxy::server_rmaint`]: one per server when an address was written as a
+/// name (a resolver may take it away at run time), else empty.
+fn server_rmaint(count: usize, extras: &ibex_config::ast::ServerExtras) -> Arc<Vec<std::sync::atomic::AtomicBool>> {
+    if extras.names.is_empty() {
+        Arc::default()
+    } else {
+        Arc::new((0..count).map(|i| std::sync::atomic::AtomicBool::new(extras.unresolved(i))).collect())
+    }
 }
 
 /// The names for [`Proxy::server_fqdn`]: empty when no address was written as one.
@@ -4833,6 +4849,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         } else {
             Vec::new()
         };
+        // Where a server's `resolvers` reaches the data path: its section's task and sockets.
+        let resolvers = if worker_id == 0 {
+            crate::resolvers::build(config, &proxies, &mut scheduler, &mut fdtab, &poller, now)?
+        } else {
+            Vec::new()
+        };
 
 
         // A worker on its own answers itself; `share_mailboxes` joins it to the others.
@@ -4854,6 +4876,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             listeners,
             proxies,
             checks,
+            resolvers,
             sessions,
             applets,
             cli_listener: None,
@@ -5528,6 +5551,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     quic_ready.push(q_idx as usize);
                 }
                 FdState::Mailbox => mail = true,
+                FdState::Resolver { section } => {
+                    if let Some(sec) = self.resolvers.get(section as usize) {
+                        self.scheduler.tasklet_wakeup(sec.task, Class::Normal, state::WOKEN_IO);
+                    }
+                }
                 // One of this worker's idle server connections: its server closed it, or
                 // sent what nobody asked for (T434).
                 FdState::Idle => {
@@ -5574,6 +5602,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             applets: &mut self.applets,
             proxies: &mut self.proxies,
             checks: &mut self.checks,
+            resolvers: &mut self.resolvers,
             fdtab: &mut self.fdtab,
             poller: &mut self.poller,
             listeners: &mut self.listeners,
@@ -7933,12 +7962,25 @@ pub fn set_proxy_maxconn(
     }
 }
 
+/// A check of server `s` of proxy `p` ended in a layer-4 timeout: its resolutions may be due
+/// now (`resolvers::Section::trigger`). Out of line: kept off the dispatcher's code.
+#[cold]
+#[inline(never)]
+fn trigger_resolutions(resolvers: &mut [crate::resolvers::Section], timers: &mut Vec<(TaskRef, Tick)>, now: Tick, p: usize, s: usize) {
+    for sec in resolvers.iter_mut() {
+        if sec.trigger(p, s) {
+            timers.push((sec.task, now));
+        }
+    }
+}
+
 /// Internal dispatcher executing scheduler tasks against runtime sessions and health checks.
 struct EngineDispatcher<'a> {
     sessions: &'a mut SessionArena,
     applets: &'a mut AppletArena,
     proxies: &'a mut Proxies,
     checks: &'a mut [ServerCheckState],
+    resolvers: &'a mut [crate::resolvers::Section],
     fdtab: &'a mut FdTab,
     poller: &'a mut Poller,
     listeners: &'a mut [Listener],
@@ -13299,6 +13341,9 @@ impl EngineDispatcher<'_> {
 
             let proxy_idx = check.proxy();
             let server_idx = check.server();
+            if crate::resolvers::take_l4_timeout() {
+                trigger_resolutions(self.resolvers, &mut self.timer_updates, now, proxy_idx, server_idx);
+            }
             if check.enabled
                 && proxy_idx < self.proxies.len()
                 && server_idx < self.proxies[proxy_idx].server_statuses.len()
@@ -13340,6 +13385,26 @@ impl EngineDispatcher<'_> {
         } else {
             Outcome::Done
         }
+    }
+
+    /// Runs `resolvers` section `idx` (`crate::resolvers`): its log lines go to the servers'
+    /// proxies and to stderr, as `HAProxy`'s `send_log` and `ha_warning`. Out of line: kept off
+    /// the stream path's code.
+    #[cold]
+    #[inline(never)]
+    fn step_resolver(&mut self, idx: usize) -> Outcome {
+        let Some(sec) = self.resolvers.get_mut(idx) else { return Outcome::Done };
+        // Lines are rare (a change of a server's address or state): a `Vec` per change.
+        let mut lines: Vec<(usize, LogLevel, String)> = Vec::new();
+        let wait = sec.step(self.proxies, self.checks, &mut |p, level, msg| lines.push((p, level, msg.to_string())));
+        let task = sec.task;
+        for (p, level, msg) in lines {
+            crate::stderr_line!("[WARNING]  ({}) : {msg}", self.pid);
+            self.send_log(p, level, b"", msg.as_bytes());
+        }
+        let ms = u32::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u32::MAX).max(1);
+        self.timer_updates.push((task, self.now.add(ms)));
+        Outcome::Keep
     }
 
     /// Emits one line to every syslog target the given proxy resolved to.
@@ -13510,6 +13575,7 @@ impl EngineDispatcher<'_> {
                 let check_idx = kind.index() as usize;
                 self.step_check(check_idx)
             }
+            Some(Kind::Resolver) => self.step_resolver(kind.index() as usize),
             Some(Kind::Applet) => {
                 let applet_idx = kind.index() as usize;
                 self.step_applet(applet_idx)

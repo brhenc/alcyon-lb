@@ -538,6 +538,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     }
 
     resolvers::check_resolvers(&resolvers);
+    check_server_resolvers(&listens, &backends, &resolvers)?;
     let mut init_notices = resolve_server_addrs(&mut listens, &mut backends)?;
 
     let config = Config {
@@ -564,6 +565,26 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     register_checks_from_config(&config);
 
     Ok(config)
+}
+
+/// Every server's `resolvers` names a section (`resolvers_finalize_config`): `HAProxy`'s alert
+/// for each one that does not, then the load fails.
+fn check_server_resolvers(listens: &[ListenSection], backends: &[BackendSection], sections: &[crate::ast::ResolversSection]) -> Result<(), ConfigError> {
+    let all = listens
+        .iter()
+        .filter(|l| !l.disabled)
+        .map(|l| ("proxy", l.name.as_str(), &l.servers, &l.server_extras))
+        .chain(backends.iter().filter(|b| !b.disabled).map(|b| ("backend", b.name.as_str(), &b.servers, &b.server_extras)));
+    let mut alerts = Vec::new();
+    for (kind, px, servers, extras) in all {
+        for (idx, _line, sec) in &extras.resolvers_refs {
+            if !sections.iter().any(|r| *r.name == **sec) {
+                let srv = servers.get(*idx as usize).map_or("", |s| s.id.as_str());
+                alerts.push((0, format!("{kind} '{px}', server '{srv}': unable to find required resolvers '{sec}'")));
+            }
+        }
+    }
+    if alerts.is_empty() { Ok(()) } else { Err(ConfigError::alerts(alerts)) }
 }
 
 thread_local! {
@@ -599,9 +620,12 @@ fn resolve_server_addrs(listens: &mut [ListenSection], backends: &mut [BackendSe
             let line = entry.line as usize;
             let mut methods = entry.init_addr;
             if methods.methods == 0 {
-                // `last,libc`; `last` finds no state file and is skipped. `none` comes with a
-                // server's `resolvers`, which is refused until T484.
+                // `last,libc`; `last` finds no state file and is skipped. With `resolvers`,
+                // `none`, so that the resolver gives the address (`srv_iterate_initaddr`).
                 methods.push(M::Libc);
+                if entry.resolvers.is_some() {
+                    methods.push(M::None);
+                }
             }
             if dontfail {
                 methods.push(M::None);
