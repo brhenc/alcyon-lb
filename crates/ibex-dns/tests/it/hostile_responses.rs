@@ -67,3 +67,123 @@ fn a_header_claiming_more_records_than_it_carries_is_refused() {
          allocation loop, got: {res:?}"
     );
 }
+
+// ---- The resolver itself (T482): what reaches `Resolver::handle_response`. ----
+
+use std::net::{Ipv4Addr, SocketAddr};
+use std::time::{Duration, Instant};
+
+use hickory_proto::op::ResponseCode;
+use hickory_proto::rr::RecordType;
+use ibex_dns::{Protocol, Question, Received, Requester, Resolver, ResolverConfig};
+
+use crate::resolver_behavior::{a_rec, a_response, response};
+
+fn ns1() -> SocketAddr {
+    "127.0.0.1:53".parse().unwrap()
+}
+
+/// A resolver with one query for `name` in flight; returns it and the query's message id.
+fn in_flight(name: &str, t0: Instant) -> (Resolver, u16) {
+    let mut r = Resolver::new(ResolverConfig { nameservers: vec![ns1()], ..ResolverConfig::default() });
+    r.query(t0, name, Question::v4(), Requester::Server).unwrap();
+    let (_, _, buf) = r.poll_transmit(t0).unwrap();
+    (r, u16::from_be_bytes([buf[0], buf[1]]))
+}
+
+// B.P2: a reply with the right id but for another name was accepted as the answer.
+#[test]
+fn a_reply_for_another_name_is_not_accepted() {
+    let t0 = Instant::now();
+    let (mut r, id) = in_flight("a1.test", t0);
+    let evil = response(id, "evil.test", RecordType::A, ResponseCode::NoError, vec![a_rec("evil.test", Ipv4Addr::new(6, 6, 6, 6), 60)]);
+    assert_eq!(r.handle_response(t0, ns1(), Protocol::Udp, &evil), Received::Invalid);
+    assert!(r.poll_result().is_none(), "a reply for another name must not end the resolution");
+}
+
+// The id is kept across retries (A.t4), so a spoofed reply has one id to guess per resolution;
+// once the resolution ended, a second reply with that id is `outdated` and changes nothing.
+#[test]
+fn a_reply_after_the_resolution_ended_is_outdated() {
+    let t0 = Instant::now();
+    let (mut r, id) = in_flight("a1.test", t0);
+    let (_, _, again) = r.poll_transmit(t0 + Duration::from_secs(1)).unwrap();
+    assert_eq!(u16::from_be_bytes([again[0], again[1]]), id, "the retry reuses the id");
+    let ok = a_response(id, "a1.test", Ipv4Addr::new(10, 0, 0, 1), 60);
+    assert_eq!(r.handle_response(t0, ns1(), Protocol::Udp, &ok), Received::Valid);
+    assert!(r.poll_result().unwrap().1.is_ok());
+    let spoof = a_response(id, "a1.test", Ipv4Addr::new(6, 6, 6, 6), 60);
+    assert_eq!(r.handle_response(t0, ns1(), Protocol::Udp, &spoof), Received::Outdated);
+    assert!(r.poll_result().is_none());
+}
+
+// resolvers.c:2401: a UDP datagram longer than accepted_payload_size is `too_big`, dropped
+// before it is decoded. B.P8 decoded 64,020 bytes.
+#[test]
+fn a_65535_byte_udp_reply_is_dropped_as_too_big() {
+    let t0 = Instant::now();
+    let (mut r, id) = in_flight("a1.test", t0);
+    let mut buf = a_response(id, "a1.test", Ipv4Addr::new(10, 0, 0, 1), 60);
+    buf.resize(65_535, 0);
+    assert_eq!(r.handle_response(t0, ns1(), Protocol::Udp, &buf), Received::TooBig);
+    assert!(r.poll_result().is_none());
+}
+
+// resolvers.c:1120: qdcount must be 1.
+#[test]
+fn a_question_less_reply_is_invalid() {
+    let t0 = Instant::now();
+    let (mut r, id) = in_flight("a1.test", t0);
+    let mut m = Message::from_vec(&a_response(id, "a1.test", Ipv4Addr::new(6, 6, 6, 6), 60)).unwrap();
+    m.take_queries();
+    assert_eq!(r.handle_response(t0, ns1(), Protocol::Udp, &m.to_vec().unwrap()), Received::Invalid);
+    assert!(r.poll_result().is_none());
+}
+
+// resolv_read_name returns 0 for the root name and the record is `invalid_resp`
+// (resolvers.c:1227): an answer whose owner is "." is not an answer for the name asked.
+#[test]
+fn an_answer_with_a_zero_length_name_is_invalid() {
+    let t0 = Instant::now();
+    let (mut r, id) = in_flight("a1.test", t0);
+    let buf = response(id, "a1.test", RecordType::A, ResponseCode::NoError, vec![a_rec(".", Ipv4Addr::new(6, 6, 6, 6), 60)]);
+    assert_eq!(r.handle_response(t0, ns1(), Protocol::Udp, &buf), Received::Invalid);
+    assert!(r.poll_result().is_none());
+}
+
+// B.P11 kept as a test: random and mutated replies carrying the live id must not panic.
+#[test]
+fn random_and_mutated_replies_do_not_panic() {
+    let t0 = Instant::now();
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for i in 0..20_000u32 {
+        let (mut r, id) = in_flight("f.test", t0);
+        let base = a_response(id, "f.test", Ipv4Addr::new(1, 2, 3, 4), 60);
+        #[allow(clippy::cast_possible_truncation)]
+        let mut b: Vec<u8> = if i % 2 == 0 {
+            base
+        } else {
+            (0..(rnd() % 600) as usize).map(|_| rnd() as u8).collect()
+        };
+        if b.len() >= 2 {
+            #[allow(clippy::cast_possible_truncation)]
+            if i % 2 == 0 {
+                for _ in 0..=(rnd() % 4) {
+                    let k = (rnd() as usize) % b.len();
+                    b[k] = rnd() as u8;
+                }
+            }
+            b[..2].copy_from_slice(&id.to_be_bytes());
+        }
+        let proto = if i % 3 == 0 { Protocol::Tcp } else { Protocol::Udp };
+        let _ = r.handle_response(t0, ns1(), proto, &b);
+        let _ = r.poll_result();
+        let _ = r.poll_transmit(t0);
+    }
+}
