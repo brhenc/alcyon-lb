@@ -4375,6 +4375,7 @@ fn server_check_configs(servers: &[ibex_config::ast::Server], check_timeout: Opt
             if let Some(inter) = s.inter {
                 cfg.inter = inter;
             }
+            cfg.check_port = s.check_port;
             cfg.fastinter_ms = s.fastinter_ms();
             cfg.downinter_ms = s.downinter_ms();
             if let Some(fall) = s.fall {
