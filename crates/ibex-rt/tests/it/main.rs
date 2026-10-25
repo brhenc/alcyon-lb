@@ -114,6 +114,7 @@ mod default_nbthread;
 mod defaults_rules;
 mod dgram_path;
 mod dump_all_vars;
+mod deny_keeps_server_conn;
 mod empty_conditions;
 mod error_log_format;
 mod error_pages;
