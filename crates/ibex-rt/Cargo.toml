@@ -59,6 +59,11 @@ path = "tests/backend_memory.rs"
 name = "capture_rule_allocations"
 path = "tests/capture_rule_allocations.rs"
 
+# Own process: counts the test process's buffer-sized allocations (#[global_allocator])
+[[test]]
+name = "prealloc_allocations"
+path = "tests/prealloc_allocations.rs"
+
 # Own process: lowers the test process's RLIMIT_NOFILE (other tests would get EMFILE)
 [[test]]
 name = "cli_accept_emfile"

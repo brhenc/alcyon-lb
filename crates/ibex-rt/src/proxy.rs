@@ -2129,6 +2129,38 @@ impl TcpSession {
         self.ending.get_or_insert(Ending::Error);
     }
 
+    /// The request buffer, or this stream waits for one (S6): `Ok(false)` while it waits, the
+    /// client not read; `Err` (out of memory) when the refusal is not the limit's, as in S5.
+    #[inline]
+    fn alloc_or_wait_req(&mut self) -> io::Result<bool> {
+        if self.req.alloc_if_needed() {
+            return Ok(true);
+        }
+        self.wait_for_buffer(crate::buf_wait::Class::MuxRx)
+    }
+
+    /// The response buffer for the server's bytes, or this stream waits for one (S6, as
+    /// [`Self::alloc_or_wait_req`]; `DB_SE_RX`, served before new connections).
+    #[inline]
+    fn alloc_or_wait_rep(&mut self) -> io::Result<bool> {
+        if self.rep.alloc_if_needed() {
+            return Ok(true);
+        }
+        self.wait_for_buffer(crate::buf_wait::Class::SeRx)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wait_for_buffer(&mut self, class: crate::buf_wait::Class) -> io::Result<bool> {
+        // An HTTP/2 connection or stream fails as in S5: its streams run inside the
+        // connection's run, which the queue does not tell apart yet.
+        if !crate::buf_wait::should_wait() || self.h2_ctx.is_some() || self.is_h2_child() {
+            return Err(crate::buf::oom());
+        }
+        crate::buf_wait::want(class);
+        Ok(false)
+    }
+
     /// A buffer this stream needs cannot be had (S5, `docs/design/memory-2026-10-24.md` 3.10):
     /// the stream fails as one of `HAProxy`'s whose allocation failed under `-dMfail` (measured,
     /// `tasks/S5-progress.md`): answered `500` while nothing of a response has gone to the
@@ -2498,10 +2530,7 @@ impl TcpSession {
         } else {
             // Read from the client into the request buffer while reading is permitted
             // and buffer space exists. Backpressure stops reads when full.
-            if self.cli_state.can_read() && !self.req.is_full() && !self.cli_cant_recv {
-                if !self.req.alloc_if_needed() {
-                    return Err(crate::buf::oom());
-                }
+            if self.cli_state.can_read() && !self.req.is_full() && !self.cli_cant_recv && self.alloc_or_wait_req()? {
                 let dst = self.req.writable();
                 let asked = dst.len();
                 let r = self.cli.recv(&mut self.cli_xprt, dst)?;
@@ -3138,16 +3167,13 @@ impl TcpSession {
             }
         }
 
-        if self.srv_state.can_read() && !self.rep.is_full() && self.reads_server() && !self.srv_cant_recv {
+        if self.srv_state.can_read() && !self.rep.is_full() && self.reads_server() && !self.srv_cant_recv && self.alloc_or_wait_rep()? {
             let r = {
                 let sfd = self
                     .srv
                     .as_ref()
                     .map(AsFd::as_fd)
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
-                if !self.rep.alloc_if_needed() {
-                    return Err(crate::buf::oom());
-                }
                 let dst = self.rep.writable();
                 let asked = dst.len();
                 // A TLS protocol error *after* the handshake (a post-handshake alert,
@@ -3743,30 +3769,9 @@ pub enum AclEvalResult {
     MissingData,
 }
 
-#[must_use]
-pub fn eval_acl_term_extended(
-    term: &ibex_config::AclTerm,
-    acls: &ibex_sample::Acls,
-    registry: &Registry,
-    ctx: &SampleContext,
-    req_bytes: &[u8],
-    can_wait: bool,
-) -> AclEvalResult {
-    let expr_opt = acls.get(&term.name);
-    let parsed_expr;
-    let expr = if let Some(e) = expr_opt {
-        e
-    } else if let Ok(e) = Expr::cached(&term.name) {
-        parsed_expr = e;
-        &*parsed_expr
-    } else {
-        return if term.negated {
-            AclEvalResult::Matched
-        } else {
-            AclEvalResult::NotMatched
-        };
-    };
-
+/// A payload-aware ACL term already resolved to its expression (a condition
+/// compiled at load, [`crate::rule_compiled::Cond::eval_extended`]).
+pub(crate) fn eval_expr_extended(expr: &Expr, negated: bool, registry: &Registry, ctx: &SampleContext, req_bytes: &[u8], can_wait: bool) -> AclEvalResult {
     if can_wait {
         if expr.fetch_name == "wait_end" {
             // `smp_fetch_wait_end`: no sample until the rules cannot wait any longer.
@@ -3823,24 +3828,12 @@ pub fn eval_acl_term_extended(
             return AclEvalResult::MissingData;
         }
     }
-    let effective = if term.negated { !is_match } else { is_match };
+    let effective = if negated { !is_match } else { is_match };
     if effective {
         AclEvalResult::Matched
     } else {
         AclEvalResult::NotMatched
     }
-}
-
-#[must_use]
-pub fn eval_acl_condition_extended(
-    cond: &ibex_config::AclCondition,
-    acls: &ibex_sample::Acls,
-    registry: &Registry,
-    ctx: &SampleContext,
-    req_bytes: &[u8],
-    can_wait: bool,
-) -> AclEvalResult {
-    combine_condition(cond, |term| eval_acl_term_extended(term, acls, registry, ctx, req_bytes, can_wait))
 }
 
 /// `acl_exec_cond` (src/acl.c): within an alternative a failing term fails it and a

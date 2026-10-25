@@ -189,7 +189,10 @@ impl EcdsaKeyPair {
             rng,
         };
 
-        self.sign_digest(h, &nonce_rng, cpu)
+        let sig = self.sign_digest(h, &nonce_rng, cpu);
+        // ring-ibex: the nonce scalar multiplication's registers (ZEROIZE.md section 2).
+        crate::vregs::clear_if_zeroize(cpu);
+        sig
     }
 
     #[cfg(test)]

@@ -735,6 +735,31 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
     }
     for r in &config.sample_refs {
         let in_line = |e: String| format!("parsing [line {}]: {e}", r.line);
+        if r.whole_format {
+            // T455: a rule's format is compiled at load, as `parse_logformat_string` does: an
+            // alias that does not exist, or that Ibex cannot render, is refused here and not
+            // printed as text per request. (Its expressions were checked by their own refs.)
+            if let Err(e) = crate::logfmt::LogFormat::compile(&r.expr, registry) {
+                if e.starts_with("failed to parse sample expression") {
+                    continue;
+                }
+                let msg = match r.directive.as_str() {
+                    "tcp-request" | "tcp-response" => e,
+                    _ => {
+                        let kind = match r.section {
+                            SectionKind::Frontend => "frontend",
+                            SectionKind::Backend => "backend",
+                            SectionKind::Listen => "proxy",
+                            SectionKind::Defaults => "defaults",
+                        };
+                        let what = r.proxy.as_deref().map_or_else(|| format!("{kind} section"), |n| format!("{kind} '{n}'"));
+                        format!("error detected in {what} while parsing '{} {}' rule : {e}.", r.directive, r.action)
+                    }
+                };
+                return Err(in_line(msg));
+            }
+            continue;
+        }
         // The patterns of an anonymous ACL, which a named one has checked since `validate_acls`.
         // What `HAProxy` names the condition an ACL is written in.
         let condition = || match r.directive.as_str() {
@@ -785,7 +810,11 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
             _ if in_log => crate::rule_exprs::request_part(fetch, false)
                 .filter(|p| p.ends_with("headers"))
                 .or_else(|| crate::rule_exprs::response_part(fetch)),
-            _ => crate::rule_exprs::response_part(fetch).or_else(|| crate::rule_exprs::server_part(fetch)),
+            // A frontend's request rules run before a backend is chosen (T455): `be_id` and
+            // `be_name` are `SMP_USE_BKEND`.
+            _ => crate::rule_exprs::response_part(fetch).or_else(|| crate::rule_exprs::server_part(fetch)).or_else(|| {
+                (matches!(r.section, SectionKind::Frontend | SectionKind::Listen) && matches!(fetch, "be_id" | "be_name")).then_some("backend")
+            }),
         };
         if let Some(part) = (!r.acl).then(|| part_missing(crate::rule_exprs::leading_fetch(&r.expr))).flatten() {
             let fetch = crate::rule_exprs::leading_fetch(&r.expr);

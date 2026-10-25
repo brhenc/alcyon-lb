@@ -89,6 +89,48 @@ limit, like #8). `Context` of AES-GCM/Poly1305 per-record state (running hash, n
   Green after. AES-NI/clmul tests return early if the CPU lacks the feature; vp and fallback schedules are
   checked as "whole struct zero".
 
+### Vector registers (Ibex T462)
+
+`src/vregs.rs`: `clear()` zeroes the vector registers: `vzeroall` when ring's CPU detection reports AVX
+(`cpu::intel::Avx`, the same `GetFeature` check ring's AVX code uses), else `pxor` on xmm0-15; on AArch64
+`eor` on v0-v31; 32-bit x86 `pxor` on xmm0-7. With the feature off, `clear_if_zeroize` is empty. It runs once
+at the end of each public operation that ran assembly with key material in registers, not after every
+assembly call inside it (ring's Rust code runs in between, and only the last call's registers remain):
+
+- AEAD: `Algorithm::new_key` (AES key setup, GHASH table init, ChaCha20 key), `Algorithm::seal`,
+  `Algorithm::open_within` (`src/aead/algorithm.rs`; every AES-GCM and ChaCha20-Poly1305 seal and open
+  goes through these), QUIC `HeaderProtectionKey::new_mask`.
+- Key agreement: `EphemeralPrivateKey::generate` and `compute_public_key`, `agree_ephemeral_` after the
+  scalar multiplication and again after the caller's KDF (rustls runs HKDF-extract on the secret there).
+- Signatures: `EcdsaKeyPair::sign`, `Ed25519KeyPair::sign`, `RsaKeyPair::sign` (guard `ClearOnDrop`, all
+  exit paths). HMAC: `Key::sign` and `Context::try_sign` (SHA-NI/AVX2 state is key-derived under HMAC).
+
+Cost per record: one load of ring's feature word, one test and branch, one `vzeroall`: about 5
+instructions per seal or open (measured from Ibex, `tradeoff.md` 6.27). So it stays per record.
+
+What the test found: BoringSSL's AES-NI assembly already clears the round keys it loaded
+(`aes_hw_ctr32_encrypt_blocks` ends with a register-bank clear, and the tag is computed with it), so after
+a seal no round key was in xmm0-15 even without the patch. The GHASH code does not clear: xmm6 and xmm7
+held two entries of the H-power table (key-derived: whoever has H can forge tags). Test
+`aead::zeroize_tests::seal_leaves_no_aes_or_ghash_key_in_the_xmm_registers` (x86_64): seals 576 bytes with
+AES-128-GCM and reads xmm0-15 with `asm!` immediately after; the needles are the 11 round keys, H, and
+the 16-byte entries of the `clmulavxmovbe` table built from the same key. Red with `clear_if_zeroize`
+emptied (`[(6, 12), (7, 14)]`: xmm6 = table entry 12, xmm7 = entry 14), green with it.
+
+Not cleared: general-purpose registers. They are overwritten within a few instructions of the return
+(the caller's code reuses them at once), and the assembly keeps addresses and counters there in its loops,
+key words only transiently (ChaCha20's scalar path, the bignum code). AVX-512 registers zmm16-31 and the
+upper halves of zmm0-15: ring 0.17.14 has no AVX-512 code. The kernel's saved copy of the registers on a
+context switch is not reachable from user space.
+
+### Stack (Ibex T462)
+
+Stack copies (inventory 7 and 8, the moved-from `Seed` and `[u8; 32]` keys, `digest::Output`/`hmac::Tag`
+values including the HKDF-extract result, asm spill slots) are not wiped by ring. Ibex scrubs the stack
+below its TLS layer after each handshake step (`ibex_alloc::scrub_stack`, Ibex `tradeoff.md` 6.27), which
+covers every frame ring and rustls used during the handshake. Per-record operations are not followed by
+a scrub; their keys live in the structs wiped on drop.
+
 ## Renaming for side-by-side linking (DONE): package and lib `ringibex`
 `Cargo.toml`: `name = "ringibex"`, `links = "ringibex_core_0_17_14_"`, `[lib] name = "ringibex"` (chosen so
 the crate name cannot clash with vanilla `ring` even without `package =` renames; tests and doc comments use

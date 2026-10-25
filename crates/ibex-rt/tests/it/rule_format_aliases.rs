@@ -103,11 +103,9 @@ fn response_headers_render_the_server_address_and_names() {
 }
 
 #[test]
-fn an_alias_the_renderer_does_not_know_stays_text() {
-    // Today's behaviour, not HAProxy's: HAProxy refuses `%zz` at load ("no such format alias")
-    // and prints `%ft` as the frontend's name (`ret`). T455
-    // (tasks/T455-rule-formats-compiled-at-load.md) compiles rule formats at load, and will
-    // refuse the one and render the other, and change this test.
-    let r = exchange(&format!("{DEFAULTS}listen ret\n  bind ADDR accept-proxy\n  http-request return status 200 content-type text/plain lf-string \"ft=%ft zz=%zz ci=%ci\"\n"), GET);
-    assert!(r.ends_with("\r\n\r\nft=%ft zz=%zz ci=192.0.2.7"), "{r}");
+fn the_frontend_alias_renders_and_an_unknown_one_is_refused_at_load() {
+    // HAProxy 3.5-dev8 prints `%ft` as the frontend's name (`ret`) and refuses `%zz` at load
+    // ("no such format alias", `rule_format_compile`); T455 compiles rule formats at load.
+    let r = exchange(&format!("{DEFAULTS}listen ret\n  bind ADDR accept-proxy\n  http-request return status 200 content-type text/plain lf-string \"ft=%ft ci=%ci\"\n"), GET);
+    assert!(r.ends_with("\r\n\r\nft=ret ci=192.0.2.7"), "{r}");
 }

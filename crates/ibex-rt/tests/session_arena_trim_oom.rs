@@ -51,6 +51,7 @@ fn entry() -> SessionEntry {
         log_line: None,
         log_err: false,
         log_sd: 0,
+        buf_wait: ibex_rt::buf_wait::WaitState::default(),
     }
 }
 

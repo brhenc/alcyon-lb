@@ -9,6 +9,11 @@ autotests = false
 [dependencies]
 zeroize = "1"
 
+[features]
+# Test-only (T462): `stack_probe`, which reads and paints the stack below the caller. Turned on by
+# dev-dependencies only (ibex-tls); no shipped build enables it.
+test-probe = []
+
 [lints.rust]
 unsafe_code = "allow"
 

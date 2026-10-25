@@ -13,9 +13,10 @@ key material when it is freed (feature `zeroize`, which `rustls-ringibex` turns 
 rustls 0.24 provider, a fork of `rustls-ring` 0.24.0-dev.2. What it wipes and what it cannot:
 `ringibex/ZEROIZE.md`. Why vanilla ring stays the default: `tradeoff.md` 6.27.
 
-- **Source:** `~/ring-ibex`, branch `zeroize`, commit `237a2547ddfbe612d0f6edad2b37047082a45775`
-  (237a254), `git archive` of the tracked files: no `.git`, no `target/`. `rustls-ringibex/` there
-  is `vendor/rustls-ringibex/` here.
+- **Source:** `~/ring-ibex`, branch `zeroize`, commit `741d7a834f828984bd2185bb6897366b1c1232cd`
+  (741d7a8, T462: vector registers cleared after AEAD, key agreement, signing and HMAC; was
+  237a254 at T460), `git archive` of the tracked files: no `.git`, no `target/`, no `.cargo-ok`.
+  `rustls-ringibex/` there is `vendor/rustls-ringibex/` here.
 - **Left out:** ring's `tests/` (1.9 MB of test vectors; Ibex does not run ring's suite), and the
   two crates' `Cargo.lock`. `ringibex/Cargo.toml` still lists the `[[test]]` targets: they are
   only read when ring's own tests are built, which is not done from here.
@@ -25,7 +26,7 @@ rustls 0.24 provider, a fork of `rustls-ring` 0.24.0-dev.2. What it wipes and wh
   crate (the `rustls-ring` crate package carries none; it is the same project and licence,
   `Apache-2.0 OR ISC OR MIT`).
 
-### Changes made here (not in ~/ring-ibex 237a254)
+### Changes made here (not in ~/ring-ibex 237a254; 1 and 3 are in it since 3d454d8 and bc75ed8)
 
 1. `ringibex/pregenerated/ring_core_generated/prefix_symbols{.h,_asm.h,_nasm.inc}`: the symbol
    prefix `ring_core_0_17_14_` renamed `ringibex_core_0_17_14_`. Without a `.git` directory

@@ -32,6 +32,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tokio = { workspace = true, features = ["full"] }
 rcgen = "0.13"
 tempfile = "3"
+# T462: `ibex_alloc::stack_probe` for the stack scrub test (reads below the stack pointer).
+ibex-alloc = { workspace = true, features = ["test-probe"] }
 
 [lints.rust]
 unsafe_code = "forbid"

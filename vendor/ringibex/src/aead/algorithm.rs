@@ -83,7 +83,10 @@ impl Algorithm {
         key_bytes: &[u8],
         cpu_features: cpu::Features,
     ) -> Result<KeyInner, error::Unspecified> {
-        (self.init)(key_bytes, cpu_features)
+        let key = (self.init)(key_bytes, cpu_features);
+        // ring-ibex: the key schedule's registers (ZEROIZE.md section 2).
+        crate::vregs::clear_if_zeroize(cpu_features);
+        key
     }
 
     pub(super) fn open_within<'io>(
@@ -98,7 +101,10 @@ impl Algorithm {
     ) -> Result<&'io mut [u8], error::Unspecified> {
         let ciphertext_len = in_out.get(src.clone()).ok_or(error::Unspecified)?.len();
 
-        let Tag(calculated_tag) = (self.open)(key, nonce, aad, in_out, src, cpu_features)?;
+        let tag = (self.open)(key, nonce, aad, in_out, src, cpu_features);
+        // ring-ibex: round keys, GHASH key powers, ChaCha20 key words (ZEROIZE.md section 2).
+        crate::vregs::clear_if_zeroize(cpu_features);
+        let Tag(calculated_tag) = tag?;
 
         if bb::verify_slices_are_equal(calculated_tag.as_ref(), received_tag.as_ref()).is_err() {
             // Zero out the plaintext so that it isn't accidentally leaked or used
@@ -124,7 +130,10 @@ impl Algorithm {
         in_out: &mut [u8],
         cpu_features: cpu::Features,
     ) -> Result<Tag, error::Unspecified> {
-        (self.seal)(key, nonce, aad, in_out, cpu_features)
+        let tag = (self.seal)(key, nonce, aad, in_out, cpu_features);
+        // ring-ibex: round keys, GHASH key powers, ChaCha20 key words (ZEROIZE.md section 2).
+        crate::vregs::clear_if_zeroize(cpu_features);
+        tag
     }
 }
 

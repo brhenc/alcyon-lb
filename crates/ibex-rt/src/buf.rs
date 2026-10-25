@@ -118,7 +118,8 @@ impl<const CLASS: u8> Poolable for Mem<CLASS> {
 // Floor 64: what a thread has always kept, and what keeps the steady state at no malloc
 // (design 3.3). The floor objects are not counted against `tune.memory.hot-size`.
 // `limited`: `tune.buffers.limit` counts the standard buffers (`pool_head_buffer->limit`).
-declare_pool!(static BUF_STD: Pool<Mem<0>> = PoolSpec::new("buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64).limited(););
+// `presized`: `tune.memory.prealloc` sizes it from `maxconn` (T468, [`prealloc_standard`]).
+declare_pool!(static BUF_STD: Pool<Mem<0>> = PoolSpec::new("buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64).limited().presized(););
 declare_pool!(static BUF_SMALL: Pool<Mem<1>> = PoolSpec::new("small_buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64););
 declare_pool!(static BUF_LARGE: Pool<Mem<2>> = PoolSpec::new("large_buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64););
 
@@ -304,9 +305,24 @@ fn give_mem<const C: u8>(pool: &'static Pool<Mem<C>>, data: Box<[u8]>) {
 
 /// `tune.buffers.limit`: the most standard buffers the process holds at once, cached ones
 /// included (0: no limit; `HAProxy` raises 1 and 2 to 3, as the parser does). A take past it is
-/// refused and that stream fails (S5; `HAProxy` makes it wait, S6).
+/// refused, and the stream waits for one ([`crate::buf_wait`], S6).
 pub fn set_buffers_limit(n: usize) {
     BUF_STD.set_limit(n);
+}
+
+/// `tune.memory.prealloc` (T468): this thread's cache of standard buffers holds `n`, made now,
+/// kept whatever the budget and `pool_gc`. False when memory is short. After
+/// [`init_buffer_sizes`], on the worker thread.
+pub fn prealloc_standard(n: usize) -> bool {
+    ensure_registered();
+    BUF_STD.prealloc(n)
+}
+
+/// Whether the standard buffer pool is at `tune.buffers.limit`: a stream refused one waits
+/// (S6, [`crate::buf_wait`]).
+#[must_use]
+pub fn standard_at_limit() -> bool {
+    BUF_STD.at_limit()
 }
 
 fn alloc_standard() -> Option<Box<[u8]>> {
@@ -408,7 +424,10 @@ impl Drop for Buf {
         self.wipe_used();
         let data = std::mem::replace(&mut self.data, Box::new([]));
         match self.class {
-            BufClass::Standard => give_mem(&BUF_STD, data),
+            BufClass::Standard => {
+                give_mem(&BUF_STD, data);
+                crate::buf_wait::offer();
+            }
             BufClass::Small => give_mem(&BUF_SMALL, data),
             BufClass::Large => give_mem(&BUF_LARGE, data),
             BufClass::Custom => {}

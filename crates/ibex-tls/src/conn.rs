@@ -163,8 +163,16 @@ impl TlsCtx {
     #[must_use]
     pub fn connect(config: &Arc<ClientConfig>, name: ServerName<'static>, sni: Option<String>) -> Self {
         let mut ctx = Self::new(false, None, sni);
-        ctx.session = config.connect(name).start_handshake(&mut ctx.tx).ok().map(Session::ClientHs);
+        ctx.session = Self::start_client(config, name, &mut ctx.tx);
+        // The key share was just generated (T462).
+        ibex_alloc::scrub_stack();
         ctx
+    }
+
+    /// The client's first flight. Not inlined, so that its frames are below the scrub.
+    #[inline(never)]
+    fn start_client(config: &Arc<ClientConfig>, name: ServerName<'static>, tx: &mut Vec<u8>) -> Option<Session> {
+        config.connect(name).start_handshake(tx).ok().map(Session::ClientHs)
     }
 
     /// Captures the `ClientHello` of this server-side session, keeping `size` bytes
@@ -239,6 +247,22 @@ impl TlsCtx {
     /// # Errors
     /// rustls refused the handshake.
     pub fn handshake(&mut self, input: &mut dyn TlsInputBuffer) -> Result<(), Error> {
+        let was_done = self.handshake_done;
+        let r = self.handshake_step(input);
+        // What rustls and ring left on the stack below this frame (moved-from keys, `Copy` HMAC
+        // outputs, the ECDH point, assembly spills) goes before anything else runs, on every exit
+        // including the step that finishes the handshake: `tune.ibex.ssl-zero-buffers` (T462,
+        // `tradeoff.md` 6.27). Not per record, nor on a call after the handshake (no crypto ran).
+        if !was_done {
+            ibex_alloc::scrub_stack();
+        }
+        r
+    }
+
+    /// [`Self::handshake`] before the scrub. Not inlined: its frame (which holds the handshake
+    /// states rustls hands back by value) is below the caller's, inside the scrubbed range.
+    #[inline(never)]
+    fn handshake_step(&mut self, input: &mut dyn TlsInputBuffer) -> Result<(), Error> {
         loop {
             let Some(session) = self.session.take() else { return Ok(()) };
             match session {

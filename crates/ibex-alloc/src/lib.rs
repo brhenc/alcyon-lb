@@ -15,6 +15,8 @@ pub mod arena;
 pub use arena::{Arena, ArenaStats};
 pub mod pool;
 pub mod zero_on_free;
+#[cfg(feature = "test-probe")]
+pub mod stack_probe;
 pub use zero_on_free::{IbexAllocator, ZeroOnFree};
 pub use pool::{
     drain_local_pools, for_each_pool, hot_size, local_hot_bytes, set_hot_size, Pool, PoolBox, PoolDyn, PoolSpec, Poolable,
@@ -816,6 +818,43 @@ pub fn wipe_ssl(bytes: &mut [u8]) {
     if pool::wipe_ssl_on() {
         zeroize::Zeroize::zeroize(bytes);
     }
+}
+
+/// How much stack [`scrub_stack`] zeroes below its caller's frame (T462).
+///
+/// Measured by painting the stack (`ibex-tls` test `stack_scrub`, which prints each depth): the
+/// deepest any handshake step reached below `TlsCtx`'s frame, server and client side, TLS 1.2 and
+/// 1.3, X25519 and P-384 key exchange, RSA-4096 and P-384 certificates, both providers, was
+/// **23,864 bytes** in a release build (RSA-4096, TLS 1.3, ring-ibex; P-384 certificates 16.7-18.8 KB)
+/// and **72,056 bytes** in a debug build (unoptimised rustls and ring frames). N is about twice
+/// that, for the paths the test does not take (resumption, client certificates): 48 KiB, and
+/// 128 KiB in a debug build. The worker threads run on Rust's default 2 MiB stack (8 MiB for the
+/// main thread), so the scrub's own frame is 2.3% (release) of the smallest.
+pub const STACK_SCRUB_BYTES: usize = if cfg!(debug_assertions) { SCRUB_DEBUG } else { SCRUB_RELEASE };
+const SCRUB_RELEASE: usize = 48 * 1024;
+const SCRUB_DEBUG: usize = 128 * 1024;
+
+/// Zeroes [`STACK_SCRUB_BYTES`] of the stack just below the caller's frame, where the frames of
+/// the calls it just returned from were, under `tune.ibex.ssl-zero-buffers` (default on; the
+/// thread's copy). For the TLS layer after a handshake step (T462): rustls and ring leave moved-from
+/// key copies, `Copy` hash and HMAC outputs (the HKDF-extract result among them), the ECDH point
+/// and assembly spills in those frames, and nothing else overwrites them until the stack grows that
+/// deep again. Not inlined, so that the zeroes go below the caller's frame, not into it.
+#[inline(never)]
+pub fn scrub_stack() {
+    if pool::wipe_ssl_on() {
+        scrub_stack_now();
+    }
+}
+
+/// The scrub itself. The zeroes are a plain `memset` of a local array that is then handed to
+/// `black_box` (an opaque read), so the stores cannot be dropped as dead; `zeroize`'s
+/// byte-at-a-time volatile stores would cost about 3 instructions a byte, ~200,000 per call.
+#[inline(never)]
+#[allow(clippy::large_stack_arrays)] // the point: a frame STACK_SCRUB_BYTES deep
+fn scrub_stack_now() {
+    let zeros = [0u8; STACK_SCRUB_BYTES];
+    core::hint::black_box(&zeros);
 }
 
 /// [`wipe`] for a whole `Vec`: its bytes and its spare capacity, which holds what earlier

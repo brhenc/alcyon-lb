@@ -307,10 +307,27 @@ pub(crate) fn parse_global_directive(
                 // The emergency buffers it reserves serve the buffer wait queue, which Ibex does
                 // not have yet (a stream without a buffer fails): accepted and dropped, it would
                 // promise what is not there (AGENTS.md 5).
-                return Err(ConfigError::new(kw.line, kw.col, "'tune.buffers.reserve' is not supported by Ibex yet: it reserves buffers for the buffer wait queue, which Ibex does not have (a stream that cannot have a buffer fails)."));
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.buffers.reserve' is not supported by Ibex yet: it sets aside per-thread emergency buffers for the buffer wait queue, which Ibex's queue does not have (a stream past tune.buffers.limit waits without them)."));
             }
             let n = usize::try_from(n).unwrap_or(usize::MAX);
             global.buffers_limit = Some(if n == 0 { 0 } else { n.max(3) });
+            Ok(())
+        }
+        "tune.memory.prealloc" => {
+            // Ibex extension (T468): HAProxy 3.5-dev8 has no such keyword. Whether `maxconn` or
+            // `-m` sizes it is checked at load (`ibex_rt::prealloc::check`), `-m` being on the
+            // command line.
+            let Some(arg) = tokens.get(1) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.memory.prealloc' expects 'on' or 'off'."));
+            };
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'tune.memory.prealloc' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            global.memory_prealloc = Some(match arg.text.as_str() {
+                "on" => true,
+                "off" => false,
+                other => return Err(ConfigError::new(arg.line, arg.col, format!("'tune.memory.prealloc' expects 'on' or 'off', got '{other}'."))),
+            });
             Ok(())
         }
         "tune.ibex.zero-buffers" => {
