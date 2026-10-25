@@ -202,3 +202,88 @@ fn show_pools_shows_the_presize_at_start_and_after_a_burst_of_maxconn() {
     assert_eq!(pool(&sock, "buffer"), (2 * MAXCONN, 0), "standard buffers after the burst");
     assert_eq!(pool(&sock, "session").0, MAXCONN, "session slots after the burst");
 }
+
+/// The worker thread `c` is served by: `GET /t` answers `%[thread]` on the connection, which
+/// stays open (keep-alive).
+fn thread_of(c: &mut TcpStream) -> Option<String> {
+    c.write_all(b"GET /t HTTP/1.1\r\nHost: a\r\n\r\n").ok()?;
+    c.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let mut got = Vec::new();
+    let mut b = [0u8; 512];
+    loop {
+        let n = c.read(&mut b).ok()?;
+        if n == 0 {
+            return None;
+        }
+        got.extend_from_slice(&b[..n]);
+        let text = String::from_utf8_lossy(&got).into_owned();
+        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+            let len: usize = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))?;
+            if body.len() >= len {
+                return Some(body[..len].to_string());
+            }
+        }
+    }
+}
+
+/// T475: `nbthread 4`, `maxconn 100`: the limit is 200 buffers, each thread's start makes 50.
+/// All held connections are on one thread: Ibex has no `bind ... thread N` (each worker has
+/// its own `SO_REUSEPORT` socket and the kernel picks one by the four-tuple), so each
+/// connection first asks `GET /t` which thread serves it, and only those on the first one's
+/// thread are kept. A held connection (a response it does not read) holds one buffer: 80 of
+/// them need 80, more than the 50 made on their thread, while the other threads are idle. None
+/// of the 80 may be refused (the process is at 80 of 100 connections) and the pool does not
+/// grow past 200.
+#[test]
+fn a_thread_out_of_its_share_uses_the_buffers_other_threads_hold() {
+    const HELD: usize = 80;
+    let be = flood();
+    let fe = common::reserve_addr();
+    let d = dir("shared");
+    let sock = d.join("cli.sock").display().to_string();
+    let cfg = format!(
+        "global\n    nbthread 4\n    maxconn 100\n    tune.memory.prealloc on\n    stats socket {sock} level admin\n{DEFAULTS}\
+         frontend f\n    bind {fe}\n    http-request return status 200 content-type text/plain lf-string \"%[thread]\" if {{ path /t }}\n    default_backend b\n\
+         backend b\n    server s {be}\n"
+    );
+    let path = d.join("c.cfg");
+    std::fs::write(&path, cfg).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let _ibex = Ibex(child, d);
+    assert!(common::wait_listening(fe), "ibex did not listen");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::path::Path::new(&sock).exists() {
+        assert!(Instant::now() < deadline, "no stats socket");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(pool(&sock, "buffer"), (200, 0), "standard buffers right after start");
+
+    let mut clients = Vec::new();
+    let mut target = None;
+    let mut seen = std::collections::BTreeSet::new();
+    // Connections closed before `GET /t` was answered: refused a buffer.
+    let mut refused = 0;
+    for _ in 0..2000 {
+        if clients.len() == HELD {
+            break;
+        }
+        let mut c = TcpStream::connect(fe).unwrap();
+        let Some(t) = thread_of(&mut c) else {
+            refused += 1;
+            continue;
+        };
+        seen.insert(t.clone());
+        if target.get_or_insert_with(|| t.clone()) == &t {
+            c.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+            clients.push(c);
+        }
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    let held = in_use(&sock, "buffer");
+    let n = clients.len();
+    assert!(held >= HELD && n == HELD && refused == 0, "{n} connections held on thread {target:?} hold {held} buffers, {refused} refused");
+    assert_eq!(seen.len(), 4, "every thread accepts: {seen:?}");
+    assert_eq!(pool(&sock, "buffer"), (200, 0), "standard buffers during the burst ({held} held)");
+    drop(clients);
+}
