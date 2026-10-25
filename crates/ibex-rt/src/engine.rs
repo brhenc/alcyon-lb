@@ -709,7 +709,6 @@ impl IdlePool {
         let slot = &self.pools.slots[self.wid];
         let mut pool = IdlePools::lock(slot);
         let pools = &*self.pools;
-        let mut closed: Vec<((usize, usize), usize)> = Vec::new();
         // `srv_cleanup_idle_conns`: the server's idle connections, peak and need are
         // server-wide, and this worker closes its share of the excess (T270: weighed per
         // worker, each worker's few idle connections stood against the whole server's peak
@@ -732,15 +731,12 @@ impl IdlePool {
             });
             (s.max_used, s.est_need) = (in_use, est);
             let n = to_kill.map_or(0, |k| (k.saturating_mul(own) / all).saturating_add(1).min(own));
-            if n > 0 {
-                closed.push((srv, n));
-            }
+            // Counted here, as the counts above are: no list of what was closed, whose memory
+            // could fail (T465).
+            pools.count_idle(srv, 0, n);
             n
         });
         slot.conns.store(pool.conns, Ordering::Relaxed);
-        for (srv, n) in closed {
-            pools.count_idle(srv, 0, n);
-        }
         self.next_purge = pool.next_purge();
     }
 }
