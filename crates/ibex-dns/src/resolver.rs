@@ -54,7 +54,8 @@ struct InFlight {
     name: String,
     kind: RecordKind,
     proto: Protocol,
-    nameserver_idx: usize,
+    /// Set once a UDP answer came back truncated: the TCP retry goes to that server only.
+    tcp_ns: Option<SocketAddr>,
     retries_left: usize,
     next_transmit: Instant,
     deadline: Instant,
@@ -112,7 +113,7 @@ impl Resolver {
             name: name.to_string(),
             kind,
             proto: Protocol::Udp,
-            nameserver_idx: 0,
+            tcp_ns: None,
             retries_left: self.cfg.resolve_retries,
             next_transmit: now,
             deadline: now + self.cfg.timeout_resolve,
@@ -165,8 +166,17 @@ impl Resolver {
                 }
 
                 if let Ok(buf) = msg.to_vec() {
-                    let ns = self.cfg.nameservers[inflight.nameserver_idx];
-                    inflight.nameserver_idx = (inflight.nameserver_idx + 1) % self.cfg.nameservers.len();
+                    // HAProxy (resolv_send_query) sends every try to every nameserver at once.
+                    let proto = inflight.proto;
+                    let ns = match inflight.tcp_ns {
+                        Some(ns) => ns,
+                        None => {
+                            for &other in &self.cfg.nameservers[1..] {
+                                self.transmits.push_back((other, proto, buf.clone()));
+                            }
+                            self.cfg.nameservers[0]
+                        }
+                    };
                     if inflight.retries_left > 0 {
                         inflight.retries_left -= 1;
                     }
@@ -178,7 +188,7 @@ impl Resolver {
         None
     }
 
-    pub fn handle_response(&mut self, now: Instant, _from: SocketAddr, buf: &[u8]) {
+    pub fn handle_response(&mut self, now: Instant, from: SocketAddr, buf: &[u8]) {
         let Ok(msg) = Message::from_vec(buf) else {
             return;
         };
@@ -205,6 +215,7 @@ impl Resolver {
         if msg.truncated() && inflight.proto == Protocol::Udp {
             let mut inflight_copy = self.in_flight.remove(idx);
             inflight_copy.proto = Protocol::Tcp;
+            inflight_copy.tcp_ns = Some(from);
             inflight_copy.next_transmit = now; // Retry immediately
             self.in_flight.push(inflight_copy);
             return;
