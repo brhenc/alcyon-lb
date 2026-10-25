@@ -3,7 +3,7 @@
 
 //! QUIC endpoint implementation encapsulating `quinn-proto`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,6 +35,14 @@ pub struct QuicEndpoint {
     active_handles: Vec<ConnectionHandle>,
     round_robin_idx: usize,
     next_timeout: Option<Instant>,
+    /// How many times a connection's `poll_timeout` was asked (a test counter: the cost of a
+    /// datagram must not grow with the number of idle connections).
+    timeout_polls: u64,
+    /// Every connection's next deadline, ordered: the earliest is the first element. A
+    /// connection is re-keyed (`refresh_timer`) only when its own timeout may have changed.
+    timers: BTreeSet<(Instant, usize)>,
+    /// The deadline each connection has in `timers`.
+    timer_of: HashMap<ConnectionHandle, Instant>,
     response_buf: Vec<u8>,
     tx_buf: Vec<u8>,
     /// Set by a soft stop: connections already here are served to the end, a new Initial is refused.
@@ -182,6 +190,9 @@ impl QuicEndpoint {
             active_handles: Vec::new(),
             round_robin_idx: 0,
             next_timeout: None,
+            timeout_polls: 0,
+            timers: BTreeSet::new(),
+            timer_of: HashMap::new(),
             response_buf: Vec::with_capacity(2048),
             tx_buf: Vec::with_capacity(2048),
             refusing_new: false,
@@ -218,6 +229,12 @@ impl QuicEndpoint {
         self.amplification_overshoots
     }
 
+    /// Number of per-connection timeout queries so far (see the `timeout_polls` field).
+    #[must_use]
+    pub const fn timeout_polls(&self) -> u64 {
+        self.timeout_polls
+    }
+
     /// Whether `bytes` may be sent to `handle` under its anti-amplification budget.
     fn may_send(&self, handle: ConnectionHandle, bytes: u64) -> bool {
         // Fail closed. A missing budget means this code has lost track of a connection, and
@@ -228,20 +245,43 @@ impl QuicEndpoint {
             .is_some_and(|b| b.is_allowed(bytes))
     }
 
-    /// Recomputes and caches the earliest timeout across all active connections.
+    /// Caches the earliest deadline of all connections: the first of `timers`, O(log n).
     pub fn update_next_timeout(&mut self) {
-        let mut min_timeout: Option<Instant> = None;
-        for conn in self.connections.values_mut() {
-            if let Some(timeout) = conn.poll_timeout() {
-                min_timeout = match min_timeout {
-                    Some(current) => Some(current.min(timeout)),
-                    None => Some(timeout),
-                };
-            }
-        }
-        self.next_timeout = min_timeout;
+        self.next_timeout = self.timers.first().map(|&(t, _)| t);
     }
 
+    /// Re-keys one connection's deadline after something that may have changed it, then
+    /// refreshes the cached earliest deadline. Costs one connection's `poll_timeout`, however
+    /// many other connections there are.
+    fn refresh_timer(&mut self, handle: ConnectionHandle) {
+        if let Some(conn) = self.connections.get_mut(&handle) {
+            self.timeout_polls += 1;
+            let new = conn.poll_timeout();
+            let old = self.timer_of.get(&handle).copied();
+            if new != old {
+                if let Some(t) = old {
+                    self.timers.remove(&(t, handle.0));
+                }
+                match new {
+                    Some(t) => {
+                        self.timers.insert((t, handle.0));
+                        self.timer_of.insert(handle, t);
+                    }
+                    None => {
+                        self.timer_of.remove(&handle);
+                    }
+                }
+            }
+        }
+        self.update_next_timeout();
+    }
+
+    /// Drops a connection's deadline (it is gone).
+    fn forget_timer(&mut self, handle: ConnectionHandle) {
+        if let Some(t) = self.timer_of.remove(&handle) {
+            self.timers.remove(&(t, handle.0));
+        }
+    }
 
     /// Helper to look up connection handle by `ConnectionId`.
     fn get_handle(&self, conn_id: &ConnectionId) -> Result<ConnectionHandle> {
@@ -404,14 +444,17 @@ impl QuicEndpoint {
 
     /// Cleans up drained or dead connections from the table and handle list.
     pub fn cleanup_drained(&mut self) {
-        let mut to_remove = Vec::new();
-        for (&handle, conn) in &self.connections {
-            if conn.is_drained() {
-                to_remove.push(handle);
-            }
-        }
+        let all: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
+        self.remove_drained(&all);
+    }
 
-        for handle in to_remove {
+    /// Removes those of `candidates` that are drained.
+    fn remove_drained(&mut self, candidates: &[ConnectionHandle]) {
+        for &handle in candidates {
+            if !self.connections.get(&handle).is_some_and(quinn_proto::Connection::is_drained) {
+                continue;
+            }
+            self.forget_timer(handle);
             self.connections.remove(&handle);
             self.handle_to_primary_cid.remove(&handle);
             // Released before its address was validated (`quic_conn_release`).
@@ -458,7 +501,6 @@ impl QuicTransport for QuicEndpoint {
             .endpoint
             .handle(now, from, local_ip, None, data, &mut self.response_buf);
 
-        self.update_next_timeout();
         match event {
             Some(DatagramEvent::NewConnection(incoming)) => {
                 let remote_addr = incoming.remote_address();
@@ -516,7 +558,7 @@ impl QuicTransport for QuicEndpoint {
                         });
 
                         self.drive_connection(handle, now);
-                        self.update_next_timeout();
+                        self.refresh_timer(handle);
                         DatagramOutcome::Accepted
                     }
                     Err(e) => {
@@ -548,7 +590,7 @@ impl QuicTransport for QuicEndpoint {
                 if let Some(conn) = self.connections.get_mut(&handle) {
                     conn.handle_event(conn_evt);
                     self.drive_connection(handle, now);
-                    self.update_next_timeout();
+                    self.refresh_timer(handle);
                     Ok(DatagramOutcome::Routed)
                 } else {
                     Ok(DatagramOutcome::Ignored)
@@ -633,7 +675,7 @@ impl QuicTransport for QuicEndpoint {
                                 self.amplification_overshoots += 1;
                                 // Exceeds 3x anti-amplification limit before address validation (RFC 9000 §8.1).
                                 // Suppress transmission to prevent DDoS amplification reflection.
-                                self.update_next_timeout();
+                                self.refresh_timer(handle);
                                 continue;
                             }
                             budget.record_sent(size as u64);
@@ -641,7 +683,7 @@ impl QuicTransport for QuicEndpoint {
                     }
 
                     out[..size].copy_from_slice(&self.tx_buf[..size]);
-                    self.update_next_timeout();
+                    self.refresh_timer(handle);
                     return Some(Transmit {
                         destination: tx.destination,
                         src_ip: tx.src_ip,
@@ -661,27 +703,28 @@ impl QuicTransport for QuicEndpoint {
     }
 
     fn handle_timeout(&mut self, now: Instant) {
-        for &handle in &self.active_handles {
-            if let Some(conn) = self.connections.get_mut(&handle) {
-                if let Some(timeout) = conn.poll_timeout() {
-                    if timeout <= now {
-                        conn.handle_timeout(now);
-                    }
-                }
+        // Only the connections whose deadline has come: the head of `timers`.
+        let mut expired = Vec::new();
+        while let Some(&(t, h)) = self.timers.first() {
+            if t > now {
+                break;
             }
+            self.timers.remove(&(t, h));
+            self.timer_of.remove(&ConnectionHandle(h));
+            expired.push(ConnectionHandle(h));
         }
-
-        let handles = self.active_handles.clone();
-        for handle in handles {
+        for &handle in &expired {
+            if let Some(conn) = self.connections.get_mut(&handle) {
+                conn.handle_timeout(now);
+            }
             self.drive_connection(handle, now);
         }
-
-        self.cleanup_drained();
+        self.remove_drained(&expired);
+        for handle in expired {
+            self.refresh_timer(handle);
+        }
         self.update_next_timeout();
     }
-
-
-
 
     fn poll_event(&mut self) -> Option<TransportEvent> {
         self.event_queue.pop_front()
@@ -821,7 +864,7 @@ impl QuicTransport for QuicEndpoint {
             // Closing arms a drain timer. Left out of the cached deadline, the engine would not
             // wake for it, and the connection would be counted live until some unrelated
             // datagram refreshed the cache.
-            self.update_next_timeout();
+            self.refresh_timer(handle);
         }
     }
 
