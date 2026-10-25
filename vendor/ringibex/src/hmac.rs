@@ -283,6 +283,8 @@ impl Key {
     }
 
     pub(crate) fn sign(&self, data: &[u8], cpu: cpu::Features) -> Result<Tag, InputTooLongError> {
+        // ring-ibex: the SHA state's registers (ZEROIZE.md section 2).
+        let _clear = crate::vregs::ClearOnDrop(cpu);
         let mut ctx = Context::with_key(self);
         ctx.update(data);
         ctx.try_sign(cpu)
@@ -356,6 +358,8 @@ impl Context {
     }
 
     pub(crate) fn try_sign(self, cpu_features: cpu::Features) -> Result<Tag, InputTooLongError> {
+        // ring-ibex: the SHA state's registers (ZEROIZE.md section 2).
+        let _clear = crate::vregs::ClearOnDrop(cpu_features);
         // Consequently, `num_pending` is valid.
         debug_assert_eq!(self.inner.algorithm(), self.outer.algorithm);
         debug_assert!(self.inner.algorithm().output_len() < self.outer.algorithm.block_len());

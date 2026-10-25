@@ -412,6 +412,14 @@ pub(crate) fn wipe_ssl_on() -> bool {
     HOT.try_with(|h| h.wipe_ssl.get()).unwrap_or(true)
 }
 
+/// Sets this thread's copy of `tune.ibex.ssl-zero-buffers` only, until its next refresh: for a
+/// test that must not change the setting under the other tests of its process
+/// ([`crate::stack_probe`]).
+#[cfg(feature = "test-probe")]
+pub(crate) fn set_thread_wipe_ssl(on: bool) {
+    let _ = HOT.try_with(|h| h.wipe_ssl.set(on));
+}
+
 /// A setting the threads copy changed (`tune.memory.hot-size`, `tune.ibex.zero-buffers`,
 /// `tune.ibex.zero-spares`).
 pub(crate) fn settings_changed() {
