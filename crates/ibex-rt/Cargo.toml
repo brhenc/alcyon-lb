@@ -178,3 +178,8 @@ path = "tests/spare_strings.rs"
 [[test]]
 name = "buffer_alloc_failure"
 path = "tests/buffer_alloc_failure.rs"
+
+# Own process: the counting allocator refuses the wait queue's growth (S6); needs a pristine buffer pool
+[[test]]
+name = "buffer_wait_queue_alloc"
+path = "tests/buffer_wait_queue_alloc.rs"
