@@ -107,6 +107,17 @@ impl QuicConfig {
         self
     }
 
+    /// Sets the flow-control windows as `HAProxy` does (`quic_transport_params_init`): the
+    /// connection may have `streams` request streams of `bufsize - 4` bytes in flight, and one
+    /// stream `stream_data_ratio` percent of that (`tune.quic.fe.stream-data-ratio`).
+    #[must_use]
+    pub fn with_flow_windows(mut self, bufsize: usize, streams: u32, stream_data_ratio: u32) -> Self {
+        let conn = u64::from(streams) * (bufsize.saturating_sub(4) as u64);
+        self.receive_window = conn;
+        self.stream_receive_window = conn * u64::from(stream_data_ratio) / 100;
+        self
+    }
+
     /// Sets the ALPN protocols list.
     #[must_use]
     pub fn with_alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
