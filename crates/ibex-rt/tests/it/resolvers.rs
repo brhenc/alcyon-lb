@@ -13,6 +13,7 @@
 use crate::common;
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::net::UnixStream;
@@ -722,4 +723,183 @@ fn a_reload_keeps_the_resolved_address() {
     dns.set("a1.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 2)]));
     new.wait_state("s1", "10.0.0.2 2 0", 5);
     new.wait_log("l/s1: IP changed from '10.0.0.1' to '10.0.0.2' by 'r/ns1'.", 2);
+
+/// The text of `show resolvers` for one nameserver, every counter 0 (`HAProxy` 3.5-dev8, measured).
+fn zeros(name: &str) -> String {
+    let mut s = format!(" nameserver {name}:\n");
+    for (c, pad) in COUNTER_PADS {
+        let _ = writeln!(s, "  {c}:{pad}0");
+    }
+    s
+}
+
+/// The 16 counters of `show resolvers` in order, with the spaces after the colon.
+const COUNTER_PADS: [(&str, &str); 16] = [
+    ("sent", "         "),
+    ("snd_error", "    "),
+    ("valid", "        "),
+    ("update", "       "),
+    ("cname", "        "),
+    ("cname_error", "  "),
+    ("any_err", "      "),
+    ("nx", "           "),
+    ("timeout", "      "),
+    ("refused", "      "),
+    ("other", "        "),
+    ("invalid", "      "),
+    ("too_big", "      "),
+    ("truncated", "    "),
+    ("tcp_fallback", " "),
+    ("outdated", "     "),
+];
+
+/// The counters of nameserver `ns` of section `sec` in `show resolvers`.
+fn counters(ibex: &Ibex, sec: &str, ns: &str) -> HashMap<String, u64> {
+    let out = ibex.cli(&format!("show resolvers {sec}"));
+    let mut lines = out.lines().skip_while(|l| *l != format!(" nameserver {ns}:")).skip(1);
+    let mut m = HashMap::new();
+    for l in lines.by_ref().take_while(|l| l.starts_with("  ")) {
+        let (k, v) = l.trim().split_once(':').expect("name: value");
+        m.insert(k.to_string(), v.trim().parse().expect("a number"));
+    }
+    assert_eq!(m.len(), 16, "{out}");
+    m
+}
+
+/// T485, measured on `HAProxy` 3.5-dev8: the section header, each nameserver and its 16 counters
+/// (`name:` padded to 14 columns), the blank line that ends a CLI answer and nothing between
+/// sections. A section no server uses is listed; an unknown one is an error.
+#[test]
+fn show_resolvers_lists_every_section_byte_for_byte() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, "  nameserver ns2 127.0.0.1:9\nresolvers empty\n", "", "");
+    let want = format!("Resolvers section r\n{}{}Resolvers section empty\n\n", zeros("ns1"), zeros("ns2"));
+    assert_eq!(ibex.cli("show resolvers"), want);
+    assert_eq!(ibex.cli("show resolvers r"), format!("Resolvers section r\n{}{}\n", zeros("ns1"), zeros("ns2")));
+    assert_eq!(ibex.cli("show resolvers nosuch"), "Can't find that resolvers section\n\n");
+}
+
+/// A.t5: every query sent is counted by its nameserver, every valid answer too, and a changed
+/// address once as `update`; a silent nameserver counts `sent` and nothing else (`timeout`
+/// stays 0 on `HAProxy`).
+#[test]
+fn show_resolvers_counts_sent_valid_update() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, &format!("{FAST}  hold timeout 1s\n"), "  server s1 a1.test:80 resolvers r\n", "");
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    dns.set("a1.test", Zone::Silent);
+    ibex.wait_state("s1", "- 0 32", 4);
+    let c = counters(&ibex, "r", "ns1");
+    assert!(c["valid"] >= 1 && c["sent"] > c["valid"], "{c:?}");
+    assert_eq!(c["update"], 1, "{c:?}");
+    for k in ["snd_error", "cname", "cname_error", "any_err", "nx", "timeout", "refused", "other", "invalid", "too_big", "truncated", "tcp_fallback", "outdated"] {
+        assert_eq!(c[k], 0, "{k} in {c:?}");
+    }
+}
+
+/// A.t10: ns1 says NXDOMAIN, ns2 answers: `nx` on ns1, `valid` and `update` on ns2, and the
+/// address is ns2's.
+#[test]
+fn show_resolvers_counts_each_nameserver_apart() {
+    let (dns1, dns2) = (FakeDns::start(), FakeDns::start());
+    dns1.set("a1.test", Zone::Nx);
+    dns2.set("a1.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 9)]));
+    let ibex = start(dns1.addr, &format!("{FAST}  nameserver ns2 {}\n", dns2.addr), "  server s1 a1.test:80 resolvers r\n", "");
+    ibex.wait_state("s1", "10.0.0.9 2 0", 3);
+    let (c1, c2) = (counters(&ibex, "r", "ns1"), counters(&ibex, "r", "ns2"));
+    assert!(c1["nx"] >= 1 && c1["valid"] == 0 && c1["update"] == 0, "{c1:?}");
+    assert!(c2["valid"] >= 1 && c2["update"] == 1 && c2["nx"] == 0, "{c2:?}");
+    assert!(c1["sent"] >= 1 && c2["sent"] >= 1);
+}
+
+/// REFUSED, NODATA and SERVFAIL go to `refused`, `any_err` and `other`.
+#[test]
+fn show_resolvers_counts_error_classes() {
+    for (z, key) in [(Zone::Refused, "refused"), (Zone::NoData, "any_err"), (Zone::ServFail, "other")] {
+        let dns = FakeDns::start();
+        dns.set("a1.test", z);
+        let ibex = start(dns.addr, FAST, "  server s1 a1.test:80 resolvers r\n", "");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while counters(&ibex, "r", "ns1")[key] == 0 {
+            assert!(Instant::now() < deadline, "{key} stays 0: {:?}", counters(&ibex, "r", "ns1"));
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// A datagram the resolver cannot place: an id nobody waits for is `outdated`, a short one
+/// `invalid`... only from the configured nameserver (the socket is connected to it).
+#[test]
+fn show_resolvers_counts_outdated_and_too_big() {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    sock.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+    let ibex = start(sock.local_addr().expect("addr"), "  accepted_payload_size 512\n", "  server s1 a1.test:80 resolvers r\n", "");
+    let mut buf = [0u8; 600];
+    let (_, from) = sock.recv_from(&mut buf).expect("a query");
+    // An id that is not the query's: outdated.
+    let q = u16::from_be_bytes([buf[0], buf[1]]);
+    let mut reply = vec![0u8; 12];
+    reply[..2].copy_from_slice(&q.wrapping_add(1).to_be_bytes());
+    sock.send_to(&reply, from).expect("send");
+    // More than accepted_payload_size: too_big.
+    sock.send_to(&[0u8; 600], from).expect("send");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let c = counters(&ibex, "r", "ns1");
+        if c["outdated"] == 1 && c["too_big"] == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{c:?}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `haproxy_resolver_*` (`rslv_promex_*`, `resolvers.c:4282`): one gauge per counter and
+/// nameserver, labelled `resolver` and `nameserver`, with the descriptions of `resolv_stats`.
+#[test]
+fn the_exporter_has_the_resolver_metrics() {
+    let dns = FakeDns::start();
+    let ibex = start(
+        dns.addr,
+        "",
+        "  http-request use-service prometheus-exporter if { path /metrics }\n  server s1 a1.test:80 resolvers r\n",
+        "",
+    );
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    let scrape = |q: &str| {
+        let mut c = TcpStream::connect(ibex.fe).expect("connect");
+        c.write_all(format!("GET /metrics{q} HTTP/1.0\r\n\r\n").as_bytes()).expect("send");
+        let mut s = String::new();
+        let _ = c.read_to_string(&mut s);
+        s
+    };
+    let all = scrape("?scope=resolvers");
+    let metrics = [
+        ("sent", "Sent"),
+        ("send_error", "Send error"),
+        ("valid", "Valid"),
+        ("update", "Update"),
+        ("cname", "CNAME"),
+        ("cname_error", "CNAME error"),
+        ("any_err", "Any errors"),
+        ("nx", "NX"),
+        ("timeout", "Timeout"),
+        ("refused", "Refused"),
+        ("other", "Other"),
+        ("invalid", "Invalid"),
+        ("too_big", "Too big"),
+        ("truncated", "Truncated"),
+        ("tcp_fallback", "TCP fallback"),
+        ("outdated", "Outdated"),
+    ];
+    for (n, d) in metrics {
+        let name = format!("haproxy_resolver_{n}");
+        assert!(all.contains(&format!("# HELP {name} {d}\n# TYPE {name} gauge\n{name}{{resolver=\"r\",nameserver=\"ns1\"}} ")), "{name} in {all}");
+    }
+    assert!(!all.contains("haproxy_server_"), "{all}");
+    let sent = all.lines().find(|l| l.starts_with("haproxy_resolver_sent{")).expect("sent");
+    assert!(sent.rsplit(' ').next().expect("v").parse::<u64>().expect("n") >= 1, "{sent}");
+    // `metrics=` filters like the others, and `scope=resolver` is HAProxy's module name.
+    let one = scrape("?scope=resolver&metrics=haproxy_resolver_nx");
+    assert!(one.contains("haproxy_resolver_nx{") && !one.contains("haproxy_resolver_sent"), "{one}");
 }

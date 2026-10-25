@@ -79,6 +79,89 @@ pub fn register_pools() {
     RESOLUTION_POOL.register();
 }
 
+/// The per-nameserver counters of `show resolvers`, in its order, with the name and description
+/// `haproxy_resolver_*` gives each (`resolv_stats`, `resolvers.c:104`).
+pub const COUNTERS: [(&str, &str, &str); 16] = [
+    ("sent", "sent", "Sent"),
+    ("snd_error", "send_error", "Send error"),
+    ("valid", "valid", "Valid"),
+    ("update", "update", "Update"),
+    ("cname", "cname", "CNAME"),
+    ("cname_error", "cname_error", "CNAME error"),
+    ("any_err", "any_err", "Any errors"),
+    ("nx", "nx", "NX"),
+    ("timeout", "timeout", "Timeout"),
+    ("refused", "refused", "Refused"),
+    ("other", "other", "Other"),
+    ("invalid", "invalid", "Invalid"),
+    ("too_big", "too_big", "Too big"),
+    ("truncated", "truncated", "Truncated"),
+    ("tcp_fallback", "tcp_fallback", "TCP fallback"),
+    ("outdated", "outdated", "Outdated"),
+];
+const C_SENT: usize = 0;
+const C_SND_ERROR: usize = 1;
+const C_VALID: usize = 2;
+const C_UPDATE: usize = 3;
+const C_CNAME_ERROR: usize = 5;
+const C_ANY_ERR: usize = 6;
+const C_NX: usize = 7;
+const C_REFUSED: usize = 9;
+const C_OTHER: usize = 10;
+const C_INVALID: usize = 11;
+const C_TOO_BIG: usize = 12;
+const C_TRUNCATED: usize = 13;
+const C_OUTDATED: usize = 15;
+// `cname` and `timeout` are never counted by HAProxy either (A.t5: `timeout 0` after a timeout);
+// `tcp_fallback` waits for T488.
+
+/// One `resolvers` section's nameservers and their counters, as `show resolvers` and the
+/// exporter read them.
+pub struct SectionStats {
+    pub name: Box<str>,
+    pub nameservers: Vec<(Box<str>, [u64; 16])>,
+}
+
+/// Every configured section (also one no server uses), in configuration order. Written only by
+/// the worker that owns a section, when its counters changed (never on the request path); read
+/// by the CLI and the exporter on any worker.
+static STATS: std::sync::Mutex<Vec<SectionStats>> = std::sync::Mutex::new(Vec::new());
+
+/// Runs `f` on the sections' counters.
+pub fn with_stats<R>(f: impl FnOnce(&[SectionStats]) -> R) -> R {
+    f(&STATS.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+/// `show resolvers [<id>]` (`cli_io_handler_dump_resolvers_to_buffer`): the text, one
+/// `Resolvers section` block each, or the error `HAProxy` gives for an unknown id. `HAProxy`
+/// always has a `default` section; Ibex does not (design §2.8), so with no section it says what
+/// `HAProxy` says for an empty list.
+#[must_use]
+pub fn show(id: Option<&str>) -> String {
+    use std::fmt::Write as _;
+    with_stats(|all| {
+        if let Some(id) = id {
+            if !all.iter().any(|s| &*s.name == id) {
+                return "Can't find that resolvers section\n".to_string();
+            }
+        }
+        if all.is_empty() {
+            return "No resolvers found\n".to_string();
+        }
+        let mut out = String::new();
+        for s in all.iter().filter(|s| id.is_none_or(|i| i == &*s.name)) {
+            let _ = writeln!(out, "Resolvers section {}", s.name);
+            for (ns, c) in &s.nameservers {
+                let _ = writeln!(out, " nameserver {ns}:");
+                for ((name, _, _), v) in COUNTERS.iter().zip(c) {
+                    let _ = writeln!(out, "  {:<13} {v}", format!("{name}:"));
+                }
+            }
+        }
+        out
+    })
+}
+
 /// Why a server went into `SRV_ADMF_RMAINT` (`srv_adm_st_chg_cause`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cause {
@@ -203,6 +286,8 @@ struct Nameserver {
     name: Box<str>,
     addr: SocketAddr,
     sock: UdpSocket,
+    /// `ns->counters`, in the order of [`COUNTERS`]; this worker alone writes them.
+    counts: [u64; 16],
 }
 
 /// The holds and timers of a section that this module reads (the crate reads the rest).
@@ -228,6 +313,10 @@ pub struct Section {
     resolutions: Vec<Box<Resolution>>,
     /// The read buffer, the task's own (64 KiB: a datagram never needs more).
     buf: Box<[u8]>,
+    /// Where this section's counters are in [`STATS`] (the configuration order).
+    stats_idx: usize,
+    /// A counter changed since the last [`Section::publish`].
+    dirty: bool,
 }
 
 /// What a step reports to the engine: a line to log on the server's proxy, at a level, also
@@ -276,6 +365,12 @@ pub fn build(
     now: ibex_sched::Tick,
 ) -> io::Result<Vec<Section>> {
     let t0 = Instant::now();
+    // `show resolvers` and the exporter list every configured section, used or not.
+    *STATS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = config
+        .resolvers
+        .iter()
+        .map(|r| SectionStats { name: r.name.as_str().into(), nameservers: r.nameservers.iter().map(|n| (n.name.as_str().into(), [0; 16])).collect() })
+        .collect();
     if config.resolvers.is_empty() {
         return Ok(Vec::new());
     }
@@ -304,7 +399,9 @@ pub fn build(
             let sec_idx = if let Some(i) = out.iter().position(|s| *s.name == *sec_name) {
                 i
             } else {
-                out.push(Section::new(cfg, usize_to_u32(out.len()), scheduler, fdtab, poller, now)?);
+                let mut sec = Section::new(cfg, usize_to_u32(out.len()), scheduler, fdtab, poller, now)?;
+                sec.stats_idx = config.resolvers.iter().position(|r| r.name == sec_name).unwrap_or(0);
+                out.push(sec);
                 out.len() - 1
             };
             // `resolv_link_resolution`: the type asked first, fixed now (A.t18).
@@ -365,7 +462,7 @@ impl Section {
             let fd = sock.as_raw_fd();
             fdtab.insert(fd, crate::fdtab::FdState::Resolver { section: idx }, crate::fdtab::Interest::READ);
             poller.add(std::os::fd::AsFd::as_fd(&sock), u64::try_from(fd).unwrap_or(0), true, false)?;
-            nameservers.push(Nameserver { name: ns.name.as_str().into(), addr: ns.addr, sock });
+            nameservers.push(Nameserver { name: ns.name.as_str().into(), addr: ns.addr, sock, counts: [0; 16] });
         }
         let h = &cfg.hold;
         let dns = ibex_dns::Resolver::new(ibex_dns::ResolverConfig {
@@ -404,6 +501,8 @@ impl Section {
             },
             resolutions: Vec::new(),
             buf: vec![0u8; 65_536].into_boxed_slice(),
+            stats_idx: 0,
+            dirty: false,
         })
     }
 
@@ -422,7 +521,8 @@ impl Section {
                     Err(_) => break,
                 };
                 let from = self.nameservers[ns_idx].addr;
-                let _counter = self.dns.handle_response(now, from, Protocol::Udp, &self.buf[..n]);
+                let got = self.dns.handle_response(now, from, Protocol::Udp, &self.buf[..n]);
+                self.count(ns_idx, received_counter(got));
                 self.drain_results(now, Some(ns_idx), proxies, checks, log);
             }
         }
@@ -444,13 +544,19 @@ impl Section {
         // Sends, and the retry timer (which may end resolutions in a timeout).
         while let Some((to, proto, bytes)) = self.dns.poll_transmit(now) {
             if proto == Protocol::Udp {
-                if let Some(ns) = self.nameservers.iter().find(|n| n.addr == to) {
-                    // A failed send is `snd_error` (T485); the retry timer sends again.
-                    let _ = ns.sock.send(&bytes);
+                if let Some(i) = self.nameservers.iter().position(|n| n.addr == to) {
+                    // A failed send is `snd_error`; the retry timer sends again. A full socket
+                    // buffer is neither (`dns.c:165`: HAProxy queues the datagram).
+                    match self.nameservers[i].sock.send(&bytes) {
+                        Ok(_) => self.count(i, C_SENT),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(_) => self.count(i, C_SND_ERROR),
+                    }
                 }
             }
         }
         self.drain_results(now, None, proxies, checks, log);
+        self.publish();
         let next = self
             .resolutions
             .iter()
@@ -481,6 +587,24 @@ impl Section {
     }
 
     /// Applies the results the crate has. A valid answer read from `ns` names it in the log.
+    fn count(&mut self, ns: usize, counter: usize) {
+        self.nameservers[ns].counts[counter] += 1;
+        self.dirty = true;
+    }
+
+    /// Copies the counters to [`STATS`] when one changed.
+    fn publish(&mut self) {
+        if !std::mem::take(&mut self.dirty) {
+            return;
+        }
+        let mut all = STATS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(s) = all.get_mut(self.stats_idx) {
+            for (dst, src) in s.nameservers.iter_mut().zip(&self.nameservers) {
+                dst.1 = src.counts;
+            }
+        }
+    }
+
     fn drain_results(&mut self, now: Instant, ns: Option<usize>, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
         while let Some((qid, res)) = self.dns.poll_result() {
             let Some(r) = self.resolutions.iter_mut().find(|r| r.in_flight == Some(qid)) else { continue };
@@ -490,7 +614,12 @@ impl Section {
             match res {
                 Ok(answers) => {
                     let by = ns.map(|i| format!("{}/{}", self.name, self.nameservers[i].name));
-                    on_valid(r, &answers, by.as_deref(), &self.holds, now, proxies, checks, log);
+                    if on_valid(r, &answers, by.as_deref(), &self.holds, now, proxies, checks, log) {
+                        if let Some(i) = ns {
+                            self.nameservers[i].counts[C_UPDATE] += 1;
+                            self.dirty = true;
+                        }
+                    }
                 }
                 Err(e) => on_error(r, &e, &self.holds, now, proxies, checks, log),
             }
@@ -498,8 +627,26 @@ impl Section {
     }
 }
 
+/// The counter `resolv_process_responses` bumps for a datagram (`resolvers.c:2398-2486`).
+fn received_counter(r: ibex_dns::Received) -> usize {
+    use ibex_dns::Received as R;
+    match r {
+        R::Valid => C_VALID,
+        R::Nx => C_NX,
+        R::Refused => C_REFUSED,
+        R::AnyErr => C_ANY_ERR,
+        R::CnameError => C_CNAME_ERROR,
+        R::Truncated => C_TRUNCATED,
+        R::Other => C_OTHER,
+        R::Invalid => C_INVALID,
+        R::TooBig => C_TOO_BIG,
+        R::Outdated => C_OUTDATED,
+    }
+}
+
 /// `resolv_process_responses`, valid: the items are refreshed and every requester runs
-/// `snr_resolution_cb`, the first one naming the nameserver, the others `DNS cache`.
+/// `snr_resolution_cb`, the first one naming the nameserver, the others `DNS cache`. Whether
+/// the first one moved its server (`counters->app.resolver.update++`).
 #[allow(clippy::too_many_arguments)]
 fn on_valid(
     r: &mut Resolution,
@@ -510,14 +657,17 @@ fn on_valid(
     proxies: &[Proxy],
     checks: &mut [ServerCheckState],
     log: &mut LogFn<'_>,
-) {
+) -> bool {
     r.status = Status::Valid;
     r.last_valid = Some(now);
     refresh_items(r, answers, active_families(now), holds.obsolete, now);
-    let mut by = by;
+    let mut updated = false;
     for k in 0..r.reqs.len() {
-        server_answer(r, k, by.take().unwrap_or("DNS cache"), holds, now, proxies, checks, log);
+        let first = k == 0 && by.is_some();
+        let moved = server_answer(r, k, by.filter(|_| k == 0).unwrap_or("DNS cache"), holds, now, proxies, checks, log);
+        updated |= first && moved;
     }
+    updated
 }
 
 /// The answer's addresses into the items (in key order, kept when already there), then the
@@ -561,12 +711,12 @@ enum Pick {
 
 /// `snr_resolution_cb` for requester `k`.
 #[allow(clippy::too_many_arguments)]
-fn server_answer(r: &mut Resolution, k: usize, by: &str, holds: &Holds, now: Instant, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
+fn server_answer(r: &mut Resolution, k: usize, by: &str, holds: &Holds, now: Instant, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) -> bool {
     let (p, s) = (r.reqs[k].proxy as usize, r.reqs[k].server as usize);
-    let Some(px) = proxies.get(p) else { return };
+    let Some(px) = proxies.get(p) else { return false };
     let cur = px.servers.get(s).map(|a| a.ip()).filter(|ip| !ip.is_unspecified());
     match pick(r, k, cur, active_families(now)) {
-        Pick::No => {}
+        Pick::No => false,
         Pick::New(ip) => {
             // `srv_update_addr` (the line where an answer becomes the server's address).
             let old = px.servers.get(s).unwrap_or_else(|| SocketAddr::new(ip, 0));
@@ -577,11 +727,13 @@ fn server_answer(r: &mut Resolution, k: usize, by: &str, holds: &Holds, now: Ins
             if px.server_rmaint(s) {
                 leave_rmaint(&r.reqs[k], &r.name, proxies, checks, log);
             }
+            true
         }
         Pick::NoIp => {
             if set_srv_down(r, k, holds, now, proxies, checks, log) {
                 clear_addr(px, s);
             }
+            false
         }
     }
 }
@@ -805,6 +957,45 @@ fn leave_rmaint(req: &Req, fqdn: &str, proxies: &[Proxy], checks: &mut [ServerCh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `Received` bumps the counter of its name (`resolvers.c:2398-2486`).
+    #[test]
+    fn a_received_class_names_its_counter() {
+        use ibex_dns::Received as R;
+        for (r, name) in [
+            (R::Valid, "valid"),
+            (R::Nx, "nx"),
+            (R::Refused, "refused"),
+            (R::AnyErr, "any_err"),
+            (R::CnameError, "cname_error"),
+            (R::Truncated, "truncated"),
+            (R::Other, "other"),
+            (R::Invalid, "invalid"),
+            (R::TooBig, "too_big"),
+            (R::Outdated, "outdated"),
+        ] {
+            assert_eq!(COUNTERS[received_counter(r)].0, name);
+        }
+        assert_eq!(COUNTERS[C_SENT].0, "sent");
+        assert_eq!(COUNTERS[C_SND_ERROR].0, "snd_error");
+        assert_eq!(COUNTERS[C_UPDATE].0, "update");
+    }
+
+    /// `show resolvers` with no section, an unknown id, and one section (the only test that
+    /// writes `STATS` in this binary).
+    #[test]
+    fn show_resolvers_without_sections_and_with_an_unknown_id() {
+        *STATS.lock().unwrap() = Vec::new();
+        assert_eq!(show(None), "No resolvers found\n");
+        let mut c = [0u64; 16];
+        c[C_NX] = 7;
+        *STATS.lock().unwrap() = vec![SectionStats { name: "r".into(), nameservers: vec![("ns1".into(), c)] }];
+        assert_eq!(show(Some("zz")), "Can't find that resolvers section\n");
+        let text = show(Some("r"));
+        assert!(text.starts_with("Resolvers section r\n nameserver ns1:\n  sent:         0\n"), "{text}");
+        assert!(text.contains("\n  nx:           7\n"), "{text}");
+        *STATS.lock().unwrap() = Vec::new();
+    }
 
     /// The pool never gets a resolution back, so only this reaches the `Poolable` impl.
     #[test]

@@ -194,9 +194,20 @@ Not refused, on purpose:
   resolution early (the honest answer is still taken); only a layer-4 timeout of a check, not a
   refused connect, triggers a resolution. Still refused: `server-template` (T486), SRV names
   (`_...`, T487), TCP (`tcp@` nameservers and the fallback on a truncated answer, which is an error
-  until T488), `do-resolve`, `parse-resolv-conf` and `dns-accept-family` (T489), any other address prefix on a `nameserver`. `show resolvers` is T485. HAProxy also
+  until T488), `do-resolve`, `parse-resolv-conf` and `dns-accept-family` (T489), any other address
+  prefix on a `nameserver`. HAProxy also
   creates an implicit `default` section (from `/etc/resolv.conf`, used by its httpclient); Ibex has
-  no httpclient and does not (user, 2026-10-25).
+  no httpclient and does not (user, 2026-10-25). `show resolvers` (T485) therefore lacks the block
+  HAProxy 3.5-dev8 ends with, even for a configuration with no `resolvers` section at all:
+  `Resolvers section default` / ` nameserver 127.0.0.53:` and the sixteen counters at 0 (the first
+  `nameserver` of `/etc/resolv.conf`; `show stat domain resolvers` has the row `127.0.0.53,default,0,...`).
+  With no section Ibex prints `No resolvers found` (HAProxy never does). The counters are the
+  sixteen of `show resolvers` per nameserver, bumped where `resolv_process_responses` bumps them,
+  also readable as `haproxy_resolver_<counter>{resolver=,nameserver=}` (the name `send_error` for
+  `snd_error`; scrape with `scope=resolver`; the reference binary here has no exporter, so the
+  names come from `resolvers.c:104`). `cname` and `timeout` stay 0 (HAProxy never bumps them
+  either), `tcp_fallback` waits for T488. Not done: `show stat domain resolvers` (typed rows) and
+  `show resolvers` in `help`.
 - A name on a `server` line is resolved by libc while the configuration loads, as HAProxy does
   (`localhost` is the first answer of `getaddrinfo`, `::1` on most hosts, no longer `127.0.0.1`),
   and `init-addr last|libc|none|<ip>` is applied in order; `last` (and so the default
@@ -592,9 +603,9 @@ Left out, because Ibex does not count them (printing 0 would pass a default for 
 | `haproxy_{frontend,backend,server}_{req,res}_bytes_{in,out}_total` | bytes by direction are not tracked |
 | `haproxy_server_{idle,private_idle,unsafe_idle,safe_idle,used,need}_connections_current` | no per-server connection pool gauges |
 | `haproxy_{backend,server}_last_session_seconds` | `lastsess` is not tracked |
+| `haproxy_resolver_*` | present once a `resolvers` section is configured (T485); HAProxy always has the implicit `default` section, Ibex does not build it |
 | `haproxy_frontend_intercepted_requests_total`, `haproxy_{frontend,backend}_http_cache_hint_hits_total` | not tracked |
 | `haproxy_backend_agg_server_status`, `_agg_server_check_status`, `_agg_check_status`, `haproxy_server_check_status`, `haproxy_server_agent_*` | per-state check/agent aggregates; Ibex has no agent checks |
-| `haproxy_resolver_*` | no resolvers |
 
 Not done: `extra-counters` is accepted and adds nothing (Ibex has no stats-module counters: `h1`,
 `h2`, `ssl`, ...), and `tcp-request content use-service` stays refused (HAProxy refuses it too,
