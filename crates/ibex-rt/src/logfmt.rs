@@ -521,7 +521,37 @@ impl LogFormat {
     /// # Errors
     /// As [`LogFormat::compile`] (T455).
     pub fn compile_rule(fmt: &str, registry: &Registry, http: bool) -> Result<Self, String> {
-        Self::compile_with(fmt, registry, false).map(|f| LogFormat { http, ..f })
+        let mut f = Self::compile_with(fmt, registry, false)?;
+        f.http = http;
+        if http {
+            f.drop_http_incompatible();
+        }
+        Ok(f)
+    }
+
+    /// `_lf_expr_postcheck_node_opt` for a format compiled with `LOG_OPT_HTTP` (a header's or a
+    /// path's value): the encodings (`+json`, `+cbor`, `+bin`, `+utf8`) are ignored, whether
+    /// per node or global, and a sample is not quoted (`+Q`), since it goes through
+    /// `lf_encode_chunk` with `http_encode_map`. An alias still honours `+Q`. Measured on
+    /// 3.5-dev8-885761-29 (T471).
+    fn drop_http_incompatible(&mut self) {
+        let clear = |o: &mut Opts| {
+            o.json = false;
+            o.cbor = false;
+            o.bin = false;
+            o.utf8 = false;
+        };
+        clear(&mut self.global);
+        for n in &mut self.nodes {
+            match n {
+                Node::Alias(_, o, _) => clear(o),
+                Node::Expr(_, o, _) => {
+                    clear(o);
+                    o.quote = false;
+                }
+                Node::Text(_) => {}
+            }
+        }
     }
 
     /// Whether the format reads anything of the stream beyond the names, addresses and
