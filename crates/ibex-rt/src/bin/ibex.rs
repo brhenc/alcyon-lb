@@ -685,6 +685,7 @@ fn main() {
     if config_files.len() == 1 {
         ibex_config::env::set_file(&config_files[0].display().to_string());
     }
+    ibex_config::set_resolve_dontfail(opts.ignore_resolve_fail);
     let parsed = ibex_config::parse_str(&combined_config);
     for name in ["HAPROXY_HTTP_LOG_FMT", "HAPROXY_HTTP_CLF_LOG_FMT", "HAPROXY_HTTPS_LOG_FMT", "HAPROXY_TCP_LOG_FMT", "HAPROXY_TCP_CLF_LOG_FMT"] {
         std::env::remove_var(name);
@@ -729,15 +730,18 @@ fn main() {
     for w in load_msgs {
         use ibex_config::ast::global::WarnStyle;
         let (file, line) = locate(&config_starts, w.line);
-        let sev = if w.alert { "[ALERT]   " } else { "[WARNING] " };
+        let sev = if w.alert { "[ALERT]   " } else if w.style == WarnStyle::Notice { "[NOTICE]  " } else { "[WARNING] " };
         let pid = process::id();
         match w.style {
+            WarnStyle::Bare | WarnStyle::Notice => {
+                ibex_rt::stderr_line!("{sev} ({pid}) : {}", w.text.replace("{at}", &format!("[{file}:{line}]")));
+            }
             WarnStyle::Spaced => ibex_rt::stderr_line!("{sev} ({pid}) : config : parsing [{file}:{line}] : {}", w.text),
             WarnStyle::SpacedBlank => ibex_rt::stderr_line!("{sev} ({pid}) : config : parsing [{file}:{line}] : {}\n", w.text),
             WarnStyle::Tight => ibex_rt::stderr_line!("{sev} ({pid}) : config : parsing [{file}:{line}]: {}", w.text),
             WarnStyle::At => ibex_rt::stderr_line!("{sev} ({pid}) : config : [{file}:{line}] : {}", w.text),
         }
-        warned |= !w.alert;
+        warned |= !w.alert && w.style != WarnStyle::Notice;
     }
     for text in config.check_warnings() {
         ibex_rt::stderr_line!("[WARNING]  ({}) : {text}", process::id());

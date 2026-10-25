@@ -35,6 +35,31 @@ fn expand_vars(s: &str) -> String {
 }
 
 pub(crate) fn parse_socket_addr(token: &Token, default_port: Option<u16>) -> Result<(SocketAddr, bool), ConfigError> {
+    parse_addr(token, default_port, false).map(|(a, q, _)| (a, q))
+}
+
+/// A `server` line's address: as [`parse_socket_addr`], and a host that is not an IP
+/// address is a name (`str2sa_range` with `fqdn`), returned third with the unspecified
+/// address in its place. It is resolved once the configuration is read
+/// (`resolve_server_addrs`, `srv_init_addr` in `HAProxy`).
+pub(crate) fn parse_server_addr(token: &Token, default_port: Option<u16>) -> Result<(SocketAddr, bool, Option<String>), ConfigError> {
+    parse_addr(token, default_port, true)
+}
+
+/// `localhost` is a name like any other on a server line (libc gives `::1` first on most
+/// hosts, A.t1f); elsewhere it is still `127.0.0.1`.
+fn host_ip(s: &str, allow_name: bool, name: &mut Option<String>, line: usize, col: usize) -> Result<IpAddr, ConfigError> {
+    let t = s.trim();
+    if allow_name && !t.is_empty() && t != "*" && t != "0" && t.parse::<IpAddr>().is_err() {
+        *name = Some(t.to_string());
+        return Ok(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+    parse_ip(s, line, col)
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_addr(token: &Token, default_port: Option<u16>, allow_name: bool) -> Result<(SocketAddr, bool, Option<String>), ConfigError> {
+    let mut name = None;
     let expanded = expand_vars(token.text.as_str());
 
     // An address that was written as `${VAR}` and expanded to nothing is a deployment that
@@ -134,7 +159,7 @@ pub(crate) fn parse_socket_addr(token: &Token, default_port: Option<u16>) -> Res
                 ));
             };
             let ip = parse_ip(ip_str, token.line, token.col)?;
-            return Ok((SocketAddr::new(ip, port), is_quic));
+            return Ok((SocketAddr::new(ip, port), is_quic, name));
         }
     }
 
@@ -165,14 +190,14 @@ pub(crate) fn parse_socket_addr(token: &Token, default_port: Option<u16>) -> Res
                 )
             })?
         };
-        let ip = parse_ip(host_part, token.line, token.col)?;
-        Ok((SocketAddr::new(ip, port), is_quic))
+        let ip = host_ip(host_part, allow_name, &mut name, token.line, token.col)?;
+        Ok((SocketAddr::new(ip, port), is_quic, name))
     } else if let Some(port) = default_port {
-        let ip = parse_ip(s, token.line, token.col)?;
-        Ok((SocketAddr::new(ip, port), is_quic))
+        let ip = host_ip(s, allow_name, &mut name, token.line, token.col)?;
+        Ok((SocketAddr::new(ip, port), is_quic, name))
     } else if s.is_empty() {
         let ip = parse_ip(s, token.line, token.col)?;
-        Ok((SocketAddr::new(ip, 0), is_quic))
+        Ok((SocketAddr::new(ip, 0), is_quic, name))
     } else {
         Err(ConfigError::new(
             token.line,
@@ -194,3 +219,26 @@ pub(crate) fn parse_ip(s: &str, line: usize, col: usize) -> Result<IpAddr, Confi
         .map_err(|_| ConfigError::new(line, col, format!("invalid IP address '{s}'")))
 }
 
+
+/// `resolv_hostname_validation`: at most 255 characters, labels of at most 63 letters,
+/// digits, `-` and `_`.
+fn valid_hostname(name: &str) -> bool {
+    name.len() <= 255
+        && name.split('.').all(|l| l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+}
+
+/// `str2ip2(name, .., 1)`: the first address `getaddrinfo` gives for a valid host name
+/// (`srv_set_addr_via_libc`). Called while the configuration loads, never after.
+pub(crate) fn libc_resolve(name: &str) -> Option<IpAddr> {
+    use std::net::ToSocketAddrs;
+    if !valid_hostname(name) {
+        return None;
+    }
+    (name, 0).to_socket_addrs().ok()?.next().map(|a| a.ip())
+}
+
+/// `resolv_str_to_dn_label` fails on an empty label (`a..b`, `.a`); a final dot is allowed.
+pub(crate) fn dn_label_ok(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    !name.is_empty() && name.split('.').all(|l| !l.is_empty())
+}

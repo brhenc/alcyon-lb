@@ -141,15 +141,17 @@ pub fn attach(proxies: &mut [Proxy], config: &ibex_config::Config) {
     };
     // Section order is proxy order: `build_shared_state` pushes listens, then backends.
     let mut tracks: Vec<Vec<Option<Track>>> = Vec::new();
-    for (name, servers) in &sections {
+    for (p, (name, servers)) in sections.iter().enumerate() {
         tracks.push(
             servers
                 .iter()
-                .map(|server| {
+                .enumerate()
+                .map(|(s, server)| {
                     let spec = server.track.as_deref()?;
                     let (tpx, tsv) = tracked_target(name, spec);
                     let target = find(tpx, tsv)?;
-                    let own = if server.disabled { ServerStatus::Maint } else { ServerStatus::Up };
+                    // A server with no address (`init-addr none`) is in maintenance of its own.
+                    let own = if server.disabled || proxies[p].server_rmaint(s) { ServerStatus::Maint } else { ServerStatus::Up };
                     Some(Track { target, label: format!("{tpx}/{tsv}"), own: AtomicU8::new(own as u8) })
                 })
                 .collect(),
@@ -197,6 +199,12 @@ pub fn inherited(proxy: &Proxy, s: usize) -> bool {
 /// admin form. It moves the admin state only: what the checks found (`cur_state`) is kept,
 /// so `ready` does not send traffic to a server they found dead (T274 E1).
 pub fn apply_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus) {
+    // A server with no address stays in maintenance (`SRV_ADMF_RMAINT` outlives `enable
+    // server` and `set server state ready`: "leaving forced maintenance but remains in
+    // maintenance").
+    if proxies.get(p).is_some_and(|px| px.server_rmaint(s)) {
+        return;
+    }
     let check = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s);
     if track_of(proxies, p, s).is_some() {
         set_status(proxies, p, s, to);

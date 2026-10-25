@@ -65,6 +65,7 @@ mod redispatch_option;
 mod response_deny;
 mod response_redirect;
 mod retry_on;
+mod resolvers_config;
 mod ring_sections;
 mod sc_set_gpt0_default;
 mod sc_value_missing;

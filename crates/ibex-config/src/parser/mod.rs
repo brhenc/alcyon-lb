@@ -60,6 +60,8 @@ pub(crate) enum CurrentSection {
     Ring(RingSection),
     /// `log-forward <name>`.
     LogForward(LogForwardSection),
+    /// `resolvers <name>`.
+    Resolvers(crate::ast::ResolversSection),
 }
 
 impl CurrentSection {
@@ -87,6 +89,7 @@ pub(crate) use checks::*;
 pub(crate) mod server;
 pub(crate) use server::*;
 pub(crate) mod ring;
+pub(crate) mod resolvers;
 pub(crate) mod bind_keywords;
 pub(crate) mod tls_versions;
 pub(crate) mod server_keywords;
@@ -165,6 +168,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     let mut backends = Vec::new();
     let mut rings: Vec<RingSection> = Vec::new();
     let mut log_forwards: Vec<LogForwardSection> = Vec::new();
+    let mut resolvers: Vec<crate::ast::ResolversSection> = Vec::new();
     let mut cur_section: Option<CurrentSection> = None;
     let mut sample_refs = Vec::new();
     // The proxy sections in the order written, and the explicit `id` of each, for the
@@ -199,6 +203,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                     &mut rings,
                     &mut log_forwards,
+                    &mut resolvers,
                 );
                 // HAProxy reads every `global` section into the same struct: a later one
                 // adds to the earlier ones, it does not replace them.
@@ -215,6 +220,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                     &mut rings,
                     &mut log_forwards,
+                    &mut resolvers,
                 );
                 check_inheritance(Inheritor::Defaults, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 if tokens.len() >= 2 && !tokens[1].text.is_empty() && tokens[1].text != "from" {
@@ -269,6 +275,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                     &mut rings,
                     &mut log_forwards,
+                    &mut resolvers,
                 );
                 check_inheritance(Inheritor::Listen, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 proxy_order.push((ProxyKind::Listen, listens.len()));
@@ -290,6 +297,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                     &mut rings,
                     &mut log_forwards,
+                    &mut resolvers,
                 );
                 check_inheritance(Inheritor::Frontend, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 proxy_order.push((ProxyKind::Frontend, frontends.len()));
@@ -311,6 +319,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                     &mut rings,
                     &mut log_forwards,
+                    &mut resolvers,
                 );
                 check_inheritance(Inheritor::Backend, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 if !tokens.iter().any(|t| t.text == "from") {
@@ -337,6 +346,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                     &mut rings,
                     &mut log_forwards,
+                    &mut resolvers,
                 );
                 cur_section = Some(CurrentSection::Ring(ring::parse_ring_header(tokens, kw, &rings)?));
             }
@@ -351,15 +361,24 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                     &mut rings,
                     &mut log_forwards,
+                    &mut resolvers,
                 );
                 cur_section = Some(CurrentSection::LogForward(ring::parse_log_forward_header(tokens, kw, &log_forwards)?));
             }
             "resolvers" => {
-                return Err(ConfigError::new(
-                    kw.line,
-                    kw.col,
-                    "'resolvers' sections are not supported: Ibex does no DNS resolution at run time (out of M1 scope)",
-                ));
+                flush_current_section(
+                    &mut cur_section,
+                    &mut global,
+                    &mut defaults,
+                    &mut named_defaults,
+                    &mut listens,
+                    &mut frontends,
+                    &mut backends,
+                    &mut rings,
+                    &mut log_forwards,
+                    &mut resolvers,
+                );
+                cur_section = Some(CurrentSection::Resolvers(resolvers::parse_resolvers_header(tokens, kw, &resolvers)?));
             }
             "userlist" => {
                 flush_current_section(
@@ -372,6 +391,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                     &mut rings,
                     &mut log_forwards,
+                    &mut resolvers,
                 );
                 let Some(name) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
                     return Err(ConfigError::new(kw.line, kw.col, "'userlist' expects <name> as arguments."));
@@ -389,6 +409,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut backends,
                     &mut rings,
                     &mut log_forwards,
+                    &mut resolvers,
                 );
                 if tokens.len() < 2 || tokens[1].text.is_empty() {
                     return Err(ConfigError::new(
@@ -464,6 +485,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         &mut backends,
         &mut rings,
         &mut log_forwards,
+        &mut resolvers,
     );
 
     // HAProxy 3.5 accepts a config with no proxy sections -- including a completely
@@ -514,6 +536,9 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         list.resolve().map_err(|(line, msg)| ConfigError::new(line, 1, msg))?;
     }
 
+    resolvers::check_resolvers(&resolvers);
+    let mut init_notices = resolve_server_addrs(&mut listens, &mut backends)?;
+
     let config = Config {
         global,
         defaults,
@@ -522,6 +547,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         backends,
         rings,
         log_forwards,
+        resolvers,
         sample_refs,
         userlists,
         proxy_order,
@@ -529,6 +555,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         env_ops,
         proxy_warnings: {
             proxy_warnings.extend(warn::take());
+            proxy_warnings.append(&mut init_notices);
             proxy_warnings.sort_by_key(|w| w.line);
             proxy_warnings
         },
@@ -536,6 +563,97 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     register_checks_from_config(&config);
 
     Ok(config)
+}
+
+thread_local! {
+    /// `-dr`: a server whose name does not resolve starts in maintenance instead of failing
+    /// the load (`GTUNE_RESOLVE_DONTFAIL`).
+    static RESOLVE_DONTFAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `-dr` on the command line, for the next [`parse_str`] on this thread.
+pub fn set_resolve_dontfail(on: bool) {
+    RESOLVE_DONTFAIL.with(|c| c.set(on));
+}
+
+/// `srv_init_addr`: each server of an enabled backend whose address is a name gets its
+/// first address, by its `init-addr` methods in order (`srv_iterate_initaddr`). Returns the
+/// notices to print; a server no method gives an address fails the load with `HAProxy`'s
+/// alerts, every such server's, then one summary (A.t0, d6).
+fn resolve_server_addrs(listens: &mut [ListenSection], backends: &mut [BackendSection]) -> Result<Vec<crate::ast::global::LoadWarning>, ConfigError> {
+    use crate::ast::global::{LoadWarning, WarnStyle};
+    use crate::ast::InitAddrMethod as M;
+    let dontfail = RESOLVE_DONTFAIL.with(std::cell::Cell::get);
+    let mut notices = Vec::new();
+    let mut alerts: Vec<(usize, String)> = Vec::new();
+    let sections = listens
+        .iter_mut()
+        .filter(|l| !l.disabled)
+        .map(|l| (l.name.as_str(), &mut l.servers, &mut l.server_extras))
+        .chain(backends.iter_mut().filter(|b| !b.disabled).map(|b| (b.name.as_str(), &mut b.servers, &mut b.server_extras)));
+    for (px, servers, extras) in sections {
+        for entry in &mut extras.names {
+            let Some(srv) = servers.get_mut(entry.index as usize) else { continue };
+            let name = &*entry.fqdn;
+            let line = entry.line as usize;
+            let mut methods = entry.init_addr;
+            if methods.methods == 0 {
+                // `last,libc`; `last` finds no state file and is skipped. `none` comes with a
+                // server's `resolvers`, which is refused until T484.
+                methods.push(M::Libc);
+            }
+            if dontfail {
+                methods.push(M::None);
+            }
+            let mut failed = false;
+            let mut done = false;
+            for m in methods.iter() {
+                match m {
+                    M::Last => {}
+                    M::Libc => match address::libc_resolve(name) {
+                        Some(ip) => {
+                            srv.addr.set_ip(ip);
+                            done = true;
+                        }
+                        None => failed = true,
+                    },
+                    M::None => {
+                        entry.unresolved = true;
+                        if failed {
+                            let text = format!("{{at}} : 'server {px}/{}' : could not resolve address '{name}', disabling server.", srv.id);
+                            notices.push(LoadWarning { line, alert: false, text, style: WarnStyle::Notice });
+                        }
+                        done = true;
+                    }
+                    M::Ip => {
+                        if let Some(ip) = methods.ip {
+                            srv.addr.set_ip(ip);
+                        }
+                        if failed {
+                            let text = format!(
+                                "{{at}} : 'server {px}/{}' : could not resolve address '{name}', falling back to configured address.",
+                                srv.id
+                            );
+                            notices.push(LoadWarning { line, alert: false, text, style: WarnStyle::Notice });
+                        }
+                        done = true;
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+            if !done {
+                let what = if failed { "could not resolve" } else { "no method found to resolve" };
+                alerts.push((line, format!("{{at}} : 'server {px}/{}' : {what} address '{name}'.", srv.id)));
+            }
+        }
+    }
+    if alerts.is_empty() {
+        return Ok(notices);
+    }
+    alerts.push((0, "Failed to initialize server(s) addr.".to_string()));
+    Err(ConfigError::alerts(alerts))
 }
 
 /// `path` under `base` when it is relative (`ssl_sock_load_cert_file`, `ssl_store_load_locations_file`
@@ -759,6 +877,7 @@ pub(crate) fn flush_current_section(
     backends: &mut Vec<BackendSection>,
     rings: &mut Vec<RingSection>,
     log_forwards: &mut Vec<LogForwardSection>,
+    resolvers: &mut Vec<crate::ast::ResolversSection>,
 ) {
     if let Some(sec) = cur.take() {
         match sec {
@@ -776,6 +895,7 @@ pub(crate) fn flush_current_section(
             CurrentSection::HttpErrors(name, table) => register_http_errors_section(name, table),
             CurrentSection::Ring(r) => rings.push(r),
             CurrentSection::LogForward(l) => log_forwards.push(l),
+            CurrentSection::Resolvers(r) => resolvers.push(r),
         }
     }
 }
@@ -797,6 +917,7 @@ pub(crate) fn parse_section_directive(
         CurrentSection::Userlist(u) => parse_userlist_directive(u, tokens, kw),
         CurrentSection::Ring(r) => ring::parse_ring_directive(r, tokens, kw),
         CurrentSection::LogForward(l) => ring::parse_log_forward_directive(l, tokens, kw),
+        CurrentSection::Resolvers(r) => resolvers::parse_resolvers_directive(r, tokens, kw),
         CurrentSection::HttpErrors(_, table) => match kw.text.as_str() {
             "errorfile" => parse_errorfile_directive(table, tokens, kw),
             other => Err(ConfigError::new(
