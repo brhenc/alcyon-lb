@@ -172,6 +172,7 @@ mod h3_end_to_end;
 mod h3_field_validity;
 mod h3_many_threads;
 mod h3_proxy_path;
+mod h3_same_port;
 mod h3_request_framing_to_backend;
 mod header_bytes_limits;
 mod h2_pua_header;
