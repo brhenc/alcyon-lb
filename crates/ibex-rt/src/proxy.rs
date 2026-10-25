@@ -3769,14 +3769,24 @@ pub fn eval_acl_condition_extended(
 /// leaves the condition a miss. `unless` inverts pass and fail; a miss stays a miss.
 pub fn combine_condition(
     cond: &ibex_config::AclCondition,
-    mut term: impl FnMut(&ibex_config::AclTerm) -> AclEvalResult,
+    term: impl FnMut(&ibex_config::AclTerm) -> AclEvalResult,
+) -> AclEvalResult {
+    combine_suites(cond.is_if, cond.suites(), term)
+}
+
+/// [`combine_condition`] of the alternatives `suites` (an `if` when `is_if`, else an
+/// `unless`), for a condition compiled at load ([`crate::rule_compiled::Cond`]) as well.
+pub(crate) fn combine_suites<'t, T: 't>(
+    is_if: bool,
+    suites: impl Iterator<Item = &'t [T]>,
+    mut term: impl FnMut(&T) -> AclEvalResult,
 ) -> AclEvalResult {
     let mut any_missing = false;
     let mut passed = false;
     // An alternative with no term in it (`if` and nothing, `if !`, a trailing `||`) is not
     // one: `HAProxy` builds no suite for it, so `if` is false and `unless` true when none
     // is left (measured: `http-request deny if` lets the request through).
-    for suite in cond.suites().filter(|s| !s.is_empty()) {
+    for suite in suites.filter(|s| !s.is_empty()) {
         let mut suite_res = AclEvalResult::Matched;
         for t in suite {
             match term(t) {
@@ -3798,10 +3808,10 @@ pub fn combine_condition(
         }
     }
     if passed {
-        if cond.is_if { AclEvalResult::Matched } else { AclEvalResult::NotMatched }
+        if is_if { AclEvalResult::Matched } else { AclEvalResult::NotMatched }
     } else if any_missing {
         AclEvalResult::MissingData
-    } else if cond.is_if {
+    } else if is_if {
         AclEvalResult::NotMatched
     } else {
         AclEvalResult::Matched

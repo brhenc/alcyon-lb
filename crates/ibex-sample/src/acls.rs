@@ -55,7 +55,18 @@ fn predefined() -> &'static HashMap<&'static str, Expr> {
 /// A proxy's ACLs by name: its own, then the predefined ones.
 #[derive(Debug, Clone, Default)]
 pub struct Acls {
-    own: HashMap<String, Expr>,
+    own: HashMap<String, usize>,
+    exprs: Box<[Expr]>,
+}
+
+/// An ACL [`Acls::resolve`]d once, when the configuration loads: evaluated through
+/// [`Acls::at`] with no lookup by its name (S7).
+#[derive(Debug, Clone, Copy)]
+pub enum AclRef {
+    /// The proxy's own, by its index.
+    Own(usize),
+    /// A predefined one.
+    Predefined(&'static Expr),
 }
 
 impl Acls {
@@ -66,23 +77,43 @@ impl Acls {
     pub fn compile<'a>(lines: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
         // Compiled with the configuration, so that no request pays for it.
         let _ = predefined();
-        let mut own: HashMap<String, Expr> = HashMap::new();
+        let mut own: HashMap<String, usize> = HashMap::new();
+        let mut exprs: Vec<Expr> = Vec::new();
         for (name, text) in lines {
             let Ok(expr) = Expr::parse(text) else { continue };
-            match own.get_mut(name) {
-                Some(first) => first.alternates.push(expr),
+            match own.get(name) {
+                Some(&first) => exprs[first].alternates.push(expr),
                 None => {
-                    own.insert(name.to_string(), expr);
+                    own.insert(name.to_string(), exprs.len());
+                    exprs.push(expr);
                 }
             }
         }
-        Self { own }
+        Self { own, exprs: exprs.into_boxed_slice() }
     }
 
     /// The ACL named `name`: the proxy's own, else the predefined one.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Expr> {
-        self.own.get(name).or_else(|| predefined().get(name))
+        self.resolve(name).and_then(|r| self.at(r))
+    }
+
+    /// The ACL named `name`, to be evaluated later with [`Self::at`].
+    #[must_use]
+    pub fn resolve(&self, name: &str) -> Option<AclRef> {
+        match self.own.get(name) {
+            Some(&i) => Some(AclRef::Own(i)),
+            None => predefined().get(name).map(AclRef::Predefined),
+        }
+    }
+
+    /// The ACL `r` is: one [`Self::resolve`] gave for these ACLs (none for another proxy's).
+    #[must_use]
+    pub fn at(&self, r: AclRef) -> Option<&Expr> {
+        match r {
+            AclRef::Own(i) => self.exprs.get(i),
+            AclRef::Predefined(e) => Some(e),
+        }
     }
 
     /// Whether `name` names an ACL, the proxy's own or a predefined one.

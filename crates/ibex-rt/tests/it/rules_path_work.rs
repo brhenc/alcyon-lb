@@ -83,6 +83,11 @@ fn request(client: &mut TcpStream, engine: &mut Engine) -> String {
 /// The counts of `rounds` requests on each of `clients` keep-alive connections (in turn), after
 /// a warm-up request on each; the last response, and the last request head the server saw.
 fn work(clients: usize, rounds: usize) -> ([u64; 4], String, String) {
+    work_with(RULES, clients, rounds)
+}
+
+/// [`work`] with the frontend's `rules`.
+fn work_with(rules: &str, clients: usize, rounds: usize) -> ([u64; 4], String, String) {
     let srv = TcpListener::bind("127.0.0.1:0").expect("bind");
     let srv_addr = srv.local_addr().expect("addr");
     let fe = common::reserve_addr();
@@ -90,7 +95,7 @@ fn work(clients: usize, rounds: usize) -> ([u64; 4], String, String) {
     let be = backend(srv, Arc::clone(&running));
     let cfg = format!(
         "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
-         frontend fe\n  bind {fe}\n{RULES}  default_backend be\nbackend be\n  server s1 {srv_addr}\n"
+         frontend fe\n  bind {fe}\n{rules}  default_backend be\nbackend be\n  server s1 {srv_addr}\n"
     );
     let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
     let mut conns: Vec<TcpStream> = (0..clients)
@@ -133,7 +138,7 @@ fn the_rules_scenario_costs_what_is_pinned() {
     assert!(seen_lc.contains("x-forwarded-proto: http\r\n") && seen_lc.contains("x-id: ") && !seen_lc.contains("x-junk"), "request the server saw: {seen:?}");
     assert_eq!(counts[Op::ReqRebuild as usize], N, "request head rebuilds: one per rule pass");
     assert_eq!(counts[Op::CtxClone as usize], 0, "sample context copies");
-    assert_eq!(counts[Op::ExprLookup as usize], 2 * N, "expressions looked up by text");
+    assert_eq!(counts[Op::ExprLookup as usize], 0, "expressions looked up by text");
 }
 
 /// Idle server connections looked at per request, with eight clients taking turns: each request
@@ -147,4 +152,22 @@ fn reusing_an_idle_connection_looks_at_few() {
     println!("[MEASUREMENT S7] idle connections looked at: {scanned} for {} requests", CLIENTS * ROUNDS);
     assert!(rsp.starts_with("HTTP/1.1 200"), "response: {rsp:?}");
     assert!(scanned <= (CLIENTS * ROUNDS * CLIENTS) as u64, "{scanned} idle connections looked at");
+}
+
+/// Anonymous ACLs, `%[...]` in request and response formats, response `set-var` and
+/// `set-var-fmt`, an `http-after-response` format: compiled with the proxy, none is looked up by
+/// its text per request (before S7: 8 per request).
+#[test]
+fn rule_expressions_are_not_looked_up_per_request() {
+    const N: u64 = 20;
+    let rules = "  http-request set-header X-A %[req.hdr(host)] if { path_beg /api }\n  \
+        http-request set-var-fmt(txn.f) %[path]-x\n  \
+        http-response set-header X-B %[var(txn.f)] if { status 200 } !{ res.hdr(x-none) -m found }\n  \
+        http-response set-var(txn.s) status\n  \
+        http-response set-var-fmt(txn.t) s%[var(txn.s)]\n  \
+        http-after-response add-header X-C %[var(txn.t)],%[var(txn.s)] if TRUE\n";
+    let (counts, rsp, seen) = work_with(rules, 1, N as usize);
+    assert!(rsp.contains("x-b: /api/test-x\r\n") && rsp.contains("x-c: s200,200\r\n"), "response: {rsp:?}");
+    assert!(seen.to_ascii_lowercase().contains("x-a: localhost\r\n"), "request the server saw: {seen:?}");
+    assert_eq!(counts[Op::ExprLookup as usize], 0, "expressions looked up by text");
 }
