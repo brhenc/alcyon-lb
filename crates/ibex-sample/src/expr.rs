@@ -87,6 +87,7 @@ impl Expr {
     /// # Errors
     /// As [`Expr::parse`], the error remembered as well.
     pub fn cached(input: &str) -> Result<std::rc::Rc<Self>, String> {
+        crate::work::note(crate::work::Op::ExprLookup, 1);
         let generation = GENERATION.load(std::sync::atomic::Ordering::Relaxed);
         let hit = CACHE.with(|c| {
             let mut c = c.borrow_mut();

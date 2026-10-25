@@ -304,6 +304,8 @@ pub struct SampleContext<'a> {
     /// The stream's tracked stick-table entries, for the `sc_*` and `src_*` fetches. `None`
     /// where the caller has none, and those fetches then give no sample.
     pub stick: Option<&'a dyn StickState>,
+    /// Counts the copies of the context ([`crate::work::Op::CtxClone`]).
+    pub clones: crate::work::CloneCount,
 }
 
 /// What a TLS session tells the `ssl_*` fetches, as the transport knows it once the

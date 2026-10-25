@@ -60,6 +60,12 @@ use ibex_sample::vars::VarStore;
 thread_local! {
     pub static WORKER_ID: Cell<usize> = const { Cell::new(0) };
     static STRICT_MODE: Cell<bool> = const { Cell::new(true) };
+    /// The request rules are editing the head of the request they run for: the head is written
+    /// out of the HTX into the request buffer once, when they are done (or before a rule that
+    /// reads the buffer), not after each edit ([`hold_req_rebuild`]). `.1`: an edit was made
+    /// since, the buffer's head is not the HTX's yet. A rule pass runs to its end for one
+    /// session before the thread does anything else.
+    static REQ_REBUILD: Cell<(bool, bool)> = const { Cell::new((false, false)) };
     /// The line of the `http-response` rule that last ended the rules (`allow`, `deny`,
     /// `redirect`), left by `run_res_rules` for its caller to take.
     static LAST_RULE: Cell<Option<u32>> = const { Cell::new(None) };
@@ -239,7 +245,9 @@ impl WorkerPool {
             (true, Always) => &[true, false],
         };
         for &safe in order {
-            if let Some(pos) = s.conns.iter().position(|p| p.safe == safe && p.addr == key.addr && p.name == key.name) {
+            let found = s.conns.iter().position(|p| p.safe == safe && p.addr == key.addr && p.name == key.name);
+            ibex_sample::work::note(ibex_sample::work::Op::IdleScanned, found.map_or(s.conns.len(), |pos| pos + 1) as u64);
+            if let Some(pos) = found {
                 let p = s.conns.remove(pos)?;
                 s.safe -= usize::from(safe);
                 self.conns -= 1;
@@ -11746,7 +11754,7 @@ impl EngineDispatcher<'_> {
 
         let stick = StickView::new(proxies, &entry.sess.tracked_sc);
         let act_conn = proxies[proxy_idx].counters().act_conn.load(Ordering::Relaxed);
-        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], capture_exprs: &[Option<Expr>], acls: &ibex_sample::Acls, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize, be_stage: bool, start: usize| -> Result<RuleFlow, u16> {
+        let eval_http_rules_held = |rules: &[ibex_config::HttpReqRule], capture_exprs: &[Option<Expr>], acls: &ibex_sample::Acls, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize, be_stage: bool, start: usize| -> Result<RuleFlow, u16> {
             macro_rules! make_ctx {
                 ($s:expr) => {
                     SampleContext {
@@ -11817,6 +11825,22 @@ impl EngineDispatcher<'_> {
                         | ibex_config::HttpReqAction::SilentDropTtl(_)
                 ) {
                     note_last_rule(sess, rule.line);
+                }
+
+                // Only the edits that read nothing of the request buffer go on holding its head.
+                let edit_only = matches!(
+                    rule.action,
+                    ibex_config::HttpReqAction::SetHeader { .. }
+                        | ibex_config::HttpReqAction::AddHeader { .. }
+                        | ibex_config::HttpReqAction::DelHeader { .. }
+                        | ibex_config::HttpReqAction::ReplaceHeader { .. }
+                        | ibex_config::HttpReqAction::ReplaceValue { .. }
+                        | ibex_config::HttpReqAction::SetVar { .. }
+                        | ibex_config::HttpReqAction::SetVarFmt { .. }
+                        | ibex_config::HttpReqAction::UnsetVar { .. }
+                );
+                if !edit_only {
+                    flush_req_rebuild(sess, true);
                 }
 
                 match &rule.action {
@@ -12388,6 +12412,13 @@ impl EngineDispatcher<'_> {
                 }
             }
             Ok(RuleFlow::Next)
+        };
+        // A pass over a rule list writes the head it edited once, when it ends however it ends.
+        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], capture_exprs: &[Option<Expr>], acls: &ibex_sample::Acls, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize, be_stage: bool, start: usize| -> Result<RuleFlow, u16> {
+            hold_req_rebuild();
+            let flow = eval_http_rules_held(rules, capture_exprs, acls, sess, be_retries, fe_name, be_name, pages_idx, be_stage, start);
+            release_req_rebuild(sess);
+            flow
         };
 
         // Execute frontend rules
@@ -14541,10 +14572,43 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
     srv
 }
 
+/// Writes the request head out of its HTX into the request buffer, or, while the rules hold it
+/// ([`hold_req_rebuild`]), notes that it is due: a run of header edits writes the head once.
 fn rebuild_req_buffer(sess: &mut TcpSession) {
+    if REQ_REBUILD.get().0 {
+        REQ_REBUILD.set((true, true));
+        return;
+    }
+    write_req_head(sess);
+}
+
+/// From here to [`release_req_rebuild`], the head edits only change the HTX (S7: five header
+/// rules were five rebuilds, each an 8 KiB `memset`, a `memmove` and the request line split
+/// again).
+fn hold_req_rebuild() {
+    REQ_REBUILD.set((true, false));
+}
+
+/// The head written out if an edit is due, before anything reads the request buffer; `hold`
+/// to go on holding after.
+fn flush_req_rebuild(sess: &mut TcpSession, hold: bool) {
+    let (_, due) = REQ_REBUILD.replace((false, false));
+    if due {
+        write_req_head(sess);
+    }
+    REQ_REBUILD.set((hold, false));
+}
+
+/// [`flush_req_rebuild`], and no more holding.
+fn release_req_rebuild(sess: &mut TcpSession) {
+    flush_req_rebuild(sess, false);
+}
+
+fn write_req_head(sess: &mut TcpSession) {
     let Some((hdr_len, eoh_len)) = sess.req.eoh() else {
         return;
     };
+    ibex_sample::work::note(ibex_sample::work::Op::ReqRebuild, 1);
     if let Some(htx) = sess.htx_slice() {
         if sess.h2_active().is_some_and(|a| a.chunk_out) {
             let mut wire = htx.write_h1_wire_vec();
