@@ -822,6 +822,13 @@ fn main() {
         }
     }
 
+    // 8b. `tune.memory.prealloc` needs `maxconn` or `-m` to size the pools, and must fit `-m`
+    //     (T468); under `-c` too.
+    if let Err(alert) = ibex_rt::prealloc::check(&config, opts.memory_limit_mb) {
+        config_alert(&alert);
+        process::exit(1);
+    }
+
     // 9. Handle check-only syntax validation (-c)
     if opts.check_only {
         // Certificates are loaded here, not just parsed. Reporting a config valid and

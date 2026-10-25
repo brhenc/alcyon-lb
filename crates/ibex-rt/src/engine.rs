@@ -1980,6 +1980,8 @@ pub struct SessionArena {
     floor: usize,
     /// The most slots it has held since its memory was last made fresh.
     peak: usize,
+    /// `tune.memory.prealloc` made its slots: `pool_gc` does not compact it.
+    presized: bool,
     published: ibex_alloc::arena::Published,
 }
 
@@ -1998,6 +2000,7 @@ impl SessionArena {
             live: 0,
             floor: cap,
             peak: 0,
+            presized: false,
             published: ibex_alloc::arena::Published::default(),
         }
     }
@@ -2014,6 +2017,26 @@ impl SessionArena {
         let mut last = self.published;
         SESSION_POOL.publish_arena::<SessionEntry>(&mut last, self);
         self.published = last;
+    }
+
+    /// `tune.memory.prealloc` (T468): `n` slots made now (free, resident), and kept as the
+    /// floor. False when memory is short.
+    pub fn prealloc(&mut self, n: usize) -> bool {
+        let more = n.saturating_sub(self.entries.len());
+        if self.entries.try_reserve_exact(more).is_err() || self.free.try_reserve_exact(more).is_err() {
+            return false;
+        }
+        while self.entries.len() < n {
+            let Ok(idx) = u32::try_from(self.entries.len()) else { return false };
+            self.entries.push(None);
+            self.free.push(idx);
+        }
+        // Lowest index first, as a fresh arena hands them out.
+        self.free.reverse();
+        self.presized = true;
+        self.floor = self.floor.max(self.entries.capacity());
+        self.peak = self.peak.max(self.entries.len());
+        true
     }
 
     /// A slot for `entry`, or `None` (the entry is dropped) when the arena is full and the
@@ -2119,6 +2142,10 @@ impl ibex_alloc::Arena<SessionEntry> for SessionArena {
     }
 
     fn compact(&mut self) -> usize {
+        // `tune.memory.prealloc`'s slots stay made: sized once, at start (T468).
+        if self.presized {
+            return 0;
+        }
         ibex_alloc::arena::compact_slots(&mut self.entries, &mut self.free, self.live, self.floor, &mut self.peak, &SESSION_POOL)
     }
 }
@@ -4476,7 +4503,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let poller = Poller::new(capacity)?;
         let mut scheduler = Scheduler::with_capacity(capacity);
         let mut fdtab = FdTab::with_capacity(capacity * 2);
-        let sessions = SessionArena::with_capacity(capacity);
+        let mut sessions = SessionArena::with_capacity(capacity);
         let applets = AppletArena::with_capacity(capacity);
 
         ibex_sample::set_userlists(
@@ -4528,6 +4555,16 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         ibex_sample::vars::set_limits(vl.global, vl.proc_, vl.sess, vl.txn, vl.reqres, vl.check);
         if bufsize_large.is_some() {
             crate::buf::preallocate_large_buffers();
+        }
+        // `tune.memory.prealloc` (T468): this thread's buffers and session slots, from `maxconn`.
+        if let Some(plan) = crate::prealloc::plan(config) {
+            crate::buf::set_buffers_limit(plan.buffers_limit);
+            if !crate::buf::prealloc_standard(plan.buffers) || !sessions.prealloc(plan.sessions) {
+                return Err(io::Error::other(format!(
+                    "tune.memory.prealloc: cannot allocate {} buffers and {} session slots",
+                    plan.buffers, plan.sessions
+                )));
+            }
         }
 
         let mut quic_listeners: Vec<crate::quic_listener::QuicListener> = Vec::new();

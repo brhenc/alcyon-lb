@@ -127,6 +127,10 @@ pub struct PoolSpec {
     /// Whether the give's wipe follows `tune.ibex.zero-spares` (spare strings and lists) instead
     /// of `tune.ibex.zero-buffers` (buffers). Both are read from the thread's copy.
     pub spares: bool,
+    /// Whether [`Pool::prealloc`] can raise this thread's floor and count past the spec's
+    /// (`tune.memory.prealloc`, T468). Off, the per-thread figure is never read: the spec's
+    /// constants are folded as before.
+    pub presized: bool,
     /// Alignment `show pools` prints (`/8`); the buffers' is 64.
     pub align: usize,
     pub file: &'static str,
@@ -136,7 +140,7 @@ pub struct PoolSpec {
 impl PoolSpec {
     #[must_use]
     pub const fn new(name: &'static str) -> Self {
-        PoolSpec { name, size: 0, max_item: usize::MAX, max_count: usize::MAX, floor: 0, limited: false, spares: false, align: 8, file: "", line: 0 }
+        PoolSpec { name, size: 0, max_item: usize::MAX, max_count: usize::MAX, floor: 0, limited: false, spares: false, presized: false, align: 8, file: "", line: 0 }
     }
     #[must_use]
     pub const fn size(mut self, n: usize) -> Self {
@@ -161,6 +165,12 @@ impl PoolSpec {
     #[must_use]
     pub const fn limited(mut self) -> Self {
         self.limited = true;
+        self
+    }
+    /// [`Pool::prealloc`] may size this pool's caches (`tune.memory.prealloc`).
+    #[must_use]
+    pub const fn presized(mut self) -> Self {
+        self.presized = true;
         self
     }
     /// The give wipes under `tune.ibex.zero-spares` (the spare strings and lists).
@@ -201,12 +211,15 @@ struct Local<T> {
     over: (usize, usize, isize),
     /// The pool's shared part, known once the thread used the pool.
     shared: Option<&'static PoolShared>,
+    /// [`Pool::prealloc`]'s size: this thread's floor and most kept, when above the spec's
+    /// (a [`PoolSpec::presized`] pool only).
+    pre: usize,
 }
 
 impl<T> Cache<T> {
     #[must_use]
     pub const fn new() -> Self {
-        Cache { inner: RefCell::new(Local { items: Vec::new(), boxes: 0, touched: false, over: (0, 0, 0), shared: None }) }
+        Cache { inner: RefCell::new(Local { items: Vec::new(), boxes: 0, touched: false, over: (0, 0, 0), shared: None, pre: 0 }) }
     }
 }
 
@@ -712,6 +725,35 @@ impl<T: Poolable> Pool<T> {
         }
     }
 
+    /// `tune.memory.prealloc` (T468): this thread's cache made to hold `n` objects, all floor
+    /// objects (no eviction, no `pool_gc` takes them), and filled to `n`. False when memory
+    /// is short (what was made stays). For a [`PoolSpec::presized`] pool, at start.
+    #[must_use]
+    pub fn prealloc(&'static self, n: usize) -> bool {
+        let have = self
+            .cache
+            .try_with(|c| {
+                let mut l = c.inner.try_borrow_mut().ok()?;
+                self.touch(&mut l);
+                l.pre = n;
+                let more = n.saturating_sub(l.items.len());
+                l.items.try_reserve_exact(more).ok()?;
+                Some(l.items.len())
+            })
+            .ok()
+            .flatten();
+        let Some(have) = have else { return false };
+        self.prefill(n.saturating_sub(have));
+        self.local_count() >= n
+    }
+
+    /// This thread's floor: the spec's, or [`Self::prealloc`]'s when larger.
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
+    fn floor_of(&self, l: &Local<T>) -> usize {
+        if self.spec.presized { self.spec.floor.max(l.pre) } else { self.spec.floor }
+    }
+
     /// `tune.buffers.limit`: the most objects [`Self::take`] makes (0: no limit). For
     /// `limited` pools.
     pub fn set_limit(&self, n: usize) {
@@ -747,10 +789,10 @@ impl<T: Poolable> Pool<T> {
     #[inline(always)] // see `put`
     #[allow(clippy::inline_always)]
     fn pop(&'static self, boxed: bool) -> Option<T> {
-        let floor = self.spec.floor;
         self.cache
             .try_with(|c| {
                 let mut l = c.inner.try_borrow_mut().ok()?;
+                let floor = self.floor_of(&l);
                 let v = l.items.pop()?;
                 if boxed {
                     l.boxes += 1;
@@ -782,11 +824,13 @@ impl<T: Poolable> Pool<T> {
             let Ok(mut l) = c.inner.try_borrow_mut() else { return Err(v) };
             let n = l.items.len();
             // A floor object is kept whatever the budget; the others only when they fit it.
-            let counted = n >= spec.floor;
+            let counted = n >= self.floor_of(&l);
+            // Folded to the spec's constant unless the pool is `presized`.
+            let max_count = if spec.presized { spec.max_count.max(l.pre) } else { spec.max_count };
             let max_item = if counted && max < spec.max_item { max } else { spec.max_item };
             // Not kept, or no room and the `Vec` cannot grow (memory is short).
             // Under `tune.fail-alloc` nothing is kept: each take is an allocation that may fail.
-            if n >= spec.max_count || fail || !v.keep(max_item) || (n == l.items.capacity() && !self.grow_items(&mut l)) {
+            if n >= max_count || fail || !v.keep(max_item) || (n == l.items.capacity() && !self.grow_items(&mut l)) {
                 return Err(v);
             }
             l.items.push(v);
@@ -935,14 +979,13 @@ impl<T: Poolable> Pool<T> {
 
     /// Evicts up to `n` objects above the floor, newest first, each dropped outside the borrow.
     fn evict_n(&self, n: usize) -> usize {
-        let floor = self.spec.floor;
         let mut done = 0;
         while done < n {
             let one = self
                 .cache
                 .try_with(|c| {
                     let mut l = c.inner.try_borrow_mut().ok()?;
-                    if l.items.len() <= floor {
+                    if l.items.len() <= self.floor_of(&l) {
                         return None;
                     }
                     l.items.pop()
@@ -1001,6 +1044,10 @@ impl<T: Poolable> PoolDyn for Pool<T> {
     }
 
     fn drain_local(&self) -> usize {
+        // `tune.memory.prealloc`'s objects stay: the pool is sized once, at start (T468).
+        if self.spec.presized && self.cache.try_with(|c| c.inner.try_borrow().map_or(0, |l| l.pre)).unwrap_or(0) != 0 {
+            return self.evict_n(usize::MAX);
+        }
         // An ending thread (no cache any more) or a borrowed one has nothing to drain here.
         let (items, counted_bytes) = self
             .cache
@@ -1020,7 +1067,7 @@ impl<T: Poolable> PoolDyn for Pool<T> {
     }
 
     fn local_hot_bytes(&self) -> usize {
-        self.cache.try_with(|c| c.inner.try_borrow().map_or(0, |l| l.items.iter().skip(self.spec.floor).map(T::footprint).sum())).unwrap_or(0)
+        self.cache.try_with(|c| c.inner.try_borrow().map_or(0, |l| l.items.iter().skip(self.floor_of(&l)).map(T::footprint).sum())).unwrap_or(0)
     }
 
     fn evict_local(&self, n: usize) -> usize {
@@ -1028,7 +1075,7 @@ impl<T: Poolable> PoolDyn for Pool<T> {
     }
 
     fn local_hot_count(&self) -> usize {
-        self.local_count().saturating_sub(self.spec.floor)
+        self.cache.try_with(|c| c.inner.try_borrow().map_or(0, |l| l.items.len().saturating_sub(self.floor_of(&l)))).unwrap_or(0)
     }
 
     fn publish_local(&self, slot: usize) {
@@ -1153,6 +1200,7 @@ mod tests {
     crate::declare_pool!(static OVER: Pool<Vec<u8>> = PoolSpec::new("t_over"););
     crate::declare_pool!(static BLOBS: Pool<Blob> = PoolSpec::new("t_blobs").max_item(100););
     crate::declare_pool!(static PREFILLED: Pool<Blob> = PoolSpec::new("t_prefilled").limited(););
+    crate::declare_pool!(static PRESIZED: Pool<Blob> = PoolSpec::new("t_presized").limited().floor(1).max_count(2).presized(););
 
     /// A pooled type that keeps the default [`Poolable::keep`] (footprint within the bound).
     #[derive(Debug, Default)]
@@ -1414,6 +1462,24 @@ mod tests {
         assert_eq!(PREFILLED.shared.grown.load(Ordering::Relaxed), 0);
         assert!(FAILING.take_with(|| None).is_none());
         assert_eq!(FAILING.failures(), 1);
+    }
+
+    /// T468: `prealloc(n)` fills the thread's cache to `n` past the spec's `max_count`, the
+    /// objects are floor objects (no budget, no eviction) and `pool_gc` (`drain_local`) keeps
+    /// them; at the limit a take past them is refused.
+    #[test]
+    fn prealloc_fills_past_max_count_and_survives_eviction_and_drain() {
+        PRESIZED.set_limit(5);
+        assert!(PRESIZED.prealloc(5));
+        assert_eq!(PRESIZED.local_count(), 5);
+        assert_eq!(PRESIZED.local_hot_bytes(), 0, "prealloc objects are not counted against the budget");
+        assert_eq!(PRESIZED.evict_local(5), 0);
+        assert_eq!(PRESIZED.drain_local(), 0);
+        let boxes: Vec<_> = (0..5).map(|_| PRESIZED.take().expect("a prealloc object")).collect();
+        assert!(PRESIZED.take().is_none(), "past the limit");
+        drop(boxes);
+        assert_eq!(PRESIZED.local_count(), 5, "all kept, past max_count 2");
+        assert_eq!(PRESIZED.shared.grown.load(Ordering::Relaxed), 5);
     }
 
     /// A box given back to a full pool is freed and leaves the limit's count; eviction stops at
