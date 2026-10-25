@@ -11,7 +11,6 @@
 //! looks at `th_ctx->bufq_map`.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
@@ -101,9 +100,103 @@ impl WaitState {
 /// it is woken, so a slot reused by another stream is not woken by mistake).
 type Waiter = (TaskRef, u32);
 
+/// No slot.
+const NIL: u32 = u32::MAX;
+
+/// The four FIFO queues as lists threaded through arrays indexed by session slot (S6b §3): a
+/// stream is in one queue at most, so the arrays sized for the thread's sessions at start
+/// ([`presize`]) hold every waiter there can be, and queueing allocates nothing. A slot past
+/// them (the session arena grew past its presize) grows them, fallibly.
+struct Queues {
+    next: Vec<u32>,
+    prev: Vec<u32>,
+    /// The waiting stream's task; [`NIL`]: the slot is in no queue.
+    task: Vec<u32>,
+    head: [u32; 4],
+    tail: [u32; 4],
+    len: [usize; 4],
+}
+
+impl Queues {
+    const fn new() -> Self {
+        Queues { next: Vec::new(), prev: Vec::new(), task: Vec::new(), head: [NIL; 4], tail: [NIL; 4], len: [0; 4] }
+    }
+
+    /// Slots `0..n`, filled in within the room [`presize`] reserved (no allocation), past it
+    /// grown; false when memory is short.
+    fn grow(&mut self, n: usize) -> bool {
+        let more = n.saturating_sub(self.task.len());
+        if more == 0 {
+            return true;
+        }
+        if self.next.try_reserve_exact(more).is_err() || self.prev.try_reserve_exact(more).is_err() || self.task.try_reserve_exact(more).is_err() {
+            return false;
+        }
+        self.next.resize(n, NIL);
+        self.prev.resize(n, NIL);
+        self.task.resize(n, NIL);
+        true
+    }
+
+    fn push(&mut self, q: usize, slot: u32, task: TaskRef, front: bool) {
+        let i = slot as usize;
+        self.task[i] = task.0;
+        if front {
+            self.prev[i] = NIL;
+            self.next[i] = self.head[q];
+            match self.head[q] {
+                NIL => self.tail[q] = slot,
+                h => self.prev[h as usize] = slot,
+            }
+            self.head[q] = slot;
+        } else {
+            self.next[i] = NIL;
+            self.prev[i] = self.tail[q];
+            match self.tail[q] {
+                NIL => self.head[q] = slot,
+                t => self.next[t as usize] = slot,
+            }
+            self.tail[q] = slot;
+        }
+        self.len[q] += 1;
+    }
+
+    /// Takes `slot` out of queue `q`, which holds it.
+    fn unlink(&mut self, q: usize, slot: u32) {
+        let i = slot as usize;
+        let (p, n) = (self.prev[i], self.next[i]);
+        match p {
+            NIL => self.head[q] = n,
+            p => self.next[p as usize] = n,
+        }
+        match n {
+            NIL => self.tail[q] = p,
+            n => self.prev[n as usize] = p,
+        }
+        self.task[i] = NIL;
+        self.len[q] -= 1;
+    }
+
+    /// The queue holding `slot`, if one does (walked from its end to the head: cold).
+    fn queue_of(&self, slot: u32) -> Option<usize> {
+        if self.task.get(slot as usize).is_none_or(|&t| t == NIL) {
+            return None;
+        }
+        let mut h = slot;
+        while self.prev[h as usize] != NIL {
+            h = self.prev[h as usize];
+        }
+        self.head.iter().position(|&x| x == h)
+    }
+
+    fn map(&self) -> u8 {
+        self.len.iter().enumerate().fold(0, |m, (i, &n)| if n > 0 { m | 1 << i } else { m })
+    }
+}
+
 thread_local! {
     /// The four queues, FIFO each.
-    static QUEUES: RefCell<[VecDeque<Waiter>; 4]> = const { RefCell::new([VecDeque::new(), VecDeque::new(), VecDeque::new(), VecDeque::new()]) };
+    static QUEUES: RefCell<Queues> = const { RefCell::new(Queues::new()) };
     /// Bit `q` set while queue `q` has waiters (`th_ctx->bufq_map`).
     static MAP: Cell<u8> = const { Cell::new(0) };
     /// The class (+1) a buffer was refused for in the stream running now (0: none), for the
@@ -226,38 +319,49 @@ pub fn take_want() -> Option<Class> {
     Some(c)
 }
 
-/// Puts the stream of `task` (session slot `slot`) in queue `class`: at the back, or at the
-/// front when it was just woken and refused again (it keeps its place). `false` when the queue
-/// cannot grow (the caller fails the stream instead).
+/// Sizes the queues for the thread's `n` session slots, at start (S6b §3): queueing then
+/// allocates nothing. False when memory is short (they grow on use instead, fallibly).
 #[must_use]
-pub fn enter(task: TaskRef, slot: u32, class: Class, front: bool) -> bool {
+pub fn presize(n: usize) -> bool {
     QUEUES.with(|q| {
-        let q = &mut q.borrow_mut()[class as usize];
-        // A queue that cannot grow leaves the stream out (the caller fails it, as in S5).
-        let room = q.try_reserve(1).is_ok();
-        if room {
-            if front {
-                q.push_front((task, slot));
-            } else {
-                q.push_back((task, slot));
-            }
-            set_map(MAP.get() | (1 << class as u8));
-        }
-        room
+        let mut q = q.borrow_mut();
+        // Reserved, not filled: untouched, the pages cost no resident memory (as the session
+        // arena's); a slot is filled in when it first waits, within this room.
+        let more = n.saturating_sub(q.task.len());
+        q.next.try_reserve_exact(more).is_ok() && q.prev.try_reserve_exact(more).is_ok() && q.task.try_reserve_exact(more).is_ok()
     })
 }
 
-/// Takes the stream of `task` out of every queue (it ended while waiting).
-pub fn leave(task: TaskRef) {
+/// Puts the stream of `task` (session slot `slot`) in queue `class`: at the back, or at the
+/// front when it was just woken and refused again (it keeps its place). `false` when the queue
+/// cannot grow (a slot past [`presize`] and memory short: the caller fails the stream).
+#[must_use]
+pub fn enter(task: TaskRef, slot: u32, class: Class, front: bool) -> bool {
     QUEUES.with(|q| {
         let mut q = q.borrow_mut();
-        let mut map = 0;
-        for (i, queue) in q.iter_mut().enumerate() {
-            queue.retain(|&(t, _)| t != task);
-            if !queue.is_empty() {
-                map |= 1 << i;
-            }
+        if slot == NIL || !q.grow(slot as usize + 1) {
+            return false;
         }
+        if let Some(old) = q.queue_of(slot) {
+            q.unlink(old, slot);
+        }
+        q.push(class as usize, slot, task, front);
+        let map = q.map();
+        drop(q);
+        set_map(map);
+        true
+    })
+}
+
+/// Takes the stream in session slot `slot` out of the queue it is in (it ended while waiting).
+pub fn leave(slot: u32) {
+    QUEUES.with(|q| {
+        let mut q = q.borrow_mut();
+        if let Some(c) = q.queue_of(slot) {
+            q.unlink(c, slot);
+        }
+        let map = q.map();
+        drop(q);
         set_map(map);
     });
 }
@@ -305,27 +409,25 @@ pub fn next_offered() -> Option<Waiter> {
     }
     QUEUES.with(|q| {
         let mut q = q.borrow_mut();
-        for (i, queue) in q.iter_mut().enumerate() {
-            if let Some(w) = queue.pop_front() {
-                if queue.is_empty() {
-                    set_map(MAP.get() & !(1 << i));
-                }
-                OFFERED.set(n - 1);
-                return Some(w);
-            }
-        }
-        OFFERED.set(0);
-        None
+        let Some(c) = (0..4).find(|&c| q.head[c] != NIL) else {
+            OFFERED.set(0);
+            return None;
+        };
+        let slot = q.head[c];
+        let task = TaskRef(q.task[slot as usize]);
+        q.unlink(c, slot);
+        let map = q.map();
+        drop(q);
+        set_map(map);
+        OFFERED.set(n - 1);
+        Some((task, slot))
     })
 }
 
 /// How many streams wait on this thread, per queue.
 #[must_use]
 pub fn waiting() -> [usize; 4] {
-    QUEUES.with(|q| {
-        let q = q.borrow();
-        [q[0].len(), q[1].len(), q[2].len(), q[3].len()]
-    })
+    QUEUES.with(|q| q.borrow().len)
 }
 
 #[cfg(test)]
@@ -356,7 +458,7 @@ mod tests {
         offer();
         assert!(!pending());
         assert!(enter(TaskRef(7), 7, Class::MuxRx, false));
-        leave(TaskRef(7));
+        leave(7);
         assert_eq!(waiting(), [0; 4]);
         offer();
         assert!(!pending(), "the queue is empty again: nothing to offer");
@@ -385,6 +487,40 @@ mod tests {
             assert!(!wanted());
             assert_eq!(take_want(), None);
         }
+    }
+
+    /// S6b §3: presized, queueing allocates nothing (the room stays what `presize` reserved),
+    /// and a stream leaves from the middle of a queue, the head or the tail, the order of the
+    /// others kept; a stream queued again moves to its new queue.
+    #[test]
+    fn presized_queues_allocate_nothing_and_keep_their_order() {
+        assert!(presize(64));
+        let room = QUEUES.with(|q| (q.borrow().task.capacity(), q.borrow().next.capacity(), q.borrow().prev.capacity()));
+        for slot in 0..64 {
+            assert!(enter(TaskRef(slot + 100), slot, if slot % 2 == 0 { Class::MuxRx } else { Class::SeRx }, false));
+        }
+        assert_eq!(QUEUES.with(|q| (q.borrow().task.capacity(), q.borrow().next.capacity(), q.borrow().prev.capacity())), room, "nothing allocated");
+        assert_eq!(waiting(), [0, 0, 32, 32]);
+        leave(1);
+        leave(63);
+        leave(31);
+        assert!(enter(TaskRef(102), 2, Class::MuxTx, false), "queued again: moves");
+        assert!(enter(TaskRef(9), 9, Class::SeRx, true), "to the front");
+        assert_eq!(waiting(), [1, 0, 29, 31]);
+        for _ in 0..64 {
+            offer();
+        }
+        let mut order = Vec::new();
+        while let Some((t, slot)) = next_offered() {
+            order.push((t.0, slot));
+        }
+        let mut want = vec![(102, 2), (9, 9)];
+        want.extend((3..63).step_by(2).filter(|&s| s != 9 && s != 31).map(|s| (s + 100, s)));
+        want.extend((0..64).step_by(2).filter(|&s| s != 2).map(|s| (s + 100, s)));
+        assert_eq!(order, want);
+        assert_eq!(waiting(), [0; 4]);
+        leave(5);
+        assert!(!enter(TaskRef(1), NIL, Class::MuxRx, false), "no such slot");
     }
 
     /// A buffer offered to a waiter that had gone goes to the next one.

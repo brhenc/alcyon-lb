@@ -4592,6 +4592,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mut scheduler = Scheduler::with_capacity(capacity);
         let mut fdtab = FdTab::with_capacity(capacity * 2);
         let mut sessions = SessionArena::with_capacity(capacity);
+        // The buffer wait queues, for as many streams as the arena is sized for (S6b §3): a
+        // stream queued at `tune.buffers.limit` allocates nothing. Short of memory, they grow
+        // on use instead.
+        let _ = crate::buf_wait::presize(capacity);
         let applets = AppletArena::with_capacity(capacity);
 
         ibex_sample::set_userlists(
@@ -10190,7 +10194,7 @@ impl EngineDispatcher<'_> {
         }
         if let Some(mut entry) = self.sessions.free(session_idx) {
             if entry.buf_wait.queued() {
-                crate::buf_wait::leave(entry.task);
+                crate::buf_wait::leave(session_idx);
             }
             if entry.sess.is_h2_child() {
                 // The stream is freed in its own run: its variables are in the run's map
