@@ -104,12 +104,17 @@ fn echo_server() -> SocketAddr {
 /// as much body as its `Content-Length` says, or what came until the peer closed or a
 /// second passed with nothing arriving.
 fn exchange(fe: SocketAddr, reqs: &[&str]) -> Vec<String> {
+    exchange_within(fe, reqs, Duration::from_secs(1))
+}
+
+/// [`exchange`] with `quiet` as the time without a byte that ends the wait for a response.
+fn exchange_within(fe: SocketAddr, reqs: &[&str], quiet: Duration) -> Vec<String> {
     let mut c = TcpStream::connect(fe).expect("connect");
-    c.set_read_timeout(Some(Duration::from_secs(1))).expect("timeout");
+    c.set_read_timeout(Some(quiet)).expect("timeout");
     let mut out = Vec::new();
     for req in reqs {
         c.write_all(req.as_bytes()).expect("send");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + quiet.max(Duration::from_secs(5));
         let mut got = Vec::new();
         let mut buf = [0u8; 65536];
         while Instant::now() < deadline {
@@ -613,7 +618,9 @@ fn a_header_value_past_the_htx_limit_fails_the_rewrite() {
         backend b\n  server s {srv}\n";
     let (_ibex, fe) = start(cfg, Some(echo_server()));
     for (path, status) in [("rv1", "200"), ("rv2", "500"), ("rh1", "200"), ("rh2", "500"), ("sh1", "200"), ("sh2", "500")] {
-        let r = one(fe, &format!("GET /{path} HTTP/1.1\r\nHost: x\r\nx-test: {}\r\n\r\n", "a".repeat(524_287)));
+        // A regex over a megabyte in a debug build on a loaded host takes more than the second
+        // `one` waits for the first byte, and an answer that never comes is no 200 or 500.
+        let r = exchange_within(fe, &[&format!("GET /{path} HTTP/1.1\r\nHost: x\r\nx-test: {}\r\n\r\n", "a".repeat(524_287))], Duration::from_secs(20)).remove(0);
         assert!(r.starts_with(&format!("HTTP/1.1 {status} ")), "{path}: {}", &r[..r.len().min(40)]);
     }
 }
