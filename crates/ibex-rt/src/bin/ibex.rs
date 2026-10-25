@@ -1242,15 +1242,12 @@ fn main() {
     //     with nothing accepting, and READY=1 reported a service that did not exist yet. A
     //     worker that fails to start says so (or, if it panicked, closes its end), and the
     //     start is abandoned with every worker's sockets closed first.
-    for _ in 0..nbthread {
-        if !matches!(ready_rx.recv(), Ok(Ok(()))) {
-            abort_start(&go, threads);
-        }
-    }
+    let mut started = (0..nbthread).all(|_| matches!(ready_rx.recv(), Ok(Ok(()))));
     // HAProxy arms its watchdog per thread at thread init (src/wdt.c:246) and does not fail
     // to start without it.
     let warn_after = config.global.as_ref().and_then(|g| g.warn_blocked_traffic_after).unwrap_or(ibex_rt::watchdog::DEFAULT_WARN_AFTER);
-    if !start_watchdog(ibex_rt::watchdog::start, warn_after, config.global.as_ref().is_some_and(|g| g.ibex_watchdog_warn_only)) {
+    started = started && start_watchdog(ibex_rt::watchdog::start, warn_after, config.global.as_ref().is_some_and(|g| g.ibex_watchdog_warn_only));
+    if !started {
         abort_start(&go, threads);
     }
     let unused = ibex_rt::handover::drop_unused_inherited();
