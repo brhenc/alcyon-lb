@@ -169,11 +169,11 @@ fn other_pool_debugging_features_are_refused() {
     assert!(!out.status.success(), "{out:?}");
 }
 
-/// `tune.buffers.limit 3` (Ibex: no wait queue yet, S6): with three connections each holding a
-/// buffer for a partial request, a fourth gets nothing and is closed; once one of the three is
-/// gone, the next request is served. `HAProxy` makes the fourth wait instead.
+/// `tune.buffers.limit 3`: with three connections each holding a buffer for a partial request,
+/// a fourth waits for a buffer (S6, as `HAProxy`; `buffer_wait.rs`) and is served once one of the
+/// three is gone. It was closed with nothing here before the wait queue.
 #[test]
-fn past_tune_buffers_limit_a_stream_fails_and_the_next_one_is_served() {
+fn past_tune_buffers_limit_a_stream_waits_and_is_served_when_a_buffer_frees() {
     if std::env::var("S5_ORACLE").is_ok() {
         return;
     }
@@ -186,10 +186,12 @@ fn past_tune_buffers_limit_a_stream_fails_and_the_next_one_is_served() {
         })
         .collect();
     thread::sleep(Duration::from_millis(200));
-    assert_eq!(get(p.port), 0, "a fourth buffer past the limit");
+    let port = p.port;
+    let fourth = thread::spawn(move || get(port));
+    thread::sleep(Duration::from_millis(500));
+    assert!(!fourth.is_finished(), "a fourth buffer past the limit did not wait");
     drop(held);
-    thread::sleep(Duration::from_millis(200));
-    assert_eq!(get(p.port), 200, "a buffer is free again");
+    assert_eq!(fourth.join().expect("fourth"), 200, "a buffer is free again");
     assert!(p.child.try_wait().expect("try_wait").is_none());
 }
 

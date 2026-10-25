@@ -28,6 +28,7 @@ pub mod version {
 
 pub mod applet;
 pub mod buf;
+pub mod buf_wait;
 pub mod check;
 pub mod cli_listener;
 pub mod crash;

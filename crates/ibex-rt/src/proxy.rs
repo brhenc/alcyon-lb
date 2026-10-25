@@ -2125,6 +2125,26 @@ impl TcpSession {
         self.ending.get_or_insert(Ending::Error);
     }
 
+    /// The request buffer, or this stream waits for one (S6): `Ok(false)` while it waits, the
+    /// client not read; `Err` (out of memory) when the refusal is not the limit's, as in S5.
+    #[inline]
+    fn alloc_or_wait_req(&mut self) -> io::Result<bool> {
+        if self.req.alloc_if_needed() {
+            return Ok(true);
+        }
+        self.wait_for_buffer(crate::buf_wait::Class::MuxRx)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wait_for_buffer(&mut self, class: crate::buf_wait::Class) -> io::Result<bool> {
+        if !crate::buf_wait::should_wait() {
+            return Err(crate::buf::oom());
+        }
+        crate::buf_wait::want(class);
+        Ok(false)
+    }
+
     /// A buffer this stream needs cannot be had (S5, `docs/design/memory-2026-10-24.md` 3.10):
     /// the stream fails as one of `HAProxy`'s whose allocation failed under `-dMfail` (measured,
     /// `tasks/S5-progress.md`): answered `500` while nothing of a response has gone to the
@@ -2482,10 +2502,7 @@ impl TcpSession {
         } else {
             // Read from the client into the request buffer while reading is permitted
             // and buffer space exists. Backpressure stops reads when full.
-            if self.cli_state.can_read() && !self.req.is_full() && !self.cli_cant_recv {
-                if !self.req.alloc_if_needed() {
-                    return Err(crate::buf::oom());
-                }
+            if self.cli_state.can_read() && !self.req.is_full() && !self.cli_cant_recv && self.alloc_or_wait_req()? {
                 let dst = self.req.writable();
                 let asked = dst.len();
                 let r = self.cli.recv(&mut self.cli_xprt, dst)?;
