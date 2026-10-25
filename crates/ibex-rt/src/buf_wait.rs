@@ -523,6 +523,14 @@ mod tests {
         assert!(!enter(TaskRef(1), NIL, Class::MuxRx, false), "no such slot");
     }
 
+    /// Queues made at run time (the thread-local's are const-evaluated) are empty.
+    #[test]
+    fn queues_made_at_run_time_are_empty() {
+        let q = Queues::new();
+        assert_eq!((q.map(), q.len, q.head, q.task.len()), (0, [0; 4], [NIL; 4], 0));
+        assert_eq!(q.queue_of(3), None);
+    }
+
     /// A buffer offered to a waiter that had gone goes to the next one.
     #[test]
     fn a_reoffered_buffer_goes_to_the_next_waiter() {

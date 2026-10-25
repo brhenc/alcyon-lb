@@ -2163,7 +2163,7 @@ impl TcpSession {
     /// client not read; `Err` (out of memory) when the refusal is not the limit's, as in S5.
     #[inline]
     fn alloc_or_wait_req(&mut self) -> io::Result<bool> {
-        if self.req.alloc_for(crate::buf_wait::Class::MuxRx) {
+        if self.cli_xprt.alloc_rx() && self.req.alloc_for(crate::buf_wait::Class::MuxRx) {
             return Ok(true);
         }
         self.wait_for_buffer(crate::buf_wait::Class::MuxRx)
@@ -2378,13 +2378,6 @@ impl TcpSession {
         // the session waited out a timeout (T261).
         let changed_io = self.process_cli_io().unwrap_or_else(|e| {
             if crate::buf::is_oom(&e) {
-                // A TLS read refused its buffer at the limit (`xprt.rs` `read_once`): the
-                // stream waits for one, as for its request buffer (S6b). The request buffer,
-                // empty, goes back, so that a waiter holds nothing.
-                if self.cli_xprt.is_tls() && self.wait_for_buffer(crate::buf_wait::Class::MuxRx).is_ok() {
-                    self.req.release();
-                    return true;
-                }
                 self.fail_alloc();
             } else {
                 self.client_conn_failed();

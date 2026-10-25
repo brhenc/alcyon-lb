@@ -532,6 +532,16 @@ fn a_tls_connection_past_the_limit_waits_for_a_buffer() {
     });
     thread::sleep(Duration::from_millis(700));
     assert!(!waiter.is_finished(), "the TLS connection did not wait: {:?}\n{}", waiter.join().ok(), p.log());
+    // One buffer free: the TLS read's, the request's still wanting. The waiter holds the one it
+    // has and waits for the other without spinning (it took the request buffer, was refused
+    // the read buffer, gave the first back and was offered it again, in a loop).
+    let mut held = held;
+    drop(held.remove(0));
+    thread::sleep(Duration::from_millis(300));
+    let before = p.buffer_failures();
+    thread::sleep(Duration::from_secs(1));
+    let refused = p.buffer_failures() - before;
+    assert!(refused < 50, "refused takes in one second of waiting with one buffer free: {refused}");
     drop(held);
     let got = waiter.join().expect("waiter");
     assert!(got.starts_with("HTTP/1.1 200") && got.contains("hello"), "not served once buffers were free: {got:?}\n{}", p.log());

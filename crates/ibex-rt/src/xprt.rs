@@ -676,6 +676,17 @@ impl ClientXprt {
         matches!(self, ClientXprt::Tls(_))
     }
 
+    /// The TLS receive buffer, taken before the request's (S6b): a stream at the limit then
+    /// waits holding nothing, or holding this one, never taking the request buffer only to be
+    /// refused this one (which spun: given back, offered again). True for plaintext.
+    #[inline]
+    pub fn alloc_rx(&mut self) -> bool {
+        match self {
+            ClientXprt::Plain => true,
+            ClientXprt::Tls(t) => t.rx.buf.alloc_for(crate::buf_wait::Class::MuxRx),
+        }
+    }
+
     /// What the `ssl_fc*` fetches read of the session: nothing for plaintext, and for TLS
     /// what the handshake settled. Borrows only; no allocation.
     #[must_use]
