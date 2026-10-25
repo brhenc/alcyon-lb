@@ -86,6 +86,38 @@ pub struct LogData<'a> {
     pub unique_id: Option<&'a str>,
 }
 
+impl<'a> LogData<'a> {
+    /// What a `SampleContext` holds of the stream, for a rule's format: the addresses, the names
+    /// of the proxies and the server, the accept date, the termination state, the captures and
+    /// the unique id. The rest is what a stream that has just begun measured (`HAProxy` 3.5-dev8
+    /// prints `-1` for the timers of a stream with no response, `0` for the totals). Until a
+    /// backend is chosen the stream's backend is its frontend (`s->be`).
+    #[must_use]
+    pub fn of_context(ctx: &SampleContext<'a>) -> Self {
+        let timers = ctx.stream.and_then(|f| f.timers);
+        LogData {
+            client: ctx.client_addr,
+            frontend_addr: ctx.server_addr,
+            server_addr: ctx.bc_dst,
+            frontend: ctx.fe_name.unwrap_or_default(),
+            backend: ctx.be_name.or(ctx.fe_name).unwrap_or_default(),
+            server: ctx.srv_name,
+            accept_date: ctx.accept_date.unwrap_or((0, 0)),
+            t_idle: timers.map_or(0, |t| t[0].max(0)),
+            t_request: timers.map_or(-1, |t| t[1]),
+            t_queue: timers.map_or(-1, |t| t[2]),
+            t_connect: timers.map_or(-1, |t| t[3]),
+            t_data: timers.map_or(-1, |t| t[4]),
+            status: ctx.res_status.map_or(-1, i64::from),
+            term_state: ctx.term_state.unwrap_or(*b"--"),
+            req_captures: ctx.captures_req_hdr,
+            res_captures: ctx.captures_res_hdr,
+            unique_id: ctx.unique_id,
+            ..LogData::default()
+        }
+    }
+}
+
 impl Default for LogData<'_> {
     fn default() -> Self {
         LogData {
@@ -473,6 +505,48 @@ impl LogFormat {
     /// As [`LogFormat::compile`].
     pub fn compile_unique_id(fmt: &str, registry: &Registry) -> Result<Self, String> {
         Self::compile_with(fmt, registry, false).map(|f| LogFormat { http: true, ..f })
+    }
+
+    /// Compiles a rule's format (`set-header`, `set-var-fmt`, `redirect`, `lf-string`, ...): as
+    /// [`LogFormat::compile`], with an absent value printing nothing rather than `-`, and with
+    /// `http` a sample has the bytes of `http_encode_map` written `%XX` (`LOG_OPT_HTTP`).
+    ///
+    /// # Errors
+    /// As [`LogFormat::compile`] (T455).
+    pub fn compile_rule(fmt: &str, registry: &Registry, http: bool) -> Result<Self, String> {
+        Self::compile_with(fmt, registry, false).map(|f| LogFormat { http, ..f })
+    }
+
+    /// Whether the format reads anything of the stream beyond the names, addresses and
+    /// samples a `SampleContext` holds: the timers, the status, the byte counts, the request
+    /// line, the counters. A format that does not is rendered from [`LogData::of_context`] alone.
+    #[must_use]
+    pub fn needs_stream(&self) -> bool {
+        self.nodes.iter().any(|n| {
+            !matches!(
+                n,
+                Node::Text(_)
+                    | Node::Expr(..)
+                    | Node::Alias(
+                        Alias::ClientIp | Alias::ClientPort | Alias::FrontendIp | Alias::FrontendPort | Alias::ServerIp | Alias::ServerPort | Alias::Frontend | Alias::Backend | Alias::Server,
+                        ..
+                    )
+            )
+        })
+    }
+
+    /// [`LogFormat::render_value`] appended to `out`, through a buffer of the thread's, so that
+    /// a value that is plain text costs no allocation (T455).
+    pub fn render_value_into(&self, out: &mut String, d: &LogData, registry: &Registry, ctx: &SampleContext) {
+        let mut buf = LOGLINE.take_raw(|| Some(Vec::with_capacity(160))).unwrap_or_default();
+        buf.clear();
+        let mut line = Out(buf);
+        self.render_into(&mut line, d, registry, ctx, false);
+        match std::str::from_utf8(&line.0) {
+            Ok(t) if !ibex_regex::bytetext::has_escapes(t) => out.push_str(t),
+            _ => out.push_str(&ibex_regex::bytetext::bytes_to_text(&line.0)),
+        }
+        LOGLINE.give(line.0);
     }
 
     /// `%(name[:type])`, at `i` (the `(`): the name and cast, and where they end.
@@ -1084,7 +1158,11 @@ fn text<S: AsRef<[u8]> + ?Sized>(out: &mut Out, s: Option<&S>, o: Opts) {
 
 fn ip(out: &mut Out, a: Option<SocketAddr>, o: Opts) {
     match a {
-        None => out.push('-'),
+        None => {
+            if o.mandatory {
+                out.push('-');
+            }
+        }
         Some(SocketAddr::V4(v)) if o.hex => {
             for b in v.ip().octets() {
                 let _ = write!(out, "{b:02X}");
@@ -1103,7 +1181,11 @@ fn ip(out: &mut Out, a: Option<SocketAddr>, o: Opts) {
 
 fn port(out: &mut Out, a: Option<SocketAddr>, o: Opts) {
     match a {
-        None => out.push('-'),
+        None => {
+            if o.mandatory {
+                out.push('-');
+            }
+        }
         Some(a) if o.hex => {
             let _ = write!(out, "{:04X}", a.port());
         }
@@ -1205,9 +1287,10 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
         Alias::Bytes => int(out, i64::try_from(d.bytes_out).unwrap_or(i64::MAX)),
         Alias::BytesUp => int(out, i64::try_from(d.bytes_in).unwrap_or(i64::MAX)),
         // Ibex has no `capture cookie`, so there is never a cookie to show.
-        Alias::CookieClient | Alias::CookieServer => text(out, Some("-"), o),
+        // A value that is not there is `-` in a log line and nothing in a rule's format (T455).
+        Alias::CookieClient | Alias::CookieServer => text(out, Some(if o.mandatory { "-" } else { "" }), o),
         Alias::Hostname => text(out, Some(d.hostname), o),
-        Alias::UniqueId => text(out, Some(d.unique_id.unwrap_or("-")), o),
+        Alias::UniqueId => text(out, Some(d.unique_id.unwrap_or(if o.mandatory { "-" } else { "" })), o),
         Alias::Status => int(out, d.status),
         Alias::DateGmt => date_zone(out, Civil::at(d.accept_date.0, 0)),
         Alias::DateLocal => date_zone(out, Civil::local(d.accept_date.0)),
@@ -1311,8 +1394,8 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
                 out.push(char::from(*c));
             }
         }
-        Alias::SslCipher => text(out, Some(d.ssl_cipher.unwrap_or("-")), o),
-        Alias::SslVersion => text(out, Some(d.ssl_version.unwrap_or("-")), o),
+        Alias::SslCipher => text(out, Some(d.ssl_cipher.unwrap_or(if o.mandatory { "-" } else { "" })), o),
+        Alias::SslVersion => text(out, Some(d.ssl_version.unwrap_or(if o.mandatory { "-" } else { "" })), o),
         Alias::HdrReq | Alias::HdrRes => {
             let caps = if a == Alias::HdrReq { d.req_captures } else { d.res_captures };
             if let Some(caps) = caps.filter(|c| !c.is_empty()) {
@@ -1374,7 +1457,7 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
 fn sample_bytes(s: &Sample) -> std::borrow::Cow<'_, [u8]> {
     use std::borrow::Cow;
     match s {
-        Sample::Str(v) => Cow::Borrowed(v.as_bytes()),
+        Sample::Str(v) => ibex_regex::bytetext::text_to_bytes(v),
         Sample::Bin(v) => Cow::Borrowed(v),
         Sample::Sint(v) => Cow::Owned(v.to_string().into_bytes()),
         Sample::Bool(v) => Cow::Borrowed(if *v { b"1" } else { b"0" }),
@@ -1442,7 +1525,8 @@ fn sample(out: &mut Out, s: &Sample, o: Opts, cast: Cast, converted: bool) {
                 text(out, Some(v), o);
             }
         }
-        Sample::Str(v) => text(out, Some(v.as_str()), o),
+        // A string holds a byte that is not UTF-8 as the character `bytetext` gave it (T455).
+        Sample::Str(v) => text(out, Some(&*ibex_regex::bytetext::text_to_bytes(v)), o),
         Sample::Sint(v) => {
             let _ = write!(out, "{v}");
         }

@@ -305,6 +305,8 @@ mod req_cook_names;
 mod res_cook_names;
 mod names_delimiter;
 mod response_aliases;
+mod rule_format_compile;
+mod rule_format_render;
 mod res_cook_cnt;
 mod res_hdrs_bin;
 mod response_fetch_in_request;

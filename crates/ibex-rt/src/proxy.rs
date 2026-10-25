@@ -3750,7 +3750,12 @@ pub fn eval_acl_term_extended(
             AclEvalResult::NotMatched
         };
     };
+    eval_expr_extended(expr, term.negated, registry, ctx, req_bytes, can_wait)
+}
 
+/// [`eval_acl_term_extended`] of a term already resolved to its expression (a condition
+/// compiled at load, [`crate::rule_compiled::Cond::eval_extended`]).
+pub(crate) fn eval_expr_extended(expr: &Expr, negated: bool, registry: &Registry, ctx: &SampleContext, req_bytes: &[u8], can_wait: bool) -> AclEvalResult {
     if can_wait {
         if expr.fetch_name == "wait_end" {
             // `smp_fetch_wait_end`: no sample until the rules cannot wait any longer.
@@ -3807,7 +3812,7 @@ pub fn eval_acl_term_extended(
             return AclEvalResult::MissingData;
         }
     }
-    let effective = if term.negated { !is_match } else { is_match };
+    let effective = if negated { !is_match } else { is_match };
     if effective {
         AclEvalResult::Matched
     } else {
