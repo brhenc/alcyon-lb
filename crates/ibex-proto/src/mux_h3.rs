@@ -478,6 +478,8 @@ pub struct H3MuxContext {
     pub relaxed_path: bool,
     signals: VecDeque<H3Signal>,
     decoded: DecodedFields,
+    // Boxed: the bridge takes a head as the `Box` h2's `H2Dispatch` carries, and gives it back.
+    #[allow(clippy::vec_box)]
     spare_heads: Vec<Box<H2ReqHead>>,
     /// A field section being encoded, kept for the next.
     scratch: Vec<u8>,
@@ -884,6 +886,7 @@ fn parse_head(head: &str) -> Option<(u16, impl Iterator<Item = (&str, &str)>)> {
 /// What the demux of a stream borrows from its connection.
 struct Shared<'a> {
     decoded: &'a mut DecodedFields,
+    #[allow(clippy::vec_box)]
     spare_heads: &'a mut Vec<Box<H2ReqHead>>,
     relaxed: bool,
 }
@@ -1148,9 +1151,8 @@ fn control_frames(rx: &[u8], settings_recv: &mut bool, goaway_recv: &mut Option<
                 *goaway_recv = Some(id);
             }
             // From a client, a CANCEL_PUSH names a push that never was (h3.c:2140).
-            FRAME_CANCEL_PUSH if len == 0 => return Err(H3Error::FrameError),
+            FRAME_CANCEL_PUSH | FRAME_MAX_PUSH_ID if len == 0 => return Err(H3Error::FrameError),
             FRAME_CANCEL_PUSH => return Err(H3Error::IdError),
-            FRAME_MAX_PUSH_ID if len == 0 => return Err(H3Error::FrameError),
             _ => {}
         }
     }
@@ -1329,6 +1331,34 @@ impl HtxMux for H3MuxContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn varint_into_writes_every_width() {
+        for v in [0u64, 63, 64, 16_383, 16_384, 1_073_741_823, 1_073_741_824, (1 << 62) - 1] {
+            let mut b = [0u8; 8];
+            let n = varint_into(&mut b, v);
+            let mut want = Vec::new();
+            encode_varint(&mut want, v);
+            assert_eq!(&b[..n], &want[..], "value {v}");
+        }
+    }
+
+    #[test]
+    fn a_stream_given_back_wiped_keeps_its_memory_and_nothing_else() {
+        let mut st = H3StreamCtx { id: 8, rx: b"secret".to_vec(), tx: b"reply".to_vec(), dispatched: true, ..H3StreamCtx::default() };
+        let mut head = Box::<H2ReqHead>::default();
+        head.text.push_str("GET /secret HTTP/1.1");
+        st.req_head = Some(head);
+        st.rx_htx.push(HtxBlock::Eoh);
+        let cap = st.rx.capacity();
+        Poolable::reset(&mut st, true);
+        assert_eq!((st.id, st.dispatched, st.rx.len(), st.tx.len()), (0, false, 0, 0));
+        assert_eq!(st.rx.capacity(), cap, "the buffer is kept for the next stream");
+        assert!(st.rx_htx.blocks().is_empty());
+        assert!(st.req_head.as_ref().is_some_and(|h| h.text.is_empty()));
+        Poolable::reset(&mut st, false);
+        assert!(st.footprint() >= std::mem::size_of::<H3StreamCtx>());
+    }
 
     #[test]
     fn varint_round_trips_at_every_width() {

@@ -3,7 +3,7 @@
 
 //! The HTTP/3 mux (`H3MuxContext`, T503) from frame vectors: what a client's request and
 //! unidirectional streams become (HTX, a stream error, a connection error), and the frames
-//! a response is encoded to. Expected codes are the oracle's (HAProxy 3.5-dev7 + QUIC,
+//! a response is encoded to. Expected codes are the oracle's (`HAProxy` 3.5-dev7 + QUIC,
 //! `docs/design/h3-engine-2026-10-26.md` section 8, and `tasks/T503-progress.md` for the rows
 //! measured in this task); where only `h3.c`/`qpack-dec.c` say, the line is cited.
 
@@ -110,7 +110,7 @@ fn a_get_becomes_a_head_and_the_end_of_the_message() {
     assert_eq!(head.uri(), "/plain");
     assert_eq!(head.get_header("host"), Some("localhost"));
     assert_eq!(head.abs_prefix(), Some("https://localhost"));
-    assert!(signals(&mut m).is_empty());
+    assert_eq!(signals(&mut m), vec![]);
     assert_eq!(m.head_partial(), None);
     assert_eq!(m.next_request, 4, "GOAWAY id: the stream after the last one opened");
 }
@@ -162,7 +162,7 @@ fn a_body_is_held_to_one_buffer_and_the_rest_waits_in_the_transport() {
     let st = m.stream(0).expect("stream");
     assert_eq!(st.rx_buffered, body.len() - RX_DATA_ROOM);
     assert!(st.rx_htx().is_eom());
-    assert!(signals(&mut m).is_empty());
+    assert_eq!(signals(&mut m), vec![]);
 }
 
 #[test]
@@ -326,10 +326,10 @@ fn the_control_stream_rules() {
     let f = frames(&ctl[1..]);
     assert_eq!(f.len(), 1);
     assert_eq!(f[0].0, SETTINGS);
-    let mut p = 0;
+    let mut at = 0;
     let mut kv = Vec::new();
-    while p < f[0].1.len() {
-        kv.push((parse_varint(&f[0].1, &mut p).unwrap(), parse_varint(&f[0].1, &mut p).unwrap()));
+    while at < f[0].1.len() {
+        kv.push((parse_varint(&f[0].1, &mut at).unwrap(), parse_varint(&f[0].1, &mut at).unwrap()));
     }
     assert_eq!(kv, vec![(0x1, 0), (0x7, 0), (0x6, 65536)]);
 
@@ -655,4 +655,65 @@ fn the_static_encoder_finds_what_a_scan_of_the_table_finds() {
     assert_eq!(qpack::static_ref("x-ibex", "1"), qpack::StaticRef::None);
     assert_eq!(qpack::static_ref("", ""), qpack::StaticRef::None);
     assert_eq!(qpack::static_ref("zzzz", ""), qpack::StaticRef::None);
+}
+
+#[test]
+fn the_corners_of_the_stream_and_connection_state() {
+    // A context made by `Default` is a new one.
+    let d = H3MuxContext::default();
+    assert_eq!((d.max_concurrent, d.next_request, d.control_out), (mux_h3::MAX_CONCURRENT, 0, None));
+
+    // The client may not stop our control stream (RFC 9114 section 6.2.1).
+    let mut m = mux();
+    assert_eq!(m.on_stop_sending(3, 0x100), Err(H3Error::ClosedCriticalStream));
+
+    // Our FIN before the client's: half-closed local; a reset stream stays reset.
+    let mut m = mux();
+    m.recv(0, &headers(GET), false, 0).expect("request");
+    m.recv(4, &headers(GET), false, 0).expect("request");
+    m.stream_mut(4).expect("stream").set_dispatched();
+    assert!(HtxStream::dispatched(m.stream(4).expect("stream")));
+    m.fin_written(0);
+    assert_eq!(m.stream(0).expect("stream").state, H3StreamState::HalfClosedLocal);
+    HtxMux::reset(&mut m, 4, MuxReset::Refused);
+    assert_eq!(signals(&mut m), vec![H3Signal::ResetStream { id: 4, code: 0x10b }]);
+    m.fin_written(4);
+    assert_eq!(m.stream(4).expect("stream").state, H3StreamState::Reset(0x10b));
+    assert!(m.send_interim(4, b"HTTP/1.1 103 Early Hints"), "a reset stream takes an interim head too");
+
+    // Two different lengths in one content-length.
+    let mut m = mux();
+    m.recv(0, &headers_owned(&post(&[("content-length", "5, 6")])), false, 0).expect("stream error only");
+    assert_eq!(stream_error(&signals(&mut m), 0), Some(0x10e));
+
+    // A control frame in pieces waits for the rest.
+    let mut m = mux();
+    let mut b = vec![0x00];
+    b.extend(frame(SETTINGS, &[0x01, 0x00]));
+    m.recv(2, &b[..3], false, 0).expect("part");
+    assert!(!m.settings_recv);
+    assert!(m.rx_room(2) < mux_h3::RX_CAP, "the control stream holds its partial frame");
+    m.recv(2, &b[3..], false, 0).expect("rest");
+    assert!(m.settings_recv);
+}
+
+#[test]
+fn a_fin_with_more_data_than_room_waits_for_the_child() {
+    let mut m = mux();
+    let body = vec![b'q'; RX_DATA_ROOM + 100];
+    let mut b = headers_owned(&post(&[]));
+    b.extend(frame(DATA, &body));
+    // An owner that read past `rx_room` (the whole stream at once): the DATA beyond the
+    // HTX's room waits in `rx`, and the end of the message with it.
+    m.recv(0, &b, true, 0).expect("request");
+    let st = m.stream(0).expect("stream");
+    assert_eq!(st.rx_buffered, RX_DATA_ROOM);
+    assert!(!st.rx_htx().is_eom(), "100 bytes are still to come");
+    assert_eq!(m.rx_room(0), 0);
+    m.stream_mut(0).expect("stream").rx_htx_mut().clear();
+    m.rx_taken(0, RX_DATA_ROOM);
+    let st = m.stream(0).expect("stream");
+    assert_eq!(st.rx_buffered, 100);
+    assert!(st.rx_htx().is_eom());
+    assert_eq!(st.known_body, Some(body.len() as u64));
 }

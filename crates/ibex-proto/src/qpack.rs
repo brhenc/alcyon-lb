@@ -360,3 +360,21 @@ pub fn static_ref(name: &str, value: &str) -> StaticRef {
     let lowest = SORTED[first..].iter().take_while(|&&(n, _, _)| n == name).map(|&(_, _, i)| i).min();
     lowest.map_or(StaticRef::None, |i| StaticRef::Name(usize::from(i)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sorted_table_is_the_static_table_in_order() {
+        // `SORTED` is built by the compiler; built again here, at run time, it must be the
+        // same, every entry once, in (name, value, index) order.
+        let t = sorted_table();
+        assert_eq!(t, SORTED);
+        assert!(t.windows(2).all(|w| entry_cmp(w[0], w[1]) < 0));
+        let mut idx: Vec<u8> = t.iter().map(|e| e.2).collect();
+        idx.sort_unstable();
+        assert_eq!(idx, (0..99).collect::<Vec<u8>>());
+        assert_eq!(entry_cmp(t[3], t[3]), 0);
+    }
+}

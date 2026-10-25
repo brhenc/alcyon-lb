@@ -120,3 +120,23 @@ impl RxTaken for H2MuxContext {
         true
     }
 }
+
+/// What the bridge will do, generic over the mux: every call goes through the trait.
+fn respond<M: HtxMux>(m: &mut M, id: u64) {
+    let head = m.stream_mut(id).and_then(HtxStream::take_req_head).expect("head");
+    m.give_back_head(head);
+    assert!(m.send_interim(id, b"HTTP/1.1 100 Continue"));
+    assert!(m.send_head(id, b"HTTP/1.1 200 OK", false));
+    let n = m.data_budget(id).min(2);
+    assert_eq!(m.send_data(id, &b"ok"[..n], false), 2);
+    assert!(m.send_trailers(id, &[("x-a", "1")]));
+}
+
+#[test]
+fn the_bridge_s_calls_through_the_trait_on_h2() {
+    let mut m = h2_with_get();
+    respond(&mut m, 1);
+    let h = sent_headers(&m);
+    assert_eq!(h.len(), 3, "100, 200, trailers");
+    assert_eq!(h[2].1, vec![("x-a".to_string(), "1".to_string())]);
+}

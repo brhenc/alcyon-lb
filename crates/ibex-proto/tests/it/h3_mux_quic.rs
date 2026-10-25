@@ -259,18 +259,15 @@ impl Pair {
             mux.rx_taken(id, took);
             if child.eom && !child.answered && !mux.is_reset(id) {
                 child.answered = true;
-                match child.path.as_str() {
-                    "/trailers" => {
-                        mux.send_head(id, b"HTTP/1.1 200 OK\r\ntrailer: x-sum\r\ntransfer-encoding: chunked", false);
-                        mux.send_data(id, b"abc", false);
-                        mux.send_trailers(id, &[("x-sum", "42")]);
-                    }
-                    _ => {
-                        let body = format!("got {}", child.body);
-                        let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}", body.len());
-                        mux.send_head(id, head.as_bytes(), false);
-                        mux.send_data(id, body.as_bytes(), true);
-                    }
+                if child.path == "/trailers" {
+                    mux.send_head(id, b"HTTP/1.1 200 OK\r\ntrailer: x-sum\r\ntransfer-encoding: chunked", false);
+                    mux.send_data(id, b"abc", false);
+                    mux.send_trailers(id, &[("x-sum", "42")]);
+                } else {
+                    let body = format!("got {}", child.body);
+                    let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}", body.len());
+                    mux.send_head(id, head.as_bytes(), false);
+                    mux.send_data(id, body.as_bytes(), true);
                 }
             }
         }
@@ -286,7 +283,7 @@ impl Pair {
             }
         }
         if let Some(e) = mux.error {
-            s.close(Instant::now(), VarInt::from_u64(e as u64).expect("code"), Default::default());
+            s.close(Instant::now(), VarInt::from_u64(e as u64).expect("code"), Vec::new().into());
             return;
         }
         for _ in 0..64 {
