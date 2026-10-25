@@ -491,26 +491,13 @@ def _wait_listening(port: int, proc: subprocess.Popen, timeout: float = 5.0) -> 
     raise RuntimeError(f"proxy did not listen on {port} within {timeout}s")
 
 
-# T452 (2026-10-25, quiet-host run, tasks/T452-measure-1conn-bimodal-variance.md): on a quiet
-# host the 1-conn samples had ONE mode in every batch (736 samples, 23 batches). What moved the
-# rate was the machine state, not the build:
-#   * perf counters attached to the proxy: 16.4k req/s, not attached: 18.9k (the old "19k mode");
-#   * a busy SMT sibling of the proxy's CPU 14.5k, proxy and client on SMT siblings 13.5k,
-#     across L3s 12.7k (the old "15k mode").
-# So every 1-conn sample here has perf stat attached to the proxy and is taken again if its
-# counters did not come back (`perf_attached`), and the run is refused unless the governor is
-# `performance` on the CPUs it uses and those CPUs, their SMT siblings and their CCX are idle
-# (`host_problems`). A/A spread with these checks: see the T452 task file (night run).
-
-
-def perf_attached(stat_out: str) -> bool:
-    """True if `perf stat -x,` output has a nonzero count: a counter that was not attached
-    prints `<not counted>` or `<not supported>`, or 0."""
-    for line in stat_out.splitlines():
-        first = line.split(",")[0].strip()
-        if first.isdigit() and int(first) > 0:
-            return True
-    return False
+# T452 (2026-10-25, quiet-host run, tasks/T452-measure-1conn-bimodal-variance.md): the gate
+# measures without perf counters attached (~18.9k req/s at 1 connection on this host). Its old
+# 15k/19k split came from the host, not the build: a busy SMT sibling of the proxy's CPU gave
+# 14.5k, proxy and client on SMT siblings 13.5k, across L3s 12.7k (T452's batches; on a quiet
+# host every batch had one mode). So the run is refused unless the governor is `performance`
+# on the CPUs it uses and those CPUs, their SMT siblings and their CCX are idle
+# (`host_problems`). A/A spread with this check: see the T452 task file (night run).
 
 
 def _cpu_list(text: str) -> List[int]:
@@ -570,6 +557,11 @@ def host_problems(stat_a: str, stat_b: str, cpus: List[int], sysfs: str = "/sys/
     return why
 
 
+def measure_cpus() -> List[str]:
+    """The CPUs measure_ab pins to: proxy, client, backend."""
+    return os.environ.get("IBEX_MEASURE_CPUS", "4,5,6").split(",")
+
+
 def check_host_quiet(cpus: List[int]) -> List[str]:
     """host_problems over one second of the real /proc/stat."""
     a = _read("/proc/stat")
@@ -581,7 +573,6 @@ def check_host_quiet(cpus: List[int]) -> List[str]:
 # the gate's CPUs 4;5;6, T452). Within a mode the spread is about 10%, so a step of more than
 # MODE_GAP_PCT between two neighbouring samples is the gap between the modes.
 MODE_GAP_PCT = 12.0
-PERF_RETAKES = 2  # a 1-conn sample without perf counters is taken again this many times
 
 
 def _median(xs: List[int]) -> int:
@@ -634,7 +625,7 @@ def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
     # Proxy, client and backend each on their own core, all three sharing one L3. Left to
     # the scheduler, samples of one build split into two clusters ~25% apart (same L3 or
     # not), and an A/A run differed by 6%.
-    cpus = os.environ.get("IBEX_MEASURE_CPUS", "4,5,6").split(",")
+    cpus = measure_cpus()
     pin = (lambda i: ["taskset", "-c", cpus[i]]) if shutil.which("taskset") and len(cpus) >= 3 \
         else (lambda i: [])
     cfg = ("global\n    nbthread 1\n"
@@ -646,27 +637,6 @@ def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
         cfg_path = tf.name
     rps: Dict[str, List[int]] = {"cand": [], "ref": []}
     cpu: Dict[str, List[int]] = {"cand": [], "ref": []}
-
-    perf_missed = {"cand": 0, "ref": 0}
-
-    def timed_with_perf(pid: int, addr: str, n: int, what: str) -> Tuple[float, bool]:
-        """The 1-conn sample with `perf stat` counting the proxy (see the T452 note): the wall
-        time and whether the counters came back."""
-        with tempfile.NamedTemporaryFile("r", suffix=".stat") as out:
-            perf = subprocess.Popen(["perf", "stat", "-x,", "-e", "instructions:u", "-p", str(pid),
-                                     "-o", out.name], stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
-            time.sleep(0.2)
-            try:
-                wall = fixed(addr, 1, n, what)
-            finally:
-                perf.send_signal(signal.SIGINT)
-                try:
-                    perf.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    perf.kill()
-                    perf.wait()
-            return wall, perf_attached(out.read())
 
     def fixed(addr: str, conns: int, n: int, what: str) -> float:
         """Sends exactly `n` requests; returns the wall time."""
@@ -694,12 +664,7 @@ def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
                     addr = f"127.0.0.1:{fe_port}"
                     what = f"{side} round {r}"
                     fixed(addr, 1, 5000, what + " warmup")
-                    for attempt in range(PERF_RETAKES + 1):
-                        wall, attached = timed_with_perf(proc.pid, addr, latency_requests, what)
-                        if attached:
-                            rps[side].append(int(latency_requests / wall))
-                            break
-                        perf_missed[side] += 1
+                    rps[side].append(int(latency_requests / fixed(addr, 1, latency_requests, what)))
                     before = _cpu_ns(proc.pid)
                     fixed(addr, load_conns, load_requests, what)
                     cpu[side].append(int((_cpu_ns(proc.pid) - before) / load_requests))
@@ -718,12 +683,8 @@ def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
             be.kill()
         os.remove(cfg_path)
 
-    for side in ("cand", "ref"):
-        if not rps[side]:
-            raise RuntimeError(f"{side}: perf did not attach to any 1-conn sample "
-                               f"({perf_missed[side]} tries); is perf_event_paranoid <= 1?")
     median = _median
-    return {"perf_missed": perf_missed, "cand": median(rps["cand"]), "ref": median(rps["ref"]),
+    return {"cand": median(rps["cand"]), "ref": median(rps["ref"]),
             "cand_samples": rps["cand"], "ref_samples": rps["ref"],
             "modes": split_modes(rps["cand"], rps["ref"]),
             "cand_ns": median(cpu["cand"]), "ref_ns": median(cpu["ref"]),
@@ -1277,15 +1238,11 @@ def main() -> int:
     # commits data/measurements.jsonl, so "the last record" drifted to an old one and the
     # growth of every change since added up until a harmless change failed the gate.
     record["binary_bytes_ref"], record["text_bytes_ref"] = measure_binary_size(ref_bin)
-    cpus = [int(c) for c in os.environ.get("IBEX_MEASURE_CPUS", "4,5,6").split(",")]
-    why = check_host_quiet(cpus)
+    why = check_host_quiet([int(c) for c in measure_cpus()])
     if why:
         print("      refusing to measure, the host is not quiet (T452): " + "; ".join(why))
         return 1
     ab = measure_ab(ibex_bin, ref_bin, target_dir)
-    record["rps_1conn_perf_missed"] = ab["perf_missed"]
-    if any(ab["perf_missed"].values()):
-        print(f"      perf counters missing on 1-conn samples, taken again: {ab['perf_missed']}")
     record["rps_1conn"] = ab["cand"]
     record["rps_1conn_ref"] = ab["ref"]
     record["rps_1conn_ref_sha"] = ref_sha

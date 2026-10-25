@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from measure import (check_regressions, MetricDelta, Verdict, reference_sha, split_modes,
-                     parse_insreq, min_ins_per_req, perf_attached, host_problems)
+                     parse_insreq, min_ins_per_req, host_problems)
 
 
 def _git(repo, *args):
@@ -230,19 +230,6 @@ class TestSplitModes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class TestPerfAttached(unittest.TestCase):
-    """T452: with perf stat attached to the proxy the 1-conn rate is 16.4k, without it 18.9k.
-    A sample whose counters are missing or zero is of the other machine state."""
-
-    def test_counts_present_and_nonzero(self):
-        self.assertTrue(perf_attached("1234567,,instructions:u,2000000,100.00,,\n"))
-
-    def test_not_counted_is_not_attached(self):
-        self.assertFalse(perf_attached("<not counted>,,instructions:u,0,0.00,,\n"))
-        self.assertFalse(perf_attached("0,,instructions:u,2000000,100.00,,\n"))
-        self.assertFalse(perf_attached(""))
 
 
 class TestHostProblems(unittest.TestCase):
