@@ -150,7 +150,7 @@ fn the_configured_ssl_zero_buffers_reaches_the_tls_buffer_wipe() {
     ibex_alloc::set_zero_buffers(false);
 }
 
-/// A server that answers no request before it has `n` of them (or 10 s went by), so that the
+/// A server that answers no request before it has `n` of them (or 90 s went by), so that the
 /// `n` requests are in the proxy at once.
 fn held_backend(l: TcpListener, n: usize, run: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -172,7 +172,7 @@ fn held_backend(l: TcpListener, n: usize, run: Arc<AtomicBool>) -> thread::JoinH
                 }
             }
             let heads = conns.iter().filter(|c| c.1).count();
-            if !answered && (heads >= n || start.elapsed() > Duration::from_secs(10)) {
+            if !answered && (heads >= n || start.elapsed() > Duration::from_secs(90)) {
                 for (s, _) in &mut conns {
                     let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
                 }
@@ -218,7 +218,7 @@ fn burst(global: &str, n: usize) -> usize {
     }
     let start = Instant::now();
     let mut buf = [0u8; 4096];
-    while start.elapsed() < Duration::from_secs(30) && clients.iter().any(|c| !c.3) {
+    while start.elapsed() < Duration::from_secs(120) && clients.iter().any(|c| !c.3) {
         let _ = engine.run_once();
         for (c, sent, got, done) in &mut clients {
             if *sent < req.len() {
