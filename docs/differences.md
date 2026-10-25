@@ -192,7 +192,7 @@ Not refused, on purpose:
   has an IPv6 route, re-probed every 30 s). Differences: every section runs on worker 0 (with the
   health checks; HAProxy spreads them over threads); a forged or malformed reply never ends a
   resolution early (the honest answer is still taken); only a layer-4 timeout of a check, not a
-  refused connect, triggers a resolution. Still refused: `server-template` (T486), SRV names
+  refused connect, triggers a resolution. `server-template <prefix> <n|lo-hi> <name>[:port]` expands to servers `<prefix><n>` that share one resolution (T486); `from none` is accepted, `from be:`/`from srv:` are refused, and a parameter error names `server <slot>` where HAProxy says `server-template <px>/<prefix>`. Still refused: SRV names
   (`_...`, T487), TCP (`tcp@` nameservers and the fallback on a truncated answer, which is an error
   until T488), `do-resolve`, `parse-resolv-conf` and `dns-accept-family` (T489), any other address
   prefix on a `nameserver`. HAProxy also
