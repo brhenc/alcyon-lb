@@ -305,7 +305,7 @@ fn give_mem<const C: u8>(pool: &'static Pool<Mem<C>>, data: Box<[u8]>) {
 
 /// `tune.buffers.limit`: the most standard buffers the process holds at once, cached ones
 /// included (0: no limit; `HAProxy` raises 1 and 2 to 3, as the parser does). A take past it is
-/// refused and that stream fails (S5; `HAProxy` makes it wait, S6).
+/// refused, and the stream waits for one ([`crate::buf_wait`], S6).
 pub fn set_buffers_limit(n: usize) {
     BUF_STD.set_limit(n);
 }
@@ -316,6 +316,13 @@ pub fn set_buffers_limit(n: usize) {
 pub fn prealloc_standard(n: usize) -> bool {
     ensure_registered();
     BUF_STD.prealloc(n)
+}
+
+/// Whether the standard buffer pool is at `tune.buffers.limit`: a stream refused one waits
+/// (S6, [`crate::buf_wait`]).
+#[must_use]
+pub fn standard_at_limit() -> bool {
+    BUF_STD.at_limit()
 }
 
 fn alloc_standard() -> Option<Box<[u8]>> {
@@ -417,7 +424,10 @@ impl Drop for Buf {
         self.wipe_used();
         let data = std::mem::replace(&mut self.data, Box::new([]));
         match self.class {
-            BufClass::Standard => give_mem(&BUF_STD, data),
+            BufClass::Standard => {
+                give_mem(&BUF_STD, data);
+                crate::buf_wait::offer();
+            }
             BufClass::Small => give_mem(&BUF_SMALL, data),
             BufClass::Large => give_mem(&BUF_LARGE, data),
             BufClass::Custom => {}

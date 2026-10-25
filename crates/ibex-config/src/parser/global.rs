@@ -307,7 +307,7 @@ pub(crate) fn parse_global_directive(
                 // The emergency buffers it reserves serve the buffer wait queue, which Ibex does
                 // not have yet (a stream without a buffer fails): accepted and dropped, it would
                 // promise what is not there (AGENTS.md 5).
-                return Err(ConfigError::new(kw.line, kw.col, "'tune.buffers.reserve' is not supported by Ibex yet: it reserves buffers for the buffer wait queue, which Ibex does not have (a stream that cannot have a buffer fails)."));
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.buffers.reserve' is not supported by Ibex yet: it sets aside per-thread emergency buffers for the buffer wait queue, which Ibex's queue does not have (a stream past tune.buffers.limit waits without them)."));
             }
             let n = usize::try_from(n).unwrap_or(usize::MAX);
             global.buffers_limit = Some(if n == 0 { 0 } else { n.max(3) });

@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
+//! The buffer wait queue (memory slice S6, `docs/design/memory-q3-2026-10-25.md`): a connection
+//! that cannot have a buffer past `tune.buffers.limit` waits for one, as on `HAProxy`, instead of
+//! being reset.
+//!
+//! Measured on `HAProxy` 3.5-dev8-885761-29 (`nbthread 1` and 2, `tune.buffers.limit 8`, slow
+//! readers holding the buffers): no stream ever fails for want of a buffer; a new connection
+//! waits and is served `200` once buffers are given back (drain shape, Q3 doc 1.2); a connection
+//! still waiting when `timeout client` fires is answered `408` and logged
+//! `fe/<NOSRV> -1/-1/-1/-1/<timeout> 408 0 - - cR-- ... "<BADREQ>"`. `HAProxy`'s cap is the limit
+//! plus `nbthread` x `tune.buffers.reserve` (4); Ibex has no reserve yet, its cap is the limit, so
+//! the number of holders here is Ibex's.
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::common;
+
+/// Body length of `GET /big`.
+const BIG: usize = 2 << 20;
+
+/// A server answering every head `200` with `ok` (`GET /big`: [`BIG`] bytes), then closing.
+fn backend() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let port = l.local_addr().expect("addr").port();
+    thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            thread::spawn(move || {
+                c.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match c.read(&mut tmp) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                if buf.starts_with(b"GET /big") {
+                    let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {BIG}\r\nConnection: close\r\n\r\n").as_bytes());
+                    let chunk = vec![b'x'; 65536];
+                    for _ in 0..BIG / chunk.len() {
+                        if c.write_all(&chunk).is_err() {
+                            return;
+                        }
+                    }
+                } else {
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                }
+            });
+        }
+    });
+    port
+}
+
+struct Proxy {
+    child: Child,
+    port: u16,
+    /// Frontend `fe2`, with `timeout client 2s`: same pool, its own timeout.
+    port2: u16,
+    log: Arc<Mutex<String>>,
+    dir: tempfile::TempDir,
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        common::stop(&mut self.child);
+    }
+}
+
+impl Proxy {
+    fn log(&self) -> String {
+        self.log.lock().expect("log").clone()
+    }
+
+    /// One CLI command's answer.
+    fn cli(&self, cmd: &str) -> String {
+        let mut s = UnixStream::connect(self.dir.path().join("s.sock")).expect("cli connect");
+        s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+        s.write_all(format!("{cmd}\n").as_bytes()).expect("cli write");
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    }
+
+    /// `show pools`' standard buffer line: refused takes.
+    fn buffer_failures(&self) -> usize {
+        let out = self.cli("show pools");
+        let line = out.lines().find(|l| l.contains("Pool buffer ")).unwrap_or_else(|| panic!("no buffer pool line in {out}"));
+        line.split(" failures").next().and_then(|h| h.rsplit(' ').next()).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{line}"))
+    }
+
+    /// `show pools`' standard buffer line: (used, of them in thread caches).
+    fn buffers(&self) -> (usize, usize) {
+        let out = self.cli("show pools");
+        let line = out.lines().find(|l| l.contains("Pool buffer ")).unwrap_or_else(|| panic!("no buffer pool line in {out}"));
+        let num = |after: &str| -> usize {
+            let rest = &line[line.find(after).map_or(0, |i| i + after.len())..];
+            rest.trim_start().split(|c: char| !c.is_ascii_digit()).next().unwrap_or("").parse().unwrap_or_else(|_| panic!("{line}"))
+        };
+        (num("bytes), "), num("used (~"))
+    }
+}
+
+/// The proxy, `nbthread 1`, with `tune.buffers.limit 3` and this `timeout client` (frontend
+/// `fe2`: 2 s).
+fn start(timeout_client: &str) -> Proxy {
+    let be = backend();
+    let dir = tempfile::TempDir::new().expect("dir");
+    let cfg = dir.path().join("c.cfg");
+    let sock = dir.path().join("s.sock");
+    let port = common::reserve_port();
+    let port2 = common::reserve_port();
+    std::fs::write(
+        &cfg,
+        format!(
+            "global\n\tnbthread 1\n\ttune.buffers.limit 3\n\tstats socket {} level admin\n\
+             defaults\n\tmode http\n\tlog stderr format raw local0\n\toption httplog\n\
+             \ttimeout connect 3s\n\ttimeout client {timeout_client}\n\ttimeout server 5s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             frontend fe2\n\tbind 127.0.0.1:{port2}\n\ttimeout client 2s\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{be}\n",
+            sock.display()
+        ),
+    )
+    .expect("write config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&cfg).arg("-db").stdout(Stdio::null()).stderr(Stdio::piped()).spawn().expect("spawn");
+    let log = Arc::new(Mutex::new(String::new()));
+    let (mut err, sink) = (child.stderr.take().expect("stderr"), Arc::clone(&log));
+    thread::spawn(move || {
+        let mut tmp = [0u8; 4096];
+        while let Ok(n) = err.read(&mut tmp) {
+            if n == 0 {
+                break;
+            }
+            sink.lock().expect("log").push_str(&String::from_utf8_lossy(&tmp[..n]));
+        }
+    });
+    assert!(common::wait_listening(([127, 0, 0, 1], port).into()), "the proxy never listened on {port}");
+    assert!(common::wait_listening(([127, 0, 0, 1], port2).into()), "the proxy never listened on {port2}");
+    Proxy { child, port, port2, log, dir }
+}
+
+/// Three connections each holding a buffer for a partial request head: the limit.
+fn hold(port: u16) -> Vec<TcpStream> {
+    let held = (0..3)
+        .map(|_| {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            c.write_all(b"GET /held HTTP/1.1\r\nHost: x\r\n").expect("partial head");
+            c
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(300));
+    held
+}
+
+/// A `GET` on a new connection, in a thread: what it read (empty when reset or closed with
+/// nothing) and how long it took.
+fn get_in_thread(port: u16) -> thread::JoinHandle<(String, Duration)> {
+    thread::spawn(move || {
+        let t = Instant::now();
+        let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        c.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let _ = c.write_all(b"GET /waiter HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let mut got = Vec::new();
+        let _ = c.read_to_end(&mut got);
+        (String::from_utf8_lossy(&got).into_owned(), t.elapsed())
+    })
+}
+
+/// Past the limit, the connection waits (it is neither reset nor answered `500`) and is
+/// served `200` once a holder leaves and gives its buffer back.
+#[test]
+fn past_the_limit_a_connection_waits_and_is_served_when_a_buffer_frees() {
+    let p = start("10s");
+    let mut held = hold(p.port);
+    let waiter = get_in_thread(p.port);
+    thread::sleep(Duration::from_millis(700));
+    assert!(!waiter.is_finished(), "the connection past the limit did not wait: {:?}\n{}", waiter.join().ok(), p.log());
+    drop(held.remove(0));
+    let (got, _) = waiter.join().expect("waiter");
+    assert!(got.starts_with("HTTP/1.1 200"), "not served once a buffer was free: {got:?}\n{}", p.log());
+    assert!(!p.log().contains("IR--"), "a stream failed for want of a buffer:\n{}", p.log());
+}
+
+/// Still waiting when `timeout client` fires: `408`, logged as `HAProxy` does
+/// (`fe/<NOSRV> -1/-1/-1/-1/<timeout> 408 0 - - cR-- ... "<BADREQ>"`). The holders are on a
+/// frontend with a longer timeout, so they keep the buffers past the waiter's.
+#[test]
+fn a_connection_waiting_for_a_buffer_times_out_with_408_cr() {
+    let p = start("10s");
+    let _held = hold(p.port);
+    let waiter = get_in_thread(p.port2);
+    thread::sleep(Duration::from_millis(700));
+    assert!(!waiter.is_finished(), "the connection past the limit did not wait: {:?}\n{}", waiter.join().ok(), p.log());
+    let (got, took) = waiter.join().expect("waiter");
+    assert!(got.starts_with("HTTP/1.1 408"), "not a 408 at the client timeout: {got:?}\n{}", p.log());
+    assert!(took >= Duration::from_millis(1800), "answered before the timeout: {took:?}");
+    thread::sleep(Duration::from_millis(200));
+    let log = p.log();
+    assert!(
+        log.lines().any(|l| l.contains(" fe2 fe2/<NOSRV> -1/-1/-1/-1/") && l.contains(" 408 0 - - cR-- ") && l.ends_with("\"<BADREQ>\"")),
+        "no 408 cR-- line for the waiter:\n{log}"
+    );
+}
+
+/// A waiter whose client leaves is not kept: once the holders are gone too, every buffer is
+/// back in the thread cache (`show pools` used = cached) and the next request is served.
+#[test]
+fn a_waiter_that_disconnects_leaves_the_queue() {
+    let p = start("10s");
+    let held = hold(p.port);
+    let mut c = TcpStream::connect(("127.0.0.1", p.port)).expect("connect");
+    c.write_all(b"GET /gone HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("request");
+    thread::sleep(Duration::from_millis(300));
+    drop(c);
+    thread::sleep(Duration::from_millis(300));
+    drop(held);
+    thread::sleep(Duration::from_millis(500));
+    let (got, _) = get_in_thread(p.port).join().expect("get");
+    assert!(got.starts_with("HTTP/1.1 200"), "{got:?}\n{}", p.log());
+    thread::sleep(Duration::from_millis(300));
+    let (used, cached) = p.buffers();
+    assert_eq!(used, cached, "buffers still in use after every connection left:\n{}", p.cli("show pools"));
+    assert!(!p.log().contains("IR--"), "a stream failed for want of a buffer:\n{}", p.log());
+}
+
+/// Slow readers of a large response past the limit: every one gets its whole body. A stream
+/// already answering waits for its next buffer (`HAProxy` never cut a response in the Q3 runs:
+/// no `ID--`), where Ibex cut them (`ID--`, 200 with part of the body).
+#[test]
+fn slow_readers_past_the_limit_each_get_the_whole_body() {
+    let p = start("10s");
+    let readers: Vec<TcpStream> = (0..6)
+        .map(|_| {
+            let mut c = TcpStream::connect(("127.0.0.1", p.port)).expect("connect");
+            rustix::net::sockopt::set_socket_recv_buffer_size(&c, 4096).expect("SO_RCVBUF");
+            c.write_all(b"GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("request");
+            c
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(500));
+    let got: Vec<usize> = readers
+        .into_iter()
+        .map(|mut c| {
+            thread::spawn(move || {
+                c.set_read_timeout(Some(Duration::from_secs(8))).ok();
+                // Reading at last: a window of 4 KiB would make this slow, not the proxy.
+                rustix::net::sockopt::set_socket_recv_buffer_size(&c, 1 << 20).expect("SO_RCVBUF");
+                let mut all = Vec::new();
+                let _ = c.read_to_end(&mut all);
+                all.windows(4).position(|w| w == b"\r\n\r\n").map_or(0, |h| all.len() - h - 4)
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|t| t.join().expect("reader"))
+        .collect();
+    assert!(got.iter().all(|&n| n == BIG), "bodies {got:?} of {BIG}:\n{}", p.log());
+    assert!(!p.log().contains(" ID-- ") && !p.log().contains("IR--"), "a stream failed for want of a buffer:\n{}", p.log());
+}
+
+/// A waiting connection does not spin: its client socket, with its request unread, is not
+/// polled until a buffer is given back (the poller is level-triggered). Before, the stream ran
+/// on every loop and was refused each time: ~300000 refused takes a second, 150 % CPU.
+#[test]
+fn a_waiting_connection_is_not_run_again_until_a_buffer_frees() {
+    let p = start("10s");
+    let _held = hold(p.port);
+    let _waiter = get_in_thread(p.port);
+    thread::sleep(Duration::from_millis(300));
+    let before = p.buffer_failures();
+    thread::sleep(Duration::from_secs(1));
+    let after = p.buffer_failures();
+    assert!(after - before < 50, "refused takes in one second of waiting: {}", after - before);
+}
