@@ -44,6 +44,7 @@ mod if_error_position;
 mod monitor_fail;
 mod monitor_in_backend;
 mod lexer_hex_escape;
+mod master_worker_keyword;
 mod log_format_config;
 mod log_tag_sample;
 mod m1_scope_refusals;

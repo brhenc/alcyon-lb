@@ -300,8 +300,6 @@ pub struct GlobalSection {
     pub memmax_mb: Option<u32>,
     /// Background daemon mode.
     pub daemon: bool,
-    /// Master-worker mode.
-    pub master_worker: bool,
     /// User name for privilege dropping.
     pub user: Option<String>,
     /// Group name for privilege dropping.

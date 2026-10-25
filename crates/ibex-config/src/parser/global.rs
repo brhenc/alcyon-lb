@@ -703,9 +703,14 @@ pub(crate) fn parse_global_directive(
             global.daemon = true;
             Ok(())
         }
+        // Removed in HAProxy 3.5 (`cfg_parse_global`, src/cfgparse-global.c): the mode is
+        // chosen on the command line (`-W`, `-Ws`), which `ibex` handles; accepting and
+        // ignoring the keyword started a process with no master (VV-26).
         "master-worker" => {
-            global.master_worker = true;
-            Ok(())
+            if tokens.get(1).is_some_and(|t| t.text == "no-exit-on-failure") {
+                return Err(ConfigError::new(kw.line, kw.col, "'master-worker no-exit-on-failure' is only supported in master-worker mode. Use -W or -Ws in the startup script."));
+            }
+            Err(ConfigError::new(kw.line, kw.col, "support for 'master-worker' was removed in version 3.5. Use -W or -Ws in the startup script instead."))
         }
         // `HAProxy`'s `cfg_parse_global` (src/cfgparse-global.c): the names are resolved
         // here, so an unknown one fails `-c` as well; the ids are applied in `ibex-rt`
