@@ -720,7 +720,7 @@ pub struct TcpSession {
     /// `%bi` and `%bp`: the local address of the server connection, read once when it is
     /// attached (T474). Cleared and moved with `target_addr`. Packed, where a `SocketAddr`
     /// would grow every session by 32 bytes.
-    pub bc_src: LocalAddr,
+    pub bc_src: Option<PackedAddr>,
     /// The server connection's `conn->err_code`: [`BC_CONNECTED`] once connected, the
     /// failure of a connect, `None` while there is none or it is connecting: `bc_err`.
     pub bc_err: Option<&'static ibex_sample::ConnErr<'static>>,
@@ -776,8 +776,8 @@ pub struct TcpSession {
     /// produced chunk by chunk (`crate::promex::pump`). One pointer for both, so that only
     /// the sessions that have one pay for it.
     pub pending_resp: Option<Box<PendingOut>>,
-    pub fc_src: Option<SocketAddr>,
-    pub fc_dst: Option<SocketAddr>,
+    pub fc_src: Option<PackedAddr>,
+    pub fc_dst: Option<PackedAddr>,
     pub tcp_inspect_done: bool,
     pub inspect_exp: Option<Tick>,
     /// The backend's `tcp-request content` rules are waiting (TCP mode): `inspect_exp` is
@@ -898,10 +898,22 @@ impl TcpSession {
         (self.mode == Mode::Http && self.srv.is_some()).then_some(1)
     }
 
+    /// The client connection's source address as the connection saw it.
+    #[must_use]
+    pub fn fc_src(&self) -> Option<SocketAddr> {
+        self.fc_src.map(PackedAddr::get)
+    }
+
+    /// The client connection's destination address as the connection saw it.
+    #[must_use]
+    pub fn fc_dst(&self) -> Option<SocketAddr> {
+        self.fc_dst.map(PackedAddr::get)
+    }
+
     /// `%bi` and `%bp`: the local address of the server connection.
     #[must_use]
     pub fn bc_src(&self) -> Option<SocketAddr> {
-        self.bc_src.get()
+        self.bc_src.map(PackedAddr::get)
     }
 
     /// `bc_dst`: where the server connection was made, or is being made, to -- the
@@ -1286,7 +1298,7 @@ impl TcpSession {
             retry_conn: true,
             redispatched: false,
             target_addr: None,
-            bc_src: LocalAddr::NONE,
+            bc_src: None,
             bc_err: None,
             lb_picked: false,
             cli_exp: Tick::ETERNITY,
@@ -1644,7 +1656,7 @@ impl TcpSession {
     /// Attaches a server-side connection with a specific transport (`ServerXprt`).
     pub fn attach_server_with_xprt(&mut self, fd: OwnedFd, xprt: ServerXprt, now: Tick) {
         self.log.queue.get_or_insert_with(crate::txnlog::loop_now);
-        self.bc_src = crate::raw::local_addr(std::os::fd::AsFd::as_fd(&fd)).map_or(LocalAddr::NONE, LocalAddr::new);
+        self.bc_src = crate::raw::local_addr(std::os::fd::AsFd::as_fd(&fd)).map(PackedAddr::new);
         self.srv = Some(fd);
         self.srv_xprt = xprt;
         self.srv_cant_recv = false;
@@ -4328,31 +4340,33 @@ mod tests {
     }
 }
 
-/// A socket address in 18 bytes with no alignment (`SocketAddr` is 32, aligned to 4): the local
-/// address of a server connection, which every session carries a slot for. An IPv4 address is
-/// kept as its IPv4-mapped IPv6 form, and port 0 (a connected socket has none) is "no address".
+/// A socket address in 19 bytes with no alignment (`SocketAddr` is 32, aligned to 4), for the
+/// addresses a session holds a slot for: `Option<PackedAddr>` is as small as `PackedAddr`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LocalAddr {
+pub struct PackedAddr {
     octets: [u8; 16],
     port: [u8; 2],
+    v6: bool,
 }
 
-impl LocalAddr {
-    pub const NONE: LocalAddr = LocalAddr { octets: [0; 16], port: [0; 2] };
-
+impl PackedAddr {
     #[must_use]
     pub fn new(a: SocketAddr) -> Self {
-        let octets = match a.ip() {
-            std::net::IpAddr::V4(i) => i.to_ipv6_mapped().octets(),
-            std::net::IpAddr::V6(i) => i.octets(),
-        };
-        LocalAddr { octets, port: a.port().to_ne_bytes() }
+        let mut octets = [0; 16];
+        match a.ip() {
+            std::net::IpAddr::V4(i) => octets[..4].copy_from_slice(&i.octets()),
+            std::net::IpAddr::V6(i) => octets = i.octets(),
+        }
+        PackedAddr { octets, port: a.port().to_ne_bytes(), v6: a.is_ipv6() }
     }
 
-    /// The address, `None` for [`Self::NONE`]. A real IPv4-mapped IPv6 address reads as IPv4.
     #[must_use]
-    pub fn get(self) -> Option<SocketAddr> {
-        let port = u16::from_ne_bytes(self.port);
-        (port != 0).then(|| SocketAddr::new(std::net::Ipv6Addr::from(self.octets).to_canonical(), port))
+    pub fn get(self) -> SocketAddr {
+        let ip = if self.v6 {
+            std::net::IpAddr::from(self.octets)
+        } else {
+            std::net::IpAddr::from([self.octets[0], self.octets[1], self.octets[2], self.octets[3]])
+        };
+        SocketAddr::new(ip, u16::from_ne_bytes(self.port))
     }
 }

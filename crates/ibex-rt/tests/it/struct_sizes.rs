@@ -46,11 +46,9 @@ fn server_check_state_stays_small() {
 /// A session is held for every client connection, idle ones included, in the worker's
 /// arena (T183: HAProxy keeps ~1 KB per idle client). Box what only some connections use
 /// (`h2_ctx`, `proxy_info`, `pending_resp` are). T442 added 8: the boxed chunk parser of a
-/// response whose rules removed its `Transfer-Encoding` (`HttpTxn::rsp_dechunk`). T474
-/// added 24: the local address of the server connection (`%bi`, `%bp`), packed in 18 bytes where a
-/// `SocketAddr` is 32; boxed, it would be one allocation per server connection.
+/// response whose rules removed its `Transfer-Encoding` (`HttpTxn::rsp_dechunk`).
 #[test]
 fn session_entry_stays_small() {
     let n = size_of::<ibex_rt::engine::SessionEntry>();
-    assert!(n <= 1624, "SessionEntry grew to {n} bytes (bound 1624): one is held per client connection, box the new field");
+    assert!(n <= 1600, "SessionEntry grew to {n} bytes (bound 1600): one is held per client connection, box the new field");
 }
