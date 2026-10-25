@@ -10670,7 +10670,7 @@ impl EngineDispatcher<'_> {
         // The keys of the request, and the response's own, wait for the server's id.
         let mut stick_stores = std::mem::take(&mut entry.sess.stick_stores);
         let stick = StickView::new(proxies, &entry.sess.tracked_sc);
-        let ctx = SampleContext {
+        let mut ctx = SampleContext {
             proxies: Some(&ProxiesView(proxies)),
             stick: Some(&stick),
             client_addr: entry.sess.client_addr,
@@ -10759,7 +10759,8 @@ impl EngineDispatcher<'_> {
             // headers are not there to fetch until they are done.
             CURRENT_RES_STATUS.set(0);
             CURRENT_RES_HEADERS.with(|h| crate::reuse::clear_pairs(&mut h.borrow_mut()));
-            let tcp_ctx = SampleContext { res_version: None, ..ctx.clone() };
+            // Copied only for a backend that has the rules (S7: a copy per response).
+            let tcp_ctx = (resume.is_none() && !proxies[be_idx].tcp_res_content_rules.is_empty()).then(|| SampleContext { res_version: None, ..ctx.clone() });
             // `tcp-response inspect-delay` runs from the first pass over the head; with none,
             // the rules cannot wait (`tcp_inspect_response`).
             let inspect_exp = inspect_wait.map(|w| w.deadline).or_else(|| {
@@ -10768,7 +10769,7 @@ impl EngineDispatcher<'_> {
             // A server that closed after its response does not end the wait: measured, the
             // response still waits for the whole delay.
             let inspect_final = rep_full || srv_timed_out || inspect_exp.is_none_or(|exp| exp.is_expired(now));
-            for rule in proxies[be_idx].tcp_res_content_rules.iter().filter(|_| resume.is_none()) {
+            for (rule, tcp_ctx) in tcp_ctx.iter().flat_map(|c| proxies[be_idx].tcp_res_content_rules.iter().map(move |r| (r, c))) {
                 let matches = match &rule.cond {
                     None => true,
                     Some(cond) => {
@@ -10776,7 +10777,7 @@ impl EngineDispatcher<'_> {
                             let parsed = if proxies[be_idx].acls.contains_key(&term.name) { None } else { Expr::cached(&term.name).ok() };
                             match proxies[be_idx].acls.get(&term.name).or(parsed.as_deref()) {
                                 Some(expr) if expr.fetch_name == "wait_end" && !inspect_final => crate::proxy::AclEvalResult::MissingData,
-                                Some(expr) if expr.eval(registry, &tcp_ctx) != term.negated => crate::proxy::AclEvalResult::Matched,
+                                Some(expr) if expr.eval(registry, tcp_ctx) != term.negated => crate::proxy::AclEvalResult::Matched,
                                 _ => crate::proxy::AclEvalResult::NotMatched,
                             }
                         });
@@ -10802,10 +10803,10 @@ impl EngineDispatcher<'_> {
                         break 'rules None;
                     }
                     ibex_config::TcpResAction::SetVar { var_name, expr } => {
-                        set_var_from_expr(&mut entry.sess.vars, var_name, expr, &tcp_ctx, registry);
+                        set_var_from_expr(&mut entry.sess.vars, var_name, expr, tcp_ctx, registry);
                     }
                     ibex_config::TcpResAction::SetVarFmt { var_name, fmt } => {
-                        let val = format_sample_string(fmt, &tcp_ctx, registry);
+                        let val = format_sample_string(fmt, tcp_ctx, registry);
                         store_var(&mut entry.sess.vars, var_name, val);
                     }
                     ibex_config::TcpResAction::UnsetVar { var_name } => {
@@ -10872,7 +10873,7 @@ impl EngineDispatcher<'_> {
                     rules,
                     &proxies[px].acls,
                     (&mut hdrs, &mut status, &mut status_msg),
-                    &ctx,
+                    &mut ctx,
                     caps,
                     registry,
                     &mut entry.sess.vars,
@@ -10943,7 +10944,7 @@ impl EngineDispatcher<'_> {
                 fe_idx,
                 be_idx,
                 (&mut hdrs, &mut status, &mut status_msg),
-                &ctx,
+                &mut ctx,
                 Some(&mut res_caps),
                 registry,
                 &mut entry.sess.vars,
@@ -15142,8 +15143,29 @@ fn res_action(
 /// `caps` is the response capture slots with their lengths, for the lists that have
 /// `http-response capture`: a rule writes its slot there, and the rules after it (and the
 /// caller, once the list is done) read what it wrote.
+///
+/// The rules see the proxy's ACLs (`when(acl,<name>)`) in `ctx`, which is the caller's again
+/// when they are done.
 #[allow(clippy::too_many_arguments)]
-fn run_res_rules<'a>(
+fn run_res_rules<'a, 'c>(
+    rules: impl Iterator<Item = (ResRule<'a>, Option<&'a ibex_config::AclCondition>, u32)>,
+    acls: &'c ibex_sample::Acls,
+    head: (&mut Vec<(String, String)>, &mut u16, &mut String),
+    ctx: &mut SampleContext<'c>,
+    caps: Option<(&mut Vec<Option<Vec<u8>>>, &[(String, usize)])>,
+    registry: &Registry,
+    vars: &mut VarStore,
+    wait: Option<ResWait<'_>>,
+) -> Result<Option<usize>, ResStop> {
+    // In place, not a copy of the context per rule (S7).
+    let prev = ctx.acls.replace(acls);
+    let flow = run_res_rules_in(rules, acls, head, ctx, caps, registry, vars, wait);
+    ctx.acls = prev;
+    flow
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_res_rules_in<'a>(
     rules: impl Iterator<Item = (ResRule<'a>, Option<&'a ibex_config::AclCondition>, u32)>,
     acls: &ibex_sample::Acls,
     head: (&mut Vec<(String, String)>, &mut u16, &mut String),
@@ -15157,15 +15179,18 @@ fn run_res_rules<'a>(
     STRICT_MODE.set(true);
     let mut result = Ok(None);
     let start = wait.as_ref().map_or(0, |w| w.start);
+    let outer = ctx;
     for (idx, (op, cond, line)) in rules.enumerate().skip(start) {
-        // The slots as the earlier rules left them, for `capture.res.hdr`.
-        // and the proxy's ACLs, for `when(acl,<name>)`.
-        let with_caps = SampleContext {
-            captures_res_hdr: caps.as_ref().map(|(slots, _)| slots.as_slice()).or(ctx.captures_res_hdr),
-            acls: Some(acls),
-            ..ctx.clone()
+        // The slots as the earlier rules left them, for `capture.res.hdr`: a copy of the
+        // context per rule, for the lists that capture.
+        let with_caps;
+        let ctx = match caps.as_ref() {
+            Some((slots, _)) => {
+                with_caps = SampleContext { captures_res_hdr: Some(slots.as_slice()), ..outer.clone() };
+                &with_caps
+            }
+            None => outer,
         };
-        let ctx = &with_caps;
         if cond.is_some_and(|c| !eval_condition(c, ctx, acls, registry)) {
             continue;
         }
@@ -15233,12 +15258,12 @@ fn run_res_rules<'a>(
 /// The response side starts with the request's `req.*` variables pruned. `head` is the
 /// response's headers, status and reason, rewritten in place.
 #[allow(clippy::too_many_arguments)]
-fn eval_after_res_rules(
-    proxies: &[Proxy],
+fn eval_after_res_rules<'c>(
+    proxies: &'c [Proxy],
     fe_idx: usize,
     be_idx: usize,
     head: (&mut Vec<(String, String)>, &mut u16, &mut String),
-    ctx: &SampleContext,
+    ctx: &mut SampleContext<'c>,
     mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
     vars: &mut VarStore,
@@ -15478,7 +15503,7 @@ fn after_res_on_reply<'r>(
         // The reply is the proxy's own, and the rules read the same state they read on a server's.
         let view = ProxiesView(proxies);
         let stick = StickView::new(proxies, &sess.tracked_sc);
-        let ctx = SampleContext {
+        let mut ctx = SampleContext {
             proxies: Some(&view),
             stick: Some(&stick),
             prio: (sess.log.prio_class, sess.log.prio_offset),
@@ -15522,7 +15547,7 @@ fn after_res_on_reply<'r>(
             fe_idx,
             be_idx,
             (&mut hdrs, &mut status, &mut reason),
-            &ctx,
+            &mut ctx,
             Some(&mut res_caps),
             sample_registry(),
             &mut vars,

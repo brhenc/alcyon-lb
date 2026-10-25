@@ -132,7 +132,7 @@ fn the_rules_scenario_costs_what_is_pinned() {
     let seen_lc = seen.to_ascii_lowercase();
     assert!(seen_lc.contains("x-forwarded-proto: http\r\n") && seen_lc.contains("x-id: ") && !seen_lc.contains("x-junk"), "request the server saw: {seen:?}");
     assert_eq!(counts[Op::ReqRebuild as usize], N, "request head rebuilds: one per rule pass");
-    assert_eq!(counts[Op::CtxClone as usize], 3 * N, "sample context copies");
+    assert_eq!(counts[Op::CtxClone as usize], 0, "sample context copies");
     assert_eq!(counts[Op::ExprLookup as usize], 2 * N, "expressions looked up by text");
 }
 
