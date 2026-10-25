@@ -304,12 +304,27 @@ fn queued_request_is_served_when_the_slot_frees() {
     // a 5 s `timeout queue`.
     let be = backend(Be::Slow);
     let t = "  timeout connect 1500ms\n  timeout client 10s\n  timeout server 10s\n  timeout queue 5s\n";
-    let (d, status) = with_ibex(t, "http", "", be, |fe, _| {
+    let (gap, status) = with_ibex(t, "http", "", be, |fe, _| {
         let mut a = TcpStream::connect(fe).expect("a");
         a.write_all(b"GET /a HTTP/1.1\r\nHost: t\r\n\r\n").expect("a");
+        // When the first answer reaches us: the slot frees then. Both instants are taken in
+        // this test, so a slow start or a late wake-up on a loaded host moves them together.
+        let a_done = {
+            let mut a = a.try_clone().expect("clone");
+            thread::spawn(move || {
+                let mut r = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !r.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match a.read(&mut buf) {
+                        Ok(n) if n > 0 => r.extend_from_slice(&buf[..n]),
+                        _ => break,
+                    }
+                }
+                Instant::now()
+            })
+        };
         thread::sleep(Duration::from_millis(200));
         let mut b = TcpStream::connect(fe).expect("b");
-        let t0 = Instant::now();
         b.write_all(b"GET /b HTTP/1.1\r\nHost: t\r\n\r\n").expect("b");
         b.set_read_timeout(Some(Duration::from_secs(8))).expect("rt");
         let mut r = Vec::new();
@@ -320,12 +335,19 @@ fn queued_request_is_served_when_the_slot_frees() {
                 _ => break,
             }
         }
+        let b_done = Instant::now();
+        let a_done = a_done.join().expect("a reader");
         let _ = a.shutdown(std::net::Shutdown::Both);
-        (t0.elapsed(), String::from_utf8_lossy(&r).lines().next().unwrap_or("").to_string())
+        (
+            b_done.saturating_duration_since(a_done),
+            String::from_utf8_lossy(&r).lines().next().unwrap_or("").to_string(),
+        )
     });
     assert_eq!(status, "HTTP/1.1 200 OK");
-    // 1.8 s for the first answer to leave, 2 s for the second one's own backend delay.
-    assert!(d >= Duration::from_millis(3500) && d < Duration::from_millis(4600), "{d:?}");
+    // The second request only goes to the server once the first one's answer has left, and
+    // then the backend takes its own 2 s: it cannot be answered sooner than that after the
+    // first, and a request that waited out the 5 s `timeout queue` would have been a 503.
+    assert!(gap >= Duration::from_millis(1900) && gap < Duration::from_millis(3500), "{gap:?}");
 }
 
 #[test]

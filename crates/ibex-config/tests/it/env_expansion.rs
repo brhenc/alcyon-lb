@@ -12,12 +12,20 @@ fn notices(cfg: &str) -> Vec<String> {
     parse_str(cfg).unwrap().directive_messages.into_iter().map(|m| m.text).collect()
 }
 
+/// The tests set, read and (one of them) wipe the process environment, which they share:
+/// each holds this for its whole run, so no other sees the variables of the one running.
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn refusal(cfg: &str) -> String {
     parse_str(cfg).unwrap_err().message
 }
 
 #[test]
 fn a_variable_in_double_quotes_is_expanded_in_any_keyword() {
+    let _env = env_lock();
     std::env::set_var("IBEX_T430_P", "127.0.0.1:18431");
     let c = parse_str(
         "defaults\n mode http\nfrontend f\n bind 127.0.0.1:18999\n http-request return status 200 hdr x1 \"${IBEX_T430_P}\" hdr x2 ${IBEX_T430_P}\n",
@@ -30,6 +38,7 @@ fn a_variable_in_double_quotes_is_expanded_in_any_keyword() {
 
 #[test]
 fn the_forms_of_a_reference() {
+    let _env = env_lock();
     std::env::set_var("IBEX_T430_Q", "hello");
     let cfg = "global\n\
         .notice \"$IBEX_T430_Q\"\n\
@@ -69,6 +78,7 @@ fn the_forms_of_a_reference() {
 
 #[test]
 fn a_reference_that_cannot_be_read_is_refused() {
+    let _env = env_lock();
     assert!(refusal("global\n.notice \"$\"\n").contains("forbidden first char in environment variable name at position 11"));
     assert!(refusal("global\n.notice \"$1\"\n").contains("forbidden first char in environment variable name"));
     assert!(refusal("global\n.notice \"${.FOO}\"\n").contains("forbidden first char in environment variable name at position 12"));
@@ -80,6 +90,7 @@ fn a_reference_that_cannot_be_read_is_refused() {
 
 #[test]
 fn an_argument_left_empty_by_an_unset_variable_is_refused() {
+    let _env = env_lock();
     let e = refusal("frontend f\n bind 127.0.0.1:18999\n http-request return status 200 hdr x \"${IBEX_T430_NO}\" hdr y z\n");
     assert!(e.contains("argument number 6 at position 42 is empty and marks the end of the argument list"), "{e}");
     let e = refusal("frontend f\n bind 127.0.0.1:18999\n http-request return status 200 hdr x \"\"\n");
@@ -88,6 +99,7 @@ fn an_argument_left_empty_by_an_unset_variable_is_refused() {
 
 #[test]
 fn the_words_of_a_reference_in_brackets_are_split() {
+    let _env = env_lock();
     let e = refusal("global\nsetenv IBEX_T430_W \"a  b c\"\n.notice \"${IBEX_T430_W[*]}\"\n");
     assert!(e.contains("Unexpected argument 'b' for '.notice'"), "{e}");
     let e = refusal("global\nsetenv IBEX_T430_W \" a  b \"\n.notice x \"${IBEX_T430_W[*]}\"\n");
@@ -98,6 +110,7 @@ fn the_words_of_a_reference_in_brackets_are_split() {
 
 #[test]
 fn setenv_acts_on_the_lines_after_it_and_before_it() {
+    let _env = env_lock();
     // HAProxy reads the file twice and runs the environment keywords on the first pass: the
     // first `.notice` already sees the last value.
     let cfg = "global\n.notice \"${IBEX_T430_A-unset}\"\nsetenv IBEX_T430_A one\n.notice \"${IBEX_T430_A-unset}\"\nsetenv IBEX_T430_A two\n.notice \"${IBEX_T430_A-unset}\"\n";
@@ -106,6 +119,7 @@ fn setenv_acts_on_the_lines_after_it_and_before_it() {
 
 #[test]
 fn presetenv_unsetenv_and_resetenv() {
+    let _env = env_lock();
     let cfg = "global\npresetenv IBEX_T430_B one\npresetenv IBEX_T430_B two\n.notice \"${IBEX_T430_B}\"\n";
     assert_eq!(notices(cfg), ["one"]);
     std::env::set_var("IBEX_T430_C", "inherited");
@@ -121,12 +135,14 @@ fn presetenv_unsetenv_and_resetenv() {
 
 #[test]
 fn a_setenv_in_a_branch_that_is_left_out_does_nothing() {
+    let _env = env_lock();
     let cfg = "global\n.if 0\nsetenv IBEX_T430_G b\n.endif\n.notice \"${IBEX_T430_G-unset}\"\n.if defined(IBEX_T430_H)\n.notice yes\n.else\n.notice no\n.endif\nsetenv IBEX_T430_H x\n";
     assert_eq!(notices(cfg), ["unset", "yes"]);
 }
 
 #[test]
 fn setenv_is_reported_for_the_process_and_refused_outside_global() {
+    let _env = env_lock();
     let c = parse_str("global\nsetenv IBEX_T430_I v\nunsetenv IBEX_T430_J\nresetenv IBEX_T430_K\n").unwrap();
     assert_eq!(c.env_ops.len(), 6, "each keyword is run by both passes: {:?}", c.env_ops);
     assert!(refusal("global\nsetenv A b\nfrontend f\n setenv C d\n").contains("unknown keyword 'setenv' in 'frontend' section"));
@@ -134,6 +150,7 @@ fn setenv_is_reported_for_the_process_and_refused_outside_global() {
 
 #[test]
 fn the_refusals_of_the_keywords_are_haproxys() {
+    let _env = env_lock();
     assert!(refusal("global\nsetenv A\n").contains("'setenv' expects environment variable value for 'A'."));
     assert!(refusal("global\nsetenv\n").contains("'setenv' expects environment variable name."));
     assert!(refusal("global\nsetenv \"\" c\n").contains("'setenv' expects environment variable name."));
@@ -147,6 +164,7 @@ fn the_refusals_of_the_keywords_are_haproxys() {
 
 #[test]
 fn the_recorded_changes_can_be_replayed_on_the_process() {
+    let _env = env_lock();
     use ibex_config::env::{apply_to_process, EnvOp};
     std::env::set_var("IBEX_T430_R1", "old");
     apply_to_process(&[
@@ -161,6 +179,7 @@ fn the_recorded_changes_can_be_replayed_on_the_process() {
 
 #[test]
 fn file_reset_replay_empty_single_quotes_open_default_and_vanishing_line() {
+    let _env = env_lock();
     // env.rs file(): `${.FILE}` is the name given to `set_file`.
     ibex_config::env::set_file("t430.cfg");
     assert_eq!(notices("global\n.notice \"${.FILE}\"\n"), ["t430.cfg"]);
@@ -179,6 +198,7 @@ fn file_reset_replay_empty_single_quotes_open_default_and_vanishing_line() {
 
 #[test]
 fn preprocess_skips_a_line_without_tokens() {
+    let _env = env_lock();
     // `lex` never yields one that parse_str lets through (a token-less line is kept only
     // with a lex error), but `Line` is public and `preprocess` indexes the first token.
     let mut lines = ibex_config::lexer::lex("global\n.notice ok\n");
