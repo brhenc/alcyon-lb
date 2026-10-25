@@ -114,3 +114,73 @@ fn off_shows_no_ibex_lines() {
     assert!(info(&p, "Uptime_sec").is_some());
     assert_eq!(info(&p, "ZeroOnFree"), None);
 }
+
+/// `show pools` output.
+fn pools(p: &Proxy) -> String {
+    let mut s = UnixStream::connect(&p.sock).expect("cli");
+    s.write_all(b"show pools\n").expect("write");
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+/// (blocks, bytes, users) of the quarantine's line, `None` when there is none.
+fn quarantine_line(out: &str) -> Option<(u64, u64, u64)> {
+    let l = out.lines().find(|l| l.starts_with("  - Pool zero_quarantine "))?;
+    let num = |after: &str, before: &str| -> u64 {
+        let r = l.split_once(after).expect(after).1;
+        r.split(before).next().expect(before).trim().parse().expect("number")
+    };
+    Some((num(": ", " allocated"), num("allocated (", " bytes)"), num("failures, ", " users")))
+}
+
+#[test]
+fn soft_lists_the_quarantine_in_show_pools_and_counts_it_in_total() {
+    let p = start("\ttune.ibex.zero-on-free soft\n");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    // Blocks wait only across busy passes (an idle pass empties the quarantine before it
+    // publishes), so keep the proxy busy while looking.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let port = p.port;
+    let loaders: Vec<_> = (0..2)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    get(port);
+                }
+            })
+        })
+        .collect();
+    let out = loop {
+        let out = pools(&p);
+        if quarantine_line(&out).is_some_and(|(b, _, _)| b > 0) || Instant::now() > deadline {
+            break out;
+        }
+    };
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for l in loaders {
+        l.join().expect("loader");
+    }
+    let (blocks, bytes, users) = quarantine_line(&out).unwrap_or_else(|| panic!("no quarantine line in show pools:\n{out}"));
+    assert!(blocks > 0 && bytes > 0, "nothing counted:\n{out}");
+    assert_eq!(users, 1);
+    let total = out.lines().find(|l| l.starts_with("Total: ")).expect("Total");
+    let allocated: u64 = total.split(", ").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse().ok()).expect("total bytes");
+    assert!(allocated >= bytes, "Total ({allocated}) leaves out the quarantine ({bytes}):\n{out}");
+    // Idle: the passes empty it.
+    std::thread::sleep(Duration::from_millis(400));
+    let (_, bytes, _) = quarantine_line(&pools(&p)).expect("line stays with soft");
+    assert!(bytes < 64 * 1024, "{bytes} bytes still waiting while idle");
+}
+
+#[test]
+fn off_and_hard_list_no_quarantine_in_show_pools() {
+    for g in ["", "\ttune.ibex.zero-on-free hard\n"] {
+        let p = start(g);
+        get(p.port);
+        let out = pools(&p);
+        assert!(out.contains("Dumping pools usage"), "{out}");
+        assert_eq!(quarantine_line(&out), None, "{g:?}:\n{out}");
+    }
+}

@@ -513,6 +513,31 @@ pub fn stats() -> QuarantineStats {
     st
 }
 
+/// The quarantine as a `show pools` line (T470), named as an Ibex pool since `HAProxy` has no
+/// equivalent: present with `soft` only (the other modes keep nothing), `allocated` and `used` are
+/// the blocks waiting (as the threads last published them, at most 10 ms old), `size` their mean
+/// size, and `alloc_bytes` the exact bytes, which `Total:` adds up.
+#[must_use]
+pub fn quarantine_head() -> Option<crate::PoolHead> {
+    if zero_on_free() != ZeroOnFree::Soft {
+        return None;
+    }
+    let s = stats();
+    Some(crate::PoolHead {
+        name: "zero_quarantine",
+        size: s.bytes.checked_div(s.blocks).unwrap_or(0),
+        align: 1,
+        allocated: s.blocks,
+        alloc_bytes: s.bytes,
+        used: s.blocks,
+        cached: 0,
+        needed_avg: s.blocks,
+        failures: 0,
+        users: 1,
+        reg: None,
+    })
+}
+
 // -----------------------------------------------------------------------------
 // The allocator
 // -----------------------------------------------------------------------------

@@ -531,6 +531,7 @@ impl PoolRegistry {
         if self.is_global() {
             pool::publish_local();
             pool::for_each_pool(|p| pools.push(p.head()));
+            pools.extend(zero_on_free::quarantine_head());
         }
         pools.retain(|p| !(by == 3 && p.allocated == 0) && prefix.is_none_or(|x| p.name.starts_with(x)));
         match by {
