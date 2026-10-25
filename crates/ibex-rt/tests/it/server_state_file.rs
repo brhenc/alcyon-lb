@@ -475,6 +475,12 @@ fn none_reads_nothing_and_global_without_a_file_warns() {
     let run = Run::start(&base("  server-state-file st\n", LOAD_GLOBAL, "", ""), &[("st", &file)]);
     assert_eq!(run.rows()[0], "b/s1 0 1 9 5 0 0");
     drop(run);
+    // A global file no backend reads is not opened (it does not exist: no notice).
+    let run = Run::start(&base(&global_file("missing"), "  load-server-state-from-file local\n", "", ""), &[("b", &file)]);
+    assert_eq!(run.rows()[0], "b/s1 0 1 9 5 0 0");
+    // Without a base, a local file is under the working directory, and named as written.
+    assert_eq!(run.messages(), ["NOTICE Proxy 'c': Can't open server state file 'c': No such file or directory."]);
+    drop(run);
     let run = Run::start(&base("", LOAD_GLOBAL, "", ""), &[]);
     assert_eq!(run.rows(), UNTOUCHED);
     assert_eq!(

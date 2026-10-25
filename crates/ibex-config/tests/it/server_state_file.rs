@@ -92,6 +92,9 @@ fn server_state_file_name_defaults_to_the_backend_name() {
     let c = ok(&format!("{D}backend b\n  server-state-file-name x\nbackend c\n  server-state-file-name use-backend-name\nbackend d\n  server-state-file-name x\n  server-state-file-name\nbackend e\n"));
     let names: Vec<Option<&str>> = c.backends.iter().map(|b| b.server_state_file_name.as_deref()).collect();
     assert_eq!(names, [Some("x"), Some("c"), Some("d"), None]);
+    let c = ok(&format!("{D}listen l\n  bind 127.0.0.1:19899\n  server-state-file-name\nlisten m\n  bind 127.0.0.1:19898\n  server-state-file-name /st/m\n"));
+    let names: Vec<Option<&str>> = c.listens.iter().map(|l| l.server_state_file_name.as_deref()).collect();
+    assert_eq!(names, [Some("l"), Some("/st/m")]);
     assert_eq!(
         refusal(&format!("{D}backend b\n  server-state-file-name x y\n")),
         "'server-state-file-name' cannot handle unexpected argument 'y'."

@@ -166,7 +166,7 @@ struct Fields {
     check_status: i64,
     health: i64,
     check_state: i64,
-    port: Option<u16>,
+    port: u16,
     use_ssl: Option<bool>,
     check_port: Option<String>,
     check_addr: Option<String>,
@@ -203,8 +203,8 @@ fn check_fields(f: &[&str; MAX_FIELDS]) -> Result<Fields, String> {
     if !fqdn.starts_with('-') && (fqdn.len() > 255 || invalid_domain(fqdn)) {
         let _ = write!(msg, ", invalid srv_fqdn value '{fqdn}'");
     }
-    let port = u16::try_from(strl2uic(f[18])).ok();
-    if port.is_none() {
+    let port = u16::try_from(strl2uic(f[18]));
+    if port.is_err() {
         let _ = write!(msg, ", invalid srv_port value '{}'", f[18]);
     }
     if !msg.is_empty() {
@@ -220,7 +220,7 @@ fn check_fields(f: &[&str; MAX_FIELDS]) -> Result<Fields, String> {
         check_status,
         health,
         check_state,
-        port,
+        port: port.unwrap_or(0),
         use_ssl: Some(f[20]).filter(|v| !v.is_empty()).map(|v| strtol(v).unwrap_or(0) != 0),
         check_port: opt(21, "0"),
         check_addr: opt(22, "-"),
@@ -318,11 +318,9 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &ibex_config::Server, f: &[&str; M
     if v.iweight == cfg_iweight {
         p.server_weights.set(i, v.uweight);
     }
-    if let Some(port) = v.port {
-        if let Some(a) = p.servers.get(i) {
-            p.servers.set(i, std::net::SocketAddr::new(a.ip(), port));
-        }
-    }
+    // `i` is a server of the configuration, so of `p.servers`.
+    let addr = p.servers.at(i);
+    p.servers.set(i, std::net::SocketAddr::new(addr.ip(), v.port));
     if !has_check {
         // What `show servers state` prints as the health of a server with no check.
         let n = p.servers.len();
