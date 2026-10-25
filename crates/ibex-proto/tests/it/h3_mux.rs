@@ -12,7 +12,6 @@ use ibex_proto::htx::HtxBlock;
 use ibex_proto::htx_mux::{HtxMux, HtxStream, MuxReset};
 use ibex_proto::mux_h3::{self, H3MuxContext, H3Signal, H3StreamState, RX_DATA_ROOM, TX_ROOM};
 use ibex_proto::qpack;
-use ibex_alloc::PoolDyn as _;
 
 const DATA: u64 = 0x00;
 const HEADERS: u64 = 0x01;

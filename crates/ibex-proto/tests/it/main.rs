@@ -15,6 +15,7 @@
 mod h1_strictness;
 mod h3_framing;
 mod h3_mux;
+mod h3_mux_quic;
 mod haproxy_ffi_differential;
 mod http1_conformance;
 mod http2_conformance;
