@@ -455,12 +455,21 @@ under way before new connections, each queue first come first served) and is wok
 buffer is given back on its thread; `timeout client` while waiting answers `408`, logged `cR--`,
 as HAProxy. Differences that remain:
 
-- HAProxy's cap is the limit plus `nbthread` x `tune.buffers.reserve` (default 4) emergency
-  buffers taken at start (`show pools` shows 11 allocated at start with `limit 8`); Ibex has no
-  emergency buffers, its cap is the limit, and **`tune.buffers.reserve` is refused at load**
-  (accepting it would promise what is not there, AGENTS.md 5).
-- A local reply (`408`, `503`, stats) that finds no buffer, the TLS receive buffer and an
-  HTTP/2 stream's buffers still fail as before the queue: 500 `IR--`/`IH--`, or a close.
+- `tune.buffers.reserve <n>` (S6b) makes `n` emergency buffers per thread at start and raises
+  the limit by `nbthread` x `n`, as HAProxy; a take the pool refuses may have one by its class
+  (`left * 3 >= q * n`: a local reply down to the last, a client's first buffer only while the
+  reserve is full), and a buffer given back refills the reserve first. The default is HAProxy's
+  4, but Ibex makes the reserve only when `tune.buffers.limit` is set (without a limit its pool
+  refuses only when memory is short, where the stream fails as in S5; HAProxy makes the 4 per
+  thread always). At start HAProxy also fills the pool to its `minavail` (3): `limit 3` shows 7
+  allocated from the start on HAProxy, 4 on Ibex; both reach 7. Ibex gates only the emergency take on the
+  reserve; HAProxy also refuses a pool take of queues 1-3 while its reserve is not full enough.
+- A thread's cache does not keep free buffers while another thread's streams wait: they go to
+  the pool's shelf and the waiting thread is woken (S6b; HAProxy wakes waiters on the freeing
+  thread only, and its caches keep theirs).
+- The local reply and the TLS receive buffer wait like the others (S6b; HAProxy's TLS reads into
+  OpenSSL's own memory, so its handshake needs no buffer at all). An HTTP/2 connection's and
+  stream's buffers still fail as before the queue: 500 `IR--`/`IH--`, or a close.
 - Each queue is served in order; HAProxy's own order was not (fast GETs answered 5, 4, 2, 1,
   0, 3 in one run), an artefact of retrying every woken waiter in one pass.
 - Ibex's CLI does not wait for a buffer; HAProxy's answers nothing while they are exhausted.

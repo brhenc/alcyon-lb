@@ -4751,6 +4751,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mut scheduler = Scheduler::with_capacity(capacity);
         let mut fdtab = FdTab::with_capacity(capacity * 2);
         let mut sessions = SessionArena::with_capacity(capacity);
+        // The buffer wait queues, for as many streams as the arena is sized for (S6b §3): a
+        // stream queued at `tune.buffers.limit` allocates nothing. Short of memory, they grow
+        // on use instead.
+        let _ = crate::buf_wait::presize(capacity);
         let applets = AppletArena::with_capacity(capacity);
 
         ibex_sample::set_userlists(
@@ -4790,7 +4794,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         ibex_alloc::set_hot_size(config.global.as_ref().and_then(|g| g.hot_size).unwrap_or(ibex_alloc::HOT_SIZE_DEFAULT));
         // `tune.buffers.limit`, `tune.fail-alloc` under `-dMfail` (S5): read by the pools' miss
         // paths (`buf::take_mem`, `Pool::miss`) and the accept (`register_new_session`).
-        crate::buf::set_buffers_limit(config.global.as_ref().and_then(|g| g.buffers_limit).unwrap_or(0));
+        // `tune.buffers.reserve` (S6b): each thread's emergency buffers raise the limit. Default
+        // `RESERVED_BUFS` (4), as HAProxy, but only with a limit: without one the pool refuses
+        // only when memory is short, where Ibex fails the stream (S5).
+        let limit = config.global.as_ref().and_then(|g| g.buffers_limit).unwrap_or(0);
+        let reserve = config.global.as_ref().and_then(|g| g.buffers_reserve).unwrap_or(if limit == 0 { 0 } else { crate::buf::RESERVED_BUFS });
+        let nbthread = crate::stats::NBTHREAD.load(Ordering::Relaxed) as usize;
+        crate::buf::set_buffers_limit(crate::buf::limit_with_reserve(limit, reserve, nbthread));
         ibex_alloc::pool::set_fail_alloc(ibex_alloc::pool::effective_fail_alloc(config.global.as_ref().and_then(|g| g.fail_alloc)));
         // A variable whose memory is refused collects and retries once (T445).
         ibex_sample::vars::set_alloc_failure_hook(crate::pool_gc::pool_gc);
@@ -4803,9 +4813,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         if bufsize_large.is_some() {
             crate::buf::preallocate_large_buffers();
         }
+        if !crate::buf::fill_emergency(reserve) {
+            return Err(io::Error::other(format!("tune.buffers.reserve: cannot allocate {reserve} emergency buffers")));
+        }
         // `tune.memory.prealloc` (T468): this thread's buffers and session slots, from `maxconn`.
         if let Some(plan) = crate::prealloc::plan(config) {
-            crate::buf::set_buffers_limit(plan.buffers_limit);
+            crate::buf::set_buffers_limit(crate::buf::limit_with_reserve(plan.buffers_limit, reserve, nbthread));
             if !crate::buf::prealloc_standard(plan.buffers) || !sessions.prealloc(plan.sessions) {
                 return Err(io::Error::other(format!(
                     "tune.memory.prealloc: cannot allocate {} buffers and {} session slots",
@@ -5136,6 +5149,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.poller.add(fd, raw_fd_to_u64(fd.as_raw_fd()), true, false)?;
         self.mailboxes = Arc::clone(boxes);
         self.mailbox_wid = wid;
+        crate::buf_wait::join(boxes, wid);
         Ok(())
     }
 
@@ -5162,6 +5176,25 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     }
                 }
             }
+        }
+        let sig = self.mailboxes.take_signals(wid);
+        if sig != 0 {
+            self.serve_buffer_signals(sig);
+        }
+    }
+
+    /// S6b: another thread waits for a buffer (this one's cached buffers go on the shelf, unless
+    /// it waits too), or put buffers on the shelf (this thread's waiters are offered them).
+    #[cold]
+    #[inline(never)]
+    fn serve_buffer_signals(&mut self, sig: u8) {
+        use crate::mailbox::Signal;
+        if sig & Signal::ShelveBuffers as u8 != 0 && !crate::buf_wait::has_waiters() {
+            let _ = crate::buf::shelve_standard();
+        }
+        if sig & Signal::BuffersShelved as u8 != 0 {
+            crate::buf_wait::offer_shelved();
+            self.wake_buffer_waiters();
         }
     }
 
@@ -9973,7 +10006,9 @@ impl EngineDispatcher<'_> {
         if crate::buf_wait::wanted() {
             match self.sessions.get_mut(session_idx) {
                 Some(entry) => {
-                    buf_wait_enter(entry, session_idx);
+                    if buf_wait_enter(entry, session_idx) {
+                        self.wake_queue.push(entry.task);
+                    }
                     update_interests(entry, self.fdtab, self.poller);
                 }
                 None => drop(crate::buf_wait::take_want()),
@@ -10368,7 +10403,7 @@ impl EngineDispatcher<'_> {
         }
         if let Some(mut entry) = self.sessions.free(session_idx) {
             if entry.buf_wait.queued() {
-                crate::buf_wait::leave(entry.task);
+                crate::buf_wait::leave(session_idx);
             }
             if entry.sess.is_h2_child() {
                 // The stream is freed in its own run: its variables are in the run's map
@@ -16806,18 +16841,27 @@ mod stats_req_headers_tests {
 
 /// Puts a stream refused a buffer at `tune.buffers.limit` in its class's wait queue (S6,
 /// [`crate::buf_wait`]); a stream woken for a buffer and refused again goes back to the front.
-/// The queue cannot grow: the stream fails, as in S5.
+/// The queue cannot grow: the stream fails, as in S5, and `true` says it must run again (its
+/// failure's answer is written in its next run; nothing else would wake it: T473).
 #[cold]
 #[inline(never)]
-fn buf_wait_enter(entry: &mut SessionEntry, session_idx: u32) {
-    let Some(class) = crate::buf_wait::take_want() else { return };
+fn buf_wait_enter(entry: &mut SessionEntry, session_idx: u32) -> bool {
+    let Some(class) = crate::buf_wait::take_want() else { return false };
     let front = entry.buf_wait.take_offered();
     if entry.buf_wait.queued() {
-        return;
+        return false;
     }
     if crate::buf_wait::enter(entry.task, session_idx, class, front) {
         entry.buf_wait.enqueued(class);
+        // A buffer given back on this thread after the refusal, before the stream was queued
+        // (the stream's own empty request buffer, released as it waits for a TLS read: S6b)
+        // was offered to nobody: it is the waiter's now.
+        if crate::buf::cached_standard() > 0 {
+            crate::buf_wait::reoffer();
+        }
+        false
     } else {
         entry.sess.fail_alloc();
+        true
     }
 }
