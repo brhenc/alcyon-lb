@@ -7213,16 +7213,11 @@ fn register_new_session(
 
     // `-dMfail` (`tune.fail-alloc`): a session `HAProxy`'s `pool_alloc` refuses in `session_new`;
     // the connection is closed, as when the arena cannot grow.
-    if ibex_alloc::pool::inject_failure() {
+    let refused = ibex_alloc::pool::inject_failure();
+    if refused {
         SESSION_POOL.failed();
-        if let Some(idx) = target_server_idx {
-            if idx < proxy.server_actconn.len() {
-                proxy.server_actconn[idx].fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-        return;
     }
-    let Some(session_idx) = engine.sessions.alloc(SessionEntry {
+    let Some(session_idx) = (!refused).then_some(()).and_then(|()| engine.sessions.alloc(SessionEntry {
         sess,
         task: TaskRef::NONE,
         proxy_idx,
@@ -7242,7 +7237,7 @@ fn register_new_session(
         log_line: None,
         log_err: false,
         log_sd: 0,
-    }) else {
+    })) else {
         if let Some(idx) = target_server_idx {
             if idx < proxy.server_actconn.len() {
                 proxy.server_actconn[idx].fetch_sub(1, Ordering::Relaxed);

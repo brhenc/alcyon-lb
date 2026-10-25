@@ -202,10 +202,12 @@ fn a_failed_socket_handover_is_reported() {
 }
 
 /// T351: `-dM` (HAProxy: poison pool memory) has no Ibex equivalent, so every form is refused
-/// with a message naming the option instead of printing a banner and doing nothing.
+/// with a message naming the option instead of printing a banner and doing nothing. Except
+/// `-dMfail` / `-dMno-fail` alone (S5, `tests/it/fail_alloc.rs`): a list with any other feature
+/// is still refused.
 #[test]
 fn dm_is_refused_in_every_form() {
-    for flag in ["-dM", "-dMhelp", "-dM0x55", "-dMfail", "-dMno-cache"] {
+    for flag in ["-dM", "-dMhelp", "-dM0x55", "-dMfail,poison", "-dMno-cache"] {
         let (code, err) = run(&[flag, "-f", "CFG", "-c"]);
         assert_eq!(code, Some(1), "{flag}: {err:?}");
         assert!(err.contains("-dM") && err.contains("not supported"), "{flag}: {err:?}");

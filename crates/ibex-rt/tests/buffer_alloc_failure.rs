@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ibex_alloc::{fail_thread_allocs_from, refusals_left, refuse_allocs_of, CountingAllocator};
+use ibex_alloc::{fail_thread_allocs_from, refusals_left, refuse_allocs_here, refuse_allocs_of, CountingAllocator};
 use ibex_rt::buf::{Buf, BufClass};
 use ibex_rt::engine::Engine;
 
@@ -336,6 +336,13 @@ fn a_buffer_without_memory_writes_nothing_and_says_so() {
     assert!(!custom.is_allocated());
     assert!(!Buf::unallocated(BufClass::Custom).alloc_if_needed());
     assert!(std_buf.grow_capacity(2 * BUFSIZE) && std_buf.readable() == b"abc");
+
+    // The test hook itself: `refuse_allocs_here` refuses on this thread only.
+    refuse_allocs_here(5555, 0, 1);
+    let elsewhere = thread::spawn(|| Vec::<u8>::new().try_reserve_exact(5555).is_ok()).join().expect("thread");
+    let here = Vec::<u8>::new().try_reserve_exact(5555).is_ok();
+    refuse_allocs_of(5555, 0, 0);
+    assert!(elsewhere && !here, "another thread's allocation is not refused, this one's is");
 }
 
 /// A TLS client's request over a new connection, from another thread (its allocations are not
@@ -385,9 +392,16 @@ fn a_tls_connection_whose_input_buffer_cannot_be_had_is_closed_and_the_next_is_s
         }
         h.join().expect("client thread")
     };
-    // Exactly a buffer's size: rustls makes larger allocations of its own, which abort when
-    // refused (`tradeoff.md` 6.23).
-    refuse_allocs_of(BUFSIZE, 0, 2);
+    // Exactly a buffer's size (rustls makes larger allocations of its own, which abort when
+    // refused, `tradeoff.md` 6.23), and on the engine's thread only (the client's rustls is not
+    // the engine's).
+    for _ in 0..3 {
+        let _ = engine.run_once();
+    }
+    ibex_alloc::drain_local_pools();
+    // The first is the plaintext request buffer (taken before the socket is read), the next the
+    // TLS input buffer.
+    refuse_allocs_here(BUFSIZE, 1, 2);
     let first = run(&mut engine, tls_get(addr, c.cert.der().to_vec()));
     assert_eq!(refusals_left(), 0, "the input buffer was asked for");
     refuse_allocs_of(BUFSIZE, 0, 0);
@@ -543,5 +557,41 @@ fn a_request_whose_target_cannot_be_copied_is_answered_500() {
     assert_eq!(left, 0, "the target's copy was asked for");
     assert!(got.starts_with("HTTP/1.1 500"), "{got:?}");
     let after = send(&mut engine, addr, req.as_bytes());
+    assert!(after.starts_with("HTTP/1.1 200"), "after: {after:?}");
+}
+
+/// The request is in its buffer, but no memory is left for its head's HTX, pooled or of its
+/// own size: that stream fails (closed: its answer has no buffer either), the next is served.
+#[test]
+fn a_head_whose_htx_cannot_be_had_fails_its_stream() {
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut engine, addr) = engine();
+    let mut c = TcpStream::connect(addr).expect("connect");
+    c.set_nonblocking(true).expect("nonblocking");
+    c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").expect("first part");
+    for _ in 0..20 {
+        let _ = engine.run_once();
+    }
+    // The request buffer is taken; from here on nothing of 4 KiB or more can be had here.
+    ibex_alloc::drain_local_pools();
+    fail_thread_allocs_from(4096);
+    c.write_all(b"Connection: close\r\n\r\n").expect("rest");
+    let mut got = Vec::new();
+    let mut buf = [0u8; 1024];
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(2), "not closed: {:?}", String::from_utf8_lossy(&got));
+        let _ = engine.run_once();
+        match c.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => break,
+        }
+    }
+    fail_thread_allocs_from(usize::MAX);
+    let got = String::from_utf8_lossy(&got);
+    assert!(got.is_empty() || got.starts_with("HTTP/1.1 500"), "{got:?}");
+    let after = send(&mut engine, addr, GET);
     assert!(after.starts_with("HTTP/1.1 200"), "after: {after:?}");
 }

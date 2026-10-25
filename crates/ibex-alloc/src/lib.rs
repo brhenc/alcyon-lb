@@ -125,9 +125,26 @@ static REFUSE_LEFT: AtomicUsize = AtomicUsize::new(0);
 /// turns it off (S5: a buffer that cannot be had, wherever the engine runs).
 pub fn refuse_allocs_of(size: usize, skip: usize, times: usize) {
     REFUSE_LEFT.store(0, Ordering::SeqCst);
+    REFUSE_ANYWHERE.store(true, Ordering::SeqCst);
     REFUSE_SIZE.store(size, Ordering::SeqCst);
     REFUSE_SKIP.store(skip, Ordering::SeqCst);
     REFUSE_LEFT.store(times, Ordering::SeqCst);
+}
+
+/// [`refuse_allocs_of`] for the calling thread's allocations only (an engine in the test's thread
+/// while a client on another makes allocations of the same size).
+pub fn refuse_allocs_here(size: usize, skip: usize, times: usize) {
+    refuse_allocs_of(size, skip, 0);
+    REFUSE_ANYWHERE.store(false, Ordering::SeqCst);
+    REFUSE_HERE.with(|h| h.set(true));
+    REFUSE_LEFT.store(times, Ordering::SeqCst);
+}
+
+/// Whether the refusals are for every thread, or only for those [`refuse_allocs_here`] marked.
+static REFUSE_ANYWHERE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+thread_local! {
+    static REFUSE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// What is left of the [`refuse_allocs_of`] refusals.
@@ -138,6 +155,9 @@ pub fn refusals_left() -> usize {
 
 fn refused(size: usize) -> bool {
     if size != REFUSE_SIZE.load(Ordering::Relaxed) || REFUSE_LEFT.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    if !REFUSE_ANYWHERE.load(Ordering::Relaxed) && !REFUSE_HERE.try_with(std::cell::Cell::get).unwrap_or(false) {
         return false;
     }
     if REFUSE_SKIP.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
