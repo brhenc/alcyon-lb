@@ -13,24 +13,53 @@
 //!   UDP datagram -> QUIC packet -> stream -> HTTP/3 HEADERS -> QPACK decode
 //!     -> response -> QPACK encode -> HEADERS + DATA -> stream -> QUIC -> UDP datagram
 
+use crate::common;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ibex_rt::QuicListener;
+/// Ibex started on a real configuration (T463): one frontend with a QUIC bind, one backend.
+/// Every request goes through the stream engine, the path an operator's Ibex takes.
+struct Ibex {
+    child: Child,
+    _cfg: tempfile::NamedTempFile,
+    port: u16,
+}
 
-const CERT: &str = "../../examples/certs/localhost.pem";
+impl Ibex {
+    fn start(backend: std::net::SocketAddr) -> Self {
+        let tcp = common::reserve_addr();
+        let quic = common::reserve_addr();
+        let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
+        let cfg = format!(
+            "global\n  nbthread 1\n\
+             defaults\n  mode http\n  timeout connect 2s\n  timeout client 10s\n  timeout server 10s\n\
+             frontend fe\n  bind {tcp}\n  bind quic4@{quic} ssl crt {crt} alpn h3\n  default_backend be\n\
+             backend be\n  server s1 {backend}\n"
+        );
+        let mut f = tempfile::NamedTempFile::new().expect("tmp");
+        f.write_all(cfg.as_bytes()).expect("write cfg");
+        let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+            .arg("-f")
+            .arg(f.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn ibex");
+        assert!(common::wait_listening(tcp), "ibex never started listening on {tcp}");
+        Self { child, _cfg: f, port: quic.port() }
+    }
+}
 
-fn server_config() -> Arc<ibex_tls::tcp::BindTls> {
-    let path = std::path::Path::new(CERT);
-    let (certs, key) = ibex_tls::config::load_cert_file(path).expect("load test certificate");
-    // Without h3 a client offering it gets no ALPN back and gives up before sending a
-    // request, which looks exactly like a server that is not listening.
-    ibex_tls::tcp::BindTls::single_tls13(certs, key, vec![b"h3".to_vec()]).expect("build server config")
+impl Drop for Ibex {
+    fn drop(&mut self) {
+        common::stop(&mut self.child);
+    }
 }
 
 fn curl_has_http3() -> bool {
@@ -88,19 +117,8 @@ fn curl_http3_is_proxied_to_a_backend() {
     let stop = Arc::new(AtomicBool::new(false));
     let backend = spawn_echo_backend(Arc::clone(&stop));
 
-    let tls = server_config();
-    let addr = "127.0.0.1:0".parse().expect("addr");
-    let mut listener = QuicListener::bind(addr, &tls, None).expect("bind QUIC listener");
-    listener.set_backend(backend);
-    let port = listener.addr().port();
-
-    let stop_worker = Arc::clone(&stop);
-    let worker = thread::spawn(move || {
-        while !stop_worker.load(Ordering::Relaxed) {
-            let _ = listener.pump(Instant::now());
-            thread::sleep(Duration::from_millis(2));
-        }
-    });
+    let ibex = Ibex::start(backend);
+    let port = ibex.port;
 
     let out = Command::new("curl")
         .args([
@@ -112,8 +130,8 @@ fn curl_http3_is_proxied_to_a_backend() {
         .output()
         .expect("run curl");
 
+    drop(ibex);
     stop.store(true, Ordering::Relaxed);
-    let _ = worker.join();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -139,22 +157,27 @@ fn curl_http3_gets_a_response_from_ibex() {
         return;
     }
 
-    let tls = server_config();
-    let addr = "127.0.0.1:0".parse().expect("addr");
-    let mut listener = QuicListener::bind(addr, &tls, None).expect("bind QUIC listener");
-    let port = listener.addr().port();
-
+    // The body comes from a backend now: Ibex has no canned response of its own (T463).
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_worker = Arc::clone(&stop);
-
-    // The listener is not yet driven by the engine's poller, so the test drives it. A short
-    // sleep between pumps keeps this from spinning a core while curl does its handshake.
-    let worker = thread::spawn(move || {
-        while !stop_worker.load(Ordering::Relaxed) {
-            let _ = listener.pump(Instant::now());
-            thread::sleep(Duration::from_millis(2));
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let backend = l.local_addr().expect("addr");
+    l.set_nonblocking(true).expect("nonblocking");
+    let stop_be = Arc::clone(&stop);
+    thread::spawn(move || {
+        while !stop_be.load(Ordering::Relaxed) {
+            match l.accept() {
+                Ok((mut c, _)) => {
+                    let mut buf = [0u8; 4096];
+                    let _ = c.set_read_timeout(Some(Duration::from_millis(200)));
+                    let _ = c.read(&mut buf);
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\nhello-from-ibex-h3");
+                }
+                Err(_) => thread::sleep(Duration::from_millis(5)),
+            }
         }
     });
+    let ibex = Ibex::start(backend);
+    let port = ibex.port;
 
     let out = Command::new("curl")
         .args([
@@ -174,8 +197,8 @@ fn curl_http3_gets_a_response_from_ibex() {
         .output()
         .expect("run curl");
 
+    drop(ibex);
     stop.store(true, Ordering::Relaxed);
-    let _ = worker.join();
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -240,19 +263,8 @@ fn a_slow_backend_does_not_stall_other_quic_connections() {
         }
     });
 
-    let tls = server_config();
-    let mut listener =
-        QuicListener::bind("127.0.0.1:0".parse().expect("addr"), &tls, None).expect("bind");
-    listener.set_backend(backend);
-    let port = listener.addr().port();
-
-    let stop_worker = Arc::clone(&stop);
-    let worker = thread::spawn(move || {
-        while !stop_worker.load(Ordering::Relaxed) {
-            let _ = listener.pump(Instant::now());
-            thread::sleep(Duration::from_millis(2));
-        }
-    });
+    let ibex = Ibex::start(backend);
+    let port = ibex.port;
 
     let started = Instant::now();
     let clients: Vec<_> = (0..2)
@@ -277,8 +289,8 @@ fn a_slow_backend_does_not_stall_other_quic_connections() {
         .collect();
     let elapsed = started.elapsed();
 
+    drop(ibex);
     stop.store(true, Ordering::Relaxed);
-    let _ = worker.join();
 
     for (i, o) in outs.iter().enumerate() {
         assert!(o.contains("|200"), "request {i} did not get 200: {o}");

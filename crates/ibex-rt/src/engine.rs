@@ -5044,39 +5044,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.step(now)
     }
 
-    /// Performs one single iteration of the engine execution pass.
-    ///
-    /// # Errors
-    /// Returns an error if polling epoll fails.
-    /// Binds a QUIC listener and registers it with the poller.
-    ///
-    /// # Errors
-    /// Returns an error if the socket cannot be bound or the endpoint cannot be built.
-    pub fn add_quic_listener(
-        &mut self,
-        addr: std::net::SocketAddr,
-        tls: &Arc<ibex_tls::tcp::BindTls>,
-        backend: Option<std::net::SocketAddr>,
-    ) -> io::Result<u16> {
-        let mut ql = crate::quic_listener::QuicListener::bind(addr, tls, None)?;
-        if let Some(be) = backend {
-            ql.set_backend(be);
-        }
-        let port = ql.addr().port();
-        let idx = self.quic_listeners.len();
-        let fd = ql.raw_fd();
-        self.fdtab.insert(
-            fd,
-            FdState::QuicListener { listener: usize_to_u32(idx) },
-            Interest::READ,
-        );
-        // SAFETY-adjacent: the listener owns the fd for as long as it is in the vector, and
-        // it is removed from the poller only when the listener is dropped.
-        self.poller.add(ql.borrowed_fd(), raw_fd_to_u64(fd), true, false)?;
-        self.quic_listeners.push(ql);
-        Ok(port)
-    }
-
     /// Registers any backend socket a QUIC listener has opened since the last pass.
     ///
     /// The listener creates these when a request arrives, so the engine learns about them
