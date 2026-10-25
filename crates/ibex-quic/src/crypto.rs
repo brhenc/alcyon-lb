@@ -51,7 +51,7 @@ use quinn_proto::crypto::{
 use quinn_proto::transport_parameters::TransportParameters;
 use quinn_proto::{ConnectionId, Side, TransportError, TransportErrorCode};
 use rustls24::crypto::cipher::{AeadKey, Iv};
-use rustls24::crypto::tls13::OkmBlock;
+use rustls24::crypto::tls13::{HkdfExpander, OkmBlock};
 use rustls24::error::AlertDescription;
 use rustls24::quic::{
     self as rq, KeyChange, QuicEvent, Secrets, ServerHandshake, Suite, Version,
@@ -504,11 +504,38 @@ fn random_secret(p: TlsCryptoProvider) -> Result<[u8; 64], String> {
     Ok(secret)
 }
 
-/// The stateless reset key of an endpoint (RFC 9000 10.3.2): HMAC-SHA256 under a random key,
-/// computed by the active provider.
-pub struct ResetKey {
-    key: [u8; 64],
+/// An endpoint's secret, keyed once per provider: the HMAC key schedule (or the HKDF PRK) is
+/// built the first time a provider computes with it, not once per token.
+struct Keyed {
+    secret: [u8; 64],
+    /// What `build` made of the secret on each provider, in `TlsCryptoProvider::ALL` order.
+    built: [std::sync::OnceLock<Box<dyn HkdfExpander>>; 2],
+    build: fn(&'static dyn rustls24::crypto::tls13::Hkdf, &[u8]) -> Box<dyn HkdfExpander>,
 }
+
+impl Keyed {
+    fn new(build: fn(&'static dyn rustls24::crypto::tls13::Hkdf, &[u8]) -> Box<dyn HkdfExpander>) -> Result<Self, String> {
+        Ok(Self { secret: random_secret(provider::active())?, built: Default::default(), build })
+    }
+
+    /// The secret keyed on the active provider (HMAC-SHA256 / HKDF-SHA256).
+    fn on_active(&self) -> &dyn HkdfExpander {
+        let p = provider::active();
+        let i = TlsCryptoProvider::ALL.iter().position(|q| *q == p).unwrap_or(0).min(1);
+        self.built[i].get_or_init(|| (self.build)(provider::quic_initial_suite(p).hkdf_provider, &self.secret)).as_ref()
+    }
+}
+
+impl Drop for Keyed {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+/// The stateless reset key of an endpoint (RFC 9000 10.3.2): a reset token is
+/// HMAC-SHA256(key, connection ID || 0x01) (one HKDF-Expand block), a PRF under a random key,
+/// computed by the active provider.
+pub struct ResetKey(Keyed);
 
 impl ResetKey {
     /// A fresh random key.
@@ -516,18 +543,11 @@ impl ResetKey {
     /// # Errors
     /// The provider has no random bytes.
     pub fn new() -> Result<Self, String> {
-        Ok(Self { key: random_secret(provider::active())? })
+        Keyed::new(|hkdf, secret| hkdf.expander_for_okm(&OkmBlock::new(&secret[..32]))).map(Self)
     }
 
-    fn tag(&self, data: &[u8]) -> rustls24::crypto::hmac::Tag {
-        let hkdf = provider::quic_initial_suite(provider::active()).hkdf_provider;
-        hkdf.hmac_sign(&OkmBlock::new(&self.key), data)
-    }
-}
-
-impl Drop for ResetKey {
-    fn drop(&mut self) {
-        self.key.zeroize();
+    fn tag(&self, data: &[u8]) -> OkmBlock {
+        self.0.on_active().expand_block(&[data])
     }
 }
 
@@ -556,9 +576,7 @@ impl qc::HmacKey for ResetKey {
 
 /// The key of an endpoint's address validation tokens (Retry and `NEW_TOKEN`): an HKDF
 /// master key, from which each token's AES-256-GCM key is derived, by the active provider.
-pub struct TokenKey {
-    key: [u8; 64],
-}
+pub struct TokenKey(Keyed);
 
 impl TokenKey {
     /// A fresh random key.
@@ -566,24 +584,16 @@ impl TokenKey {
     /// # Errors
     /// The provider has no random bytes.
     pub fn new() -> Result<Self, String> {
-        Ok(Self { key: random_secret(provider::active())? })
-    }
-}
-
-impl Drop for TokenKey {
-    fn drop(&mut self) {
-        self.key.zeroize();
+        Keyed::new(|hkdf, secret| hkdf.extract_from_secret(None, secret)).map(Self)
     }
 }
 
 impl qc::HandshakeTokenKey for TokenKey {
     fn aead_from_hkdf(&self, random_bytes: &[u8]) -> Box<dyn qc::AeadKey> {
-        let p = provider::active();
-        let prk = provider::quic_initial_suite(p).hkdf_provider.extract_from_secret(None, &self.key);
         let mut key = [0u8; 32];
         // 32 bytes is within HKDF-SHA256's 255 * 32.
-        let _ = prk.expand_slice(&[random_bytes], &mut key);
-        let suite = provider::quic_token_suite(p);
+        let _ = self.0.on_active().expand_slice(&[random_bytes], &mut key);
+        let suite = provider::quic_token_suite(provider::active());
         let alg = Suite::try_from(suite).unwrap_or_else(|_| unreachable_suite()).quic;
         let packet = alg.packet_key(AeadKey::from(key), Iv::from([0u8; 12]));
         key.zeroize();
