@@ -3656,9 +3656,7 @@ pub fn prebind_quic(config: &Config, workers: usize) -> io::Result<()> {
 /// `-m <megs>` as `HAProxy` applies it (`compute_ideal_maxconn`, src/limits.c): the budget
 /// is recorded for `show info` and `/metrics`, and sizes `global maxconn` when the
 /// configuration has none; a configured one that leaves no room for TLS is refused.
-/// Nothing is limited at the system level, where `HAProxy` also sets `RLIMIT_DATA`: past it
-/// `malloc` would fail and Rust aborts the process, where `HAProxy`'s pools fail one stream.
-/// Ibex sets it once its pools are fallible (T448, tradeoff.md 6.25, docs/differences.md).
+/// `RLIMIT_DATA` is set apart, by `globalconn::apply_memmax_rlimit` (T465, tradeoff.md 6.25).
 ///
 /// # Errors
 /// The alert text `HAProxy` exits 1 with.

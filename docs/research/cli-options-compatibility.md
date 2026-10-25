@@ -126,7 +126,7 @@ The following catalog categorizes every command-line option in HAProxy 3.5 as im
 | `-st <pids...>` | Hard stop: send `SIGTERM` to old PIDs | Parses variable PID list; sends `Signal::Term` via `rustix::process::kill_process` | **Supported** | Pure safe Rust (`rustix`) |
 | `-n <maxconn>` | Global maxconn override | Clamps engine capacity and per-listener/proxy `maxconn` | **Supported** | Runtime capacity override |
 | `-N <maxsock>` | Per-proxy maxconn default override | Overrides default proxy maxconn bounds | **Supported** | Config AST override |
-| `-m <megs>` | Memory limit in MB | Sizes the automatic `maxconn` only; sets no rlimit (tradeoff.md 6.25) | **Partial** | `RLIMIT_DATA` once T448 (fallible pools) merges |
+| `-m <megs>` | Memory limit in MB | Sets `RLIMIT_DATA` (soft and hard) and sizes the automatic `maxconn` (T465b, tradeoff.md 6.25) | **Supported** | Allocations still infallible (rustls, h2, std) abort past the limit (tradeoff.md 6.23) |
 | `-S <bind>` | Master CLI socket | Binds CLI socket via `Engine::bind_cli_socket()` | **Supported** | Safe UNIX domain socket |
 | `-u`, `-g`, `-U`, `-G`, `-ch` | User, Group, UID, GID, Chroot | Parses and applies/logs security identity and chroot targets | **Supported** | Security context management |
 | `-dr` | Ignore server DNS failures | Logs diagnostic and activates non-failing address resolution | **Supported** | Diagnostic flag |
@@ -216,10 +216,11 @@ This ensures zero unsafe code, correct handling of dead PIDs (`ESRCH`), and exac
 
 ### 4.3 Memory limit (`-m`)
 
-Not an rlimit yet. Ibex's `-m` sizes the automatic `maxconn` from the budget
-(`engine::apply_memmax`) and reports `Memmax_MB` in `show info`. HAProxy sets `RLIMIT_DATA`.
-Ibex sets it only once its pools fail one stream instead of aborting the process
-(T448); before that, a cap would only make it abort sooner. See tradeoff.md 6.25.
+Supported (T465b). Ibex's `-m` sets `RLIMIT_DATA` soft and hard to the budget, as HAProxy
+does (`/proc/<pid>/limits`), sizes the automatic `maxconn` from it (`engine::apply_memmax`)
+and reports `Memmax_MB` in `show info`. A hard limit it cannot raise is the same alert and
+exit 1 as HAProxy's. Past the limit Ibex's buffers, sessions, timers and idle lists fail one
+stream or connection; the allocations still infallible abort. See tradeoff.md 6.23, 6.25.
 
 ## 5. Integration Verification Matrix
 
