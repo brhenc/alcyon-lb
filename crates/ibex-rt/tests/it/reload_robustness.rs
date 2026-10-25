@@ -332,7 +332,20 @@ fn a_worker_that_never_becomes_ready_does_not_block_reloads() {
     assert!(common::wait_listening(SocketAddr::from(([127, 0, 0, 1], port))));
     std::fs::write(&cfg, http(port, "v2", &format!("  errorfile 503 {}\n", fifo.display()))).unwrap();
     let s2 = sock.clone();
-    let first = std::thread::spawn(move || master(&s2, "reload", Duration::from_secs(15)));
+    // The master counts the startup load as a reload until its worker has reported ready, which
+    // on a loaded host can come after the port is listening: it then answers "Another reload is
+    // still in progress." to a reload sent at once. That is not the reload under test, so send
+    // it again until the master takes it.
+    let first = std::thread::spawn(move || {
+        let give_up = Instant::now() + Duration::from_secs(30);
+        loop {
+            let out = master(&s2, "reload", Duration::from_secs(15));
+            if !out.contains("still in progress") || Instant::now() > give_up {
+                return out;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
     // Wait for the event, not for a time: the first reload is under way once the master has a
     // second child (the new worker). A reload sent before the master took the first one would
     // be the one that runs, and the first would be told "in progress".
