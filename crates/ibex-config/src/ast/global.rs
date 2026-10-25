@@ -406,6 +406,11 @@ pub enum WarnStyle {
     Tight,
     /// `config : [file:line] : text`
     At,
+    /// `text`, with no frame: `{at}` in it is `[file:line]` (`resolvers 'r' [f:3] has no
+    /// nameservers configured!`).
+    Bare,
+    /// As `Bare`, printed as a `[NOTICE]` (`could not resolve address 'x', disabling server.`).
+    Notice,
 }
 
 /// The rustls crypto provider TLS over TCP runs on (`tune.ibex.crypto-provider`, T460).

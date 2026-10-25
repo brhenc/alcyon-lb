@@ -589,7 +589,8 @@ impl CliApplet {
                     if p.name != target && p.ids.iid.to_string() != target { continue; }
                 }
                 for (s_idx, s) in p.server_ids.iter().enumerate() {
-                    let addr = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.ip().to_string());
+                    let rmaint = p.server_rmaint(s_idx);
+                    let addr = p.servers.get(s_idx).filter(|_| !rmaint).map_or_else(|| "-".to_string(), |a| a.ip().to_string());
                     let port = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.port().to_string());
                     let raw = p.server_statuses.get(s_idx).map(|s| s.load(std::sync::atomic::Ordering::Relaxed));
                     let status = raw.map(ServerStatus::from);
@@ -612,6 +613,8 @@ impl CliApplet {
                         _ if raw == Some(crate::check::DRAIN_DOWN) => 8,
                         _ => 0,
                     } | if p.server_cmaint(s_idx) { 4 } else { 0 };
+                    // No address: SRV_ADMF_RMAINT (32) is the maintenance, not the operator's.
+                    let admin_state = if rmaint { (admin_state & !1) | 32 } else { admin_state };
                     let uweight = p.server_weights.get(s_idx).unwrap_or(1);
                     let iweight = p.initial_weight(s_idx);
                     
@@ -662,8 +665,9 @@ impl CliApplet {
                     let srv_forced = u8::from(p.server_forced_id(s_idx));
                     self.out_buf.extend_from_slice(
                         format!(
-                            "{} {} {} {} {} {} {} {} {} 1 {} {} {} {} 0 {} {} - {} - 0 0 - - 0\n",
-                            p.ids.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, check_status, check_result, check_health, check_state, bk_forced, srv_forced, port
+                            "{} {} {} {} {} {} {} {} {} 1 {} {} {} {} 0 {} {} {} {} - 0 0 - - 0\n",
+                            p.ids.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, check_status, check_result, check_health, check_state, bk_forced, srv_forced,
+                            p.server_fqdn(s_idx).unwrap_or("-"), port
                         ).as_bytes()
                     );
                 }
@@ -1740,6 +1744,11 @@ impl CliApplet {
                 self.finish_msg("");
             }
             Some("addr") => {
+                // No address, so no family to keep (`srv_update_addr_port`, measured).
+                if ctx.proxies[p_idx].server_rmaint(s_idx) {
+                    self.finish_msg("Update for the current server address family is only supported through configuration file.");
+                    return;
+                }
                 let Some(&ip_s) = parts.get(2) else {
                     self.finish_msg("set server <b>/<s> addr requires an address and optionally a port.");
                     return;
