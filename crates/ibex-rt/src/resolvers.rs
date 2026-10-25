@@ -452,7 +452,7 @@ pub fn build(
                             cursor: 0,
                             in_flight: None,
                             next_at: t0,
-                            last_valid: None,
+                            last_valid: Some(t0),
                             ended_at: None,
                             status: Status::None,
                         }))
@@ -1054,7 +1054,7 @@ fn on_error(r: &mut Resolution, e: &DnsError, holds: &Holds, now: Instant, proxi
 }
 
 /// `snr_set_srv_down`: whether requester `k`'s server went into `SRV_ADMF_RMAINT` now (the
-/// hold of the status ran out since the last valid answer, or there never was one, F5).
+/// hold of the status ran out since `last_valid`, which starts at the resolution's creation, T510).
 #[allow(clippy::many_single_char_names)] // HAProxy's names: r(esolution), k, p(roxy), s(erver)
 fn set_srv_down(r: &Resolution, k: usize, holds: &Holds, now: Instant, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) -> bool {
     let req = &r.reqs[k];

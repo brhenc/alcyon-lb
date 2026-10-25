@@ -621,15 +621,49 @@ fn t6c_nodata_is_other() {
     held_down(Zone::NoData, "hold other", "unspecified DNS error");
 }
 
-/// A.t7: a nameserver nobody listens on (ICMP unreachable) is a timeout; the `init-addr`
-/// address serves until then, and a name never valid goes down at its first error.
+/// A.t7 (re-measured, T510): a nameserver nobody listens on (ICMP unreachable) is a timeout, but
+/// the hold is counted from `last_valid`, which a resolution starts with at its creation: the
+/// `init-addr` address keeps serving for the whole `hold timeout`, then the server goes down at
+/// the first error after it (HAProxy: `hold timeout 30s` -> DOWN at 31.2 s, "(DNS timeout status)").
 #[test]
-fn t7_a_dead_nameserver_is_a_timeout() {
+fn t7_a_dead_nameserver_is_held_from_the_start() {
     let dead = UdpSocket::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
-    let ibex = start(dead, &format!("{FAST}  hold timeout 30s\n"), "  server s1 a1.test:80 resolvers r init-addr 10.9.9.9\n", "");
+    let ibex = start(dead, &format!("{FAST}  hold timeout 1500ms\n"), "  server s1 a1.test:80 resolvers r init-addr 10.9.9.9\n", "");
+    let t0 = Instant::now();
     assert_eq!(ibex.state("s1").0, "10.9.9.9 2 0");
-    ibex.wait_state("s1", "- 0 32", 3);
+    thread::sleep(Duration::from_millis(1100));
+    assert_eq!(ibex.state("s1").0, "10.9.9.9 2 0", "down before the hold ran out");
+    ibex.wait_state("s1", "- 0 32", 4);
+    assert!(t0.elapsed() >= Duration::from_millis(1500), "{:?}", t0.elapsed());
     ibex.wait_log(&format!("Server l/s1 is going DOWN for maintenance (DNS timeout status). {LEFT}"), 2);
+}
+
+/// T510: the same with `init-addr libc` (HAProxy: kept 30 s, "(DNS timeout status)").
+#[test]
+fn t7b_a_dead_nameserver_libc_init_addr_is_held() {
+    let dead = UdpSocket::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+    let ibex = start(dead, &format!("{FAST}  hold timeout 1500ms\n"), "  server s1 localhost:80 resolvers r init-addr libc\n", "");
+    let t0 = Instant::now();
+    assert!(ibex.state("s1").0.ends_with(" 2 0"), "{:?}", ibex.state("s1"));
+    thread::sleep(Duration::from_millis(1100));
+    assert!(ibex.state("s1").0.ends_with(" 2 0"), "down before the hold ran out: {:?}", ibex.state("s1"));
+    ibex.wait_state("s1", "- 0 32", 4);
+    assert!(t0.elapsed() >= Duration::from_millis(1500), "{:?}", t0.elapsed());
+}
+
+/// T510: NX from the start with an `init-addr`: held `hold nx` from the creation, log
+/// "(DNS NX status)" (HAProxy: DOWN at 31.2 s with `hold nx 30s`).
+#[test]
+fn t7c_nx_from_the_start_is_held_from_the_start() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, &format!("{FAST}  hold nx 1500ms\n"), "  server s1 nx.test:80 resolvers r init-addr 10.9.9.9\n", "");
+    let t0 = Instant::now();
+    assert_eq!(ibex.state("s1").0, "10.9.9.9 2 0");
+    thread::sleep(Duration::from_millis(1100));
+    assert_eq!(ibex.state("s1").0, "10.9.9.9 2 0", "down before the hold ran out");
+    ibex.wait_state("s1", "- 0 32", 4);
+    assert!(t0.elapsed() >= Duration::from_millis(1500), "{:?}", t0.elapsed());
+    ibex.wait_log(&format!("Server l/s1 is going DOWN for maintenance (DNS NX status). {LEFT}"), 2);
 }
 
 /// A.t12b: two servers on one name with one address: the first takes it, the second has
