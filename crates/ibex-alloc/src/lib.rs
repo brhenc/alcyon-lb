@@ -14,6 +14,8 @@
 pub mod arena;
 pub use arena::{Arena, ArenaStats};
 pub mod pool;
+pub mod zero_on_free;
+pub use zero_on_free::{IbexAllocator, ZeroOnFree};
 pub use pool::{
     drain_local_pools, for_each_pool, hot_size, local_hot_bytes, set_hot_size, Pool, PoolBox, PoolDyn, PoolSpec, Poolable,
     HOT_SIZE_DEFAULT,
@@ -234,6 +236,9 @@ impl CountingAllocator {
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if failing(layout.size()) {
+            // A refused allocation empties the quarantine first (and is still refused: the
+            // refusals a test asked for are not spent twice).
+            zero_on_free::drain_for_refusal();
             return std::ptr::null_mut();
         }
         let ptr = System.alloc(layout);
@@ -250,17 +255,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if layout.size() == WATCH_SIZE.load(Ordering::Relaxed) && layout.size() != 0 {
-            WATCH_SIZE.store(0, Ordering::Relaxed);
-            let n = layout.size().min(WATCH_LEN);
-            // SAFETY: `ptr` is a live block of `layout.size()` bytes until `System.dealloc` below.
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
-            for (slot, &b) in WATCHED.iter().zip(bytes) {
-                slot.store(b, Ordering::Relaxed);
-            }
-            WATCHED_LEN.store(n, Ordering::Release);
-        }
-        System.dealloc(ptr, layout);
+        // `tune.ibex.zero-on-free`: freed, wiped and freed, or quarantined (and the test watch).
+        zero_on_free::release::<true>(ptr, layout);
         let sz = layout.size();
         self.deallocs.fetch_add(1, Ordering::SeqCst);
         self.bytes_dealloc.fetch_add(sz, Ordering::SeqCst);
@@ -272,9 +268,14 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if new_size > layout.size() && failing(new_size) {
+            zero_on_free::drain_for_refusal();
             return std::ptr::null_mut();
         }
-        let new_ptr = System.realloc(ptr, layout, new_size);
+        let new_ptr = if zero_on_free::wipes() {
+            zero_on_free::realloc_by_copy(ptr, layout, new_size, |l| System.alloc(l))
+        } else {
+            System.realloc(ptr, layout, new_size)
+        };
         if !new_ptr.is_null() {
             let old_size = layout.size();
             self.reallocs.fetch_add(1, Ordering::SeqCst);
@@ -302,7 +303,26 @@ static WATCH_SIZE: AtomicUsize = AtomicUsize::new(0);
 static WATCHED_LEN: AtomicUsize = AtomicUsize::new(usize::MAX);
 static WATCHED: [core::sync::atomic::AtomicU8; WATCH_LEN] = [const { core::sync::atomic::AtomicU8::new(0) }; WATCH_LEN];
 
-/// For a test that installs [`CountingAllocator`]: the next block of exactly `size` bytes
+/// Copies the first bytes of a block about to be given to the system allocator when it is the
+/// size [`watch_freed`] waits for.
+///
+/// # Safety
+/// `ptr` is a live block of `size` bytes.
+#[inline]
+pub(crate) unsafe fn watch_on_free(ptr: *mut u8, size: usize) {
+    if size == WATCH_SIZE.load(Ordering::Relaxed) && size != 0 {
+        WATCH_SIZE.store(0, Ordering::Relaxed);
+        let n = size.min(WATCH_LEN);
+        // SAFETY: the caller's: `ptr` is live for `size` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, n) };
+        for (slot, &b) in WATCHED.iter().zip(bytes) {
+            slot.store(b, Ordering::Relaxed);
+        }
+        WATCHED_LEN.store(n, Ordering::Release);
+    }
+}
+
+/// For a test that installs [`CountingAllocator`] (or runs under [`IbexAllocator`]): the next block of exactly `size` bytes
 /// freed has its first bytes kept for [`freed_bytes`], so the test can see what a released
 /// object left in memory without reading freed memory itself (the wipe of a pooled string).
 pub fn watch_freed(size: usize) {

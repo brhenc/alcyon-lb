@@ -635,8 +635,28 @@ fn show_info_pairs(
 ) -> Vec<(&'static str, String)> {
     let mut p = InfoPairs::default();
     fill_info_pairs(&mut p, start_time, pid, total_tasks, run_queue_len, active_conns, max_conns, cum_conns, cum_reqs);
+    zero_on_free_pairs(&mut p);
     p.v.truncate(p.n);
     p.v
+}
+
+/// `tune.ibex.zero-on-free` (T459), when it is not `off`: Ibex-only lines at the end of `show
+/// info` (`typed` and `json` leave them out: they have no field number), so that an operator sees
+/// both levers of `soft` (the bytes and age of what waits, the wipes the bounds forced).
+fn zero_on_free_pairs(p: &mut InfoPairs) {
+    let mode = ibex_alloc::zero_on_free::zero_on_free();
+    if mode == ibex_alloc::ZeroOnFree::Off {
+        return;
+    }
+    let s = ibex_alloc::zero_on_free::stats();
+    p.put("ZeroOnFree", format_args!("{}", mode.name()));
+    p.put("ZeroOnFreeBytes", format_args!("{}", s.bytes));
+    p.put("ZeroOnFreeBlocks", format_args!("{}", s.blocks));
+    p.put("ZeroOnFreeOldest_ms", format_args!("{}", s.oldest_ms));
+    p.put("ZeroOnFreeQueued", format_args!("{}", s.queued));
+    p.put("ZeroOnFreeWiped", format_args!("{}", s.wiped));
+    p.put("ZeroOnFreeForced", format_args!("{}", s.forced));
+    p.put("ZeroOnFreeExpired", format_args!("{}", s.expired));
 }
 
 fn fill_info_pairs(

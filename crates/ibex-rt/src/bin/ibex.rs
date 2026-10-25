@@ -19,6 +19,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
 
+/// The system allocator with `tune.ibex.zero-on-free` on every free (T459): off until the
+/// configuration says otherwise, a load and a compare per free then.
+#[global_allocator]
+static ALLOCATOR: ibex_alloc::IbexAllocator = ibex_alloc::IbexAllocator;
+
 /// `println!` that does not panic when stdout is closed (`ibex -h | head`): the output is
 /// best effort, and an EPIPE is the reader's choice, not an error of ours.
 macro_rules! println {

@@ -49,6 +49,7 @@ mod log_tag_sample;
 mod m1_scope_refusals;
 mod no_memory_trimming;
 mod zero_buffers;
+mod zero_on_free;
 mod ssl_zero_buffers;
 mod zero_spares;
 mod fail_alloc_keywords;

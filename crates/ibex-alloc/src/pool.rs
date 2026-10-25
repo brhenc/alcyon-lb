@@ -299,8 +299,13 @@ impl Drop for SlotGuard {
     }
 }
 
+/// One past the highest slot ever given out.
+pub(crate) fn slot_hwm() -> usize {
+    SLOT_HWM.load(Ordering::Relaxed).min(MAX_THREADS)
+}
+
 /// This thread's slot ([`MAX_THREADS`] = the overflow slot).
-fn thread_slot() -> usize {
+pub(crate) fn thread_slot() -> usize {
     SLOT.try_with(|g| {
         if g.0.get() == SLOT_UNSET {
             let i = (0..MAX_THREADS)
@@ -487,8 +492,9 @@ pub fn publish_local() {
 
 
 
-/// Empties every pool cache of the calling thread, floors included (`pool_gc`, T445). Returns
-/// the objects freed. They were wiped when they were given back.
+/// Empties every pool cache of the calling thread, floors included (`pool_gc`, T445), and its
+/// `zero-on-free` quarantine. Returns the objects and blocks freed. The objects were wiped when
+/// they were given back, the blocks are wiped now.
 pub fn drain_local_pools() -> usize {
     let mut n = 0;
     let pools: [Option<&'static dyn PoolDyn>; MAX_POOLS] = HOT
@@ -498,7 +504,8 @@ pub fn drain_local_pools() -> usize {
         n += p.drain_local();
     }
     publish_local();
-    n
+    // And what `tune.ibex.zero-on-free soft` holds of the freed memory, wiped.
+    n + crate::zero_on_free::drain_local()
 }
 
 /// Bytes this thread's pools hold against `tune.memory.hot-size`.
