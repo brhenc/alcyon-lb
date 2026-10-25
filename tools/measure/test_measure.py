@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from measure import (check_regressions, MetricDelta, Verdict, reference_sha, split_modes,
-                     parse_insreq, min_ins_per_req)
+                     parse_insreq, min_ins_per_req, perf_attached, host_problems)
 
 
 def _git(repo, *args):
@@ -230,3 +230,64 @@ class TestSplitModes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPerfAttached(unittest.TestCase):
+    """T452: with perf stat attached to the proxy the 1-conn rate is 16.4k, without it 18.9k.
+    A sample whose counters are missing or zero is of the other machine state."""
+
+    def test_counts_present_and_nonzero(self):
+        self.assertTrue(perf_attached("1234567,,instructions:u,2000000,100.00,,\n"))
+
+    def test_not_counted_is_not_attached(self):
+        self.assertFalse(perf_attached("<not counted>,,instructions:u,0,0.00,,\n"))
+        self.assertFalse(perf_attached("0,,instructions:u,2000000,100.00,,\n"))
+        self.assertFalse(perf_attached(""))
+
+
+class TestHostProblems(unittest.TestCase):
+    """The host must be quiet where the gate pins: governor performance on the CPUs used, and
+    the CPUs, the proxy's SMT sibling and its CCX idle over a second (T452)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        for c in (4, 5, 6, 7, 36):
+            self.sys(c, "cpufreq/scaling_governor", "performance\n")
+            self.sys(c, "topology/thread_siblings_list", f"{c % 32},{c % 32 + 32}\n" if c < 32 else "4,36\n")
+            self.sys(c, "cache/index3/shared_cpu_list", "4-7,36-39\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def sys(self, cpu, rel, text):
+        path = os.path.join(self.root, f"cpu{cpu}", rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+
+    @staticmethod
+    def stat(busy):
+        """/proc/stat text with 100 jiffies on each CPU; `busy` maps cpu -> jiffies of them in
+        user mode, the rest idle. Time since an all-zero first reading."""
+        return "cpu  0 0 0 0 0 0 0\n" + "".join(
+            f"cpu{c} {busy.get(c, 0)} 0 0 {100 - busy.get(c, 0)} 0 0 0 0 0 0\n"
+            for c in (4, 5, 6, 7, 36, 37, 38, 39))
+
+    def check(self, after):
+        zero = "".join(f"cpu{c} 0 0 0 0 0 0 0 0 0 0\n" for c in (4, 5, 6, 7, 36, 37, 38, 39))
+        return host_problems(zero, self.stat(after), [4, 5, 6], self.root)
+
+    def test_quiet_host(self):
+        self.assertEqual(self.check({}), [])
+
+    def test_busy_sibling_is_refused(self):
+        why = self.check({36: 100})
+        self.assertEqual(len(why), 1)
+        self.assertIn("36", why[0])
+
+    def test_wrong_governor_is_refused(self):
+        self.sys(5, "cpufreq/scaling_governor", "schedutil\n")
+        why = self.check({})
+        self.assertEqual(len(why), 1)
+        self.assertIn("schedutil", why[0])

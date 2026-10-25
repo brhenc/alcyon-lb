@@ -491,10 +491,97 @@ def _wait_listening(port: int, proc: subprocess.Popen, timeout: float = 5.0) -> 
     raise RuntimeError(f"proxy did not listen on {port} within {timeout}s")
 
 
+# T452 (2026-10-25, quiet-host run, tasks/T452-measure-1conn-bimodal-variance.md): on a quiet
+# host the 1-conn samples had ONE mode in every batch (736 samples, 23 batches). What moved the
+# rate was the machine state, not the build:
+#   * perf counters attached to the proxy: 16.4k req/s, not attached: 18.9k (the old "19k mode");
+#   * a busy SMT sibling of the proxy's CPU 14.5k, proxy and client on SMT siblings 13.5k,
+#     across L3s 12.7k (the old "15k mode").
+# So every 1-conn sample here has perf stat attached to the proxy and is taken again if its
+# counters did not come back (`perf_attached`), and the run is refused unless the governor is
+# `performance` on the CPUs it uses and those CPUs, their SMT siblings and their CCX are idle
+# (`host_problems`). A/A spread with these checks: see the T452 task file (night run).
+
+
+def perf_attached(stat_out: str) -> bool:
+    """True if `perf stat -x,` output has a nonzero count: a counter that was not attached
+    prints `<not counted>` or `<not supported>`, or 0."""
+    for line in stat_out.splitlines():
+        first = line.split(",")[0].strip()
+        if first.isdigit() and int(first) > 0:
+            return True
+    return False
+
+
+def _cpu_list(text: str) -> List[int]:
+    """"4-7,36-39" -> [4, 5, 6, 7, 36, 37, 38, 39]."""
+    out: List[int] = []
+    for part in text.strip().split(","):
+        if "-" in part:
+            lo, hi = part.split("-")
+            out.extend(range(int(lo), int(hi) + 1))
+        elif part:
+            out.append(int(part))
+    return out
+
+
+def _read(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _busy_share(stat_a: str, stat_b: str) -> Dict[int, float]:
+    """Share of non-idle time per CPU between two /proc/stat readings."""
+    def parse(text: str) -> Dict[int, Tuple[int, int]]:
+        t = {}
+        for line in text.splitlines():
+            f = line.split()
+            if f and f[0].startswith("cpu") and f[0] != "cpu":
+                v = [int(x) for x in f[1:]]
+                t[int(f[0][3:])] = (sum(v) - v[3] - v[4], sum(v))
+        return t
+    a, b = parse(stat_a), parse(stat_b)
+    return {c: (b[c][0] - a[c][0]) / max(1, b[c][1] - a[c][1]) for c in a if c in b}
+
+
+HOST_BUSY_MAX = 0.10
+
+
+def host_problems(stat_a: str, stat_b: str, cpus: List[int], sysfs: str = "/sys/devices/system/cpu",
+                  busy_max: float = HOST_BUSY_MAX) -> List[str]:
+    """Why this host is not quiet enough to measure on, [] if it is: the governor of each CPU in
+    `cpus` is not `performance`, or one of `cpus`, their SMT siblings or their L3 (CCX) was
+    busy over the interval between the two /proc/stat readings."""
+    why = []
+    watch = set(cpus)
+    for c in cpus:
+        gov = _read(f"{sysfs}/cpu{c}/cpufreq/scaling_governor")
+        if gov != "performance":
+            why.append(f"cpu{c} governor is {gov or 'unreadable'}, not performance")
+        for rel in ("topology/thread_siblings_list", "cache/index3/shared_cpu_list"):
+            watch.update(_cpu_list(_read(f"{sysfs}/cpu{c}/{rel}")))
+    busy = _busy_share(stat_a, stat_b)
+    hot = {c: round(100 * busy[c]) for c in sorted(watch) if busy.get(c, 0) > busy_max}
+    if hot:
+        why.append("busy CPUs (%): " + ", ".join(f"{c}: {p}" for c, p in hot.items()))
+    return why
+
+
+def check_host_quiet(cpus: List[int]) -> List[str]:
+    """host_problems over one second of the real /proc/stat."""
+    a = _read("/proc/stat")
+    time.sleep(1.0)
+    return host_problems(a, _read("/proc/stat"), cpus)
+
+
 # The 1-conn samples of one build fall in two modes about 25% apart (~15k and ~19k req/s on
 # the gate's CPUs 4;5;6, T452). Within a mode the spread is about 10%, so a step of more than
 # MODE_GAP_PCT between two neighbouring samples is the gap between the modes.
 MODE_GAP_PCT = 12.0
+PERF_RETAKES = 2  # a 1-conn sample without perf counters is taken again this many times
 
 
 def _median(xs: List[int]) -> int:
@@ -560,6 +647,27 @@ def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
     rps: Dict[str, List[int]] = {"cand": [], "ref": []}
     cpu: Dict[str, List[int]] = {"cand": [], "ref": []}
 
+    perf_missed = {"cand": 0, "ref": 0}
+
+    def timed_with_perf(pid: int, addr: str, n: int, what: str) -> Tuple[float, bool]:
+        """The 1-conn sample with `perf stat` counting the proxy (see the T452 note): the wall
+        time and whether the counters came back."""
+        with tempfile.NamedTemporaryFile("r", suffix=".stat") as out:
+            perf = subprocess.Popen(["perf", "stat", "-x,", "-e", "instructions:u", "-p", str(pid),
+                                     "-o", out.name], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            time.sleep(0.2)
+            try:
+                wall = fixed(addr, 1, n, what)
+            finally:
+                perf.send_signal(signal.SIGINT)
+                try:
+                    perf.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    perf.kill()
+                    perf.wait()
+            return wall, perf_attached(out.read())
+
     def fixed(addr: str, conns: int, n: int, what: str) -> float:
         """Sends exactly `n` requests; returns the wall time."""
         t0 = time.monotonic()
@@ -586,7 +694,12 @@ def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
                     addr = f"127.0.0.1:{fe_port}"
                     what = f"{side} round {r}"
                     fixed(addr, 1, 5000, what + " warmup")
-                    rps[side].append(int(latency_requests / fixed(addr, 1, latency_requests, what)))
+                    for attempt in range(PERF_RETAKES + 1):
+                        wall, attached = timed_with_perf(proc.pid, addr, latency_requests, what)
+                        if attached:
+                            rps[side].append(int(latency_requests / wall))
+                            break
+                        perf_missed[side] += 1
                     before = _cpu_ns(proc.pid)
                     fixed(addr, load_conns, load_requests, what)
                     cpu[side].append(int((_cpu_ns(proc.pid) - before) / load_requests))
@@ -605,8 +718,12 @@ def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
             be.kill()
         os.remove(cfg_path)
 
+    for side in ("cand", "ref"):
+        if not rps[side]:
+            raise RuntimeError(f"{side}: perf did not attach to any 1-conn sample "
+                               f"({perf_missed[side]} tries); is perf_event_paranoid <= 1?")
     median = _median
-    return {"cand": median(rps["cand"]), "ref": median(rps["ref"]),
+    return {"perf_missed": perf_missed, "cand": median(rps["cand"]), "ref": median(rps["ref"]),
             "cand_samples": rps["cand"], "ref_samples": rps["ref"],
             "modes": split_modes(rps["cand"], rps["ref"]),
             "cand_ns": median(cpu["cand"]), "ref_ns": median(cpu["ref"]),
@@ -1160,7 +1277,15 @@ def main() -> int:
     # commits data/measurements.jsonl, so "the last record" drifted to an old one and the
     # growth of every change since added up until a harmless change failed the gate.
     record["binary_bytes_ref"], record["text_bytes_ref"] = measure_binary_size(ref_bin)
+    cpus = [int(c) for c in os.environ.get("IBEX_MEASURE_CPUS", "4,5,6").split(",")]
+    why = check_host_quiet(cpus)
+    if why:
+        print("      refusing to measure, the host is not quiet (T452): " + "; ".join(why))
+        return 1
     ab = measure_ab(ibex_bin, ref_bin, target_dir)
+    record["rps_1conn_perf_missed"] = ab["perf_missed"]
+    if any(ab["perf_missed"].values()):
+        print(f"      perf counters missing on 1-conn samples, taken again: {ab['perf_missed']}")
     record["rps_1conn"] = ab["cand"]
     record["rps_1conn_ref"] = ab["ref"]
     record["rps_1conn_ref_sha"] = ref_sha
