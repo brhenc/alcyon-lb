@@ -175,7 +175,7 @@ impl H2ReqHead {
     /// (measured, T437): without `:method`, with a `:status`, or with a `:protocol` outside
     /// an extended CONNECT. A `host` after the first is dropped, as `HAProxy` drops it.
     /// Every request of a server connection is written this way.
-    fn write(&mut self, fields: &DecodedFields) -> Result<(), &'static str> {
+    pub(crate) fn write(&mut self, fields: &DecodedFields) -> Result<(), &'static str> {
         self.clear();
         let (mut method, mut path, mut authority, mut host, mut scheme, mut protocol) = (None, None, None, None, false, false);
         let mut seen_regular = false;
@@ -299,41 +299,49 @@ impl H2StreamCtx {
 
 /// The streams of a connection by id, in id order, as a `BTreeMap` iterates them: a sorted
 /// `Vec` (T437), whose memory a connection serving one stream after another keeps, where
-/// the map allocated a node for its first stream and freed it with its last.
-#[derive(Debug, Clone, Default)]
-pub struct StreamMap {
-    v: Vec<(u32, H2StreamCtx)>,
+/// the map allocated a node for its first stream and freed it with its last. Generic over
+/// the stream and its id (T503): `H2StreamCtx` by `u32` for HTTP/2, the h3 mux's streams by
+/// QUIC stream id.
+#[derive(Debug, Clone)]
+pub struct StreamMap<S = H2StreamCtx, K = u32> {
+    v: Vec<(K, S)>,
+}
+
+impl<S, K> Default for StreamMap<S, K> {
+    fn default() -> Self {
+        Self { v: Vec::new() }
+    }
 }
 
 /// Past this many slots, a map left empty gives its memory back.
 const STREAM_MAP_KEEP: usize = 16;
 
-impl StreamMap {
+impl<S, K: Ord + Copy> StreamMap<S, K> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn pos(&self, id: u32) -> Result<usize, usize> {
+    fn pos(&self, id: K) -> Result<usize, usize> {
         self.v.binary_search_by_key(&id, |e| e.0)
     }
 
     #[must_use]
-    pub fn get(&self, id: &u32) -> Option<&H2StreamCtx> {
+    pub fn get(&self, id: &K) -> Option<&S> {
         self.pos(*id).ok().map(|i| &self.v[i].1)
     }
 
-    pub fn get_mut(&mut self, id: &u32) -> Option<&mut H2StreamCtx> {
+    pub fn get_mut(&mut self, id: &K) -> Option<&mut S> {
         self.pos(*id).ok().map(|i| &mut self.v[i].1)
     }
 
     #[must_use]
-    pub fn contains_key(&self, id: &u32) -> bool {
+    pub fn contains_key(&self, id: &K) -> bool {
         self.pos(*id).is_ok()
     }
 
     /// Inserts `s` as stream `id`: the stream it replaces, if there was one.
-    pub fn insert(&mut self, id: u32, s: H2StreamCtx) -> Option<H2StreamCtx> {
+    pub fn insert(&mut self, id: K, s: S) -> Option<S> {
         match self.pos(id) {
             Ok(i) => Some(std::mem::replace(&mut self.v[i].1, s)),
             Err(i) => {
@@ -343,7 +351,7 @@ impl StreamMap {
         }
     }
 
-    pub fn remove(&mut self, id: &u32) -> Option<H2StreamCtx> {
+    pub fn remove(&mut self, id: &K) -> Option<S> {
         let i = self.pos(*id).ok()?;
         let s = self.v.remove(i).1;
         self.shrink();
@@ -351,7 +359,7 @@ impl StreamMap {
     }
 
     /// Keeps the streams `f` says to keep.
-    pub fn retain(&mut self, mut f: impl FnMut(&u32, &mut H2StreamCtx) -> bool) {
+    pub fn retain(&mut self, mut f: impl FnMut(&K, &mut S) -> bool) {
         self.v.retain_mut(|(id, s)| f(id, s));
         self.shrink();
     }
@@ -372,40 +380,40 @@ impl StreamMap {
         self.v.is_empty()
     }
 
-    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &u32> + Clone + '_ {
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &K> + Clone + '_ {
         self.v.iter().map(|(id, _)| id)
     }
 
-    pub fn values(&self) -> impl DoubleEndedIterator<Item = &H2StreamCtx> + Clone + '_ {
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = &S> + Clone + '_ {
         self.v.iter().map(|(_, s)| s)
     }
 
-    pub fn values_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut H2StreamCtx> + '_ {
+    pub fn values_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut S> + '_ {
         self.v.iter_mut().map(|(_, s)| s)
     }
 
     /// The stream `id`, as `BTreeMap::entry` gives it.
-    pub fn entry(&mut self, id: u32) -> StreamEntry<'_> {
+    pub fn entry(&mut self, id: K) -> StreamEntry<'_, S, K> {
         StreamEntry { map: self, id }
     }
 }
 
 /// [`StreamMap::entry`].
-pub struct StreamEntry<'a> {
-    map: &'a mut StreamMap,
-    id: u32,
+pub struct StreamEntry<'a, S = H2StreamCtx, K = u32> {
+    map: &'a mut StreamMap<S, K>,
+    id: K,
 }
 
-impl<'a> StreamEntry<'a> {
+impl<'a, S, K: Ord + Copy> StreamEntry<'a, S, K> {
     /// Runs `f` on the stream, if there is one.
-    pub fn and_modify(self, f: impl FnOnce(&mut H2StreamCtx)) {
+    pub fn and_modify(self, f: impl FnOnce(&mut S)) {
         if let Some(s) = self.map.get_mut(&self.id) {
             f(s);
         }
     }
 
     /// The stream, inserted from `f` if there was none.
-    pub fn or_insert_with(self, f: impl FnOnce() -> H2StreamCtx) -> &'a mut H2StreamCtx {
+    pub fn or_insert_with(self, f: impl FnOnce() -> S) -> &'a mut S {
         let i = match self.map.pos(self.id) {
             Ok(i) => i,
             Err(i) => {
@@ -542,7 +550,7 @@ pub const SPARE_STREAMS: usize = 4;
 pub const IDLE_SPARES: usize = 2;
 
 /// `status` as its decimal digits in `buf`.
-fn status_text(status: u16, buf: &mut [u8; 5]) -> &str {
+pub(crate) fn status_text(status: u16, buf: &mut [u8; 5]) -> &str {
     let mut n = status;
     let mut i = buf.len();
     loop {

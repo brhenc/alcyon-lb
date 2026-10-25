@@ -859,6 +859,20 @@ impl DecodedFields {
     fn pos(&self) -> u32 {
         u32::try_from(self.text.len()).unwrap_or(u32::MAX)
     }
+
+    /// The memory a decoder writes the next field into (the text, and the Huffman
+    /// scratch), and where the field starts: the QPACK decoder's way in
+    /// (`qpack::decode_qpack_static_into`).
+    pub(crate) fn begin_field(&mut self) -> (u32, &mut String, &mut Vec<u8>) {
+        (self.pos(), &mut self.text, &mut self.huff)
+    }
+
+    /// The field begun at `start` ([`Self::begin_field`]): its name ends at `mid`, its
+    /// value at the end of the text.
+    pub(crate) fn end_field(&mut self, start: u32, mid: u32) {
+        let end = self.pos();
+        self.spans.push((start, mid, end));
+    }
 }
 
 /// Header fields one block may decode to. HAProxy decodes into a list of
