@@ -175,7 +175,7 @@ impl H2ReqHead {
     /// (measured, T437): without `:method`, with a `:status`, or with a `:protocol` outside
     /// an extended CONNECT. A `host` after the first is dropped, as `HAProxy` drops it.
     /// Every request of a server connection is written this way.
-    fn write(&mut self, fields: &DecodedFields) -> Result<(), &'static str> {
+    pub(crate) fn write(&mut self, fields: &DecodedFields) -> Result<(), &'static str> {
         self.clear();
         let (mut method, mut path, mut authority, mut host, mut scheme, mut protocol) = (None, None, None, None, false, false);
         let mut seen_regular = false;
@@ -299,41 +299,49 @@ impl H2StreamCtx {
 
 /// The streams of a connection by id, in id order, as a `BTreeMap` iterates them: a sorted
 /// `Vec` (T437), whose memory a connection serving one stream after another keeps, where
-/// the map allocated a node for its first stream and freed it with its last.
-#[derive(Debug, Clone, Default)]
-pub struct StreamMap {
-    v: Vec<(u32, H2StreamCtx)>,
+/// the map allocated a node for its first stream and freed it with its last. Generic over
+/// the stream and its id (T503): `H2StreamCtx` by `u32` for HTTP/2, the h3 mux's streams by
+/// QUIC stream id.
+#[derive(Debug, Clone)]
+pub struct StreamMap<S = H2StreamCtx, K = u32> {
+    v: Vec<(K, S)>,
+}
+
+impl<S, K> Default for StreamMap<S, K> {
+    fn default() -> Self {
+        Self { v: Vec::new() }
+    }
 }
 
 /// Past this many slots, a map left empty gives its memory back.
 const STREAM_MAP_KEEP: usize = 16;
 
-impl StreamMap {
+impl<S, K: Ord + Copy> StreamMap<S, K> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn pos(&self, id: u32) -> Result<usize, usize> {
+    fn pos(&self, id: K) -> Result<usize, usize> {
         self.v.binary_search_by_key(&id, |e| e.0)
     }
 
     #[must_use]
-    pub fn get(&self, id: &u32) -> Option<&H2StreamCtx> {
+    pub fn get(&self, id: &K) -> Option<&S> {
         self.pos(*id).ok().map(|i| &self.v[i].1)
     }
 
-    pub fn get_mut(&mut self, id: &u32) -> Option<&mut H2StreamCtx> {
+    pub fn get_mut(&mut self, id: &K) -> Option<&mut S> {
         self.pos(*id).ok().map(|i| &mut self.v[i].1)
     }
 
     #[must_use]
-    pub fn contains_key(&self, id: &u32) -> bool {
+    pub fn contains_key(&self, id: &K) -> bool {
         self.pos(*id).is_ok()
     }
 
     /// Inserts `s` as stream `id`: the stream it replaces, if there was one.
-    pub fn insert(&mut self, id: u32, s: H2StreamCtx) -> Option<H2StreamCtx> {
+    pub fn insert(&mut self, id: K, s: S) -> Option<S> {
         match self.pos(id) {
             Ok(i) => Some(std::mem::replace(&mut self.v[i].1, s)),
             Err(i) => {
@@ -343,7 +351,7 @@ impl StreamMap {
         }
     }
 
-    pub fn remove(&mut self, id: &u32) -> Option<H2StreamCtx> {
+    pub fn remove(&mut self, id: &K) -> Option<S> {
         let i = self.pos(*id).ok()?;
         let s = self.v.remove(i).1;
         self.shrink();
@@ -351,7 +359,7 @@ impl StreamMap {
     }
 
     /// Keeps the streams `f` says to keep.
-    pub fn retain(&mut self, mut f: impl FnMut(&u32, &mut H2StreamCtx) -> bool) {
+    pub fn retain(&mut self, mut f: impl FnMut(&K, &mut S) -> bool) {
         self.v.retain_mut(|(id, s)| f(id, s));
         self.shrink();
     }
@@ -372,40 +380,40 @@ impl StreamMap {
         self.v.is_empty()
     }
 
-    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &u32> + Clone + '_ {
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item = &K> + Clone + '_ {
         self.v.iter().map(|(id, _)| id)
     }
 
-    pub fn values(&self) -> impl DoubleEndedIterator<Item = &H2StreamCtx> + Clone + '_ {
+    pub fn values(&self) -> impl DoubleEndedIterator<Item = &S> + Clone + '_ {
         self.v.iter().map(|(_, s)| s)
     }
 
-    pub fn values_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut H2StreamCtx> + '_ {
+    pub fn values_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut S> + '_ {
         self.v.iter_mut().map(|(_, s)| s)
     }
 
     /// The stream `id`, as `BTreeMap::entry` gives it.
-    pub fn entry(&mut self, id: u32) -> StreamEntry<'_> {
+    pub fn entry(&mut self, id: K) -> StreamEntry<'_, S, K> {
         StreamEntry { map: self, id }
     }
 }
 
 /// [`StreamMap::entry`].
-pub struct StreamEntry<'a> {
-    map: &'a mut StreamMap,
-    id: u32,
+pub struct StreamEntry<'a, S = H2StreamCtx, K = u32> {
+    map: &'a mut StreamMap<S, K>,
+    id: K,
 }
 
-impl<'a> StreamEntry<'a> {
+impl<'a, S, K: Ord + Copy> StreamEntry<'a, S, K> {
     /// Runs `f` on the stream, if there is one.
-    pub fn and_modify(self, f: impl FnOnce(&mut H2StreamCtx)) {
+    pub fn and_modify(self, f: impl FnOnce(&mut S)) {
         if let Some(s) = self.map.get_mut(&self.id) {
             f(s);
         }
     }
 
     /// The stream, inserted from `f` if there was none.
-    pub fn or_insert_with(self, f: impl FnOnce() -> H2StreamCtx) -> &'a mut H2StreamCtx {
+    pub fn or_insert_with(self, f: impl FnOnce() -> S) -> &'a mut S {
         let i = match self.map.pos(self.id) {
             Ok(i) => i,
             Err(i) => {
@@ -542,7 +550,7 @@ pub const SPARE_STREAMS: usize = 4;
 pub const IDLE_SPARES: usize = 2;
 
 /// `status` as its decimal digits in `buf`.
-fn status_text(status: u16, buf: &mut [u8; 5]) -> &str {
+pub(crate) fn status_text(status: u16, buf: &mut [u8; 5]) -> &str {
     let mut n = status;
     let mut i = buf.len();
     loop {
@@ -943,6 +951,41 @@ impl H2MuxContext {
         sent
     }
 
+    /// Sends an interim (1xx) response head, an HTTP/1 one, as a HEADERS frame without
+    /// END_STREAM (T503; `h2s_snd_fhdrs` for a 1xx). False if `head` is not a 1xx head.
+    pub fn send_interim(&mut self, stream_id: u32, head: &[u8]) -> bool {
+        if self.streams.get(&stream_id).is_some_and(|s| matches!(s.state, H2StreamState::Reset(_))) {
+            return true;
+        }
+        let head_str = String::from_utf8_lossy(head);
+        let mut lines = head_str.lines();
+        let status = lines.next().and_then(|l| l.split_whitespace().nth(1)).and_then(|c| c.parse::<u16>().ok());
+        let Some(status) = status.filter(|s| (100..200).contains(s)) else { return false };
+        let headers = lines.filter_map(|line| line.split_once(':')).map(|(name, val)| (name.trim(), val.trim()));
+        self.send_headers_frame(stream_id, status, headers, false);
+        true
+    }
+
+    /// Sends the response's trailers as a HEADERS frame that ends the stream (T503;
+    /// `h2s_snd_ftrl`), the names lowercased.
+    pub fn send_trailers(&mut self, stream_id: u32, trailers: &[(&str, &str)]) -> bool {
+        if self.streams.get(&stream_id).is_some_and(|s| matches!(s.state, H2StreamState::Reset(_))) {
+            return true;
+        }
+        let at = self.begin_frame(FrameType::Headers, frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id);
+        let mut lower = std::mem::take(&mut self.lower_name);
+        for (name, val) in trailers {
+            lower.clear();
+            lower.push_str(name);
+            lower.make_ascii_lowercase();
+            self.encoder.encode_field(&lower, val, &mut self.tx_buf);
+        }
+        self.lower_name = lower;
+        self.end_frame(at);
+        self.local_end_stream(stream_id);
+        true
+    }
+
     /// The stream's state once we have sent END_STREAM.
     fn local_end_stream(&mut self, stream_id: u32) {
         self.streams.entry(stream_id).and_modify(|stream| {
@@ -951,6 +994,115 @@ impl H2MuxContext {
                 _ => H2StreamState::HalfClosedLocal,
             };
         });
+    }
+}
+
+impl crate::htx_mux::HtxStream for H2StreamCtx {
+    fn rx_htx(&self) -> &Htx {
+        &self.rx_htx
+    }
+    fn rx_htx_mut(&mut self) -> &mut Htx {
+        &mut self.rx_htx
+    }
+    fn dispatched(&self) -> bool {
+        self.dispatched
+    }
+    fn set_dispatched(&mut self) {
+        self.dispatched = true;
+    }
+    fn rx_buffered(&self) -> usize {
+        self.rx_buffered
+    }
+    fn is_reset(&self) -> bool {
+        matches!(self.state, H2StreamState::Reset(_))
+    }
+    fn req_head(&self) -> Option<&H2ReqHead> {
+        self.req_head.as_deref()
+    }
+    fn take_req_head(&mut self) -> Option<Box<H2ReqHead>> {
+        self.req_head.take()
+    }
+    fn bad_request(&self) -> bool {
+        self.bad_request
+    }
+}
+
+/// The h2 mux as the bridge drives it (T503, design section 2.4): its own methods, by a
+/// `u64` id (an h2 id is 31 bits; one past that names no stream).
+impl crate::htx_mux::HtxMux for H2MuxContext {
+    type Stream = H2StreamCtx;
+
+    fn stream(&self, id: u64) -> Option<&H2StreamCtx> {
+        self.streams.get(&u32::try_from(id).ok()?)
+    }
+
+    fn stream_mut(&mut self, id: u64) -> Option<&mut H2StreamCtx> {
+        self.streams.get_mut(&u32::try_from(id).ok()?)
+    }
+
+    /// As `h2_bridge::dispatch_next` picks: the lowest stream with its head that is
+    /// neither served, closed nor reset.
+    fn next_dispatch(&self) -> Option<u64> {
+        self.streams
+            .values()
+            .find(|st| {
+                !st.dispatched
+                    && st.state != H2StreamState::Closed
+                    && !matches!(st.state, H2StreamState::Reset(_))
+                    && st.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Eoh))
+            })
+            .map(|st| u64::from(st.id))
+    }
+
+    fn give_back_head(&mut self, head: Box<H2ReqHead>) {
+        H2MuxContext::give_back_head(self, head);
+    }
+
+    fn send_head(&mut self, id: u64, head: &[u8], end_stream: bool) -> bool {
+        self.send_h1_head(u32::try_from(id).unwrap_or(u32::MAX), head, end_stream)
+    }
+
+    fn send_data(&mut self, id: u64, data: &[u8], end_stream: bool) -> usize {
+        H2MuxContext::send_data(self, u32::try_from(id).unwrap_or(u32::MAX), data, end_stream)
+    }
+
+    fn send_trailers(&mut self, id: u64, trailers: &[(&str, &str)]) -> bool {
+        H2MuxContext::send_trailers(self, u32::try_from(id).unwrap_or(u32::MAX), trailers)
+    }
+
+    fn send_interim(&mut self, id: u64, head: &[u8]) -> bool {
+        H2MuxContext::send_interim(self, u32::try_from(id).unwrap_or(u32::MAX), head)
+    }
+
+    fn data_budget(&self, id: u64) -> usize {
+        H2MuxContext::data_budget(self, u32::try_from(id).unwrap_or(u32::MAX))
+    }
+
+    /// Credits the stream and demuxes what waited, as `pump_request_body` does.
+    fn rx_taken(&mut self, id: u64, n: usize) {
+        H2MuxContext::rx_taken(self, u32::try_from(id).unwrap_or(u32::MAX), n);
+        self.resume();
+    }
+
+    fn reset(&mut self, id: u64, why: crate::htx_mux::MuxReset) {
+        let code = match why {
+            crate::htx_mux::MuxReset::Cancel => H2Error::Cancel,
+            crate::htx_mux::MuxReset::Internal => H2Error::InternalError,
+            crate::htx_mux::MuxReset::Refused => H2Error::RefusedStream,
+        };
+        self.send_rst_stream(u32::try_from(id).unwrap_or(u32::MAX), code);
+    }
+
+    fn is_reset(&self, id: u64) -> bool {
+        crate::htx_mux::HtxMux::stream(self, id).is_some_and(|s| matches!(s.state, H2StreamState::Reset(_)))
+    }
+
+    fn tx_pending(&self) -> bool {
+        self.tx_buf.len() > self.tx_consumed
+    }
+
+    fn glitches(&self) -> u64 {
+        self.glitch_count as u64
     }
 }
 
