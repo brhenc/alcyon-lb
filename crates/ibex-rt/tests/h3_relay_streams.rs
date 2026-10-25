@@ -417,20 +417,6 @@ fn a_blocked_response_waits_and_a_closed_connection_frees_it() {
     assert!(rig.run_until(|r| !r.server.is_busy()), "the listener still holds the connection");
 }
 
-/// The standalone mode (`set_backend`, no engine) waits on its backend leg for reading only
-/// once the request is written: write interest there is what made a slow backend spin.
-#[test]
-fn a_standalone_leg_waits_for_reading_once_its_request_is_written() {
-    let be = std::net::TcpListener::bind("127.0.0.1:0").expect("backend");
-    let addr = be.local_addr().expect("addr");
-    let mut rig = Rig::with(|s| s.set_backend(addr));
-    rig.open(&headers(&[("content-length", "0")]), true);
-    assert!(
-        rig.run_until(|r| r.server.io_fds().iter().any(|&(_, rd, wr)| rd && !wr)),
-        "the leg never settled on read interest"
-    );
-}
-
 /// A response delimited by the close: its data goes out as it comes, and the stream ends
 /// when the engine closes.
 #[test]
@@ -621,4 +607,18 @@ fn a_headers_frame_just_under_the_cap_still_works() {
     rig.open(&headers_of_len(FRAME_CAP + 1), true);
     run_to_close(&mut rig);
     assert_excessive_load(&rig);
+}
+
+/// A listener nobody gave a frontend answers nothing (T463): pumping it is an error, not a
+/// canned response.
+#[test]
+fn a_listener_without_a_frontend_refuses_to_run() {
+    ibex_tls::config::install_default_crypto_provider();
+    let crt = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem"));
+    let (certs, key) = ibex_tls::config::load_cert_file(crt).expect("cert");
+    let mut tls = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key).expect("tls");
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let mut server = QuicListener::bind("127.0.0.1:0".parse().expect("addr"), &tls, None).expect("bind");
+    let err = server.pump(Instant::now()).expect_err("no frontend");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }

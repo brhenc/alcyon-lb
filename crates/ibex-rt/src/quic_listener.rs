@@ -15,9 +15,7 @@ use crate::dgram::{DgramBuf, DgramOut, DgramSocket};
 use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
 
 use ibex_proto::h3::H3Error;
-use ibex_proto::htx::{HtxBlock, HtxSlice};
 use ibex_proto::mux_h3;
-use ibex_proto::qpack;
 use ibex_quic::{
     ConnectionId, QuicConfig, QuicEndpoint, QuicTransport, StreamDirection, StreamId,
     TransportEvent,
@@ -76,12 +74,6 @@ pub struct QuicListener {
     recv_cmsg_bufs: Vec<Vec<u8>>,
     send_raw_bufs: Vec<Vec<u8>>,
     h3: HashMap<ConnectionId, H3State>,
-    /// Where to proxy requests. Without one the listener answers directly, which is what
-    /// the bring-up test used before there was a backend leg.
-    backend: Option<SocketAddr>,
-    /// Backend requests still in flight, one per answered request stream (standalone mode
-    /// only, see [`QuicListener::set_backend`]).
-    legs: Vec<BackendLeg>,
     /// Set by the engine: each request is handed to the frontend's stream engine.
     frontend: Option<usize>,
     /// Request streams handed to the engine, one per socket pair.
@@ -104,22 +96,6 @@ pub struct QuicListener {
     /// forget: the number is free for the kernel to hand out again, and a stale table entry
     /// under it would keep the next socket to get it out of the poller.
     released: Vec<RawFd>,
-}
-
-/// One backend request in flight, driven without blocking the pump loop.
-///
-/// The first version did `TcpStream::connect` plus blocking reads inside `on_readable`, so a
-/// single slow backend stalled every QUIC connection on the listener. Non-blocking from the
-/// start now: `raw::connect` returns immediately with `EINPROGRESS`, and each `pump` advances
-/// whatever legs are outstanding.
-struct BackendLeg {
-    fd: OwnedFd,
-    conn_id: ConnectionId,
-    stream_id: StreamId,
-    connected: bool,
-    request: Vec<u8>,
-    written: usize,
-    response: Vec<u8>,
 }
 
 /// A request stream handed to the stream engine over a socket pair (see `h3_relay`).
@@ -240,8 +216,6 @@ impl QuicListener {
             recv_cmsg_bufs,
             send_raw_bufs,
             h3: HashMap::new(),
-            backend: None,
-            legs: Vec::new(),
             frontend: None,
             relays: Vec::new(),
             accepted: Vec::new(),
@@ -254,13 +228,6 @@ impl QuicListener {
         }
     }
 
-
-    /// Sets the backend this listener proxies to, without the stream engine: the request
-    /// goes straight to `addr`, with no rule, load balancing or log. For the standalone
-    /// bring-up tests and `duress_target`; the engine uses [`QuicListener::set_frontend`].
-    pub fn set_backend(&mut self, addr: SocketAddr) {
-        self.backend = Some(addr);
-    }
 
     /// Hands every request to the stream engine (T130): each one becomes a client
     /// connection of the frontend, collected with [`QuicListener::take_accepted`].
@@ -292,15 +259,11 @@ impl QuicListener {
     /// otherwise wakes the loop at once, every pass (the spin T108 found).
     #[must_use]
     pub fn io_fds(&self) -> Vec<(std::os::fd::BorrowedFd<'_>, bool, bool)> {
-        let legs = self.legs.iter().map(|l| {
-            let writing = !l.connected || l.written < l.request.len();
-            (l.fd.as_fd(), !writing, writing)
-        });
         let relays = self.relays.iter().map(|r| {
             let backlog = self.outq.get(&(r.conn_id, r.stream_id)).map_or(0, |q| q.buf.len() - q.off);
             (r.fd.as_fd(), !r.done && backlog < RELAY_BACKLOG, !r.to_engine.is_empty())
         });
-        legs.chain(relays).collect()
+        relays.collect()
     }
 
     /// Returns the local bound address of the listener.
@@ -442,6 +405,11 @@ impl QuicListener {
     /// # Errors
     /// Returns an error if a non-transient socket error occurs.
     pub fn pump(&mut self, now: Instant) -> io::Result<()> {
+        // Every request goes to a frontend's stream engine (T463): a listener without one
+        // is a bug in whoever built it, and answering anyway would hide it.
+        if self.frontend.is_none() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "QUIC listener has no frontend"));
+        }
         self.recv_batch(now)?;
 
         // Reused across passes: a relay reads the engine's response through it, 64 KB a time.
@@ -508,7 +476,6 @@ impl QuicListener {
             }
         }
 
-        self.advance_backends();
         self.advance_relays(&mut scratch);
         self.flush_out();
         if self.stopping {
@@ -588,7 +555,7 @@ impl QuicListener {
     /// not yet finished closing, or a backend request in flight.
     #[must_use]
     pub fn is_busy(&self) -> bool {
-        !self.legs.is_empty() || !self.relays.is_empty() || self.endpoint.connection_count() > 0
+        !self.relays.is_empty() || self.endpoint.connection_count() > 0
     }
 
     /// Sends GOAWAY once on a connection's control stream.
@@ -605,7 +572,6 @@ impl QuicListener {
         for (conn_id, st) in &self.h3 {
             let owes = !st.unacked.is_empty()
                 || st.req.values().any(|b| !b.is_empty())
-                || self.legs.iter().any(|l| l.conn_id == *conn_id)
                 || self.relays.iter().any(|r| r.conn_id == *conn_id)
                 || self.outq.keys().any(|(c, _)| c == conn_id);
             if !owes {
@@ -650,96 +616,6 @@ impl QuicListener {
             if let Some(st) = self.h3.get_mut(&conn_id) {
                 st.unacked.push(stream_id);
             }
-        }
-    }
-
-    /// Advances every in-flight backend leg by whatever it can do without blocking.
-    fn advance_backends(&mut self) {
-        let mut finished: Vec<(ConnectionId, StreamId, Vec<u8>)> = Vec::new();
-        let mut still = Vec::with_capacity(self.legs.len());
-        let before: Vec<RawFd> = self.legs.iter().map(|l| l.fd.as_raw_fd()).collect();
-
-        for mut leg in std::mem::take(&mut self.legs) {
-            if !leg.connected {
-                if matches!(crate::raw::check_connect_error(leg.fd.as_fd()), Ok(None)) {
-                    leg.connected = true;
-                } else {
-                    finished.push((leg.conn_id, leg.stream_id,
-                                   mux_h3::encode_response(502, &[], b"")));
-                    continue;
-                }
-            }
-
-            while leg.written < leg.request.len() {
-                match crate::raw::send(leg.fd.as_fd(), &leg.request[leg.written..]) {
-                    Ok(crate::raw::Io::Done(n)) => leg.written += n,
-                    Ok(crate::raw::Io::WouldBlock) => break,
-                    _ => {
-                        finished.push((leg.conn_id, leg.stream_id,
-                                       mux_h3::encode_response(502, &[], b"")));
-                        leg.written = usize::MAX;
-                        break;
-                    }
-                }
-            }
-            if leg.written == usize::MAX {
-                continue;
-            }
-            if leg.written < leg.request.len() {
-                still.push(leg);
-                continue;
-            }
-
-            let mut chunk = [0u8; 4096];
-            let mut done = false;
-            let mut failed = false;
-            loop {
-                match crate::raw::recv(leg.fd.as_fd(), &mut chunk) {
-                    Ok(crate::raw::Io::Done(n)) => leg.response.extend_from_slice(&chunk[..n]),
-                    Ok(crate::raw::Io::WouldBlock) => break,
-                    Ok(crate::raw::Io::Eof) => {
-                        done = true;
-                        break;
-                    }
-                    _ => {
-                        failed = true;
-                        break;
-                    }
-                }
-                if Self::try_split_response(&leg.response).is_some() {
-                    done = true;
-                    break;
-                }
-            }
-
-            if failed && Self::try_split_response(&leg.response).is_none() {
-                finished.push((leg.conn_id, leg.stream_id,
-                               mux_h3::encode_response(502, &[], b"")));
-                continue;
-            }
-            if done || Self::try_split_response(&leg.response).is_some() {
-                let resp = match Self::try_split_response(&leg.response) {
-                    Some((status, body)) => mux_h3::encode_response(
-                        status,
-                        &[("content-length".to_string(), body.len().to_string())],
-                        &body,
-                    ),
-                    None => mux_h3::encode_response(502, &[], b""),
-                };
-                finished.push((leg.conn_id, leg.stream_id, resp));
-                continue;
-            }
-            still.push(leg);
-        }
-
-        self.legs = still;
-        for fd in before {
-            if !self.legs.iter().any(|l| l.fd.as_raw_fd() == fd) {
-                self.released.push(fd);
-            }
-        }
-        for (conn_id, stream_id, resp) in finished {
-            self.respond(conn_id, stream_id, &resp);
         }
     }
 
@@ -827,35 +703,20 @@ impl QuicListener {
         // (`h3.c` `h3_rcv_buf`). A HEADERS frame can be split across datagrams, so
         // `Ok(None)` means wait for more -- but never for more than one buffer of it.
         let cap = crate::buf::get_bufsize().saturating_sub(4);
-        let field_section = match mux_h3::take_request_headers(held, cap) {
-            Ok(Some(section)) => section,
+        match mux_h3::take_request_headers(held, cap) {
+            Ok(Some(_)) => {}
             Ok(None) if held.len() <= cap + MAX_FRAME_HEADER => return,
             _ => {
                 st.req.remove(&stream_id);
                 self.endpoint.close_connection(conn_id, H3Error::ExcessiveLoad as u64, b"");
                 return;
             }
-        };
+        }
 
         st.answered.push(stream_id);
         let buf = st.req.remove(&stream_id).unwrap_or_default();
 
-        if self.frontend.is_some() {
-            self.start_relay(conn_id, stream_id, &buf, fin);
-        } else if let Some(be) = self.backend {
-            match Self::start_backend(be, conn_id, stream_id, &field_section) {
-                Ok(leg) => self.legs.push(leg),
-                Err(resp) => self.respond(conn_id, stream_id, &resp),
-            }
-        } else {
-            let body = b"hello-from-ibex-h3".to_vec();
-            let resp = mux_h3::encode_response(
-                200,
-                &[("content-length".to_string(), body.len().to_string())],
-                &body,
-            );
-            self.respond(conn_id, stream_id, &resp);
-        }
+        self.start_relay(conn_id, stream_id, &buf, fin);
     }
 
     /// The client reset the request or asked us to stop sending the response: the engine's
@@ -1011,80 +872,6 @@ impl Relay {
         }
         self.done = true;
         (!self.resp.head_sent).then(|| mux_h3::encode_response(400, &[], b""))
-    }
-}
-
-impl QuicListener {
-    /// Converts a decoded HTTP/3 request and starts a non-blocking backend connect.
-    ///
-    /// The conversion goes through `headers_to_htx`, the same `pseudo_headers_to_htx` the
-    /// HTTP/2 mux uses: `:authority` becomes `Host`, `:scheme` is consumed, and no
-    /// pseudo-header reaches the backend. Reimplementing that mapping here is how HTTP/3
-    /// inherited the missing-`Host` defect in the first place.
-    ///
-    /// # Errors
-    /// Returns an already-encoded HTTP/3 error response when the request cannot be converted
-    /// or the socket cannot be created.
-    fn start_backend(
-        backend: SocketAddr,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        field_section: &[u8],
-    ) -> Result<BackendLeg, Vec<u8>> {
-        let fields = qpack::decode_qpack_static(field_section)
-            .map_err(|_| mux_h3::encode_response(400, &[], b""))?;
-        let blocks = ibex_proto::h3::headers_to_htx(fields)
-            .map_err(|_| mux_h3::encode_response(400, &[], b""))?;
-
-        let mut scratch = vec![0u8; 16384];
-        let mut slice = HtxSlice::new(&mut scratch);
-        for block in &blocks {
-            let pushed = match block {
-                HtxBlock::ReqLine(rl) => {
-                    slice.push_req_line(rl.method.as_str(), &rl.uri, "HTTP/1.1")
-                }
-                HtxBlock::Header(h) => slice.push_header(&h.name, &h.value),
-                HtxBlock::Eoh => slice.push_eoh(),
-                _ => Ok(()),
-            };
-            if pushed.is_err() {
-                return Err(mux_h3::encode_response(431, &[], b""));
-            }
-        }
-        let request = slice.as_ref().to_h1_wire();
-
-        let (fd, connected) = crate::raw::connect(backend)
-            .map_err(|_| mux_h3::encode_response(502, &[], b""))?;
-
-        Ok(BackendLeg {
-            fd,
-            conn_id,
-            stream_id,
-            connected,
-            request,
-            written: 0,
-            response: Vec::new(),
-        })
-    }
-
-    /// Parses a complete HTTP/1 response, or `None` if more bytes are needed.
-    fn try_split_response(raw: &[u8]) -> Option<(u16, Vec<u8>)> {
-        let head_end = raw.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-        let head = std::str::from_utf8(&raw[..head_end]).ok()?;
-        let status: u16 = head.split_whitespace().nth(1)?.parse().ok()?;
-        let content_length = head
-            .lines()
-            .find_map(|l| {
-                let (n, v) = l.split_once(':')?;
-                n.trim().eq_ignore_ascii_case("content-length")
-                    .then(|| v.trim().parse::<usize>().ok())?
-            })
-            .unwrap_or(0);
-        let body = &raw[head_end..];
-        if body.len() < content_length {
-            return None;
-        }
-        Some((status, body[..content_length].to_vec()))
     }
 }
 
