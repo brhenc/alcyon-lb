@@ -168,7 +168,7 @@ fn resolve_keywords_check_their_arguments() {
         "'server s1' : 'resolve-opts' : unknown resolve-opts option 'bar', supported methods are 'allow-dup-ip', 'ignore-weight', and 'prevent-dup-ip'.."
     );
     // Accepted alone, as HAProxy does (they only act with `resolvers`, T484).
-    for kw in ["resolve-prefer ipv4", "resolve-prefer ipv6", "resolve-net 10.0.0.0/8,2001:db8::/32,10.1.2.3", "resolve-opts", "resolve-opts allow-dup-ip,prevent-dup-ip,ignore-weight"] {
+    for kw in ["resolve-prefer ipv4", "resolve-prefer ipv6", "resolve-net 10.0.0.0/8,2001:db8::/32,10.1.2.3,2001:db8::1", "resolve-opts", "resolve-opts allow-dup-ip,prevent-dup-ip,ignore-weight"] {
         parse_str(&backend(&format!("  server s1 127.0.0.1:80 {kw}"))).unwrap_or_else(|e| panic!("{kw}: {}", e.message));
         parse_str(&backend(&format!("  default-server {kw}\n  server s1 127.0.0.1:80"))).unwrap_or_else(|e| panic!("{kw}: {}", e.message));
     }

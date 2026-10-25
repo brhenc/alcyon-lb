@@ -30,7 +30,7 @@
 
 use ibex_config::{parse_str, Config, ConfigError};
 
-const DEFAULTS: &str = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 1s\n  timeout server 1s\n";
+const DEFAULTS: &str = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 1s\n  timeout server 1s\nresolvers r1\n  nameserver ns 127.0.0.1:53\n";
 
 fn server_line(rest: &str) -> Result<Config, ConfigError> {
     parse_str(&format!("{DEFAULTS}backend b\n  server s1 127.0.0.1:8080 {rest}\n"))
@@ -94,7 +94,7 @@ const KEYWORDS: &[(&str, Ibex)] = &[
     ("resolve-net 10.0.0.0/8", Accepts),
     ("resolve-opts allow-dup-ip", Accepts),
     ("resolve-prefer ipv4", Accepts),
-    ("resolvers r1", Refuses),
+    ("resolvers r1", Accepts),
     ("send-proxy", Accepts),
     ("send-proxy-v2", Accepts),
     ("set-proxy-v2-tlv-fmt(0xE1) foo", Refuses),
@@ -337,4 +337,24 @@ fn default_server_settings_are_inherited_and_no_keywords_clear_them() {
     assert!(!s2.send_proxy_v2, "no-send-proxy-v2");
     assert!(!s2.backup, "no-backup");
     assert_eq!(s2.weight, Some(7));
+}
+
+#[test]
+fn resolvers_naming_a_missing_section_is_refused_as_haproxy_refuses_it() {
+    // Measured with HAProxy 3.5-dev8 (`haproxy -c`): on a `server` line the alert is
+    // "backend 'b', server 's1': unable to find required resolvers 'r1'", status 1. On a
+    // `default-server` line with a section present it loads.
+    let defaults = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 1s\n  timeout server 1s\n";
+    let cases = [
+        format!("{defaults}backend b\n  server s1 127.0.0.1:8080 resolvers r1\n"),
+        format!("{defaults}backend b\n  default-server resolvers r1\n  server s1 127.0.0.1:8080\n"),
+    ];
+    for cfg in &cases {
+        let e = parse_str(cfg).expect_err("a missing resolvers section must be refused");
+        assert!(
+            e.message.contains("unable to find required resolvers 'r1'"),
+            "wrong message: {}",
+            e.message
+        );
+    }
 }
