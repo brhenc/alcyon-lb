@@ -147,15 +147,16 @@ fn a_replacement_with_an_alias_prints_it() {
 }
 
 /// `set-timeout` from a string sample (T455 compiles its expression at load): measured on
-/// 3.5-dev8 on 2026-10-25, `str(9000)` gives a client timeout of 9000. (`str(7s)` gives 7 on
+/// 3.5-dev8 on 2026-10-25, `int(7000)` gives a server timeout of 7000 and `str(9000)` a client
+/// timeout of 9000. (`str(7s)` gives 7 on
 /// `HAProxy`, which casts the string to an integer, and 7000 on Ibex: T472.)
 #[test]
 fn set_timeout_takes_a_string_sample() {
     let r = exchange(
         &format!(
-            "{DEFAULTS}listen fe\n  bind ADDR\n  http-request set-timeout client str(9000)\n  http-request return status 200 content-type text/plain lf-string \"c=%[cur_client_timeout]\"\n  server s SRV\n"
+            "{DEFAULTS}listen fe\n  bind ADDR\n  http-request set-timeout server int(7000)\n  http-request set-timeout client str(9000)\n  http-request return status 200 content-type text/plain lf-string \"s=%[cur_server_timeout] c=%[cur_client_timeout]\"\n  server s SRV\n"
         ),
         GET,
     );
-    assert_eq!(body(&r), "c=9000", "{r}");
+    assert_eq!(body(&r), "s=7000 c=9000", "{r}");
 }
