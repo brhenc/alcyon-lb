@@ -491,6 +491,84 @@ def _wait_listening(port: int, proc: subprocess.Popen, timeout: float = 5.0) -> 
     raise RuntimeError(f"proxy did not listen on {port} within {timeout}s")
 
 
+# T452 (2026-10-25, quiet-host run, tasks/T452-measure-1conn-bimodal-variance.md): the gate
+# measures without perf counters attached (~18.9k req/s at 1 connection on this host). Its old
+# 15k/19k split came from the host, not the build: a busy SMT sibling of the proxy's CPU gave
+# 14.5k, proxy and client on SMT siblings 13.5k, across L3s 12.7k (T452's batches; on a quiet
+# host every batch had one mode). So the run is refused unless the governor is `performance`
+# on the CPUs it uses and those CPUs, their SMT siblings and their CCX are idle
+# (`host_problems`). A/A spread with this check: see the T452 task file (night run).
+
+
+def _cpu_list(text: str) -> List[int]:
+    """"4-7,36-39" -> [4, 5, 6, 7, 36, 37, 38, 39]."""
+    out: List[int] = []
+    for part in text.strip().split(","):
+        if "-" in part:
+            lo, hi = part.split("-")
+            out.extend(range(int(lo), int(hi) + 1))
+        elif part:
+            out.append(int(part))
+    return out
+
+
+def _read(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _busy_share(stat_a: str, stat_b: str) -> Dict[int, float]:
+    """Share of non-idle time per CPU between two /proc/stat readings."""
+    def parse(text: str) -> Dict[int, Tuple[int, int]]:
+        t = {}
+        for line in text.splitlines():
+            f = line.split()
+            if f and f[0].startswith("cpu") and f[0] != "cpu":
+                v = [int(x) for x in f[1:]]
+                t[int(f[0][3:])] = (sum(v) - v[3] - v[4], sum(v))
+        return t
+    a, b = parse(stat_a), parse(stat_b)
+    return {c: (b[c][0] - a[c][0]) / max(1, b[c][1] - a[c][1]) for c in a if c in b}
+
+
+HOST_BUSY_MAX = 0.10
+
+
+def host_problems(stat_a: str, stat_b: str, cpus: List[int], sysfs: str = "/sys/devices/system/cpu",
+                  busy_max: float = HOST_BUSY_MAX) -> List[str]:
+    """Why this host is not quiet enough to measure on, [] if it is: the governor of each CPU in
+    `cpus` is not `performance`, or one of `cpus`, their SMT siblings or their L3 (CCX) was
+    busy over the interval between the two /proc/stat readings."""
+    why = []
+    watch = set(cpus)
+    for c in cpus:
+        gov = _read(f"{sysfs}/cpu{c}/cpufreq/scaling_governor")
+        if gov != "performance":
+            why.append(f"cpu{c} governor is {gov or 'unreadable'}, not performance")
+        for rel in ("topology/thread_siblings_list", "cache/index3/shared_cpu_list"):
+            watch.update(_cpu_list(_read(f"{sysfs}/cpu{c}/{rel}")))
+    busy = _busy_share(stat_a, stat_b)
+    hot = {c: round(100 * busy[c]) for c in sorted(watch) if busy.get(c, 0) > busy_max}
+    if hot:
+        why.append("busy CPUs (%): " + ", ".join(f"{c}: {p}" for c, p in hot.items()))
+    return why
+
+
+def measure_cpus() -> List[str]:
+    """The CPUs measure_ab pins to: proxy, client, backend."""
+    return os.environ.get("IBEX_MEASURE_CPUS", "4,5,6").split(",")
+
+
+def check_host_quiet(cpus: List[int]) -> List[str]:
+    """host_problems over one second of the real /proc/stat."""
+    a = _read("/proc/stat")
+    time.sleep(1.0)
+    return host_problems(a, _read("/proc/stat"), cpus)
+
+
 # The 1-conn samples of one build fall in two modes about 25% apart (~15k and ~19k req/s on
 # the gate's CPUs 4;5;6, T452). Within a mode the spread is about 10%, so a step of more than
 # MODE_GAP_PCT between two neighbouring samples is the gap between the modes.
@@ -547,7 +625,7 @@ def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
     # Proxy, client and backend each on their own core, all three sharing one L3. Left to
     # the scheduler, samples of one build split into two clusters ~25% apart (same L3 or
     # not), and an A/A run differed by 6%.
-    cpus = os.environ.get("IBEX_MEASURE_CPUS", "4,5,6").split(",")
+    cpus = measure_cpus()
     pin = (lambda i: ["taskset", "-c", cpus[i]]) if shutil.which("taskset") and len(cpus) >= 3 \
         else (lambda i: [])
     cfg = ("global\n    nbthread 1\n"
@@ -1160,6 +1238,10 @@ def main() -> int:
     # commits data/measurements.jsonl, so "the last record" drifted to an old one and the
     # growth of every change since added up until a harmless change failed the gate.
     record["binary_bytes_ref"], record["text_bytes_ref"] = measure_binary_size(ref_bin)
+    why = check_host_quiet([int(c) for c in measure_cpus()])
+    if why:
+        print("      refusing to measure, the host is not quiet (T452): " + "; ".join(why))
+        return 1
     ab = measure_ab(ibex_bin, ref_bin, target_dir)
     record["rps_1conn"] = ab["cand"]
     record["rps_1conn_ref"] = ab["ref"]

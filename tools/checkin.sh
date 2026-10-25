@@ -210,6 +210,8 @@ stage_harness-tests() {
   # (T254 found test_covercheck.py half-skipped). A few seconds.
   python3 -m unittest discover -s harness -p 'test_*.py' 2>&1 | grep -E "^(Ran |OK|FAILED|FAIL:|ERROR:)"
   check "${PIPESTATUS[0]}" "harness tests"
+  (cd tools/measure && python3 -m unittest test_measure 2>&1 | grep -E "^(Ran |OK|FAILED|FAIL:|ERROR:)"; exit "${PIPESTATUS[0]}")
+  check "$?" "measure.py tests"
   # The findings ledger (T292): a malformed data/findings.csv or verification_runs.csv fails the
   # gate; an open finding does not.
   python3 tools/findings.py --check
