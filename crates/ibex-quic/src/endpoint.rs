@@ -39,6 +39,13 @@ pub struct QuicEndpoint {
     tx_buf: Vec<u8>,
     /// Set by a soft stop: connections already here are served to the end, a new Initial is refused.
     refusing_new: bool,
+    /// `quic-force-retry`: every new connection without a valid token gets a Retry.
+    force_retry: bool,
+    /// `tune.quic.fe.sec.retry-threshold`: Retry once this many connections are half open.
+    retry_threshold: u64,
+    /// Connections whose peer address is not validated yet (`HAProxy`'s `half_open_conn`):
+    /// those with an [`AmplificationBudget`] not `validated`.
+    half_open: u64,
 }
 
 /// RFC 9000 §8.1 accounting for one connection on an unvalidated path.
@@ -107,36 +114,57 @@ impl QuicEndpoint {
         let config = quic_config.unwrap_or_default();
         let server_config = config.build_server_config(tls)?;
         let endpoint_config = Arc::new(config.build_endpoint_config()?);
-        Ok(Self::with_configs_and_amplification(
+        Ok(Self::from_config(endpoint_config, server_config, &config))
+    }
+
+    /// Creates a `QuicEndpoint` over built `EndpointConfig` and `ServerConfig`, with the
+    /// endpoint-level settings of `config` (Retry policy, anti-amplification factor).
+    #[must_use]
+    pub fn from_config(
+        endpoint_config: Arc<EndpointConfig>,
+        server_config: Arc<ServerConfig>,
+        config: &QuicConfig,
+    ) -> Self {
+        let mut endpoint = Self::with_configs_and_amplification(
             endpoint_config,
             server_config,
             config.require_retry,
             config.anti_amplification_factor,
-        ))
+        );
+        endpoint.retry_threshold = config.retry_threshold;
+        endpoint
     }
 
-    /// Creates a `QuicEndpoint` with custom `EndpointConfig`, `ServerConfig`, and retry requirement.
+    /// Creates a `QuicEndpoint` with custom `EndpointConfig`, `ServerConfig`, and
+    /// `quic-force-retry`.
     #[must_use]
     pub fn with_configs(
         endpoint_config: Arc<EndpointConfig>,
         server_config: Arc<ServerConfig>,
-        require_retry: bool,
+        force_retry: bool,
     ) -> Self {
-        Self::with_configs_and_amplification(endpoint_config, server_config, require_retry, 3)
+        Self::with_configs_and_amplification(endpoint_config, server_config, force_retry, 3)
     }
 
-    /// Creates a `QuicEndpoint` with custom `EndpointConfig`, `ServerConfig`, retry requirement, and anti-amplification factor.
+    /// Creates a `QuicEndpoint` with custom `EndpointConfig`, `ServerConfig`,
+    /// `quic-force-retry`, and anti-amplification factor. The Retry threshold is the default
+    /// (100); [`QuicEndpoint::from_config`] takes it from a [`QuicConfig`].
     #[must_use]
     pub fn with_configs_and_amplification(
         endpoint_config: Arc<EndpointConfig>,
         server_config: Arc<ServerConfig>,
-        require_retry: bool,
+        force_retry: bool,
         anti_amplification_factor: u64,
     ) -> Self {
+        // The third argument is quinn-proto's `allow_mtud`, not a Retry switch (it was passed
+        // `require_retry`, so Retry could never be enabled, T492). Path MTU discovery is only
+        // sound on a socket that sets the don't-fragment bit, and Ibex's UDP sockets do not
+        // (no IP_MTU_DISCOVER / IPV6_DONTFRAG), so it stays off: packets keep the configured
+        // `initial_mtu`, as `HAProxy` keeps its fixed maximum datagram size.
         let endpoint = Endpoint::new(
             endpoint_config,
             Some(server_config.clone()),
-            require_retry,
+            false,
             None,
         );
 
@@ -157,6 +185,9 @@ impl QuicEndpoint {
             response_buf: Vec::with_capacity(2048),
             tx_buf: Vec::with_capacity(2048),
             refusing_new: false,
+            force_retry,
+            retry_threshold: QuicConfig::default().retry_threshold,
+            half_open: 0,
         }
     }
 
@@ -244,6 +275,9 @@ impl QuicEndpoint {
             match evt {
                 quinn_proto::Event::Connected => {
                     if let Some(budget) = self.amplification_budgets.get_mut(&handle) {
+                        if !budget.validated {
+                            self.half_open = self.half_open.saturating_sub(1);
+                        }
                         budget.validated = true;
                     }
 
@@ -341,6 +375,33 @@ impl QuicEndpoint {
 
 
 
+    /// Answers `incoming` with a Retry (`send_retry`, `src/quic_tx.c`): the Retry is queued, and
+    /// no connection state is kept.
+    fn send_retry(&mut self, incoming: quinn_proto::Incoming) -> DatagramOutcome {
+        self.response_buf.clear();
+        match self.endpoint.retry(incoming, &mut self.response_buf) {
+            Ok(tx) => {
+                self.pending_transmits.push_back(TransmitEntry {
+                    transmit: Transmit {
+                        destination: tx.destination,
+                        src_ip: tx.src_ip,
+                        size: tx.size,
+                        segment_size: tx.segment_size,
+                        ecn: tx.ecn.map(EcnCodepoint::from),
+                    },
+                    data: self.response_buf.clone(),
+                });
+                DatagramOutcome::StatelessResponse
+            }
+            // Only an Incoming that already answered a Retry may not be retried,
+            // and that one is validated.
+            Err(e) => {
+                self.endpoint.ignore(e.into_incoming());
+                DatagramOutcome::Ignored
+            }
+        }
+    }
+
     /// Cleans up drained or dead connections from the table and handle list.
     pub fn cleanup_drained(&mut self) {
         let mut to_remove = Vec::new();
@@ -353,14 +414,36 @@ impl QuicEndpoint {
         for handle in to_remove {
             self.connections.remove(&handle);
             self.handle_to_primary_cid.remove(&handle);
-            self.amplification_budgets.remove(&handle);
+            // Released before its address was validated (`quic_conn_release`).
+            if self.amplification_budgets.remove(&handle).is_some_and(|b| !b.validated) {
+                self.half_open = self.half_open.saturating_sub(1);
+            }
             self.connection_table.remove_connection(handle);
             self.active_handles.retain(|&h| h != handle);
         }
     }
 }
 
+/// The token length of a QUIC v1 Initial packet at the start of `buf`, `None` for any other
+/// packet or one too short to say (RFC 9000 §17.2.2).
+fn initial_token_len(buf: &[u8]) -> Option<u64> {
+    let first = *buf.first()?;
+    // Long header, type Initial (0), version 1.
+    if first & 0xb0 != 0x80 || buf.get(1..5)? != [0, 0, 0, 1] {
+        return None;
+    }
+    let dcid_len = usize::from(*buf.get(5)?);
+    let scid_at = 6 + dcid_len;
+    let scid_len = usize::from(*buf.get(scid_at)?);
+    let at = scid_at + 1 + scid_len;
+    let b0 = *buf.get(at)?;
+    let len = 1usize << (b0 >> 6);
+    let bytes = buf.get(at..at + len)?;
+    Some(bytes[1..].iter().fold(u64::from(b0 & 0x3f), |v, &b| (v << 8) | u64::from(b)))
+}
+
 impl QuicTransport for QuicEndpoint {
+    #[allow(clippy::too_many_lines)]
     fn handle_datagram(
         &mut self,
         now: Instant,
@@ -394,6 +477,18 @@ impl QuicTransport for QuicEndpoint {
                     });
                     return Ok(DatagramOutcome::StatelessResponse);
                 }
+                let validated = incoming.remote_address_validated();
+                // `quic_rx_pkt_retrieve_conn`: an Initial whose token does not validate is
+                // dropped, nothing sent. quinn-proto would go on as if there were no token
+                // for one it cannot decode; Ibex issues no NEW_TOKEN tokens (no `bloom`
+                // feature), so any token it cannot validate is forged or someone else's.
+                if !validated && initial_token_len(buf).is_some_and(|n| n > 0) {
+                    self.endpoint.ignore(incoming);
+                    return Ok(DatagramOutcome::Ignored);
+                }
+                if !validated && (self.force_retry || self.half_open >= self.retry_threshold) {
+                    return Ok(self.send_retry(incoming));
+                }
                 let primary_cid = ConnectionId::from(*incoming.orig_dst_cid());
                 let outcome = match self.endpoint.accept(
                     incoming,
@@ -406,10 +501,14 @@ impl QuicTransport for QuicEndpoint {
                         self.handle_to_primary_cid.insert(handle, primary_cid);
                         self.connections.insert(handle, conn);
                         self.active_handles.push(handle);
-                        self.amplification_budgets.insert(
-                            handle,
-                            AmplificationBudget::new(buf.len() as u64, self.anti_amplification_factor),
-                        );
+                        let mut budget = AmplificationBudget::new(buf.len() as u64, self.anti_amplification_factor);
+                        // A Retry token validates the address (RFC 9000 §8.1.2): no
+                        // amplification limit, and not half open (`qc_new_conn`).
+                        budget.validated = validated;
+                        if !validated {
+                            self.half_open += 1;
+                        }
+                        self.amplification_budgets.insert(handle, budget);
 
                         self.event_queue.push_back(TransportEvent::NewConnection {
                             conn_id: primary_cid,
@@ -454,6 +553,11 @@ impl QuicTransport for QuicEndpoint {
                 } else {
                     Ok(DatagramOutcome::Ignored)
                 }
+            }
+            // quinn-proto closes with INVALID_TOKEN on a Retry token it decodes and refuses
+            // (another address, expired); `HAProxy` drops the datagram and sends nothing.
+            Some(DatagramEvent::Response(_)) if initial_token_len(buf).is_some_and(|n| n > 0) => {
+                Ok(DatagramOutcome::Ignored)
             }
             Some(DatagramEvent::Response(tx)) => {
                 let transmit = Transmit {

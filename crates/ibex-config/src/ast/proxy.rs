@@ -205,6 +205,10 @@ pub struct SocketTuning {
     pub congestion: Option<String>,
     /// `mss <n>`: `TCP_MAXSEG`.
     pub mss: Option<u32>,
+    /// `quic-force-retry`: a QUIC listener answers every new connection with a Retry first
+    /// (`QuicEndpoint`'s Retry policy). Accepted on a TCP bind, where it does nothing, as
+    /// `HAProxy` accepts it.
+    pub quic_force_retry: bool,
 }
 
 /// Bind configuration for frontend listeners.

@@ -227,6 +227,9 @@ pub struct GlobalSection {
     pub extra_stats_sockets: Vec<StatsSocket>,
     /// Maximum rewrite size in bytes.
     pub maxrewrite: Option<usize>,
+    /// `tune.quic.fe.sec.retry-threshold`: half-open QUIC connections past which a new one
+    /// is answered by a Retry; `None` is the default, 100.
+    pub quic_retry_threshold: Option<u64>,
     /// `ibex.debug.panic <request|response> <path-prefix>`: a test-only fault (T447), accepted
     /// only in builds with `debug_assertions`.
     pub debug_panic: Option<DebugPanic>,

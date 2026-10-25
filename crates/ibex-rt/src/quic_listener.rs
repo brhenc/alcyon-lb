@@ -185,13 +185,13 @@ impl QuicListener {
             .build_server_config(tls)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         // The whole config has to reach the endpoint, not just its TLS half. Routing through
-        // `bind_with_server_config` dropped `require_retry` and `anti_amplification_factor`,
-        // so a stricter factor an operator asked for was silently ignored.
-        let endpoint = QuicEndpoint::with_configs_and_amplification(
+        // `bind_with_server_config` dropped `require_retry`, the Retry threshold and
+        // `anti_amplification_factor`, so a stricter factor an operator asked for was
+        // silently ignored.
+        let endpoint = QuicEndpoint::from_config(
             Arc::new(config.build_endpoint_config().map_err(|e| io::Error::other(e.to_string()))?),
             server_config,
-            config.require_retry,
-            config.anti_amplification_factor,
+            &config,
         );
         let socket = match worker.and_then(|w| take_prebound(addr, w)) {
             Some(s) => s,

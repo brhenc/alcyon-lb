@@ -899,6 +899,8 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
                 })?);
                 i += 1;
             }
+            // `bind_parse_quic_force_retry`: a flag, on any bind; the QUIC listener reads it.
+            "quic-force-retry" => bind.sock.get_or_insert_with(Default::default).quic_force_retry = true,
             "v6only" => bind.sock.get_or_insert_with(Default::default).v6only = Some(true),
             "v4v6" => bind.sock.get_or_insert_with(Default::default).v6only = Some(false),
             "tcp-ut" => {

@@ -17,6 +17,9 @@ use crate::error::{QuicError, Result};
 /// Default ALPN protocol for HTTP/3 over QUIC.
 pub const ALPN_H3: &[u8] = b"h3";
 
+/// How long a Retry token is accepted: `HAProxy`'s `QUIC_RETRY_DURATION_SEC`.
+pub const RETRY_TOKEN_LIFETIME: Duration = Duration::from_secs(10);
+
 /// QUIC transport and endpoint configuration builder.
 #[derive(Debug, Clone)]
 pub struct QuicConfig {
@@ -44,10 +47,18 @@ pub struct QuicConfig {
     pub enable_gso: bool,
     /// Configured ALPN protocols (e.g. `vec![b"h3".to_vec()]`).
     pub alpn_protocols: Vec<Vec<u8>>,
-    /// Whether stateless reset packets are enabled.
-    pub enable_stateless_reset: bool,
-    /// Whether retry packets are required for address validation under load.
+    /// `quic-force-retry` on the bind: every new connection is first answered by a Retry,
+    /// whatever the half-open count.
+    ///
+    /// There is no stateless-reset switch: quinn-proto always answers a short-header packet
+    /// for an unknown connection with a stateless reset, and so does `HAProxy` (it only
+    /// limits the rate, `tune.quic.sec.stateless-reset-rate`, which Ibex does not have).
     pub require_retry: bool,
+    /// `tune.quic.fe.sec.retry-threshold` (default 100): once this many connections of the
+    /// endpoint are half open (handshake started, peer address not yet validated), every new
+    /// Initial without a token is answered by a Retry. The count is per endpoint, that is
+    /// per worker, as `HAProxy`'s is per thread.
+    pub retry_threshold: u64,
     /// Anti-amplification factor limit for unvalidated peer paths (default: 3, per RFC 9000 §8.1).
     pub anti_amplification_factor: u64,
 }
@@ -72,8 +83,8 @@ impl Default for QuicConfig {
             min_mtu: 1200,
             enable_gso: true,
             alpn_protocols: vec![ALPN_H3.to_vec()],
-            enable_stateless_reset: true,
             require_retry: false,
+            retry_threshold: 100,
             anti_amplification_factor: 3,
         }
     }
@@ -118,6 +129,13 @@ impl QuicConfig {
     #[must_use]
     pub const fn with_anti_amplification_factor(mut self, factor: u64) -> Self {
         self.anti_amplification_factor = factor;
+        self
+    }
+
+    /// Sets `tune.quic.fe.sec.retry-threshold`.
+    #[must_use]
+    pub const fn with_retry_threshold(mut self, n: u64) -> Self {
+        self.retry_threshold = n;
         self
     }
 
@@ -192,6 +210,8 @@ impl QuicConfig {
         let token_key = crate::crypto::TokenKey::new().map_err(QuicError::Tls)?;
         let mut server_config = quinn_proto::ServerConfig::new(Arc::new(quic_crypto), Arc::new(token_key));
         server_config.transport_config(Arc::new(self.build_transport_config()));
+        // `QUIC_RETRY_DURATION_SEC`: a Retry token is good for 10 s (quinn-proto's default 15).
+        server_config.retry_token_lifetime(RETRY_TOKEN_LIFETIME);
 
         Ok(Arc::new(server_config))
     }
