@@ -32,7 +32,7 @@ the end.
   added. The ring code itself is shared through the provider. Only the provider glue is copied.
 - **Build time.** Each rustls copy is one more large crate to compile, in debug and in release.
   The release `--timings` of T460 (report) give the per-crate time.
-- **Upkeep.** 0.24 is a pre-release pinned exactly (`=0.24.0-dev.2`, tradeoff.md 6.21). Each
+- **Upkeep.** 0.24 is a pre-release pinned exactly (`=0.24.0-dev.2`, tradeoff.md 6.22). Each
   upstream release means rebasing the fork and its providers, and porting the duplicated
   connection layer (section 3) to any API change twice.
 
