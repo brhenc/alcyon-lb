@@ -20,8 +20,11 @@ fn main() {
     // answers 503, which is enough to measure the handshake and amplification behaviour.
     let backend = std::env::args().nth(2).unwrap_or_else(|| "127.0.0.1:9".to_string());
 
+    // Argument 3 is the certificate; by default the one in this checkout.
+    let cert = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem").to_string());
     ibex_tls::config::install_default_crypto_provider();
-    let cert = "/home/bhenc/project-ibex/examples/certs/localhost.pem";
 
     // The listener comes from the configuration, as it does in a deployed Ibex: the engine
     // builds it, hands every request to the frontend's stream engine and drives it.
