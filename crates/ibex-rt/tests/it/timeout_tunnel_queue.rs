@@ -158,6 +158,12 @@ fn near(got: Duration, want_ms: u64) -> bool {
     g + 150 >= want_ms && g <= want_ms + 250
 }
 
+/// `Tw`, the milliseconds a request waited in the queue, from the `Tq/Tw/Tc/Tr/Ta` field of an
+/// `httplog` line.
+fn queue_wait_ms(log: &str) -> Option<u64> {
+    log.split(' ').find(|f| f.split('/').count() == 5 && f.split('/').all(|n| !n.is_empty() && n.trim_start_matches(['-', '+']).bytes().all(|b| b.is_ascii_digit()))).and_then(|f| f.split('/').nth(1)?.parse().ok())
+}
+
 fn logged(lines: &Arc<Mutex<Vec<String>>>, needle: &str) -> bool {
     for _ in 0..30 {
         if lines.lock().expect("lock").iter().any(|l| l.contains(needle)) {
@@ -285,7 +291,12 @@ fn queued_request_gets_503_after_timeout_queue() {
 fn queued_request_waits_timeout_connect_when_no_timeout_queue() {
     let t = "  timeout connect 1500ms\n  timeout client 10s\n  timeout server 10s\n";
     let (d, status, _, _, log) = queued(t, "");
-    assert!(near(d, 1500), "answered after {d:?}: {status}; log {log}");
+    // Never sooner than the timer, by the test's clock. How long the request waited is the
+    // proxy's own `Tw`: the test's clock also holds the time this thread took to write and to
+    // wake up, which a loaded host stretches.
+    assert!(d + Duration::from_millis(150) >= Duration::from_millis(1500), "answered after {d:?}: {status}; log {log}");
+    let tw = queue_wait_ms(&log);
+    assert!(tw.is_some_and(|tw| near(Duration::from_millis(tw), 1500)), "Tw {tw:?} ms; answered after {d:?}: {status}; log {log}");
     assert_eq!(status, "HTTP/1.1 503 Service Unavailable", "{log}");
     assert!(log.contains(" sQ-- "), "{log}");
 }
