@@ -233,7 +233,9 @@ impl TlsConn {
     fn new(ctx: TlsCtx, provider: ibex_tls::TlsCryptoProvider) -> Self {
         Self {
             ctx,
-            rx: TlsRx { buf: Buf::standard(), eof: false, closed: false },
+            // Its memory is taken at the first read (S5: one that cannot be had fails that
+            // stream, not the process).
+            rx: TlsRx { buf: Buf::unallocated(crate::buf::BufClass::Standard), eof: false, closed: false },
             _counted: crate::stats::SslConnCount::new(),
             provider,
             truncated: false,
@@ -328,6 +330,9 @@ impl TlsConn {
     /// still in it (the buffer may move its bytes to make room).
     fn read_once(&mut self, fd: BorrowedFd<'_>) -> io::Result<Read1> {
         debug_assert!(!self.ctx.has_plain());
+        if !self.rx.buf.alloc_if_needed() {
+            return Err(crate::buf::oom());
+        }
         if self.rx.buf.ensure_writable(4096).is_empty() {
             // Full of a record or a handshake message not complete yet.
             let len = self.rx.buf.len();
@@ -335,7 +340,9 @@ impl TlsConn {
             // as soon as its header is in, and takes every complete record, so the input holds
             // at most one message and one record, under MAX_INPUT. Kept as the memory bound.
             if len >= MAX_INPUT { return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS message too large")); }
-            self.rx.buf.grow_capacity((len + 16_384 + 2048 + 5).min(MAX_INPUT));
+            // Not reached (above): a growth that cannot be had leaves the buffer full, and the
+            // read below reads nothing.
+            let _ = self.rx.buf.grow_capacity((len + 16_384 + 2048 + 5).min(MAX_INPUT));
         }
         let w = self.rx.buf.ensure_writable(1);
         let room = w.len();

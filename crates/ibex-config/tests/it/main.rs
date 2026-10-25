@@ -51,6 +51,7 @@ mod no_memory_trimming;
 mod zero_buffers;
 mod ssl_zero_buffers;
 mod zero_spares;
+mod fail_alloc_keywords;
 mod hot_size;
 mod normalize_uri_experimental;
 mod node_description;

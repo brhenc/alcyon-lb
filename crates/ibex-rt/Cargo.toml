@@ -164,3 +164,8 @@ path = "tests/zero_buffers.rs"
 [[test]]
 name = "spare_strings"
 path = "tests/spare_strings.rs"
+
+# Own process: its #[global_allocator] refuses buffer-sized allocations on demand (S5)
+[[test]]
+name = "buffer_alloc_failure"
+path = "tests/buffer_alloc_failure.rs"

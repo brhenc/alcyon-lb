@@ -29,6 +29,19 @@ static BUFSIZE_LARGE: AtomicUsize = AtomicUsize::new(0); // 0 means not configur
 /// Standard `HAProxy` buffer size constant (16,384 bytes).
 pub const BUFSIZE: usize = 16_384;
 
+/// The error a stream's I/O returns when a buffer it needs cannot be had (S5): the stream is
+/// failed as `HAProxy` fails one whose allocation failed (`500`, `%ts` `I`), not the process.
+#[must_use]
+pub fn oom() -> std::io::Error {
+    std::io::ErrorKind::OutOfMemory.into()
+}
+
+/// Whether `e` is [`oom`].
+#[must_use]
+pub fn is_oom(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::OutOfMemory
+}
+
 /// Returns current configured standard buffer size (`tune.bufsize`).
 #[must_use]
 pub fn get_bufsize() -> usize {
@@ -92,16 +105,18 @@ impl<const CLASS: u8> Poolable for Mem<CLASS> {
         Self::size()
     }
     fn try_new() -> Option<Self> {
+        let m = try_zeroed(Self::size())?;
         if CLASS == 0 {
             BUF_STD_FRESH.fetch_add(1, Ordering::Relaxed);
         }
-        Some(Mem(vec![0u8; Self::size()].into_boxed_slice()))
+        Some(Mem(m))
     }
 }
 
 // Floor 64: what a thread has always kept, and what keeps the steady state at no malloc
 // (design 3.3). The floor objects are not counted against `tune.memory.hot-size`.
-declare_pool!(static BUF_STD: Pool<Mem<0>> = PoolSpec::new("buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64););
+// `limited`: `tune.buffers.limit` counts the standard buffers (`pool_head_buffer->limit`).
+declare_pool!(static BUF_STD: Pool<Mem<0>> = PoolSpec::new("buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64).limited(););
 declare_pool!(static BUF_SMALL: Pool<Mem<1>> = PoolSpec::new("small_buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64););
 declare_pool!(static BUF_LARGE: Pool<Mem<2>> = PoolSpec::new("large_buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64););
 
@@ -247,10 +262,36 @@ pub fn preallocate_large_buffers() {
 
 /// A buffer's memory from the pool of its class, counted as in use. Not inlined into the many
 /// callers: the pool is a known static here.
+/// `n` zeroed bytes, or `None` when the allocator has none (S5: the caller fails its stream; a
+/// `vec!` would abort the process).
+pub(crate) fn try_zeroed(n: usize) -> Option<Box<[u8]>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).ok()?;
+    v.resize(n, 0);
+    Some(v.into_boxed_slice())
+}
+
+/// A buffer's memory from the pool of its class, or `None` (`failures` counted by the pool).
 #[inline(never)]
-fn take_mem<const C: u8>(pool: &'static Pool<Mem<C>>) -> Box<[u8]> {
-    // `try_new` makes the memory with `vec!`, which aborts when there is none (as before S5).
-    pool.take_counted(Mem::<C>::try_new).map_or_else(|| std::alloc::handle_alloc_error(std::alloc::Layout::new::<u8>()), |m| m.0)
+fn take_mem<const C: u8>(pool: &'static Pool<Mem<C>>) -> Option<Box<[u8]>> {
+    match pool.take_counted(Mem::<C>::try_new) {
+        Some(m) => Some(m.0),
+        None => take_mem_again(pool),
+    }
+}
+
+/// The allocator refused a buffer: every cache is given back and it is asked once more (design
+/// 3.5, `pool_gc` then retry, as `HAProxy`'s `pool_alloc_nocache`). Not when the pool is at
+/// its limit, which a collection does not change, nor when `tune.fail-alloc` refused it, which
+/// `HAProxy` does not retry either.
+#[cold]
+#[inline(never)]
+fn take_mem_again<const C: u8>(pool: &'static Pool<Mem<C>>) -> Option<Box<[u8]>> {
+    if ibex_alloc::pool::take_injected() || pool.at_limit() {
+        return None;
+    }
+    crate::pool_gc::pool_gc();
+    pool.take_counted(Mem::<C>::try_new).map(|m| m.0)
 }
 
 /// Gives a buffer's memory back to the pool of its class.
@@ -259,17 +300,24 @@ fn give_mem<const C: u8>(pool: &'static Pool<Mem<C>>, data: Box<[u8]>) {
     pool.give_counted(Mem(data));
 }
 
-fn alloc_standard() -> Box<[u8]> {
+/// `tune.buffers.limit`: the most standard buffers the process holds at once, cached ones
+/// included (0: no limit; `HAProxy` raises 1 and 2 to 3, as the parser does). A take past it is
+/// refused and that stream fails (S5; `HAProxy` makes it wait, S6).
+pub fn set_buffers_limit(n: usize) {
+    BUF_STD.set_limit(n);
+}
+
+fn alloc_standard() -> Option<Box<[u8]>> {
     ensure_registered();
     take_mem(&BUF_STD)
 }
 
-fn alloc_small() -> Box<[u8]> {
+fn alloc_small() -> Option<Box<[u8]>> {
     ensure_registered();
     take_mem(&BUF_SMALL)
 }
 
-fn alloc_large() -> Box<[u8]> {
+fn alloc_large() -> Option<Box<[u8]>> {
     ensure_registered();
     take_mem(&BUF_LARGE)
 }
@@ -414,46 +462,25 @@ impl Buf {
     /// Allocates a standard-size buffer from the thread-local pool.
     #[must_use]
     pub fn standard() -> Self {
-        Buf {
-            data: alloc_standard(),
-            head: 0,
-            len: 0,
-            hwm: 0,
-            lo: NO_LO,
-            class: BufClass::Standard,
-
-            eoh: Cell::new(EOH_UNKNOWN),
-        }
+        let mut b = Self::unallocated(BufClass::Standard);
+        b.alloc_if_needed();
+        b
     }
 
     /// Allocates a small-size buffer from the thread-local pool.
     #[must_use]
     pub fn small() -> Self {
-        Buf {
-            data: alloc_small(),
-            head: 0,
-            len: 0,
-            hwm: 0,
-            lo: NO_LO,
-            class: BufClass::Small,
-
-            eoh: Cell::new(EOH_UNKNOWN),
-        }
+        let mut b = Self::unallocated(BufClass::Small);
+        b.alloc_if_needed();
+        b
     }
 
     /// Allocates a large-size buffer from the thread-local pool.
     #[must_use]
     pub fn large() -> Self {
-        Buf {
-            data: alloc_large(),
-            head: 0,
-            len: 0,
-            hwm: 0,
-            lo: NO_LO,
-            class: BufClass::Large,
-
-            eoh: Cell::new(EOH_UNKNOWN),
-        }
+        let mut b = Self::unallocated(BufClass::Large);
+        b.alloc_if_needed();
+        b
     }
 
     /// Allocates a buffer of the given capacity, mapping matching sizes to their pool class.
@@ -467,7 +494,7 @@ impl Buf {
             Self::large()
         } else {
             Buf {
-                data: vec![0u8; cap].into_boxed_slice(),
+                data: try_zeroed(cap).unwrap_or_default(),
                 head: 0,
                 len: 0,
                 hwm: 0,
@@ -514,18 +541,28 @@ impl Buf {
         }
     }
 
+    /// Takes the memory of the class from the pool unless the buffer has it (`b_alloc`).
+    /// `false` when there is none to be had (S5): the buffer stays without memory, every
+    /// write to it writes nothing, and the caller fails its stream ([`oom`]).
     #[inline]
-    pub fn alloc_if_needed(&mut self) {
+    pub fn alloc_if_needed(&mut self) -> bool {
         self.eoh.set(EOH_UNKNOWN);
-        if self.data.is_empty() {
-            self.data = match self.class {
-                BufClass::Standard => alloc_standard(),
-                BufClass::Small => alloc_small(),
-                BufClass::Large => alloc_large(),
-                BufClass::Custom => return,
-            };
-            self.head = 0;
-        }
+        !self.data.is_empty() || self.alloc_now()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_now(&mut self) -> bool {
+        let data = match self.class {
+            BufClass::Standard => alloc_standard(),
+            BufClass::Small => alloc_small(),
+            BufClass::Large => alloc_large(),
+            BufClass::Custom => None,
+        };
+        let Some(data) = data else { return false };
+        self.data = data;
+        self.head = 0;
+        true
     }
 
     /// Returns the pool size class this buffer belongs to.
@@ -550,7 +587,8 @@ impl Buf {
             return true;
         }
 
-        let mut new_data = alloc_standard();
+        // No standard buffer to be had: the bytes stay in the small one, which is full.
+        let Some(mut new_data) = alloc_standard() else { return false };
         if self.len > 0 {
             let valid = &self.data[self.head..self.head + self.len];
             new_data[..self.len].copy_from_slice(valid);
@@ -746,9 +784,10 @@ impl Buf {
 
     /// Makes room for at least `min` bytes in all: a message held whole until its end
     /// arrives, longer than the buffer (a chunked body's trailer section behind its head).
-    pub fn grow_capacity(&mut self, min: usize) {
+    /// `false` when the memory cannot be had (S5): the buffer is as it was.
+    pub fn grow_capacity(&mut self, min: usize) -> bool {
         self.eoh.set(EOH_UNKNOWN);
-        self.grow_to(min);
+        self.grow_to(min)
     }
 
     /// Makes the backing store at least `min` bytes, readable data moved to index 0.
@@ -758,14 +797,16 @@ impl Buf {
     /// longer fit would silently lose body bytes the socket already delivered, so the buffer
     /// grows by what the rewrite added. Later reads then see the extra room as ordinary
     /// space and the body behind the head stays intact.
-    fn grow_to(&mut self, min: usize) {
+    fn grow_to(&mut self, min: usize) -> bool {
         self.eoh.set(EOH_UNKNOWN);
-        self.alloc_if_needed();
+        if !self.alloc_if_needed() && self.class != BufClass::Custom {
+            return false;
+        }
         if self.class == BufClass::Small && min > self.data.len() {
             self.promote_to_standard();
         }
         if min > self.data.len() {
-            let mut bigger = vec![0u8; min].into_boxed_slice();
+            let Some(mut bigger) = try_zeroed(min) else { return false };
             bigger[..self.len].copy_from_slice(&self.data[self.head..self.head + self.len]);
             self.replace_data(bigger);
             self.head = 0;
@@ -774,6 +815,7 @@ impl Buf {
             self.data.copy_within(self.head..self.head + self.len, 0);
             self.head = 0;
         }
+        true
     }
 
     /// Replaces the leading `old_len` bytes in the readable portion of the buffer

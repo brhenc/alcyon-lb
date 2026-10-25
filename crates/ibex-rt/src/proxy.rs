@@ -1404,6 +1404,11 @@ impl TcpSession {
         }
         let new_len = len + (needed - free) + 4096;
         let mut bigger = Buf::with_capacity(new_len);
+        // No memory for the larger one: the HTX keeps the one it has, and what does not fit
+        // in it is refused as when the rewrite space runs out.
+        if !bigger.is_allocated() {
+            return;
+        }
         let old = self.htx_buf.raw_slice();
         let new = bigger.htx_slice_mut();
         new[..self.htx_tail].copy_from_slice(&old[..self.htx_tail]);
@@ -1977,6 +1982,14 @@ impl TcpSession {
             txn::MsgState::Body(txn::Body::Length(raw.len() as u64))
         };
         self.rep.clear();
+        if !self.rep.alloc_if_needed() {
+            // No buffer for the answer either (S5): the connection is closed without one, as
+            // `HAProxy` closes one whose reply it cannot allocate.
+            self.pending_resp = None;
+            self.ending.get_or_insert(Ending::Error);
+            self.cli_state = ScState::Closed;
+            return;
+        }
         let w = self.rep.writable();
         let n = raw.len().min(w.len());
         w[..n].copy_from_slice(&raw[..n]);
@@ -2107,6 +2120,26 @@ impl TcpSession {
         self.ending.get_or_insert(Ending::Error);
     }
 
+    /// A buffer this stream needs cannot be had (S5, `docs/design/memory-2026-10-24.md` 3.10):
+    /// the stream fails as one of `HAProxy`'s whose allocation failed under `-dMfail` (measured,
+    /// `tasks/S5-progress.md`): answered `500` while nothing of a response has gone to the
+    /// client, `%ts` `I` and the phase (`IR` before the request is in); otherwise closed. Only
+    /// this stream: the process and the other streams go on.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn fail_alloc(&mut self) {
+        self.ending = Some(Ending::Error);
+        if self.mode == Mode::Http && self.bytes_out == self.log.bytes_out_at_start && self.rep.is_empty() {
+            self.req.clear();
+            self.txn = Some(HttpTxn::failed(500));
+            if !matches!(self.cli_state, ScState::Closed | ScState::Error) {
+                self.cli_state = ScState::ShutR;
+            }
+        } else if !matches!(self.cli_state, ScState::Closed | ScState::Error) {
+            self.cli_state = ScState::Closed;
+        }
+    }
+
     /// The client's `close` and `keep-alive` taken out of the request's `Connection` headers,
     /// and a header left with nothing removed, as `HAProxy`'s parser does
     /// (`h1_parse_connection_header`, `src/h1.c`): the rules do not see them, and a `close`
@@ -2184,6 +2217,9 @@ impl TcpSession {
         let lines = self.req.readable()[..head_len].iter().filter(|&&b| b == b'\n').count();
         // One more line for a `Sec-WebSocket-Key` the proxy may write.
         self.htx_reserve(head_len + 64 + ibex_proto::htx::HTX_DESC_SIZE * (lines + 3));
+        if !self.htx_buf.is_allocated() {
+            return Err(crate::buf::oom());
+        }
         let raw = self.htx_buf.htx_slice_mut();
         let mut slice = ibex_proto::htx::HtxSlice::new(raw);
         if let Err(e) = stream.parse(&self.req.readable()[..head_len], &mut slice) {
@@ -2257,8 +2293,12 @@ impl TcpSession {
         // reset does, and as HAProxy does (EOF at once; `CR`, `CD` or `PR` by what was
         // under way, measured). Propagated, it ended nothing: the engine dropped it and
         // the session waited out a timeout (T261).
-        let changed_io = self.process_cli_io().unwrap_or_else(|_| {
-            self.client_conn_failed();
+        let changed_io = self.process_cli_io().unwrap_or_else(|e| {
+            if crate::buf::is_oom(&e) {
+                self.fail_alloc();
+            } else {
+                self.client_conn_failed();
+            }
             true
         });
         let changed_trans = self.process_cli_transitions();
@@ -2438,6 +2478,9 @@ impl TcpSession {
             // Read from the client into the request buffer while reading is permitted
             // and buffer space exists. Backpressure stops reads when full.
             if self.cli_state.can_read() && !self.req.is_full() && !self.cli_cant_recv {
+                if !self.req.alloc_if_needed() {
+                    return Err(crate::buf::oom());
+                }
                 let dst = self.req.writable();
                 let asked = dst.len();
                 let r = self.cli.recv(&mut self.cli_xprt, dst)?;
@@ -2639,6 +2682,10 @@ impl TcpSession {
                 // the parser be swapped.
                 let (mut close, len_hdrs) = match self.validate_request_head(total_hdr_len) {
                     Ok(v) => v,
+                    Err(e) if crate::buf::is_oom(&e) => {
+                        self.fail_alloc();
+                        return Ok(true);
+                    }
                     Err(e) => {
                         // 400, or the 413 / 422 HAProxy answers to some heads (T276).
                         self.fail_request(ibex_proto::h1::Refusal::status_of(&e));
@@ -2764,7 +2811,9 @@ impl TcpSession {
                         }
                         txn::BodyCheck::Held { trailer: true, .. } if self.req.len() >= self.bufsize => {
                             // Held whole until the section is (`MsgState::holds_trailer`).
-                            self.req.grow_capacity(2 * self.bufsize);
+                            if !self.req.grow_capacity(2 * self.bufsize) {
+                                return Err(crate::buf::oom());
+                            }
                         }
                         txn::BodyCheck::Fine | txn::BodyCheck::Held { .. } => {}
                     }
@@ -3073,6 +3122,9 @@ impl TcpSession {
                     .as_ref()
                     .map(AsFd::as_fd)
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+                if !self.rep.alloc_if_needed() {
+                    return Err(crate::buf::oom());
+                }
                 let dst = self.rep.writable();
                 let asked = dst.len();
                 // A TLS protocol error *after* the handshake (a post-handshake alert,
@@ -3201,8 +3253,12 @@ impl TcpSession {
         self.passes_ran_out = false;
         for pass in 0..16 {
             let a = self.process_cli();
-            let b = self.process_srv().unwrap_or_else(|_| {
-                self.server_conn_failed();
+            let b = self.process_srv().unwrap_or_else(|e| {
+                if crate::buf::is_oom(&e) {
+                    self.fail_alloc();
+                } else {
+                    self.server_conn_failed();
+                }
                 true
             });
             if !a && !b {

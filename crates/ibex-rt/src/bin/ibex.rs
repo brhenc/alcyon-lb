@@ -448,10 +448,19 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
                 opts.memory_limit_mb = Some(parse_arg_u64(&other[2..], "-m"));
             }
             other if other.starts_with("-dM") => {
-                ibex_rt::stderr_line!(
-                    "{other}: -dM (memory pool debugging) is not supported: Ibex has no memory pools to poison"
-                );
-                process::exit(1);
+                // Of `HAProxy`'s pool debugging features only `fail` / `no-fail` are honoured (S5:
+                // `tune.fail-alloc` refusals, `ibex_alloc::pool`); poisoning, tags, UAF checks
+                // and the rest are refused rather than accepted and ignored (AGENTS.md 5).
+                let feats = &other[3..];
+                if feats.is_empty() || !feats.split(',').all(|f| f == "fail" || f == "no-fail") {
+                    ibex_rt::stderr_line!(
+                        "{other}: -dM (memory pool debugging) is not supported, except -dMfail and -dMno-fail"
+                    );
+                    process::exit(1);
+                }
+                for f in feats.split(',') {
+                    ibex_alloc::pool::set_debug_fail(f == "fail");
+                }
             }
             unknown => {
                 ibex_rt::stderr_line!("Unknown option: {unknown}");

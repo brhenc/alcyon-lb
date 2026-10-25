@@ -278,6 +278,41 @@ pub(crate) fn parse_global_directive(
             global.hot_size = Some(usize::try_from(n).unwrap_or(usize::MAX));
             Ok(())
         }
+        "tune.fail-alloc" => {
+            // `mem_parse_global_fail_alloc` (src/pool.c): `too_many_args(1)`, `atoi`, 0..=100.
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'tune.fail-alloc' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            let n = tokens.get(1).map_or(0, |t| super::server_keywords::atol(&t.text));
+            let Ok(rate) = u8::try_from(n).map_err(|_| ()).and_then(|r| if r <= 100 { Ok(r) } else { Err(()) }) else {
+                let at = tokens.get(1).unwrap_or(kw);
+                return Err(ConfigError::new(at.line, at.col, "'tune.fail-alloc' expects a numeric value between 0 and 100."));
+            };
+            global.fail_alloc = Some(rate);
+            Ok(())
+        }
+        "tune.buffers.limit" | "tune.buffers.reserve" => {
+            // `cfg_parse_tune_buffers_limit` / `_reserve` (src/dynbuf.c): `too_many_args(1)`, `atoi`, >= 0.
+            let name = kw.text.as_str();
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'{name}' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            let arg = tokens.get(1).map_or("", |t| t.text.as_str());
+            let n = super::server_keywords::atol(arg);
+            let at = tokens.get(1).unwrap_or(kw);
+            if n < 0 {
+                return Err(ConfigError::new(at.line, at.col, format!("'{name}' expects a non-negative number but got '{arg}'.")));
+            }
+            if name == "tune.buffers.reserve" {
+                // The emergency buffers it reserves serve the buffer wait queue, which Ibex does
+                // not have yet (a stream without a buffer fails): accepted and dropped, it would
+                // promise what is not there (AGENTS.md 5).
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.buffers.reserve' is not supported by Ibex yet: it reserves buffers for the buffer wait queue, which Ibex does not have (a stream that cannot have a buffer fails)."));
+            }
+            let n = usize::try_from(n).unwrap_or(usize::MAX);
+            global.buffers_limit = Some(if n == 0 { 0 } else { n.max(3) });
+            Ok(())
+        }
         "tune.ibex.zero-buffers" => {
             let Some(arg) = tokens.get(1) else {
                 return Err(ConfigError::new(kw.line, kw.col, "'tune.ibex.zero-buffers' expects 'on' or 'off'."));

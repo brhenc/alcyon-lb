@@ -249,6 +249,12 @@ pub struct GlobalSection {
     /// `tune.memory.hot-size <bytes>`: the most each thread keeps in its pools together
     /// (`global.tune.pool_cache_size`, 524288 when unset).
     pub hot_size: Option<usize>,
+    /// `tune.fail-alloc <0..100>`: the percentage of pool allocations refused at random, which
+    /// counts only under `-dMfail` (`mem_fail_rate`; `-dMfail` alone makes it 1).
+    pub fail_alloc: Option<u8>,
+    /// `tune.buffers.limit <n>`: the most standard buffers held at once (0: none; 1 and 2 are 3,
+    /// as `HAProxy` makes them).
+    pub buffers_limit: Option<usize>,
     /// `tune.ibex.crypto-provider ring|ring-ibex` (Ibex-only, T460): the rustls crypto provider
     /// of every TCP TLS configuration. Vanilla ring when unset.
     pub crypto_provider: Option<TlsCryptoProvider>,

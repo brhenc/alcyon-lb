@@ -114,7 +114,42 @@ pub fn fail_thread_allocs_from(min: usize) {
     FAIL_FROM.with(|f| f.set(min));
 }
 
+/// The size [`refuse_allocs_of`] refuses, how many of them to let through first, and how many
+/// to refuse then.
+static REFUSE_SIZE: AtomicUsize = AtomicUsize::new(0);
+static REFUSE_SKIP: AtomicUsize = AtomicUsize::new(0);
+static REFUSE_LEFT: AtomicUsize = AtomicUsize::new(0);
+
+/// Makes [`CountingAllocator`], on every thread, let the next `skip` allocations (and growing
+/// reallocations) of exactly `size` bytes through and refuse the `times` after them; `times` 0
+/// turns it off (S5: a buffer that cannot be had, wherever the engine runs).
+pub fn refuse_allocs_of(size: usize, skip: usize, times: usize) {
+    REFUSE_LEFT.store(0, Ordering::SeqCst);
+    REFUSE_SIZE.store(size, Ordering::SeqCst);
+    REFUSE_SKIP.store(skip, Ordering::SeqCst);
+    REFUSE_LEFT.store(times, Ordering::SeqCst);
+}
+
+/// What is left of the [`refuse_allocs_of`] refusals.
+#[must_use]
+pub fn refusals_left() -> usize {
+    REFUSE_LEFT.load(Ordering::SeqCst)
+}
+
+fn refused(size: usize) -> bool {
+    if size != REFUSE_SIZE.load(Ordering::Relaxed) || REFUSE_LEFT.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    if REFUSE_SKIP.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+        return false;
+    }
+    REFUSE_LEFT.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+}
+
 fn failing(size: usize) -> bool {
+    if refused(size) {
+        return true;
+    }
     FAIL_FROM.try_with(std::cell::Cell::get).is_ok_and(|min| size >= min)
 }
 

@@ -117,6 +117,7 @@ mod error_reply_header_case;
 mod eth_converters;
 mod expect_proxy;
 mod expr_compile_once;
+mod fail_alloc;
 mod fc_rcvd_proxy;
 mod fc_stream_info;
 mod fd_hygiene;

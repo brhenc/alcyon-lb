@@ -123,6 +123,8 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
         sess.htx_buf = Buf::unallocated(crate::buf::BufClass::Small);
     }
     let raw = sess.htx_buf.htx_slice_mut();
+    // A buffer that cannot be had fails this stream (S5), once its transaction is set up.
+    let mut no_mem = raw.is_empty();
     let mut slice = ibex_proto::htx::HtxSlice::new(raw);
     let parsed = p_stream.parse(head, &mut slice).is_ok();
     let (tail, blocks) = (slice.tail_addr(), slice.num_blocks());
@@ -147,6 +149,7 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     if wire_req.len() * 2 <= crate::buf::get_bufsize_small() && sess.req.raw_slice().is_empty() {
         sess.req = Buf::unallocated(crate::buf::BufClass::Small);
     }
+    no_mem |= !sess.req.alloc_if_needed();
     let w = sess.req.writable();
     let n = wire_req.len().min(w.len());
     w[..n].copy_from_slice(&wire_req[..n]);
@@ -162,6 +165,8 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     sess.cli_state = ScState::Established;
     if d.bad_request {
         sess.fail_request(400);
+    } else if no_mem {
+        sess.fail_alloc();
     }
     d.head
 }

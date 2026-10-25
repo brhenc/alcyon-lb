@@ -24,7 +24,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::thread::LocalKey;
 use std::time::{Duration, Instant};
@@ -245,6 +245,12 @@ struct Hot {
     wipe_spares: Cell<bool>,
     /// `tune.ibex.ssl-zero-buffers` (default on).
     wipe_ssl: Cell<bool>,
+    /// `tune.fail-alloc` under `-dMfail`: the percentage of misses refused (0: none).
+    fail: Cell<u8>,
+    /// The last refusal was one of `tune.fail-alloc`'s ([`take_injected`]).
+    injected: Cell<bool>,
+    /// This thread's random state for `tune.fail-alloc`.
+    rng: Cell<u32>,
     /// The settings generation copied.
     gen: Cell<u64>,
     /// When [`pass`] publishes next (`None`: at the next pass).
@@ -262,6 +268,9 @@ thread_local! {
             wipe: Cell::new(false),
             wipe_spares: Cell::new(false),
             wipe_ssl: Cell::new(true),
+            fail: Cell::new(0),
+            injected: Cell::new(false),
+            rng: Cell::new(0),
             gen: Cell::new(0),
             next_publish: Cell::new(None),
             pools: [const { Cell::new(None) }; MAX_POOLS],
@@ -328,6 +337,70 @@ pub fn hot_size() -> usize {
     HOT_SIZE.load(Ordering::Relaxed)
 }
 
+/// `tune.fail-alloc` as `-dMfail` makes it count (0 without `-dMfail`).
+static FAIL_RATE: AtomicU8 = AtomicU8::new(0);
+
+/// Sets the percentage of pool allocations refused at random (`-dMfail` with `tune.fail-alloc`,
+/// `HAProxy`'s `mem_should_fail`): every take of a counted pool (buffers) and every new session
+/// may be refused with this probability, as a failed `malloc` would be. While it is not 0 the
+/// thread caches keep nothing, so that every take is an allocation that may fail, as in
+/// `HAProxy`, where the check comes before the cache. Taken at the next [`pass`] by the other
+/// threads. Values over 100 count as 100.
+pub fn set_fail_alloc(percent: u8) {
+    FAIL_RATE.store(percent.min(100), Ordering::Relaxed);
+    settings_changed();
+}
+
+/// `-dMfail` (`POOL_DBG_FAIL_ALLOC`): `tune.fail-alloc` counts only with it.
+static DEBUG_FAIL: AtomicBool = AtomicBool::new(false);
+
+/// Records `-dMfail` (`true`) or `-dMno-fail`, from the command line, before the configuration
+/// is applied.
+pub fn set_debug_fail(on: bool) {
+    DEBUG_FAIL.store(on, Ordering::Relaxed);
+}
+
+/// The refusal rate the configuration's `tune.fail-alloc` makes (`rate`, `None` when unset):
+/// none without `-dMfail`; 1 % with it when the configuration says nothing (`HAProxy`'s
+/// `-dMfail` presets `mem_fail_rate` to 1).
+#[must_use]
+pub fn effective_fail_alloc(rate: Option<u8>) -> u8 {
+    if DEBUG_FAIL.load(Ordering::Relaxed) { rate.unwrap_or(1) } else { 0 }
+}
+
+/// Whether this allocation is one `tune.fail-alloc` refuses (`mem_should_fail`). A load and a
+/// compare when it is off.
+#[inline]
+#[must_use]
+pub fn inject_failure() -> bool {
+    HOT.try_with(|h| h.fail.get() != 0 && roll(h)).unwrap_or(false)
+}
+
+#[cold]
+#[inline(never)]
+fn roll(h: &Hot) -> bool {
+    // xorshift32, seeded per thread from its slot; quality is not the point.
+    let mut x = h.rng.get();
+    if x == 0 {
+        x = 0x9e37_79b9 ^ u32::try_from(thread_slot()).unwrap_or(0).wrapping_mul(0x85eb_ca6b);
+    }
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    h.rng.set(x);
+    let refused = x % 100 < u32::from(h.fail.get());
+    h.injected.set(refused);
+    refused
+}
+
+/// Whether the last refusal on this thread was one of `tune.fail-alloc`'s (and forgets it): a
+/// caller that would collect and retry after a real failure does not after one of these, as
+/// `HAProxy` does not.
+#[must_use]
+pub fn take_injected() -> bool {
+    HOT.try_with(|h| h.injected.replace(false)).unwrap_or(false)
+}
+
 /// This thread's copy of `tune.ibex.ssl-zero-buffers` (on when the thread is ending).
 #[inline]
 pub(crate) fn wipe_ssl_on() -> bool {
@@ -351,6 +424,7 @@ fn refresh_local() {
             h.wipe.set(crate::zero_buffers());
             h.wipe_spares.set(crate::zero_spares());
             h.wipe_ssl.set(crate::ssl_zero_buffers());
+            h.fail.set(FAIL_RATE.load(Ordering::Relaxed));
             h.bytes.get() > max
         })
         .unwrap_or(false);
@@ -637,6 +711,14 @@ impl<T: Poolable> Pool<T> {
         self.shared.limit.store(n, Ordering::Relaxed);
     }
 
+    /// Whether [`Self::take`] refuses to make another object: a `limited` pool holding its
+    /// [`Self::set_limit`] objects (cached ones included, as `HAProxy`'s `pool->limit`).
+    #[must_use]
+    pub fn at_limit(&self) -> bool {
+        let lim = self.shared.limit.load(Ordering::Relaxed);
+        self.spec.limited && lim != 0 && self.shared.grown.load(Ordering::Relaxed) >= isize::try_from(lim).unwrap_or(isize::MAX)
+    }
+
     /// Refused takes since the start.
     #[must_use]
     pub fn failures(&self) -> usize {
@@ -683,9 +765,9 @@ impl<T: Poolable> Pool<T> {
     #[allow(clippy::inline_always)]
     fn put(&'static self, mut v: T, boxed: bool) {
         let spares = self.spec.spares;
-        let (wipe, max) = HOT
-            .try_with(|h| (if spares { h.wipe_spares.get() } else { h.wipe.get() }, h.max.get()))
-            .unwrap_or((true, 0));
+        let (wipe, max, fail) = HOT
+            .try_with(|h| (if spares { h.wipe_spares.get() } else { h.wipe.get() }, h.max.get(), h.fail.get() != 0))
+            .unwrap_or((true, 0, false));
         v.reset(wipe);
         let fp = v.footprint();
         let spec = &self.spec;
@@ -696,7 +778,8 @@ impl<T: Poolable> Pool<T> {
             let counted = n >= spec.floor;
             let max_item = if counted && max < spec.max_item { max } else { spec.max_item };
             // Not kept, or no room and the `Vec` cannot grow (memory is short).
-            if n >= spec.max_count || !v.keep(max_item) || (n == l.items.capacity() && !self.grow_items(&mut l)) {
+            // Under `tune.fail-alloc` nothing is kept: each take is an allocation that may fail.
+            if n >= spec.max_count || fail || !v.keep(max_item) || (n == l.items.capacity() && !self.grow_items(&mut l)) {
                 return Err(v);
             }
             l.items.push(v);
@@ -774,12 +857,9 @@ impl<T: Poolable> Pool<T> {
             }
         });
         let limited = boxed && self.spec.limited;
-        if limited {
-            let lim = self.shared.limit.load(Ordering::Relaxed);
-            if lim != 0 && self.shared.grown.load(Ordering::Relaxed) >= isize::try_from(lim).unwrap_or(isize::MAX) {
-                self.shared.failures.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
+        if (limited && self.at_limit()) || (boxed && inject_failure()) {
+            self.shared.failures.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
         let Some(v) = init() else {
             self.shared.failures.fetch_add(1, Ordering::Relaxed);
@@ -1062,6 +1142,7 @@ mod tests {
     crate::declare_pool!(static COUNTED: Pool<Vec<u8>> = PoolSpec::new("t_counted").limited(););
     crate::declare_pool!(static ONE: Pool<Vec<u8>> = PoolSpec::new("t_one").limited().max_count(1););
     crate::declare_pool!(static FAILING: Pool<Vec<u8>> = PoolSpec::new("t_failing"););
+    crate::declare_pool!(static RANDOM: Pool<Vec<u8>> = PoolSpec::new("t_random").limited(););
     crate::declare_pool!(static OVER: Pool<Vec<u8>> = PoolSpec::new("t_over"););
     crate::declare_pool!(static BLOBS: Pool<Blob> = PoolSpec::new("t_blobs").max_item(100););
     crate::declare_pool!(static PREFILLED: Pool<Blob> = PoolSpec::new("t_prefilled").limited(););
@@ -1128,6 +1209,35 @@ mod tests {
         static RUNTIME_CACHE: Cache<Vec<u8>> = const { Cache::new() };
     }
     static RUNTIME_SHARED: PoolShared = PoolShared::new();
+
+    /// `-dMfail` with `tune.fail-alloc 50`: about half the takes are refused, each counted and
+    /// marked as injected, nothing is cached meanwhile (each take is an allocation), and the
+    /// rate counts only with `-dMfail`, 1 % when the configuration gives none.
+    #[test]
+    fn fail_alloc_refuses_at_its_rate_and_caches_nothing() {
+        set_debug_fail(false);
+        assert_eq!(effective_fail_alloc(Some(5)), 0);
+        set_debug_fail(true);
+        assert_eq!((effective_fail_alloc(None), effective_fail_alloc(Some(7))), (1, 7));
+        set_debug_fail(false);
+        let failures = RANDOM.failures();
+        set_fail_alloc(50);
+        let mut refused = 0;
+        for _ in 0..1000 {
+            match RANDOM.take_with(|| vec_of(64)) {
+                None => {
+                    assert!(take_injected() && !take_injected(), "marked once");
+                    refused += 1;
+                }
+                Some(b) => drop(b),
+            }
+        }
+        assert_eq!(RANDOM.local_count(), 0, "nothing cached under tune.fail-alloc");
+        set_fail_alloc(0);
+        assert!((300..700).contains(&refused), "{refused} of 1000");
+        assert_eq!(RANDOM.failures(), failures + refused);
+        assert!(RANDOM.take_with(|| vec_of(64)).is_some() && !take_injected());
+    }
 
     fn vec_of(cap: usize) -> Option<Vec<u8>> {
         let mut v = Vec::new();
