@@ -397,16 +397,17 @@ default. `ibex.watchdog-warn-only` (global, no argument; HAProxy refuses it as a
 warnings and `BlockedTrafficWarnings` and never aborts, for an operator who prefers a slow process to a restart.
 The `ibex.` prefix keeps it from clashing with a future HAProxy keyword.
 
-## `-m <megs>` is a connection budget on Ibex; on HAProxy it is also an rlimit
+## `-m <megs>`: a connection budget and an rlimit, as on HAProxy
 
 HAProxy's `-m` sets `RLIMIT_DATA` to `<megs>` MiB (soft and hard, `/proc/<pid>/limits`;
 measured on 3.5-dev8, T453), shows the value as `Memmax_MB` / `Memmax_bytes` and sizes
 `maxconn` from it (`STREAM_MAX_COST + 2 * tune.bufsize` per connection, 97% of the budget,
 TLS costs when a `bind` or `server` uses `ssl`; a configured `maxconn` that leaves no room for
 TLS is refused, exit 1). Past the limit its pools fail allocations and the streams that needed
-them, and the process goes on. Ibex does the same sizing and reporting but **sets no rlimit**:
-past a limit `malloc` returns NULL and Rust aborts the whole process (exit 134), so until
-Ibex's pools are fallible (T448) a cap would only make it abort sooner (tradeoff.md 6.25).
+them, and the process goes on. Ibex does the same sizing and reporting and, since T465b, sets `RLIMIT_DATA` the same way.
+Past the limit its buffers, sessions, timers and idle lists fail one stream or connection;
+an allocation that is still infallible (rustls, h2, std) aborts the process (tradeoff.md 6.23,
+6.25). Under `-m` the session arenas are presized for the budget rather than 65536 slots.
 Differences left: Ibex's per-connection cost is a constant calibrated on
 HAProxy's results (`sizeof(struct stream)` has no Ibex counterpart), `maxsslconn` and
 `tune.ssl.cachesize` are not configurable, so `MaxSslConns` stays 0 and the

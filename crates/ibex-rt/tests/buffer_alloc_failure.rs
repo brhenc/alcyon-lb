@@ -689,3 +689,28 @@ fn a_server_connection_the_idle_list_cannot_hold_is_closed_and_the_request_serve
     let after = send(&mut engine, addr, GET);
     assert!(after.starts_with("HTTP/1.1 200") && after.ends_with("ok"), "after: {after:?}");
 }
+
+/// The purge of idle server connections closes them without memory of its own
+/// (`IdlePool::purge`, where T446's run under `RLIMIT_DATA` aborted on a 96-byte `Vec::push`
+/// once the idle lists were fallible, T465).
+#[test]
+fn idle_server_connections_are_purged_without_memory() {
+    // The first push of a `Vec` of (server, count) pairs: room for 4 of 24 bytes.
+    const CLOSED: usize = 96;
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let srv = keepalive_backend(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let (mut engine, addr) = engine_with("", &format!("  default_backend b\nbackend b\n  server s1 {srv} pool-purge-delay 20ms\n"));
+    let got = keepalive_get(&mut engine, addr);
+    assert!(got.starts_with("HTTP/1.1 200"), "{got:?}");
+    for _ in 0..20 {
+        let _ = engine.run_once();
+    }
+    thread::sleep(Duration::from_millis(50));
+    refuse_allocs_here(CLOSED, 0, usize::MAX);
+    for _ in 0..20 {
+        let _ = engine.run_once();
+    }
+    refuse_allocs_of(CLOSED, 0, 0);
+    let after = keepalive_get(&mut engine, addr);
+    assert!(after.starts_with("HTTP/1.1 200") && after.ends_with("ok"), "after: {after:?}");
+}

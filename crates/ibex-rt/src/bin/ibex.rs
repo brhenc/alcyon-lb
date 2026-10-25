@@ -81,7 +81,6 @@ fn print_help(program: &str) {
     println!("        -c check mode : only check config files and exit");
     println!("        -n sets the maximum total # of connections");
     println!("        -m limits the usable amount of memory (in MB)");
-    println!("           (Ibex: sizes maxconn only, sets no rlimit yet; see tradeoff.md 6.25)");
     println!("        -N sets the default, per-proxy maximum # of connections");
     println!("        -p writes pids of all children to this file");
     println!("        -de disables epoll() usage even when available");
@@ -868,9 +867,8 @@ fn main() {
         (file.to_string(), l)
     });
 
-    // 10. Enforce memory limits if requested (-m <megabytes>)
-    //     A budget for `maxconn`, not an rlimit (see `engine::apply_memmax`): HAProxy sets
-    //     `RLIMIT_DATA`, Ibex does once its pools are fallible (T448, tradeoff.md 6.25).
+    // 10. Enforce memory limits if requested (-m <megabytes>): a budget for `maxconn`
+    //     (`engine::apply_memmax`) and `RLIMIT_DATA`, set below (tradeoff.md 6.25).
     if let Some(megs) = opts.memory_limit_mb {
         config.global.get_or_insert_with(Default::default).memmax_mb = Some(u32::try_from(megs).unwrap_or(u32::MAX));
     }
@@ -915,6 +913,17 @@ fn main() {
         config_alert_plain(&alert);
         process::exit(1);
     }
+    if let Some(Err(alert)) = opts.memory_limit_mb.map(ibex_rt::globalconn::apply_memmax_rlimit) {
+        config_alert_plain(&alert);
+        process::exit(1);
+    }
+    // Under `-m` the session arenas are presized for the cleartext sessions the budget holds
+    // (as `maxconn` without one is sized), not for 65536 (100 MiB a worker, past a 64 MB
+    // `RLIMIT_DATA` before the first accept; T465). Past the presize they grow fallibly.
+    let capacity = match opts.memory_limit_mb {
+        Some(megs) => capacity.min(ibex_rt::globalconn::memmax_maxconn(u32::try_from(megs).unwrap_or(u32::MAX), None, 0, 16384, 0).map_or(1, |n| n as usize)),
+        None => capacity,
+    };
     ibex_rt::engine::configure_maxconn(&config);
     let maxsock = ibex_rt::engine::config_maxsock(&config, nbthread);
     match ibex_rt::globalconn::apply_nofile_limit(u64::try_from(maxsock).unwrap_or(u64::MAX), strict) {
