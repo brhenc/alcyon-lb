@@ -410,19 +410,13 @@ impl QuicEndpoint {
 
 
 
-    /// Drops `incoming` without an answer.
-    fn ignore_incoming(&mut self, incoming: quinn_proto::Incoming) -> DatagramOutcome {
-        self.endpoint.ignore(incoming);
-        DatagramOutcome::Ignored
-    }
-
     /// Answers `incoming` with a Retry (`send_retry`, `src/quic_tx.c`): the Retry is queued, and
     /// no connection state is kept.
     fn send_retry(&mut self, incoming: quinn_proto::Incoming) -> DatagramOutcome {
         self.response_buf.clear();
         // Only an Incoming that already answered a Retry may not be retried, and that one is
         // validated, so the refusal is not reached by a test (one line, ignored).
-        let tx = match self.endpoint.retry(incoming, &mut self.response_buf) { Ok(tx) => tx, Err(e) => return self.ignore_incoming(e.into_incoming()) };
+        let tx = match self.endpoint.retry(incoming, &mut self.response_buf) { Ok(tx) => tx, Err(e) => { self.endpoint.ignore(e.into_incoming()); return DatagramOutcome::Ignored } };
         self.pending_transmits.push_back(TransmitEntry {
             transmit: Transmit {
                 destination: tx.destination,

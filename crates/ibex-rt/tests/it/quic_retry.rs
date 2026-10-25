@@ -63,7 +63,7 @@ fn ibex(global: &str, bind_opts: &str) -> Ibex {
     let mut cfg = NamedTempFile::new().expect("cfg");
     write!(
         cfg,
-        "global\n    nbthread 1\n{global}defaults\n    mode http\n    timeout client 10s\n    timeout server 3s\n    \
+        "global\n    nbthread 1\n    hard-stop-after 300ms\n{global}defaults\n    mode http\n    timeout client 10s\n    timeout server 3s\n    \
          timeout connect 1s\nfrontend f\n    bind {tcp}\n    bind quic4@{quic} ssl crt {crt} alpn h3{bind_opts}\n    \
          http-request return status 200\n"
     )
