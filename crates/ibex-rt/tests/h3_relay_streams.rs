@@ -73,8 +73,7 @@ impl Rig {
         ibex_tls::config::install_default_crypto_provider();
         let crt = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem"));
         let (certs, key) = ibex_tls::config::load_cert_file(crt).expect("cert");
-        let mut tls = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key).expect("tls");
-        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let tls = ibex_tls::tcp::BindTls::single_tls13(certs, key, vec![b"h3".to_vec()]).expect("tls");
         let mut server = QuicListener::bind("127.0.0.1:0".parse().expect("addr"), &tls, None).expect("bind");
         setup(&mut server);
 

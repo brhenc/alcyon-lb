@@ -28,18 +28,18 @@ impl QuicListener {
     /// Returns an error if the UDP socket fails to bind or if endpoint configuration fails.
     pub fn bind(
         addr: SocketAddr,
-        tls_server_config: &rustls::ServerConfig,
+        tls: &Arc<ibex_tls::tcp::BindTls>,
         quic_config: Option<QuicConfig>,
     ) -> io::Result<Self> {
         let config = quic_config.unwrap_or_default();
         let server_config = config
-            .build_server_config(tls_server_config)
+            .build_server_config(tls)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         // The whole config has to reach the endpoint, not just its TLS half. Routing through
         // `bind_with_server_config` dropped `require_retry` and `anti_amplification_factor` on
         // the floor, so a stricter factor an operator asked for was silently ignored.
         let endpoint = QuicEndpoint::with_configs_and_amplification(
-            Arc::new(config.build_endpoint_config()),
+            Arc::new(config.build_endpoint_config().map_err(|e| io::Error::other(e.to_string()))?),
             server_config,
             config.require_retry,
             config.anti_amplification_factor,

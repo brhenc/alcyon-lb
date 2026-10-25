@@ -354,18 +354,23 @@ touched by any of them; OpenSSL wipes its own key material (`OPENSSL_cleanse`). 
 ## `tune.ibex.crypto-provider ring|ring-ibex`, `set ssl crypto-provider` and `show ssl crypto-provider`: Ibex-only (T460)
 
 The rustls crypto provider every TCP TLS configuration is built on: binds, server lines and
-their health checks, TLS 1.2 and 1.3. `ring` (the default) is upstream ring through
+their health checks, TLS 1.2 and 1.3; and since T461 every QUIC bind, which is on rustls 0.24 too. `ring` (the default) is upstream ring through
 `rustls-ring`; `ring-ibex` is the vendored ring fork that wipes key material when it is freed
 (`vendor/ringibex`, built with its `zeroize` feature on; what it wipes: `vendor/ringibex/ZEROIZE.md`,
 `tradeoff.md` 6.27). Exactly one argument, `ring` or `ring-ibex`; anything else is a configuration
 error. HAProxy refuses the keyword as unknown.
 
-QUIC, the TLS binds of a `log-forward` section and the TLS servers of a `ring` section are still on
+The TLS binds of a `log-forward` section and the TLS servers of a `ring` section are still on
 rustls 0.23, which only vanilla ring serves: `ring-ibex` with any of them is refused at startup
 (and by `-c`), naming the line, rather than letting that part run on vanilla ring unsaid.
 
+QUIC (T461): the handshake, the packet and header protection keys, and what quinn-proto took from
+vanilla ring directly (the stateless reset tokens' HMAC, the address validation tokens' HKDF and
+AES-256-GCM, the Retry integrity tag) all run on the chosen provider. A QUIC bind's TLS is the
+same configuration as a TCP bind's of the same line, TLS 1.3 only, with its session tickets.
+
 `show ssl crypto-provider` (CLI, admin level) prints the provider new handshakes use and the
-handshakes completed on each provider since start, front and back:
+handshakes completed on each provider since start, front and back, QUIC included:
 
     current ring
     provider ring handshakes 12
@@ -380,8 +385,11 @@ error>`. A connection already open keeps the session and the provider it started
 the server connection of its session. A configuration keeps both builds once it has them: swapping
 back reuses the configurations of startup. Session tickets and session IDs belong to one build (the
 ticket keys come from the provider), so a client resuming a session from before the swap gets a
-full handshake, not a failure. `ring-ibex` is refused at run time in the same cases as at startup
-(QUIC, log-forward or ring TLS). The swap lasts as long as the process: a reload starts the new
+full handshake, not a failure. A QUIC connection takes its bind's build for the provider current
+when its first Initial packet arrives, and keeps it. The endpoint's stateless reset and token keys
+are its own random bytes, computed on the current provider: HMAC, HKDF and AES-GCM give the same
+bytes on either, so a token or reset issued before a swap still verifies after it. `ring-ibex` is
+refused at run time in the same cases as at startup (log-forward or ring TLS). The swap lasts as long as the process: a reload starts the new
 process on the configured provider, and so does a restart. HAProxy has no such command (switching
 SSL libraries there means a new binary).
 

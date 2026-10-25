@@ -11,3 +11,4 @@
 //! a test file no target compiles.
 
 mod quic_transport_tests;
+mod dependency_graph;

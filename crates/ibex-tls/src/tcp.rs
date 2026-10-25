@@ -263,6 +263,20 @@ impl BindTls {
         let plan = BindPlan { alpn, pairs: vec![(certs, key, std::path::PathBuf::from("(memory)"))] };
         build(&plan, kind, true, true).map(Arc::new)
     }
+
+    /// [`Self::single`] for QUIC: TLS 1.3 only (RFC 9001), on the active provider. A swap does
+    /// not build it again (it has no `bind` line).
+    ///
+    /// # Errors
+    /// As [`Self::single`].
+    pub fn single_tls13(
+        certs: Vec<rustls24::pki_types::CertificateDer<'static>>,
+        key: rustls24::pki_types::PrivateKeyDer<'static>,
+        alpn: Vec<Vec<u8>>,
+    ) -> Result<Arc<Self>, String> {
+        let plan = BindPlan { alpn, pairs: vec![(certs, key, std::path::PathBuf::from("(memory)"))] };
+        build(&plan, provider::active(), false, true).map(Arc::new)
+    }
 }
 
 fn build(plan: &BindPlan, kind: TlsCryptoProvider, tls12: bool, tls13: bool) -> Result<BindTls, String> {

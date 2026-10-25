@@ -9,8 +9,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::ServerConfig;
+use ibex_tls::tcp::BindTls;
+use rustls24::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::error::{QuicError, Result};
 
@@ -157,40 +157,47 @@ impl QuicConfig {
         tc
     }
 
-    /// Builds the `quinn_proto::EndpointConfig` corresponding to these settings.
-    #[must_use]
-    pub fn build_endpoint_config(&self) -> quinn_proto::EndpointConfig {
-        let mut ec = quinn_proto::EndpointConfig::default();
+    /// Builds the `quinn_proto::EndpointConfig` corresponding to these settings, with a fresh
+    /// stateless reset key ([`crate::crypto::ResetKey`]).
+    ///
+    /// # Errors
+    /// The crypto provider has no random bytes for the key.
+    pub fn build_endpoint_config(&self) -> Result<quinn_proto::EndpointConfig> {
+        let key = crate::crypto::ResetKey::new().map_err(QuicError::Tls)?;
+        let mut ec = quinn_proto::EndpointConfig::new(Arc::new(key));
         if let Ok(ec_res) = ec.max_udp_payload_size(self.initial_mtu) {
             let _ = ec_res;
         }
-        ec
+        Ok(ec)
     }
 
-    /// Builds a `quinn_proto::ServerConfig` from a `rustls::ServerConfig`.
+    /// Builds a `quinn_proto::ServerConfig` over a bind's TLS (rustls 0.24, T461), with a fresh
+    /// address validation token key ([`crate::crypto::TokenKey`]).
+    ///
+    /// A bind with no ALPN gets these settings' (`h3`); it is then not rebuilt by a provider
+    /// swap, which only the binds of a configuration file are.
     ///
     /// # Errors
-    /// Returns `QuicError::Tls` if the TLS configuration cannot be converted into a QUIC server crypto config.
-    pub fn build_server_config(
-        &self,
-        tls_config: &ServerConfig,
-    ) -> Result<Arc<quinn_proto::ServerConfig>> {
-        // Ensure ALPN protocols are configured with HTTP/3
-        let mut tls = tls_config.clone();
-        if tls.alpn_protocols.is_empty() {
-            tls.alpn_protocols.clone_from(&self.alpn_protocols);
-        }
-
-        let quic_crypto = quinn_proto::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
-            .map_err(|e| QuicError::Tls(format!("failed to convert rustls ServerConfig for QUIC: {e}")))?;
-
-        let mut server_config = quinn_proto::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    /// Returns `QuicError::Tls` if the TLS configuration cannot serve QUIC.
+    pub fn build_server_config(&self, bind: &Arc<BindTls>) -> Result<Arc<quinn_proto::ServerConfig>> {
+        let bind = if bind.config.alpn_protocols.is_empty() {
+            let mut config = (*bind.config).clone();
+            config.alpn_protocols = self.alpn_protocols.iter().map(|p| p.clone().into()).collect();
+            Arc::new(BindTls::from_parts(Arc::new(config), Arc::clone(&bind.no_alpn), Arc::clone(&bind.resolver), bind.provider))
+        } else {
+            Arc::clone(bind)
+        };
+        let quic_crypto = crate::crypto::QuicServerConfig::new(bind)
+            .map_err(|e| QuicError::Tls(format!("failed to build the QUIC TLS configuration: {e}")))?;
+        let token_key = crate::crypto::TokenKey::new().map_err(QuicError::Tls)?;
+        let mut server_config = quinn_proto::ServerConfig::new(Arc::new(quic_crypto), Arc::new(token_key));
         server_config.transport_config(Arc::new(self.build_transport_config()));
 
         Ok(Arc::new(server_config))
     }
 
-    /// Loads certificates and private key from a PEM file and creates a `rustls::ServerConfig`.
+    /// Loads certificates and private key from a PEM file and builds the QUIC server
+    /// configuration serving them, on the active crypto provider.
     ///
     /// # Errors
     /// Returns an error if the file cannot be opened, or if no certificates/private key are found.
@@ -200,29 +207,9 @@ impl QuicConfig {
     ) -> Result<Arc<quinn_proto::ServerConfig>> {
         let path = pem_path.as_ref();
         let (certs, key) = load_pem_cert_and_key(path)?;
-
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let certified_key = ibex_tls::create_certified_key(certs.clone(), &key)
+        let bind = BindTls::single_tls13(certs, key, self.alpn_protocols.clone())
             .map_err(|e| QuicError::Tls(format!("invalid key in {}: {e}", path.display())))?;
-
-        let mut resolver = ibex_tls::IbexCertResolver::new();
-        resolver.set_default_cert(Arc::new(certified_key.clone()));
-
-        if let Some(first_cert) = certs.first() {
-            for domain in ibex_tls::extract_dns_sans(first_cert.as_ref()) {
-                resolver.add_cert(&domain, Arc::new(certified_key.clone()));
-            }
-        }
-
-        let mut rustls_config = ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|e| QuicError::Tls(format!("TLS protocol version error: {e:?}")))?
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(resolver));
-
-        rustls_config.alpn_protocols.clone_from(&self.alpn_protocols);
-
-        self.build_server_config(&rustls_config)
+        self.build_server_config(&bind)
     }
 }
 

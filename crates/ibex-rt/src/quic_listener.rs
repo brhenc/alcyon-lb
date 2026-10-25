@@ -187,10 +187,10 @@ impl QuicListener {
     /// Returns an error if the UDP socket cannot be bound or if endpoint initialization fails.
     pub fn bind(
         addr: SocketAddr,
-        tls_server_config: &rustls::ServerConfig,
+        tls: &Arc<ibex_tls::tcp::BindTls>,
         quic_config: Option<QuicConfig>,
     ) -> io::Result<Self> {
-        Self::bind_for_worker(addr, tls_server_config, quic_config, None)
+        Self::bind_for_worker(addr, tls, quic_config, None)
     }
 
     /// [`QuicListener::bind`] for a worker: it takes the socket [`prebind`] bound for it on
@@ -200,19 +200,19 @@ impl QuicListener {
     /// As [`QuicListener::bind`].
     pub fn bind_for_worker(
         addr: SocketAddr,
-        tls_server_config: &rustls::ServerConfig,
+        tls: &Arc<ibex_tls::tcp::BindTls>,
         quic_config: Option<QuicConfig>,
         worker: Option<usize>,
     ) -> io::Result<Self> {
         let config = quic_config.unwrap_or_default();
         let server_config = config
-            .build_server_config(tls_server_config)
+            .build_server_config(tls)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         // The whole config has to reach the endpoint, not just its TLS half. Routing through
         // `bind_with_server_config` dropped `require_retry` and `anti_amplification_factor`,
         // so a stricter factor an operator asked for was silently ignored.
         let endpoint = QuicEndpoint::with_configs_and_amplification(
-            Arc::new(config.build_endpoint_config()),
+            Arc::new(config.build_endpoint_config().map_err(|e| io::Error::other(e.to_string()))?),
             server_config,
             config.require_retry,
             config.anti_amplification_factor,

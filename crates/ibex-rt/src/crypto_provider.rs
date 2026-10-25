@@ -6,10 +6,11 @@
 //!
 //! [`apply`] runs before any TLS configuration is built (`validate_tls`, `build_shared_state`)
 //! and makes the configured provider [`ibex_tls::provider::active`]: every TCP TLS
-//! configuration (binds, server lines, health checks) is built on it from then on. QUIC and
-//! the rustls 0.23 users (log-forward TLS binds, ring TLS servers) cannot run on
-//! `rustls-ringibex`; with `ring-ibex` and one of them, the configuration is refused rather
-//! than half of the TLS running on vanilla ring unsaid (AGENTS.md section 5).
+//! configuration (binds, server lines, health checks) is built on it from then on, and so is
+//! every QUIC bind's (T461: QUIC is on rustls 0.24, `ibex_quic::crypto`). The rustls 0.23
+//! users (log-forward TLS binds, ring TLS servers) cannot run on `rustls-ringibex`; with
+//! `ring-ibex` and one of them, the configuration is refused rather than half of the TLS
+//! running on vanilla ring unsaid (AGENTS.md section 5).
 //!
 //! [`set`] swaps the provider at run time ([`ibex_tls::provider::swap`]), refused in the same
 //! case. It holds for this process: a reload (a new process) starts on the configured provider.
@@ -37,20 +38,13 @@ pub fn configured(config: &Config) -> TlsCryptoProvider {
 
 /// The first TLS user of `config` still on rustls 0.23, named for the error.
 fn rustls_023_user(config: &Config) -> Option<String> {
-    let quic = |name: &str, binds: &[ibex_config::ast::BindConfig]| {
-        binds.iter().find(|b| b.quic).map(|b| format!("QUIC bind {} in '{name}'", b.addr))
-    };
     config
-        .frontends
+        .log_forwards
         .iter()
-        .find_map(|f| quic(&f.name, &f.binds))
-        .or_else(|| config.listens.iter().find_map(|l| quic(&l.name, &l.binds)))
-        .or_else(|| {
-            config.log_forwards.iter().find_map(|lf| {
-                lf.binds.iter().find_map(|b| match b {
-                    LogForwardBind::Tcp(b) if b.ssl => Some(format!("TLS bind {} in log-forward '{}'", b.addr, lf.name)),
-                    _ => None,
-                })
+        .find_map(|lf| {
+            lf.binds.iter().find_map(|b| match b {
+                LogForwardBind::Tcp(b) if b.ssl => Some(format!("TLS bind {} in log-forward '{}'", b.addr, lf.name)),
+                _ => None,
             })
         })
         .or_else(|| {

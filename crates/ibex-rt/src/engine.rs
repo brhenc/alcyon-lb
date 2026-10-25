@@ -3562,14 +3562,14 @@ fn bind_tls(
     bind_tls_with(section, binds, addr, ibex_tls::tcp::from_bind_config)
 }
 
-/// [`bind_tls`] for a QUIC bind: its configuration on rustls 0.23, which `quinn-proto` needs
-/// (T440: TCP is on 0.24).
+/// [`bind_tls`] for a QUIC bind: the same rustls 0.24 configuration as TCP's, TLS 1.3 only
+/// (`BindPlan::versions` of a `quic` bind), on the provider a swap makes current (T461).
 fn bind_tls_quic(
     section: &str,
     binds: &[ibex_config::ast::BindConfig],
     addr: SocketAddr,
-) -> io::Result<Option<Arc<rustls::ServerConfig>>> {
-    bind_tls_with(section, binds, addr, ibex_tls::TlsConfig::from_bind_config)
+) -> io::Result<Option<Arc<ibex_tls::tcp::BindTls>>> {
+    bind_tls_with(section, binds, addr, ibex_tls::tcp::from_bind_config)
 }
 
 fn bind_tls_with<T>(
@@ -5063,7 +5063,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     pub fn add_quic_listener(
         &mut self,
         addr: std::net::SocketAddr,
-        tls: &rustls::ServerConfig,
+        tls: &Arc<ibex_tls::tcp::BindTls>,
         backend: Option<std::net::SocketAddr>,
     ) -> io::Result<u16> {
         let mut ql = crate::quic_listener::QuicListener::bind(addr, tls, None)?;

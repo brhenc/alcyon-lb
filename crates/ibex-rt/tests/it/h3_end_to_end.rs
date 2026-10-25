@@ -22,22 +22,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ibex_rt::QuicListener;
-use rustls::ServerConfig;
 
 const CERT: &str = "../../examples/certs/localhost.pem";
 
-fn server_config() -> Arc<ServerConfig> {
-    ibex_tls::config::install_default_crypto_provider();
+fn server_config() -> Arc<ibex_tls::tcp::BindTls> {
     let path = std::path::Path::new(CERT);
     let (certs, key) = ibex_tls::config::load_cert_file(path).expect("load test certificate");
-    let mut cfg = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .expect("build server config");
-    // Without this a client offering h3 gets no ALPN back and gives up before sending a
+    // Without h3 a client offering it gets no ALPN back and gives up before sending a
     // request, which looks exactly like a server that is not listening.
-    cfg.alpn_protocols = vec![b"h3".to_vec()];
-    Arc::new(cfg)
+    ibex_tls::tcp::BindTls::single_tls13(certs, key, vec![b"h3".to_vec()]).expect("build server config")
 }
 
 fn curl_has_http3() -> bool {

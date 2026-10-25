@@ -4,9 +4,10 @@
 //! T460: `tune.ibex.crypto-provider ring|ring-ibex` (Ibex-only) picks the rustls provider of
 //! every TCP TLS configuration, `set ssl crypto-provider` changes it at run time for the
 //! handshakes that start after it, and `show ssl crypto-provider` reports the provider and the
-//! handshakes completed on each. `ring-ibex` with a TLS user still on rustls 0.23 (QUIC,
-//! log-forward TLS binds, ring TLS servers) is refused at startup: those would run on vanilla
-//! ring while the operator asked for the zeroizing fork.
+//! handshakes completed on each. `ring-ibex` with a TLS user still on rustls 0.23 (log-forward
+//! TLS binds, ring TLS servers) is refused at startup: those would run on vanilla ring while
+//! the operator asked for the zeroizing fork. QUIC is on rustls 0.24 since T461 and runs on
+//! either provider, swap included.
 
 use crate::common;
 
@@ -58,10 +59,9 @@ fn port() -> u16 {
 
 #[test]
 fn ring_ibex_with_a_rustls_023_user_is_refused_and_ring_is_not() {
-    let quic = format!("frontend fe\n  bind quic4@127.0.0.1:{} ssl crt {{pem}} alpn h3\n", port());
     let logfwd = format!("log-forward lf\n  bind 127.0.0.1:{} ssl crt {{pem}}\n  log 127.0.0.1:{} local0\n", port(), port());
     let ring = format!("ring r\n  format rfc5424\n  size 4096\n  server s 127.0.0.1:{} ssl verify none\n", port());
-    for (what, body, says) in [("quic", &quic, "QUIC bind"), ("logfwd", &logfwd, "log-forward 'lf'"), ("ring", &ring, "ring 'r'")] {
+    for (what, body, says) in [("logfwd", &logfwd, "log-forward 'lf'"), ("ring", &ring, "ring 'r'")] {
         let (ok, out) = check(what, &format!("global\n  tune.ibex.crypto-provider ring-ibex\n{body}"));
         assert!(!ok, "{what}: ring-ibex accepted: {out}");
         assert!(out.contains("'tune.ibex.crypto-provider ring-ibex'") && out.contains(says) && out.contains("rustls 0.23"), "{what}: {out}");
@@ -271,27 +271,63 @@ fn a_swap_that_cannot_build_every_configuration_changes_nothing() {
     assert_eq!(settle(&sock, (6, 0)), ("ring".to_string(), 6, 0), "ring still serves");
 }
 
-#[test]
-fn a_swap_to_ring_ibex_with_quic_is_refused_at_run_time() {
-    let d = dir("swapquic");
+/// One HTTP/3 request to `quic` (`curl --http3-only`): the status line curl prints.
+fn h3_status(quic: SocketAddr) -> String {
+    let out = Command::new("curl")
+        .args(["-sS", "-o", "/dev/null", "-w", "%{http_code} %{http_version}", "--http3-only", "-k", "--max-time", "8"])
+        .arg("--resolve")
+        .arg(format!("localhost:{}:{}", quic.port(), quic.ip()))
+        .arg(format!("https://localhost:{}/", quic.port()))
+        .output()
+        .expect("curl");
+    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+}
+
+/// A frontend with a TCP bind and a QUIC bind answering 200, on `provider` (`None`: the
+/// keyword left out): the process, its stats socket and the QUIC address.
+fn start_quic(tag: &str, provider: Option<&str>) -> (Ibex, String, SocketAddr) {
+    let d = dir(tag);
     let (pem, _) = cert(&d);
     let sock = d.join("cli.sock").display().to_string();
     let (tcp, quic) = (common::reserve_addr(), common::reserve_addr());
+    let kw = provider.map(|p| format!("  tune.ibex.crypto-provider {p}\n")).unwrap_or_default();
     let cfg = format!(
-        "global\n  stats socket {sock} level admin\n\
+        "global\n  stats socket {sock} level admin\n{kw}\
          defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
          frontend fe\n  bind {tcp}\n  bind quic4@{quic} ssl crt {pem} alpn h3\n  http-request return status 200\n"
     );
     std::fs::write(d.join("c.cfg"), cfg).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(d.join("c.cfg")).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    let _ibex = Ibex(child, d);
-    assert!(common::wait_listening(tcp));
+    let ibex = Ibex(child, d);
+    assert!(common::wait_listening(tcp), "ibex did not start (refused the configuration?)");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !std::path::Path::new(&sock).exists() {
         assert!(Instant::now() < deadline, "no stats socket");
         std::thread::sleep(Duration::from_millis(20));
     }
+    (ibex, sock, quic)
+}
+
+/// T461: `ring-ibex` with a QUIC bind starts (T460 refused it: QUIC was on rustls 0.23), and an
+/// HTTP/3 request completes, its handshake on `ring-ibex`.
+#[test]
+fn ring_ibex_with_a_quic_bind_starts_and_serves_http3_on_it() {
+    let (ok, out) = check("quicchk", &format!("global\n  tune.ibex.crypto-provider ring-ibex\nfrontend fe\n  bind quic4@127.0.0.1:{} ssl crt {{pem}} alpn h3\n", port()));
+    assert!(ok, "ring-ibex with a QUIC bind refused: {out}");
+    let (_ibex, sock, quic) = start_quic("quicibex", Some("ring-ibex"));
+    assert_eq!(h3_status(quic), "200 3");
+    assert_eq!(settle(&sock, (0, 1)), ("ring-ibex".to_string(), 0, 1), "the QUIC handshake ran on ring-ibex");
+}
+
+/// T461: `set ssl crypto-provider` reaches QUIC as it reaches TCP: the handshakes after the swap
+/// run on the new provider.
+#[test]
+fn a_swap_at_run_time_reaches_new_quic_handshakes() {
+    let (_ibex, sock, quic) = start_quic("swapquic", None);
+    assert_eq!(h3_status(quic), "200 3");
+    assert_eq!(settle(&sock, (1, 0)), ("ring".to_string(), 1, 0));
     let out = cli(&sock, "set ssl crypto-provider ring-ibex");
-    assert!(out.contains("unchanged") && out.contains("QUIC bind") && out.contains("rustls 0.23"), "{out:?}");
-    assert_eq!(shown(&sock).0, "ring");
+    assert!(out.contains("is now 'ring-ibex'"), "{out:?}");
+    assert_eq!(h3_status(quic), "200 3");
+    assert_eq!(settle(&sock, (1, 1)), ("ring-ibex".to_string(), 1, 1), "the second QUIC handshake ran on ring-ibex");
 }

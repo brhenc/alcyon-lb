@@ -23,11 +23,7 @@ fn main() {
     ibex_tls::config::install_default_crypto_provider();
     let cert = std::path::Path::new("/home/bhenc/project-ibex/examples/certs/localhost.pem");
     let (certs, key) = ibex_tls::config::load_cert_file(cert).expect("load certificate");
-    let mut tls = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .expect("build TLS config");
-    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let tls = ibex_tls::tcp::BindTls::single_tls13(certs, key, vec![b"h3".to_vec()]).expect("build TLS config");
 
     // A minimal config so the engine has somewhere to put its scheduler and pools; the QUIC
     // listener is added directly rather than through the config surface, which does not yet

@@ -21,9 +21,10 @@
 //! ticket keys are the provider's): a session from before a swap resumes no more, and the
 //! client gets a full handshake instead.
 //!
-//! QUIC and the 0.23 configurations of [`crate::config`] (log-forward TLS binds, ring servers)
-//! are on rustls 0.23, which `rustls-ringibex` does not serve: the engine refuses `ring-ibex`
-//! with any of them instead of letting them run on vanilla ring unsaid.
+//! QUIC binds are [`crate::tcp::BindTls`]es too (T461, `ibex_quic::crypto`), TLS 1.3 only, and
+//! swap like the TCP ones. The 0.23 configurations of [`crate::config`] (log-forward TLS binds,
+//! ring servers) are on rustls 0.23, which `rustls-ringibex` does not serve: the engine refuses
+//! `ring-ibex` with any of them instead of letting them run on vanilla ring unsaid.
 
 use ibex_config::TlsCryptoProvider;
 use rustls24::crypto::CryptoProvider;
@@ -150,6 +151,35 @@ pub fn swap(p: TlsCryptoProvider) -> Result<usize, String> {
 /// configuration that issued it.
 pub(crate) fn ticketer(p: TlsCryptoProvider) -> Result<Arc<dyn rustls24::crypto::TicketProducer>, rustls24::Error> {
     base(p).ticketer_factory.ticketer()
+}
+
+/// `TLS13_AES_128_GCM_SHA256` of provider `p`: the suite of QUIC's Initial packets and Retry
+/// integrity tags (RFC 9001 5.2, 5.8), whose HMAC-SHA256 and HKDF also key a QUIC endpoint's
+/// stateless resets and address validation tokens (T461).
+#[must_use]
+pub fn quic_initial_suite(p: TlsCryptoProvider) -> &'static rustls24::Tls13CipherSuite {
+    match p {
+        TlsCryptoProvider::Ring => rustls24_ring::cipher_suite::TLS13_AES_128_GCM_SHA256,
+        TlsCryptoProvider::RingIbex => rustls24_ringibex::cipher_suite::TLS13_AES_128_GCM_SHA256,
+    }
+}
+
+/// `TLS13_AES_256_GCM_SHA384` of provider `p`: the AEAD of a QUIC endpoint's address
+/// validation tokens (AES-256-GCM, as quinn-proto seals them).
+#[must_use]
+pub fn quic_token_suite(p: TlsCryptoProvider) -> &'static rustls24::Tls13CipherSuite {
+    match p {
+        TlsCryptoProvider::Ring => rustls24_ring::cipher_suite::TLS13_AES_256_GCM_SHA384,
+        TlsCryptoProvider::RingIbex => rustls24_ringibex::cipher_suite::TLS13_AES_256_GCM_SHA384,
+    }
+}
+
+/// Fills `out` from the secure random source of provider `p`.
+///
+/// # Errors
+/// The source failed.
+pub fn fill_random(p: TlsCryptoProvider, out: &mut [u8]) -> Result<(), rustls24::crypto::GetRandomFailed> {
+    base(p).secure_random.fill(out)
 }
 
 #[cfg(test)]

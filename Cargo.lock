@@ -643,13 +643,16 @@ name = "ibex-quic"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "ibex-config",
  "ibex-tls",
  "quinn-proto",
  "rcgen",
  "rustix 0.38.44",
  "rustls 0.23.45",
+ "rustls 0.24.0-dev.2",
  "rustls-pemfile",
  "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]
@@ -677,6 +680,7 @@ dependencies = [
  "ibex-tls",
  "memchr",
  "nix",
+ "quinn-proto",
  "rcgen",
  "rustix 0.38.44",
  "rustls 0.23.45",

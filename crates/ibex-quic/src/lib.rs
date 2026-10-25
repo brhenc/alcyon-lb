@@ -6,7 +6,7 @@
 //! Pure memory-safe QUIC transport layer for Project Ibex.
 //!
 //! Features:
-//! - Pure `#![forbid(unsafe_code)]` with `quinn-proto 0.11` and `rustls 0.23`.
+//! - Pure `#![forbid(unsafe_code)]` with `quinn-proto 0.11` and `rustls 0.24` (T461, [`crypto`]).
 //! - Pure sans-IO architecture: operates on datagram buffers and clocks without async runtimes.
 //! - Transport seam: [`QuicTransport`] encapsulates the underlying state machine.
 //! - Connection table keyed by Destination Connection ID (DCID), supporting client migration.
@@ -18,6 +18,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 pub mod config;
 pub mod connection;
+pub mod crypto;
 pub mod endpoint;
 pub mod error;
 pub mod listener;

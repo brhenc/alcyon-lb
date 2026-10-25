@@ -101,12 +101,12 @@ impl QuicEndpoint {
     /// # Errors
     /// Returns `QuicError::Config` if endpoint initialization fails.
     pub fn new(
-        tls_server_config: &rustls::ServerConfig,
+        tls: &Arc<ibex_tls::tcp::BindTls>,
         quic_config: Option<QuicConfig>,
     ) -> Result<Self> {
         let config = quic_config.unwrap_or_default();
-        let server_config = config.build_server_config(tls_server_config)?;
-        let endpoint_config = Arc::new(config.build_endpoint_config());
+        let server_config = config.build_server_config(tls)?;
+        let endpoint_config = Arc::new(config.build_endpoint_config()?);
         Ok(Self::with_configs_and_amplification(
             endpoint_config,
             server_config,
@@ -172,7 +172,8 @@ impl QuicEndpoint {
     /// # Errors
     /// Returns `QuicError::Config` if initialization fails.
     pub fn with_server_config(server_config: Arc<ServerConfig>) -> Result<Self> {
-        Ok(Self::with_configs(Arc::new(EndpointConfig::default()), server_config, false))
+        let reset = crate::crypto::ResetKey::new().map_err(QuicError::Config)?;
+        Ok(Self::with_configs(Arc::new(EndpointConfig::new(Arc::new(reset))), server_config, false))
     }
 
     /// Sets the anti-amplification factor limit for unvalidated peer paths.
@@ -250,7 +251,7 @@ impl QuicEndpoint {
                     let mut server_name = None;
 
                     if let Some(hd_any) = conn.crypto_session().handshake_data() {
-                        if let Some(hd) = hd_any.downcast_ref::<quinn_proto::crypto::rustls::HandshakeData>() {
+                        if let Some(hd) = hd_any.downcast_ref::<crate::crypto::HandshakeData>() {
                             alpn.clone_from(&hd.protocol);
                             server_name.clone_from(&hd.server_name);
                         }
@@ -728,7 +729,7 @@ impl QuicTransport for QuicEndpoint {
         let handle = self.connection_table.lookup(&conn_id)?;
         let conn = self.connections.get(&handle)?;
         let hd_any = conn.crypto_session().handshake_data()?;
-        let hd = hd_any.downcast_ref::<quinn_proto::crypto::rustls::HandshakeData>()?;
+        let hd = hd_any.downcast_ref::<crate::crypto::HandshakeData>()?;
         hd.protocol.clone()
     }
 
@@ -736,7 +737,7 @@ impl QuicTransport for QuicEndpoint {
         let handle = self.connection_table.lookup(&conn_id)?;
         let conn = self.connections.get(&handle)?;
         let hd_any = conn.crypto_session().handshake_data()?;
-        let hd = hd_any.downcast_ref::<quinn_proto::crypto::rustls::HandshakeData>()?;
+        let hd = hd_any.downcast_ref::<crate::crypto::HandshakeData>()?;
         hd.server_name.clone()
     }
 }

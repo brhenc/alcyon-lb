@@ -36,6 +36,9 @@ pedantic = { level = "warn", priority = -1 }
 
 [dev-dependencies]
 tempfile = "3"
+# The HTTP/3 test clients: quinn's own client on rustls 0.23 (rustls 0.24.0-dev.2 has no QUIC
+# client). Dev-only: the binary's quinn-proto has no `rustls-ring` (T461).
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
 rcgen = "0.13"
 serde = { workspace = true }
 serde_json = { workspace = true }

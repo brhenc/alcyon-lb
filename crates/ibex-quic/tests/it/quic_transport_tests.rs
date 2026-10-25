@@ -701,15 +701,7 @@ fn a_configured_factor_of_two_is_enforced_across_retransmissions() {
             .expect("read certs")
     };
 
-    let certified_key = ibex_tls::create_certified_key(certs.clone(), &key).expect("cert key");
-    let mut resolver = ibex_tls::IbexCertResolver::new();
-    resolver.set_default_cert(Arc::new(certified_key.clone()));
-
-    let rustls_config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("safe proto")
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(resolver));
+    let rustls_config = ibex_tls::tcp::BindTls::single_tls13(certs, key, Vec::new()).expect("bind tls");
 
     // Configure strict anti-amplification factor of 2x (HAProxy baseline single flight profile)
     let quic_config = QuicConfig::new().with_anti_amplification_factor(2);
@@ -759,25 +751,12 @@ fn a_configured_factor_of_two_is_enforced_across_retransmissions() {
 
 
 
-/// A `rustls::ServerConfig` for the tests that need to hand one to `QuicListener::bind`.
-fn rustls_server_config() -> rustls::ServerConfig {
+/// A bind's TLS (rustls 0.24, no ALPN: the QUIC config's `h3`) for the tests that need to hand
+/// one to `QuicListener::bind`.
+fn rustls_server_config() -> Arc<ibex_tls::tcp::BindTls> {
     let pem_path = cert_path();
-    let (_, key) = ibex_quic::config::load_pem_cert_and_key(pem_path.as_path()).expect("load key");
-    let certs = {
-        let file = std::fs::File::open(pem_path.as_path()).expect("open cert");
-        let mut reader = std::io::BufReader::new(file);
-        rustls_pemfile::certs(&mut reader)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("read certs")
-    };
-    let certified_key = ibex_tls::create_certified_key(certs, &key).expect("cert key");
-    let mut resolver = ibex_tls::IbexCertResolver::new();
-    resolver.set_default_cert(Arc::new(certified_key));
-    rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("safe proto")
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(resolver))
+    let (certs, key) = ibex_quic::config::load_pem_cert_and_key(pem_path.as_path()).expect("load key");
+    ibex_tls::tcp::BindTls::single_tls13(certs, key, Vec::new()).expect("bind tls")
 }
 
 /// Produces a genuine client Initial datagram aimed at `server_addr`.

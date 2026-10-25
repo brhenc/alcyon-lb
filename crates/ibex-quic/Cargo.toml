@@ -9,15 +9,23 @@ rust-version.workspace = true
 autotests = false
 
 [dependencies]
-quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
-rustls = { workspace = true }
+# T461: no `rustls-ring`: QUIC's TLS is rustls 0.24 (`src/crypto.rs`), and neither quinn's rustls
+# 0.23 nor its *ring* is linked into the binary.
+quinn-proto = { version = "0.11", default-features = false }
+rustls24 = { workspace = true }
 rustls-pemfile = "2.2.0"
 ibex-tls = { workspace = true }
+ibex-config = { path = "../ibex-config" }
+zeroize = "1"
 bytes = { workspace = true }
 thiserror = { workspace = true }
 
 
 [dev-dependencies]
+# The test clients: quinn's own client on rustls 0.23 (rustls 0.24.0-dev.2 has no QUIC client).
+# Dev-only, so the features reach test builds and not the binary (resolver 2).
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
+rustls = { workspace = true }
 rcgen = "0.13"
 rustix = { version = "0.38", features = ["event", "net", "std"] }
 
