@@ -709,8 +709,12 @@ fn the_check_port_is_shown_and_restored() {
         assert!(std::time::Instant::now() < deadline, "b/s2 never went DOWN: {:?}", run.statuses());
         thread::sleep(Duration::from_millis(50));
     }
+    // `HAProxy` 3.5-dev8 also writes `Server b/s1 is DOWN, reason: Layer4 connection problem...`
+    // for the checks that fail (T404; the figures in it vary), so those lines are looked at apart.
+    let messages = run.messages();
+    assert!(messages.iter().any(|m| m.starts_with("WARNING Server b/s2 is DOWN, reason: Layer4 connection problem")), "{messages:?}");
     assert_eq!(
-        run.messages(),
+        messages.into_iter().filter(|m| !m.starts_with("WARNING Server b/")).collect::<Vec<_>>(),
         [
             "WARNING server-state partially applied for server 'b/s4', provided port is not an integer",
             "WARNING server-state partially applied for server 'b/s5', provided port is invalid",
