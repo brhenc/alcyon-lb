@@ -2982,7 +2982,7 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         retries: i64::from(s.max_retries.saturating_sub(s.conn_retries)),
         redispatched: s.log.redispatched,
         uniq_id: l.uniq_id,
-        be_queue: l.be_queue,
+        be_queue: u64::from(l.be_queue),
         log_counter: fe.log_count.load(Ordering::Relaxed),
         pid,
         hostname: log_hostname(),
@@ -12994,7 +12994,7 @@ impl EngineDispatcher<'_> {
         }
         let ms = entry.sess.queue_ms();
         let deadline = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
-        entry.sess.log.be_queue = u64::from(entry.sess.queue.enter(entry.task, be_idx, proxies[be_idx].stats.clone(), deadline));
+        entry.sess.log.be_queue = entry.sess.queue.enter(entry.task, be_idx, proxies[be_idx].stats.clone(), deadline);
         None
     }
 
