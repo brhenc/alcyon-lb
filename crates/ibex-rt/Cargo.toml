@@ -13,7 +13,6 @@ ibex-config = { path = "../ibex-config" }
 ibex-sample = { path = "../ibex-sample" }
 ibex-tls = { path = "../ibex-tls" }
 ibex-alloc = { workspace = true }
-rustls = { workspace = true }
 rustls24 = { workspace = true }
 rustls24-ring = { workspace = true }
 ibex-stick-table = { path = "../ibex-stick-table" }
@@ -36,6 +35,8 @@ pedantic = { level = "warn", priority = -1 }
 
 [dev-dependencies]
 tempfile = "3"
+# The TLS test clients (T461: no rustls 0.23 in the binary any more).
+rustls = { workspace = true }
 # The HTTP/3 test clients: quinn's own client on rustls 0.23 (rustls 0.24.0-dev.2 has no QUIC
 # client). Dev-only: the binary's quinn-proto has no `rustls-ring` (T461).
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }

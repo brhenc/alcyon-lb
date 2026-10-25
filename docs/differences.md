@@ -354,15 +354,17 @@ touched by any of them; OpenSSL wipes its own key material (`OPENSSL_cleanse`). 
 ## `tune.ibex.crypto-provider ring|ring-ibex`, `set ssl crypto-provider` and `show ssl crypto-provider`: Ibex-only (T460)
 
 The rustls crypto provider every TCP TLS configuration is built on: binds, server lines and
-their health checks, TLS 1.2 and 1.3; and since T461 every QUIC bind, which is on rustls 0.24 too. `ring` (the default) is upstream ring through
+their health checks, TLS 1.2 and 1.3; and since T461 every QUIC bind, log-forward TLS bind and
+ring TLS server, which are on rustls 0.24 too. `ring` (the default) is upstream ring through
 `rustls-ring`; `ring-ibex` is the vendored ring fork that wipes key material when it is freed
 (`vendor/ringibex`, built with its `zeroize` feature on; what it wipes: `vendor/ringibex/ZEROIZE.md`,
 `tradeoff.md` 6.27). Exactly one argument, `ring` or `ring-ibex`; anything else is a configuration
 error. HAProxy refuses the keyword as unknown.
 
-The TLS binds of a `log-forward` section and the TLS servers of a `ring` section are still on
-rustls 0.23, which only vanilla ring serves: `ring-ibex` with any of them is refused at startup
-(and by `-c`), naming the line, rather than letting that part run on vanilla ring unsaid.
+The TLS binds of a `log-forward` section and the TLS servers of a `ring` section run on it too
+since T461 (they were on rustls 0.23, and T460 refused `ring-ibex` with them): every TLS user of
+the process is on rustls 0.24 and the chosen provider, and nothing refuses `ring-ibex`. Their
+handshakes count in `show ssl crypto-provider`, and a swap reaches their new connections.
 
 QUIC (T461): the handshake, the packet and header protection keys, and what quinn-proto took from
 vanilla ring directly (the stateless reset tokens' HMAC, the address validation tokens' HKDF and
@@ -388,9 +390,9 @@ ticket keys come from the provider), so a client resuming a session from before 
 full handshake, not a failure. A QUIC connection takes its bind's build for the provider current
 when its first Initial packet arrives, and keeps it. The endpoint's stateless reset and token keys
 are its own random bytes, computed on the current provider: HMAC, HKDF and AES-GCM give the same
-bytes on either, so a token or reset issued before a swap still verifies after it. `ring-ibex` is
-refused at run time in the same cases as at startup (log-forward or ring TLS). The swap lasts as long as the process: a reload starts the new
-process on the configured provider, and so does a restart. HAProxy has no such command (switching
+bytes on either, so a token or reset issued before a swap still verifies after it. The swap
+lasts as long as the process: a reload starts the new process on the configured provider, and so
+does a restart. HAProxy has no such command (switching
 SSL libraries there means a new binary).
 
 HAProxy's `ssl-provider`, `ssl-provider-path` and `ssl-propquery` load OpenSSL 3 providers

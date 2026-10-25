@@ -3582,14 +3582,6 @@ fn bind_tls_with<T>(
         return Ok(None);
     };
 
-    // Chosen explicitly rather than inferred from crate features. rustls picks a default
-    // provider only when exactly one of `ring` and `aws-lc-rs` is enabled, and any
-    // dependency anywhere in the graph that turns on the other makes that ambiguous --
-    // at which point `ServerConfig::builder()` panics. It panicked here under
-    // `cargo test --workspace`, where a dev-dependency pulled the second provider in.
-    // Relying on feature arithmetic to decide whether the proxy can start is not a
-    // property worth having; this is idempotent and costs one atomic on the first bind.
-    ibex_tls::install_default_crypto_provider();
     if bind.crt.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

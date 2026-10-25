@@ -5,30 +5,16 @@
 //! `show ssl crypto-provider`.
 //!
 //! [`apply`] runs before any TLS configuration is built (`validate_tls`, `build_shared_state`)
-//! and makes the configured provider [`ibex_tls::provider::active`]: every TCP TLS
-//! configuration (binds, server lines, health checks) is built on it from then on, and so is
-//! every QUIC bind's (T461: QUIC is on rustls 0.24, `ibex_quic::crypto`). The rustls 0.23
-//! users (log-forward TLS binds, ring TLS servers) cannot run on `rustls-ringibex`; with
-//! `ring-ibex` and one of them, the configuration is refused rather than half of the TLS
-//! running on vanilla ring unsaid (AGENTS.md section 5).
+//! and makes the configured provider [`ibex_tls::provider::active`]: every TLS configuration
+//! is built on it from then on: TCP binds, server lines and health checks; QUIC binds (T461,
+//! `ibex_quic::crypto`); log-forward TLS binds and ring TLS servers (T461,
+//! `ibex_tls::blocking`). Nothing is left on rustls 0.23, so nothing refuses `ring-ibex`.
 //!
-//! [`set`] swaps the provider at run time ([`ibex_tls::provider::swap`]), refused in the same
-//! case. It holds for this process: a reload (a new process) starts on the configured provider.
+//! [`set`] swaps the provider at run time ([`ibex_tls::provider::swap`]). It holds for this
+//! process: a reload (a new process) starts on the configured provider.
 
-use ibex_config::{Config, LogForwardBind, TlsCryptoProvider};
+use ibex_config::{Config, TlsCryptoProvider};
 use std::io;
-use std::sync::{Mutex, PoisonError};
-
-/// The TLS user of the running configuration that only vanilla ring serves, if any: what makes
-/// `set ssl crypto-provider ring-ibex` refused too.
-static RING_ONLY: Mutex<Option<String>> = Mutex::new(None);
-
-fn refusal(user: &str) -> String {
-    format!(
-        "'tune.ibex.crypto-provider ring-ibex' cannot serve the {user}: it runs on rustls 0.23, \
-         which only vanilla ring serves."
-    )
-}
 
 /// The provider `config` asks for (`ring` when it says nothing).
 #[must_use]
@@ -36,41 +22,12 @@ pub fn configured(config: &Config) -> TlsCryptoProvider {
     config.global.as_ref().and_then(|g| g.crypto_provider).unwrap_or_default()
 }
 
-/// The first TLS user of `config` still on rustls 0.23, named for the error.
-fn rustls_023_user(config: &Config) -> Option<String> {
-    config
-        .log_forwards
-        .iter()
-        .find_map(|lf| {
-            lf.binds.iter().find_map(|b| match b {
-                LogForwardBind::Tcp(b) if b.ssl => Some(format!("TLS bind {} in log-forward '{}'", b.addr, lf.name)),
-                _ => None,
-            })
-        })
-        .or_else(|| {
-            config.rings.iter().find_map(|r| {
-                r.servers.iter().find(|s| s.ssl).map(|s| format!("TLS server '{}' in ring '{}'", s.name, r.name))
-            })
-        })
-}
-
 /// Makes the configured provider the one TLS configurations are built on.
 ///
 /// # Errors
-/// `ring-ibex` with a TLS user that only vanilla ring can serve.
+/// None today: every TLS user runs on either provider. Kept for the startup path's `?`.
 pub fn apply(config: &Config) -> io::Result<()> {
-    let p = configured(config);
-    let user = rustls_023_user(config);
-    if p == TlsCryptoProvider::RingIbex {
-        if let Some(user) = &user {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{} Use 'tune.ibex.crypto-provider ring' or remove it.", refusal(user)),
-            ));
-        }
-    }
-    *RING_ONLY.lock().unwrap_or_else(PoisonError::into_inner) = user;
-    ibex_tls::provider::set_active(p);
+    ibex_tls::provider::set_active(configured(config));
     Ok(())
 }
 
@@ -83,11 +40,6 @@ pub fn set(args: &str) -> String {
         return "'set ssl crypto-provider' expects 'ring' or 'ring-ibex'.".to_string();
     };
     let was = ibex_tls::provider::active();
-    if p == TlsCryptoProvider::RingIbex {
-        if let Some(user) = RING_ONLY.lock().unwrap_or_else(PoisonError::into_inner).as_deref() {
-            return format!("Crypto provider unchanged ('{}'): {}", was.name(), refusal(user));
-        }
-    }
     match ibex_tls::provider::swap(p) {
         Ok(n) => format!("Crypto provider is now '{}' for new handshakes ({n} TLS configurations built for it).", p.name()),
         Err(e) => format!("Crypto provider unchanged ('{}'): {e}", was.name()),

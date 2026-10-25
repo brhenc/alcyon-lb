@@ -293,16 +293,16 @@ fn connect(server: &RingServer, connect_timeout: Duration, write_timeout: Durati
     Ok(Box::new(client_tls(sock, name)?))
 }
 
-/// A TLS client over `sock`. The only verification a ring server offers is `verify none`.
+/// A TLS client over `sock`, on rustls 0.24 and the active provider (T461). The only
+/// verification a ring server offers is `verify none`.
 fn client_tls<S: io::Read + Write + Send + 'static>(
     sock: S,
-    name: rustls::pki_types::ServerName<'static>,
-) -> io::Result<rustls::StreamOwned<rustls::ClientConnection, S>> {
-    ibex_tls::install_default_crypto_provider();
+    name: rustls24::pki_types::ServerName<'static>,
+) -> io::Result<ibex_tls::blocking::BlockingTls<S>> {
     let opts = ibex_tls::BackendTlsOptions { verify_required: false, ..ibex_tls::BackendTlsOptions::default() };
-    let cfg = ibex_tls::build_backend_client_config(&opts).map_err(io::Error::other)?;
-    let conn = rustls::ClientConnection::new(cfg, name).map_err(io::Error::other)?;
-    Ok(rustls::StreamOwned::new(conn, sock))
+    let kind = ibex_tls::provider::active();
+    let cfg = ibex_tls::tcp::build_backend_client_config_with(&opts, kind).map_err(io::Error::other)?;
+    ibex_tls::blocking::BlockingTls::connect(&cfg, kind, name, sock)
 }
 
 /// The forwarder of one `server` line: connects, then writes every event the ring holds and

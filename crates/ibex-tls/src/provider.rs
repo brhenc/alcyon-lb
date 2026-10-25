@@ -21,10 +21,10 @@
 //! ticket keys are the provider's): a session from before a swap resumes no more, and the
 //! client gets a full handshake instead.
 //!
-//! QUIC binds are [`crate::tcp::BindTls`]es too (T461, `ibex_quic::crypto`), TLS 1.3 only, and
-//! swap like the TCP ones. The 0.23 configurations of [`crate::config`] (log-forward TLS binds,
-//! ring servers) are on rustls 0.23, which `rustls-ringibex` does not serve: the engine refuses
-//! `ring-ibex` with any of them instead of letting them run on vanilla ring unsaid.
+//! QUIC binds and log-forward TLS binds are [`crate::tcp::BindTls`]es too (T461:
+//! `ibex_quic::crypto`, [`crate::blocking`]), and swap like the TCP ones; a ring TLS server
+//! builds its client configuration on [`active`] at each connection. The rustls 0.23
+//! configurations of [`crate::config`] are left to the tests: nothing in the binary uses them.
 
 use ibex_config::TlsCryptoProvider;
 use rustls24::crypto::CryptoProvider;

@@ -299,12 +299,13 @@ impl rustls::client::danger::ServerCertVerifier for NoServerAuth {
     }
 }
 
-/// Loads CA certificates from a PEM file or directory into a [`RootCertStore`].
+/// Loads CA certificates from a PEM file or directory into a rustls 0.24 root store (T461:
+/// what the binary verifies with; a rustls 0.23 caller takes its `roots`).
 ///
 /// # Errors
 /// Returns an error if reading the file fails or no valid certificates are found.
-pub fn load_ca_file(path: &std::path::Path) -> Result<RootCertStore, String> {
-    let mut root_store = RootCertStore::empty();
+pub fn load_ca_file(path: &std::path::Path) -> Result<rustls24::RootCertStore, String> {
+    let mut root_store = rustls24::RootCertStore::empty();
     let file = std::fs::File::open(path)
         .map_err(|e| format!("Failed to open CA file {}: {}", path.display(), e))?;
     let mut reader = std::io::BufReader::new(file);
@@ -336,7 +337,7 @@ const STANDARD_CA_PATHS: &[&str] = &[
 
 /// Loads the default system root CA certificate store.
 #[must_use]
-pub fn load_system_ca_roots() -> RootCertStore {
+pub fn load_system_ca_roots() -> rustls24::RootCertStore {
     if let Ok(path) = std::env::var("SSL_CERT_FILE") {
         if let Ok(store) = load_ca_file(std::path::Path::new(&path)) {
             if !store.is_empty() {
@@ -354,7 +355,7 @@ pub fn load_system_ca_roots() -> RootCertStore {
             }
         }
     }
-    RootCertStore::empty()
+    rustls24::RootCertStore::empty()
 }
 
 /// What a `server` line says about the TLS it speaks (`src/cfgparse-ssl.c`), as the
@@ -431,7 +432,7 @@ pub(crate) fn spoken_versions() -> String {
 ///
 /// # Errors
 /// A bundle that cannot be read, or holds no certificate.
-pub fn load_server_ca(path: &std::path::Path) -> Result<RootCertStore, String> {
+pub fn load_server_ca(path: &std::path::Path) -> Result<rustls24::RootCertStore, String> {
     if path.as_os_str() == "@system-ca" {
         return Ok(load_system_ca_roots());
     }
@@ -522,7 +523,7 @@ impl ServerVerifier {
         let Some(ca_path) = options.ca_file.as_deref() else {
             return Err("verify is enabled but no CA file specified".to_string());
         };
-        let roots = load_server_ca(ca_path)?;
+        let roots = RootCertStore { roots: load_server_ca(ca_path)?.roots };
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut builder = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider);
         if let Some(crl_path) = options.crl_file.as_deref() {

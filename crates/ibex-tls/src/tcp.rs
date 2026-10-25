@@ -377,7 +377,7 @@ impl ServerVerifier {
         let Some(ca_path) = options.ca_file.as_deref() else {
             return Err("verify is enabled but no CA file specified".to_string());
         };
-        let roots = rustls24::RootCertStore { roots: load_server_ca(ca_path)?.roots };
+        let roots = load_server_ca(ca_path)?;
         let mut builder = rustls24::client::WebPkiServerVerifier::builder(Arc::new(roots), provider);
         if let Some(crl_path) = options.crl_file.as_deref() {
             builder = builder.with_crls(load_crl_file(crl_path)?);

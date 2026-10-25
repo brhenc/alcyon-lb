@@ -4,10 +4,9 @@
 //! T460: `tune.ibex.crypto-provider ring|ring-ibex` (Ibex-only) picks the rustls provider of
 //! every TCP TLS configuration, `set ssl crypto-provider` changes it at run time for the
 //! handshakes that start after it, and `show ssl crypto-provider` reports the provider and the
-//! handshakes completed on each. `ring-ibex` with a TLS user still on rustls 0.23 (log-forward
-//! TLS binds, ring TLS servers) is refused at startup: those would run on vanilla ring while
-//! the operator asked for the zeroizing fork. QUIC is on rustls 0.24 since T461 and runs on
-//! either provider, swap included.
+//! handshakes completed on each. T460 refused `ring-ibex` with a TLS user on rustls 0.23 (QUIC,
+//! log-forward TLS binds, ring TLS servers); since T461 all of them are on rustls 0.24 and run
+//! on either provider, swap included.
 
 use crate::common;
 
@@ -57,17 +56,45 @@ fn port() -> u16 {
     common::reserve_addr().port()
 }
 
+/// T461: `ring-ibex` serves the log-forward TLS binds and the ring TLS servers too (T460
+/// refused both: they were on rustls 0.23). A frontend logs to a ring whose server is `ssl
+/// verify none`, into a log-forward `ssl crt` listener of the same process, which writes to a
+/// UDP collector: the line arrives, and both handshakes (the ring's, the listener's) count on
+/// `ring-ibex`.
 #[test]
-fn ring_ibex_with_a_rustls_023_user_is_refused_and_ring_is_not() {
-    let logfwd = format!("log-forward lf\n  bind 127.0.0.1:{} ssl crt {{pem}}\n  log 127.0.0.1:{} local0\n", port(), port());
-    let ring = format!("ring r\n  format rfc5424\n  size 4096\n  server s 127.0.0.1:{} ssl verify none\n", port());
-    for (what, body, says) in [("logfwd", &logfwd, "log-forward 'lf'"), ("ring", &ring, "ring 'r'")] {
-        let (ok, out) = check(what, &format!("global\n  tune.ibex.crypto-provider ring-ibex\n{body}"));
-        assert!(!ok, "{what}: ring-ibex accepted: {out}");
-        assert!(out.contains("'tune.ibex.crypto-provider ring-ibex'") && out.contains(says) && out.contains("rustls 0.23"), "{what}: {out}");
-        let (ok, out) = check(what, &format!("global\n  tune.ibex.crypto-provider ring\n{body}"));
-        assert!(ok, "{what}: ring refused: {out}");
+fn ring_ibex_serves_log_forward_and_ring_tls() {
+    let d = dir("logtls");
+    let (pem, _) = cert(&d);
+    let sock = d.join("cli.sock").display().to_string();
+    let col = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    col.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let cp = col.local_addr().unwrap().port();
+    let (fe, lf) = (common::reserve_addr(), common::reserve_addr());
+    let cfg = format!(
+        "global\n  stats socket {sock} level admin\n  tune.ibex.crypto-provider ring-ibex\n\
+         log-forward lf\n  bind {lf} ssl crt {pem}\n  log 127.0.0.1:{cp} local0\n\
+         ring r\n  format rfc5424\n  size 4096\n  server s {lf} ssl verify none\n\
+         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind {fe}\n  option dontlognull\n  log ring@r local0\n  log-format \"over-tls %ST\"\n  http-request return status 200\n"
+    );
+    std::fs::write(d.join("c.cfg"), cfg).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(d.join("c.cfg")).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut ibex = Ibex(child, d);
+    if !common::wait_listening(fe) {
+        let mut err = String::new();
+        let _ = ibex.0.stderr.take().map(|mut e| e.read_to_string(&mut err));
+        panic!("ibex did not start: {err}");
     }
+    let mut c = TcpStream::connect(fe).unwrap();
+    c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+    let mut resp = String::new();
+    let _ = c.read_to_string(&mut resp);
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");
+    let mut b = [0u8; 2048];
+    let n = col.recv(&mut b).expect("the log line crossed the ring's TLS and the listener's");
+    let line = String::from_utf8_lossy(&b[..n]);
+    assert!(line.trim_end().ends_with("over-tls 200"), "{line:?}");
+    assert_eq!(settle(&sock, (0, 2)), ("ring-ibex".to_string(), 0, 2), "the ring's and the listener's handshakes ran on ring-ibex");
 }
 
 fn cli(sock: &str, cmd: &str) -> String {

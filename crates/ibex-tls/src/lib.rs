@@ -16,6 +16,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 pub mod arena;
+pub mod blocking;
 pub mod capture;
 pub mod cipher_names;
 pub mod config;

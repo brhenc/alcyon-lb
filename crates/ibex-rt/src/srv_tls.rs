@@ -41,7 +41,6 @@ struct Built {
 
 impl Built {
     fn build(ssl: &ServerSsl, alpn: &[String], who: &str, provider: ibex_tls::TlsCryptoProvider) -> io::Result<Self> {
-        ibex_tls::install_default_crypto_provider();
         let opts = ibex_tls::BackendTlsOptions {
             verify_required: ssl.verify != Some(SslVerify::None),
             ca_file: ssl.ca_file.as_deref().map(Into::into),

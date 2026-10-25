@@ -315,7 +315,7 @@ fn serve_dgram(name: &str, sock: UdpSocket, fwd: Arc<Forwarder>) -> io::Result<(
 }
 
 /// One TCP `bind` socket's thread: accepts until the soft stop, a thread per connection.
-fn serve_tcp(name: &str, listener: TcpListener, fwd: Arc<Forwarder>, tls: Option<Arc<rustls::ServerConfig>>) -> io::Result<()> {
+fn serve_tcp(name: &str, listener: TcpListener, fwd: Arc<Forwarder>, tls: Option<Arc<ibex_tls::tcp::BindTls>>) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     spawn(&format!("logfwd-{name}"), move || {
         while wait_readable(&listener) {
@@ -334,11 +334,7 @@ fn serve_tcp(name: &str, listener: TcpListener, fwd: Arc<Forwarder>, tls: Option
                 let peer = conn.peer_addr().ok().map(|a| a.ip());
                 let _ = conn.set_read_timeout(fwd.timeout);
                 match tls {
-                    Some(cfg) => {
-                        if let Ok(c) = rustls::ServerConnection::new(cfg) {
-                            fwd.serve_stream(rustls::StreamOwned::new(c, conn), peer);
-                        }
-                    }
+                    Some(bind) => fwd.serve_stream(ibex_tls::blocking::BlockingTls::accept(&bind, conn), peer),
                     None => fwd.serve_stream(conn, peer),
                 }
             });
@@ -379,11 +375,11 @@ fn start_section(config: &Config, section: &LogForwardSection) -> io::Result<()>
                             format!("'{}': bind {} has 'ssl' but no 'crt'", section.name, b.addr),
                         ));
                     }
-                    ibex_tls::install_default_crypto_provider();
                     let mut b = b.clone();
                     // A syslog stream has no application protocol to negotiate.
                     b.alpn = vec!["http/1.1".to_string()];
-                    Some(ibex_tls::TlsConfig::from_bind_config(&b).map_err(|e| {
+                    // rustls 0.24 on the active provider, rebuilt by a swap (T461).
+                    Some(ibex_tls::tcp::from_bind_config(&b).map_err(|e| {
                         io::Error::new(io::ErrorKind::InvalidInput, format!("'{}': bind {} ssl: {e}", section.name, b.addr))
                     })?)
                 } else {

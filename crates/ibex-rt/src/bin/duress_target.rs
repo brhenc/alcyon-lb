@@ -20,7 +20,6 @@ fn main() {
         .unwrap_or(4433);
     let backend: Option<SocketAddr> = std::env::args().nth(2).and_then(|s| s.parse().ok());
 
-    ibex_tls::config::install_default_crypto_provider();
     let cert = std::path::Path::new("/home/bhenc/project-ibex/examples/certs/localhost.pem");
     let (certs, key) = ibex_tls::config::load_cert_file(cert).expect("load certificate");
     let tls = ibex_tls::tcp::BindTls::single_tls13(certs, key, vec![b"h3".to_vec()]).expect("build TLS config");
