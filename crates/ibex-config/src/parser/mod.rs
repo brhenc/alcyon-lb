@@ -114,6 +114,7 @@ pub(crate) mod sample_refs;
 pub(crate) mod scope;
 pub(crate) mod acl_scope;
 pub(crate) mod warn;
+pub(crate) mod server_state;
 pub(crate) mod refs;
 pub use sample_refs::log_format_exprs;
 pub(crate) use error_pages::*;

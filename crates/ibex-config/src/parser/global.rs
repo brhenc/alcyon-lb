@@ -726,6 +726,30 @@ pub(crate) fn parse_global_directive(
             global.chroot = Some(dir.to_string());
             Ok(())
         }
+        // `cfg_parse_global` (src/cfgparse-global.c): a second line is an alert that does not
+        // fail the load, and words after the path are not looked at. Read by
+        // `ibex-rt` `server_state::apply` when the proxies are built (T490).
+        "server-state-file" | "server-state-base" => {
+            let file = kw.text == "server-state-file";
+            let slot = if file { &mut global.server_state_file } else { &mut global.server_state_base };
+            if slot.is_some() {
+                global.load_warnings.push(LoadWarning {
+                    line: kw.line,
+                    alert: true,
+                    text: format!("'{}' already specified. Continuing.", kw.text),
+                    style: crate::ast::global::WarnStyle::Spaced,
+                });
+                return Ok(());
+            }
+            match tokens.get(1).map(|t| t.text.as_str()).filter(|t| !t.is_empty()) {
+                Some(path) => {
+                    *slot = Some(path.to_string());
+                    Ok(())
+                }
+                None if file => Err(ConfigError::new(kw.line, kw.col, "'server-state-file' expect one argument: a file path.")),
+                None => Err(ConfigError::new(kw.line, kw.col, "'server-state-base' expects one argument: a directory path.")),
+            }
+        }
         "pidfile" => {
             if tokens.len() >= 2 {
                 global.pidfile = Some(tokens[1].text.clone());

@@ -327,6 +327,7 @@ mod server_disabled_use_server;
 mod server_request_header_case;
 mod server_reuse_chunked;
 mod server_state_fetches;
+mod server_state_file;
 mod server_state_refusals;
 mod server_state_transitions;
 mod server_tls;

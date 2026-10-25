@@ -630,40 +630,30 @@ impl CliApplet {
                             check_state |= 1; // CHK_ST_INPROGRESS
                         }
 
-                        check_status = match check.last_status_code {
-                            "UNK" => 0,
-                            "INI" => 1,
-                            "START" => 2,
-                            "CHECKED" => 3,
-                            "HANA" => 4,
-                            "SOCKERR" => 5,
-                            "L4OK" => 6,
-                            "L4TOUT" => 7,
-                            "L4CON" => 8,
-                            "L6OK" => 9,
-                            "L6TOUT" => 10,
-                            "L6RSP" => 11,
-                            "L7TOUT" => 12,
-                            "L7RSP" => 13,
-                            "L57DATA" => 14,
-                            "L7OK" | "L7OKD" => 15,
-                            "L7OKC" | "L7OKCD" => 16,
-                            "L7STS" => 17,
-                            "PROCERR" => 18,
-                            "PROCTOUT" => 19,
-                            "PROCOK" => 20,
-                            _ => 1,
-                        };
+                        check_status = crate::check::check_status_number(check.last_status_code);
                         check_result = crate::check::check_result_of(check.last_status_code);
+                        // CHK_ST_PAUSED while the server is in maintenance.
+                        if check.status == ServerStatus::Maint {
+                            check_state |= 8;
+                        }
+                    } else if p.server_cmaint(s_idx) {
+                        // A server with no check that the configuration disabled keeps
+                        // CHK_ST_PAUSED, also once it is enabled (measured).
+                        check_state = 8;
                     }
+                    let lastchg = p.ids.server_lastchg(
+                        s_idx,
+                        p.ids.tc.get().and_then(|c| c.srv.get(s_idx)).map_or(0, |c| c.last_chg.load(std::sync::atomic::Ordering::Relaxed)),
+                    );
+                    let use_ssl = u8::from(p.server_tls.get(s_idx).is_some_and(Option::is_some));
 
                     let puid = p.server_puid(s_idx);
                     let bk_forced = u8::from(p.ids.forced_id);
                     let srv_forced = u8::from(p.server_forced_id(s_idx));
                     self.out_buf.extend_from_slice(
                         format!(
-                            "{} {} {} {} {} {} {} {} {} 1 {} {} {} {} 0 {} {} - {} - 0 0 - - 0\n",
-                            p.ids.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, check_status, check_result, check_health, check_state, bk_forced, srv_forced, port
+                            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} 0 {} {} - {} - {} 0 - - 0\n",
+                            p.ids.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, lastchg, check_status, check_result, check_health, check_state, bk_forced, srv_forced, port, use_ssl
                         ).as_bytes()
                     );
                 }

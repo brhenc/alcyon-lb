@@ -80,6 +80,8 @@ pub(crate) fn parse_listen_header(
         srvtimeout: timeouts.server,
         timeouts,
         retries: defaults.and_then(|d| d.retries).unwrap_or(3),
+        load_server_state: defaults.and_then(|d| d.load_server_state).unwrap_or_default(),
+        server_state_file_name: None,
         retry_on: defaults.and_then(|d| d.retry_on).unwrap_or(crate::ast::RE_CONN_FAILED),
         redisp: defaults.map_or(false, |d| d.redisp),
         redisp_after: defaults.map_or(-1, |d| if d.redisp { d.redisp_after } else { -1 }),
@@ -301,6 +303,8 @@ pub(crate) fn parse_backend_header(
         srvtimeout: timeouts.server,
         timeouts,
         retries: defaults.and_then(|d| d.retries).unwrap_or(3),
+        load_server_state: defaults.and_then(|d| d.load_server_state).unwrap_or_default(),
+        server_state_file_name: None,
         retry_on: defaults.and_then(|d| d.retry_on).unwrap_or(crate::ast::RE_CONN_FAILED),
         redisp: defaults.map_or(false, |d| d.redisp),
         redisp_after: defaults.map_or(-1, |d| if d.redisp { d.redisp_after } else { -1 }),
@@ -373,6 +377,14 @@ pub(crate) fn parse_listen_directive(
         "srvtimeout" => parse_srvtimeout(kw),
         "timeout" => parse_timeout_directive(&mut proxy.timeouts, tokens, kw),
         "retries" => parse_retries(&mut proxy.retries, tokens, kw),
+        "load-server-state-from-file" => {
+            proxy.load_server_state = super::server_state::parse_load(tokens, kw)?;
+            Ok(())
+        }
+        "server-state-file-name" => {
+            proxy.server_state_file_name = Some(super::server_state::parse_file_name(tokens, &proxy.name)?);
+            Ok(())
+        }
         "retry-on" => super::parse_retry_on(&mut proxy.retry_on, tokens, kw),
         "redisp" => parse_redisp(kw),
         "maxconn" => parse_maxconn(&mut proxy.maxconn, tokens, kw),
@@ -522,6 +534,7 @@ pub(crate) fn parse_frontend_directive(
             Ok(())
         }
         "tcp-request" => parse_frontend_tcp_request(fe, tokens, kw),
+        "load-server-state-from-file" | "server-state-file-name" => super::server_state::in_frontend(tokens, kw, &fe.name),
         // `stream_parse_set_retries`: a retry budget belongs to a backend.
         "http-request" if tokens.get(1).is_some_and(|t| t.text == "set-retries") => Err(ConfigError::new(
             tokens[1].line,
@@ -677,6 +690,14 @@ pub(crate) fn parse_backend_directive(
         "srvtimeout" => parse_srvtimeout(kw),
         "timeout" => parse_timeout_directive(&mut be.timeouts, tokens, kw),
         "retries" => parse_retries(&mut be.retries, tokens, kw),
+        "load-server-state-from-file" => {
+            be.load_server_state = super::server_state::parse_load(tokens, kw)?;
+            Ok(())
+        }
+        "server-state-file-name" => {
+            be.server_state_file_name = Some(super::server_state::parse_file_name(tokens, &be.name)?);
+            Ok(())
+        }
         "retry-on" => super::parse_retry_on(&mut be.retry_on, tokens, kw),
         "redisp" => parse_redisp(kw),
         "dispatch" => parse_dispatch(kw),

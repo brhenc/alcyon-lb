@@ -839,6 +839,51 @@ pub fn check_result_of(code: &str) -> u8 {
     }
 }
 
+/// `check_statuses[]` (`src/check.c`) by `HCHK_STATUS_*` number: the code and the
+/// description; `START` (2) and `L57DATA` (14) are placeholders no check ends with.
+const CHECK_STATUSES: [(&str, &str); 21] = [
+    ("UNK", "Unknown"),
+    ("INI", "Initializing"),
+    ("START", ""),
+    ("CHECKED", "No status change"),
+    ("HANA", "Health analyze"),
+    ("SOCKERR", "Socket error"),
+    ("L4OK", "Layer4 check passed"),
+    ("L4TOUT", "Layer4 timeout"),
+    ("L4CON", "Layer4 connection problem"),
+    ("L6OK", "Layer6 check passed"),
+    ("L6TOUT", "Layer6 timeout"),
+    ("L6RSP", "Layer6 invalid response"),
+    ("L7TOUT", "Layer7 timeout"),
+    ("L7RSP", "Layer7 invalid response"),
+    ("L57DATA", ""),
+    ("L7OK", "Layer7 check passed"),
+    ("L7OKC", "Layer7 check conditionally passed"),
+    ("L7STS", "Layer7 wrong status"),
+    ("PROCERR", "External check error"),
+    ("PROCTOUT", "External check timeout"),
+    ("PROCOK", "External check passed"),
+];
+
+/// `srv_check_status` of `show servers state` for a check status code (`HCHK_STATUS_*`);
+/// `INI` (1) for a code it does not know.
+#[must_use]
+pub fn check_status_number(code: &str) -> u8 {
+    let code = match code {
+        "L7OKD" => "L7OK",
+        "L7OKCD" => "L7OKC",
+        c => c,
+    };
+    CHECK_STATUSES.iter().position(|&(c, _)| c == code).map_or(1, |i| u8::try_from(i).unwrap_or(1))
+}
+
+/// The code and description of `HCHK_STATUS_*` number `n`, for a check status restored
+/// from a server-state file; `None` for a placeholder or a number out of range.
+#[must_use]
+pub fn check_status_of(n: i64) -> Option<(&'static str, &'static str)> {
+    usize::try_from(n).ok().and_then(|i| CHECK_STATUSES.get(i)).copied().filter(|&(_, desc)| !desc.is_empty())
+}
+
 /// `httpchk_build_status_header` (`src/check.c`): the value of `X-Haproxy-Server-State`.
 ///
 /// The backend's stream count in `scur=<srv>/<backend>` is the streams on the backend's

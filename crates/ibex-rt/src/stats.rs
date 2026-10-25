@@ -983,7 +983,7 @@ pub(crate) fn write_server_row(
     r.set("reuse", ld(&c.reuse));
     r.set("rate", c.sess_rate.rate());
     r.set("rate_max", c.rate_max.load(std::sync::atomic::Ordering::Relaxed));
-    r.set("lastchg", crate::statcnt::TxnCounters::since_secs(c.last_chg.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or_else(|| crate::statcnt::now_ms() / 1000));
+    r.set("lastchg", proxy.ids.server_lastchg(s_idx, c.last_chg.load(std::sync::atomic::Ordering::Relaxed)));
     fill_counters(&mut r, c, proxy.mode == ibex_config::Mode::Http, true);
     r.set("uweight", weight);
     let (wretr, wredis, econ) = proxy

@@ -32,6 +32,11 @@ pub(crate) fn parse_defaults_directive(
             Ok(())
         }
         "redisp" => parse_redisp(kw),
+        "load-server-state-from-file" => {
+            defaults.load_server_state = Some(super::server_state::parse_load(tokens, kw)?);
+            Ok(())
+        }
+        "server-state-file-name" => super::server_state::file_name_in_defaults(tokens, kw),
         "maxconn" => {
             let mut mc = defaults.maxconn.unwrap_or(0);
             parse_maxconn(&mut mc, tokens, kw)?;

@@ -69,6 +69,7 @@ mod ring_sections;
 mod sc_set_gpt0_default;
 mod sc_value_missing;
 mod server_keywords;
+mod server_state_file;
 mod server_tls;
 mod set_dst_port_retries;
 mod set_timeout_rule;

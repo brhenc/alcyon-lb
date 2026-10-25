@@ -181,8 +181,15 @@ server|global|frontend|backend`, `set weight`, `shutdown sessions server|backend
 Run: `set server b/s1 weight 5` then `disable server b/s1` and `show servers state` showed
 weight 5 and admin state 1.
 
-Runtime changes are not persisted. `server-state-file` is **not** claimed to work here; I did
-not test it.
+Runtime changes are not persisted by themselves. As with HAProxy, save them before a reload
+(`echo "show servers state" | socat - /run/ibex.sock > /var/lib/ibex/state`) and point
+`server-state-file` (or `server-state-base` + `load-server-state-from-file local`) at it with
+`load-server-state-from-file global` in `defaults`: the new process starts each server with the
+saved admin state (maint, drain), operational state, weight (unless the configured weight
+changed), `disable health`, last check status and port (T490, tests in
+`crates/ibex-rt/tests/it/server_state_file.rs`). Not restored yet: the fqdn and DNS-learnt
+addresses (`init-addr last` is refused); `srv_use_ssl`, check port/address and agent columns
+are not applied and the start says so.
 
 ## Master CLI
 
@@ -221,7 +228,7 @@ no command (HAProxy's worker interactive mode) prints nothing.
 - Error messages from `-c` do not name the file.
 - A connection refused by a server is reported only after the connect timeout (3 s in my test
   where HAProxy answers 503 at once): T170.
-- Unix-socket syslog target and `server-state-file`: not verified (above).
+- Unix-socket syslog target: not verified (above).
 - Reload under load repeated 100 times, RSS and fd stability: not measured.
 - Everything the parser refuses (HTTP/3, Lua, SPOE, peers, cache, FastCGI, compression, ...):
   [differences.md](differences.md).
