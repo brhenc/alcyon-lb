@@ -451,6 +451,31 @@ HAProxy's results (`sizeof(struct stream)` has no Ibex counterpart), `maxsslconn
 `tune.ssl.cachesize` are not configurable, so `MaxSslConns` stays 0 and the
 `Automatically setting global.maxconn ...` notice is not printed.
 
+## `tune.memory.prealloc on|off`: an Ibex-only global keyword (T468)
+
+HAProxy 3.5-dev8 refuses it as unknown (`did you mean 'prealloc-fd' maybe ?`), and nothing in
+HAProxy pre-fills a pool: pools grow on demand and keep what `tune.memory.hot-size` allows
+(`-dM` options are debugging aids; `prealloc-fd` pre-touches the fd table). Ibex grows and keeps
+too (design Q1); `tune.memory.prealloc on` (default off) instead sizes, at start, from `maxconn`:
+
+- the standard `buffer` pool: `2 * maxconn` buffers in the process (a request and a response
+  buffer per connection, as `-m` counts one), the smaller `tune.buffers.limit` when one is set.
+  Each worker thread makes its share, `ceil(total / nbthread)`, at start; they are floor objects
+  (no `hot-size` eviction, kept by `pool_gc`). The total is the pool's limit: after start it
+  never grows, and a stream that needs a buffer past it fails as under `tune.buffers.limit`;
+- the `session` arena: `ceil(maxconn / nbthread)` slots per worker, made at start and never
+  compacted. Past them it still grows (fallibly): HTTP/2 streams take session slots and `maxconn`
+  does not bound them.
+
+`show pools` shows the pre-sized `allocated` right after start. It is refused at load (exit 1,
+under `-c` too) without an explicit global `maxconn` or `-m` (`'tune.memory.prealloc' needs an
+explicit global 'maxconn' or '-m' to size the pools.`), and when the configured `maxconn` needs
+more than `-m` (`maxconn * (2 * tune.bufsize + one session slot)`). Not sized by it: small and
+large buffers, spare strings and lists, variables, log lines, check runs, stats rows, the applet
+and task arenas. The share is per thread and the limit per process: a thread that has used its
+share takes no buffer while the others hold theirs, so with `nbthread` above 1 a stream can fail
+before `maxconn` connections when the connections are unevenly spread.
+
 ## `ssl_fc_ja4`: an Ibex-only fetch (T344)
 
 `ssl_fc_ja4` returns the JA4 TLS client fingerprint (`t13d1516h2_8daaf6152771_e5627efa2ab1`),
