@@ -3,10 +3,7 @@
 
 //! TLS configuration types and builders for `ibex-tls`.
 
-use crate::resolver::IbexCertResolver;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use std::sync::Arc;
+use rustls24::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
 /// Sessions a server keeps for resumption by session ID: `HAProxy`'s default
 /// `tune.ssl.cachesize`.
@@ -21,286 +18,7 @@ pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// A fresh ticket key: ring's AEAD ticketer, used by [`rustls::TicketRotator`] for one
-/// rotation period. rustls keeps its own generator private; the ticketer it does export
-/// rotates every 6 hours, which is never reached here because the rotator drops it first.
-fn ticket_key() -> Result<Box<dyn rustls::server::ProducesTickets>, rustls::crypto::GetRandomFailed> {
-    let t = rustls::crypto::ring::Ticketer::new().map_err(|_| rustls::crypto::GetRandomFailed)?;
-    Ok(Box::new(TicketKey(t)))
-}
-
-#[derive(Debug)]
-struct TicketKey(Arc<dyn rustls::server::ProducesTickets>);
-
-impl rustls::server::ProducesTickets for TicketKey {
-    fn enabled(&self) -> bool {
-        self.0.enabled()
-    }
-    fn lifetime(&self) -> u32 {
-        self.0.lifetime()
-    }
-    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
-        self.0.encrypt(plain)
-    }
-    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
-        self.0.decrypt(cipher)
-    }
-}
-
-/// The session-ID cache (TLS 1.2 resumption by ID), whose entries are refused once
-/// `lifetime` seconds old: rustls's memory cache only evicts by size.
-#[derive(Debug)]
-struct ExpiringSessions {
-    inner: Arc<rustls::server::ServerSessionMemoryCache>,
-    lifetime: u64,
-    now: fn() -> u64,
-}
-
-impl ExpiringSessions {
-    fn new(size: usize, lifetime: u32, now: fn() -> u64) -> Self {
-        Self { inner: rustls::server::ServerSessionMemoryCache::new(size), lifetime: u64::from(lifetime), now }
-    }
-
-    /// The value stored with its creation time in front, if it is still fresh.
-    fn fresh(&self, stored: Option<Vec<u8>>) -> Option<Vec<u8>> {
-        let mut v = stored?;
-        let born = u64::from_be_bytes(v.get(..8)?.try_into().ok()?);
-        if (self.now)().saturating_sub(born) > self.lifetime {
-            return None;
-        }
-        v.drain(..8);
-        Some(v)
-    }
-}
-
-impl rustls::server::StoresServerSessions for ExpiringSessions {
-    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
-        let mut v = (self.now)().to_be_bytes().to_vec();
-        v.extend_from_slice(&value);
-        self.inner.put(key, v)
-    }
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.fresh(self.inner.get(key))
-    }
-    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.fresh(self.inner.take(key))
-    }
-    fn can_cache(&self) -> bool {
-        self.inner.can_cache()
-    }
-}
-
-/// Installs the default `ring` crypto provider for the process.
-pub fn install_default_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-/// Supported TLS backend engines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsEngineKind {
-    /// Pure Rustls engine (default, memory-safe).
-    Rustls,
-    /// OpenSSL engine (FIPS & legacy compatibility).
-    OpenSsl,
-    /// `BoringSSL` engine.
-    BoringSsl,
-}
-
-/// Unified TLS server configuration builder.
-#[derive(Clone, Debug)]
-pub struct TlsConfig {
-    /// Active TLS engine kind.
-    pub engine: TlsEngineKind,
-    /// Configured ALPN protocol list (e.g. `[b"h2", b"http/1.1"]`).
-    pub alpn_protocols: Vec<Vec<u8>>,
-    /// Multi-certificate SNI resolver.
-    pub cert_resolver: Option<Arc<IbexCertResolver>>,
-    /// Whether session tickets are enabled for session resumption.
-    pub session_tickets_enabled: bool,
-    /// The protocol versions offered: `ssl-min-ver` / `ssl-max-ver` and their relatives
-    /// narrow the set rustls speaks (TLS 1.2 and 1.3).
-    pub versions: Vec<&'static rustls::SupportedProtocolVersion>,
-}
-
-impl Default for TlsConfig {
-    fn default() -> Self {
-        Self {
-            engine: TlsEngineKind::Rustls,
-            alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-            cert_resolver: None,
-            session_tickets_enabled: true,
-            versions: rustls::DEFAULT_VERSIONS.to_vec(),
-        }
-    }
-}
-
-impl TlsConfig {
-    /// Creates a new TLS configuration with defaults.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Sets the SNI certificate resolver.
-    #[must_use]
-    pub fn with_cert_resolver(mut self, resolver: Arc<IbexCertResolver>) -> Self {
-        self.cert_resolver = Some(resolver);
-        self
-    }
-
-    /// Sets the ALPN protocols list.
-    #[must_use]
-    pub fn with_alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
-        self.alpn_protocols = protocols;
-        self
-    }
-
-    /// Limits the protocol versions to those `min` to `max` allow.
-    #[must_use]
-    pub fn with_version_range(mut self, min: Option<ibex_config::TlsVersion>, max: Option<ibex_config::TlsVersion>) -> Self {
-        self.versions = versions_between(min, max);
-        self
-    }
-
-    /// Builds a [`ServerConfig`] configured with the certificate resolver and ALPN protocols.
-    ///
-    /// # Errors
-    /// Returns an error if no certificate resolver is configured or if configuration fails.
-    pub fn build_server_config(&self) -> Result<Arc<ServerConfig>, String> {
-        let resolver = self
-            .cert_resolver
-            .clone()
-            .ok_or_else(|| "Certificate resolver is required to build ServerConfig".to_string())?;
-
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut config = ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&self.versions)
-            .map_err(|e| format!("Protocol version error: {e:?}"))?
-            .with_no_client_auth()
-            .with_cert_resolver(resolver);
-
-        config.alpn_protocols.clone_from(&self.alpn_protocols);
-        // Session resumption as `HAProxy` (OpenSSL) does it: stateless tickets, and a
-        // session-ID cache of `tune.ssl.cachesize` (20000) entries for the clients that
-        // resume by ID. rustls's defaults are a 256-entry cache that TLS 1.3 tickets are
-        // entries of, two per connection: a few hundred clients evicted every earlier
-        // session, and a flood of reconnecting clients made every handshake a full one,
-        // an RSA signature each, where `HAProxy` resumed them (T283, MY-2). The
-        // `ServerConfig` is shared by every worker (`from_bind_config`), so are the keys.
-        //
-        // A session lasts `SESSION_LIFETIME` (OpenSSL's default timeout, which `HAProxy`
-        // keeps without `tune.ssl.lifetime`). rustls checks no age on resumption, so the
-        // bound is the ticket keys' rotation (a key encrypts for half the lifetime and
-        // decrypts for the other half) and the session-ID store's own expiry.
-        config.session_storage = Arc::new(ExpiringSessions::new(SESSION_CACHE_SIZE, SESSION_LIFETIME, unix_now));
-        if self.session_tickets_enabled {
-            config.ticketer = Arc::new(
-                rustls::TicketRotator::new(SESSION_LIFETIME / 2, ticket_key)
-                    .map_err(|e| format!("session ticket keys: {e}"))?,
-            );
-        } else {
-            config.send_tls13_tickets = 0;
-        }
-
-        Ok(Arc::new(config))
-    }
-
-    /// Builds a [`ClientConfig`] configured with trust roots and ALPN protocols.
-    ///
-    /// # Errors
-    /// Returns an error if client configuration fails.
-    pub fn build_client_config(
-        &self,
-        root_store: RootCertStore,
-    ) -> Result<Arc<ClientConfig>, String> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut config = ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&self.versions)
-            .map_err(|e| format!("Protocol version error: {e:?}"))?
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        config.alpn_protocols.clone_from(&self.alpn_protocols);
-        if !self.session_tickets_enabled {
-            config.resumption = rustls::client::Resumption::disabled();
-        }
-
-        Ok(Arc::new(config))
-    }
-}
-
-/// A custom certificate verifier that skips server authentication.
-///
-/// Used exclusively when `verify none` is explicitly configured for backend TLS.
-#[derive(Debug)]
-pub struct NoServerAuth {
-    provider: Arc<rustls::crypto::CryptoProvider>,
-}
-
-impl Default for NoServerAuth {
-    fn default() -> Self {
-        Self {
-            provider: Arc::new(rustls::crypto::ring::default_provider()),
-        }
-    }
-}
-
-impl NoServerAuth {
-    #[must_use]
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for NoServerAuth {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-/// Loads CA certificates from a PEM file or directory into a rustls 0.24 root store (T461:
-/// what the binary verifies with; a rustls 0.23 caller takes its `roots`).
+/// Loads CA certificates from a PEM file or directory into a root store.
 ///
 /// # Errors
 /// Returns an error if reading the file fails or no valid certificates are found.
@@ -401,35 +119,37 @@ impl Default for BackendTlsOptions {
     }
 }
 
-/// The protocol versions between `min` and `max`, out of those this build of rustls speaks
-/// (TLS 1.3, and TLS 1.2 with the `tls12` feature, which the workspace turns on): what
-/// `ssl-min-ver`, `ssl-max-ver`, `no-tlsvN` and `force-tlsvN` ask a handshake to offer
-/// (`bind`) or to accept (`server`).
-#[must_use]
-pub fn versions_between(
-    min: Option<ibex_config::TlsVersion>,
-    max: Option<ibex_config::TlsVersion>,
-) -> Vec<&'static rustls::SupportedProtocolVersion> {
-    use ibex_config::TlsVersion;
-    // What a line can name, against what rustls calls it. A version this build
-    // of rustls does not speak is simply absent from `DEFAULT_VERSIONS`.
-    const NAMED: &[(rustls::ProtocolVersion, TlsVersion)] =
-        &[(rustls::ProtocolVersion::TLSv1_2, TlsVersion::Tls12), (rustls::ProtocolVersion::TLSv1_3, TlsVersion::Tls13)];
-    let allowed = |v: TlsVersion| min.is_none_or(|m| m <= v) && max.is_none_or(|m| v <= m);
-    rustls::DEFAULT_VERSIONS
-        .iter()
-        .copied()
-        .filter(|v| NAMED.iter().any(|&(p, t)| p == v.version && allowed(t)))
-        .collect()
+/// The protocol versions a handshake may use: TLS 1.2 and TLS 1.3, the two this build speaks
+/// (rustls has nothing older). A pair of flags because that is what the provider of a version
+/// range is built from ([`crate::provider::of`]: its cipher suite lists).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TlsVersions {
+    pub tls12: bool,
+    pub tls13: bool,
 }
 
-/// What this build of rustls speaks, for the error when a server line allows none of it.
+impl TlsVersions {
+    /// No version left.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        !self.tls12 && !self.tls13
+    }
+}
+
+/// The protocol versions between `min` and `max`, out of those this build speaks (TLS 1.2
+/// and 1.3): what `ssl-min-ver`, `ssl-max-ver`, `no-tlsvN` and `force-tlsvN` ask a
+/// handshake to offer (`bind`) or to accept (`server`).
+#[must_use]
+pub fn versions_between(min: Option<ibex_config::TlsVersion>, max: Option<ibex_config::TlsVersion>) -> TlsVersions {
+    use ibex_config::TlsVersion;
+    let allowed = |v: TlsVersion| min.is_none_or(|m| m <= v) && max.is_none_or(|m| v <= m);
+    TlsVersions { tls12: allowed(TlsVersion::Tls12), tls13: allowed(TlsVersion::Tls13) }
+}
+
+/// What this build speaks, for the error when a server line allows none of it (rustls's
+/// names for the versions, newest first, as rustls 0.23's `DEFAULT_VERSIONS` listed them).
 pub(crate) fn spoken_versions() -> String {
-    rustls::DEFAULT_VERSIONS
-        .iter()
-        .map(|v| format!("{:?}", v.version))
-        .collect::<Vec<_>>()
-        .join(", ")
+    "TLSv1_3, TLSv1_2".to_string()
 }
 
 /// Loads `path` as the trust anchors of a server line: `@system-ca` is the system's
@@ -445,7 +165,7 @@ pub fn load_server_ca(path: &std::path::Path) -> Result<rustls24::RootCertStore,
 }
 
 /// Loads the PEM-encoded CRLs of a `crl-file`.
-pub(crate) fn load_crl_file(path: &std::path::Path) -> Result<Vec<rustls::pki_types::CertificateRevocationListDer<'static>>, String> {
+pub(crate) fn load_crl_file(path: &std::path::Path) -> Result<Vec<rustls24::pki_types::CertificateRevocationListDer<'static>>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("Couldn't open the crl-file '{}' ({e})", path.display()))?;
     let mut reader = std::io::BufReader::new(file);
     let mut crls = Vec::new();
@@ -502,135 +222,6 @@ pub(crate) fn cert_covers_name(der: &[u8], name: &str) -> bool {
     extract_subject_cn(der).is_some_and(|cn| hostcheck(&cn, name))
 }
 
-/// The server certificate check of a `verify required` server line, with `HAProxy`'s
-/// rules (`ssl_sock_srv_verifycbk`, `src/ssl_sock.c`) rather than webpki's.
-///
-/// The chain is verified by webpki against the `ca-file` anchors (and `crl-file`). The
-/// name is where the two differ: `HAProxy` checks it only against the SNI it sent or, when
-/// it sent none, against `verifyhost`, and not at all when neither is set; and it falls
-/// back to the subject CN when the certificate has no dNSName, which webpki never does.
-/// The engine encodes that in the [`ServerName`] it connects with: a DNS name is the name
-/// to check (and send, unless the config's `enable_sni` is off), the server's IP address
-/// means "no name to check". Measured on 3.5-dev8: a CN-only certificate passes a matching
-/// `verifyhost`, and with neither SNI nor `verifyhost` any name passes.
-#[derive(Debug)]
-pub struct ServerVerifier {
-    inner: Arc<rustls::client::WebPkiServerVerifier>,
-}
-
-impl ServerVerifier {
-    /// Builds the verifier of a server line.
-    ///
-    /// # Errors
-    /// No `ca-file` (`HAProxy`: "verify is enabled but no CA file specified"), or one
-    /// that cannot be loaded, or a `crl-file` that cannot.
-    pub fn from_options(options: &BackendTlsOptions) -> Result<Arc<Self>, String> {
-        let Some(ca_path) = options.ca_file.as_deref() else {
-            return Err("verify is enabled but no CA file specified".to_string());
-        };
-        let roots = RootCertStore { roots: load_server_ca(ca_path)?.roots };
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut builder = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider);
-        if let Some(crl_path) = options.crl_file.as_deref() {
-            builder = builder.with_crls(load_crl_file(crl_path)?);
-        }
-        let inner = builder.build().map_err(|e| format!("unable to set up certificate verification: {e}"))?;
-        Ok(Arc::new(Self { inner }))
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for ServerVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
-        now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        use rustls::client::danger::ServerCertVerified;
-        use rustls::{CertificateError, Error};
-        match self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now) {
-            // webpki verifies the chain before the name, so a name error means the chain
-            // is good and only HAProxy's name rule is left to apply.
-            Err(Error::InvalidCertificate(CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. })) => {
-                match server_name {
-                    ServerName::IpAddress(_) => Ok(ServerCertVerified::assertion()),
-                    ServerName::DnsName(name) if cert_covers_name(end_entity.as_ref(), name.as_ref()) => {
-                        Ok(ServerCertVerified::assertion())
-                    }
-                    _ => Err(Error::InvalidCertificate(CertificateError::NotValidForName)),
-                }
-            }
-            other => other,
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
-    }
-}
-
-/// Builds the [`ClientConfig`] of a server line. `enable_sni` is on; the engine clones
-/// it off for a connection that verifies against `verifyhost` without sending a name.
-///
-/// # Errors
-/// `verify required` without a loadable `ca-file`, a `crl-file` or `crt` that cannot be
-/// loaded, or a version range with nothing in it.
-pub fn build_backend_client_config(
-    options: &BackendTlsOptions,
-) -> Result<Arc<ClientConfig>, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let versions = versions_between(options.min_ver, options.max_ver);
-    if versions.is_empty() {
-        return Err(format!(
-            "no TLS version is left between 'ssl-min-ver' and 'ssl-max-ver': this build speaks {}",
-            spoken_versions()
-        ));
-    }
-    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = if options.verify_required {
-        ServerVerifier::from_options(options)?
-    } else {
-        NoServerAuth::new()
-    };
-    let builder = ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&versions)
-        .map_err(|e| format!("Protocol version error: {e:?}"))?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier);
-    let mut config = if let Some(ref crt_path) = options.client_crt {
-        let (certs, key) = load_cert_file(crt_path)?;
-        builder
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| format!("unable to load SSL certificate from file '{}': {e}", crt_path.display()))?
-    } else {
-        builder.with_no_client_auth()
-    };
-    config.alpn_protocols.clone_from(&options.alpn);
-    if options.no_reuse {
-        config.resumption = rustls::client::Resumption::disabled();
-    }
-    Ok(Arc::new(config))
-}
-
 /// Parses a server name string (DNS hostname or IP address) into a [`ServerName`].
 ///
 /// # Errors
@@ -640,70 +231,11 @@ pub fn parse_server_name(name: &str) -> Result<ServerName<'static>, String> {
         .map_err(|e| format!("Invalid server name '{name}': {e:?}"))
 }
 
-/// Helper to create a [`rustls::sign::CertifiedKey`] from DER certificates and private key.
-///
-/// # Errors
-/// Returns an error if private key parsing or signing key creation fails.
-pub fn create_certified_key(
-    cert_chain: Vec<CertificateDer<'static>>,
-    private_key: &PrivateKeyDer<'static>,
-) -> Result<rustls::sign::CertifiedKey, String> {
-    let key = rustls::crypto::ring::sign::any_supported_type(private_key)
-        .map_err(|e| format!("Invalid private key: {e:?}"))?;
-    Ok(rustls::sign::CertifiedKey::new(cert_chain, key))
-}
 use ibex_config::ast::BindConfig;
 
-impl TlsConfig {
-        /// # Errors
-    /// Returns an error if certificates cannot be loaded, private keys are missing,
-    /// or if the underlying `ServerConfig` builder fails.
-    pub fn from_bind_config(bind: &BindConfig) -> Result<Arc<ServerConfig>, String> {
-        // Every worker thread asks for the config of every bind. Identical binds (same
-        // files as they are now on disk, same options) share one `ServerConfig` so a
-        // large `crt` directory is held in memory once, not once per thread per bind.
-        // A bind whose files cannot be inspected gets the empty key; it cannot build
-        // either, so nothing is ever stored under it.
-        let key = shared_key(bind).unwrap_or_default();
-        let mut cache = shared_cache().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(live) = cache.get(&key).and_then(std::sync::Weak::upgrade) {
-            return Ok(live);
-        }
-        let built = Self::build_from_bind(bind)?;
-        cache.retain(|_, w| w.strong_count() > 0);
-        cache.insert(key, Arc::downgrade(&built));
-        Ok(built)
-    }
-
-    fn build_from_bind(bind: &BindConfig) -> Result<Arc<ServerConfig>, String> {
-        let plan = BindPlan::of(bind)?;
-        let mut resolver = IbexCertResolver::new();
-        let mut is_first = true;
-        for (certs, key, file_path) in &plan.pairs {
-            let certified_key = Arc::new(create_certified_key(certs.clone(), key)?);
-            match certified_key.keys_match() {
-                Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
-                Err(rustls::Error::InconsistentKeys(_)) => return Err(key_mismatch(file_path)),
-                Err(_) => return Err(wrong_tag(file_path)),
-            }
-            if is_first {
-                resolver.set_default_cert(certified_key.clone());
-                is_first = false;
-            }
-            for domain in cert_names(certs) {
-                resolver.add_cert(&domain, certified_key.clone());
-            }
-        }
-        let config = TlsConfig::new()
-            .with_alpn(plan.alpn.clone())
-            .with_cert_resolver(Arc::new(resolver));
-        TlsConfig { versions: plan.versions(bind)?, ..config }.build_server_config()
-    }
-}
-
 /// What a `bind ... ssl` line asks for, whichever rustls builds it: the ALPN list it advertises
-/// and the certificates of its `crt` files, loaded. Shared by the QUIC build (rustls 0.23) and
-/// the TCP one ([`crate::tcp`], rustls 0.24).
+/// and the certificates of its `crt` files, loaded. What [`crate::tcp`] builds a bind from
+/// (TCP and QUIC alike).
 pub(crate) struct BindPlan {
     pub(crate) alpn: Vec<Vec<u8>>,
     pub(crate) pairs: Vec<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, std::path::PathBuf)>,
@@ -713,7 +245,7 @@ impl BindPlan {
     pub(crate) fn of(bind: &BindConfig) -> Result<Self, String> {
         // Advertise only what the runtime can actually serve.
         //
-        // `TlsConfig::default` offers `h2, http/1.1`, and curl duly negotiated h2 against
+        // The default offer was `h2, http/1.1`, and curl duly negotiated h2 against
         // a listener whose stream layer speaks HTTP/1 only -- the handshake succeeded,
         // the certificate verified, and then the connection died with a TLS decode error
         // because neither side was speaking what the other sent. Offering a protocol we
@@ -754,16 +286,16 @@ impl BindPlan {
         Ok(Self { alpn: supported.iter().map(|s| s.as_bytes().to_vec()).collect(), pairs })
     }
 
-    /// The protocol versions the bind offers (rustls 0.23's names for them).
-    pub(crate) fn versions(&self, bind: &BindConfig) -> Result<Vec<&'static rustls::SupportedProtocolVersion>, String> {
+    /// The protocol versions the bind offers.
+    pub(crate) fn versions(&self, bind: &BindConfig) -> Result<TlsVersions, String> {
         let mut versions = versions_between(bind.min_ver, bind.max_ver);
         if bind.quic {
             // QUIC is TLS 1.3 by definition (RFC 9001): never offer 1.2 there, whatever
             // the TCP binds of the proxy do.
-            if versions.iter().all(|v| v.version != rustls::ProtocolVersion::TLSv1_3) {
+            if !versions.tls13 {
                 return Err(format!("bind {}: QUIC needs TLS 1.3, which 'ssl-max-ver' rules out", bind.addr));
             }
-            versions = vec![&rustls::version::TLS13];
+            versions.tls12 = false;
         }
         if versions.is_empty() {
             return Err(format!("all SSL/TLS versions are disabled for bind '{}'", bind.addr));
@@ -790,13 +322,6 @@ pub(crate) fn cert_names(certs: &[CertificateDer<'static>]) -> Vec<String> {
         }
     }
     names
-}
-
-type SharedCache = std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<ServerConfig>>>;
-
-fn shared_cache() -> &'static SharedCache {
-    static CACHE: std::sync::OnceLock<SharedCache> = std::sync::OnceLock::new();
-    CACHE.get_or_init(Default::default)
 }
 
 /// Identity of the config a bind would build: its options and the size and mtime of every
@@ -1066,65 +591,6 @@ pub fn extract_subject_cn(der: &[u8]) -> Option<String> {
         }
     }
     cn
-}
-
-#[cfg(test)]
-mod expiring_sessions {
-    use super::ExpiringSessions;
-    use rustls::server::StoresServerSessions;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NOW: AtomicU64 = AtomicU64::new(1_000_000);
-    fn now() -> u64 {
-        NOW.load(Ordering::Relaxed)
-    }
-
-    /// An entry is served up to its lifetime and refused after, by `get` and `take`.
-    #[test]
-    fn a_session_id_expires_after_its_lifetime() {
-        let s = ExpiringSessions::new(16, 7200, now);
-        assert!(s.can_cache());
-        assert!(s.put(b"a".to_vec(), b"one".to_vec()));
-        assert!(s.put(b"b".to_vec(), b"two".to_vec()));
-        NOW.fetch_add(7200, Ordering::Relaxed);
-        assert_eq!(s.get(b"a"), Some(b"one".to_vec()));
-        NOW.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(s.get(b"a"), None);
-        assert_eq!(s.take(b"b"), None);
-        assert_eq!(s.get(b"missing"), None);
-        // A value too short to carry its time is no session.
-        assert_eq!(s.fresh(Some(vec![1, 2, 3])), None);
-        assert!(s.put(b"c".to_vec(), b"three".to_vec()));
-        assert_eq!(s.take(b"c"), Some(b"three".to_vec()));
-        assert_eq!(s.take(b"c"), None);
-    }
-}
-
-#[cfg(test)]
-mod ticket_keys {
-    use super::{ticket_key, TlsConfig};
-
-    /// A key the rotator is handed encrypts what only it decrypts.
-    #[test]
-    fn a_ticket_key_round_trips_and_refuses_another_keys_tickets() {
-        let (a, b) = (ticket_key().expect("key"), ticket_key().expect("key"));
-        assert!(a.enabled());
-        assert!(a.lifetime() > 0);
-        let t = a.encrypt(b"session").expect("encrypt");
-        assert_eq!(a.decrypt(&t), Some(b"session".to_vec()));
-        assert_eq!(b.decrypt(&t), None);
-    }
-
-    /// With tickets off, a server issues none, in TLS 1.2 or 1.3.
-    #[test]
-    fn tickets_off_issues_none() {
-        super::install_default_crypto_provider();
-        let mut cfg = TlsConfig::new().with_cert_resolver(std::sync::Arc::new(crate::resolver::IbexCertResolver::new()));
-        cfg.session_tickets_enabled = false;
-        let built = cfg.build_server_config().expect("build");
-        assert!(!built.ticketer.enabled());
-        assert_eq!(built.send_tls13_tickets, 0);
-    }
 }
 
 #[cfg(test)]

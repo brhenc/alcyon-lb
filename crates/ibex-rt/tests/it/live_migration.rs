@@ -1337,7 +1337,7 @@ fn tls_connect(addr: SocketAddr) -> Tls {
             rustls::crypto::CryptoProvider::get_default().map(|p| p.signature_verification_algorithms.supported_schemes()).unwrap_or_default()
         }
     }
-    ibex_tls::install_default_crypto_provider();
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cfg = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(Any)).with_no_client_auth();
     let conn = rustls::ClientConnection::new(Arc::new(cfg), ServerName::try_from("localhost").expect("name")).expect("tls client");
     let sock = std::net::TcpStream::connect(addr).expect("connect tls");

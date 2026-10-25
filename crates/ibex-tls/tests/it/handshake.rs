@@ -2,108 +2,25 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! Integration tests verifying full TLS 1.3 handshake, bidirectional data exchange,
-//! SNI dispatch, ALPN negotiation, and `TlsInfo` introspection over `RustlsTransport`.
+//! SNI dispatch, ALPN negotiation, and `TlsInfo` introspection over the binary's TLS
+//! session ([`ibex_tls::conn::TlsCtx`], rustls 0.24; T479 moved them off `RustlsTransport`).
 
-use crate::common;
-
-use common::{build_root_store, generate_test_cert};
-use ibex_proto::transport::{TlsInfo, Transport, VerifyResult};
-use ibex_tls::{IbexCertResolver, RustlsContext, RustlsTransport, TlsConfig};
-use rustls::pki_types::ServerName;
-use std::sync::Arc;
-
-/// Pumps ciphertext bidirectionally between client and server until both complete the handshake.
-fn pump_handshake(
-    server_transport: &RustlsTransport,
-    server_ctx: &mut RustlsContext,
-    client_transport: &RustlsTransport,
-    client_ctx: &mut RustlsContext,
-) {
-    let mut iterations = 0;
-    while (!server_ctx.handshake_done || !client_ctx.handshake_done) && iterations < 50 {
-        iterations += 1;
-
-        // Drive client
-        let _ = client_transport.handshake(client_ctx);
-        let client_out = client_ctx.take_raw_output();
-        if !client_out.is_empty() {
-            server_ctx.feed_raw_input(&client_out);
-        }
-
-        // Drive server
-        let _ = server_transport.handshake(server_ctx);
-        let server_out = server_ctx.take_raw_output();
-        if !server_out.is_empty() {
-            client_ctx.feed_raw_input(&server_out);
-        }
-    }
-
-    assert!(server_ctx.handshake_done, "Server handshake timed out");
-    assert!(client_ctx.handshake_done, "Client handshake timed out");
-}
-
-/// Pumps encrypted application data from sender to receiver.
-fn transfer_data(
-    sender_transport: &RustlsTransport,
-    sender_ctx: &mut RustlsContext,
-    receiver_transport: &RustlsTransport,
-    receiver_ctx: &mut RustlsContext,
-    plaintext: &[u8],
-) -> Vec<u8> {
-    let sent = sender_transport
-        .send(sender_ctx, plaintext)
-        .expect("Send plaintext");
-    assert_eq!(sent, plaintext.len());
-
-    let raw_ciphertext = sender_ctx.take_raw_output();
-    assert!(!raw_ciphertext.is_empty(), "Ciphertext generated");
-
-    receiver_ctx.feed_raw_input(&raw_ciphertext);
-
-    let mut rx_buf = vec![0u8; plaintext.len() + 128];
-    let n = receiver_transport
-        .recv(receiver_ctx, &mut rx_buf)
-        .expect("Recv plaintext");
-    rx_buf.truncate(n);
-    rx_buf
-}
+use crate::common::{client_trusting, Pair, TestCert};
+use ibex_config::ast::BindConfig;
+use ibex_proto::transport::{TlsInfo, VerifyResult};
+use ibex_tls::conn::TlsCtx;
 
 #[test]
 fn test_tls13_handshake_and_bidirectional_data() {
-    let (cert, cert_der) = generate_test_cert(vec!["example.com".to_string()]);
-    let mut resolver = IbexCertResolver::new();
-    resolver.add_exact("example.com", cert);
-
-    let server_tls_cfg = TlsConfig::new()
-        .with_cert_resolver(Arc::new(resolver))
-        .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
-    let server_config = server_tls_cfg.build_server_config().unwrap();
-    let server_transport = RustlsTransport::new_server(server_config);
-
-    let root_store = build_root_store(&[cert_der]);
-    let client_tls_cfg = TlsConfig::new().with_alpn(vec![b"h2".to_vec()]);
-    let client_config = client_tls_cfg.build_client_config(root_store).unwrap();
-    let server_name = ServerName::try_from("example.com").unwrap();
-    let client_transport = RustlsTransport::new_client(client_config, server_name);
-
-    let mut server_ctx = server_transport.init(1, true).unwrap();
-    let mut client_ctx = client_transport.init(2, false).unwrap();
+    let cert = TestCert::new(vec!["example.com".to_string()]);
+    let bind = cert.bind(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    let mut p = Pair::new(bind, &client_trusting(&cert.cert_pem, vec![b"h2".to_vec()]), "example.com");
 
     // 1. Handshake
-    pump_handshake(
-        &server_transport,
-        &mut server_ctx,
-        &client_transport,
-        &mut client_ctx,
-    );
-
-    assert!(server_transport.is_handshake_done(&server_ctx));
-    assert!(client_transport.is_handshake_done(&client_ctx));
+    p.complete();
 
     // 2. Check TlsInfo on both ends
-    let s_info = server_transport.tls_info(&server_ctx).unwrap();
-    let c_info = client_transport.tls_info(&client_ctx).unwrap();
-
+    let (s_info, c_info) = (&p.srv.tls_info, &p.cli.tls_info);
     assert_eq!(s_info.sni(), Some("example.com"));
     assert_eq!(c_info.sni(), Some("example.com"));
 
@@ -122,140 +39,89 @@ fn test_tls13_handshake_and_bidirectional_data() {
 
     // 3. Client -> Server data transfer
     let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-    let received_by_server = transfer_data(
-        &client_transport,
-        &mut client_ctx,
-        &server_transport,
-        &mut server_ctx,
-        request,
-    );
-    assert_eq!(received_by_server, request);
+    assert_eq!(p.send_to_server(request), request);
 
     // 4. Server -> Client data transfer
     let response = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, Ibex!\n";
-    let received_by_client = transfer_data(
-        &server_transport,
-        &mut server_ctx,
-        &client_transport,
-        &mut client_ctx,
-        response,
-    );
-    assert_eq!(received_by_client, response);
+    assert_eq!(p.send_to_client(response), response);
 
     // 5. Shutdown write
-    client_transport.shutdown_write(&mut client_ctx).unwrap();
-    let shutdown_raw = client_ctx.take_raw_output();
-    assert!(!shutdown_raw.is_empty());
+    p.cli.close_notify();
+    assert!(p.cli.wants_write(), "close_notify queued");
 }
 
+/// A `crt` file per name: an exact name and a wildcard, each served for its own SNI. Each
+/// client trusts only the certificate it must be served, so the wrong one fails it.
 #[test]
 fn test_sni_multi_cert_dispatch() {
-    let (exact_cert, exact_der) = generate_test_cert(vec!["site-a.com".to_string()]);
-    let (wildcard_cert, wildcard_der) = generate_test_cert(vec!["*.wildcard.org".to_string()]);
-
-    let mut resolver = IbexCertResolver::new();
-    resolver.add_exact("site-a.com", exact_cert);
-    resolver.add_wildcard("*.wildcard.org", wildcard_cert);
-
-    let server_config = TlsConfig::new()
-        .with_cert_resolver(Arc::new(resolver))
-        .build_server_config()
-        .unwrap();
-    let server_transport = RustlsTransport::new_server(server_config);
+    let exact = TestCert::new(vec!["site-a.com".to_string()]);
+    let wildcard = TestCert::new(vec!["*.wildcard.org".to_string()]);
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let mut crt = Vec::new();
+    for (name, c) in [("a.pem", &exact), ("w.pem", &wildcard)] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, c.bundle_pem()).expect("write");
+        crt.push(path.to_string_lossy().to_string());
+    }
+    let bind = BindConfig {
+        line: 0,
+        sock: None,
+        addr: "127.0.0.1:443".parse().expect("addr"),
+        quic: false,
+        ssl: true,
+        crt,
+        alpn: vec![],
+        proto: None,
+        accept_proxy: false,
+        accept_proxy_v2: false,
+        name: None,
+        id: None,
+        min_ver: None,
+        max_ver: None,
+    };
+    let bind = ibex_tls::tcp::from_bind_config(&bind).expect("bind");
 
     // Connect with SNI = "site-a.com"
-    {
-        let root_store = build_root_store(std::slice::from_ref(&exact_der));
-        let client_config = TlsConfig::new().build_client_config(root_store).unwrap();
-        let server_name = ServerName::try_from("site-a.com").unwrap();
-        let client_transport = RustlsTransport::new_client(client_config, server_name);
-
-        let mut server_ctx = server_transport.init(10, true).unwrap();
-        let mut client_ctx = client_transport.init(11, false).unwrap();
-
-        pump_handshake(
-            &server_transport,
-            &mut server_ctx,
-            &client_transport,
-            &mut client_ctx,
-        );
-
-        assert_eq!(server_ctx.tls_info.sni(), Some("site-a.com"));
-        assert_eq!(client_ctx.tls_info.peer_verify(), VerifyResult::Ok);
-    }
+    let mut p = Pair::new(bind.clone(), &client_trusting(&exact.cert_pem, vec![]), "site-a.com");
+    p.complete();
+    assert_eq!(p.srv.tls_info.sni(), Some("site-a.com"));
+    assert_eq!(p.cli.tls_info.peer_verify(), VerifyResult::Ok);
 
     // Connect with SNI = "api.wildcard.org" (matches *.wildcard.org)
-    {
-        let root_store = build_root_store(std::slice::from_ref(&wildcard_der));
-        let client_config = TlsConfig::new().build_client_config(root_store).unwrap();
-        let server_name = ServerName::try_from("api.wildcard.org").unwrap();
-        let client_transport = RustlsTransport::new_client(client_config, server_name);
+    let mut p = Pair::new(bind.clone(), &client_trusting(&wildcard.cert_pem, vec![]), "api.wildcard.org");
+    p.complete();
+    assert_eq!(p.srv.tls_info.sni(), Some("api.wildcard.org"));
+    assert_eq!(p.cli.tls_info.peer_verify(), VerifyResult::Ok);
 
-        let mut server_ctx = server_transport.init(20, true).unwrap();
-        let mut client_ctx = client_transport.init(21, false).unwrap();
-
-        pump_handshake(
-            &server_transport,
-            &mut server_ctx,
-            &client_transport,
-            &mut client_ctx,
-        );
-
-        assert_eq!(server_ctx.tls_info.sni(), Some("api.wildcard.org"));
-        assert_eq!(client_ctx.tls_info.peer_verify(), VerifyResult::Ok);
-    }
+    // The wildcard's client asking for the exact name gets the exact name's certificate,
+    // which it does not trust.
+    let mut p = Pair::new(bind, &client_trusting(&wildcard.cert_pem, vec![]), "site-a.com");
+    let (_, c) = p.handshake();
+    assert!(c.is_err(), "the exact name's certificate, not the wildcard's");
 }
 
 #[test]
 fn test_alpn_negotiation_fallback() {
-    let (cert, cert_der) = generate_test_cert(vec!["example.com".to_string()]);
-    let mut resolver = IbexCertResolver::new();
-    resolver.set_default_cert(cert);
-
+    let cert = TestCert::new(vec!["example.com".to_string()]);
     // Server supports [http/1.1]
-    let server_config = TlsConfig::new()
-        .with_cert_resolver(Arc::new(resolver))
-        .with_alpn(vec![b"http/1.1".to_vec()])
-        .build_server_config()
-        .unwrap();
-    let server_transport = RustlsTransport::new_server(server_config);
-
+    let bind = cert.bind(vec![b"http/1.1".to_vec()]);
     // Client supports [h2, http/1.1]
-    let root_store = build_root_store(&[cert_der]);
-    let client_config = TlsConfig::new()
-        .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
-        .build_client_config(root_store)
-        .unwrap();
-    let server_name = ServerName::try_from("example.com").unwrap();
-    let client_transport = RustlsTransport::new_client(client_config, server_name);
-
-    let mut server_ctx = server_transport.init(1, true).unwrap();
-    let mut client_ctx = client_transport.init(2, false).unwrap();
-
-    pump_handshake(
-        &server_transport,
-        &mut server_ctx,
-        &client_transport,
-        &mut client_ctx,
-    );
+    let cfg = client_trusting(&cert.cert_pem, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    let mut p = Pair::new(bind, &cfg, "example.com");
+    p.complete();
 
     // Should negotiate http/1.1
-    let s_info = server_transport.tls_info(&server_ctx).unwrap();
-    let c_info = client_transport.tls_info(&client_ctx).unwrap();
-    assert_eq!(s_info.alpn(), Some(&b"http/1.1"[..]));
-    assert_eq!(c_info.alpn(), Some(&b"http/1.1"[..]));
+    assert_eq!(p.srv.tls_info.alpn(), Some(&b"http/1.1"[..]));
+    assert_eq!(p.cli.tls_info.alpn(), Some(&b"http/1.1"[..]));
 }
 
-/// `with_capture_buffer_size` reaches the server context `init` builds: a transport made
-/// with a capture size taps the ClientHello, one without does not (covercheck, T344).
+/// A capture size reaches the server session: one given a size taps the `ClientHello`, one
+/// without does not (covercheck, T344).
 #[test]
 fn the_transport_capture_size_reaches_the_server_context() {
-    let (cert, _der) = generate_test_cert(vec!["example.com".to_string()]);
-    let mut resolver = IbexCertResolver::new();
-    resolver.add_exact("example.com", cert);
-    let server_config = TlsConfig::new().with_cert_resolver(Arc::new(resolver)).build_server_config().unwrap();
-    let plain = RustlsTransport::new_dual(Some(Arc::clone(&server_config)), None, None);
-    assert!(!plain.init(1, true).unwrap().tapping());
-    let capturing = RustlsTransport::new_dual(Some(server_config), None, None).with_capture_buffer_size(256);
-    assert!(capturing.init(1, true).unwrap().tapping());
+    let bind = TestCert::new(vec!["example.com".to_string()]).bind(vec![]);
+    assert!(!TlsCtx::accept(bind.clone()).tapping());
+    let mut capturing = TlsCtx::accept(bind);
+    capturing.enable_capture(256);
+    assert!(capturing.tapping());
 }

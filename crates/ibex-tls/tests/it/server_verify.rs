@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-// Own binary (T260): installs a process-wide default rustls CryptoProvider, which every other test in a shared binary would see
 
 //! How a server's certificate is checked (T113): `HAProxy`'s rules, not webpki's.
 //!
@@ -13,10 +12,16 @@
 //! verifies against a matching `verifyhost` (200), a mismatching `verifyhost` with no SNI
 //! fails (503), and with neither SNI nor `verifyhost` the name is not checked (200).
 
-use ibex_tls::{build_backend_client_config, hostcheck, BackendTlsOptions, ServerVerifier};
+//!
+//! On rustls 0.24, the verifier the binary's server lines use (T479: a module of `it`
+//! now; it was its own binary for rustls 0.23's process-wide provider, which 0.24 has none of).
+
+use ibex_tls::tcp::{build_backend_client_config, rustls24, ServerVerifier};
+use ibex_tls::{hostcheck, BackendTlsOptions, TlsCryptoProvider};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
-use rustls::client::danger::ServerCertVerifier;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls24::client::danger::{ServerIdentity, ServerVerifier as _};
+use rustls24::crypto::Identity;
+use rustls24::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use std::io::Write;
 use std::sync::Arc;
 
@@ -26,7 +31,6 @@ struct Ca {
 }
 
 fn make_ca(name: &str) -> Ca {
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.distinguished_name.push(DnType::CommonName, name);
@@ -43,16 +47,26 @@ fn leaf(ca: &Ca, sans: &[&str], cn: &str) -> CertificateDer<'static> {
     params.signed_by(&key, &ca.cert, &ca.key).expect("sign").der().clone()
 }
 
+/// The verifier of a server line with `options`, on ring with both versions.
+fn verifier(options: &BackendTlsOptions) -> Result<Arc<ServerVerifier>, String> {
+    ServerVerifier::from_options(options, &ibex_tls::provider::of(TlsCryptoProvider::Ring, true, true))
+}
+
 fn verifier_for(ca: &Ca) -> Arc<ServerVerifier> {
     let mut f = tempfile::NamedTempFile::new().expect("tmp");
     f.write_all(ca.cert.pem().as_bytes()).expect("write");
-    ServerVerifier::from_options(&BackendTlsOptions { ca_file: Some(f.path().to_path_buf()), ..Default::default() })
-        .expect("verifier")
+    verifier(&BackendTlsOptions { ca_file: Some(f.path().to_path_buf()), ..Default::default() }).expect("verifier")
 }
 
 fn verify(v: &ServerVerifier, cert: &CertificateDer<'static>, name: &str) -> bool {
     let name = ServerName::try_from(name.to_string()).expect("name");
-    v.verify_server_cert(cert, &[], &name, &[], UnixTime::now()).is_ok()
+    let identity = Identity::from_cert_chain(vec![cert.clone()]).expect("identity");
+    v.verify_identity(&ServerIdentity::new(&identity, &name, UnixTime::now())).is_ok()
+}
+
+/// What a client configuration offers, as bytes.
+fn alpn_of(cfg: &rustls24::ClientConfig) -> Vec<Vec<u8>> {
+    cfg.alpn_protocols.iter().map(|p| p.as_ref().to_vec()).collect()
 }
 
 #[test]
@@ -112,7 +126,7 @@ fn the_client_config_offers_what_the_server_line_asked_for() {
         ..Default::default()
     })
     .expect("config");
-    assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    assert_eq!(alpn_of(&cfg), vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     assert!(cfg.enable_sni);
 
     // No `alpn`: nothing is offered, as HAProxy offers nothing (measured: a server
@@ -156,7 +170,7 @@ fn a_crl_file_revokes_the_certificate_it_names() {
     ca_f.write_all(ca.cert.pem().as_bytes()).expect("write");
     let mut crl_f = tempfile::NamedTempFile::new().expect("tmp");
     crl_f.write_all(crl.pem().expect("pem").as_bytes()).expect("write");
-    let v = ServerVerifier::from_options(&BackendTlsOptions {
+    let v = verifier(&BackendTlsOptions {
         ca_file: Some(ca_f.path().to_path_buf()),
         crl_file: Some(crl_f.path().to_path_buf()),
         ..Default::default()
@@ -165,14 +179,14 @@ fn a_crl_file_revokes_the_certificate_it_names() {
     assert!(!verify(&v, &revoked, "backend.example.com"), "a revoked certificate must be refused");
     assert!(verify(&v, &other, "backend.example.com"), "one the CRL does not name passes");
 
-    let err = ServerVerifier::from_options(&BackendTlsOptions {
+    let err = verifier(&BackendTlsOptions {
         ca_file: Some(ca_f.path().to_path_buf()),
         crl_file: Some("/nonexistent/crl.pem".into()),
         ..Default::default()
     })
     .expect_err("missing crl-file");
     assert!(err.contains("/nonexistent/crl.pem"), "{err}");
-    let err = ServerVerifier::from_options(&BackendTlsOptions {
+    let err = verifier(&BackendTlsOptions {
         ca_file: Some(ca_f.path().to_path_buf()),
         crl_file: Some(ca_f.path().to_path_buf()),
         ..Default::default()
@@ -186,7 +200,7 @@ fn a_crl_file_revokes_the_certificate_it_names() {
 #[test]
 fn system_ca_is_a_trust_store_that_knows_no_test_ca() {
     let ca = make_ca("Not In The System");
-    let v = ServerVerifier::from_options(&BackendTlsOptions { ca_file: Some("@system-ca".into()), ..Default::default() })
+    let v = verifier(&BackendTlsOptions { ca_file: Some("@system-ca".into()), ..Default::default() })
         .expect("system roots");
     assert!(!verify(&v, &leaf(&ca, &["backend.example.com"], "x"), "backend.example.com"));
 }
@@ -208,27 +222,23 @@ fn version_limits_and_no_reuse() {
     assert!(err.contains("no TLS version is left") && err.contains("TLSv1_3"), "{err}");
 }
 
-/// A TLS 1.2 handshake through the verifier. The `ibex` binary's rustls speaks TLS 1.3
-/// only (no `tls12` feature in the workspace dependency); this crate's test build has
-/// TLS 1.2 through the `tokio-rustls` dev-dependency, so here is where
-/// `ssl-max-ver TLSv1.2` and `ServerVerifier::verify_tls12_signature` are exercised.
+/// A TLS 1.2 handshake through the verifier: `ssl-max-ver TLSv1.2` on the server line, a
+/// bind that speaks both, so `ServerVerifier::verify_tls12_signature` checks the server's
+/// signature.
 #[test]
 fn a_tls12_handshake_verifies_the_servers_signature() {
     use ibex_config::TlsVersion;
-    use std::io::{Read as _, Write as _};
-    use std::net::{TcpListener, TcpStream};
     let ca = make_ca("TLS12 Root");
     let mut params = CertificateParams::new(vec!["backend.example.com".to_string()]).expect("params");
     params.distinguished_name.push(DnType::CommonName, "backend.example.com");
     let key = KeyPair::generate().expect("key");
     let cert = params.signed_by(&key, &ca.cert, &ca.key).expect("sign");
-    let server_cfg = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![cert.der().clone()],
-            rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der())),
-        )
-        .expect("server config");
+    let bind = ibex_tls::tcp::BindTls::single(
+        vec![cert.der().clone()],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        vec![],
+    )
+    .expect("bind");
     let mut f = tempfile::NamedTempFile::new().expect("tmp");
     f.write_all(ca.cert.pem().as_bytes()).expect("write");
     let client_cfg = build_backend_client_config(&BackendTlsOptions {
@@ -238,27 +248,30 @@ fn a_tls12_handshake_verifies_the_servers_signature() {
     })
     .expect("client config");
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let server = std::thread::spawn(move || {
-        let (mut sock, _) = listener.accept().expect("accept");
-        let mut conn = rustls::ServerConnection::new(Arc::new(server_cfg)).expect("server conn");
-        let mut tls = rustls::Stream::new(&mut conn, &mut sock);
-        let mut b = [0u8; 4];
-        tls.read_exact(&mut b).expect("read");
-        tls.write_all(b"pong").expect("write");
-        b
-    });
-    let mut sock = TcpStream::connect(addr).expect("connect");
-    let name = ServerName::try_from("backend.example.com".to_string()).expect("name");
-    let mut conn = rustls::ClientConnection::new(client_cfg, name).expect("client conn");
-    let mut tls = rustls::Stream::new(&mut conn, &mut sock);
-    tls.write_all(b"ping").expect("write");
-    let mut b = [0u8; 4];
-    tls.read_exact(&mut b).expect("read");
-    assert_eq!(&b, b"pong");
-    assert_eq!(tls.conn.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_2), "the handshake must have been TLS 1.2");
-    assert_eq!(&server.join().expect("server thread"), b"ping");
+    let mut p = crate::common::Pair::new(bind, &client_cfg, "backend.example.com");
+    p.complete();
+    assert_eq!(p.send_to_server(b"ping"), b"ping");
+    assert_eq!(p.send_to_client(b"pong"), b"pong");
+    assert_eq!(p.cli.tls_info.protocol_version.as_deref(), Some("TLSv1.2"), "the handshake must have been TLS 1.2");
+
+    // The same server, a client that trusts another CA: the chain fails.
+    let other = make_ca("Another Root");
+    let mut g = tempfile::NamedTempFile::new().expect("tmp");
+    g.write_all(other.cert.pem().as_bytes()).expect("write");
+    let untrusting = build_backend_client_config(&BackendTlsOptions {
+        ca_file: Some(g.path().to_path_buf()),
+        max_ver: Some(TlsVersion::Tls12),
+        ..Default::default()
+    })
+    .expect("client config");
+    let bind = ibex_tls::tcp::BindTls::single(
+        vec![cert.der().clone()],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        vec![],
+    )
+    .expect("bind");
+    let (_, c) = crate::common::Pair::new(bind, &untrusting, "backend.example.com").handshake();
+    assert!(c.is_err(), "a chain to an unknown CA is refused");
 }
 
 #[test]

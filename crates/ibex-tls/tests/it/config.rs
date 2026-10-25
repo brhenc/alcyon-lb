@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
+//! A `bind ... ssl` line's configuration, built as the binary builds it
+//! ([`ibex_tls::tcp::from_bind_config`], rustls 0.24; T479 moved these off `TlsConfig`).
+
 use ibex_config::ast::BindConfig;
-use ibex_tls::{TlsConfig, RustlsTransport, RustlsContext};
+use ibex_proto::transport::TlsInfo;
+use ibex_tls::tcp::from_bind_config;
 use std::fs;
 use tempfile::TempDir;
-use rustls::pki_types::ServerName;
-use ibex_proto::transport::Transport;
 
 use crate::common;
 
-fn generate_pem(sans: Vec<String>) -> (String, rustls::pki_types::CertificateDer<'static>) {
-    let cert = rcgen::generate_simple_self_signed(sans).unwrap();
-    let cert_pem = cert.cert.pem();
-    let key_pem = cert.key_pair.serialize_pem();
-    (format!("{cert_pem}{key_pem}"), rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec()))
+/// The bundle (certificate and key) and the certificate alone, in PEM.
+fn generate_pem(sans: Vec<String>) -> (String, String) {
+    let cert = common::TestCert::new(sans);
+    (cert.bundle_pem(), cert.cert_pem)
+}
+
+/// What a configuration offers, as bytes.
+fn alpn_of(cfg: &ibex_tls::tcp::rustls24::ServerConfig) -> Vec<Vec<u8>> {
+    cfg.alpn_protocols.iter().map(|p| p.as_ref().to_vec()).collect()
 }
 
 fn default_bind() -> BindConfig {
@@ -35,65 +41,23 @@ fn default_bind() -> BindConfig {
     }
 }
 
-fn pump_handshake(
-    server_transport: &RustlsTransport,
-    server_ctx: &mut RustlsContext,
-    client_transport: &RustlsTransport,
-    client_ctx: &mut RustlsContext,
-) {
-    let mut iterations = 0;
-    while (!server_ctx.handshake_done || !client_ctx.handshake_done) && iterations < 50 {
-        iterations += 1;
-
-        let _ = client_transport.handshake(client_ctx);
-        let client_out = client_ctx.take_raw_output();
-        if !client_out.is_empty() {
-            server_ctx.feed_raw_input(&client_out);
-        }
-
-        let _ = server_transport.handshake(server_ctx);
-        let server_out = server_ctx.take_raw_output();
-        if !server_out.is_empty() {
-            client_ctx.feed_raw_input(&server_out);
-        }
-    }
-    assert!(server_ctx.handshake_done, "Server handshake timed out");
-    assert!(client_ctx.handshake_done, "Client handshake timed out");
-}
-
 #[test]
 fn test_sni_name_mismatch_filename() {
     let temp_dir = TempDir::new().unwrap();
     // Filename DOES NOT match SAN (actual-domain.com vs completely_different_name.pem)
     let cert_path = temp_dir.path().join("completely_different_name.pem");
-    let (pem, der) = generate_pem(vec!["actual-domain.com".to_string()]);
+    let (pem, cert_pem) = generate_pem(vec!["actual-domain.com".to_string()]);
     fs::write(&cert_path, pem).unwrap();
 
     let mut bind = default_bind();
     bind.crt = vec![cert_path.to_string_lossy().to_string()];
 
-    // Create server transport using the parsed config
-    let server_config = TlsConfig::from_bind_config(&bind).expect("Should load config");
-    let server_transport = RustlsTransport::new_server(server_config);
+    // The server from the parsed config, a client requesting "actual-domain.com"
+    let server = from_bind_config(&bind).expect("Should load config");
+    let mut p = common::Pair::new(server, &common::client_trusting(&cert_pem, vec![]), "actual-domain.com");
+    p.complete();
 
-    // Create client requesting "actual-domain.com"
-    let root_store = common::build_root_store(&[der]);
-    let client_config = TlsConfig::new().build_client_config(root_store).unwrap();
-    let server_name = ServerName::try_from("actual-domain.com").unwrap();
-    let client_transport = RustlsTransport::new_client(client_config, server_name);
-
-    let mut server_ctx = server_transport.init(1, true).unwrap();
-    let mut client_ctx = client_transport.init(2, false).unwrap();
-
-    pump_handshake(
-        &server_transport,
-        &mut server_ctx,
-        &client_transport,
-        &mut client_ctx,
-    );
-
-    let s_info = server_transport.tls_info(&server_ctx).unwrap();
-    assert_eq!(s_info.sni(), Some("actual-domain.com"));
+    assert_eq!(p.srv.tls_info.sni(), Some("actual-domain.com"));
 }
 
 #[test]
@@ -101,7 +65,7 @@ fn test_cert_path_does_not_exist() {
     let mut bind = default_bind();
     bind.crt = vec!["/tmp/does_not_exist.pem".to_string()];
 
-    let err = TlsConfig::from_bind_config(&bind).unwrap_err();
+    let err = from_bind_config(&bind).unwrap_err();
     assert!(err.contains("Failed to read metadata for /tmp/does_not_exist.pem") || err.contains("Failed to open file /tmp/does_not_exist.pem"));
 }
 
@@ -116,7 +80,7 @@ fn test_cert_no_private_key() {
     let mut bind = default_bind();
     bind.crt = vec![cert_path.to_string_lossy().to_string()];
 
-    let err = TlsConfig::from_bind_config(&bind).unwrap_err();
+    let err = from_bind_config(&bind).unwrap_err();
     assert!(err.contains("No private key found"));
 }
 
@@ -130,7 +94,7 @@ fn test_single_cert() {
     let mut bind = default_bind();
     bind.crt = vec![cert_path.to_string_lossy().to_string()];
 
-    let _config = TlsConfig::from_bind_config(&bind).expect("Should load config");
+    let _config = from_bind_config(&bind).expect("Should load config");
 }
 
 #[test]
@@ -151,7 +115,7 @@ fn test_multiple_certs_sni() {
         cert2.to_string_lossy().to_string(),
     ];
 
-    let _config = TlsConfig::from_bind_config(&bind).expect("Should load config");
+    let _config = from_bind_config(&bind).expect("Should load config");
 }
 
 #[test]
@@ -169,7 +133,7 @@ fn test_load_directory() {
     let mut bind = default_bind();
     bind.crt = vec![temp_dir.path().to_string_lossy().to_string()];
 
-    let _config = TlsConfig::from_bind_config(&bind).expect("Should load config");
+    let _config = from_bind_config(&bind).expect("Should load config");
 }
 
 /// Regression tests for the DER walk that produces the SNI names.
@@ -266,7 +230,7 @@ mod san_extraction {
 /// ALPN must offer only what the runtime can serve.
 mod alpn {
     use ibex_config::ast::BindConfig;
-    use ibex_tls::TlsConfig;
+    use ibex_tls::tcp::from_bind_config;
 
     fn bind_with(alpn: Vec<String>, crt: String) -> BindConfig {
         BindConfig {
@@ -301,9 +265,9 @@ mod alpn {
     #[test]
     fn h2_is_advertised_by_default() {
         let (_dir, crt) = a_cert();
-        let cfg = TlsConfig::from_bind_config(&bind_with(Vec::new(), crt)).expect("build");
+        let cfg = from_bind_config(&bind_with(Vec::new(), crt)).expect("build");
         assert_eq!(
-            cfg.alpn_protocols,
+            super::alpn_of(&cfg.config),
             vec![b"h2".to_vec(), b"http/1.1".to_vec()],
             "both h2 and http/1.1 are offered by default"
         );
@@ -314,8 +278,8 @@ mod alpn {
     fn a_requested_h2_is_honoured() {
         let (_dir, crt) = a_cert();
         let bind = bind_with(vec!["h2".to_string(), "http/1.1".to_string()], crt);
-        let cfg = TlsConfig::from_bind_config(&bind).expect("build");
-        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        let cfg = from_bind_config(&bind).expect("build");
+        assert_eq!(super::alpn_of(&cfg.config), vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
     /// Asking for nothing servable is an error, not an empty offer.
@@ -323,7 +287,7 @@ mod alpn {
     fn requesting_only_unservable_protocols_is_refused() {
         let (_dir, crt) = a_cert();
         let bind = bind_with(vec!["spdy/3".to_string()], crt);
-        let err = TlsConfig::from_bind_config(&bind).expect_err("must refuse");
+        let err = from_bind_config(&bind).expect_err("must refuse");
         assert!(err.contains("ALPN"), "{err}");
     }
 }
@@ -333,7 +297,7 @@ mod alpn {
 mod versions {
     use ibex_config::ast::BindConfig;
     use ibex_config::TlsVersion;
-    use ibex_tls::TlsConfig;
+    use ibex_tls::tcp::from_bind_config;
 
     fn bind(quic: bool, min: Option<TlsVersion>, max: Option<TlsVersion>) -> (tempfile::TempDir, BindConfig) {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -361,30 +325,33 @@ mod versions {
     #[test]
     fn a_range_with_no_version_in_it_is_refused() {
         let (_d, b) = bind(false, Some(TlsVersion::Tls13), Some(TlsVersion::Tls12));
-        let err = TlsConfig::from_bind_config(&b).expect_err("nothing left");
+        let err = from_bind_config(&b).expect_err("nothing left");
         assert!(err.contains("all SSL/TLS versions are disabled for bind '127.0.0.1:8443'"), "{err}");
     }
 
     #[test]
     fn a_quic_bind_cannot_be_held_to_tls12() {
         let (_d, b) = bind(true, None, Some(TlsVersion::Tls12));
-        let err = TlsConfig::from_bind_config(&b).expect_err("QUIC is TLS 1.3");
+        let err = from_bind_config(&b).expect_err("QUIC is TLS 1.3");
         assert!(err.contains("QUIC needs TLS 1.3"), "{err}");
         // With no bound, or a bound that leaves 1.3, it builds (and offers 1.3 only).
         for (min, max) in [(None, None), (Some(TlsVersion::Tls12), None)] {
             let (_d, b) = bind(true, min, max);
-            TlsConfig::from_bind_config(&b).expect("builds");
+            let built = from_bind_config(&b).expect("builds");
+            let p = built.config.provider();
+            assert!(p.tls12_cipher_suites.is_empty() && !p.tls13_cipher_suites.is_empty(), "TLS 1.3 only");
         }
     }
 
     #[test]
     fn version_ranges_narrow_what_rustls_speaks() {
-        use rustls::ProtocolVersion::{TLSv1_2, TLSv1_3};
-        let names = |min, max| ibex_tls::versions_between(min, max).iter().map(|v| v.version).collect::<Vec<_>>();
-        assert_eq!(names(None, None), vec![TLSv1_3, TLSv1_2]);
-        assert_eq!(names(Some(TlsVersion::Tls13), None), vec![TLSv1_3]);
-        assert_eq!(names(None, Some(TlsVersion::Tls12)), vec![TLSv1_2]);
+        use ibex_tls::TlsVersions;
+        let names = ibex_tls::versions_between;
+        assert_eq!(names(None, None), TlsVersions { tls12: true, tls13: true });
+        assert_eq!(names(Some(TlsVersion::Tls13), None), TlsVersions { tls12: false, tls13: true });
+        assert_eq!(names(None, Some(TlsVersion::Tls12)), TlsVersions { tls12: true, tls13: false });
         assert!(names(Some(TlsVersion::Tls13), Some(TlsVersion::Tls12)).is_empty());
+        assert!(!names(Some(TlsVersion::Tls12), Some(TlsVersion::Tls12)).is_empty());
     }
 }
 
@@ -394,14 +361,14 @@ mod versions {
 /// and 1.3 alike, 3.5-dev8-885761-29), and past which OpenSSL refuses to resume.
 /// rustls's own ticketer advertised 43200 s and kept its keys for as long.
 mod resumption_lifetime {
-    use ibex_tls::TlsConfig;
+    use ibex_tls::tcp::from_bind_config;
 
     #[test]
     fn tickets_advertise_and_last_haproxys_7200_s() {
         let (_dir, crt) = super::a_test_cert();
-        let cfg = TlsConfig::from_bind_config(&super::a_test_bind(crt)).expect("build");
-        assert!(cfg.ticketer.enabled(), "tickets are on by default, as in HAProxy");
-        assert_eq!(cfg.ticketer.lifetime(), 7200, "the NewSessionTicket lifetime hint");
+        let cfg = from_bind_config(&super::a_test_bind(crt)).expect("build");
+        let ticketer = cfg.config.ticketer.as_ref().expect("tickets are on by default, as in HAProxy");
+        assert_eq!(ticketer.lifetime(), std::time::Duration::from_secs(7200), "the NewSessionTicket lifetime hint");
     }
 }
 

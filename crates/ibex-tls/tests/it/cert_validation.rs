@@ -5,7 +5,7 @@
 //! with HAProxy's alert text; a `crt` directory is loaded once and shared.
 
 use ibex_config::ast::BindConfig;
-use ibex_tls::TlsConfig;
+use ibex_tls::tcp::from_bind_config;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -40,7 +40,7 @@ fn key_not_matching_certificate_is_refused() {
     let (_, other_key) = pair("b.example");
     let p = dir.path().join("mism.pem");
     std::fs::write(&p, format!("{cert}{other_key}")).unwrap();
-    let err = TlsConfig::from_bind_config(&bind(vec![p.to_string_lossy().into()])).unwrap_err();
+    let err = from_bind_config(&bind(vec![p.to_string_lossy().into()])).unwrap_err();
     assert_eq!(
         err,
         format!(
@@ -60,7 +60,7 @@ fn certificate_that_is_not_der_is_refused() {
         format!("-----BEGIN CERTIFICATE-----\nAAAAAAAA\n-----END CERTIFICATE-----\n{key}"),
     )
     .unwrap();
-    let err = TlsConfig::from_bind_config(&bind(vec![p.to_string_lossy().into()])).unwrap_err();
+    let err = from_bind_config(&bind(vec![p.to_string_lossy().into()])).unwrap_err();
     assert_eq!(
         err,
         format!("unable to load certificate from file '{}': wrong tag.", p.display())
@@ -75,7 +75,7 @@ fn crt_directory_is_loaded_once_and_shared() {
         std::fs::write(dir.path().join(format!("c{i}.pem")), format!("{c}{k}")).unwrap();
     }
     let b = bind(vec![dir.path().to_string_lossy().into()]);
-    let a1 = TlsConfig::from_bind_config(&b).unwrap();
-    let a2 = TlsConfig::from_bind_config(&b).unwrap();
+    let a1 = from_bind_config(&b).unwrap();
+    let a2 = from_bind_config(&b).unwrap();
     assert!(Arc::ptr_eq(&a1, &a2));
 }
