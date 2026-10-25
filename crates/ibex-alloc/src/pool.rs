@@ -25,7 +25,7 @@
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread::LocalKey;
 use std::time::{Duration, Instant};
 
@@ -41,13 +41,20 @@ pub const MAX_THREADS: usize = 256;
 /// `CONFIG_HAP_POOL_CLUSTER_SIZE`: `HAProxy` evicts this many at a time; Ibex evicts one at a
 /// time (its objects vary in size) but keeps the cluster in the share rule.
 const CLUSTER: usize = 8;
+/// `tune.memory.prealloc` (T475): the most objects a thread's cache of a
+/// [`PoolSpec::presized`] pool holds; the rest of what [`Pool::prealloc`] makes is in the
+/// pool's [`Shelf`], which any thread takes from on a miss and gives to past this. 32 standard
+/// buffers are `HAProxy`'s per-thread cache (`CONFIG_HAP_POOL_CACHE_SIZE`, 512 KiB of 16 KiB),
+/// and a small figure lets a busy thread use nearly all of the limit while the others are idle
+/// (it can reach `limit - (nbthread - 1) * PREALLOC_LOCAL`).
+pub const PREALLOC_LOCAL: usize = 4 * CLUSTER;
 
 // -----------------------------------------------------------------------------
 // What a pooled object is
 // -----------------------------------------------------------------------------
 
 /// What a pooled object must do.
-pub trait Poolable: Sized + 'static {
+pub trait Poolable: Sized + Send + 'static {
     /// Bytes this object holds (its capacity, not its length): the byte budget sums these.
     fn footprint(&self) -> usize;
     /// Makes it ready for the next owner: clears it, and wipes the used bytes when `wipe`
@@ -615,6 +622,9 @@ pub struct PoolShared {
     grown: AtomicIsize,
     failures: AtomicUsize,
     limit: AtomicUsize,
+    /// Objects and footprints on the pool's [`Shelf`], changed under its lock.
+    shelf_count: AtomicUsize,
+    shelf_bytes: AtomicUsize,
     shown: [Shown; MAX_THREADS + 1],
 }
 
@@ -626,6 +636,8 @@ impl PoolShared {
             grown: AtomicIsize::new(0),
             failures: AtomicUsize::new(0),
             limit: AtomicUsize::new(0),
+            shelf_count: AtomicUsize::new(0),
+            shelf_bytes: AtomicUsize::new(0),
             shown: [const { Shown { count: AtomicUsize::new(0), bytes: AtomicUsize::new(0), boxes: AtomicIsize::new(0) } }; MAX_THREADS + 1],
         }
     }
@@ -637,12 +649,36 @@ impl Default for PoolShared {
     }
 }
 
+/// The objects of a [`PoolSpec::presized`] pool that no thread's cache holds (T475,
+/// `HAProxy`'s `pool_head->free_list` behind the thread caches). Locked only on a miss and on a
+/// give past [`PREALLOC_LOCAL`], a cluster at a time: never on a take or give the cache serves.
+/// Public for [`declare_pool!`] only.
+pub struct Shelf<T>(Mutex<Vec<T>>);
+
+impl<T> Shelf<T> {
+    #[must_use]
+    pub const fn new() -> Self {
+        Shelf(Mutex::new(Vec::new()))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<T>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl<T> Default for Shelf<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A pool of `T`, declared with [`declare_pool!`]. Holds only references and constants, so
 /// the compiler sees through it: the thread-local access and the spec's limits are folded
 /// into each call site.
 pub struct Pool<T: Poolable> {
     spec: PoolSpec,
     shared: &'static PoolShared,
+    shelf: &'static Shelf<T>,
     cache: &'static LocalKey<Cache<T>>,
     _t: PhantomData<fn() -> T>,
 }
@@ -650,8 +686,8 @@ pub struct Pool<T: Poolable> {
 impl<T: Poolable> Pool<T> {
     #[doc(hidden)]
     #[must_use]
-    pub const fn new(spec: PoolSpec, shared: &'static PoolShared, cache: &'static LocalKey<Cache<T>>) -> Self {
-        Pool { spec, shared, cache, _t: PhantomData }
+    pub const fn new(spec: PoolSpec, shared: &'static PoolShared, shelf: &'static Shelf<T>, cache: &'static LocalKey<Cache<T>>) -> Self {
+        Pool { spec, shared, shelf, cache, _t: PhantomData }
     }
 
     #[must_use]
@@ -733,33 +769,55 @@ impl<T: Poolable> Pool<T> {
         }
     }
 
-    /// `tune.memory.prealloc` (T468): this thread's cache made to hold `n` objects, all floor
-    /// objects (no eviction, no `pool_gc` takes them), and filled to `n`. False when memory
-    /// is short (what was made stays). For a [`PoolSpec::presized`] pool, at start.
+    /// `tune.memory.prealloc` (T468): `n` objects made for this thread, all floor objects (no
+    /// eviction, no `pool_gc` takes them). Up to [`PREALLOC_LOCAL`] fill this thread's cache,
+    /// which then holds no more; the rest go on the pool's [`Shelf`], where a thread whose cache
+    /// is empty finds them (T475). False when memory is short (what was made stays). For a
+    /// [`PoolSpec::presized`] pool, at start, after [`Self::set_limit`].
     #[must_use]
     pub fn prealloc(&'static self, n: usize) -> bool {
+        let k = n.min(PREALLOC_LOCAL);
         let have = self
             .cache
             .try_with(|c| {
                 let mut l = c.inner.try_borrow_mut().ok()?;
                 self.touch(&mut l);
-                l.pre = n;
-                let more = n.saturating_sub(l.items.len());
+                l.pre = k;
+                let more = k.saturating_sub(l.items.len());
                 l.items.try_reserve_exact(more).ok()?;
                 Some(l.items.len())
             })
             .ok()
             .flatten();
         let Some(have) = have else { return false };
-        self.prefill(n.saturating_sub(have));
-        self.local_count() >= n
+        self.prefill(k.saturating_sub(have));
+        if self.local_count() < k {
+            return false;
+        }
+        let mut stock = self.shelf.lock();
+        // Room for every object the limit allows, so that a give never grows the shelf.
+        let room = self.shared.limit.load(Ordering::Relaxed).max(stock.len() + n - k);
+        let more = room.saturating_sub(stock.len());
+        if stock.try_reserve_exact(more).is_err() {
+            return false;
+        }
+        for _ in k..n {
+            let Some(v) = T::try_new() else { return false };
+            if self.spec.limited {
+                self.shared.grown.fetch_add(1, Ordering::Relaxed);
+            }
+            self.shared.shelf_count.fetch_add(1, Ordering::Relaxed);
+            self.shared.shelf_bytes.fetch_add(v.footprint(), Ordering::Relaxed);
+            stock.push(v);
+        }
+        true
     }
 
     /// This thread's floor: the spec's, or [`Self::prealloc`]'s when larger.
     #[inline(always)]
     #[allow(clippy::inline_always)]
     fn floor_of(&self, l: &Local<T>) -> usize {
-        if self.spec.presized { self.spec.floor.max(l.pre) } else { self.spec.floor }
+        if self.spec.presized && l.pre != 0 { l.pre } else { self.spec.floor }
     }
 
     /// `tune.buffers.limit`: the most objects [`Self::take`] makes (0: no limit). For
@@ -834,7 +892,7 @@ impl<T: Poolable> Pool<T> {
             // A floor object is kept whatever the budget; the others only when they fit it.
             let counted = n >= self.floor_of(&l);
             // Folded to the spec's constant unless the pool is `presized`.
-            let max_count = if spec.presized { spec.max_count.max(l.pre) } else { spec.max_count };
+            let max_count = if spec.presized && l.pre != 0 { l.pre } else { spec.max_count };
             let max_item = if counted && max < spec.max_item { max } else { spec.max_item };
             // Not kept, or no room and the `Vec` cannot grow (memory is short).
             // Under `tune.fail-alloc` nothing is kept: each take is an allocation that may fail.
@@ -864,8 +922,83 @@ impl<T: Poolable> Pool<T> {
                     self.over_three_quarters();
                 }
             }
-            Err(v) => self.free_given(v, boxed),
+            Err(v) => self.not_kept(v, boxed),
         }
+    }
+
+    /// A given object the cache does not keep: onto the shelf when the cache of a
+    /// [`Self::prealloc`]ed pool is full (T475), else freed.
+    #[cold]
+    #[inline(never)]
+    fn not_kept(&'static self, v: T, boxed: bool) {
+        let v = if self.spec.presized { self.shelve(v, boxed) } else { Some(v) };
+        if let Some(v) = v {
+            self.free_given(v, boxed);
+        }
+    }
+
+    /// `v` and a cluster of the cache's objects onto the shelf, when the cache holds its
+    /// [`Self::prealloc`] size; else `v` back. Nothing allocated: the shelf has room for the limit.
+    fn shelve(&'static self, v: T, boxed: bool) -> Option<T> {
+        let fail = HOT.try_with(|h| h.fail.get() != 0).unwrap_or(true);
+        if fail || !v.keep(self.spec.max_item) {
+            return Some(v);
+        }
+        let moved = self.cache.try_with(|c| {
+            let Ok(mut l) = c.inner.try_borrow_mut() else { return Err(v) };
+            if l.pre == 0 || l.items.len() < l.pre {
+                return Err(v);
+            }
+            let mut stock = self.shelf.lock();
+            let k = CLUSTER.min(l.items.len());
+            if stock.capacity() - stock.len() <= k {
+                return Err(v);
+            }
+            let mut bytes = v.footprint();
+            stock.push(v);
+            let at = l.items.len() - k;
+            for o in l.items.drain(at..) {
+                bytes += o.footprint();
+                stock.push(o);
+            }
+            self.shared.shelf_count.fetch_add(k + 1, Ordering::Relaxed);
+            self.shared.shelf_bytes.fetch_add(bytes, Ordering::Relaxed);
+            if boxed {
+                l.boxes -= 1;
+            }
+            Ok(())
+        });
+        // No cache (the thread is ending): `v` went with the closure, as in `put`.
+        moved.map_or(None, Result::err)
+    }
+
+    /// A miss on a [`Self::prealloc`]ed pool: an object from the shelf, and up to a cluster
+    /// more into this thread's cache (T475).
+    fn unshelve(&'static self, boxed: bool) -> Option<T> {
+        if self.shared.shelf_count.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        self.cache
+            .try_with(|c| {
+                let mut l = c.inner.try_borrow_mut().ok()?;
+                let mut stock = self.shelf.lock();
+                let v = stock.pop()?;
+                let mut bytes = v.footprint();
+                let more = (CLUSTER - 1).min(l.pre.saturating_sub(l.items.len())).min(l.items.capacity() - l.items.len()).min(stock.len());
+                let at = stock.len() - more;
+                for o in stock.drain(at..) {
+                    bytes += o.footprint();
+                    l.items.push(o);
+                }
+                self.shared.shelf_count.fetch_sub(more + 1, Ordering::Relaxed);
+                self.shared.shelf_bytes.fetch_sub(bytes, Ordering::Relaxed);
+                if boxed {
+                    l.boxes += 1;
+                }
+                Some(v)
+            })
+            .ok()
+            .flatten()
     }
 
     /// The cache's `Vec` is full: grows it (fallibly), and on the first use on this thread puts
@@ -915,6 +1048,11 @@ impl<T: Poolable> Pool<T> {
                 self.touch(&mut l);
             }
         });
+        if self.spec.presized {
+            if let Some(v) = self.unshelve(boxed) {
+                return Some(v);
+            }
+        }
         let limited = boxed && self.spec.limited;
         if (limited && self.at_limit()) || (boxed && inject_failure()) {
             self.shared.failures.fetch_add(1, Ordering::Relaxed);
@@ -1026,6 +1164,8 @@ impl<T: Poolable> PoolDyn for Pool<T> {
             bytes = bytes.wrapping_add(s.bytes.load(Ordering::Relaxed));
             boxes = boxes.wrapping_add(s.boxes.load(Ordering::Relaxed));
         }
+        count = count.wrapping_add(self.shared.shelf_count.load(Ordering::Relaxed));
+        bytes = bytes.wrapping_add(self.shared.shelf_bytes.load(Ordering::Relaxed));
         let used = usize::try_from(boxes).unwrap_or(0);
         let nominal = T::nominal_size();
         let size = if self.spec.size != 0 {
@@ -1185,10 +1325,11 @@ macro_rules! declare_pool {
         $(#[$m])*
         $vis static $name: $crate::pool::Pool<$t> = {
             static SHARED: $crate::pool::PoolShared = $crate::pool::PoolShared::new();
+            static SHELF: $crate::pool::Shelf<$t> = $crate::pool::Shelf::new();
             ::std::thread_local! {
                 static CACHE: $crate::pool::Cache<$t> = const { $crate::pool::Cache::new() };
             }
-            $crate::pool::Pool::new($spec.at(file!(), line!()), &SHARED, &CACHE)
+            $crate::pool::Pool::new($spec.at(file!(), line!()), &SHARED, &SHELF, &CACHE)
         };
     };
 }
@@ -1209,6 +1350,7 @@ mod tests {
     crate::declare_pool!(static BLOBS: Pool<Blob> = PoolSpec::new("t_blobs").max_item(100););
     crate::declare_pool!(static PREFILLED: Pool<Blob> = PoolSpec::new("t_prefilled").limited(););
     crate::declare_pool!(static PRESIZED: Pool<Blob> = PoolSpec::new("t_presized").limited().floor(1).max_count(2).presized(););
+    crate::declare_pool!(static SHELVED: Pool<Blob> = PoolSpec::new("t_shelved").limited().max_item(100).max_count(2).presized(););
 
     /// A pooled type that keeps the default [`Poolable::keep`] (footprint within the bound).
     #[derive(Debug, Default)]
@@ -1272,6 +1414,7 @@ mod tests {
         static RUNTIME_CACHE: Cache<Vec<u8>> = const { Cache::new() };
     }
     static RUNTIME_SHARED: PoolShared = PoolShared::new();
+    static RUNTIME_SHELF: Shelf<Vec<u8>> = Shelf::new();
 
     /// `-dMfail` with `tune.fail-alloc 50`: about half the takes are refused, each counted and
     /// marked as injected, nothing is cached meanwhile (each take is an allocation), and the
@@ -1406,7 +1549,7 @@ mod tests {
         assert!(Cache::<String>::default().inner.borrow().items.is_empty());
         let shared = PoolShared::default();
         assert!(!shared.registered.load(Ordering::Relaxed) && shared.failures.load(Ordering::Relaxed) == 0);
-        let pool: &'static Pool<Vec<u8>> = Box::leak(Box::new(Pool::new(spec, &RUNTIME_SHARED, &RUNTIME_CACHE)));
+        let pool: &'static Pool<Vec<u8>> = Box::leak(Box::new(Pool::new(spec, &RUNTIME_SHARED, &RUNTIME_SHELF, &RUNTIME_CACHE)));
         assert_eq!(pool.spec().name, "t_runtime");
         assert_eq!(PoolDyn::name(pool), "t_runtime");
         pool.give(vec_of(100).expect("vec"));
@@ -1495,6 +1638,50 @@ mod tests {
         drop(boxes);
         assert_eq!(PRESIZED.local_count(), 5, "all kept, past max_count 2");
         assert_eq!(PRESIZED.shared.grown.load(Ordering::Relaxed), 5);
+    }
+
+    /// T475: past [`PREALLOC_LOCAL`], `prealloc(n)` puts the rest on the shelf. A miss takes
+    /// one from it and a cluster more into the cache; a give to a full cache moves itself and a
+    /// cluster onto it. `show pools` counts the shelf as cached: `allocated` stays at the limit.
+    #[test]
+    fn prealloc_past_the_local_size_shelves_the_rest_for_any_thread() {
+        std::thread::spawn(|| {
+            SHELVED.set_limit(40);
+            assert!(SHELVED.prealloc(40));
+            assert_eq!(SHELVED.local_count(), PREALLOC_LOCAL);
+            assert_eq!(SHELVED.shared.shelf_count.load(Ordering::Relaxed), 8);
+            assert_eq!(SHELVED.shared.grown.load(Ordering::Relaxed), 40);
+            let mut boxes: Vec<_> = (0..PREALLOC_LOCAL).map(|_| SHELVED.take().expect("a cached object")).collect();
+            boxes.push(SHELVED.take().expect("one from the shelf"));
+            assert_eq!(SHELVED.local_count(), CLUSTER - 1, "and a cluster less one into the cache");
+            assert_eq!(SHELVED.shared.shelf_count.load(Ordering::Relaxed), 0);
+            boxes.extend((0..CLUSTER - 1).map(|_| SHELVED.take().expect("a cached object")));
+            assert!(SHELVED.take().is_none(), "past the limit");
+            assert_eq!(SHELVED.failures(), 1);
+            drop(boxes);
+            assert_eq!(SHELVED.local_count(), PREALLOC_LOCAL - 1, "a full cache shelved itself and a cluster");
+            assert_eq!(SHELVED.shared.shelf_count.load(Ordering::Relaxed), 40 - (PREALLOC_LOCAL - 1));
+            super::publish_local();
+            let h = SHELVED.head();
+            assert_eq!((h.allocated, h.cached, h.used), (40, 40, 0));
+            assert_eq!(h.alloc_bytes, 400);
+            // Too large to keep: freed, not shelved.
+            SHELVED.give(Blob(1000));
+            assert_eq!(SHELVED.local_count(), PREALLOC_LOCAL - 1);
+            assert_eq!(SHELVED.shared.shelf_count.load(Ordering::Relaxed), 40 - (PREALLOC_LOCAL - 1));
+        })
+        .join()
+        .expect("thread");
+        // A thread that did not prealloc keeps the spec's two and frees the third.
+        std::thread::spawn(|| {
+            for _ in 0..3 {
+                SHELVED.give(Blob(10));
+            }
+            assert_eq!(SHELVED.local_count(), 2);
+            assert_eq!(SHELVED.shared.shelf_count.load(Ordering::Relaxed), 40 - (PREALLOC_LOCAL - 1));
+        })
+        .join()
+        .expect("thread");
     }
 
     /// A box given back to a full pool is freed and leaves the limit's count; eviction stops at
