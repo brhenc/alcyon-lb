@@ -134,6 +134,20 @@ fn soft_under_a_free_storm_stays_within_its_bytes_and_counts_the_forced_wipes() 
     free_big_secret(max * 2);
     let got = ibex_alloc::freed_bytes().expect("too big to wait");
     assert!(zeros(&got), "{got:?}");
+    // A bound lowered under what waits: the next pass frees down to it (forced).
+    zof::set_bounds(max, Duration::from_secs(3600));
+    zof::set_pass_budget(0);
+    zof::pass(Instant::now(), false);
+    for _ in 0..8 {
+        drop(std::hint::black_box(vec![7u8; 4000]));
+    }
+    let (held, forced) = (zof::local_stats().bytes, zof::local_stats().forced);
+    assert!(held >= 8 * 4000, "{held}");
+    zof::set_bounds(10_000, Duration::from_secs(3600));
+    zof::pass(Instant::now(), false);
+    assert!(zof::local_stats().bytes <= 10_000, "{:?}", zof::local_stats());
+    assert!(zof::local_stats().forced >= forced + 5);
+    zof::set_pass_budget(zof::PASS_BUDGET_DEFAULT);
     zof::set_zero_on_free(ZeroOnFree::Off);
     let _ = zof::drain_local();
 }
@@ -196,6 +210,8 @@ fn the_setting_names_and_the_failed_allocation_retry() {
     assert_eq!(ZeroOnFree::parse("off"), Some(ZeroOnFree::Off));
     assert_eq!(ZeroOnFree::parse("on"), None);
     assert_eq!(ZeroOnFree::Soft.name(), "soft");
+    assert_eq!(ZeroOnFree::Off.name(), "off");
+    assert_eq!(ZeroOnFree::Hard.name(), "hard");
     assert_eq!(zof::zero_on_free(), ZeroOnFree::Soft);
     // A refused allocation frees the quarantine first (it may hold what the allocation needs).
     free_secret();
@@ -250,9 +266,14 @@ fn the_process_allocator_applies_the_setting_and_retries_after_emptying_the_quar
         zof::set_zero_on_free(ZeroOnFree::Soft);
         zof::pass(Instant::now(), false);
         let huge = Layout::from_size_align(1 << 62, 8).expect("layout");
-        for f in 0..3 {
+        for f in 0..4 {
+            zof::set_zero_on_free(ZeroOnFree::Soft);
             free_secret();
             assert_eq!(ibex_alloc::freed_bytes(), None, "quarantined");
+            if f == 3 {
+                // Off again before a pass: a plain reallocation, refused, empties what is left.
+                zof::set_zero_on_free(ZeroOnFree::Off);
+            }
             let p = a.alloc(l);
             let got = match f {
                 0 => a.alloc(huge),
