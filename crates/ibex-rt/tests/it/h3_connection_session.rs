@@ -195,3 +195,18 @@ fn the_transport_windows_follow_bufsize_and_the_stream_data_ratio() {
         assert_eq!(p.params(), expected, "global: {global:?}");
     }
 }
+
+/// `global maxconn` reached: HAProxy's listener does not accept the connection at all, so it is
+/// neither waiting nor in any counter (3.5-dev7, `global maxconn 3`, 6 connections: `CurrConns 3`,
+/// `CumSslConns 3`, `scur 3`, three clients served and three failed).
+#[test]
+fn global_maxconn_refuses_the_connections_beyond_it() {
+    let rig = start("globalmax", "  maxconn 3\n", "");
+    let mut p = Probe::run(rig.quic, 6, 1, 3, 4);
+    assert_eq!(p.served(3), "ready ok=3 fail=3");
+    let s = stat(&rig.sock);
+    let i = info(&rig.sock);
+    assert_eq!((s["scur"], s["stot"], s["req_tot"]), (3, 3, 3), "{s:?}");
+    assert_eq!((i["CurrConns"], i["CurrSslConns"], i["CumSslConns"]), (3, 3, 3));
+    assert_eq!(p.line(), "closed");
+}

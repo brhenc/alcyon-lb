@@ -278,23 +278,26 @@ impl QuicListener {
     }
 
     /// Connections that completed their handshake since the last call, now waiting for
-    /// admission; their number, for the engine to count.
-    pub fn take_handshaken(&mut self) -> usize {
-        let n = self.handshaken.len();
-        self.waiting.extend(self.handshaken.drain(..));
-        n
+    /// admission, for the engine to count (or [`QuicListener::refuse`]).
+    pub fn take_handshaken(&mut self) -> Vec<ConnectionId> {
+        let new = std::mem::take(&mut self.handshaken);
+        self.waiting.extend(new.iter().copied());
+        new
+    }
+
+    /// Closes a connection the engine will not count (`global maxconn` is reached, as
+    /// `HAProxy`'s listener refuses it).
+    pub fn refuse(&mut self, conn_id: ConnectionId) {
+        self.pending.remove(&conn_id);
+        self.held.remove(&conn_id);
+        self.waiting.retain(|c| *c != conn_id);
+        self.endpoint.close_connection(conn_id, H3_NO_ERROR, b"");
     }
 
     /// Whether a connection waits for admission.
     #[must_use]
     pub fn has_waiting(&self) -> bool {
         !self.waiting.is_empty()
-    }
-
-    /// Connections waiting for admission (for the engine's global `maxconn` arithmetic).
-    #[must_use]
-    pub fn waiting_len(&self) -> usize {
-        self.waiting.len() + self.handshaken.len()
     }
 
     /// Serves the oldest waiting connection: its control stream, and the streams it opened

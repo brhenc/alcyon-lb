@@ -5306,18 +5306,18 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     proxy.maxconn.dec();
                 }
             }
-            for _ in 0..ql.take_handshaken() {
-                crate::globalconn::acquire();
+            for conn_id in ql.take_handshaken() {
+                // `global maxconn` is reached: HAProxy's listener does not accept it, and it
+                // is in no counter.
+                if !crate::globalconn::try_acquire() {
+                    ql.refuse(conn_id);
+                    continue;
+                }
                 crate::stats::SSL_CURR.fetch_add(1, Ordering::Relaxed);
                 crate::stats::SSL_CUM.fetch_add(1, Ordering::Relaxed);
             }
             while ql.has_waiting() {
                 let proxy = &self.proxies[proxy_idx];
-                // The waiting connections hold a slot of `global maxconn` themselves.
-                let (gmax, cur) = (crate::globalconn::max(), crate::globalconn::current());
-                if gmax != 0 && usize::try_from(cur).unwrap_or(usize::MAX).saturating_sub(ql.waiting_len()) >= gmax as usize {
-                    break;
-                }
                 if !proxy.maxconn.try_inc() {
                     break;
                 }
