@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! `-m <megs>` as `HAProxy` means it: a budget that sizes `maxconn`, shown as `Memmax_MB` and
-//! `Memmax_bytes`, never an rlimit (past an `RLIMIT_AS` Rust aborts the process on the first
-//! failed allocation). Every expected value was measured on `haproxy` 3.5-dev8-885761-29
+//! `Memmax_bytes`, and `RLIMIT_DATA` soft and hard (T465b; never `RLIMIT_AS`). Every expected value was measured on `haproxy` 3.5-dev8-885761-29
 //! (2026-10-17, `nbthread 1`, `tune.bufsize` 16384):
 //!
 //! | config                         | `-m` | Maxconn | Memmax_bytes | other                           |
@@ -168,8 +167,9 @@ fn explicit_maxconn_too_high_for_tls_is_refused() {
 }
 
 /// `-m 8` used to be `setrlimit(RLIMIT_AS, 8 MB)`: the worker died of `memory allocation of
-/// N bytes failed` (exit 134) under 200 connections. `HAProxy` sets no rlimit; with `-m 8` its
-/// `maxconn` is 220 and it serves all of them.
+/// N bytes failed` (exit 134) under 200 connections. `HAProxy` sets `RLIMIT_DATA` to 8 MiB (its
+/// `VmData` is already 43 MB then); its `maxconn` is 220 and it serves all 200 (measured 2026-10-25).
+/// Ibex does the same, under the same limit.
 #[test]
 fn m8_with_200_keepalive_connections_does_not_abort() {
     let port = common::reserve_port();
@@ -192,4 +192,35 @@ fn m8_with_200_keepalive_connections_does_not_abort() {
     // bindable for the next run.
     drop(conns);
     std::thread::sleep(std::time::Duration::from_millis(300));
+}
+
+/// `-m N` sets `RLIMIT_DATA`, soft and hard, to N MiB, as `HAProxy` 3.5-dev8 does (measured:
+/// `Max data size 67108864 67108864 bytes` for `-m 64`, 8388608 for `-m 8`; T465).
+#[test]
+fn m_sets_rlimit_data_soft_and_hard() {
+    for (megs, bytes) in [("64", "67108864"), ("8", "8388608")] {
+        let port = common::reserve_port();
+        let (cfg, sock) = config(&format!("mlimit{megs}"), port, false, "");
+        let run = spawn(megs, &cfg, sock, port);
+        let limits = std::fs::read_to_string(format!("/proc/{}/limits", run.child.id())).expect("limits");
+        let line = limits.lines().find(|l| l.starts_with("Max data size")).expect("Max data size");
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(fields[3..5], [bytes, bytes], "-m {megs}: {line}");
+    }
+}
+
+/// A hard `RLIMIT_DATA` below the `-m` budget cannot be raised unprivileged: `HAProxy` 3.5-dev8
+/// exits 1 with `[ALERT] ... : [haproxy.main()] Cannot fix MEM limit to 300 megs.` (measured
+/// under `prlimit --data=200000000`; T465).
+#[test]
+fn m_above_the_hard_data_limit_is_refused() {
+    let port = common::reserve_port();
+    let (cfg, _sock) = config("mhard", port, false, "");
+    let out = Command::new("prlimit")
+        .args(["--data=200000000", env!("CARGO_BIN_EXE_ibex"), "-m", "300", "-f", &cfg])
+        .output()
+        .expect("prlimit");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {err}");
+    assert!(err.contains("[haproxy.main()] Cannot fix MEM limit to 300 megs."), "stderr: {err}");
 }

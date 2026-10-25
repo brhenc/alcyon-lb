@@ -26,6 +26,19 @@ static LISTENERS: AtomicUsize = AtomicUsize::new(0);
 /// connections refused afterwards and stats-socket accepts included, as in listener.c.
 static REACHED: AtomicU64 = AtomicU64::new(0);
 
+/// `-m <megs>`: `RLIMIT_DATA`, soft and hard, to `megs` MiB, as `HAProxy` sets it (T465). Past
+/// it an allocation fails: Ibex's buffers, sessions, timers and idle lists fail one stream or
+/// connection then (tradeoff.md 6.23), other allocations abort the process.
+///
+/// # Errors
+/// `HAProxy`'s alert, which it exits 1 with, when the limit cannot be set (a hard limit below
+/// it, without the privilege to raise it).
+pub fn apply_memmax_rlimit(megs: u64) -> Result<(), String> {
+    use rustix::process::{setrlimit, Resource, Rlimit};
+    let bytes = megs.saturating_mul(1_048_576);
+    setrlimit(Resource::Data, Rlimit { current: Some(bytes), maximum: Some(bytes) }).map_err(|_| format!("[haproxy.main()] Cannot fix MEM limit to {megs} megs."))
+}
+
 /// Raises the soft limit on open files to `maxsock` when it is lower, as `HAProxy` does at
 /// startup (`apply_nofile_limit`, src/limits.c): the hard limit is raised along with it when
 /// it is lower too (which only a privileged process may do); a higher soft limit is left

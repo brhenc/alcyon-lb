@@ -709,7 +709,6 @@ impl IdlePool {
         let slot = &self.pools.slots[self.wid];
         let mut pool = IdlePools::lock(slot);
         let pools = &*self.pools;
-        let mut closed: Vec<((usize, usize), usize)> = Vec::new();
         // `srv_cleanup_idle_conns`: the server's idle connections, peak and need are
         // server-wide, and this worker closes its share of the excess (T270: weighed per
         // worker, each worker's few idle connections stood against the whole server's peak
@@ -732,15 +731,12 @@ impl IdlePool {
             });
             (s.max_used, s.est_need) = (in_use, est);
             let n = to_kill.map_or(0, |k| (k.saturating_mul(own) / all).saturating_add(1).min(own));
-            if n > 0 {
-                closed.push((srv, n));
-            }
+            // Counted here, as the counts above are: no list of what was closed, whose memory
+            // could fail (T465).
+            pools.count_idle(srv, 0, n);
             n
         });
         slot.conns.store(pool.conns, Ordering::Relaxed);
-        for (srv, n) in closed {
-            pools.count_idle(srv, 0, n);
-        }
         self.next_purge = pool.next_purge();
     }
 }
@@ -3660,9 +3656,7 @@ pub fn prebind_quic(config: &Config, workers: usize) -> io::Result<()> {
 /// `-m <megs>` as `HAProxy` applies it (`compute_ideal_maxconn`, src/limits.c): the budget
 /// is recorded for `show info` and `/metrics`, and sizes `global maxconn` when the
 /// configuration has none; a configured one that leaves no room for TLS is refused.
-/// Nothing is limited at the system level, where `HAProxy` also sets `RLIMIT_DATA`: past it
-/// `malloc` would fail and Rust aborts the process, where `HAProxy`'s pools fail one stream.
-/// Ibex sets it once its pools are fallible (T448, tradeoff.md 6.25, docs/differences.md).
+/// `RLIMIT_DATA` is set apart, by `globalconn::apply_memmax_rlimit` (T465, tradeoff.md 6.25).
 ///
 /// # Errors
 /// The alert text `HAProxy` exits 1 with.
