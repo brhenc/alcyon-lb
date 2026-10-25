@@ -2012,6 +2012,12 @@ impl TcpSession {
         };
         self.rep.clear();
         if !self.rep.alloc_if_needed() {
+            // At `tune.buffers.limit` the reply waits for a buffer (S6b, `DB_MUX_TX`, the most
+            // critical queue), kept whole until then (`process_cli_io` copies it in).
+            if self.wait_for_buffer(crate::buf_wait::Class::MuxTx).is_ok() {
+                self.pending_resp = Some(Box::new(PendingOut::Raw(raw.to_vec(), 0)));
+                return;
+            }
             // No buffer for the answer either (S5): the connection is closed without one, as
             // `HAProxy` closes one whose reply it cannot allocate.
             self.pending_resp = None;
@@ -2372,6 +2378,13 @@ impl TcpSession {
         // the session waited out a timeout (T261).
         let changed_io = self.process_cli_io().unwrap_or_else(|e| {
             if crate::buf::is_oom(&e) {
+                // A TLS read refused its buffer at the limit (`xprt.rs` `read_once`): the
+                // stream waits for one, as for its request buffer (S6b). The request buffer,
+                // empty, goes back, so that a waiter holds nothing.
+                if self.cli_xprt.is_tls() && self.wait_for_buffer(crate::buf_wait::Class::MuxRx).is_ok() {
+                    self.req.release();
+                    return true;
+                }
                 self.fail_alloc();
             } else {
                 self.client_conn_failed();
@@ -2948,6 +2961,10 @@ impl TcpSession {
         }
 
         // Drain pending synthetic response into rep if space is available
+        if matches!(self.pending_resp.as_deref(), Some(PendingOut::Raw(..))) && !self.rep.is_allocated() && !self.rep.alloc_if_needed() {
+            // A reply waiting for a buffer (S6b, `write_reply_with`), refused again.
+            return self.wait_for_buffer(crate::buf_wait::Class::MuxTx).map(|_| changed);
+        }
         if let Some(PendingOut::Raw(ref data, ref mut offset)) = self.pending_resp.as_deref_mut() {
             if self.rep.writable().is_empty() && self.rep.len() < self.rep.capacity() {
                 self.rep.compact();

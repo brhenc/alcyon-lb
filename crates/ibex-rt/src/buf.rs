@@ -324,6 +324,12 @@ pub fn shelve_standard() -> usize {
     BUF_STD.shelve_local()
 }
 
+/// Standard buffers in this thread's cache.
+#[must_use]
+pub fn cached_standard() -> usize {
+    BUF_STD.local_count()
+}
+
 /// Standard buffers on the pool's shelf.
 #[must_use]
 pub fn shelved_standard() -> usize {

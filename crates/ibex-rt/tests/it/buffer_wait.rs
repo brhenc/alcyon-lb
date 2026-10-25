@@ -65,6 +65,9 @@ struct Proxy {
     port: u16,
     /// Frontend `fe2`, with `timeout client 2s`: same pool, its own timeout.
     port2: u16,
+    /// `fe`'s TLS bind (S6b), and the certificate it serves.
+    tls_port: u16,
+    cert: Option<rustls::pki_types::CertificateDer<'static>>,
     log: Arc<Mutex<String>>,
     dir: tempfile::TempDir,
 }
@@ -110,7 +113,7 @@ impl Proxy {
 }
 
 /// The proxy, `nbthread 1`, with `tune.buffers.limit 3` and this `timeout client` (frontend
-/// `fe2`: 2 s).
+/// `fe2`: 2 s). `fe` answers `GET /r` itself (`hello`) and has a TLS bind too.
 fn start(timeout_client: &str) -> Proxy {
     let be = backend();
     let dir = tempfile::TempDir::new().expect("dir");
@@ -118,16 +121,22 @@ fn start(timeout_client: &str) -> Proxy {
     let sock = dir.path().join("s.sock");
     let port = common::reserve_port();
     let port2 = common::reserve_port();
+    let tls_port = common::reserve_port();
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+    let pem = dir.path().join("c.pem");
+    std::fs::write(&pem, format!("{}{}", ck.cert.pem(), ck.key_pair.serialize_pem())).expect("write pem");
     std::fs::write(
         &cfg,
         format!(
             "global\n\tnbthread 1\n\ttune.buffers.limit 3\n\tstats socket {} level admin\n\
              defaults\n\tmode http\n\tlog stderr format raw local0\n\toption httplog\n\
              \ttimeout connect 3s\n\ttimeout client {timeout_client}\n\ttimeout server 5s\n\n\
-             frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\tbind 127.0.0.1:{tls_port} ssl crt {}\n\
+             \thttp-request return status 200 content-type text/plain string hello if {{ path /r }}\n\tdefault_backend be\n\n\
              frontend fe2\n\tbind 127.0.0.1:{port2}\n\ttimeout client 2s\n\tdefault_backend be\n\n\
              backend be\n\tserver s1 127.0.0.1:{be}\n",
-            sock.display()
+            sock.display(),
+            pem.display()
         ),
     )
     .expect("write config");
@@ -145,12 +154,17 @@ fn start(timeout_client: &str) -> Proxy {
     });
     assert!(common::wait_listening(([127, 0, 0, 1], port).into()), "the proxy never listened on {port}");
     assert!(common::wait_listening(([127, 0, 0, 1], port2).into()), "the proxy never listened on {port2}");
-    Proxy { child, port, port2, log, dir }
+    Proxy { child, port, port2, tls_port, cert: Some(ck.cert.der().clone()), log, dir }
 }
 
 /// Three connections each holding a buffer for a partial request head: the limit.
 fn hold(port: u16) -> Vec<TcpStream> {
-    let held = (0..3)
+    hold_n(port, 3)
+}
+
+/// `n` connections each holding a buffer for a partial request head.
+fn hold_n(port: u16, n: usize) -> Vec<TcpStream> {
+    let held = (0..n)
         .map(|_| {
             let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
             c.write_all(b"GET /held HTTP/1.1\r\nHost: x\r\n").expect("partial head");
@@ -324,7 +338,7 @@ fn start_two_threads() -> Proxy {
         }
     });
     assert!(common::wait_listening(([127, 0, 0, 1], port).into()), "the proxy never listened on {port}");
-    Proxy { child, port, port2, log, dir }
+    Proxy { child, port, port2, tls_port: 0, cert: None, log, dir }
 }
 
 /// The worker thread serving `c`, asked with `GET /t` (the connection stays open).
@@ -420,4 +434,100 @@ fn a_waiter_is_woken_by_buffers_another_thread_gives_back() {
     drop(a);
     let (got, took) = waiter.join().expect("B");
     assert!(got.starts_with("HTTP/1.1 200") && took < Duration::from_secs(3), "B after A's holders left, {took:?}: {got:?}\n{}", p.log());
+}
+
+// -----------------------------------------------------------------------------
+// S6b §2: a local reply and a TLS read past the limit wait too
+// -----------------------------------------------------------------------------
+
+/// Two holders and a `GET /r` the frontend answers itself: its request has the third buffer
+/// and the reply none. Measured on `HAProxy` 3.5-dev8 (`limit 3`, `reserve 0`): the request
+/// waits and is answered `200` once a holder leaves (0.7 s, when it left). Ibex closed the
+/// connection without an answer (`write_reply_with`: no buffer for the reply). Now the reply
+/// waits for a buffer, and gets the one its request, consumed, gave back: it is answered while
+/// the holders stay (Ibex's request and reply do not need two buffers at once, `HAProxy`'s do).
+#[test]
+fn a_local_reply_past_the_limit_waits_for_a_buffer() {
+    let p = start("10s");
+    let _held = hold_n(p.port, 2);
+    let t = Instant::now();
+    let mut c = TcpStream::connect(("127.0.0.1", p.port)).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let _ = c.write_all(b"GET /r HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    let mut got = Vec::new();
+    let _ = c.read_to_end(&mut got);
+    let got = String::from_utf8_lossy(&got);
+    assert!(got.starts_with("HTTP/1.1 200") && got.ends_with("hello"), "the local reply at the limit: {got:?}\n{}", p.log());
+    assert!(t.elapsed() < Duration::from_secs(2), "answered after {:?}", t.elapsed());
+}
+
+/// The same with the start of a second request behind the first: the request buffer is not
+/// empty after the first, so the reply has no buffer until a holder leaves; it waits for one
+/// (it was closed unanswered), and is answered then, as on `HAProxy`.
+#[test]
+fn a_local_reply_with_a_pipelined_request_waits_for_a_holder_to_leave() {
+    let p = start("10s");
+    let mut held = hold_n(p.port, 2);
+    let port = p.port;
+    let waiter = thread::spawn(move || {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        c.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let _ = c.write_all(b"GET /r HTTP/1.1\r\nHost: x\r\n\r\nGET /r HTTP/1.1\r\n");
+        let mut got = Vec::new();
+        let mut b = [0u8; 4096];
+        while !got.ends_with(b"hello") {
+            match c.read(&mut b) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got.extend_from_slice(&b[..n]),
+            }
+        }
+        String::from_utf8_lossy(&got).into_owned()
+    });
+    thread::sleep(Duration::from_millis(700));
+    assert!(!waiter.is_finished(), "the local reply did not wait: {:?}\n{}", waiter.join().ok(), p.log());
+    drop(held.remove(0));
+    let got = waiter.join().expect("waiter");
+    assert!(got.starts_with("HTTP/1.1 200") && got.ends_with("hello"), "not answered once a buffer was free: {got:?}\n{}", p.log());
+}
+
+/// A TLS connection past the limit: Ibex reads the handshake into a standard buffer (`HAProxy`'s
+/// OpenSSL reads into its own memory: measured, its handshake completes at once and the request
+/// waits). The connection waits for the buffer, and is served `200` once the holders leave,
+/// where it failed (S5) with the handshake refused.
+#[test]
+fn a_tls_connection_past_the_limit_waits_for_a_buffer() {
+    let p = start("10s");
+    let held = hold(p.port);
+    let cert = p.cert.clone().expect("cert");
+    let addr: std::net::SocketAddr = ([127, 0, 0, 1], p.tls_port).into();
+    let waiter = thread::spawn(move || {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("root");
+        let cfg = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("name");
+        let conn = rustls::ClientConnection::new(Arc::new(cfg), name).expect("client");
+        let tcp = TcpStream::connect(addr).expect("connect");
+        tcp.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let mut tls = rustls::StreamOwned::new(conn, tcp);
+        let _ = tls.write_all(b"GET /r HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let mut got = Vec::new();
+        let mut b = [0u8; 4096];
+        loop {
+            match tls.read(&mut b) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&b[..n]),
+                Err(e) => {
+                    got.extend_from_slice(format!(" <{e}>").as_bytes());
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&got).into_owned()
+    });
+    thread::sleep(Duration::from_millis(700));
+    assert!(!waiter.is_finished(), "the TLS connection did not wait: {:?}\n{}", waiter.join().ok(), p.log());
+    drop(held);
+    let got = waiter.join().expect("waiter");
+    assert!(got.starts_with("HTTP/1.1 200") && got.contains("hello"), "not served once buffers were free: {got:?}\n{}", p.log());
 }

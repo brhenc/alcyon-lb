@@ -472,6 +472,11 @@ impl TlsConn {
             Err(e) => Err(e),
         };
         if let Err(e) = &r {
+            // No buffer to read into (`read_once`): nothing was read, the stream may wait for
+            // one and come back (S6b).
+            if crate::buf::is_oom(e) {
+                return r;
+            }
             self.failed = true;
             self.fail = Some(if e.kind() == io::ErrorKind::UnexpectedEof {
                 // The first record was a whole handshake record with a message header in it, and

@@ -16614,6 +16614,12 @@ fn buf_wait_enter(entry: &mut SessionEntry, session_idx: u32) {
     }
     if crate::buf_wait::enter(entry.task, session_idx, class, front) {
         entry.buf_wait.enqueued(class);
+        // A buffer given back on this thread after the refusal, before the stream was queued
+        // (the stream's own empty request buffer, released as it waits for a TLS read: S6b)
+        // was offered to nobody: it is the waiter's now.
+        if crate::buf::cached_standard() > 0 {
+            crate::buf_wait::reoffer();
+        }
     } else {
         entry.sess.fail_alloc();
     }
