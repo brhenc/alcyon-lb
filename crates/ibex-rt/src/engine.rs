@@ -14324,7 +14324,7 @@ fn req_set_method(sess: &mut TcpSession, method: String) -> bool {
 
 /// The bytes the request's headers named `name` take in the HTX message.
 fn req_hdr_bytes(sess: &TcpSession, name: &str) -> usize {
-    sess.htx_slice().map_or(0, |h| h.headers().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(k, v)| htx_hdr_size(k, v)).sum())
+    sess.htx_slice().map_or(0, |h| h.header_blocks_where(|k| k.eq_ignore_ascii_case(name.as_bytes())).map(|(_, k, v)| htx_hdr_size(k, v)).sum())
 }
 
 /// `add-header` (`replace` false) and `set-header` (`replace` true: every occurrence goes

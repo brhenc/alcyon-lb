@@ -36,6 +36,9 @@ const RULES: &str = "  acl api path_reg ^/(api|v[0-9]+)/\n  acl hosty hdr(host) 
 /// `measure-bench backend`'s answer: a `Server` header for the response rule to remove.
 const RSP: &[u8] = b"HTTP/1.1 200 OK\r\nServer: be\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
 
+/// The index in [`work`]'s counts of the HTX blocks read as UTF-8 ([`ibex_proto::htx::utf8_checks_on_this_thread`]).
+const UTF8: usize = 4;
+
 /// A keep-alive server: one answer per request head, on every connection it accepted.
 fn backend(listener: TcpListener, running: Arc<AtomicBool>) -> thread::JoinHandle<Vec<Vec<u8>>> {
     thread::spawn(move || {
@@ -82,12 +85,12 @@ fn request(client: &mut TcpStream, engine: &mut Engine) -> String {
 
 /// The counts of `rounds` requests on each of `clients` keep-alive connections (in turn), after
 /// a warm-up request on each; the last response, and the last request head the server saw.
-fn work(clients: usize, rounds: usize) -> ([u64; 4], String, String) {
+fn work(clients: usize, rounds: usize) -> ([u64; 5], String, String) {
     work_with(RULES, clients, rounds)
 }
 
 /// [`work`] with the frontend's `rules`.
-fn work_with(rules: &str, clients: usize, rounds: usize) -> ([u64; 4], String, String) {
+fn work_with(rules: &str, clients: usize, rounds: usize) -> ([u64; 5], String, String) {
     let srv = TcpListener::bind("127.0.0.1:0").expect("bind");
     let srv_addr = srv.local_addr().expect("addr");
     let fe = common::reserve_addr();
@@ -110,19 +113,21 @@ fn work_with(rules: &str, clients: usize, rounds: usize) -> ([u64; 4], String, S
         last = request(c, &mut engine);
     }
     let before = ibex_sample::work::on_this_thread();
+    let utf8_before = ibex_proto::htx::utf8_checks_on_this_thread();
     for _ in 0..rounds {
         for c in &mut conns {
             last = request(c, &mut engine);
         }
     }
     let after = ibex_sample::work::on_this_thread();
+    let utf8 = ibex_proto::htx::utf8_checks_on_this_thread() - utf8_before;
     drop(conns);
     for _ in 0..5 {
         let _ = engine.run_once();
     }
     running.store(false, Ordering::Relaxed);
     let seen = be.join().expect("backend").pop().unwrap_or_default();
-    (std::array::from_fn(|i| after[i] - before[i]), last, String::from_utf8_lossy(&seen).into_owned())
+    (std::array::from_fn(|i| if i == UTF8 { utf8 } else { after[i] - before[i] }), last, String::from_utf8_lossy(&seen).into_owned())
 }
 
 /// Per request on one keep-alive connection: what the rules cost, and what they still do.
@@ -131,7 +136,7 @@ fn the_rules_scenario_costs_what_is_pinned() {
     const N: u64 = 50;
     let (counts, rsp, seen) = work(1, N as usize);
     let per = counts.map(|c| c as f64 / N as f64);
-    println!("[MEASUREMENT S7] per request: rebuilds {}, context copies {}, expression lookups {}, idle scanned {}", per[Op::ReqRebuild as usize], per[Op::CtxClone as usize], per[Op::ExprLookup as usize], per[Op::IdleScanned as usize]);
+    println!("[MEASUREMENT S7] per request: rebuilds {}, context copies {}, expression lookups {}, idle scanned {}, UTF-8 reads {}", per[Op::ReqRebuild as usize], per[Op::CtxClone as usize], per[Op::ExprLookup as usize], per[Op::IdleScanned as usize], per[UTF8]);
     // The rules did what they say.
     assert!(rsp.starts_with("HTTP/1.1 200") && rsp.contains("x-served: ibex") && !rsp.to_ascii_lowercase().contains("server: be"), "response: {rsp:?}");
     let seen_lc = seen.to_ascii_lowercase();
@@ -139,6 +144,7 @@ fn the_rules_scenario_costs_what_is_pinned() {
     assert_eq!(counts[Op::ReqRebuild as usize], N, "request head rebuilds: one per rule pass");
     assert_eq!(counts[Op::CtxClone as usize], 0, "sample context copies");
     assert_eq!(counts[Op::ExprLookup as usize], 0, "expressions looked up by text");
+    assert_eq!(counts[UTF8], 24 * N, "HTX blocks read as UTF-8");
 }
 
 /// Idle server connections looked at per request, with eight clients taking turns: each request

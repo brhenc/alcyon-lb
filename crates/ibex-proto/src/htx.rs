@@ -20,6 +20,25 @@ use std::fmt;
 use std::io::Write;
 
 /// Maximum length of header / trailer name in bytes.
+
+thread_local! {
+    static UTF8_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the HTX has read a block's bytes as UTF-8 on this thread: a test reads it
+/// around a request to hold the rules path to the few it needs (S7).
+#[must_use]
+pub fn utf8_checks_on_this_thread() -> u64 {
+    UTF8_CHECKS.with(std::cell::Cell::get)
+}
+
+/// [`std::str::from_utf8`], counted.
+#[inline]
+fn utf8(b: &[u8]) -> Result<&str, std::str::Utf8Error> {
+    UTF8_CHECKS.with(|n| n.set(n.get() + 1));
+    std::str::from_utf8(b)
+}
+
 pub const HTX_HDR_NAME_MAX_LEN: usize = 255;
 /// Maximum length of header / trailer value in bytes (1 MB).
 pub const HTX_HDR_VALUE_MAX_LEN: usize = 1_048_575;
@@ -51,7 +70,7 @@ pub fn latin1_to_text(value: &[u8]) -> String {
 /// The bytes a value of [`HTX_BLK_FL_LATIN1`] stands for, written at `cursor`.
 fn write_latin1(out: &mut [u8], cursor: usize, text: &[u8]) -> Result<usize, HtxError> {
     // Held as text this crate wrote.
-    let Ok(text) = std::str::from_utf8(text) else { return write_slice(out, cursor, text) };
+    let Ok(text) = utf8(text) else { return write_slice(out, cursor, text) };
     write_slice(out, cursor, &ibex_regex::bytetext::text_to_bytes(text))
 }
 
@@ -658,7 +677,7 @@ fn replace_block_value_raw(
     }
     // The value is written as bytes when it holds an escaped byte (T286).
     if desc.blk_type == HtxBlockType::Header {
-        let escaped = !new_value.is_ascii() && std::str::from_utf8(new_value).is_ok_and(ibex_regex::bytetext::has_escapes);
+        let escaped = !new_value.is_ascii() && utf8(new_value).is_ok_and(ibex_regex::bytetext::has_escapes);
         if escaped {
             desc.flags |= HTX_BLK_FL_LATIN1;
         } else {
@@ -798,7 +817,7 @@ impl<'a> HtxSliceRef<'a> {
             if desc.blk_type == HtxBlockType::ReqLine {
                 let start = desc.addr as usize;
                 let end = start + desc.value_len as usize;
-                let raw = std::str::from_utf8(&self.buf[start..end]).ok()?;
+                let raw = utf8(&self.buf[start..end]).ok()?;
                 let [method, uri, version] = if raw.is_ascii() { ascii_words3(raw) } else { words3(raw) };
                 let method = method?;
                 let uri = uri?;
@@ -823,7 +842,7 @@ impl<'a> HtxSliceRef<'a> {
         let [method, uri, version] = if raw.is_ascii() {
             ascii_words3_bytes(raw)
         } else {
-            words3(std::str::from_utf8(raw).ok()?).map(|w| w.map(str::as_bytes))
+            words3(utf8(raw).ok()?).map(|w| w.map(str::as_bytes))
         };
         Some(RequestLineBytes { method: method?, uri: uri?, version: version.unwrap_or(b"HTTP/1.1") })
     }
@@ -835,7 +854,7 @@ impl<'a> HtxSliceRef<'a> {
             if desc.blk_type == HtxBlockType::ResLine {
                 let start = desc.addr as usize;
                 let end = start + desc.value_len as usize;
-                let raw = std::str::from_utf8(&self.buf[start..end]).ok()?;
+                let raw = utf8(&self.buf[start..end]).ok()?;
                 let mut parts = raw.splitn(3, ' ');
                 let version = parts.next()?;
                 let _status_str = parts.next()?;
@@ -854,7 +873,7 @@ impl<'a> HtxSliceRef<'a> {
     /// there is none, or when its value is not UTF-8 ([`Self::get_header_bytes`] reads it).
     #[must_use]
     pub fn get_header(&self, name: &str) -> Option<&'a str> {
-        self.get_header_bytes(name.as_bytes()).and_then(|v| std::str::from_utf8(v).ok())
+        self.get_header_bytes(name.as_bytes()).and_then(|v| utf8(v).ok())
     }
 
     /// The value of the first header named `name` (ASCII case aside), as its bytes (T436:
@@ -877,11 +896,11 @@ impl<'a> HtxSliceRef<'a> {
             if desc.blk_type == HtxBlockType::Trailer {
                 let name_start = desc.addr as usize;
                 let name_end = name_start + desc.name_len as usize;
-                let hdr_name = std::str::from_utf8(&self.buf[name_start..name_end]).ok()?;
+                let hdr_name = utf8(&self.buf[name_start..name_end]).ok()?;
                 if hdr_name.eq_ignore_ascii_case(name) {
                     let val_start = name_end;
                     let val_end = val_start + desc.value_len as usize;
-                    return std::str::from_utf8(&self.buf[val_start..val_end]).ok();
+                    return utf8(&self.buf[val_start..val_end]).ok();
                 }
             }
         }
@@ -1072,8 +1091,8 @@ impl<'a> HtxSliceRef<'a> {
                 let name_end = name_start + desc.name_len as usize;
                 let val_start = name_end;
                 let val_end = val_start + desc.value_len as usize;
-                let name = std::str::from_utf8(&self.buf[name_start..name_end]).ok()?;
-                let val = std::str::from_utf8(&self.buf[val_start..val_end]).ok()?;
+                let name = utf8(&self.buf[name_start..name_end]).ok()?;
+                let val = utf8(&self.buf[val_start..val_end]).ok()?;
                 Some((name, val))
             } else {
                 None
@@ -1096,8 +1115,8 @@ impl<'a> HtxSliceRef<'a> {
                 return None;
             }
             let val_end = name_end + desc.value_len as usize;
-            let name = std::str::from_utf8(&self.buf[name_start..name_end]).ok()?;
-            let val = std::str::from_utf8(&self.buf[name_end..val_end]).ok()?;
+            let name = utf8(&self.buf[name_start..name_end]).ok()?;
+            let val = utf8(&self.buf[name_end..val_end]).ok()?;
             Some((i, name, val))
         })
     }
@@ -1114,8 +1133,8 @@ impl<'a> HtxSliceRef<'a> {
             let name_start = desc.addr as usize;
             let name_end = name_start + desc.name_len as usize;
             let val_end = name_end + desc.value_len as usize;
-            let name = std::str::from_utf8(&self.buf[name_start..name_end]).ok()?;
-            let val = std::str::from_utf8(&self.buf[name_end..val_end]).ok()?;
+            let name = utf8(&self.buf[name_start..name_end]).ok()?;
+            let val = utf8(&self.buf[name_end..val_end]).ok()?;
             Some((i, name, val))
         })
     }
@@ -1128,8 +1147,8 @@ impl<'a> HtxSliceRef<'a> {
                 let name_end = name_start + desc.name_len as usize;
                 let val_start = name_end;
                 let val_end = val_start + desc.value_len as usize;
-                let name = std::str::from_utf8(&self.buf[name_start..name_end]).ok()?;
-                let val = std::str::from_utf8(&self.buf[val_start..val_end]).ok()?;
+                let name = utf8(&self.buf[name_start..name_end]).ok()?;
+                let val = utf8(&self.buf[val_start..val_end]).ok()?;
                 Some((name, val))
             } else {
                 None
@@ -1211,7 +1230,7 @@ impl<'a> HtxSliceRef<'a> {
             let addr = desc.addr as usize;
             match desc.blk_type {
                 HtxBlockType::ReqLine => {
-                    let raw = std::str::from_utf8(&self.buf[addr..addr + desc.value_len as usize]).unwrap_or("");
+                    let raw = utf8(&self.buf[addr..addr + desc.value_len as usize]).unwrap_or("");
                     let mut parts = raw.split_whitespace();
                     blocks.push(HtxBlock::ReqLine(RequestLine {
                         method: HttpMethod::from_bytes(parts.next().unwrap_or("GET").as_bytes()),
@@ -1220,7 +1239,7 @@ impl<'a> HtxSliceRef<'a> {
                     }));
                 }
                 HtxBlockType::ResLine => {
-                    let raw = std::str::from_utf8(&self.buf[addr..addr + desc.value_len as usize]).unwrap_or("");
+                    let raw = utf8(&self.buf[addr..addr + desc.value_len as usize]).unwrap_or("");
                     let mut parts = raw.splitn(3, ' ');
                     blocks.push(HtxBlock::ResLine(ResponseLine {
                         version: HttpVersion::from_bytes(parts.next().unwrap_or("HTTP/1.1").as_bytes()),
@@ -1229,13 +1248,13 @@ impl<'a> HtxSliceRef<'a> {
                     }));
                 }
                 HtxBlockType::Header => {
-                    let name = std::str::from_utf8(&self.buf[addr..addr + desc.name_len as usize]).unwrap_or("").to_string();
-                    let value = std::str::from_utf8(&self.buf[addr + desc.name_len as usize..addr + desc.name_len as usize + desc.value_len as usize]).unwrap_or("").to_string();
+                    let name = utf8(&self.buf[addr..addr + desc.name_len as usize]).unwrap_or("").to_string();
+                    let value = utf8(&self.buf[addr + desc.name_len as usize..addr + desc.name_len as usize + desc.value_len as usize]).unwrap_or("").to_string();
                     blocks.push(HtxBlock::Header(HeaderField { name, value }));
                 }
                 HtxBlockType::Trailer => {
-                    let name = std::str::from_utf8(&self.buf[addr..addr + desc.name_len as usize]).unwrap_or("").to_string();
-                    let value = std::str::from_utf8(&self.buf[addr + desc.name_len as usize..addr + desc.name_len as usize + desc.value_len as usize]).unwrap_or("").to_string();
+                    let name = utf8(&self.buf[addr..addr + desc.name_len as usize]).unwrap_or("").to_string();
+                    let value = utf8(&self.buf[addr + desc.name_len as usize..addr + desc.name_len as usize + desc.value_len as usize]).unwrap_or("").to_string();
                     blocks.push(HtxBlock::Trailer(HeaderField { name, value }));
                 }
                 HtxBlockType::Eoh => blocks.push(HtxBlock::Eoh),
@@ -1304,8 +1323,8 @@ impl std::fmt::Debug for HtxSliceRef<'_> {
                     let s = desc.addr as usize;
                     let nl = desc.name_len as usize;
                     let vl = desc.value_len as usize;
-                    let n = std::str::from_utf8(&self.buf[s..s + nl]).unwrap_or("");
-                    let v = std::str::from_utf8(&self.buf[s + nl..s + nl + vl]).unwrap_or("");
+                    let n = utf8(&self.buf[s..s + nl]).unwrap_or("");
+                    let v = utf8(&self.buf[s + nl..s + nl + vl]).unwrap_or("");
                     list.entry(&(n, v));
                 }
                 HtxBlockType::Data => {
@@ -1324,8 +1343,8 @@ impl std::fmt::Debug for HtxSliceRef<'_> {
                     let s = desc.addr as usize;
                     let nl = desc.name_len as usize;
                     let vl = desc.value_len as usize;
-                    let n = std::str::from_utf8(&self.buf[s..s + nl]).unwrap_or("");
-                    let v = std::str::from_utf8(&self.buf[s + nl..s + nl + vl]).unwrap_or("");
+                    let n = utf8(&self.buf[s..s + nl]).unwrap_or("");
+                    let v = utf8(&self.buf[s + nl..s + nl + vl]).unwrap_or("");
                     list.entry(&("Trailer", n, v));
                 }
                 HtxBlockType::RawData => {
@@ -1783,7 +1802,7 @@ impl<'a> HtxSlice<'a> {
             if desc.blk_type == HtxBlockType::Header {
                 let s = desc.addr as usize;
                 let nl = desc.name_len as usize;
-                if let Ok(hdr_name) = std::str::from_utf8(&self.buf[s..s + nl]) {
+                if let Ok(hdr_name) = utf8(&self.buf[s..s + nl]) {
                     if hdr_name.eq_ignore_ascii_case(name) {
                         if first_match.is_none() {
                             first_match = Some(i);
@@ -1816,9 +1835,9 @@ impl<'a> HtxSlice<'a> {
                 let s = desc.addr as usize;
                 let nl = desc.name_len as usize;
                 let vl = desc.value_len as usize;
-                if let Ok(hdr_name) = std::str::from_utf8(&self.buf[s..s + nl]) {
+                if let Ok(hdr_name) = utf8(&self.buf[s..s + nl]) {
                     if hdr_name.eq_ignore_ascii_case(name) {
-                        if let Ok(hdr_val) = std::str::from_utf8(&self.buf[s + nl..s + nl + vl]) {
+                        if let Ok(hdr_val) = utf8(&self.buf[s + nl..s + nl + vl]) {
                             let new_val = re.replace_all(hdr_val, repl).to_string();
                             if new_val != hdr_val {
                                 self.replace_block_value(i, new_val.as_bytes())?;
@@ -1939,12 +1958,12 @@ impl<'a> HtxSlice<'a> {
             if desc.blk_type == HtxBlockType::Header {
                 let s = desc.addr as usize;
                 let nl = desc.name_len as usize;
-                if let Ok(hdr_name) = std::str::from_utf8(&self.buf[s..s + nl]) {
-                    if hdr_name.eq_ignore_ascii_case(name) {
-                        desc.blk_type = HtxBlockType::Unused;
-                        write_desc_at(self.buf, self.num_blocks, i, &desc);
-                        count += 1;
-                    }
+                // Compared as bytes: a name equal to `name` but for the case of its ASCII
+                // letters is as valid UTF-8 as `name` is (S7: it was read as UTF-8 first).
+                if self.buf[s..s + nl].eq_ignore_ascii_case(name.as_bytes()) {
+                    desc.blk_type = HtxBlockType::Unused;
+                    write_desc_at(self.buf, self.num_blocks, i, &desc);
+                    count += 1;
                 }
             }
         }
@@ -3045,7 +3064,7 @@ mod tests {
 
         let mut wire = [0u8; 1024];
         let n = htx.write_h1_wire(&mut wire).expect("wire");
-        let wire_str = std::str::from_utf8(&wire[..n]).expect("utf8");
+        let wire_str = utf8(&wire[..n]).expect("utf8");
         assert!(wire_str.starts_with("POST /v1/submit HTTP/1.1\r\n"));
         assert!(wire_str.contains("Host: api.ibex.internal\r\n"));
         assert!(wire_str.contains("chunk-part-1-and-part-2"));
@@ -3147,7 +3166,7 @@ mod tests {
 
         let mut wire = [0u8; 512];
         let n = buf.write_h1_wire(&mut wire).expect("wire");
-        let wire_str = std::str::from_utf8(&wire[..n]).expect("utf8");
+        let wire_str = utf8(&wire[..n]).expect("utf8");
         assert!(wire_str.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(wire_str.contains("{\"status\":\"healthy\"}"));
     }
