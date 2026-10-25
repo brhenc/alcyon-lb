@@ -90,13 +90,38 @@ impl TicketProducer for Hint {
     }
 }
 
-/// The session-ID cache, entries refused once `SESSION_LIFETIME` old (rustls's memory cache only evicts by size).
+/// The session-ID cache: at most `cap` entries, oldest evicted first, entries refused once
+/// `SESSION_LIFETIME` old. It grows as sessions are stored and every growth is fallible: when
+/// memory (`-m`, `RLIMIT_DATA`) is short a session is simply not cached, never an abort (T507;
+/// rustls's `ServerSessionMemoryCache` reserves its whole capacity up front and aborts).
+/// Not an `ibex_alloc::Pool`: entries are variable-sized and live behind rustls's
+/// `StoresServerSessions` API (handshake path, not the request path), and the bound is `cap`.
 #[derive(Debug)]
 struct ExpiringSessions {
-    inner: Arc<rustls24::server::ServerSessionMemoryCache>,
+    cap: usize,
+    inner: std::sync::Mutex<SessionMap>,
+}
+
+#[derive(Debug, Default)]
+struct SessionMap {
+    map: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    /// Insertion order; may hold keys already taken (dropped lazily).
+    order: std::collections::VecDeque<Vec<u8>>,
+}
+
+fn try_copy(src: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(prefix.len() + src.len()).ok()?;
+    v.extend_from_slice(prefix);
+    v.extend_from_slice(src);
+    Some(v)
 }
 
 impl ExpiringSessions {
+    fn new(cap: usize) -> Self {
+        Self { cap, inner: std::sync::Mutex::new(SessionMap::default()) }
+    }
+
     fn fresh(stored: Option<Vec<u8>>) -> Option<Vec<u8>> {
         let mut v = stored?;
         let born = u64::from_be_bytes(v.get(..8)?.try_into().ok()?);
@@ -106,22 +131,58 @@ impl ExpiringSessions {
         v.drain(..8);
         Some(v)
     }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SessionMap> {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl SessionMap {
+    /// Store `value` under `key`; false when memory is short (nothing changed that matters).
+    fn insert(&mut self, cap: usize, key: &[u8], value: Vec<u8>) -> bool {
+        if let Some(slot) = self.map.get_mut(key) {
+            *slot = value;
+            return true;
+        }
+        // Drop taken keys from the order list once it has twice the capacity (no allocation).
+        if self.order.len() >= cap.saturating_mul(2) {
+            let map = &self.map;
+            self.order.retain(|k| map.contains_key(k));
+        }
+        while self.map.len() >= cap {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.map.remove(&old);
+                }
+                None => break,
+            }
+        }
+        let Some(k1) = try_copy(key, &[]) else { return false };
+        let Some(k2) = try_copy(key, &[]) else { return false };
+        if self.map.try_reserve(1).is_err() || self.order.try_reserve(1).is_err() {
+            return false;
+        }
+        self.order.push_back(k2);
+        self.map.insert(k1, value);
+        true
+    }
 }
 
 impl StoresServerSessions for ExpiringSessions {
     fn put(&self, key: ServerSessionKey<'_>, value: Vec<u8>) -> bool {
-        let mut v = unix_now().to_be_bytes().to_vec();
-        v.extend_from_slice(&value);
-        self.inner.put(key, v)
+        let Some(v) = try_copy(&value, &unix_now().to_be_bytes()) else { return false };
+        self.lock().insert(self.cap, key.as_ref(), v)
     }
     fn get(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>> {
-        Self::fresh(self.inner.get(key))
+        let stored = self.lock().map.get(key.as_ref()).and_then(|v| try_copy(v, &[]));
+        Self::fresh(stored)
     }
     fn take(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>> {
-        Self::fresh(self.inner.take(key))
+        let stored = self.lock().map.remove(key.as_ref());
+        Self::fresh(stored)
     }
     fn can_cache(&self) -> bool {
-        self.inner.can_cache()
+        true
     }
 }
 
@@ -310,7 +371,7 @@ fn build(plan: &BindPlan, kind: TlsCryptoProvider, tls12: bool, tls13: bool) -> 
     config.alpn_protocols = plan.alpn.iter().map(|p| p.clone().into()).collect();
     // Session resumption as `HAProxy` has it by default: stateless
     // tickets, and a session-ID cache of `tune.ssl.cachesize` (20000) entries.
-    config.session_storage = Arc::new(ExpiringSessions { inner: rustls24::server::ServerSessionMemoryCache::new(SESSION_CACHE_SIZE) });
+    config.session_storage = Arc::new(ExpiringSessions::new(SESSION_CACHE_SIZE));
     config.ticketer = Some(Arc::new(Hint(
         rustls24::TicketRotator::new(Duration::from_secs(u64::from(SESSION_LIFETIME / 2)), ticket_key_of(kind))
             .map_err(|e| format!("session ticket keys: {e}"))?,
@@ -547,5 +608,46 @@ mod tests {
         assert!(ticket_key::<true>().expect("key").lifetime() > Duration::ZERO);
         let ticket = hint.encrypt(b"resume me").expect("encrypt");
         assert_eq!(hint.decrypt(&ticket).as_deref(), Some(&b"resume me"[..]));
+    }
+}
+
+#[cfg(test)]
+mod session_cache_tests {
+    use super::*;
+
+    #[test]
+    fn the_oldest_session_goes_when_the_cache_is_full() {
+        let mut m = SessionMap::default();
+        for i in 0u8..3 {
+            assert!(m.insert(3, &[i], vec![i]));
+        }
+        assert!(m.insert(3, &[1], vec![9]), "replace in place");
+        assert_eq!(m.map.len(), 3);
+        assert!(m.insert(3, &[3], vec![3]));
+        assert_eq!(m.map.len(), 3);
+        assert!(!m.map.contains_key(&[0u8][..]), "oldest evicted");
+        assert_eq!(m.map.get(&[1u8][..]), Some(&vec![9]));
+    }
+
+    #[test]
+    fn taken_keys_do_not_grow_the_order_list_without_bound() {
+        let mut m = SessionMap::default();
+        for i in 0u8..40 {
+            assert!(m.insert(2, &[i], vec![i]));
+            m.map.remove(&[i][..]);
+        }
+        assert!(m.order.len() <= 4, "{}", m.order.len());
+    }
+
+    #[test]
+    fn put_get_take_and_expiry() {
+        let c = ExpiringSessions::new(4);
+        let born = unix_now().to_be_bytes();
+        assert!(c.lock().insert(4, b"k", try_copy(b"v", &born).unwrap()));
+        assert_eq!(ExpiringSessions::fresh(c.lock().map.get(&b"k"[..]).cloned()), Some(b"v".to_vec()));
+        let old = (unix_now() - u64::from(SESSION_LIFETIME) - 10).to_be_bytes();
+        assert_eq!(ExpiringSessions::fresh(try_copy(b"v", &old)), None);
+        assert_eq!(ExpiringSessions::fresh(Some(vec![1, 2])), None, "too short");
+        assert!(c.can_cache());
     }
 }
