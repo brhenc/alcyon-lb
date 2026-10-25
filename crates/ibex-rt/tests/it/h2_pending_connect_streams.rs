@@ -386,6 +386,12 @@ fn streams_waiting_for_a_connect_hold_the_demux_not_an_fd_each() {
     let answered: usize = clients.iter().map(|c| c.answered.values().filter(|&&b| b == 0x88).count()).sum();
     let reset_after: usize = clients.iter().map(|c| c.reset.len()).sum();
     eprintln!("released: {answered} of {} streams answered 200, {reset_after} reset", CONNS * 100);
+    let mut statuses = std::collections::BTreeMap::new();
+    for b in clients.iter().flat_map(|c| c.answered.values()) {
+        *statuses.entry(*b).or_insert(0usize) += 1;
+    }
+    let unfinished = clients.iter().filter(|c| !c.done()).count();
+    eprintln!("released: first header bytes {statuses:x?}; connections not done {unfinished}");
 
     // HAProxy: +24 (one client fd and seven server fds per connection).
     assert!(held <= CONNS * 16, "+{held} fds for {CONNS} connections: a pending connect per stream");
