@@ -12342,13 +12342,19 @@ impl EngineDispatcher<'_> {
                     }
                     ibex_config::HttpReqAction::SetTimeout { timeout_type, timeout_val } => {
                         let ms = match rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &make_ctx!(sess))) {
-                            Some(Sample::Sint(n)) => u32::try_from(n).unwrap_or(0),
-                            Some(Sample::Str(ref s)) => parse_timeout_val(s),
+                            // The sample is cast to an integer of milliseconds (no units) and
+                            // truncated to 32 bits, as `http_action_set_timeout` does.
+                            Some(Sample::Sint(n)) => n as u32,
+                            Some(Sample::Str(ref s)) => str_to_sint(s) as u32,
                             _ => parse_timeout_val(timeout_val),
                         };
                         // `stream_set_timeout` (src/stream.c): the stream runs on it from here,
-                        // and `cur_*_timeout` reports it. 0 leaves the timeout as it was.
-                        if let Some(kind) = TimeoutKind::from_name(timeout_type).filter(|_| ms != 0) {
+                        // and `cur_*_timeout` reports it. 0 is applied too (no timeout) for
+                        // client, server and connect; for queue, tunnel and tarpit `timeouts_set`
+                        // holds 0 for "not set", so 0 leaves those as they were (not measured).
+                        if let Some(kind) = TimeoutKind::from_name(timeout_type)
+                            .filter(|k| ms != 0 || matches!(k, TimeoutKind::Client | TimeoutKind::Server | TimeoutKind::Connect))
+                        {
                             let before = sess.timeouts;
                             sess.timeouts_set.get_or_insert_with(|| Box::new(crate::proxy::TimeoutsSet { ms: [0; 6], before })).ms[kind as usize] = ms;
                             match kind {
@@ -13748,6 +13754,17 @@ fn pause_ms(time_ms: u32, expr: Option<&Expr>, registry: &Registry, ctx: &Sample
         Some(Sample::Sint(n)) => u32::try_from(n.clamp(0, 0x7fff_ffff)).unwrap_or(0),
         _ => 0,
     }
+}
+
+/// A string cast to an integer: an optional sign and the leading digits, 0 when there are none.
+fn str_to_sint(s: &str) -> i64 {
+    let (neg, digits) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let n = digits.bytes().take_while(u8::is_ascii_digit).fold(0i64, |a, d| a.wrapping_mul(10).wrapping_add(i64::from(d - b'0')));
+    if neg { n.wrapping_neg() } else { n }
 }
 
 fn parse_timeout_val(s: &str) -> u32 {
