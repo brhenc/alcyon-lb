@@ -23,7 +23,10 @@ use std::time::{Duration, Instant};
 
 use crate::common;
 
-/// A server answering every head `200` with `ok`, then closing.
+/// Body length of `GET /big`.
+const BIG: usize = 2 << 20;
+
+/// A server answering every head `200` with `ok` (`GET /big`: [`BIG`] bytes), then closing.
 fn backend() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let port = l.local_addr().expect("addr").port();
@@ -40,7 +43,17 @@ fn backend() -> u16 {
                         Ok(n) => buf.extend_from_slice(&tmp[..n]),
                     }
                 }
-                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                if buf.starts_with(b"GET /big") {
+                    let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {BIG}\r\nConnection: close\r\n\r\n").as_bytes());
+                    let chunk = vec![b'x'; 65536];
+                    for _ in 0..BIG / chunk.len() {
+                        if c.write_all(&chunk).is_err() {
+                            return;
+                        }
+                    }
+                } else {
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                }
             });
         }
     });
@@ -210,4 +223,39 @@ fn a_waiter_that_disconnects_leaves_the_queue() {
     let (used, cached) = p.buffers();
     assert_eq!(used, cached, "buffers still in use after every connection left:\n{}", p.cli("show pools"));
     assert!(!p.log().contains("IR--"), "a stream failed for want of a buffer:\n{}", p.log());
+}
+
+/// Slow readers of a large response past the limit: every one gets its whole body. A stream
+/// already answering waits for its next buffer (`HAProxy` never cut a response in the Q3 runs:
+/// no `ID--`), where Ibex cut them (`ID--`, 200 with part of the body).
+#[test]
+fn slow_readers_past_the_limit_each_get_the_whole_body() {
+    let p = start("10s");
+    let readers: Vec<TcpStream> = (0..6)
+        .map(|_| {
+            let mut c = TcpStream::connect(("127.0.0.1", p.port)).expect("connect");
+            rustix::net::sockopt::set_socket_recv_buffer_size(&c, 4096).expect("SO_RCVBUF");
+            c.write_all(b"GET /big HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("request");
+            c
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(500));
+    let got: Vec<usize> = readers
+        .into_iter()
+        .map(|mut c| {
+            thread::spawn(move || {
+                c.set_read_timeout(Some(Duration::from_secs(8))).ok();
+                // Reading at last: a window of 4 KiB would make this slow, not the proxy.
+                rustix::net::sockopt::set_socket_recv_buffer_size(&c, 1 << 20).expect("SO_RCVBUF");
+                let mut all = Vec::new();
+                let _ = c.read_to_end(&mut all);
+                all.windows(4).position(|w| w == b"\r\n\r\n").map_or(0, |h| all.len() - h - 4)
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|t| t.join().expect("reader"))
+        .collect();
+    assert!(got.iter().all(|&n| n == BIG), "bodies {got:?} of {BIG}:\n{}", p.log());
+    assert!(!p.log().contains(" ID-- ") && !p.log().contains("IR--"), "a stream failed for want of a buffer:\n{}", p.log());
 }
