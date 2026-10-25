@@ -15,6 +15,9 @@ pub const MAX_NODES: u32 = ROOT - 1;
 /// Sentinel `bit` value marking the head of a duplicate subtree.
 const DUP: i16 = -1;
 
+/// The end of the free list: no slot index reaches it (`MAX_NODES` < `ROOT` < `u32::MAX`).
+const NO_FREE: u32 = u32::MAX;
+
 // `node_p` / `leaf_p` keep the names they have in the C original so the port can be
 // cross-referenced against `include/import/ebtree-t.h` line for line. That is worth more
 // than satisfying the struct_field_names heuristic.
@@ -56,7 +59,10 @@ enum Up {
 #[derive(Clone, Debug)]
 pub struct Eb32Tree {
     nodes: Vec<Node>,
-    free: Vec<u32>,
+    /// The first free slot of the arena, or [`NO_FREE`]; each free slot's `data` names the
+    /// next. Intrusive, so that a delete never allocates (T465: a `Vec` free list grew on a
+    /// delete and aborted the process when memory ran out).
+    free: u32,
     /// The tree root's branch slots. Only `[0]` is ever occupied; `[1]` stays `NONE`
     /// and is what terminates an upward walk in [`Self::next`], exactly as the NULL
     /// right branch does in C.
@@ -76,7 +82,7 @@ impl Eb32Tree {
     pub const fn new() -> Self {
         Self {
             nodes: Vec::new(),
-            free: Vec::new(),
+            free: NO_FREE,
             root: [Branch::NONE, Branch::NONE],
             unique: false,
             len: 0,
@@ -97,7 +103,7 @@ impl Eb32Tree {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             nodes: Vec::with_capacity(cap),
-            free: Vec::new(),
+            free: NO_FREE,
             root: [Branch::NONE, Branch::NONE],
             unique: false,
             len: 0,
@@ -137,6 +143,19 @@ impl Eb32Tree {
         self.nodes.reserve(additional);
     }
 
+    /// How many nodes the tree holds before its arena must grow: an insert past it allocates.
+    #[must_use]
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.nodes.capacity()
+    }
+
+    /// Makes room for `total` nodes in all, `false` (the tree unchanged) when the memory cannot
+    /// be had. A caller that does this before it needs a node never has an insert allocate.
+    pub fn try_reserve_total(&mut self, total: usize) -> bool {
+        self.nodes.try_reserve(total.saturating_sub(self.nodes.len())).is_ok()
+    }
+
     fn alloc(&mut self, key: u32, data: u32) -> u32 {
         let node = Node {
             branches: [Branch::NONE; 2],
@@ -146,13 +165,15 @@ impl Eb32Tree {
             key,
             data,
         };
-        if let Some(idx) = self.free.pop() {
-            self.nodes[idx as usize] = node;
-            idx
-        } else {
+        if self.free == NO_FREE {
             let idx = u32::try_from(self.nodes.len()).unwrap_or(u32::MAX);
             assert!(idx < MAX_NODES, "ebtree: arena exhausted");
             self.nodes.push(node);
+            idx
+        } else {
+            let idx = self.free;
+            self.free = self.nodes[idx as usize].data;
+            self.nodes[idx as usize] = node;
             idx
         }
     }
@@ -665,7 +686,8 @@ impl Eb32Tree {
         n.leaf_p = Parent::NONE;
         n.node_p = Parent::NONE;
         n.branches = [Branch::NONE; 2];
-        self.free.push(idx);
+        n.data = self.free;
+        self.free = idx;
         self.len -= 1;
     }
 

@@ -127,6 +127,14 @@ struct Pooled {
     conn: IdleConn,
 }
 
+/// The size of one entry of a server's idle list, the memory its first kept connection asks
+/// for (a test refuses it, T465).
+#[doc(hidden)]
+#[must_use]
+pub const fn idle_entry_size() -> usize {
+    std::mem::size_of::<Pooled>()
+}
+
 /// The fds in use and the two counts they are weighed against (`ha_used_fds`,
 /// `tune.pool_low_count`, `tune.pool_high_count`).
 #[derive(Clone, Copy, Debug)]
@@ -156,6 +164,12 @@ struct SrvIdle {
     /// none was scheduled, re-armed while connections remain (`idle_conn_srv`).
     purge_at: Option<Instant>,
     purge_delay: Duration,
+}
+
+/// Server `srv`'s idle lists, made if it has none; `None` when the map cannot grow for it (T465).
+fn server_entry(servers: &mut HashMap<(usize, usize), SrvIdle>, srv: (usize, usize)) -> Option<&mut SrvIdle> {
+    let room = servers.len() < servers.capacity() || servers.contains_key(&srv) || servers.try_reserve(1).is_ok();
+    room.then(|| servers.entry(srv).or_default())
 }
 
 /// The idle server connections of a worker, per server (`srv->per_thr[tid]`). Shared with
@@ -201,7 +215,7 @@ impl WorkerPool {
         if cfg.purge_delay_ms == 0 || fds.used >= fds.high {
             return Err((conn, key));
         }
-        let s = self.servers.entry(key.srv).or_default();
+        let Some(s) = server_entry(&mut self.servers, key.srv) else { return Err((conn, key)) };
         // `srv_use_conn` raises both with every connection in use; seen from here, the
         // peak is at least the connections in use at a release.
         s.max_used = s.max_used.max(used).max(peak);
@@ -214,6 +228,11 @@ impl WorkerPool {
         let idle_empty = curr_idle == s.safe;
         let curr = u32::try_from(all_idle).unwrap_or(u32::MAX);
         if !((s.safe == 0 && (is_safe || idle_empty)) || (fds.used < fds.low && used.saturating_add(curr) <= used.max(s.est_need).saturating_add(cfg.low_conn))) {
+            return Err((conn, key));
+        }
+        // `HAProxy`'s idle lists are intrusive; ours closes the connection when the list cannot
+        // grow (T465: an abort under `RLIMIT_DATA`).
+        if s.conns.try_reserve(1).is_err() {
             return Err((conn, key));
         }
         s.conns.push_back(Pooled { addr: key.addr, name: key.name, safe: is_safe, conn });
@@ -509,7 +528,7 @@ impl IdlePool {
         let (all, peak, est) = self.pools.srv_need(srv, used);
         // The server's need is server-wide and every worker's purge moves it: this worker's
         // copy starts from it, which `keep_with` raises to what it sees.
-        let s = pool.servers.entry(srv).or_default();
+        let Some(s) = server_entry(&mut pool.servers, srv) else { return Err(conn) };
         let own = s.conns.len();
         (s.max_used, s.est_need) = (peak, est);
         // `HAProxy` weighs a connection it may keep with its fd still counted; this one has
@@ -15597,7 +15616,7 @@ fn after_res_on_reply<'r>(
 fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Proxy], status: u16) -> Vec<u8> {
     let own = |proxy: &Proxy| -> Option<Vec<u8>> {
         match proxy.error_replies.get(&status) {
-            Some(ibex_config::ErrorPageSource::Raw(bytes)) => return Some(bytes.clone()),
+            Some(ibex_config::ErrorPageSource::Raw(bytes)) => return Some(copy_page(bytes)),
             Some(ibex_config::ErrorPageSource::Custom { content_type, lf_string }) => {
                 let ctx = SampleContext {
                     proxies: Some(&ProxiesView(proxies)),
@@ -15633,12 +15652,23 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Pr
             }
             Some(ibex_config::ErrorPageSource::DefaultErrorfiles) | None => {}
         }
-        proxy.error_files.get(&status).cloned()
+        proxy.error_files.get(&status).map(|page| copy_page(page))
     };
     own(be)
         .or_else(|| own(fe))
-        .or_else(|| builtin_error_page(status).map(<[u8]>::to_vec))
+        .or_else(|| builtin_error_page(status).map(copy_page))
         .unwrap_or_else(|| ibex_proto::build_synthetic_response(status, None, None))
+}
+
+/// A copy of an error page, or an empty page -- nothing is sent and the connection closes, as
+/// for an empty `errorfile` -- when the memory for it cannot be had (T465: an abort under
+/// `RLIMIT_DATA`).
+fn copy_page(page: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    if v.try_reserve_exact(page.len()).is_ok() {
+        v.extend_from_slice(page);
+    }
+    v
 }
 
 fn builtin_error_page(status: u16) -> Option<&'static [u8]> {

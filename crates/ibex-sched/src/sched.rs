@@ -361,9 +361,27 @@ impl Scheduler {
         self.timers.reserve(additional);
     }
 
-    /// Allocates a task.
+    /// Allocates a task. `None` when its slot, or its room in the run queue and the timer
+    /// tree, cannot be had: each task holds at most one node of each tree, so trees as large
+    /// as the task arena never grow on an insert (T465).
     pub fn create(&mut self, kind: WorkKind) -> Option<TaskRef> {
-        self.tasks.alloc(kind)
+        let r = self.tasks.alloc(kind)?;
+        let cap = self.tasks.capacity();
+        if self.timers.capacity() < cap || self.rqueue.capacity() < cap {
+            return self.reserve_queues(r, cap);
+        }
+        Some(r)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reserve_queues(&mut self, r: TaskRef, cap: usize) -> Option<TaskRef> {
+        if self.timers.try_reserve_total(cap) && self.rqueue.try_reserve_total(cap) {
+            return Some(r);
+        }
+        crate::task::TASK_POOL.failed();
+        self.tasks.free(r);
+        None
     }
 
     /// Destroys a task, unlinking it from every queue first.

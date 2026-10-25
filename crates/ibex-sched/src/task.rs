@@ -359,6 +359,8 @@ impl TaskArena {
     /// Makes room for `additional` more tasks at once (see [`crate::Scheduler::reserve`]).
     pub fn reserve(&mut self, additional: usize) {
         self.tasks.reserve(additional);
+        // The free list keeps room for every slot, so that `free` never allocates (T465).
+        self.free.reserve(self.tasks.capacity().saturating_sub(self.free.len()));
     }
 
     /// Allocates a task. Returns `None` if the arena is exhausted.

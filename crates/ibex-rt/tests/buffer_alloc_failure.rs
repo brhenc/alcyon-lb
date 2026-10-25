@@ -595,3 +595,97 @@ fn a_head_whose_htx_cannot_be_had_fails_its_stream() {
     let after = send(&mut engine, addr, GET);
     assert!(after.starts_with("HTTP/1.1 200"), "after: {after:?}");
 }
+
+/// The error page cannot be copied for its answer (`proxy_error_response`, where T446's run
+/// under `RLIMIT_DATA` aborted once the timer tree no longer did, T465): that connection is
+/// closed without an answer, as for an empty `errorfile`, and the next is served.
+#[test]
+fn an_error_page_that_cannot_be_copied_closes_its_connection_only() {
+    const BAD: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\nBad Name: y\r\n\r\n";
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut engine, addr) = engine();
+    let page = send(&mut engine, addr, BAD);
+    assert!(page.starts_with("HTTP/1.1 400"), "{page:?}");
+    ibex_alloc::drain_local_pools();
+    refuse_allocs_of(page.len(), 0, 1);
+    let got = send(&mut engine, addr, BAD);
+    let left = refusals_left();
+    refuse_allocs_of(page.len(), 0, 0);
+    assert_eq!(left, 0, "the page's copy was asked for");
+    assert!(got.is_empty(), "{got:?}");
+    let after = send(&mut engine, addr, GET);
+    assert!(after.starts_with("HTTP/1.1 200"), "after: {after:?}");
+}
+
+/// A server that answers every head on a connection with `rsp` and keeps the connection open.
+fn keepalive_backend(rsp: &'static [u8]) -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = l.local_addr().expect("addr");
+    thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            thread::spawn(move || {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = s.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                    while let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        req.drain(..end + 4);
+                        if s.write_all(rsp).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Sends a keep-alive `GET` and runs the engine until its 2-byte body is in (within 2 s); the
+/// connection is closed after.
+fn keepalive_get(engine: &mut Engine, addr: SocketAddr) -> String {
+    let mut c = TcpStream::connect(addr).expect("connect");
+    c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("request");
+    c.set_nonblocking(true).expect("nonblocking");
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    let start = Instant::now();
+    while !got.ends_with(b"ok") {
+        assert!(start.elapsed() < Duration::from_secs(2), "no answer; got {:?}", String::from_utf8_lossy(&got));
+        let _ = engine.run_once();
+        match c.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(_) => {}
+        }
+    }
+    String::from_utf8_lossy(&got).into_owned()
+}
+
+/// The server's idle list cannot grow to keep the released server connection
+/// (`WorkerPool::keep_with`, where T446's run under `RLIMIT_DATA` aborted, T465): the
+/// connection is closed instead of kept, the request was served, and so is the next.
+#[test]
+fn a_server_connection_the_idle_list_cannot_hold_is_closed_and_the_request_served() {
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let srv = keepalive_backend(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let (mut engine, addr) = engine_with("", &format!("  default_backend b\nbackend b\n  server s1 {srv}\n  server s2 {srv}\n"));
+    // The first request, to s1, makes what the backend makes once; the second goes to s2
+    // (round robin: a client's first request takes no idle connection), whose idle list is new.
+    let first = keepalive_get(&mut engine, addr);
+    assert!(first.starts_with("HTTP/1.1 200"), "{first:?}");
+    // A first `VecDeque` allocation is room for 4 entries of up to 1 KiB, else for one.
+    let entry = ibex_rt::engine::idle_entry_size();
+    let entry = if entry > 1024 { entry } else { 4 * entry };
+    refuse_allocs_of(entry, 0, 1);
+    let got = keepalive_get(&mut engine, addr);
+    let left = refusals_left();
+    refuse_allocs_of(entry, 0, 0);
+    assert_eq!(left, 0, "the idle list's room was asked for");
+    assert!(got.starts_with("HTTP/1.1 200") && got.ends_with("ok"), "{got:?}");
+    let after = send(&mut engine, addr, GET);
+    assert!(after.starts_with("HTTP/1.1 200") && after.ends_with("ok"), "after: {after:?}");
+}
