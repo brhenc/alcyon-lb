@@ -539,6 +539,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
 
     resolvers::check_resolvers(&resolvers);
     check_server_resolvers(&listens, &backends, &resolvers)?;
+    crate::server_state_file::read_names(global.as_ref(), &mut listens, &mut backends);
     let mut init_notices = resolve_server_addrs(&mut listens, &mut backends)?;
 
     let config = Config {
@@ -599,7 +600,8 @@ pub fn set_resolve_dontfail(on: bool) {
 }
 
 /// `srv_init_addr`: each server of an enabled backend whose address is a name gets its
-/// first address, by its `init-addr` methods in order (`srv_iterate_initaddr`). Returns the
+/// first address, by its `init-addr` methods in order (`srv_iterate_initaddr`); `last` is
+/// what `server_state_file::read_names` found for it. Returns the
 /// notices to print; a server no method gives an address fails the load with `HAProxy`'s
 /// alerts, every such server's, then one summary (A.t0, d6).
 fn resolve_server_addrs(listens: &mut [ListenSection], backends: &mut [BackendSection]) -> Result<Vec<crate::ast::global::LoadWarning>, ConfigError> {
@@ -620,8 +622,9 @@ fn resolve_server_addrs(listens: &mut [ListenSection], backends: &mut [BackendSe
             let line = entry.line as usize;
             let mut methods = entry.init_addr;
             if methods.methods == 0 {
-                // `last,libc`; `last` finds no state file and is skipped. With `resolvers`,
-                // `none`, so that the resolver gives the address (`srv_iterate_initaddr`).
+                // `last,libc`. With `resolvers`, `none`, so that the resolver gives the
+                // address (`srv_iterate_initaddr`).
+                methods.push(M::Last);
                 methods.push(M::Libc);
                 if entry.resolvers.is_some() {
                     methods.push(M::None);
@@ -634,7 +637,15 @@ fn resolve_server_addrs(listens: &mut [ListenSection], backends: &mut [BackendSe
             let mut done = false;
             for m in methods.iter() {
                 match m {
-                    M::Last => {}
+                    // The server-state file's address (`srv_apply_lastaddr`); none: skipped.
+                    M::Last => match entry.last_addr.as_deref().map(str::parse::<std::net::IpAddr>) {
+                        Some(Ok(ip)) => {
+                            srv.addr.set_ip(ip);
+                            done = true;
+                        }
+                        Some(Err(_)) => failed = true,
+                        None => {}
+                    },
                     M::Libc => match address::libc_resolve(name) {
                         Some(ip) => {
                             srv.addr.set_ip(ip);

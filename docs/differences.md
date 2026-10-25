@@ -194,15 +194,16 @@ Not refused, on purpose:
   resolution early (the honest answer is still taken); only a layer-4 timeout of a check, not a
   refused connect, triggers a resolution. Still refused: `server-template` (T486), SRV names
   (`_...`, T487), TCP (`tcp@` nameservers and the fallback on a truncated answer, which is an error
-  until T488), `do-resolve`, `parse-resolv-conf` and `dns-accept-family` (T489), `init-addr last`
-  (T490), any other address prefix on a `nameserver`. `show resolvers` is T485. HAProxy also
+  until T488), `do-resolve`, `parse-resolv-conf` and `dns-accept-family` (T489), any other address prefix on a `nameserver`. `show resolvers` is T485. HAProxy also
   creates an implicit `default` section (from `/etc/resolv.conf`, used by its httpclient); Ibex has
   no httpclient and does not (user, 2026-10-25).
 - A name on a `server` line is resolved by libc while the configuration loads, as HAProxy does
   (`localhost` is the first answer of `getaddrinfo`, `::1` on most hosts, no longer `127.0.0.1`),
-  and `init-addr libc|none|<ip>` is applied in order. `init-addr last` is refused: Ibex has no
-  `server-state-file` to read the last address from (user, 2026-10-25; T490). The default
-  `last,libc` is therefore `libc`. A server that starts without an address (`init-addr none`)
+  and `init-addr last|libc|none|<ip>` is applied in order; `last` (and so the default
+  `last,libc`) is the `srv_addr` of the server's line in its server-state file (T490), read while
+  the configuration loads. When the load then fails on an address, HAProxy has already printed
+  the state file's own messages ("Can't open ...") and Ibex has not; when it does not fail, Ibex
+  prints the `init-addr` notices before them, HAProxy after. A server that starts without an address (`init-addr none`)
   shows `srv_admin_state 32`; after `disable server` HAProxy shows 33 and Ibex still 32 (Ibex keeps
   one admin state per server, not HAProxy's flags), and in both it stays in `MAINT (resolution)`.
   `-dr` appends `none`, as in HAProxy.

@@ -1533,6 +1533,12 @@ pub struct ProxyIdInfo {
     /// The name each server's address was written as (`srv_fqdn`); empty when no server's
     /// was (see [`Proxy::server_fqdn`]).
     pub server_fqdns: Vec<Option<Box<str>>>,
+    /// Which servers' `srv_fqdn` the server-state file had changed from the CLI
+    /// (`SRV_ADMF_FQDN_CHANGED`, 64 in `srv_admin_state`; T490); empty when none.
+    pub server_fqdn_changed: Vec<bool>,
+    /// Each server's `port` (`check port`, `default-server port`): `srv_agent_port`, and
+    /// `srv_check_port` of a server with no check; empty when no server has one.
+    pub server_check_ports: Vec<u16>,
     /// Each server's `econ`: the requests whose connection attempts all failed, the last
     /// attempt having been to that server (see [`count_connect_failure`]).
     /// Each listener's numeric id (`luid`) by `bind` line, as `so_id` reads it.
@@ -1847,6 +1853,18 @@ impl Proxy {
     #[must_use]
     pub fn server_fqdn(&self, idx: usize) -> Option<&str> {
         self.ids.server_fqdns.get(idx).and_then(Option::as_deref)
+    }
+
+    /// Whether the server-state file kept `SRV_ADMF_FQDN_CHANGED` for the server at `idx`.
+    #[must_use]
+    pub fn server_fqdn_changed(&self, idx: usize) -> bool {
+        self.ids.server_fqdn_changed.get(idx).copied().unwrap_or(false)
+    }
+
+    /// The `port` keyword of the server at `idx`, 0 without one (`srv_agent_port`).
+    #[must_use]
+    pub fn server_check_port(&self, idx: usize) -> u16 {
+        self.ids.server_check_ports.get(idx).copied().unwrap_or(0)
     }
 
     /// Whether the server at `idx` has an `id` of its own (`SRV_F_FORCED_ID`).
@@ -3981,6 +3999,26 @@ fn server_fqdns(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<Op
     if extras.names.is_empty() { Vec::new() } else { (0..count).map(|i| extras.fqdn(i).map(Box::from)).collect() }
 }
 
+/// [`ProxyIdInfo::server_fqdn_changed`].
+fn server_fqdn_changed(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<bool> {
+    let mut out = Vec::new();
+    for n in extras.names.iter().filter(|n| n.fqdn_changed) {
+        out.resize(count, false);
+        if let Some(slot) = out.get_mut(n.index as usize) {
+            *slot = true;
+        }
+    }
+    out
+}
+
+/// [`ProxyIdInfo::server_check_ports`].
+fn server_check_ports(servers: &[ibex_config::ast::Server]) -> Vec<u16> {
+    if servers.iter().all(|s| s.check_port.is_none()) {
+        return Vec::new();
+    }
+    servers.iter().map(|s| s.check_port.unwrap_or(0)).collect()
+}
+
 /// The flags for [`Proxy::server_forced_ids`]: empty when none asked for an id.
 fn server_forced_ids(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<bool> {
     let mut forced = Vec::new();
@@ -4051,6 +4089,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_cmaint: server_cmaint(&listen.servers),
             server_rmaint: server_rmaint(listen.servers.len(), &listen.server_extras),
             server_fqdns: server_fqdns(listen.servers.len(), &listen.server_extras),
+            server_fqdn_changed: server_fqdn_changed(listen.servers.len(), &listen.server_extras),
+            server_check_ports: server_check_ports(&listen.servers),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
             server_pool: pool_cfgs(&listen.servers),
             http_mode: listen.http_mode,
@@ -4346,6 +4386,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_cmaint: server_cmaint(&be.servers),
             server_rmaint: server_rmaint(be.servers.len(), &be.server_extras),
             server_fqdns: server_fqdns(be.servers.len(), &be.server_extras),
+            server_fqdn_changed: server_fqdn_changed(be.servers.len(), &be.server_extras),
+            server_check_ports: server_check_ports(&be.servers),
             listener_ids: Vec::new(),
             server_pool: pool_cfgs(&be.servers),
             http_mode: be.http_mode,

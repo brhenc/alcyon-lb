@@ -110,10 +110,22 @@ fn init_addr_refusals_are_haproxys() {
         refused(&backend("  server s1 nosuch.invalid:80 init-addr libc,libc,libc,libc,libc,libc,libc,libc,libc,libc,libc")),
         "'server s1' : 'init-addr' : too many init-addr methods when trying to add 'libc'."
     );
-    // The user's decision (2026-10-25): `last` needs the server-state file (T490).
-    let last = refused(&backend("  server s1 nosuch.invalid:80 init-addr last,libc"));
-    assert!(last.contains("'init-addr' : method 'last' is not supported"), "{last}");
-    assert!(refused(&backend("  default-server init-addr last\n  server s1 nosuch.invalid:80")).contains("method 'last'"));
+}
+
+/// `last` is the server-state file's address (T490); with no file it gives nothing and the
+/// next method is tried (`HAProxy`, measured: "no method found" when it is the only one).
+#[test]
+fn init_addr_last_without_a_state_file_gives_nothing() {
+    assert_eq!(
+        alerts(&backend("  server s1 nosuch.invalid:80 init-addr last,libc")),
+        ["{at} : 'server l/s1' : could not resolve address 'nosuch.invalid'.", "Failed to initialize server(s) addr."]
+    );
+    assert_eq!(
+        alerts(&backend("  default-server init-addr last\n  server s1 nosuch.invalid:80")),
+        ["{at} : 'server l/s1' : no method found to resolve address 'nosuch.invalid'.", "Failed to initialize server(s) addr."]
+    );
+    let cfg = parse_str(&backend("  server s1 nosuch.invalid:80 init-addr last,libc,none")).expect("parses");
+    assert!(cfg.backends[0].server_extras.unresolved(0));
 }
 
 #[test]
