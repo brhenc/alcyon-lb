@@ -723,6 +723,7 @@ fn a_reload_keeps_the_resolved_address() {
     dns.set("a1.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 2)]));
     new.wait_state("s1", "10.0.0.2 2 0", 5);
     new.wait_log("l/s1: IP changed from '10.0.0.1' to '10.0.0.2' by 'r/ns1'.", 2);
+}
 
 /// The text of `show resolvers` for one nameserver, every counter 0 (`HAProxy` 3.5-dev8, measured).
 fn zeros(name: &str) -> String {
