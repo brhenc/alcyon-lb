@@ -2,7 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! The owner session of an HTTP/3 connection (T509, `tune.ibex.h3-path mux`): its
-//! `tcp-request connection` rules run once, for the connection. Measured on HAProxy 3.5-dev7
+//! `tcp-request connection` rules run once, for the connection. Measured on `HAProxy` 3.5-dev7
 //! with QUIC (`reference/haproxy-quic`), `tcp-request connection reject if { src 127.0.0.1 }`
 //! on the QUIC bind: curl gets no response (`ERR_DRAINING`, the connection closed); a rule that
 //! does not match leaves the request served. On the relay (no `IBEX_H3_PATH`) the rules run

@@ -4,7 +4,7 @@
 //! `tune.ibex.h3-path relay|mux` (T509, Ibex-only, temporary: deleted with the relay in slice
 //! H5 of `docs/design/h3-engine-2026-10-26.md`): which path an HTTP/3 request takes into the
 //! stream engine, the HTTP/1 relay over a socket pair (`relay`, the default) or the h3 mux
-//! through the bridge h2 streams use (`mux`). HAProxy refuses it as unknown.
+//! through the bridge h2 streams use (`mux`). `HAProxy` refuses it as unknown.
 
 use ibex_config::parse_str;
 

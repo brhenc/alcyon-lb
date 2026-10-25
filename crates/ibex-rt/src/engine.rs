@@ -5895,16 +5895,18 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.adopt_quic_owners();
         self.adopt_quic_streams();
         self.sync_quic_backend_fds();
-        let mut quic_wake = std::mem::take(&mut self.wake_scratch);
-        for ql in &mut self.quic_listeners {
-            ql.take_wake(&mut quic_wake);
-        }
-        for t in quic_wake.drain(..) {
-            if self.scheduler.is_live(t) {
-                self.scheduler.tasklet_wakeup(t, Class::Urgent, state::WOKEN_IO);
+        if !self.quic_listeners.is_empty() {
+            let mut quic_wake = std::mem::take(&mut self.wake_scratch);
+            for ql in &mut self.quic_listeners {
+                ql.take_wake(&mut quic_wake);
             }
+            for t in quic_wake.drain(..) {
+                if self.scheduler.is_live(t) {
+                    self.scheduler.tasklet_wakeup(t, Class::Urgent, state::WOKEN_IO);
+                }
+            }
+            self.wake_scratch = quic_wake;
         }
-        self.wake_scratch = quic_wake;
 
         // 5. Run runnable tasks through Dispatch
         let pid = self.pid;
@@ -5965,11 +5967,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         for (owner_idx, owner_task) in h2_spawn.drain(..) {
             self.spawn_h2_children(owner_idx, owner_task, &mut wake_queue);
         }
-        // What the owners of HTTP/3 connections wrote goes out now (T509).
-        let inst = Instant::now();
+        // What the owners of HTTP/3 connections wrote goes out now (T509). The clock is read
+        // only when one did: once per pass is a fifth of an h1 request's added cost otherwise.
         for ql in &mut self.quic_listeners {
             if ql.take_dirty() {
-                let _ = ql.send_batch(inst);
+                let _ = ql.send_batch(Instant::now());
             }
             ql.take_wake(&mut wake_queue);
         }
@@ -10435,7 +10437,8 @@ impl EngineDispatcher<'_> {
         // in the poller, so a stream woken by a request after an idle second would arm a
         // `wait-for-body` of 300 ms from a second ago.
         let now = self.now;
-        if self.sessions.get(session_idx).is_some_and(|e| e.sess.h3_owner.is_some()) {
+        let (is_h2_owner, is_h3_owner) = self.sessions.get(session_idx).map_or((false, false), |e| (e.sess.h2_ctx.is_some(), e.sess.h3_owner.is_some()));
+        if is_h3_owner {
             let out = self.step_h3_owner(session_idx, now);
             if matches!(out, Outcome::Done) {
                 self.end_stream(session_idx, now, false);
@@ -10443,7 +10446,6 @@ impl EngineDispatcher<'_> {
             return out;
         }
         let mut connect_line: Option<(usize, String)> = None;
-        let is_h2_owner = self.sessions.get(session_idx).is_some_and(|e| e.sess.h2_ctx.is_some());
         {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
                 return Outcome::Done;
