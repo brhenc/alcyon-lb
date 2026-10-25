@@ -160,3 +160,29 @@ fn set_timeout_takes_a_string_sample() {
     );
     assert_eq!(body(&r), "s=7000 c=9000", "{r}");
 }
+
+/// `set-timeout` casts a string sample to an integer of milliseconds (no units), the way the
+/// oracle does (3.5-dev8-885761-29): `str(7s)` is 7, `str(1500ms)` 1500, `str(12abc)` 12,
+/// `str(abc)` and `str(0)` 0, and a negative value wraps to u32.
+#[test]
+fn set_timeout_casts_a_string_sample_to_an_integer() {
+    for (sample, want) in [
+        ("str(7s)", "s=7 c=7"),
+        ("str(1500ms)", "s=1500 c=1500"),
+        ("str(12abc)", "s=12 c=12"),
+        ("str(+8)", "s=8 c=8"),
+        ("str(abc)", "s=0 c=0"),
+        ("str(0)", "s=0 c=0"),
+        ("str(-5)", "s=4294967291 c=4294967291"),
+        ("int(-5)", "s=4294967291 c=4294967291"),
+        ("int(5000000000)", "s=705032704 c=705032704"),
+    ] {
+        let r = exchange(
+            &format!(
+                "{DEFAULTS}listen fe\n  bind ADDR\n  timeout client 3s\n  timeout server 4s\n  http-request set-timeout server {sample}\n  http-request set-timeout client {sample}\n  http-request return status 200 content-type text/plain lf-string \"s=%[cur_server_timeout] c=%[cur_client_timeout]\"\n  server s SRV\n"
+            ),
+            GET,
+        );
+        assert_eq!(body(&r), want, "{sample}: {r}");
+    }
+}
