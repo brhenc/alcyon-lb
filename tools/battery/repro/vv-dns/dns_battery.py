@@ -3,7 +3,7 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 """Run-time DNS resolution, Ibex vs HAProxy (rc4, T483/T484). Functional only: no timing claims.
 
-dns_battery.py IBEX [HAPROXY] [-k name,name] [-o OUTDIR]
+dns_battery.py IBEX [HAPROXY] [-k name,name] [-o OUTDIR] [-p OFFSET]
 
 Each case is one config plus a timeline of zone changes. Both proxies run it in turn against the same
 scripted nameservers (vvdns.py: ns1 127.0.0.1:19953, ns2 :19954, a dead one at :19959). The battery
@@ -16,20 +16,27 @@ samples `show servers state` every 0.25 s and prints, per proxy:
   alive     whether the process was still running at the end (a crash is a finding whatever HAProxy does)
 SAME/DIFF compares start, the state sequence (times ignored), the log lines and http; "<-- t" flags a
 state reached more than 1 s apart. Ports: proxy 19970, backends 127.0.0.1:19971 and 127.0.0.2:19971.
+-p OFFSET (or VV_DNS_PORT_OFFSET) adds OFFSET to every port, and the default OUTDIR becomes
+/tmp/vv-dns-pOFFSET, so two runs with different offsets do not share ports or the stats socket.
 Expected differences, from docs/design/dns-2026-10-25.md §2.7/§2.8, are tagged in the case's note.
 """
 import json, os, re, shutil, signal, socket, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 args = [a for a in sys.argv[1:]]
-only, out = None, "/tmp/vv-dns"
+only, out = None, None
+off = int(os.environ.get("VV_DNS_PORT_OFFSET", "0"))
 if "-k" in args:
     i = args.index("-k"); only = set(args[i + 1].split(",")); del args[i:i + 2]
 if "-o" in args:
     i = args.index("-o"); out = args[i + 1]; del args[i:i + 2]
+if "-p" in args:
+    i = args.index("-p"); off = int(args[i + 1]); del args[i:i + 2]
+if out is None:
+    out = "/tmp/vv-dns" if off == 0 else "/tmp/vv-dns-p%d" % off
 IB = args[0]
 HA = args[1] if len(args) > 1 else "/home/bhenc/reference/haproxy/haproxy"
-P, NS1, NS2, DEAD = 19970, 19953, 19954, 19959
+P, NS1, NS2, DEAD, BE = (x + off for x in (19970, 19953, 19954, 19959, 19971))
 SOCK = os.path.join(out, "cli.sock")
 for b in (IB, HA):
     if not os.access(b, os.X_OK):
@@ -61,7 +68,7 @@ S1 = "    server s1 a1.test:80 resolvers r\n"
 # name, config, ns1 zone at start, timeline [(t, "ns1"|"ns2", zone)], seconds, flags, note
 CASES = [
  # --- start-up (T483): libc, init-addr
- ("start-localhost", cfg("", "    server s1 localhost:19971\n"), z(), [], 1.5, "", "A.t1f: HAProxy ::1 (libc prefers v6)"),
+ ("start-localhost", cfg("", "    server s1 localhost:%d\n" % BE), z(), [], 1.5, "", "A.t1f: HAProxy ::1 (libc prefers v6)"),
  ("start-libc-fail", cfg("", "    server s1 nosuch.invalid:80\n"), z(), [], 1.5, "", "A.t0: fatal"),
  ("start-libc-none", cfg("", "    server s1 nosuch.invalid:80 init-addr libc,none\n"), z(), [], 1.5, "", "A.t1e: RMAINT forever"),
  ("start-init-ip", cfg("", "    server s1 nosuch.invalid:80 init-addr 10.9.9.9\n"), z(), [], 1.5, "", ""),
@@ -75,10 +82,10 @@ CASES = [
  ("resolve-basic", cfg(RS, S1), z(), [], 2.5, "", "A.t1a: MAINT (resolution) then READY with 10.0.0.1"),
  ("resolve-init-none", cfg(RS, "    server s1 a1.test:80 resolvers r init-addr none\n"), z(), [], 2.5, "", "A.t1b"),
  ("resolve-init-ip", cfg(RS, "    server s1 a1.test:80 resolvers r init-addr 10.9.9.9\n"), z(), [], 2.5, "", "A.t1c"),
- ("resolve-libc-none", cfg(RS, "    server s1 localhost:19971 resolvers r init-addr libc,none\n"),
+ ("resolve-libc-none", cfg(RS, "    server s1 localhost:%d resolvers r init-addr libc,none\n" % BE),
   z(localhost={"a": ["10.0.0.5"]}), [], 2.5, "", "libc first, then the resolver's answer replaces it"),
  ("addr-change", cfg(RS, S1), z(), [(2.0, "ns1", z(a1_test={"a": ["10.0.0.2"]}))], 4.0, "", "A.t3"),
- ("addr-change-traffic", cfg(RS, "    server s1 be.test:19971 resolvers r\n"), z(),
+ ("addr-change-traffic", cfg(RS, "    server s1 be.test:%d resolvers r\n" % BE), z(),
   [(2.5, "ns1", z(be_test={"a": ["127.0.0.2"]}))], 6.0, "http", "A.t3b: same client conn, next request goes to the new address"),
  ("addr-keep-current", cfg(RS, "    server s1 multi.test:80 resolvers r\n"), z(),
   [(2.0, "ns1", z(multi_test={"a": ["10.0.0.3", "10.0.0.1", "10.0.0.2"]}))], 4.0, "", "F7: +1 for the current address"),
@@ -128,7 +135,7 @@ CASES = [
  ("refused-template", cfg(RS, "    server-template srv 3 multi.test:80 resolvers r\n"), z(), [], 2.5, "",
   "refused until T486"),
  ("refused-srv", cfg(RS, "    server-template srv 2 _http._tcp.srv.test resolvers r\n"), z(), [], 2.0, "", "refused until T487"),
- ("refused-do-resolve", cfg(RS, "    http-request do-resolve(txn.ip,r,ipv4) str(a1.test)\n    server s1 127.0.0.1:19971\n"),
+ ("refused-do-resolve", cfg(RS, "    http-request do-resolve(txn.ip,r,ipv4) str(a1.test)\n    server s1 127.0.0.1:%d\n" % BE),
   z(), [], 1.5, "", "refused until T489"),
  ("refused-parse-resolv-conf", cfg(RS + "    parse-resolv-conf\n", S1), z(), [], 1.5, "", "refused until T489"),
  ("refused-tcp-ns", cfg("resolvers r\n    nameserver ns1 tcp@127.0.0.1:%d\n" % NS1, S1), z(), [], 1.5, "", "refused until T488"),
@@ -227,7 +234,7 @@ def run_one(binary, name, conf, zone0, timeline, secs, flags):
           for port, zf, lf in ((NS1, z1, l1), (NS2, z2, l2))]
     bes = []
     if "http" in flags:
-        bes = [subprocess.Popen(["python3", "-I", "/home/bhenc/ibex-worktrees/review/night-1025/t481-oracle/be.py", ip, "19971"],
+        bes = [subprocess.Popen(["python3", "-I", "/home/bhenc/ibex-worktrees/review/night-1025/t481-oracle/be.py", ip, str(BE)],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for ip in ("127.0.0.1", "127.0.0.2")]
     time.sleep(0.3)
     logp = os.path.join(d, tag + ".log")
