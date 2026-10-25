@@ -327,6 +327,21 @@ pub(crate) fn parse_global_directive(
             });
             Ok(())
         }
+        "tune.ibex.zero-on-free" => {
+            let Some(arg) = tokens.get(1) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.ibex.zero-on-free' expects 'off', 'soft' or 'hard'."));
+            };
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'tune.ibex.zero-on-free' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            global.zero_on_free = Some(match arg.text.as_str() {
+                "off" => crate::ast::ZeroOnFree::Off,
+                "soft" => crate::ast::ZeroOnFree::Soft,
+                "hard" => crate::ast::ZeroOnFree::Hard,
+                other => return Err(ConfigError::new(arg.line, arg.col, format!("'tune.ibex.zero-on-free' expects 'off', 'soft' or 'hard', got '{other}'."))),
+            });
+            Ok(())
+        }
         "tune.ibex.zero-spares" => {
             let Some(arg) = tokens.get(1) else {
                 return Err(ConfigError::new(kw.line, kw.col, "'tune.ibex.zero-spares' expects 'on' or 'off'."));

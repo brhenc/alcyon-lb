@@ -5,12 +5,13 @@
 # Instructions per request (perf stat instructions:u) of one proxy binary on one scenario.
 # Works for ibex and for haproxy, so the oracle can be measured with the same backend and client.
 #
-#   tools/measure/insreq.sh <label> <proxy-bin> <scenario.body> <client: mb50|ab1|ab1s|hs1> <N> <rounds> <outdir>
+#   tools/measure/insreq.sh <label> <proxy-bin> <scenario.body> <client: mb50|ab1|ab1s|hs1|nc1> <N> <rounds> <outdir>
 #
 #   client mb50: measure-bench, 50 keep-alive connections, N requests (what the gate uses)
 #   client ab1:  ab -k -c 1, N requests (one connection, the T447 figure)
 #   client ab1s: ab1 over TLS (https://; the scenario's frontend binds with `ssl crt`, T460)
 #   client hs1:  ab -c 1 over TLS without keep-alive: one TLS handshake per request (T460)
+#   client nc1:  ab -c 1 without keep-alive: one new TCP connection per request (T459)
 #
 # The scenario body is a config with @FE@ and @BE@ for the two ports (tools/measure/scenarios/),
 # and @CRT@ for a certificate and key (IBEX_MEASURE_CRT, else a self-signed P-256 one made in
@@ -21,7 +22,7 @@
 # `flock -x /tmp/ibex-load.lock` around a batch, and keep a batch under 15 minutes. Needs
 # $HOME/ibex-targets/gate-slot1/release/measure-bench (MEASURE_BENCH overrides).
 set -u
-if [ $# -ne 7 ]; then sed -n '5,22p' "$0"; exit 2; fi
+if [ $# -ne 7 ]; then sed -n '5,23p' "$0"; exit 2; fi
 LABEL=$1; BIN=$2; BODY=$3; CL=$4; N=$5; ROUNDS=$6; OUT=$7
 mkdir -p "$OUT" || exit 1
 BENCH=${MEASURE_BENCH:-$HOME/ibex-targets/gate-slot1/release/measure-bench}
@@ -45,6 +46,7 @@ client() {
     ab1)  taskset -c "$CPU_C" ab -k -q -c 1 -n "$1" "http://127.0.0.1:$FE/" ;;
     ab1s) taskset -c "$CPU_C" ab -k -q -c 1 -n "$1" "https://127.0.0.1:$FE/" ;;
     hs1)  taskset -c "$CPU_C" ab -q -c 1 -n "$1" "https://127.0.0.1:$FE/" ;;
+    nc1)  taskset -c "$CPU_C" ab -q -c 1 -n "$1" "http://127.0.0.1:$FE/" ;;
     *) echo "unknown client $CL" >&2; return 1 ;;
   esac
 }

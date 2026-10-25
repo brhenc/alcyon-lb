@@ -179,6 +179,18 @@ impl StatsAddr {
 }
 
 /// Global section configuration.
+/// `tune.ibex.zero-on-free off|soft|hard` (Ibex-only, T459): what the allocator does with a
+/// freed block (`ibex_alloc::zero_on_free`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZeroOnFree {
+    /// Freed as it is.
+    Off,
+    /// Quarantined per thread, wiped and freed when the thread has time, within bounds.
+    Soft,
+    /// Wiped, then freed.
+    Hard,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GlobalSection {
     /// `node <name>`: the name `show info` and the stats page report (`global.node`); `None` is the host name.
@@ -246,6 +258,9 @@ pub struct GlobalSection {
     /// `tune.ibex.ssl-zero-buffers on|off` (Ibex-only): zero the TLS record buffers (plaintext and
     /// ciphertext) when they are released. On when unset.
     pub ssl_zero_buffers: Option<bool>,
+    /// `tune.ibex.zero-on-free off|soft|hard` (Ibex-only, T459): wipe every freed heap block. Off
+    /// when unset.
+    pub zero_on_free: Option<ZeroOnFree>,
     /// `tune.memory.hot-size <bytes>`: the most each thread keeps in its pools together
     /// (`global.tune.pool_cache_size`, 524288 when unset).
     pub hot_size: Option<usize>,

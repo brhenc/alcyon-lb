@@ -327,6 +327,30 @@ not left in memory. Default **off**: the wipe costs ~1k instructions per request
 benchmark, and HAProxy wipes nothing either. HAProxy refuses the keyword as unknown. It takes
 exactly `on` or `off`; anything else, or a missing argument, is a configuration error.
 
+## `tune.ibex.zero-on-free off|soft|hard`: an Ibex-only global keyword (T459)
+
+What the process's allocator does with every heap block that is freed (rustls and ring state,
+Ibex's own objects, std's): `off` (default) frees it as it is; `hard` overwrites it with zeros,
+then frees it (the old block of a reallocation too); `soft` puts it on the freeing thread's
+quarantine and wipes and frees it when the thread is idle, within bounds (at most 4 x
+`tune.memory.hot-size` bytes per thread, at most ~100 ms, emptied by `pool_gc` and a refused
+allocation; `tradeoff.md` 6.29). With `soft` or `hard`, `show info` ends with Ibex-only lines
+`ZeroOnFree`, `ZeroOnFreeBytes`, `ZeroOnFreeBlocks`, `ZeroOnFreeOldest_ms`, `ZeroOnFreeQueued`,
+`ZeroOnFreeWiped`, `ZeroOnFreeForced`, `ZeroOnFreeExpired` (`typed` and `json` leave them out);
+with `off` it is HAProxy's list. Pooled objects are not freed and follow their pools' settings
+(`zero-buffers`, `zero-spares`, `ssl-zero-buffers`); the stack is not covered.
+
+HAProxy 3.5-dev8 has no such setting and refuses the keyword as unknown. Its nearest options are
+the `-dM` debugging forms (measured with `-dMhelp`): `-dM[<byte>]` fills objects with a byte on
+*allocation* (`poison`, default byte `0x50`), `-dMintegrity` fills an object put in a thread cache
+with a changing pattern and checks it on reuse, `-dMuaf` gives every pool object its own pages and
+unmaps them on free, and `fail`, `no-merge`, `cold-first`, `no-global`, `no-cache`, `caller`,
+`tag`, `backup` (and their `no-`/opposite forms) change caching and checks. They are debugging
+aids for pool objects, not a wipe of freed memory, and `malloc`'d memory outside the pools is not
+touched by any of them; OpenSSL wipes its own key material (`OPENSSL_cleanse`). Ibex accepts
+`-dMfail` and `-dMno-fail` only (S5) and refuses the other `-dM` forms. The keyword takes exactly
+`off`, `soft` or `hard`; anything else, or a missing argument, is a configuration error.
+
 ## `tune.ibex.crypto-provider ring|ring-ibex`, `set ssl crypto-provider` and `show ssl crypto-provider`: Ibex-only (T460)
 
 The rustls crypto provider every TCP TLS configuration is built on: binds, server lines and

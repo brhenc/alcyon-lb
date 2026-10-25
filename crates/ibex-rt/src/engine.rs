@@ -4507,6 +4507,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         ibex_alloc::set_zero_buffers(config.global.as_ref().and_then(|g| g.zero_buffers).unwrap_or(false));
         ibex_alloc::set_ssl_zero_buffers(config.global.as_ref().and_then(|g| g.ssl_zero_buffers).unwrap_or(true));
         ibex_alloc::set_zero_spares(config.global.as_ref().and_then(|g| g.zero_spares).unwrap_or(false));
+        // `tune.ibex.zero-on-free` (T459, off unless configured): read by the binary's allocator
+        // on every free (`ibex_alloc::IbexAllocator`), the quarantine emptied by the pass below.
+        ibex_alloc::zero_on_free::set_zero_on_free(match config.global.as_ref().and_then(|g| g.zero_on_free) {
+            Some(ibex_config::ast::ZeroOnFree::Soft) => ibex_alloc::ZeroOnFree::Soft,
+            Some(ibex_config::ast::ZeroOnFree::Hard) => ibex_alloc::ZeroOnFree::Hard,
+            Some(ibex_config::ast::ZeroOnFree::Off) | None => ibex_alloc::ZeroOnFree::Off,
+        });
         ibex_alloc::set_hot_size(config.global.as_ref().and_then(|g| g.hot_size).unwrap_or(ibex_alloc::HOT_SIZE_DEFAULT));
         // `tune.buffers.limit`, `tune.fail-alloc` under `-dMfail` (S5): read by the pools' miss
         // paths (`buf::take_mem`, `Pool::miss`) and the accept (`register_new_session`).
@@ -5277,6 +5284,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // ms poll bound). One clock read per loop pass, as HAProxy's `tv_update_date` after
         // its poller. The timers that expired during the wait are woken by it too.
         let pass_start = Instant::now();
+        // `tune.ibex.zero-on-free soft`: this thread's quarantine, emptied when the poller found
+        // nothing to do, else what passed the age bound and a small budget. One load when off.
+        ibex_alloc::zero_on_free::pass(pass_start, events.is_empty());
         crate::txnlog::set_loop_now(pass_start);
         let now = self.tick_at(pass_start);
         self.now = now;
