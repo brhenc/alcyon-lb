@@ -15,3 +15,4 @@ mod dependency_graph;
 mod quic_resumption;
 mod stack_scrub;
 mod retry;
+mod timers;
