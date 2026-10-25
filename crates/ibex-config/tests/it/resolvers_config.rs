@@ -179,9 +179,30 @@ fn resolve_keywords_check_their_arguments() {
 }
 
 #[test]
-fn a_servers_resolvers_stays_refused_until_t484() {
-    let m = refused(&with_resolvers("").replace("server s1 127.0.0.1:80", "server s1 a1.test:80 resolvers r"));
-    assert!(m.contains("'resolvers' is not supported"), "{m}");
+fn a_servers_resolvers_and_resolve_options_are_kept() {
+    let cfg = parse_str(
+        &with_resolvers("")
+            .replace("server s1 127.0.0.1:80", "default-server resolvers r resolve-opts allow-dup-ip
+  server s1 a1.test:80 resolve-prefer ipv4 resolve-net 10.0.0.0/255.255.0.0,2001:db8::/32
+  server s2 a2.test:80 resolve-opts prevent-dup-ip
+  server s3 127.0.0.1:80 resolvers r"),
+    )
+    .unwrap_or_else(|e| panic!("{}", e.message));
+    let ex = &cfg.backends[0].server_extras;
+    let (s1, s2) = (&ex.names[0], &ex.names[1]);
+    assert_eq!((s1.resolvers.as_deref(), s1.resolve.prefer_ipv4, s1.resolve.allow_dup_ip), (Some("r"), true, true));
+    assert_eq!(s1.resolve.nets, vec![("10.0.0.0".parse().unwrap(), 16), ("2001:db8::".parse().unwrap(), 32)]);
+    assert_eq!((s2.resolvers.as_deref(), s2.resolve.prefer_ipv4, s2.resolve.allow_dup_ip), (Some("r"), false, false));
+    // `none` comes with `resolvers` (`srv_iterate_initaddr`): the names did not resolve.
+    assert!(s1.unresolved && s2.unresolved);
+    // Every server's section is checked, an address's too.
+    assert_eq!(ex.resolvers_refs.iter().map(|r| r.0).collect::<Vec<_>>(), vec![0, 1, 2]);
+    let e = parse_str(&with_resolvers("").replace("server s1 127.0.0.1:80", "server s1 127.0.0.1:80 resolvers nosuch")).expect_err("refused");
+    assert_eq!(e.message, "backend 'l', server 's1': unable to find required resolvers 'nosuch'");
+    assert_eq!(refused(&backend("  server s1 127.0.0.1:80 resolvers")), "'server s1' : 'resolvers' expects <resolvers_id> as argument.");
+    assert_eq!(refused(&backend("  default-server resolvers")), "'resolvers' expects <resolvers_id> as argument.");
+    assert_eq!(refused(&backend("  server s1 127.0.0.1:80 resolve-net 10.0.0.0/33")), "'server s1' : 'resolve-net' invalid network '10.0.0.0/33'..");
+    assert_eq!(refused(&backend("  server s1 127.0.0.1:80 resolve-net ::/129")), "'server s1' : 'resolve-net' invalid network '::/129'..");
 }
 
 // --- the resolvers section (A.t15d and the t483 rows) ---

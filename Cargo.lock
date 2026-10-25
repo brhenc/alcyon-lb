@@ -671,6 +671,7 @@ dependencies = [
  "ctrlc",
  "ibex-alloc",
  "ibex-config",
+ "ibex-dns",
  "ibex-mmsg",
  "ibex-proto",
  "ibex-quic",

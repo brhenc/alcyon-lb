@@ -39,6 +39,8 @@ pub(crate) fn parse_server(
         }
     }
     let mut init_addr = default_server.and_then(|d| d.init_addr).unwrap_or_default();
+    let mut resolvers = default_server.and_then(|d| d.resolvers.clone());
+    let mut resolve = default_server.map(|d| d.resolve.clone()).unwrap_or_default();
     let mut check = default_server.is_some_and(|d| d.check);
     let mut inter = default_server.and_then(|d| d.inter);
     let mut fastinter = default_server.and_then(|d| d.fastinter);
@@ -192,11 +194,14 @@ pub(crate) fn parse_server(
                 i += 1;
             }
             "resolve-prefer" | "resolve-net" | "resolve-opts" => {
-                check_resolve_keyword(tokens, i, who)?;
                 // `resolve-opts` alone is accepted and changes nothing.
-                if tokens.get(i + 1).is_some_and(|t| !t.text.is_empty()) {
-                    i = unimplemented_server_keyword(tokens, i, who)?;
+                if parse_resolve_keyword(&mut resolve, tokens, i, who)? {
+                    i += 1;
                 }
+            }
+            "resolvers" => {
+                resolvers = Some(server_kw_arg(tokens, i, who, "expects <resolvers_id> as argument.")?.text.as_str().into());
+                i += 1;
             }
             // What these turn on, Ibex never does: they leave the server as Ibex runs it.
             "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
@@ -225,6 +230,9 @@ pub(crate) fn parse_server(
     if track.is_some() {
         extras.track_line.push((index, u32::try_from(kw.line).unwrap_or(u32::MAX)));
     }
+    if let Some(sec) = &resolvers {
+        extras.resolvers_refs.push((index, u32::try_from(kw.line).unwrap_or(u32::MAX), sec.clone()));
+    }
     if let Some(name) = fqdn {
         extras.names.push(crate::ast::ServerName {
             index,
@@ -232,6 +240,8 @@ pub(crate) fn parse_server(
             fqdn: name.into_boxed_str(),
             init_addr,
             unresolved: false,
+            resolvers,
+            resolve,
         });
     }
     servers.push(Server {
@@ -308,10 +318,10 @@ fn parse_init_addr(tokens: &[Token], i: usize, who: Option<&str>) -> Result<crat
     Ok(out)
 }
 
-/// The arguments of `resolve-prefer`, `resolve-net` and `resolve-opts`, checked as
-/// `HAProxy` checks them (`srv_parse_resolve_*`). They only act with a server's
-/// `resolvers`, which is refused until T484, so nothing keeps them.
-fn check_resolve_keyword(tokens: &[Token], i: usize, who: Option<&str>) -> Result<(), ConfigError> {
+/// `resolve-prefer`, `resolve-net` and `resolve-opts` into `opts`, checked as `HAProxy` checks
+/// them (`srv_parse_resolve_*`). They act with a server's `resolvers` (T484,
+/// `resolvers::pick`). Returns whether the keyword took its argument.
+fn parse_resolve_keyword(opts: &mut crate::ast::ResolveOpts, tokens: &[Token], i: usize, who: Option<&str>) -> Result<bool, ConfigError> {
     let prefix = server_keywords::server_prefix(who);
     let tok = &tokens[i];
     let kw = tok.text.as_str();
@@ -322,44 +332,64 @@ fn check_resolve_keyword(tokens: &[Token], i: usize, who: Option<&str>) -> Resul
             if a != "ipv4" && a != "ipv6" {
                 return Err(fail("expects either ipv4 or ipv6 as argument..".to_string()));
             }
+            opts.prefer_ipv4 = a == "ipv4";
         }
         "resolve-net" => {
             if a.is_empty() {
                 return Err(fail("expects a list of networks..".to_string()));
             }
+            opts.nets.clear();
             for (n, net) in a.split(',').filter(|p| !p.is_empty()).enumerate() {
                 if n >= 5 {
                     return Err(fail("exceed 5 networks..".to_string()));
                 }
-                if !is_network(net) {
-                    return Err(fail(format!("invalid network '{net}'..")));
-                }
+                opts.nets.push(parse_network(net).ok_or_else(|| fail(format!("invalid network '{net}'..")))?);
             }
         }
         _ => {
             for p in a.split(',').filter(|p| !p.is_empty()) {
-                if !matches!(p, "allow-dup-ip" | "ignore-weight" | "prevent-dup-ip") {
-                    return Err(fail(format!(
-                        ": unknown resolve-opts option '{p}', supported methods are 'allow-dup-ip', 'ignore-weight', and 'prevent-dup-ip'.."
-                    )));
+                match p {
+                    "allow-dup-ip" => opts.allow_dup_ip = true,
+                    "prevent-dup-ip" => opts.allow_dup_ip = false,
+                    // SRV weights (T487): nothing to ignore without SRV records.
+                    "ignore-weight" => {}
+                    _ => {
+                        return Err(fail(format!(
+                            ": unknown resolve-opts option '{p}', supported methods are 'allow-dup-ip', 'ignore-weight', and 'prevent-dup-ip'.."
+                        )))
+                    }
                 }
             }
         }
     }
-    Ok(())
+    Ok(!a.is_empty())
 }
 
 /// `str2net` (an IPv4 address, a `/bits` or dotted mask optional) or `str62net` (an IPv6
-/// address, `/0` to `/128` optional).
-fn is_network(net: &str) -> bool {
+/// address, `/0` to `/128` optional), as (address, prefix length).
+fn parse_network(net: &str) -> Option<(std::net::IpAddr, u8)> {
     let (addr, mask) = match net.rsplit_once('/') {
         Some((a, m)) => (a, Some(m)),
         None => (net, None),
     };
-    if addr.parse::<std::net::Ipv4Addr>().is_ok() {
-        return mask.is_none_or(|m| m.parse::<u8>().is_ok_and(|b| b <= 32) || m.parse::<std::net::Ipv4Addr>().is_ok());
+    if let Ok(a) = addr.parse::<std::net::Ipv4Addr>() {
+        let bits = match mask {
+            None => 32,
+            Some(m) => match m.parse::<u8>() {
+                Ok(b) if b <= 32 => b,
+                Ok(_) => return None,
+                // A dotted mask: its leading ones.
+                Err(_) => u8::try_from(u32::from(m.parse::<std::net::Ipv4Addr>().ok()?).leading_ones()).ok()?,
+            },
+        };
+        return Some((a.into(), bits));
     }
-    addr.parse::<std::net::Ipv6Addr>().is_ok() && mask.is_none_or(|m| m.parse::<u8>().is_ok_and(|b| b <= 128))
+    let a = addr.parse::<std::net::Ipv6Addr>().ok()?;
+    let bits = match mask {
+        None => 128,
+        Some(m) => m.parse::<u8>().ok().filter(|b| *b <= 128)?,
+    };
+    Some((a.into(), bits))
 }
 
 /// The TLS keywords of a server line (`src/cfgparse-ssl.c`). `Ok(Some(last))` when
@@ -756,11 +786,13 @@ pub(crate) fn parse_default_server(
                 i += 1;
             }
             "resolve-prefer" | "resolve-net" | "resolve-opts" => {
-                check_resolve_keyword(tokens, i, None)?;
-                // `resolve-opts` alone is accepted and changes nothing.
-                if tokens.get(i + 1).is_some_and(|t| !t.text.is_empty()) {
-                    i = unimplemented_server_keyword(tokens, i, None)?;
+                if parse_resolve_keyword(&mut cfg.resolve, tokens, i, None)? {
+                    i += 1;
                 }
+            }
+            "resolvers" => {
+                cfg.resolvers = Some(server_kw_arg(tokens, i, None, "expects <resolvers_id> as argument.")?.text.as_str().into());
+                i += 1;
             }
             "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
             | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}

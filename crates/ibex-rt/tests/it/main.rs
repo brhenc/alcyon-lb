@@ -367,6 +367,7 @@ mod stats_auth;
 mod stats_csv_schema;
 mod stats_global_keywords;
 mod stats_refresh;
+mod resolvers;
 mod resolvers_refused;
 mod no_directive;
 mod stats_parity;

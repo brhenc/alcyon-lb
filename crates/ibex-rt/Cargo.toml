@@ -19,6 +19,7 @@ ibex-stick-table = { path = "../ibex-stick-table" }
 rustix = { version = "0.38", features = ["event", "net", "fs", "process", "std", "system", "time"] }
 ibex-mmsg = { path = "../ibex-mmsg" }
 ibex-quic = { path = "../ibex-quic" }
+ibex-dns = { path = "../ibex-dns" }
 ctrlc = "3.5.2"
 nix = { version = "0.31", default-features = false, features = ["net", "user"] }
 ibex-regex = { workspace = true }

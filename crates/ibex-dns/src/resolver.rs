@@ -67,6 +67,9 @@ pub struct ResolverConfig {
     /// The message id generator. T484 passes `ibex_rt`'s RNG; the default is `SipHash` under
     /// the standard library's random keys.
     pub random_id: fn() -> u16,
+    /// A truncated UDP answer is asked again over TCP (`HAProxy`'s behaviour, A.t9). Off, it
+    /// is an error like a truncated TCP answer (`Other`): Ibex until its TCP path (T488).
+    pub tcp_fallback: bool,
 }
 
 impl Default for ResolverConfig {
@@ -84,6 +87,7 @@ impl Default for ResolverConfig {
             hold_obsolete: Duration::from_secs(0),
             accepted_payload_size: 512,
             random_id: default_random_id,
+            tcp_fallback: true,
         }
     }
 }
@@ -385,7 +389,7 @@ impl Resolver {
                 self.results.push_back((f.id, Ok(answers)));
                 return Received::Valid;
             }
-            Verdict::Truncated if proto == Protocol::Udp => {
+            Verdict::Truncated if proto == Protocol::Udp && self.cfg.tcp_fallback => {
                 // resolv_send_tcp_fallback: the same question over TCP to this nameserver,
                 // without using a try.
                 f.nb_queries += 1;
