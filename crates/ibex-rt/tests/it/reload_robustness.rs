@@ -324,17 +324,26 @@ fn a_worker_that_never_becomes_ready_does_not_block_reloads() {
     let mut ibex = Ibex::spawn(
         &dir,
         &["-W", "-S", sock.to_str().unwrap(), "-f", cfg.to_str().unwrap()],
-        &[("IBEX_WORKER_LOAD_TIMEOUT_MS", "1500")],
+        &[("IBEX_WORKER_LOAD_TIMEOUT_MS", "6000")],
     );
+    // The second reload below is sent 300 ms after the first; on a loaded host this thread can
+    // be stalled for longer than a short give-up time, and the first reload would be over.
     wait_for_socket(&sock);
     assert!(common::wait_listening(SocketAddr::from(([127, 0, 0, 1], port))));
     std::fs::write(&cfg, http(port, "v2", &format!("  errorfile 503 {}\n", fifo.display()))).unwrap();
     let s2 = sock.clone();
-    let first = std::thread::spawn(move || master(&s2, "reload", Duration::from_secs(10)));
-    std::thread::sleep(Duration::from_millis(300));
+    let first = std::thread::spawn(move || master(&s2, "reload", Duration::from_secs(15)));
+    // Wait for the event, not for a time: the first reload is under way once the master has a
+    // second child (the new worker). A reload sent before the master took the first one would
+    // be the one that runs, and the first would be told "in progress".
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while children(ibex.pid()).len() < 2 {
+        assert!(Instant::now() < deadline, "the reload never started a worker");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     ibex.note_children();
     assert_eq!(
-        master(&sock, "reload", Duration::from_secs(5)),
+        master(&sock, "reload", Duration::from_secs(12)),
         "Success=0\n--\nAnother reload is still in progress.\n",
         "while the worker loads"
     );
