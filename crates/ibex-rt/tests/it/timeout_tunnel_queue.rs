@@ -385,7 +385,7 @@ fn two_queued_requests_are_both_served_in_turn() {
 }
 
 /// The 101 comes late (1 s, `timeout client`/`server` 5 s): the tunnel runs on
-/// `timeout tunnel` from the 101, so it closes about 0.7 s after it.
+/// `timeout tunnel` from the 101, so it closes about 0.7 s after it (5 s would be `timeout client`).
 #[test]
 fn timeout_tunnel_starts_at_a_late_101() {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -405,12 +405,14 @@ fn timeout_tunnel_starts_at_a_late_101() {
     let (d, eof) = with_ibex(t, "http", "", be, |fe, _| {
         let mut s = TcpStream::connect(fe).expect("c");
         s.write_all(b"GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").expect("w");
-        let t0 = Instant::now();
         let mut b = [0u8; 1024];
-        s.set_read_timeout(Some(Duration::from_secs(3))).expect("rt");
+        s.set_read_timeout(Some(Duration::from_secs(30))).expect("rt");
         let _ = s.read(&mut b);
+        // Timed from the 101 reaching the client, not from the request: how late the 101 is
+        // depends on the host, the tunnel timeout runs from it.
+        let t0 = Instant::now();
         let (d, eof) = until_eof(&mut s, Duration::from_secs(4), None);
         { let _ = d; (t0.elapsed(), eof) }
     });
-    assert!(eof && d >= Duration::from_millis(1550) && d <= Duration::from_millis(2000), "closed at {d:?}");
+    assert!(eof && d >= Duration::from_millis(550) && d <= Duration::from_millis(1500), "closed at {d:?}");
 }

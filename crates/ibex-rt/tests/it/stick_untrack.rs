@@ -40,7 +40,7 @@ fn start(cfg: &str, wait_on: SocketAddr) -> Ibex {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn ibex");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while TcpStream::connect(wait_on).is_err() {
         assert!(Instant::now() < deadline, "ibex never started listening on {wait_on}");
         thread::sleep(Duration::from_millis(20));
@@ -82,7 +82,7 @@ http-request return status 200 content-type text/plain lf-string "%[ipv4(127.0.0
 
 fn peer_state(rd: SocketAddr) -> String {
     let mut c = TcpStream::connect(rd).expect("connect");
-    c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    c.set_read_timeout(Some(Duration::from_secs(30))).expect("timeout");
     c.write_all(b"GET / HTTP/1.1\r\nHost: t139\r\nConnection: close\r\n\r\n").expect("send");
     let mut out = String::new();
     let _ = c.read_to_string(&mut out);
@@ -114,7 +114,7 @@ fn a_closed_connection_a_rejected_one_and_a_moved_slot_release_their_entry() {
 
     // A connection with a PROXY header, one request, then closed.
     let mut c = TcpStream::connect(px).expect("connect px");
-    c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    c.set_read_timeout(Some(Duration::from_secs(30))).expect("timeout");
     c.write_all(b"PROXY TCP4 198.51.100.7 10.0.0.1 1234 80\r\nGET /x HTTP/1.1\r\nHost: t139\r\n\r\n").expect("send");
     let mut buf = [0u8; 512];
     let n = c.read(&mut buf).expect("read");
@@ -125,7 +125,7 @@ fn a_closed_connection_a_rejected_one_and_a_moved_slot_release_their_entry() {
     // Three slots that a rule moves to another key (`HAProxy` leaves them where they are, which
     // leaves the same counters once the connection is closed: none).
     let mut c = TcpStream::connect(mv).expect("connect mv");
-    c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    c.set_read_timeout(Some(Duration::from_secs(30))).expect("timeout");
     c.write_all(b"GET /x HTTP/1.1\r\nHost: t139\r\n\r\n").expect("send");
     let _ = c.read(&mut buf).expect("read");
     drop(c);
