@@ -33,6 +33,7 @@ pub mod registry;
 pub mod sample;
 pub mod spare;
 pub mod vars;
+pub mod work;
 
 pub use acls::Acls;
 

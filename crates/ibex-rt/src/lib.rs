@@ -62,6 +62,7 @@ pub mod h2_bridge;
 pub mod h3_relay;
 pub mod raw;
 pub mod rule_exprs;
+pub mod rule_compiled;
 pub mod reuse;
 pub mod srv_rt;
 pub mod srv_tls;
