@@ -83,4 +83,9 @@ pub struct SampleRef {
     /// For an anonymous ACL (`{ ... }`), the whole expression with its flags and patterns,
     /// as `acl <name> ...` would hold it: what is compiled when the configuration loads.
     pub full: Option<String>,
+    /// `expr` is a whole format string (a rule's `set-header` value, `redirect` target,
+    /// `lf-string`, ...), to be compiled as `HAProxy` compiles a rule's `log-format`, so that an
+    /// alias it does not know is refused at load (T455). `acl` is `false` and the `%[...]`
+    /// expressions in it are recorded on their own, before this one.
+    pub whole_format: bool,
 }

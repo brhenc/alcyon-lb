@@ -100,6 +100,7 @@ pub(crate) fn collect(section: &CurrentSection, tokens: &[Token], out: &mut Vec<
             action: tokens.get(1).map(|t| t.text.clone()).unwrap_or_default(),
             expr: expr.to_string(),
             full,
+            whole_format: false,
         });
     };
     if tokens[0].text == "acl" {
@@ -143,6 +144,54 @@ pub(crate) fn collect(section: &CurrentSection, tokens: &[Token], out: &mut Vec<
             push(out, t, false, expr, None);
         }
     }
+    // The whole formats, after the expressions in them, which are checked first.
+    for i in format_words(tokens) {
+        let t = &tokens[i];
+        out.push(SampleRef {
+            line: t.line,
+            section: kind,
+            proxy: proxy.clone(),
+            acl: false,
+            directive: tokens[0].text.clone(),
+            action: tokens.get(1).map(|t| t.text.clone()).unwrap_or_default(),
+            expr: t.text.clone(),
+            full: None,
+            whole_format: true,
+        });
+    }
+}
+
+/// The indexes of the words of a rule that `HAProxy` compiles as a format
+/// (`parse_logformat_string`): a header's value, a `set-var-fmt`'s, the target of a `set-path`
+/// or `redirect`, the replacement of a `replace-header`, an `lf-string`.
+fn format_words(tokens: &[Token]) -> Vec<usize> {
+    let word = |i: usize| tokens.get(i).map(|t| t.text.as_str());
+    let a = match word(0) {
+        Some("http-request" | "http-response" | "http-after-response") => 1,
+        Some("tcp-request" | "tcp-response") => 2,
+        _ => return Vec::new(),
+    };
+    let Some(action) = word(a) else { return Vec::new() };
+    let mut found = Vec::new();
+    match action {
+        "set-header" | "add-header" | "early-hint" | "replace-path" | "replace-pathq" | "replace-uri" => found.push(a + 2),
+        "set-path" | "set-pathq" | "set-query" | "set-uri" | "set-method" => found.push(a + 1),
+        "replace-header" | "replace-value" => found.push(a + 3),
+        "redirect" => {
+            if let Some(i) = tokens.iter().position(|t| matches!(t.text.as_str(), "location" | "prefix" | "scheme")) {
+                found.push(i + 1);
+            }
+        }
+        _ if action.starts_with("set-var-fmt") => found.push(a + 1),
+        _ => {}
+    }
+    for (i, t) in tokens.iter().enumerate() {
+        if matches!(t.text.as_str(), "lf-string" | "set-cookie-fmt") && !found.contains(&(i + 1)) {
+            found.push(i + 1);
+        }
+    }
+    found.retain(|&i| i < tokens.len() && tokens[i].text != "if" && tokens[i].text != "unless");
+    found
 }
 
 #[cfg(test)]

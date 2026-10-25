@@ -182,6 +182,10 @@ pub struct StreamFacts {
     pub retries: u32,
     /// The stream was redispatched (`txn.redispatched`).
     pub redispatched: bool,
+    /// What the stream has measured, in milliseconds from its start, `-1` for what has not
+    /// happened: the first byte, the request, the queue, the connect and the response
+    /// (`%Ti`, `%TR`..., a rule's format reads them, T455). `None` where the caller has none.
+    pub timers: Option<[i64; 5]>,
 }
 
 /// Why a client connection failed before a session began (`conn->err_code`): what

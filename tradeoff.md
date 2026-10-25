@@ -691,3 +691,12 @@ registry `show pools` and `pool_gc` walk. Where it differs from the design (§3)
 | **Differs from HAProxy** | HAProxy has no wipe of freed memory; its `-dM` options poison or pattern-fill pool objects for debugging (`docs/differences.md`), and OpenSSL clears its own key material. |
 | **Cost (measured 2026-10-25, 1 thread, `tools/measure/insreq.sh`, min of 3-5 rounds, base = main da8524ca, interleaved; llama-server partly running, figures relative)** | Keep-alive requests (`ab1`, 30000): base 49211-49222, `off` 49247-49249 instructions per request (+30, +0.06%: the request path frees nothing). New connection per request (`nc1`, 5000): base 58687-58692, `off` 58726-58727 (+0.06%), `soft` 59179 (+0.8%), `hard` 59141-59142 (+0.77%). One TLS handshake per request (`hs1`, 2000): base 1506936-1506940, `off` 1508265-1508357 (+0.09%), `soft` 1514877-1514879 (+0.53%), `hard` 1512101-1512365 (+0.34%). Connections/s and handshakes/s (`ab -c 1`, client-bound) were the same within noise in every mode: ~4040/s and ~1015/s. `soft` costs more instructions than `hard` (the list and the pass), and moves them off the free. |
 | **Not done** | The bounds are fixed (4 x hot-size, 100 ms, 16 KiB per busy pass), not keywords. `show pools` does not list the quarantine. Threads past the 256th publish no figures. |
+
+## T455: `%bi` / `%bp` in a rule format are refused at load
+
+HAProxy accepts `%bi` and `%bp` (the backend connection's source address and port) in a rule
+format. Ibex does not record the backend connection's source address (`getsockname` on connect),
+so the log-format compiler refuses both as "not implemented", and now so does every rule
+format, where they used to print as literal text. A configuration that uses them fails to load
+with `log-format alias '%bi' is not implemented`. Fix: record the local address once per server
+connection and give it to `LogData`.
