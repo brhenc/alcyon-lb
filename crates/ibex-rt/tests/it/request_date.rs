@@ -87,12 +87,27 @@ fn request_date_adds_the_idle_time_before_the_request() {
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         c
     };
+    // The idle time is what the server saw between the accept (or the previous answer) and the
+    // request, so a loaded host that oversleeps or delays a send lengthens it. The expected value
+    // is therefore the wait this thread measured (not the nominal one), with the same tolerance.
+    // The first idle time is counted from the accept, and a loaded server may accept late; the
+    // accept date it reports says by how much (the connection has been established since `t0`), and
+    // that part of the wait is not idle time.
+    let now_ms = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
     let mut c = connect();
+    let t0 = now_ms();
+    let t = std::time::Instant::now();
     std::thread::sleep(Duration::from_millis(1000));
+    let mut w1 = t.elapsed().as_millis() as i64;
     let first = ask(&mut c);
+    let accept1: i64 = first.split('|').next().unwrap().split_once('-').unwrap().1.parse().unwrap();
+    w1 -= (accept1 - t0).max(0);
+    let t = std::time::Instant::now();
     std::thread::sleep(Duration::from_millis(700));
+    let w2 = t.elapsed().as_millis() as i64;
     let second = ask(&mut c);
     drop(c);
+    let w3 = 0;
     let third = ask(&mut connect());
     let mut logs = Vec::new();
     for _ in 0..3 {
@@ -101,9 +116,12 @@ fn request_date_adds_the_idle_time_before_the_request() {
         let line = String::from_utf8_lossy(&buf[..n]).into_owned();
         logs.push(line[line.find("LOG ").expect("the log-format line") + 4..].trim_end().to_string());
     }
+    // A connection's line is written when it ends, so the third may reach the collector before
+    // the second: order the lines by accept date, which is the order of the connections.
+    logs.sort_by_key(|l| l.split_once('-').unwrap().1.parse::<i64>().unwrap());
     for (what, got) in [("rule", [&first, &second, &third].map(|s| idle(s))), ("log", [&logs[0], &logs[1], &logs[2]].map(|s| idle(s)))] {
-        for (want, got) in [1000, 700, 0].into_iter().zip(got) {
-            assert!((want - 150..want + 150).contains(&got) && got >= 0, "{what}: request_date - accept_date is {got} ms, not {want}: {first:?} {second:?} {third:?} {logs:?}");
+        for (want, got) in [w1, w2, w3].into_iter().zip(got) {
+            assert!((want - 150..want + 150).contains(&got) && got >= 0, "{what}: request_date - accept_date is {got} ms, not {want} (waited {w1}/{w2}/{w3}): {first:?} {second:?} {third:?} {logs:?}");
         }
     }
     // The units are of one date: microseconds, milliseconds, seconds.
