@@ -1238,7 +1238,7 @@ impl<'a> HtxSliceRef<'a> {
                     }));
                 }
                 HtxBlockType::ResLine => {
-                    let raw = utf8(&self.buf[addr..addr + desc.value_len as usize]).unwrap_or("");
+                    let raw = std::str::from_utf8(&self.buf[addr..addr + desc.value_len as usize]).unwrap_or("");
                     let mut parts = raw.splitn(3, ' ');
                     blocks.push(HtxBlock::ResLine(ResponseLine {
                         version: HttpVersion::from_bytes(parts.next().unwrap_or("HTTP/1.1").as_bytes()),
@@ -1342,8 +1342,8 @@ impl std::fmt::Debug for HtxSliceRef<'_> {
                     let s = desc.addr as usize;
                     let nl = desc.name_len as usize;
                     let vl = desc.value_len as usize;
-                    let n = utf8(&self.buf[s..s + nl]).unwrap_or("");
-                    let v = utf8(&self.buf[s + nl..s + nl + vl]).unwrap_or("");
+                    let n = std::str::from_utf8(&self.buf[s..s + nl]).unwrap_or("");
+                    let v = std::str::from_utf8(&self.buf[s + nl..s + nl + vl]).unwrap_or("");
                     list.entry(&("Trailer", n, v));
                 }
                 HtxBlockType::RawData => {

@@ -13594,7 +13594,7 @@ pub(crate) fn push_alias(out: &mut String, name: &str, ctx: &SampleContext, push
     }
 }
 
-fn render_sample_format_into(out: &mut String, fmt: &str, ctx: &SampleContext, registry: &Registry, http: bool) {
+pub(crate) fn render_sample_format_into(out: &mut String, fmt: &str, ctx: &SampleContext, registry: &Registry, http: bool) {
     let push = |out: &mut String, v: &str| if http { push_http_encoded(out, v) } else { out.push_str(v) };
     let mut chars = fmt.char_indices().peekable();
 
@@ -14656,7 +14656,7 @@ fn write_req_head(sess: &mut TcpSession) {
     }
 }
 
-fn eval_condition(
+pub(crate) fn eval_condition(
     cond: &ibex_config::AclCondition,
     ctx: &SampleContext,
     acls: &ibex_sample::Acls,

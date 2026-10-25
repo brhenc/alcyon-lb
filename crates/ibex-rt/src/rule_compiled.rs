@@ -102,19 +102,15 @@ impl Format {
                 Some('[') => {
                     chars.next();
                     let start = chars.peek().map_or(fmt.len(), |p| p.0);
-                    let mut end = fmt.len();
+                    // Up to the `]` that closes it.
                     let mut depth = 1;
-                    for (i, ec) in chars.by_ref() {
-                        if ec == '[' {
-                            depth += 1;
-                        } else if ec == ']' {
-                            depth -= 1;
-                            if depth == 0 {
-                                end = i;
-                                break;
-                            }
-                        }
-                    }
+                    let end = chars
+                        .by_ref()
+                        .find(|&(_, ec)| {
+                            depth += i32::from(ec == '[') - i32::from(ec == ']');
+                            depth == 0
+                        })
+                        .map_or(fmt.len(), |(i, _)| i);
                     flush(&mut segs, &mut lit);
                     segs.push(Seg::Sample(Expr::parse(&fmt[start..end]).ok().map(Box::new)));
                 }
@@ -245,4 +241,71 @@ pub fn http_after_res(rules: &[ibex_config::HttpAfterResRule], acls: &Acls) -> V
             HttpAfterResAction::Capture { .. } | HttpAfterResAction::DelHeader { .. } => Rule::new(r.cond.as_ref(), acls, None, None),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ibex_config::AclTerm;
+
+    /// A compiled condition holds when its text does (`eval_condition`, which looks each term
+    /// up per request).
+    #[test]
+    fn conditions_hold_as_their_text_does() {
+        let acls = Acls::compile([("yes", "always_true"), ("no", "always_false")]);
+        let registry = crate::engine::sample_registry();
+        let ctx = SampleContext::default();
+        let cases: &[&[(bool, &str)]] = &[
+            &[(false, "always_true")],
+            &[(true, "always_true")],
+            &[(false, "always_false")],
+            &[(false, "yes"), (true, "no")],
+            &[(false, "no"), (false, AclCondition::OR), (false, "yes")],
+            &[(false, "yes"), (false, AclCondition::OR)],
+            &[(false, "TRUE")],
+            &[(true, "FALSE")],
+            &[(false, "{ always_true }")],
+            &[(false, "not an expression(")],
+            &[(true, "not an expression(")],
+            &[],
+        ];
+        for is_if in [true, false] {
+            for terms in cases {
+                let cond = AclCondition { is_if, terms: terms.iter().map(|&(negated, name)| AclTerm { negated, name: name.to_string() }).collect() };
+                let text = crate::engine::eval_condition(&cond, &ctx, &acls, registry);
+                assert_eq!(Cond::compile(&cond, &acls).eval(&ctx, &acls, registry), text, "{cond:?}");
+            }
+        }
+    }
+
+    /// A compiled format renders what its text does (`render_sample_format_into`).
+    #[test]
+    fn formats_render_as_their_text_does() {
+        let registry = crate::engine::sample_registry();
+        let ctx = SampleContext::default();
+        let formats = [
+            "",
+            "plain",
+            "%[str(a)]",
+            "a%[str(x)]b%[str(y)]c",
+            "%[str(a),concat([x])]",
+            "%[str(a)",
+            "%%",
+            "100%",
+            "% x",
+            "%[not an expression(]",
+            "%ci:%cp-%[str(b)]",
+            "%H",
+            "\u{e9}%[str(\u{fc} x)]",
+        ];
+        for http in [false, true] {
+            for fmt in formats {
+                let mut text = String::new();
+                crate::engine::render_sample_format_into(&mut text, fmt, &ctx, registry, http);
+                let mut compiled = String::new();
+                Format::compile(fmt).render_into(&mut compiled, &ctx, registry, http);
+                assert_eq!(compiled, text, "{fmt:?} (http {http})");
+            }
+        }
+    }
 }
