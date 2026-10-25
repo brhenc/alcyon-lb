@@ -170,6 +170,32 @@ impl H2ReqHead {
         self.field_bytes += name.len() + value.len();
     }
 
+    /// The `cookie` field of the values `values`, joined with "; "; none, no field.
+    fn push_cookies<'a>(&mut self, values: impl Iterator<Item = &'a str>) {
+        let pos = |t: &String| u32::try_from(t.len()).unwrap_or(u32::MAX);
+        let mut first = true;
+        let (mut a, mut b, mut c) = (0, 0, 0);
+        for v in values {
+            if first {
+                first = false;
+                a = pos(&self.text);
+                self.text.push_str("cookie");
+                b = pos(&self.text);
+                self.text.push_str(": ");
+                c = pos(&self.text);
+            } else {
+                self.text.push_str("; ");
+            }
+            self.text.push_str(v);
+        }
+        if !first {
+            let d = pos(&self.text);
+            self.text.push_str("\r\n");
+            self.fields.push((a, b, c, d));
+            self.field_bytes += "cookie".len() + (d - c) as usize;
+        }
+    }
+
     /// Writes the request of `fields`, checked as
     /// `pseudo_headers_to_htx` checks it, and refused as `HAProxy` 3.5-dev8 refuses it
     /// (measured, T437): without `:method`, with a `:status`, or with a `:protocol` outside
@@ -251,11 +277,18 @@ impl H2ReqHead {
                 }
                 host_seen = true;
             }
+            // The cookie fields are merged after the others (below).
+            if n == "cookie" {
+                continue;
+            }
             // A value's leading and trailing blanks go, as `h2_make_htx_request` trims them
-            // (RFC 9113 section 8.2.1); a cookie's stay (`http_cookie_merge`, measured).
-            let v = if n == "cookie" { v } else { v.trim_matches([' ', '\t']) };
-            self.push_field(n, v);
+            // (RFC 9113 section 8.2.1).
+            self.push_field(n, v.trim_matches([' ', '\t']));
         }
+        // RFC 9113 section 8.2.3: the cookie fields are one line, their values joined with
+        // "; " and their blanks kept, after the other fields (`h2_make_htx_request`;
+        // measured, T506).
+        self.push_cookies(fields.iter().filter(|(n, _)| *n == "cookie").map(|(_, v)| v));
         self.text.push_str("\r\n");
         self.head_len = self.text.len();
         // `HAProxy`'s start line: the first `:scheme` and `:authority`.
