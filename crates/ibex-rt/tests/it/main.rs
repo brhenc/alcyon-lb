@@ -63,6 +63,7 @@ mod check_condition;
 mod check_malformed_replies;
 mod check_reply_buffer_bound;
 mod check_rules;
+mod check_port;
 mod check_stats_columns;
 mod check_status_word;
 mod check_verdicts;

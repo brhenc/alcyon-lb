@@ -120,6 +120,8 @@ pub struct ServerCheckConfig {
     pub fall: u32,
     /// Timeout for an individual health check connection attempt.
     pub timeout: Duration,
+    /// `check port` / `port`: the port the checks connect to instead of the traffic port.
+    pub check_port: Option<u16>,
 }
 
 impl Default for ServerCheckConfig {
@@ -131,6 +133,7 @@ impl Default for ServerCheckConfig {
             rise: 2,
             fall: 3,
             timeout: Duration::from_millis(2000),
+            check_port: None,
         }
     }
 }
@@ -1760,7 +1763,7 @@ pub fn step_check(
                         let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
                         check.sock = Some(sock);
 
-                        check.run.sub_state = CheckSubState::ProtoConnecting { target_addr: check.addr };
+                        check.run.sub_state = CheckSubState::ProtoConnecting { target_addr: check_target(check) };
                         Ok(CheckStep::pending(Some(check.exp)))
                     }
                     Err(e) => {
@@ -2384,12 +2387,18 @@ fn finish_reply(
     CheckStep { next: Some(next), event }
 }
 
+/// Where the plain TCP and protocol checks connect: the server's address, on `check port`
+/// when it has one (T495).
+fn check_target(check: &ServerCheckState) -> SocketAddr {
+    SocketAddr::new(check.addr.ip(), check.config.check_port.unwrap_or(check.addr.port()))
+}
+
 /// Connects a check to `addr` (the server's unless given) and, when the server line asks
 /// for it (`check-ssl`, or `ssl` inherited), puts the check's TLS over the socket. This
 /// is where `check-ssl` reaches the check (T113). A TLS check never takes the immediate
 /// path: its handshake runs from the `*Connecting` state ([`drive_check_handshake`]).
 fn connect_check(check: &mut ServerCheckState, addr: Option<SocketAddr>) -> io::Result<(OwnedFd, bool)> {
-    let addr = addr.unwrap_or(check.addr);
+    let addr = addr.unwrap_or_else(|| check_target(check));
     let (sock, immediate) = raw::connect(addr)?;
     let Some(tls) = check.tls.as_ref() else {
         check.xprt = ServerXprt::Plain;
