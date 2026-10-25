@@ -40,7 +40,11 @@ fn main() {
     use std::io::Write;
     std::io::stdout().flush().expect("flush");
 
-    loop {
+    // SIGUSR1 ends the loop and returns from main, so the process exits normally (and writes
+    // its coverage profile) instead of dying to the signal's default action.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGUSR1, std::sync::Arc::clone(&stop)).expect("SIGUSR1 handler");
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         if engine.run_once().is_err() {
             break;
         }

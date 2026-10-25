@@ -3,8 +3,8 @@
 //! The `duress_target` binary serves HTTP/3 through the engine's frontend (T463): a request
 //! to it reaches the backend given as its second argument.
 //!
-//! It handles no signal of its own, so the default action of SIGUSR1 (what `common::stop`
-//! sends first) ends it; `common::stop` kills it after 5 s if that ever stops being so.
+//! SIGUSR1 (what `common::stop` sends first) makes it leave its loop and exit normally, so the
+//! process writes its coverage profile; the test checks it exits by itself with status 0.
 
 use crate::common;
 
@@ -55,6 +55,8 @@ fn duress_target_proxies_an_h3_request_to_its_backend() {
         .output()
         .expect("curl");
     common::stop(&mut child);
+    let status = child.wait().expect("wait");
+    assert!(status.success(), "SIGUSR1 must end duress_target normally, got {status:?}");
     let body = String::from_utf8_lossy(&res.stdout);
     assert!(
         body.contains("from-be-T463"),
