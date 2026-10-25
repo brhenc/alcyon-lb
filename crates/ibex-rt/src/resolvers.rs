@@ -276,6 +276,11 @@ pub fn build(
     now: ibex_sched::Tick,
 ) -> io::Result<Vec<Section>> {
     let t0 = Instant::now();
+    if config.resolvers.is_empty() {
+        return Ok(Vec::new());
+    }
+    // In `show pools` once a configuration has resolvers.
+    register_pools();
     let families = active_families(t0);
     let mut out: Vec<Section> = Vec::new();
     // `config.listens` then `config.backends`, enabled ones, are `proxies` in order

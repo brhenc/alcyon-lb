@@ -7922,6 +7922,18 @@ pub fn set_proxy_maxconn(
     }
 }
 
+/// A check of server `s` of proxy `p` ended in a layer-4 timeout: its resolutions may be due
+/// now (`resolvers::Section::trigger`). Out of line: kept off the dispatcher's code.
+#[cold]
+#[inline(never)]
+fn trigger_resolutions(resolvers: &mut [crate::resolvers::Section], timers: &mut Vec<(TaskRef, Tick)>, now: Tick, p: usize, s: usize) {
+    for sec in resolvers.iter_mut() {
+        if sec.trigger(p, s) {
+            timers.push((sec.task, now));
+        }
+    }
+}
+
 /// Internal dispatcher executing scheduler tasks against runtime sessions and health checks.
 struct EngineDispatcher<'a> {
     sessions: &'a mut SessionArena,
@@ -13280,11 +13292,7 @@ impl EngineDispatcher<'_> {
             let proxy_idx = check.proxy();
             let server_idx = check.server();
             if crate::resolvers::take_l4_timeout() {
-                for sec in self.resolvers.iter_mut() {
-                    if sec.trigger(proxy_idx, server_idx) {
-                        self.timer_updates.push((sec.task, now));
-                    }
-                }
+                trigger_resolutions(self.resolvers, &mut self.timer_updates, now, proxy_idx, server_idx);
             }
             if check.enabled
                 && proxy_idx < self.proxies.len()
@@ -13330,7 +13338,10 @@ impl EngineDispatcher<'_> {
     }
 
     /// Runs `resolvers` section `idx` (`crate::resolvers`): its log lines go to the servers'
-    /// proxies and to stderr, as `HAProxy`'s `send_log` and `ha_warning`.
+    /// proxies and to stderr, as `HAProxy`'s `send_log` and `ha_warning`. Out of line: kept off
+    /// the stream path's code.
+    #[cold]
+    #[inline(never)]
     fn step_resolver(&mut self, idx: usize) -> Outcome {
         let Some(sec) = self.resolvers.get_mut(idx) else { return Outcome::Done };
         // Lines are rare (a change of a server's address or state): a `Vec` per change.
