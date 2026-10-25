@@ -30,6 +30,7 @@ struct Run {
     syslog: UdpSocket,
     sock: String,
     err: String,
+    front: std::net::SocketAddr,
     log: Vec<String>,
 }
 
@@ -41,7 +42,7 @@ impl Run {
         let sock = dir.join("cli.sock").to_string_lossy().into_owned();
         let cfg = format!(
             "global\n  stats socket {sock} level admin\n{extra_global}defaults\n  mode http\n  log 127.0.0.1:{} local0\n  \
-             timeout connect 1s\n  timeout client 2s\n  timeout server 2s\nfrontend f\n  bind {front}\n  default_backend b\n\
+             timeout connect 1s\n  timeout client 2s\n  timeout server 2s\nfrontend f\n  bind {front}\n  stats enable\n  stats uri /st\n  stats admin if TRUE\n  default_backend b\n\
              backend b\n{extra_be}{servers}",
             syslog.local_addr().unwrap().port()
         );
@@ -55,7 +56,7 @@ impl Run {
             .stderr(std::fs::File::create(&err).expect("err file"))
             .spawn()
             .expect("spawn ibex");
-        Run { ibex: common::Ibex(child), syslog, sock, err: err.to_string_lossy().into_owned(), log: Vec::new() }
+        Run { ibex: common::Ibex(child), syslog, sock, err: err.to_string_lossy().into_owned(), front, log: Vec::new() }
     }
 
     /// Reads the log until `what` was seen (or 5 s), returns all lines so far.
@@ -86,6 +87,18 @@ impl Run {
         let mut out = String::new();
         c.read_to_string(&mut out).expect("cli read");
         out
+    }
+
+    fn post(&self, body: &str) {
+        let mut c = std::net::TcpStream::connect(self.front).expect("connect");
+        c.set_read_timeout(Some(Duration::from_secs(3))).ok();
+        let req = format!(
+            "POST /st HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        c.write_all(req.as_bytes()).expect("post");
+        let mut out = Vec::new();
+        let _ = c.read_to_end(&mut out);
     }
 
     /// stderr so far (after ibex was stopped, so that nothing is missing).
@@ -205,4 +218,37 @@ fn the_server_state_file_down_is_on_stderr() {
         err.contains(") : Server b/s1 is DOWN, changed from server-state after a reload. 0 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.\n"),
         "stderr: {err}"
     );
+}
+
+#[test]
+fn stats_page_and_cli_health_changes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (_l, srv) = listener();
+    let mut r = Run::start(
+        dir.path(),
+        "g.cfg",
+        "",
+        "",
+        &format!("  server s1 {srv} check inter 200ms fall 1 rise 1\n  server s2 {srv} backup\n"),
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    let down = "Server b/s1 is going DOWN for maintenance ('disable' on stats page). 0 active and 1 backup servers left. Running on backup. 0 sessions active, 0 requeued, 0 remaining in queue.";
+    r.post("s=s1&action=disable&b=b");
+    assert!(r.wait_log(down), "log: {:?}", r.log);
+    r.post("s=s1&action=ready&b=b");
+    assert!(r.wait_log("Server b/s1 is UP/READY (leaving forced maintenance)."), "log: {:?}", r.log);
+    r.post("s=s1&action=stop&b=b");
+    assert!(
+        r.wait_log("Server b/s1 enters drain state ('stop' on stats page). 0 active and 1 backup servers online. Running on backup."),
+        "log: {:?}",
+        r.log
+    );
+    r.post("s=s1&action=ready&b=b");
+    assert!(r.wait_log("Server b/s1 is UP (leaving forced drain)."), "log: {:?}", r.log);
+    r.post("s=s1&action=hdown&b=b");
+    assert!(r.wait_log("Server b/s1 is DOWN, changed from Web interface. 0 active and 1 backup servers left."), "log: {:?}", r.log);
+    r.post("s=s1&action=hrunn&b=b");
+    assert!(r.wait_log("Server b/s1 is UP, changed from Web interface."), "log: {:?}", r.log);
+    r.cli("set server b/s1 health down");
+    assert!(r.wait_log("Server b/s1 is DOWN, changed from CLI. 0 active and 1 backup servers left."), "log: {:?}", r.log);
 }
