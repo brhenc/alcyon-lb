@@ -3489,6 +3489,12 @@ impl TcpSession {
         let awaiting_server = self.mode == Mode::Http
             && self.txn.as_ref().is_some_and(|t| t.req.is_done() && !t.local && t.error.is_none())
             && !self.has_pending_output();
+        // A request with no body is complete once its head is in: the client owes nothing
+        // while the stream connects or waits for a connection (`sC--`, not `cH--`, T496).
+        let head_only = self.mode == Mode::Http
+            && self.txn.as_ref().is_some_and(|t| matches!(t.req, txn::MsgState::Head { body: txn::Framing::None, .. }) && !t.local && t.error.is_none())
+            && !self.has_pending_output();
+        let awaiting_server = awaiting_server || head_only;
         // So is the turnaround before a retry (`SC_ST_TAR`).
         !awaiting_server
             && !self.retry_after.is_set()
