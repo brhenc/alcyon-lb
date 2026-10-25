@@ -112,6 +112,8 @@ pub enum SettingsParameter {
     InitialWindowSize = 0x4,
     MaxFrameSize = 0x5,
     MaxHeaderListSize = 0x6,
+    /// RFC 8441 section 3.
+    EnableConnectProtocol = 0x8,
     Unknown(u16),
 }
 
@@ -124,6 +126,7 @@ impl From<u16> for SettingsParameter {
             0x4 => SettingsParameter::InitialWindowSize,
             0x5 => SettingsParameter::MaxFrameSize,
             0x6 => SettingsParameter::MaxHeaderListSize,
+            0x8 => SettingsParameter::EnableConnectProtocol,
             other => SettingsParameter::Unknown(other),
         }
     }
@@ -138,6 +141,7 @@ impl From<SettingsParameter> for u16 {
             SettingsParameter::InitialWindowSize => 0x4,
             SettingsParameter::MaxFrameSize => 0x5,
             SettingsParameter::MaxHeaderListSize => 0x6,
+            SettingsParameter::EnableConnectProtocol => 0x8,
             SettingsParameter::Unknown(other) => other,
         }
     }

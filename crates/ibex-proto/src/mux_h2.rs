@@ -39,6 +39,9 @@ const RX_BUF: usize = 16384;
 /// The body bytes one receive buffer holds: [`RX_BUF`] less the HTX header (40 bytes) and
 /// one data block (8), `htx_free_data_space` of an empty rxbuf. A 16 KB DATA frame spans two.
 const RX_SLOT_DATA: usize = RX_BUF - 40 - 8;
+/// The initial stream window a client connection is advertised: `MAX(16384, tune.bufsize -
+/// sizeof(htx) - sizeof(htx_blk))` (`h2_settings_initial_window_size`).
+const LOCAL_INITIAL_WINDOW: i32 = 16384;
 
 static H2_OPS: MuxOps = MuxOps {
     name: "h2",
@@ -81,6 +84,9 @@ pub struct H2StreamCtx {
     /// The request's first `content-length`, as a number, kept for the stream's window
     /// (the head written as text is taken by the data path).
     pub req_content_length: Option<usize>,
+    /// The request is an extended CONNECT (RFC 8441, [`H2ReqHead::ext_connect`]): the
+    /// server's `101` is a `200` to the client, and what follows a tunnel.
+    pub ext_connect: bool,
 }
 
 /// A request head as HTTP/1.1, from the fields of its HEADERS (T437): `METHOD PATH
@@ -107,6 +113,9 @@ pub struct H2ReqHead {
     pub field_bytes: usize,
     /// The head has a start line (`method` and `uri` are its).
     pub has_line: bool,
+    /// The request is an extended CONNECT (RFC 8441), written as the `GET` with
+    /// `upgrade: <protocol>` and `connection: upgrade` of an HTTP/1.1 upgrade.
+    pub ext_connect: bool,
 }
 
 impl H2ReqHead {
@@ -114,7 +123,7 @@ impl H2ReqHead {
     pub fn clear(&mut self) {
         self.text.clear();
         self.fields.clear();
-        (self.head_len, self.method_len, self.uri, self.abs, self.field_bytes, self.has_line) = (0, 0, (0, 0), (0, 0), 0, false);
+        (self.head_len, self.method_len, self.uri, self.abs, self.field_bytes, self.has_line, self.ext_connect) = (0, 0, (0, 0), (0, 0), 0, false, false);
     }
 
     /// A head of `wire` alone: no start line or field of its own (a head made elsewhere).
@@ -177,7 +186,7 @@ impl H2ReqHead {
     /// Every request of a server connection is written this way.
     fn write(&mut self, fields: &DecodedFields) -> Result<(), &'static str> {
         self.clear();
-        let (mut method, mut path, mut authority, mut host, mut scheme, mut protocol) = (None, None, None, None, false, false);
+        let (mut method, mut path, mut authority, mut host, mut scheme, mut protocol) = (None, None, None, None, false, None);
         let mut seen_regular = false;
         for (n, v) in fields.iter() {
             if n.starts_with(':') {
@@ -193,12 +202,12 @@ impl H2ReqHead {
                         &mut path
                     }
                     ":authority" => &mut authority,
-                    ":scheme" | ":protocol" => {
-                        let seen = if n == ":scheme" { &mut scheme } else { &mut protocol };
-                        if *seen {
+                    ":protocol" => &mut protocol,
+                    ":scheme" => {
+                        if scheme {
                             return Err("duplicate pseudo-header");
                         }
-                        *seen = true;
+                        scheme = true;
                         continue;
                     }
                     _ => return Err("unknown pseudo-header"),
@@ -220,11 +229,22 @@ impl H2ReqHead {
             }
         }
         let method = method.ok_or("no :method")?;
-        // `:protocol` is an extended CONNECT's (RFC 8441), consumed as the HTX conversion
-        // consumes it.
-        if protocol && method != "CONNECT" {
+        // `:protocol` is an extended CONNECT's (RFC 8441), which goes to the server as the
+        // `GET` of an HTTP/1.1 upgrade to that protocol (`h2_prepare_htx_reqline`,
+        // `h2_make_htx_request`): with `:scheme`, `:path` and `:authority`, and not to h2.
+        if protocol.is_some() && method != "CONNECT" {
             return Err(":protocol outside CONNECT");
         }
+        if let Some(p) = protocol {
+            if !scheme || path.is_none() || authority.is_none() {
+                return Err("extended CONNECT without :scheme, :path or :authority");
+            }
+            if p.eq_ignore_ascii_case("h2c") || p.eq_ignore_ascii_case("h2") {
+                return Err("extended CONNECT to h2");
+            }
+        }
+        self.ext_connect = protocol.is_some();
+        let method = if self.ext_connect { "GET" } else { method };
         self.has_line = true;
         self.text.push_str(method);
         self.method_len = self.text.len();
@@ -255,6 +275,10 @@ impl H2ReqHead {
             // (RFC 9113 section 8.2.1); a cookie's stay (`http_cookie_merge`, measured).
             let v = if n == "cookie" { v } else { v.trim_matches([' ', '\t']) };
             self.push_field(n, v);
+        }
+        if let Some(p) = protocol {
+            self.push_field("upgrade", p);
+            self.push_field("connection", "upgrade");
         }
         self.text.push_str("\r\n");
         self.head_len = self.text.len();
@@ -448,6 +472,7 @@ impl H2StreamCtx {
             bad_request: false,
             req_head: None,
             req_content_length: None,
+            ext_connect: false,
         }
     }
 }
@@ -575,7 +600,9 @@ impl H2MuxContext {
             conn_recv_window: DEFAULT_INITIAL_WINDOW_SIZE,
             rx_window_opened: false,
             remote_initial_window: DEFAULT_INITIAL_WINDOW_SIZE,
-            local_initial_window: DEFAULT_INITIAL_WINDOW_SIZE,
+            // What a stream may send before its window grows: `tune.bufsize` less an HTX
+            // header and block, at least 16384 (`h2_settings_initial_window_size`): 16384.
+            local_initial_window: if is_server { LOCAL_INITIAL_WINDOW } else { DEFAULT_INITIAL_WINDOW_SIZE },
             max_concurrent_streams: 100,
             max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             last_client_stream_id: 0,
@@ -875,7 +902,12 @@ impl H2MuxContext {
         let mut lines = head_str.lines();
         let Some(status_line) = lines.next() else { return false };
         let Some(code) = status_line.split_whitespace().nth(1) else { return false };
-        let Ok(status) = code.parse::<u16>() else { return false };
+        let Ok(mut status) = code.parse::<u16>() else { return false };
+        // An extended CONNECT is answered 200 where HTTP/1.1 switches protocols (RFC 8441
+        // section 5).
+        if status == 101 && self.streams.get(&stream_id).is_some_and(|s| s.ext_connect) {
+            status = 200;
+        }
         let headers = lines.filter_map(|line| line.split_once(':')).map(|(name, val)| (name.trim(), val.trim()));
         self.send_headers_frame(stream_id, status, headers, end_stream);
         true
@@ -1039,14 +1071,19 @@ impl Mux for MuxH2 {
             consumed += H2_CONN_PREFACE.len();
             ctx.conn_state = H2ConnState::ExpectSettings;
 
-            // Server immediately replies with its own initial SETTINGS frame. A limit of 0
-            // is not advertised (HAProxy sends no MAX_CONCURRENT_STREAMS then), yet every
-            // stream is refused.
-            let mut settings = Vec::with_capacity(2);
+            // Server immediately replies with its own initial SETTINGS frame, as
+            // `h2c_send_settings` writes it (measured on 3.5-dev8: 8=1, 4=16384, 3=100):
+            // extended CONNECT (RFC 8441), the initial window when it is not the protocol's
+            // default, the stream limit. A limit of 0 is not advertised (HAProxy sends no
+            // MAX_CONCURRENT_STREAMS then), yet every stream is refused.
+            let mut settings = Vec::with_capacity(3);
+            settings.push((SettingsParameter::EnableConnectProtocol, 1));
+            if ctx.local_initial_window != DEFAULT_INITIAL_WINDOW_SIZE {
+                settings.push((SettingsParameter::InitialWindowSize, ctx.local_initial_window as u32));
+            }
             if ctx.max_concurrent_streams > 0 {
                 settings.push((SettingsParameter::MaxConcurrentStreams, ctx.max_concurrent_streams));
             }
-            settings.push((SettingsParameter::InitialWindowSize, ctx.local_initial_window as u32));
             let server_settings = Frame::Settings {
                 flags: 0,
                 settings,
@@ -1426,6 +1463,7 @@ impl MuxH2 {
             let mut head = stream.req_head.take().or_else(|| ctx.spare_heads.pop()).unwrap_or_default();
             if head.write(decoded).is_ok() {
                 stream.req_content_length = head.get_header("content-length").and_then(|v| v.trim().parse::<usize>().ok());
+                stream.ext_connect = head.ext_connect;
                 stream.req_head = Some(head);
                 stream.rx_htx.push(HtxBlock::Eoh);
                 Ok(())
@@ -1676,7 +1714,14 @@ impl MuxH2 {
                     }
                     if (flags & frame_flags::END_STREAM) != 0 {
                         match stream.state {
-                            H2StreamState::HalfClosedLocal => stream.state = H2StreamState::Closed,
+                            H2StreamState::HalfClosedLocal => {
+                                // A tunnel the server ended first ends here (T505): the
+                                // data path waits for this end, which carries no body.
+                                if stream.ext_connect {
+                                    stream.rx_htx.push(HtxBlock::Eom);
+                                }
+                                stream.state = H2StreamState::Closed;
+                            }
                             H2StreamState::Open => {
                                 stream.rx_htx.push(HtxBlock::Eom);
                                 stream.state = H2StreamState::HalfClosedRemote;
@@ -2237,15 +2282,17 @@ mod tests {
 
     /// `HAProxy` 3.5-dev8 (measured, one POST and 64 KB of DATA): the stream's window grows
     /// by 1409024 at the first DATA, and the connection's opens by 2147434496 at the first
-    /// update. Ibex's initial stream window is 65535, not 16384: the grown window is the
-    /// same 88 buffers, so the stream is granted 88 x 16384 - 65535.
+    /// update. The initial stream window is HAProxy's 16384 (T505; it was 65535): the
+    /// grown window is 88 buffers, so the stream is granted 88 x 16384 - 16384, one buffer
+    /// more than `HAProxy`'s first update (whose window then slides as DATA are received,
+    /// so that it too holds 88 frames: `data_past_the_stream_window_waits_until_the_stream_drains`).
     #[test]
     fn a_receiving_stream_is_granted_its_share_and_the_connection_window_opens_wide() {
         let (mux, mut ctx) = open_conn();
         mux.parse(&mut ctx, &post_headers(1)).expect("open");
         let before = ctx.tx_buf.len();
         mux.parse(&mut ctx, &data(1, 16384, 0)).expect("data");
-        assert_eq!(wu_sent(&ctx, before, 1), vec![88 * 16384 - 65535]);
+        assert_eq!(wu_sent(&ctx, before, 1), vec![88 * 16384 - 16384]);
         assert!(wu_sent(&ctx, before, 0).iter().sum::<u64>() < 65536, "the connection window is not opened before a byte is taken");
         let before = ctx.tx_buf.len();
         let open_from = ctx.conn_recv_window;
@@ -2724,11 +2771,46 @@ mod tests {
         let (ctx, s) = answer(&headers(frame_flags::END_HEADERS, 1, block.clone()));
         assert_eq!(s, vec![]);
         let st = ctx.streams.get(&1).expect("the stream");
-        assert_eq!((st.request_method(), st.request_uri(), st.request_header("Content-Length")), (Some("CONNECT"), Some("/"), Some("3")));
+        // T505: as the `GET` of an HTTP/1.1 upgrade to the protocol (measured: the server
+        // is sent `GET / HTTP/1.1`, then `upgrade: websocket`, `connection: upgrade`).
+        assert_eq!((st.request_method(), st.request_uri(), st.request_header("Content-Length")), (Some("GET"), Some("/"), Some("3")));
+        assert_eq!((st.request_header("upgrade"), st.request_header("connection"), st.ext_connect), (Some("websocket"), Some("upgrade"), true));
         assert_eq!(st.request_content_length(), Some(3));
         let twice = [block, lit(b":protocol", b"websocket")].concat();
         let (_, s) = answer(&headers(frame_flags::END_HEADERS, 1, twice));
         assert_eq!(s, vec![(3, 1, 1)]);
+    }
+
+    /// T505: an extended CONNECT needs `:scheme`, `:path` and `:authority`, and is not to
+    /// h2 (measured on 3.5-dev8: RST_STREAM PROTOCOL_ERROR without `:path`, and for `h2c`).
+    /// The server's 101 answers it as a 200 without the upgrade's headers.
+    #[test]
+    fn an_extended_connect_needs_its_pseudo_headers_and_its_101_is_a_200() {
+        let ext = |scheme: bool, path: bool, auth: bool, proto: &[u8]| {
+            let mut b = [lit(b":method", b"CONNECT"), lit(b":protocol", proto)].concat();
+            if scheme {
+                b.push(0x86);
+            }
+            if path {
+                b.push(0x84);
+            }
+            if auth {
+                b.extend(lit(b":authority", b"a"));
+            }
+            headers(frame_flags::END_HEADERS, 1, b)
+        };
+        for (scheme, path, auth, proto) in [(false, true, true, &b"websocket"[..]), (true, false, true, b"websocket"), (true, true, false, b"websocket"), (true, true, true, b"H2C"), (true, true, true, b"h2")] {
+            let (_, s) = answer(&ext(scheme, path, auth, proto));
+            assert_eq!(s, vec![(3, 1, 1)], "{scheme} {path} {auth} {proto:?}");
+        }
+        let (mut ctx, s) = answer(&ext(true, true, true, b"websocket"));
+        assert_eq!(s, vec![]);
+        let from = ctx.tx_buf.len();
+        assert!(ctx.send_h1_head(1, b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\n", false));
+        let block = &ctx.tx_buf[from + 9..];
+        let fields: Vec<(String, String)> = HpackDecoder::new().decode(block).expect("hpack").into_iter().map(|f| (f.name, f.value)).collect();
+        assert_eq!(fields, vec![(":status".into(), "200".into()), ("sec-websocket-accept".into(), "x".into())]);
+        assert_eq!(ctx.tx_buf[from + 4], frame_flags::END_HEADERS, "no END_STREAM");
     }
 
     /// The stream map answers as the `BTreeMap` it replaced (T437): an insert over a stream

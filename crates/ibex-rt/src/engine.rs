@@ -8178,6 +8178,18 @@ fn h2_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     if let Some(u) = t.req_htx.as_mut() {
         *u += trailers;
     }
+    // The client's END_STREAM on an extended CONNECT's tunnel ends what the server is sent,
+    // once what came before has gone: its FIN, as `HAProxy` sends it, and the stream ends
+    // when the server closes (T505).
+    if t.req == MsgState::Tunnel && ch.stream.body.done && cs.req.is_empty() && matches!(cs.srv_state, ScState::Ready | ScState::Established) {
+        if let Some(sfd) = cs.srv.as_ref().map(std::os::fd::AsFd::as_fd) {
+            cs.srv_xprt.send_close_notify(sfd);
+            crate::raw::shutdown_write(sfd);
+        }
+        cs.srv_state = ScState::ShutW;
+        t.close_after = true;
+        moved = true;
+    }
     let before = (cs.rep.len(), t.rsp);
     let srv_gone = matches!(cs.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
     if crate::h2_bridge::forward_response(h2, ch.stream.id, t, &mut cs.rep, srv_gone) {
@@ -8241,8 +8253,9 @@ fn h2_bridge_state(o: &mut SessionEntry, c: &mut SessionEntry, proxies: &[Proxy]
 /// sent after the whole response are counted in `%U`, the line is logged then, and nothing
 /// more is sent on the stream); ended here, the line went out without them, the stream was
 /// reset, and the trailers that came after were a `GOAWAY` for a frame on a closed stream.
+/// So too an extended CONNECT's tunnel the server ended first (T505).
 fn h2_request_open(sess: &TcpSession, txn: &crate::txn::HttpTxn) -> bool {
-    txn.req.is_done() && !txn.local && sess.h2_active().is_some_and(|a| !a.body.done)
+    (txn.req.is_done() || txn.req == MsgState::Tunnel) && !txn.local && sess.h2_active().is_some_and(|a| !a.body.done)
 }
 
 /// A stream of an HTTP/2 connection whose reply the proxy made itself (`http-request
