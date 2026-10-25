@@ -932,7 +932,10 @@ pub(crate) fn write_server_row(
             self.0.as_ref().map_or(Ok(()), |v| write!(f, "{v}"))
         }
     }
-    let status_str = if let Some(c) = check_state {
+    let rmaint = proxy.server_rmaint(s_idx);
+    let status_str = if rmaint {
+        Word(None, "MAINT (resolution)", "")
+    } else if let Some(c) = check_state {
         Word(Some(c), "", "")
     } else {
         let s = proxy.server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
@@ -1018,7 +1021,10 @@ pub(crate) fn write_server_row(
         r.set("last_chk", last_chk);
         r.set("check_desc", check_desc);
     }
-    r.set("addr", srv_addr);
+    // No address: the column is empty, as `HAProxy`'s for `AF_UNSPEC`.
+    if !rmaint {
+        r.set("addr", srv_addr);
+    }
     r.default_untracked('S', proxy.mode == ibex_config::Mode::Http, "");
     r.emit(out, fmt);
 }

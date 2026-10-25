@@ -40,6 +40,64 @@ pub struct DefaultServerConfig {
     pub disabled: bool,
     /// `track [<proxy>/]<server>`, as written.
     pub track: Option<Box<str>>,
+    /// `init-addr`.
+    pub init_addr: Option<InitAddr>,
+}
+
+/// One method of `init-addr` (`enum srv_initaddr`, its values `HAProxy`'s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InitAddrMethod {
+    /// `none`: the server starts in maintenance with no address.
+    None = 1,
+    /// `libc`: `getaddrinfo` while the configuration loads.
+    Libc = 2,
+    /// `last`: the server-state file's address; refused until Ibex has one (T490).
+    Last = 3,
+    /// `<ip>`: [`InitAddr::ip`].
+    Ip = 4,
+}
+
+/// `init-addr <method>[,...]`: how a server whose address is a name gets its first one, in
+/// order (`srv_iterate_initaddr`). `methods` holds up to ten, three bits each, first in the
+/// lowest bits, as `srv_append_initaddr` packs them; 0 is "none given" (`last,libc`, plus
+/// `none` with `resolvers`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InitAddr {
+    pub methods: u32,
+    /// The `<ip>` method's address.
+    pub ip: Option<std::net::IpAddr>,
+}
+
+impl InitAddr {
+    /// `srv_append_initaddr`: `false` when the ten slots are taken.
+    pub fn push(&mut self, m: InitAddrMethod) -> bool {
+        let mut shift = 0;
+        while shift + 3 < 32 && (self.methods >> shift) != 0 {
+            shift += 3;
+        }
+        if shift + 3 > 32 {
+            return false;
+        }
+        self.methods |= (m as u32) << shift;
+        true
+    }
+
+    /// The methods, in order.
+    pub fn iter(self) -> impl Iterator<Item = InitAddrMethod> {
+        let mut list = self.methods;
+        std::iter::from_fn(move || {
+            let m = list & 7;
+            list >>= 3;
+            Some(match m {
+                1 => InitAddrMethod::None,
+                2 => InitAddrMethod::Libc,
+                3 => InitAddrMethod::Last,
+                4 => InitAddrMethod::Ip,
+                _ => return None,
+            })
+        })
+    }
 }
 
 /// `verify none|required` on a server line.
@@ -237,6 +295,40 @@ pub struct ServerExtras {
     /// TLS servers with no CA file to verify against, whose refusal waits for the global
     /// `ssl-server-verify`, which may come later in the file; see [`NoCa`].
     pub no_ca: Vec<NoCa>,
+    /// The servers whose address is a name, in order; see [`ServerName`].
+    pub names: Vec<ServerName>,
+}
+
+impl ServerExtras {
+    /// The name the address of server `idx` was written as, if it was one.
+    #[must_use]
+    pub fn fqdn(&self, idx: usize) -> Option<&str> {
+        self.names.iter().find(|n| n.index as usize == idx).map(|n| &*n.fqdn)
+    }
+
+    /// Whether server `idx` started without an address ([`ServerName::unresolved`]).
+    #[must_use]
+    pub fn unresolved(&self, idx: usize) -> bool {
+        self.names.iter().any(|n| n.index as usize == idx && n.unresolved)
+    }
+}
+
+/// A server whose address was written as a name (`srv->hostname`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerName {
+    /// The server's index in its section.
+    pub index: u32,
+    /// The line of its `server` line.
+    pub line: u32,
+    /// The name, what `show servers state` prints as `srv_fqdn`. The server's `addr` is
+    /// what libc gave for it while the configuration loaded (`resolve_server_addrs`).
+    pub fqdn: Box<str>,
+    /// Its `init-addr`, the `default-server`'s if it has none.
+    pub init_addr: InitAddr,
+    /// The name did not resolve and `init-addr none` let the server start without an
+    /// address: in maintenance (`SRV_ADMF_RMAINT`, `MAINT (resolution)`) for good until
+    /// run-time resolution exists (T484). `addr` is then the unspecified address.
+    pub unresolved: bool,
 }
 
 /// A TLS server line that needs a CA file it has not got; see [`ServerExtras::no_ca`].

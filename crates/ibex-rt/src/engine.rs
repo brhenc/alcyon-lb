@@ -1456,6 +1456,13 @@ pub struct ProxyIdInfo {
     /// Which servers the configuration disabled (`SRV_ADMF_CMAINT`, 4 in `show servers state`
     /// whatever the CLI does afterwards); empty when none (see [`Proxy::server_cmaint`]).
     pub server_cmaint: Vec<bool>,
+    /// Which servers started without an address (`init-addr none` after a name did not
+    /// resolve: `SRV_ADMF_RMAINT`, 32 in `show servers state`, `MAINT (resolution)`); empty
+    /// when none (see [`Proxy::server_rmaint`]).
+    pub server_rmaint: Vec<bool>,
+    /// The name each server's address was written as (`srv_fqdn`); empty when no server's
+    /// was (see [`Proxy::server_fqdn`]).
+    pub server_fqdns: Vec<Option<Box<str>>>,
     /// Each server's `econ`: the requests whose connection attempts all failed, the last
     /// attempt having been to that server (see [`count_connect_failure`]).
     /// Each listener's numeric id (`luid`) by `bind` line, as `so_id` reads it.
@@ -1732,6 +1739,19 @@ impl Proxy {
     #[must_use]
     pub fn server_cmaint(&self, idx: usize) -> bool {
         self.ids.server_cmaint.get(idx).copied().unwrap_or(false)
+    }
+
+    /// Whether the server at `idx` has no address (`SRV_ADMF_RMAINT`): it stays in
+    /// maintenance whatever the CLI asks, as nothing can give it one before T484.
+    #[must_use]
+    pub fn server_rmaint(&self, idx: usize) -> bool {
+        self.ids.server_rmaint.get(idx).copied().unwrap_or(false)
+    }
+
+    /// The name the address of the server at `idx` was written as, if it was one.
+    #[must_use]
+    pub fn server_fqdn(&self, idx: usize) -> Option<&str> {
+        self.ids.server_fqdns.get(idx).and_then(Option::as_deref)
     }
 
     /// Whether the server at `idx` has an `id` of its own (`SRV_F_FORCED_ID`).
@@ -3713,8 +3733,9 @@ fn section_timeouts(
 #[allow(clippy::too_many_lines)] // a field-by-field mirror of the section
 /// The state a server starts in: `disabled` is maintenance, which the CLI's `enable
 /// server` ends.
-fn initial_status(s: &ibex_config::Server) -> u8 {
-    if s.disabled { ServerStatus::Maint as u8 } else { ServerStatus::Up as u8 }
+fn initial_status(s: &ibex_config::Server, unresolved: bool) -> u8 {
+    // A server whose name did not resolve (`init-addr none`) has no address to send to.
+    if s.disabled || unresolved { ServerStatus::Maint as u8 } else { ServerStatus::Up as u8 }
 }
 
 /// The `bind` lines of a frontend, as the engine opens them: the `bind` shorthand of a
@@ -3840,6 +3861,16 @@ fn server_cmaint(servers: &[ibex_config::Server]) -> Vec<bool> {
     if servers.iter().any(|s| s.disabled) { servers.iter().map(|s| s.disabled).collect() } else { Vec::new() }
 }
 
+/// The flags for [`Proxy::server_rmaint`]: empty when every server has an address.
+fn server_rmaint(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<bool> {
+    if extras.names.iter().any(|n| n.unresolved) { (0..count).map(|i| extras.unresolved(i)).collect() } else { Vec::new() }
+}
+
+/// The names for [`Proxy::server_fqdn`]: empty when no address was written as one.
+fn server_fqdns(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<Option<Box<str>>> {
+    if extras.names.is_empty() { Vec::new() } else { (0..count).map(|i| extras.fqdn(i).map(Box::from)).collect() }
+}
+
 /// The flags for [`Proxy::server_forced_ids`]: empty when none asked for an id.
 fn server_forced_ids(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<bool> {
     let mut forced = Vec::new();
@@ -3908,6 +3939,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
             server_cmaint: server_cmaint(&listen.servers),
+            server_rmaint: server_rmaint(listen.servers.len(), &listen.server_extras),
+            server_fqdns: server_fqdns(listen.servers.len(), &listen.server_extras),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
             server_pool: pool_cfgs(&listen.servers),
             http_mode: listen.http_mode,
@@ -3936,7 +3969,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         servers: listen.servers.iter().map(|s| s.addr).collect(),
         server_ids: listen.servers.iter().map(|s| s.id.clone()).collect(),
         server_cookies: listen.servers.iter().map(|s| s.cookie.as_deref().map(Box::from)).collect(),
-        server_statuses: Arc::new(listen.servers.iter().map(|s| AtomicU8::new(initial_status(s))).collect()),
+        server_statuses: Arc::new(listen.servers.iter().enumerate().map(|(i, s)| AtomicU8::new(initial_status(s, listen.server_extras.unresolved(i)))).collect()),
         server_track: None,
         server_weights: listen
             .servers
@@ -4201,6 +4234,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
             server_cmaint: server_cmaint(&be.servers),
+            server_rmaint: server_rmaint(be.servers.len(), &be.server_extras),
+            server_fqdns: server_fqdns(be.servers.len(), &be.server_extras),
             listener_ids: Vec::new(),
             server_pool: pool_cfgs(&be.servers),
             http_mode: be.http_mode,
@@ -4229,7 +4264,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         servers: be.servers.iter().map(|s| s.addr).collect(),
         server_ids: be.servers.iter().map(|s| s.id.clone()).collect(),
         server_cookies: be.servers.iter().map(|s| s.cookie.as_deref().map(Box::from)).collect(),
-        server_statuses: Arc::new(be.servers.iter().map(|s| AtomicU8::new(initial_status(s))).collect()),
+        server_statuses: Arc::new(be.servers.iter().enumerate().map(|(i, s)| AtomicU8::new(initial_status(s, be.server_extras.unresolved(i)))).collect()),
         server_track: None,
         server_weights: be.servers.iter().map(|s| s.weight.unwrap_or(1)).collect(),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
