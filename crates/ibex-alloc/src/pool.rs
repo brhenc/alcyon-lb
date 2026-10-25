@@ -1640,6 +1640,13 @@ mod tests {
         assert_eq!(PRESIZED.shared.grown.load(Ordering::Relaxed), 5);
     }
 
+    /// A shelf made at run time (`declare_pool!`'s is evaluated by the compiler) starts empty.
+    #[test]
+    fn a_shelf_made_at_run_time_is_empty() {
+        let shelf = Shelf::<Blob>::default();
+        assert_eq!(shelf.lock().len(), 0);
+    }
+
     /// T475: past [`PREALLOC_LOCAL`], `prealloc(n)` puts the rest on the shelf. A miss takes
     /// one from it and a cluster more into the cache; a give to a full cache moves itself and a
     /// cluster onto it. `show pools` counts the shelf as cached: `allocated` stays at the limit.
