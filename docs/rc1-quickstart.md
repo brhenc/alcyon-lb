@@ -126,8 +126,10 @@ User-visible ones; the full list is [differences.md](differences.md) and [../tra
   `HAPROXY_*` variables HAProxy exports, only `HAPROXY_LOCALPEER` (the host name) is set.
 - Variables keep their sample type and a keep-alive `set-var` allocates nothing (T364); the
   `tune.vars.*` accounting differs from HAProxy's in four small ways (`tradeoff.md` 6.17).
-- Memory: object pools are not implemented yet (T372; `tradeoff.md` 6.13): the request path
-  still allocates, so RSS follows the traffic and is given back later than HAProxy would. An
+- Memory: Ibex has one pool type since 2026-10-25 (`tradeoff.md` 6.13, 6.28); `show pools` lists them. A keep-alive
+  request allocates nothing; like HAProxy, Ibex keeps the peak of a burst until `pool_gc` (SIGQUIT,
+  soft stop) or `tune.memory.hot-size` eviction. Waiting for a buffer (S6) is not built: a stream past
+  `tune.buffers.limit` fails instead of queueing. An
   HTTP/1 request gives its head buffer back once the head is forwarded (T371); an HTTP/2 or
   HTTP/3 one keeps it to the end of the transaction.
 - A chunked HTTP/1 server's trailers do not reach an HTTP/2 client (T430 #4; matters for gRPC
