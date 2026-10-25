@@ -658,3 +658,25 @@ fn the_server_keyword_is_checked() {
     let (ok, err) = check(&format!("{base}  server s1 _http._tcp.a.test resolvers r\n"));
     assert!(!ok && err.contains("DNS SRV record name"), "{err}");
 }
+
+/// F14, A.t16: a check that ends in a layer-4 timeout asks for a resolution at once (the
+/// server may have moved), but only when the last one is older than `hold valid`.
+#[test]
+fn a_layer4_timeout_triggers_a_resolution_after_hold_valid() {
+    let run = |hold_valid: &str| {
+        let dns = FakeDns::start();
+        // 192.0.2.1 (TEST-NET-1) answers nothing: every check times out.
+        dns.set("a1.test", Zone::A(vec![Ipv4Addr::new(192, 0, 2, 1)]));
+        let _ibex = start(
+            dns.addr,
+            &format!("  timeout resolve 10s\n  hold valid {hold_valid}\n"),
+            "  timeout check 100ms\n  server s1 a1.test:80 resolvers r check inter 300ms\n",
+            "",
+        );
+        thread::sleep(Duration::from_millis(2000));
+        dns.queries().len()
+    };
+    // Measured on HAProxy (A.t16): `hold valid` 10 s, no query but the first.
+    assert_eq!(run("10s"), 1);
+    assert!(run("100ms") >= 3, "the timeouts asked for no resolution");
+}

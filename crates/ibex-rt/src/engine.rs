@@ -13279,6 +13279,13 @@ impl EngineDispatcher<'_> {
 
             let proxy_idx = check.proxy();
             let server_idx = check.server();
+            if crate::resolvers::take_l4_timeout() {
+                for sec in self.resolvers.iter_mut() {
+                    if sec.trigger(proxy_idx, server_idx) {
+                        self.timer_updates.push((sec.task, now));
+                    }
+                }
+            }
             if check.enabled
                 && proxy_idx < self.proxies.len()
                 && server_idx < self.proxies[proxy_idx].server_statuses.len()

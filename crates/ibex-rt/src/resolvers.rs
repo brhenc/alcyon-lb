@@ -58,6 +58,21 @@ impl ibex_alloc::Poolable for Box<Resolution> {
     }
 }
 
+thread_local! {
+    /// A check on this thread ended in a layer-4 timeout since the last look.
+    static L4_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A check ended in a layer-4 timeout (`crate::check`): its server's resolution may be due.
+pub fn note_l4_timeout() {
+    L4_TIMEOUT.set(true);
+}
+
+/// Whether a check ended in a layer-4 timeout since the last call.
+pub fn take_l4_timeout() -> bool {
+    L4_TIMEOUT.replace(false)
+}
+
 /// Lists the pool in `show pools` from the start.
 pub fn register_pools() {
     RESOLUTION_POOL.register();
@@ -97,8 +112,19 @@ enum Status {
 /// One address of the last answers (`struct resolv_answer_item`).
 #[derive(Debug, Clone, Copy)]
 struct AnswerItem {
+    /// `XXH32(rdata, type)`: `HAProxy` keeps the items in a tree on it, which is the order
+    /// [`pick`] reads them in.
+    key: u32,
     ip: IpAddr,
     last_seen: Instant,
+}
+
+/// The tree key of an answer item (`resolv_validate_dns_response`).
+fn item_key(ip: IpAddr) -> u32 {
+    match ip {
+        IpAddr::V4(a) => ibex_sample::hash::hash_xxh32(&a.octets(), u32::from(TYPE_A)),
+        IpAddr::V6(a) => ibex_sample::hash::hash_xxh32(&a.octets(), u32::from(TYPE_AAAA)),
+    }
 }
 
 /// A server that asks for a resolution (`struct resolv_requester`).
@@ -130,6 +156,8 @@ pub struct Resolution {
     /// When the next resolution starts (`last_resolution + timeout resolve`).
     next_at: Instant,
     last_valid: Option<Instant>,
+    /// When the last resolution ended (`last_resolution`).
+    last_resolution: Option<Instant>,
     status: Status,
 }
 
@@ -142,6 +170,7 @@ struct Nameserver {
 /// The holds and timers of a section that this module reads (the crate reads the rest).
 struct Holds {
     timeout_resolve: Duration,
+    valid: Duration,
     nx: Duration,
     other: Duration,
     refused: Duration,
@@ -251,6 +280,7 @@ pub fn build(
                             in_flight: None,
                             next_at: t0,
                             last_valid: None,
+                            last_resolution: None,
                             status: Status::None,
                         }))
                     })
@@ -318,6 +348,7 @@ impl Section {
             dns,
             holds: Holds {
                 timeout_resolve: cfg.timeout_resolve,
+                valid: h.valid,
                 nx: h.nx,
                 other: h.other,
                 refused: h.refused,
@@ -384,12 +415,31 @@ impl Section {
         next.saturating_duration_since(Instant::now())
     }
 
+    /// `resolv_trigger_resolution` for server `s` of proxy `p`, whose check ended in a layer-4
+    /// timeout (`check.c:950`): its resolution starts now unless one runs or the last valid
+    /// one is younger than `hold valid` (A.t16). Whether the section must run.
+    pub fn trigger(&mut self, p: usize, s: usize) -> bool {
+        let now = Instant::now();
+        let mut due = false;
+        for r in &mut self.resolutions {
+            if r.in_flight.is_some() || !r.reqs.iter().any(|q| q.proxy as usize == p && q.server as usize == s) {
+                continue;
+            }
+            if r.status != Status::Valid || r.last_resolution.is_none_or(|t| now >= t + self.holds.valid) {
+                r.next_at = now;
+                due = true;
+            }
+        }
+        due
+    }
+
     /// Applies the results the crate has. A valid answer read from `ns` names it in the log.
     fn drain_results(&mut self, now: Instant, ns: Option<usize>, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
         while let Some((qid, res)) = self.dns.poll_result() {
             let Some(r) = self.resolutions.iter_mut().find(|r| r.in_flight == Some(qid)) else { continue };
             r.in_flight = None;
             r.next_at = now + self.holds.timeout_resolve;
+            r.last_resolution = Some(now);
             match res {
                 Ok(answers) => {
                     let by = ns.map(|i| format!("{}/{}", self.name, self.nameservers[i].name));
@@ -416,7 +466,16 @@ fn on_valid(
 ) {
     r.status = Status::Valid;
     r.last_valid = Some(now);
-    let fam = active_families(now);
+    refresh_items(r, answers, active_families(now), holds.obsolete, now);
+    let mut by = by;
+    for k in 0..r.reqs.len() {
+        server_answer(r, k, by.take().unwrap_or("DNS cache"), holds, now, proxies, checks, log);
+    }
+}
+
+/// The answer's addresses into the items (in key order, kept when already there), then the
+/// items not seen for `hold obsolete` go, and the servers on them lose them.
+fn refresh_items(r: &mut Resolution, answers: &[Answer], fam: Families, obsolete: Duration, now: Instant) {
     for a in answers {
         let ip: IpAddr = match a.rdata {
             Rdata::A(v4) if fam.ipv4 => v4.into(),
@@ -425,21 +484,19 @@ fn on_valid(
         };
         match r.items.iter_mut().find(|i| i.ip == ip) {
             Some(i) => i.last_seen = now,
-            None => r.items.push(AnswerItem { ip, last_seen: now }),
+            None => {
+                let key = item_key(ip);
+                let at = r.items.partition_point(|i| i.key <= key);
+                r.items.insert(at, AnswerItem { key, ip, last_seen: now });
+            }
         }
     }
-    // Items not seen for `hold obsolete` go, and the servers on them lose them.
-    let obsolete = holds.obsolete;
     r.items.retain(|i| i.last_seen + obsolete >= now);
     let items = &r.items;
     for req in &mut r.reqs {
         if req.attached.is_some_and(|ip| !items.iter().any(|i| i.ip == ip)) {
             req.attached = None;
         }
-    }
-    let mut by = by;
-    for k in 0..r.reqs.len() {
-        server_answer(r, k, by.take().unwrap_or("DNS cache"), holds, now, proxies, checks, log);
     }
 }
 
@@ -704,11 +761,12 @@ mod tests {
             name: "x.test".into(),
             prefer: TYPE_A,
             reqs,
-            items: ips.iter().map(|i| AnswerItem { ip: i.parse().expect("ip"), last_seen: now }).collect(),
+            items: ips.iter().map(|i| AnswerItem { key: 0, ip: i.parse().expect("ip"), last_seen: now }).collect(),
             cursor: 0,
             in_flight: None,
             next_at: now,
             last_valid: None,
+            last_resolution: None,
             status: Status::None,
         }
     }
@@ -749,6 +807,30 @@ mod tests {
         assert!(in_net(ip("1.2.3.4"), ip("9.9.9.9"), 0));
         assert!(in_net(ip("::1"), ip("::2"), 0));
         assert!(!in_net(ip("::1"), ip("1.2.3.4"), 0));
+    }
+
+    /// The battery's `oversize-4000` (4000 A records 10.77.x.y): `HAProxy` reads the items in
+    /// `XXH32` order and gives the server 10.77.8.138, not the first record.
+    #[test]
+    fn items_are_read_in_haproxys_tree_order() {
+        let answers: Vec<Answer> = (0..4000u32)
+            .map(|i| Answer { rdata: Rdata::A(Ipv4Addr::new(10, 77, u8::try_from(i / 250).unwrap(), u8::try_from(i % 250 + 1).unwrap())), ttl: 1 })
+            .collect();
+        let mut r = res(&[], vec![req(0, 0, ResolveOpts::default())]);
+        let now = Instant::now();
+        refresh_items(&mut r, &answers, Families::IPV4, Duration::ZERO, now);
+        assert_eq!(r.items.len(), 4000);
+        assert_eq!(pick(&mut r, 0, None, Families::IPV4), Pick::New(ip("10.77.8.138")));
+        // Seen again: kept; gone from the next answer: dropped, and the server with it.
+        refresh_items(&mut r, &answers[..1], Families::IPV4, Duration::ZERO, now + Duration::from_millis(1));
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.reqs[0].attached, None);
+        // An AAAA record while IPv6 is not accepted is not an item.
+        let v6 = [Answer { rdata: Rdata::Aaaa("2001:db8::1".parse().unwrap()), ttl: 1 }];
+        refresh_items(&mut r, &v6, Families::IPV4, Duration::from_secs(9), now);
+        assert_eq!(r.items.len(), 1);
+        refresh_items(&mut r, &v6, Families::BOTH, Duration::from_secs(9), now);
+        assert_eq!(r.items.len(), 2);
     }
 
     /// A server already on an item still in the answer keeps it; a second server of the
