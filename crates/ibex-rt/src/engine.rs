@@ -1327,32 +1327,102 @@ impl RateCtr {
     }
 }
 
-/// Process-wide connection rate (`show info` `ConnRate`), ticked by every engine thread
-/// and by the QUIC listener: the per-thread `RateCtr` writes are not atomic as a whole.
-pub static GLOBAL_CONN_RATE: std::sync::Mutex<RateCtr> = std::sync::Mutex::new(RateCtr::new());
-/// Process-wide session rate (`show info` `SessRate`).
-pub static GLOBAL_SESS_RATE: std::sync::Mutex<RateCtr> = std::sync::Mutex::new(RateCtr::new());
-/// Highest `ConnRate` seen since start or the last `clear counters` (`MaxConnRate`).
-pub static MAX_CONN_RATE: AtomicU32 = AtomicU32::new(0);
-/// Highest `SessRate` seen since start or the last `clear counters` (`MaxSessRate`).
-pub static MAX_SESS_RATE: AtomicU32 = AtomicU32::new(0);
+/// One engine thread's share of the process-wide `show info` rates. Only its owner thread
+/// writes it; `show info` sums the registered shares on read (AGENTS.md §8: no shared write
+/// per accepted connection). The peak is that thread's own, so `MaxConnRate` is the sum of the
+/// threads' peaks: exact with one thread, an upper bound when the peaks are not simultaneous.
+struct ThreadRates {
+    conn: RateCtr,
+    sess: RateCtr,
+    max_conn: AtomicU32,
+    max_sess: AtomicU32,
+    /// The `CLEAR_EPOCH` the maxima belong to; a share from before the last `clear counters` reads as 0.
+    epoch: AtomicU32,
+}
 
-fn tick_global(ctr: &std::sync::Mutex<RateCtr>, max: &AtomicU32) {
-    let ctr = ctr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    ctr.tick();
-    max.fetch_max(u32::try_from(ctr.rate()).unwrap_or(u32::MAX), Ordering::Relaxed);
+static THREAD_RATES: std::sync::Mutex<Vec<&'static ThreadRates>> = std::sync::Mutex::new(Vec::new());
+/// Bumped by `clear counters`; each thread zeroes its own maxima when it next counts.
+static CLEAR_EPOCH: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    static LOCAL_RATES: &'static ThreadRates = {
+        let r: &'static ThreadRates = Box::leak(Box::new(ThreadRates {
+            conn: RateCtr::new(),
+            sess: RateCtr::new(),
+            max_conn: AtomicU32::new(0),
+            max_sess: AtomicU32::new(0),
+            epoch: AtomicU32::new(CLEAR_EPOCH.load(Ordering::Relaxed)),
+        }));
+        THREAD_RATES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(r);
+        r
+    };
+}
+
+fn tick_local(pick: impl Fn(&ThreadRates) -> (&RateCtr, &AtomicU32)) {
+    LOCAL_RATES.with(|r| {
+        let epoch = CLEAR_EPOCH.load(Ordering::Relaxed);
+        if r.epoch.load(Ordering::Relaxed) != epoch {
+            r.max_conn.store(0, Ordering::Relaxed);
+            r.max_sess.store(0, Ordering::Relaxed);
+            r.epoch.store(epoch, Ordering::Relaxed);
+        }
+        let (ctr, max) = pick(r);
+        ctr.tick();
+        let rate = u32::try_from(ctr.rate()).unwrap_or(u32::MAX);
+        if rate > max.load(Ordering::Relaxed) {
+            max.store(rate, Ordering::Relaxed);
+        }
+    });
+}
+
+fn sum_rates(f: impl Fn(&ThreadRates) -> u64) -> u64 {
+    THREAD_RATES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().map(|r| f(r)).sum()
+}
+
+fn sum_max(f: impl Fn(&ThreadRates) -> &AtomicU32) -> u64 {
+    let epoch = CLEAR_EPOCH.load(Ordering::Relaxed);
+    sum_rates(|r| if r.epoch.load(Ordering::Relaxed) == epoch { u64::from(f(r).load(Ordering::Relaxed)) } else { 0 })
+}
+
+/// `ConnRate`: connections accepted over the last second, all threads.
+#[must_use]
+pub fn global_conn_rate() -> u64 {
+    sum_rates(|r| r.conn.rate())
+}
+
+/// `SessRate`: sessions created over the last second, all threads.
+#[must_use]
+pub fn global_sess_rate() -> u64 {
+    sum_rates(|r| r.sess.rate())
+}
+
+/// `MaxConnRate` since start or the last `clear counters`.
+#[must_use]
+pub fn max_conn_rate() -> u64 {
+    sum_max(|r| &r.max_conn)
+}
+
+/// `MaxSessRate` since start or the last `clear counters`.
+#[must_use]
+pub fn max_sess_rate() -> u64 {
+    sum_max(|r| &r.max_sess)
+}
+
+/// `clear counters`: forget the maxima (each thread zeroes its own share when it next counts).
+pub fn clear_rate_maxima() {
+    CLEAR_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 /// One accepted client connection, counted before `tcp-request connection` rules run
 /// (`listener_accept`: rejected and silently dropped connections are in `ConnRate`).
 /// Not for the CLI, which `HAProxy` binds unlimited (`BC_O_UNLIMITED`).
 pub(crate) fn count_global_conn() {
-    tick_global(&GLOBAL_CONN_RATE, &MAX_CONN_RATE);
+    tick_local(|r| (&r.conn, &r.max_conn));
 }
 
 /// One session, counted once the connection survived the `tcp-request connection` rules.
 pub(crate) fn count_global_sess() {
-    tick_global(&GLOBAL_SESS_RATE, &MAX_SESS_RATE);
+    tick_local(|r| (&r.sess, &r.max_sess));
 }
 
 /// Accumulated statistics per proxy.

@@ -251,3 +251,44 @@ fn h3_requests_on_one_quic_connection_count_once() {
     assert_eq!(get_rate(&info, "SessRate"), 1, "SessRate");
     assert_eq!(get_rate(&info, "MaxSessRate"), 1, "MaxSessRate");
 }
+
+/// T499 part 2: the rates are per-thread counters summed on read. With `nbthread 4` and eight
+/// clients connecting at once (so several threads accept), the sum is every connection and
+/// `clear counters` zeroes the maxima of every thread, not only the one that served the CLI.
+#[test]
+fn rates_sum_over_threads_with_parallel_clients() {
+    let addr = common::reserve_addr();
+    let sock = std::env::temp_dir().join(format!("ibex_t499_par_{}.sock", std::process::id()));
+    let cfg = format!(
+        "global\n  nbthread 4\n  stats socket {} level admin\n\
+         defaults\n  mode http\n  timeout client 10s\n\
+         frontend f\n  bind {addr}\n  http-request return status 200\n",
+        sock.display()
+    );
+    let _d = start_quiet("par", &cfg, &[addr], &sock);
+    let workers: Vec<_> = (0..8)
+        .map(|_| {
+            thread::spawn(move || {
+                for _ in 0..25 {
+                    assert_eq!(get_status(addr.port(), "/"), "200");
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().expect("client");
+    }
+    let info = show_info(&sock);
+    for k in ["ConnRate", "MaxConnRate", "SessRate", "MaxSessRate"] {
+        assert_eq!(get_rate(&info, k), 200, "{k} after 8 x 25 parallel connections");
+    }
+    assert_eq!(cli(&sock, "clear counters"), "\n");
+    let info = show_info(&sock);
+    assert_eq!(get_rate(&info, "ConnRate"), 200, "ConnRate survives clear counters");
+    assert_eq!(get_rate(&info, "MaxConnRate"), 0, "MaxConnRate zeroed on every thread");
+    assert_eq!(get_rate(&info, "MaxSessRate"), 0, "MaxSessRate zeroed on every thread");
+    // A new connection after the clear starts the maxima again from the current rate.
+    assert_eq!(get_status(addr.port(), "/"), "200");
+    let info = show_info(&sock);
+    assert!(get_rate(&info, "MaxConnRate") >= 1, "MaxConnRate counts again after the clear");
+}
