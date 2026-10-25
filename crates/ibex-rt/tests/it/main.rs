@@ -436,3 +436,4 @@ mod x509_v_err_str;
 mod xxh32_xxh64;
 mod ssl_f_fetches;
 mod zero_on_free;
+mod memory_prealloc;

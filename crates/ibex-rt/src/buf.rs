@@ -118,7 +118,8 @@ impl<const CLASS: u8> Poolable for Mem<CLASS> {
 // Floor 64: what a thread has always kept, and what keeps the steady state at no malloc
 // (design 3.3). The floor objects are not counted against `tune.memory.hot-size`.
 // `limited`: `tune.buffers.limit` counts the standard buffers (`pool_head_buffer->limit`).
-declare_pool!(static BUF_STD: Pool<Mem<0>> = PoolSpec::new("buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64).limited(););
+// `presized`: `tune.memory.prealloc` sizes it from `maxconn` (T468, [`prealloc_standard`]).
+declare_pool!(static BUF_STD: Pool<Mem<0>> = PoolSpec::new("buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64).limited().presized(););
 declare_pool!(static BUF_SMALL: Pool<Mem<1>> = PoolSpec::new("small_buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64););
 declare_pool!(static BUF_LARGE: Pool<Mem<2>> = PoolSpec::new("large_buffer").floor(MAX_CACHED_PER_THREAD).max_count(MAX_CACHED_PER_THREAD).align(64););
 
@@ -307,6 +308,14 @@ fn give_mem<const C: u8>(pool: &'static Pool<Mem<C>>, data: Box<[u8]>) {
 /// refused and that stream fails (S5; `HAProxy` makes it wait, S6).
 pub fn set_buffers_limit(n: usize) {
     BUF_STD.set_limit(n);
+}
+
+/// `tune.memory.prealloc` (T468): this thread's cache of standard buffers holds `n`, made now,
+/// kept whatever the budget and `pool_gc`. False when memory is short. After
+/// [`init_buffer_sizes`], on the worker thread.
+pub fn prealloc_standard(n: usize) -> bool {
+    ensure_registered();
+    BUF_STD.prealloc(n)
 }
 
 fn alloc_standard() -> Option<Box<[u8]>> {
