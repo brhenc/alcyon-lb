@@ -2811,6 +2811,13 @@ mod tests {
         let fields: Vec<(String, String)> = HpackDecoder::new().decode(block).expect("hpack").into_iter().map(|f| (f.name, f.value)).collect();
         assert_eq!(fields, vec![(":status".into(), "200".into()), ("sec-websocket-accept".into(), "x".into())]);
         assert_eq!(ctx.tx_buf[from + 4], frame_flags::END_HEADERS, "no END_STREAM");
+        // A client's own ENABLE_CONNECT_PROTOCOL is read, and changes nothing.
+        let from = ctx.tx_buf.len();
+        let mux = MuxH2;
+        let settings = Frame::Settings { flags: 0, settings: vec![(SettingsParameter::from(8), 1)] };
+        assert!(matches!(&settings, Frame::Settings { settings, .. } if settings[0].0 == SettingsParameter::EnableConnectProtocol));
+        mux.parse(&mut ctx, &settings.encode()).expect("settings");
+        assert_eq!(sent(&ctx, from), vec![], "acknowledged, no error");
     }
 
     /// The stream map answers as the `BTreeMap` it replaced (T437): an insert over a stream
