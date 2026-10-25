@@ -904,3 +904,68 @@ fn the_exporter_has_the_resolver_metrics() {
     let one = scrape("?scope=resolver&metrics=haproxy_resolver_nx");
     assert!(one.contains("haproxy_resolver_nx{") && !one.contains("haproxy_resolver_sent"), "{one}");
 }
+
+// --- T486: `server-template` with a name (F11; A.t12, A.t12b, A.t12c) ---
+
+/// A.t12: three slots on a three-address name take one address each (the first logs the
+/// nameserver, the others `DNS cache`); when `10.0.0.2` leaves the answer its slot goes to
+/// maintenance at that answer with `No IP for server ` (trailing space) and no hold, and the
+/// other two keep theirs. One resolution serves the three slots.
+#[test]
+fn t12_template_slots_take_distinct_addresses_and_the_one_that_lost_its_address_goes_down() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n", "  server-template srv 3 multi.test:80 resolvers r\n", "");
+    for (sv, ip) in [("srv1", "10.0.0.1"), ("srv2", "10.0.0.2"), ("srv3", "10.0.0.3")] {
+        ibex.wait_state(sv, &format!("{ip} 2 0"), 3);
+        assert_eq!(ibex.state(sv).1, "multi.test");
+    }
+    ibex.wait_log("l/srv1: IP changed from '(none)' to '10.0.0.1' by 'r/ns1'.", 2);
+    ibex.wait_log("l/srv2: IP changed from '(none)' to '10.0.0.2' by 'DNS cache'.", 2);
+    ibex.wait_log("l/srv3: IP changed from '(none)' to '10.0.0.3' by 'DNS cache'.", 2);
+    dns.set("multi.test", Zone::A([1, 3].map(|o| Ipv4Addr::new(10, 0, 0, o)).to_vec()));
+    ibex.wait_state("srv2", "- 0 32", 3);
+    assert_eq!(ibex.state("srv1").0, "10.0.0.1 2 0");
+    assert_eq!(ibex.state("srv3").0, "10.0.0.3 2 0");
+    assert!(
+        ibex.log().iter().any(|l| l.starts_with("Server l/srv2 is going DOWN for maintenance (No IP for server ). 2 active and 0 backup servers left.")),
+        "{:?}",
+        ibex.log()
+    );
+    // One resolution for the three slots: one query per 300 ms, not three.
+    let n = dns.queries().len();
+    let secs = dns.queries().last().map_or(0.0, |q| q.at.duration_since(dns.queries()[0].at).as_secs_f64());
+    assert!(n as f64 <= secs / 0.3 + 3.0, "{n} queries in {secs:.2} s");
+}
+
+/// A.t12b with a template of 2: one address, so the second slot has none and stays in
+/// maintenance, silently; `allow-dup-ip` (A.t12c) gives it the same one, `DNS cache`.
+#[test]
+fn t12b_template_of_two_on_a_one_address_name() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, "", "  server-template s 2 a1.test:80 resolvers r\n", "");
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    thread::sleep(Duration::from_millis(1200));
+    assert_eq!(ibex.state("s2").0, "- 0 32");
+    assert!(!ibex.log().iter().any(|l| l.contains("l/s2")), "{:?}", ibex.log());
+
+    let ibex = start(dns.addr, "", "  server-template s 2 a1.test:80 resolvers r resolve-opts allow-dup-ip\n", "");
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    ibex.wait_state("s2", "10.0.0.1 2 0", 3);
+    ibex.wait_log(UP, 2);
+    ibex.wait_log("l/s2: IP changed from '(none)' to '10.0.0.1' by 'DNS cache'.", 2);
+}
+
+/// Ten slots on a three-address name: three take an address each, the other seven stay in
+/// maintenance with `-`, and nothing else is logged for them.
+#[test]
+fn ten_slots_on_three_addresses() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, "", "  server-template s 10 multi.test:80 resolvers r\n", "");
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    ibex.wait_state("s3", "10.0.0.3 2 0", 3);
+    thread::sleep(Duration::from_millis(800));
+    for n in 4..=10 {
+        assert_eq!(ibex.state(&format!("s{n}")).0, "- 0 32", "s{n}");
+    }
+    assert_eq!(ibex.log().iter().filter(|l| l.contains("IP changed")).count(), 3, "{:?}", ibex.log());
+}

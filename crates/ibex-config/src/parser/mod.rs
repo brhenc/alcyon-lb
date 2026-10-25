@@ -620,6 +620,8 @@ fn resolve_server_addrs(listens: &mut [ListenSection], backends: &mut [BackendSe
             let Some(srv) = servers.get_mut(entry.index as usize) else { continue };
             let name = &*entry.fqdn;
             let line = entry.line as usize;
+            // The first slot of a `server-template` is named by its prefix (A.t12).
+            let who = entry.template.as_deref().map_or_else(|| format!("server {px}/{}", srv.id), |t| format!("server-template {px}/{t}"));
             let mut methods = entry.init_addr;
             if methods.methods == 0 {
                 // `last,libc`. With `resolvers`, `none`, so that the resolver gives the
@@ -656,7 +658,7 @@ fn resolve_server_addrs(listens: &mut [ListenSection], backends: &mut [BackendSe
                     M::None => {
                         entry.unresolved = true;
                         if failed {
-                            let text = format!("{{at}} : 'server {px}/{}' : could not resolve address '{name}', disabling server.", srv.id);
+                            let text = format!("{{at}} : '{who}' : could not resolve address '{name}', disabling server.");
                             notices.push(LoadWarning { line, alert: false, text, style: WarnStyle::Notice });
                         }
                         done = true;
@@ -667,8 +669,7 @@ fn resolve_server_addrs(listens: &mut [ListenSection], backends: &mut [BackendSe
                         }
                         if failed {
                             let text = format!(
-                                "{{at}} : 'server {px}/{}' : could not resolve address '{name}', falling back to configured address.",
-                                srv.id
+                                "{{at}} : '{who}' : could not resolve address '{name}', falling back to configured address."
                             );
                             notices.push(LoadWarning { line, alert: false, text, style: WarnStyle::Notice });
                         }
@@ -681,7 +682,7 @@ fn resolve_server_addrs(listens: &mut [ListenSection], backends: &mut [BackendSe
             }
             if !done {
                 let what = if failed { "could not resolve" } else { "no method found to resolve" };
-                alerts.push((line, format!("{{at}} : 'server {px}/{}' : {what} address '{name}'.", srv.id)));
+                alerts.push((line, format!("{{at}} : '{who}' : {what} address '{name}'.")));
             }
         }
     }

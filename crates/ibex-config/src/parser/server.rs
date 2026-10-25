@@ -244,6 +244,7 @@ pub(crate) fn parse_server(
             resolve,
             last_addr: None,
             fqdn_changed: false,
+            template: None,
         });
     }
     servers.push(Server {
@@ -279,6 +280,89 @@ pub(crate) fn parse_server(
         disabled,
         track,
     });
+    Ok(())
+}
+
+/// `atoi`: the leading `[-]digits` of `s`, 0 when there are none.
+fn atoi(s: &str) -> i64 {
+    let (neg, digits) = s.strip_prefix('-').map_or((false, s), |d| (true, d));
+    let n = digits.bytes().take_while(u8::is_ascii_digit).take(12).fold(0i64, |a, b| a * 10 + i64::from(b - b'0'));
+    if neg { -n } else { n }
+}
+
+/// `server-template <prefix> <num | lo-hi> <addr>[:<port>] [from <origin>] [params*]`
+/// (`_srv_parse_init` with `SRV_PARSE_TEMPLATE`): one `server <prefix><n> <addr> params*` per
+/// number, so each slot is a server of its own that shares the name (and, with `resolvers`, the
+/// resolution) with its siblings.
+///
+/// `from none` ignores `default-server`. `from be:<backend>` and `from srv:<server>` copy the
+/// settings of another backend's default server or of a server, which Ibex does not keep: refused.
+pub(crate) fn parse_server_template(
+    servers: &mut Vec<Server>,
+    extras: &mut ServerExtras,
+    default_server: Option<&DefaultServerConfig>,
+    proxy: &str,
+    tokens: &[Token],
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if tokens.len() < 4 || tokens[3].text.is_empty() {
+        return Err(ConfigError::new(kw.line, kw.col, "'server-template' expects <prefix> <nb | range> <addr>[:<port>] as arguments."));
+    }
+    let prefix = &tokens[1].text;
+    let range = &tokens[2];
+    let (low, high) = match range.text.split_once('-') {
+        Some((lo, hi)) => (atoi(lo), atoi(hi)),
+        None => (1, atoi(&range.text)),
+    };
+    // A leading `-` makes the low bound negative (`atoi` of the whole argument).
+    let low = if range.text.starts_with('-') { atoi(&range.text) } else { low };
+    if low < 0 || high < low {
+        return Err(ConfigError::new(range.line, range.col, format!("Wrong server-template number or range arg '{}'.", range.text)));
+    }
+    let who = format!("'server-template {proxy}/{prefix}' : ");
+    let mut rest = 4;
+    let mut default_server = default_server;
+    if tokens.get(4).is_some_and(|t| t.text == "from") {
+        let from = tokens.get(5).filter(|t| !t.text.is_empty());
+        let Some(from) = from else {
+            return Err(ConfigError::new(tokens[4].line, tokens[4].col, format!("{who}from: missing value.")));
+        };
+        if from.text == "none" {
+            default_server = None;
+        } else if from.text.starts_with("be:") || from.text.starts_with("srv:") {
+            return Err(ConfigError::new(
+                from.line,
+                from.col,
+                format!("{who}'from {}' is not supported: Ibex settings come from default-server or 'from none' only.", from.text),
+            ));
+        } else {
+            return Err(ConfigError::new(from.line, from.col, format!("{who}invalid '{}' value for 'from' keyword.", from.text)));
+        }
+        rest = 6;
+    }
+    let mut line: Vec<Token> = Vec::with_capacity(tokens.len());
+    for n in low..=high {
+        let id = format!("{prefix}{n}");
+        if servers.iter().any(|s| s.id == id) {
+            return Err(ConfigError::new(
+                tokens[1].line,
+                tokens[1].col,
+                format!("{who}another server named '{id}' was already defined, please use a distinct name."),
+            ));
+        }
+        line.clear();
+        line.push(Token { text: "server".to_string(), ..kw.clone() });
+        line.push(Token { text: id, ..tokens[1].clone() });
+        line.push(tokens[3].clone());
+        line.extend_from_slice(&tokens[rest.min(tokens.len())..]);
+        let before = servers.len();
+        parse_server(servers, extras, default_server, &line, kw)?;
+        if n == low && extras.names.last().is_some_and(|e| e.index as usize == before) {
+            if let Some(e) = extras.names.last_mut() {
+                e.template = Some(prefix.as_str().into());
+            }
+        }
+    }
     Ok(())
 }
 

@@ -403,3 +403,93 @@ fn dash_dr_starts_an_unresolvable_server_in_maintenance() {
     let cfg = got.expect("parses");
     assert!(cfg.backends[0].server_extras.unresolved(0));
 }
+
+// --- server-template (T486, A.t12): `parse_server` once per slot, `SRV_PARSE_TEMPLATE` ---
+
+#[test]
+fn server_template_expands_to_numbered_servers_sharing_one_name_and_its_parameters() {
+    let cfg = parse_str(&with_resolvers("").replace(
+        "server s1 127.0.0.1:80",
+        "server-template srv 3 multi.test:80 resolvers r check inter 5s weight 7 resolve-opts allow-dup-ip\n  server-template web 2-4 a1.test resolvers r backup",
+    ))
+    .unwrap_or_else(|e| panic!("{}", e.message));
+    let be = &cfg.backends[0];
+    let ids: Vec<&str> = be.servers.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["srv1", "srv2", "srv3", "web2", "web3", "web4"]);
+    for s in &be.servers[..3] {
+        assert!(s.check && s.weight == Some(7) && !s.backup, "{s:?}");
+        assert_eq!(s.addr.port(), 80);
+        assert_eq!(s.inter, Some(std::time::Duration::from_secs(5)));
+    }
+    assert!(be.servers[3..].iter().all(|s| s.backup && s.addr.port() == 0 && !s.check));
+    let names = &be.server_extras.names;
+    assert_eq!(names.iter().map(|n| n.index).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5]);
+    assert!(names[..3].iter().all(|n| &*n.fqdn == "multi.test" && n.resolvers.as_deref() == Some("r") && n.resolve.allow_dup_ip));
+    assert!(names[3..].iter().all(|n| &*n.fqdn == "a1.test" && !n.resolve.allow_dup_ip));
+    assert_eq!(be.server_extras.resolvers_refs.len(), 6);
+}
+
+#[test]
+fn server_template_inherits_default_server_and_from_none_drops_it() {
+    let cfg = parse_str(&backend(
+        "  default-server check weight 3\n  server-template a 2 localhost:80\n  server-template b 1 localhost:80 from none\n  server-template c 1 127.0.0.1:81",
+    ))
+    .unwrap_or_else(|e| panic!("{}", e.message));
+    let s = &cfg.backends[0].servers;
+    assert_eq!(s.iter().map(|s| (s.id.as_str(), s.check, s.weight)).collect::<Vec<_>>(), [("a1", true, Some(3)), ("a2", true, Some(3)), ("b1", false, None), ("c1", true, Some(3))]);
+    // A template on an address is not a name: the slot keeps it, no resolution.
+    assert_eq!(s[3].addr, "127.0.0.1:81".parse().unwrap());
+    assert_eq!(cfg.backends[0].server_extras.names.len(), 3);
+}
+
+#[test]
+fn server_template_works_in_a_listen_section_and_without_resolvers() {
+    let cfg = parse_str(&format!("{HEAD}  server-template s 2 localhost:80\n").replace("backend l", "listen l\n  bind 127.0.0.1:0"))
+        .unwrap_or_else(|e| panic!("{}", e.message));
+    let l = &cfg.listens[0];
+    assert_eq!(l.servers.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s1", "s2"]);
+    // Both slots took libc's answer (A.t12 without `resolvers`).
+    assert_eq!(l.servers[0].addr.ip(), libc_first("localhost"));
+    assert_eq!(l.servers[1].addr.ip(), libc_first("localhost"));
+}
+
+#[test]
+fn server_template_refusals_are_haproxys() {
+    let t = |args: &str| refused(&backend(&format!("  server-template {args}")));
+    assert_eq!(t("s 0 a.test:80"), "Wrong server-template number or range arg '0'.");
+    assert_eq!(t("s 3-1 a.test:80"), "Wrong server-template number or range arg '3-1'.");
+    assert_eq!(t("s x a.test:80"), "Wrong server-template number or range arg 'x'.");
+    assert_eq!(t("s -3 a.test:80"), "Wrong server-template number or range arg '-3'.");
+    assert_eq!(t("s 2"), "'server-template' expects <prefix> <nb | range> <addr>[:<port>] as arguments.");
+    assert_eq!(t(""), "'server-template' expects <prefix> <nb | range> <addr>[:<port>] as arguments.");
+    assert_eq!(t("s 2 a.test:80 from"), "'server-template l/s' : from: missing value.");
+    assert_eq!(t("s 2 a.test:80 from bogus"), "'server-template l/s' : invalid 'bogus' value for 'from' keyword.");
+    assert!(t("s 2 a.test:80 from be:l").contains("from"), "refused: Ibex has no server defaults to copy from another backend");
+    assert!(t("s 2 a.test:80 from srv:s1").contains("from"));
+    // SRV names stay refused until T487.
+    assert!(t("s 2 _http._tcp.x resolvers r").contains("SRV"));
+    // A slot that clashes with a server already there.
+    let m = refused(&backend("  server s1 127.0.0.1:80\n  server-template s 2 a.test:80"));
+    assert_eq!(m, "'server-template l/s' : another server named 's1' was already defined, please use a distinct name.");
+    let m = refused(&backend("  server-template s 2 a.test:80\n  server-template s 2-3 a.test:80"));
+    assert_eq!(m, "'server-template l/s' : another server named 's2' was already defined, please use a distinct name.");
+}
+
+#[test]
+fn server_template_is_not_a_defaults_or_frontend_keyword() {
+    let e = parse_str("defaults\n  server-template s 2 a.test:80\n").expect_err("refused");
+    assert!(e.message.contains("server-template"), "{}", e.message);
+}
+
+#[test]
+fn server_template_alerts_name_the_template_for_its_first_slot() {
+    // Measured: `server-template b/s` for the first slot, `server b/s2` for the others.
+    assert_eq!(
+        alerts(&backend("  server-template s 2 nosuch.invalid:80")),
+        [
+            "{at} : 'server-template l/s' : could not resolve address 'nosuch.invalid'.",
+            "{at} : 'server l/s2' : could not resolve address 'nosuch.invalid'.",
+            "Failed to initialize server(s) addr.",
+        ]
+    );
+}

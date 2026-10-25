@@ -359,6 +359,9 @@ pub struct ServerName {
     /// differs from the configuration's name (`srv_state_srv_update`); `show servers state`
     /// keeps the flag in `srv_admin_state`. With `resolvers`, `fqdn` is then the file's.
     pub fqdn_changed: bool,
+    /// The prefix of the `server-template` line this is the first slot of (T486): HAProxy
+    /// names that slot in the start-up notices as `server-template <proxy>/<prefix>`.
+    pub template: Option<Box<str>>,
 }
 
 /// A TLS server line that needs a CA file it has not got; see [`ServerExtras::no_ca`].
