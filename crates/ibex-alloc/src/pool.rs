@@ -625,6 +625,9 @@ pub struct PoolShared {
     /// Objects and footprints on the pool's [`Shelf`], changed under its lock.
     shelf_count: AtomicUsize,
     shelf_bytes: AtomicUsize,
+    /// Called after objects were put on the shelf ([`Pool::set_on_shelve`], S6b): the
+    /// buffers' wakes the streams other threads have waiting for one.
+    on_shelve: OnceLock<fn()>,
     shown: [Shown; MAX_THREADS + 1],
 }
 
@@ -638,6 +641,7 @@ impl PoolShared {
             limit: AtomicUsize::new(0),
             shelf_count: AtomicUsize::new(0),
             shelf_bytes: AtomicUsize::new(0),
+            on_shelve: OnceLock::new(),
             shown: [const { Shown { count: AtomicUsize::new(0), bytes: AtomicUsize::new(0), boxes: AtomicIsize::new(0) } }; MAX_THREADS + 1],
         }
     }
@@ -826,12 +830,79 @@ impl<T: Poolable> Pool<T> {
         self.shared.limit.store(n, Ordering::Relaxed);
     }
 
+    /// What to call after objects were put on the shelf (S6b: the buffers wake the waiters of
+    /// other threads). Once per process; later calls are ignored.
+    pub fn set_on_shelve(&self, f: fn()) {
+        let _ = self.shared.on_shelve.set(f);
+    }
+
+    fn shelved(&self) {
+        if let Some(f) = self.shared.on_shelve.get() {
+            f();
+        }
+    }
+
+    /// Room on the shelf of a [`PoolSpec::presized`] pool for every object the limit allows
+    /// (S6b: `tune.buffers.limit` without `tune.memory.prealloc`), so that
+    /// [`Self::shelve_local`] never allocates. At start; false when memory is short.
+    #[must_use]
+    pub fn reserve_shelf(&self) -> bool {
+        let lim = self.shared.limit.load(Ordering::Relaxed);
+        let mut stock = self.shelf.lock();
+        let more = lim.saturating_sub(stock.len());
+        stock.try_reserve_exact(more).is_ok()
+    }
+
+    /// Moves what this thread's cache holds onto the shelf, as much as it has room for (S6b):
+    /// another thread was refused an object at the limit while these sat here. How many moved.
+    /// Then calls the [`Self::set_on_shelve`] hook when any did.
+    #[must_use]
+    pub fn shelve_local(&'static self) -> usize {
+        if !self.spec.presized {
+            return 0;
+        }
+        let moved = self
+            .cache
+            .try_with(|c| {
+                let Ok(mut l) = c.inner.try_borrow_mut() else { return 0 };
+                let floor = self.floor_of(&l);
+                let mut stock = self.shelf.lock();
+                let k = (stock.capacity() - stock.len()).min(l.items.len());
+                let at = l.items.len() - k;
+                let (mut bytes, mut hot) = (0, 0);
+                for (i, o) in l.items.drain(at..).enumerate() {
+                    let fp = o.footprint();
+                    bytes += fp;
+                    // The objects above the floor were counted in the thread's budget.
+                    if at + i >= floor {
+                        hot += fp;
+                    }
+                    stock.push(o);
+                }
+                self.shared.shelf_count.fetch_add(k, Ordering::Relaxed);
+                self.shared.shelf_bytes.fetch_add(bytes, Ordering::Relaxed);
+                let _ = HOT.try_with(|h| h.bytes.set(h.bytes.get() - hot));
+                k
+            })
+            .unwrap_or(0);
+        if moved > 0 {
+            self.shelved();
+        }
+        moved
+    }
+
     /// Whether [`Self::take`] refuses to make another object: a `limited` pool holding its
     /// [`Self::set_limit`] objects (cached ones included, as `HAProxy`'s `pool->limit`).
     #[must_use]
     pub fn at_limit(&self) -> bool {
         let lim = self.shared.limit.load(Ordering::Relaxed);
         self.spec.limited && lim != 0 && self.shared.grown.load(Ordering::Relaxed) >= isize::try_from(lim).unwrap_or(isize::MAX)
+    }
+
+    /// Objects on the shelf, any thread's to take.
+    #[must_use]
+    pub fn shelf_len(&self) -> usize {
+        self.shared.shelf_count.load(Ordering::Relaxed)
     }
 
     /// Refused takes since the start.
@@ -932,8 +1003,9 @@ impl<T: Poolable> Pool<T> {
     #[inline(never)]
     fn not_kept(&'static self, v: T, boxed: bool) {
         let v = if self.spec.presized { self.shelve(v, boxed) } else { Some(v) };
-        if let Some(v) = v {
-            self.free_given(v, boxed);
+        match v {
+            Some(v) => self.free_given(v, boxed),
+            None => self.shelved(),
         }
     }
 
@@ -1351,6 +1423,7 @@ mod tests {
     crate::declare_pool!(static PREFILLED: Pool<Blob> = PoolSpec::new("t_prefilled").limited(););
     crate::declare_pool!(static PRESIZED: Pool<Blob> = PoolSpec::new("t_presized").limited().floor(1).max_count(2).presized(););
     crate::declare_pool!(static SHELVED: Pool<Blob> = PoolSpec::new("t_shelved").limited().max_item(100).max_count(2).presized(););
+    crate::declare_pool!(static LIMIT_SHELF: Pool<Blob> = PoolSpec::new("t_limit_shelf").limited().floor(1).max_count(8).presized(););
 
     /// A pooled type that keeps the default [`Poolable::keep`] (footprint within the bound).
     #[derive(Debug, Default)]
@@ -1689,6 +1762,47 @@ mod tests {
         })
         .join()
         .expect("thread");
+    }
+
+    static SHELVED_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// S6b: at the limit, without prealloc, the objects one thread's cache holds go onto the
+    /// shelf when asked (`shelve_local`), the hook is called, and another thread's miss is
+    /// served from the shelf instead of being refused. Objects above the floor leave the
+    /// thread's byte budget with them.
+    #[test]
+    fn a_thread_shelves_its_cache_for_another_thread_at_the_limit() {
+        LIMIT_SHELF.set_limit(4);
+        assert!(LIMIT_SHELF.reserve_shelf());
+        LIMIT_SHELF.set_on_shelve(|| {
+            SHELVED_CALLS.fetch_add(1, Ordering::Relaxed);
+        });
+        std::thread::spawn(|| {
+            assert_eq!(LIMIT_SHELF.shelve_local(), 0, "nothing cached");
+            let boxes: Vec<_> = (0..4).map(|_| LIMIT_SHELF.take().expect("within the limit")).collect();
+            assert!(LIMIT_SHELF.take().is_none(), "past the limit");
+            drop(boxes);
+            assert_eq!(LIMIT_SHELF.local_count(), 4);
+            let hot = super::local_hot_bytes();
+            assert_eq!(SHELVED_CALLS.load(Ordering::Relaxed), 0);
+            assert_eq!(LIMIT_SHELF.shelve_local(), 4);
+            assert_eq!(SHELVED_CALLS.load(Ordering::Relaxed), 1, "the hook");
+            assert_eq!(super::local_hot_bytes(), hot - 30, "the three above the floor left the budget");
+            assert_eq!(LIMIT_SHELF.local_count(), 0);
+        })
+        .join()
+        .expect("thread A");
+        std::thread::spawn(|| {
+            let boxes: Vec<_> = (0..4).map(|_| LIMIT_SHELF.take().expect("one from the shelf")).collect();
+            assert_eq!(LIMIT_SHELF.local_count(), 0, "one at a time: nothing more into a cache without prealloc");
+            assert!(LIMIT_SHELF.take().is_none(), "the limit holds");
+            assert_eq!(LIMIT_SHELF.shared.grown.load(Ordering::Relaxed), 4);
+            drop(boxes);
+        })
+        .join()
+        .expect("thread B");
+        // A pool that is not presized has no shelf.
+        assert_eq!(LIMITED.shelve_local(), 0);
     }
 
     /// A box given back to a full pool is freed and leaves the limit's count; eviction stops at

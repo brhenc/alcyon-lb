@@ -281,3 +281,143 @@ fn a_waiting_connection_is_not_run_again_until_a_buffer_frees() {
     let after = p.buffer_failures();
     assert!(after - before < 50, "refused takes in one second of waiting: {}", after - before);
 }
+
+// -----------------------------------------------------------------------------
+// S6b §4: buffers another thread's cache holds
+// -----------------------------------------------------------------------------
+
+/// `nbthread 2`, `tune.buffers.limit 8`, no `tune.memory.prealloc`; `GET /t` answers
+/// `%[thread]` (Ibex has no `bind ... thread N`: each worker has its own `SO_REUSEPORT` socket,
+/// so a test finds which thread serves a connection by asking it, as `memory_prealloc.rs`).
+fn start_two_threads() -> Proxy {
+    let be = backend();
+    let dir = tempfile::TempDir::new().expect("dir");
+    let cfg = dir.path().join("c.cfg");
+    let sock = dir.path().join("s.sock");
+    let port = common::reserve_port();
+    let port2 = common::reserve_port();
+    std::fs::write(
+        &cfg,
+        format!(
+            "global\n\tnbthread 2\n\ttune.buffers.limit 8\n\tstats socket {} level admin\n\
+             defaults\n\tmode http\n\tlog stderr format raw local0\n\toption httplog\n\
+             \ttimeout connect 3s\n\ttimeout client 4s\n\ttimeout server 5s\n\n\
+             frontend fe\n\tbind 127.0.0.1:{port}\n\
+             \thttp-request return status 200 content-type text/plain lf-string \"%[thread]\" if {{ path /t }}\n\
+             \tdefault_backend be\n\n\
+             frontend fe2\n\tbind 127.0.0.1:{port2}\n\tdefault_backend be\n\n\
+             backend be\n\tserver s1 127.0.0.1:{be}\n",
+            sock.display()
+        ),
+    )
+    .expect("write config");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&cfg).arg("-db").stdout(Stdio::null()).stderr(Stdio::piped()).spawn().expect("spawn");
+    let log = Arc::new(Mutex::new(String::new()));
+    let (mut err, sink) = (child.stderr.take().expect("stderr"), Arc::clone(&log));
+    thread::spawn(move || {
+        let mut tmp = [0u8; 4096];
+        while let Ok(n) = err.read(&mut tmp) {
+            if n == 0 {
+                break;
+            }
+            sink.lock().expect("log").push_str(&String::from_utf8_lossy(&tmp[..n]));
+        }
+    });
+    assert!(common::wait_listening(([127, 0, 0, 1], port).into()), "the proxy never listened on {port}");
+    Proxy { child, port, port2, log, dir }
+}
+
+/// The worker thread serving `c`, asked with `GET /t` (the connection stays open).
+fn thread_of(c: &mut TcpStream) -> String {
+    c.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    c.write_all(b"GET /t HTTP/1.1\r\nHost: a\r\n\r\n").expect("GET /t");
+    let mut got = Vec::new();
+    let mut b = [0u8; 512];
+    loop {
+        let n = c.read(&mut b).expect("read /t");
+        assert!(n > 0, "closed before answering /t: {:?}", String::from_utf8_lossy(&got));
+        got.extend_from_slice(&b[..n]);
+        let text = String::from_utf8_lossy(&got).into_owned();
+        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+            let len: usize = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0))).expect("content-length");
+            if body.len() >= len {
+                return body[..len].to_string();
+            }
+        }
+    }
+}
+
+/// Idle keep-alive connections: eight on one thread ("A") and one on the other ("B").
+fn split_threads(p: &Proxy) -> (Vec<TcpStream>, TcpStream) {
+    let mut by: std::collections::BTreeMap<String, Vec<TcpStream>> = std::collections::BTreeMap::new();
+    for _ in 0..400 {
+        let mut c = TcpStream::connect(("127.0.0.1", p.port)).expect("connect");
+        let t = thread_of(&mut c);
+        by.entry(t).or_default().push(c);
+        if by.len() == 2 && by.values().all(|v| v.len() >= 8) {
+            break;
+        }
+    }
+    let mut it = by.into_values();
+    let (a, mut b) = (it.next().expect("thread A"), it.next().expect("thread B: one thread accepts everything"));
+    (a.into_iter().take(8).collect(), b.remove(0))
+}
+
+/// Each of `held` sends a partial request head: it holds a buffer on its thread, all eight of
+/// the limit between them. Before, the buffers thread B's cache kept from its `GET /t` counted
+/// against the limit and three of A's holders waited (`8 used (~3 by thread caches)`).
+fn hold_on(p: &Proxy, held: &mut [TcpStream]) {
+    for c in held.iter_mut() {
+        c.write_all(b"GET /held HTTP/1.1\r\nHost: x\r\n").expect("partial head");
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        thread::sleep(Duration::from_millis(100));
+        let (used, cached) = p.buffers();
+        if used - cached == held.len() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{} holders on one thread hold {} buffers:\n{}", held.len(), used - cached, p.cli("show pools"));
+    }
+}
+
+/// A `GET` on `c` in a thread: what it read and how long it took.
+fn get_on(mut c: TcpStream) -> thread::JoinHandle<(String, Duration)> {
+    thread::spawn(move || {
+        let t = Instant::now();
+        c.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let _ = c.write_all(b"GET /b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        let mut got = Vec::new();
+        let _ = c.read_to_end(&mut got);
+        (String::from_utf8_lossy(&got).into_owned(), t.elapsed())
+    })
+}
+
+/// Thread A held the eight buffers of the limit and gave them back: thread B's next request is
+/// served at once. Before, A's cache kept the eight (they count against the limit) and B waited
+/// for `timeout client` (408).
+#[test]
+fn buffers_another_thread_gave_back_serve_this_thread() {
+    let p = start_two_threads();
+    let (mut a, b) = split_threads(&p);
+    hold_on(&p, &mut a);
+    drop(a);
+    thread::sleep(Duration::from_millis(300));
+    let (got, took) = get_on(b).join().expect("B");
+    assert!(got.starts_with("HTTP/1.1 200") && took < Duration::from_secs(2), "B after A gave its buffers back, {took:?}: {got:?}\n{}", p.cli("show pools"));
+}
+
+/// Thread B waits while thread A holds the limit; A's holders leave: B is woken and served,
+/// not left waiting for its timeout while A's cache holds the buffers.
+#[test]
+fn a_waiter_is_woken_by_buffers_another_thread_gives_back() {
+    let p = start_two_threads();
+    let (mut a, b) = split_threads(&p);
+    hold_on(&p, &mut a);
+    let waiter = get_on(b);
+    thread::sleep(Duration::from_millis(700));
+    assert!(!waiter.is_finished(), "B did not wait: {:?}", waiter.join().ok());
+    drop(a);
+    let (got, took) = waiter.join().expect("B");
+    assert!(got.starts_with("HTTP/1.1 200") && took < Duration::from_secs(3), "B after A's holders left, {took:?}: {got:?}\n{}", p.log());
+}

@@ -12,6 +12,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
+
+use crate::mailbox::{Mailboxes, Signal};
 
 use ibex_sched::TaskRef;
 
@@ -107,6 +111,86 @@ thread_local! {
     static WANT: Cell<u8> = const { Cell::new(0) };
     /// Buffers given back while there were waiters, not yet handed to one by the engine.
     static OFFERED: Cell<u32> = const { Cell::new(0) };
+    /// This thread's worker id among the [`BOXES`] ([`join`]); `usize::MAX`: none.
+    static WID: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+// Across threads (S6b): a thread's cache can hold free buffers counted against the limit while
+// another thread's stream waits. The waiting threads are known here; a thread with free
+// buffers puts them on the pool's shelf and signals them (`Mailboxes::signal`, no allocation).
+// Written only when a thread's queues go from empty to not or back, read on a give only
+// through [`ANY_WAITING`].
+
+/// Bit `w % 64` of word `w / 64`: worker `w` has streams waiting for a buffer.
+static WAITING: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// How many workers have streams waiting: the one load a give makes besides [`MAP`].
+static ANY_WAITING: AtomicUsize = AtomicUsize::new(0);
+/// Every worker's mailbox, to signal them.
+static BOXES: Mutex<Option<Weak<Mailboxes>>> = Mutex::new(None);
+
+/// This thread is worker `wid` of `boxes` (`Engine::share_mailboxes`).
+pub fn join(boxes: &Arc<Mailboxes>, wid: usize) {
+    WID.set(wid);
+    *BOXES.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::downgrade(boxes));
+}
+
+fn boxes() -> Option<Arc<Mailboxes>> {
+    BOXES.lock().unwrap_or_else(PoisonError::into_inner).as_ref().and_then(Weak::upgrade)
+}
+
+/// The queues' map becomes `map`: a thread that starts waiting asks the others for their
+/// cached buffers; one whose queues are empty again is no longer signalled.
+fn set_map(map: u8) {
+    let old = MAP.replace(map);
+    let wid = WID.get();
+    if (old == 0) == (map == 0) || wid >= WAITING.len() * 64 {
+        return;
+    }
+    let (word, bit) = (&WAITING[wid / 64], 1u64 << (wid % 64));
+    if map == 0 {
+        word.fetch_and(!bit, Ordering::AcqRel);
+        ANY_WAITING.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
+    word.fetch_or(bit, Ordering::AcqRel);
+    ANY_WAITING.fetch_add(1, Ordering::AcqRel);
+    if let Some(b) = boxes() {
+        for w in (0..b.len()).filter(|&w| w != wid) {
+            b.signal(w, Signal::ShelveBuffers);
+        }
+    }
+}
+
+/// Buffers were put on the shelf (the pool's hook): every other waiting worker is told.
+pub fn shelved() {
+    if ANY_WAITING.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let Some(b) = boxes() else { return };
+    let me = WID.get();
+    for (i, word) in WAITING.iter().enumerate() {
+        let mut bits = word.load(Ordering::Acquire);
+        while bits != 0 {
+            let w = i * 64 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            if w != me {
+                b.signal(w, Signal::BuffersShelved);
+            }
+        }
+    }
+}
+
+/// Whether this thread has streams waiting for a buffer.
+#[must_use]
+pub fn has_waiters() -> bool {
+    MAP.get() != 0
+}
+
+/// Another thread put buffers on the shelf: as many of this thread's waiters are offered one
+/// (each takes it from the shelf on its miss), up to how many wait.
+pub fn offer_shelved() {
+    let n = crate::buf::shelved_standard().min(waiting().iter().sum());
+    OFFERED.set(OFFERED.get().saturating_add(u32::try_from(n).unwrap_or(u32::MAX)));
 }
 
 /// Whether a stream refused a standard buffer should wait for one rather than fail: the pool
@@ -157,7 +241,7 @@ pub fn enter(task: TaskRef, slot: u32, class: Class, front: bool) -> bool {
             } else {
                 q.push_back((task, slot));
             }
-            MAP.set(MAP.get() | (1 << class as u8));
+            set_map(MAP.get() | (1 << class as u8));
         }
         room
     })
@@ -174,15 +258,16 @@ pub fn leave(task: TaskRef) {
                 map |= 1 << i;
             }
         }
-        MAP.set(map);
+        set_map(map);
     });
 }
 
-/// A standard buffer was given back on this thread: counted for a waiter, if there is one.
+/// A standard buffer was given back on this thread: counted for a waiter, if there is one;
+/// else, when another thread waits, this thread's cached buffers go on the shelf for it (S6b).
 #[inline(always)]
-#[allow(clippy::inline_always)] // one byte read on the give path; the rest is out of line
+#[allow(clippy::inline_always)] // a byte and a word read on the give path; the rest is out of line
 pub fn offer() {
-    if MAP.get() != 0 {
+    if MAP.get() != 0 || ANY_WAITING.load(Ordering::Relaxed) != 0 {
         offer_slow();
     }
 }
@@ -190,7 +275,11 @@ pub fn offer() {
 #[cold]
 #[inline(never)]
 fn offer_slow() {
-    OFFERED.set(OFFERED.get() + 1);
+    if MAP.get() != 0 {
+        OFFERED.set(OFFERED.get() + 1);
+    } else {
+        let _ = crate::buf::shelve_standard();
+    }
 }
 
 /// A buffer offered to a waiter that had gone: it is the next one's.
@@ -219,7 +308,7 @@ pub fn next_offered() -> Option<Waiter> {
         for (i, queue) in q.iter_mut().enumerate() {
             if let Some(w) = queue.pop_front() {
                 if queue.is_empty() {
-                    MAP.set(MAP.get() & !(1 << i));
+                    set_map(MAP.get() & !(1 << i));
                 }
                 OFFERED.set(n - 1);
                 return Some(w);

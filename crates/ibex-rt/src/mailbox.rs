@@ -18,7 +18,7 @@
 use ibex_sched::task::TaskRef;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// What one worker asks of another.
@@ -112,6 +112,18 @@ struct Mailbox {
     efd: OwnedFd,
     /// The worker is stopping and has nothing left to serve, or is gone ([`Mailboxes::all_done`]).
     done: AtomicBool,
+    /// [`Signal`]s posted without a message (no allocation): bits, cleared by [`Mailboxes::take_signals`].
+    signals: AtomicU8,
+}
+
+/// What a worker is told without a [`Msg`] (S6b, the buffer wait queue across threads).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Signal {
+    /// Another thread waits for a standard buffer: put the cached ones on the pool's shelf.
+    ShelveBuffers = 1,
+    /// Buffers were put on the shelf: wake this thread's buffer waiters.
+    BuffersShelved = 2,
 }
 
 /// One mailbox per worker.
@@ -128,7 +140,7 @@ impl Mailboxes {
         let boxes = (0..workers.max(1))
             .map(|_| {
                 let efd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK)?;
-                Ok(Mailbox { inbox: Mutex::new(Inbox::default()), efd, done: AtomicBool::new(false) })
+                Ok(Mailbox { inbox: Mutex::new(Inbox::default()), efd, done: AtomicBool::new(false), signals: AtomicU8::new(0) })
             })
             .collect::<io::Result<Vec<_>>>()?;
         Ok(Arc::new(Self { boxes }))
@@ -166,6 +178,22 @@ impl Mailboxes {
         inbox.msgs.push(msg);
         drop(inbox);
         let _ = rustix::io::write(&b.efd, &1u64.to_ne_bytes());
+    }
+
+    /// Tells worker `wid` `sig` and wakes it: one atomic and an eventfd write, nothing allocated.
+    pub fn signal(&self, wid: usize, sig: Signal) {
+        if let Some(b) = self.boxes.get(wid) {
+            b.signals.fetch_or(sig as u8, Ordering::Release);
+            let _ = rustix::io::write(&b.efd, &1u64.to_ne_bytes());
+        }
+    }
+
+    /// Whether worker `wid` was told `sig` since it last looked, and the others it was told;
+    /// clears them. After [`Self::take`] (which clears the wakeup), so that a signal posted
+    /// between the two wakes the worker again.
+    #[must_use]
+    pub fn take_signals(&self, wid: usize) -> u8 {
+        self.boxes.get(wid).map_or(0, |b| b.signals.swap(0, Ordering::Acquire))
     }
 
     /// Sends a message made by `make` to every worker.

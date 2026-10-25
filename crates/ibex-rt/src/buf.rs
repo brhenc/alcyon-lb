@@ -308,6 +308,26 @@ fn give_mem<const C: u8>(pool: &'static Pool<Mem<C>>, data: Box<[u8]>) {
 /// refused, and the stream waits for one ([`crate::buf_wait`], S6).
 pub fn set_buffers_limit(n: usize) {
     BUF_STD.set_limit(n);
+    // S6b: a thread's cache can hold buffers counted against the limit while another thread's
+    // stream waits; they go to the pool's shelf (room for the limit, made now), and putting
+    // them there wakes the waiting threads.
+    BUF_STD.set_on_shelve(crate::buf_wait::shelved);
+    // Memory short at start: the shelf has what room it got (`shelve_local` moves no more),
+    // and a waiter beyond it waits for its own thread's buffers, as before.
+    let _ = n != 0 && BUF_STD.reserve_shelf();
+}
+
+/// Puts this thread's cached standard buffers on the pool's shelf for another thread's waiters
+/// (S6b); how many.
+#[must_use]
+pub fn shelve_standard() -> usize {
+    BUF_STD.shelve_local()
+}
+
+/// Standard buffers on the pool's shelf.
+#[must_use]
+pub fn shelved_standard() -> usize {
+    BUF_STD.shelf_len()
 }
 
 /// `tune.memory.prealloc` (T468): this thread's cache of standard buffers holds `n`, made now,

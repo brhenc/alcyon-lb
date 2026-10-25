@@ -4970,6 +4970,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.poller.add(fd, raw_fd_to_u64(fd.as_raw_fd()), true, false)?;
         self.mailboxes = Arc::clone(boxes);
         self.mailbox_wid = wid;
+        crate::buf_wait::join(boxes, wid);
         Ok(())
     }
 
@@ -4996,6 +4997,25 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     }
                 }
             }
+        }
+        let sig = self.mailboxes.take_signals(wid);
+        if sig != 0 {
+            self.serve_buffer_signals(sig);
+        }
+    }
+
+    /// S6b: another thread waits for a buffer (this one's cached buffers go on the shelf, unless
+    /// it waits too), or put buffers on the shelf (this thread's waiters are offered them).
+    #[cold]
+    #[inline(never)]
+    fn serve_buffer_signals(&mut self, sig: u8) {
+        use crate::mailbox::Signal;
+        if sig & Signal::ShelveBuffers as u8 != 0 && !crate::buf_wait::has_waiters() {
+            let _ = crate::buf::shelve_standard();
+        }
+        if sig & Signal::BuffersShelved as u8 != 0 {
+            crate::buf_wait::offer_shelved();
+            self.wake_buffer_waiters();
         }
     }
 
