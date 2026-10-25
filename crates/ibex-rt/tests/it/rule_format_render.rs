@@ -91,3 +91,29 @@ fn a_response_header_prints_the_timers_of_the_answer() {
     assert!(num("Tc=").is_some_and(|n| n >= 0), "{r}");
     assert_eq!((num("TR="), num("Tw="), num("ST=")), (Some(0), Some(0), Some(200)), "{r}");
 }
+
+/// The replacement of a `replace-header`, `replace-value` and `replace-path` is a format
+/// (`%[...]`, `%ci`), rendered before the groups are substituted; measured on 3.5-dev8 with the
+/// same configuration: `abc-zz-q b-zz /pq`.
+#[test]
+fn a_replacement_is_a_format() {
+    let r = exchange(
+        &format!(
+            "{DEFAULTS}frontend fe\n  bind ADDR\n  http-request set-header x-in abc\n  http-request set-header x-v a,b\n  http-request replace-header x-in ^(.*)$ \"\\1-%[str(zz)]-%[str(q)]\"\n  http-request replace-value x-v ^(.)$ \"\\1-%[str(zz)]\"\n  http-request replace-path ^(.*)$ \"/p%[str(q)]\"\n  http-request return status 200 content-type text/plain lf-string \"%[req.hdr(x-in)] %[req.hdr(x-v)] %[path]\"\n"
+        ),
+        GET,
+    );
+    assert_eq!(body(&r), "abc-zz-q b-zz /pq", "{r}");
+}
+
+/// The same for the response rules: `http-after-response replace-header`.
+#[test]
+fn a_response_replacement_is_a_format() {
+    let r = exchange(
+        &format!(
+            "{DEFAULTS}frontend fe\n  bind ADDR\n  http-after-response set-header x-b abc\n  http-after-response replace-header x-b ^(.*)$ \"\\1-%[str(zz)]\"\n  http-request deny\n"
+        ),
+        GET,
+    );
+    assert_eq!(header(&r, "x-b"), Some("abc-zz"), "{r}");
+}

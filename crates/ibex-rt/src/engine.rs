@@ -3869,6 +3869,9 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         tcp_req_content: crate::rule_compiled::tcp_req_content(&tcp_req_content_rules, &acls),
         tcp_res_content: crate::rule_compiled::tcp_res_content(&listen.tcp_res_content_rules, &acls),
         stick: crate::rule_compiled::stick(&listen.stick_rules, &acls),
+        use_backend: crate::rule_compiled::use_backend(&listen.use_backends, &acls),
+        use_server: crate::rule_compiled::use_server(&listen.use_servers, &acls),
+        force_be: crate::rule_compiled::force_be(&listen.force_be_switch, &acls),
         reply_pages: crate::rule_compiled::reply_pages(&listen.error_replies),
         res_stream: false,
     }.finish());
@@ -4014,6 +4017,9 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         tcp_req_content: crate::rule_compiled::tcp_req_content(&tcp_req_content_rules, &acls),
         tcp_res_content: crate::rule_compiled::tcp_res_content(&[], &acls),
         stick: crate::rule_compiled::stick(&fe.stick_rules, &acls),
+        use_backend: crate::rule_compiled::use_backend(&fe.use_backends, &acls),
+        use_server: crate::rule_compiled::use_server(&[], &acls),
+        force_be: crate::rule_compiled::force_be(&fe.force_be_switch, &acls),
         reply_pages: crate::rule_compiled::reply_pages(&fe.error_replies),
         res_stream: false,
     }.finish());
@@ -4156,6 +4162,9 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         tcp_req_content: crate::rule_compiled::tcp_req_content(&be.tcp_req_content_rules, &acls),
         tcp_res_content: crate::rule_compiled::tcp_res_content(&be.tcp_res_content_rules, &acls),
         stick: crate::rule_compiled::stick(&be.stick_rules, &acls),
+        use_backend: crate::rule_compiled::use_backend(&[], &acls),
+        use_server: crate::rule_compiled::use_server(&be.use_servers, &acls),
+        force_be: crate::rule_compiled::force_be(&[], &acls),
         reply_pages: crate::rule_compiled::reply_pages(&be.error_replies),
         res_stream: false,
     }.finish());
@@ -8724,14 +8733,11 @@ impl EngineDispatcher<'_> {
         let registry = sample_registry();
         // `lookup_fe_persist_rules`: the frontend's `force-be-switch` conditions.
         let forced = || {
-            proxy.force_be_switch.iter().any(|c| crate::proxy::eval_acl_condition(c, &proxy.acls, registry, &ctx))
+            proxy.rules.force_be.iter().any(|c| c.eval(&ctx, &proxy.acls, registry))
         };
 
-        for rule in &proxy.use_backends {
-            let mut matches = true;
-            if let Some(ref cond) = rule.cond {
-                matches = crate::proxy::eval_acl_condition(cond, &proxy.acls, registry, &ctx);
-            }
+        for (rule, rc) in proxy.use_backends.iter().zip(&proxy.rules.use_backend) {
+            let matches = rc.cond.as_ref().is_none_or(|cond| cond.eval(&ctx, &proxy.acls, registry));
             if matches {
                 if let Some(idx) = proxies.iter().position(|p| p.name == rule.backend) {
                     return Some(idx);
@@ -8767,8 +8773,8 @@ impl EngineDispatcher<'_> {
         let stick = StickView::new(proxies, &sess.tracked_sc);
         let ctx = Self::request_ctx(sess, be, &view, &stick);
         let registry = sample_registry();
-        for rule in &be.use_servers {
-            if !crate::proxy::eval_acl_condition(&rule.cond, &be.acls, registry, &ctx) {
+        for (rule, rc) in be.use_servers.iter().zip(&be.rules.use_server) {
+            if !rc.cond.as_ref().is_some_and(|cond| cond.eval(&ctx, &be.acls, registry)) {
                 continue;
             }
             let Some(i) = be.server_ids.iter().position(|s| *s == rule.server) else { continue };
@@ -12114,12 +12120,12 @@ impl EngineDispatcher<'_> {
                             return Err(500);
                         }
                     }
-                    ibex_config::HttpReqAction::ReplacePath { regex, repl } => {
+                    ibex_config::HttpReqAction::ReplacePath { regex, .. } => {
                         let step = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             // A target with no path (`*`, `http://h?q=1`) is left alone.
                             target_parts(current_uri).filter(|(_, path, _)| !path.is_empty()).and_then(|(pfx, path, query)| {
-                                replace_uri_part(path, regex, repl, &make_ctx!(sess), registry)
+                                replace_uri_part(path, regex, rc.fmt.as_ref(), &make_ctx!(sess), registry)
                                     .map(|r| r.map(|new_path| rebuild_uri(pfx, &new_path, query)))
                             })
                         };
@@ -12144,12 +12150,12 @@ impl EngineDispatcher<'_> {
                             return Err(500);
                         }
                     }
-                    ibex_config::HttpReqAction::ReplacePathq { regex, repl } => {
+                    ibex_config::HttpReqAction::ReplacePathq { regex, .. } => {
                         let step = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
                             target_parts(current_uri).and_then(|(pfx, path, query)| {
                                 let pathq = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
-                                replace_uri_part(&pathq, regex, repl, &make_ctx!(sess), registry).map(|r| r.map(|n| format!("{pfx}{n}")))
+                                replace_uri_part(&pathq, regex, rc.fmt.as_ref(), &make_ctx!(sess), registry).map(|r| r.map(|n| format!("{pfx}{n}")))
                             })
                         };
                         match step {
@@ -12162,11 +12168,11 @@ impl EngineDispatcher<'_> {
                             }
                         }
                     }
-                    ibex_config::HttpReqAction::ReplaceUri { regex, repl } => {
+                    ibex_config::HttpReqAction::ReplaceUri { regex, .. } => {
                         // The whole target, scheme and authority included.
                         let step = {
                             let current_uri = sess.req_uri.as_deref().unwrap_or("/");
-                            replace_uri_part(current_uri, regex, repl, &make_ctx!(sess), registry)
+                            replace_uri_part(current_uri, regex, rc.fmt.as_ref(), &make_ctx!(sess), registry)
                         };
                         match step {
                             None => {}
@@ -12369,15 +12375,24 @@ impl EngineDispatcher<'_> {
                             }
                         }
                     }
-                    ibex_config::HttpReqAction::ReplaceHeader { name, regex, repl } => {
-                        if replace_req_header(sess, name, regex, repl).is_err() {
+                    ibex_config::HttpReqAction::ReplaceHeader { name, regex, .. } => {
+                        let mut repl = crate::reuse::string();
+                        rc.fmt.iter().for_each(|f| f.render_into(&mut repl, &make_ctx!(sess), registry, None));
+                        let failed = replace_req_header(sess, name, regex, &repl).is_err();
+                        crate::reuse::give(repl);
+                        if failed {
                             return Err(500);
                         }
                     }
-                    ibex_config::HttpReqAction::ReplaceValue { name, regex, repl }
-                        if replace_req_value(sess, name, regex, repl).is_err() => {
+                    ibex_config::HttpReqAction::ReplaceValue { name, regex, .. } => {
+                        let mut repl = crate::reuse::string();
+                        rc.fmt.iter().for_each(|f| f.render_into(&mut repl, &make_ctx!(sess), registry, None));
+                        let failed = replace_req_value(sess, name, regex, &repl).is_err();
+                        crate::reuse::give(repl);
+                        if failed {
                             return Err(500);
                         }
+                    }
                     ibex_config::HttpReqAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
                     ibex_config::HttpReqAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
                     ibex_config::HttpReqAction::ScSetGpt0 { sc, expr } => {
@@ -14928,14 +14943,17 @@ fn res_htx_resize(free: usize, take: usize) -> bool {
 fn replace_uri_part(
     part: &str,
     regex: &str,
-    repl: &str,
+    repl: Option<&crate::rule_compiled::Format>,
     ctx: &SampleContext,
     registry: &Registry,
 ) -> Option<Result<String, ()>> {
     let re = ibex_regex::UserRegex::cached(regex).ok()?;
     let caps = re.captures(part)?;
-    let fmt = format_http_string(repl, ctx, registry);
-    Some(exp_replace(&fmt, &caps).ok_or(()))
+    let mut fmt = crate::reuse::string();
+    repl.iter().for_each(|f| f.render_into(&mut fmt, ctx, registry, None));
+    let out = exp_replace(&fmt, &caps).ok_or(());
+    crate::reuse::give(fmt);
+    Some(out)
 }
 
 /// `exp_replace` (`src/regex.c`): `repl` with `\0`..`\9` replaced by that group of the
@@ -15151,8 +15169,11 @@ fn res_action(
     if let Some((hdr_name, full)) = replace {
         // `http_replace_hdrs`: header by header, the first that does not fit failing the
         // action with the ones before it rewritten.
-        let Some((re_str, repl)) = act_fmt.split_once('\t') else { return Ok(true) };
+        let Some((re_str, _)) = act_fmt.split_once('\t') else { return Ok(true) };
         let Ok(re) = ibex_regex::UserRegex::cached(re_str) else { return Ok(true) };
+        let mut repl_text = crate::reuse::string();
+        rc.fmt.iter().for_each(|f| render_res_format(f, &mut repl_text, ctx, registry, *status));
+        let repl = repl_text.as_str();
         let mut result = Ok(true);
         for (k, v) in hdrs.iter_mut().filter(|(k, _)| k.eq_ignore_ascii_case(hdr_name)) {
             let new_v = if full {
@@ -15171,6 +15192,7 @@ fn res_action(
                 }
             }
         }
+        crate::reuse::give(repl_text);
         publish(hdrs);
         return result;
     }

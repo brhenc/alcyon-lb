@@ -291,6 +291,10 @@ pub struct Rules {
     pub tcp_res_content: Vec<Rule>,
     /// The `stick` rules and `track-sc` of the old style (`Proxy::stick_rules`).
     pub stick: Vec<Rule>,
+    /// `use_backend` and `use-server` rules (their conditions), and `force-be-switch` conditions.
+    pub use_backend: Vec<Rule>,
+    pub use_server: Vec<Rule>,
+    pub force_be: Vec<Cond>,
     /// The `http-error` / `errorfiles` templates of `Proxy::error_replies`, by status.
     pub reply_pages: std::collections::HashMap<u16, std::sync::Arc<Reply>>,
     /// Some response rule's format reads the stream's measures: the response context then
@@ -379,6 +383,11 @@ pub fn http_req(rules: &[ibex_config::HttpReqRule], acls: &Acls) -> Vec<Rule> {
                 | HttpReqAction::HeadersBin { expr, .. }
                 | HttpReqAction::SetTimeout { timeout_val: expr, .. } => (Some(expr.as_str()), None),
                 HttpReqAction::SetVarFmt { fmt, .. } => (None, Some((fmt.as_str(), false))),
+                HttpReqAction::ReplaceHeader { repl, .. }
+                | HttpReqAction::ReplaceValue { repl, .. }
+                | HttpReqAction::ReplacePath { repl, .. }
+                | HttpReqAction::ReplacePathq { repl, .. }
+                | HttpReqAction::ReplaceUri { repl, .. } => (None, Some((repl.as_str(), true))),
                 HttpReqAction::SetHeader { fmt, .. }
                 | HttpReqAction::AddHeader { fmt, .. }
                 | HttpReqAction::SetPath { fmt }
@@ -412,6 +421,9 @@ fn res_header(cond: Option<&AclCondition>, acls: &Acls, name: &str, fmt: &str) -
         Rule::new(cond, acls, Some(fmt), None)
     } else if name.starts_with("\0set-var-fmt:") {
         Rule::new(cond, acls, None, Some((fmt, false)))
+    } else if name.starts_with("\0replace-header:") || name.starts_with("\0replace-value:") {
+        // `<regex>\t<replacement>`: the replacement is a format.
+        Rule::new(cond, acls, None, fmt.split_once('\t').map(|(_, repl)| (repl, true)))
     } else if !name.starts_with('\0') {
         Rule::new(cond, acls, None, Some((fmt, true)))
     } else {
@@ -451,6 +463,24 @@ pub fn http_after_res(rules: &[ibex_config::HttpAfterResRule], acls: &Acls) -> V
             HttpAfterResAction::DelHeader { .. } => Rule::new(r.cond.as_ref(), acls, None, None),
         })
         .collect()
+}
+
+/// The `use_backend` rules', in their order: the condition.
+#[must_use]
+pub fn use_backend(rules: &[ibex_config::UseBackendRule], acls: &Acls) -> Vec<Rule> {
+    rules.iter().map(|r| Rule::new(r.cond.as_ref(), acls, None, None)).collect()
+}
+
+/// The `use-server` rules', in their order: the condition.
+#[must_use]
+pub fn use_server(rules: &[ibex_config::UseServerRule], acls: &Acls) -> Vec<Rule> {
+    rules.iter().map(|r| Rule::new(Some(&r.cond), acls, None, None)).collect()
+}
+
+/// The `force-be-switch` conditions, compiled.
+#[must_use]
+pub fn force_be(conds: &[AclCondition], acls: &Acls) -> Vec<Cond> {
+    conds.iter().map(|c| Cond::compile(c, acls)).collect()
 }
 
 /// The `stick` rules', in their order: the condition, the key's expression.
