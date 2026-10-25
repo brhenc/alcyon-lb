@@ -15,6 +15,7 @@ quinn-proto = { version = "0.11", default-features = false }
 rustls24 = { workspace = true }
 rustls-pemfile = "2.2.0"
 ibex-tls = { workspace = true }
+ibex-alloc = { workspace = true }
 ibex-config = { path = "../ibex-config" }
 zeroize = "1"
 bytes = { workspace = true }
@@ -27,6 +28,7 @@ thiserror = { workspace = true }
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
 rustls = { workspace = true }
 rcgen = "0.13"
+ibex-alloc = { workspace = true, features = ["test-probe"] }
 rustix = { version = "0.38", features = ["event", "net", "std"] }
 
 [lints]

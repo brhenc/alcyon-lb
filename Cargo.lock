@@ -643,6 +643,7 @@ name = "ibex-quic"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "ibex-alloc",
  "ibex-config",
  "ibex-tls",
  "quinn-proto",
