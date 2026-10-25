@@ -135,6 +135,11 @@ path = "tests/promex.rs"
 name = "request_allocations"
 path = "tests/request_allocations.rs"
 
+# Own process: counts allocations (#[global_allocator]); HTTP/3 through the mux (T509)
+[[test]]
+name = "request_allocations_h3"
+path = "tests/request_allocations_h3.rs"
+
 # Own process: fails large allocations on demand (#[global_allocator])
 [[test]]
 name = "session_arena_trim_oom"
