@@ -9757,6 +9757,13 @@ impl EngineDispatcher<'_> {
             stream_timeouts_enter(self.proxies, entry.proxy_idx, entry.backend_idx, &entry.sess);
         }
         let out = self.step_stream_run(session_idx);
+        // Refused a buffer at `tune.buffers.limit` in this run: it waits for one (S6).
+        if crate::buf_wait::wanted() {
+            match self.sessions.get_mut(session_idx) {
+                Some(entry) => buf_wait_enter(entry, session_idx),
+                None => drop(crate::buf_wait::take_want()),
+            }
+        }
         stream_vars_leave(self.sessions.get_mut(session_idx).map(|e| &mut e.sess));
         CURRENT_TIMEOUTS.set(None);
         out
@@ -9844,10 +9851,6 @@ impl EngineDispatcher<'_> {
             // Step 3: Stream engine process pass
             if !entry.sess.is_done() {
                 entry.sess.advance(now);
-                // Refused a buffer at `tune.buffers.limit`: it waits for one (S6).
-                if crate::buf_wait::wanted() {
-                    buf_wait_enter(entry, session_idx);
-                }
             }
             #[cfg(debug_assertions)]
             crate::crash::fault_point(false, entry.sess.req_uri.as_deref().filter(|_| entry.sess.txn.is_some()));

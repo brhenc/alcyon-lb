@@ -419,11 +419,23 @@ a busy thread by up to 10 ms (`tradeoff.md` 6.28).
 
 `tune.buffers.limit <n>` (parsed as HAProxy: one argument, `atoi`, not negative; 1 and 2 become 3,
 0 is no limit) caps the standard buffers the process holds at once, cached ones included. A
-stream that would pass it fails: 500 with termination state `IR--` (request buffer) or `IH--`
-(response buffer), or a close once its response began; where HAProxy puts it on its buffer wait
-queue until one frees (that queue is open work, S6, `tradeoff.md` 6.13). An HTTP/2 stream whose
-buffer cannot be had closes its connection. **`tune.buffers.reserve` is refused at load** (it
-reserves buffers for that wait queue; accepting it would promise what is not there, AGENTS.md 5).
+stream refused its request buffer or the buffer for its server's response waits for one, as on
+HAProxy (S6, `docs/design/memory-q3-2026-10-25.md`), in a per-thread queue by class (responses
+under way before new connections, each queue first come first served) and is woken when a
+buffer is given back on its thread; `timeout client` while waiting answers `408`, logged `cR--`,
+as HAProxy. Differences that remain:
+
+- HAProxy's cap is the limit plus `nbthread` x `tune.buffers.reserve` (default 4) emergency
+  buffers taken at start (`show pools` shows 11 allocated at start with `limit 8`); Ibex has no
+  emergency buffers, its cap is the limit, and **`tune.buffers.reserve` is refused at load**
+  (accepting it would promise what is not there, AGENTS.md 5).
+- A local reply (`408`, `503`, stats) that finds no buffer, the TLS receive buffer and an
+  HTTP/2 stream's buffers still fail as before the queue: 500 `IR--`/`IH--`, or a close.
+- Each queue is served in order; HAProxy's own order was not (fast GETs answered 5, 4, 2, 1,
+  0, 3 in one run), an artefact of retrying every woken waiter in one pass.
+- Ibex's CLI does not wait for a buffer; HAProxy's answers nothing while they are exhausted.
+- HAProxy 3.5-dev8 hit `BUG_ON` `stconn.c:1027` (`tick_is_expired(task->expire, now_ms)`, in
+  `sc_notify`) in 2 of 3 runs of a waiter that left with the CLI polling; Ibex has no such path.
 
 `tune.fail-alloc <0..100>` refuses that percentage of pool allocations at random, and, as on
 HAProxy, counts only under `-dMfail` (`-dMfail` alone is a rate of 1). Ibex honours exactly the

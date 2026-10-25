@@ -2148,7 +2148,9 @@ impl TcpSession {
     #[cold]
     #[inline(never)]
     fn wait_for_buffer(&mut self, class: crate::buf_wait::Class) -> io::Result<bool> {
-        if !crate::buf_wait::should_wait() {
+        // An HTTP/2 connection or stream fails as in S5: its streams run inside the
+        // connection's run, which the queue does not tell apart yet.
+        if !crate::buf_wait::should_wait() || self.h2_ctx.is_some() || self.is_h2_child() {
             return Err(crate::buf::oom());
         }
         crate::buf_wait::want(class);
