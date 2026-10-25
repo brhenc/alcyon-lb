@@ -951,6 +951,41 @@ impl H2MuxContext {
         sent
     }
 
+    /// Sends an interim (1xx) response head, an HTTP/1 one, as a HEADERS frame without
+    /// END_STREAM (T503; `h2s_snd_fhdrs` for a 1xx). False if `head` is not a 1xx head.
+    pub fn send_interim(&mut self, stream_id: u32, head: &[u8]) -> bool {
+        if self.streams.get(&stream_id).is_some_and(|s| matches!(s.state, H2StreamState::Reset(_))) {
+            return true;
+        }
+        let head_str = String::from_utf8_lossy(head);
+        let mut lines = head_str.lines();
+        let status = lines.next().and_then(|l| l.split_whitespace().nth(1)).and_then(|c| c.parse::<u16>().ok());
+        let Some(status) = status.filter(|s| (100..200).contains(s)) else { return false };
+        let headers = lines.filter_map(|line| line.split_once(':')).map(|(name, val)| (name.trim(), val.trim()));
+        self.send_headers_frame(stream_id, status, headers, false);
+        true
+    }
+
+    /// Sends the response's trailers as a HEADERS frame that ends the stream (T503;
+    /// `h2s_snd_ftrl`), the names lowercased.
+    pub fn send_trailers(&mut self, stream_id: u32, trailers: &[(&str, &str)]) -> bool {
+        if self.streams.get(&stream_id).is_some_and(|s| matches!(s.state, H2StreamState::Reset(_))) {
+            return true;
+        }
+        let at = self.begin_frame(FrameType::Headers, frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id);
+        let mut lower = std::mem::take(&mut self.lower_name);
+        for (name, val) in trailers {
+            lower.clear();
+            lower.push_str(name);
+            lower.make_ascii_lowercase();
+            self.encoder.encode_field(&lower, val, &mut self.tx_buf);
+        }
+        self.lower_name = lower;
+        self.end_frame(at);
+        self.local_end_stream(stream_id);
+        true
+    }
+
     /// The stream's state once we have sent END_STREAM.
     fn local_end_stream(&mut self, stream_id: u32) {
         self.streams.entry(stream_id).and_modify(|stream| {
@@ -959,6 +994,115 @@ impl H2MuxContext {
                 _ => H2StreamState::HalfClosedLocal,
             };
         });
+    }
+}
+
+impl crate::htx_mux::HtxStream for H2StreamCtx {
+    fn rx_htx(&self) -> &Htx {
+        &self.rx_htx
+    }
+    fn rx_htx_mut(&mut self) -> &mut Htx {
+        &mut self.rx_htx
+    }
+    fn dispatched(&self) -> bool {
+        self.dispatched
+    }
+    fn set_dispatched(&mut self) {
+        self.dispatched = true;
+    }
+    fn rx_buffered(&self) -> usize {
+        self.rx_buffered
+    }
+    fn is_reset(&self) -> bool {
+        matches!(self.state, H2StreamState::Reset(_))
+    }
+    fn req_head(&self) -> Option<&H2ReqHead> {
+        self.req_head.as_deref()
+    }
+    fn take_req_head(&mut self) -> Option<Box<H2ReqHead>> {
+        self.req_head.take()
+    }
+    fn bad_request(&self) -> bool {
+        self.bad_request
+    }
+}
+
+/// The h2 mux as the bridge drives it (T503, design section 2.4): its own methods, by a
+/// `u64` id (an h2 id is 31 bits; one past that names no stream).
+impl crate::htx_mux::HtxMux for H2MuxContext {
+    type Stream = H2StreamCtx;
+
+    fn stream(&self, id: u64) -> Option<&H2StreamCtx> {
+        self.streams.get(&u32::try_from(id).ok()?)
+    }
+
+    fn stream_mut(&mut self, id: u64) -> Option<&mut H2StreamCtx> {
+        self.streams.get_mut(&u32::try_from(id).ok()?)
+    }
+
+    /// As `h2_bridge::dispatch_next` picks: the lowest stream with its head that is
+    /// neither served, closed nor reset.
+    fn next_dispatch(&self) -> Option<u64> {
+        self.streams
+            .values()
+            .find(|st| {
+                !st.dispatched
+                    && st.state != H2StreamState::Closed
+                    && !matches!(st.state, H2StreamState::Reset(_))
+                    && st.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Eoh))
+            })
+            .map(|st| u64::from(st.id))
+    }
+
+    fn give_back_head(&mut self, head: Box<H2ReqHead>) {
+        H2MuxContext::give_back_head(self, head);
+    }
+
+    fn send_head(&mut self, id: u64, head: &[u8], end_stream: bool) -> bool {
+        self.send_h1_head(u32::try_from(id).unwrap_or(u32::MAX), head, end_stream)
+    }
+
+    fn send_data(&mut self, id: u64, data: &[u8], end_stream: bool) -> usize {
+        H2MuxContext::send_data(self, u32::try_from(id).unwrap_or(u32::MAX), data, end_stream)
+    }
+
+    fn send_trailers(&mut self, id: u64, trailers: &[(&str, &str)]) -> bool {
+        H2MuxContext::send_trailers(self, u32::try_from(id).unwrap_or(u32::MAX), trailers)
+    }
+
+    fn send_interim(&mut self, id: u64, head: &[u8]) -> bool {
+        H2MuxContext::send_interim(self, u32::try_from(id).unwrap_or(u32::MAX), head)
+    }
+
+    fn data_budget(&self, id: u64) -> usize {
+        H2MuxContext::data_budget(self, u32::try_from(id).unwrap_or(u32::MAX))
+    }
+
+    /// Credits the stream and demuxes what waited, as `pump_request_body` does.
+    fn rx_taken(&mut self, id: u64, n: usize) {
+        H2MuxContext::rx_taken(self, u32::try_from(id).unwrap_or(u32::MAX), n);
+        self.resume();
+    }
+
+    fn reset(&mut self, id: u64, why: crate::htx_mux::MuxReset) {
+        let code = match why {
+            crate::htx_mux::MuxReset::Cancel => H2Error::Cancel,
+            crate::htx_mux::MuxReset::Internal => H2Error::InternalError,
+            crate::htx_mux::MuxReset::Refused => H2Error::RefusedStream,
+        };
+        self.send_rst_stream(u32::try_from(id).unwrap_or(u32::MAX), code);
+    }
+
+    fn is_reset(&self, id: u64) -> bool {
+        crate::htx_mux::HtxMux::stream(self, id).is_some_and(|s| matches!(s.state, H2StreamState::Reset(_)))
+    }
+
+    fn tx_pending(&self) -> bool {
+        self.tx_buf.len() > self.tx_consumed
+    }
+
+    fn glitches(&self) -> u64 {
+        self.glitch_count as u64
     }
 }
 

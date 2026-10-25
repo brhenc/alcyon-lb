@@ -19,6 +19,7 @@ mod haproxy_ffi_differential;
 mod http1_conformance;
 mod http2_conformance;
 mod htx_differential;
+mod htx_mux;
 mod layering;
 mod no_panic;
 mod parser_seam;
