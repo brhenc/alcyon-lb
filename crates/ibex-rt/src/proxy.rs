@@ -566,21 +566,26 @@ impl ReqText {
 
     /// Replaces the text with `s`, reusing the buffer (grown to fit, not doubled). A new
     /// connection's first request takes a spare string (as fix/t444), the one an earlier
-    /// session gave back when it ended, rather than allocating.
-    pub fn set(&mut self, s: &str) {
+    /// session gave back when it ended, rather than allocating. `false`, and no text, when the
+    /// memory cannot be had (S5: T446's run under `RLIMIT_DATA` aborted here, `reserve_exact`).
+    pub fn set(&mut self, s: &str) -> bool {
         if self.buf.capacity() == 0 {
             self.buf = crate::reuse::string();
         }
         self.buf.clear();
-        self.buf.reserve_exact(s.len());
-        self.buf.push_str(s);
-        self.set = true;
+        self.set = self.buf.try_reserve_exact(s.len()).is_ok();
+        if self.set {
+            self.buf.push_str(s);
+        }
+        self.set
     }
 
     /// Sets the text to `s`, or clears it when `s` is `None`.
     pub fn set_opt(&mut self, s: Option<&str>) {
         match s {
-            Some(s) => self.set(s),
+            Some(s) => {
+                self.set(s);
+            }
             None => self.reset(),
         }
     }
@@ -2719,8 +2724,10 @@ impl TcpSession {
                         debug_assert_eq!(line, htx.req_line().map(|r| (r.method, r.uri, r.version.as_bytes())));
                         if let Some((method, uri, version)) = line {
                             // Copied into the session's own buffers: no allocation once warm.
-                            self.req_method.set(method);
-                            self.req_uri.set(uri);
+                            if !(self.req_method.set(method) & self.req_uri.set(uri)) {
+                                self.fail_alloc();
+                                return Ok(true);
+                            }
                             if version == b"HTTP/1.0"
                                 && !conn_tokens.map_or_else(|| connection().any(|v| txn::connection_has(v, "keep-alive")), |t| t.1)
                             {

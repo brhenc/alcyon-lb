@@ -525,3 +525,23 @@ fn a_response_cut_short_by_a_buffer_that_cannot_be_had_closes_the_connection() {
     let after = send(&mut engine, addr, GET);
     assert!(after.starts_with("HTTP/1.1 200") && after.ends_with("abcd"), "after: {after:?}");
 }
+
+/// The request's target cannot be copied into the session (`ReqText::set`, where T446's run
+/// under `RLIMIT_DATA` aborted once the buffers were fallible): that stream is answered `500`.
+#[test]
+fn a_request_whose_target_cannot_be_copied_is_answered_500() {
+    const URI_LEN: usize = 333;
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut engine, addr) = engine();
+    let uri = format!("/{}", "u".repeat(URI_LEN - 1));
+    let req = format!("GET {uri} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    ibex_alloc::drain_local_pools();
+    refuse_allocs_of(URI_LEN, 0, 1);
+    let got = send(&mut engine, addr, req.as_bytes());
+    let left = refusals_left();
+    refuse_allocs_of(URI_LEN, 0, 0);
+    assert_eq!(left, 0, "the target's copy was asked for");
+    assert!(got.starts_with("HTTP/1.1 500"), "{got:?}");
+    let after = send(&mut engine, addr, req.as_bytes());
+    assert!(after.starts_with("HTTP/1.1 200"), "after: {after:?}");
+}
