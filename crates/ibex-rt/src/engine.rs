@@ -9706,9 +9706,9 @@ impl EngineDispatcher<'_> {
                 entry.sess.cli_linger = true;
                 entry.sess.req.clear();
                 entry.sess.arm_client(now);
-            } else {
-                close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
+                return;
             }
+            close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
             return;
         }
         if !child {

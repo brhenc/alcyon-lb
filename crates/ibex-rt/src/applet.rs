@@ -1905,9 +1905,17 @@ pub struct AppletArena {
 impl AppletArena {
     #[must_use]
     pub fn with_capacity(cap: usize) -> Self {
+        // Reserved if the memory is there (a tiny `-m`, T508): else the arena grows on use, and
+        // refuses a CLI connection it cannot grow for.
+        fn reserved<T>(cap: usize) -> Vec<T> {
+            let mut v = Vec::new();
+            let _ = v.try_reserve_exact(cap);
+            v
+        }
+        let (entries, free) = (reserved(cap), reserved(cap));
         AppletArena {
-            entries: Vec::with_capacity(cap),
-            free: Vec::with_capacity(cap),
+            entries,
+            free,
             live: 0,
             floor: cap,
             peak: 0,
