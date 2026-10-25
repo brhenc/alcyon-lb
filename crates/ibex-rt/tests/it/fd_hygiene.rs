@@ -19,13 +19,16 @@ use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
 /// A backend that answers one request per connection and closes the connection 200 ms later:
-/// with a FIN, or with an RST (`SO_LINGER` 0).
-fn closing_backend(rst: bool) -> SocketAddr {
+/// with a FIN, or with an RST (`SO_LINGER` 0). The counter says how many connections it has closed.
+fn closing_backend(rst: bool) -> (SocketAddr, Arc<AtomicUsize>) {
+    let closed = Arc::new(AtomicUsize::new(0));
+    let done = Arc::clone(&closed);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let addr = listener.local_addr().expect("addr");
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
+            let done = Arc::clone(&done);
             thread::spawn(move || {
                 let mut buf = [0u8; 4096];
                 if s.read(&mut buf).unwrap_or(0) == 0 {
@@ -36,10 +39,12 @@ fn closing_backend(rst: bool) -> SocketAddr {
                 if rst {
                     let _ = rustix::net::sockopt::set_socket_linger(&s, Some(Duration::ZERO));
                 }
+                drop(s);
+                done.fetch_add(1, Ordering::SeqCst);
             });
         }
     });
-    addr
+    (addr, closed)
 }
 
 struct Ibex(Child, #[allow(dead_code)] NamedTempFile);
@@ -93,7 +98,7 @@ fn ask(c: &mut TcpStream) -> String {
 /// returns the sockets the proxy holds beyond its listener and the clients one second
 /// later, and the answers to a second request on each client.
 fn closed_by_server(rst: bool, n: usize) -> (usize, Vec<String>) {
-    let be = closing_backend(rst);
+    let (be, closed) = closing_backend(rst);
     let fe = common::reserve_addr();
     let ibex = start(
         &format!(
@@ -111,6 +116,14 @@ fn closed_by_server(rst: bool, n: usize) -> (usize, Vec<String>) {
         clients.push(c);
         thread::sleep(Duration::from_millis(10));
     }
+    // The server closes each connection 200 ms after it answered; on a loaded host that thread may
+    // be late, and the proxy cannot close a socket before its server did. Wait for every close
+    // (the wait is bounded), and only then give the proxy its 6 s to notice.
+    let all_closed = Instant::now() + Duration::from_secs(120);
+    while closed.load(Ordering::SeqCst) < n && Instant::now() < all_closed {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(closed.load(Ordering::SeqCst), n, "the backend did not close every connection");
     let deadline = Instant::now() + Duration::from_secs(6);
     // the listener and the clients are the sockets that belong there
     let want = n + 1;
@@ -139,7 +152,7 @@ fn an_idle_server_connection_the_server_closed_is_closed() {
 use std::collections::BTreeMap;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A keep-alive backend on a fixed port that can be stopped (every connection it holds is

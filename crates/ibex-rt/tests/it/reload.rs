@@ -13,6 +13,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -169,24 +171,33 @@ fn a_graceful_reload_keeps_the_port_and_the_stats_socket() {
     new.stop();
 }
 
-/// A backend that holds `/hold` for `hold`, and answers everything else at once.
-fn holding_backend(hold: Duration) -> SocketAddr {
+/// A backend that holds `/hold` until `release` is set (at most 120 s), counting in `arrived` the
+/// `/hold` requests it has received, and answers everything else at once.
+fn holding_backend() -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicBool>) {
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(AtomicBool::new(false));
+    let (a, r) = (Arc::clone(&arrived), Arc::clone(&release));
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let addr = listener.local_addr().expect("addr");
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
+            let (a, r) = (Arc::clone(&a), Arc::clone(&r));
             thread::spawn(move || {
                 let mut buf = [0u8; 2048];
                 let n = s.read(&mut buf).unwrap_or(0);
                 if String::from_utf8_lossy(&buf[..n]).contains("GET /hold") {
-                    thread::sleep(hold);
+                    a.fetch_add(1, Ordering::SeqCst);
+                    let end = Instant::now() + Duration::from_secs(120);
+                    while !r.load(Ordering::SeqCst) && Instant::now() < end {
+                        thread::sleep(Duration::from_millis(10));
+                    }
                 }
                 let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
             });
         }
     });
-    addr
+    (addr, arrived, release)
 }
 
 fn read_all(s: &mut TcpStream, within: Duration) -> String {
@@ -215,7 +226,7 @@ fn read_all(s: &mut TcpStream, within: Duration) -> String {
 #[test]
 fn a_reload_with_x_keeps_the_connections_queued_on_the_old_socket() {
     const QUEUED: usize = 5;
-    let be = holding_backend(Duration::from_millis(1500));
+    let (be, arrived, release) = holding_backend();
     let fe = common::reserve_addr();
     let sock = short_sock("hitless");
     let text = format!(
@@ -229,13 +240,15 @@ fn a_reload_with_x_keeps_the_connections_queued_on_the_old_socket() {
 
     let mut old = Proc::start(cfg.path(), &[]);
     wait_listening(fe);
-    // The probe `wait_listening` made counts against maxconn until the old process sees
-    // it close; give that a moment so the held request below is the one filling it.
-    thread::sleep(Duration::from_millis(200));
-
     let mut held = TcpStream::connect(fe).expect("connect held");
     held.write_all(b"GET /hold HTTP/1.1\r\nHost: x\r\n\r\n").expect("send held");
-    thread::sleep(Duration::from_millis(300));
+    // The backend has the held request: the old process accepted that connection, so its
+    // `maxconn 1` is full (the probe of `wait_listening` only delays this, it cannot prevent it).
+    let end = Instant::now() + Duration::from_secs(60);
+    while arrived.load(Ordering::SeqCst) == 0 && Instant::now() < end {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(arrived.load(Ordering::SeqCst), 1, "the held request never reached the backend");
 
     let mut queued: Vec<TcpStream> = (0..QUEUED)
         .map(|i| {
@@ -269,6 +282,7 @@ fn a_reload_with_x_keeps_the_connections_queued_on_the_old_socket() {
         );
     }
 
+    release.store(true, Ordering::SeqCst);
     let held_resp = read_all(&mut held, Duration::from_secs(5));
     assert!(held_resp.starts_with("HTTP/1.1 200"), "held request: {held_resp:?}");
     let st = old.wait_exit(Duration::from_secs(5));

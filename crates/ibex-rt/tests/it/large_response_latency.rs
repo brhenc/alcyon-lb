@@ -94,9 +94,9 @@ fn round_trip(c: &mut TcpStream, req: &[u8], body_len: usize) -> Duration {
     t.elapsed()
 }
 
-fn median_of_five(fe: SocketAddr, req: &[u8], body_len: usize) -> Duration {
+fn best_of_nine(fe: SocketAddr, req: &[u8], body_len: usize) -> Duration {
     let mut times = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..9 {
         let mut c = TcpStream::connect(fe).expect("connect");
         c.set_nodelay(true).expect("nodelay");
         c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
@@ -106,17 +106,18 @@ fn median_of_five(fe: SocketAddr, req: &[u8], body_len: usize) -> Duration {
         let b = round_trip(&mut c, req, body_len);
         times.push(a.max(b));
     }
-    times.sort();
-    times[2]
+    // The delay this guards against (Nagle against delayed ACK, ~41 ms) hits every exchange; a
+    // loaded host only some, so the fastest connection is the one that tells them apart.
+    times.into_iter().min().expect("nine times")
 }
 
 fn check(size: usize, req: &[u8]) {
     let be = origin(size);
     let (mut child, fe, path) = spawn_ibex(&format!("{size}_{}", req.len()), be);
-    let med = median_of_five(fe, req, size);
+    let med = best_of_nine(fe, req, size);
     common::stop(&mut child);
     let _ = std::fs::remove_file(&path);
-    assert!(med < Duration::from_millis(15), "{size}-byte exchange on a kept-alive connection took {med:?} (median of 5)");
+    assert!(med < Duration::from_millis(15), "{size}-byte exchange on a kept-alive connection took {med:?} (best of 9)");
 }
 
 #[test]
