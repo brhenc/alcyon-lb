@@ -3,7 +3,7 @@
 
 //! QUIC endpoint implementation encapsulating `quinn-proto`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,10 +35,25 @@ pub struct QuicEndpoint {
     active_handles: Vec<ConnectionHandle>,
     round_robin_idx: usize,
     next_timeout: Option<Instant>,
+    /// How many times a connection's `poll_timeout` was asked (a test counter: the cost of a
+    /// datagram must not grow with the number of idle connections).
+    timeout_polls: u64,
+    /// Every connection's next deadline, ordered: the earliest is the first element. A
+    /// connection is re-keyed (`refresh_timer`) only when its own timeout may have changed.
+    timers: BTreeSet<(Instant, usize)>,
+    /// The deadline each connection has in `timers`.
+    timer_of: HashMap<ConnectionHandle, Instant>,
     response_buf: Vec<u8>,
     tx_buf: Vec<u8>,
     /// Set by a soft stop: connections already here are served to the end, a new Initial is refused.
     refusing_new: bool,
+    /// `quic-force-retry`: every new connection without a valid token gets a Retry.
+    force_retry: bool,
+    /// `tune.quic.fe.sec.retry-threshold`: Retry once this many connections are half open.
+    retry_threshold: u64,
+    /// Connections whose peer address is not validated yet (`HAProxy`'s `half_open_conn`):
+    /// those with an [`AmplificationBudget`] not `validated`.
+    half_open: u64,
 }
 
 /// RFC 9000 §8.1 accounting for one connection on an unvalidated path.
@@ -107,36 +122,57 @@ impl QuicEndpoint {
         let config = quic_config.unwrap_or_default();
         let server_config = config.build_server_config(tls)?;
         let endpoint_config = Arc::new(config.build_endpoint_config()?);
-        Ok(Self::with_configs_and_amplification(
+        Ok(Self::from_config(endpoint_config, server_config, &config))
+    }
+
+    /// Creates a `QuicEndpoint` over built `EndpointConfig` and `ServerConfig`, with the
+    /// endpoint-level settings of `config` (Retry policy, anti-amplification factor).
+    #[must_use]
+    pub fn from_config(
+        endpoint_config: Arc<EndpointConfig>,
+        server_config: Arc<ServerConfig>,
+        config: &QuicConfig,
+    ) -> Self {
+        let mut endpoint = Self::with_configs_and_amplification(
             endpoint_config,
             server_config,
             config.require_retry,
             config.anti_amplification_factor,
-        ))
+        );
+        endpoint.retry_threshold = config.retry_threshold;
+        endpoint
     }
 
-    /// Creates a `QuicEndpoint` with custom `EndpointConfig`, `ServerConfig`, and retry requirement.
+    /// Creates a `QuicEndpoint` with custom `EndpointConfig`, `ServerConfig`, and
+    /// `quic-force-retry`.
     #[must_use]
     pub fn with_configs(
         endpoint_config: Arc<EndpointConfig>,
         server_config: Arc<ServerConfig>,
-        require_retry: bool,
+        force_retry: bool,
     ) -> Self {
-        Self::with_configs_and_amplification(endpoint_config, server_config, require_retry, 3)
+        Self::with_configs_and_amplification(endpoint_config, server_config, force_retry, 3)
     }
 
-    /// Creates a `QuicEndpoint` with custom `EndpointConfig`, `ServerConfig`, retry requirement, and anti-amplification factor.
+    /// Creates a `QuicEndpoint` with custom `EndpointConfig`, `ServerConfig`,
+    /// `quic-force-retry`, and anti-amplification factor. The Retry threshold is the default
+    /// (100); [`QuicEndpoint::from_config`] takes it from a [`QuicConfig`].
     #[must_use]
     pub fn with_configs_and_amplification(
         endpoint_config: Arc<EndpointConfig>,
         server_config: Arc<ServerConfig>,
-        require_retry: bool,
+        force_retry: bool,
         anti_amplification_factor: u64,
     ) -> Self {
+        // The third argument is quinn-proto's `allow_mtud`, not a Retry switch (it was passed
+        // `require_retry`, so Retry could never be enabled, T492). Path MTU discovery is only
+        // sound on a socket that sets the don't-fragment bit, and Ibex's UDP sockets do not
+        // (no IP_MTU_DISCOVER / IPV6_DONTFRAG), so it stays off: packets keep the configured
+        // `initial_mtu`, as `HAProxy` keeps its fixed maximum datagram size.
         let endpoint = Endpoint::new(
             endpoint_config,
             Some(server_config.clone()),
-            require_retry,
+            false,
             None,
         );
 
@@ -154,9 +190,15 @@ impl QuicEndpoint {
             active_handles: Vec::new(),
             round_robin_idx: 0,
             next_timeout: None,
+            timeout_polls: 0,
+            timers: BTreeSet::new(),
+            timer_of: HashMap::new(),
             response_buf: Vec::with_capacity(2048),
             tx_buf: Vec::with_capacity(2048),
             refusing_new: false,
+            force_retry,
+            retry_threshold: QuicConfig::default().retry_threshold,
+            half_open: 0,
         }
     }
 
@@ -187,6 +229,12 @@ impl QuicEndpoint {
         self.amplification_overshoots
     }
 
+    /// Number of per-connection timeout queries so far (see the `timeout_polls` field).
+    #[must_use]
+    pub const fn timeout_polls(&self) -> u64 {
+        self.timeout_polls
+    }
+
     /// Whether `bytes` may be sent to `handle` under its anti-amplification budget.
     fn may_send(&self, handle: ConnectionHandle, bytes: u64) -> bool {
         // Fail closed. A missing budget means this code has lost track of a connection, and
@@ -197,20 +245,38 @@ impl QuicEndpoint {
             .is_some_and(|b| b.is_allowed(bytes))
     }
 
-    /// Recomputes and caches the earliest timeout across all active connections.
+    /// Caches the earliest deadline of all connections: the first of `timers`, O(log n).
     pub fn update_next_timeout(&mut self) {
-        let mut min_timeout: Option<Instant> = None;
-        for conn in self.connections.values_mut() {
-            if let Some(timeout) = conn.poll_timeout() {
-                min_timeout = match min_timeout {
-                    Some(current) => Some(current.min(timeout)),
-                    None => Some(timeout),
-                };
-            }
-        }
-        self.next_timeout = min_timeout;
+        self.next_timeout = self.timers.first().map(|&(t, _)| t);
     }
 
+    /// Re-keys one connection's deadline after something that may have changed it, then
+    /// refreshes the cached earliest deadline. Costs one connection's `poll_timeout`, however
+    /// many other connections there are.
+    fn refresh_timer(&mut self, handle: ConnectionHandle) {
+        if let Some(conn) = self.connections.get_mut(&handle) {
+            self.timeout_polls += 1;
+            let new = conn.poll_timeout();
+            let old = self.timer_of.get(&handle).copied();
+            if new != old {
+                if let Some(t) = old {
+                    self.timers.remove(&(t, handle.0));
+                }
+                self.timer_of.remove(&handle);
+                if let Some(t) = new {
+                    self.timers.insert((t, handle.0));
+                    self.timer_of.insert(handle, t);
+                }
+            }
+        }
+        self.update_next_timeout();
+    }
+
+    /// Drops a connection's deadline (it is gone).
+    fn forget_timer(&mut self, handle: ConnectionHandle) {
+        let old = self.timer_of.remove(&handle);
+        let _ = old.is_some_and(|t| self.timers.remove(&(t, handle.0)));
+    }
 
     /// Helper to look up connection handle by `ConnectionId`.
     fn get_handle(&self, conn_id: &ConnectionId) -> Result<ConnectionHandle> {
@@ -244,6 +310,9 @@ impl QuicEndpoint {
             match evt {
                 quinn_proto::Event::Connected => {
                     if let Some(budget) = self.amplification_budgets.get_mut(&handle) {
+                        if !budget.validated {
+                            self.half_open = self.half_open.saturating_sub(1);
+                        }
                         budget.validated = true;
                     }
 
@@ -341,26 +410,65 @@ impl QuicEndpoint {
 
 
 
-    /// Cleans up drained or dead connections from the table and handle list.
-    pub fn cleanup_drained(&mut self) {
-        let mut to_remove = Vec::new();
-        for (&handle, conn) in &self.connections {
-            if conn.is_drained() {
-                to_remove.push(handle);
-            }
-        }
+    /// Answers `incoming` with a Retry (`send_retry`, `src/quic_tx.c`): the Retry is queued, and
+    /// no connection state is kept.
+    fn send_retry(&mut self, incoming: quinn_proto::Incoming) -> DatagramOutcome {
+        self.response_buf.clear();
+        // Only an Incoming that already answered a Retry may not be retried, and that one is
+        // validated, so the refusal is not reached by a test (one line, ignored).
+        let tx = match self.endpoint.retry(incoming, &mut self.response_buf) { Ok(tx) => tx, Err(e) => { self.endpoint.ignore(e.into_incoming()); return DatagramOutcome::Ignored } };
+        self.pending_transmits.push_back(TransmitEntry {
+            transmit: Transmit {
+                destination: tx.destination,
+                src_ip: tx.src_ip,
+                size: tx.size,
+                segment_size: tx.segment_size,
+                ecn: tx.ecn.map(EcnCodepoint::from),
+            },
+            data: self.response_buf.clone(),
+        });
+        DatagramOutcome::StatelessResponse
+    }
 
-        for handle in to_remove {
+    /// Removes those of `candidates` that are drained.
+    fn remove_drained(&mut self, candidates: &[ConnectionHandle]) {
+        for &handle in candidates {
+            if !self.connections.get(&handle).is_some_and(quinn_proto::Connection::is_drained) {
+                continue;
+            }
+            self.forget_timer(handle);
             self.connections.remove(&handle);
             self.handle_to_primary_cid.remove(&handle);
-            self.amplification_budgets.remove(&handle);
+            // Released before its address was validated (`quic_conn_release`).
+            if self.amplification_budgets.remove(&handle).is_some_and(|b| !b.validated) {
+                self.half_open = self.half_open.saturating_sub(1);
+            }
             self.connection_table.remove_connection(handle);
             self.active_handles.retain(|&h| h != handle);
         }
     }
 }
 
+/// The token length of a QUIC v1 Initial packet at the start of `buf`, `None` for any other
+/// packet or one too short to say (RFC 9000 §17.2.2).
+fn initial_token_len(buf: &[u8]) -> Option<u64> {
+    let first = *buf.first()?;
+    // Long header, type Initial (0), version 1.
+    if first & 0xb0 != 0x80 || buf.get(1..5)? != [0, 0, 0, 1] {
+        return None;
+    }
+    let dcid_len = usize::from(*buf.get(5)?);
+    let scid_at = 6 + dcid_len;
+    let scid_len = usize::from(*buf.get(scid_at)?);
+    let at = scid_at + 1 + scid_len;
+    let b0 = *buf.get(at)?;
+    let len = 1usize << (b0 >> 6);
+    let bytes = buf.get(at..at + len)?;
+    Some(bytes[1..].iter().fold(u64::from(b0 & 0x3f), |v, &b| (v << 8) | u64::from(b)))
+}
+
 impl QuicTransport for QuicEndpoint {
+    #[allow(clippy::too_many_lines)]
     fn handle_datagram(
         &mut self,
         now: Instant,
@@ -375,7 +483,6 @@ impl QuicTransport for QuicEndpoint {
             .endpoint
             .handle(now, from, local_ip, None, data, &mut self.response_buf);
 
-        self.update_next_timeout();
         match event {
             Some(DatagramEvent::NewConnection(incoming)) => {
                 let remote_addr = incoming.remote_address();
@@ -394,6 +501,18 @@ impl QuicTransport for QuicEndpoint {
                     });
                     return Ok(DatagramOutcome::StatelessResponse);
                 }
+                let validated = incoming.remote_address_validated();
+                // `quic_rx_pkt_retrieve_conn`: an Initial whose token does not validate is
+                // dropped, nothing sent. quinn-proto would go on as if there were no token
+                // for one it cannot decode; Ibex issues no NEW_TOKEN tokens (no `bloom`
+                // feature), so any token it cannot validate is forged or someone else's.
+                if !validated && initial_token_len(buf).is_some_and(|n| n > 0) {
+                    self.endpoint.ignore(incoming);
+                    return Ok(DatagramOutcome::Ignored);
+                }
+                if !validated && (self.force_retry || self.half_open >= self.retry_threshold) {
+                    return Ok(self.send_retry(incoming));
+                }
                 let primary_cid = ConnectionId::from(*incoming.orig_dst_cid());
                 let outcome = match self.endpoint.accept(
                     incoming,
@@ -406,10 +525,14 @@ impl QuicTransport for QuicEndpoint {
                         self.handle_to_primary_cid.insert(handle, primary_cid);
                         self.connections.insert(handle, conn);
                         self.active_handles.push(handle);
-                        self.amplification_budgets.insert(
-                            handle,
-                            AmplificationBudget::new(buf.len() as u64, self.anti_amplification_factor),
-                        );
+                        let mut budget = AmplificationBudget::new(buf.len() as u64, self.anti_amplification_factor);
+                        // A Retry token validates the address (RFC 9000 §8.1.2): no
+                        // amplification limit, and not half open (`qc_new_conn`).
+                        budget.validated = validated;
+                        if !validated {
+                            self.half_open += 1;
+                        }
+                        self.amplification_budgets.insert(handle, budget);
 
                         self.event_queue.push_back(TransportEvent::NewConnection {
                             conn_id: primary_cid,
@@ -417,7 +540,7 @@ impl QuicTransport for QuicEndpoint {
                         });
 
                         self.drive_connection(handle, now);
-                        self.update_next_timeout();
+                        self.refresh_timer(handle);
                         DatagramOutcome::Accepted
                     }
                     Err(e) => {
@@ -449,11 +572,16 @@ impl QuicTransport for QuicEndpoint {
                 if let Some(conn) = self.connections.get_mut(&handle) {
                     conn.handle_event(conn_evt);
                     self.drive_connection(handle, now);
-                    self.update_next_timeout();
+                    self.refresh_timer(handle);
                     Ok(DatagramOutcome::Routed)
                 } else {
                     Ok(DatagramOutcome::Ignored)
                 }
+            }
+            // quinn-proto closes with INVALID_TOKEN on a Retry token it decodes and refuses
+            // (another address, expired); `HAProxy` drops the datagram and sends nothing.
+            Some(DatagramEvent::Response(_)) if initial_token_len(buf).is_some_and(|n| n > 0) => {
+                Ok(DatagramOutcome::Ignored)
             }
             Some(DatagramEvent::Response(tx)) => {
                 let transmit = Transmit {
@@ -521,6 +649,8 @@ impl QuicTransport for QuicEndpoint {
                         }
                     }
 
+                    // The packet moved the connection's deadline, whether or not it is sent.
+                    self.refresh_timer(handle);
                     if handshaking {
                         if let Some(budget) = self.amplification_budgets.get_mut(&handle) {
                             if !budget.is_allowed(size as u64) {
@@ -529,7 +659,6 @@ impl QuicTransport for QuicEndpoint {
                                 self.amplification_overshoots += 1;
                                 // Exceeds 3x anti-amplification limit before address validation (RFC 9000 §8.1).
                                 // Suppress transmission to prevent DDoS amplification reflection.
-                                self.update_next_timeout();
                                 continue;
                             }
                             budget.record_sent(size as u64);
@@ -537,7 +666,6 @@ impl QuicTransport for QuicEndpoint {
                     }
 
                     out[..size].copy_from_slice(&self.tx_buf[..size]);
-                    self.update_next_timeout();
                     return Some(Transmit {
                         destination: tx.destination,
                         src_ip: tx.src_ip,
@@ -557,27 +685,28 @@ impl QuicTransport for QuicEndpoint {
     }
 
     fn handle_timeout(&mut self, now: Instant) {
-        for &handle in &self.active_handles {
-            if let Some(conn) = self.connections.get_mut(&handle) {
-                if let Some(timeout) = conn.poll_timeout() {
-                    if timeout <= now {
-                        conn.handle_timeout(now);
-                    }
-                }
+        // Only the connections whose deadline has come: the head of `timers`.
+        let mut expired = Vec::new();
+        while let Some(&(t, h)) = self.timers.first() {
+            if t > now {
+                break;
             }
+            self.timers.remove(&(t, h));
+            self.timer_of.remove(&ConnectionHandle(h));
+            expired.push(ConnectionHandle(h));
         }
-
-        let handles = self.active_handles.clone();
-        for handle in handles {
+        for &handle in &expired {
+            if let Some(conn) = self.connections.get_mut(&handle) {
+                conn.handle_timeout(now);
+            }
             self.drive_connection(handle, now);
         }
-
-        self.cleanup_drained();
+        self.remove_drained(&expired);
+        for handle in expired {
+            self.refresh_timer(handle);
+        }
         self.update_next_timeout();
     }
-
-
-
 
     fn poll_event(&mut self) -> Option<TransportEvent> {
         self.event_queue.pop_front()
@@ -717,7 +846,7 @@ impl QuicTransport for QuicEndpoint {
             // Closing arms a drain timer. Left out of the cached deadline, the engine would not
             // wake for it, and the connection would be counted live until some unrelated
             // datagram refreshed the cache.
-            self.update_next_timeout();
+            self.refresh_timer(handle);
         }
     }
 

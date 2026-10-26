@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-//! T358 #4, revised by T483: a `resolvers` section is parsed and checked as `HAProxy` 3.5-dev8
-//! does (T483), but nothing resolves at run time until T484, so what would use it, a
-//! server's `resolvers` (or `default-server`'s), is refused naming the keyword: an operator
-//! must not believe their servers re-resolve.
+//! T358 #4, revised by T483 and T484: a `resolvers` section is parsed and checked as `HAProxy`
+//! 3.5-dev8 does (T483), and a server's `resolvers` (or `default-server`'s) resolves at run time
+//! (T484).
 
 use std::process::Command;
 
@@ -27,10 +26,11 @@ fn a_resolvers_section_is_parsed() {
 }
 
 #[test]
-fn resolvers_on_a_server_or_default_server_is_refused() {
+fn resolvers_on_a_server_or_default_server_is_accepted() {
+    // T484: they resolve at run time now (`tests/it/resolvers.rs`).
     let ns = "resolvers dns\n  nameserver ns1 127.0.0.1:53\n";
     let (ok, err) = check(&format!("{BASE}{ns}listen s\n  bind 127.0.0.1:0\n  server a 127.0.0.1:1 resolvers dns\n"));
-    assert!(!ok && err.contains("'resolvers' is not supported"), "{err}");
+    assert!(ok, "{err}");
     let (ok, err) = check(&format!("{BASE}{ns}listen s\n  bind 127.0.0.1:0\n  default-server resolvers dns\n  server a 127.0.0.1:1\n"));
-    assert!(!ok && err.contains("'resolvers' is not supported"), "{err}");
+    assert!(ok, "{err}");
 }

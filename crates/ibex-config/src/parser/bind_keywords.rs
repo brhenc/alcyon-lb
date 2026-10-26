@@ -89,7 +89,6 @@ pub(crate) const UNIMPLEMENTED_BIND_KEYWORDS: &[BindKeyword] = &[
     refuse!("tls-tickets", 0),
     refuse!("verify", 1),
     refuse!("quic-cc-algo", 1),
-    refuse!("quic-force-retry", 0),
     refuse!("quic-socket", 1),
 ];
 

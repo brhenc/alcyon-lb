@@ -405,7 +405,7 @@ pub enum ConnEnd {
     ShutBoth,
     /// `abort_with_rst`.
     Abort,
-    /// `silent_drop`: IPv6 or not, and the TTL of the RST.
+    /// `silent_drop`: IPv6 or not, and the TTL of the RST (0: `TCP_REPAIR` first, then TTL 1).
     SilentDrop(bool, u8),
 }
 
@@ -810,6 +810,12 @@ pub struct TcpSession {
     pub h2_ctx: Option<Box<H2MuxContext>>,
     /// The first GOAWAY of an HTTP/2 `timeout client` has gone: the next expiry closes.
     pub h2_idle_goaway: bool,
+    /// The 400 for a stalled upload went out and the transaction is over, but the connection
+    /// is held for one more `timeout client` (T501): what the client sends is dropped and
+    /// restarts the wait, its FIN or the timeout closes.
+    pub cli_linger: bool,
+    /// The bind is `proto h2`: the connection is the h2 mux's from the first byte.
+    pub proto_h2: bool,
     /// `idle_start` of an HTTP/2 connection (`struct h2c`): when it last went idle (no
     /// stream, nothing to send), or when the request now being received began. The idle
     /// timeouts count from here, not from the last byte.
@@ -1019,8 +1025,14 @@ impl TcpSession {
     pub fn refuse_request(&mut self, silent: bool, is_ipv6: bool, ttl: u8) {
         use ibex_proto::h2::H2Error;
         if let Some(c) = self.h2_child_mut() {
-            c.rst = Some(if silent { H2Error::RefusedStream } else { H2Error::EnhanceYourCalm });
-            c.goaway = (!silent).then_some(H2Error::EnhanceYourCalm);
+            if silent && ttl == 0 && raw::can_tcp_repair() {
+                // Plain `silent-drop` with `TCP_REPAIR` available (measured on `HAProxy` as root): no
+                // frame at all, the connection goes quiet when its owner closes it.
+                c.end_conn(ConnEnd::SilentDrop(is_ipv6, 0));
+            } else {
+                c.rst = Some(if silent { H2Error::RefusedStream } else { H2Error::EnhanceYourCalm });
+                c.goaway = (!silent).then_some(H2Error::EnhanceYourCalm);
+            }
             c.finished = true;
         } else if silent {
             self.silent_drop_client(is_ipv6, ttl);
@@ -1355,6 +1367,8 @@ impl TcpSession {
             stick_stores: Vec::new(),
             h2_ctx: None,
             h2_idle_goaway: false,
+            cli_linger: false,
+            proto_h2: false,
             h2_idle_start: now,
             h2_out_waited: false,
             h2_head_partial: false,
@@ -2017,7 +2031,13 @@ impl TcpSession {
             txn::MsgState::Body(txn::Body::Length(raw.len() as u64))
         };
         self.rep.clear();
-        if !self.rep.alloc_if_needed() {
+        if !self.rep.alloc_for(crate::buf_wait::Class::MuxTx) {
+            // At `tune.buffers.limit` the reply waits for a buffer (S6b, `DB_MUX_TX`, the most
+            // critical queue), kept whole until then (`process_cli_io` copies it in).
+            if self.wait_for_buffer(crate::buf_wait::Class::MuxTx).is_ok() {
+                self.pending_resp = Some(Box::new(PendingOut::Raw(raw.to_vec(), 0)));
+                return;
+            }
             // No buffer for the answer either (S5): the connection is closed without one, as
             // `HAProxy` closes one whose reply it cannot allocate.
             self.pending_resp = None;
@@ -2164,7 +2184,7 @@ impl TcpSession {
     /// client not read; `Err` (out of memory) when the refusal is not the limit's, as in S5.
     #[inline]
     fn alloc_or_wait_req(&mut self) -> io::Result<bool> {
-        if self.req.alloc_if_needed() {
+        if self.cli_xprt.alloc_rx() && self.req.alloc_for(crate::buf_wait::Class::MuxRx) {
             return Ok(true);
         }
         self.wait_for_buffer(crate::buf_wait::Class::MuxRx)
@@ -2174,7 +2194,7 @@ impl TcpSession {
     /// [`Self::alloc_or_wait_req`]; `DB_SE_RX`, served before new connections).
     #[inline]
     fn alloc_or_wait_rep(&mut self) -> io::Result<bool> {
-        if self.rep.alloc_if_needed() {
+        if self.rep.alloc_for(crate::buf_wait::Class::SeRx) {
             return Ok(true);
         }
         self.wait_for_buffer(crate::buf_wait::Class::SeRx)
@@ -2393,7 +2413,7 @@ impl TcpSession {
     /// connection is `HAProxy`'s h2 mux's, waiting for the preface, not an HTTP/1 one.
     #[must_use]
     pub fn h2_preface_pending(&self) -> bool {
-        self.h2_ctx.is_none() && self.cli_xprt.alpn() == Some(b"h2".as_slice())
+        self.h2_ctx.is_none() && (self.proto_h2 || self.cli_xprt.alpn() == Some(b"h2".as_slice()))
     }
 
     /// The client connection failed: it is closed, as one the client reset.
@@ -2584,6 +2604,10 @@ impl TcpSession {
                         self.ending.get_or_insert(Ending::ClientAbort);
                         changed = true;
                     }
+                    Io::Done(n) if n > 0 && self.cli_linger => {
+                        self.bytes_in += n as u64;
+                        changed = true;
+                    }
                     Io::Done(n) if n > 0 => {
                         self.req.commit(n);
                         self.rewrite_req_chunk_framing();
@@ -2609,6 +2633,7 @@ impl TcpSession {
                 let _ = MuxH2.parse(&mut h2, &to_parse).map_err(|_| h2.ensure_goaway());
                 self.req.clear();
                 self.h2_ctx = Some(Box::new(h2));
+                self.h2_idle_goaway = false;
                 changed = true;
             } else if self.h2_preface_pending() && !self.req.is_empty() && !H2_CONN_PREFACE.starts_with(self.req.readable()) {
                 // ALPN `h2` and not the preface: `HAProxy`'s h2 mux fails the connection
@@ -2955,6 +2980,10 @@ impl TcpSession {
         }
 
         // Drain pending synthetic response into rep if space is available
+        if matches!(self.pending_resp.as_deref(), Some(PendingOut::Raw(..))) && !self.rep.is_allocated() && !self.rep.alloc_for(crate::buf_wait::Class::MuxTx) {
+            // A reply waiting for a buffer (S6b, `write_reply_with`), refused again.
+            return self.wait_for_buffer(crate::buf_wait::Class::MuxTx).map(|_| changed);
+        }
         if let Some(PendingOut::Raw(ref data, ref mut offset)) = self.pending_resp.as_deref_mut() {
             if self.rep.writable().is_empty() && self.rep.len() < self.rep.capacity() {
                 self.rep.compact();
@@ -3421,6 +3450,15 @@ impl TcpSession {
                     self.ending.get_or_insert(Ending::Timeout(Which::Client));
                     return true;
                 }
+                // An h2 mux still waiting for the preface times out silently once, and closes
+                // at the end of the next `timeout client` (measured on HAProxy 3.5-dev8: no
+                // byte at T, close at 2T; T501, VV-5).
+                if self.h2_preface_pending() && !self.h2_idle_goaway {
+                    self.h2_idle_goaway = true;
+                    self.cli_exp = Tick::ETERNITY;
+                    self.arm_client(now);
+                    return false;
+                }
                 self.cli_state = ScState::Error;
                 self.ending.get_or_insert(Ending::Timeout(Which::Client));
                 return true;
@@ -3446,7 +3484,7 @@ impl TcpSession {
     fn expire_request(&mut self) -> bool {
         self.req_exp = Tick::ETERNITY;
         // Armed before the connection was known to be HTTP/2: its waits are its own now.
-        if self.h2_ctx.is_some() {
+        if self.h2_ctx.is_some() || self.h2_preface_pending() {
             return false;
         }
         let live = (self.head_pending() || self.idle_wait()) && self.cli_timer_live();
@@ -3494,7 +3532,19 @@ impl TcpSession {
         let head_only = self.mode == Mode::Http
             && self.txn.as_ref().is_some_and(|t| matches!(t.req, txn::MsgState::Head { body: txn::Framing::None, .. }) && !t.local && t.error.is_none())
             && !self.has_pending_output();
-        let awaiting_server = awaiting_server || head_only;
+        // So is one whose `Content-Length` body is all in the buffer, only waiting for the
+        // server connection to forward it (T501; HAProxy: a complete POST to an unreachable
+        // server is `sC--` at the connect timeout, not `cC--` at the client's).
+        let body_buffered = self.mode == Mode::Http
+            && !self.has_pending_output()
+            && self.txn.as_ref().is_some_and(|t| match t.req {
+                txn::MsgState::Head { body: txn::Framing::Length(n), .. } if !t.local && t.error.is_none() => {
+                    let data = self.req.readable();
+                    find_eoh(data).is_some_and(|(h, e)| (data.len() - (h + e)) as u64 >= n)
+                }
+                _ => false,
+            });
+        let awaiting_server = awaiting_server || head_only || body_buffered;
         // So is the turnaround before a retry (`SC_ST_TAR`).
         !awaiting_server
             && !self.retry_after.is_set()

@@ -79,6 +79,8 @@ pub enum Kind {
     Listener = 4,
     /// Synthetic work used by tests and benchmarks.
     Synthetic = 5,
+    /// A `resolvers` section's DNS I/O and timers (`process_resolvers`).
+    Resolver = 6,
 }
 
 impl Kind {
@@ -92,6 +94,7 @@ impl Kind {
             3 => Some(Kind::Check),
             4 => Some(Kind::Listener),
             5 => Some(Kind::Synthetic),
+            6 => Some(Kind::Resolver),
             _ => None,
         }
     }
@@ -444,6 +447,7 @@ mod tests {
             (Kind::Check, 60_000),
             (Kind::Applet, MAX_KIND_INDEX),
             (Kind::Synthetic, 1),
+            (Kind::Resolver, 3),
         ] {
             let w = WorkKind::new(k, i);
             assert_eq!(w.kind(), Some(k), "tag lost for {k:?}");

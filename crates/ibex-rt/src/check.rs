@@ -366,7 +366,7 @@ pub enum CheckEvent {
 }
 
 impl CheckEvent {
-    /// True for events that are logged regardless of `option log-health-checks`.
+    /// True for the events that move the server between UP and DOWN.
     #[must_use]
     pub const fn is_transition(self) -> bool {
         matches!(self, CheckEvent::WentUp | CheckEvent::WentDown)
@@ -627,31 +627,31 @@ impl ServerCheckState {
             (self.health, self.config.rise)
         };
 
-        let mut out = format!(
-            "Health check for server {backend}/{server} {verb}, reason: {}",
-            self.last_status_desc
-        );
-
-        // `check_append_info` (src/check.c): every status from L57DATA on prints a code,
-        // 0 when the check set none.
-        if self.carries_code() {
-            let _ = write!(out, ", code: {}", self.http_code.unwrap_or(0));
-        }
-
-        if let Some(ref info) = self.last_status_info {
-            let _ = write!(out, ", info: \"{info}\"");
-        }
+        let mut out = format!("Health check for server {backend}/{server} {verb}");
+        self.append_info(&mut out);
 
         let _ = write!(
             out,
-            ", check duration: {}ms, status: {}/{} {}.",
-            self.check_duration_ms,
+            ", status: {}/{} {}.",
             count,
             threshold,
             self.status.as_str()
         );
 
         out
+    }
+
+    /// `check_append_info` (src/check.c): `, reason: <desc>[, code: N][, info: "..."], check
+    /// duration: Nms`, the part of a state-change message that says what the check found.
+    pub fn append_info(&self, out: &mut String) {
+        let _ = write!(out, ", reason: {}", self.last_status_desc);
+        if self.carries_code() {
+            let _ = write!(out, ", code: {}", self.http_code.unwrap_or(0));
+        }
+        if let Some(ref info) = self.last_status_info {
+            let _ = write!(out, ", info: \"{info}\"");
+        }
+        let _ = write!(out, ", check duration: {}ms", self.check_duration_ms);
     }
 
     /// Computes the interval until the next check as a [`Tick`].
@@ -1455,6 +1455,11 @@ pub fn step_check(
             };
 
             cleanup_check_socket(check, fdtab, poller);
+            if code == "L4TOUT" {
+                // "might be due to a server IP change" (`check.c:946`): the engine asks the
+                // server's resolvers (`resolvers::Section::trigger`).
+                crate::resolvers::note_l4_timeout();
+            }
             let event = check.on_failure_full(code, desc, duration, None, info);
             let next = check.schedule_next(now);
             check.next_check = next;
@@ -1707,7 +1712,11 @@ pub fn step_check(
             }
         }
     } else {
-        // Start a brand new check
+        // Start a brand new check, at the server's address now: `set server addr` or a
+        // resolver may have moved it since the last one (T484).
+        if let Some(a) = proxies.get(check.proxy()).and_then(|px| px.servers.get(check.server())) {
+            check.addr = a;
+        }
         check.run.start_tick = now;
         check.http_code = None;
         check.last_status_info = None;

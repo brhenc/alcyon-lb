@@ -42,6 +42,22 @@ pub struct DefaultServerConfig {
     pub track: Option<Box<str>>,
     /// `init-addr`.
     pub init_addr: Option<InitAddr>,
+    /// `resolvers <section>`.
+    pub resolvers: Option<Box<str>>,
+    /// `resolve-prefer`, `resolve-net`, `resolve-opts`.
+    pub resolve: ResolveOpts,
+}
+
+/// `resolve-prefer`, `resolve-net` and `resolve-opts` (`struct resolv_options`): how a server
+/// picks its address among the records of an answer (`resolv_get_ip_from_response`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolveOpts {
+    /// `resolve-prefer ipv4`; the default is IPv6, as `HAProxy`'s (`family_prio = AF_INET6`).
+    pub prefer_ipv4: bool,
+    /// `resolve-net`: up to five networks, as (address, prefix length).
+    pub nets: Vec<(std::net::IpAddr, u8)>,
+    /// `resolve-opts allow-dup-ip` (`prevent-dup-ip`, the default, clears it).
+    pub allow_dup_ip: bool,
 }
 
 /// One method of `init-addr` (`enum srv_initaddr`, its values `HAProxy`'s).
@@ -52,7 +68,7 @@ pub enum InitAddrMethod {
     None = 1,
     /// `libc`: `getaddrinfo` while the configuration loads.
     Libc = 2,
-    /// `last`: the server-state file's address; refused until Ibex has one (T490).
+    /// `last`: the address the server-state file has for the server ([`ServerName::last_addr`]).
     Last = 3,
     /// `<ip>`: [`InitAddr::ip`].
     Ip = 4,
@@ -297,6 +313,10 @@ pub struct ServerExtras {
     pub no_ca: Vec<NoCa>,
     /// The servers whose address is a name, in order; see [`ServerName`].
     pub names: Vec<ServerName>,
+    /// Every server's `resolvers <section>`, an address or a name, with its line: the
+    /// section must exist (checked at the end of the parse, as `HAProxy`'s
+    /// `resolvers_finalize_config`).
+    pub resolvers_refs: Vec<(u32, u32, Box<str>)>,
 }
 
 impl ServerExtras {
@@ -326,9 +346,22 @@ pub struct ServerName {
     /// Its `init-addr`, the `default-server`'s if it has none.
     pub init_addr: InitAddr,
     /// The name did not resolve and `init-addr none` let the server start without an
-    /// address: in maintenance (`SRV_ADMF_RMAINT`, `MAINT (resolution)`) for good until
-    /// run-time resolution exists (T484). `addr` is then the unspecified address.
+    /// address: in maintenance (`SRV_ADMF_RMAINT`, `MAINT (resolution)`) until its resolvers
+    /// give it one, for good without `resolvers`. `addr` is then the unspecified address.
     pub unresolved: bool,
+    /// `resolvers <section>`: the section that resolves the name at run time (T484).
+    pub resolvers: Option<Box<str>>,
+    pub resolve: ResolveOpts,
+    /// `srv_addr` of the server's line in the server-state file, as written
+    /// (`srv->lastaddr`): what `init-addr last` gives it (T490).
+    pub last_addr: Option<Box<str>>,
+    /// `SRV_ADMF_FQDN_CHANGED`: the server-state file had `srv_fqdn` set from the CLI and it
+    /// differs from the configuration's name (`srv_state_srv_update`); `show servers state`
+    /// keeps the flag in `srv_admin_state`. With `resolvers`, `fqdn` is then the file's.
+    pub fqdn_changed: bool,
+    /// The prefix of the `server-template` line this is the first slot of (T486): HAProxy
+    /// names that slot in the start-up notices as `server-template <proxy>/<prefix>`.
+    pub template: Option<Box<str>>,
 }
 
 /// A TLS server line that needs a CA file it has not got; see [`ServerExtras::no_ca`].

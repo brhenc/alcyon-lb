@@ -214,6 +214,21 @@ pub(crate) fn parse_global_directive(
             }
             Ok(())
         }
+        // `cfg_parse_quic_tune_setting` (src/cfgparse-quic.c, QUIC oracle 3.5-dev7): one
+        // argument, `atoi` into an `unsigned int`, at least 1. So `-1` is 4294967295 and
+        // `abc` is refused. Reaches `QuicEndpoint`'s Retry policy through `QuicConfig`.
+        "tune.quic.fe.sec.retry-threshold" => {
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text)));
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let n = tokens.get(1).map_or(0, |t| c_atoi(&t.text) as u32);
+            if n < 1 {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' expects a positive integer.", kw.text)));
+            }
+            global.quic_retry_threshold = Some(u64::from(n));
+            Ok(())
+        }
         "tune.maxaccept" => {
             // `cfgparse-global.c`: `atol`, so `abc` is 0 (the default); only a value over
             // INT_MAX is refused (`max < -1` is commented out there); a second one is a
@@ -303,13 +318,13 @@ pub(crate) fn parse_global_directive(
             if n < 0 {
                 return Err(ConfigError::new(at.line, at.col, format!("'{name}' expects a non-negative number but got '{arg}'.")));
             }
-            if name == "tune.buffers.reserve" {
-                // The emergency buffers it reserves serve the buffer wait queue, which Ibex does
-                // not have yet (a stream without a buffer fails): accepted and dropped, it would
-                // promise what is not there (AGENTS.md 5).
-                return Err(ConfigError::new(kw.line, kw.col, "'tune.buffers.reserve' is not supported by Ibex yet: it sets aside per-thread emergency buffers for the buffer wait queue, which Ibex's queue does not have (a stream past tune.buffers.limit waits without them)."));
-            }
             let n = usize::try_from(n).unwrap_or(usize::MAX);
+            if name == "tune.buffers.reserve" {
+                // Each thread's emergency buffers (S6b): `ibex_rt::buf::fill_emergency` at start,
+                // taken by `Buf::alloc_for` when the pool refuses.
+                global.buffers_reserve = Some(n);
+                return Ok(());
+            }
             global.buffers_limit = Some(if n == 0 { 0 } else { n.max(3) });
             Ok(())
         }
@@ -703,9 +718,14 @@ pub(crate) fn parse_global_directive(
             global.daemon = true;
             Ok(())
         }
+        // Removed in HAProxy 3.5 (`cfg_parse_global`, src/cfgparse-global.c): the mode is
+        // chosen on the command line (`-W`, `-Ws`), which `ibex` handles; accepting and
+        // ignoring the keyword started a process with no master (VV-26).
         "master-worker" => {
-            global.master_worker = true;
-            Ok(())
+            if tokens.get(1).is_some_and(|t| t.text == "no-exit-on-failure") {
+                return Err(ConfigError::new(kw.line, kw.col, "'master-worker no-exit-on-failure' is only supported in master-worker mode. Use -W or -Ws in the startup script."));
+            }
+            Err(ConfigError::new(kw.line, kw.col, "support for 'master-worker' was removed in version 3.5. Use -W or -Ws in the startup script instead."))
         }
         // `HAProxy`'s `cfg_parse_global` (src/cfgparse-global.c): the names are resolved
         // here, so an unknown one fails `-c` as well; the ids are applied in `ibex-rt`

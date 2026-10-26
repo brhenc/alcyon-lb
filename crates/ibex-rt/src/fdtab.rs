@@ -65,6 +65,9 @@ pub enum FdState {
     QuicBackend { listener: u32 },
     /// This worker's mailbox (`crate::mailbox`): another worker asked something.
     Mailbox,
+    /// A nameserver's socket of a `resolvers` section (`crate::resolvers`), by section:
+    /// readiness wakes the section's task.
+    Resolver { section: u32 },
     /// An idle server connection in this worker's lists (`crate::engine::IdlePool`),
     /// still registered for reads: an event on it is its server closing it, or sending
     /// what nobody asked for (T434). Not counted in [`used`]: the lists count their own.

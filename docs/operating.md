@@ -186,10 +186,11 @@ Runtime changes are not persisted by themselves. As with HAProxy, save them befo
 `server-state-file` (or `server-state-base` + `load-server-state-from-file local`) at it with
 `load-server-state-from-file global` in `defaults`: the new process starts each server with the
 saved admin state (maint, drain), operational state, weight (unless the configured weight
-changed), `disable health`, last check status and port (T490, tests in
-`crates/ibex-rt/tests/it/server_state_file.rs`). Not restored yet: the fqdn and DNS-learnt
-addresses (`init-addr last` is refused); `srv_use_ssl`, check port/address and agent columns
-are not applied and the start says so.
+changed), `disable health`, last check status, port and check port, and a server written as a
+name starts on the saved address (`init-addr last`, the default `last,libc`), so a reload keeps
+the addresses DNS gave; a `srv_fqdn` changed from HAProxy's CLI is kept with `resolvers` (T490,
+tests in `crates/ibex-rt/tests/it/server_state_file.rs` and `resolvers.rs`). `srv_use_ssl`, check
+address and agent columns are not applied and the start says so.
 
 ## Master CLI
 

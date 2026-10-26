@@ -24,9 +24,14 @@ const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
 const DEFAULTS: &str = "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n";
 
 fn engine_with(global: &str, lines: &str) -> (Engine, SocketAddr) {
+    engine_sized(global, lines, 64)
+}
+
+/// [`engine_with`] presized for `capacity` sessions (and so many buffer wait queue slots).
+fn engine_sized(global: &str, lines: &str, capacity: usize) -> (Engine, SocketAddr) {
     let addr = common::reserve_addr();
     let cfg = format!("{global}{DEFAULTS}frontend f\n  bind {addr}\n{lines}");
-    let engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), capacity).expect("Engine::new");
     ibex_alloc::drain_local_pools();
     (engine, addr)
 }
@@ -61,15 +66,16 @@ fn send(engine: &mut Engine, addr: SocketAddr, req: &[u8]) -> String {
 }
 
 /// A stream past `tune.buffers.limit` waits in a queue; when the queue cannot grow to take it
-/// (S6, `buf_wait::enter`), that stream fails as in S5 (closed), and the next stream is served
-/// once the holders are gone. The client queue is filled to its capacity (2048 waiters of 8
-/// bytes) with waiters whose sessions do not exist, so that its next growth, to 32768 bytes, is
-/// an allocation nothing else makes and can be refused alone; the engine drops those waiters
-/// when buffers come back (a woken waiter whose session is gone).
+/// (S6, `buf_wait::enter`), that stream fails as in S5, and the next stream is served once the
+/// holders are gone. Since S6b the queues are lists through arrays indexed by session slot,
+/// reserved for the engine's sessions at start: only a slot past them makes them grow. The
+/// engine is presized for three sessions: the holders take slots 0-2 and the stream slot 3,
+/// whose entry grows the first array from 3 to 4 `u32`s (16 bytes), refused. The stream's
+/// failure answer (500) itself waits for a buffer as any local reply (S6b) and comes once the
+/// holders are gone: it used to wait for `timeout client`, nothing waking it (T473).
 #[test]
 fn a_stream_whose_wait_queue_cannot_grow_fails_as_without_a_buffer() {
-    use ibex_rt::buf_wait::{enter, Class};
-    let (mut engine, addr) = engine_with("global\n  tune.buffers.limit 3\n", "  http-request return status 200 content-type text/plain string ok\n");
+    let (mut engine, addr) = engine_sized("global\n  tune.buffers.limit 3\n  tune.buffers.reserve 0\n", "  http-request return status 200 content-type text/plain string ok\n", 3);
     // Three connections each holding a buffer for a partial head: the limit.
     let mut held: Vec<TcpStream> = (0..3)
         .map(|_| {
@@ -82,11 +88,7 @@ fn a_stream_whose_wait_queue_cannot_grow_fails_as_without_a_buffer() {
         let _ = engine.run_once();
         thread::sleep(Duration::from_millis(2));
     }
-    let waiter = std::mem::size_of::<(ibex_sched::TaskRef, u32)>();
-    for i in 0..2048 {
-        assert!(enter(ibex_sched::TaskRef(4_000_000 + i), u32::MAX - 1, Class::MuxRx, false));
-    }
-    refuse_allocs_here(4096 * waiter, 0, 1);
+    refuse_allocs_here(4 * std::mem::size_of::<u32>(), 0, 1);
     let mut c4 = TcpStream::connect(addr).expect("connect");
     c4.write_all(GET).expect("write");
     c4.set_nonblocking(true).expect("nonblocking");
@@ -113,7 +115,8 @@ fn a_stream_whose_wait_queue_cannot_grow_fails_as_without_a_buffer() {
         }
     }
     let got = String::from_utf8_lossy(&got);
-    assert!(got.starts_with("HTTP/1.1 500") || got.is_empty(), "the stream that could not wait: {got:?}");
+    assert!(got.starts_with("HTTP/1.1 500"), "the stream that could not wait: {got:?}");
+    assert!(start.elapsed() < Duration::from_secs(2), "the 500 waited {:?} (timeout client 5s)", start.elapsed());
     let after = send(&mut engine, addr, GET);
     assert!(after.starts_with("HTTP/1.1 200") && after.ends_with("ok"), "after: {after:?}");
 }

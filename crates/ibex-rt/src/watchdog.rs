@@ -42,6 +42,10 @@ use std::time::Duration;
 /// `HAProxy`'s default `warn-blocked-traffic-after` (src/wdt.c:48).
 pub const DEFAULT_WARN_AFTER: Duration = Duration::from_millis(100);
 
+/// The monitor thread's stack: it only reads counters and prints, so 256 KiB rather than the 2 MiB
+/// default, which a very small `-m` (`RLIMIT_DATA`) cannot give it (T508).
+const WATCHDOG_STACK: usize = 256 * 1024;
+
 /// Stuck this long (CPU time), a worker is marked stuck; still stuck at the next tick, the
 /// process is aborted (src/wdt.c:196).
 const STUCK_NS: u64 = 1_000_000_000;
@@ -169,7 +173,7 @@ pub fn under_control() {
 /// The thread could not be spawned.
 pub fn start(warn_after: Duration, warn_only: bool) -> std::io::Result<()> {
     let Some(wd) = WATCHDOG.get() else { return Ok(()) };
-    std::thread::Builder::new().name("ibex-wdt".into()).spawn(move || monitor(wd, warn_after, warn_only)).map(|_| ())
+    std::thread::Builder::new().name("ibex-wdt".into()).stack_size(WATCHDOG_STACK).spawn(move || monitor(wd, warn_after, warn_only)).map(|_| ())
 }
 
 fn monitor(wd: &'static Watchdog, tick: Duration, warn_only: bool) -> ! {

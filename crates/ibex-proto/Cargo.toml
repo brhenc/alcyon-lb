@@ -11,13 +11,17 @@ ibex-sched = { path = "../ibex-sched" }
 ibex-regex = { workspace = true }
 memchr = { workspace = true }
 ibex-h1-sys = { path = "../ibex-h1-sys", optional = true }
+# The h3 mux's stream and connection contexts ("qcs", "qcc", T503).
+ibex-alloc = { path = "../ibex-alloc" }
 
 [features]
 haproxy-ffi = ["dep:ibex-h1-sys"]
 
 [dev-dependencies]
 proptest = { workspace = true }
-ibex-alloc = { path = "../ibex-alloc" }
+# The h3 mux driver (T503): a quinn-proto client and server in one process, the mux between.
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
+rustls = { workspace = true }
 ibex-sample = { path = "../ibex-sample" }
 
 [lints.rust]

@@ -227,6 +227,9 @@ pub struct GlobalSection {
     pub extra_stats_sockets: Vec<StatsSocket>,
     /// Maximum rewrite size in bytes.
     pub maxrewrite: Option<usize>,
+    /// `tune.quic.fe.sec.retry-threshold`: half-open QUIC connections past which a new one
+    /// is answered by a Retry; `None` is the default, 100.
+    pub quic_retry_threshold: Option<u64>,
     /// `ibex.debug.panic <request|response> <path-prefix>`: a test-only fault (T447), accepted
     /// only in builds with `debug_assertions`.
     pub debug_panic: Option<DebugPanic>,
@@ -270,6 +273,9 @@ pub struct GlobalSection {
     /// `tune.buffers.limit <n>`: the most standard buffers held at once (0: none; 1 and 2 are 3,
     /// as `HAProxy` makes them).
     pub buffers_limit: Option<usize>,
+    /// `tune.buffers.reserve <n>`: emergency standard buffers per thread, made at start, which
+    /// raise the limit by as many (S6b; `None`: Ibex's 0, `HAProxy`'s 4: see differences.md).
+    pub buffers_reserve: Option<usize>,
     /// `tune.memory.prealloc on|off` (Ibex-only, T468): fill the standard buffer pool and the
     /// session arenas to what `maxconn` implies at start, and keep the buffer pool there. Needs
     /// an explicit `maxconn` or `-m` (checked at load). Off when unset.
@@ -300,8 +306,6 @@ pub struct GlobalSection {
     pub memmax_mb: Option<u32>,
     /// Background daemon mode.
     pub daemon: bool,
-    /// Master-worker mode.
-    pub master_worker: bool,
     /// User name for privilege dropping.
     pub user: Option<String>,
     /// Group name for privilege dropping.

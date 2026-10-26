@@ -177,7 +177,8 @@ fn past_tune_buffers_limit_a_stream_waits_and_is_served_when_a_buffer_frees() {
     if std::env::var("S5_ORACLE").is_ok() {
         return;
     }
-    let mut p = start("\ttune.buffers.limit 3\n", &[]);
+    // No reserve: the cap is the limit's three (S6b: the default reserve, 4, would raise it).
+    let mut p = start("\ttune.buffers.limit 3\n\ttune.buffers.reserve 0\n", &[]);
     let held: Vec<TcpStream> = (0..3)
         .map(|_| {
             let mut c = TcpStream::connect(("127.0.0.1", p.port)).expect("connect");

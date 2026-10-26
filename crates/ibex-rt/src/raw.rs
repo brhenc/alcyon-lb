@@ -289,9 +289,30 @@ pub fn reset_pending(fd: BorrowedFd<'_>) -> bool {
     matches!(poll(&mut fds, 0), Ok(n) if n > 0) && fds[0].revents().contains(PollFlags::ERR)
 }
 
-/// Discards the connection quietly: sets the TTL to `ttl` (1 unless `rst-ttl`, so emitted RST packets expire
-/// `ttl` hops away and do not reach the client) and linger 0.
+/// Whether this process may put a TCP socket in repair mode (`CAP_NET_ADMIN`): probed once on a
+/// scratch socket, since the answer is the process's and does not change.
+#[must_use]
+pub fn can_tcp_repair() -> bool {
+    static CAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CAN.get_or_init(|| {
+        net::socket(AddressFamily::INET, SocketType::STREAM, None)
+            .is_ok_and(|fd| nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::TcpRepair, &1u32).is_ok())
+    })
+}
+
+/// Discards the connection quietly. `ttl` 0 is plain `silent-drop`: as `HAProxy` (`tcp_exec_action_silent_drop`)
+/// first tries `TCP_REPAIR`, after which the close sends nothing at all (the client's socket just hangs), and
+/// only when that is refused (no `CAP_NET_ADMIN`) falls back to TTL 1. Any other `ttl` is `rst-ttl`: the TTL is
+/// set to `ttl` and linger to 0, so the reset the close emits expires `ttl` hops away.
 pub fn silent_drop(fd: BorrowedFd<'_>, is_ipv6: bool, ttl: u8) {
+    let ttl = if ttl == 0 {
+        if nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::TcpRepair, &1u32).is_ok() {
+            return;
+        }
+        1
+    } else {
+        ttl
+    };
     if is_ipv6 {
         let _ = net::sockopt::set_ipv6_unicast_hops(fd, Some(ttl));
     } else {
@@ -299,4 +320,3 @@ pub fn silent_drop(fd: BorrowedFd<'_>, is_ipv6: bool, ttl: u8) {
     }
     let _ = net::sockopt::set_socket_linger(fd, Some(std::time::Duration::ZERO));
 }
-

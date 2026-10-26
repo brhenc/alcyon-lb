@@ -3,18 +3,32 @@
 
 //! `resolvers` sections (`cfg_parse_resolvers`, `src/resolvers.c`).
 //!
-//! Parsed and checked as `HAProxy` checks them. Nothing reads them yet: a server's
-//! `resolvers` keyword, the only thing that would, is refused until run-time resolution
-//! exists (T484, `docs/design/dns-2026-10-25.md` §2.7). A section no server uses does
-//! nothing observable in `HAProxy` either, except in `show resolvers` (T485).
+//! Parsed and checked as `HAProxy` checks them; a section a server names runs at run time
+//! (`ibex_rt::resolvers`, T484). A section no server uses does nothing observable in
+//! `HAProxy` either, except in `show resolvers` (T485).
 
 use std::net::SocketAddr;
 use std::time::Duration;
+
+/// The transport a `nameserver` address asks for (`str2sa_range` with `PA_O_DEFAULT_DGRAM`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NsTransport {
+    /// No explicit type (`ip:port`, `ipv4@`, `ipv6@`, `ip@`): UDP, and a truncated answer is
+    /// asked again over TCP.
+    #[default]
+    Default,
+    /// `udp@`, `udp4@`, `udp6@`, `dgram+`: UDP only, no TCP fallback.
+    Udp,
+    /// `tcp@`, `tcp4@`, `tcp6@`, `stream+`: every query goes over TCP.
+    Tcp,
+}
 
 /// A `nameserver <name> <addr>:<port>` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nameserver {
     pub name: String,
+    /// How it is reached (the address prefix).
+    pub transport: NsTransport,
     /// The address, a name in it resolved by libc while the configuration loads.
     pub addr: SocketAddr,
     /// The line it is on, for the duplicate-name alert.

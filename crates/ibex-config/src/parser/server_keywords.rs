@@ -100,13 +100,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
         "Ibex does not implement it; requests it should keep apart would share server connections",
     )),
     kw!("redir", Arg::Word, ROUTE),
-    // Checked in `server.rs` first (`check_resolve_keyword`); they act only with `resolvers`.
-    kw!("resolve-net", Arg::Word, Ignore("DNS resolution at run time, which needs 'resolvers'; Ibex refuses it until T484")),
-    kw!("resolve-opts", Arg::Word, Ignore("DNS resolution at run time, which needs 'resolvers'; Ibex refuses it until T484")),
-    kw!("resolve-prefer", Arg::Word, Ignore("DNS resolution at run time, which needs 'resolvers'; Ibex refuses it until T484")),
-    kw!("resolvers", Arg::Word, Refuse(
-        "Ibex does not resolve names at run time yet (T484); the address libc gave at startup would never change",
-    )),
     kw!("set-proxy-v2-tlv-fmt", Arg::Word, SENT),
     kw!("shard", Arg::Word, Ignore("peers only")),
     kw!("slowstart", Arg::Delay, Ignore("the warm-up of a server coming back up")),

@@ -330,7 +330,7 @@ impl TlsConn {
     /// still in it (the buffer may move its bytes to make room).
     fn read_once(&mut self, fd: BorrowedFd<'_>) -> io::Result<Read1> {
         debug_assert!(!self.ctx.has_plain());
-        if !self.rx.buf.alloc_if_needed() {
+        if !self.rx.buf.alloc_for(crate::buf_wait::Class::MuxRx) {
             return Err(crate::buf::oom());
         }
         if self.rx.buf.ensure_writable(4096).is_empty() {
@@ -669,6 +669,17 @@ impl ClientXprt {
     #[must_use]
     pub const fn is_tls(&self) -> bool {
         matches!(self, ClientXprt::Tls(_))
+    }
+
+    /// The TLS receive buffer, taken before the request's (S6b): a stream at the limit then
+    /// waits holding nothing, or holding this one, never taking the request buffer only to be
+    /// refused this one (which spun: given back, offered again). True for plaintext.
+    #[inline]
+    pub fn alloc_rx(&mut self) -> bool {
+        match self {
+            ClientXprt::Plain => true,
+            ClientXprt::Tls(t) => t.rx.buf.alloc_for(crate::buf_wait::Class::MuxRx),
+        }
     }
 
     /// What the `ssl_fc*` fetches read of the session: nothing for plaintext, and for TLS

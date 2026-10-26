@@ -613,8 +613,23 @@ impl CliApplet {
                         _ if raw == Some(crate::check::DRAIN_DOWN) => 8,
                         _ => 0,
                     } | if p.server_cmaint(s_idx) { 4 } else { 0 };
-                    // No address: SRV_ADMF_RMAINT (32) is the maintenance, not the operator's.
-                    let admin_state = if rmaint { (admin_state & !1) | 32 } else { admin_state };
+                    // No address: SRV_ADMF_RMAINT (32) is the maintenance; the operator's kept
+                    // under it is FMAINT (1) or FDRAIN (8).
+                    let admin_state = if rmaint {
+                        let kept = match p.server_rmaint_kept(s_idx) {
+                            ServerStatus::Maint => 1,
+                            ServerStatus::Drain => 8,
+                            _ => 0,
+                        };
+                        (admin_state & !1) | 32 | kept
+                    } else {
+                        admin_state
+                    };
+                    let admin_state = admin_state | if p.server_fqdn_changed(s_idx) { 64 } else { 0 };
+                    // `check.port` (the file may have changed it), and `agent.port`, which the
+                    // `port` keyword sets too.
+                    let agent_port = p.server_check_port(s_idx);
+                    let mut check_port = agent_port;
                     let uweight = p.server_weights.get(s_idx).unwrap_or(1);
                     let iweight = p.initial_weight(s_idx);
                     
@@ -625,6 +640,7 @@ impl CliApplet {
                     
                     if let Some(check) = ctx.checks.iter().find(|c| c.proxy() == p_idx && c.server() == s_idx) {
                         check_health = check.health;
+                        check_port = check.config.check_port.unwrap_or(0);
                         check_state = 2; // CHK_ST_CONFIGURED
                         if check.enabled {
                             check_state |= 4; // CHK_ST_ENABLED
@@ -655,9 +671,9 @@ impl CliApplet {
                     let srv_forced = u8::from(p.server_forced_id(s_idx));
                     self.out_buf.extend_from_slice(
                         format!(
-                            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} 0 {} {} {} {} - {} 0 - - 0\n",
+                            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} 0 {} {} {} {} - {} {} - - {}\n",
                             p.ids.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, lastchg, check_status, check_result, check_health, check_state, bk_forced, srv_forced,
-                            p.server_fqdn(s_idx).unwrap_or("-"), port, use_ssl
+                            p.server_fqdn(s_idx).unwrap_or("-"), port, use_ssl, check_port, agent_port
                         ).as_bytes()
                     );
                 }
@@ -678,6 +694,11 @@ impl CliApplet {
         } else if cmd == "show ssl crypto-provider" {
             // T460 (Ibex-only): the provider and the handshakes of each, then the empty line.
             self.finish_msg(&crate::crypto_provider::show());
+        } else if cmd == "show resolvers" || cmd.starts_with("show resolvers ") {
+            // The section counters worker 0's resolver tasks publish (`crate::resolvers`).
+            let id = cmd["show resolvers".len()..].split_whitespace().next();
+            let out = crate::resolvers::show(id);
+            self.finish_msg(out.trim_end_matches('\n'));
         } else if cmd == "show pools" || cmd.starts_with("show pools ") {
             let args: Vec<&str> = cmd["show pools".len()..].split_whitespace().collect();
             // The answer ends with the empty line already, also when it is the error.
@@ -902,7 +923,8 @@ impl CliApplet {
             self.finish_msg(&format!("'show info {a}' is not supported by Ibex."));
             return;
         }
-        let active_conns: u32 = ctx.proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
+        // `actconn`: includes the QUIC connections `maxconn` holds (T504).
+        let active_conns = crate::globalconn::current();
         let max_conns: u32 = ctx.proxies.iter().map(|p| p.maxconn.get()).sum();
         let cum_conns: u64 = ctx.proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
         let cum_reqs: u64 = ctx.proxies.iter().filter_map(|p| p.ids.tc.get()).map(|c| c.fe.req_tot.load(std::sync::atomic::Ordering::Relaxed)).sum();
@@ -1395,15 +1417,13 @@ impl CliApplet {
             return;
         } else if first == Some("all") {
             crate::engine::clear_proxy_counters(ctx.proxies, None);
-            crate::engine::MAX_CONN_RATE.store(0, std::sync::atomic::Ordering::Relaxed);
-            crate::engine::MAX_SESS_RATE.store(0, std::sync::atomic::Ordering::Relaxed);
+            crate::engine::clear_rate_maxima();
             crate::stats::SSL_MAX.store(0, std::sync::atomic::Ordering::Relaxed); // T320
             self.finish_msg("");
             return;
         } else {
             crate::engine::clear_proxy_maxima(ctx.proxies);
-            crate::engine::MAX_CONN_RATE.store(0, std::sync::atomic::Ordering::Relaxed);
-            crate::engine::MAX_SESS_RATE.store(0, std::sync::atomic::Ordering::Relaxed);
+            crate::engine::clear_rate_maxima();
             crate::stats::SSL_MAX.store(0, std::sync::atomic::Ordering::Relaxed); // T320
             self.finish_msg("");
             return;
@@ -1537,7 +1557,7 @@ impl CliApplet {
             }
         }
         for (p_idx, s_idx, st) in track_changes {
-            crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, st);
+            crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, st, crate::srvlog::Cause::Cli);
         }
         // `HAProxy` ends every answer, an empty one too, with an empty line.
         self.finish_msg(if !found_px {
@@ -1569,7 +1589,7 @@ impl CliApplet {
             }
         }
         for (p_idx, s_idx, st) in track_changes {
-            crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, st);
+            crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, st, crate::srvlog::Cause::Cli);
         }
         // `HAProxy` ends every answer, an empty one too, with an empty line.
         self.finish_msg(if !found_px {
@@ -1705,7 +1725,7 @@ impl CliApplet {
                         return;
                     }
                 };
-                crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, status);
+                crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, status, crate::srvlog::Cause::Cli);
                 self.finish_msg("");
             }
             Some("weight") => self.apply_weight(ctx, loc, parts.get(2).copied()),
@@ -1730,7 +1750,7 @@ impl CliApplet {
                 };
                 // The operator's maintenance or drain is kept: the operational state moves
                 // under it (`DRAIN` becomes `DOWN`, `MAINT` keeps only the counter).
-                crate::track::apply_health(ctx.proxies, ctx.checks, p_idx, s_idx, up);
+                crate::track::apply_health(ctx.proxies, ctx.checks, p_idx, s_idx, up, crate::srvlog::Cause::Cli);
                 self.finish_msg("");
             }
             Some("addr") => {
@@ -1895,9 +1915,17 @@ pub struct AppletArena {
 impl AppletArena {
     #[must_use]
     pub fn with_capacity(cap: usize) -> Self {
+        // Reserved if the memory is there (a tiny `-m`, T508): else the arena grows on use, and
+        // refuses a CLI connection it cannot grow for.
+        fn reserved<T>(cap: usize) -> Vec<T> {
+            let mut v = Vec::new();
+            let _ = v.try_reserve_exact(cap);
+            v
+        }
+        let (entries, free) = (reserved(cap), reserved(cap));
         AppletArena {
-            entries: Vec::with_capacity(cap),
-            free: Vec::with_capacity(cap),
+            entries,
+            free,
             live: 0,
             floor: cap,
             peak: 0,

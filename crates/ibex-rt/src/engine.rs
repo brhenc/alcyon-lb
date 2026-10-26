@@ -1327,32 +1327,102 @@ impl RateCtr {
     }
 }
 
-/// Process-wide connection rate (`show info` `ConnRate`), ticked by every engine thread
-/// and by the QUIC listener: the per-thread `RateCtr` writes are not atomic as a whole.
-pub static GLOBAL_CONN_RATE: std::sync::Mutex<RateCtr> = std::sync::Mutex::new(RateCtr::new());
-/// Process-wide session rate (`show info` `SessRate`).
-pub static GLOBAL_SESS_RATE: std::sync::Mutex<RateCtr> = std::sync::Mutex::new(RateCtr::new());
-/// Highest `ConnRate` seen since start or the last `clear counters` (`MaxConnRate`).
-pub static MAX_CONN_RATE: AtomicU32 = AtomicU32::new(0);
-/// Highest `SessRate` seen since start or the last `clear counters` (`MaxSessRate`).
-pub static MAX_SESS_RATE: AtomicU32 = AtomicU32::new(0);
+/// One engine thread's share of the process-wide `show info` rates. Only its owner thread
+/// writes it; `show info` sums the registered shares on read (AGENTS.md §8: no shared write
+/// per accepted connection). The peak is that thread's own, so `MaxConnRate` is the sum of the
+/// threads' peaks: exact with one thread, an upper bound when the peaks are not simultaneous.
+struct ThreadRates {
+    conn: RateCtr,
+    sess: RateCtr,
+    max_conn: AtomicU32,
+    max_sess: AtomicU32,
+    /// The `CLEAR_EPOCH` the maxima belong to; a share from before the last `clear counters` reads as 0.
+    epoch: AtomicU32,
+}
 
-fn tick_global(ctr: &std::sync::Mutex<RateCtr>, max: &AtomicU32) {
-    let ctr = ctr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    ctr.tick();
-    max.fetch_max(u32::try_from(ctr.rate()).unwrap_or(u32::MAX), Ordering::Relaxed);
+static THREAD_RATES: std::sync::Mutex<Vec<&'static ThreadRates>> = std::sync::Mutex::new(Vec::new());
+/// Bumped by `clear counters`; each thread zeroes its own maxima when it next counts.
+static CLEAR_EPOCH: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    static LOCAL_RATES: &'static ThreadRates = {
+        let r: &'static ThreadRates = Box::leak(Box::new(ThreadRates {
+            conn: RateCtr::new(),
+            sess: RateCtr::new(),
+            max_conn: AtomicU32::new(0),
+            max_sess: AtomicU32::new(0),
+            epoch: AtomicU32::new(CLEAR_EPOCH.load(Ordering::Relaxed)),
+        }));
+        THREAD_RATES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(r);
+        r
+    };
+}
+
+fn tick_local(pick: impl Fn(&ThreadRates) -> (&RateCtr, &AtomicU32)) {
+    LOCAL_RATES.with(|r| {
+        let epoch = CLEAR_EPOCH.load(Ordering::Relaxed);
+        if r.epoch.load(Ordering::Relaxed) != epoch {
+            r.max_conn.store(0, Ordering::Relaxed);
+            r.max_sess.store(0, Ordering::Relaxed);
+            r.epoch.store(epoch, Ordering::Relaxed);
+        }
+        let (ctr, max) = pick(r);
+        ctr.tick();
+        let rate = u32::try_from(ctr.rate()).unwrap_or(u32::MAX);
+        if rate > max.load(Ordering::Relaxed) {
+            max.store(rate, Ordering::Relaxed);
+        }
+    });
+}
+
+fn sum_rates(f: impl Fn(&ThreadRates) -> u64) -> u64 {
+    THREAD_RATES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().map(|r| f(r)).sum()
+}
+
+fn sum_max(f: impl Fn(&ThreadRates) -> &AtomicU32) -> u64 {
+    let epoch = CLEAR_EPOCH.load(Ordering::Relaxed);
+    sum_rates(|r| if r.epoch.load(Ordering::Relaxed) == epoch { u64::from(f(r).load(Ordering::Relaxed)) } else { 0 })
+}
+
+/// `ConnRate`: connections accepted over the last second, all threads.
+#[must_use]
+pub fn global_conn_rate() -> u64 {
+    sum_rates(|r| r.conn.rate())
+}
+
+/// `SessRate`: sessions created over the last second, all threads.
+#[must_use]
+pub fn global_sess_rate() -> u64 {
+    sum_rates(|r| r.sess.rate())
+}
+
+/// `MaxConnRate` since start or the last `clear counters`.
+#[must_use]
+pub fn max_conn_rate() -> u64 {
+    sum_max(|r| &r.max_conn)
+}
+
+/// `MaxSessRate` since start or the last `clear counters`.
+#[must_use]
+pub fn max_sess_rate() -> u64 {
+    sum_max(|r| &r.max_sess)
+}
+
+/// `clear counters`: forget the maxima (each thread zeroes its own share when it next counts).
+pub fn clear_rate_maxima() {
+    CLEAR_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 /// One accepted client connection, counted before `tcp-request connection` rules run
 /// (`listener_accept`: rejected and silently dropped connections are in `ConnRate`).
 /// Not for the CLI, which `HAProxy` binds unlimited (`BC_O_UNLIMITED`).
 pub(crate) fn count_global_conn() {
-    tick_global(&GLOBAL_CONN_RATE, &MAX_CONN_RATE);
+    tick_local(|r| (&r.conn, &r.max_conn));
 }
 
 /// One session, counted once the connection survived the `tcp-request connection` rules.
 pub(crate) fn count_global_sess() {
-    tick_global(&GLOBAL_SESS_RATE, &MAX_SESS_RATE);
+    tick_local(|r| (&r.sess, &r.max_sess));
 }
 
 /// Accumulated statistics per proxy.
@@ -1456,13 +1526,21 @@ pub struct ProxyIdInfo {
     /// Which servers the configuration disabled (`SRV_ADMF_CMAINT`, 4 in `show servers state`
     /// whatever the CLI does afterwards); empty when none (see [`Proxy::server_cmaint`]).
     pub server_cmaint: Vec<bool>,
-    /// Which servers started without an address (`init-addr none` after a name did not
-    /// resolve: `SRV_ADMF_RMAINT`, 32 in `show servers state`, `MAINT (resolution)`); empty
-    /// when none (see [`Proxy::server_rmaint`]).
-    pub server_rmaint: Vec<bool>,
+    /// Which servers have no address (`init-addr none` after a name did not resolve, or a
+    /// resolver took it: `SRV_ADMF_RMAINT`, 32 in `show servers state`, `MAINT
+    /// (resolution)`), and the operator's admin state kept under it (`SRV_ADMF_FMAINT`,
+    /// `SRV_ADMF_FDRAIN`): 0 none, else 1 + that [`ServerStatus`]; empty when no server's
+    /// address is a name (see [`Proxy::server_rmaint`], [`Proxy::server_rmaint_kept`]).
+    pub server_rmaint: Arc<Vec<std::sync::atomic::AtomicU8>>,
     /// The name each server's address was written as (`srv_fqdn`); empty when no server's
     /// was (see [`Proxy::server_fqdn`]).
     pub server_fqdns: Vec<Option<Box<str>>>,
+    /// Which servers' `srv_fqdn` the server-state file had changed from the CLI
+    /// (`SRV_ADMF_FQDN_CHANGED`, 64 in `srv_admin_state`; T490); empty when none.
+    pub server_fqdn_changed: Vec<bool>,
+    /// Each server's `port` (`check port`, `default-server port`): `srv_agent_port`, and
+    /// `srv_check_port` of a server with no check; empty when no server has one.
+    pub server_check_ports: Vec<u16>,
     /// Each server's `econ`: the requests whose connection attempts all failed, the last
     /// attempt having been to that server (see [`count_connect_failure`]).
     /// Each listener's numeric id (`luid`) by `bind` line, as `so_id` reads it.
@@ -1759,16 +1837,47 @@ impl Proxy {
     }
 
     /// Whether the server at `idx` has no address (`SRV_ADMF_RMAINT`): it stays in
-    /// maintenance whatever the CLI asks, as nothing can give it one before T484.
+    /// maintenance whatever the CLI asks, until its resolver gives it one (`crate::resolvers`).
     #[must_use]
     pub fn server_rmaint(&self, idx: usize) -> bool {
-        self.ids.server_rmaint.get(idx).copied().unwrap_or(false)
+        self.ids.server_rmaint.get(idx).is_some_and(|f| f.load(Ordering::Relaxed) != 0)
+    }
+
+    /// The admin state the operator (or `disabled`) gave the server at `idx` while it is in
+    /// `SRV_ADMF_RMAINT`: `Maint`, `Drain` or `Up`, the one it takes back when its name
+    /// resolves again. `Up` when it is not in `RMAINT`.
+    #[must_use]
+    pub fn server_rmaint_kept(&self, idx: usize) -> ServerStatus {
+        match self.ids.server_rmaint.get(idx).map_or(0, |f| f.load(Ordering::Relaxed)) {
+            0 => ServerStatus::Up,
+            v => ServerStatus::from(v - 1),
+        }
+    }
+
+    /// Puts the server at `idx` in `SRV_ADMF_RMAINT`, keeping the admin state `kept`, or takes
+    /// it out with `None` (a server whose address is a name: the others have no flag).
+    pub fn set_server_rmaint(&self, idx: usize, kept: Option<ServerStatus>) {
+        if let Some(f) = self.ids.server_rmaint.get(idx) {
+            f.store(kept.map_or(0, |k| k as u8 + 1), Ordering::Relaxed);
+        }
     }
 
     /// The name the address of the server at `idx` was written as, if it was one.
     #[must_use]
     pub fn server_fqdn(&self, idx: usize) -> Option<&str> {
         self.ids.server_fqdns.get(idx).and_then(Option::as_deref)
+    }
+
+    /// Whether the server-state file kept `SRV_ADMF_FQDN_CHANGED` for the server at `idx`.
+    #[must_use]
+    pub fn server_fqdn_changed(&self, idx: usize) -> bool {
+        self.ids.server_fqdn_changed.get(idx).copied().unwrap_or(false)
+    }
+
+    /// The `port` keyword of the server at `idx`, 0 without one (`srv_agent_port`).
+    #[must_use]
+    pub fn server_check_port(&self, idx: usize) -> u16 {
+        self.ids.server_check_ports.get(idx).copied().unwrap_or(0)
     }
 
     /// Whether the server at `idx` has an `id` of its own (`SRV_F_FORCED_ID`).
@@ -2205,6 +2314,9 @@ pub struct Engine {
     /// inside each `Proxy` (T177).
     pub proxies: Proxies,
     pub checks: Vec<ServerCheckState>,
+    /// The `resolvers` sections the servers use, on worker 0 with the checks they change
+    /// (`crate::resolvers`); empty elsewhere.
+    resolvers: Vec<crate::resolvers::Section>,
     pub sessions: SessionArena,
     pub applets: AppletArena,
     pub cli_listener: Option<crate::cli_listener::CliListener>,
@@ -3885,14 +3997,41 @@ fn server_cmaint(servers: &[ibex_config::Server]) -> Vec<bool> {
     if servers.iter().any(|s| s.disabled) { servers.iter().map(|s| s.disabled).collect() } else { Vec::new() }
 }
 
-/// The flags for [`Proxy::server_rmaint`]: empty when every server has an address.
-fn server_rmaint(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<bool> {
-    if extras.names.iter().any(|n| n.unresolved) { (0..count).map(|i| extras.unresolved(i)).collect() } else { Vec::new() }
+/// The flags for [`Proxy::server_rmaint`]: one per server when an address was written as a
+/// name (a resolver may take it away at run time), else empty. A `disabled` server keeps
+/// `Maint` under it.
+fn server_rmaint(servers: &[ibex_config::Server], extras: &ibex_config::ast::ServerExtras) -> Arc<Vec<std::sync::atomic::AtomicU8>> {
+    if extras.names.is_empty() {
+        Arc::default()
+    } else {
+        let kept = |i: usize| if servers.get(i).is_some_and(|s| s.disabled) { ServerStatus::Maint } else { ServerStatus::Up };
+        Arc::new((0..servers.len()).map(|i| std::sync::atomic::AtomicU8::new(if extras.unresolved(i) { kept(i) as u8 + 1 } else { 0 })).collect())
+    }
 }
 
 /// The names for [`Proxy::server_fqdn`]: empty when no address was written as one.
 fn server_fqdns(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<Option<Box<str>>> {
     if extras.names.is_empty() { Vec::new() } else { (0..count).map(|i| extras.fqdn(i).map(Box::from)).collect() }
+}
+
+/// [`ProxyIdInfo::server_fqdn_changed`].
+fn server_fqdn_changed(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<bool> {
+    let mut out = Vec::new();
+    for n in extras.names.iter().filter(|n| n.fqdn_changed) {
+        out.resize(count, false);
+        if let Some(slot) = out.get_mut(n.index as usize) {
+            *slot = true;
+        }
+    }
+    out
+}
+
+/// [`ProxyIdInfo::server_check_ports`].
+fn server_check_ports(servers: &[ibex_config::ast::Server]) -> Vec<u16> {
+    if servers.iter().all(|s| s.check_port.is_none()) {
+        return Vec::new();
+    }
+    servers.iter().map(|s| s.check_port.unwrap_or(0)).collect()
 }
 
 /// The flags for [`Proxy::server_forced_ids`]: empty when none asked for an id.
@@ -3963,8 +4102,10 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
             server_cmaint: server_cmaint(&listen.servers),
-            server_rmaint: server_rmaint(listen.servers.len(), &listen.server_extras),
+            server_rmaint: server_rmaint(&listen.servers, &listen.server_extras),
             server_fqdns: server_fqdns(listen.servers.len(), &listen.server_extras),
+            server_fqdn_changed: server_fqdn_changed(listen.servers.len(), &listen.server_extras),
+            server_check_ports: server_check_ports(&listen.servers),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
             server_pool: pool_cfgs(&listen.servers),
             http_mode: listen.http_mode,
@@ -4258,8 +4399,10 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
             server_cmaint: server_cmaint(&be.servers),
-            server_rmaint: server_rmaint(be.servers.len(), &be.server_extras),
+            server_rmaint: server_rmaint(&be.servers, &be.server_extras),
             server_fqdns: server_fqdns(be.servers.len(), &be.server_extras),
+            server_fqdn_changed: server_fqdn_changed(be.servers.len(), &be.server_extras),
+            server_check_ports: server_check_ports(&be.servers),
             listener_ids: Vec::new(),
             server_pool: pool_cfgs(&be.servers),
             http_mode: be.http_mode,
@@ -4665,6 +4808,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mut scheduler = Scheduler::with_capacity(capacity);
         let mut fdtab = FdTab::with_capacity(capacity * 2);
         let mut sessions = SessionArena::with_capacity(capacity);
+        // The buffer wait queues, for as many streams as the arena is sized for (S6b §3): a
+        // stream queued at `tune.buffers.limit` allocates nothing. Short of memory, they grow
+        // on use instead.
+        let _ = crate::buf_wait::presize(capacity);
         let applets = AppletArena::with_capacity(capacity);
 
         ibex_sample::set_userlists(
@@ -4704,7 +4851,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         ibex_alloc::set_hot_size(config.global.as_ref().and_then(|g| g.hot_size).unwrap_or(ibex_alloc::HOT_SIZE_DEFAULT));
         // `tune.buffers.limit`, `tune.fail-alloc` under `-dMfail` (S5): read by the pools' miss
         // paths (`buf::take_mem`, `Pool::miss`) and the accept (`register_new_session`).
-        crate::buf::set_buffers_limit(config.global.as_ref().and_then(|g| g.buffers_limit).unwrap_or(0));
+        // `tune.buffers.reserve` (S6b): each thread's emergency buffers raise the limit. Default
+        // `RESERVED_BUFS` (4), as HAProxy, but only with a limit: without one the pool refuses
+        // only when memory is short, where Ibex fails the stream (S5).
+        let limit = config.global.as_ref().and_then(|g| g.buffers_limit).unwrap_or(0);
+        let reserve = config.global.as_ref().and_then(|g| g.buffers_reserve).unwrap_or(if limit == 0 { 0 } else { crate::buf::RESERVED_BUFS });
+        let nbthread = crate::stats::NBTHREAD.load(Ordering::Relaxed) as usize;
+        crate::buf::set_buffers_limit(crate::buf::limit_with_reserve(limit, reserve, nbthread));
         ibex_alloc::pool::set_fail_alloc(ibex_alloc::pool::effective_fail_alloc(config.global.as_ref().and_then(|g| g.fail_alloc)));
         // A variable whose memory is refused collects and retries once (T445).
         ibex_sample::vars::set_alloc_failure_hook(crate::pool_gc::pool_gc);
@@ -4717,9 +4870,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         if bufsize_large.is_some() {
             crate::buf::preallocate_large_buffers();
         }
+        if !crate::buf::fill_emergency(reserve) {
+            return Err(io::Error::other(format!("tune.buffers.reserve: cannot allocate {reserve} emergency buffers")));
+        }
         // `tune.memory.prealloc` (T468): this thread's buffers and session slots, from `maxconn`.
         if let Some(plan) = crate::prealloc::plan(config) {
-            crate::buf::set_buffers_limit(plan.buffers_limit);
+            crate::buf::set_buffers_limit(crate::buf::limit_with_reserve(plan.buffers_limit, reserve, nbthread));
             if !crate::buf::prealloc_standard(plan.buffers) || !sessions.prealloc(plan.sessions) {
                 return Err(io::Error::other(format!(
                     "tune.memory.prealloc: cannot allocate {} buffers and {} session slots",
@@ -4762,6 +4918,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     listener.name = b.name.as_deref().map(Into::into);
                     listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
                     listener.accept_proxy_v2 = b.accept_proxy_v2;
+                    listener.proto_h2 = b.proto.as_deref() == Some("h2");
                     listener.tls.clone_from(&tls);
                     let l_idx = listeners.len();
                     let lfd = listener.raw_fd();
@@ -4787,8 +4944,17 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     // Each request is handed to this frontend's stream engine (T130). It
                     // used to go straight to the first server of the default backend, and
                     // no rule, `use_backend`, balancing or log line ever saw it.
-                    let mut ql = crate::quic_listener::QuicListener::bind_for_worker(bind_addr, &tls, None, Some(worker_id))?;
+                    // `quic-force-retry` and `tune.quic.fe.sec.retry-threshold` (T492); windows from
+                    // `tune.bufsize`, as HAProxy's (h3-engine design 2.3): 100 streams of `bufsize - 4`,
+                    // 90 % of it for one (T504).
+                    let mut qc = ibex_quic::QuicConfig::new().with_flow_windows(bufsize, 100, 90);
+                    qc.require_retry = b.sock.as_ref().is_some_and(|s| s.quic_force_retry);
+                    if let Some(n) = config.global.as_ref().and_then(|g| g.quic_retry_threshold) {
+                        qc.retry_threshold = n;
+                    }
+                    let mut ql = crate::quic_listener::QuicListener::bind_for_worker(bind_addr, &tls, Some(qc), Some(worker_id))?;
                     ql.set_frontend(proxy_idx);
+                    ql.gate_connections();
 
                     let l_idx = quic_listeners.len();
                     let lfd = ql.raw_fd();
@@ -4807,6 +4973,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         listener.name = b.name.as_deref().map(Into::into);
                     listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
                     listener.accept_proxy_v2 = b.accept_proxy_v2;
+                    listener.proto_h2 = b.proto.as_deref() == Some("h2");
                         listener.tls.clone_from(&tls);
                         let l_idx = listeners.len();
                         let lfd = listener.raw_fd();
@@ -4833,6 +5000,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         } else {
             Vec::new()
         };
+        // Where a server's `resolvers` reaches the data path: its section's task and sockets.
+        let resolvers = if worker_id == 0 {
+            crate::resolvers::build(config, &proxies, &mut scheduler, &mut fdtab, &poller, now)?
+        } else {
+            Vec::new()
+        };
 
 
         // A worker on its own answers itself; `share_mailboxes` joins it to the others.
@@ -4854,6 +5027,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             listeners,
             proxies,
             checks,
+            resolvers,
             sessions,
             applets,
             cli_listener: None,
@@ -5043,6 +5217,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.poller.add(fd, raw_fd_to_u64(fd.as_raw_fd()), true, false)?;
         self.mailboxes = Arc::clone(boxes);
         self.mailbox_wid = wid;
+        crate::buf_wait::join(boxes, wid);
         Ok(())
     }
 
@@ -5069,6 +5244,25 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     }
                 }
             }
+        }
+        let sig = self.mailboxes.take_signals(wid);
+        if sig != 0 {
+            self.serve_buffer_signals(sig);
+        }
+    }
+
+    /// S6b: another thread waits for a buffer (this one's cached buffers go on the shelf, unless
+    /// it waits too), or put buffers on the shelf (this thread's waiters are offered them).
+    #[cold]
+    #[inline(never)]
+    fn serve_buffer_signals(&mut self, sig: u8) {
+        use crate::mailbox::Signal;
+        if sig & Signal::ShelveBuffers as u8 != 0 && !crate::buf_wait::has_waiters() {
+            let _ = crate::buf::shelve_standard();
+        }
+        if sig & Signal::BuffersShelved as u8 != 0 {
+            crate::buf_wait::offer_shelved();
+            self.wake_buffer_waiters();
         }
     }
 
@@ -5212,7 +5406,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     #[must_use]
     pub fn format_stats_info(&self) -> String {
         let pid = std::process::id();
-        let active_conns: u32 = self.proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(Ordering::Relaxed)).sum::<u32>()).sum();
+        // `actconn`: the QUIC connections `maxconn` holds are in it, not in any `scur` (T504).
+        let active_conns = crate::globalconn::current();
         let max_conns: u32 = self.proxies.iter().map(|p| p.maxconn.get()).sum();
         let cum_conns: u64 = self.proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(Ordering::Relaxed)).sum::<u64>()).sum();
         let cum_reqs: u64 = self.proxies.iter().filter_map(|p| p.ids.tc.get()).map(|c| c.fe.req_tot.load(Ordering::Relaxed)).sum();
@@ -5283,6 +5478,53 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         for (idx, ql) in self.quic_listeners.iter().enumerate() {
             for (b, readable, writable) in ql.io_fds() {
                 sync_quic_fd(&mut self.fdtab, &self.poller, idx, b, Interest { readable, writable }, true);
+            }
+        }
+    }
+
+    /// A QUIC connection is a session of its frontend (T504; HAProxy's `quic_accept_push_qc` ->
+    /// `listener_accept` -> `session_new`). At its handshake it is a connection (`CurrConns`,
+    /// `CurrSslConns`/`CumSslConns`, held by `global maxconn` as every connection is); once
+    /// the frontend's `maxconn` has room it is a session (`scur`, `stot`, `conn_tot`,
+    /// `CumConns`), served, oldest first. Its request streams count in `req_tot` only.
+    fn admit_quic_connections(&mut self) {
+        for q_idx in 0..self.quic_listeners.len() {
+            let Some(proxy_idx) = self.quic_listeners[q_idx].frontend() else { continue };
+            let ql = &mut self.quic_listeners[q_idx];
+            for (_, admitted) in ql.take_closed() {
+                crate::globalconn::release();
+                crate::stats::SSL_CURR.fetch_sub(1, Ordering::Relaxed);
+                if admitted {
+                    let proxy = &self.proxies[proxy_idx];
+                    proxy.counters().act_conn.fetch_sub(1, Ordering::Relaxed);
+                    proxy.maxconn.dec();
+                }
+            }
+            for conn_id in ql.take_handshaken() {
+                // `global maxconn` is reached: HAProxy's listener does not accept it, and it
+                // is in no counter.
+                if !crate::globalconn::try_acquire() {
+                    ql.refuse(conn_id);
+                    continue;
+                }
+                crate::stats::SSL_CURR.fetch_add(1, Ordering::Relaxed);
+                crate::stats::SSL_CUM.fetch_add(1, Ordering::Relaxed);
+            }
+            while ql.has_waiting() {
+                let proxy = &self.proxies[proxy_idx];
+                if !proxy.maxconn.try_inc() {
+                    break;
+                }
+                let c = proxy.counters();
+                c.cum_conn.fetch_add(1, Ordering::Relaxed);
+                c.fe_sess_rate.tick();
+                c.fe_conn_rate.tick();
+                count_global_sess();
+                let conn_rate = c.fe_conn_rate.rate();
+                proxy.txn_counters().fe.conn_rate_max.fetch_max(u32::try_from(conn_rate).unwrap_or(u32::MAX), Ordering::Relaxed);
+                let act = c.act_conn.fetch_add(1, Ordering::Relaxed) + 1;
+                c.max_conn.fetch_max(act, Ordering::Relaxed);
+                ql.admit_next();
             }
         }
     }
@@ -5528,6 +5770,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     quic_ready.push(q_idx as usize);
                 }
                 FdState::Mailbox => mail = true,
+                FdState::Resolver { section } => {
+                    if let Some(sec) = self.resolvers.get(section as usize) {
+                        self.scheduler.tasklet_wakeup(sec.task, Class::Normal, state::WOKEN_IO);
+                    }
+                }
                 // One of this worker's idle server connections: its server closed it, or
                 // sent what nobody asked for (T434).
                 FdState::Idle => {
@@ -5557,6 +5804,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let _ = ql.pump(inst);
             }
         }
+        self.admit_quic_connections();
         self.adopt_quic_streams();
         self.sync_quic_backend_fds();
 
@@ -5574,6 +5822,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             applets: &mut self.applets,
             proxies: &mut self.proxies,
             checks: &mut self.checks,
+            resolvers: &mut self.resolvers,
             fdtab: &mut self.fdtab,
             poller: &mut self.poller,
             listeners: &mut self.listeners,
@@ -5594,6 +5843,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         };
 
         let tasks_run = self.scheduler.process_runnable_tasks(&mut dispatcher);
+        // The server state changes the pass made (a check, the CLI, the stats page).
+        if crate::srvlog::pending() {
+            let proxies = dispatcher.proxies.clone();
+            crate::srvlog::drain(&proxies, |proxy, level, msg| dispatcher.send_log(proxy, level, b"", msg.as_bytes()));
+        }
         // A task recorded here may have ended later in the same pass (a session shut down
         // by the CLI, then run to `Outcome::Done`), and the scheduler has freed it. Its
         // slot must not be queued: it is handed to the next connection, and the stale
@@ -6062,25 +6316,28 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             };
 
             let proxy = &self.proxies[proxy_idx];
-            proxy.counters().cum_conn.fetch_add(1, Ordering::Relaxed);
-            proxy.counters().fe_sess_rate.tick();
-            proxy.counters().fe_conn_rate.tick();
+            // An HTTP/3 request stream (`l_idx` is `None`) is a stream of its QUIC connection,
+            // which `admit_quic_connections` counted as the session: no connection counter.
+            if l_idx.is_some() {
+                proxy.counters().cum_conn.fetch_add(1, Ordering::Relaxed);
+                proxy.counters().fe_sess_rate.tick();
+                proxy.counters().fe_conn_rate.tick();
+            }
             // Once per TCP connection; a QUIC connection is counted by the QUIC listener,
             // not per HTTP/3 request stream (`l_idx` is `None` for those).
             if l_idx.is_some() {
                 count_global_sess();
             }
             // `rate_max` counts sessions: it is raised once the TLS handshake is done, not here.
-            let conn_rate = proxy.counters().fe_conn_rate.rate();
-            proxy.txn_counters().fe.conn_rate_max.fetch_max(u32::try_from(conn_rate).unwrap_or(u32::MAX), Ordering::Relaxed);
-            proxy.counters().act_conn.fetch_add(1, Ordering::Relaxed);
-            // From the accept loop the slot is already taken (`try_acquire`); an HTTP/3
-            // request stream arrives without one.
-            if l_idx.is_none() {
-                crate::globalconn::acquire();
-            }
-            if proxy.counters().act_conn.load(Ordering::Relaxed) > proxy.counters().max_conn.load(Ordering::Relaxed) {
-                proxy.counters().max_conn.store(proxy.counters().act_conn.load(Ordering::Relaxed), Ordering::Relaxed);
+            // An HTTP/3 request stream takes no connection slot (`admit_quic_connections`).
+            if l_idx.is_some() {
+                let conn_rate = proxy.counters().fe_conn_rate.rate();
+                proxy.txn_counters().fe.conn_rate_max.fetch_max(u32::try_from(conn_rate).unwrap_or(u32::MAX), Ordering::Relaxed);
+                proxy.counters().act_conn.fetch_add(1, Ordering::Relaxed);
+                // From the accept loop the slot of `global maxconn` is already taken (`try_acquire`).
+                if proxy.counters().act_conn.load(Ordering::Relaxed) > proxy.counters().max_conn.load(Ordering::Relaxed) {
+                    proxy.counters().max_conn.store(proxy.counters().act_conn.load(Ordering::Relaxed), Ordering::Relaxed);
+                }
             }
 
             if let Some(l_idx) = l_idx.filter(|&i| self.listeners[i].is_full()) {
@@ -6456,7 +6713,7 @@ enum ConnEvalOutcome {
     /// Client, server, `fc_src`, `fc_dst`, and whether `expect-proxy` matched.
     Accept(SocketAddr, SocketAddr, SocketAddr, SocketAddr, bool),
     Reject,
-    /// `silent-drop`; the TTL of the RST (`rst-ttl`, 1 without it).
+    /// `silent-drop`; the TTL of the RST (`rst-ttl`, 0 without it: `TCP_REPAIR` first, then 1).
     SilentDrop(u8),
 }
 
@@ -6527,7 +6784,7 @@ fn eval_tcp_req_conn_rules(
         }
         match &rule.action {
             ibex_config::TcpReqConnAction::SilentDrop => {
-                return ConnEvalOutcome::SilentDrop(1);
+                return ConnEvalOutcome::SilentDrop(0);
             }
             ibex_config::TcpReqConnAction::SilentDropTtl(ttl) => {
                 return ConnEvalOutcome::SilentDrop(*ttl);
@@ -6628,7 +6885,7 @@ fn eval_tcp_req_session_rules(
         }
         match &rule.action {
             ibex_config::TcpReqSessionAction::SilentDrop => {
-                return SessionEvalOutcome::SilentDrop(1);
+                return SessionEvalOutcome::SilentDrop(0);
             }
             ibex_config::TcpReqSessionAction::SilentDropTtl(ttl) => {
                 return SessionEvalOutcome::SilentDrop(*ttl);
@@ -6861,7 +7118,7 @@ fn eval_tcp_req_content_rules(
         match &rule.action {
             ibex_config::TcpReqContentAction::SilentDrop => {
                 note_last_rule(sess, rule.line);
-                return ContentEvalResult::SilentDrop(1);
+                return ContentEvalResult::SilentDrop(0);
             }
             ibex_config::TcpReqContentAction::SilentDropTtl(ttl) => {
                 note_last_rule(sess, rule.line);
@@ -7135,7 +7392,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
             }
             ibex_config::TcpResAction::SilentDrop => {
                 note_last_rule(sess, rule.line);
-                return ContentEvalResult::SilentDrop(1);
+                return ContentEvalResult::SilentDrop(0);
             }
             ibex_config::TcpResAction::SetVar { var_name, expr: _ } => {
                 set_var_from(&mut sess.vars, var_name, rc.expr.as_ref(), &ctx, registry);
@@ -7349,6 +7606,7 @@ fn register_new_session(
     // Without a listener, the client is an HTTP/3 request stream (`adopt_quic_streams`).
     sess.reset_with_request = reset_pending;
     sess.h3 = listener_idx.is_none();
+    sess.proto_h2 = listener_idx.and_then(|i| engine.listeners.get(i)).is_some_and(|l| l.proto_h2);
     sess.so_name = listener_idx.and_then(|i| engine.listeners.get(i)).and_then(|l| l.name.clone());
     sess.so_id = listener_idx.and_then(|i| engine.listeners.get(i)).map(|l| l.luid).filter(|&id| id != 0);
 
@@ -7786,7 +8044,8 @@ pub fn shutdown_session_entry(
         entry.actconn_reclaimed = true;
         let proxy_idx = entry.proxy_idx;
         // A stream of an HTTP/2 connection holds no connection slot (T280).
-        if proxy_idx < proxies.len() && !entry.sess.is_h2_child() {
+        // ... nor does an HTTP/3 request stream (T504): its connection does.
+        if proxy_idx < proxies.len() && !entry.sess.is_h2_child() && !entry.sess.h3 {
             proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
             crate::globalconn::release();
         }
@@ -7933,12 +8192,25 @@ pub fn set_proxy_maxconn(
     }
 }
 
+/// A check of server `s` of proxy `p` ended in a layer-4 timeout: its resolutions may be due
+/// now (`resolvers::Section::trigger`). Out of line: kept off the dispatcher's code.
+#[cold]
+#[inline(never)]
+fn trigger_resolutions(resolvers: &mut [crate::resolvers::Section], timers: &mut Vec<(TaskRef, Tick)>, now: Tick, p: usize, s: usize) {
+    for sec in resolvers.iter_mut() {
+        if sec.trigger(p, s) {
+            timers.push((sec.task, now));
+        }
+    }
+}
+
 /// Internal dispatcher executing scheduler tasks against runtime sessions and health checks.
 struct EngineDispatcher<'a> {
     sessions: &'a mut SessionArena,
     applets: &'a mut AppletArena,
     proxies: &'a mut Proxies,
     checks: &'a mut [ServerCheckState],
+    resolvers: &'a mut [crate::resolvers::Section],
     fdtab: &'a mut FdTab,
     poller: &'a mut Poller,
     listeners: &'a mut [Listener],
@@ -8180,6 +8452,18 @@ fn h2_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     if let Some(u) = t.req_htx.as_mut() {
         *u += trailers;
     }
+    // The client's END_STREAM on an extended CONNECT's tunnel ends what the server is sent,
+    // once what came before has gone: its FIN, as `HAProxy` sends it, and the stream ends
+    // when the server closes (T505).
+    if t.req == MsgState::Tunnel && ch.stream.body.done && cs.req.is_empty() && matches!(cs.srv_state, ScState::Ready | ScState::Established) {
+        if let Some(sfd) = cs.srv.as_ref().map(std::os::fd::AsFd::as_fd) {
+            cs.srv_xprt.send_close_notify(sfd);
+            crate::raw::shutdown_write(sfd);
+        }
+        cs.srv_state = ScState::ShutW;
+        t.close_after = true;
+        moved = true;
+    }
     let before = (cs.rep.len(), t.rsp);
     let srv_gone = matches!(cs.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
     if crate::h2_bridge::forward_response(h2, ch.stream.id, t, &mut cs.rep, srv_gone) {
@@ -8243,8 +8527,9 @@ fn h2_bridge_state(o: &mut SessionEntry, c: &mut SessionEntry, proxies: &[Proxy]
 /// sent after the whole response are counted in `%U`, the line is logged then, and nothing
 /// more is sent on the stream); ended here, the line went out without them, the stream was
 /// reset, and the trailers that came after were a `GOAWAY` for a frame on a closed stream.
+/// So too an extended CONNECT's tunnel the server ended first (T505).
 fn h2_request_open(sess: &TcpSession, txn: &crate::txn::HttpTxn) -> bool {
-    txn.req.is_done() && !txn.local && sess.h2_active().is_some_and(|a| !a.body.done)
+    (txn.req.is_done() || txn.req == MsgState::Tunnel) && !txn.local && sess.h2_active().is_some_and(|a| !a.body.done)
 }
 
 /// A stream of an HTTP/2 connection whose reply the proxy made itself (`http-request
@@ -8716,7 +9001,7 @@ fn cleanup_done(
     let proxy_idx = entry.proxy_idx;
     proxies[proxy_idx].counters().bytes_in.fetch_add(entry.sess.bytes_in, Ordering::Relaxed);
     proxies[proxy_idx].counters().bytes_out.fetch_add(entry.sess.bytes_out, Ordering::Relaxed);
-    if !entry.actconn_reclaimed {
+    if !entry.actconn_reclaimed && !entry.sess.h3 {
         proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
         crate::globalconn::release();
 
@@ -9415,7 +9700,9 @@ impl EngineDispatcher<'_> {
         let Some(txn) = entry.sess.txn.as_mut() else { return };
         if !txn.req.is_done() && !txn.local && txn.rsp == MsgState::Waiting && txn.body_wait.is_none() && entry.sess.rep.is_empty() {
             txn.srv_reusable = false;
-            entry.sess.log.term = Some(*b"cH");
+            // The server connection still being made: the client gave up during the connect
+            // (`cC--`), not while the server waited for the rest of the body (`cH--`).
+            entry.sess.log.term = Some(if entry.sess.srv_state == ScState::Connecting { *b"cC" } else { *b"cH" });
             entry.sess.log.status = Some(400);
             if child {
                 entry.sess.cli_state = cli_before;
@@ -9433,6 +9720,22 @@ impl EngineDispatcher<'_> {
             let mut page = proxy_error_response(&entry.sess, be, fe, proxies, 400);
             rewrite_header_names(&mut page, client_case_table(fe));
             entry.sess.send_before_close(&page);
+            // The connection is not closed with the page: the client side waits one more
+            // `timeout client`, whatever arrives restarting it, and a FIN ends it (T501,
+            // VV-9; measured on HAProxy 3.5-dev8: 400 at T, close at 2T). The stream is over
+            // and logged now; the server side is let go.
+            if entry.sess.timeouts.client != 0 && entry.sess.cli_state == ScState::Error {
+                set_stream_log(entry, proxies, std::process::id());
+                release_server(entry, proxies, fdtab, poller, idle_pool, false);
+                entry.sess.txn = None;
+                entry.sess.srv_state = ScState::Closed;
+                entry.sess.cli_state = ScState::Ready;
+                entry.sess.ending = None;
+                entry.sess.cli_linger = true;
+                entry.sess.req.clear();
+                entry.sess.arm_client(now);
+                return;
+            }
             close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
             return;
         }
@@ -9861,7 +10164,9 @@ impl EngineDispatcher<'_> {
         if crate::buf_wait::wanted() {
             match self.sessions.get_mut(session_idx) {
                 Some(entry) => {
-                    buf_wait_enter(entry, session_idx);
+                    if buf_wait_enter(entry, session_idx) {
+                        self.wake_queue.push(entry.task);
+                    }
                     update_interests(entry, self.fdtab, self.poller);
                 }
                 None => drop(crate::buf_wait::take_want()),
@@ -10256,7 +10561,7 @@ impl EngineDispatcher<'_> {
         }
         if let Some(mut entry) = self.sessions.free(session_idx) {
             if entry.buf_wait.queued() {
-                crate::buf_wait::leave(entry.task);
+                crate::buf_wait::leave(session_idx);
             }
             if entry.sess.is_h2_child() {
                 // The stream is freed in its own run: its variables are in the run's map
@@ -11222,7 +11527,7 @@ impl EngineDispatcher<'_> {
                     proxies[entry.proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     proxies[entry.backend_idx.min(proxies.len() - 1)].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                     let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                    entry.sess.refuse_request(true, is_ipv6, 1);
+                    entry.sess.refuse_request(true, is_ipv6, 0);
                     if let Some(txn) = entry.sess.txn.as_mut() {
                         txn.close_after = true;
                         txn.aborted = true;
@@ -11496,27 +11801,28 @@ impl EngineDispatcher<'_> {
             let cur = proxies[p].server_statuses.get(s).map_or(0, |a| a.load(Ordering::Relaxed));
             let maint = ServerStatus::from(cur) == ServerStatus::Maint;
             let drain = cur == check::DRAIN_DOWN || cur == ServerStatus::Drain as u8;
-            let set = |to: ServerStatus, checks: &mut [ServerCheckState]| {
-                crate::track::apply_admin(proxies, checks, p, s, to);
+            let set = |to: ServerStatus, cause: crate::srvlog::Cause<'_>, checks: &mut [ServerCheckState]| {
+                crate::track::apply_admin(proxies, checks, p, s, to, cause);
                 true
             };
+            use crate::srvlog::Cause as C;
             Some(match verb {
-                Verb::Ready => set(ServerStatus::Up, checks),
-                Verb::Drain => set(ServerStatus::Drain, checks),
-                Verb::Maint => set(ServerStatus::Maint, checks),
-                Verb::Disable => !maint && set(ServerStatus::Maint, checks),
-                Verb::Enable => maint && set(ServerStatus::Up, checks),
+                Verb::Ready => set(ServerStatus::Up, C::Web, checks),
+                Verb::Drain => set(ServerStatus::Drain, C::Web, checks),
+                Verb::Maint => set(ServerStatus::Maint, C::Web, checks),
+                Verb::Disable => !maint && set(ServerStatus::Maint, C::WebDisable, checks),
+                Verb::Enable => maint && set(ServerStatus::Up, C::Web, checks),
                 // A server in maintenance keeps its state: Ibex has one admin state, HAProxy
                 // two flags (the drain flag is set under the maintenance one).
-                Verb::Stop => !drain && (maint || set(ServerStatus::Drain, checks)),
-                Verb::Start => drain && set(ServerStatus::Up, checks),
+                Verb::Stop => !drain && (maint || set(ServerStatus::Drain, C::WebStop, checks)),
+                Verb::Start => drain && set(ServerStatus::Up, C::Web, checks),
                 Verb::Dhlth => set_health_check_enabled(checks, proxies, &proxies[p].name, name, false, now),
                 Verb::Ehlth => set_health_check_enabled(checks, proxies, &proxies[p].name, name, true, now),
                 Verb::Hrunn | Verb::Hdown => {
                     if crate::track::is_tracking(proxies, p, s) {
                         false
                     } else {
-                        crate::track::apply_health(proxies, checks, p, s, verb == Verb::Hrunn);
+                        crate::track::apply_health(proxies, checks, p, s, verb == Verb::Hrunn, C::Web);
                         true
                     }
                 }
@@ -11723,7 +12029,7 @@ impl EngineDispatcher<'_> {
                         }
                     }
                     for (p_idx, s_idx, st) in status_changes {
-                        crate::track::apply_admin(proxies, checks, p_idx, s_idx, st);
+                        crate::track::apply_admin(proxies, checks, p_idx, s_idx, st, crate::srvlog::Cause::Web);
                     }
                 }
             }
@@ -12156,7 +12462,7 @@ impl EngineDispatcher<'_> {
                         for_tracked(proxies, sess, |data| data.count_err());
                         let is_ipv6 = sess.client_addr.is_some_and(|a| a.is_ipv6());
                         let (silent, ttl) = match rule.action {
-                            ibex_config::HttpReqAction::SilentDrop => (true, 1),
+                            ibex_config::HttpReqAction::SilentDrop => (true, 0),
                             ibex_config::HttpReqAction::SilentDropTtl(ttl) => (true, ttl),
                             _ => (false, 1),
                         };
@@ -13299,11 +13605,14 @@ impl EngineDispatcher<'_> {
 
             let proxy_idx = check.proxy();
             let server_idx = check.server();
+            if crate::resolvers::take_l4_timeout() {
+                trigger_resolutions(self.resolvers, &mut self.timer_updates, now, proxy_idx, server_idx);
+            }
             if check.enabled
                 && proxy_idx < self.proxies.len()
                 && server_idx < self.proxies[proxy_idx].server_statuses.len()
             {
-                crate::track::set_raw(self.proxies, proxy_idx, server_idx, check.published());
+                crate::track::set_raw(self.proxies, proxy_idx, server_idx, check.published(), crate::srvlog::Kind::Op, crate::srvlog::Cause::Check(check));
             }
 
             // The message is built while `check` is still borrowed, then the borrow ends
@@ -13317,11 +13626,12 @@ impl EngineDispatcher<'_> {
             );
             let log = step.ok().and_then(|s| s.event).and_then(|event| {
                 let proxy = self.proxies.get(proxy_idx)?;
-                // HAProxy logs an UP/DOWN transition always, and every other check result
-                // only under `option log-health-checks` (src/check.c, PR_O2_LOGHCHKS).
+                // HAProxy logs "Health check for server ..." only under `option
+                // log-health-checks` (src/check.c, PR_O2_LOGHCHKS), a transition too; the
+                // transition has its own line, "Server ... is DOWN" (`crate::srvlog`).
                 // Without that gate a one-second check interval fills a collector with a
                 // line per server per second.
-                if !event.is_transition() && !proxy.log_health_checks {
+                if !proxy.log_health_checks {
                     return None;
                 }
                 let server = proxy
@@ -13340,6 +13650,26 @@ impl EngineDispatcher<'_> {
         } else {
             Outcome::Done
         }
+    }
+
+    /// Runs `resolvers` section `idx` (`crate::resolvers`): its log lines go to the servers'
+    /// proxies and to stderr, as `HAProxy`'s `send_log` and `ha_warning`. Out of line: kept off
+    /// the stream path's code.
+    #[cold]
+    #[inline(never)]
+    fn step_resolver(&mut self, idx: usize) -> Outcome {
+        let Some(sec) = self.resolvers.get_mut(idx) else { return Outcome::Done };
+        // Lines are rare (a change of a server's address or state): a `Vec` per change.
+        let mut lines: Vec<(usize, LogLevel, String)> = Vec::new();
+        let wait = sec.step(self.proxies, self.checks, &mut |p, level, msg| lines.push((p, level, msg.to_string())), &mut self.fdtab, &self.poller);
+        let task = sec.task;
+        for (p, level, msg) in lines {
+            crate::stderr_line!("[WARNING]  ({}) : {msg}", self.pid);
+            self.send_log(p, level, b"", msg.as_bytes());
+        }
+        let ms = u32::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u32::MAX).max(1);
+        self.timer_updates.push((task, self.now.add(ms)));
+        Outcome::Keep
     }
 
     /// Emits one line to every syslog target the given proxy resolved to.
@@ -13510,6 +13840,7 @@ impl EngineDispatcher<'_> {
                 let check_idx = kind.index() as usize;
                 self.step_check(check_idx)
             }
+            Some(Kind::Resolver) => self.step_resolver(kind.index() as usize),
             Some(Kind::Applet) => {
                 let applet_idx = kind.index() as usize;
                 self.step_applet(applet_idx)
@@ -16670,18 +17001,27 @@ mod stats_req_headers_tests {
 
 /// Puts a stream refused a buffer at `tune.buffers.limit` in its class's wait queue (S6,
 /// [`crate::buf_wait`]); a stream woken for a buffer and refused again goes back to the front.
-/// The queue cannot grow: the stream fails, as in S5.
+/// The queue cannot grow: the stream fails, as in S5, and `true` says it must run again (its
+/// failure's answer is written in its next run; nothing else would wake it: T473).
 #[cold]
 #[inline(never)]
-fn buf_wait_enter(entry: &mut SessionEntry, session_idx: u32) {
-    let Some(class) = crate::buf_wait::take_want() else { return };
+fn buf_wait_enter(entry: &mut SessionEntry, session_idx: u32) -> bool {
+    let Some(class) = crate::buf_wait::take_want() else { return false };
     let front = entry.buf_wait.take_offered();
     if entry.buf_wait.queued() {
-        return;
+        return false;
     }
     if crate::buf_wait::enter(entry.task, session_idx, class, front) {
         entry.buf_wait.enqueued(class);
+        // A buffer given back on this thread after the refusal, before the stream was queued
+        // (the stream's own empty request buffer, released as it waits for a TLS read: S6b)
+        // was offered to nobody: it is the waiter's now.
+        if crate::buf::cached_standard() > 0 {
+            crate::buf_wait::reoffer();
+        }
+        false
     } else {
         entry.sess.fail_alloc();
+        true
     }
 }

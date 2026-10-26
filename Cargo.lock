@@ -636,6 +636,8 @@ dependencies = [
  "ibex-sched",
  "memchr",
  "proptest",
+ "quinn-proto",
+ "rustls 0.23.45",
 ]
 
 [[package]]
@@ -671,6 +673,7 @@ dependencies = [
  "ctrlc",
  "ibex-alloc",
  "ibex-config",
+ "ibex-dns",
  "ibex-mmsg",
  "ibex-proto",
  "ibex-quic",

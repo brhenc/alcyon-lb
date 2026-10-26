@@ -399,6 +399,14 @@ pub(crate) fn parse_listen_directive(
             tokens,
             kw,
         ),
+        "server-template" => parse_server_template(
+            &mut proxy.servers,
+            &mut proxy.server_extras,
+            proxy.default_server.as_ref(),
+            &proxy.name,
+            tokens,
+            kw,
+        ),
         "log" => parse_log(&mut proxy.logs, tokens, kw).map(|g| proxy.log_global |= g),
         "log-tag" => parse_log_tag(tokens, kw).map(|t| proxy.log_tag = Some(t)),
         "cliexp" => parse_cliexp(kw),
@@ -703,6 +711,7 @@ pub(crate) fn parse_backend_directive(
         "dispatch" => parse_dispatch(kw),
         "default-server" => parse_default_server(&mut be.default_server, tokens, kw),
         "server" => parse_server(&mut be.servers, &mut be.server_extras, be.default_server.as_ref(), tokens, kw),
+        "server-template" => parse_server_template(&mut be.servers, &mut be.server_extras, be.default_server.as_ref(), &be.name, tokens, kw),
         "tcp-request" => parse_backend_tcp_request(be, tokens, kw),
         "http-request" => in_section(
             parse_http_req_rule(&mut be.http_req_rules, tokens, kw)
@@ -899,6 +908,8 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
                 })?);
                 i += 1;
             }
+            // `bind_parse_quic_force_retry`: a flag, on any bind; the QUIC listener reads it.
+            "quic-force-retry" => bind.sock.get_or_insert_with(Default::default).quic_force_retry = true,
             "v6only" => bind.sock.get_or_insert_with(Default::default).v6only = Some(true),
             "v4v6" => bind.sock.get_or_insert_with(Default::default).v6only = Some(false),
             "tcp-ut" => {

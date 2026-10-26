@@ -200,20 +200,20 @@ fn a_server_going_down_emits_a_syslog_datagram() {
 
     let line = got.expect("no syslog datagram arrived for the server going DOWN");
 
-    // PRI = facility 16 (local0) * 8 + severity 5 (notice) = 133. HAProxy logs check
-    // transitions at LOG_NOTICE (src/check.c).
+    // PRI = facility 16 (local0) * 8 + severity 1 (alert) = 129. A server going DOWN is
+    // logged at LOG_ALERT (src/server.c); the "Health check for server" line is written only
+    // under `option log-health-checks`, which this configuration does not have (T404).
     assert!(
-        line.starts_with("<133>"),
+        line.starts_with("<129>"),
         "wrong facility/severity in {line:?}"
     );
     assert!(
-        line.contains("Health check for server be_log/dead_srv failed"),
+        line.contains("Server be_log/dead_srv is DOWN, reason: "),
         "unexpected message body: {line:?}"
     );
-    // health has hit its floor, so the numerator is 0 and the denominator is `rise`.
     assert!(
-        line.contains("status: 0/1 DOWN."),
-        "missing or malformed status field: {line:?}"
+        line.contains(". 0 active and 0 backup servers left."),
+        "missing or malformed counts: {line:?}"
     );
 }
 

@@ -110,7 +110,7 @@ pub(crate) fn collect(section: &CurrentSection, tokens: &[Token], out: &mut Vec<
         }
     }
     // A server's `sni <expr>` is a sample expression evaluated when it is connected to.
-    if tokens[0].text == "server" || tokens[0].text == "default-server" {
+    if matches!(tokens[0].text.as_str(), "server" | "server-template") || tokens[0].text == "default-server" {
         for (i, t) in tokens.iter().enumerate() {
             if t.text == "sni" {
                 if let Some(e) = tokens.get(i + 1) {

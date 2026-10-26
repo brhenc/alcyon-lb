@@ -59,6 +59,7 @@ dependencies = [
 name = "ibex-proto"
 version = "0.1.0"
 dependencies = [
+ "ibex-alloc",
  "ibex-regex",
  "ibex-sched",
  "memchr",

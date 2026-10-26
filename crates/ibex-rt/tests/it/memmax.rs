@@ -224,3 +224,59 @@ fn m_above_the_hard_data_limit_is_refused() {
     assert_eq!(out.status.code(), Some(1), "stderr: {err}");
     assert!(err.contains("[haproxy.main()] Cannot fix MEM limit to 300 megs."), "stderr: {err}");
 }
+
+/// T508: under a very small `-m` the start either serves, with its watchdog, or is refused
+/// with an `[ALERT]` and exit 1: never a panic or abort (exit 134, "failed to spawn thread"),
+/// never a warning that lockup detection is off. HAProxy 3.5-dev8 serves at every `-m` from 1
+/// to 8 (measured 2026-10-25, 503 from a dead server); its watchdog is a timer, Ibex's a thread.
+#[test]
+fn a_tiny_m_serves_or_refuses_cleanly() {
+    for megs in 1..=8 {
+        let port = common::reserve_port();
+        let (cfg, sock) = config(&format!("tiny{megs}"), port, false, "");
+        let errfile = format!("{DIR}/tiny{megs}-{}.err", std::process::id());
+        let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+            .args(["-m", &megs.to_string(), "-f", &cfg])
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&errfile).unwrap())
+            .spawn()
+            .expect("spawn ibex");
+        let mut run = Run { child, sock };
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let start = std::time::Instant::now();
+        let exited = loop {
+            if let Some(st) = run.child.try_wait().unwrap() {
+                break Some(st);
+            }
+            if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100)).is_ok() || start.elapsed().as_secs() > 10 {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let err = std::fs::read_to_string(&errfile).unwrap();
+        let _ = std::fs::remove_file(&errfile);
+        assert!(!err.contains("panicked") && !err.contains("disabling lockup"), "-m {megs}: stderr: {err}");
+        if let Some(st) = exited {
+            assert_eq!(st.code(), Some(1), "-m {megs}: {st:?} stderr: {err}");
+            assert!(err.contains("[ALERT]") && err.contains("thread"), "-m {megs}: stderr: {err}");
+        }
+    }
+}
+
+/// A worker thread that cannot be created (`RLIMIT_NPROC` 1: the user already runs more than
+/// one task, so every `clone` fails with EAGAIN, whatever the host's memory) fails the start
+/// with the alert and exit 1, never a panic (T508; the path `-m` only reaches by chance).
+#[test]
+fn a_thread_that_cannot_be_created_fails_the_start_cleanly() {
+    let port = common::reserve_port();
+    let (cfg, _sock) = config("nproc", port, false, "");
+    let out = Command::new("sh")
+        .args(["-c", "ulimit -u 1 && exec \"$0\" -f \"$1\"", env!("CARGO_BIN_EXE_ibex"), &cfg])
+        .stdout(Stdio::null())
+        .output()
+        .expect("run ibex");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stderr: {err}");
+    assert!(err.contains("[ALERT]") && err.contains("Failed to create thread 0"), "stderr: {err}");
+    assert!(!err.contains("panicked"), "stderr: {err}");
+}

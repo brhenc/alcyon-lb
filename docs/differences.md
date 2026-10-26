@@ -183,20 +183,43 @@ Not refused, on purpose:
 - QUIC / HTTP/3 (`quic4@`, `quic6@`, `proto quic`, `alpn h3`): Ibex has a QUIC listener
   (`ibex-quic`, exercised by `crates/ibex-config/tests/it/quic_bind.rs`); it is experimental.
   The reference HAProxy binary here is built without QUIC and refuses these.
-- `resolvers` sections: parsed and checked as HAProxy does (T483, `parser/resolvers.rs`);
-  run-time resolution: T484. Until then a server's (or `default-server`'s) `resolvers` keyword is
-  refused, as are `server-template` (T486), SRV names `_...` on a server line (T487),
-  `parse-resolv-conf` (T489), `tcp@` / `udp@` nameservers (T488) and any other address prefix on a
-  `nameserver` (HAProxy takes `ipv4@`, `unix@`...). `resolve-prefer`, `resolve-net` and
-  `resolve-opts` are checked as HAProxy checks them and then do nothing, as in HAProxy without
-  `resolvers` (Ibex warns that it ignores them). HAProxy also creates an implicit `default` section
-  (from `/etc/resolv.conf`, used by its httpclient); Ibex has no httpclient and does not (user,
-  2026-10-25; `show resolvers` is T485).
+- `resolvers` sections: parsed and checked as HAProxy does (T483), and a server whose address is a
+  name and that has `resolvers` (or inherits it from `default-server`) is re-resolved at run time
+  as HAProxy does it (T484): one query every `timeout resolve` whatever the TTL, retries, the
+  `hold` timers, `MAINT (resolution)`, the address swaps and their log lines, `resolve-prefer`,
+  `resolve-net`, `resolve-opts allow-dup-ip|prevent-dup-ip`, a layer-4 check timeout asking for a
+  resolution. Families are HAProxy's default `dns-accept-family auto` (AAAA only while the host
+  has an IPv6 route, re-probed every 30 s). Differences: every section runs on worker 0 (with the
+  health checks; HAProxy spreads them over threads); a forged or malformed reply never ends a
+  resolution early (the honest answer is still taken); only a layer-4 timeout of a check, not a
+  refused connect, triggers a resolution. `server-template <prefix> <n|lo-hi> <name>[:port]` expands to servers `<prefix><n>` that share one resolution (T486); `from none` is accepted, `from be:`/`from srv:` are refused, and a parameter error names `server <slot>` where HAProxy says `server-template <px>/<prefix>`. Still refused: SRV names
+  (`_...`, T487), `do-resolve`, `parse-resolv-conf` and `dns-accept-family` (T489), and the address
+  prefixes `mptcp@`, `unix@`, `abns@`, `quic4@`... on a `nameserver`. TCP is done (T488): a
+  truncated UDP answer is asked again over TCP to the same nameserver at once (one connection per
+  nameserver, opened by the first query, four queries in flight, closed after 5 s idle); `tcp@`,
+  `tcp4@`, `tcp6@`, `stream+` send everything over TCP; `udp@`, `udp4@`, `udp6@`, `dgram+` are UDP
+  without fallback. HAProxy numbers the queries of a TCP stream 1, 2, 3; Ibex keeps random ids. A
+  TCP port nobody listens on is not a `snd_error` (measured: the queries count `sent`, the
+  resolution times out), as in HAProxy. HAProxy also
+  creates an implicit `default` section (from `/etc/resolv.conf`, used by its httpclient); Ibex has
+  no httpclient and does not (user, 2026-10-25). `show resolvers` (T485) therefore lacks the block
+  HAProxy 3.5-dev8 ends with, even for a configuration with no `resolvers` section at all:
+  `Resolvers section default` / ` nameserver 127.0.0.53:` and the sixteen counters at 0 (the first
+  `nameserver` of `/etc/resolv.conf`; `show stat domain resolvers` has the row `127.0.0.53,default,0,...`).
+  With no section Ibex prints `No resolvers found` (HAProxy never does). The counters are the
+  sixteen of `show resolvers` per nameserver, bumped where `resolv_process_responses` bumps them,
+  also readable as `haproxy_resolver_<counter>{resolver=,nameserver=}` (the name `send_error` for
+  `snd_error`; scrape with `scope=resolver`; the reference binary here has no exporter, so the
+  names come from `resolvers.c:104`). `cname` and `timeout` stay 0 (HAProxy never bumps them
+  either), `tcp_fallback` counts the TCP queries sent after a truncated UDP answer (T488). Not done: `show stat domain resolvers` (typed rows) and
+  `show resolvers` in `help`.
 - A name on a `server` line is resolved by libc while the configuration loads, as HAProxy does
   (`localhost` is the first answer of `getaddrinfo`, `::1` on most hosts, no longer `127.0.0.1`),
-  and `init-addr libc|none|<ip>` is applied in order. `init-addr last` is refused: Ibex has no
-  `server-state-file` to read the last address from (user, 2026-10-25; T490). The default
-  `last,libc` is therefore `libc`. A server that starts without an address (`init-addr none`)
+  and `init-addr last|libc|none|<ip>` is applied in order; `last` (and so the default
+  `last,libc`) is the `srv_addr` of the server's line in its server-state file (T490), read while
+  the configuration loads. When the load then fails on an address, HAProxy has already printed
+  the state file's own messages ("Can't open ...") and Ibex has not; when it does not fail, Ibex
+  prints the `init-addr` notices before them, HAProxy after. A server that starts without an address (`init-addr none`)
   shows `srv_admin_state 32`; after `disable server` HAProxy shows 33 and Ibex still 32 (Ibex keeps
   one admin state per server, not HAProxy's flags), and in both it stays in `MAINT (resolution)`.
   `-dr` appends `none`, as in HAProxy.
@@ -449,12 +472,21 @@ under way before new connections, each queue first come first served) and is wok
 buffer is given back on its thread; `timeout client` while waiting answers `408`, logged `cR--`,
 as HAProxy. Differences that remain:
 
-- HAProxy's cap is the limit plus `nbthread` x `tune.buffers.reserve` (default 4) emergency
-  buffers taken at start (`show pools` shows 11 allocated at start with `limit 8`); Ibex has no
-  emergency buffers, its cap is the limit, and **`tune.buffers.reserve` is refused at load**
-  (accepting it would promise what is not there, AGENTS.md 5).
-- A local reply (`408`, `503`, stats) that finds no buffer, the TLS receive buffer and an
-  HTTP/2 stream's buffers still fail as before the queue: 500 `IR--`/`IH--`, or a close.
+- `tune.buffers.reserve <n>` (S6b) makes `n` emergency buffers per thread at start and raises
+  the limit by `nbthread` x `n`, as HAProxy; a take the pool refuses may have one by its class
+  (`left * 3 >= q * n`: a local reply down to the last, a client's first buffer only while the
+  reserve is full), and a buffer given back refills the reserve first. The default is HAProxy's
+  4, but Ibex makes the reserve only when `tune.buffers.limit` is set (without a limit its pool
+  refuses only when memory is short, where the stream fails as in S5; HAProxy makes the 4 per
+  thread always). At start HAProxy also fills the pool to its `minavail` (3): `limit 3` shows 7
+  allocated from the start on HAProxy, 4 on Ibex; both reach 7. Ibex gates only the emergency take on the
+  reserve; HAProxy also refuses a pool take of queues 1-3 while its reserve is not full enough.
+- A thread's cache does not keep free buffers while another thread's streams wait: they go to
+  the pool's shelf and the waiting thread is woken (S6b; HAProxy wakes waiters on the freeing
+  thread only, and its caches keep theirs).
+- The local reply and the TLS receive buffer wait like the others (S6b; HAProxy's TLS reads into
+  OpenSSL's own memory, so its handshake needs no buffer at all). An HTTP/2 connection's and
+  stream's buffers still fail as before the queue: 500 `IR--`/`IH--`, or a close.
 - Each queue is served in order; HAProxy's own order was not (fast GETs answered 5, 4, 2, 1,
   0, 3 in one run), an artefact of retrying every woken waiter in one pass.
 - Ibex's CLI does not wait for a buffer; HAProxy's answers nothing while they are exhausted.
@@ -486,6 +518,13 @@ Differences left: Ibex's per-connection cost is a constant calibrated on
 HAProxy's results (`sizeof(struct stream)` has no Ibex counterpart), `maxsslconn` and
 `tune.ssl.cachesize` are not configurable, so `MaxSslConns` stays 0 and the
 `Automatically setting global.maxconn ...` notice is not printed.
+
+A budget too small for the threads themselves (T508) differs: HAProxy serves at every `-m` from 1
+to 8 (its `VmData` is already 43 MB), but Ibex's worker and watchdog threads each need a stack
+under `RLIMIT_DATA`. When one cannot be created, Ibex refuses the start with an
+`[ALERT] ... Failed to create thread N` or `Failed to start the watchdog thread` line and exit 1,
+instead of a panic or running without lockup detection. Measured here: `-m 1` and `-m 2`
+refuse (worker), `-m 3` refuses (watchdog), `-m 4` and up serve (`nbthread 1`).
 
 ## `tune.memory.prealloc on|off`: an Ibex-only global keyword (T468)
 
@@ -569,9 +608,9 @@ Left out, because Ibex does not count them (printing 0 would pass a default for 
 | `haproxy_{frontend,backend,server}_{req,res}_bytes_{in,out}_total` | bytes by direction are not tracked |
 | `haproxy_server_{idle,private_idle,unsafe_idle,safe_idle,used,need}_connections_current` | no per-server connection pool gauges |
 | `haproxy_{backend,server}_last_session_seconds` | `lastsess` is not tracked |
+| `haproxy_resolver_*` | present once a `resolvers` section is configured (T485); HAProxy always has the implicit `default` section, Ibex does not build it |
 | `haproxy_frontend_intercepted_requests_total`, `haproxy_{frontend,backend}_http_cache_hint_hits_total` | not tracked |
 | `haproxy_backend_agg_server_status`, `_agg_server_check_status`, `_agg_check_status`, `haproxy_server_check_status`, `haproxy_server_agent_*` | per-state check/agent aggregates; Ibex has no agent checks |
-| `haproxy_resolver_*` | no resolvers |
 
 Not done: `extra-counters` is accepted and adds nothing (Ibex has no stats-module counters: `h1`,
 `h2`, `ssl`, ...), and `tcp-request content use-service` stays refused (HAProxy refuses it too,

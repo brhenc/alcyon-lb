@@ -15,7 +15,7 @@ use ibex_quic::{
     ALPN_H3,
 };
 
-fn cert_path() -> PathBuf {
+pub(crate) fn cert_path() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir.join("../../examples/certs/localhost.pem")
 }
@@ -58,7 +58,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
     }
 }
 
-fn create_client_endpoint() -> (quinn_proto::Endpoint, Arc<quinn_proto::ClientConfig>) {
+pub(crate) fn create_client_endpoint() -> (quinn_proto::Endpoint, Arc<quinn_proto::ClientConfig>) {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut rustls_client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()

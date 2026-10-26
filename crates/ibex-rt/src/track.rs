@@ -13,6 +13,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::check::ServerStatus;
+use crate::srvlog::{Cause, Kind};
 use crate::engine::Proxy;
 
 /// What a tracking server follows.
@@ -74,13 +75,15 @@ fn propagate(proxies: &[Proxy], p: usize, s: usize) {
 /// Sets the state of server `s` of proxy `p`: a check's verdict, or what an operator asked.
 /// For a tracker, the state is what the operator forced on it (`Up` for nothing), and the
 /// server's own is that combined with its target's.
-pub fn set_status(proxies: &[Proxy], p: usize, s: usize, st: ServerStatus) {
-    set_raw(proxies, p, s, st as u8);
+pub fn set_status(proxies: &[Proxy], p: usize, s: usize, st: ServerStatus, kind: Kind, cause: Cause<'_>) {
+    set_raw(proxies, p, s, st as u8, kind, cause);
 }
 
 /// [`set_status`] with a `Proxy::server_statuses` value, [`crate::check::DRAIN_DOWN`]
 /// included.
-pub fn set_raw(proxies: &[Proxy], p: usize, s: usize, raw: u8) {
+///
+/// `kind` and `cause` say what `HAProxy` would write about the change ([`crate::srvlog`]).
+pub fn set_raw(proxies: &[Proxy], p: usize, s: usize, raw: u8, kind: Kind, cause: Cause<'_>) {
     let status_of = || proxies.get(p).and_then(|px| px.server_statuses.get(s)).map_or(0, |a| a.load(Ordering::Relaxed));
     let before = status_of();
     set_status_inner(proxies, p, s, raw);
@@ -102,6 +105,7 @@ pub fn set_raw(proxies: &[Proxy], p: usize, s: usize, raw: u8) {
         if be_down != was_be_down {
             pc.be.state_changed(was_be_down, be_down);
         }
+        crate::srvlog::note(proxies, p, s, before, after, kind, cause, be_down && !was_be_down);
     }
 }
 
@@ -198,21 +202,34 @@ pub fn inherited(proxy: &Proxy, s: usize) -> bool {
 /// `Drain` or `Maint`): `enable`/`disable server`, `set server state`, the stats page's
 /// admin form. It moves the admin state only: what the checks found (`cur_state`) is kept,
 /// so `ready` does not send traffic to a server they found dead (T274 E1).
-pub fn apply_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus) {
+pub fn apply_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus, cause: Cause<'_>) {
     // A server with no address stays in maintenance (`SRV_ADMF_RMAINT` outlives `enable
     // server` and `set server state ready`: "leaving forced maintenance but remains in
     // maintenance").
-    if proxies.get(p).is_some_and(|px| px.server_rmaint(s)) {
+    // The operator's state is kept under it, taken back when the name resolves again
+    // (`SRV_ADMF_FMAINT`/`FDRAIN` beside `RMAINT`; measured on HAProxy 3.5-dev8).
+    if let Some(px) = proxies.get(p).filter(|px| px.server_rmaint(s)) {
+        let to = if matches!(to, ServerStatus::Maint | ServerStatus::Drain) { to } else { ServerStatus::Up };
+        if px.server_rmaint_kept(s) == ServerStatus::Maint && to != ServerStatus::Maint {
+            crate::srvlog::line(proxies, p, s, ibex_config::LogLevel::Notice, "is leaving forced maintenance but remains in maintenance");
+        }
+        px.set_server_rmaint(s, Some(to));
         return;
     }
+    set_admin(proxies, checks, p, s, to, cause);
+}
+
+/// [`apply_admin`] without the `SRV_ADMF_RMAINT` guard: the resolver taking a server into
+/// maintenance, or giving it back the admin state it had (`crate::resolvers`).
+pub fn set_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus, cause: Cause<'_>) {
     let check = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s);
     if track_of(proxies, p, s).is_some() {
-        set_status(proxies, p, s, to);
+        set_status(proxies, p, s, to, Kind::Admin, cause);
     } else if let Some(c) = check {
         c.set_admin_status(to);
-        set_raw(proxies, p, s, c.published());
+        set_raw(proxies, p, s, c.published(), Kind::Admin, cause);
     } else if let Some(cur) = proxies.get(p).and_then(|px| px.server_statuses.get(s)) {
-        set_raw(proxies, p, s, crate::check::admin_transition(cur.load(Ordering::Relaxed), to));
+        set_raw(proxies, p, s, crate::check::admin_transition(cur.load(Ordering::Relaxed), to), Kind::Admin, cause);
     }
 }
 
@@ -223,11 +240,11 @@ pub fn is_tracking(proxies: &[Proxy], p: usize, s: usize) -> bool {
 
 /// `set server health up|down` on server `s` of proxy `p` (not a tracker: refused before):
 /// the operational state moves, the admin state stays.
-pub fn apply_health(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, up: bool) {
+pub fn apply_health(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, up: bool, cause: Cause<'_>) {
     if let Some(c) = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s) {
         c.set_health(up);
-        set_raw(proxies, p, s, c.published());
+        set_raw(proxies, p, s, c.published(), Kind::Op, cause);
     } else if let Some(cur) = proxies.get(p).and_then(|px| px.server_statuses.get(s)) {
-        set_raw(proxies, p, s, crate::check::health_transition(cur.load(Ordering::Relaxed), up));
+        set_raw(proxies, p, s, crate::check::health_transition(cur.load(Ordering::Relaxed), up), Kind::Op, cause);
     }
 }

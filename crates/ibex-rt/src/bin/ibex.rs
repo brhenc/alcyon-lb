@@ -570,11 +570,15 @@ fn adoption_failed(e: &std::io::Error, ready_tx: &std::sync::mpsc::Sender<Result
     let _ = ready_tx.send(Err(()));
 }
 
-/// Starts the watchdog with `start`; a failure is a warning, not the end of the start.
-fn start_watchdog(start: fn(std::time::Duration, bool) -> std::io::Result<()>, warn_after: std::time::Duration, warn_only: bool) {
+/// Starts the watchdog with `start`; false (after the alert) when its thread cannot be created
+/// (T508: HAProxy's watchdog is a timer that cannot fail like this; running without Ibex's
+/// would be a silent loss of lockup detection, so the start fails instead).
+fn start_watchdog(start: fn(std::time::Duration, bool) -> std::io::Result<()>, warn_after: std::time::Duration, warn_only: bool) -> bool {
     if let Err(e) = start(warn_after, warn_only) {
-        ibex_rt::stderr_line!("[WARNING]  ({}) : Failed to start the watchdog thread ({e}), disabling lockup detection.", process::id());
+        ibex_rt::stderr_line!("[ALERT]    ({}) : Failed to start the watchdog thread ({e}); the memory limit (-m) is too small for the threads.", process::id());
+        return false;
     }
+    true
 }
 
 /// What a worker, bound and waiting, is told: to serve, or to drop what it bound and
@@ -1156,9 +1160,9 @@ fn main() {
         let (cli_pre, extra_pre) = if worker_id == 0 { (cli_pre.take(), extra_pre.take()) } else { (None, None) };
         let lifecycle_clone = lifecycle.clone();
         let ready_tx = ready_tx.clone();
-        let go = std::sync::Arc::clone(&go);
+        let worker_go = std::sync::Arc::clone(&go);
 
-        let t = std::thread::spawn(move || {
+        let spawned = std::thread::Builder::new().name(format!("ibex-w{worker_id}")).spawn(move || {
             // Before the ready message, so before the chroot: it opens this thread's
             // /proc/thread-self/schedstat.
             ibex_rt::watchdog::register(worker_id);
@@ -1202,7 +1206,7 @@ fn main() {
             engine.set_lifecycle(lifecycle_clone);
             let _ = ready_tx.send(Ok(()));
             drop(ready_tx);
-            let (lock, cvar) = &*go;
+            let (lock, cvar) = &*worker_go;
             let mut released = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             while matches!(*released, Start::Wait) {
                 released = cvar.wait(released).unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1219,7 +1223,15 @@ fn main() {
                 process::exit(1);
             }
         });
-        threads.push(t);
+        match spawned {
+            Ok(t) => threads.push(t),
+            Err(e) => {
+                // Under a tiny `-m` the stack of a thread does not fit (T508): the start fails
+                // with a message, the workers already started are told to give up.
+                ibex_rt::stderr_line!("[ALERT]    ({}) : Failed to create thread {worker_id} ({e}); the memory limit (-m) is too small for the threads.", process::id());
+                abort_start(&go, threads);
+            }
+        }
     }
 
     drop(ready_tx);
@@ -1230,15 +1242,14 @@ fn main() {
     //     with nothing accepting, and READY=1 reported a service that did not exist yet. A
     //     worker that fails to start says so (or, if it panicked, closes its end), and the
     //     start is abandoned with every worker's sockets closed first.
-    for _ in 0..nbthread {
-        if !matches!(ready_rx.recv(), Ok(Ok(()))) {
-            abort_start(&go, threads);
-        }
-    }
+    let mut started = (0..nbthread).all(|_| matches!(ready_rx.recv(), Ok(Ok(()))));
     // HAProxy arms its watchdog per thread at thread init (src/wdt.c:246) and does not fail
     // to start without it.
     let warn_after = config.global.as_ref().and_then(|g| g.warn_blocked_traffic_after).unwrap_or(ibex_rt::watchdog::DEFAULT_WARN_AFTER);
-    start_watchdog(ibex_rt::watchdog::start, warn_after, config.global.as_ref().is_some_and(|g| g.ibex_watchdog_warn_only));
+    started = started && start_watchdog(ibex_rt::watchdog::start, warn_after, config.global.as_ref().is_some_and(|g| g.ibex_watchdog_warn_only));
+    if !started {
+        abort_start(&go, threads);
+    }
     let unused = ibex_rt::handover::drop_unused_inherited();
     if unused > 0 && !opts.quiet {
         ibex_rt::stderr_line!("[NOTICE] closed {unused} inherited socket(s) that no bind in this configuration uses");
@@ -1507,7 +1518,8 @@ mod tests {
     }
 
     #[test]
-    fn a_watchdog_that_cannot_start_is_only_a_warning() {
-        start_watchdog(|_, _| Err(std::io::Error::from_raw_os_error(11)), std::time::Duration::from_millis(10), false);
+    fn a_watchdog_that_cannot_start_fails_the_start() {
+        assert!(!start_watchdog(|_, _| Err(std::io::Error::from_raw_os_error(11)), std::time::Duration::from_millis(10), false));
+        assert!(start_watchdog(|_, _| Ok(()), std::time::Duration::from_millis(10), false));
     }
 }
