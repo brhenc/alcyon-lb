@@ -1526,10 +1526,12 @@ pub struct ProxyIdInfo {
     /// Which servers the configuration disabled (`SRV_ADMF_CMAINT`, 4 in `show servers state`
     /// whatever the CLI does afterwards); empty when none (see [`Proxy::server_cmaint`]).
     pub server_cmaint: Vec<bool>,
-    /// Which servers started without an address (`init-addr none` after a name did not
-    /// resolve: `SRV_ADMF_RMAINT`, 32 in `show servers state`, `MAINT (resolution)`); empty
-    /// when none (see [`Proxy::server_rmaint`]).
-    pub server_rmaint: Arc<Vec<std::sync::atomic::AtomicBool>>,
+    /// Which servers have no address (`init-addr none` after a name did not resolve, or a
+    /// resolver took it: `SRV_ADMF_RMAINT`, 32 in `show servers state`, `MAINT
+    /// (resolution)`), and the operator's admin state kept under it (`SRV_ADMF_FMAINT`,
+    /// `SRV_ADMF_FDRAIN`): 0 none, else 1 + that [`ServerStatus`]; empty when no server's
+    /// address is a name (see [`Proxy::server_rmaint`], [`Proxy::server_rmaint_kept`]).
+    pub server_rmaint: Arc<Vec<std::sync::atomic::AtomicU8>>,
     /// The name each server's address was written as (`srv_fqdn`); empty when no server's
     /// was (see [`Proxy::server_fqdn`]).
     pub server_fqdns: Vec<Option<Box<str>>>,
@@ -1838,14 +1840,25 @@ impl Proxy {
     /// maintenance whatever the CLI asks, until its resolver gives it one (`crate::resolvers`).
     #[must_use]
     pub fn server_rmaint(&self, idx: usize) -> bool {
-        self.ids.server_rmaint.get(idx).is_some_and(|f| f.load(Ordering::Relaxed))
+        self.ids.server_rmaint.get(idx).is_some_and(|f| f.load(Ordering::Relaxed) != 0)
     }
 
-    /// Sets or clears `SRV_ADMF_RMAINT` on the server at `idx` (a server whose address is a
-    /// name: the others have no flag).
-    pub fn set_server_rmaint(&self, idx: usize, on: bool) {
+    /// The admin state the operator (or `disabled`) gave the server at `idx` while it is in
+    /// `SRV_ADMF_RMAINT`: `Maint`, `Drain` or `Up`, the one it takes back when its name
+    /// resolves again. `Up` when it is not in `RMAINT`.
+    #[must_use]
+    pub fn server_rmaint_kept(&self, idx: usize) -> ServerStatus {
+        match self.ids.server_rmaint.get(idx).map_or(0, |f| f.load(Ordering::Relaxed)) {
+            0 => ServerStatus::Up,
+            v => ServerStatus::from(v - 1),
+        }
+    }
+
+    /// Puts the server at `idx` in `SRV_ADMF_RMAINT`, keeping the admin state `kept`, or takes
+    /// it out with `None` (a server whose address is a name: the others have no flag).
+    pub fn set_server_rmaint(&self, idx: usize, kept: Option<ServerStatus>) {
         if let Some(f) = self.ids.server_rmaint.get(idx) {
-            f.store(on, Ordering::Relaxed);
+            f.store(kept.map_or(0, |k| k as u8 + 1), Ordering::Relaxed);
         }
     }
 
@@ -3985,12 +3998,14 @@ fn server_cmaint(servers: &[ibex_config::Server]) -> Vec<bool> {
 }
 
 /// The flags for [`Proxy::server_rmaint`]: one per server when an address was written as a
-/// name (a resolver may take it away at run time), else empty.
-fn server_rmaint(count: usize, extras: &ibex_config::ast::ServerExtras) -> Arc<Vec<std::sync::atomic::AtomicBool>> {
+/// name (a resolver may take it away at run time), else empty. A `disabled` server keeps
+/// `Maint` under it.
+fn server_rmaint(servers: &[ibex_config::Server], extras: &ibex_config::ast::ServerExtras) -> Arc<Vec<std::sync::atomic::AtomicU8>> {
     if extras.names.is_empty() {
         Arc::default()
     } else {
-        Arc::new((0..count).map(|i| std::sync::atomic::AtomicBool::new(extras.unresolved(i))).collect())
+        let kept = |i: usize| if servers.get(i).is_some_and(|s| s.disabled) { ServerStatus::Maint } else { ServerStatus::Up };
+        Arc::new((0..servers.len()).map(|i| std::sync::atomic::AtomicU8::new(if extras.unresolved(i) { kept(i) as u8 + 1 } else { 0 })).collect())
     }
 }
 
@@ -4087,7 +4102,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
             server_cmaint: server_cmaint(&listen.servers),
-            server_rmaint: server_rmaint(listen.servers.len(), &listen.server_extras),
+            server_rmaint: server_rmaint(&listen.servers, &listen.server_extras),
             server_fqdns: server_fqdns(listen.servers.len(), &listen.server_extras),
             server_fqdn_changed: server_fqdn_changed(listen.servers.len(), &listen.server_extras),
             server_check_ports: server_check_ports(&listen.servers),
@@ -4384,7 +4399,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
             server_cmaint: server_cmaint(&be.servers),
-            server_rmaint: server_rmaint(be.servers.len(), &be.server_extras),
+            server_rmaint: server_rmaint(&be.servers, &be.server_extras),
             server_fqdns: server_fqdns(be.servers.len(), &be.server_extras),
             server_fqdn_changed: server_fqdn_changed(be.servers.len(), &be.server_extras),
             server_check_ports: server_check_ports(&be.servers),

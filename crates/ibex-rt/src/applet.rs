@@ -613,8 +613,18 @@ impl CliApplet {
                         _ if raw == Some(crate::check::DRAIN_DOWN) => 8,
                         _ => 0,
                     } | if p.server_cmaint(s_idx) { 4 } else { 0 };
-                    // No address: SRV_ADMF_RMAINT (32) is the maintenance, not the operator's.
-                    let admin_state = if rmaint { (admin_state & !1) | 32 } else { admin_state };
+                    // No address: SRV_ADMF_RMAINT (32) is the maintenance; the operator's kept
+                    // under it is FMAINT (1) or FDRAIN (8).
+                    let admin_state = if rmaint {
+                        let kept = match p.server_rmaint_kept(s_idx) {
+                            ServerStatus::Maint => 1,
+                            ServerStatus::Drain => 8,
+                            _ => 0,
+                        };
+                        (admin_state & !1) | 32 | kept
+                    } else {
+                        admin_state
+                    };
                     let admin_state = admin_state | if p.server_fqdn_changed(s_idx) { 64 } else { 0 };
                     // `check.port` (the file may have changed it), and `agent.port`, which the
                     // `port` keyword sets too.

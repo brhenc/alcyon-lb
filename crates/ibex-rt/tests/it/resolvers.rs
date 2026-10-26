@@ -42,6 +42,8 @@ enum Zone {
     AlwaysTruncated,
     /// This many A records (10.x.y.z), whatever the transport.
     Many(usize),
+    /// One AAAA record, whatever the type asked.
+    Aaaa(std::net::Ipv6Addr),
 }
 
 /// One query the fake nameserver saw.
@@ -201,7 +203,7 @@ fn build_reply(question: &[u8], z: &Zone, tcp: bool) -> Option<Vec<u8>> {
         Zone::Nx => 3,
         Zone::Refused => 5,
         Zone::ServFail => 2,
-        Zone::A(_) | Zone::NoData | Zone::Truncated(_) | Zone::AlwaysTruncated | Zone::Many(_) => 0,
+        Zone::A(_) | Zone::NoData | Zone::Truncated(_) | Zone::AlwaysTruncated | Zone::Many(_) | Zone::Aaaa(_) => 0,
     };
     let many: Vec<Ipv4Addr>;
     let ips: &[Ipv4Addr] = match z {
@@ -216,15 +218,20 @@ fn build_reply(question: &[u8], z: &Zone, tcp: bool) -> Option<Vec<u8>> {
     let qtype = u16::from_be_bytes([question[question.len() - 4], question[question.len() - 3]]);
     // An A query is answered with the A records; an AAAA one with nothing (NODATA).
     let ips = if qtype == 1 { ips } else { &[] };
+    let v6 = if let Zone::Aaaa(v6) = z { Some(*v6) } else { None };
     let mut r = Vec::with_capacity(512);
     r.extend_from_slice(&question[..2]);
     r.extend_from_slice(&[0x81 | if truncated { 2 } else { 0 }, 0x80 | rcode, 0, 1]);
-    r.extend_from_slice(&u16::try_from(ips.len()).expect("count").to_be_bytes());
+    r.extend_from_slice(&u16::try_from(ips.len() + usize::from(v6.is_some())).expect("count").to_be_bytes());
     r.extend_from_slice(&[0, 0, 0, 0]);
     r.extend_from_slice(&question[12..]);
     for ip in ips {
         r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4]);
         r.extend_from_slice(&ip.octets());
+    }
+    if let Some(v6) = v6 {
+        r.extend_from_slice(&[0xc0, 0x0c, 0, 28, 0, 1, 0, 0, 1, 0x2c, 0, 16]);
+        r.extend_from_slice(&v6.octets());
     }
     Some(r)
 }
@@ -1222,4 +1229,316 @@ fn an_idle_tcp_connection_is_closed_and_reopened() {
         thread::sleep(Duration::from_millis(50));
     }
     wait_counter(&ibex, "valid", 3, |v| v >= 2);
+}
+
+// --- Covercheck (T484): the operator-visible paths no test above reached, each measured on
+// `HAProxy` 3.5-dev8-885761-29 with the same configuration (2026-10-26). ---
+
+/// A name is asked as it is written: `HAProxy` checks no character of a server's name
+/// (`resolv_str_to_dn_label`), so `a!b.test` is sent and its answer taken (measured: `s1
+/// 10.0.0.7 2 0`, "IP changed from '(none)' to '10.0.0.7'").
+#[test]
+fn a_name_is_asked_as_it_is_written() {
+    let dns = FakeDns::start();
+    dns.set("a!b.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 7)]));
+    let ibex = start(dns.addr, "", "  server s1 a!b.test:80 resolvers r init-addr none\n", "");
+    ibex.wait_state("s1", "10.0.0.7 2 0", 3);
+    ibex.wait_log("l/s1: IP changed from '(none)' to '10.0.0.7' by 'r/ns1'.", 2);
+    assert!(dns.queries().iter().all(|q| q.name == "a!b.test"), "{:?}", dns.queries());
+}
+
+/// A nameserver nobody listens on, three names asked at once: `HAProxy`'s socket is not
+/// connected, so the ICMP unreachable a datagram draws fails no later send (measured: `sent:
+/// 21  snd_error: 0` in 2.2 s); every query counts as sent.
+#[test]
+fn a_dead_nameserver_counts_every_query_sent() {
+    let dead = UdpSocket::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr");
+    let servers = "  server s1 a1.test:80 resolvers r init-addr 10.9.9.9\n  server s2 a2.test:80 resolvers r init-addr 10.9.9.8\n  server s3 a3.test:80 resolvers r init-addr 10.9.9.7\n";
+    let ibex = start(dead, &format!("{FAST}  hold timeout 30s\n"), servers, "");
+    wait_counter(&ibex, "sent", 5, |v| v >= 12);
+    let c = counters(&ibex, "r", "ns1");
+    assert_eq!(c["snd_error"], 0, "{c:?}");
+}
+
+/// A `tcp@` nameserver on a multicast address: the kernel refuses the connect at once
+/// (`ENETUNREACH`); the queries count as sent, the resolution times out (measured: `sent: 9`
+/// in 3 s, "going DOWN for maintenance (DNS timeout status)" after `hold timeout`).
+#[test]
+fn a_tcp_nameserver_that_cannot_be_reached_is_a_timeout() {
+    let ibex = start("tcp@224.0.0.1:53", &format!("{FAST}  hold timeout 1s\n"), "  server s1 a1.test:80 resolvers r init-addr 10.9.9.9\n", "");
+    ibex.wait_state("s1", "- 0 32", 5);
+    ibex.wait_log(&format!("Server l/s1 is going DOWN for maintenance (DNS timeout status). {LEFT}"), 2);
+    let c = counters(&ibex, "r", "ns1");
+    assert!(c["sent"] >= 4 && c["snd_error"] == 0, "{c:?}");
+}
+
+/// A listener whose accept queue is full (backlog 0, one connection waiting): the SYN goes
+/// unanswered and the connect never completes. `HAProxy` counts each query sent when it is
+/// queued for the connection (measured: `sent: 8` in 2.8 s, no connection accepted, DOWN with
+/// "DNS timeout status").
+#[test]
+fn a_tcp_nameserver_that_never_accepts_counts_its_queries_sent() {
+    use rustix::net::{AddressFamily, SocketType};
+    let fd = rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None).expect("socket");
+    rustix::net::bind_v4(&fd, &std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    rustix::net::listen(&fd, 0).expect("listen");
+    let listener = TcpListener::from(fd);
+    let addr = listener.local_addr().expect("addr");
+    let _filler = TcpStream::connect(addr).expect("fill the accept queue");
+    let ibex = start(format!("tcp@{addr}"), &format!("{FAST}  hold timeout 1s\n"), "  server s1 a1.test:80 resolvers r init-addr 10.9.9.9\n", "");
+    ibex.wait_state("s1", "- 0 32", 5);
+    ibex.wait_log(&format!("Server l/s1 is going DOWN for maintenance (DNS timeout status). {LEFT}"), 2);
+    let c = counters(&ibex, "r", "ns1");
+    assert!(c["sent"] >= 4 && c["snd_error"] == 0, "{c:?}");
+}
+
+#[derive(Clone, Copy)]
+enum TcpMode {
+    /// Reads the query, closes (FIN).
+    Fin,
+    /// Closes with the query unread (RST).
+    Rst,
+    /// Answers `10.0.0.1` in two writes 100 ms apart, the first of 5 bytes.
+    Split,
+}
+
+/// A TCP nameserver that behaves as `mode` says, and the connections it accepted.
+fn tcp_ns(mode: TcpMode) -> (SocketAddr, Arc<AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = l.local_addr().expect("addr");
+    let conns = Arc::new(AtomicUsize::new(0));
+    let n = Arc::clone(&conns);
+    thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            n.fetch_add(1, Ordering::Relaxed);
+            thread::spawn(move || loop {
+                let mut len = [0u8; 2];
+                if c.read_exact(&mut len).is_err() {
+                    return;
+                }
+                if let TcpMode::Rst = mode {
+                    // The query is left unread: closing sends a reset.
+                    thread::sleep(Duration::from_millis(20));
+                    return;
+                }
+                let mut msg = vec![0u8; usize::from(u16::from_be_bytes(len))];
+                if c.read_exact(&mut msg).is_err() {
+                    return;
+                }
+                if let TcpMode::Fin = mode {
+                    return;
+                }
+                let Some((_, qend)) = parse_query(&msg, true) else { return };
+                let reply = build_reply(&msg[..qend], &Zone::A(vec![Ipv4Addr::new(10, 0, 0, 1)]), true).expect("reply");
+                let mut out = u16::try_from(reply.len()).expect("size").to_be_bytes().to_vec();
+                out.extend_from_slice(&reply);
+                if c.write_all(&out[..5]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+                if c.write_all(&out[5..]).is_err() {
+                    return;
+                }
+            });
+        }
+    });
+    (addr, conns)
+}
+
+/// A TCP nameserver that closes, or resets, the connection after reading a query: each try
+/// opens a new one, and the resolution times out (measured, both: 8 connections and `sent: 8`
+/// in 2.8 s, DOWN with "DNS timeout status").
+#[test]
+fn a_tcp_nameserver_that_closes_or_resets_after_the_query_is_a_timeout() {
+    for mode in [TcpMode::Fin, TcpMode::Rst] {
+        let (addr, conns) = tcp_ns(mode);
+        let ibex = start(format!("tcp@{addr}"), &format!("{FAST}  hold timeout 1s\n"), "  server s1 a1.test:80 resolvers r init-addr 10.9.9.9\n", "");
+        ibex.wait_state("s1", "- 0 32", 5);
+        ibex.wait_log(&format!("Server l/s1 is going DOWN for maintenance (DNS timeout status). {LEFT}"), 2);
+        let c = counters(&ibex, "r", "ns1");
+        assert!(c["sent"] >= 4 && c["snd_error"] == 0 && c["valid"] == 0, "{c:?}");
+        assert!(conns.load(Ordering::Relaxed) >= 4, "{}", conns.load(Ordering::Relaxed));
+    }
+}
+
+/// A TCP answer that comes in two segments is put together (measured: `10.0.0.1 2 0`).
+#[test]
+fn a_tcp_answer_in_two_segments_is_assembled() {
+    let (addr, _) = tcp_ns(TcpMode::Split);
+    let ibex = start(format!("tcp@{addr}"), FAST, "  server s1 a1.test:80 resolvers r init-addr 10.9.9.9\n", "");
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    ibex.wait_log("l/s1: IP changed from '10.9.9.9' to '10.0.0.1' by 'r/ns1'.", 2);
+}
+
+/// F14: a layer-4 timeout asks again for its own server's name only (measured, 2 s: `a1.test`
+/// asked 4 times, `b.test` once).
+#[test]
+fn a_layer4_timeout_triggers_only_its_own_resolution() {
+    let dns = FakeDns::start();
+    dns.set("a1.test", Zone::A(vec![Ipv4Addr::new(192, 0, 2, 1)]));
+    dns.set("b.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 9)]));
+    let _ibex = start(
+        dns.addr,
+        "  timeout resolve 10s\n  hold valid 100ms\n",
+        "  timeout check 100ms\n  server s1 a1.test:80 resolvers r check inter 300ms\n  server s2 b.test:80 resolvers r\n",
+        "",
+    );
+    thread::sleep(Duration::from_millis(2000));
+    let q = dns.queries();
+    assert!(q.iter().filter(|q| q.name == "a1.test").count() >= 3, "{q:?}");
+    assert_eq!(q.iter().filter(|q| q.name == "b.test").count(), 1, "{q:?}");
+}
+
+/// F7 scores: a server whose `init-addr` is in the answer keeps it (the current address breaks
+/// the tie), and one whose address scores 15 (preferred family, its network, unused, current)
+/// keeps it at once; neither logs a change (measured: `10.0.0.2 2 0`, `10.0.0.5 2 0`, no line).
+#[test]
+fn a_server_keeps_an_address_still_in_the_answer() {
+    let dns = FakeDns::start();
+    dns.set("multi2.test", Zone::A([4, 5, 6].map(|o| Ipv4Addr::new(10, 0, 0, o)).to_vec()));
+    let ibex = start(
+        dns.addr,
+        "  timeout resolve 300ms\n",
+        "  server s1 multi.test:80 resolvers r init-addr 10.0.0.2\n  server s2 multi2.test:80 resolvers r resolve-prefer ipv4 resolve-net 10.0.0.5/32 init-addr 10.0.0.5\n",
+        "",
+    );
+    wait_counter(&ibex, "valid", 3, |v| v >= 4);
+    assert_eq!(ibex.state("s1").0, "10.0.0.2 2 0");
+    assert_eq!(ibex.state("s2").0, "10.0.0.5 2 0");
+    assert!(!ibex.log().iter().any(|l| l.contains("IP changed")), "{:?}", ibex.log());
+}
+
+/// A valid answer with no address of a family in use (an AAAA record for an A query, on a
+/// host with no IPv6 route): "No IP for server" (measured: `- 0 32`, "Server l/s1 is going
+/// DOWN for maintenance (No IP for server ). 0 active ..."). With an IPv6 route the record
+/// is an address, so the case does not exist there.
+#[test]
+fn an_answer_with_no_usable_address_takes_the_server_down() {
+    if UdpSocket::bind("[::]:0").and_then(|s| s.connect("[2001::]:53")).is_ok() {
+        return;
+    }
+    let dns = FakeDns::start();
+    dns.set("a1.test", Zone::Aaaa("2001:db8::1".parse().expect("v6")));
+    let ibex = start(dns.addr, FAST, "  server s1 a1.test:80 resolvers r init-addr 10.9.9.9\n", "");
+    ibex.wait_state("s1", "- 0 32", 3);
+    ibex.wait_log(&format!("Server l/s1 is going DOWN for maintenance (No IP for server ). {LEFT}"), 2);
+}
+
+/// A server its checks found DOWN loses its name: "was DOWN and now enters maintenance"
+/// (measured, `hold nx 500ms`).
+#[test]
+fn a_server_down_by_its_checks_enters_maintenance_when_its_name_goes() {
+    let dead = TcpListener::bind("127.0.0.1:0").expect("bind").local_addr().expect("addr").port();
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, &format!("{FAST}  hold nx 500ms\n"), &format!("  server s1 be.test:{dead} resolvers r check inter 100ms fall 1 rise 1\n"), "");
+    ibex.wait_state("s1", "127.0.0.1 0 0", 3);
+    dns.set("be.test", Zone::Nx);
+    ibex.wait_state("s1", "- 0 32", 4);
+    ibex.wait_log("Server l/s1 was DOWN and now enters maintenance (DNS NX status).", 2);
+}
+
+/// The servers left count the backup ones (measured: "0 active and 1 backup servers left.
+/// Running on backup.").
+#[test]
+fn a_backup_server_takes_over_when_the_name_goes() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, &format!("{FAST}  hold nx 500ms\n"), "  server s1 a1.test:80 resolvers r\n  server s2 127.0.0.1:9 backup\n", "");
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    dns.set("a1.test", Zone::Nx);
+    ibex.wait_state("s1", "- 0 32", 4);
+    ibex.wait_log(
+        "Server l/s1 is going DOWN for maintenance (DNS NX status). 0 active and 1 backup servers left. Running on backup. 0 sessions active, 0 requeued, 0 remaining in queue.",
+        2,
+    );
+}
+
+/// `disabled`: the answer is taken but the server stays in maintenance; losing the name says
+/// nothing more, and `SRV_ADMF_FMAINT` stays with `RMAINT` (measured: `10.0.0.1 0 5`, then
+/// `- 0 37` with no line, then `10.0.0.1 0 5` and the "remains in maintenance" line again).
+#[test]
+fn a_disabled_server_resolves_but_stays_in_maintenance() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, &format!("{FAST}  hold nx 500ms\n"), "  server s1 a1.test:80 resolvers r disabled\n", "");
+    let again = "Server l/s1 ('a1.test') resolves again but remains in maintenance.";
+    ibex.wait_state("s1", "10.0.0.1 0 5", 3);
+    ibex.wait_log(again, 2);
+    dns.set("a1.test", Zone::Nx);
+    ibex.wait_state("s1", "- 0 37", 4);
+    dns.set("a1.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 1)]));
+    ibex.wait_state("s1", "10.0.0.1 0 5", 3);
+    thread::sleep(Duration::from_millis(300));
+    let log = ibex.log();
+    assert_eq!(log.iter().filter(|l| *l == again).count(), 2, "{log:?}");
+    assert!(!log.iter().any(|l| l.contains("enters maintenance") || l.contains("going DOWN")), "{log:?}");
+}
+
+/// The operator's maintenance (`set server state maint`) outlives a DNS maintenance: `- 0 33`
+/// while the name is gone, and back in maintenance when it resolves again (measured: `10.0.0.1
+/// 0 1`, "resolves again but remains in maintenance").
+#[test]
+fn the_operators_maintenance_outlives_a_dns_maintenance() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, &format!("{FAST}  hold nx 500ms\n"), "  server s1 a1.test:80 resolvers r\n", "");
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    ibex.cli("set server l/s1 state maint");
+    ibex.wait_state("s1", "10.0.0.1 0 1", 2);
+    dns.set("a1.test", Zone::Nx);
+    ibex.wait_state("s1", "- 0 33", 4);
+    dns.set("a1.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 1)]));
+    ibex.wait_state("s1", "10.0.0.1 0 1", 3);
+    ibex.wait_log("Server l/s1 ('a1.test') resolves again but remains in maintenance.", 2);
+}
+
+/// The operator's drain outlives it too: `- 0 40`, then `10.0.0.1 2 8` with "is UP/DRAIN
+/// (resolves again)" and "remains in forced drain mode", in that order (measured).
+#[test]
+fn the_operators_drain_outlives_a_dns_maintenance() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, &format!("{FAST}  hold nx 500ms\n"), "  server s1 a1.test:80 resolvers r\n", "");
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    ibex.cli("set server l/s1 state drain");
+    ibex.wait_state("s1", "10.0.0.1 2 8", 2);
+    dns.set("a1.test", Zone::Nx);
+    ibex.wait_state("s1", "- 0 40", 4);
+    dns.set("a1.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 1)]));
+    ibex.wait_state("s1", "10.0.0.1 2 8", 3);
+    let drain = "Server l/s1 ('a1.test') is UP/DRAIN (resolves again).";
+    let remains = "Server l/s1 remains in forced drain mode.";
+    ibex.wait_log(drain, 2);
+    ibex.wait_log(remains, 2);
+    let log = ibex.log();
+    let at = |t: &str| log.iter().position(|l| l == t).expect("line");
+    assert!(at(drain) < at(remains) && at(remains) < log.iter().rposition(|l| l == READY).expect("ready"), "{log:?}");
+}
+
+/// The CLI moves the admin state kept under a DNS maintenance (measured on a name never
+/// resolved: maint `- 0 33`; drain `- 0 40` with "leaving forced maintenance but remains in
+/// maintenance"; ready `- 0 32`; maint, ready: the line again).
+#[test]
+fn the_cli_sets_the_admin_state_kept_under_a_dns_maintenance() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, FAST, "  server s1 nx.test:80 resolvers r\n", "");
+    let leaving = "Server l/s1 is leaving forced maintenance but remains in maintenance.";
+    for (cmd, want) in [("maint", "- 0 33"), ("drain", "- 0 40"), ("ready", "- 0 32"), ("maint", "- 0 33"), ("ready", "- 0 32")] {
+        ibex.cli(&format!("set server l/s1 state {cmd}"));
+        ibex.wait_state("s1", want, 2);
+    }
+    ibex.wait_log(leaving, 2);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(ibex.log().iter().filter(|l| *l == leaving).count(), 2, "{:?}", ibex.log());
+}
+
+/// The IPv6 route is probed again after 30 s (`INET6_CONNECTIVITY_CACHE_TIME`); the
+/// resolutions go on at their period across it.
+#[test]
+fn the_ipv6_route_is_probed_again_after_30_s() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, "  timeout resolve 1s\n", "  server s1 a1.test:80 resolvers r\n", "");
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    thread::sleep(Duration::from_secs(32));
+    let q = dns.queries();
+    let late = q.iter().filter(|x| x.at.duration_since(q[0].at) > Duration::from_secs(30)).count();
+    assert!(late >= 1, "{q:?}");
+    assert_eq!(ibex.state("s1").0, "10.0.0.1 2 0");
 }

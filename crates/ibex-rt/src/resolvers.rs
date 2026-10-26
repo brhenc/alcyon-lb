@@ -257,9 +257,6 @@ struct Req {
     opts: ResolveOpts,
     /// The answer item the server took its address from (`srv->ip_rec_item`).
     attached: Option<IpAddr>,
-    /// The admin state to give back when the server leaves `SRV_ADMF_RMAINT`: what the
-    /// operator or the configuration set (`Maint` for `disabled`, `Drain`), else `Up`.
-    saved: ServerStatus,
 }
 
 /// One name and query type (`struct resolv_resolution`).
@@ -436,8 +433,7 @@ pub fn build(
             // `resolv_link_resolution`: the type asked first, fixed now (A.t18).
             let prefer = if !families.ipv6 || n.resolve.prefer_ipv4 { TYPE_A } else { TYPE_AAAA };
             let key = (sec_idx, n.fqdn.to_ascii_lowercase().into_boxed_str(), prefer);
-            let saved = if px.server_cmaint(s_idx) { ServerStatus::Maint } else { ServerStatus::Up };
-            let req = Req { proxy: usize_to_u32(p_idx), server: n.index, opts: n.resolve.clone(), attached: None, saved };
+            let req = Req { proxy: usize_to_u32(p_idx), server: n.index, opts: n.resolve.clone(), attached: None };
             let sec = &mut out[sec_idx];
             if let Some(&(_, r)) = by_key.get(&key) {
                 sec.resolutions[r].reqs.push(req);
@@ -610,11 +606,22 @@ impl Section {
                 if self.nameservers[i].transport == NsTransport::Auto {
                     self.count(i, C_TCP_FALLBACK);
                 }
+                // `sent` when it is queued for a connection, up or not (`dns_session_io_handler`
+                // hands it to a session: a connect that never completes still counts).
+                self.count(i, C_SENT);
                 self.nameservers[i].queue.push_back(bytes);
             } else if let Some(sock) = &self.nameservers[i].sock {
                 // A failed send is `snd_error`; the retry timer sends again. A full socket
                 // buffer is neither (`dns.c:165`: HAProxy queues the datagram).
-                match sock.send(&bytes) {
+                // An ICMP unreachable an earlier datagram drew fails the next send on a
+                // connected socket, and this datagram is not sent: `HAProxy`'s socket is not
+                // connected, so it never sees that error (a dead nameserver: every query
+                // `sent`, no `snd_error`). The failed send took the error: again.
+                let sent = match sock.send(&bytes) {
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => sock.send(&bytes),
+                    r => r,
+                };
+                match sent {
                     Ok(_) => self.count(i, C_SENT),
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(_) => self.count(i, C_SND_ERROR),
@@ -711,7 +718,6 @@ impl Section {
         if !broken && c.up && c.pending == 0 && ns.queue.is_empty() && now >= c.last_use + TCP_IDLE {
             broken = true;
         }
-        let mut sent = 0;
         let mut frames: Vec<Vec<u8>> = Vec::new();
         if !broken && c.up {
             while c.pending < TCP_PIPELINED {
@@ -720,7 +726,6 @@ impl Section {
                 c.out.extend_from_slice(&q);
                 c.pending += 1;
                 c.last_use = now;
-                sent += 1;
             }
             while !c.out.is_empty() {
                 match c.stream.write(&c.out) {
@@ -758,9 +763,6 @@ impl Section {
             }
         }
         let more = !ns.queue.is_empty() && !broken;
-        for _ in 0..sent {
-            self.count(i, C_SENT);
-        }
         let from = self.nameservers[i].addr;
         for f in &frames {
             let got = self.dns.handle_response(now, from, Protocol::Tcp, f);
@@ -779,13 +781,9 @@ impl Section {
 
     /// The queries waiting for a connection that is not coming are dropped; the retry timer
     /// sends them again.
+    /// (They were counted `sent` when queued.)
     fn drop_queued(&mut self, i: usize) {
-        let n = self.nameservers[i].queue.len();
         self.nameservers[i].queue.clear();
-        // `HAProxy` counts a query it queued as sent whether or not the connection came up.
-        for _ in 0..n {
-            self.count(i, C_SENT);
-        }
     }
 
     /// Applies the results the crate has. A valid answer read from `ns` names it in the log.
@@ -1098,7 +1096,16 @@ fn enter_rmaint(req: &Req, cause: Cause, proxies: &[Proxy], checks: &mut [Server
     let (p, s) = (req.proxy as usize, req.server as usize);
     let px = &proxies[p];
     let before = status_of(px, s);
-    px.set_server_rmaint(s, true);
+    // The operator's maintenance or drain (not one inherited from a tracked server) is kept
+    // under `RMAINT` and taken back when the name resolves again.
+    let own = !crate::track::inherited(px, s);
+    let kept = match ServerStatus::from(before) {
+        ServerStatus::Maint if own => ServerStatus::Maint,
+        ServerStatus::Drain if own => ServerStatus::Drain,
+        _ if before == DRAIN_DOWN && own => ServerStatus::Drain,
+        _ => ServerStatus::Up,
+    };
+    px.set_server_rmaint(s, Some(kept));
     crate::track::set_admin(proxies, checks, p, s, ServerStatus::Maint, crate::srvlog::Cause::Dns);
     let srv = &px.server_ids[s];
     let backup = if px.server_backups.get(s).copied().unwrap_or(false) { "Backup " } else { "" };
@@ -1140,19 +1147,23 @@ fn usable_servers(px: &Proxy) -> (usize, usize) {
 fn leave_rmaint(req: &Req, fqdn: &str, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
     let (p, s) = (req.proxy as usize, req.server as usize);
     let px = &proxies[p];
-    px.set_server_rmaint(s, false);
-    crate::track::set_admin(proxies, checks, p, s, req.saved, crate::srvlog::Cause::Dns);
+    let saved = px.server_rmaint_kept(s);
+    px.set_server_rmaint(s, None);
+    crate::track::set_admin(proxies, checks, p, s, saved, crate::srvlog::Cause::Dns);
     let srv = &px.server_ids[s];
     let backup = if px.server_backups.get(s).copied().unwrap_or(false) { "Backup " } else { "" };
     let after = status_of(px, s);
-    let msg = if req.saved == ServerStatus::Maint {
+    let msg = if saved == ServerStatus::Maint {
         format!("{backup}Server {}/{srv} ('{fqdn}') resolves again but remains in maintenance.", px.name)
     } else {
         let op = if after == ServerStatus::Down as u8 || after == DRAIN_DOWN { "DOWN" } else { "UP" };
-        let adm = if req.saved == ServerStatus::Drain { "DRAIN" } else { "READY" };
+        let adm = if saved == ServerStatus::Drain { "DRAIN" } else { "READY" };
         format!("{backup}Server {}/{srv} ('{fqdn}') is {op}/{adm} (resolves again).", px.name)
     };
     log(p, LogLevel::Notice, &msg);
+    if saved == ServerStatus::Drain {
+        log(p, LogLevel::Notice, &format!("{backup}Server {}/{srv} remains in forced drain mode.", px.name));
+    }
     log(p, LogLevel::Notice, &format!("Server {}/{srv} administratively READY thanks to valid DNS answer.", px.name));
 }
 
@@ -1235,7 +1246,7 @@ mod tests {
     }
 
     fn req(proxy: u32, server: u32, opts: ResolveOpts) -> Req {
-        Req { proxy, server, opts, attached: None, saved: ServerStatus::Up }
+        Req { proxy, server, opts, attached: None }
     }
 
     fn ip(s: &str) -> IpAddr {

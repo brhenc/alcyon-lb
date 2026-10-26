@@ -220,6 +220,16 @@ pub fn note(proxies: &[Proxy], p: usize, s: usize, before: u8, after: u8, kind: 
     }
 }
 
+/// A line about server `s` of proxy `p` that no state change describes (the admin state kept
+/// under `SRV_ADMF_RMAINT` moved), queued with the others: `[{backup}Server px/srv {text}]`.
+pub fn line(proxies: &[Proxy], p: usize, s: usize, level: LogLevel, text: &str) {
+    let Some(px) = proxies.get(p) else { return };
+    let Some(name) = px.server_ids.get(s) else { return };
+    let backup = if px.server_backups.get(s).copied().unwrap_or(false) { "Backup " } else { "" };
+    let text = format!("{backup}Server {}/{name} {text}", px.name);
+    px.txn_counters().srv_events.push(Event { proxy: p, level, alert: false, stderr: text.clone(), log: format!("{text}.") });
+}
+
 /// Writes the lines noted since the last call on `proxies`, in the order they were noted,
 /// through `send` (the log targets of the proxy). Every line goes to stderr too.
 pub fn drain(proxies: &[Proxy], mut send: impl FnMut(usize, LogLevel, &str)) {

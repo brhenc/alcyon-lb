@@ -165,6 +165,28 @@ pub struct Resolver {
     results: VecDeque<(QueryId, Result<Vec<Answer>, DnsError>)>,
 }
 
+/// `resolv_str_to_dn_label` alone, what a server's name gets (`resolv_link_resolution`): an
+/// empty label is refused, a trailing dot dropped, and nothing else checked, so `a!b.test` is
+/// asked as written and a 64-byte label goes out with its length byte as it is (measured on
+/// `HAProxy` 3.5-dev8).
+fn to_dn_label(name: &str) -> Result<Vec<u8>, QueryError> {
+    let trimmed = name.strip_suffix('.').unwrap_or(name);
+    if trimmed.is_empty() {
+        return Err(QueryError::InvalidName("empty hostname"));
+    }
+    let mut dn = Vec::with_capacity(trimmed.len() + 2);
+    for label in trimmed.split('.') {
+        if label.is_empty() {
+            return Err(QueryError::InvalidName("empty label"));
+        }
+        // `dn[offset] = (i - offset)`: a char, so the low byte of the length.
+        dn.push(label.len().to_le_bytes()[0]);
+        dn.extend(label.bytes().map(|b| b.to_ascii_lowercase()));
+    }
+    dn.push(0);
+    Ok(dn)
+}
+
 /// `resolv_hostname_validation` + `resolv_str_to_dn_label`: the wire form, lower-cased.
 fn to_dn(name: &str) -> Result<Vec<u8>, QueryError> {
     if name.len() > MAX_NAME {
@@ -264,7 +286,7 @@ impl Resolver {
         question: Question,
         requester: Requester,
     ) -> Result<QueryId, QueryError> {
-        let dn = to_dn(name)?;
+        let dn = if requester == Requester::Server { to_dn_label(name)? } else { to_dn(name)? };
         let prefer_type = match question {
             Question::Srv => TYPE_SRV,
             // The preferred family if accepted, else the other one (A.t18).

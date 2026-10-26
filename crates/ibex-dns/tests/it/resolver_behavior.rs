@@ -567,7 +567,7 @@ fn an_invalid_name_is_refused_at_query() {
         (long_label.as_str(), "one label too long"),
         (long_name.as_str(), "hostname too long"),
     ] {
-        let got = r.query(t0, name, Question::v4(), Requester::Server);
+        let got = r.query(t0, name, Question::v4(), Requester::DoResolve);
         match got {
             Err(QueryError::InvalidName(msg)) => {
                 if why != "invalid" {
@@ -580,7 +580,31 @@ fn an_invalid_name_is_refused_at_query() {
     assert!(r.poll_transmit(t0).is_none(), "nothing is sent for a refused name");
     assert!(r.poll_result().is_none());
     // A trailing dot and 63-byte labels are fine.
-    assert!(r.query(t0, &format!("{}.test.", "a".repeat(63)), Question::v4(), Requester::Server).is_ok());
+    assert!(r.query(t0, &format!("{}.test.", "a".repeat(63)), Question::v4(), Requester::DoResolve).is_ok());
+}
+
+/// A server's name is only cut into labels (`resolv_str_to_dn_label`, measured on `HAProxy`
+/// 3.5-dev8: `server s1 a!b.test:80 resolvers r` is asked and resolves): an empty label is
+/// refused, any character and any length go out as written.
+#[test]
+fn a_server_name_is_asked_as_written() {
+    let mut r = Resolver::new(cfg(&[NS1]));
+    let t0 = Instant::now();
+    for name in ["bad..name", "", ".", ".a.test"] {
+        assert!(matches!(r.query(t0, name, Question::v4(), Requester::Server), Err(QueryError::InvalidName(_))), "{name:?}");
+    }
+    let long_label = format!("{}.test", "a".repeat(64));
+    for name in ["a!b.test", "a b.test", long_label.as_str()] {
+        assert!(r.query(t0, name, Question::v4(), Requester::Server).is_ok(), "{name:?}");
+    }
+    let mut sent = Vec::new();
+    while let Some((_, _, buf)) = r.poll_transmit(t0) {
+        sent.push(buf);
+    }
+    assert_eq!(sent.len(), 3);
+    // The question of the first: 3 "a!b", 4 "test", 0.
+    assert_eq!(&sent[0][12..22], b"\x03a!b\x04test\x00");
+    assert_eq!(sent[2][12], 64);
 }
 
 // Item 9 (rewrites test_ttl_drives_reresolution). HAProxy ignores the TTL: a server is
