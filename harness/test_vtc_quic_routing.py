@@ -98,6 +98,17 @@ class Routing(unittest.TestCase):
         self.assertFalse(self.ran(self.ibex))
         self.assertFalse(self.ran(self.oracle))
 
+    def test_force_features_runs_a_test_whose_feature_cmd_fails(self):
+        text = 'varnishtest "x"\nfeature cmd "false"\n' + vtc("frontend f\n  bind fd@1\n").split("\n", 1)[1]
+        f = tempfile.NamedTemporaryFile("w", suffix=".vtc", delete=False)
+        f.write(text)
+        f.close()
+        for force, want in ((False, "SKIP"), (True, "PASS")):
+            p = vtc_runner.VtcParser(text, f.name)
+            p.parse()
+            ex = vtc_runner.VtcExecutor(p, self.ibex.path, timeout=5.0, force_features=force)
+            self.assertEqual(asyncio.run(ex.execute()).status, want)
+
     def test_a_plain_test_never_looks_at_the_client_binary(self):
         res = run(vtc("frontend f\n  bind fd@1\n"), self.ibex.path, None)
         self.assertEqual(res.status, "PASS", res.error_message)

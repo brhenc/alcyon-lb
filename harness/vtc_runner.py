@@ -1888,8 +1888,10 @@ class VtcExecutor:
     """Executes a parsed VTC test script against a target binary."""
 
     def __init__(self, parser: VtcParser, target_binary: str, timeout: float = 15.0, verbose: bool = False,
-                 quic_client_binary: Optional[str] = None):
+                 quic_client_binary: Optional[str] = None, force_features: bool = False):
         self.parser = parser
+        # `feature cmd` lines are not evaluated: what a test does when its condition is lifted.
+        self.force_features = force_features
         self.target_binary = os.path.abspath(target_binary)
         # The binary that runs a `haproxy` block acting as the QUIC client (see quic_roles).
         self.quic_client_binary = quic_client_binary
@@ -2085,6 +2087,8 @@ class VtcExecutor:
                     continue
                 feat_type = feat_args[0]
                 if feat_type == "ignore_unknown_macro":
+                    continue
+                elif feat_type == "cmd" and self.force_features:
                     continue
                 elif feat_type == "cmd":
                     cmd_str = " ".join(feat_args[1:])
@@ -2580,6 +2584,7 @@ async def run_suite(
     fail_fast: bool = False,
     triage: Optional["TriageIndex"] = None,
     quic_client_binary: Optional[str] = None,
+    force_features: bool = False,
 ) -> List[TestResult]:
     results: List[TestResult] = []
     triage = triage or TriageIndex()
@@ -2621,6 +2626,7 @@ async def run_suite(
             timeout=timeout,
             verbose=verbose,
             quic_client_binary=quic_client_binary,
+            force_features=force_features,
         )
 
         res = await executor.execute()
@@ -2734,6 +2740,10 @@ def main() -> None:
                              "OUT_OF_SCOPE reclassification (T528: the QUIC tests are triaged "
                              "out, which hides what they do)")
 
+    parser.add_argument("--force-features", action="store_true",
+                        help="Do not evaluate `feature cmd` conditions (T528: run the tests the "
+                             "rustls build skips for `ssllib_name_startswith(OpenSSL)`)")
+
     args = parser.parse_args()
 
     vtc_files = find_vtc_files(args.paths)
@@ -2758,6 +2768,7 @@ def main() -> None:
             timeout=args.timeout,
             verbose=args.verbose,
             fail_fast=args.fail_fast,
+            force_features=args.force_features,
             triage=TriageIndex(os.devnull) if args.no_triage else None,
             quic_client_binary=os.environ.get("VTC_QUIC_CLIENT_BINARY", DEFAULT_QUIC_CLIENT_BINARY),
         )
