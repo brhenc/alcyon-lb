@@ -576,7 +576,15 @@ impl Iter {
         let ty = self.bytes.get::<FrameType>()?;
         self.last_ty = Some(ty);
         Ok(match ty {
-            FrameType::PADDING => Frame::Padding,
+            FrameType::PADDING => {
+                // A run of PADDING is one frame: skip it at once instead of one byte per
+                // `next()`. RFC 9000 19.1: PADDING has no content, so a run is equivalent to
+                // one frame (a client that pads every packet to 1200 bytes made the
+                // byte-at-a-time walk half the server's per-request instructions; Ibex T542).
+                let run = self.bytes.iter().position(|&b| b != 0).unwrap_or(self.bytes.len());
+                self.bytes.advance(run);
+                Frame::Padding
+            }
             FrameType::RESET_STREAM => Frame::ResetStream(ResetStream {
                 id: self.bytes.get()?,
                 error_code: self.bytes.get()?,
@@ -1004,5 +1012,21 @@ mod test {
         let frames = frames(buf);
         assert_eq!(frames.len(), 1);
         assert_matches!(&frames[0], Frame::ImmediateAck);
+    }
+
+    /// A run of PADDING is one `Frame::Padding` (Ibex T542). RFC 9000 19.1: a PADDING frame has
+    /// no content, so a run of them is equivalent to one; an h3 client that pads each packet to
+    /// 1200 bytes made the receiver walk ~1150 one-byte frames per packet.
+    #[test]
+    fn padding_run_is_one_frame() {
+        let mut buf = vec![0u8; 1150];
+        assert_eq!(frames(buf.clone()).len(), 1);
+        // A frame after the run is still decoded; PADDING before and after it.
+        buf[600] = FrameType::PING.0 as u8;
+        let frames = frames(buf);
+        assert_eq!(frames.len(), 3);
+        assert_matches!(&frames[0], Frame::Padding);
+        assert_matches!(&frames[1], Frame::Ping);
+        assert_matches!(&frames[2], Frame::Padding);
     }
 }
