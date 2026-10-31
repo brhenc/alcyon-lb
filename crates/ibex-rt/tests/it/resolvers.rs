@@ -927,6 +927,41 @@ fn a_state_file_keeps_the_operators_state_of_an_unresolved_server() {
     ibex.wait_log("Server l/s2 remains in forced drain mode.", 2);
 }
 
+/// T522, 3.5-dev8: an unresolved server (`init-addr none`) whose state-file line has
+/// `srv_op_state 0` is stopped by the file before `HAProxy` puts it in resolution maintenance, so
+/// stderr says `Server l/s1 is DOWN, changed from server-state after a reload. 0 active and 0
+/// backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.` for any admin
+/// state of the line (0, 32, 33, 40); the log targets, not up yet, get nothing. Ibex said nothing.
+#[test]
+fn a_state_file_stopping_an_unresolved_server_is_said_on_stderr() {
+    for admin in ["0", "32", "33", "40"] {
+        let dns = FakeDns::start();
+        dns.set("b.test", Zone::Nx);
+        let mut state = NamedTempFile::new().expect("tmp");
+        write!(
+            state,
+            "1\n# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_uweight srv_iweight \
+             srv_time_since_last_change srv_check_status srv_check_result srv_check_health srv_check_state \
+             srv_agent_state bk_f_forced_id srv_f_forced_id srv_fqdn srv_port srvrecord srv_use_ssl \
+             srv_check_port srv_check_addr srv_agent_addr srv_agent_port\n\
+             2 l 1 s1 - 0 {admin} 1 1 1 1 0 0 0 0 0 0 b.test 80 - 0 0 - - 0\n"
+        )
+        .expect("write state");
+        let ibex = start(
+            dns.addr,
+            &format!("{FAST}  hold nx 500ms\n"),
+            "  load-server-state-from-file global\n  server s1 b.test:80 resolvers r init-addr none\n",
+            &format!("  server-state-file {}\n", state.path().display()),
+        );
+        let said = format!(
+            "[WARNING]  ({}) : Server l/s1 is DOWN, changed from server-state after a reload. 0 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.",
+            ibex.child.id()
+        );
+        assert!(ibex.stderr().contains(&said), "admin {admin}: no {said:?} in {:?}", ibex.stderr());
+        assert!(!ibex.log().iter().any(|l| l.contains("changed from server-state")), "admin {admin}: {:?}", ibex.log());
+    }
+}
+
 /// `ibex -c` on `cfg`: whether it passed, and stderr.
 fn check(cfg: &str) -> (bool, String) {
     let f = NamedTempFile::new().expect("tmp");

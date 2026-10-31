@@ -151,6 +151,7 @@ mod h2_alpn_settings;
 mod h2_buffering;
 mod h2_early_response_rst;
 mod h2_extended_connect;
+mod head_size_normalised;
 mod h2_backend_dies_under_streams;
 mod h2_backend_reuse;
 mod h2_concurrent_streams;

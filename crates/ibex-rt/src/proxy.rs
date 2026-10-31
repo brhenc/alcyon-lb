@@ -2352,7 +2352,7 @@ impl TcpSession {
     /// A framing violation: a malformed `Content-Length` / `Transfer-Encoding`, a bare CR as a line terminator, an invalid header name, or a
     /// malformed chunk size. Each of these is a way for two intermediaries to read the
     /// same bytes as different requests.
-    fn validate_request_head(&mut self, head_len: usize) -> io::Result<(bool, txn::LenHdrs)> {
+    fn validate_request_head(&mut self, head_len: usize) -> io::Result<(bool, txn::LenHdrs, Option<Option<u64>>)> {
         // The built-in parser is a value on this frame: a `Box<dyn HttpStream>` per request
         // head was an allocation per request (Z2, 56 bytes). Nothing sets `parser_kind` to
         // another parser (the other kinds are not built into this crate: `build` refuses them,
@@ -2394,6 +2394,10 @@ impl TcpSession {
             slice.remove_header("content-length");
             close = true;
         }
+        // What `%U` counts of a head the parser changed (an `Upgrade` cleaned, an authority
+        // and `Host` normalised, a repeated `Host` dropped): the message as HAProxy's parser
+        // leaves it, which is the HTX here, before the key below (T522).
+        let parsed_size = (head_rewritten || conflict).then(|| txn::htx_head_size(&slice.as_ref().write_h1_wire_vec(), true));
         // The websocket handshake, for the response (T281): a key written when the request
         // has none and the frontend accepts that (`h1_process_mux`).
         // Without an `Upgrade` line the request asks for nothing (T436: not looked for).
@@ -2416,7 +2420,7 @@ impl TcpSession {
         self.htx_modified = conflict || key_written || head_rewritten;
         // What frames the request as parsed (`H1_MF_CLEN`, `H1_MF_CHNK`), for after its rules (T439).
         let len_hdrs = txn::LenHdrs { clen: h1_parser.content_length.is_some() && !h1_parser.is_chunked, chnk: h1_parser.is_chunked };
-        Ok((close, len_hdrs))
+        Ok((close, len_hdrs, parsed_size))
     }
 
     #[must_use]
@@ -2835,7 +2839,7 @@ impl TcpSession {
                 // stream needs no state across calls. One allocation per request head
                 // for the trait object; it buys the framing rules and the seam that lets
                 // the parser be swapped.
-                let (mut close, len_hdrs) = match self.validate_request_head(total_hdr_len) {
+                let (mut close, len_hdrs, parsed_size) = match self.validate_request_head(total_hdr_len) {
                     Ok(v) => v,
                     Err(e) if crate::buf::is_oom(&e) => {
                         self.fail_alloc();
@@ -2986,7 +2990,7 @@ impl TcpSession {
                 let chunked10 = framing == txn::Framing::Chunked && !ibex_proto::h1::version_is_11(ver);
                 let mut txn = HttpTxn::new(framing, close || self.close_client || chunked10);
                 txn.close_opt = self.close_client && !self.stopping && !close && !chunked10;
-                txn.req_htx = req_htx;
+                txn.req_htx = parsed_size.unwrap_or(req_htx);
                 txn.req_len_hdrs = Some(len_hdrs);
                 txn.req_http11 = ibex_proto::h1::version_is_11(ver);
                 txn.req_version = txn::version_digits(ver).unwrap_or(txn.req_version);
