@@ -214,3 +214,61 @@ fn retry_on_a_status_needs_a_retry_left_and_a_request_that_was_kept() {
     assert_eq!(bad_hits.load(Ordering::Relaxed), 1);
     assert_eq!(body, "HTTP/1.1 503 Service Unavailable", "the request was not whole when it was sent");
 }
+
+/// T519: the request's copy for an `retry-on` retry is a buffer of the pool, and with none left
+/// (`tune.buffers.limit 3`, `nbthread 1`, 12 requests in flight) the request goes without a
+/// retry (`b_alloc(&l7_buffer)` fails: `TX_L7_RETRY` is cleared). Measured on HAProxy
+/// 3.5-dev8 with the same 12 clients: 2 answered 200 after a retry, 10 the 503.
+#[test]
+fn retry_on_without_a_buffer_for_the_copy_does_not_retry() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let sport = listener.local_addr().expect("addr").port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let h = Arc::clone(&hits);
+    thread::spawn(move || {
+        for mut c in listener.incoming().flatten() {
+            let h = Arc::clone(&h);
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let n = h.fetch_add(1, Ordering::Relaxed) + 1;
+                thread::sleep(Duration::from_millis(700));
+                let st = if n <= 12 { "503 Service Unavailable" } else { "200 OK" };
+                let _ = write!(c, "HTTP/1.1 {st}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            });
+        }
+    });
+    let port = common::reserve_port();
+    let cfg = format!(
+        "global\n  nbthread 1\n  tune.buffers.limit 3\n  tune.buffers.reserve 2\n\
+         defaults\n  mode http\n  timeout connect 1s\n  timeout client 8s\n  timeout server 8s\n\
+         frontend fe\n  bind 127.0.0.1:{port}\n  default_backend be\n\
+         backend be\n  retries 2\n  retry-on 503\n  server s 127.0.0.1:{sport}\n"
+    );
+    let path = std::env::temp_dir().join(format!("ibex_retryon_nobuf_{}", std::process::id()));
+    std::fs::write(&path, cfg).expect("write config");
+    let mut child = Command::new(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string())).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "the daemon never listened on {port}");
+        thread::sleep(Duration::from_millis(25));
+    }
+    let mut clients: Vec<TcpStream> = (0..12)
+        .map(|_| {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(8))).ok();
+            s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("write");
+            s
+        })
+        .collect();
+    let mut ok = 0;
+    for s in &mut clients {
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        ok += usize::from(out.starts_with(b"HTTP/1.1 200"));
+    }
+    common::stop(&mut child);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(ok, 2, "only the requests whose copy found a buffer were retried (HAProxy: 2 of 12)");
+    assert_eq!(hits.load(Ordering::Relaxed), 14);
+}
