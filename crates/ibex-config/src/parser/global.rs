@@ -229,6 +229,88 @@ pub(crate) fn parse_global_directive(
             global.quic_retry_threshold = Some(u64::from(n));
             Ok(())
         }
+        // `cfg_parse_quic_tune_setting`, as above (T525). Reach `QuicConfig` (the transport
+        // parameter `initial_max_streams_bidi`) and the listener (`stream.max-total`) in
+        // `engine.rs`, where the QUIC listener is built.
+        "tune.quic.fe.stream.max-concurrent" | "tune.quic.fe.stream.max-total" => {
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text)));
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let n = tokens.get(1).map_or(0, |t| c_atoi(&t.text) as u32);
+            if n < 1 {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' expects a positive integer.", kw.text)));
+            }
+            if kw.text == "tune.quic.fe.stream.max-concurrent" {
+                global.quic_stream_max_concurrent = Some(n);
+            } else {
+                global.quic_stream_max_total = Some(n);
+            }
+            Ok(())
+        }
+        // `cfg_parse_quic_time`: milliseconds, `parse_time_err`.
+        "tune.quic.fe.max-idle-timeout" => {
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text)));
+            }
+            let text = tokens.get(1).map_or("", |t| t.text.as_str());
+            let name = kw.text.as_str();
+            match parse_time_ms_err(text) {
+                Ok(ms) => global.quic_max_idle_timeout = Some(ms),
+                Err(TimeMsErr::Over) => {
+                    return Err(ConfigError::new(
+                        kw.line,
+                        kw.col,
+                        format!("timer overflow in argument '{text}' to '{name}' (maximum value is 2147483647 ms or ~24.8 days)"),
+                    ));
+                }
+                Err(TimeMsErr::Char(c)) => {
+                    return Err(ConfigError::new(kw.line, kw.col, format!("unexpected character '{}' in '{name}'", if c == '\0' { String::new() } else { c.to_string() })));
+                }
+            }
+            Ok(())
+        }
+        // `cfg_parse_quic_tune_on_off`. Read by `engine.rs`: off binds no UDP socket.
+        "tune.quic.listen" => {
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text)));
+            }
+            global.quic_listen = match tokens.get(1).map(|t| t.text.as_str()) {
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                _ => return Err(ConfigError::new(kw.line, kw.col, format!("'{}' expects 'on' or 'off'.", kw.text))),
+            };
+            Ok(())
+        }
+        // The oracle's other `tune.quic.*` keywords (congestion control, pacing, GSO, socket per
+        // connection, buffers, the backend side). Ibex has nothing for them to tune: refused,
+        // not parsed and dropped (AGENTS.md section 5). Listed in docs/differences.md.
+        "tune.quic.mem.tx-max"
+        | "tune.quic.sec.stateless-reset-rate"
+        | "tune.quic.zero-copy-fwd-send"
+        | "tune.quic.fe.cc.cubic-min-losses"
+        | "tune.quic.fe.cc.hystart"
+        | "tune.quic.fe.cc.max-frame-loss"
+        | "tune.quic.fe.cc.max-win-size"
+        | "tune.quic.fe.cc.reorder-ratio"
+        | "tune.quic.fe.sec.glitches-threshold"
+        | "tune.quic.fe.sock-per-conn"
+        | "tune.quic.fe.stream.data-ratio"
+        | "tune.quic.fe.stream.rxbuf"
+        | "tune.quic.fe.tx.pacing"
+        | "tune.quic.fe.tx.udp-gso"
+        | "tune.quic.be.cc.cubic-min-losses"
+        | "tune.quic.be.cc.hystart"
+        | "tune.quic.be.cc.max-frame-loss"
+        | "tune.quic.be.cc.max-win-size"
+        | "tune.quic.be.cc.reorder-ratio"
+        | "tune.quic.be.max-idle-timeout"
+        | "tune.quic.be.sec.glitches-threshold"
+        | "tune.quic.be.stream.data-ratio"
+        | "tune.quic.be.stream.max-concurrent"
+        | "tune.quic.be.stream.rxbuf"
+        | "tune.quic.be.tx.pacing"
+        | "tune.quic.be.tx.udp-gso" => Err(ConfigError::new(kw.line, kw.col, format!("'{}' is not supported by Ibex.", kw.text))),
         "tune.resolvers.cache-size" => {
             // Ibex-only (T489): the `do-resolve` answers each worker keeps, at least 1.
             let Some(t) = tokens.get(1) else {

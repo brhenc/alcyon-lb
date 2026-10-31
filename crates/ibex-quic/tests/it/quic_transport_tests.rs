@@ -20,63 +20,18 @@ pub(crate) fn cert_path() -> PathBuf {
     manifest_dir.join("../../examples/certs/localhost.pem")
 }
 
-#[derive(Debug)]
-struct NoCertVerifier(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
+/// The test client: Ibex's own (T534, `crypto::client`, rustls 0.24), `verify none`, ALPN
+/// `h3`, on an endpoint whose stateless reset key is Ibex's too: no rustls 0.23 in it.
 pub(crate) fn create_client_endpoint() -> (quinn_proto::Endpoint, Arc<quinn_proto::ClientConfig>) {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut rustls_client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .expect("protocols")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertVerifier(provider)))
-        .with_no_client_auth();
-    rustls_client_config.alpn_protocols = vec![ALPN_H3.to_vec()];
-
-    let quic_client_crypto =
-        quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client_config))
-            .expect("client crypto");
-    let mut client_config = quinn_proto::ClientConfig::new(Arc::new(quic_client_crypto));
+    let crypto = ibex_quic::crypto::QuicClientConfig::without_verification(&[ALPN_H3], ibex_config::TlsCryptoProvider::Ring)
+        .expect("client crypto");
+    let mut client_config = quinn_proto::ClientConfig::new(Arc::new(crypto));
     let mut tc = quinn_proto::TransportConfig::default();
     tc.initial_rtt(Duration::from_millis(10));
     client_config.transport_config(Arc::new(tc));
 
-    let endpoint_config = Arc::new(quinn_proto::EndpointConfig::default());
+    let reset = Arc::new(ibex_quic::crypto::ResetKey::new().expect("reset key"));
+    let endpoint_config = Arc::new(quinn_proto::EndpointConfig::new(reset));
     let endpoint = quinn_proto::Endpoint::new(endpoint_config, None, false, None);
 
     (endpoint, Arc::new(client_config))

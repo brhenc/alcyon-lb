@@ -554,13 +554,14 @@ crate::h3_both_paths! {
 /// T517: the server answers one request on a connection and closes it 200 ms later; each
 /// second stream takes the kept connection and is lost on it. `HAProxy` 3.5-dev7 (default
 /// config, 40 streams): 20 x 200, 20 RESET_STREAM H3_REQUEST_CANCELLED, as on h1 and h2
-/// (`retry_on_reused_close.rs`). The relay serves every stream: it is more lenient than
-/// `HAProxy` there (`docs/differences.md`), pinned until it is removed in slice H5.
+/// (`retry_on_reused_close.rs`). The relay served every stream until T523, because it never
+/// reused a server connection for an HTTP/3 request; it reuses one now, as `HAProxy` does, and
+/// a stream whose request the engine dropped without a response is reset as on the mux.
 fn a_request_lost_on_a_reused_connection_is_reset_by_default() {
     let be = crate::retry_on_reused_close::closing_backend();
     let ibex = ibex_with(be, "", "");
     let mut cl = Client::connect(ibex.quic, None);
-    let want = if common::h3_mux() { crate::retry_on_reused_close::alternating() } else { crate::retry_on_reused_close::all_served() };
+    let want = crate::retry_on_reused_close::alternating();
     assert_eq!(sequential(&mut cl, want.len()), want);
 }
 }

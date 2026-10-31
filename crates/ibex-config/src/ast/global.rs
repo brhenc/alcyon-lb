@@ -251,6 +251,18 @@ pub struct GlobalSection {
     /// `tune.quic.fe.sec.retry-threshold`: half-open QUIC connections past which a new one
     /// is answered by a Retry; `None` is the default, 100.
     pub quic_retry_threshold: Option<u64>,
+    /// `tune.quic.fe.max-idle-timeout`: milliseconds, the transport parameter sent to a QUIC
+    /// client and the idle time after which the connection closes; `None` is 30 s. `0`
+    /// sends none (no transport idle timeout). T525.
+    pub quic_max_idle_timeout: Option<u32>,
+    /// `tune.quic.fe.stream.max-concurrent`: `initial_max_streams_bidi` sent to a client
+    /// (default 100). T525.
+    pub quic_stream_max_concurrent: Option<u32>,
+    /// `tune.quic.fe.stream.max-total`: request streams one QUIC connection may carry; it
+    /// is closed once the last of them is done (unset: no limit). T525.
+    pub quic_stream_max_total: Option<u32>,
+    /// `tune.quic.listen off`: `quic4@`/`quic6@` binds get no UDP socket. T525.
+    pub quic_listen: Option<bool>,
     /// `ibex.debug.panic <request|response> <path-prefix>`: a test-only fault (T447), accepted
     /// only in builds with `debug_assertions`.
     pub debug_panic: Option<DebugPanic>,
@@ -285,7 +297,7 @@ pub struct GlobalSection {
     /// `tune.ibex.h3-path relay|mux` (Ibex-only, T509, deleted with the relay in slice H5):
     /// `Some(true)` serves HTTP/3 request streams through the h3 mux and the bridge h2
     /// streams use, `Some(false)` through the HTTP/1 relay; unset, the `IBEX_H3_PATH`
-    /// environment variable decides, then the relay.
+    /// environment variable decides, then the mux (T536).
     pub h3_mux: Option<bool>,
     /// `tune.ibex.zero-on-free off|soft|hard` (Ibex-only, T459): wipe every freed heap block. Off
     /// when unset.

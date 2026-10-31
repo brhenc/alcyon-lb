@@ -3,8 +3,8 @@
 
 //! `quic-force-retry` and `tune.quic.fe.sec.retry-threshold` reach the QUIC listener (T492).
 //!
-//! Measured on the QUIC oracle (`HAProxy` 3.5-dev7, aioquic 1.3.0 client, `nbthread 1`: the
-//! half-open count is per thread there and per worker here):
+//! Measured on the QUIC oracle (`HAProxy` 3.5-dev7, aioquic 1.3.0 client, `nbthread 1`; the
+//! half-open count is the frontend's at any `nbthread`, the last test, T523):
 //! - `quic-force-retry`: the first Initial is answered by a Retry alone; the client that
 //!   answers it connects.
 //! - `tune.quic.fe.sec.retry-threshold 2` and two clients that sent one Initial and went
@@ -57,18 +57,22 @@ impl Drop for Ibex {
 }
 
 fn ibex(global: &str, bind_opts: &str) -> Ibex {
+    ibex_threads(1, global, bind_opts)
+}
+
+fn ibex_threads(nbthread: usize, global: &str, bind_opts: &str) -> Ibex {
     let tcp = common::reserve_addr();
     let quic = common::reserve_addr();
     let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
     let mut cfg = NamedTempFile::new().expect("cfg");
     write!(
         cfg,
-        "global\n    nbthread 1\n    hard-stop-after 300ms\n{global}defaults\n    mode http\n    timeout client 10s\n    timeout server 3s\n    \
+        "global\n    nbthread {nbthread}\n    hard-stop-after 300ms\n{global}defaults\n    mode http\n    timeout client 10s\n    timeout server 3s\n    \
          timeout connect 1s\nfrontend f\n    bind {tcp}\n    bind quic4@{quic} ssl crt {crt} alpn h3{bind_opts}\n    \
          http-request return status 200\n"
     )
     .expect("write cfg");
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+    let child = Command::new(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string()))
         .arg("-f")
         .arg(cfg.path())
         .stdout(Stdio::null())
@@ -214,4 +218,26 @@ fn retry_threshold_one_retries_the_second_half_open_client() {
     let mut second = Client::new(ibex.quic);
     assert_eq!(second.first_flight(), ["Retry"]);
     assert!(second.handshake(), "the client that answered the Retry connects");
+}
+
+/// The half-open count is the frontend's, not a worker's (T523). `HAProxy` keeps
+/// `half_open_conn` in the frontend's QUIC counters, one set per thread group
+/// (`EXTRA_COUNTERS_GET(prx->extra_counters_fe, ...)`, `qc_new_conn`), so at `nbthread 16`
+/// the Retry threshold weighs every thread's half-open connections: measured on the QUIC
+/// oracle with this test (`IBEX_TEST_BIN`), the ninth client gets a Retry; in the burst of
+/// 200 (`tools/battery/repro/h3_burst.sh`) 84 of 200 clients were retried, as at
+/// `nbthread 1`. Counted per worker, eight quiet clients spread over 16 sockets of the
+/// reuseport group left every worker under 8, and Ibex sent no Retry at all at `nbthread 16`.
+#[test]
+fn the_retry_threshold_counts_the_half_open_connections_of_every_thread() {
+    let ibex = ibex_threads(16, "    tune.quic.fe.sec.retry-threshold 8\n", "");
+    let mut quiet = Vec::new();
+    for _ in 0..8 {
+        let mut q = Client::new(ibex.quic);
+        assert_eq!(q.first_flight().first(), Some(&"Initial"), "under the threshold, served");
+        quiet.push(q);
+    }
+    let mut c = Client::new(ibex.quic);
+    assert_eq!(c.first_flight(), ["Retry"], "eight half-open connections over 16 threads reach a threshold of 8");
+    assert!(c.handshake(), "the client that answered the Retry connects");
 }
