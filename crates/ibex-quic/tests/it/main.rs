@@ -17,3 +17,4 @@ mod stack_scrub;
 mod retry;
 mod timers;
 mod quic_client;
+mod handle_hasher;
