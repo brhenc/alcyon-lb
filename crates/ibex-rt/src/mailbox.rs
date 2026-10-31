@@ -29,6 +29,10 @@ pub enum Msg {
     Shutdown(Arc<SessFilter>, Arc<Gather<usize>>),
     /// A gather a task of this worker waits on is complete: wake the task.
     Wake(TaskRef),
+    /// To worker 0: a `do-resolve` question its sections answer (T489).
+    DoResolve(ibex_alloc::PoolBox<Box<crate::resolvers::DrMsg>>),
+    /// Back to the worker that asked: the answer, for its cache and the waiting stream.
+    DoResolved(ibex_alloc::PoolBox<Box<crate::resolvers::DrMsg>>),
 }
 
 impl Msg {
@@ -37,7 +41,8 @@ impl Msg {
         match self {
             Msg::ShowSess(g) => g.reply(wid, Vec::new()),
             Msg::Shutdown(_, g) => g.reply(wid, 0),
-            Msg::Wake(_) => {}
+            // The stream that asked gives up at its deadline.
+            Msg::Wake(_) | Msg::DoResolve(_) | Msg::DoResolved(_) => {}
         }
     }
 }

@@ -67,6 +67,8 @@ fn take_prebound(addr: SocketAddr, worker: usize) -> Option<DgramSocket> {
 
 /// A QUIC listener managing datagram I/O on a nonblocking UDP socket and driving the QUIC transport.
 pub struct QuicListener {
+    /// The poller saw the socket readable this pass ([`QuicListener::mark_ready`]).
+    ready: bool,
     socket: DgramSocket,
     endpoint: QuicEndpoint,
     addr: SocketAddr,
@@ -260,6 +262,7 @@ impl QuicListener {
         let send_raw_bufs = vec![vec![0u8; DGRAM_BUF_SIZE]; BATCH_SIZE];
 
         Self {
+            ready: false,
             socket,
             endpoint,
             addr: bound_addr,
@@ -317,6 +320,17 @@ impl QuicListener {
     /// The owners to wake for what the transport did since the last call.
     pub fn take_wake(&mut self, into: &mut Vec<ibex_sched::TaskRef>) {
         into.append(&mut self.wake);
+    }
+
+    /// The poller found the socket readable: the next [`QuicListener::take_ready`] is true.
+    /// A flag rather than an index list the engine collects, so a pass allocates nothing (T512).
+    pub fn mark_ready(&mut self) {
+        self.ready = true;
+    }
+
+    /// Whether the socket was marked readable since the last call.
+    pub fn take_ready(&mut self) -> bool {
+        std::mem::replace(&mut self.ready, false)
     }
 
     /// Whether an owner wrote to the transport since the last call: its datagrams go out.
@@ -576,12 +590,12 @@ impl QuicListener {
     /// # Errors
     /// Returns an error if a non-transient socket error occurs.
     pub fn recv_batch(&mut self, now: Instant) -> io::Result<usize> {
-        let mut dgram_bufs: Vec<DgramBuf> = self
-            .recv_raw_bufs
-            .iter_mut()
-            .zip(self.recv_cmsg_bufs.iter_mut())
-            .map(|(buf, cmsg_buf)| DgramBuf::new(buf.as_mut_slice(), cmsg_buf.as_mut_slice()))
-            .collect();
+        // On the stack, not a `Vec` per call (T512: one allocation a pass). Both lists hold
+        // `BATCH_SIZE` buffers, so the empty fallback is never used.
+        let mut lent = self.recv_raw_bufs.iter_mut().zip(self.recv_cmsg_bufs.iter_mut());
+        let mut dgram_bufs: [DgramBuf; BATCH_SIZE] = std::array::from_fn(|_| {
+            lent.next().map_or_else(|| DgramBuf::new(&mut [], &mut []), |(buf, cmsg_buf)| DgramBuf::new(buf.as_mut_slice(), cmsg_buf.as_mut_slice()))
+        });
 
         let n = self.socket.recv_batch(&mut dgram_bufs)?;
         Self::dispatch(&mut self.endpoint, now, &dgram_bufs, n);
@@ -621,31 +635,34 @@ impl QuicListener {
         let mut total_sent = 0;
 
         loop {
-            let mut transmits = Vec::with_capacity(BATCH_SIZE);
-            let mut send_msgs = Vec::with_capacity(BATCH_SIZE);
-
-            for i in 0..BATCH_SIZE {
-                if let Some(tx) = self.endpoint.poll_transmit(now, &mut self.send_raw_bufs[i]) {
-                    transmits.push(tx);
-                } else {
-                    break;
-                }
+            // What each datagram needs once its bytes are in `send_raw_bufs[i]`: on the stack,
+            // not two `Vec`s per round (T512: they were half of an h3 request's allocations).
+            let mut heads: [Option<(usize, SocketAddr, Option<std::net::IpAddr>)>; BATCH_SIZE] = [None; BATCH_SIZE];
+            let mut count = 0;
+            for (head, buf) in heads.iter_mut().zip(self.send_raw_bufs.iter_mut()) {
+                let Some(tx) = self.endpoint.poll_transmit(now, buf) else { break };
+                *head = Some((tx.size, tx.destination, tx.src_ip));
+                count += 1;
             }
 
-            if transmits.is_empty() {
+            if count == 0 {
                 break;
             }
 
-            for (i, tx) in transmits.iter().enumerate() {
-                let mut msg = DgramOut::new(&self.send_raw_bufs[i][..tx.size]);
-                msg.dst_addr = Some(tx.destination);
-                msg.src_addr = tx.src_ip;
-                send_msgs.push(msg);
-            }
+            let bufs = &self.send_raw_bufs;
+            let send_msgs: [DgramOut; BATCH_SIZE] = std::array::from_fn(|i| match (heads[i], bufs.get(i)) {
+                (Some((size, dst, src)), Some(buf)) => {
+                    let mut msg = DgramOut::new(&buf[..size]);
+                    msg.dst_addr = Some(dst);
+                    msg.src_addr = src;
+                    msg
+                }
+                _ => DgramOut::new(&[]),
+            });
 
-            let sent = self.socket.send_batch(&send_msgs)?;
+            let sent = self.socket.send_batch(&send_msgs[..count])?;
             total_sent += sent;
-            if sent < transmits.len() {
+            if sent < count {
                 break;
             }
         }

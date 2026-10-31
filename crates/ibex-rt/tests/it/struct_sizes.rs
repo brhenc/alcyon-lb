@@ -50,8 +50,11 @@ fn server_check_state_stays_small() {
 /// T515 added 40: `fc_src`/`fc_dst`/`bc_src` are plain `Option<SocketAddr>` again (T474 had
 /// packed them; unpacking them for every sample context cost ~700 instructions a request on
 /// `rules`, 0.86%). Boxing them would be an allocation per connection.
+/// T489 added 8: `TcpSession::dr_wait`, a `u32` (the waiting `tcp-request content do-resolve`
+/// rule and its cache mark, packed); no padding was left, and a box would be 8 as well and an
+/// allocation per wait.
 #[test]
 fn session_entry_stays_small() {
     let n = size_of::<ibex_rt::engine::SessionEntry>();
-    assert!(n <= 1640, "SessionEntry grew to {n} bytes (bound 1640): one is held per client connection, box the new field");
+    assert!(n <= 1648, "SessionEntry grew to {n} bytes (bound 1648): one is held per client connection, box the new field");
 }

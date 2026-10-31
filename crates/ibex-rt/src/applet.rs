@@ -1802,6 +1802,47 @@ impl CliApplet {
                 }
                 self.finish_msg(&msg);
             }
+            Some("fqdn") => {
+                // `cli_parse_set_server` (`server.c:6065`), then `srv_update_fqdn` and
+                // `srv_set_fqdn`; the answer is the reply, nothing is logged (measured).
+                let Some(&name) = parts.get(2) else {
+                    self.finish_msg("set server <b>/<s> fqdn requires a FQDN.");
+                    return;
+                };
+                let px = &ctx.proxies[p_idx];
+                if px.server_resolvers(s_idx).is_none() {
+                    self.finish_msg("set server <b>/<s> fqdn failed because no resolution is configured.");
+                    return;
+                }
+                if px.server_srv_record(s_idx).is_some() {
+                    self.finish_msg("set server <b>/<s> fqdn failed because SRV resolution is configured.");
+                    return;
+                }
+                const BY: &str = " by 'stats socket command'";
+                let cur = px.server_hostname(s_idx);
+                if cur.as_deref() == Some(name) {
+                    self.finish_msg(&format!("no need to change the FDQN{BY}"));
+                    return;
+                }
+                if name.len() > 255 || ibex_config::server_state_file::invalid_domain(name) {
+                    self.finish_msg(&format!("invalid fqdn '{name}'{BY}"));
+                    return;
+                }
+                // `resolv_str_to_dn_label`: an empty label (a final dot aside) is refused.
+                let dn = |n: &str| n.strip_suffix('.').unwrap_or(n).to_ascii_lowercase();
+                let new_dn = dn(name);
+                if new_dn.is_empty() || new_dn.split('.').any(str::is_empty) {
+                    self.finish_msg(&format!("could not update {target} FQDN{BY}"));
+                    return;
+                }
+                // The same name but for case or a final dot is the same resolution: the
+                // server keeps its name (`srv_set_fqdn` returns before changing it).
+                if cur.as_deref().map(dn) != Some(new_dn) {
+                    px.set_server_hostname(s_idx, name);
+                    crate::resolvers::request_fqdn(p_idx, s_idx, name);
+                }
+                self.finish_msg(&format!("{target} changed its FQDN from {} to {name}{BY}", cur.as_deref().unwrap_or("(null)")));
+            }
             _ => self.finish_msg(USAGE),
         }
     }

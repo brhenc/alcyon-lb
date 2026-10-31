@@ -80,6 +80,8 @@ pub enum TcpReqContentAction {
     TrackSc1 { expr: String, table: Option<String> },
     TrackSc2 { expr: String, table: Option<String> },
     SetVar { var_name: String, expr: String },
+    /// `do-resolve(<var>,<resolvers>[,ipv4|ipv6]) <expr>` (T489).
+    DoResolve(crate::ast::DoResolve),
     SetVarFmt { var_name: String, fmt: String },
     UnsetVar { var_name: String },
     SetSrc { expr: String },

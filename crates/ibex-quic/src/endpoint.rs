@@ -18,6 +18,66 @@ use crate::error::{QuicError, Result};
 use crate::table::ConnectionTable;
 use crate::transport::{DatagramOutcome, EcnCodepoint, QuicTransport, TransportEvent, Transmit};
 
+/// The receive block's size ([`CopyBlock`]): the listener's datagram buffer.
+const RX_BLOCK: usize = 2048;
+/// The STREAM write block's size ([`CopyBlock`]): a standard buffer.
+const TX_BLOCK: usize = 16384;
+
+/// A block that what quinn-proto takes as an owned `BytesMut`/`Bytes` (a received datagram,
+/// STREAM data written) is copied into and cut from (T512). A new buffer for each was one or
+/// two allocations (the bytes, then the shared header once quinn splits it); pieces cut from
+/// one block share its header, and the block's space is used again once quinn has dropped
+/// every piece (`try_reclaim`, which allocates nothing). While quinn still holds a piece past
+/// the free space (stream data not read yet, data not acked, an `Incoming` not accepted),
+/// [`CopyBlock::copy`] says no and the caller allocates as before (a new block for a datagram,
+/// so a datagram quinn holds pins one block, as its own buffer did; quinn's own copy for a
+/// STREAM write). Under `tune.ibex.zero-buffers`, what
+/// the pieces left is wiped when the block starts over (quinn decrypts datagrams in place, so
+/// it is plaintext either way).
+struct CopyBlock {
+    buf: BytesMut,
+    /// Bytes written since the block last started over.
+    fill: usize,
+    size: usize,
+}
+
+impl CopyBlock {
+    fn new(size: usize) -> Self {
+        Self { buf: BytesMut::with_capacity(size), fill: 0, size }
+    }
+
+    /// `data` copied into the block, or `None`: empty or larger than a block, or the block's free space
+    /// too small and a piece of it still held. `wipe`: `tune.ibex.zero-buffers`.
+    fn copy(&mut self, data: &[u8], wipe: bool) -> Option<BytesMut> {
+        let n = data.len();
+        if n == 0 || n > self.size {
+            return None;
+        }
+        if self.buf.capacity() < n {
+            if !self.buf.try_reclaim(n) {
+                return None;
+            }
+            // Back at the block's start: what the earlier pieces left is stale.
+            if wipe {
+                self.buf.resize(self.fill, 0);
+                ibex_alloc::wipe_bytes(&mut self.buf);
+                self.buf.clear();
+            }
+            self.fill = 0;
+        }
+        self.buf.extend_from_slice(data);
+        self.fill += n;
+        Some(self.buf.split())
+    }
+
+    /// A new block (the old one is freed when quinn drops its last piece).
+    fn renew(&mut self) -> &mut Self {
+        self.buf = BytesMut::with_capacity(self.size);
+        self.fill = 0;
+        self
+    }
+}
+
 /// A QUIC server endpoint managing connections, the connection table, and packet dispatch.
 pub struct QuicEndpoint {
     endpoint: Endpoint,
@@ -45,6 +105,10 @@ pub struct QuicEndpoint {
     timer_of: HashMap<ConnectionHandle, Instant>,
     response_buf: Vec<u8>,
     tx_buf: Vec<u8>,
+    /// What each received datagram is copied into for quinn-proto, which takes it by value.
+    rx: CopyBlock,
+    /// What each STREAM write is copied into for quinn-proto, which keeps it until acked.
+    tx: CopyBlock,
     /// Set by a soft stop: connections already here are served to the end, a new Initial is refused.
     refusing_new: bool,
     /// `quic-force-retry`: every new connection without a valid token gets a Retry.
@@ -194,6 +258,8 @@ impl QuicEndpoint {
             timers: BTreeSet::new(),
             timer_of: HashMap::new(),
             response_buf: Vec::with_capacity(2048),
+            rx: CopyBlock::new(RX_BLOCK),
+            tx: CopyBlock::new(TX_BLOCK),
             tx_buf: Vec::with_capacity(2048),
             refusing_new: false,
             force_retry,
@@ -488,7 +554,8 @@ impl QuicTransport for QuicEndpoint {
         buf: &[u8],
     ) -> Result<DatagramOutcome> {
         self.response_buf.clear();
-        let data = BytesMut::from(buf);
+        let wipe = ibex_alloc::zero_buffers();
+        let data = self.rx.copy(buf, wipe).or_else(|| self.rx.renew().copy(buf, wipe)).unwrap_or_else(|| BytesMut::from(buf));
 
         let event = self
             .endpoint
@@ -803,9 +870,14 @@ impl QuicTransport for QuicEndpoint {
 
         let mut send = conn.send_stream(stream_id.into());
         // Flow control or the send buffer full is not an error: nothing was taken, and the
-        // caller keeps the bytes until the stream is writable again.
-        let written = send
-            .write(buf)
+        // caller keeps the bytes until the stream is writable again. The bytes go in as a
+        // piece of `tx` (T512), else as quinn's own copy (`write`) as before; what quinn does
+        // not take of a piece is dropped with it.
+        let wrote = match self.tx.copy(buf, ibex_alloc::zero_buffers()) {
+            Some(piece) => send.write_chunks(&mut [piece.freeze()]).map(|w| w.bytes),
+            None => send.write(buf),
+        };
+        let written = wrote
             .or_else(|e| if e == quinn_proto::WriteError::Blocked { Ok(0) } else { Err(e) })
             .map_err(|e| QuicError::Transport(format!("stream write error: {e}")))?;
 
@@ -882,3 +954,39 @@ impl QuicTransport for QuicEndpoint {
     }
 }
 
+#[cfg(test)]
+mod copy_block_tests {
+    use super::CopyBlock;
+
+    /// T512: pieces share the block while it has room; once quinn has dropped them all the
+    /// block starts over (wiped when asked) instead of a new buffer.
+    #[test]
+    fn a_block_is_reused_once_every_piece_is_dropped() {
+        for wipe in [false, true] {
+            let mut b = CopyBlock::new(8);
+            let one = b.copy(b"abcde", wipe).expect("room");
+            let two = b.copy(b"fg", wipe).expect("room");
+            assert_eq!((&one[..], &two[..]), (&b"abcde"[..], &b"fg"[..]));
+            // No room past the pieces, and a piece still held: no.
+            assert!(b.copy(b"xyz", wipe).is_none());
+            drop(one);
+            assert!(b.copy(b"xyz", wipe).is_none(), "`two` still holds the block");
+            drop(two);
+            let three = b.copy(b"xyz", wipe).expect("the block starts over");
+            assert_eq!(&three[..], b"xyz");
+            assert_eq!(b.fill, 3);
+        }
+    }
+
+    /// Empty, larger than a block: no; a new block takes what the held one cannot.
+    #[test]
+    fn what_a_block_cannot_take_is_refused() {
+        let mut b = CopyBlock::new(4);
+        assert!(b.copy(b"", false).is_none());
+        assert!(b.copy(b"12345", false).is_none());
+        let held = b.copy(b"1234", false).expect("room");
+        assert!(b.copy(b"5", false).is_none());
+        assert_eq!(&b.renew().copy(b"5", false).expect("a new block")[..], b"5");
+        assert_eq!(&held[..], b"1234");
+    }
+}

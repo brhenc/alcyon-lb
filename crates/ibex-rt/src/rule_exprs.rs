@@ -275,6 +275,7 @@ fn http_req(a: &HttpReqAction) -> Exprs<'_> {
             vec![("set-retries".into(), expr, false)]
         }
         HttpReqAction::SetVar { var_name, expr } => vec![(format!("set-var({var_name})"), expr, false)],
+        HttpReqAction::DoResolve(d) => vec![("do-resolve".into(), &d.expr, false)],
         HttpReqAction::Capture { expr, .. } => vec![("capture".into(), expr, false)],
         HttpReqAction::Pause { expr: Some(expr), .. } => vec![("pause".into(), expr, false)],
         HttpReqAction::HeadersBin { op, expr, .. } => vec![(op.keyword().into(), expr, false)],
@@ -347,6 +348,7 @@ fn tcp_content(a: &TcpReqContentAction) -> Exprs<'_> {
         TcpReqContentAction::TrackSc1 { expr, .. } => vec![track(1, expr)],
         TcpReqContentAction::TrackSc2 { expr, .. } => vec![track(2, expr)],
         TcpReqContentAction::SetVar { var_name, expr } => vec![(format!("set-var({var_name})"), expr, false)],
+        TcpReqContentAction::DoResolve(d) => vec![("do-resolve".into(), &d.expr, false)],
         TcpReqContentAction::SetSrc { expr } => vec![("set-src".into(), expr, false)],
         TcpReqContentAction::SetDst { expr } => vec![("set-dst".into(), expr, false)],
         TcpReqContentAction::Capture { expr, .. } => vec![("capture".into(), expr, false)],

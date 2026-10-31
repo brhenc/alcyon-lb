@@ -16,13 +16,15 @@
 # The scenario body is a config with @FE@ and @BE@ for the two ports (tools/measure/scenarios/),
 # and @CRT@ for a certificate and key (IBEX_MEASURE_CRT, else a self-signed P-256 one made in
 # <outdir>).
+# The proxy under test is a `cargo build --profile release-perf --bin ibex` binary
+# (target/release-perf/ibex, T518: the budget is judged on one fat-LTO layout, not `release`).
 # Pins the proxy to CPU 4, the client to 5, the backend to 6 (as measure.py); IBEX_MEASURE_CPUS
 # "a,b,c" overrides. Warms up with 2000 requests, then counts the proxy process's user-space
 # instructions over each round and prints instructions per request. Takes no lock: hold
 # `flock -x /tmp/ibex-load.lock` around a batch, and keep a batch under 15 minutes. Needs
 # $HOME/ibex-targets/gate-slot1/release/measure-bench (MEASURE_BENCH overrides).
 set -u
-if [ $# -ne 7 ]; then sed -n '5,23p' "$0"; exit 2; fi
+if [ $# -ne 7 ]; then sed -n '5,25p' "$0"; exit 2; fi
 LABEL=$1; BIN=$2; BODY=$3; CL=$4; N=$5; ROUNDS=$6; OUT=$7
 mkdir -p "$OUT" || exit 1
 BENCH=${MEASURE_BENCH:-$HOME/ibex-targets/gate-slot1/release/measure-bench}

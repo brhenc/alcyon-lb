@@ -404,7 +404,10 @@ fn parse_tcp_req_content_at(
     }
     let act_tok = &tokens[2];
     let act_str = &act_tok.text;
-    if let Some(rule) = parse_tcp_content_var(tokens, act_str)? {
+    if act_str == "do-resolve" || act_str.starts_with("do-resolve(") {
+        let (dr, cond) = super::resolvers::parse_do_resolve("tcp-request content", tokens, 3)?;
+        rules.push(TcpReqContentRule { action: TcpReqContentAction::DoResolve(dr), cond, line: 0 });
+    } else if let Some(rule) = parse_tcp_content_var(tokens, act_str)? {
         rules.push(rule);
     } else if let Some(sc) = parse_sc_counter_action(act_str, "sc-inc-gpc0", act_tok)? {
         let (_, cond) = parse_rule_condition(tokens, 3)?;

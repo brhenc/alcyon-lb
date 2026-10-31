@@ -235,6 +235,58 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
     let _ = be.join();
 }
 
+/// T519: with `retry-on 503` armed the request is kept to be sent again (`l7_buffer`). Its copy
+/// came from the heap (`data.to_vec()` in a `Box`: 2 allocations per request, found by T517);
+/// it is a buffer of the pool now, given back with the transaction.
+#[test]
+fn a_request_with_retry_on_a_status_copies_it_into_a_pooled_buffer() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let (srv_listener, srv_addr) = loopback0();
+    let fe_addr = common::reserve_addr();
+    let running = Arc::new(AtomicBool::new(true));
+    let be = start_dummy_http_backend(srv_listener, Arc::clone(&running));
+
+    let fe = FrontendSection {
+        name: "fe_retry".into(),
+        bind: Some(fe_addr),
+        mode: Mode::Http,
+        default_backend: Some("be_retry".into()),
+        clitimeout: Some(Duration::from_secs(5)),
+        ..Default::default()
+    };
+    let config = Config {
+        frontends: vec![fe],
+        backends: vec![BackendSection {
+            name: "be_retry".into(),
+            mode: Mode::Http,
+            contimeout: Some(Duration::from_secs(5)),
+            srvtimeout: Some(Duration::from_secs(5)),
+            retry_on: ibex_config::RE_CONN_FAILED | 0x2000, // retry-on conn-failure 503
+            servers: vec![Server::new("s1", srv_addr)],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine = Engine::new(&config, 64).expect("Engine::new");
+
+    drive_single_http_request(fe_addr, &mut engine);
+    drive_single_http_request(fe_addr, &mut engine);
+    let before = ibex_alloc::alloc_counters();
+    drive_single_http_request(fe_addr, &mut engine);
+    let diff = before.diff(&ibex_alloc::alloc_counters());
+    println!("[MEASUREMENT T519] retry-on 503 request: {} allocs, {} bytes", diff.alloc_count, diff.bytes_allocated);
+    assert!(
+        diff.alloc_count <= 2,
+        "a retry-on request allocated {} times (> 2, the plain request's); diff: {diff:?}",
+        diff.alloc_count
+    );
+    assert!(diff.bytes_allocated <= 102, "a retry-on request allocated {} bytes (> 102)", diff.bytes_allocated);
+
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}
+
 /// The request-line version check runs on every HTTP/1 request (proxy.rs, before the
 /// head is parsed): it must not allocate. T286 added it with a `Vec` of the line's
 /// tokens, 64 bytes per request (measuring gate on 18bddeb: Bytes / req 151 -> 191).

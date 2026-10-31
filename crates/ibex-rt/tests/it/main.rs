@@ -333,6 +333,7 @@ mod response_head_validation;
 mod response_te;
 mod response_rule_actions;
 mod retry_on;
+mod retry_on_reused_close;
 mod rfc7239_field;
 mod roundrobin_after_direct;
 mod sc_src_fetches;

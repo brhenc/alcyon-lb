@@ -357,6 +357,7 @@ pub fn http_req(rules: &[ibex_config::HttpReqRule], acls: &Acls) -> Vec<Rule> {
         .map(|r| {
             let (expr, fmt) = match &r.action {
                 HttpReqAction::Capture { expr, .. }
+                | HttpReqAction::DoResolve(ibex_config::ast::DoResolve { expr, .. })
                 | HttpReqAction::SetVar { expr, .. }
                 | HttpReqAction::TrackSc0 { expr, .. }
                 | HttpReqAction::TrackSc1 { expr, .. }
@@ -540,6 +541,7 @@ pub fn tcp_req_content(rules: &[ibex_config::TcpReqContentRule], acls: &Acls) ->
                 | TcpReqContentAction::TrackSc1 { expr, .. }
                 | TcpReqContentAction::TrackSc2 { expr, .. }
                 | TcpReqContentAction::SetVar { expr, .. }
+                | TcpReqContentAction::DoResolve(ibex_config::ast::DoResolve { expr, .. })
                 | TcpReqContentAction::SetSrc { expr }
                 | TcpReqContentAction::SetDst { expr }
                 | TcpReqContentAction::SetSrcPort { expr }
