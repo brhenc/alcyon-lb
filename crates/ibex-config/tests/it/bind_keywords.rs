@@ -59,10 +59,41 @@ fn listen_accept_proxy_v2_is_kept() {
     assert!(cfg.listens[0].binds[0].accept_proxy_v2);
 }
 
+/// T530: `listen` takes a QUIC bind as a frontend does (`haproxy -c`, 3.5-dev7 +QUIC, accepts it).
 #[test]
-fn listen_refuses_quic() {
-    let err = in_listen("bind quic4@127.0.0.1:8443 ssl crt /tmp/c.pem").unwrap_err();
-    assert!(err.to_string().contains("QUIC"), "{err}");
+fn listen_accepts_quic() {
+    let cfg = in_listen("bind quic4@127.0.0.1:8443 ssl crt /tmp/c.pem alpn h3").unwrap();
+    let b = &cfg.listens[0].binds[0];
+    assert!(b.quic && b.ssl && b.alpn == ["h3"], "{b:?}");
+}
+
+/// Measured: `bind quic4@... ssl crt c.pem` in a `listen` without `alpn` is accepted, and
+/// `alpn h3` is the default, as in a frontend.
+#[test]
+fn listen_quic_defaults_alpn_to_h3() {
+    let cfg = in_listen("bind quic4@127.0.0.1:8443 ssl crt /tmp/c.pem").unwrap();
+    assert_eq!(cfg.listens[0].binds[0].alpn, ["h3"]);
+}
+
+/// Measured: without `ssl` the warning is followed by `Proxy 'x': no SSL certificate
+/// specified for bind` and the configuration is refused.
+#[test]
+fn listen_quic_without_ssl_is_refused() {
+    let err = in_listen("bind quic4@127.0.0.1:8443").unwrap_err();
+    assert!(err.to_string().contains("no SSL certificate"), "{err}");
+}
+
+/// Measured: `mode tcp` listen: `proxy 'x' : MUX protocol 'quic' is not usable for
+/// 'bind quic4@127.0.0.1:61071' at [file:7].`
+#[test]
+fn listen_quic_in_tcp_mode_is_refused() {
+    let err = parse_str(&format!(
+        "{}listen x\n  mode tcp\n  bind quic4@127.0.0.1:61071 ssl crt /tmp/c.pem alpn h3\n",
+        DEFAULTS
+    ))
+    .unwrap_err();
+    let text = format!("{err:?} {err}");
+    assert!(text.contains("proxy 'x' : MUX protocol 'quic' is not usable for 'bind quic4@127.0.0.1:61071'"), "{text}");
 }
 
 #[test]

@@ -1674,6 +1674,15 @@ pub(crate) fn validate_config(
             ));
         }
     }
+    for l in listens.iter().filter(|l| l.mode != Mode::Http) {
+        for b in l.binds.iter().filter(|b| b.quic) {
+            let family = if b.addr.is_ipv6() { "quic6" } else { "quic4" };
+            quic_alerts.push((
+                b.line,
+                format!("proxy '{}' : MUX protocol 'quic' is not usable for 'bind {family}@{}' at {{at}}.", l.name, b.addr),
+            ));
+        }
+    }
     if !quic_alerts.is_empty() {
         return Err(ConfigError::alerts(quic_alerts));
     }
