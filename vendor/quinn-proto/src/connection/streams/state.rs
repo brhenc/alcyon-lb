@@ -72,6 +72,9 @@ pub struct StreamsState {
     pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
     pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
     pub(super) free_recv: Vec<StreamRecv>,
+    /// Freed `Send`s, reset, kept for the next stream of this connection (Ibex T543): a stream
+    /// costs no allocation once the connection has had as many streams open at once
+    pub(super) free_send: Vec<Box<Send>>,
     pub(super) next: [u64; 2],
     /// Maximum number of locally-initiated streams that may be opened over the lifetime of the
     /// connection so far, per direction
@@ -158,6 +161,7 @@ impl StreamsState {
             send: FxHashMap::default(),
             recv: FxHashMap::default(),
             free_recv: Vec::new(),
+            free_send: Vec::new(),
             next: [0, 0],
             max: [0, 0],
             max_remote: [max_remote_bi.into(), max_remote_uni.into()],
@@ -270,7 +274,7 @@ impl StreamsState {
         let rs = match self
             .recv
             .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
+            .map(get_or_insert_recv(self.stream_receive_window, &mut self.free_recv))
         {
             Some(rs) => rs,
             None => {
@@ -323,7 +327,7 @@ impl StreamsState {
         let rs = match self
             .recv
             .get_mut(&id)
-            .map(get_or_insert_recv(self.stream_receive_window))
+            .map(get_or_insert_recv(self.stream_receive_window, &mut self.free_recv))
         {
             Some(stream) => stream,
             None => {
@@ -373,7 +377,7 @@ impl StreamsState {
         let stream = match self
             .send
             .get_mut(&id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, &mut self.free_send))
         {
             Some(ss) => ss,
             None => return,
@@ -391,7 +395,9 @@ impl StreamsState {
             hash_map::Entry::Vacant(_) => {}
             hash_map::Entry::Occupied(e) => {
                 if let Some(SendState::ResetSent) = e.get().as_ref().map(|s| s.state) {
-                    e.remove_entry();
+                    if let (_, Some(s)) = e.remove_entry() {
+                        self.send_freed(s);
+                    }
                     self.stream_freed(id, StreamHalf::Send);
                 }
             }
@@ -720,7 +726,9 @@ impl StreamsState {
             return;
         }
 
-        entry.remove_entry();
+        if let (_, Some(s)) = entry.remove_entry() {
+            self.send_freed(s);
+        }
         self.stream_freed(id, StreamHalf::Send);
         self.events.push_back(StreamEvent::Finished { id });
     }
@@ -804,7 +812,7 @@ impl StreamsState {
         if let Some(ss) = self
             .send
             .get_mut(&id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, &mut self.free_send))
         {
             if ss.increase_max_data(offset) {
                 if write_limit > 0 {
@@ -950,8 +958,10 @@ impl StreamsState {
         }
         // bidirectional OR (unidirectional AND remote)
         if bi || remote {
-            let recv = self.free_recv.pop();
-            assert!(self.recv.insert(id, recv).is_none());
+            // A freed `Recv` is taken at the stream's first use (`get_or_insert_recv`), not here:
+            // slots are made available up to the stream limit ahead of use, so popping here
+            // left the free list empty for the streams already made available (Ibex T543)
+            assert!(self.recv.insert(id, None).is_none());
         }
     }
 
@@ -1003,6 +1013,12 @@ impl StreamsState {
         }
     }
 
+    /// Keep a freed `Send` for the next stream, its data released (Ibex T543)
+    pub(super) fn send_freed(&mut self, mut send: Box<Send>) {
+        send.free();
+        self.free_send.push(send);
+    }
+
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
         self.free_recv.push(recv.free(self.stream_receive_window));
         self.stream_freed(id, StreamHalf::Recv);
@@ -1023,20 +1039,34 @@ impl StreamsState {
 #[inline]
 pub(super) fn get_or_insert_send(
     max_data: VarInt,
-) -> impl Fn(&mut Option<Box<Send>>) -> &mut Box<Send> {
-    move |opt| opt.get_or_insert_with(|| Send::new(max_data))
+    free: &mut Vec<Box<Send>>,
+) -> impl FnOnce(&mut Option<Box<Send>>) -> &mut Box<Send> + '_ {
+    move |opt| {
+        opt.get_or_insert_with(|| match free.pop() {
+            Some(mut s) => {
+                s.reinit(max_data);
+                s
+            }
+            None => Send::new(max_data),
+        })
+    }
 }
 
 #[inline]
 pub(super) fn get_or_insert_recv(
     initial_max_data: u64,
-) -> impl FnMut(&mut Option<StreamRecv>) -> &mut Recv {
+    free: &mut Vec<StreamRecv>,
+) -> impl FnOnce(&mut Option<StreamRecv>) -> &mut Recv + '_ {
     move |opt| {
         *opt = opt.take().map(|s| match s {
             StreamRecv::Free(recv) => StreamRecv::Open(recv),
             s => s,
         });
-        opt.get_or_insert_with(|| StreamRecv::Open(Recv::new(initial_max_data)))
+        // A freed `Recv` (already reinitialised by `StreamRecv::free`) before a new one (Ibex T543)
+        opt.get_or_insert_with(|| match free.pop() {
+            Some(s) => StreamRecv::Open(s.into_inner()),
+            None => StreamRecv::Open(Recv::new(initial_max_data)),
+        })
             .as_open_recv_mut()
             .unwrap()
     }

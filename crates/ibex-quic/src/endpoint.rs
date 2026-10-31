@@ -16,7 +16,7 @@ use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Ser
 use crate::config::QuicConfig;
 use crate::connection::{ConnectionId, ReadStreamResult, StreamDirection, StreamId};
 use crate::error::{QuicError, Result};
-use crate::table::{ConnectionTable, HandleMap};
+use crate::table::{ConnectionTable, HandleHasher, HandleMap};
 use crate::transport::{DatagramOutcome, EcnCodepoint, QuicTransport, TransportEvent, Transmit};
 
 /// The receive block's size ([`CopyBlock`]): the listener's datagram buffer.
@@ -94,11 +94,20 @@ pub struct QuicEndpoint {
     pending_transmits: VecDeque<TransmitEntry>,
     event_queue: VecDeque<TransportEvent>,
     active_handles: Vec<ConnectionHandle>,
-    round_robin_idx: usize,
     next_timeout: Option<Instant>,
     /// How many times a connection's `poll_timeout` was asked (a test counter: the cost of a
     /// datagram must not grow with the number of idle connections).
     timeout_polls: u64,
+    /// How many times a connection was asked for a packet (a test counter, T543).
+    transmit_polls: u64,
+    /// The connections that may have a packet to send: something reached them (a datagram, a
+    /// timer, a stream call, a close) since they last had none (T543). quinn-proto changes
+    /// only through such calls, so a connection outside this queue has nothing to send, and
+    /// `poll_transmit` does not ask it: its empty `poll_transmit` re-checks every space, path
+    /// and queue, and the h3 listener drains transmits ~8 times a request.
+    to_poll: VecDeque<ConnectionHandle>,
+    /// Membership of `to_poll`.
+    queued: std::collections::HashSet<ConnectionHandle, std::hash::BuildHasherDefault<HandleHasher>>,
     /// Every connection's next deadline, ordered: the earliest is the first element. A
     /// connection is re-keyed (`refresh_timer`) only when its own timeout may have changed.
     timers: BTreeSet<(Instant, usize)>,
@@ -284,9 +293,11 @@ impl QuicEndpoint {
             pending_transmits: VecDeque::new(),
             event_queue: VecDeque::new(),
             active_handles: Vec::new(),
-            round_robin_idx: 0,
             next_timeout: None,
             timeout_polls: 0,
+            transmit_polls: 0,
+            to_poll: VecDeque::new(),
+            queued: std::collections::HashSet::default(),
             timers: BTreeSet::new(),
             timer_of: HandleMap::default(),
             response_buf: Vec::with_capacity(2048),
@@ -350,6 +361,7 @@ impl QuicEndpoint {
     pub fn stop_sending(&mut self, conn_id: ConnectionId, stream_id: StreamId, error_code: u64) {
         let Ok(code) = VarInt::from_u64(error_code) else { return };
         let Some(handle) = self.connection_table.lookup(&conn_id) else { return };
+        self.mark(handle);
         if let Some(conn) = self.connections.get_mut(&handle) {
             let _ = conn.recv_stream(stream_id.into()).stop(code);
         }
@@ -379,6 +391,18 @@ impl QuicEndpoint {
     #[must_use]
     pub const fn timeout_polls(&self) -> u64 {
         self.timeout_polls
+    }
+
+    /// Something reached this connection: ask it for packets (`to_poll`).
+    fn mark(&mut self, handle: ConnectionHandle) {
+        if self.queued.insert(handle) {
+            self.to_poll.push_back(handle);
+        }
+    }
+
+    /// Number of times a connection was asked for a packet (see the `transmit_polls` field).
+    pub const fn transmit_polls(&self) -> u64 {
+        self.transmit_polls
     }
 
     /// Whether `bytes` may be sent to `handle` under its anti-amplification budget.
@@ -680,6 +704,7 @@ impl QuicTransport for QuicEndpoint {
                         self.connection_table.insert(primary_cid, handle);
                         self.handle_to_primary_cid.insert(handle, primary_cid);
                         self.connections.insert(handle, conn);
+                        self.mark(handle);
                         self.active_handles.push(handle);
                         let mut budget = AmplificationBudget::new(buf.len() as u64, self.anti_amplification_factor);
                         // A Retry token validates the address (RFC 9000 §8.1.2): no
@@ -726,6 +751,7 @@ impl QuicTransport for QuicEndpoint {
                 if let Some(budget) = self.amplification_budgets.get_mut(&handle) {
                     budget.record_received(buf.len() as u64);
                 }
+                self.mark(handle);
                 if let Some(conn) = self.connections.get_mut(&handle) {
                     conn.handle_event(conn_evt);
                     self.drive_connection(handle, now);
@@ -767,16 +793,11 @@ impl QuicTransport for QuicEndpoint {
             }
         }
 
-        // 2. Second priority: connection-level transmits (fair round-robin)
-        if self.active_handles.is_empty() {
-            return None;
-        }
-
-        let num_handles = self.active_handles.len();
-        for _ in 0..num_handles {
-            let idx = self.round_robin_idx % num_handles;
-            self.round_robin_idx = self.round_robin_idx.wrapping_add(1);
-            let handle = self.active_handles[idx];
+        // 2. Second priority: connection-level transmits, round-robin over the connections
+        // that may have one (`to_poll`, T543). One that hands a packet goes to the back of
+        // the queue; one that has none leaves it until something reaches it again.
+        for _ in 0..self.to_poll.len() {
+            let Some(handle) = self.to_poll.pop_front() else { break };
 
             // Decide before asking for a packet, not after. `poll_transmit` assigns a packet
             // number and arms loss recovery before it returns, so a packet refused afterwards
@@ -788,15 +809,20 @@ impl QuicTransport for QuicEndpoint {
                 .get(&handle)
                 .map(|c| (u64::from(c.current_mtu()), c.is_handshaking()))
             else {
+                self.queued.remove(&handle);
                 continue;
             };
             if handshaking && !self.may_send(handle, mtu) {
+                // No budget until the client sends more, which marks it again.
+                self.queued.remove(&handle);
                 continue;
             }
 
             if let Some(conn) = self.connections.get_mut(&handle) {
                 self.tx_buf.clear();
+                self.transmit_polls += 1;
                 if let Some(tx) = conn.poll_transmit(now, 1, &mut self.tx_buf) {
+                    self.to_poll.push_back(handle);
                     let size = tx.size.min(out.len()).min(self.tx_buf.len());
 
                     // Drive any endpoint events produced during transmit
@@ -831,6 +857,12 @@ impl QuicTransport for QuicEndpoint {
                         ecn: tx.ecn.map(EcnCodepoint::from),
                     });
                 }
+                // Nothing to send: off the queue. An empty poll can still arm a timer (pacing),
+                // which wakes it through `handle_timeout`.
+                self.queued.remove(&handle);
+                self.refresh_timer(handle);
+            } else {
+                self.queued.remove(&handle);
             }
         }
 
@@ -853,6 +885,7 @@ impl QuicTransport for QuicEndpoint {
             expired.push(ConnectionHandle(h));
         }
         for &handle in &expired {
+            self.mark(handle);
             if let Some(conn) = self.connections.get_mut(&handle) {
                 conn.handle_timeout(now);
             }
@@ -871,6 +904,7 @@ impl QuicTransport for QuicEndpoint {
 
     fn open_stream(&mut self, conn_id: ConnectionId, dir: StreamDirection) -> Result<StreamId> {
         let handle = self.get_handle(&conn_id)?;
+        self.mark(handle);
         let conn = self
             .connections
             .get_mut(&handle)
@@ -884,6 +918,7 @@ impl QuicTransport for QuicEndpoint {
 
     fn accept_stream(&mut self, conn_id: ConnectionId, dir: StreamDirection) -> Option<StreamId> {
         let handle = self.connection_table.lookup(&conn_id)?;
+        self.mark(handle);
         let conn = self.connections.get_mut(&handle)?;
         conn.streams().accept(dir.into()).map(StreamId::from)
     }
@@ -895,6 +930,7 @@ impl QuicTransport for QuicEndpoint {
         buf: &mut [u8],
     ) -> Result<ReadStreamResult> {
         let handle = self.get_handle(&conn_id)?;
+        self.mark(handle);
         let conn = self
             .connections
             .get_mut(&handle)
@@ -942,6 +978,7 @@ impl QuicTransport for QuicEndpoint {
         fin: bool,
     ) -> Result<usize> {
         let handle = self.get_handle(&conn_id)?;
+        self.mark(handle);
         let conn = self
             .connections
             .get_mut(&handle)
@@ -972,6 +1009,7 @@ impl QuicTransport for QuicEndpoint {
 
     fn finish_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) -> Result<()> {
         let handle = self.get_handle(&conn_id)?;
+        self.mark(handle);
         let conn = self
             .connections
             .get_mut(&handle)
@@ -987,6 +1025,7 @@ impl QuicTransport for QuicEndpoint {
     fn reset_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId, error_code: u64) -> Result<()> {
         let code = VarInt::from_u64(error_code).map_err(|e| QuicError::Transport(format!("error code: {e}")))?;
         let handle = self.get_handle(&conn_id)?;
+        self.mark(handle);
         let conn = self
             .connections
             .get_mut(&handle)
@@ -999,6 +1038,7 @@ impl QuicTransport for QuicEndpoint {
 
     fn close_connection(&mut self, conn_id: ConnectionId, error_code: u64, reason: &[u8]) {
         if let Some(handle) = self.connection_table.lookup(&conn_id) {
+            self.mark(handle);
             if let Some(conn) = self.connections.get_mut(&handle) {
                 if let Ok(code) = VarInt::from_u64(error_code) {
                     conn.close(Instant::now(), code, Bytes::copy_from_slice(reason));

@@ -180,6 +180,9 @@ pub struct Connection {
     highest_space: SpaceId,
     /// 1-RTT keys used prior to a key update
     prev_crypto: Option<PrevCrypto>,
+    /// Emptied `Retransmits` boxes of acknowledged or lost packets, for the next packets'
+    /// control frames (Ibex T543)
+    spare_retransmits: Vec<Box<Retransmits>>,
     /// 1-RTT keys to be used for the next key update
     ///
     /// These are generated in advance to prevent timing attacks and/or DoS by third-party attackers
@@ -317,6 +320,7 @@ impl Connection {
             spaces: [initial_space, PacketSpace::new(now), PacketSpace::new(now)],
             highest_space: SpaceId::Initial,
             prev_crypto: None,
+            spare_retransmits: Vec::new(),
             next_crypto: None,
             accepted_0rtt: false,
             permit_idle_reset: true,
@@ -1633,6 +1637,7 @@ impl Connection {
                 self.streams.reset_acked(*id);
             }
         }
+        info.retransmits.recycle(&mut self.spare_retransmits);
 
         for frame in info.stream_frames {
             self.streams.received_ack_of(frame);
@@ -1790,7 +1795,8 @@ impl Connection {
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);
                 }
-                self.spaces[pn_space].pending |= info.retransmits;
+                info.retransmits
+                    .requeue(&mut self.spaces[pn_space].pending, &mut self.spare_retransmits);
                 self.path.mtud.on_non_probe_lost(packet, info.size);
             }
 
@@ -3161,7 +3167,10 @@ impl Connection {
         max_size: usize,
         pn: u64,
     ) -> SentFrames {
-        let mut sent = SentFrames::default();
+        let mut sent = SentFrames {
+            retransmits: ThinRetransmits::from_spare(&mut self.spare_retransmits),
+            ..SentFrames::default()
+        };
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
         space.pending_acks.maybe_ack_non_eliciting();

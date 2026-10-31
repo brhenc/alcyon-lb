@@ -192,10 +192,11 @@ impl PacketBuilder {
         let exact_number = self.exact_number;
         let space_id = self.space;
         let (size, padded) = self.finish(conn, now, buffer);
-        let sent = match sent {
+        let mut sent = match sent {
             Some(sent) => sent,
             None => return,
         };
+        sent.retransmits.return_if_vacant(&mut conn.spare_retransmits);
 
         let size = match padded || ack_eliciting {
             true => size as u16,

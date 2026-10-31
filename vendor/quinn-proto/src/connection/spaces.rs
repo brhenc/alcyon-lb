@@ -358,14 +358,36 @@ impl Retransmits {
             && !self.max_stream_id.into_iter().any(|x| x)
             && self.reset_stream.is_empty()
             && self.stop_sending.is_empty()
-            && self
-                .max_stream_data
-                .iter()
-                .all(|&id| !streams.can_send_flow_control(id))
-            && self
-                .stream_data_blocked
-                .iter()
-                .all(|&id| streams.stream_data_blocked_limit(id).is_none())
+            // The length first (Ibex T543): iterating an emptied set scans all its buckets, and
+            // this runs for every packet built and every `poll_transmit`
+            && (self.max_stream_data.is_empty()
+                || self
+                    .max_stream_data
+                    .iter()
+                    .all(|&id| !streams.can_send_flow_control(id)))
+            && (self.stream_data_blocked.is_empty()
+                || self
+                    .stream_data_blocked
+                    .iter()
+                    .all(|&id| streams.stream_data_blocked_limit(id).is_none()))
+            && self.crypto.is_empty()
+            && self.new_cids.is_empty()
+            && self.retire_cids.is_empty()
+            && !self.ack_frequency
+            && !self.handshake_done
+            && self.new_tokens.is_empty()
+    }
+
+    /// Whether nothing at all is recorded (`is_empty` also calls empty what `streams` no longer
+    /// needs): a box in this state can be handed back to the spares (Ibex T543)
+    fn is_vacant(&self) -> bool {
+        !self.max_data
+            && !self.data_blocked
+            && !self.max_stream_id.into_iter().any(|x| x)
+            && self.reset_stream.is_empty()
+            && self.stop_sending.is_empty()
+            && self.max_stream_data.is_empty()
+            && self.stream_data_blocked.is_empty()
             && self.crypto.is_empty()
             && self.new_cids.is_empty()
             && self.retire_cids.is_empty()
@@ -440,6 +462,40 @@ impl ThinRetransmits {
         }
     }
 
+    /// Start a packet's record with a spare box, so that the frames it carries do not allocate
+    /// one (Ibex T543)
+    pub(super) fn from_spare(spare: &mut Vec<Box<Retransmits>>) -> Self {
+        Self {
+            retransmits: spare.pop(),
+        }
+    }
+
+    /// Hand an unused box back to the spares (a packet that carried no retransmittable frame),
+    /// leaving `self` empty (Ibex T543)
+    pub(super) fn return_if_vacant(&mut self, spare: &mut Vec<Box<Retransmits>>) {
+        if self.retransmits.as_deref().is_some_and(Retransmits::is_vacant) {
+            spare_push(spare, self.retransmits.take().unwrap());
+        }
+    }
+
+    /// Drop what the box holds and keep the box for another packet (Ibex T543)
+    pub(super) fn recycle(self, spare: &mut Vec<Box<Retransmits>>) {
+        if let Some(mut b) = self.retransmits {
+            if !b.is_vacant() {
+                *b = Retransmits::default();
+            }
+            spare_push(spare, b);
+        }
+    }
+
+    /// `*pending |= self`, keeping the box for another packet (Ibex T543)
+    pub(super) fn requeue(self, pending: &mut Retransmits, spare: &mut Vec<Box<Retransmits>>) {
+        if let Some(mut b) = self.retransmits {
+            *pending |= mem::take(&mut *b);
+            spare_push(spare, b);
+        }
+    }
+
     /// Returns a reference to the retransmits stored in this box
     pub(super) fn get(&self) -> Option<&Retransmits> {
         self.retransmits.as_deref()
@@ -453,6 +509,16 @@ impl ThinRetransmits {
             self.retransmits = Some(Box::default());
         }
         self.retransmits.as_deref_mut().unwrap()
+    }
+}
+
+/// Most `Retransmits` boxes a connection keeps for reuse (Ibex T543): about the packets with
+/// control frames that are in flight at once
+const SPARE_RETRANSMITS: usize = 8;
+
+fn spare_push(spare: &mut Vec<Box<Retransmits>>, b: Box<Retransmits>) {
+    if spare.len() < SPARE_RETRANSMITS {
+        spare.push(b);
     }
 }
 
