@@ -47,8 +47,11 @@ fn server_check_state_stays_small() {
 /// arena (T183: HAProxy keeps ~1 KB per idle client). Box what only some connections use
 /// (`h2_ctx`, `proxy_info`, `pending_resp` are). T442 added 8: the boxed chunk parser of a
 /// response whose rules removed its `Transfer-Encoding` (`HttpTxn::rsp_dechunk`).
+/// T515 added 40: `fc_src`/`fc_dst`/`bc_src` are plain `Option<SocketAddr>` again (T474 had
+/// packed them; unpacking them for every sample context cost ~700 instructions a request on
+/// `rules`, 0.86%). Boxing them would be an allocation per connection.
 #[test]
 fn session_entry_stays_small() {
     let n = size_of::<ibex_rt::engine::SessionEntry>();
-    assert!(n <= 1600, "SessionEntry grew to {n} bytes (bound 1600): one is held per client connection, box the new field");
+    assert!(n <= 1640, "SessionEntry grew to {n} bytes (bound 1640): one is held per client connection, box the new field");
 }
