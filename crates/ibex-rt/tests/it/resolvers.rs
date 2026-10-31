@@ -1069,7 +1069,8 @@ fn show_resolvers_counts_each_nameserver_apart() {
     let ibex = start(dns1.addr, &format!("{FAST}  nameserver ns2 {}\n", dns2.addr), "  server s1 a1.test:80 resolvers r\n", "");
     ibex.wait_state("s1", "10.0.0.9 2 0", 3);
     let (c1, c2) = (counters(&ibex, "r", "ns1"), counters(&ibex, "r", "ns2"));
-    assert!(c1["nx"] >= 1 && c1["valid"] == 0 && c1["update"] == 0, "{c1:?}");
+    // ns1's NX can land after ns2's answer ended the resolution: then it counts `outdated`.
+    assert!(c1["nx"] + c1["outdated"] >= 1 && c1["valid"] == 0 && c1["update"] == 0, "{c1:?}");
     assert!(c2["valid"] >= 1 && c2["update"] == 1 && c2["nx"] == 0, "{c2:?}");
     assert!(c1["sent"] >= 1 && c2["sent"] >= 1);
 }
