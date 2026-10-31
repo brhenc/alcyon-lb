@@ -389,6 +389,40 @@ application no transport-level close; both tell the client the connection ended 
 error, and nothing is served either way. (On the relay path a session rule resets the request
 stream with `H3_REQUEST_CANCELLED`, a 502 before T523: gone with the relay, slice H5.)
 
+## HTTP/3 under the mux: interim responses, trailers and CONNECT (T520)
+
+Measured on HAProxy 3.5-dev7 with QUIC (aioquic client) and, for h2, 3.5-dev8 (curl):
+
+- **Interim responses (`100`, `103`) to an h3 client.** HAProxy 3.5-dev7 sends the interim
+  HEADERS **with the FIN**, which ends the stream: the final response never arrives (`103`
+  from the server, then `200`; `expect: 100-continue`). When the server's `103` and `200` come
+  in one segment it aborts (`BUG_ON htx.c:391`, SIGILL). Both are an HAProxy 3.5-dev regression
+  fixed upstream by 76454cbbf (in 3.5-dev8; 3.0/3.2 unaffected): a QUIC oracle from current master
+  forwards `103` then `200` as Ibex does. Ibex (mux path) follows RFC 9114 4.1:
+  an interim HEADERS without FIN, then the final response; both in one segment are forwarded.
+  The relay path (the default until slice H5) drops interim responses and response trailers.
+  `%B` of such a request: HAProxy counts the interim head (`B=119` for a 103 with one `link`
+  field and a 2-byte `200`), Ibex does not (`B=51`), on h2 and h3.
+- **Interim responses to an h2 client** are forwarded as HAProxy does (they were dropped before).
+- **Response trailers to an h3 client** (mux path): a chunked response's trailer section is one
+  HEADERS frame after the DATA, with the FIN, as HAProxy; `%B` counts the trailer names and
+  values as HAProxy. With `option http-drop-response-trailers` the data ends with the FIN as on
+  HAProxy, but `%B` is smaller by the dropped fields (HAProxy counts them: they are in its HTX
+  message when dropped; Ibex cuts them from the buffer first). **Response trailers to an h2
+  client are still not sent** (HAProxy sends them; known since T381).
+- **CONNECT** under the mux is reset with `H3_REQUEST_REJECTED` (0x10b), extended CONNECT and a
+  `te` other than `trailers` with `H3_MESSAGE_ERROR` (0x10e), the connection staying usable, as
+  HAProxy. The relay answers a CONNECT with a 400 and no reset.
+
+## The HTTP/3 relay has no connection timers (T521, until H5)
+
+HAProxy 3.5-dev7 ends an HTTP/3 connection with a GOAWAY and `CONNECTION_CLOSE H3_NO_ERROR` at
+`timeout http-request` from its start (no request yet) or from a partial head's stream start, and
+at `timeout http-keep-alive` (else `http-request`) from the end of its last stream
+(`qcc_refresh_timeout`). The mux path does the same (`h3_mux_drain.rs`). On the relay path (the
+default) only quinn's 30 s transport idle timeout ends a connection that sends nothing or a
+partial head (RV-16). Gone with the relay, slice H5.
+
 ## `tune.ibex.zero-spares on|off`: an Ibex-only global keyword (S1)
 
 The header rules, samples and formats reuse per-thread spare strings and header lists (`show
@@ -691,3 +725,20 @@ as upper-case hex, integer bare, `true`/`false`, address as text, method quoted)
 prints the stored type name. Within one scope Ibex lists the variables sorted by name; HAProxy walks its
 hash tree, so its order differs between processes (it is seeded per process). A rule must not depend on
 the order in either.
+
+## `show quic`: the one-line form, with `-` where quinn-proto has no value (T524)
+
+`show quic [oneline] [all|clo|be]` prints HAProxy's header and one line per connection with its
+column widths (measured on 3.5-dev7 with QUIC; `show quic help` is byte for byte HAProxy's, as are the
+messages for a bad argument, a bad level and a bad pointer). Differences:
+
+* `in_flight`, `infl_p` and both CIDs print `-`: quinn-proto keeps the bytes and packets in flight and
+  the connection IDs private, and a made-up number is worse than none. `lost_p`, the state
+  (`HDSHK`, `ESTAB`, `CLOSE`; quinn-proto cannot tell `CLOSE` from `DRAIN`) and both addresses are real.
+* The first column is the first eight bytes of the first Initial's destination CID, not a pointer; the
+  `[NN]` is the worker (HAProxy's thread), the order is per worker.
+* `stream`, `full`, a level list (`tp,sock,pktns,cc,mux`) and a `0x...` connection filter are refused
+  with a message naming them. `be` lists nothing (Ibex has no QUIC to servers). `clo` and `all` show the
+  connections quinn-proto still holds closing, which are removed sooner than HAProxy's.
+* `show info` has no QUIC field on HAProxy 3.5-dev7 (the field list is identical with and without a
+  `quic4@` bind), so Ibex has none either; the connection counters QUIC feeds are T504's.

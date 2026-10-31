@@ -131,6 +131,27 @@ impl Drop for QuicEndpoint {
     }
 }
 
+/// Where a connection is in its life, as `show quic` tells it (`HDSHK`, `ESTAB`, `CLOSE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnPhase {
+    Handshake,
+    Established,
+    /// Closing or draining; quinn-proto does not tell the two apart.
+    Closing,
+}
+
+/// One connection as [`QuicEndpoint::connection_infos`] reports it.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnInfo {
+    /// The connection's key in the endpoint: the destination CID of its first Initial.
+    pub id: ConnectionId,
+    pub remote: std::net::SocketAddr,
+    /// The local address the client reached, when the kernel told.
+    pub local_ip: Option<std::net::IpAddr>,
+    pub state: ConnPhase,
+    pub lost_packets: u64,
+}
+
 /// RFC 9000 §8.1 accounting for one connection on an unvalidated path.
 ///
 /// `validated` is set when the connection completes, which is *later* than the RFC requires:
@@ -295,6 +316,32 @@ impl QuicEndpoint {
     /// CONNECTION_REFUSED close and goes to whichever process is taking over.
     pub fn stop_accepting(&mut self) {
         self.refusing_new = true;
+    }
+
+    /// What `show quic` lists of each connection (T524): read-only, one entry per live
+    /// connection, in no particular order.
+    #[must_use]
+    pub fn connection_infos(&self) -> Vec<ConnInfo> {
+        self.connections
+            .iter()
+            .filter_map(|(h, c)| {
+                let id = *self.handle_to_primary_cid.get(h)?;
+                let state = if c.is_closed() {
+                    ConnPhase::Closing
+                } else if c.is_handshaking() {
+                    ConnPhase::Handshake
+                } else {
+                    ConnPhase::Established
+                };
+                Some(ConnInfo {
+                    id,
+                    remote: c.remote_address(),
+                    local_ip: c.local_ip(),
+                    state,
+                    lost_packets: c.stats().path.lost_packets,
+                })
+            })
+            .collect()
     }
 
     /// Asks the peer to stop sending on a stream (`STOP_SENDING`, `HAProxy`'s

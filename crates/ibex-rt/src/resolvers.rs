@@ -1021,17 +1021,16 @@ impl Section {
                     break;
                 }
                 let mut frame = c.inb[2..2 + len].to_vec();
-                // The reply carries the connection's id: back to the resolution's.
-                if frame.len() >= 2 {
-                    let wire = u16::from_be_bytes([frame[0], frame[1]]);
-                    if let Some(k) = c.ids.iter().position(|&(w, _)| w == wire) {
-                        frame[..2].copy_from_slice(&c.ids.swap_remove(k).1.to_be_bytes());
-                    }
-                }
-                frames.push(frame);
                 c.inb.drain(..2 + len);
-                c.pending = c.pending.saturating_sub(1);
                 c.last_use = now;
+                // The reply carries the connection's id: back to the resolution's. A frame
+                // with no id of ours (or no room for one) is dropped, counted nowhere
+                // (`dns_session_io_handler`, `dns.c:794`).
+                let wire = frame.first_chunk::<2>().map(|b| u16::from_be_bytes(*b));
+                let Some(k) = wire.and_then(|w| c.ids.iter().position(|&(id, _)| id == w)) else { continue };
+                frame[..2].copy_from_slice(&c.ids.swap_remove(k).1.to_be_bytes());
+                frames.push(frame);
+                c.pending = c.pending.saturating_sub(1);
             }
         }
         let more = !ns.queue.is_empty() && !broken;
@@ -1883,6 +1882,27 @@ mod tests {
         // The first leaves its item: the third can have it.
         set_attached(&mut r, 0, None);
         assert_eq!(pick(&mut r, 2, None, Families::IPV4), Pick::New(a));
+    }
+
+    /// T527: a `do-resolve` question that gets no message id (100 draws all taken by a
+    /// resolution in flight) is answered with nothing now, like one the nameservers fail.
+    #[test]
+    fn do_resolve_without_a_free_message_id_is_answered_empty() {
+        let cfg = ibex_config::ast::ResolversSection::new("r".into(), 1);
+        let mut sched = ibex_sched::Scheduler::with_capacity(8);
+        let mut fdtab = crate::fdtab::FdTab::with_capacity(8);
+        let poller = crate::poller::Poller::new(4).expect("poller");
+        let mut sec = Section::new(&cfg, 0, &mut sched, &mut fdtab, &poller, ibex_sched::Tick(1)).expect("section");
+        // A nameserver nobody listens on, and ids that always collide.
+        sec.dns = ibex_dns::Resolver::new(ibex_dns::ResolverConfig { nameservers: vec!["127.0.0.1:9".parse().expect("addr")], random_id: || 7, ..ibex_dns::ResolverConfig::default() });
+        let ask = |sec: &mut Section, name: &[u8]| {
+            let mut m = DR_MSG_POOL.take().expect("message");
+            m.len = dr_name(name, &mut m.name).expect("name");
+            sec.do_resolve(m)
+        };
+        assert!(ask(&mut sec, b"a.test").is_none(), "the first waits for the nameserver");
+        let m = ask(&mut sec, b"b.test").expect("answered at once");
+        assert_eq!((m.answer, m.hold), (None, Duration::ZERO));
     }
 }
 

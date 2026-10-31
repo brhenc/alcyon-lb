@@ -423,6 +423,39 @@ impl MsgState {
     /// a body whose payload has all been taken reaches [`MsgState::Done`] without more
     /// room being made. Only a body state moves; any other consumes nothing.
     pub fn take_body(&mut self, data: &[u8], limit: usize, out: &mut Vec<u8>) -> usize {
+        self.take_body_in(data, limit, out, false)
+    }
+
+    /// [`Self::take_body`] that stops where a chunked body's trailer section begins (T520):
+    /// the section is left in `data` for [`Self::trailer_section`], to go out as the
+    /// protocol's trailers rather than be skipped.
+    pub fn take_body_to_trailers(&mut self, data: &[u8], limit: usize, out: &mut Vec<u8>) -> usize {
+        self.take_body_in(data, limit, out, true)
+    }
+
+    /// Whether a chunked body is at the first byte of its trailer section (the last-chunk
+    /// line is behind it).
+    #[must_use]
+    pub fn at_trailer_section(&self) -> bool {
+        matches!(self, MsgState::Body(Body::Chunked(Chunk::Trailer { len: 0, fields: 0 })))
+    }
+
+    /// The length of the trailer section at the start of `data`, with the blank line that ends
+    /// the message, when the body [`Self::at_trailer_section`] and all of it is here. `None`
+    /// while the rest is to come; a section that is not valid is `None` too (the read side
+    /// refuses those before they reach a client, T281).
+    #[must_use]
+    pub fn trailer_section(&self, data: &[u8]) -> Option<usize> {
+        match *self {
+            MsgState::Body(Body::Chunked(c)) => match c.scan(data, &mut 0, false) {
+                (n, Ok(None)) => Some(n),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn take_body_in(&mut self, data: &[u8], limit: usize, out: &mut Vec<u8>, to_trailers: bool) -> usize {
         let start = out.len();
         let room = |out: &Vec<u8>| limit.saturating_sub(out.len() - start);
         match *self {
@@ -454,7 +487,13 @@ impl MsgState {
                     let (n, next) = c.scan(&data[i..=i], &mut 0, false);
                     i += n;
                     match next {
-                        Ok(Some(next)) => c = next,
+                        Ok(Some(next)) => {
+                            c = next;
+                            if to_trailers && matches!(c, Chunk::Trailer { len: 0, fields: 0 }) {
+                                *self = MsgState::Body(Body::Chunked(c));
+                                return i;
+                            }
+                        }
                         Ok(None) => {
                             *self = MsgState::Done;
                             return i;
@@ -2148,10 +2187,15 @@ impl ibex_alloc::Poolable for Box<L7Snapshot> {
     }
 
     fn try_new() -> Option<Self> {
-        Some(Box::new(L7Snapshot {
-            bytes: crate::buf::Buf::unallocated(crate::buf::BufClass::Standard),
-            req_state: MsgState::Waiting,
-        }))
+        Some(L7Snapshot::empty())
+    }
+}
+
+impl L7Snapshot {
+    /// A snapshot holding nothing (the box is small and unpooled memory; the copy's buffer is the
+    /// one that can be refused).
+    fn empty() -> Box<Self> {
+        Box::new(L7Snapshot { bytes: crate::buf::Buf::unallocated(crate::buf::BufClass::Standard), req_state: MsgState::Waiting })
     }
 }
 
@@ -2163,9 +2207,8 @@ impl L7Retry {
     #[cold]
     #[inline(never)]
     pub fn save(data: &[u8], req_state: MsgState) -> L7Retry {
-        let Some(mut snap) = L7_SNAPSHOT.take_raw(<Box<L7Snapshot> as ibex_alloc::Poolable>::try_new) else {
-            return L7Retry::Dead;
-        };
+        // `take_raw` of an unlimited pool whose `try_new` always succeeds gives a box.
+        let mut snap = L7_SNAPSHOT.take_raw(<Box<L7Snapshot> as ibex_alloc::Poolable>::try_new).unwrap_or_else(L7Snapshot::empty);
         if snap.bytes.alloc_if_needed() && snap.bytes.put(data) {
             snap.req_state = req_state;
             L7Retry::Saved(L7Box(Some(snap)))
@@ -2348,6 +2391,24 @@ pub fn version_digits(ver: &[u8]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chunked_body_stops_at_its_trailer_section_to_hand_it_over() {
+        let body = b"3\r\nabc\r\n0\r\nx-sum: 42\r\n\r\n";
+        let mut s = MsgState::Body(Body::Chunked(CHUNK_START));
+        let mut out = Vec::new();
+        let used = s.take_body_to_trailers(body, usize::MAX, &mut out);
+        assert_eq!((out.as_slice(), used), (&b"abc"[..], 11), "the data, and the framing up to the last-chunk line");
+        assert!(s.at_trailer_section());
+        assert_eq!(s.trailer_section(&body[used..]), Some(body.len() - used));
+        assert_eq!(s.trailer_section(&body[used..body.len() - 2]), None, "all of it, or none");
+        assert_eq!(s.trailer_section(b"x-a: 1\r\ncontent-length: 5\r\n\r\n"), None, "a forbidden field is no section");
+        // `take_body` goes through it.
+        let mut s = MsgState::Body(Body::Chunked(CHUNK_START));
+        assert_eq!(s.take_body(body, usize::MAX, &mut Vec::new()), body.len());
+        assert!(s.is_done() && !s.at_trailer_section());
+        assert_eq!(s.trailer_section(b"\r\n"), None, "not in a chunked body's trailer");
+    }
 
     #[test]
     fn split_lf_splits_as_split_does() {

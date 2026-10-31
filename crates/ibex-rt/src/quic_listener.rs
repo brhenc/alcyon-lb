@@ -157,6 +157,10 @@ struct OwnedConn {
     control: bool,
     /// The connection is gone.
     closed: bool,
+    /// Request streams whose FIN is written and not yet acknowledged: a soft stop closes
+    /// the connection only once this is empty, for quinn retransmits nothing after a close
+    /// (T521; `HAProxy` keeps a stream until its FIN is acknowledged, `qcc_streams_sent_done`).
+    unacked: Vec<u64>,
 }
 
 /// What an owner's read of its connection found ([`QuicListener::owner_recv`]).
@@ -451,7 +455,11 @@ impl QuicListener {
             let n = if bytes.is_empty() { 0 } else { self.endpoint.write_stream(conn_id, StreamId(id), bytes, false).unwrap_or(0) };
             mux.tx_written(id, n);
             if mux.fin_due(id) {
-                let _ = self.endpoint.finish_stream(conn_id, StreamId(id));
+                if self.endpoint.finish_stream(conn_id, StreamId(id)).is_ok() {
+                    if let Some(oc) = self.owned.get_mut(&conn_id) {
+                        oc.unacked.push(id);
+                    }
+                }
                 mux.fin_written(id);
                 if done(id) {
                     mux.release(id);
@@ -460,6 +468,20 @@ impl QuicListener {
                 break;
             }
         }
+    }
+
+    /// Whether a FIN written on connection `conn_id` waits for its acknowledgement.
+    #[must_use]
+    pub fn owner_unacked(&self, conn_id: ConnectionId) -> bool {
+        self.owned.get(&conn_id).is_some_and(|oc| !oc.unacked.is_empty())
+    }
+
+    /// Stream `id` of an owned connection needs no acknowledgement any more (its FIN was, or
+    /// the client stopped it): whether it was waiting for one.
+    fn acked(oc: &mut OwnedConn, id: u64) -> bool {
+        let Some(i) = oc.unacked.iter().position(|s| *s == id) else { return false };
+        oc.unacked.swap_remove(i);
+        true
     }
 
     /// Closes connection `conn_id`, its owner gone or ending it (`H3_NO_ERROR`).
@@ -503,6 +525,25 @@ impl QuicListener {
     #[must_use]
     pub fn pending_request_bytes(&self) -> usize {
         self.h3.values().flat_map(|st| st.req.values()).map(Vec::len).sum()
+    }
+
+    /// The connections for `show quic` (T524), read-only. The local address is the listener's
+    /// port with the IP the client reached when the kernel said so.
+    #[must_use]
+    pub fn show_infos(&self, worker: usize) -> Vec<crate::mailbox::QuicSnap> {
+        self.endpoint
+            .connection_infos()
+            .into_iter()
+            .map(|i| crate::mailbox::QuicSnap {
+                worker,
+                fe: self.frontend,
+                id: i.id,
+                phase: i.state,
+                local: SocketAddr::new(i.local_ip.unwrap_or(self.addr.ip()), self.addr.port()),
+                peer: i.remote,
+                lost_packets: i.lost_packets,
+            })
+            .collect()
     }
 
     /// Makes the engine decide, per connection, when it is served (T504): a connection that
@@ -770,6 +811,9 @@ impl QuicListener {
                 // A finished stream and a reset stream are both done with; the difference
                 // matters to the peer, not to our buffer bookkeeping.
                 TransportEvent::StreamFinished { conn_id, stream_id } => {
+                    if self.owned.get_mut(&conn_id).is_some_and(|oc| Self::acked(oc, stream_id.0)) {
+                        self.owned_news(conn_id, None, None);
+                    }
                     if let Some(st) = self.h3.get_mut(&conn_id) {
                         st.req.remove(&stream_id);
                         st.unacked.retain(|s| *s != stream_id);
@@ -778,6 +822,9 @@ impl QuicListener {
                 // The client asked us to stop sending the response. (A reset of its request
                 // arrives as a read error instead, in `on_readable`.)
                 TransportEvent::StreamStopped { conn_id, stream_id, error_code } => {
+                    if let Some(oc) = self.owned.get_mut(&conn_id) {
+                        Self::acked(oc, stream_id.0);
+                    }
                     if !self.owned_news(conn_id, None, Some((stream_id.0, error_code))) {
                         self.abandon_stream(conn_id, stream_id);
                     }

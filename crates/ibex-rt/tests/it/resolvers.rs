@@ -40,6 +40,8 @@ enum Zone {
     Truncated(Vec<Ipv4Addr>),
     /// TC on both transports.
     AlwaysTruncated,
+    /// TC over UDP, then over TCP a frame of one byte (shorter than a DNS header id).
+    ShortTcpFrame,
     /// This many A records (10.x.y.z), whatever the transport.
     Many(usize),
     /// One AAAA record, whatever the type asked.
@@ -222,16 +224,19 @@ fn parse_query(b: &[u8], tcp: bool) -> Option<(Query, usize)> {
 
 fn build_reply(question: &[u8], z: &Zone, tcp: bool) -> Option<Vec<u8>> {
     let truncated = match z {
-        Zone::Truncated(_) => !tcp,
+        Zone::Truncated(_) | Zone::ShortTcpFrame => !tcp,
         Zone::AlwaysTruncated => true,
         _ => false,
     };
+    if matches!(z, Zone::ShortTcpFrame) && tcp {
+        return Some(vec![0xff]);
+    }
     let rcode = match z {
         Zone::Silent => return None,
         Zone::Nx => 3,
         Zone::Refused => 5,
         Zone::ServFail => 2,
-        Zone::A(_) | Zone::NoData | Zone::Truncated(_) | Zone::AlwaysTruncated | Zone::Many(_) | Zone::Aaaa(_) | Zone::Dual(..) | Zone::Srv(..) | Zone::SrvThenA(_) => 0,
+        Zone::A(_) | Zone::NoData | Zone::Truncated(_) | Zone::AlwaysTruncated | Zone::ShortTcpFrame | Zone::Many(_) | Zone::Aaaa(_) | Zone::Dual(..) | Zone::Srv(..) | Zone::SrvThenA(_) => 0,
     };
     let many: Vec<Ipv4Addr>;
     let ips: &[Ipv4Addr] = match z {
@@ -662,7 +667,16 @@ fn t4_nx_is_held_then_takes_the_server_down() {
     assert!(ids.len() >= 4 && ids[0] == ids[1] && ids[1] != ids[2] && ids[2] == ids[3], "{q:?}");
     dns.set("a1.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 1)]));
     ibex.wait_state("s1", "10.0.0.1 2 0", 3);
-    let n = ibex.log().iter().filter(|l| *l == UP).count();
+    // The UP line is written just after the state changes: wait for it rather than count at once.
+    let t0 = Instant::now();
+    let mut n = 0;
+    while t0.elapsed() < Duration::from_secs(3) {
+        n = ibex.log().iter().filter(|l| *l == UP).count();
+        if n >= 2 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(n, 2, "{:?}", ibex.log());
 }
 
@@ -911,6 +925,41 @@ fn a_state_file_keeps_the_operators_state_of_an_unresolved_server() {
     ibex.wait_log("Server l/s1 ('b.test') resolves again but remains in maintenance.", 2);
     ibex.wait_log("Server l/s2 ('c.test') is UP/DRAIN (resolves again).", 2);
     ibex.wait_log("Server l/s2 remains in forced drain mode.", 2);
+}
+
+/// T522, 3.5-dev8: an unresolved server (`init-addr none`) whose state-file line has
+/// `srv_op_state 0` is stopped by the file before `HAProxy` puts it in resolution maintenance, so
+/// stderr says `Server l/s1 is DOWN, changed from server-state after a reload. 0 active and 0
+/// backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.` for any admin
+/// state of the line (0, 32, 33, 40); the log targets, not up yet, get nothing. Ibex said nothing.
+#[test]
+fn a_state_file_stopping_an_unresolved_server_is_said_on_stderr() {
+    for admin in ["0", "32", "33", "40"] {
+        let dns = FakeDns::start();
+        dns.set("b.test", Zone::Nx);
+        let mut state = NamedTempFile::new().expect("tmp");
+        write!(
+            state,
+            "1\n# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_uweight srv_iweight \
+             srv_time_since_last_change srv_check_status srv_check_result srv_check_health srv_check_state \
+             srv_agent_state bk_f_forced_id srv_f_forced_id srv_fqdn srv_port srvrecord srv_use_ssl \
+             srv_check_port srv_check_addr srv_agent_addr srv_agent_port\n\
+             2 l 1 s1 - 0 {admin} 1 1 1 1 0 0 0 0 0 0 b.test 80 - 0 0 - - 0\n"
+        )
+        .expect("write state");
+        let ibex = start(
+            dns.addr,
+            &format!("{FAST}  hold nx 500ms\n"),
+            "  load-server-state-from-file global\n  server s1 b.test:80 resolvers r init-addr none\n",
+            &format!("  server-state-file {}\n", state.path().display()),
+        );
+        let said = format!(
+            "[WARNING]  ({}) : Server l/s1 is DOWN, changed from server-state after a reload. 0 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.",
+            ibex.child.id()
+        );
+        assert!(ibex.stderr().contains(&said), "admin {admin}: no {said:?} in {:?}", ibex.stderr());
+        assert!(!ibex.log().iter().any(|l| l.contains("changed from server-state")), "admin {admin}: {:?}", ibex.log());
+    }
 }
 
 /// `ibex -c` on `cfg`: whether it passed, and stderr.
@@ -1374,6 +1423,23 @@ fn a_truncated_tcp_answer_is_other() {
     let c = counters(&ibex, "r", "ns1");
     assert!(c["tcp_fallback"] >= 2 && c["valid"] == 0, "{c:?}");
     assert_eq!(dns.tcp_conns.load(Ordering::Relaxed), 1);
+    assert_eq!(ibex.state("s1").0, "10.9.9.9 2 0");
+}
+
+/// T527: a TCP reply frame of one byte has no message id to match: dropped, counted nowhere
+/// (`dns_session_io_handler` memcpy's the id and drops an unknown one; measured on
+/// 3.5-dev8-885761-29 with a nameserver that answers a 1-byte frame: `sent` and `truncated`
+/// grow, `invalid`, `outdated`, `timeout` and `valid` stay 0).
+#[test]
+fn a_one_byte_tcp_reply_frame_is_dropped_uncounted() {
+    let dns = FakeDns::start();
+    dns.set("a1.test", Zone::ShortTcpFrame);
+    let ibex = start(dns.addr, FAST, "  server s1 a1.test:80 resolvers r init-addr 10.9.9.9\n", "");
+    wait_counter(&ibex, "tcp_fallback", 3, |v| v >= 2);
+    let c = counters(&ibex, "r", "ns1");
+    for k in ["invalid", "outdated", "valid", "other"] {
+        assert_eq!(c[k], 0, "{k} in {c:?}");
+    }
     assert_eq!(ibex.state("s1").0, "10.9.9.9 2 0");
 }
 
