@@ -34,10 +34,11 @@
 //! give the same bytes on either, so a token issued before `set ssl crypto-provider` still
 //! verifies after it.
 //!
-//! Server side only: Ibex's QUIC is a listener, and rustls 0.24.0-dev.2 has no QUIC client yet
-//! (`FromConn<ClientSide>` is `todo!`).
+//! The server half is here; the client half, for QUIC to servers (T533), is [`client`] (T534),
+//! on the same key types.
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 
@@ -60,13 +61,16 @@ use rustls24::server::ServerSide;
 use rustls24::{Connection, KeyingMaterialExporter, ServerConfig, TlsInputBuffer};
 use zeroize::Zeroize;
 
+pub mod client;
+pub use client::QuicClientConfig;
+
 /// What a handshake settled that the listener asks for: quinn's `HandshakeData`, which
 /// `Connection::crypto_session().handshake_data()` returns boxed.
 #[derive(Debug, Clone, Default)]
 pub struct HandshakeData {
     /// The negotiated application protocol (ALPN).
     pub protocol: Option<Vec<u8>>,
-    /// The server name the client sent (SNI).
+    /// The server name the client sent (SNI); on a client session, the name it connected to.
     pub server_name: Option<String>,
     /// The crypto provider the connection runs on.
     pub provider: Option<TlsCryptoProvider>,
@@ -120,20 +124,7 @@ impl qc::ServerConfig for QuicServerConfig {
     fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
         // Called only for a version `initial_keys` took, and that is QUIC v1.
         let _ = version;
-        let (nonce, key) = (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1);
-        let mut pseudo_packet = Vec::with_capacity(packet.len() + orig_dst_cid.len() + 1);
-        pseudo_packet.push(u8::try_from(orig_dst_cid.len()).unwrap_or(u8::MAX));
-        pseudo_packet.extend_from_slice(orig_dst_cid);
-        pseudo_packet.extend_from_slice(packet);
-        // The Retry integrity tag is AES-128-GCM over the pseudo-packet with an empty payload:
-        // QUIC's packet key of the Initial suite, its IV the fixed nonce, packet number 0.
-        let suite = initial_suite(self.current().provider);
-        let key = suite.quic.packet_key(AeadKey::from(key), Iv::from(nonce));
-        let mut result = [0; 16];
-        if let Ok(tag) = key.encrypt_in_place(0, &pseudo_packet, &mut [], None) {
-            result.copy_from_slice(tag.as_ref());
-        }
-        result
+        retry_tag_v1(&initial_suite(self.current().provider), orig_dst_cid, &[packet])
     }
 
     fn start_session(self: Arc<Self>, version: u32, params: &TransportParameters) -> Box<dyn qc::Session> {
@@ -156,7 +147,7 @@ impl QuicServerConfig {
             config: Arc::clone(&bind.config),
             provider: bind.provider,
             params: tp,
-            events: std::collections::VecDeque::new(),
+            events: VecDeque::new(),
             input: Input::default(),
             server_name: None,
             exporter: None,
@@ -211,7 +202,7 @@ impl Drop for Input {
     }
 }
 
-/// A QUIC server's TLS session.
+/// A QUIC server's TLS session (the client's is [`client::ClientSession`]).
 pub struct TlsSession {
     version: Version,
     got_handshake_data: bool,
@@ -223,7 +214,7 @@ pub struct TlsSession {
     /// The transport parameters to send, TLS-encoded.
     params: Vec<u8>,
     /// Handshake messages and key changes rustls produced and quinn has not taken yet.
-    events: std::collections::VecDeque<QuicEvent>,
+    events: VecDeque<QuicEvent>,
     input: Input,
     server_name: Option<String>,
     exporter: Option<KeyingMaterialExporter>,
@@ -344,19 +335,7 @@ impl qc::Session for TlsSession {
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
         self.input.push(buf);
         let was_handshaking = self.is_handshaking();
-        let advanced = self.advance_scrubbed(was_handshaking);
-        advanced.map_err(|e| match AlertDescription::try_from(&e) {
-            Ok(alert) => TransportError {
-                code: TransportErrorCode::crypto(u8::from(alert)),
-                frame: None,
-                reason: e.to_string(),
-            },
-            Err(()) => TransportError {
-                code: TransportErrorCode::PROTOCOL_VIOLATION,
-                frame: None,
-                reason: format!("TLS error: {e}"),
-            },
-        })?;
+        self.advance_scrubbed(was_handshaking).map_err(|e| transport_error(&e))?;
         if !self.got_handshake_data {
             // As quinn: the ClientHello is in once the server name or ALPN is known.
             let alpn = self.outputs().is_some_and(|o| o.alpn_protocol().is_some());
@@ -383,31 +362,11 @@ impl qc::Session for TlsSession {
     }
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
-        // The messages of the current level, up to the change of keys that ends it.
-        while let Some(ev) = self.events.pop_front() {
-            let change = match ev {
-                QuicEvent::Message(m) => {
-                    buf.extend_from_slice(&m);
-                    continue;
-                }
-                QuicEvent::KeyChange(k) => k, _ => continue, // `QuicEvent` is non_exhaustive
-            };
-            let keys = match change {
-                KeyChange::Handshake { keys } => keys,
-                KeyChange::OneRtt { keys, next } => {
-                    self.next_secrets = Some(next);
-                    keys
-                }
-            };
-            return Some(keys_of(keys));
-        }
-        None
+        take_handshake(&mut self.events, &mut self.next_secrets, buf)
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn qc::PacketKey>>> {
-        let secrets = self.next_secrets.as_mut()?;
-        let keys = secrets.next_packet_keys();
-        Some(KeyPair { local: Box::new(PacketKey(keys.local)), remote: Box::new(PacketKey(keys.remote)) })
+        next_keys(&mut self.next_secrets)
     }
 
     fn is_valid_retry(&self, _orig_dst_cid: &ConnectionId, _header: &[u8], _payload: &[u8]) -> bool {
@@ -421,10 +380,73 @@ impl qc::Session for TlsSession {
         label: &[u8],
         context: &[u8],
     ) -> Result<(), ExportKeyingMaterialError> {
-        let exporter = self.exporter.as_ref().ok_or(ExportKeyingMaterialError)?;
-        exporter.derive(label, Some(context), output).map_err(|_| ExportKeyingMaterialError)?;
-        Ok(())
+        export(self.exporter.as_ref(), output, label, context)
     }
+}
+
+/// The Retry integrity tag of QUIC v1 (RFC 9001 5.8) over the Retry packet `parts` (without
+/// its tag) sent for a client's original destination connection ID `orig_dst_cid`:
+/// AES-128-GCM over the pseudo-packet with an empty payload, QUIC's packet key of the Initial
+/// `suite`, its IV the fixed nonce, packet number 0.
+fn retry_tag_v1(suite: &Suite, orig_dst_cid: &ConnectionId, parts: &[&[u8]]) -> [u8; 16] {
+    let (nonce, key) = (RETRY_INTEGRITY_NONCE_V1, RETRY_INTEGRITY_KEY_V1);
+    let mut pseudo_packet = Vec::with_capacity(parts.iter().map(|p| p.len()).sum::<usize>() + orig_dst_cid.len() + 1);
+    pseudo_packet.push(u8::try_from(orig_dst_cid.len()).unwrap_or(u8::MAX));
+    pseudo_packet.extend_from_slice(orig_dst_cid);
+    for p in parts {
+        pseudo_packet.extend_from_slice(p);
+    }
+    let key = suite.quic.packet_key(AeadKey::from(key), Iv::from(nonce));
+    let mut result = [0; 16];
+    if let Ok(tag) = key.encrypt_in_place(0, &pseudo_packet, &mut [], None) {
+        result.copy_from_slice(tag.as_ref());
+    }
+    result
+}
+
+/// What quinn reports for a handshake rustls refused: `CRYPTO_ERROR` (0x100 + the alert,
+/// RFC 9001 4.8) when the error has an alert, `PROTOCOL_VIOLATION` otherwise.
+fn transport_error(e: &rustls24::Error) -> TransportError {
+    match AlertDescription::try_from(e) {
+        Ok(alert) => TransportError { code: TransportErrorCode::crypto(u8::from(alert)), frame: None, reason: e.to_string() },
+        Err(()) => TransportError { code: TransportErrorCode::PROTOCOL_VIOLATION, frame: None, reason: format!("TLS error: {e}") },
+    }
+}
+
+/// `qc::Session::write_handshake` on either side: the messages of the current level, up to
+/// the change of keys that ends it; the secrets of the next 1-RTT keys go to `next_secrets`.
+fn take_handshake(events: &mut VecDeque<QuicEvent>, next_secrets: &mut Option<Secrets>, buf: &mut Vec<u8>) -> Option<Keys> {
+    while let Some(ev) = events.pop_front() {
+        let change = match ev {
+            QuicEvent::Message(m) => {
+                buf.extend_from_slice(&m);
+                continue;
+            }
+            QuicEvent::KeyChange(k) => k, _ => continue, // `QuicEvent` is non_exhaustive
+        };
+        let keys = match change {
+            KeyChange::Handshake { keys } => keys,
+            KeyChange::OneRtt { keys, next } => {
+                *next_secrets = Some(next);
+                keys
+            }
+        };
+        return Some(keys_of(keys));
+    }
+    None
+}
+
+/// `qc::Session::next_1rtt_keys` on either side (RFC 9001 6: the key update).
+fn next_keys(next_secrets: &mut Option<Secrets>) -> Option<KeyPair<Box<dyn qc::PacketKey>>> {
+    let keys = next_secrets.as_mut()?.next_packet_keys();
+    Some(KeyPair { local: Box::new(PacketKey(keys.local)), remote: Box::new(PacketKey(keys.remote)) })
+}
+
+/// `qc::Session::export_keying_material` on either side.
+fn export(exporter: Option<&KeyingMaterialExporter>, output: &mut [u8], label: &[u8], context: &[u8]) -> Result<(), ExportKeyingMaterialError> {
+    let exporter = exporter.ok_or(ExportKeyingMaterialError)?;
+    exporter.derive(label, Some(context), output).map_err(|_| ExportKeyingMaterialError)?;
+    Ok(())
 }
 
 /// RFC 9001 5.8.
@@ -648,13 +670,13 @@ mod tests {
         bind_and_cert(alpn).0
     }
 
-    fn bind_and_cert(alpn: Vec<Vec<u8>>) -> (Arc<BindTls>, rustls::pki_types::CertificateDer<'static>) {
-        use ibex_tls::tcp::rustls24::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    fn bind_and_cert(alpn: Vec<Vec<u8>>) -> (Arc<BindTls>, rustls24::pki_types::CertificateDer<'static>) {
+        use rustls24::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
         let c = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(c.key_pair.serialize_der()));
         let der = CertificateDer::from(c.cert.der().to_vec());
         let bind = BindTls::single_tls13(vec![der.clone()], key, alpn).expect("bind");
-        (bind, rustls::pki_types::CertificateDer::from(der.to_vec()))
+        (bind, der)
     }
 
     fn hex(s: &str) -> Vec<u8> {
@@ -824,22 +846,21 @@ mod tests {
         TransportParameters::read(Side::Client, &mut io::Cursor::new(Vec::<u8>::new())).expect("empty parameters")
     }
 
-    /// A server session that has completed its handshake against quinn's client session
-    /// (rustls 0.23), the CRYPTO bytes carried across with their levels ignored.
+    /// A server session that has completed its handshake against Ibex's client session
+    /// (T534; it was quinn's on rustls 0.23), the CRYPTO bytes carried across with their levels
+    /// ignored.
     fn established() -> TlsSession {
+        established_pair().1
+    }
+
+    /// Both ends of [`established`].
+    fn established_pair() -> (Box<dyn qc::Session>, TlsSession) {
         use qc::ClientConfig as _;
         use qc::Session as _;
         let (server_bind, cert) = bind_and_cert(vec![b"h3".to_vec()]);
-        let mut roots = rustls::RootCertStore::empty();
+        let mut roots = rustls24::RootCertStore::empty();
         roots.add(cert).expect("trust the test certificate");
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut cc = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        cc.alpn_protocols = vec![b"h3".to_vec()];
-        let cc = Arc::new(quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(cc)).expect("client config"));
+        let cc = Arc::new(QuicClientConfig::with_roots(roots, &[b"h3"], provider::active()).expect("client config"));
         let mut client = cc.start_session(1, "localhost", &params()).expect("client session");
         let server_cfg = QuicServerConfig::new(server_bind).expect("config");
         let mut server = server_cfg.session(1, &params());
@@ -872,7 +893,81 @@ mod tests {
             }
         }
         assert!(done, "the handshake completes");
-        server
+        (client, server)
+    }
+
+    /// RFC 9001 6: each side's next 1-RTT keys open what the other's next keys seal, and the
+    /// keys of the phase before do not.
+    #[test]
+    fn the_next_1rtt_keys_of_each_side_cross() {
+        use qc::Session as _;
+        let (mut c, mut s) = established_pair();
+        let seal = |k: &dyn qc::PacketKey, pn: u64| {
+            let header = [0x40u8, 1, 2, 3];
+            let mut buf = header.to_vec();
+            buf.extend_from_slice(b"one-rtt payload");
+            buf.extend_from_slice(&[0; 16]);
+            k.encrypt(pn, &mut buf, header.len());
+            (header, BytesMut::from(&buf[header.len()..]))
+        };
+        let c1 = c.next_1rtt_keys().expect("client: phase 1");
+        let s1 = s.next_1rtt_keys().expect("server: phase 1");
+        let (h, mut sealed) = seal(c1.local.as_ref(), 5);
+        s1.remote.decrypt(5, &h, &mut sealed).expect("the server opens the client's phase-1 packet");
+        assert_eq!(&sealed[..], b"one-rtt payload");
+        let (h, mut sealed) = seal(s1.local.as_ref(), 6);
+        c1.remote.decrypt(6, &h, &mut sealed).expect("the client opens the server's phase-1 packet");
+        let c2 = c.next_1rtt_keys().expect("client: phase 2");
+        let s2 = s.next_1rtt_keys().expect("server: phase 2");
+        let (h, sealed) = seal(c2.local.as_ref(), 7);
+        assert!(s1.remote.decrypt(7, &h, &mut sealed.clone()).is_err(), "phase 1 does not open phase 2");
+        s2.remote.decrypt(7, &h, &mut sealed.clone()).expect("phase 2 opens phase 2");
+    }
+
+    /// RFC 9001 A.4 again, from the client's side: the Retry checks out, and not once changed.
+    #[test]
+    fn the_client_takes_the_retry_of_rfc_9001_a4_and_no_other() {
+        use qc::ClientConfig as _;
+        let cc = Arc::new(QuicClientConfig::without_verification(&[b"h3"], provider::active()).expect("client config"));
+        let s = cc.start_session(1, "localhost", &params()).expect("client session");
+        let odcid = ConnectionId::new(&hex("8394c8f03e515708"));
+        let header = hex("ff000000010008f067a5502a4262b574");
+        let mut payload = hex("6f6b656e04a265ba2eff4d829058fb3f0f2496ba");
+        assert!(s.is_valid_retry(&odcid, &header, &payload));
+        assert!(!s.is_valid_retry(&ConnectionId::new(&hex("8394c8f03e515709")), &header, &payload), "another ODCID");
+        let last = payload.len() - 1;
+        payload[last] ^= 1;
+        assert!(!s.is_valid_retry(&odcid, &header, &payload), "a changed tag");
+        assert!(!s.is_valid_retry(&odcid, &header, &payload[..15]), "shorter than a tag");
+    }
+
+    #[test]
+    fn a_client_configuration_with_no_root_is_refused() {
+        let e = QuicClientConfig::with_roots(rustls24::RootCertStore::empty(), &[b"h3"], provider::active()).expect_err("refused");
+        assert!(e.starts_with("unable to set up certificate verification: "), "{e}");
+    }
+
+    #[test]
+    fn a_client_session_before_its_handshake_has_nothing_to_give() {
+        use qc::ClientConfig as _;
+        let cc = Arc::new(QuicClientConfig::without_verification(&[b"h3"], provider::active()).expect("client config"));
+        assert!(Arc::clone(&cc).start_session(0x1a2a_3a4a, "localhost", &params()).is_err(), "not QUIC v1");
+        let mut s = cc.start_session(1, "localhost", &params()).expect("client session");
+        assert!(s.is_handshaking());
+        assert!(s.handshake_data().is_none());
+        assert!(s.peer_identity().is_none());
+        assert!(s.early_crypto().is_none());
+        assert!(s.next_1rtt_keys().is_none());
+        assert!(s.transport_parameters().expect("none yet").is_none());
+        assert!(s.export_keying_material(&mut [0u8; 8], b"label", b"ctx").is_err());
+        let mut hello = Vec::new();
+        assert!(s.write_handshake(&mut hello).is_none(), "the ClientHello is at the Initial level: no key change");
+        assert_eq!(hello.first(), Some(&1), "a ClientHello");
+        // A ServerHello with a body of two bytes: the session fails, and stays failed.
+        let first = s.read_handshake(&[2, 0, 0, 2, 0xff, 0xff]).expect_err("bad hello");
+        assert_ne!(first.reason, "");
+        assert!(s.read_handshake(&[]).is_err());
+        assert!(s.handshake_data().is_none());
     }
 
     #[test]
