@@ -35,7 +35,8 @@ impl Drop for Rig {
 fn start(tag: &str, global_extra: &str, fe_extra: &str) -> Rig {
     let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
     let quic = common::reserve_addr();
-    let dir = std::env::temp_dir().join(format!("h3cs-{tag}-{}", std::process::id()));
+    let path = if common::h3_mux() { "mux" } else { "relay" };
+    let dir = std::env::temp_dir().join(format!("h3cs-{tag}-{path}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     let sock = dir.join("cli.sock").display().to_string();
@@ -47,7 +48,7 @@ fn start(tag: &str, global_extra: &str, fe_extra: &str) -> Rig {
     );
     let path = dir.join("c.cfg");
     std::fs::write(&path, cfg).expect("cfg");
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+    let child = common::ibex_command(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
     let ibex = common::Ibex(child);
     let deadline = Instant::now() + Duration::from_secs(5);
     while !std::path::Path::new(&sock).exists() {
@@ -134,7 +135,7 @@ impl Drop for Probe {
     }
 }
 
-#[test]
+crate::h3_both_paths! {
 fn frontend_maxconn_holds_the_quic_connections_that_come_after_it() {
     let rig = start("maxconn", "", "  maxconn 2\n");
     let mut p = Probe::run(rig.quic, 6, 1, 3, 4);
@@ -153,8 +154,9 @@ fn frontend_maxconn_holds_the_quic_connections_that_come_after_it() {
     let i = info(&rig.sock);
     assert_eq!((s["scur"], s["stot"], i["CurrConns"], i["CurrSslConns"]), (0, 2, 0, 0), "a closed connection is given back: {s:?}");
 }
+}
 
-#[test]
+crate::h3_both_paths! {
 fn a_request_stream_counts_in_req_tot_and_the_connection_in_the_rest() {
     let rig = start("pattern", "", "");
     let mut p = Probe::run(rig.quic, 3, 2, 3, 3);
@@ -171,8 +173,9 @@ fn a_request_stream_counts_in_req_tot_and_the_connection_in_the_rest() {
     let i = info(&rig.sock);
     assert_eq!((s["scur"], s["stot"], s["req_tot"], i["CurrConns"], i["CurrSslConns"], i["CumSslConns"]), (0, 3, 6, 0, 0, 3), "{s:?}");
 }
+}
 
-#[test]
+crate::h3_both_paths! {
 fn two_hundred_idle_connections_are_two_hundred_sessions() {
     let rig = start("idle200", "", "");
     let mut p = Probe::run(rig.quic, 200, 1, 3, 15);
@@ -183,11 +186,12 @@ fn two_hundred_idle_connections_are_two_hundred_sessions() {
     assert_eq!(stat(&rig.sock)["scur"], 200);
     assert_eq!(p.line(), "closed");
 }
+}
 
+crate::h3_both_paths! {
 /// The windows are HAProxy's (`quic_transport_params_init`): 100 streams of `bufsize - 4` for the
 /// connection, 90 % of that for a request stream (`tune.quic.fe.stream-data-ratio`). Measured on
 /// 3.5-dev7 with the default bufsize (16384) and `tune.bufsize 8192`.
-#[test]
 fn the_transport_windows_follow_bufsize_and_the_stream_data_ratio() {
     for (global, expected) in [("", (1_638_000, 1_474_200)), ("  tune.bufsize 8192\n", (818_800, 736_920))] {
         let rig = start("windows", global, "");
@@ -195,11 +199,12 @@ fn the_transport_windows_follow_bufsize_and_the_stream_data_ratio() {
         assert_eq!(p.params(), expected, "global: {global:?}");
     }
 }
+}
 
+crate::h3_both_paths! {
 /// `global maxconn` reached: HAProxy's listener does not accept the connection at all, so it is
 /// neither waiting nor in any counter (3.5-dev7, `global maxconn 3`, 6 connections: `CurrConns 3`,
 /// `CumSslConns 3`, `scur 3`, three clients served and three failed).
-#[test]
 fn global_maxconn_refuses_the_connections_beyond_it() {
     let rig = start("globalmax", "  maxconn 3\n", "");
     let mut p = Probe::run(rig.quic, 6, 1, 3, 4);
@@ -209,4 +214,5 @@ fn global_maxconn_refuses_the_connections_beyond_it() {
     assert_eq!((s["scur"], s["stot"], s["req_tot"]), (3, 3, 3), "{s:?}");
     assert_eq!((i["CurrConns"], i["CurrSslConns"], i["CumSslConns"]), (3, 3, 3));
     assert_eq!(p.line(), "closed");
+}
 }

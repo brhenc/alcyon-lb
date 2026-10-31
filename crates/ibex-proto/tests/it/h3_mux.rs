@@ -231,6 +231,8 @@ fn malformed_requests_are_message_errors() {
         ("te other than trailers", vec![(":method", "GET"), (":scheme", "https"), (":path", "/"), ("te", "gzip")]),
         ("bad content-length", vec![(":method", "GET"), (":scheme", "https"), (":path", "/"), ("content-length", "+5")]),
         ("pseudo after regular", vec![(":method", "GET"), ("x", "1"), (":scheme", "https"), (":path", "/")]),
+        // Measured on 3.5-dev7 (T509, aioquic): RESET_STREAM 0x10e, nothing to the server.
+        ("neither :authority nor host", vec![(":method", "GET"), (":scheme", "https"), (":path", "/")]),
     ];
     for (what, f) in cases {
         let mut m = mux();
@@ -238,13 +240,24 @@ fn malformed_requests_are_message_errors() {
         assert_eq!(stream_error(&signals(&mut m), 0), Some(0x10e), "{what}");
         assert!(m.glitch_count > 0, "{what}: a glitch, as qcc_report_glitch");
     }
-    // `te: trailers` is the one value allowed (h3.c:1123); a method that is not a token is
-    // taken and answered 400.
+    // `te: trailers` is the one value allowed (h3.c:1123).
     let mut m = mux();
-    m.recv(0, &headers(&[(":method", "GET"), (":scheme", "https"), (":path", "/"), ("te", "trailers")]), true, 0).expect("ok");
+    m.recv(0, &headers(&[(":method", "GET"), (":scheme", "https"), (":path", "/"), ("host", "a"), ("te", "trailers")]), true, 0).expect("ok");
     assert_eq!(m.next_dispatch(), Some(0));
-    m.recv(4, &headers(&[(":method", "G(T"), (":scheme", "https"), (":path", "/")]), true, 0).expect("ok");
-    assert!(m.stream(4).expect("stream").bad_request());
+    // A method or a scheme that is not a token, which h2 takes and answers 400, is a message
+    // error over h3: measured on 3.5-dev7 (T509, aioquic), `G(T`, `G E T`, an empty
+    // method, `ht tp` and an empty scheme each RESET_STREAM 0x10e.
+    for (what, f) in [
+        ("method G(T", [(":method", "G(T"), (":scheme", "https"), (":path", "/"), (":authority", "a")]),
+        ("method G E T", [(":method", "G E T"), (":scheme", "https"), (":path", "/"), (":authority", "a")]),
+        ("empty method", [(":method", ""), (":scheme", "https"), (":path", "/"), (":authority", "a")]),
+        ("scheme ht tp", [(":method", "GET"), (":scheme", "ht tp"), (":path", "/"), (":authority", "a")]),
+        ("empty scheme", [(":method", "GET"), (":scheme", ""), (":path", "/"), (":authority", "a")]),
+    ] {
+        let mut m = mux();
+        m.recv(0, &headers(&f), true, 0).expect("stream error only");
+        assert_eq!(stream_error(&signals(&mut m), 0), Some(0x10e), "{what}");
+    }
 }
 
 #[test]
@@ -716,4 +729,23 @@ fn a_fin_with_more_data_than_room_waits_for_the_child() {
     assert_eq!(st.rx_buffered, 100);
     assert!(st.rx_htx().is_eom());
     assert_eq!(st.known_body, Some(body.len() as u64));
+}
+
+/// The bridge takes a DATA block whole by emptying it and moving its cursor past it
+/// (`h2_bridge::pump_h2_body`): DATA that comes after goes into a block of its own, or it
+/// sits behind the cursor and the upload stalls (T509: a 100 KB POST through the engine).
+#[test]
+fn data_after_a_block_the_bridge_emptied_is_a_block_of_its_own() {
+    let mut m = mux();
+    m.recv(0, &headers_owned(&post(&[])), false, 0).expect("ok");
+    m.recv(0, &frame(0x00, b"abc"), false, 0).expect("ok");
+    let st = m.stream_mut(0).expect("stream");
+    let at = st.rx_htx().blocks().iter().position(|b| matches!(b, HtxBlock::Data(_))).expect("a DATA block");
+    if let HtxBlock::Data(d) = &mut st.rx_htx_mut().blocks_mut()[at] {
+        *d = Vec::new();
+    }
+    m.rx_taken(0, 3);
+    m.recv(0, &frame(0x00, b"def"), false, 0).expect("ok");
+    let blocks = m.stream(0).expect("stream").rx_htx().blocks();
+    assert!(matches!(&blocks[at + 1], HtxBlock::Data(d) if d == b"def"), "{blocks:?}");
 }

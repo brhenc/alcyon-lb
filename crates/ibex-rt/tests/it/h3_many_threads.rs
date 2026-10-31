@@ -47,7 +47,7 @@ fn start() -> (common::Ibex, NamedTempFile, SocketAddr) {
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write cfg");
-    let child = Command::new(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string()))
+    let child = common::ibex_command(std::env::var("IBEX_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string()))
         .arg("-f")
         .arg(f.path())
         .stdout(Stdio::null())
@@ -77,7 +77,7 @@ fn one_attempt() -> Option<String> {
     }
 }
 
-#[test]
+crate::h3_both_paths! {
 fn h3_client_right_after_start_with_many_threads() {
     require_curl_http3();
     let failures: Vec<String> = (0..ATTEMPTS).filter_map(|_| one_attempt()).collect();
@@ -87,12 +87,13 @@ fn h3_client_right_after_start_with_many_threads() {
         failures.len()
     );
 }
+}
 
+crate::h3_both_paths! {
 /// A QUIC address that cannot be bound stops the start, before any worker runs, with
 /// HAProxy's alert. HAProxy (3.5-dev7 with QUIC), the port held by a UDP socket without
 /// `SO_REUSEPORT`: exit status 1 and
 /// `[ALERT] ... : Binding [<file>:10] for frontend fe: protocol quic4: cannot bind socket (Address already in use) for [127.0.0.1:18443].`
-#[test]
 fn an_unbindable_quic_address_stops_the_start() {
     let held = std::net::UdpSocket::bind("127.0.0.1:0").expect("hold a UDP port");
     let quic = held.local_addr().expect("addr");
@@ -106,7 +107,7 @@ fn an_unbindable_quic_address_stops_the_start() {
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write cfg");
-    let out = Command::new(env!("CARGO_BIN_EXE_ibex"))
+    let out = common::ibex_command(env!("CARGO_BIN_EXE_ibex"))
         .arg("-f")
         .arg(f.path())
         .stdin(Stdio::null())
@@ -116,5 +117,6 @@ fn an_unbindable_quic_address_stops_the_start() {
     assert_eq!(out.status.code(), Some(1), "stderr: {err}");
     let want = format!("for frontend fe: protocol quic4: cannot bind socket (Address already in use) for [{quic}].");
     assert!(err.contains("[ALERT]") && err.contains(&want), "want {want:?} in:\n{err}");
+}
 }
 

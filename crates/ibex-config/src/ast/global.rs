@@ -261,6 +261,11 @@ pub struct GlobalSection {
     /// `tune.ibex.ssl-zero-buffers on|off` (Ibex-only): zero the TLS record buffers (plaintext and
     /// ciphertext) when they are released. On when unset.
     pub ssl_zero_buffers: Option<bool>,
+    /// `tune.ibex.h3-path relay|mux` (Ibex-only, T509, deleted with the relay in slice H5):
+    /// `Some(true)` serves HTTP/3 request streams through the h3 mux and the bridge h2
+    /// streams use, `Some(false)` through the HTTP/1 relay; unset, the `IBEX_H3_PATH`
+    /// environment variable decides, then the relay.
+    pub h3_mux: Option<bool>,
     /// `tune.ibex.zero-on-free off|soft|hard` (Ibex-only, T459): wipe every freed heap block. Off
     /// when unset.
     pub zero_on_free: Option<ZeroOnFree>,

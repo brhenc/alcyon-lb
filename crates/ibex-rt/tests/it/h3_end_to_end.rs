@@ -44,7 +44,7 @@ impl Ibex {
         );
         let mut f = tempfile::NamedTempFile::new().expect("tmp");
         f.write_all(cfg.as_bytes()).expect("write cfg");
-        let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        let child = common::ibex_command(env!("CARGO_BIN_EXE_ibex"))
             .arg("-f")
             .arg(f.path())
             .stdout(Stdio::null())
@@ -104,10 +104,10 @@ fn spawn_echo_backend(stop: Arc<AtomicBool>) -> std::net::SocketAddr {
     addr
 }
 
+crate::h3_both_paths! {
 /// Known to flake rarely under a loaded parallel suite: 1 failure in 30 full-suite runs
 /// (2026-10-02), none in 48 runs alone. Cause not found; see `data/suite_baseline.json`
 /// (`known_flaky`). One red run is that; a repeatable failure is not.
-#[test]
 fn curl_http3_is_proxied_to_a_backend() {
     if !curl_has_http3() {
         eprintln!("curl on this host has no HTTP3 support; skipping");
@@ -149,8 +149,9 @@ fn curl_http3_is_proxied_to_a_backend() {
         "no pseudo-header may reach an HTTP/1 backend.\nstdout: {stdout}"
     );
 }
+}
 
-#[test]
+crate::h3_both_paths! {
 fn curl_http3_gets_a_response_from_ibex() {
     if !curl_has_http3() {
         eprintln!("curl on this host has no HTTP3 support; skipping");
@@ -216,9 +217,11 @@ fn curl_http3_gets_a_response_from_ibex() {
         "the response body must reach the client.\nstdout: {stdout}"
     );
 }
+}
 
 const BACKEND_DELAY: Duration = Duration::from_millis(1000);
 
+crate::h3_both_paths! {
 /// A slow backend stalls only its own request, not the whole listener.
 ///
 /// This is the property the non-blocking backend leg exists for, and the one the first
@@ -226,7 +229,6 @@ const BACKEND_DELAY: Duration = Duration::from_millis(1000);
 /// loop, so every QUIC connection on the listener waited for whichever backend request was
 /// in flight. Two concurrent requests against a backend that takes ~1s each would have taken
 /// ~2s serialised; overlapped they take ~1s.
-#[test]
 fn a_slow_backend_does_not_stall_other_quic_connections() {
     if !curl_has_http3() {
         eprintln!("curl on this host has no HTTP3 support; skipping");
@@ -305,4 +307,5 @@ fn a_slow_backend_does_not_stall_other_quic_connections() {
         "two requests against a {BACKEND_DELAY:?} backend took {elapsed:?}; \
          serialised would be >= {serialised:?}, so the backend leg is blocking the pump loop"
     );
+}
 }

@@ -112,6 +112,41 @@ pub struct QuicListener {
     held: HashMap<ConnectionId, Vec<(StreamId, bool)>>,
     /// Connections that ended since the engine last looked, and whether each was admitted.
     closed: Vec<(ConnectionId, bool)>,
+    /// `tune.ibex.h3-path mux` (T509): an admitted connection is served by an owner session
+    /// of the engine through the h3 mux, not by the relay.
+    mux: bool,
+    /// The connections owner sessions serve, by connection.
+    owned: HashMap<ConnectionId, OwnedConn>,
+    /// Connections admitted since the engine last took them, each to get its owner.
+    new_owned: Vec<ConnectionId>,
+    /// Owners with transport news since the engine last woke them.
+    wake: Vec<ibex_sched::TaskRef>,
+    /// An owner wrote to the transport since the last `send_batch`.
+    dirty: bool,
+}
+
+/// A connection an owner session serves (T509): what the transport said of it since the
+/// owner's last pass, for that pass to act on.
+#[derive(Default)]
+struct OwnedConn {
+    /// The owner's entry and task, once the engine has made it.
+    owner: Option<(u32, ibex_sched::TaskRef)>,
+    /// Streams to read: opened or readable since, or held back by the mux (no room).
+    read: Vec<u64>,
+    /// `STOP_SENDING`s from the client: stream and code.
+    stopped: Vec<(u64, u64)>,
+    /// Our control stream is open.
+    control: bool,
+    /// The connection is gone.
+    closed: bool,
+}
+
+/// What an owner's read of its connection found ([`QuicListener::owner_recv`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerConn {
+    Open,
+    /// The connection is gone: the owner ends.
+    Closed,
 }
 
 /// A request stream handed to the stream engine over a socket pair (see `h3_relay`).
@@ -248,7 +283,173 @@ impl QuicListener {
             admitted: HashSet::new(),
             held: HashMap::new(),
             closed: Vec::new(),
+            mux: false,
+            owned: HashMap::new(),
+            new_owned: Vec::new(),
+            wake: Vec::new(),
+            dirty: false,
         }
+    }
+
+    /// `tune.ibex.h3-path mux` (T509): admitted connections are served by owner sessions
+    /// ([`QuicListener::take_new_owned`]), not by the relay.
+    pub fn serve_by_mux(&mut self) {
+        self.mux = true;
+    }
+
+    /// Connections admitted since the last call, each for the engine to give an owner
+    /// session ([`QuicListener::set_owner`]).
+    pub fn take_new_owned(&mut self) -> Vec<ConnectionId> {
+        std::mem::take(&mut self.new_owned)
+    }
+
+    /// The owner session of `conn_id` is entry `idx`, task `task`: it is woken with the
+    /// transport's news of the connection.
+    pub fn set_owner(&mut self, conn_id: ConnectionId, idx: u32, task: ibex_sched::TaskRef) {
+        if let Some(oc) = self.owned.get_mut(&conn_id) {
+            oc.owner = Some((idx, task));
+            if !oc.read.is_empty() || oc.closed {
+                self.wake.push(task);
+            }
+        }
+    }
+
+    /// The owners to wake for what the transport did since the last call.
+    pub fn take_wake(&mut self, into: &mut Vec<ibex_sched::TaskRef>) {
+        into.append(&mut self.wake);
+    }
+
+    /// Whether an owner wrote to the transport since the last call: its datagrams go out.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.dirty, false)
+    }
+
+    /// Whether the connection `conn_id` is owned and the listener is in a soft stop.
+    #[must_use]
+    pub fn is_stopping(&self) -> bool {
+        self.stopping
+    }
+
+    /// The peer of a connection, or the listener's own address.
+    #[must_use]
+    pub fn peer_of(&self, conn_id: ConnectionId) -> SocketAddr {
+        self.peers.get(&conn_id).copied().unwrap_or(self.addr)
+    }
+
+    /// The owner of `conn_id` reads what the client sent into its mux (T509): `STOP_SENDING`s,
+    /// then each stream with news, as far as the mux has room for it (§2.3: the client's
+    /// window holds the rest back). Our control stream is opened on the first pass.
+    pub fn owner_recv(&mut self, conn_id: ConnectionId, mux: &mut mux_h3::H3MuxContext, now: u64) -> OwnerConn {
+        let Some(oc) = self.owned.get_mut(&conn_id) else { return OwnerConn::Closed };
+        if oc.closed {
+            return OwnerConn::Closed;
+        }
+        if !oc.control {
+            oc.control = true;
+            if let Ok(sid) = self.endpoint.open_stream(conn_id, StreamDirection::Unidirectional) {
+                mux.open_control(sid.0);
+            }
+        }
+        for (id, code) in oc.stopped.drain(..) {
+            let _ = mux.on_stop_sending(id, code);
+        }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.resize(64 * 1024, 0);
+        let mut i = 0;
+        while i < oc.read.len() {
+            let id = oc.read[i];
+            let mut keep = false;
+            while mux.error.is_none() {
+                let room = mux.rx_room(id).min(scratch.len());
+                if room == 0 {
+                    keep = true;
+                    break;
+                }
+                match self.endpoint.read_stream(conn_id, StreamId(id), &mut scratch[..room]) {
+                    Ok(r) => {
+                        if r.bytes_read > 0 || r.fin {
+                            let _ = mux.recv(id, &scratch[..r.bytes_read], r.fin, now);
+                        }
+                        if r.fin || r.bytes_read == 0 {
+                            break;
+                        }
+                    }
+                    Err(ibex_quic::error::QuicError::StreamReset(code)) => {
+                        let _ = mux.on_reset(id, code);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if keep {
+                i += 1;
+            } else {
+                oc.read.swap_remove(i);
+            }
+        }
+        self.scratch = scratch;
+        OwnerConn::Open
+    }
+
+    /// The owner of `conn_id` writes what its mux framed (T509): the stream signals, a
+    /// connection error as the close, then each stream's bytes and FIN round robin, as
+    /// much as quinn takes. A stream whose FIN went out and that `done` says no child serves
+    /// any more is let go.
+    pub fn owner_send(&mut self, conn_id: ConnectionId, mux: &mut mux_h3::H3MuxContext, done: impl Fn(u64) -> bool) {
+        if !self.owned.contains_key(&conn_id) {
+            return;
+        }
+        self.dirty = true;
+        while let Some(sig) = mux.take_signal() {
+            match sig {
+                mux_h3::H3Signal::StopSending { id, code } => self.endpoint.stop_sending(conn_id, StreamId(id), code),
+                mux_h3::H3Signal::ResetStream { id, code } => {
+                    let _ = self.endpoint.reset_stream(conn_id, StreamId(id), code);
+                }
+            }
+        }
+        if let Some(e) = mux.error {
+            self.endpoint.close_connection(conn_id, e as u64, b"");
+            return;
+        }
+        for _ in 0..256 {
+            let Some(id) = mux.next_tx() else { break };
+            let bytes = mux.tx_bytes(id);
+            let n = if bytes.is_empty() { 0 } else { self.endpoint.write_stream(conn_id, StreamId(id), bytes, false).unwrap_or(0) };
+            mux.tx_written(id, n);
+            if mux.fin_due(id) {
+                let _ = self.endpoint.finish_stream(conn_id, StreamId(id));
+                mux.fin_written(id);
+                if done(id) {
+                    mux.release(id);
+                }
+            } else if n == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Closes connection `conn_id`, its owner gone or ending it (`H3_NO_ERROR`).
+    pub fn owner_close(&mut self, conn_id: ConnectionId) {
+        if self.owned.remove(&conn_id).is_some_and(|oc| !oc.closed) {
+            self.endpoint.close_connection(conn_id, H3_NO_ERROR, b"");
+            self.dirty = true;
+        }
+    }
+
+    /// Records transport news of an owned connection for its owner, and wakes it.
+    fn owned_news(&mut self, conn_id: ConnectionId, read: Option<u64>, stopped: Option<(u64, u64)>) -> bool {
+        let Some(oc) = self.owned.get_mut(&conn_id) else { return false };
+        if let Some(id) = read.filter(|id| !oc.read.contains(id)) {
+            oc.read.push(id);
+        }
+        if let Some(st) = stopped {
+            oc.stopped.push(st);
+        }
+        if let Some((_, task)) = oc.owner {
+            self.wake.push(task);
+        }
+        true
     }
 
 
@@ -306,6 +507,18 @@ impl QuicListener {
         let Some(conn_id) = self.waiting.pop_front() else { return };
         self.pending.remove(&conn_id);
         self.admitted.insert(conn_id);
+        if self.mux {
+            // Its owner reads the streams it opened while it waited (T509).
+            let mut oc = OwnedConn::default();
+            for (stream_id, _) in self.held.remove(&conn_id).unwrap_or_default() {
+                if !oc.read.contains(&stream_id.0) {
+                    oc.read.push(stream_id.0);
+                }
+            }
+            self.owned.insert(conn_id, oc);
+            self.new_owned.push(conn_id);
+            return;
+        }
         self.open_control_stream(conn_id);
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.resize(64 * 1024, 0);
@@ -528,10 +741,22 @@ impl QuicListener {
                 }
                 // The client asked us to stop sending the response. (A reset of its request
                 // arrives as a read error instead, in `on_readable`.)
-                TransportEvent::StreamStopped { conn_id, stream_id, .. } => {
-                    self.abandon_stream(conn_id, stream_id);
+                TransportEvent::StreamStopped { conn_id, stream_id, error_code } => {
+                    if !self.owned_news(conn_id, None, Some((stream_id.0, error_code))) {
+                        self.abandon_stream(conn_id, stream_id);
+                    }
+                }
+                // Room on a stream an owner writes: it writes the rest (T509).
+                TransportEvent::StreamWritable { conn_id, .. } => {
+                    self.owned_news(conn_id, None, None);
                 }
                 TransportEvent::ConnectionClosed { conn_id, .. } => {
+                    if let Some(oc) = self.owned.get_mut(&conn_id) {
+                        oc.closed = true;
+                        if let Some((_, task)) = oc.owner {
+                            self.wake.push(task);
+                        }
+                    }
                     if self.admitted.remove(&conn_id) {
                         self.closed.push((conn_id, true));
                     } else if self.pending.remove(&conn_id) {
@@ -579,6 +804,9 @@ impl QuicListener {
         for (conn_id, st) in &mut self.h3 {
             Self::send_goaway(&mut self.endpoint, *conn_id, st);
         }
+        // Each owner (the mux path) sends its own GOAWAY and closes when idle: woken now, or
+        // one whose client went quiet sleeps through the stop until quinn's idle timeout (T511).
+        self.wake.extend(self.owned.values().filter_map(|oc| oc.owner.map(|(_, task)| task)));
         self.drain_idle_connections();
         // The GOAWAYs and closes go out now. Left for the next `pump`, they waited for an
         // unrelated wakeup -- and a closed connection's next wakeup is its drain timer, which
@@ -723,6 +951,9 @@ impl QuicListener {
     fn stream_event(&mut self, conn_id: ConnectionId, stream_id: StreamId, opened: bool, scratch: &mut [u8]) {
         if self.pending.contains(&conn_id) {
             self.held.entry(conn_id).or_default().push((stream_id, opened));
+            return;
+        }
+        if self.owned_news(conn_id, Some(stream_id.0), None) {
             return;
         }
         if opened {
