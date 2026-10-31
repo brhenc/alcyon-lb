@@ -982,12 +982,13 @@ pub(crate) fn parse_listen_bind(
     kw: &Token,
 ) -> Result<(), ConfigError> {
     let bind = parse_bind(tokens, kw, "listen")?;
-    if bind.quic {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "QUIC is not supported in listen sections".to_string(),
-        ));
+    let mut bind = bind;
+    // As a frontend's (`parse_frontend_bind`): `src/cfgparse.c` treats both alike.
+    if bind.quic && !bind.ssl {
+        return Err(ConfigError::new(kw.line, kw.col, "QUIC protocol detected, enabling ssl. Use 'ssl' to shut this warning. Proxy no SSL certificate specified for bind (use 'crt')".to_string()));
+    }
+    if bind.quic && bind.alpn.is_empty() {
+        bind.alpn.push("h3".to_string());
     }
     if proxy.binds.is_empty() {
         proxy.addr = bind.addr;

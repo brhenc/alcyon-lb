@@ -3828,7 +3828,11 @@ pub fn validate_tls(config: &Config) -> io::Result<()> {
     // A `disabled` listen is checked too: `HAProxy` loads its certificates at parse time.
     for l in &config.listens {
         for bind in l.binds.iter().filter(|b| b.ssl) {
-            bind_tls(&l.name, &l.binds, bind.addr)?;
+            if bind.quic {
+                bind_tls_quic(&l.name, &l.binds, bind.addr)?;
+            } else {
+                bind_tls(&l.name, &l.binds, bind.addr)?;
+            }
         }
     }
     // Servers: `ca-file`, `crl-file` and `crt` are opened, and the `sni` expression
@@ -3877,6 +3881,70 @@ fn bind_tls_quic(
     addr: SocketAddr,
 ) -> io::Result<Option<Arc<ibex_tls::tcp::BindTls>>> {
     bind_tls_with(section, binds, addr, true, ibex_tls::tcp::from_bind_config)
+}
+
+/// Opens one `quic` bind of a frontend or a `listen` (T530): this worker's UDP socket, handed to
+/// the proxy's stream engine, in the poller. The proxy index is what `ql.set_frontend` reads.
+#[allow(clippy::too_many_arguments)]
+fn open_quic_bind(
+    config: &Config,
+    worker_id: usize,
+    bufsize: usize,
+    b: &ibex_config::ast::BindConfig,
+    tls: &Arc<ibex_tls::tcp::BindTls>,
+    proxy_idx: usize,
+    quic_listeners: &mut Vec<crate::quic_listener::QuicListener>,
+    fdtab: &mut FdTab,
+    poller: &Poller,
+) -> io::Result<()> {
+    // `tune.quic.listen off`: `protocol_may_bind_quic` is false, a QUIC bind gets no socket
+    // (T525), for a `listen` as for a frontend; the proxy's other binds are served.
+    if config.global.as_ref().and_then(|g| g.quic_listen) == Some(false) {
+        return Ok(());
+    }
+
+    // Each request is handed to this frontend's stream engine (T130). It
+    // used to go straight to the first server of the default backend, and
+    // no rule, `use_backend`, balancing or log line ever saw it.
+    // `quic-force-retry` and `tune.quic.fe.sec.retry-threshold` (T492); windows from
+    // `tune.bufsize`, as HAProxy's (h3-engine design 2.3): 100 streams of `bufsize - 4`,
+    // 90 % of it for one (T504).
+    let mut qc = ibex_quic::QuicConfig::new().with_flow_windows(bufsize, 100, 90);
+    qc.require_retry = b.sock.as_ref().is_some_and(|s| s.quic_force_retry);
+    if let Some(n) = config.global.as_ref().and_then(|g| g.quic_retry_threshold) {
+        qc.retry_threshold = n;
+    }
+    // T525: the transport parameters sent to a client. `max_streams_bidi` is the
+    // smaller of `max-concurrent` and `max-total` (`quic_transport_params_init`).
+    let g = config.global.as_ref();
+    if let Some(ms) = g.and_then(|g| g.quic_max_idle_timeout) {
+        // 0 sends no parameter: no transport idle timeout.
+        qc.max_idle_timeout = (ms != 0).then(|| Duration::from_millis(u64::from(ms)));
+    }
+    let total = g.and_then(|g| g.quic_stream_max_total).unwrap_or(0);
+    let mut streams = g.and_then(|g| g.quic_stream_max_concurrent).unwrap_or(100);
+    if total != 0 {
+        streams = streams.min(total);
+    }
+    qc.max_concurrent_bidi_streams = u64::from(streams);
+    let mut ql = crate::quic_listener::QuicListener::bind_for_worker(b.addr, tls, Some(qc), Some(worker_id))?;
+    ql.set_frontend(proxy_idx);
+    ql.gate_connections();
+    ql.set_stream_max_total(total);
+    if h3_mux(config.global.as_ref().and_then(|g| g.h3_mux)) {
+        ql.serve_by_mux();
+    }
+
+    let l_idx = quic_listeners.len();
+    let lfd = ql.raw_fd();
+    fdtab.insert(
+        lfd,
+        FdState::QuicListener { listener: usize_to_u32(l_idx) },
+        Interest::READ,
+    );
+    poller.add(ql.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
+    quic_listeners.push(ql);
+    Ok(())
 }
 
 /// The `ssl` bind at `addr` of the given transport: a TCP and a `quic` bind may share an
@@ -3944,16 +4012,22 @@ fn initial_status(s: &ibex_config::Server, unresolved: bool) -> u8 {
 /// # Errors
 /// The first address that cannot be bound.
 pub fn prebind_quic(config: &Config, workers: usize) -> io::Result<()> {
-    for frontend in config.frontends.iter().filter(|f| !f.disabled) {
-        for b in frontend_binds(frontend).iter().filter(|b| b.quic) {
+    // `tune.quic.listen off`: no QUIC socket at all (T525).
+    if config.global.as_ref().and_then(|g| g.quic_listen) == Some(false) {
+        return Ok(());
+    }
+    let listens = config.listens.iter().filter(|l| !l.disabled).map(|l| ("listen", &l.name, l.binds.clone()));
+    let frontends = config.frontends.iter().filter(|f| !f.disabled).map(|f| ("frontend", &f.name, frontend_binds(f)));
+    for (kind, name, binds) in listens.chain(frontends) {
+        for b in binds.iter().filter(|b| b.quic) {
             crate::quic_listener::prebind(b.addr, workers).map_err(|e| {
-                // HAProxy's alert (`protocol_bind_all`), without its `[file:line]`.
+                // HAProxy's alert (`protocol_bind_all`: proxy type, then name), without its `[file:line]`.
                 let why = e.to_string();
                 let why = why.split(" (os error").next().unwrap_or(&why).to_string();
                 let proto = if b.addr.is_ipv4() { "quic4" } else { "quic6" };
                 io::Error::new(
                     e.kind(),
-                    format!("Binding for frontend {}: protocol {proto}: cannot bind socket ({why}) for [{}].", frontend.name, b.addr),
+                    format!("Binding for {kind} {name}: protocol {proto}: cannot bind socket ({why}) for [{}].", b.addr),
                 )
             })?;
         }
@@ -4975,6 +5049,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 listen.binds.clone()
             };
             for (bind_idx, b) in binds.iter().enumerate() {
+                if b.quic {
+                    let tls = bind_tls_quic(&listen.name, &binds, b.addr)?.expect("QUIC requires TLS");
+                    open_quic_bind(config, worker_id, bufsize, b, &tls, proxy_idx, &mut quic_listeners, &mut fdtab, &poller)?;
+                    continue;
+                }
                 let tls = bind_tls(&listen.name, &binds, b.addr)?;
                 for mut listener in listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&ibex_config::ast::SocketTuning::default()), crate::listener::listener_backlog(b.sock.as_deref().and_then(|s| s.backlog), listen.backlog, listen.maxconn))? {
                     listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
@@ -5003,35 +5082,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             for (bind_idx, b) in all_binds.iter().enumerate() {
                 let bind_addr = b.addr;
                 if b.quic {
+                    // `tune.quic.listen off`: `protocol_may_bind_quic` is false, a QUIC bind gets
+                    // no socket (T525); the frontend's other binds are served.
+                    if config.global.as_ref().and_then(|g| g.quic_listen) == Some(false) {
+                        continue;
+                    }
                     let tls = bind_tls_quic(&frontend.name, &frontend.binds, bind_addr)?.expect("QUIC requires TLS");
-
-                    // Each request is handed to this frontend's stream engine (T130). It
-                    // used to go straight to the first server of the default backend, and
-                    // no rule, `use_backend`, balancing or log line ever saw it.
-                    // `quic-force-retry` and `tune.quic.fe.sec.retry-threshold` (T492); windows from
-                    // `tune.bufsize`, as HAProxy's (h3-engine design 2.3): 100 streams of `bufsize - 4`,
-                    // 90 % of it for one (T504).
-                    let mut qc = ibex_quic::QuicConfig::new().with_flow_windows(bufsize, 100, 90);
-                    qc.require_retry = b.sock.as_ref().is_some_and(|s| s.quic_force_retry);
-                    if let Some(n) = config.global.as_ref().and_then(|g| g.quic_retry_threshold) {
-                        qc.retry_threshold = n;
-                    }
-                    let mut ql = crate::quic_listener::QuicListener::bind_for_worker(bind_addr, &tls, Some(qc), Some(worker_id))?;
-                    ql.set_frontend(proxy_idx);
-                    ql.gate_connections();
-                    if h3_mux(config.global.as_ref().and_then(|g| g.h3_mux)) {
-                        ql.serve_by_mux();
-                    }
-
-                    let l_idx = quic_listeners.len();
-                    let lfd = ql.raw_fd();
-                    fdtab.insert(
-                        lfd,
-                        FdState::QuicListener { listener: usize_to_u32(l_idx) },
-                        Interest::READ,
-                    );
-                    poller.add(ql.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
-                    quic_listeners.push(ql);
+                    open_quic_bind(config, worker_id, bufsize, b, &tls, proxy_idx, &mut quic_listeners, &mut fdtab, &poller)?;
                 } else {
                     let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?;
                     for mut listener in listeners_for(worker_id, bind_addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&ibex_config::ast::SocketTuning::default()), crate::listener::listener_backlog(b.sock.as_deref().and_then(|s| s.backlog), frontend.backlog, frontend.maxconn))? {
@@ -10364,7 +10421,11 @@ impl EngineDispatcher<'_> {
             release_server(entry, proxies, fdtab, poller, idle_pool, false);
         } else if !untouched && entry.sess.req.is_empty() && !private {
             let keeps = entry.target_server_idx.is_some_and(|i| proxies.get(entry.srv_backend_idx).is_some_and(|p| p.ids.server_pool(i).keeps_any()));
-            if keeps && idle_pool.total() == 0 && entry.sess.srv.is_some() {
+            // An HTTP/3 request relayed over a socket pair is its session's only one: there is
+            // no next request to keep the connection for, and parked it is no other stream's
+            // (T523: 150 server connections for a burst of 200 where HAProxy opened 115).
+            let relayed = entry.sess.h3 && !entry.sess.is_h2_child();
+            if keeps && idle_pool.total() == 0 && entry.sess.srv.is_some() && !relayed {
                 entry.sess.srv_park_exp = now.add(SRV_PARK_MS);
                 // Idle, it is not one of the server's connections in use (`scur`, and
                 // what the lists' rule weighs); the peak in use is noted first, as the
@@ -13890,8 +13951,12 @@ impl EngineDispatcher<'_> {
             let low = s_idx.map_or(0, |i| proxies[be_idx].ids.server_pool(i).low_conn);
             let steal = key.as_ref().is_none_or(|k| idle_pool.may_steal(k.srv, low));
             let srv = key.as_ref().map(|k| k.srv);
-            // Every stream of an HTTP/2 frontend is "not the first request" (`SE_FL_NOT_FIRST`, `mux_h2.c`).
-            if let Some((conn, safe, registered)) = key.and_then(|k| idle_pool.take(&k, entry.sess.is_first_req && !entry.sess.is_h2_child(), proxies[be_idx].http_reuse, steal)) {
+            // Every stream of an HTTP/2 frontend is "not the first request" (`SE_FL_NOT_FIRST`, `mux_h2.c`),
+            // and so is every HTTP/3 request, the relay's included (`qcs_new`, `mux_quic.c`): one
+            // server connection per HTTP/3 request overflowed a small server's accept queue
+            // under a burst of 200 (T523).
+            let first_req = entry.sess.is_first_req && !entry.sess.is_h2_child() && !entry.sess.h3;
+            if let Some((conn, safe, registered)) = key.and_then(|k| idle_pool.take(&k, first_req, proxies[be_idx].http_reuse, steal)) {
                 entry.srv_served = if safe { 2 } else { 1 };
                 reused = Some((conn, registered));
             }
@@ -17354,6 +17419,38 @@ mod idle_poll_tests {
         }
         assert_eq!(e.idle_backend_pool.total(), 2);
         assert_eq!(e.poller.ctl_calls() - before, 0, "epoll_ctl calls for 10 requests through the lists");
+    }
+
+    /// An HTTP/3 request relayed over a socket pair (a session with no listener, T130) gives
+    /// its server connection to the server's lists with its response, also while the lists
+    /// are empty: its session carries no other request, and a connection parked on it for
+    /// `SRV_PARK_MS` is no other stream's (T523: in a burst of 200 HTTP/3 connections, 150
+    /// server connections where `HAProxy`, whose h3 stream ends with its response, opened 115).
+    #[test]
+    fn a_relayed_h3_request_parks_no_server_connection() {
+        let (srv, _conns) = backend();
+        let (mut e, _fe) = engine(srv);
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        ours.set_nonblocking(true).expect("nonblocking");
+        let local: SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        e.admit_connection(0, None, theirs.into(), "127.0.0.1:50000".parse().expect("addr"), local);
+        ours.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 512];
+        let start = Instant::now();
+        while !got.ends_with(b"ok") {
+            assert!(start.elapsed() < Duration::from_secs(5), "no answer: {got:?}");
+            let _ = e.run_once();
+            if let Ok(n) = ours.read(&mut buf) {
+                got.extend_from_slice(&buf[..n]);
+            }
+        }
+        // The relay keeps its side open. Parked, the connection reaches the lists only when
+        // its park ends (`SRV_PARK_MS`, 100 ms: the next `run_once` sleeps until then).
+        let answered = Instant::now();
+        assert!(drive_until(&mut e, |e| e.idle_backend_pool.total() == 1), "never reached the lists");
+        let took = answered.elapsed();
+        assert!(took < Duration::from_millis(50), "the server connection stayed on the relayed session for {took:?}");
     }
 
     /// A server that closes a connection while it is in its lists: the close is an event

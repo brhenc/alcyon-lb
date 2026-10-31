@@ -36,7 +36,7 @@ from `/tmp/t533`). All on ports 63000-63999, every process stopped by PID at the
 | How close is QUIC/h3 to servers? | **After A: 7 slices, 1 S, 5 M, 1 L-conditional ≈ 7-8 sessions**, of which B0 is T534 (started). What is there: quinn-proto 0.11 can connect as a client; Ibex's QUIC server, h3 mux (T509-T520) and static QPACK; rustls 0.24.0-dev.2's QUIC client connection (see the TLS row). What is not: the client half of Ibex's quinn↔rustls adapter (`crypto.rs` is server-only), a client endpoint and UDP socket per connection, the h3 mux's client role, and A's backend mux to hang it on. |
 | Blockers | (1) **The engine's single-fd server leg** (A2, L): every multiplexed backend needs it; nothing in B can be wired before it. (2) **TLS for B**: rustls 0.24.0-dev.2 *has* a QUIC client connection (`ClientConnectionBuilder::build_quic`, `client/connection.rs:89`, driven by `Connection<ClientSide, Quic>::read_hs`, `quic.rs:275-296`, which verifies the server inline in `MessageIterMode::All`); only the typed step-by-step API is unfinished in dev.2 (`FromConn<ClientSide> for ()` is `todo!("nyi")`, `quic.rs:146-152`, reached from `VerifyPeerIdentity::continue_with`) and was finished upstream in `f238d682f` "Support `quic::ClientHandshake`" on 2026-10-14, the day after the dev.2 tag (2026-10-13), unreleased (main is 64 commits past dev.2 today; no milestone or date). T534 writes the client half on the `read_hs` path and proves it with a test; if that path fails, the pin moves to a git rev ≥ `f238d682f` (API churn: `NeedsInput` became generic, so the server half is re-ported too). No rustls 0.23 comes back. (3) **The +0.5 % instructions-per-request budget** on the HTTP/1 path, which A2 touches (§A.5). (4) HAProxy's own QUIC backend is **experimental** (`expose-experimental-directives`; "QUIC is currently incompatible with dynamic backends deletion", `server.c:3842`), so B's oracle moves (the last 8 commits to `mux_quic.c` in the dev10 tree are all bug fixes, two MEDIUM and one MAJOR). |
 | Should h2 come first? | **Yes** (and the user decided it). Everything that makes B hard is in A: a backend connection serving several sessions, its owner, the per-worker avail/idle lists, `http-reuse` for a multiplexed connection, `max-reuse`, server GOAWAY/RST handling, per-stream timeouts, checks through a mux. B then adds a transport (UDP, quinn) and a second mux kind behind the same interface. Built QUIC-first, the same engine work would be done against a less stable oracle and harder tooling (no vtest h3). |
-| A defect to fix now, independent of A | **`server ... ssl alpn h2` and `alpn h2,http/1.1` are accepted today and every request fails 502** against a server that picks h2 (measured, §A.3 row 1: HAProxy 200 `ver=2.0`, Ibex `502 Bad Gateway`); `check-alpn h2` with `option httpchk` leaves the server DOWN (`L7TOUT`; HAProxy UP `L7OK`, checks arrive as `HTTP/2.0`). Known since T341/T353 (open boxes), never fixed. AGENTS.md §5: slice A0 (S) makes the parser refuse an `h2` in `alpn`/`check-alpn` until A lands — user decision D1. |
+| A defect to fix now, independent of A | **`server ... ssl alpn h2` and `alpn h2,http/1.1` are accepted today and every request fails 502** against a server that picks h2 (measured, §A.3 row 1: HAProxy 200 `ver=2.0`, Ibex `502 Bad Gateway`); `check-alpn h2` with `option httpchk` leaves the server DOWN (`L7TOUT`; HAProxy UP `L7OK`, checks arrive as `HTTP/2.0`). Known since T341/T353 (open boxes), never fixed. AGENTS.md §5: slice A0 (S) makes the parser refuse an `h2` in `alpn`/`check-alpn` until A lands — user decision D1. **Superseded 10-31 (T535, §A.6b): not refused; one stream per server connection, 2 M + 3 S.** |
 | What it unlocks | A: 15 dev8 reg-tests whose server line needs h2 (`proto h2` ×13, `alpn h2` ×3, `check-proto h2` ×1; board `93a00df9`: 10 OUT_OF_SCOPE, 3 FAIL, 2 SKIP; list in §A.4), gRPC through Ibex, h2c to app servers. B: T528's 17 OUT_OF_SCOPE QUIC tests (a QUIC bind and a `server quic4@` in one block) and the 12 skipped for `ssllib_name_startswith(OpenSSL)` once forced; Ibex-to-Ibex h3 chains (the server half already works with HAProxy as the h3 client, measured §B.2). |
 
 ---
@@ -238,6 +238,28 @@ pub struct BeStream { sess: (u32, TaskRef), req_sent: usize, head_sent: bool, rs
 
 **Total A: 3 S + 5 M + 1 L** = about 9-11 agent sessions with their gates, i.e. roughly **two
 working weeks** at the project's cadence, plus one night for A8's numbers.
+
+## A.6b Update 2026-10-31 (T535): one stream per server connection first
+
+User decision 10-31: `alpn h2` is **not** refused (A0 / D1 dropped). T535 measured HAProxy dev8
+under the default `http-reuse safe` with an h2 client sending 10 concurrent streams: **10 server
+connections** (`proto h2` and `ssl alpn h2` alike); sequential streams reuse 1. HAProxy
+multiplexes only under `aggressive`/`always` (1 connection). So one stream at a time per server
+connection is HAProxy's default behaviour, and it needs no `ServerLeg`/`BeConn` (A2).
+
+A spike (local branch `spike/t535`, not merged) proved it: an h2 codec as a `ServerXprt` variant
+under the session (HTTP/1.1 text in and out, frames on the wire), installed when TLS ALPN selects
+`h2` and for `proto h2`. It passed `alpn h2`, `alpn h2,http/1.1`, `proto h2`, POST over the flow
+control window, HEAD, server GOAWAY after 3 streams (`3 3 1` as HAProxy), server reject (`502
+SH--` as HAProxy), `check-alpn h2` (UP `L7OK`, `HTTP/2.0` on the server), and matched HAProxy's
+connection count in every `safe` row. Findings, wire captures and the slice list:
+`tasks/T535-progress.md`.
+
+**Revised estimate for a working `alpn h2` / `proto h2`:** H1 (codec, M) + H2 (wiring, M), then
+H3 checks (S), H4 gRPC/trailers (S), H5 docs/reg-tests (S): **2 M + 3 S ≈ 3-4 sessions**, in
+place of A0 and ahead of A1-A8. H1 is A1's codec; A2-A5 remain for multiplexing under
+`aggressive`/`always`, `tune.h2.be.*`, and replay of GOAWAY/REFUSED_STREAM streams. The full A
+total (9-11 sessions) is unchanged, less A0 and most of A1 (≈ 2 sessions) once H lands.
 
 ---
 
