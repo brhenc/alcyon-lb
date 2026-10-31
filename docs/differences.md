@@ -400,6 +400,29 @@ stream: each stream is a new HTTP/1 session over its socket pair, and `http-reus
 session's first request on a connection of its own, so no stream takes a kept one. Under
 `retry-on empty-response` both paths and HAProxy serve them all. Gone with the relay, slice H5.
 
+## HTTP/3 under the mux: interim responses, trailers and CONNECT (T520)
+
+Measured on HAProxy 3.5-dev7 with QUIC (aioquic client) and, for h2, 3.5-dev8 (curl):
+
+- **Interim responses (`100`, `103`) to an h3 client.** HAProxy 3.5-dev7 sends the interim
+  HEADERS **with the FIN**, which ends the stream: the final response never arrives (`103`
+  from the server, then `200`; `expect: 100-continue`). When the server's `103` and `200` come
+  in one segment it aborts (`BUG_ON htx.c:391`, SIGILL). Ibex (mux path) follows RFC 9114 4.1:
+  an interim HEADERS without FIN, then the final response; both in one segment are forwarded.
+  The relay path (the default until slice H5) drops interim responses and response trailers.
+  `%B` of such a request: HAProxy counts the interim head (`B=119` for a 103 with one `link`
+  field and a 2-byte `200`), Ibex does not (`B=51`), on h2 and h3.
+- **Interim responses to an h2 client** are forwarded as HAProxy does (they were dropped before).
+- **Response trailers to an h3 client** (mux path): a chunked response's trailer section is one
+  HEADERS frame after the DATA, with the FIN, as HAProxy; `%B` counts the trailer names and
+  values as HAProxy. With `option http-drop-response-trailers` the data ends with the FIN as on
+  HAProxy, but `%B` is smaller by the dropped fields (HAProxy counts them: they are in its HTX
+  message when dropped; Ibex cuts them from the buffer first). **Response trailers to an h2
+  client are still not sent** (HAProxy sends them; known since T381).
+- **CONNECT** under the mux is reset with `H3_REQUEST_REJECTED` (0x10b), extended CONNECT and a
+  `te` other than `trailers` with `H3_MESSAGE_ERROR` (0x10e), the connection staying usable, as
+  HAProxy. The relay answers a CONNECT with a 400 and no reset.
+
 ## `tune.ibex.zero-spares on|off`: an Ibex-only global keyword (S1)
 
 The header rules, samples and formats reuse per-thread spare strings and header lists (`show

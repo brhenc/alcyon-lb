@@ -184,6 +184,8 @@ mod quic_retry;
 mod h3_many_threads;
 mod h3_mux_edges;
 mod h3_mux_owner;
+mod h3_mux_trailers;
+mod h2_interim_responses;
 mod h3_proxy_path;
 mod h3_same_port;
 mod h3_request_framing_to_backend;

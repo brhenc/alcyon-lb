@@ -334,6 +334,26 @@ pub fn pump_request_body_mux<M: HtxMux>(mux: &mut M, active: &mut H2ActiveStream
     (changed, body.trailer_bytes - before)
 }
 
+/// The most trailer fields the bridge sends: the h1 parser accepts as many (`txn`).
+const MAX_TRAILER_FIELDS: usize = 100;
+
+/// The fields of a chunked trailer section (`name: value` lines ended by CRLF, a blank line
+/// last, as `rewrite_rep_chunk_framing` leaves them) in `out`: how many. A field that is not
+/// text is left out.
+fn trailer_fields<'a>(section: &'a [u8], out: &mut [(&'a str, &'a str); MAX_TRAILER_FIELDS]) -> usize {
+    let mut n = 0;
+    for line in section.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
+        let value = line[colon + 1..].trim_ascii();
+        if let (Ok(name), Ok(value), true) = (std::str::from_utf8(&line[..colon]), std::str::from_utf8(value), n < out.len()) {
+            out[n] = (name, value);
+            n += 1;
+        }
+    }
+    n
+}
+
 /// [`forward_response`] for any mux the bridge drives (T509), the DATA staged in `scratch`.
 pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, scratch: &mut Vec<u8>) -> bool {
     let id = u64::from(stream_id);
@@ -343,7 +363,11 @@ pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut Ht
     let data = rep.readable();
     let win = txn.rsp.window(data);
     if txn.rsp_interim {
-        // Interim responses are dropped as on h2 (they go out in slice H3b).
+        // An interim response (`100`, `103`) is a HEADERS frame without the end of the
+        // stream; the final response follows (T520). One that is no head the mux can send
+        // is dropped.
+        let Some((h, _)) = find_eoh(data) else { return false };
+        mux.send_interim(id, &data[..h]);
         txn.response_sent(data, win);
         rep.consume(win);
         return false;
@@ -368,12 +392,35 @@ pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut Ht
     }
     scratch.clear();
     let mut state = txn.rsp;
-    let used = state.take_body(data, mux.data_budget(id), scratch);
+    // Already at the trailer section (it was not all here before): nothing to take first.
+    let mut used = if state.at_trailer_section() { 0 } else { state.take_body_to_trailers(data, mux.data_budget(id), scratch) };
+    // A chunked body's trailer section, once all of it is here: the trailers of the stream
+    // (T520), or nothing but the end of the message.
+    let mut trailers = &data[..0];
+    if state.at_trailer_section() {
+        if let Some(n) = state.trailer_section(&data[used..]) {
+            trailers = &data[used..used + n];
+            used += n;
+            state = MsgState::Done;
+        }
+    }
     let end = state.is_done();
     if let Some(t) = txn.rsp_htx.as_mut().filter(|_| !txn.local) {
         *t += scratch.len() as u64 + u64::from(end && matches!(txn.rsp, MsgState::Body(txn::Body::Chunked(_))));
     }
-    if !scratch.is_empty() || end {
+    if trailers.len() > 2 {
+        // Not the blank line alone: the fields, on the stack (the common response has none).
+        if !scratch.is_empty() {
+            mux.send_data(id, scratch, false);
+        }
+        let mut fields = [("", ""); MAX_TRAILER_FIELDS];
+        let n = trailer_fields(trailers, &mut fields);
+        mux.send_trailers(id, &fields[..n]);
+        // `%B` counts the trailers' names and values (HTX trailer blocks).
+        if let Some(t) = txn.rsp_htx.as_mut().filter(|_| !txn.local) {
+            *t += fields[..n].iter().map(|(k, v)| (k.len() + v.len()) as u64).sum::<u64>();
+        }
+    } else if !scratch.is_empty() || end {
         mux.send_data(id, scratch, end);
     }
     if used > 0 || end {
@@ -405,7 +452,10 @@ pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn
     let data = rep.readable();
     let win = txn.rsp.window(data);
     if txn.rsp_interim {
-        // An HTTP/1 interim response has no place in this conversion; it is dropped.
+        // An interim response (`100`, `103`) is a HEADERS frame without END_STREAM; the
+        // final response follows (T520). One the mux cannot send is dropped.
+        let Some((h, _)) = find_eoh(data) else { return false };
+        h2.send_interim(stream_id, &data[..h]);
         txn.response_sent(data, win);
         rep.consume(win);
         return false;
@@ -737,6 +787,15 @@ mod tests {
             bad_request: false,
             add_len: None,
         }
+    }
+
+    #[test]
+    fn trailer_fields_are_the_text_lines_with_a_colon_up_to_the_cap() {
+        let mut out = [("", ""); MAX_TRAILER_FIELDS];
+        let n = trailer_fields(b"x-a: 1\r\nno colon\r\nx-b:2\r\nx-\xff: 3\r\nx-c: \xff\r\nx-d:  4 \r\n\r\n", &mut out);
+        assert_eq!(&out[..n], [("x-a", "1"), ("x-b", "2"), ("x-d", "4")]);
+        let many: Vec<u8> = (0..MAX_TRAILER_FIELDS + 5).flat_map(|i| format!("x-{i}: v\r\n").into_bytes()).collect();
+        assert_eq!(trailer_fields(&many, &mut out), MAX_TRAILER_FIELDS);
     }
 
     #[test]
