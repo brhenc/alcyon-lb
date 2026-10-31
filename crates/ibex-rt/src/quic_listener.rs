@@ -486,6 +486,25 @@ impl QuicListener {
         self.h3.values().flat_map(|st| st.req.values()).map(Vec::len).sum()
     }
 
+    /// The connections for `show quic` (T524), read-only. The local address is the listener's
+    /// port with the IP the client reached when the kernel said so.
+    #[must_use]
+    pub fn show_infos(&self, worker: usize) -> Vec<crate::mailbox::QuicSnap> {
+        self.endpoint
+            .connection_infos()
+            .into_iter()
+            .map(|i| crate::mailbox::QuicSnap {
+                worker,
+                fe: self.frontend,
+                id: i.id,
+                phase: i.state,
+                local: SocketAddr::new(i.local_ip.unwrap_or(self.addr.ip()), self.addr.port()),
+                peer: i.remote,
+                lost_packets: i.lost_packets,
+            })
+            .collect()
+    }
+
     /// Makes the engine decide, per connection, when it is served (T504): a connection that
     /// completes its HTTP/3 handshake waits until [`QuicListener::admit_next`] says so.
     pub fn gate_connections(&mut self) {

@@ -702,3 +702,20 @@ as upper-case hex, integer bare, `true`/`false`, address as text, method quoted)
 prints the stored type name. Within one scope Ibex lists the variables sorted by name; HAProxy walks its
 hash tree, so its order differs between processes (it is seeded per process). A rule must not depend on
 the order in either.
+
+## `show quic`: the one-line form, with `-` where quinn-proto has no value (T524)
+
+`show quic [oneline] [all|clo|be]` prints HAProxy's header and one line per connection with its
+column widths (measured on 3.5-dev7 with QUIC; `show quic help` is byte for byte HAProxy's, as are the
+messages for a bad argument, a bad level and a bad pointer). Differences:
+
+* `in_flight`, `infl_p` and both CIDs print `-`: quinn-proto keeps the bytes and packets in flight and
+  the connection IDs private, and a made-up number is worse than none. `lost_p`, the state
+  (`HDSHK`, `ESTAB`, `CLOSE`; quinn-proto cannot tell `CLOSE` from `DRAIN`) and both addresses are real.
+* The first column is the first eight bytes of the first Initial's destination CID, not a pointer; the
+  `[NN]` is the worker (HAProxy's thread), the order is per worker.
+* `stream`, `full`, a level list (`tp,sock,pktns,cc,mux`) and a `0x...` connection filter are refused
+  with a message naming them. `be` lists nothing (Ibex has no QUIC to servers). `clo` and `all` show the
+  connections quinn-proto still holds closing, which are removed sooner than HAProxy's.
+* `show info` has no QUIC field on HAProxy 3.5-dev7 (the field list is identical with and without a
+  `quic4@` bind), so Ibex has none either; the connection counters QUIC feeds are T504's.

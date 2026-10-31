@@ -92,6 +92,7 @@ mod cli_options;
 mod cli_set_server;
 mod cli_set_server_health;
 mod cli_show_events;
+mod cli_show_quic;
 mod cli_show_sess;
 mod cli_show_stat_end;
 mod cli_show_typed_json;

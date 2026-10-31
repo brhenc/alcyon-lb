@@ -25,6 +25,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub enum Msg {
     /// List this worker's streams (`show sess`).
     ShowSess(Arc<Gather<Vec<SessSnap>>>),
+    /// List this worker's QUIC connections (`show quic`, T524).
+    ShowQuic(Arc<Gather<Vec<QuicSnap>>>),
     /// Shut down this worker's streams that match; reply how many.
     Shutdown(Arc<SessFilter>, Arc<Gather<usize>>),
     /// A gather a task of this worker waits on is complete: wake the task.
@@ -40,6 +42,7 @@ impl Msg {
     fn answer_empty(self, wid: usize) {
         match self {
             Msg::ShowSess(g) => g.reply(wid, Vec::new()),
+            Msg::ShowQuic(g) => g.reply(wid, Vec::new()),
             Msg::Shutdown(_, g) => g.reply(wid, 0),
             // The stream that asked gives up at its deadline.
             Msg::Wake(_) | Msg::DoResolve(_) | Msg::DoResolved(_) => {}
@@ -90,6 +93,20 @@ pub struct SessSnap {
     /// Connection retries done (`s->conn_retries`, which counts up in HAProxy 3.x).
     pub retries: u16,
     pub uri: Option<String>,
+}
+
+/// One QUIC connection as `show quic` prints it, copied on its worker (T524).
+#[derive(Clone, Debug)]
+pub struct QuicSnap {
+    pub worker: usize,
+    /// The frontend (proxy index) the listener serves, `None` for a listener without one.
+    pub fe: Option<usize>,
+    /// The connection's key: the destination CID of its first Initial.
+    pub id: ibex_quic::ConnectionId,
+    pub phase: ibex_quic::ConnPhase,
+    pub local: std::net::SocketAddr,
+    pub peer: std::net::SocketAddr,
+    pub lost_packets: u64,
 }
 
 /// The id `show sess` prints for stream `idx` of worker `wid`'s arena, and `shutdown
