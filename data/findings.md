@@ -15,11 +15,11 @@ needs `fixed_on`; `fixed` (time) feeds the mean time to fix. Check with
 never an open finding. Then `python3 tools/findings.py --md` and commit the CSVs and this file.
 
 ```
-== (a) open findings: 10 of 81
+== (a) open findings: 11 of 82
 severity        dos    parity     flaky  total
 critical          0         0         0      0
 high              0         0         0      0
-medium            0         1         0      1
+medium            0         2         0      2
 low               3         5         1      9
 
 == (b) new findings per method per day
@@ -31,12 +31,13 @@ day               vv-battery           vv-soak          vv-probe           redte
 2026-10-18                 0                 0                 3                 0                 0                 0                 0                 0
 2026-10-19                 0                 0                 2                 0                 0                 0                 1                 0
 2026-10-25                 1                 0                 4                 0                 0                 0                 0                 0
+2026-10-31                 0                 0                 1                 0                 0                 0                 0                 0
 
 == (c) clean hours since the method's last new finding (runs on the main lineage)
 method               hours  last finding     runs
-vv-battery             0.0  2026-10-25 20:08 0
+vv-battery             0.2  2026-10-25 20:08 1
 vv-soak                7.0  2026-10-12 14:38 2
-vv-probe               0.0  2026-10-25 20:58 0
+vv-probe               0.0  2026-10-31 23:21 0
 vv-recheck             1.0  never            7
 redteam                5.6  2026-10-12 12:31 37
 fuzz-libfuzzer         3.0  2026-10-10 22:18 4
