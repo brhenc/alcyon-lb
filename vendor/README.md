@@ -92,6 +92,13 @@ The first vendor commit is the pristine 0.11.18; each change below is its own co
    `Retransmits` boxes per connection (`spare_retransmits`); each packet starts with one, an
    unused one goes back in `finish_and_track`, an acked or lost packet's is emptied and kept.
    0.08 -> 0. Pinned by `crates/ibex-rt/tests/request_allocations_h3.rs` (GET and POST: 0).
+5. `src/frame.rs` `zero_run` (T543, 013efdec): the end of a PADDING run is found 32 bytes a
+   step (an OR-fold the compiler vectorises), not with a byte-at-a-time `position`. Test:
+   `frame::test::zero_run_finds_the_first_nonzero_byte`.
+6. `src/connection/spaces.rs` `Retransmits::is_empty` (T543, ff26c231): the two stream sets'
+   lengths are checked before iterating them (an emptied hashbrown set scans every bucket).
+   No behaviour change. Items 5 and 6 with Ibex's `ConnectionId` hash (57b26eff): h3c1
+   121.8k -> 113.0k ins/req at 1.5 client datagrams per request (T543 progress, batch 4).
 
 ### Running quinn-proto's own tests
 
