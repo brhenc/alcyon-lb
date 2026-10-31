@@ -11030,16 +11030,14 @@ impl EngineDispatcher<'_> {
         if entry.sess.conn_retries == 0 {
             return false;
         }
-        let Some(snap) = entry.sess.txn.as_ref().and_then(|t| match &t.l7 {
-            crate::txn::L7Retry::Saved(s) => Some((s.bytes.clone(), s.req_state)),
-            _ => None,
-        }) else {
-            return false;
-        };
-        entry.sess.rep.clear();
-        entry.sess.req.replace_prefix(0, &snap.0);
-        if let Some(t) = entry.sess.txn.as_mut() {
-            t.req = snap.1;
+        let sess = &mut entry.sess;
+        let Some(t) = sess.txn.as_mut() else { return false };
+        let crate::txn::L7Retry::Saved(snap) = &t.l7 else { return false };
+        sess.rep.clear();
+        sess.req.replace_prefix(0, snap.bytes.readable());
+        let req_state = snap.req_state;
+        {
+            t.req = req_state;
             t.rsp = MsgState::Waiting;
             t.rsp_interim = false;
             t.status = 0;
@@ -11051,6 +11049,12 @@ impl EngineDispatcher<'_> {
         entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
         entry.sess.ending = None;
         entry.sess.l7_retried();
+        // The last retry is spent: the copy goes back to the pool now, not with the transaction.
+        if entry.sess.conn_retries == 0 {
+            if let Some(t) = entry.sess.txn.as_mut() {
+                t.l7 = crate::txn::L7Retry::Dead;
+            }
+        }
         // The connect that follows is any other retry's: a refusal at once is the next
         // failure (`server_connect_failed`: `econ` once, retries without turnaround).
         retry_now(entry, proxies, fdtab, poller, now);

@@ -2115,14 +2115,87 @@ pub enum L7Retry {
     /// The request did not fit, or was not whole when it was first sent: no retry.
     Dead,
     /// The request as it was sent, and where its message state stood before.
-    Saved(Box<L7Snapshot>),
+    Saved(L7Box),
 }
 
 /// What a retry on a response replays.
 #[derive(Debug)]
 pub struct L7Snapshot {
-    pub bytes: Vec<u8>,
+    /// The request, in a buffer of the pool (`l7_buffer`, `b_alloc`): given back with the
+    /// transaction, or when the retry is spent.
+    pub bytes: crate::buf::Buf,
     pub req_state: MsgState,
+}
+
+ibex_alloc::declare_pool!(
+    /// `show pools` `l7_snapshot`: the boxes that hold a request's copy for `retry-on`, for
+    /// the next ones (the copy itself is a standard buffer of the buffer pool).
+    static L7_SNAPSHOT: Pool<Box<L7Snapshot>> = ibex_alloc::PoolSpec::new("l7_snapshot").max_count(1024);
+);
+
+impl ibex_alloc::Poolable for Box<L7Snapshot> {
+    fn footprint(&self) -> usize {
+        std::mem::size_of::<L7Snapshot>()
+    }
+
+    /// The copy goes back to the buffer pool; the box keeps no memory of its own.
+    fn reset(&mut self, _wipe: bool) {
+        self.bytes.clear();
+        self.bytes.release();
+    }
+
+    fn try_new() -> Option<Self> {
+        Some(Box::new(L7Snapshot {
+            bytes: crate::buf::Buf::unallocated(crate::buf::BufClass::Standard),
+            req_state: MsgState::Waiting,
+        }))
+    }
+}
+
+impl L7Retry {
+    /// Keeps `data`, the request as it was sent, in a buffer of the pool; `Dead` when the pool
+    /// has none (`tune.buffers.limit`: `b_alloc(&l7_buffer, DB_UNLIKELY)` fails, `TX_L7_RETRY`
+    /// is cleared and the request goes without a retry).
+    #[must_use]
+    #[cold]
+    #[inline(never)]
+    pub fn save(data: &[u8], req_state: MsgState) -> L7Retry {
+        let Some(mut snap) = L7_SNAPSHOT.take_raw(<Box<L7Snapshot> as ibex_alloc::Poolable>::try_new) else {
+            return L7Retry::Dead;
+        };
+        if snap.bytes.alloc_if_needed() && snap.bytes.put(data) {
+            snap.req_state = req_state;
+            L7Retry::Saved(L7Box(Some(snap)))
+        } else {
+            L7_SNAPSHOT.give(snap);
+            L7Retry::Dead
+        }
+    }
+
+    /// Lists the pool in `show pools` from the start.
+    pub fn register_pools() {
+        L7_SNAPSHOT.register();
+    }
+}
+
+/// A pooled [`L7Snapshot`] box, given back to its pool when dropped.
+#[derive(Debug)]
+pub struct L7Box(Option<Box<L7Snapshot>>);
+
+impl std::ops::Deref for L7Box {
+    type Target = L7Snapshot;
+    fn deref(&self) -> &L7Snapshot {
+        // Always set until dropped.
+        self.0.as_deref().expect("L7Box holds its snapshot until dropped")
+    }
+}
+
+impl Drop for L7Box {
+    fn drop(&mut self) {
+        if let Some(snap) = self.0.take() {
+            L7_SNAPSHOT.give(snap);
+        }
+    }
 }
 
 impl HttpTxn {
