@@ -5,8 +5,8 @@
 //! messages (measured on 3.5-dev8-885761-29, `docs/design/dns-2026-10-25.md` appendix A).
 //!
 //! Where it goes: `Config::resolvers`, which `ibex_rt::resolvers::build` reads for the
-//! sections a server names (T484). What Ibex cannot do yet is refused
-//! here: `parse-resolv-conf` (T489) (T489).
+//! sections a server names (T484). `parse-resolv-conf` (T489) adds the `nameserver` lines of
+//! `/etc/resolv.conf` where it stands.
 
 use super::{address, server_keywords, ConfigError, Duration, IpAddr, SocketAddr, Token};
 use crate::ast::{Nameserver, NsTransport, ResolversSection};
@@ -46,7 +46,24 @@ pub(crate) fn parse_resolvers_directive(r: &mut ResolversSection, tokens: &[Toke
             r.nameservers.push(ns);
         }
         "parse-resolv-conf" => {
-            return Err(err(kw, "'parse-resolv-conf' is not supported: Ibex does not read /etc/resolv.conf yet (T489); list the nameservers"));
+            let warnings = parse_resolv_conf(r, RESOLV_CONF).map_err(|e| {
+                ConfigError::alerts(vec![
+                    (kw.line, format!("config : parsing {{at}}: {e}")),
+                    (kw.line, "config : Error(s) found in configuration file : {file}".to_string()),
+                    (kw.line, "config : Fatal errors found in configuration.".to_string()),
+                ])
+            })?;
+            // `indent_msg(&warnmsg, 8)`: one line as it is, several each on its own line.
+            let text = match warnings.as_slice() {
+                [] => return Ok(()),
+                [one] => one.clone(),
+                many => many.iter().fold(String::new(), |mut acc, w| {
+                    acc.push_str("\n        ");
+                    acc.push_str(w);
+                    acc
+                }),
+            };
+            super::warn::push(kw.line, crate::ast::global::WarnStyle::Tight, &text);
         }
         "hold" => {
             let (event, time) = (arg(tokens, 1), arg(tokens, 2));
@@ -232,7 +249,51 @@ fn parse_nameserver(r: &ResolversSection, tokens: &[Token], kw: &Token) -> Resul
     if (fam == Some(4) && !ip.is_ipv4()) || (fam == Some(6) && !ip.is_ipv6()) {
         return Err(fail(format!("invalid address: '{shown}' in '{text_full}'")));
     }
-    Ok(Nameserver { transport, name: name.to_string(), addr: SocketAddr::new(ip, port), line: kw.line })
+    Ok(Nameserver { transport, name: name.to_string(), addr: SocketAddr::new(ip, port), line: kw.line, from_resolv_conf: false })
+}
+
+/// The file `parse-resolv-conf` reads: `HAProxy` reads this one only.
+pub const RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// `parse_resolve_conf` (`resolvers.c:3598`): adds to `r`, in order, a nameserver for each
+/// `nameserver <addr>` line of `path` (named after the address, port 53, UDP with the TCP
+/// fallback), and returns the warnings for the lines it skips, as `HAProxy` words them
+/// (`{file}` is the configuration file). `path` is [`RESOLV_CONF`] but for tests.
+///
+/// # Errors
+/// `failed to open /etc/resolv.conf.` when `path` cannot be read (fatal in `HAProxy`).
+pub fn parse_resolv_conf(r: &mut ResolversSection, path: &str) -> Result<Vec<String>, String> {
+    let bytes = std::fs::read(path).map_err(|_| format!("failed to open {RESOLV_CONF}."))?;
+    let mut warnings = Vec::new();
+    let ws = |c: char| matches!(c, '\r' | '\n' | '\t' | ' ');
+    for (i, line) in String::from_utf8_lossy(&bytes).split_inclusive('\n').enumerate() {
+        let n = i + 1;
+        let Some(rest) = line.strip_prefix("nameserver") else { continue };
+        // `strtok(line + 10, " \t\r\n")`: a token right after the keyword is another
+        // keyword (`nameserverX`), no token is a missing address.
+        if rest.starts_with(|c: char| !ws(c)) {
+            continue;
+        }
+        let Some(addr) = rest.split(ws).find(|t| !t.is_empty()) else {
+            warnings.push(format!("parsing [{RESOLV_CONF}:{n}] : nameserver line is missing address."));
+            continue;
+        };
+        if let Some(other) = r.nameservers.iter().find(|o| o.name == addr) {
+            let file = if other.from_resolv_conf { RESOLV_CONF } else { "{file}" };
+            warnings.push(format!(
+                "Parsing [{RESOLV_CONF}:{n}] : generated name for {RESOLV_CONF} nameserver '{addr}' conflicts with another nameserver (declared at {file}:{}), it appears to be a duplicate and will be excluded.",
+                other.line
+            ));
+            continue;
+        }
+        // `str2ip2(address, sk, 1)`: an address, or a name libc resolves.
+        let Some(ip) = addr.parse::<IpAddr>().ok().or_else(|| address::libc_resolve(addr)) else {
+            warnings.push(format!("parsing [{RESOLV_CONF}:{n}] : address '{addr}' could not be recognized, nameserver will be excluded."));
+            continue;
+        };
+        r.nameservers.push(Nameserver { name: addr.to_string(), transport: NsTransport::Default, addr: SocketAddr::new(ip, 53), line: n, from_resolv_conf: true });
+    }
+    Ok(warnings)
 }
 
 /// `cfg_post_check_resolvers`: a section without a nameserver draws a warning.

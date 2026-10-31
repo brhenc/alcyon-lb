@@ -44,6 +44,9 @@ enum Zone {
     Many(usize),
     /// One AAAA record, whatever the type asked.
     Aaaa(std::net::Ipv6Addr),
+    /// A records to an A query, AAAA records to an AAAA query (T489); either may be empty
+    /// (NODATA).
+    Dual(Vec<Ipv4Addr>, Vec<std::net::Ipv6Addr>),
     /// SRV records `(priority, weight, port, target)` and additional A records
     /// `(owner, address)` (T487); an SRV query only, NODATA for the others.
     Srv(Vec<(u16, u16, u16, String)>, Vec<(String, Ipv4Addr)>),
@@ -225,12 +228,13 @@ fn build_reply(question: &[u8], z: &Zone, tcp: bool) -> Option<Vec<u8>> {
         Zone::Nx => 3,
         Zone::Refused => 5,
         Zone::ServFail => 2,
-        Zone::A(_) | Zone::NoData | Zone::Truncated(_) | Zone::AlwaysTruncated | Zone::Many(_) | Zone::Aaaa(_) | Zone::Srv(..) => 0,
+        Zone::A(_) | Zone::NoData | Zone::Truncated(_) | Zone::AlwaysTruncated | Zone::Many(_) | Zone::Aaaa(_) | Zone::Dual(..) | Zone::Srv(..) => 0,
     };
     let many: Vec<Ipv4Addr>;
     let ips: &[Ipv4Addr] = match z {
         Zone::A(v) => v,
         Zone::Truncated(v) if tcp => v,
+        Zone::Dual(v, _) => v,
         Zone::Many(n) => {
             many = (0..*n).map(|i| Ipv4Addr::new(10, u8::try_from(i >> 16).expect("octet"), u8::try_from((i >> 8) & 255).expect("octet"), u8::try_from(i & 255).expect("octet"))).collect();
             &many
@@ -240,7 +244,11 @@ fn build_reply(question: &[u8], z: &Zone, tcp: bool) -> Option<Vec<u8>> {
     let qtype = u16::from_be_bytes([question[question.len() - 4], question[question.len() - 3]]);
     // An A query is answered with the A records; an AAAA one with nothing (NODATA).
     let ips = if qtype == 1 { ips } else { &[] };
-    let v6 = if let Zone::Aaaa(v6) = z { Some(*v6) } else { None };
+    let v6: Vec<std::net::Ipv6Addr> = match z {
+        Zone::Aaaa(v6) => vec![*v6],
+        Zone::Dual(_, v6) if qtype == 28 => v6.clone(),
+        _ => Vec::new(),
+    };
     if let Zone::Srv(recs, ar) = z {
         let (recs, ar): (&[_], &[_]) = if qtype == 33 { (recs, ar) } else { (&[], &[]) };
         let mut r = Vec::with_capacity(512);
@@ -269,14 +277,14 @@ fn build_reply(question: &[u8], z: &Zone, tcp: bool) -> Option<Vec<u8>> {
     let mut r = Vec::with_capacity(512);
     r.extend_from_slice(&question[..2]);
     r.extend_from_slice(&[0x81 | if truncated { 2 } else { 0 }, 0x80 | rcode, 0, 1]);
-    r.extend_from_slice(&u16::try_from(ips.len() + usize::from(v6.is_some())).expect("count").to_be_bytes());
+    r.extend_from_slice(&u16::try_from(ips.len() + v6.len()).expect("count").to_be_bytes());
     r.extend_from_slice(&[0, 0, 0, 0]);
     r.extend_from_slice(&question[12..]);
     for ip in ips {
         r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4]);
         r.extend_from_slice(&ip.octets());
     }
-    if let Some(v6) = v6 {
+    for v6 in v6 {
         r.extend_from_slice(&[0xc0, 0x0c, 0, 28, 0, 1, 0, 0, 1, 0x2c, 0, 16]);
         r.extend_from_slice(&v6.octets());
     }
@@ -1921,4 +1929,147 @@ fn an_srv_resolution_failing_within_its_hold_keeps_its_records() {
     assert!(dns.queries().iter().filter(|q| q.name == SRV).count() >= 5, "{:?}", dns.queries());
     assert_eq!(ibex.srv_cols("srv1"), format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"));
     assert!(!ibex.log().iter().any(|l| l.contains("going DOWN")), "{:?}", ibex.log());
+}
+
+/// `both.test`: 10.0.0.1 and 2001:db8::1; `v6only.test`: 2001:db8::6 (design A.t8, A.t18).
+fn dual_zone(dns: &FakeDns) {
+    dns.set("both.test", Zone::Dual(vec![Ipv4Addr::new(10, 0, 0, 1)], vec!["2001:db8::1".parse().expect("v6")]));
+    dns.set("v6only.test", Zone::Dual(Vec::new(), vec!["2001:db8::6".parse().expect("v6")]));
+}
+
+/// T489, `dns-accept-family` with fixed families (`resolv_active_families`, the query type at
+/// `resolvers.c:2179`). Measured on `HAProxy` 3.5-dev8 (`tools/battery/repro/vv-dns/t489/fam*.json`,
+/// `timeout resolve 1s`): `ipv4,ipv6` asks `resolve-prefer`'s type, IPv6 by default
+/// (fam46both: AAAA only, `2001:db8::1`; fam46v6: `2001:db8::6`; fam46both4 with `resolve-prefer
+/// ipv4`: A only, `10.0.0.1`); `ipv6` asks AAAA whatever the preference (fam6both: `2001:db8::1`;
+/// fam6a1: an A-only name gets NODATA, the same id three times, stays `- 0 32`); `ipv4` asks A
+/// (fam4both, `resolve-prefer ipv6`: `10.0.0.1`).
+#[test]
+fn dns_accept_family_fixes_the_query_type() {
+    for (family, server, want, qtype) in [
+        ("ipv4,ipv6", "both.test:80 resolvers r", "2001:db8::1 2 0", 28),
+        ("ipv4,ipv6", "v6only.test:80 resolvers r", "2001:db8::6 2 0", 28),
+        ("ipv4,ipv6", "both.test:80 resolvers r resolve-prefer ipv4", "10.0.0.1 2 0", 1),
+        ("ipv6", "both.test:80 resolvers r resolve-prefer ipv4", "2001:db8::1 2 0", 28),
+        ("ipv4", "both.test:80 resolvers r resolve-prefer ipv6", "10.0.0.1 2 0", 1),
+    ] {
+        let dns = FakeDns::start();
+        dual_zone(&dns);
+        let ibex = start(dns.addr, "  timeout resolve 300ms\n", &format!("  server s1 {server}\n"), &format!("  dns-accept-family {family}\n"));
+        ibex.wait_state("s1", want, 3);
+        thread::sleep(Duration::from_millis(700));
+        let q = dns.queries();
+        assert!(q.len() >= 2 && q.iter().all(|q| q.qtype == qtype), "{family} {server}: {q:?}");
+    }
+    // `ipv6` and a name with only an A record: AAAA, NODATA, its tries share one id; never A.
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, "  timeout retry 200ms\n", "  server s1 a1.test:80 resolvers r\n", "  dns-accept-family ipv6\n");
+    thread::sleep(Duration::from_millis(900));
+    assert_eq!(ibex.state("s1").0, "- 0 32");
+    let q = dns.queries();
+    assert!(q.len() >= 3 && q.iter().all(|q| q.qtype == 28) && q[..3].iter().all(|x| x.id == q[0].id), "{q:?}");
+}
+
+/// T489: `auto` anywhere in the list is `auto` (famauto6, `auto,ipv6` on a host with no IPv6
+/// route: `v6only.test` is asked A only and stays in maintenance).
+#[test]
+fn dns_accept_family_auto_wins_in_a_list() {
+    let v6 = UdpSocket::bind("[::]:0").and_then(|s| s.connect("[2001::]:53")).is_ok();
+    let dns = FakeDns::start();
+    dual_zone(&dns);
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n", "  server s1 v6only.test:80 resolvers r\n", "  dns-accept-family auto,ipv6\n");
+    thread::sleep(Duration::from_millis(900));
+    let q = dns.queries();
+    if v6 {
+        assert_eq!(ibex.state("s1").0, "2001:db8::6 2 0");
+    } else {
+        assert_eq!(ibex.state("s1").0, "- 0 32");
+        assert!(!q.is_empty() && q.iter().all(|q| q.qtype == 1), "{q:?}");
+    }
+}
+
+/// A.t15b at run time, on the system's `/etc/resolv.conf` (`HAProxy` reads that file only):
+/// `parse-resolv-conf` before `ns1` lists the system's nameservers first in `show resolvers`,
+/// each named after its address (oracle: `nameserver 127.0.0.53:` then `nameserver ns1:`).
+#[test]
+fn t15b_parse_resolv_conf_nameservers_come_first() {
+    let Ok(text) = std::fs::read_to_string("/etc/resolv.conf") else { return };
+    let Some(first) = text.lines().find_map(|l| l.strip_prefix("nameserver").filter(|r| r.starts_with([' ', '\t'])).and_then(|r| r.split_whitespace().next())) else { return };
+    let dns = FakeDns::start();
+    let ibex = start(format!("{}\n  parse-resolv-conf\n  nameserver ns2 127.0.0.1:9", dns.addr), "", "  server s1 a1.test:80 resolvers r\n", "");
+    let out = ibex.cli("show resolvers");
+    let names: Vec<&str> = out.lines().filter_map(|l| l.strip_prefix(" nameserver ")).collect();
+    assert_eq!(names.first(), Some(&"ns1:"), "{out}");
+    assert_eq!(names.get(1), Some(&format!("{first}:").as_str()), "{out}");
+    assert_eq!(names.last(), Some(&"ns2:"), "{out}");
+}
+
+/// Runs `ibex -c` on `cfg` with `/etc/resolv.conf` replaced by `conf` (bind-mounted in a user
+/// and mount namespace), or with an empty `/etc` when `conf` is `None`. `None` when this host
+/// cannot make the namespace.
+fn check_with_resolv_conf(cfg: &str, conf: Option<&str>) -> Option<(i32, Vec<String>)> {
+    if !Command::new("unshare").args(["-rm", "true"]).status().is_ok_and(|s| s.success()) {
+        return None;
+    }
+    let dir = tempfile::tempdir().expect("tmp");
+    let c = dir.path().join("t.cfg");
+    std::fs::write(&c, cfg).expect("cfg");
+    let mount = if let Some(conf) = conf {
+        let r = dir.path().join("resolv.conf");
+        std::fs::write(&r, conf).expect("conf");
+        format!("mount --bind {} /etc/resolv.conf", r.display())
+    } else {
+        let e = dir.path().join("etc");
+        std::fs::create_dir(&e).expect("dir");
+        format!("mount --bind {} /etc", e.display())
+    };
+    let out = Command::new("unshare")
+        .args(["-rm", "sh", "-c", &format!("{mount} && exec {} -c -f {}", env!("CARGO_BIN_EXE_ibex"), c.display())])
+        .output()
+        .expect("unshare");
+    let pid = regex_lite_pid(&String::from_utf8_lossy(&out.stderr));
+    Some((out.status.code().unwrap_or(-1), pid.lines().map(|l| l.replace(&c.display().to_string(), "t.cfg")).collect()))
+}
+
+/// stderr with the `(pid)` of each line as `(P)`.
+fn regex_lite_pid(s: &str) -> String {
+    s.lines()
+        .map(|l| match (l.find(" ("), l.find(") : ")) {
+            (Some(a), Some(b)) if a < b && l[a + 2..b].bytes().all(|c| c.is_ascii_digit()) => format!("{} (P){}", &l[..a], &l[b + 1..]),
+            _ => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// T489: the warnings and the fatal error of `parse-resolv-conf` as `HAProxy` 3.5-dev8 prints
+/// them (`unshare -rm`, the same files): one warning on the line of the keyword, several each
+/// on a line of its own indented 8 (`indent_msg`); a missing file is fatal.
+#[test]
+fn parse_resolv_conf_warnings_and_failure_are_haproxys() {
+    let cfg = |rs: &str| format!("resolvers r\n{rs}defaults\n  mode http\n  timeout connect 1s\n  timeout client 1s\n  timeout server 1s\nlisten l\n  bind 127.0.0.1:0\n");
+    let one = cfg("  nameserver 10.0.0.9 127.0.0.1:5300\n  parse-resolv-conf\n");
+    let Some((rc, err)) = check_with_resolv_conf(&one, Some("nameserver 10.0.0.9\n")) else { return };
+    assert_eq!(rc, 0, "{err:?}");
+    assert!(err.contains(&"[WARNING]  (P) : config : parsing [t.cfg:3]: Parsing [/etc/resolv.conf:1] : generated name for /etc/resolv.conf nameserver '10.0.0.9' conflicts with another nameserver (declared at t.cfg:2), it appears to be a duplicate and will be excluded.".to_string()), "{err:?}");
+    let (rc, err) = check_with_resolv_conf(&cfg("  parse-resolv-conf\n"), Some("nameserver\nnameserver 10.0.0.1\nnameserver 1.2.3.4#53\n")).expect("unshare");
+    assert_eq!(rc, 0, "{err:?}");
+    let at = err.iter().position(|l| l == "[WARNING]  (P) : config : parsing [t.cfg:2]: ").unwrap_or_else(|| panic!("{err:?}"));
+    assert_eq!(
+        err[at + 1..at + 3],
+        [
+            "        parsing [/etc/resolv.conf:1] : nameserver line is missing address.".to_string(),
+            "        parsing [/etc/resolv.conf:3] : address '1.2.3.4#53' could not be recognized, nameserver will be excluded.".to_string()
+        ]
+    );
+    let (rc, err) = check_with_resolv_conf(&cfg("  parse-resolv-conf\n"), None).expect("unshare");
+    assert_eq!(rc, 1);
+    assert_eq!(
+        err,
+        [
+            "[ALERT]    (P) : config : parsing [t.cfg:2]: failed to open /etc/resolv.conf.",
+            "[ALERT]    (P) : config : Error(s) found in configuration file : t.cfg",
+            "[ALERT]    (P) : config : Fatal errors found in configuration."
+        ]
+    );
 }

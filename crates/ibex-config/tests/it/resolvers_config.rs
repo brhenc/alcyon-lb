@@ -267,8 +267,6 @@ fn resolvers_section_refusals_are_haproxys() {
         "'resolution_pool_size' directive is not supported anymore (it never appeared in a stable release)."
     );
     assert_eq!(refused(&with_resolvers("  foo bar")), "unknown keyword 'foo' in 'resolvers' section");
-    // Refused until built: `parse-resolv-conf` (T489).
-    assert!(refused(&with_resolvers("  parse-resolv-conf")).contains("'parse-resolv-conf' is not supported"));
 }
 
 /// T488, measured with `haproxy -c`: the address prefixes of `nameserver` choose the transport
@@ -557,4 +555,79 @@ fn server_template_alerts_name_the_template_for_its_first_slot() {
             "Failed to initialize server(s) addr.",
         ]
     );
+}
+
+/// T489, `dns-accept-family` (`cfg_parse_dns_accept_family`), measured with `haproxy -c` on
+/// 3.5-dev8 (cases `tools/battery/repro/vv-dns/t489/famerr*.json`): `HAProxy` cuts the argument
+/// at each comma in place, so the refusal names the list's first item whichever is wrong; a
+/// trailing comma ends the list; `auto` anywhere wins.
+#[test]
+fn dns_accept_family_is_parsed_as_haproxy() {
+    use ibex_config::ast::DnsAcceptFamily;
+    let family = |arg: &str| parse_str(&format!("global\n  dns-accept-family {arg}\n{HEAD}")).map(|c| c.global.unwrap_or_default().dns_accept_family).map_err(|e| e.message);
+    let f = |ipv4, ipv6, auto| Ok(DnsAcceptFamily { ipv4, ipv6, auto });
+    assert_eq!(parse_str(&backend("")).expect("accepted").global.unwrap_or_default().dns_accept_family, DnsAcceptFamily { ipv4: false, ipv6: false, auto: true });
+    assert_eq!(family("ipv4"), f(true, false, false));
+    assert_eq!(family("ipv6"), f(false, true, false));
+    assert_eq!(family("ipv4,ipv6"), f(true, true, false));
+    assert_eq!(family("ipv4,"), f(true, false, false));
+    assert_eq!(family("auto,ipv6"), f(false, true, true));
+    let usage = |got: &str| Err(format!("'dns-accept-family' expects a comma-delimited list of 'ipv4' and 'ipv6' but got '{got}'."));
+    assert_eq!(family("foo"), usage("foo"));
+    assert_eq!(family("IPV4"), usage("IPV4"));
+    assert_eq!(family("ipv4,,ipv6"), usage("ipv4"));
+    assert_eq!(family("ipv4,foo"), usage("ipv4"));
+    assert_eq!(family(",ipv4"), usage(""));
+    assert_eq!(family(""), usage(""));
+    assert_eq!(family("ipv4 ipv6"), Err("'dns-accept-family' cannot handle unexpected argument 'ipv6'.".to_string()));
+}
+
+/// T489, `parse-resolv-conf` on a file (`parse_resolve_conf`, `resolvers.c:3598`), measured on
+/// 3.5-dev8 with this file bind-mounted on `/etc/resolv.conf` (`unshare -rm`): only lines that
+/// start with `nameserver` and a blank count; no address is a warning, so is an address that
+/// is not one (`1.2.3.4#53`) and a name already taken (the address is the name); a name libc
+/// resolves is a nameserver; port 53; the last line needs no newline. A file that cannot be
+/// read: `failed to open /etc/resolv.conf.`
+#[test]
+fn parse_resolv_conf_reads_nameserver_lines_as_haproxy() {
+    let text = "search x\nnameserver 10.0.0.1\nnameserver\nnameserver   \nnameserverX 1.2.3.4\n  nameserver 1.1.1.1\n\
+                nameserver\t10.0.0.2 extra\nnameserver 1.2.3.4#53\nnameserver ::1\nnameserver 10.0.0.1\n\
+                nameserver localhost\n#nameserver 9.9.9.9\nnameserver ns1\nnameserver 10.0.0.3";
+    let path = std::env::temp_dir().join(format!("ibex_t489_resolv_{}.conf", std::process::id()));
+    std::fs::write(&path, text).expect("write");
+    let mut r = ibex_config::ast::ResolversSection::new("r".into(), 1);
+    r.nameservers.push(parse_str(&with_resolvers("")).expect("ok").resolvers[0].nameservers[0].clone());
+    let warnings = ibex_config::parse_resolv_conf(&mut r, path.to_str().expect("path")).expect("read");
+    let _ = std::fs::remove_file(&path);
+    let names: Vec<String> = r.nameservers.iter().map(|n| format!("{} {}", n.name, n.addr)).collect();
+    let lh = std::net::SocketAddr::new(libc_first("localhost"), 53);
+    assert_eq!(names, ["ns1 127.0.0.1:53".to_string(), "10.0.0.1 10.0.0.1:53".into(), "10.0.0.2 10.0.0.2:53".into(), "::1 [::1]:53".into(), format!("localhost {lh}"), "10.0.0.3 10.0.0.3:53".into()]);
+    assert!(r.nameservers[1..].iter().all(|n| n.from_resolv_conf && n.transport == ibex_config::ast::NsTransport::Default));
+    assert_eq!(r.nameservers[1].line, 2);
+    assert_eq!(
+        warnings,
+        [
+            "parsing [/etc/resolv.conf:3] : nameserver line is missing address.",
+            "parsing [/etc/resolv.conf:4] : nameserver line is missing address.",
+            "parsing [/etc/resolv.conf:8] : address '1.2.3.4#53' could not be recognized, nameserver will be excluded.",
+            "Parsing [/etc/resolv.conf:10] : generated name for /etc/resolv.conf nameserver '10.0.0.1' conflicts with another nameserver (declared at /etc/resolv.conf:2), it appears to be a duplicate and will be excluded.",
+            "Parsing [/etc/resolv.conf:13] : generated name for /etc/resolv.conf nameserver 'ns1' conflicts with another nameserver (declared at {file}:2), it appears to be a duplicate and will be excluded.",
+        ]
+    );
+    assert_eq!(ibex_config::parse_resolv_conf(&mut r, "/nonexistent/resolv.conf"), Err("failed to open /etc/resolv.conf.".to_string()));
+}
+
+/// A.t15b: `parse-resolv-conf` inserts the system's nameservers where it stands (here before
+/// `ns1`, after `ns0`), from `/etc/resolv.conf` itself.
+#[test]
+fn parse_resolv_conf_inserts_the_systems_nameservers_in_place() {
+    let Ok(text) = std::fs::read_to_string(ibex_config::RESOLV_CONF) else { return };
+    let mut want = vec!["ns0".to_string()];
+    let mut sys = ibex_config::ast::ResolversSection::new("r".into(), 1);
+    let _ = ibex_config::parse_resolv_conf(&mut sys, ibex_config::RESOLV_CONF);
+    want.extend(sys.nameservers.iter().filter(|n| n.name != "ns0" && n.name != "ns1").map(|n| n.name.clone()));
+    want.push("ns1".into());
+    let cfg = parse_str(&format!("resolvers r\n  nameserver ns0 127.0.0.1:5300\n  parse-resolv-conf\n  nameserver ns1 127.0.0.1:5301\n{HEAD}  server s1 127.0.0.1:80\n")).expect("accepted");
+    let got: Vec<String> = cfg.resolvers[0].nameservers.iter().map(|n| n.name.clone()).collect();
+    assert_eq!(got, want, "{text}");
 }

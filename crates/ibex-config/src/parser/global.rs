@@ -660,6 +660,36 @@ pub(crate) fn parse_global_directive(
                 format!("'{}' is not supported (embedded Lua runtime is not implemented)", kw.text),
             ))
         }
+        "dns-accept-family" => {
+            // `cfg_parse_dns_accept_family` (measured on 3.5-dev8): `HAProxy` cuts the argument
+            // in place at each comma, so the refusal names its first item whichever is wrong.
+            if let Some(t) = tokens.get(2) {
+                return Err(ConfigError::new(t.line, t.col, format!("'dns-accept-family' cannot handle unexpected argument '{}'.", t.text)));
+            }
+            let arg = tokens.get(1).map_or("", |t| t.text.as_str());
+            let usage = || {
+                let first = arg.split(',').next().unwrap_or("");
+                ConfigError::new(kw.line, kw.col, format!("'dns-accept-family' expects a comma-delimited list of 'ipv4' and 'ipv6' but got '{first}'."))
+            };
+            if arg.is_empty() {
+                return Err(usage());
+            }
+            let mut f = crate::ast::DnsAcceptFamily { ipv4: false, ipv6: false, auto: false };
+            // `for (arg = ...; arg && *arg; arg = comma)`: a trailing comma ends the list.
+            let mut rest = Some(arg);
+            while let Some(a) = rest.filter(|a| !a.is_empty()) {
+                let (item, next) = a.split_once(',').map_or((a, None), |(i, n)| (i, Some(n)));
+                match item {
+                    "ipv4" => f.ipv4 = true,
+                    "ipv6" => f.ipv6 = true,
+                    "auto" => f.auto = true,
+                    _ => return Err(usage()),
+                }
+                rest = next;
+            }
+            global.dns_accept_family = f;
+            Ok(())
+        }
         "httpclient.resolvers.disabled" | "httpclient.resolvers.prefer" => {
             Err(ConfigError::new(
                 kw.line,

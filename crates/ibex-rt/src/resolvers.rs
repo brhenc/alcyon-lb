@@ -521,10 +521,28 @@ fn inet6_reachable(now: Instant) -> bool {
     v
 }
 
-/// The families resolvers accept: `dns-accept-family auto`, `HAProxy`'s default
-/// (`resolv_active_families`): IPv4, and IPv6 while the host has a route to it.
+/// `dns-accept-family` (`resolv_accept_families`, process-wide as in `HAProxy`): bit 0 IPv4,
+/// bit 1 IPv6, bit 2 `auto`. Written once by [`build`], before any section runs.
+static ACCEPT_FAMILY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(4);
+
+/// The families resolvers accept (`resolv_active_families`): with `auto`, `HAProxy`'s
+/// default, IPv4, and IPv6 while the host has a route to it; else the configured ones.
 fn active_families(now: Instant) -> Families {
-    Families { ipv4: true, ipv6: inet6_reachable(now) }
+    let f = ACCEPT_FAMILY.load(std::sync::atomic::Ordering::Relaxed);
+    if f & 4 != 0 {
+        return Families { ipv4: true, ipv6: inet6_reachable(now) };
+    }
+    Families { ipv4: f & 1 != 0, ipv6: f & 2 != 0 }
+}
+
+/// The type a server's resolution asks first (`resolvers.c:2179`): the only accepted family,
+/// else `resolve-prefer`'s (IPv6 by default).
+fn first_type(fam: Families, prefer_ipv4: bool) -> u16 {
+    if !fam.ipv6 || (fam.ipv4 && prefer_ipv4) {
+        TYPE_A
+    } else {
+        TYPE_AAAA
+    }
 }
 
 /// Builds the sections the servers of `proxies` name, in `config` order, each with a task and
@@ -555,6 +573,8 @@ pub fn build(
     }
     // In `show pools` once a configuration has resolvers.
     register_pools();
+    let f = config.global.as_ref().map(|g| g.dns_accept_family).unwrap_or_default();
+    ACCEPT_FAMILY.store(u8::from(f.ipv4) | u8::from(f.ipv6) << 1 | u8::from(f.auto) << 2, std::sync::atomic::Ordering::Relaxed);
     let families = active_families(t0);
     let mut out: Vec<Section> = Vec::new();
     // `config.listens` then `config.backends`, enabled ones, are `proxies` in order
@@ -585,13 +605,7 @@ pub fn build(
             };
             // `resolv_link_resolution`: the type asked first, fixed now (A.t18).
             let srv = n.fqdn.starts_with('_');
-            let prefer = if srv {
-                TYPE_SRV
-            } else if !families.ipv6 || n.resolve.prefer_ipv4 {
-                TYPE_A
-            } else {
-                TYPE_AAAA
-            };
+            let prefer = if srv { TYPE_SRV } else { first_type(families, n.resolve.prefer_ipv4) };
             let key = (sec_idx, n.fqdn.to_ascii_lowercase().into_boxed_str(), prefer);
             if srv {
                 // The slots join the record's resolution (`find_srvrq_by_name`, one per proxy).
@@ -1010,7 +1024,7 @@ impl Section {
         if self.resolutions.iter().any(|r| r.reqs.iter().any(|q| q.proxy == p && q.server == s)) {
             return;
         }
-        let prefer = if !active_families(now).ipv6 || opts.prefer_ipv4 { TYPE_A } else { TYPE_AAAA };
+        let prefer = first_type(active_families(now), opts.prefer_ipv4);
         let req = Req { proxy: p, server: s, opts, attached: None };
         if let Some(r) = self.resolutions.iter_mut().find(|r| r.srv.is_none() && r.prefer == prefer && r.name.eq_ignore_ascii_case(target)) {
             r.reqs.push(req);

@@ -31,8 +31,11 @@ pub struct Nameserver {
     pub transport: NsTransport,
     /// The address, a name in it resolved by libc while the configuration loads.
     pub addr: SocketAddr,
-    /// The line it is on, for the duplicate-name alert.
+    /// The line it is on, for the duplicate-name alert: of `/etc/resolv.conf` for one
+    /// `parse-resolv-conf` added.
     pub line: usize,
+    /// Added by `parse-resolv-conf` (named after its address, port 53).
+    pub from_resolv_conf: bool,
 }
 
 /// `hold <status> <period>`: how long the last valid answer is kept after each status.
