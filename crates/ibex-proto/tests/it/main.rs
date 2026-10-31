@@ -13,6 +13,8 @@
 //! Own binaries: `htx_allocation` (reasons in Cargo.toml).
 
 mod h1_strictness;
+mod h2_srv_codec;
+mod h2_srv_live;
 mod h3_framing;
 mod h3_mux;
 mod h3_mux_quic;

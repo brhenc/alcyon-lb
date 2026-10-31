@@ -73,6 +73,7 @@ pub mod h1;
 pub mod parser;
 pub mod response_head;
 pub mod h2;
+pub mod h2_srv;
 pub mod h3;
 pub mod hpack;
 pub mod htx;
