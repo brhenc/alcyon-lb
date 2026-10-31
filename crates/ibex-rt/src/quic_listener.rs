@@ -117,6 +117,12 @@ pub struct QuicListener {
     /// `tune.ibex.h3-path mux` (T509): an admitted connection is served by an owner session
     /// of the engine through the h3 mux, not by the relay.
     mux: bool,
+    /// `tune.quic.fe.stream.max-total` (T525): the request streams one connection carries
+    /// before it is closed; 0 is no limit.
+    stream_max_total: u32,
+    /// Request streams done (their response acknowledged) per connection, kept only when
+    /// `stream_max_total` is set.
+    streams_done: HashMap<ConnectionId, u32>,
     /// The connections owner sessions serve, by connection.
     owned: HashMap<ConnectionId, OwnedConn>,
     /// Connections admitted since the engine last took them, each to get its owner.
@@ -291,6 +297,8 @@ impl QuicListener {
             held: HashMap::new(),
             closed: Vec::new(),
             mux: false,
+            stream_max_total: 0,
+            streams_done: HashMap::new(),
             owned: HashMap::new(),
             new_owned: Vec::new(),
             wake: Vec::new(),
@@ -302,6 +310,13 @@ impl QuicListener {
     /// ([`QuicListener::take_new_owned`]), not by the relay.
     pub fn serve_by_mux(&mut self) {
         self.mux = true;
+    }
+
+    /// `tune.quic.fe.stream.max-total` (T525): a connection that has finished this many request
+    /// streams is closed with `H3_NO_ERROR` (`HAProxy` stops granting stream credit at that
+    /// number and ends the connection when they are done). 0 is no limit.
+    pub fn set_stream_max_total(&mut self, n: u32) {
+        self.stream_max_total = n;
     }
 
     /// Connections admitted since the last call, each for the engine to give an owner
@@ -792,6 +807,15 @@ impl QuicListener {
                 // A finished stream and a reset stream are both done with; the difference
                 // matters to the peer, not to our buffer bookkeeping.
                 TransportEvent::StreamFinished { conn_id, stream_id } => {
+                    // A client-initiated bidirectional stream (a request) is done once its
+                    // response is acknowledged: the last one the limit allows ends the connection.
+                    if self.stream_max_total != 0 && stream_id.0.trailing_zeros() >= 2 {
+                        let done = self.streams_done.entry(conn_id).or_default();
+                        *done += 1;
+                        if *done >= self.stream_max_total {
+                            self.endpoint.close_connection(conn_id, H3_NO_ERROR, b"");
+                        }
+                    }
                     if self.owned.get_mut(&conn_id).is_some_and(|oc| Self::acked(oc, stream_id.0)) {
                         self.owned_news(conn_id, None, None);
                     }
@@ -834,6 +858,7 @@ impl QuicListener {
                     }
                     self.h3.remove(&conn_id);
                     self.peers.remove(&conn_id);
+                    self.streams_done.remove(&conn_id);
                     for r in &mut self.relays {
                         if r.conn_id == conn_id {
                             r.done = true;
