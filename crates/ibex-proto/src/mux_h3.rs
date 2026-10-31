@@ -327,6 +327,11 @@ ibex_alloc::declare_pool!(
     /// `show pools` `qcc`: HTTP/3 connections (HAProxy's `qcc` + `h3c`).
     static QCC: Pool<H3MuxContext> = ibex_alloc::PoolSpec::new("qcc");
 );
+ibex_alloc::declare_pool!(
+    /// `show pools` `h3_data`: the bytes of a request's DATA blocks (`rx_htx`), given back
+    /// once the data path wrote them out (T512: one allocation a request with a body).
+    static H3_DATA: Pool<Vec<u8>> = ibex_alloc::PoolSpec::new("h3_data").max_item(2 * RX_DATA_ROOM).max_count(16);
+);
 
 /// A request stream's state, both directions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -942,7 +947,9 @@ fn demux_frames(st: &mut H3StreamCtx, rx: &[u8], sh: &mut Shared) -> Result<(usi
             if let Some(HtxBlock::Data(d)) = st.rx_htx.blocks_mut().last_mut().filter(|b| matches!(b, HtxBlock::Data(d) if !d.is_empty())) {
                 d.extend_from_slice(&rx[used..used + n]);
             } else {
-                st.rx_htx.push(HtxBlock::Data(rx[used..used + n].to_vec()));
+                let mut d = H3_DATA.take_raw(|| Some(Vec::new())).unwrap_or_default();
+                d.extend_from_slice(&rx[used..used + n]);
+                st.rx_htx.push(HtxBlock::Data(d));
             }
             st.rx_buffered += n;
             st.data_left -= n as u64;
@@ -1224,6 +1231,10 @@ impl HtxStream for H3StreamCtx {
 
 impl HtxMux for H3MuxContext {
     type Stream = H3StreamCtx;
+
+    fn give_data(v: Vec<u8>) {
+        H3_DATA.give(v);
+    }
 
     fn stream(&self, id: u64) -> Option<&H3StreamCtx> {
         self.streams.get(&id).map(|b| &**b)

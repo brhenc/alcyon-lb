@@ -326,7 +326,7 @@ pub fn pump_request_body_mux<M: HtxMux>(mux: &mut M, active: &mut H2ActiveStream
     };
     let body = &mut active.body;
     let (before, was_done, taken) = (body.trailer_bytes, body.done, body.consumed);
-    let changed = pump_h2_body(stream.rx_htx_mut(), body, req) || body.done != was_done;
+    let changed = pump_htx_body(stream.rx_htx_mut(), body, req, M::give_data) || body.done != was_done;
     let taken = usize::try_from(body.consumed - taken).unwrap_or(usize::MAX);
     if taken > 0 {
         mux.rx_taken(id, taken);
@@ -578,6 +578,11 @@ fn h2_head_size(head: &H2ReqHead) -> u64 {
 /// is released: the stream holds only what is still to go (T195's 50 MB upload was held
 /// until the stream ended).
 pub(crate) fn pump_h2_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf) -> bool {
+    pump_htx_body(msg, st, req, drop)
+}
+
+/// [`pump_h2_body`], a block written out whole given to `release` (T512: h3's pool).
+fn pump_htx_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf, mut release: impl FnMut(Vec<u8>)) -> bool {
     let blocks = msg.blocks_mut();
     let mut wrote = false;
     while !st.done && st.cursor < blocks.len() {
@@ -617,7 +622,7 @@ pub(crate) fn pump_h2_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, r
                 st.consumed += n as u64;
                 if st.off >= d.len() {
                     if let HtxBlock::Data(d) | HtxBlock::RawData(d) = &mut blocks[st.cursor] {
-                        *d = Vec::new();
+                        release(std::mem::take(d));
                     }
                     st.cursor += 1;
                     st.off = 0;

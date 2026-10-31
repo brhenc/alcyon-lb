@@ -5863,7 +5863,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let _ = self.scheduler.wake_expired_tasks();
 
         // 4. Process polled readiness events
-        let mut quic_ready: Vec<usize> = Vec::new();
         let mut mail = false;
         for &ev in &events {
             // A descriptor handled keeps the thread from being killed, not from being
@@ -5909,7 +5908,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     // and no task to wake: the listener demultiplexes by connection ID.
                     // Both the UDP socket and any backend socket it opened drive the same
                     // listener, which is why they share an arm.
-                    quic_ready.push(q_idx as usize);
+                    if let Some(ql) = self.quic_listeners.get_mut(q_idx as usize) {
+                        ql.mark_ready();
+                    }
                 }
                 FdState::Mailbox => mail = true,
                 FdState::Resolver { section } => {
@@ -5937,12 +5938,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // wakeup, because a transport told the time has advanced when it has not will arm and
         // fire loss-recovery timers that are not due.
         let inst = Instant::now();
-        for (idx, ql) in self.quic_listeners.iter_mut().enumerate() {
+        for ql in &mut self.quic_listeners {
             let timer_due = ql.poll_timeout().is_some_and(|d| d <= inst);
             if timer_due {
                 ql.handle_timeout(inst);
             }
-            if timer_due || quic_ready.contains(&idx) {
+            if ql.take_ready() || timer_due {
                 let _ = ql.pump(inst);
             }
         }

@@ -3,10 +3,10 @@
 // Own binary (T509): counts allocations through a #[global_allocator]
 
 //! An HTTP/3 request through the h3 mux and the bridge (`tune.ibex.h3-path mux`, T509;
-//! `docs/design/h3-engine-2026-10-26.md` sections 0 and 6) allocates nothing in steady state,
-//! as the h2 path's `an_h2c_request_allocates_nothing` pins. The client is a `quinn-proto`
-//! connection in this thread; only what the engine does (`Engine::run_once`) is counted,
-//! with this thread's counters, so the client's own allocations are not.
+//! `docs/design/h3-engine-2026-10-26.md` sections 0 and 6) is to allocate nothing in steady
+//! state, as the h2 path's `an_h2c_request_allocates_nothing` pins. The client is a
+//! `quinn-proto` connection in this thread; only what the engine does (`Engine::run_once`) is
+//! counted, with this thread's counters, so the client's own allocations are not.
 
 mod common;
 
@@ -173,15 +173,24 @@ impl Rig {
     }
 }
 
-/// The engine's allocations over `n` requests on one connection, after five warm-up ones.
-fn h3_allocations(n: usize) -> usize {
+/// The engine's allocations over `n` requests on one connection, after five warm-up ones: GETs,
+/// or POSTs of `body` (one DATA frame) when it is not empty.
+fn h3_allocations(n: usize, body: &[u8]) -> usize {
     let running = Arc::new(AtomicBool::new(true));
     let (be, h) = backend(Arc::clone(&running));
     let mut rig = Rig::new(be);
-    let f: Vec<(String, String)> =
-        [(":method", "GET"), (":scheme", "https"), (":authority", "localhost"), (":path", "/")].iter().map(|(a, b)| ((*a).to_string(), (*b).to_string())).collect();
+    let len = body.len().to_string();
+    let mut f = vec![(":method", "GET"), (":scheme", "https"), (":authority", "localhost"), (":path", "/")];
+    if !body.is_empty() {
+        f[0].1 = "POST";
+        f.push(("content-length", &len));
+    }
+    let f: Vec<(String, String)> = f.iter().map(|(a, b)| ((*a).to_string(), (*b).to_string())).collect();
     let mut req = Vec::new();
     ibex_proto::mux_h3::encode_frame(&mut req, 0x01, &ibex_proto::mux_h3::encode_field_section(&f));
+    if !body.is_empty() {
+        ibex_proto::mux_h3::encode_frame(&mut req, 0x00, body);
+    }
     for _ in 0..5 {
         rig.request(&req);
     }
@@ -196,17 +205,31 @@ fn h3_allocations(n: usize) -> usize {
     allocs
 }
 
+/// What is left a request (T512, `tasks/T512-progress.md`): quinn-proto's per-stream state, which
+/// Ibex cannot pool without a fork (`tradeoff.md` 6.30). Measured 2026-10-31: 101-104 for
+/// 20 requests, 867-875 for 220, 3.8-3.9 a request (T509 measured 23).
+const PINNED: usize = 4;
+
+/// The count for `n` more requests over the count for 20 is at most [`PINNED`] a request.
+fn assert_pinned(what: &str, body: &[u8]) {
+    let few = h3_allocations(20, body);
+    let many = h3_allocations(220, body);
+    println!("[MEASUREMENT T512] h3 mux allocations, {what}: 20 requests {few}, 220 requests {many}");
+    assert!(many.saturating_sub(few) <= 200 * PINNED, "{} allocations for 200 {what}s ({few} for 20, {many} for 220); pinned at {PINNED} a request, target 0", many.saturating_sub(few));
+}
+
 /// T509 (design section 6): the target is a steady-state HTTP/3 request through the mux that
-/// allocates nothing (the count for 220 requests the count for 20). Not met yet: measured
-/// 2026-10-26, 483 for 20 and 5034 to 5075 for 220, about 23 a request (quinn-proto's stream
-/// state and the `Bytes` of each STREAM frame in and out among them; not broken down yet,
-/// `tasks/T509-progress.md`). Until it is, this pins the figure so that it does not grow:
-/// at most 24 a request.
+/// allocates nothing (the count for 220 requests the count for 20). T512 took out what was
+/// Ibex's (19 of 23 a request: the listener's datagram batches, the engine's readiness list,
+/// a new `BytesMut` per datagram and a copy per STREAM write); this pins what is left.
 #[test]
 fn an_h3_request_through_the_mux_allocates_at_most_the_pinned_count() {
-    let few = h3_allocations(20);
-    let many = h3_allocations(220);
-    println!("[MEASUREMENT T509] h3 mux allocations: 20 requests {few}, 220 requests {many}");
-    let per_request = many.saturating_sub(few) / 200;
-    assert!(per_request <= 24, "{per_request} allocations a request ({few} for 20, {many} for 220); pinned at 24, target 0");
+    assert_pinned("GET", b"");
+}
+
+/// T512: a request with a body costs no more: its DATA bytes are pooled (`h3_data`), not a
+/// new `Vec` a DATA frame.
+#[test]
+fn an_h3_post_through_the_mux_allocates_at_most_the_pinned_count() {
+    assert_pinned("POST", b"hello");
 }
