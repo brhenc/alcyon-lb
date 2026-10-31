@@ -8,7 +8,7 @@
 
 pub mod resolver;
 
-pub use resolver::{Resolver, ResolverConfig};
+pub use resolver::{NsTransport, Resolver, ResolverConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RecordKind {

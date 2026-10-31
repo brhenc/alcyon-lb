@@ -18,7 +18,7 @@ query, so a battery can change answers while the proxy runs. Per name:
                      "ancount" (header claims 200 answers, carries 1), "qd0" (no question),
                      "qd2" (two questions), "rdlen" (A record with rdlength 64)
   "many_a": N        the honest answer carries N A records 10.77.x.y (oversize over UDP)
-  "flood": N         N unsolicited replies with random ids, right name, address 10.6.6.6
+  "flood": N         N unsolicited replies with random ids (never the query's), right name, address 10.6.6.6
 Unknown names: NXDOMAIN. One log line per query: t qtype qname id proto edns=size sport=port.
 """
 import json, os, random, socket, struct, sys, threading, time
@@ -113,7 +113,8 @@ def hostile(spec, qid, qname, qtype, question):
     elif g == "rdlen":
         out.append((reply(qid, question, [rr(b"\xc0\x0c", 1, 60, b"\x0a\x06\x06\x06" + b"\x00" * 60)]), False))
     for _ in range(spec.get("flood", 0)):
-        out.append((reply(random.randrange(65536), question, [a_rr("10.6.6.6")]), False))
+        # never the query's own id: an accepted flood reply is then a defect, not a lucky guess
+        out.append((reply((qid + random.randrange(1, 65536)) & 0xFFFF, question, [a_rr("10.6.6.6")]), False))
     return out
 
 def honest(spec, z, qid, qtype, question, proto):

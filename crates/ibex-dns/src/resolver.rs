@@ -68,8 +68,22 @@ pub struct ResolverConfig {
     /// the standard library's random keys.
     pub random_id: fn() -> u16,
     /// A truncated UDP answer is asked again over TCP (`HAProxy`'s behaviour, A.t9). Off, it
-    /// is an error like a truncated TCP answer (`Other`): Ibex until its TCP path (T488).
+    /// is an error like a truncated TCP answer (`Other`).
     pub tcp_fallback: bool,
+    /// How each nameserver (by index) is reached; missing entries are [`NsTransport::Auto`].
+    pub transports: Vec<NsTransport>,
+}
+
+/// How a nameserver is reached (the address prefix of `nameserver`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum NsTransport {
+    /// UDP, and a truncated answer is asked again over TCP (`tcp_fallback`).
+    #[default]
+    Auto,
+    /// UDP only (`udp@`): a truncated answer is `Other`.
+    Udp,
+    /// Every query over TCP (`tcp@`).
+    Tcp,
 }
 
 impl Default for ResolverConfig {
@@ -88,6 +102,7 @@ impl Default for ResolverConfig {
             accepted_payload_size: 512,
             random_id: default_random_id,
             tcp_fallback: true,
+            transports: vec![],
         }
     }
 }
@@ -148,6 +163,28 @@ pub struct Resolver {
     in_flight: Vec<InFlight>,
     transmits: VecDeque<(SocketAddr, Protocol, Vec<u8>)>,
     results: VecDeque<(QueryId, Result<Vec<Answer>, DnsError>)>,
+}
+
+/// `resolv_str_to_dn_label` alone, what a server's name gets (`resolv_link_resolution`): an
+/// empty label is refused, a trailing dot dropped, and nothing else checked, so `a!b.test` is
+/// asked as written and a 64-byte label goes out with its length byte as it is (measured on
+/// `HAProxy` 3.5-dev8).
+fn to_dn_label(name: &str) -> Result<Vec<u8>, QueryError> {
+    let trimmed = name.strip_suffix('.').unwrap_or(name);
+    if trimmed.is_empty() {
+        return Err(QueryError::InvalidName("empty hostname"));
+    }
+    let mut dn = Vec::with_capacity(trimmed.len() + 2);
+    for label in trimmed.split('.') {
+        if label.is_empty() {
+            return Err(QueryError::InvalidName("empty label"));
+        }
+        // `dn[offset] = (i - offset)`: a char, so the low byte of the length.
+        dn.push(label.len().to_le_bytes()[0]);
+        dn.extend(label.bytes().map(|b| b.to_ascii_lowercase()));
+    }
+    dn.push(0);
+    Ok(dn)
 }
 
 /// `resolv_hostname_validation` + `resolv_str_to_dn_label`: the wire form, lower-cased.
@@ -249,7 +286,7 @@ impl Resolver {
         question: Question,
         requester: Requester,
     ) -> Result<QueryId, QueryError> {
-        let dn = to_dn(name)?;
+        let dn = if requester == Requester::Server { to_dn_label(name)? } else { to_dn(name)? };
         let prefer_type = match question {
             Question::Srv => TYPE_SRV,
             // The preferred family if accepted, else the other one (A.t18).
@@ -303,6 +340,10 @@ impl Resolver {
         Ok(qid)
     }
 
+    fn transport_of(&self, ns: SocketAddr) -> NsTransport {
+        self.cfg.nameservers.iter().position(|a| *a == ns).and_then(|i| self.cfg.transports.get(i)).copied().unwrap_or_default()
+    }
+
     /// The next datagram to send. Each try goes to every nameserver, in configuration order.
     /// Also runs the retry timer: call it at [`Self::poll_timeout`].
     pub fn poll_transmit(&mut self, now: Instant) -> Option<(SocketAddr, Protocol, Vec<u8>)> {
@@ -348,10 +389,11 @@ impl Resolver {
         f.nb_responses = 0;
         f.nb_tcp_fallback = 0;
         let buf = build_query(f.message_id, &f.dn, f.query_type, self.cfg.accepted_payload_size);
-        for &other in &self.cfg.nameservers[1..] {
-            self.transmits.push_back((other, Protocol::Udp, buf.clone()));
+        let proto = |i: usize| if self.cfg.transports.get(i) == Some(&NsTransport::Tcp) { Protocol::Tcp } else { Protocol::Udp };
+        for (i, &other) in self.cfg.nameservers.iter().enumerate().skip(1) {
+            self.transmits.push_back((other, proto(i), buf.clone()));
         }
-        Some((self.cfg.nameservers[0], Protocol::Udp, buf))
+        Some((self.cfg.nameservers[0], proto(0), buf))
     }
 
     /// Feeds one reply received from `from` over `proto`. The returned class is the
@@ -372,8 +414,9 @@ impl Resolver {
         let Some(idx) = self.in_flight.iter().position(|f| f.message_id == msg_id) else {
             return Received::Outdated;
         };
+        let transport = self.transport_of(from);
         let f = &mut self.in_flight[idx];
-        if proto == Protocol::Tcp && f.nb_tcp_fallback > 0 {
+        if proto == Protocol::Tcp && transport == NsTransport::Auto && f.nb_tcp_fallback > 0 {
             f.nb_tcp_fallback -= 1;
         }
         f.nb_responses += 1;
@@ -389,7 +432,7 @@ impl Resolver {
                 self.results.push_back((f.id, Ok(answers)));
                 return Received::Valid;
             }
-            Verdict::Truncated if proto == Protocol::Udp && self.cfg.tcp_fallback => {
+            Verdict::Truncated if proto == Protocol::Udp && transport == NsTransport::Auto && self.cfg.tcp_fallback => {
                 // resolv_send_tcp_fallback: the same question over TCP to this nameserver,
                 // without using a try.
                 f.nb_queries += 1;

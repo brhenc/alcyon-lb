@@ -3562,13 +3562,12 @@ impl TcpSession {
         // server is `sC--` at the connect timeout, not `cC--` at the client's).
         let body_buffered = self.mode == Mode::Http
             && !self.has_pending_output()
-            && self.txn.as_ref().is_some_and(|t| {
-                if t.local || t.error.is_some() {
-                    return false;
+            && self.txn.as_ref().is_some_and(|t| match t.req {
+                txn::MsgState::Head { body: txn::Framing::Length(n), .. } if !t.local && t.error.is_none() => {
+                    let data = self.req.readable();
+                    find_eoh(data).is_some_and(|(h, e)| (data.len() - (h + e)) as u64 >= n)
                 }
-                let txn::MsgState::Head { body: txn::Framing::Length(n), .. } = t.req else { return false };
-                let data = self.req.readable();
-                find_eoh(data).is_some_and(|(h, e)| (data.len() - (h + e)) as u64 >= n)
+                _ => false,
             });
         let awaiting_server = awaiting_server || head_only || body_buffered;
         // So is the turnaround before a retry (`SC_ST_TAR`).

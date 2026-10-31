@@ -62,7 +62,8 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
     // come (`pump_request_body`): with the length the client gave, else chunked, as
     // `HAProxy` writes it.
     let has_data = stream.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Data(_) | HtxBlock::RawData(_) | HtxBlock::Trailer(_)));
-    let chunked = stream.request_header("content-length").is_none() && (has_data || !stream.rx_htx.is_eom());
+    // An extended CONNECT's DATA are the tunnel's, which no framing goes with.
+    let chunked = !stream.ext_connect && stream.request_header("content-length").is_none() && (has_data || !stream.rx_htx.is_eom());
     let first_body = stream.rx_htx.blocks().iter().position(|b| matches!(b, HtxBlock::Eoh)).map_or(stream.rx_htx.blocks().len(), |i| i + 1);
     // The head as the mux wrote it (T437); the stream keeps none past this.
     let head = stream.req_head.take()?;
@@ -161,7 +162,23 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
         sess.log.request_line.set_opt(d.request_line.as_deref());
     }
     sess.log.request = Some(crate::txnlog::loop_now());
-    let head = d.head.wire();
+    // An extended CONNECT to a websocket goes to the server with the `Sec-WebSocket-Key`
+    // an HTTP/2 client does not send, which the server's accept must then answer
+    // (`h1_process_mux` adds it to a handshake that has none, T505). It is in the head the
+    // rules see, as the key the HTTP/1 path writes is (`HAProxy` adds it on output, after
+    // the headers the rules add).
+    let (ws, key) = if d.head.ext_connect {
+        crate::websocket::ReqWs::of(d.head.headers(), true)
+    } else {
+        (crate::websocket::ReqWs::default(), None)
+    };
+    sess.req_ws = (ws != crate::websocket::ReqWs::default()).then(|| Box::new(ws));
+    let keyed = key.map(|k| {
+        let head = d.head.wire();
+        let at = find_eoh(head).map_or(head.len(), |(h, _)| h);
+        [&head[..at], b"\r\nsec-websocket-key: ", k.as_bytes(), &head[at..]].concat()
+    });
+    let head = keyed.as_deref().unwrap_or_else(|| d.head.wire());
     let wire_req_buf: Vec<u8>;
     let wire_req: &[u8] = if chunked {
         let at = find_eoh(head).map_or(head.len(), |(h, _)| h);
@@ -409,9 +426,28 @@ pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn
         }
         return false;
     }
+    if txn.rsp == MsgState::Tunnel && h2.streams.get(&stream_id).is_some_and(|s| s.ext_connect) {
+        // The tunnel of an extended CONNECT (RFC 8441): what the server sends goes as
+        // DATA as the windows take it, and its close ends the stream.
+        let n = h2.data_budget(stream_id).min(data.len());
+        let sent = h2.send_data(stream_id, &data[..n], false);
+        rep.consume(sent);
+        if let Some(t) = txn.rsp_htx.as_mut() {
+            *t += sent as u64;
+        }
+        if srv_gone && rep.is_empty() {
+            // The stream is over once the client has ended too (`h2_request_open`).
+            h2.send_data(stream_id, &[], true);
+            txn.srv_reusable = false;
+            txn.close_after = true;
+            txn.rsp = MsgState::Done;
+        }
+        return false;
+    }
     if !matches!(txn.rsp, MsgState::Body(_)) {
-        // A body that broke its framing, or a tunnel (101, CONNECT), which this
-        // conversion does not carry: the stream is reset and the server is let go.
+        // A body that broke its framing, or a tunnel (101, CONNECT) of a request that is
+        // no extended CONNECT, which this conversion does not carry: the stream is reset
+        // and the server is let go.
         h2.send_rst_stream(stream_id, ibex_proto::h2::H2Error::InternalError);
         txn.srv_reusable = false;
         txn.rsp = MsgState::Done;

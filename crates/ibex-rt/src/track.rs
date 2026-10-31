@@ -206,7 +206,14 @@ pub fn apply_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckSta
     // A server with no address stays in maintenance (`SRV_ADMF_RMAINT` outlives `enable
     // server` and `set server state ready`: "leaving forced maintenance but remains in
     // maintenance").
-    if proxies.get(p).is_some_and(|px| px.server_rmaint(s)) {
+    // The operator's state is kept under it, taken back when the name resolves again
+    // (`SRV_ADMF_FMAINT`/`FDRAIN` beside `RMAINT`; measured on HAProxy 3.5-dev8).
+    if let Some(px) = proxies.get(p).filter(|px| px.server_rmaint(s)) {
+        let to = if matches!(to, ServerStatus::Maint | ServerStatus::Drain) { to } else { ServerStatus::Up };
+        if px.server_rmaint_kept(s) == ServerStatus::Maint && to != ServerStatus::Maint {
+            crate::srvlog::line(proxies, p, s, ibex_config::LogLevel::Notice, "is leaving forced maintenance but remains in maintenance");
+        }
+        px.set_server_rmaint(s, Some(to));
         return;
     }
     set_admin(proxies, checks, p, s, to, cause);

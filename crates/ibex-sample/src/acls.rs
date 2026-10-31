@@ -41,15 +41,14 @@ pub const PREDEFINED_ACLS: &[(&str, &str)] = &[
     ("RDP_COOKIE", "req.rdp_cookie_cnt gt 0"),
 ];
 
-/// The predefined ACLs, compiled on first use and shared by every proxy and thread.
-fn predefined() -> &'static HashMap<&'static str, Expr> {
-    static PREDEFINED: OnceLock<HashMap<&'static str, Expr>> = OnceLock::new();
-    PREDEFINED.get_or_init(|| {
-        PREDEFINED_ACLS
-            .iter()
-            .filter_map(|&(name, expr)| Some((name, Expr::parse(expr).ok()?)))
-            .collect()
-    })
+/// The predefined ACL `name`, compiled on its first use and shared by every proxy and thread.
+/// Each is compiled alone: `HTTP_URL_ABS` is a regex, whose compilation allocates tens of KB,
+/// and a configuration that never names it (nor any predefined ACL) must not pay that at
+/// start-up, where `-m 1` leaves no room for it (T508).
+fn predefined(name: &str) -> Option<&'static Expr> {
+    static PREDEFINED: [OnceLock<Option<Expr>>; PREDEFINED_ACLS.len()] = [const { OnceLock::new() }; PREDEFINED_ACLS.len()];
+    let i = PREDEFINED_ACLS.iter().position(|&(n, _)| n == name)?;
+    PREDEFINED[i].get_or_init(|| Expr::parse(PREDEFINED_ACLS[i].1).ok()).as_ref()
 }
 
 /// A proxy's ACLs by name: its own, then the predefined ones.
@@ -75,8 +74,6 @@ impl Acls {
     /// of that name. A line whose expression does not parse is skipped (the configuration
     /// check refuses it first).
     pub fn compile<'a>(lines: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
-        // Compiled with the configuration, so that no request pays for it.
-        let _ = predefined();
         let mut own: HashMap<String, usize> = HashMap::new();
         let mut exprs: Vec<Expr> = Vec::new();
         for (name, text) in lines {
@@ -102,7 +99,7 @@ impl Acls {
     pub fn resolve(&self, name: &str) -> Option<AclRef> {
         match self.own.get(name) {
             Some(&i) => Some(AclRef::Own(i)),
-            None => predefined().get(name).map(AclRef::Predefined),
+            None => predefined(name).map(AclRef::Predefined),
         }
     }
 

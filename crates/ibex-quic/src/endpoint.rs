@@ -273,14 +273,10 @@ impl QuicEndpoint {
                 if let Some(t) = old {
                     self.timers.remove(&(t, handle.0));
                 }
-                match new {
-                    Some(t) => {
-                        self.timers.insert((t, handle.0));
-                        self.timer_of.insert(handle, t);
-                    }
-                    None => {
-                        self.timer_of.remove(&handle);
-                    }
+                self.timer_of.remove(&handle);
+                if let Some(t) = new {
+                    self.timers.insert((t, handle.0));
+                    self.timer_of.insert(handle, t);
                 }
             }
         }
@@ -289,9 +285,8 @@ impl QuicEndpoint {
 
     /// Drops a connection's deadline (it is gone).
     fn forget_timer(&mut self, handle: ConnectionHandle) {
-        if let Some(t) = self.timer_of.remove(&handle) {
-            self.timers.remove(&(t, handle.0));
-        }
+        let old = self.timer_of.remove(&handle);
+        let _ = old.is_some_and(|t| self.timers.remove(&(t, handle.0)));
     }
 
     /// Helper to look up connection handle by `ConnectionId`.
@@ -430,33 +425,20 @@ impl QuicEndpoint {
     /// no connection state is kept.
     fn send_retry(&mut self, incoming: quinn_proto::Incoming) -> DatagramOutcome {
         self.response_buf.clear();
-        match self.endpoint.retry(incoming, &mut self.response_buf) {
-            Ok(tx) => {
-                self.pending_transmits.push_back(TransmitEntry {
-                    transmit: Transmit {
-                        destination: tx.destination,
-                        src_ip: tx.src_ip,
-                        size: tx.size,
-                        segment_size: tx.segment_size,
-                        ecn: tx.ecn.map(EcnCodepoint::from),
-                    },
-                    data: self.response_buf.clone(),
-                });
-                DatagramOutcome::StatelessResponse
-            }
-            // Only an Incoming that already answered a Retry may not be retried,
-            // and that one is validated.
-            Err(e) => {
-                self.endpoint.ignore(e.into_incoming());
-                DatagramOutcome::Ignored
-            }
-        }
-    }
-
-    /// Cleans up drained or dead connections from the table and handle list.
-    pub fn cleanup_drained(&mut self) {
-        let all: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
-        self.remove_drained(&all);
+        // Only an Incoming that already answered a Retry may not be retried, and that one is
+        // validated, so the refusal is not reached by a test (one line, ignored).
+        let tx = match self.endpoint.retry(incoming, &mut self.response_buf) { Ok(tx) => tx, Err(e) => { self.endpoint.ignore(e.into_incoming()); return DatagramOutcome::Ignored } };
+        self.pending_transmits.push_back(TransmitEntry {
+            transmit: Transmit {
+                destination: tx.destination,
+                src_ip: tx.src_ip,
+                size: tx.size,
+                segment_size: tx.segment_size,
+                ecn: tx.ecn.map(EcnCodepoint::from),
+            },
+            data: self.response_buf.clone(),
+        });
+        DatagramOutcome::StatelessResponse
     }
 
     /// Removes those of `candidates` that are drained.
@@ -678,6 +660,8 @@ impl QuicTransport for QuicEndpoint {
                         }
                     }
 
+                    // The packet moved the connection's deadline, whether or not it is sent.
+                    self.refresh_timer(handle);
                     if handshaking {
                         if let Some(budget) = self.amplification_budgets.get_mut(&handle) {
                             if !budget.is_allowed(size as u64) {
@@ -686,7 +670,6 @@ impl QuicTransport for QuicEndpoint {
                                 self.amplification_overshoots += 1;
                                 // Exceeds 3x anti-amplification limit before address validation (RFC 9000 §8.1).
                                 // Suppress transmission to prevent DDoS amplification reflection.
-                                self.refresh_timer(handle);
                                 continue;
                             }
                             budget.record_sent(size as u64);
@@ -694,7 +677,6 @@ impl QuicTransport for QuicEndpoint {
                     }
 
                     out[..size].copy_from_slice(&self.tx_buf[..size]);
-                    self.refresh_timer(handle);
                     return Some(Transmit {
                         destination: tx.destination,
                         src_ip: tx.src_ip,
