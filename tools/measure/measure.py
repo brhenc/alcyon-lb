@@ -208,8 +208,8 @@ def ensure_ibex_binary(target_dir: Path, profile: str = "release") -> Path:
     cmd = ["cargo", "build", "--bin", "ibex"]
     if profile == "release":
         cmd.append("--release")
-    elif profile == "livepatch":
-        cmd.extend(["--profile", "livepatch"])
+    elif profile in ("livepatch", "release-perf"):
+        cmd.extend(["--profile", profile])
 
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(target_dir)
@@ -331,7 +331,7 @@ backend be
         # Start proxy
         if proxy_type == "ibex":
             if not ibex_bin:
-                ibex_bin = ensure_ibex_binary(target_dir, profile="release")
+                ibex_bin = ensure_ibex_binary(target_dir, profile="release-perf")
             proxy_proc = subprocess.Popen([str(ibex_bin), "-f", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif proxy_type == "haproxy":
             if not HAPROXY_BIN.exists():
@@ -438,9 +438,14 @@ def reference_sha(repo: Path | str = REPO_ROOT, env: dict | None = None) -> str:
 
 
 def ensure_reference_binary(sha: str, target_dir: Path) -> Path:
-    """A release ibex built from `sha`, cached under the target directory by commit."""
+    """A release-perf ibex built from `sha`, cached under the target directory by commit.
+
+    T518: the instruction budget is judged on `release-perf` (fat LTO, one codegen unit: one
+    layout), `release` moved +-0.7% between near-identical builds. The cache file name carries
+    the profile so an old `release` binary is never reused. A cache hit costs nothing; a miss is
+    one fat-LTO build (~7 min)."""
     cache = target_dir / "measure-ref"
-    bin_path = cache / f"ibex-{sha[:12]}"
+    bin_path = cache / f"ibex-perf-{sha[:12]}"
     if bin_path.exists():
         return bin_path
     src = cache / "src"
@@ -453,11 +458,11 @@ def ensure_reference_binary(sha: str, target_dir: Path) -> Path:
                        capture_output=True)
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(cache / "target")
-    res = subprocess.run(["cargo", "build", "--release", "--bin", "ibex"], cwd=src, env=env,
+    res = subprocess.run(["cargo", "build", "--profile", "release-perf", "--bin", "ibex"], cwd=src, env=env,
                          capture_output=True, text=True)
     if res.returncode != 0:
         raise RuntimeError(f"Failed to build reference ibex at {sha[:12]}: {res.stderr[-2000:]}")
-    shutil.copy2(cache / "target" / "release" / "ibex", bin_path)
+    shutil.copy2(cache / "target" / "release-perf" / "ibex", bin_path)
     # Keep the newest few reference binaries.
     for old in sorted(cache.glob("ibex-*"), key=lambda q: q.stat().st_mtime)[:-4]:
         old.unlink()
@@ -1225,7 +1230,7 @@ def main() -> int:
 
     # Step 2: Binary & Section size
     print("[2/5] Measuring ibex binary and .text section size...")
-    ibex_bin = ensure_ibex_binary(target_dir, profile="release")
+    ibex_bin = ensure_ibex_binary(target_dir, profile="release-perf")
     bin_bytes, text_bytes = measure_binary_size(ibex_bin)
     record["binary_bytes"] = bin_bytes
     record["text_bytes"] = text_bytes
