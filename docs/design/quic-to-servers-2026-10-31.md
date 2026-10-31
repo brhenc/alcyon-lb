@@ -396,3 +396,13 @@ A (dev10) → Ibex quic4@:63022, tune.ibex.h3-path relay|mux                    
 Processes: every haproxy, ibex, nghttpd, `slow.py`, `echo.py` started here was stopped by PID;
 `ss -ltnup` showed no listener on 63000-63999 afterwards. No file in `crates/` was changed;
 `tools/checkin.sh` was not run (documentation-only branch).
+
+## Note added 2026-10-31 (supervisor, after T534)
+
+T534's QUIC client (`crates/ibex-quic/src/crypto/client.rs`) uses `build_quic` + `read_hs` +
+`events()` only; the server certificate is verified inside rustls's internal `ClientState`
+(`client/hs.rs:73-79`), so the `todo!("nyi")` of rustls 0.24.0-dev.2 (`quic.rs:146-152`, `impl
+FromConn<ClientSide> for ()`) is unreachable: it needs a `VerifyPeerIdentity<ClientSide, Quic>`,
+which only `ClientNext` builds, and `ClientNext` comes only from a TCP connection. **A future
+step-by-step client path** (`start_handshake` / `VerifyPeerIdentity` for QUIC, e.g. asynchronous
+certificate verification) would reach it on dev.2 and needs rustls f238d682f or a later dev tag.
