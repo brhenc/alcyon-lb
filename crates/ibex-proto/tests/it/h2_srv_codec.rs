@@ -636,6 +636,10 @@ fn absolute_targets_userinfo_empty_paths_and_other_schemes() {
     let mut c = ready();
     let w = request(&mut c, b"GET ftp://h/ HTTP/1.1\r\n\r\n");
     assert_eq!(&w[9..], &[&[0x82, 0x46, 3][..], b"ftp", &[0x41, 1, b'h', 0x84]].concat()[..], "another scheme: a literal");
+    // A colon without `//` is not an absolute target: the whole target is the path, scheme https.
+    let mut c = ready();
+    let w = request(&mut c, b"GET h:8080/x HTTP/1.1\r\n\r\n");
+    assert_eq!(&w[9..], &[&[0x82, 0x87, 0x44, 8][..], b"h:8080/x"].concat()[..], "colon, no //");
 }
 
 #[test]
