@@ -226,6 +226,11 @@ pub struct TlsConn {
     tap: Vec<u8>,
     /// A record refused after the plaintext before it was handed over: the next read's.
     rx_err: Option<io::Error>,
+    /// The name the `sni` expression gave for this server connection, when it is not the
+    /// one sent in SNI (rustls sends none for an IP address, `HAProxy` sends that too; a
+    /// `verifyhost` name is checked, not sent): `HAProxy` keys the connection by the
+    /// expression's value (`conn_hash` of the SNI sample), sent or not (T538).
+    key_name: Option<Box<str>>,
 }
 
 impl TlsConn {
@@ -253,6 +258,7 @@ impl TlsConn {
             notified: false,
             tap: Vec::new(),
             rx_err: None,
+            key_name: None,
         }
     }
 
@@ -928,12 +934,27 @@ impl ServerXprt {
         }
     }
 
-    /// The name sent in SNI, known from the start of the connection.
+    /// The name the connection was opened for, known from its start: what the `sni`
+    /// expression gave, which is the name sent in SNI unless rustls could not send it (an IP
+    /// address). The idle pool and the kept connection's check key by it, as `HAProxy`'s
+    /// `conn_hash` does; keyed by the name sent instead, a connection opened for Host
+    /// `127.0.0.1` was never found again: a TLS handshake per request (T538).
     #[must_use]
     pub fn sni(&self) -> Option<&str> {
         match self {
             ServerXprt::Plain => None,
-            ServerXprt::Tls(t) => t.ctx.client_sni.as_deref(),
+            ServerXprt::Tls(t) => t.key_name.as_deref().or(t.ctx.client_sni.as_deref()),
+        }
+    }
+
+    /// Records `name`, the `sni` expression's value, as what this connection is keyed by
+    /// ([`Self::sni`]) when it is not the name sent. Allocates only then: once per new
+    /// connection with an unsendable name, never on a reused one.
+    pub fn set_key_name(&mut self, name: Option<&str>) {
+        if let (ServerXprt::Tls(t), Some(name)) = (self, name.filter(|n| !n.is_empty())) {
+            if t.ctx.client_sni.as_deref() != Some(name) {
+                t.key_name = Some(name.into());
+            }
         }
     }
 

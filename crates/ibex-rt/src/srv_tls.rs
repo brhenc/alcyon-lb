@@ -109,7 +109,14 @@ impl Configs {
 
     /// Opens the TLS transport over the connected `fd`: `sni` is sent and checked when
     /// given, else `verifyhost` is checked without being sent, else no name is checked.
+    /// The connection is keyed by `sni` whether or not it could be sent ([`ServerXprt::sni`]).
     fn connect(&self, fd: &impl AsRawFd, sni: Option<&str>, server_ip: IpAddr) -> ServerXprt {
+        let mut x = self.connect_named(fd, sni, server_ip);
+        x.set_key_name(sni);
+        x
+    }
+
+    fn connect_named(&self, fd: &impl AsRawFd, sni: Option<&str>, server_ip: IpAddr) -> ServerXprt {
         let b = self.builds.current();
         let dns = |name: &str| ServerName::try_from(name.to_string()).ok().filter(|n| matches!(n, ServerName::DnsName(_)));
         if let Some(name) = sni.filter(|s| !s.is_empty()).and_then(dns) {
