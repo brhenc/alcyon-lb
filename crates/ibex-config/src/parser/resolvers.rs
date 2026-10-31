@@ -306,3 +306,65 @@ pub(crate) fn check_resolvers(sections: &[ResolversSection]) {
         );
     }
 }
+
+/// `resolv_parse_do_resolve` for the action word `act` (`do-resolve(...)`), its expression and
+/// condition from `tokens[at..]`: the `DoResolve` and the condition. `list` names the rule
+/// list in the refusal (`http-request`, `tcp-request content`).
+///
+/// # Errors
+/// `HAProxy`'s message for an action it cannot parse or an expression that is missing.
+pub(crate) fn parse_do_resolve(
+    list: &str,
+    tokens: &[Token],
+    at: usize,
+) -> Result<(crate::ast::DoResolve, Option<crate::ast::AclCondition>), ConfigError> {
+    let act_tok = &tokens[at - 1];
+    let act = act_tok.text.as_str();
+    let refuse = |what: &str, why: &str| {
+        err(
+            act_tok,
+            format!(
+                "error detected while parsing '{list} {act}' rule : Can't parse '{what}'{why}. Expects 'do-resolve(<varname>,<resolvers>[,<options>]) <expr>'. Available options are 'ipv4' and 'ipv6'."
+            ),
+        )
+    };
+    // `strchr` walks: `(`, the variable up to `,`, the section up to `,` or `)`, then options.
+    let parsed = (|| {
+        let inner = &act[act.find('(')? + 1..];
+        let (var, rest) = inner.split_once(',')?;
+        let end = rest.find([',', ')'])?;
+        let section = &rest[..end];
+        let mut rest = &rest[end..];
+        let mut prefer_ipv4 = false;
+        while !rest.starts_with(')') {
+            let body = &rest[1..];
+            let end = body.find([',', ')'])?;
+            let opt = &body[..end];
+            // `strncmp(beg, "ipv4", end - beg)`: any prefix of the word matches, even none.
+            if "ipv4".starts_with(opt) {
+                prefer_ipv4 = true;
+            } else if "ipv6".starts_with(opt) {
+                prefer_ipv4 = false;
+            } else {
+                return None;
+            }
+            rest = &body[end..];
+        }
+        Some((var.to_string(), section.to_string(), prefer_ipv4))
+    })();
+    let Some((var_name, resolvers, prefer_ipv4)) = parsed else {
+        return Err(refuse(act, ""));
+    };
+    let expr = tokens.get(at).filter(|t| t.text != "if" && t.text != "unless").map(|t| t.text.clone());
+    let Some(expr) = expr else {
+        return Err(refuse("", ": missing fetch method"));
+    };
+    let cond = match tokens.get(at + 1) {
+        None => None,
+        Some(t) if t.text == "if" || t.text == "unless" => super::parse_acl_condition_from_tokens(&tokens[at + 1..])?,
+        Some(t) => {
+            return Err(err(t, format!("'{list} {act}' expects either 'if' or 'unless' followed by a condition but found '{}'.", t.text)));
+        }
+    };
+    Ok((crate::ast::DoResolve { var_name, resolvers, section_idx: 0, prefer_ipv4, expr }, cond))
+}

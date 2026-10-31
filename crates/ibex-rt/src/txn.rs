@@ -866,6 +866,9 @@ pub struct BodyWait {
     /// The backend's `tcp-request content` rules wait for their `inspect-delay` (`backend`
     /// is set, `rule` is unused): the frontend's rules and the routing are not run again.
     pub inspect: bool,
+    /// A `do-resolve` asked worker 0 at this instant (T489): the rule reads the answer that
+    /// came after it.
+    pub asked: Option<std::time::Instant>,
 }
 
 /// Where `http-response` rules are held for a body: the rule list (the backend's, then

@@ -538,6 +538,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     }
 
     resolvers::check_resolvers(&resolvers);
+    check_do_resolve(&mut listens, &mut frontends, &mut backends, &resolvers)?;
     check_server_resolvers(&listens, &backends, &resolvers)?;
     crate::server_state_file::read_names(global.as_ref(), &mut listens, &mut backends);
     let mut init_notices = resolve_server_addrs(&mut listens, &mut backends)?;
@@ -566,6 +567,31 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     register_checks_from_config(&config);
 
     Ok(config)
+}
+
+/// Every `do-resolve` names a section (`check_action_do_resolve`): one alert per rule that
+/// does not, then the load fails.
+fn check_do_resolve(listens: &mut [ListenSection], frontends: &mut [FrontendSection], backends: &mut [BackendSection], sections: &[crate::ast::ResolversSection]) -> Result<(), ConfigError> {
+    use crate::ast::{HttpReqAction, TcpReqContentAction};
+    let all = listens
+        .iter_mut()
+        .map(|l| (l.name.as_str(), &mut l.tcp_req_content_rules, &mut l.http_req_rules))
+        .chain(frontends.iter_mut().map(|f| (f.name.as_str(), &mut f.tcp_req_content_rules, &mut f.http_req_rules)))
+        .chain(backends.iter_mut().map(|b| (b.name.as_str(), &mut b.tcp_req_content_rules, &mut b.http_req_rules)));
+    let mut alerts = Vec::new();
+    for (px, tcp, http) in all {
+        let rules = tcp
+            .iter_mut()
+            .filter_map(|r| if let TcpReqContentAction::DoResolve(d) = &mut r.action { Some(d) } else { None })
+            .chain(http.iter_mut().filter_map(|r| if let HttpReqAction::DoResolve(d) = &mut r.action { Some(d) } else { None }));
+        for d in rules {
+            match sections.iter().position(|r| r.name == d.resolvers) {
+                Some(i) => d.section_idx = u32::try_from(i).unwrap_or(u32::MAX),
+                None => alerts.push((0, format!("Proxy '{px}': Can't find resolvers section '{}' for do-resolve action.", d.resolvers))),
+            }
+        }
+    }
+    if alerts.is_empty() { Ok(()) } else { Err(ConfigError::alerts(alerts)) }
 }
 
 /// Every server's `resolvers` names a section (`resolvers_finalize_config`): `HAProxy`'s alert

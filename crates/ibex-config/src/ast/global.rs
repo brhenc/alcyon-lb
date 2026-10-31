@@ -218,6 +218,9 @@ pub struct GlobalSection {
     /// `dns-accept-family`: the families the resolvers ask for and accept
     /// (`resolv_accept_families`); the default is `auto`.
     pub dns_accept_family: DnsAcceptFamily,
+    /// `tune.resolvers.cache-size` (Ibex-only, T489): the `do-resolve` answers each worker
+    /// keeps (default 1024).
+    pub resolvers_cache_size: Option<usize>,
     /// `http-err-codes`: the statuses that count as an error (`http_err_cnt`), if set.
     pub http_err_codes: Option<StatusCodeSet>,
     /// `http-fail-codes`: the statuses that count as a failure (`http_fail_cnt`), if set.

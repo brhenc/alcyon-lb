@@ -229,6 +229,19 @@ pub(crate) fn parse_global_directive(
             global.quic_retry_threshold = Some(u64::from(n));
             Ok(())
         }
+        "tune.resolvers.cache-size" => {
+            // Ibex-only (T489): the `do-resolve` answers each worker keeps, at least 1.
+            let Some(t) = tokens.get(1) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.resolvers.cache-size' expects a positive integer argument."));
+            };
+            match parse_u32(t, "tune.resolvers.cache-size") {
+                Ok(n) if n > 0 => {
+                    global.resolvers_cache_size = Some(n as usize);
+                    Ok(())
+                }
+                _ => Err(ConfigError::new(kw.line, kw.col, "'tune.resolvers.cache-size' expects a positive integer argument.")),
+            }
+        }
         "tune.maxaccept" => {
             // `cfgparse-global.c`: `atol`, so `abc` is 0 (the default); only a value over
             // INT_MAX is refused (`max < -1` is commented out there); a second one is a

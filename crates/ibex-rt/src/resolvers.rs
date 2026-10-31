@@ -528,6 +528,11 @@ pub struct Section {
     stats_idx: usize,
     /// A counter changed since the last [`Section::publish`].
     dirty: bool,
+    /// `do-resolve` questions asked of the nameservers, and the answered messages to send back.
+    dr_pending: Vec<DrPending>,
+    // Pooled messages (`DR_MSG_POOL`).
+    #[allow(clippy::vec_box)]
+    dr_done: Vec<ibex_alloc::PoolBox<Box<DrMsg>>>,
 }
 
 /// What a step reports to the engine: a line to log on the server's proxy, at a level, also
@@ -619,6 +624,30 @@ pub fn build(
         .map(|l| (&l.servers, &l.server_extras))
         .chain(config.backends.iter().filter(|b| !b.disabled).map(|b| (&b.servers, &b.server_extras)));
     let mut by_key: HashMap<(usize, Box<str>, u16), (usize, usize)> = HashMap::new();
+    // The sections a `do-resolve` names run even when no server uses them (T489).
+    let dr_names = config
+        .listens
+        .iter()
+        .map(|l| (&l.tcp_req_content_rules, &l.http_req_rules))
+        .chain(config.frontends.iter().map(|f| (&f.tcp_req_content_rules, &f.http_req_rules)))
+        .chain(config.backends.iter().map(|b| (&b.tcp_req_content_rules, &b.http_req_rules)))
+        .flat_map(|(t, h)| {
+            t.iter()
+                .filter_map(|r| if let ibex_config::ast::TcpReqContentAction::DoResolve(d) = &r.action { Some(d.resolvers.as_str()) } else { None })
+                .chain(h.iter().filter_map(|r| if let ibex_config::HttpReqAction::DoResolve(d) = &r.action { Some(d.resolvers.as_str()) } else { None }))
+        });
+    for sec_name in dr_names {
+        if out.iter().any(|s| *s.name == *sec_name) {
+            continue;
+        }
+        let Some((i, cfg)) = config.resolvers.iter().enumerate().find(|(_, r)| r.name == sec_name) else { continue };
+        let mut sec = Section::new(cfg, usize_to_u32(out.len()), scheduler, fdtab, poller, now)?;
+        sec.stats_idx = i;
+        out.push(sec);
+    }
+    if let Some(n) = config.global.as_ref().and_then(|g| g.resolvers_cache_size) {
+        DR_CACHE_SIZE.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
     for (p_idx, (servers, extras)) in sections.enumerate() {
         let Some(px) = proxies.get(p_idx) else { continue };
         // A server written as an address with `resolvers` resolves nothing until `set server
@@ -739,7 +768,9 @@ impl Section {
             resolve_retries: usize::try_from(cfg.resolve_retries.max(1)).unwrap_or(1),
             timeout_resolve: cfg.timeout_resolve,
             timeout_retry: cfg.timeout_retry,
-            hold_valid: h.valid,
+            // The engine keeps the `do-resolve` answers (bounded, [`DrCache`]); the crate's own
+            // cache, keyed by any name a request gives, stays off.
+            hold_valid: Duration::ZERO,
             hold_nx: h.nx,
             hold_other: h.other,
             hold_refused: h.refused,
@@ -773,6 +804,8 @@ impl Section {
             buf: vec![0u8; 65_536].into_boxed_slice(),
             stats_idx: 0,
             dirty: false,
+            dr_pending: Vec::new(),
+            dr_done: Vec::new(),
         })
     }
 
@@ -1045,6 +1078,9 @@ impl Section {
 
     fn drain_results(&mut self, now: Instant, ns: Option<usize>, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
         while let Some((qid, res)) = self.dns.poll_result() {
+            if !self.dr_pending.is_empty() && self.dr_result(qid, &res, now) {
+                continue;
+            }
             let Some(r) = self.resolutions.iter_mut().find(|r| r.in_flight == Some(qid)) else { continue };
             r.in_flight = None;
             r.next_at = now + self.holds.timeout_resolve;
@@ -1810,5 +1846,353 @@ mod tests {
         // The first leaves its item: the third can have it.
         set_attached(&mut r, 0, None);
         assert_eq!(pick(&mut r, 2, None, Families::IPV4), Pick::New(a));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// `do-resolve` (T489): `resolv_action_do_resolve`, `resolvers.c:3257`.
+//
+// A rule asks its worker's cache first (no lock, no allocation: a hit sets the variable and
+// the rule goes on). A miss posts one pooled message to worker 0, which owns the sections:
+// worker 0 answers from its own cache, from a server resolution of the same name whose last
+// valid answer is younger than `hold valid` (`HAProxy` shares the resolution), or asks the
+// nameservers; the reply comes back in the same message, goes into the asking worker's cache
+// and wakes the stream, which reads it there. The caches are bounded
+// (`tune.resolvers.cache-size`, Ibex-only), since their keys come from requests.
+
+/// The longest name `do-resolve` asks (`DNS_MAX_NAME_SIZE`).
+pub const DR_NAME_MAX: usize = 255;
+
+/// One `do-resolve` question and, on its way back, its answer.
+pub struct DrMsg {
+    /// The worker that asked, and the stream task to wake there.
+    pub wid: usize,
+    pub task: ibex_sched::task::TaskRef,
+    /// The section, as its index in the configuration's `resolvers`.
+    pub section: u32,
+    pub prefer_ipv4: bool,
+    name: [u8; DR_NAME_MAX],
+    len: u8,
+    /// The answer: `Some(ip)` for a valid one with an address of an accepted family.
+    pub answer: Option<IpAddr>,
+    /// How long a valid answer stays fresh (`hold valid`); zero for an error.
+    pub hold: Duration,
+}
+
+impl DrMsg {
+    /// The name, lower case as it was stored.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        std::str::from_utf8(&self.name[..usize::from(self.len)]).unwrap_or("")
+    }
+}
+
+ibex_alloc::declare_pool!(
+    /// `show pools` `do_resolve`: the messages of the `do-resolve` cache misses between a worker
+    /// and worker 0 (one in flight per waiting stream).
+    static DR_MSG_POOL: Pool<Box<DrMsg>> = ibex_alloc::PoolSpec::new("do_resolve");
+);
+
+impl ibex_alloc::Poolable for Box<DrMsg> {
+    fn footprint(&self) -> usize {
+        std::mem::size_of::<DrMsg>()
+    }
+
+    fn reset(&mut self, _wipe: bool) {
+        self.len = 0;
+        self.answer = None;
+    }
+
+    fn try_new() -> Option<Self> {
+        Some(Box::new(DrMsg {
+            wid: 0,
+            task: ibex_sched::task::TaskRef(0),
+            section: 0,
+            prefer_ipv4: false,
+            name: [0; DR_NAME_MAX],
+            len: 0,
+            answer: None,
+            hold: Duration::ZERO,
+        }))
+    }
+}
+
+/// One cached answer.
+#[derive(Clone, Copy)]
+struct DrEntry {
+    hash: u64,
+    section: u32,
+    prefer_ipv4: bool,
+    len: u8,
+    name: [u8; DR_NAME_MAX],
+    answer: Option<IpAddr>,
+    /// When the answer came; fresh until `exp` (a failure is never fresh, but the streams that
+    /// waited for it read it by `at`).
+    at: Instant,
+    exp: Instant,
+}
+
+/// Entries per bucket: a bucket is searched whole, and its oldest entry is replaced.
+const DR_WAYS: usize = 4;
+
+/// A worker's `do-resolve` cache: buckets of [`DR_WAYS`] entries, sized once.
+pub struct DrCache {
+    buckets: Vec<[Option<DrEntry>; DR_WAYS]>,
+}
+
+ibex_alloc::declare_pool!(
+    /// `show pools` `do_resolve_cache`: one per worker that ran a `do-resolve` rule.
+    static DR_CACHE_POOL: Pool<Box<DrCache>> = ibex_alloc::PoolSpec::new("do_resolve_cache");
+);
+
+impl ibex_alloc::Poolable for Box<DrCache> {
+    fn footprint(&self) -> usize {
+        std::mem::size_of::<DrCache>() + self.buckets.capacity() * std::mem::size_of::<[Option<DrEntry>; DR_WAYS]>()
+    }
+
+    fn reset(&mut self, _wipe: bool) {
+        self.buckets.iter_mut().for_each(|b| *b = [None; DR_WAYS]);
+    }
+
+    fn try_new() -> Option<Self> {
+        let n = (DR_CACHE_SIZE.load(std::sync::atomic::Ordering::Relaxed).max(1)).div_ceil(DR_WAYS).next_power_of_two();
+        Some(Box::new(DrCache { buckets: vec![[None; DR_WAYS]; n] }))
+    }
+}
+
+/// `tune.resolvers.cache-size` (entries per worker), set by [`build`].
+static DR_CACHE_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1024);
+
+/// FNV-1a of the key (no allocation, no seed: the key is bounded and lands in one bucket of
+/// four, so a flood of colliding names only evicts within that bucket).
+fn dr_hash(section: u32, prefer_ipv4: bool, name: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in section.to_le_bytes().into_iter().chain([u8::from(prefer_ipv4)]).chain(name.iter().copied()) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+impl DrCache {
+    fn find(&self, section: u32, prefer_ipv4: bool, name: &[u8]) -> Option<&DrEntry> {
+        let h = dr_hash(section, prefer_ipv4, name);
+        let b = &self.buckets[usize::try_from(h).unwrap_or(0) & (self.buckets.len() - 1)];
+        b.iter().flatten().find(|e| e.hash == h && e.section == section && e.prefer_ipv4 == prefer_ipv4 && &e.name[..usize::from(e.len)] == name)
+    }
+
+    fn insert(&mut self, m: &DrMsg, now: Instant) {
+        let name = &m.name[..usize::from(m.len)];
+        let h = dr_hash(m.section, m.prefer_ipv4, name);
+        let mask = self.buckets.len() - 1;
+        let b = &mut self.buckets[usize::try_from(h).unwrap_or(0) & mask];
+        let same = |e: &DrEntry| e.hash == h && e.section == m.section && e.prefer_ipv4 == m.prefer_ipv4 && &e.name[..usize::from(e.len)] == name;
+        let slot = b
+            .iter()
+            .position(|e| e.as_ref().is_some_and(same))
+            .or_else(|| b.iter().position(Option::is_none))
+            .unwrap_or_else(|| (0..DR_WAYS).min_by_key(|&i| b[i].map(|e| e.at)).unwrap_or(0));
+        b[slot] = Some(DrEntry { hash: h, section: m.section, prefer_ipv4: m.prefer_ipv4, len: m.len, name: m.name, answer: m.answer, at: now, exp: now + m.hold });
+    }
+}
+
+thread_local! {
+    /// This worker's cache and the mailboxes to reach worker 0 (set by the engine).
+    static DR_LOCAL: std::cell::RefCell<Option<ibex_alloc::PoolBox<Box<DrCache>>>> = const { std::cell::RefCell::new(None) };
+    static DR_MAILBOXES: std::cell::RefCell<Option<std::sync::Arc<crate::mailbox::Mailboxes>>> = const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    /// The stream task whose `tcp-request content` rules run now (a `do-resolve` wakes it).
+    static DR_TASK: std::cell::Cell<ibex_sched::task::TaskRef> = const { std::cell::Cell::new(ibex_sched::task::TaskRef(0)) };
+}
+
+/// Names the stream task the next `tcp-request content` rules run for.
+pub fn dr_set_task(t: ibex_sched::task::TaskRef) {
+    DR_TASK.set(t);
+}
+
+/// The stream task [`dr_set_task`] named.
+#[must_use]
+pub fn dr_task() -> ibex_sched::task::TaskRef {
+    DR_TASK.get()
+}
+
+/// The engine of this worker reaches the others through `boxes`.
+pub fn dr_set_mailboxes(boxes: &std::sync::Arc<crate::mailbox::Mailboxes>) {
+    DR_MAILBOXES.with(|m| *m.borrow_mut() = Some(std::sync::Arc::clone(boxes)));
+}
+
+fn with_cache<R>(f: impl FnOnce(&mut DrCache) -> R) -> Option<R> {
+    DR_LOCAL.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.is_none() {
+            DR_CACHE_POOL.register();
+            *c = DR_CACHE_POOL.take();
+        }
+        c.as_mut().map(|b| f(b))
+    })
+}
+
+/// What a `do-resolve` rule does now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrStep {
+    /// Done: store this address in the variable (`None`: nothing to store) and go on.
+    Done(Option<IpAddr>),
+    /// Asked: wait for the answer.
+    Wait,
+}
+
+/// A `do-resolve` question in the form `HAProxy` asks it (`resolv_str_to_dn_label` +
+/// `resolv_hostname_validation`): lower case, no final dot, labels of 1 to 63 letters, digits,
+/// `-` or `_`, 255 bytes at most. `None`: the action is ignored.
+fn dr_name(name: &[u8], out: &mut [u8; DR_NAME_MAX]) -> Option<u8> {
+    let name = name.strip_suffix(b".").unwrap_or(name);
+    if name.is_empty() || name.len() > DR_NAME_MAX - 1 {
+        return None;
+    }
+    for l in name.split(|b| *b == b'.') {
+        if l.is_empty() || l.len() > 63 || !l.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_') {
+            return None;
+        }
+    }
+    for (o, b) in out.iter_mut().zip(name) {
+        *o = b.to_ascii_lowercase();
+    }
+    u8::try_from(name.len()).ok()
+}
+
+/// The first visit of a `do-resolve` rule on `name` (section `section`): a fresh answer in this
+/// worker's cache, or a question posted to worker 0 for the stream task `task` (`Wait`).
+pub fn dr_start(section: u32, prefer_ipv4: bool, name: &[u8], task: ibex_sched::task::TaskRef, now: Instant) -> DrStep {
+    let mut key = [0u8; DR_NAME_MAX];
+    let Some(len) = dr_name(name, &mut key) else { return DrStep::Done(None) };
+    let k = &key[..usize::from(len)];
+    if let Some(Some(ip)) = with_cache(|c| c.find(section, prefer_ipv4, k).filter(|e| now < e.exp).map(|e| e.answer)) {
+        return DrStep::Done(ip);
+    }
+    let Some(boxes) = DR_MAILBOXES.with(|m| m.borrow().clone()) else { return DrStep::Done(None) };
+    let Some(mut m) = DR_MSG_POOL.take() else { return DrStep::Done(None) };
+    m.wid = crate::engine::worker_id();
+    m.task = task;
+    m.section = section;
+    m.prefer_ipv4 = prefer_ipv4;
+    m.name = key;
+    m.len = len;
+    m.answer = None;
+    m.hold = Duration::ZERO;
+    boxes.post(0, crate::mailbox::Msg::DoResolve(m));
+    DrStep::Wait
+}
+
+/// A `do-resolve` rule woken after [`dr_start`] asked at `asked`: the answer if it came.
+pub fn dr_poll(section: u32, prefer_ipv4: bool, name: &[u8], asked: Instant) -> Option<Option<IpAddr>> {
+    let mut key = [0u8; DR_NAME_MAX];
+    let len = dr_name(name, &mut key)?;
+    with_cache(|c| c.find(section, prefer_ipv4, &key[..usize::from(len)]).filter(|e| e.at >= asked).map(|e| e.answer)).flatten()
+}
+
+/// The answer to a question this worker asked: into the cache, and the stream woken.
+pub fn dr_answered(m: &DrMsg) -> ibex_sched::task::TaskRef {
+    let now = Instant::now();
+    with_cache(|c| c.insert(m, now));
+    m.task
+}
+
+/// The address `do-resolve` takes from an answer (`resolv_get_ip_from_response` with the
+/// rule's family preference): the first of the preferred family, else the first accepted.
+fn dr_pick(ips: impl Iterator<Item = IpAddr> + Clone, prefer_ipv4: bool, fam: Families) -> Option<IpAddr> {
+    let ok = |ip: &IpAddr| if ip.is_ipv4() { fam.ipv4 } else { fam.ipv6 };
+    ips.clone().filter(ok).find(|ip| ip.is_ipv4() == prefer_ipv4).or_else(|| ips.filter(ok).next())
+}
+
+/// A `do-resolve` question waiting for the nameservers on worker 0.
+pub(crate) struct DrPending {
+    qid: QueryId,
+    // Pooled messages (`DR_MSG_POOL`), held until the answer.
+    #[allow(clippy::vec_box)]
+    waiters: Vec<ibex_alloc::PoolBox<Box<DrMsg>>>,
+}
+
+impl Section {
+    /// The configuration index of this section (its [`DrMsg::section`]).
+    #[must_use]
+    pub fn config_index(&self) -> u32 {
+        usize_to_u32(self.stats_idx)
+    }
+
+    /// Worker 0's side of a `do-resolve` miss: the answer now (from this worker's cache or a
+    /// server resolution younger than `hold valid`), or the message kept until the
+    /// nameservers answer. Returns the message when it is answered.
+    pub fn do_resolve(&mut self, mut m: ibex_alloc::PoolBox<Box<DrMsg>>) -> Option<ibex_alloc::PoolBox<Box<DrMsg>>> {
+        let now = Instant::now();
+        let name_buf = m.name;
+        let name = &name_buf[..usize::from(m.len)];
+        if let Some(Some(e)) = with_cache(|c| c.find(m.section, m.prefer_ipv4, name).filter(|e| now < e.exp).copied()) {
+            m.answer = e.answer;
+            m.hold = e.exp - now;
+            return Some(m);
+        }
+        let fam = active_families(now);
+        let ty = first_type(fam, m.prefer_ipv4);
+        let fresh = |r: &&Box<Resolution>| {
+            r.srv.is_none() && r.prefer == ty && r.status == Status::Valid && r.last_valid.is_some_and(|t| now.duration_since(t) < self.holds.valid) && r.name.as_bytes().eq_ignore_ascii_case(name)
+        };
+        if let Some(r) = self.resolutions.iter().find(fresh) {
+            m.answer = dr_pick(r.items.iter().map(|i| i.ip), m.prefer_ipv4, fam);
+            m.hold = self.holds.valid.saturating_sub(r.last_valid.map_or(Duration::ZERO, |t| now.duration_since(t)));
+            return Some(m);
+        }
+        if let Some(p) = self.dr_pending.iter_mut().find(|p| p.waiters.first().is_some_and(|w| w.section == m.section && w.prefer_ipv4 == m.prefer_ipv4 && w.name == m.name)) {
+            p.waiters.push(m);
+            return None;
+        }
+        let prefer = if ty == TYPE_A { Family::Ipv4 } else { Family::Ipv6 };
+        let accept = Families { ipv4: fam.ipv4 || prefer == Family::Ipv4, ipv6: fam.ipv6 || prefer == Family::Ipv6 };
+        match self.dns.query(now, m.name(), Question::Addr { accept, prefer }, Requester::DoResolve) {
+            Ok(qid) => {
+                let mut waiters = Vec::with_capacity(1);
+                waiters.push(m);
+                self.dr_pending.push(DrPending { qid, waiters });
+                None
+            }
+            Err(_) => {
+                m.answer = None;
+                m.hold = Duration::ZERO;
+                Some(m)
+            }
+        }
+    }
+
+    /// The answered `do-resolve` messages, for the engine to send back.
+    pub fn take_dr_answers(&mut self) -> Vec<ibex_alloc::PoolBox<Box<DrMsg>>> {
+        std::mem::take(&mut self.dr_done)
+    }
+
+    /// A result of the crate for a `do-resolve` question: every waiter gets it.
+    fn dr_result(&mut self, qid: QueryId, res: &Result<Vec<Answer>, DnsError>, now: Instant) -> bool {
+        let Some(i) = self.dr_pending.iter().position(|p| p.qid == qid) else { return false };
+        let p = self.dr_pending.swap_remove(i);
+        let fam = active_families(now);
+        for mut m in p.waiters {
+            match res {
+                Ok(answers) => {
+                    let ips = answers.iter().filter_map(|a| match a.rdata {
+                        Rdata::A(v4) => Some(IpAddr::from(v4)),
+                        Rdata::Aaaa(v6) => Some(IpAddr::from(v6)),
+                        _ => None,
+                    });
+                    m.answer = dr_pick(ips, m.prefer_ipv4, fam);
+                    m.hold = self.holds.valid;
+                }
+                Err(_) => {
+                    m.answer = None;
+                    m.hold = Duration::ZERO;
+                }
+            }
+            with_cache(|c| c.insert(&m, now));
+            self.dr_done.push(m);
+        }
+        true
     }
 }

@@ -631,3 +631,50 @@ fn parse_resolv_conf_inserts_the_systems_nameservers_in_place() {
     let got: Vec<String> = cfg.resolvers[0].nameservers.iter().map(|n| n.name.clone()).collect();
     assert_eq!(got, want, "{text}");
 }
+
+/// T489, `do-resolve` (`resolv_parse_do_resolve`, `check_action_do_resolve`), measured with
+/// `haproxy -c` on 3.5-dev8: the option is matched as a prefix (`ip` is `ipv4`), the last one
+/// wins, the variable name is not checked; the refusals are `HAProxy`'s.
+#[test]
+fn do_resolve_is_parsed_as_haproxy() {
+    use ibex_config::ast::{HttpReqAction, TcpReqContentAction};
+    let cfg = |act: &str| {
+        format!(
+            "resolvers r\n  nameserver ns1 127.0.0.1:53\nresolvers q\n  nameserver ns1 127.0.0.1:53\n{HEAD}  http-request {act}\n  tcp-request content {act}\n"
+        )
+    };
+    let dr = |act: &str| {
+        let c = parse_str(&cfg(act)).unwrap_or_else(|e| panic!("{act}: {}", e.message));
+        let b = &c.backends[0];
+        let HttpReqAction::DoResolve(h) = &b.http_req_rules[0].action else { panic!("{act}") };
+        let TcpReqContentAction::DoResolve(t) = &b.tcp_req_content_rules[0].action else { panic!("{act}") };
+        assert_eq!(h, t);
+        (h.var_name.clone(), h.resolvers.clone(), h.section_idx, h.prefer_ipv4, h.expr.clone())
+    };
+    assert_eq!(dr("do-resolve(txn.ip,r) str(a)"), ("txn.ip".into(), "r".into(), 0, false, "str(a)".into()));
+    assert_eq!(dr("do-resolve(txn.ip,q,ipv4) str(a)"), ("txn.ip".into(), "q".into(), 1, true, "str(a)".into()));
+    assert_eq!(dr("do-resolve(txn.ip,r,ip) str(a)").3, true);
+    assert_eq!(dr("do-resolve(txn.ip,r,ipv4,ipv6) str(a)").3, false);
+    assert_eq!(dr("do-resolve(foo,r) str(a) if TRUE").0, "foo");
+    let usage = |what: &str, why: &str| {
+        format!("error detected in backend 'l' while parsing 'http-request {what}' rule : Can't parse '{what}'{why}. Expects 'do-resolve(<varname>,<resolvers>[,<options>]) <expr>'. Available options are 'ipv4' and 'ipv6'.")
+    };
+    for act in ["do-resolve(txn.ip,r,ipv5)", "do-resolve(txn.ip)", "do-resolve", "do-resolve(txn.ip,r"] {
+        assert_eq!(refused(&cfg(&format!("{act} str(a)"))), usage(act, ""), "{act}");
+    }
+    assert_eq!(
+        refused(&cfg("do-resolve(txn.ip,r)")),
+        "error detected in backend 'l' while parsing 'http-request do-resolve(txn.ip,r)' rule : Can't parse '': missing fetch method. Expects 'do-resolve(<varname>,<resolvers>[,<options>]) <expr>'. Available options are 'ipv4' and 'ipv6'."
+    );
+    assert_eq!(
+        refused(&cfg("do-resolve(txn.ip,r) str(a) foo")),
+        "'http-request do-resolve(txn.ip,r)' expects either 'if' or 'unless' followed by a condition but found 'foo'."
+    );
+    assert_eq!(
+        alerts(&cfg("do-resolve(txn.ip,nosuch) str(a)")),
+        ["Proxy 'l': Can't find resolvers section 'nosuch' for do-resolve action.", "Proxy 'l': Can't find resolvers section 'nosuch' for do-resolve action."]
+    );
+    assert!(parse_str(&format!("global\n  tune.resolvers.cache-size 0\n{HEAD}")).is_err());
+    assert!(parse_str(&format!("global\n  tune.resolvers.cache-size\n{HEAD}")).is_err());
+    assert_eq!(parse_str(&format!("global\n  tune.resolvers.cache-size 100\n{HEAD}")).expect("ok").global.unwrap_or_default().resolvers_cache_size, Some(100));
+}

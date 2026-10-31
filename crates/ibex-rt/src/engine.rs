@@ -5064,6 +5064,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
         // A worker on its own answers itself; `share_mailboxes` joins it to the others.
         let mailboxes = crate::mailbox::Mailboxes::new(1)?;
+        crate::resolvers::dr_set_mailboxes(&mailboxes);
         let mb_fd = mailboxes.fd(0).as_raw_fd();
         fdtab.insert(mb_fd, FdState::Mailbox, Interest::READ);
         poller.add(mailboxes.fd(0), raw_fd_to_u64(mb_fd), true, false)?;
@@ -5272,6 +5273,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.mailboxes = Arc::clone(boxes);
         self.mailbox_wid = wid;
         crate::buf_wait::join(boxes, wid);
+        crate::resolvers::dr_set_mailboxes(boxes);
         Ok(())
     }
 
@@ -5293,6 +5295,30 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     g.reply(wid, n);
                 }
                 crate::mailbox::Msg::Wake(t) => {
+                    if self.scheduler.is_live(t) {
+                        self.scheduler.tasklet_wakeup(t, Class::Urgent, state::WOKEN_IO);
+                    }
+                }
+                // T489: worker 0 answers a `do-resolve` miss now, or its section asks.
+                crate::mailbox::Msg::DoResolve(mut m) => {
+                    let done = if let Some(sec) = self.resolvers.iter_mut().find(|s| s.config_index() == m.section) {
+                        let done = sec.do_resolve(m);
+                        if done.is_none() {
+                            self.scheduler.tasklet_wakeup(sec.task, Class::Urgent, state::WOKEN_IO);
+                        }
+                        done
+                    } else {
+                        m.answer = None;
+                        m.hold = std::time::Duration::ZERO;
+                        Some(m)
+                    };
+                    if let Some(m) = done {
+                        self.mailboxes.post(m.wid, crate::mailbox::Msg::DoResolved(m));
+                    }
+                }
+                crate::mailbox::Msg::DoResolved(m) => {
+                    let t = crate::resolvers::dr_answered(&m);
+                    drop(m);
                     if self.scheduler.is_live(t) {
                         self.scheduler.tasklet_wakeup(t, Class::Urgent, state::WOKEN_IO);
                     }
@@ -7302,6 +7328,35 @@ fn eval_tcp_req_content_rules(
                     store_var_smp(&mut sess.vars, var_name, val);
                 }
             }
+            ibex_config::TcpReqContentAction::DoResolve(d) => {
+                // T489: as `http-request do-resolve`, within the `inspect-delay`: at its end
+                // (or without one, `ACT_OPT_FINAL`) the rule gives up and nothing is asked.
+                // The rules run again from the first while they wait.
+                let held = sess.dr_wait.filter(|w| w.0 == rule_idx);
+                if can_wait {
+                    let task = crate::resolvers::dr_task();
+                    let step = with_rule_name(rc.expr.as_ref(), registry, &ctx, |name| match held {
+                        Some((_, asked)) => crate::resolvers::dr_poll(d.section_idx, d.prefer_ipv4, name, asked).map_or(crate::resolvers::DrStep::Wait, crate::resolvers::DrStep::Done),
+                        None => crate::resolvers::dr_start(d.section_idx, d.prefer_ipv4, name, task, std::time::Instant::now()),
+                    });
+                    match step {
+                        crate::resolvers::DrStep::Wait => {
+                            if held.is_none() {
+                                sess.dr_wait = Some((rule_idx, std::time::Instant::now()));
+                            }
+                            return ContentEvalResult::Waiting;
+                        }
+                        crate::resolvers::DrStep::Done(ip) => {
+                            if let Some(ip) = ip {
+                                store_var_smp(&mut sess.vars, &d.var_name, ip_sample(ip));
+                            }
+                        }
+                    }
+                }
+                if held.is_some() {
+                    sess.dr_wait = None;
+                }
+            }
             ibex_config::TcpReqContentAction::SetVarFmt { var_name, fmt: _ } => {
                 let val = render_rule_fmt(rc, &ctx, registry);
                 store_var(&mut sess.vars, var_name, val);
@@ -7498,6 +7553,37 @@ fn store_var(vars: &mut VarStore, name: &str, mut val: String) {
 /// stored and the new value when both are `sint`.
 ///
 /// The variable keeps the sample's type (T364): `var()` gives back this `Sample`.
+/// How long a stream waits for a `do-resolve` answer at most (T489): worker 0 always answers
+/// once the resolution ends (`resolve_retries` x `timeout retry`); this only bounds a lost one.
+const DO_RESOLVE_WAIT_MS: u32 = 30_000;
+
+/// The name a `do-resolve` expression gives, to `f`: a constant without a copy, else the
+/// sample's text. No name (the fetch failed, not a string): `Done(None)`.
+fn with_rule_name(e: Option<&ibex_sample::Expr>, registry: &ibex_sample::Registry, ctx: &SampleContext, f: impl FnOnce(&[u8]) -> crate::resolvers::DrStep) -> crate::resolvers::DrStep {
+    let none = crate::resolvers::DrStep::Done(None);
+    let Some(e) = e else { return none };
+    if let Some(c) = e.constant(registry) {
+        return match c {
+            Sample::Str(s) => f(s.as_bytes()),
+            Sample::Bin(b) => f(b),
+            _ => none,
+        };
+    }
+    match e.eval_sample(registry, ctx) {
+        Some(Sample::Str(s)) => f(s.as_bytes()),
+        Some(Sample::Bin(b)) => f(&b),
+        _ => none,
+    }
+}
+
+/// An address as a variable holds it (`SMP_T_IPV4` / `SMP_T_IPV6`).
+fn ip_sample(ip: IpAddr) -> Sample {
+    match ip {
+        IpAddr::V4(v4) => Sample::Ipv4(v4),
+        IpAddr::V6(v6) => Sample::Ipv6(v6),
+    }
+}
+
 fn store_var_smp(vars: &mut VarStore, spec: &str, val: Sample) {
     store_var_in(vars, spec, ibex_sample::vars::In::Owned(val));
 }
@@ -10377,6 +10463,7 @@ impl EngineDispatcher<'_> {
                     entry.sess.log.req_captures.clear();
                     entry.sess.log.req_captures.resize(self.proxies[proxy_idx].req_capture_slots.len(), None);
                 }
+                crate::resolvers::dr_set_task(entry.task);
                 match eval_tcp_req_content_rules(
                     &self.proxies[proxy_idx],
                     proxy_idx,
@@ -12309,6 +12396,8 @@ impl EngineDispatcher<'_> {
 
         let stick = StickView::new(proxies, &entry.sess.tracked_sc);
         let act_conn = proxies[proxy_idx].counters().act_conn.load(Ordering::Relaxed);
+        // The stream a `do-resolve` wakes (T489).
+        let my_task = entry.task;
         let eval_http_rules_held = |rules: &[ibex_config::HttpReqRule], compiled: &[crate::rule_compiled::Rule], acls: &ibex_sample::Acls, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize, be_stage: bool, start: usize| -> Result<RuleFlow, u16> {
             macro_rules! make_ctx {
                 ($s:expr) => {
@@ -12479,7 +12568,7 @@ impl EngineDispatcher<'_> {
                         );
                         if !deadline.is_expired(now) {
                             if let Some(t) = sess.txn.as_mut() {
-                                t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline, tarpit: true, inspect: false });
+                                t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline, tarpit: true, inspect: false, asked: None });
                             }
                             return Ok(RuleFlow::Suspend);
                         }
@@ -12763,6 +12852,37 @@ impl EngineDispatcher<'_> {
                             sess.server_addr = Some(SocketAddr::new(ip, port));
                         }
                     }
+                    ibex_config::HttpReqAction::DoResolve(d) => {
+                        // `resolv_action_do_resolve` (T489): the stream waits for the answer (its
+                        // `body_wait` holds the rule), then the address goes into the variable;
+                        // no answer (an error, an invalid name, the deadline) sets nothing.
+                        let held = sess.txn.as_ref().and_then(|t| t.body_wait).filter(|w| w.asked.is_some() && w.backend == be_stage && w.rule == rule_idx);
+                        let step = with_rule_name(rc.expr.as_ref(), registry, &make_ctx!(sess), |name| match held.and_then(|w| w.asked) {
+                            Some(asked) => crate::resolvers::dr_poll(d.section_idx, d.prefer_ipv4, name, asked).map_or(crate::resolvers::DrStep::Wait, crate::resolvers::DrStep::Done),
+                            None => crate::resolvers::dr_start(d.section_idx, d.prefer_ipv4, name, my_task, std::time::Instant::now()),
+                        });
+                        match step {
+                            crate::resolvers::DrStep::Wait if held.is_none_or(|w| !w.deadline.is_expired(now)) => {
+                                if held.is_none() {
+                                    if let Some(t) = sess.txn.as_mut() {
+                                        t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline: now.add(DO_RESOLVE_WAIT_MS), tarpit: false, inspect: false, asked: Some(std::time::Instant::now()) });
+                                    }
+                                }
+                                return Ok(RuleFlow::Suspend);
+                            }
+                            crate::resolvers::DrStep::Wait => {}
+                            crate::resolvers::DrStep::Done(ip) => {
+                                if let Some(ip) = ip {
+                                    store_var_smp(&mut sess.vars, &d.var_name, ip_sample(ip));
+                                }
+                            }
+                        }
+                        if held.is_some() {
+                            if let Some(t) = sess.txn.as_mut() {
+                                t.body_wait = None;
+                            }
+                        }
+                    }
                     ibex_config::HttpReqAction::SetVar { var_name, .. } => {
                         // A sample that cannot be fetched sets nothing (`action_store`, src/vars.c).
                         // The expression is a sample fetch, checked at load; one that cannot be parsed or
@@ -12920,7 +13040,7 @@ impl EngineDispatcher<'_> {
                         };
                         if let Some(deadline) = deadline.filter(|d| !d.is_expired(now)) {
                             if let Some(t) = sess.txn.as_mut() {
-                                t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline, tarpit: true, inspect: false });
+                                t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline, tarpit: true, inspect: false, asked: None });
                             }
                             return Ok(RuleFlow::Suspend);
                         }
@@ -13104,6 +13224,7 @@ impl EngineDispatcher<'_> {
                 proxies[be_idx].tcp_req_inspect_delay.map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
             });
             entry.sess.inspect_exp = deadline;
+            crate::resolvers::dr_set_task(entry.task);
             let res = eval_tcp_req_content_rules(
                 &proxies[be_idx],
                 proxy_idx,
@@ -13120,6 +13241,7 @@ impl EngineDispatcher<'_> {
                 deadline: deadline.unwrap_or(Tick::ETERNITY),
                 tarpit: false,
                 inspect: true,
+                asked: None,
             });
             entry.sess.txn.iter_mut().for_each(|txn| txn.body_wait = wait);
             if res == ContentEvalResult::Waiting {
@@ -13551,6 +13673,7 @@ impl EngineDispatcher<'_> {
                     .tcp_req_inspect_delay
                     .map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
             }
+            crate::resolvers::dr_set_task(entry.task);
             let res = eval_tcp_req_content_rules(
                 &proxies[be_idx],
                 entry.proxy_idx,
@@ -13717,6 +13840,10 @@ impl EngineDispatcher<'_> {
         let mut lines: Vec<(usize, LogLevel, String, bool)> = Vec::new();
         let wait = sec.step(self.proxies, self.checks, &mut |p, level, msg, stderr| lines.push((p, level, msg.to_string(), stderr)), &mut self.fdtab, &self.poller);
         let task = sec.task;
+        // T489: the `do-resolve` answers back to the workers that asked.
+        for m in sec.take_dr_answers() {
+            self.mailboxes.post(m.wid, crate::mailbox::Msg::DoResolved(m));
+        }
         for (p, level, msg, stderr) in lines {
             if stderr {
                 crate::stderr_line!("[WARNING]  ({}) : {msg}", self.pid);
@@ -14808,7 +14935,7 @@ fn wait_for_request_body(
     let pending = matches!(outcome, BodyWait::Pending);
     let ready = matches!(outcome, BodyWait::Ready);
     for txn in sess.txn.as_mut() {
-        txn.body_wait = pending.then_some(crate::txn::BodyWait { backend, rule, deadline, tarpit: false, inspect: false });
+        txn.body_wait = pending.then_some(crate::txn::BodyWait { backend, rule, deadline, tarpit: false, inspect: false, asked: None });
         if ready {
             txn.req_body = Some(std::mem::take(&mut body));
         }

@@ -84,3 +84,17 @@ impl ResolversSection {
         }
     }
 }
+
+/// A `do-resolve(<var>,<resolvers>[,<options>]) <expr>` action of `http-request` or
+/// `tcp-request content` (`resolv_parse_do_resolve`, `resolvers.c:3396`): the name `expr`
+/// gives is resolved by section `resolvers` and its address stored in `var`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoResolve {
+    pub var_name: String,
+    pub resolvers: String,
+    /// The index of that section in `Config::resolvers`, set once the configuration is read.
+    pub section_idx: u32,
+    /// `ipv4`: A first; the default (and `ipv6`) is AAAA first (`family_prio`).
+    pub prefer_ipv4: bool,
+    pub expr: String,
+}

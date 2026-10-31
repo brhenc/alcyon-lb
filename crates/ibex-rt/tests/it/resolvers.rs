@@ -2120,3 +2120,199 @@ fn t21_set_server_fqdn_switches_the_resolution() {
     let q = dns.queries();
     assert!(q.iter().any(|q| q.name == "a2.test"), "{q:?}");
 }
+
+// --- do-resolve (T489): oracle cases tools/battery/repro/vv-dns/t489/dr*.json ---
+
+/// The rules of `listen l` that resolve `expr` into `txn.ip` and answer with it.
+fn dr_rules(args: &str, expr: &str) -> String {
+    format!("  http-request do-resolve(txn.ip,r{args}) {expr}\n  http-request return status 200 content-type text/plain lf-string \"%[var(txn.ip)]\"\n")
+}
+
+/// One request for `path` on a new connection: the body and how long it took.
+fn dr_get(ibex: &Ibex, path: &str) -> (String, Duration) {
+    let t = Instant::now();
+    let mut c = TcpStream::connect(ibex.fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    c.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes()).expect("send");
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.starts_with("HTTP/1.1 200"), "{text:?}");
+    (text.split_once("\r\n\r\n").map_or("", |(_, b)| b).to_string(), t.elapsed())
+}
+
+/// A.t14 (dr14, drhold): the first request waits for the answer, a second one inside `hold
+/// valid` is answered from the cache (one query); past `hold valid` the name is asked again.
+#[test]
+fn t14_do_resolve_answers_from_the_cache_inside_hold_valid() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, "  hold valid 600ms\n", &dr_rules(",ipv4", "str(a1.test)"), "");
+    assert_eq!(dr_get(&ibex, "/").0, "10.0.0.1");
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(dr_get(&ibex, "/").0, "10.0.0.1");
+    assert_eq!(dns.queries().len(), 1, "{:?}", dns.queries());
+    let c = counters(&ibex, "r", "ns1");
+    assert_eq!((c["sent"], c["valid"]), (1, 1), "{c:?}");
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(dr_get(&ibex, "/").0, "10.0.0.1");
+    assert_eq!(dns.queries().len(), 2, "{:?}", dns.queries());
+    assert!(dns.queries().iter().all(|q| q.qtype == 1 && q.name == "a1.test"));
+}
+
+/// drnx, drsil, drhdr: a name that does not resolve (NX, silence) holds the request for the
+/// whole resolution (every try), then the rules go on without the variable; a name that is no
+/// host name (`bad..name`) is not asked and the rules go on at once; the next rule runs.
+#[test]
+fn do_resolve_without_an_answer_sets_nothing_and_goes_on() {
+    let dns = FakeDns::start();
+    dns.set("sil.test", Zone::Silent);
+    let rules = format!("{}  http-request set-header x-n after\n", dr_rules(",ipv4", "path,ltrim(/)"));
+    let ibex = start(dns.addr, "  timeout retry 200ms\n  resolve_retries 2\n", &rules, "");
+    for name in ["nx.test", "sil.test"] {
+        let (body, took) = dr_get(&ibex, &format!("/{name}"));
+        assert_eq!(body, "", "{name}");
+        assert!(took >= Duration::from_millis(350) && took < Duration::from_millis(2000), "{name}: {took:?}");
+    }
+    let before = dns.queries().len();
+    let (body, took) = dr_get(&ibex, "/bad..name");
+    assert_eq!(body, "");
+    assert!(took < Duration::from_millis(200), "{took:?}");
+    assert_eq!(dns.queries().len(), before);
+    assert_eq!(dr_get(&ibex, "/A1.TEST").0, "10.0.0.1");
+}
+
+/// drsrv: the server resolution of the same name is the cache (`resolv_link_resolution` shares
+/// it): the request is answered without a query of its own.
+#[test]
+fn do_resolve_shares_a_servers_resolution() {
+    let dns = FakeDns::start();
+    let rules = format!("{}  server s1 a1.test:80 resolvers r\n", dr_rules(",ipv4", "str(a1.test)"));
+    let ibex = start(dns.addr, "  timeout resolve 5s\n", &rules, "");
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    let n = dns.queries().len();
+    assert_eq!(dr_get(&ibex, "/").0, "10.0.0.1");
+    assert_eq!(dns.queries().len(), n, "{:?}", dns.queries());
+}
+
+/// dr6, drdef: the family is a preference; on a host without an IPv6 route (`auto`) A is asked.
+/// With `dns-accept-family ipv4,ipv6` the default asks AAAA first.
+#[test]
+fn do_resolve_family_is_a_preference() {
+    let v6 = UdpSocket::bind("[::]:0").and_then(|s| s.connect("[2001::]:53")).is_ok();
+    let dns = FakeDns::start();
+    dual_zone(&dns);
+    let ibex = start(dns.addr, "", &dr_rules(",ipv6", "str(both.test)"), "");
+    if !v6 {
+        assert_eq!(dr_get(&ibex, "/").0, "10.0.0.1");
+    }
+    drop(ibex);
+    let dns = FakeDns::start();
+    dual_zone(&dns);
+    let ibex = start(dns.addr, "", &dr_rules("", "str(both.test)"), "  dns-accept-family ipv4,ipv6\n");
+    assert_eq!(dr_get(&ibex, "/").0, "2001:db8::1");
+    let ibex4 = start(dns.addr, "", &dr_rules(",ipv4", "str(both.test)"), "  dns-accept-family ipv4,ipv6\n");
+    assert_eq!(dr_get(&ibex4, "/").0, "10.0.0.1");
+    drop(ibex);
+}
+
+/// drtcpd, drtcp, drtcpsil: `tcp-request content do-resolve` waits inside the
+/// `inspect-delay` only; without one nothing is asked; at its end the rules go on.
+#[test]
+fn tcp_request_content_do_resolve_waits_inside_the_inspect_delay() {
+    let dns = FakeDns::start();
+    dns.set("sil.test", Zone::Silent);
+    let rules = |delay: &str, name: &str| {
+        format!("{delay}  tcp-request content do-resolve(sess.ip,r,ipv4) str({name})\n  http-request return status 200 content-type text/plain lf-string \"%[var(sess.ip)]\"\n")
+    };
+    let ibex = start(dns.addr, "", &rules("  tcp-request inspect-delay 2s\n", "a1.test"), "");
+    assert_eq!(dr_get(&ibex, "/").0, "10.0.0.1");
+    drop(ibex);
+    let n = dns.queries().len();
+    let ibex = start(dns.addr, "", &rules("", "a1.test"), "");
+    assert_eq!(dr_get(&ibex, "/").0, "");
+    assert_eq!(dns.queries().len(), n);
+    drop(ibex);
+    let ibex = start(dns.addr, "", &rules("  tcp-request inspect-delay 400ms\n", "sil.test"), "");
+    let (body, took) = dr_get(&ibex, "/");
+    assert_eq!(body, "");
+    assert!(took >= Duration::from_millis(350) && took < Duration::from_millis(1500), "{took:?}");
+}
+
+/// The cross-worker path: with two workers every request is answered, whichever worker took
+/// it (one asks worker 0, which owns the section).
+#[test]
+fn do_resolve_answers_on_every_worker() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, "", &dr_rules(",ipv4", "str(a1.test)"), "  nbthread 2\n");
+    for _ in 0..20 {
+        assert_eq!(dr_get(&ibex, "/").0, "10.0.0.1");
+    }
+    assert!(dns.queries().len() <= 2, "{:?}", dns.queries());
+}
+
+/// 2,000 distinct names through `do-resolve` under `tune.resolvers.cache-size 100`: each is
+/// answered, and the cache stays one object of a fixed size (`show pools`; one per worker that
+/// ran a `do-resolve`).
+#[test]
+fn do_resolve_cache_is_bounded() {
+    let dns = FakeDns::start();
+    for i in 0..2000 {
+        dns.set(&format!("n{i}.test"), Zone::A(vec![Ipv4Addr::new(10, 9, u8::try_from(i / 256).expect("o"), u8::try_from(i % 256).expect("o"))]));
+    }
+    let ibex = start(dns.addr, "", &dr_rules(",ipv4", "path,ltrim(/)"), "  nbthread 1\n  tune.resolvers.cache-size 100\n");
+    let row = |ibex: &Ibex| ibex.cli("show pools").lines().find(|l| l.contains("do_resolve_cache")).map(str::to_string).unwrap_or_default();
+    for i in 0..2000 {
+        assert_eq!(dr_get(&ibex, &format!("/n{i}.test")).0, format!("10.9.{}.{}", i / 256, i % 256));
+        if i == 10 {
+            assert!(!row(&ibex).is_empty(), "{}", ibex.cli("show pools"));
+        }
+    }
+    let first = row(&ibex);
+    for i in 0..50 {
+        assert_eq!(dr_get(&ibex, &format!("/n{i}.test")).0, format!("10.9.0.{i}"));
+    }
+    assert_eq!(row(&ibex), first);
+    // One worker, one cache: `1 allocated ..., 1 used`.
+    assert!(first.contains(": 1 allocated") && first.contains(", 1 used"), "{first}");
+}
+
+/// Two requests for a name being resolved share its resolution (one id, `resolve_retries`
+/// tries); a sample that is no string (`src`) asks nothing; a binary one is a name.
+#[test]
+fn do_resolve_requests_share_a_pending_resolution() {
+    let dns = FakeDns::start();
+    dns.set("sil.test", Zone::Silent);
+    let rules = format!(
+        "  http-request do-resolve(txn.ip,r,ipv4) src if {{ path /src }}\n  http-request do-resolve(txn.ip,r,ipv4) bin(61312e74657374) if {{ path /bin }}\n  \
+         http-request do-resolve(txn.ip,r,ipv4) path,ltrim(/),hex,hex2bin if {{ path /a1.test }}\n{}",
+        dr_rules(",ipv4", "str(sil.test)").replace("do-resolve(txn.ip,r,ipv4) str(sil.test)", "do-resolve(txn.ip,r,ipv4) str(sil.test) if { path /sil }")
+    );
+    let ibex = start(dns.addr, "  timeout retry 300ms\n  resolve_retries 2\n", &rules, "");
+    let ibex = Arc::new(ibex);
+    let both: Vec<_> = (0..2)
+        .map(|_| {
+            let i = Arc::clone(&ibex);
+            thread::spawn(move || dr_get(&i, "/sil").0)
+        })
+        .collect();
+    for h in both {
+        assert_eq!(h.join().expect("join"), "");
+    }
+    let q = dns.queries();
+    assert!(q.len() == 2 && q[0].id == q[1].id, "{q:?}");
+    let (body, took) = dr_get(&ibex, "/src");
+    assert!(body.is_empty() && took < Duration::from_millis(200), "{body:?} {took:?}");
+    assert_eq!(dns.queries().len(), 2);
+    assert_eq!(dr_get(&ibex, "/bin").0, "10.0.0.1");
+    assert_eq!(dr_get(&ibex, "/a1.test").0, "10.0.0.1");
+}
+
+/// A section only servers written as addresses name runs (T489): `set server fqdn` gives one
+/// of them a name to resolve.
+#[test]
+fn set_server_fqdn_on_a_section_no_name_uses_yet() {
+    let dns = FakeDns::start();
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n", "  server s3 10.0.0.9:80 resolvers r\n", "");
+    assert!(ibex.cli("set server l/s3 fqdn a1.test").starts_with("l/s3 changed its FQDN from (null) to a1.test"));
+    ibex.wait_state("s3", "10.0.0.1 2 64", 3);
+}
