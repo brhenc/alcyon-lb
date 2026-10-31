@@ -820,6 +820,16 @@ pub fn wipe_ssl(bytes: &mut [u8]) {
     }
 }
 
+/// [`wipe_ssl`] for a buffer the TLS code gives back to a pool on every response (T541): the
+/// same setting, but one `memset` instead of `zeroize`'s volatile byte loop (~3 instructions a
+/// byte). The stores are not dead: the bytes are handed to `black_box` afterwards.
+pub fn wipe_ssl_fast(bytes: &mut [u8]) {
+    if pool::wipe_ssl_on() {
+        bytes.fill(0);
+        std::hint::black_box(&*bytes);
+    }
+}
+
 /// How much stack [`scrub_stack`] zeroes below its caller's frame (T462).
 ///
 /// Measured by painting the stack (`ibex-tls` test `stack_scrub`, which prints each depth): the
