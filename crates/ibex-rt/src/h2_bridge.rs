@@ -508,14 +508,35 @@ pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn
     let mut out = std::mem::take(&mut h2.body_scratch);
     out.clear();
     let mut state = txn.rsp;
-    let used = state.take_body(data, h2.data_budget(stream_id), &mut out);
+    // A chunked body's trailer section, once all of it is here, goes as a HEADERS frame
+    // that ends the stream, after the DATA without END_STREAM (T549, as `h2s_snd_ftrl`).
+    let mut used = if state.at_trailer_section() { 0 } else { state.take_body_to_trailers(data, h2.data_budget(stream_id), &mut out) };
+    let mut trailers = &data[..0];
+    if state.at_trailer_section() {
+        if let Some(n) = state.trailer_section(&data[used..]) {
+            trailers = &data[used..used + n];
+            used += n;
+            state = MsgState::Done;
+        }
+    }
     let end = state.is_done();
     if let Some(t) = txn.rsp_htx.as_mut().filter(|_| !txn.local) {
         // The payload, and the chunked body's end (see `htx_head_size`); not a reply
         // the proxy made in place of the server's response.
         *t += out.len() as u64 + u64::from(end && matches!(txn.rsp, MsgState::Body(txn::Body::Chunked(_))));
     }
-    if !out.is_empty() || end {
+    if trailers.len() > 2 {
+        if !out.is_empty() {
+            h2.send_data(stream_id, &out, false);
+        }
+        let mut fields = [("", ""); MAX_TRAILER_FIELDS];
+        let n = trailer_fields(trailers, &mut fields);
+        h2.send_trailers(stream_id, &fields[..n]);
+        // `%B` counts the trailers' names and values (HTX trailer blocks).
+        if let Some(t) = txn.rsp_htx.as_mut().filter(|_| !txn.local) {
+            *t += fields[..n].iter().map(|(k, v)| (k.len() + v.len()) as u64).sum::<u64>();
+        }
+    } else if !out.is_empty() || end {
         h2.send_data(stream_id, &out, end);
     }
     // Not past one frame's worth (and less once the connection is idle, `trim_idle`).

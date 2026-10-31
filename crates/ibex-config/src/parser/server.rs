@@ -55,10 +55,12 @@ pub(crate) fn parse_server(
     let mut send_proxy_v2 = default_server.is_some_and(|d| d.send_proxy_v2);
     let mut maxconn = default_server.and_then(|d| d.maxconn);
     let mut pool_max_conn = default_server.and_then(|d| d.pool_max_conn).unwrap_or(-1);
+    let mut max_reuse = default_server.and_then(|d| d.max_reuse).unwrap_or(-1);
     let mut pool_low_conn = default_server.and_then(|d| d.pool_low_conn).unwrap_or(0);
     let mut pool_purge_delay = default_server.and_then(|d| d.pool_purge_delay).unwrap_or(5000);
     let mut check_port = default_server.and_then(|d| d.check_port);
     let mut check_proto = default_server.and_then(|d| d.check_proto);
+    let mut proto_h2 = default_server.is_some_and(|d| d.proto_h2);
     let mut weight = default_server.and_then(|d| d.weight);
     let mut backup = default_server.is_some_and(|d| d.backup);
     let mut tfo = default_server.is_some_and(|d| d.tfo);
@@ -127,6 +129,10 @@ pub(crate) fn parse_server(
                 pool_max_conn = parse_pool_max_conn(tokens, i, who)?;
                 i += 1;
             }
+            "max-reuse" => {
+                max_reuse = parse_max_reuse(tokens, i, who)?;
+                i += 1;
+            }
             "pool-low-conn" => {
                 pool_low_conn = parse_pool_low_conn(tokens, i, who)?;
                 i += 1;
@@ -144,7 +150,7 @@ pub(crate) fn parse_server(
                 i += 1;
             }
             "proto" => {
-                parse_server_proto(tokens, i, who)?;
+                proto_h2 = parse_server_proto(tokens, i, who)? == "h2";
                 i += 1;
             }
             "cookie" => {
@@ -255,6 +261,7 @@ pub(crate) fn parse_server(
     servers.push(Server {
         check_port,
         check_proto,
+        proto_h2,
         // Boxed, and absent when no TLS keyword touched it, so a plaintext server is 8
         // bytes (`Server` embeds no TLS state): the memory-bound tests stay where they were.
         ssl: (ssl != ServerSsl::default()).then(|| Box::new(ssl)),
@@ -276,6 +283,7 @@ pub(crate) fn parse_server(
                 purge_delay: pool_purge_delay,
                 fastinter_ms: fastinter.map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
                 downinter_ms: downinter.map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
+                max_reuse,
             };
             (pool != crate::ast::server::ServerPool::default()).then(|| Box::new(pool))
         },
@@ -560,12 +568,23 @@ fn parse_server_ssl_keyword(
             ssl.verifyhost = Some(arg(": missing hostname to verify against.")?.text.clone());
             i + 1
         }
-        "alpn" => {
-            ssl.alpn = list(arg(": missing the comma-delimited ALPN protocol suite.")?);
-            i + 1
-        }
-        "check-alpn" => {
-            ssl.check_alpn = list(arg(": missing the comma-delimited ALPN protocol suite.")?);
+        "alpn" | "check-alpn" => {
+            let v = list(arg(": missing the comma-delimited ALPN protocol suite.")?);
+            // A TCP server cannot be offered HTTP/3, which runs over QUIC: Ibex has no QUIC
+            // connections to servers, and offered over TLS it would speak HTTP/1.1 under
+            // it (T535). `HAProxy` takes it for a `quic4@` server only.
+            if v.iter().any(|p| p == "h3") {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    format!("{prefix}'{}' : 'h3' is not supported: HTTP/3 to a server runs over QUIC, which Ibex does not connect to servers with.", kw.text),
+                ));
+            }
+            if kw.text == "alpn" {
+                ssl.alpn = v;
+            } else {
+                ssl.check_alpn = v;
+            }
             i + 1
         }
         "check-sni" => {
@@ -676,11 +695,10 @@ fn validate_server_ssl(ssl: &ServerSsl, check_port: Option<u16>, kw: &Token, who
     Ok(no_ca)
 }
 
-/// `proto <mux>` and `check-proto <mux>`: the protocol spoken to the server. Ibex speaks
-/// HTTP/1.1 and has no HTTP/2 mux towards servers, so `h2` is refused: a server that
-/// speaks only h2 would refuse every request, and until T113 the keyword was a warning
-/// that two reg-tests passed through by having both ends ignore it. `HAProxy` refuses a
-/// protocol it has no mux for ("'proto' :  unknown MUX protocol 'h3'.").
+/// `proto <mux>` and `check-proto <mux>`: the protocol spoken to the server, HTTP/1.1 or,
+/// since T540, HTTP/2 (`h2`: h2c over cleartext, one stream at a time as `HAProxy` under
+/// `http-reuse safe`; for `check-proto h2`, an HTTP check's request goes as an h2 stream). `HAProxy` refuses a protocol it has no mux for ("'proto' :  unknown
+/// MUX protocol 'h3'.").
 fn parse_server_proto(tokens: &[Token], i: usize, server: Option<&str>) -> Result<&'static str, ConfigError> {
     let kw = &tokens[i];
     let value = &server_kw_arg(tokens, i, server, ": missing value.")?.text;
@@ -689,22 +707,12 @@ fn parse_server_proto(tokens: &[Token], i: usize, server: Option<&str>) -> Resul
         // The one protocol Ibex speaks to servers; a `&'static str` so `Server` stays the
         // size it was before `ssl` joined it (60,000 of them are measured).
         "h1" => Ok("h1"),
-        "h2" => {
-            return Err(ConfigError::new(
-                kw.line,
-                kw.col,
-                format!(
-                    "{prefix}'{}' : 'h2' is not supported: Ibex has no HTTP/2 mux towards servers and speaks \
-                     HTTP/1.1 to them, which a server expecting h2 would refuse.",
-                    kw.text
-                ),
-            ));
-        }
+        "h2" => Ok("h2"),
         "fcgi" | "spop" | "quic" | "qmux" | "none" => {
             return Err(ConfigError::new(
                 kw.line,
                 kw.col,
-                format!("{prefix}'{}' : '{value}' is not supported: Ibex speaks only HTTP/1.1 to servers.", kw.text),
+                format!("{prefix}'{}' : '{value}' is not supported: Ibex speaks only HTTP/1.1 and HTTP/2 to servers.", kw.text),
             ));
         }
         other => Err(ConfigError::new(
@@ -735,6 +743,24 @@ fn parse_pool_max_conn(tokens: &[Token], i: usize, who: Option<&str>) -> Result<
         return Err(ConfigError::new(tokens[i].line, tokens[i].col, format!("{prefix}'pool-max-conn' must be >= -1")));
     }
     Ok(n.min(i64::from(i32::MAX)) as i32)
+}
+
+/// `max-reuse <count>` (`srv_parse_max_reuse`): `atoi`, so text that is not a number reads as
+/// 0 (no reuse) and any negative number is no limit.
+fn parse_max_reuse(tokens: &[Token], i: usize, who: Option<&str>) -> Result<i32, ConfigError> {
+    let arg = server_kw_arg(tokens, i, who, "expects <value> as argument.")?;
+    let t = arg.text.trim_start();
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let mut n: i64 = 0;
+    for b in digits.bytes().take_while(u8::is_ascii_digit) {
+        n = (n * 10 + i64::from(b - b'0')).min(i64::from(i32::MAX));
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(if neg { -n } else { n } as i32)
 }
 
 /// `pool-low-conn <max>` (`srv_parse_pool_low_conn`): `atoi` into an unsigned count, so text
@@ -829,6 +855,10 @@ pub(crate) fn parse_default_server(
                 cfg.pool_max_conn = Some(parse_pool_max_conn(tokens, i, None)?);
                 i += 1;
             }
+            "max-reuse" => {
+                cfg.max_reuse = Some(parse_max_reuse(tokens, i, None)?);
+                i += 1;
+            }
             "pool-low-conn" => {
                 cfg.pool_low_conn = Some(parse_pool_low_conn(tokens, i, None)?);
                 i += 1;
@@ -846,7 +876,7 @@ pub(crate) fn parse_default_server(
                 i += 1;
             }
             "proto" => {
-                parse_server_proto(tokens, i, None)?;
+                cfg.proto_h2 = parse_server_proto(tokens, i, None)? == "h2";
                 i += 1;
             }
             "cookie" => {

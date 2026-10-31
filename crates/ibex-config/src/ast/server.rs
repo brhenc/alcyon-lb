@@ -21,12 +21,16 @@ pub struct DefaultServerConfig {
     pub maxconn: Option<u32>,
     /// `pool-max-conn`.
     pub pool_max_conn: Option<i32>,
+    /// `max-reuse`.
+    pub max_reuse: Option<i32>,
     /// `pool-low-conn`.
     pub pool_low_conn: Option<u32>,
     /// `pool-purge-delay`, in milliseconds.
     pub pool_purge_delay: Option<u32>,
     pub check_port: Option<u16>,
     pub check_proto: Option<&'static str>,
+    /// `proto h2` (T540).
+    pub proto_h2: bool,
     /// The TLS keywords (`ssl`, `verify`, `sni`, `check-ssl`, ...).
     pub ssl: ServerSsl,
     /// `proxy-v2-options unique-id`.
@@ -416,6 +420,9 @@ pub struct Server {
     pub check_port: Option<u16>,
     /// Protocol for health checks (`check-proto`).
     pub check_proto: Option<&'static str>,
+    /// `proto h2`: HTTP/2 to the server, h2c over cleartext, and over TLS whatever ALPN
+    /// selects (T540).
+    pub proto_h2: bool,
     /// The TLS keywords (`ssl`, `verify`, `sni`, `check-ssl`, ...), boxed and absent for
     /// a plaintext server so 60,000 of them stay cheap (`request_allocations`).
     pub ssl: Option<Box<ServerSsl>>,
@@ -449,6 +456,7 @@ impl Default for Server {
             tfo: false,
             check_port: None,
             check_proto: None,
+            proto_h2: false,
             ssl: None,
             proxy_v2_unique_id: false,
             cookie: None,
@@ -476,11 +484,14 @@ pub struct ServerPool {
     pub fastinter_ms: u32,
     /// `downinter` in milliseconds: the check interval while the server is down; 0 is `inter`.
     pub downinter_ms: u32,
+    /// `max-reuse`: how many times an h2 connection is reused (it carries one stream more);
+    /// -1, the default, is no limit. Ignored on HTTP/1.1, as `HAProxy` ignores it there (T540).
+    pub max_reuse: i32,
 }
 
 impl Default for ServerPool {
     fn default() -> Self {
-        Self { max_conn: -1, low_conn: 0, purge_delay: 5000, fastinter_ms: 0, downinter_ms: 0 }
+        Self { max_conn: -1, low_conn: 0, purge_delay: 5000, fastinter_ms: 0, downinter_ms: 0, max_reuse: -1 }
     }
 }
 
@@ -515,6 +526,7 @@ impl Server {
             tfo: false,
             check_port: None,
             check_proto: None,
+            proto_h2: false,
             ssl: None,
             proxy_v2_unique_id: false,
             cookie: None,

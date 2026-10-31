@@ -173,6 +173,8 @@ pub fn under_control() {
 /// The thread could not be spawned.
 pub fn start(warn_after: Duration, warn_only: bool) -> std::io::Result<()> {
     let Some(wd) = WATCHDOG.get() else { return Ok(()) };
+    // The stack and std's alternative signal stack together (`headroom::thread_fits`).
+    ibex_alloc::headroom::thread_fits(WATCHDOG_STACK)?;
     std::thread::Builder::new().name("ibex-wdt".into()).stack_size(WATCHDOG_STACK).spawn(move || monitor(wd, warn_after, warn_only)).map(|_| ())
 }
 

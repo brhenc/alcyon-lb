@@ -357,6 +357,7 @@ mod server_state_fetches;
 mod server_state_file;
 mod server_state_refusals;
 mod server_state_transitions;
+mod server_h2;
 mod server_tls;
 mod server_track;
 mod session_errors;

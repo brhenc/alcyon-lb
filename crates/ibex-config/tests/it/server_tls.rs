@@ -185,15 +185,13 @@ fn the_openssl_only_keywords_stay_refused() {
     }
 }
 
-/// `proto h2` and `check-proto h2` used to be a warning; Ibex has no HTTP/2 mux towards
-/// servers, so a server that only speaks h2 would refuse every request.
+/// `proto h2` and `check-proto h2` used to be a warning, then refused (T113). Since T540 both
+/// speak h2 to the server.
 #[test]
-fn h2_towards_a_server_is_refused_not_warned_about() {
-    for line in ["proto h2", "check-proto h2", "check check-proto h2"] {
-        let err = server_line(line).expect_err(line);
-        assert!(err.message.contains("h2") && err.message.contains("HTTP/1.1"), "`{line}`: {}", err.message);
+fn h2_towards_a_server_and_its_checks_is_accepted() {
+    for line in ["proto h2", "check-proto h2", "check check-proto h2", "proto h1 check-proto h1"] {
+        assert!(server_line(line).is_ok(), "{line}");
     }
-    assert!(server_line("proto h1 check-proto h1").is_ok());
 }
 
 /// The `sni` expression is recorded for the load-time check of its fetch name, as ACL

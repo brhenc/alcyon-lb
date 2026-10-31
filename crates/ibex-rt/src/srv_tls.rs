@@ -214,7 +214,10 @@ impl CheckTls {
         let Some(ssl) = server.ssl.as_deref().filter(|s| s.check_uses_tls(server.check_port)) else {
             return Ok(None);
         };
-        let configs = Configs::build(ssl, &ssl.check_alpn, who)?;
+        // Without `check-alpn` the check offers the server's `alpn` (`HAProxy`: `alpn h2`
+        // and `check` gives an h2 check, A.3 row 23; `check-alpn http/1.1` overrides it, row 25).
+        let alpn = if ssl.check_alpn.is_empty() { &ssl.alpn } else { &ssl.check_alpn };
+        let configs = Configs::build(ssl, alpn, who)?;
         Ok(Some(Self {
             configs,
             sni: ssl.check_sni.clone(),
