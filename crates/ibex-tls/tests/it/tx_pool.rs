@@ -72,3 +72,60 @@ fn an_alert_queued_by_a_read_gets_a_buffer_and_gives_it_back() {
     p.srv.tx_done(n);
     assert_eq!(p.srv.tx_capacity(), 0);
 }
+
+/// A take the pool refuses (`tune.fail-alloc` at 100 %, as a failed `malloc`) falls back to an
+/// allocation of the chunk's size, which the release frees rather than gives to the pool.
+#[test]
+fn a_refused_take_falls_back_to_an_allocation_that_the_release_frees() {
+    use ibex_tls::conn::{tx_pool_cached, TX_CAP};
+    // Every chunk this thread's cache holds goes to a session that keeps ciphertext waiting, so
+    // that the next take is a miss (the cache is served before any refusal).
+    let mut holders = Vec::new();
+    while tx_pool_cached() > 0 {
+        let mut h = pair();
+        h.complete();
+        h.srv.write_plain(b"held").expect("write");
+        holders.push(h);
+    }
+    ibex_alloc::pool::set_fail_alloc(100);
+    // `connect` takes a buffer for the ClientHello: refused, so an allocation of its own.
+    let mut p = pair();
+    ibex_alloc::pool::set_fail_alloc(0);
+    assert!(p.cli.tx_capacity() >= TX_CAP, "the ClientHello is in a buffer of the chunk's size");
+    assert_eq!(tx_pool_cached(), 0, "nothing came from the pool");
+    let hello = p.cli.pending_tx().to_vec();
+    assert!(!hello.is_empty(), "a ClientHello is queued");
+    p.cli.tx_done(hello.len());
+    assert_eq!(p.cli.tx_capacity(), 0, "released once drained");
+    assert_eq!(tx_pool_cached(), 0, "an allocation the pool refused is freed, not given to it");
+    // The session is whole: the handshake and a request go through with pooled buffers after.
+    p.sin.extend(&hello, &p.srv);
+    p.complete();
+    assert_eq!(p.send_to_server(b"GET / HTTP/1.1\r\n\r\n"), b"GET / HTTP/1.1\r\n\r\n");
+    assert!(tx_pool_cached() >= 1, "the later takes were pooled and came back");
+    drop(holders);
+}
+
+/// A buffer written long, drained at the front after a partial send, written short, then
+/// released: the wipe covers the high-water mark, not only what `len` says is left.
+#[test]
+fn a_release_after_a_partial_send_wipes_to_the_high_water_mark() {
+    use ibex_tls::conn::tx_pool_cached;
+    let mut p = pair();
+    p.complete();
+    let long = vec![b'L'; 1000];
+    assert_eq!(p.srv.write_plain(&long).expect("write"), 1000);
+    let hw = p.srv.pending_tx().len();
+    assert!(hw > 1000, "one record of 1000 bytes plus its overhead ({hw})");
+    // Part of it reaches the wire; the next write drains that part from the front.
+    p.srv.tx_done(400);
+    assert_eq!(p.srv.write_plain(b"short").expect("write"), 5);
+    let len = p.srv.pending_tx().len();
+    assert!(len < hw, "what is left ({len}) is shorter than what the buffer once held ({hw})");
+    let cached = tx_pool_cached();
+    let wiped = ibex_alloc::wiped_ssl_fast_bytes();
+    p.srv.tx_done(len);
+    assert_eq!(p.srv.tx_capacity(), 0, "released once drained");
+    assert_eq!(ibex_alloc::wiped_ssl_fast_bytes() - wiped, hw, "wiped up to the high-water mark, not to len");
+    assert_eq!(tx_pool_cached(), cached + 1, "and given back to the pool");
+}
