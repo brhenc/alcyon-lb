@@ -66,6 +66,11 @@ impl Drop for Ibex {
 /// Ibex with `global` extra lines and `timeouts` (lines of `defaults`); every request is
 /// answered 200 by the frontend itself.
 fn ibex(global: &str, timeouts: &str) -> Ibex {
+    ibex_in("frontend f", global, timeouts)
+}
+
+/// `ibex` with the binds in `section` (`frontend f` or `listen l`, T530).
+fn ibex_in(section: &str, global: &str, timeouts: &str) -> Ibex {
     let tcp = common::reserve_addr();
     let quic = common::reserve_addr();
     let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
@@ -73,7 +78,7 @@ fn ibex(global: &str, timeouts: &str) -> Ibex {
     write!(
         cfg,
         "global\n    nbthread 1\n    hard-stop-after 300ms\n    {global}\ndefaults\n    mode http\n    {timeouts}\n\
-         frontend f\n    bind {tcp}\n    bind quic4@{quic} ssl crt {crt} alpn h3\n    http-request return status 200\n"
+         {section}\n    bind {tcp}\n    bind quic4@{quic} ssl crt {crt} alpn h3\n    http-request return status 200\n"
     )
     .expect("write cfg");
     let child = common::ibex_command(env!("CARGO_BIN_EXE_ibex"))
@@ -371,6 +376,15 @@ fn listen_off_binds_no_udp_socket_and_the_tcp_bind_still_serves() {
     assert!(got.starts_with("HTTP/1.1 200"), "{got}");
     let mut cl = Client::start(ibex.quic);
     assert!(!cl.run_until(Duration::from_millis(600), |c| !c.conn.is_handshaking()), "a handshake completed with listen off");
+}
+
+/// `listen off` reaches a `listen` section's QUIC bind too (T530 opens those binds).
+#[test]
+fn listen_off_binds_no_udp_socket_for_a_listen_section_either() {
+    let ibex = ibex_in("listen l", "tune.quic.listen off", "timeout client 10s");
+    assert!(udp_free(ibex.quic), "a UDP socket is bound on {}", ibex.quic);
+    let on = ibex_in("listen l", "", "timeout client 10s");
+    assert!(!udp_free(on.quic), "no UDP socket on {} with listen on", on.quic);
 }
 
 #[test]
