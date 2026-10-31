@@ -111,10 +111,12 @@ pub struct SrvPoolCfg {
     /// `proto h2` in `mode http`: the server's connections speak h2 (T540). Here, with the
     /// other per-connection settings, because `Proxy`'s size is bounded (`struct_sizes.rs`).
     pub h2: bool,
+    /// `max-reuse`: an h2 connection is reused this many times (-1: no limit).
+    pub max_reuse: i32,
 }
 
 impl SrvPoolCfg {
-    pub const DEFAULT: Self = Self { max_conn: -1, low_conn: 0, purge_delay_ms: 5000, h2: false };
+    pub const DEFAULT: Self = Self { max_conn: -1, low_conn: 0, purge_delay_ms: 5000, h2: false, max_reuse: -1 };
 
     /// Whether the server keeps idle connections at all.
     fn keeps_any(self) -> bool {
@@ -759,7 +761,7 @@ mod shared_pool_tests {
         IdleKey { srv: (0, 0), addr: "127.0.0.1:1".parse().unwrap(), name: None }
     }
 
-    const CFG: SrvPoolCfg = SrvPoolCfg { max_conn: -1, low_conn: 0, purge_delay_ms: 500, h2: false };
+    const CFG: SrvPoolCfg = SrvPoolCfg { max_conn: -1, low_conn: 0, purge_delay_ms: 500, h2: false, max_reuse: -1 };
 
     /// A connection worker 0 released is taken by worker 1 when shared, not when not, nor
     /// when `pool-low-conn` forbids it; worker 0's lock held a while is waited for (T224).
@@ -1059,7 +1061,7 @@ mod pool_tests {
         IdleKey { srv: (0, 0), addr: "127.0.0.1:1".parse().unwrap(), name: None }
     }
 
-    const CFG: SrvPoolCfg = SrvPoolCfg { max_conn: -1, low_conn: 0, purge_delay_ms: 500, h2: false };
+    const CFG: SrvPoolCfg = SrvPoolCfg { max_conn: -1, low_conn: 0, purge_delay_ms: 500, h2: false, max_reuse: -1 };
 
     /// HAProxy, eight connections idle after a burst of eight, `pool-purge-delay 500`:
     /// nothing is closed at the first two purges, then 3, 3 and 2 (the estimate 8, 8, 4, 2,
@@ -1119,7 +1121,7 @@ mod pool_tests {
 fn pool_cfgs(servers: &[ibex_config::Server], mode_http: bool) -> Vec<SrvPoolCfg> {
     let cfg = |s: &ibex_config::Server| {
         let p = s.pool.as_deref().copied().unwrap_or_default();
-        SrvPoolCfg { max_conn: p.max_conn, low_conn: p.low_conn, purge_delay_ms: p.purge_delay, h2: mode_http && s.proto_h2 }
+        SrvPoolCfg { max_conn: p.max_conn, low_conn: p.low_conn, purge_delay_ms: p.purge_delay, h2: mode_http && s.proto_h2, max_reuse: p.max_reuse }
     };
     if servers.iter().all(|s| cfg(s) == SrvPoolCfg::DEFAULT) {
         Vec::new()
@@ -10442,7 +10444,12 @@ impl EngineDispatcher<'_> {
             && !leftover
             && txn.req.is_done()
             && txn.rsp.is_done()
-            && entry.sess.srv_xprt.reusable();
+            && entry.sess.srv_xprt.reusable()
+            // `max-reuse`, on h2 only (`HAProxy`: 2 gives connections of 3 streams; ignored on h1).
+            && entry.sess.srv_xprt.h2_streams().is_none_or(|n| {
+                let max = entry.target_server_idx.and_then(|i| proxies.get(entry.srv_backend_idx).map(|p| p.ids.server_pool(i).max_reuse));
+                max.is_none_or(|m| m < 0 || i64::from(n) <= i64::from(m))
+            });
         if reusable {
             entry.srv_served = (entry.srv_served + 1).min(2);
         }

@@ -296,8 +296,6 @@ client session: 26 connections for 26 client sessions, T533 A.3 row 6). Measured
 - Under `aggressive` / `always` HAProxy multiplexes concurrent requests as streams of one
   connection (A.3 row 7: 20 concurrent requests on 1 connection); Ibex opens one connection
   per concurrent request (sequential requests share one, as HAProxy's).
-- `max-reuse` is still ignored, on h2 as on h1 (HAProxy enforces it on h2: `max-reuse 2` gives
-  connections of 3, 3 and 1 streams, A.3 row 11).
 - A refused stream (REFUSED_STREAM, a GOAWAY whose last id is below the stream) under `retry-on
   all-retryable-errors`: HAProxy retries it on the same connection while it lives (measured: 3
   retries on one connection, then 502 `SH--`); Ibex retries on a new connection each time (its

@@ -577,6 +577,19 @@ fn a_server_goaway_after_three_streams_moves_to_a_new_connection() {
     assert_eq!(*srv.streams.lock().unwrap(), [3, 3, 1], "as HAProxy");
 }
 
+/// `max-reuse 2`: an h2 connection carries 3 streams (`HAProxy` A.3 row 11, 7 sequential requests
+/// under `always`: `3 3 1`); `max-reuse` on an HTTP/1.1 server is ignored by both (row 12).
+#[test]
+fn max_reuse_caps_the_streams_of_an_h2_connection() {
+    let srv = scripted(Script::Ok { goaway_after: 0 });
+    let p = proxy(&format!("  http-reuse always\n  server s {} proto h2 max-reuse 2", srv.addr));
+    for _ in 0..7 {
+        assert_eq!(get(p.fe, "/x").0, 200);
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(*srv.streams.lock().unwrap(), [3, 3, 1]);
+}
+
 #[test]
 fn ten_requests_of_one_client_take_one_tls_h2_connection_under_safe() {
     if !have_nghttpd() {

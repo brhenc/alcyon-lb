@@ -55,6 +55,7 @@ pub(crate) fn parse_server(
     let mut send_proxy_v2 = default_server.is_some_and(|d| d.send_proxy_v2);
     let mut maxconn = default_server.and_then(|d| d.maxconn);
     let mut pool_max_conn = default_server.and_then(|d| d.pool_max_conn).unwrap_or(-1);
+    let mut max_reuse = default_server.and_then(|d| d.max_reuse).unwrap_or(-1);
     let mut pool_low_conn = default_server.and_then(|d| d.pool_low_conn).unwrap_or(0);
     let mut pool_purge_delay = default_server.and_then(|d| d.pool_purge_delay).unwrap_or(5000);
     let mut check_port = default_server.and_then(|d| d.check_port);
@@ -126,6 +127,10 @@ pub(crate) fn parse_server(
             }
             "pool-max-conn" => {
                 pool_max_conn = parse_pool_max_conn(tokens, i, who)?;
+                i += 1;
+            }
+            "max-reuse" => {
+                max_reuse = parse_max_reuse(tokens, i, who)?;
                 i += 1;
             }
             "pool-low-conn" => {
@@ -278,6 +283,7 @@ pub(crate) fn parse_server(
                 purge_delay: pool_purge_delay,
                 fastinter_ms: fastinter.map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
                 downinter_ms: downinter.map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
+                max_reuse,
             };
             (pool != crate::ast::server::ServerPool::default()).then(|| Box::new(pool))
         },
@@ -739,6 +745,24 @@ fn parse_pool_max_conn(tokens: &[Token], i: usize, who: Option<&str>) -> Result<
     Ok(n.min(i64::from(i32::MAX)) as i32)
 }
 
+/// `max-reuse <count>` (`srv_parse_max_reuse`): `atoi`, so text that is not a number reads as
+/// 0 (no reuse) and any negative number is no limit.
+fn parse_max_reuse(tokens: &[Token], i: usize, who: Option<&str>) -> Result<i32, ConfigError> {
+    let arg = server_kw_arg(tokens, i, who, "expects <value> as argument.")?;
+    let t = arg.text.trim_start();
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let mut n: i64 = 0;
+    for b in digits.bytes().take_while(u8::is_ascii_digit) {
+        n = (n * 10 + i64::from(b - b'0')).min(i64::from(i32::MAX));
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(if neg { -n } else { n } as i32)
+}
+
 /// `pool-low-conn <max>` (`srv_parse_pool_low_conn`): `atoi` into an unsigned count, so text
 /// that is not a number reads as 0 and a negative number wraps.
 fn parse_pool_low_conn(tokens: &[Token], i: usize, who: Option<&str>) -> Result<u32, ConfigError> {
@@ -829,6 +853,10 @@ pub(crate) fn parse_default_server(
             }
             "pool-max-conn" => {
                 cfg.pool_max_conn = Some(parse_pool_max_conn(tokens, i, None)?);
+                i += 1;
+            }
+            "max-reuse" => {
+                cfg.max_reuse = Some(parse_max_reuse(tokens, i, None)?);
                 i += 1;
             }
             "pool-low-conn" => {

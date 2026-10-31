@@ -88,7 +88,7 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("log-proto", Arg::Word, Ignore("log servers only")),
     // `atol`: 0 (or a word) is no limit, which is what Ibex does; see `parse_unimplemented`.
     kw!("maxqueue", Arg::Word, Refuse("Ibex has no per-server queue (a request waits in its backend's queue); only 'maxqueue 0' is accepted")),
-    kw!("max-reuse", Arg::Word, Ignore("how many requests a connection carries")),
+    kw!("max-reuse", Arg::Word, Ignore("handled with the other server keywords in parse_server (h2 only, T540)")),
     kw!("minconn", Arg::Word, Ignore("the dynamic connection limit")),
     kw!("namespace", Arg::Word, ROUTE),
     kw!("non-stick", Arg::None, ROUTE),
