@@ -1,0 +1,118 @@
+# HAProxy peers protocol 2.1: captured test vectors (T526, 2026-10-31)
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+#
+# Captured between two HAProxy 3.5-dev8-885761-29 processes through a logging TCP relay
+# (review dir: relay.py, decode.py, *.cfg). Each line: seconds since relay start, relay
+# connection id, direction ('>' = from the connecting side, '<' = from the accepting side),
+# byte count, the full hex of the TCP chunk, then the decoded messages (';'-separated).
+# A chunk may hold several messages; "update" fields are: updateid (u32 BE), key, values in
+# table-define bit order; frqp = (age ms, curr, prev). Decoder: decode.py in the review dir
+# (its `dec` is the exact inverse of peers.c intencode()).
+#
+# Config: peers mypeers; peer A 127.0.0.1:62001; peer B 127.0.0.1:62012 (relay -> 62002);
+#   table t type string len 32 size 100k expire 10m store http_req_cnt,http_req_rate(10s),gpc0
+#   frontend: http-request track-sc0 path table mypeers/t; http-request return status 200
+#
+# V1: start of both nodes (collision: second session killed), 4 updates with acks, heartbeats.
+# V2: B restarted at ~10 s: hello, resync-request, teach (table-define + update-timed +
+#     inc-update-timed x2 + resync-finished in one chunk), resync-confirm, no acks.
+V1     0.480 c1 OPEN
+V1     0.481 c1 >  26 484150726f78795320322e310a410a422033323132373320310a ; HELLO 'HAProxyS 2.1\nA\nB 321273 1\n'
+V1     0.481 c1 <   4 3230300a ; STATUS '200\n'
+V1     0.481 c1 <   2 0000 ; CTRL resync-request
+V1     0.481 c1 >   2 0000 ; CTRL resync-request
+V1     0.481 c1 >  21 0a821001022f740621f451f0eda3010af0e2030002 ; table-define id=1 name='/t' keytype=6 keylen=33 data=['gpc0', 'http_req_cnt', 'http_req_rate'] expire=600000ms frqp=['http_req_rate/10000ms'] ; CTRL resync-partial
+V1     0.481 c1 <  21 0a821001022f740621f451f0eda3010af0e2030002 ; table-define id=1 name='/t' keytype=6 keylen=33 data=['gpc0', 'http_req_cnt', 'http_req_rate'] expire=600000ms frqp=['http_req_rate/10000ms'] ; CTRL resync-partial
+V1     0.481 c1 <   2 0003 ; CTRL resync-confirm
+V1     0.481 c1 >   2 0003 ; CTRL resync-confirm
+V1     0.489 c1 OPEN
+V1     0.489 c1 >  26 484150726f78795320322e310a420a412033323131393720310a ; HELLO 'HAProxyS 2.1\nB\nA 321197 1\n'
+V1     0.490 c1 > EOF
+V1     0.490 c1 > EOF
+V1     0.491 c1 < EOF
+V1     0.490 c1 <   6 3230300a0000 ; STATUS '200\n' ; CTRL resync-request
+V1     1.237 c2 OPEN
+V1     1.238 c2 >  26 484150726f78795320322e310a420a412033323131393720310a ; HELLO 'HAProxyS 2.1\nB\nA 321197 1\n'
+V1     1.238 c2 <   4 3230300a ; STATUS '200\n'
+V1     1.238 c2 <   2 0000 ; CTRL resync-request
+V1     1.238 c2 >   2 0000 ; CTRL resync-request
+V1     1.238 c2 >  21 0a821001022f740621f451f0eda3010af0e2030002 ; table-define id=1 name='/t' keytype=6 keylen=33 data=['gpc0', 'http_req_cnt', 'http_req_rate'] expire=600000ms frqp=['http_req_rate/10000ms'] ; CTRL resync-partial
+V1     1.238 c2 <  21 0a821001022f740621f451f0eda3010af0e2030002 ; table-define id=1 name='/t' keytype=6 keylen=33 data=['gpc0', 'http_req_cnt', 'http_req_rate'] expire=600000ms frqp=['http_req_rate/10000ms'] ; CTRL resync-partial
+V1     1.238 c2 <   2 0003 ; CTRL resync-confirm
+V1     1.238 c2 >   2 0003 ; CTRL resync-confirm
+V1     2.483 c2 >  16 0a800d00000001032f6b310001010100 ; update updateid=1 key='/k1' gpc0=0 http_req_cnt=1 http_req_rate=(age 1ms, cur 1, prev 0)
+V1     2.483 c2 <   8 0a84050100000001 ; ack table=1 updateid=1
+V1     2.494 c2 >  16 0a800d00000002032f6b320001010100 ; update updateid=2 key='/k2' gpc0=0 http_req_cnt=1 http_req_rate=(age 1ms, cur 1, prev 0)
+V1     2.494 c2 <   8 0a84050100000002 ; ack table=1 updateid=2
+V1     2.503 c2 >  16 0a800d00000003032f6b330001010100 ; update updateid=3 key='/k3' gpc0=0 http_req_cnt=1 http_req_rate=(age 1ms, cur 1, prev 0)
+V1     2.504 c2 <   8 0a84050100000003 ; ack table=1 updateid=3
+V1     2.513 c2 <  16 0a800d00000004032f6b390001010100 ; update updateid=4 key='/k9' gpc0=0 http_req_cnt=1 http_req_rate=(age 1ms, cur 1, prev 0)
+V1 --- idle 7s for heartbeat
+V1     2.546 c2 >   8 0a84050100000004 ; ack table=1 updateid=4
+V1     5.503 c2 >   2 0004 ; CTRL heartbeat
+V1     5.513 c2 <   2 0004 ; CTRL heartbeat
+V1     8.505 c2 >   2 0004 ; CTRL heartbeat
+V1     8.513 c2 <   2 0004 ; CTRL heartbeat
+V1 --- restart B (teach)
+V2     9.533 c2 < EOF
+V2     9.533 c2 > EOF
+V2    10.115 c2 OPEN
+V2    10.116 c2 >  26 484150726f78795320322e310a410a422033323430343420310a ; HELLO 'HAProxyS 2.1\nA\nB 324044 1\n'
+V2    10.116 c2 <   4 3230300a ; STATUS '200\n'
+V2    10.116 c2 >   2 0000 ; CTRL resync-request
+V2    10.116 c2 < 101 0a821001022f740621f451f0eda3010af0e2030a85138000000400090a2f032f6b390001f3ca0201000a851300000001000909f0032f6b310001f1ce0201000a860f000909fa032f6b320001f7cd0201000a860f00090a04032f6b330001fdcc0201000001 ; table-define id=1 name='/t' keytype=6 keylen=33 data=['gpc0', 'http_req_cnt', 'http_req_rate'] expire=600000ms frqp=['http_req_rate/10000ms'] ; update-timed updateid=2147483652 expire=592431ms key='/k9' gpc0=0 http_req_cnt=1 http_req_rate=(age 7571ms, cur 1, prev 0) ; update-timed updateid=1 expire=592368ms key='/k1' gpc0=0 http_req_cnt=1 http_req_rate=(age 7633ms, cur 1, prev 0) ; inc-update-timed expire=592378ms key='/k2' gpc0=0 http_req_cnt=1 http_req_rate=(age 7623ms, cur 1, prev 0) ; inc-update-timed expire=592388ms key='/k3' gpc0=0 http_req_cnt=1 http_req_rate=(age 7613ms, cur 1, prev 0) ; CTRL resync-finished
+V2    10.116 c2 >   2 0003 ; CTRL resync-confirm
+V2    13.118 c2 <   2 0004 ; CTRL heartbeat
+V2    13.118 c2 >   2 0004 ; CTRL heartbeat
+V2    16.119 c2 >   2 0004 ; CTRL heartbeat
+V2    16.119 c2 <   2 0004 ; CTRL heartbeat
+#
+# V3: 300-request burst B -> A (h2load -c 8), relay 62013 -> 62003: incremental updates and the
+#     acks the oracle sends back. Acks after an inc-update carry a byte-swapped id
+#     (peers.c:1834, see the design doc 4.5): an Ibex sender must ignore ids outside
+#     (last_acked, last_pushed]; an Ibex receiver must ack the true id.
+V3     6.509 c1 >  27 484150726f78795320322e310a410a42203130373938373620310a ; HELLO 'HAProxyS 2.1\nA\nB 1079876 1\n'
+V3     6.510 c1 <   4 3230300a ; STATUS '200\n'
+V3     6.510 c1 <  21 0a821001022f740621f451f0eda3010af0e2030001 ; table-define id=1 name='/t' keytype=6 keylen=33 data=['gpc0', 'http_req_cnt', 'http_req_rate'] expire=600000ms frqp=['http_req_rate/10000ms'] ; CTRL resync-finished
+V3     8.799 c2 >  27 484150726f78795320322e310a410a42203130373938373620310a ; HELLO 'HAProxyS 2.1\nA\nB 1079876 1\n'
+V3     9.529 c2 >  55 0a821001022f740621f451f0eda3010af0e2030a800f00000001052f6230303000040104000a800f00000002052f623030300008010800 ; table-define id=1 name='/t' keytype=6 keylen=33 data=['gpc0', 'http_req_cnt', 'http_req_rate'] expire=600000ms frqp=['http_req_rate/10000ms'] ; update updateid=1 key='/b000' gpc0=0 http_req_cnt=4 http_req_rate=(age 1ms, cur 4, prev 0) ; update updateid=2 key='/b000' gpc0=0 http_req_cnt=8 http_req_rate=(age 1ms, cur 8, prev 0)
+V3     9.529 c2 >  64 0a800f00000003052f6230303100070207000a810b052f6230303200020002000a800f00000005052f6230303200040004000a810b052f623030310008020800 ; update updateid=3 key='/b001' gpc0=0 http_req_cnt=7 http_req_rate=(age 2ms, cur 7, prev 0) ; inc-update key='/b002' gpc0=0 http_req_cnt=2 http_req_rate=(age 0ms, cur 2, prev 0) ; update updateid=5 key='/b002' gpc0=0 http_req_cnt=4 http_req_rate=(age 0ms, cur 4, prev 0) ; inc-update key='/b001' gpc0=0 http_req_cnt=8 http_req_rate=(age 2ms, cur 8, prev 0)
+V3     9.529 c2 >  50 0a800f00000007052f6230303300030003000a810b052f6230303200060006000a800f00000009052f623030330005000500 ; update updateid=7 key='/b003' gpc0=0 http_req_cnt=3 http_req_rate=(age 0ms, cur 3, prev 0) ; inc-update key='/b002' gpc0=0 http_req_cnt=6 http_req_rate=(age 0ms, cur 6, prev 0) ; update updateid=9 key='/b003' gpc0=0 http_req_cnt=5 http_req_rate=(age 0ms, cur 5, prev 0)
+V3     9.529 c2 >  60 0a800f0000000a052f6230303200080008000a810b052f6230303400050005000a810b052f6230303500010001000a810b052f623030330006000600 ; update updateid=10 key='/b002' gpc0=0 http_req_cnt=8 http_req_rate=(age 0ms, cur 8, prev 0) ; inc-update key='/b004' gpc0=0 http_req_cnt=5 http_req_rate=(age 0ms, cur 5, prev 0) ; inc-update key='/b005' gpc0=0 http_req_cnt=1 http_req_rate=(age 0ms, cur 1, prev 0) ; inc-update key='/b003' gpc0=0 http_req_cnt=6 http_req_rate=(age 0ms, cur 6, prev 0)
+V3     9.529 c2 >  32 0a800f0000000e052f6230303500030003000a810b052f623030330008000800 ; update updateid=14 key='/b005' gpc0=0 http_req_cnt=3 http_req_rate=(age 0ms, cur 3, prev 0) ; inc-update key='/b003' gpc0=0 http_req_cnt=8 http_req_rate=(age 0ms, cur 8, prev 0)
+V3     9.529 c2 >  46 0a800f00000010052f6230303600010001000a810b052f6230303500050005000a810b052f623030340006000600 ; update updateid=16 key='/b006' gpc0=0 http_req_cnt=1 http_req_rate=(age 0ms, cur 1, prev 0) ; inc-update key='/b005' gpc0=0 http_req_cnt=5 http_req_rate=(age 0ms, cur 5, prev 0) ; inc-update key='/b004' gpc0=0 http_req_cnt=6 http_req_rate=(age 0ms, cur 6, prev 0)
+V3     9.529 c2 >  78 0a800f00000013052f6230303700010001000a810b052f6230303600030003000a810b052f6230303400080008000a800f00000016052f6230303800010001000a810b052f623030360005000500 ; update updateid=19 key='/b007' gpc0=0 http_req_cnt=1 http_req_rate=(age 0ms, cur 1, prev 0) ; inc-update key='/b006' gpc0=0 http_req_cnt=3 http_req_rate=(age 0ms, cur 3, prev 0) ; inc-update key='/b004' gpc0=0 http_req_cnt=8 http_req_rate=(age 0ms, cur 8, prev 0) ; update updateid=22 key='/b008' gpc0=0 http_req_cnt=1 http_req_rate=(age 0ms, cur 1, prev 0) ; inc-update key='/b006' gpc0=0 http_req_cnt=5 http_req_rate=(age 0ms, cur 5, prev 0)
+V3     9.529 c2 >  46 0a800f00000018052f6230303500080008000a810b052f6230303900010001000a810b052f623030370004000400 ; update updateid=24 key='/b005' gpc0=0 http_req_cnt=8 http_req_rate=(age 0ms, cur 8, prev 0) ; inc-update key='/b009' gpc0=0 http_req_cnt=1 http_req_rate=(age 0ms, cur 1, prev 0) ; inc-update key='/b007' gpc0=0 http_req_cnt=4 http_req_rate=(age 0ms, cur 4, prev 0)
+V3     9.529 c2 <  16 0a840501000000020a84050106000000 ; ack table=1 updateid=2 ; ack table=1 updateid=100663296
+V3 --
+V3     9.529 c2 <   8 0a84050101000019 ; ack table=1 updateid=16777241
+V3     9.529 c2 > 170 0a800f0000001b052f6230313000010001000a810b052f6230303800030003000a800f0000001d052f6230303600080008000a810b052f6230313100010001000a810b052f6230303700050005000a800f00000020052f6230303800050005000a810b052f6230303900040004000a810b052f6230303700070007000a800f00000023052f6230313200010001000a810b052f6230313000020002000a810b052f623030370008000800 ; update updateid=27 key='/b010' gpc0=0 http_req_cnt=1 http_req_rate=(age 0ms, cur 1, prev 0) ; inc-update key='/b008' gpc0=0 http_req_cnt=3 http_req_rate=(age 0ms, cur 3, prev 0) ; update updateid=29 key='/b006' gpc0=0 http_req_cnt=8 http_req_rate=(age 0ms, cur 8, prev 0) ; inc-update key='/b011' gpc0=0 http_req_cnt=1 http_req_rate=(age 0ms, cur 1, prev 0) ; inc-update key='/b007' gpc0=0 http_req_cnt=5 http_req_rate=(age 0ms, cur 5, prev 0) ; update updateid=32 key='/b008' gpc0=0 http_req_cnt=5 http_req_rate=(age 0ms, cur 5, prev 0) ; inc-update key='/b009' gpc0=0 http_req_cnt=4 http_req_rate=(age 0ms, cur 4, prev 0) ; inc-update key='/b007' gpc0=0 http_req_cnt=7 http_req_rate=(age 0ms, cur 7, prev 0) ; update updateid=35 key='/b012' gpc0=0 http_req_cnt=1 http_req_rate=(age 0ms, cur 1, prev 0) ; inc-update key='/b010' gpc0=0 http_req_cnt=2 http_req_rate=(age 0ms, cur 2, prev 0) ; inc-update key='/b007' gpc0=0 http_req_cnt=8 http_req_rate=(age 0ms, cur 8, prev 0)
+V3     9.529 c2 >  32 0a800f00000026052f6230313300010001000a810b052f623031310002000200 ; update updateid=38 key='/b013' gpc0=0 http_req_cnt=1 http_req_rate=(age 0ms, cur 1, prev 0) ; inc-update key='/b011' gpc0=0 http_req_cnt=2 http_req_rate=(age 0ms, cur 2, prev 0)
+V3     9.529 c2 >  18 0a800f00000028052f623030390005000500 ; update updateid=40 key='/b009' gpc0=0 http_req_cnt=5 http_req_rate=(age 0ms, cur 5, prev 0)
+V3     9.530 c2 >  32 0a800f00000029052f6230303800060006000a810b052f623031340001000100 ; update updateid=41 key='/b008' gpc0=0 http_req_cnt=6 http_req_rate=(age 0ms, cur 6, prev 0) ; inc-update key='/b014' gpc0=0 http_req_cnt=1 http_req_rate=(age 0ms, cur 1, prev 0)
+V3     9.530 c2 >  32 0a800f0000002b052f6230313000040104000a810b052f623031320002010200 ; update updateid=43 key='/b010' gpc0=0 http_req_cnt=4 http_req_rate=(age 1ms, cur 4, prev 0) ; inc-update key='/b012' gpc0=0 http_req_cnt=2 http_req_rate=(age 1ms, cur 2, prev 0)
+V3     9.530 c2 <  24 0a840501010000240a840501270000000a8405012a000000 ; ack table=1 updateid=16777252 ; ack table=1 updateid=654311424 ; ack table=1 updateid=704643072
+V3 --
+V3     9.530 c2 <   8 0a8405012c000000 ; ack table=1 updateid=738197504
+V3     9.530 c2 > 110 0a800f0000002e052f6230303900060106000a810b052f6230313000050105000a800f00000030052f6230313100040104000a810b052f6230313500010101000a810b052f6230313300020102000a800f00000033052f6230303900080108000a810b052f623031310005010500 ; update updateid=46 key='/b009' gpc0=0 http_req_cnt=6 http_req_rate=(age 1ms, cur 6, prev 0) ; inc-update key='/b010' gpc0=0 http_req_cnt=5 http_req_rate=(age 1ms, cur 5, prev 0) ; update updateid=48 key='/b011' gpc0=0 http_req_cnt=4 http_req_rate=(age 1ms, cur 4, prev 0) ; inc-update key='/b015' gpc0=0 http_req_cnt=1 http_req_rate=(age 1ms, cur 1, prev 0) ; inc-update key='/b013' gpc0=0 http_req_cnt=2 http_req_rate=(age 1ms, cur 2, prev 0) ; update updateid=51 key='/b009' gpc0=0 http_req_cnt=8 http_req_rate=(age 1ms, cur 8, prev 0) ; inc-update key='/b011' gpc0=0 http_req_cnt=5 http_req_rate=(age 1ms, cur 5, prev 0)
+V3     9.530 c2 <   8 0a8405010000002d ; ack table=1 updateid=45
+V3     9.530 c2 <   8 0a84050134000000 ; ack table=1 updateid=872415232
+V3     9.530 c2 >  46 0a800f00000035052f6230313400020102000a810b052f6230313200040104000a810b052f623031360001010100 ; update updateid=53 key='/b014' gpc0=0 http_req_cnt=2 http_req_rate=(age 1ms, cur 2, prev 0) ; inc-update key='/b012' gpc0=0 http_req_cnt=4 http_req_rate=(age 1ms, cur 4, prev 0) ; inc-update key='/b016' gpc0=0 http_req_cnt=1 http_req_rate=(age 1ms, cur 1, prev 0)
+V3     9.530 c2 >  18 0a800f00000038052f623031300006010600 ; update updateid=56 key='/b010' gpc0=0 http_req_cnt=6 http_req_rate=(age 1ms, cur 6, prev 0)
+V3     9.533 c2 <   8 0a840501010000b8 ; ack table=1 updateid=16777400
+V3     9.533 c2 <   8 0a840501bf000000 ; ack table=1 updateid=3204448256
+V3     9.533 c2 <   8 0a840501000000c0 ; ack table=1 updateid=192
+V3     9.533 c2 <   8 0a840501000000c5 ; ack table=1 updateid=197
+V3     9.533 c2 <   8 0a840501c7000000 ; ack table=1 updateid=3338665984
+V3     9.533 c2 <   8 0a840501010000c9 ; ack table=1 updateid=16777417
+V3     9.534 c2 <   8 0a840501010000cf ; ack table=1 updateid=16777423
+V3     9.534 c2 <   8 0a840501d3000001 ; ack table=1 updateid=3539992577
+V3     9.534 c2 <   8 0a840501010000d6 ; ack table=1 updateid=16777430
+V3     9.534 c2 <   8 0a840501000000d8 ; ack table=1 updateid=216
+V3     9.534 c2 <   8 0a840501da000000 ; ack table=1 updateid=3657433088
+V3     9.534 c2 <   8 0a840501000000db ; ack table=1 updateid=219
+V3     9.534 c2 <   8 0a840501000000dc ; ack table=1 updateid=220
+V3     9.534 c2 <   8 0a840501000000dd ; ack table=1 updateid=221
+V3     9.535 c2 <   8 0a840501df000000 ; ack table=1 updateid=3741319168
+V3     9.535 c2 <  16 0a840501e10000000a840501000000e3 ; ack table=1 updateid=3774873600 ; ack table=1 updateid=227
