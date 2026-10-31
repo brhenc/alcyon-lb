@@ -280,3 +280,13 @@ fn a_thread_that_cannot_be_created_fails_the_start_cleanly() {
     assert!(err.contains("[ALERT]") && err.contains("Failed to create thread 0"), "stderr: {err}");
     assert!(!err.contains("panicked"), "stderr: {err}");
 }
+
+/// T511: the session arena a worker pre-sizes for `maxconn` at its start is the largest
+/// allocation there (272000 bytes under `-m 6`); one the memory cannot hold leaves the arena
+/// empty, to grow on use, instead of aborting the process (`memory allocation of 272000
+/// bytes failed`, exit 134, seen under the gate's instrumented build).
+#[test]
+fn a_session_arena_the_memory_cannot_hold_starts_empty() {
+    let arena = ibex_rt::engine::SessionArena::with_capacity(usize::MAX / 4096);
+    assert_eq!(arena.capacity(), 0);
+}

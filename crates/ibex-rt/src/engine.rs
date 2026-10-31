@@ -2164,11 +2164,21 @@ impl Drop for SessionArena {
 }
 
 impl SessionArena {
+    /// Pre-sized for `cap` sessions; short of memory (a small `-m`), empty instead, growing on
+    /// use as `HAProxy`'s pools do: never an abort at the start (T511: under `-m 6` the
+    /// instrumented build's larger footprint left no room for the 272000 bytes asked here).
     #[must_use]
     pub fn with_capacity(cap: usize) -> Self {
+        let (mut entries, mut free) = (Vec::new(), Vec::new());
+        let cap = if entries.try_reserve_exact(cap).is_ok() && free.try_reserve_exact(cap).is_ok() {
+            cap
+        } else {
+            (entries, free) = (Vec::new(), Vec::new());
+            0
+        };
         SessionArena {
-            entries: Vec::with_capacity(cap),
-            free: Vec::with_capacity(cap),
+            entries,
+            free,
             live: 0,
             floor: cap,
             peak: 0,
@@ -4982,6 +4992,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     let mut ql = crate::quic_listener::QuicListener::bind_for_worker(bind_addr, &tls, Some(qc), Some(worker_id))?;
                     ql.set_frontend(proxy_idx);
                     ql.gate_connections();
+                    if h3_mux(config.global.as_ref().and_then(|g| g.h3_mux)) {
+                        ql.serve_by_mux();
+                    }
 
                     let l_idx = quic_listeners.len();
                     let lfd = ql.raw_fd();
@@ -5556,6 +5569,108 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
     }
 
+    /// The HTTP/3 connections admitted since the last pass get their owner sessions
+    /// (`tune.ibex.h3-path mux`, T509; design 2.2): an entry of the frontend with the
+    /// connection's mux, whose request streams are its children as an h2 connection's are.
+    /// The connection was counted at its admission (`admit_quic_connections`); its
+    /// `tcp-request connection` rules run here, once per connection as `HAProxy`'s.
+    fn adopt_quic_owners(&mut self) {
+        for q_idx in 0..self.quic_listeners.len() {
+            let Some(proxy_idx) = self.quic_listeners[q_idx].frontend() else { continue };
+            for conn in self.quic_listeners[q_idx].take_new_owned() {
+                let ql = &mut self.quic_listeners[q_idx];
+                let (peer, local) = (ql.peer_of(conn), ql.addr());
+                let tracked: [Option<(usize, StickKey)>; 3] = [None, None, None];
+                let (client_addr, server_addr, fc_src, fc_dst) =
+                    match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, &tracked) {
+                        ConnEvalOutcome::Accept(c, s, fs, fd, _) => (c, s, fs, fd),
+                        ConnEvalOutcome::Reject | ConnEvalOutcome::SilentDrop(_) => {
+                            self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
+                            ql.owner_close(conn);
+                            continue;
+                        }
+                    };
+                let Some(mut mux) = ibex_proto::mux_h3::H3MuxContext::take() else {
+                    ql.owner_close(conn);
+                    continue;
+                };
+                mux.relaxed_path = self.proxies[proxy_idx].stats_config.accept_unsafe_request;
+                let raw_fd = ql.raw_fd();
+                let Some((mut sess, _, _)) = init_client_session(
+                    &self.proxies,
+                    proxy_idx,
+                    crate::proxy::ClientSide::Quic,
+                    self.now,
+                    peer,
+                    client_addr,
+                    server_addr,
+                    fc_src,
+                    fc_dst,
+                    None,
+                    0,
+                    false,
+                    tracked,
+                    self.global_bufsize,
+                    self.global_maxrewrite,
+                    self.global_h2_flood_config,
+                    false,
+                    (false, false),
+                ) else {
+                    self.quic_listeners[q_idx].owner_close(conn);
+                    continue;
+                };
+                sess.h3 = true;
+                sess.cli_state = ScState::Established;
+                sess.cli_exp = Tick::ETERNITY;
+                sess.req_exp = Tick::ETERNITY;
+                // Its role, which keeps its children and its mux, is made now (two `Box`es a
+                // connection).
+                sess.h2_role = Some(Box::new(crate::proxy::H2Role::Owner(crate::proxy::H2Owner {
+                    h3: Some(Box::new(crate::proxy::H3Owner { mux, listener: usize_to_u32(q_idx), conn, body_scratch: Vec::new() })),
+                    ..Default::default()
+                })));
+                let entry = SessionEntry {
+                    sess,
+                    task: TaskRef::NONE,
+                    proxy_idx,
+                    backend_idx: proxy_idx,
+                    srv_backend_idx: proxy_idx,
+                    target_server_idx: None,
+                    // The listener's socket, which `show sess` shows; never polled through
+                    // this entry.
+                    cli_raw_fd: raw_fd,
+                    srv_raw_fd: None,
+                    cli_interest: Interest::NONE,
+                    srv_interest: Interest::NONE,
+                    actconn_reclaimed: true,
+                    stats_done: false,
+                    be_counted: std::cell::Cell::new(NO_BACKEND),
+                    connect_log_due: false,
+                    rate_max_due: false,
+                    srv_served: 0,
+                    log_line: None,
+                    log_err: false,
+                    log_sd: 0,
+                    buf_wait: crate::buf_wait::WaitState::default(),
+                };
+                let Some(idx) = self.sessions.alloc(entry) else {
+                    self.quic_listeners[q_idx].owner_close(conn);
+                    continue;
+                };
+                let Some(task) = self.scheduler.create(WorkKind::new(Kind::Stream, idx)) else {
+                    self.sessions.free(idx);
+                    self.quic_listeners[q_idx].owner_close(conn);
+                    continue;
+                };
+                if let Some(e) = self.sessions.get_mut(idx) {
+                    e.task = task;
+                }
+                self.quic_listeners[q_idx].set_owner(conn, idx, task);
+                self.scheduler.tasklet_wakeup(task, Class::Urgent, state::WOKEN_IO);
+            }
+        }
+    }
+
     /// Adopts the HTTP/3 request streams the QUIC listeners opened since the last pass, each
     /// as a client connection of its frontend (T130). From here an HTTP/3 request is an
     /// ordinary stream: rules, backend choice, balancing, server connection and log line.
@@ -5832,8 +5947,21 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             }
         }
         self.admit_quic_connections();
+        self.adopt_quic_owners();
         self.adopt_quic_streams();
         self.sync_quic_backend_fds();
+        if !self.quic_listeners.is_empty() {
+            let mut quic_wake = std::mem::take(&mut self.wake_scratch);
+            for ql in &mut self.quic_listeners {
+                ql.take_wake(&mut quic_wake);
+            }
+            for t in quic_wake.drain(..) {
+                if self.scheduler.is_live(t) {
+                    self.scheduler.tasklet_wakeup(t, Class::Urgent, state::WOKEN_IO);
+                }
+            }
+            self.wake_scratch = quic_wake;
+        }
 
         // 5. Run runnable tasks through Dispatch
         let pid = self.pid;
@@ -5867,6 +5995,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             idle_backend_pool: &mut self.idle_backend_pool,
             mailboxes: &self.mailboxes,
             worker_id: self.mailbox_wid,
+            quic_listeners: &mut self.quic_listeners,
         };
 
         let tasks_run = self.scheduler.process_runnable_tasks(&mut dispatcher);
@@ -5895,6 +6024,14 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.timer_updates = dispatcher.timer_updates;
         for (owner_idx, owner_task) in h2_spawn.drain(..) {
             self.spawn_h2_children(owner_idx, owner_task, &mut wake_queue);
+        }
+        // What the owners of HTTP/3 connections wrote goes out now (T509). The clock is read
+        // only when one did: once per pass is a fifth of an h1 request's added cost otherwise.
+        for ql in &mut self.quic_listeners {
+            if ql.take_dirty() {
+                let _ = ql.send_batch(Instant::now());
+            }
+            ql.take_wake(&mut wake_queue);
         }
         for task_ref in wake_queue.drain(..) {
             if self.scheduler.is_live(task_ref) {
@@ -5925,9 +6062,14 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 return;
             }
             let keep = owner.sess.keep_request_line;
-            let Some(d) = owner.sess.h2_ctx.as_deref_mut().and_then(|h2| crate::h2_bridge::dispatch_next(h2, keep)) else { return };
+            let d = match owner.sess.h3_owner_mut() {
+                Some(h3) => crate::h2_bridge::dispatch_mux(&mut *h3.mux, keep, "HTTP/3.0"),
+                None => owner.sess.h2_ctx.as_deref_mut().and_then(|h2| crate::h2_bridge::dispatch_next(h2, keep)),
+            };
+            let Some(d) = d else { return };
             let stream_id = d.stream.id;
-            let sess = TcpSession::h2_child_of(&mut owner.sess, (owner_idx, owner_task), d.stream);
+            let mut sess = TcpSession::h2_child_of(&mut owner.sess, (owner_idx, owner_task), d.stream);
+            sess.h3 = owner.sess.h3;
             let entry = SessionEntry {
                 sess,
                 task: TaskRef::NONE,
@@ -5964,6 +6106,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let head = crate::h2_bridge::start_request(&mut child.sess, d);
             if let Some(h2) = owner.sess.h2_ctx.as_deref_mut() {
                 h2.give_back_head(head);
+            } else if let Some(h3) = owner.sess.h3_owner_mut() {
+                ibex_proto::htx_mux::HtxMux::give_back_head(&mut *h3.mux, head);
             }
             // The stream's own `timeout client` starts with it (T300).
             child.sess.arm_client(now);
@@ -7583,6 +7727,14 @@ fn arm_res_inspect(proxy: &Proxy, sess: &mut TcpSession) {
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+/// `tune.ibex.h3-path` (T509, Ibex-only until the relay is removed): `mux` serves HTTP/3
+/// request streams through the h3 mux and the bridge; unset, the environment variable
+/// `IBEX_H3_PATH` (`mux` or `relay`) decides, so that the h3 tests run on both paths without a
+/// configuration of their own; else the relay.
+fn h3_mux(keyword: Option<bool>) -> bool {
+    keyword.unwrap_or_else(|| std::env::var("IBEX_H3_PATH").is_ok_and(|v| v == "mux"))
+}
+
 fn register_new_session(
     engine: &mut Engine,
     proxy_idx: usize,
@@ -7608,7 +7760,7 @@ fn register_new_session(
     let Some((mut sess, target_addr, srv_raw_fd)) = init_client_session(
         &mut engine.proxies,
         proxy_idx,
-        cli_fd,
+        crate::proxy::ClientSide::Fd(cli_fd),
         engine.now,
         peer_addr,
         client_addr,
@@ -7868,7 +8020,7 @@ fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &[Proxy], sess: &mut TcpSess
 fn init_client_session(
     proxies: &[Proxy],
     proxy_idx: usize,
-    cli_fd: std::os::fd::OwnedFd,
+    cli: crate::proxy::ClientSide,
     now: Tick,
     peer_addr: SocketAddr,
     client_addr: SocketAddr,
@@ -7892,10 +8044,13 @@ fn init_client_session(
     let srvexp = proxies[proxy_idx].srvexp.clone();
     // The TLS transport is built on the accepted socket before the session owns it, so
     // there is no session without a client socket to account for (T342).
-    let tls_xprt = tls.map(|cfg| crate::xprt::accept_tls_capturing(&cli_fd, Arc::clone(cfg), ssl_capture_size, ssl_ja4_spec));
+    let tls_xprt = match (&cli, tls) {
+        (crate::proxy::ClientSide::Fd(fd), Some(cfg)) => Some(crate::xprt::accept_tls_capturing(fd, Arc::clone(cfg), ssl_capture_size, ssl_ja4_spec)),
+        _ => None,
+    };
 
     let mut sess = TcpSession::new_with_mode(
-        crate::proxy::ClientSide::Fd(cli_fd),
+        cli,
         mode,
         cliexp,
         srvexp,
@@ -8261,6 +8416,8 @@ struct EngineDispatcher<'a> {
     idle_backend_pool: &'a mut IdlePool,
     mailboxes: &'a Arc<crate::mailbox::Mailboxes>,
     worker_id: usize,
+    /// The QUIC listeners, which the owners of HTTP/3 connections read and write (T509).
+    quic_listeners: &'a mut [crate::quic_listener::QuicListener],
 }
 
 /// Answers the current request with the page for `status`, chosen as HAProxy's
@@ -8544,6 +8701,60 @@ fn h2_bridge_state(o: &mut SessionEntry, c: &mut SessionEntry, proxies: &[Proxy]
         let due = glitches - os.glitches_credited;
         os.glitches_credited = glitches;
         for_tracked(proxies, cs, |data| data.add_glitches(due));
+    }
+    wake
+}
+
+/// [`h2_bridge_moves`] for a stream of an HTTP/3 connection (T509).
+fn h3_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> bool {
+    let (os, cs) = (&mut o.sess, &mut c.sess);
+    let Some(h3) = os.h3_owner_mut() else { return false };
+    let Some(crate::proxy::H2Role::Child(ch)) = cs.h2_role.as_deref_mut() else { return false };
+    let mux = &mut *h3.mux;
+    if ch.reset || ibex_proto::htx_mux::HtxMux::is_reset(mux, u64::from(ch.stream.id)) {
+        return false;
+    }
+    ch.stream.body.drop_trailers = cs.drop_req_trailers;
+    let (mut moved, trailers) = crate::h2_bridge::pump_request_body_mux(mux, &mut ch.stream, &mut cs.req);
+    let Some(t) = cs.txn.as_mut() else { return moved };
+    if let Some(u) = t.req_htx.as_mut() {
+        *u += trailers;
+    }
+    let before = (cs.rep.len(), t.rsp);
+    let srv_gone = matches!(cs.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
+    if crate::h2_bridge::forward_response_mux(mux, ch.stream.id, t, &mut cs.rep, srv_gone, &mut h3.body_scratch) {
+        cs.log.term = Some(*b"SD");
+        moved = true;
+    }
+    moved |= before != (cs.rep.len(), t.rsp);
+    if moved {
+        cs.arm_client(now);
+    }
+    cs.drain_request();
+    moved
+}
+
+/// [`h2_bridge_state`] for a stream of an HTTP/3 connection (T509): its reset, and the
+/// connection failing (`failed`: the mux's connection error, which closes it).
+fn h3_bridge_state(o: &mut SessionEntry, c: &mut SessionEntry, failed: bool) -> bool {
+    let (os, cs) = (&mut o.sess, &mut c.sess);
+    let Some(h3) = os.h3_owner() else { return false };
+    let tx_pending = ibex_proto::htx_mux::HtxMux::tx_pending(&*h3.mux);
+    let reset = cs.h2_active().is_some_and(|a| ibex_proto::htx_mux::HtxMux::is_reset(&*h3.mux, u64::from(a.id)));
+    let Some(crate::proxy::H2Role::Child(ch)) = cs.h2_role.as_deref_mut() else { return false };
+    let mut wake = false;
+    if reset && !ch.reset {
+        ch.reset = true;
+        wake = true;
+    }
+    if ch.owner_tx_pending != tx_pending {
+        ch.owner_tx_pending = tx_pending;
+        wake = true;
+    }
+    if failed && matches!(cs.cli_state, ScState::Ready | ScState::Established | ScState::ShutR) {
+        cs.cli_state = ScState::Closed;
+        cs.ending.get_or_insert(crate::proxy::Ending::ClientAbort);
+        wake = true;
     }
     wake
 }
@@ -10078,6 +10289,76 @@ impl EngineDispatcher<'_> {
         }
     }
 
+    /// One run of the owner of an HTTP/3 connection (T509, design 2.2): what the client sent
+    /// into the mux, its streams' bytes moved both ways (`h3_bridge_moves`, the h2 owner's
+    /// `h2_bridge_moves` over the h3 mux), the mux's frames to quinn, what happened to the
+    /// connection to the children, and the streams with their heads in dispatched after the
+    /// pass (`h2_spawn`). The connection gone, the owner ends and its children with it.
+    fn step_h3_owner(&mut self, owner_idx: u32, now: Tick) -> Outcome {
+        let Some(e) = self.sessions.get_mut(owner_idx) else { return Outcome::Done };
+        let task = e.task;
+        let Some(h3) = e.sess.h3_owner_mut() else { return Outcome::Done };
+        let (q_idx, conn) = (h3.listener as usize, h3.conn);
+        let Some(ql) = self.quic_listeners.get_mut(q_idx) else { return Outcome::Done };
+        if ql.owner_recv(conn, &mut h3.mux, u64::from(now.0)) == crate::quic_listener::OwnerConn::Closed {
+            ql.owner_close(conn);
+            e.sess.cli_state = ScState::Closed;
+            e.sess.ending.get_or_insert(crate::proxy::Ending::ClientAbort);
+            return Outcome::Done;
+        }
+        let children = e.sess.h2_owner().map_or(0, |o| o.children.len());
+        let mut moved = false;
+        for i in 0..children {
+            let Some(link) = self.sessions.get(owner_idx).and_then(|e| e.sess.h2_owner()).and_then(|o| o.children.get(i).copied()) else { break };
+            let Some((o, c)) = self.sessions.get2_mut(owner_idx, link.idx).filter(|(_, c)| c.task == link.task) else { continue };
+            if h3_bridge_moves(o, c, now) {
+                moved = true;
+                self.wake_queue.push(link.task);
+            }
+        }
+        let Some(e) = self.sessions.get_mut(owner_idx) else { return Outcome::Done };
+        let Some(crate::proxy::H2Role::Owner(crate::proxy::H2Owner { children: served_by, h3: Some(h3), .. })) = e.sess.h2_role.as_deref_mut() else { return Outcome::Done };
+        let served = |id: u64| served_by.iter().any(|l| u64::from(l.stream_id) == id);
+        let ql = &mut self.quic_listeners[q_idx];
+        // The GOAWAY of a soft stop goes out in this pass: framed after the write, it was
+        // what kept an idle owner from closing, nothing waking it to write it (T511).
+        if ql.is_stopping() {
+            h3.mux.send_goaway();
+        }
+        ql.owner_send(conn, &mut h3.mux, |id| !served(id));
+        let idle = children == 0 && !ibex_proto::htx_mux::HtxMux::tx_pending(&*h3.mux);
+        let failed = h3.mux.error.is_some();
+        for i in 0..children {
+            let Some(link) = self.sessions.get(owner_idx).and_then(|e| e.sess.h2_owner()).and_then(|o| o.children.get(i).copied()) else { break };
+            let Some((o, c)) = self.sessions.get2_mut(owner_idx, link.idx).filter(|(_, c)| c.task == link.task) else { continue };
+            if h3_bridge_state(o, c, failed) {
+                self.wake_queue.push(link.task);
+            }
+        }
+        let Some(e) = self.sessions.get_mut(owner_idx) else { return Outcome::Done };
+        // A stream ended the connection (`http-request reject`, a silent drop), the mux
+        // failed it, or a soft stop finds it idle: it closes.
+        let ended = !matches!(e.sess.cli_state, ScState::Ready | ScState::Established);
+        if ended || failed || (idle && self.quic_listeners[q_idx].is_stopping()) {
+            if !failed {
+                self.quic_listeners[q_idx].owner_close(conn);
+            }
+            e.sess.cli_state = ScState::Closed;
+            return Outcome::Done;
+        }
+        let max = e.sess.h2_max_children();
+        if e.sess.h2_owner().map_or(0, |o| o.children.len()) < max
+            && e.sess.h3_owner().is_some_and(|h| ibex_proto::htx_mux::HtxMux::next_dispatch(&*h.mux).is_some())
+        {
+            self.h2_spawn.push((owner_idx, task));
+        }
+        // More of a response may be framed now that quinn took the last.
+        if moved {
+            self.wake_queue.push(task);
+        }
+        Outcome::Keep
+    }
+
     /// A stream of an HTTP/2 connection is freed: its owner learns it, takes back what the
     /// stream changed of the connection (and a server connection it kept, as the session
     /// kept it between requests), and goes on to its next stream; or, when the stream ended
@@ -10102,6 +10383,20 @@ impl EngineDispatcher<'_> {
         let Some(owner) = owner else { return };
         let owner_task = owner.task;
         owner.sess.h2_owner_mut().into_iter().for_each(|o| o.children.retain(|l| l.task != child.task));
+        // An HTTP/3 stream whose response is all framed is let go once its FIN is out
+        // (`QuicListener::owner_send`); one that ends without it is reset and let go now.
+        if let Some(h3) = owner.sess.h3_owner_mut() {
+            let id = child.sess.h2_child().map_or(0, |c| u64::from(c.stream.id));
+            let mux = &mut *h3.mux;
+            match mux.streams.get(&id).map(|st| (st.tx_fin, st.fin_sent)) {
+                Some((_, true)) => mux.release(id),
+                Some((false, _)) => {
+                    ibex_proto::htx_mux::HtxMux::reset(mux, id, ibex_proto::htx_mux::MuxReset::Cancel);
+                    mux.release(id);
+                }
+                _ => {}
+            }
+        }
         if finished && conn_end.is_none() {
             // A stream let go before the client ended its side is reset (T300): `NO_ERROR`
             // after a whole response (`HAProxy`'s 400 to an upload its `timeout client` cut
@@ -10119,9 +10414,10 @@ impl EngineDispatcher<'_> {
                     h2.send_goaway(h2.last_client_stream_id, goaway, b"");
                 }
             }
-            if owner.sess.srv.is_some() {
+            if owner.sess.srv.is_some() || owner.sess.h3_owner().is_some() {
                 // Another stream already gave one back: this one goes to the pool, as
-                // `HAProxy`'s streams each release theirs.
+                // `HAProxy`'s streams each release theirs. The owner of an HTTP/3
+                // connection keeps none: it polls no server socket (T509).
                 release_server(child, self.proxies, self.fdtab, self.poller, self.idle_backend_pool, true);
             }
             move_server(child, owner, self.fdtab);
@@ -10210,8 +10506,15 @@ impl EngineDispatcher<'_> {
         // in the poller, so a stream woken by a request after an idle second would arm a
         // `wait-for-body` of 300 ms from a second ago.
         let now = self.now;
+        let (is_h2_owner, is_h3_owner) = self.sessions.get(session_idx).map_or((false, false), |e| (e.sess.h2_ctx.is_some(), e.sess.h3_owner().is_some()));
+        if is_h3_owner {
+            let out = self.step_h3_owner(session_idx, now);
+            if matches!(out, Outcome::Done) {
+                self.end_stream(session_idx, now, false);
+            }
+            return out;
+        }
         let mut connect_line: Option<(usize, String)> = None;
-        let is_h2_owner = self.sessions.get(session_idx).is_some_and(|e| e.sess.h2_ctx.is_some());
         {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
                 return Outcome::Done;

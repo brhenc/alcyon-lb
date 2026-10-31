@@ -92,8 +92,9 @@ pub struct RequestHead {
 }
 
 /// Builds the HTTP/1 head for a decoded field section. `known_body` is the body length when
-/// the whole request is already here (FIN seen): HAProxy then forwards a `content-length`
-/// rather than chunking, which is what a server that refuses chunked requests needs.
+/// the whole request is already here (FIN seen): checked against a `content-length`; without
+/// one the body still goes chunked, as `HAProxy` 3.5-dev7 with QUIC forwards it (measured,
+/// T511), and a bodyless request (`Some(0)`) gets no framing field.
 ///
 /// # Errors
 /// [`HeadError`]: `Decompression` for a field section that does not decode, `Message` for a
@@ -162,11 +163,9 @@ pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<Req
             ReqBody::Length(cl)
         }
         (None, Some(0)) => ReqBody::Length(0),
-        (None, Some(n)) => {
-            head.extend_from_slice(format!("content-length: {n}\r\n").as_bytes());
-            ReqBody::Length(n)
-        }
-        (None, None) => {
+        // A body without `content-length` goes chunked, also when all of it came with the
+        // head (measured on `HAProxy` 3.5-dev7 with QUIC, T511).
+        (None, Some(_) | None) => {
             head.extend_from_slice(b"transfer-encoding: chunked\r\n");
             ReqBody::Chunked
         }
@@ -599,9 +598,11 @@ mod tests {
         let (h, b) = head_of(&[], None).expect("head");
         assert!(h.starts_with("POST /p HTTP/1.1\r\nhost: x\r\n") && h.ends_with("transfer-encoding: chunked\r\n\r\n"), "{h}");
         assert_eq!(b, ReqBody::Chunked);
+        // All of a body without `content-length` here with its head: still chunked, as
+        // `HAProxy` 3.5-dev7 with QUIC forwards it (measured, T511).
         let (h, b) = head_of(&[], Some(5)).expect("head");
-        assert!(h.ends_with("content-length: 5\r\n\r\n"), "{h}");
-        assert_eq!(b, ReqBody::Length(5));
+        assert!(h.ends_with("transfer-encoding: chunked\r\n\r\n") && !h.contains("content-length"), "{h}");
+        assert_eq!(b, ReqBody::Chunked);
         let (h, b) = head_of(&[], Some(0)).expect("head");
         assert!(!h.contains("content-length") && !h.contains("chunked"), "{h}");
         assert_eq!(b, ReqBody::Length(0));

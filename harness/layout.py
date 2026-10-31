@@ -161,6 +161,12 @@ def resolve_key(key: str) -> str | None:
         return None
     if parts[-1] == "":
         return files[0]
+    # `h3_both_paths!` makes a test `fn` twice, as `<fn>::relay` and `<fn>::mux` (T511).
+    if len(parts) > 1 and parts[-1] in ("relay", "mux"):
+        both = [f for f in files if "h3_both_paths!" in open(f, encoding="utf-8").read()]
+        found = next((f for f in both if _defines([f], parts[-2])), None)
+        if found:
+            return found
     return next((f for f in files if _defines([f], parts[-1])), None)
 
 

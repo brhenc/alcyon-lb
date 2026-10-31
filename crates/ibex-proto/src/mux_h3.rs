@@ -938,7 +938,8 @@ fn demux_frames(st: &mut H3StreamCtx, rx: &[u8], sh: &mut Shared) -> Result<(usi
             if n == 0 {
                 return Ok((used, None));
             }
-            if let Some(HtxBlock::Data(d)) = st.rx_htx.blocks_mut().last_mut() {
+            // Not onto a block the bridge took whole and emptied: its cursor is past it (T509).
+            if let Some(HtxBlock::Data(d)) = st.rx_htx.blocks_mut().last_mut().filter(|b| matches!(b, HtxBlock::Data(d) if !d.is_empty())) {
                 d.extend_from_slice(&rx[used..used + n]);
             } else {
                 st.rx_htx.push(HtxBlock::Data(rx[used..used + n].to_vec()));
@@ -1010,13 +1011,13 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
     // The pseudo-headers first, as HAProxy's loop: one it does not know (`:protocol`
     // included: no extended CONNECT, RFC 9220 is out) is a message error; then CONNECT is
     // rejected (h3.c:938; measured: RESET_STREAM 0x10b, 0x10e with `:protocol`).
-    let (mut method, mut scheme, mut path) = (None, false, false);
+    let (mut method, mut scheme, mut path, mut authority) = (None, false, false, false);
     for (n, v) in f.iter() {
         match n {
             ":method" => method = Some(v),
             ":scheme" => scheme = true,
             ":path" => path = true,
-            ":authority" => {}
+            ":authority" | "host" => authority = true,
             _ if n.starts_with(':') => return Ok(Some(MESSAGE_ERROR)),
             _ => {}
         }
@@ -1024,10 +1025,18 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
     if method == Some("CONNECT") {
         return Ok(Some(REQUEST_REJECTED));
     }
-    if method.is_none() || !scheme || !path {
+    // Neither `:authority` nor `host`: measured on 3.5-dev7 (T509), RESET_STREAM 0x10e and
+    // nothing to the server.
+    if method.is_none() || !scheme || !path || !authority {
         return Ok(Some(MESSAGE_ERROR));
     }
     let Ok(bad) = check_request_fields(f.iter(), sh.relaxed) else { return Ok(Some(MESSAGE_ERROR)) };
+    // What h2 takes and answers 400 (a method or scheme that is not a token) is a message
+    // error over h3: measured on 3.5-dev7 (T509). A `:path` with a blank under
+    // `option accept-unsafe-violations-in-http-request` keeps h2's 400 (not measured).
+    if bad && !sh.relaxed {
+        return Ok(Some(MESSAGE_ERROR));
+    }
     let mut cl = None;
     for (_, v) in f.iter().filter(|(n, _)| *n == "content-length") {
         match content_length_value(v) {
@@ -1207,6 +1216,9 @@ impl HtxStream for H3StreamCtx {
     }
     fn bad_request(&self) -> bool {
         self.bad_request
+    }
+    fn content_length(&self) -> Option<u64> {
+        self.content_length
     }
 }
 

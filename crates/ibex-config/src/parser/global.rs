@@ -402,6 +402,20 @@ pub(crate) fn parse_global_directive(
             });
             Ok(())
         }
+        "tune.ibex.h3-path" => {
+            let Some(arg) = tokens.get(1) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.ibex.h3-path' expects 'relay' or 'mux'."));
+            };
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'tune.ibex.h3-path' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            global.h3_mux = Some(match arg.text.as_str() {
+                "mux" => true,
+                "relay" => false,
+                other => return Err(ConfigError::new(arg.line, arg.col, format!("'tune.ibex.h3-path' expects 'relay' or 'mux', got '{other}'."))),
+            });
+            Ok(())
+        }
         "tune.ibex.crypto-provider" => {
             const WANT: &str = "'tune.ibex.crypto-provider' expects 'ring' or 'ring-ibex'";
             let Some(arg) = tokens.get(1) else {

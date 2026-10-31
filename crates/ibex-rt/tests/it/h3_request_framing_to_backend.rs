@@ -18,6 +18,9 @@
 //! and a DATA frame is checked against the length when its header arrives, before any of
 //! its payload is passed on.
 //!
+//! T511 measured the framing of a body without `content-length` on `HAProxy` 3.5-dev7 built
+//! with QUIC (`reference/haproxy-quic`): chunked, see [`SMUGGLED_CHUNKED`].
+//!
 //! Each case drives a raw `quinn-proto` client against the `ibex` binary and records every
 //! byte the backend receives.
 
@@ -31,7 +34,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -120,7 +123,7 @@ fn ibex(be: SocketAddr) -> Ibex {
          default_backend b\nbackend b\n    http-reuse never\n    server s {be}\n"
     )
     .expect("write cfg");
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+    let child = common::ibex_command(env!("CARGO_BIN_EXE_ibex"))
         .arg("-f")
         .arg(cfg.path())
         .stdout(Stdio::null())
@@ -372,10 +375,15 @@ fn assert_all(cases: &[Case]) {
 }
 
 const SMUGGLED: &[u8] = b"5\r\nhello\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nhost: x\r\n\r\n";
+/// A body without `content-length` goes chunked, even when all of it came with the head
+/// and the stream's FIN: measured on `HAProxy` 3.5-dev7 with QUIC (aioquic, HEADERS and DATA
+/// in one STREAM frame with FIN, T511): `transfer-encoding: chunked`, one chunk.
+const SMUGGLED_CHUNKED: &[u8] = b"32\r\n5\r\nhello\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nhost: x\r\n\r\n\r\n0\r\n\r\n";
+const HELLO_CHUNKED: &[u8] = b"5\r\nhello\r\n0\r\n\r\n";
 
+crate::h3_both_paths! {
 /// RFC 9114 4.2: connection-specific fields make a request malformed, and `te` may only be
 /// `trailers`. HAProxy's `h3_headers_to_htx` answers each with H3_MESSAGE_ERROR.
-#[test]
 fn connection_specific_fields_never_reach_the_server() {
     assert_all(&[
         case("te-chunked", "POST", &[("transfer-encoding", "chunked")], &[SMUGGLED], Refused(400)),
@@ -385,14 +393,15 @@ fn connection_specific_fields_never_reach_the_server() {
         case("te-on-get", "GET", &[("transfer-encoding", "chunked")], &[], Refused(400)),
         case("te-gzip-hop", "POST", &[("te", "gzip")], &[b"hello"], Refused(400)),
         case("connection", "POST", &[("connection", "keep-alive")], &[b"hello"], Refused(400)),
-        case("te-trailers", "POST", &[("te", "trailers")], &[b"hello"], Forwarded { framing: "content-length: 5", body: b"hello" }),
+        case("te-trailers", "POST", &[("te", "trailers")], &[b"hello"], Forwarded { framing: "transfer-encoding: chunked", body: HELLO_CHUNKED }),
     ]);
 }
+}
 
+crate::h3_both_paths! {
 /// RFC 9114 4.1.2: a `content-length` other than the sum of the DATA frames is malformed.
 /// HAProxy (`http_parse_cont_len_header`) takes a comma list of one repeated value, and
 /// repeated lines of one value, as that value; anything else that is not digits is an error.
-#[test]
 fn content_length_matches_the_data_frames() {
     assert_all(&[
         case("cl-over", "POST", &[("content-length", "3")], &[b"hello"], Refused(400)),
@@ -410,15 +419,16 @@ fn content_length_matches_the_data_frames() {
         case("cl-leading-zero", "POST", &[("content-length", "005")], &[b"hello"], Forwarded { framing: "content-length: 5", body: b"hello" }),
         case("cl-two-frames", "POST", &[("content-length", "5")], &[b"he", b"llo"], Forwarded { framing: "content-length: 5", body: b"hello" }),
         case("get-with-cl", "GET", &[("content-length", "5")], &[b"hello"], Forwarded { framing: "content-length: 5", body: b"hello" }),
-        case("get-with-body", "GET", &[], &[b"hello"], Forwarded { framing: "content-length: 5", body: b"hello" }),
-        case("body-no-cl", "POST", &[], &[SMUGGLED], Forwarded { framing: "content-length: 50", body: SMUGGLED }),
+        case("get-with-body", "GET", &[], &[b"hello"], Forwarded { framing: "transfer-encoding: chunked", body: HELLO_CHUNKED }),
+        case("body-no-cl", "POST", &[], &[SMUGGLED], Forwarded { framing: "transfer-encoding: chunked", body: SMUGGLED_CHUNKED }),
     ]);
 }
+}
 
+crate::h3_both_paths! {
 /// A DATA frame longer than what is left of the `content-length` is refused when its
 /// header arrives (HAProxy adds the frame length before taking any payload): none of its
 /// payload reaches the server, even the part that would have completed the length.
-#[test]
 fn an_oversized_data_frame_is_refused_before_its_payload() {
     let mut bytes = headers("POST", "/oversized-frame", &[("content-length", "3")]);
     bytes.extend_from_slice(&data_header(43));
@@ -430,9 +440,10 @@ fn an_oversized_data_frame_is_refused_before_its_payload() {
         Case { name: "streamed-te", bytes: streamed, fin: false, expect: Refused(400) },
     ]);
 }
+}
 
+crate::h3_both_paths! {
 /// The response side: a chunked HTTP/1 response comes back as its payload in DATA frames.
-#[test]
 fn a_chunked_response_arrives_as_its_payload() {
     let (be, _rec) = backend();
     let ibex = ibex(be);
@@ -443,12 +454,13 @@ fn a_chunked_response_arrives_as_its_payload() {
     assert_eq!(status(&resp), Some(200));
     assert_eq!(body(&resp), b"hello world");
 }
+}
 
+crate::h3_both_paths! {
 /// The relay frames the engine's HTTP/1 response for HTTP/3 the way the engine framed it
 /// (`txn::response_framing`, every `Transfer-Encoding` line as one list): a single line
 /// searched for "chunked" read a response the engine forwards as close-delimited as
 /// chunked, and the last of several lines decided alone.
-#[test]
 fn the_relay_reads_a_response_as_the_engine_framed_it() {
     use ibex_rt::h3_relay::ResponseConv;
     let raw = b"5\r\nhello\r\n0\r\n\r\n";
@@ -478,4 +490,5 @@ fn the_relay_reads_a_response_as_the_engine_framed_it() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
 }

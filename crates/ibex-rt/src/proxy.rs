@@ -315,6 +315,9 @@ impl QueueWait {
 pub enum ClientSide {
     Fd(OwnedFd),
     H2Child,
+    /// The owner of an HTTP/3 connection (T509): its client is a QUIC connection, read and
+    /// written through its listener in the owner's pass ([`H3Owner`]), not a socket of its own.
+    Quic,
 }
 
 impl ClientSide {
@@ -322,7 +325,7 @@ impl ClientSide {
     fn fd(&self) -> Option<BorrowedFd<'_>> {
         match self {
             ClientSide::Fd(f) => Some(f.as_fd()),
-            ClientSide::H2Child => None,
+            ClientSide::H2Child | ClientSide::Quic => None,
         }
     }
 
@@ -330,7 +333,7 @@ impl ClientSide {
     fn recv(&self, xprt: &mut ClientXprt, dst: &mut [u8]) -> io::Result<Io> {
         match self {
             ClientSide::Fd(f) => xprt.recv(f.as_fd(), dst),
-            ClientSide::H2Child => Ok(Io::WouldBlock),
+            ClientSide::H2Child | ClientSide::Quic => Ok(Io::WouldBlock),
         }
     }
 
@@ -338,7 +341,7 @@ impl ClientSide {
     fn send(&self, xprt: &mut ClientXprt, src: &[u8]) -> io::Result<Io> {
         match self {
             ClientSide::Fd(f) => xprt.send(f.as_fd(), src),
-            ClientSide::H2Child => Ok(Io::WouldBlock),
+            ClientSide::H2Child | ClientSide::Quic => Ok(Io::WouldBlock),
         }
     }
 
@@ -358,6 +361,18 @@ pub enum H2Role {
     Child(H2Child),
 }
 
+/// The owner of an HTTP/3 connection (T509, `docs/design/h3-engine-2026-10-26.md` 2.2):
+/// its mux, and which connection of which QUIC listener it is. Its streams are its
+/// children as an h2 owner's ([`H2Owner`]).
+pub struct H3Owner {
+    pub mux: ibex_alloc::PoolBox<ibex_proto::mux_h3::H3MuxContext>,
+    /// The index of the QUIC listener in the engine's list.
+    pub listener: u32,
+    pub conn: ibex_quic::ConnectionId,
+    /// A response's DATA staged on its way to the mux, kept from one response to the next.
+    pub body_scratch: Vec<u8>,
+}
+
 /// The owner's side: its children.
 #[derive(Default)]
 pub struct H2Owner {
@@ -372,6 +387,10 @@ pub struct H2Owner {
     pub next_child: usize,
     /// The memory a stream that is over held for its request, for the next (T437).
     pub spare: H2ChildSpare,
+    /// The owner of an HTTP/3 connection: its mux and connection (T509). Kept here, in the
+    /// boxed role, not on the session: every client connection pays for a session's
+    /// fields (`struct_sizes::session_entry_stays_small`, T511).
+    pub h3: Option<Box<H3Owner>>,
 }
 
 /// What a stream's session holds of its request and gives back to its connection when it
@@ -964,6 +983,19 @@ impl TcpSession {
         }
     }
 
+    /// The owner of an HTTP/3 connection (T509), in its role.
+    #[must_use]
+    pub fn h3_owner(&self) -> Option<&H3Owner> {
+        self.h2_owner().and_then(|o| o.h3.as_deref())
+    }
+
+    pub fn h3_owner_mut(&mut self) -> Option<&mut H3Owner> {
+        match self.h2_role.as_deref_mut() {
+            Some(H2Role::Owner(o)) => o.h3.as_deref_mut(),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn h2_owner(&self) -> Option<&H2Owner> {
         match self.h2_role.as_deref() {
@@ -974,7 +1006,13 @@ impl TcpSession {
 
     /// The owner's side of an HTTP/2 connection, made on first use (one `Box` a connection).
     pub fn h2_owner_mut(&mut self) -> Option<&mut H2Owner> {
-        self.h2_ctx.as_ref()?;
+        if self.h2_ctx.is_none() {
+            // An HTTP/3 connection's owner has its role from its start.
+            return match self.h2_role.as_deref_mut() {
+                Some(H2Role::Owner(o)) if o.h3.is_some() => Some(o),
+                _ => None,
+            };
+        }
         // A child has no `h2_ctx`: the role is an owner's.
         let H2Role::Owner(o) = self.h2_role.get_or_insert_with(|| Box::new(H2Role::Owner(H2Owner::default()))).as_mut() else { return None };
         Some(o)
@@ -1503,7 +1541,11 @@ impl TcpSession {
     /// of its own; the mux refuses those over it.
     #[must_use]
     pub fn h2_max_children(&self) -> usize {
-        self.h2_ctx.as_ref().map_or(0, |h| h.max_concurrent_streams as usize)
+        match (&self.h2_ctx, self.h3_owner()) {
+            (Some(h), _) => h.max_concurrent_streams as usize,
+            (None, Some(h3)) => h3.mux.max_concurrent as usize,
+            (None, None) => 0,
+        }
     }
 
     /// A stream with its request in, waiting for its turn, and the turn free: as many
