@@ -173,7 +173,7 @@ impl Rig {
     }
 }
 
-/// The engine's allocations over `n` requests on one connection, after five warm-up ones: GETs,
+/// The engine's allocations over `n` requests on one connection, after [`WARMUP`] ones: GETs,
 /// or POSTs of `body` (one DATA frame) when it is not empty.
 fn h3_allocations(n: usize, body: &[u8]) -> usize {
     let running = Arc::new(AtomicBool::new(true));
@@ -191,7 +191,7 @@ fn h3_allocations(n: usize, body: &[u8]) -> usize {
     if !body.is_empty() {
         ibex_proto::mux_h3::encode_frame(&mut req, 0x00, body);
     }
-    for _ in 0..5 {
+    for _ in 0..WARMUP {
         rig.request(&req);
     }
     rig.engine_allocs = 0;
@@ -205,17 +205,23 @@ fn h3_allocations(n: usize, body: &[u8]) -> usize {
     allocs
 }
 
-/// What is left a request (T512, `tasks/T512-progress.md`): quinn-proto's per-stream state, which
-/// Ibex cannot pool without a fork (`tradeoff.md` 6.30). Measured 2026-10-31: 101-104 for
-/// 20 requests, 867-875 for 220, 3.8-3.9 a request (T509 measured 23).
-const PINNED: usize = 4;
+/// Allocations a steady-state request may make: none (T543). T512 left 3.8-3.9 a request, all
+/// quinn-proto's per-stream state (`tradeoff.md` 6.30: 101-104 for 20 requests, 867-875 for 220);
+/// T543's patches to the vendored quinn-proto (`vendor/README.md`) reuse that state per connection.
+const PINNED: usize = 0;
+
+/// Requests before the counted window (T543; T512 had 5). What a connection allocates once,
+/// not a request: the first spare `Send`/`Recv`/`Retransmits` boxes, and quinn's first 1-RTT key
+/// update, which comes at a random packet in 10..1000 (`Connection::new` `key_phase_size`; the
+/// next one only near the AEAD confidentiality limit). 500 requests are well past both.
+const WARMUP: usize = 500;
 
 /// The count for `n` more requests over the count for 20 is at most [`PINNED`] a request.
 fn assert_pinned(what: &str, body: &[u8]) {
     let few = h3_allocations(20, body);
     let many = h3_allocations(220, body);
-    println!("[MEASUREMENT T512] h3 mux allocations, {what}: 20 requests {few}, 220 requests {many}");
-    assert!(many.saturating_sub(few) <= 200 * PINNED, "{} allocations for 200 {what}s ({few} for 20, {many} for 220); pinned at {PINNED} a request, target 0", many.saturating_sub(few));
+    println!("[MEASUREMENT T543] h3 mux allocations, {what}: 20 requests {few}, 220 requests {many}");
+    assert!(many.saturating_sub(few) <= 200 * PINNED, "{} allocations for 200 {what}s ({few} for 20, {many} for 220); pinned at {PINNED} a request", many.saturating_sub(few));
 }
 
 /// T509 (design section 6): the target is a steady-state HTTP/3 request through the mux that
