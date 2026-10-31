@@ -640,6 +640,10 @@ fn absolute_targets_userinfo_empty_paths_and_other_schemes() {
     let mut c = ready();
     let w = request(&mut c, b"GET h:8080/x HTTP/1.1\r\n\r\n");
     assert_eq!(&w[9..], &[&[0x82, 0x87, 0x44, 8][..], b"h:8080/x"].concat()[..], "colon, no //");
+    // No colon at all: the target is the path too.
+    let mut c = ready();
+    let w = request(&mut c, b"GET x HTTP/1.1\r\n\r\n");
+    assert_eq!(&w[9..], &[0x82, 0x87, 0x44, 1, b'x'], "no colon");
 }
 
 #[test]
