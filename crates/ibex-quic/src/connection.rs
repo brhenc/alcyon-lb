@@ -13,10 +13,19 @@ pub const MAX_CID_LEN: usize = 20;
 /// Under RFC 9000 §5.1, connection IDs are up to 20 bytes long. A QUIC connection
 /// is identified by its Connection ID, allowing connections to survive client address
 /// changes (NAT rebinding, mobile handover) without resetting the connection.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ConnectionId {
     bytes: [u8; MAX_CID_LEN],
     len: u8,
+}
+
+/// The ID's own bytes, in one write (T543): the derived `Hash` fed SipHash 29 bytes in three
+/// writes on every lookup in the listener's maps. Equal IDs have equal bytes, so `Eq` holds;
+/// the hash stays the maps' keyed SipHash, as the client chooses some of these IDs.
+impl std::hash::Hash for ConnectionId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write(self.as_bytes());
+    }
 }
 
 impl ConnectionId {
@@ -214,4 +223,50 @@ pub enum QuicConnectionState {
     Drained,
     /// Connection is closed.
     Closed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionId;
+    use std::hash::{Hash, Hasher};
+
+    /// Counts what a value feeds its hasher.
+    #[derive(Default)]
+    struct Count {
+        writes: usize,
+        bytes: usize,
+    }
+
+    impl Hasher for Count {
+        fn finish(&self) -> u64 {
+            0
+        }
+        fn write(&mut self, b: &[u8]) {
+            self.writes += 1;
+            self.bytes += b.len();
+        }
+    }
+
+    /// T543: a connection ID is hashed (SipHash, the client chooses some of them) in one write
+    /// of its own bytes; the derived `Hash` fed 29 bytes in three writes (the array's length
+    /// prefix, all 20 bytes, `len`), ~2-3k instructions per h3 request over the listener's maps.
+    #[test]
+    fn a_connection_id_feeds_its_hasher_its_own_bytes_once() {
+        let cid = ConnectionId::new(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut h = Count::default();
+        cid.hash(&mut h);
+        assert_eq!((h.writes, h.bytes), (1, 8));
+    }
+
+    /// Equal IDs hash equally; IDs that differ only past `len` (from `from_parts`) are unequal
+    /// and may collide, as `Eq` requires nothing more.
+    #[test]
+    fn equal_connection_ids_hash_equally() {
+        let s = std::collections::hash_map::RandomState::new();
+        let a = ConnectionId::new(&[9, 8, 7]);
+        let b = ConnectionId::from_parts([9, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 3);
+        assert_eq!(a, b);
+        assert_eq!(std::hash::BuildHasher::hash_one(&s, a), std::hash::BuildHasher::hash_one(&s, b));
+        assert_ne!(std::hash::BuildHasher::hash_one(&s, a), std::hash::BuildHasher::hash_one(&s, ConnectionId::new(&[9, 8, 7, 0])));
+    }
 }
