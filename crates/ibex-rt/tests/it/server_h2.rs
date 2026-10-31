@@ -31,9 +31,9 @@ use tempfile::TempDir;
 const BODY: &str = "hello from nghttpd\n";
 
 /// nghttpd, stopped when dropped; its `-v` log lines collected.
-struct Nghttpd {
+pub(crate) struct Nghttpd {
     child: Child,
-    addr: SocketAddr,
+    pub(crate) addr: SocketAddr,
     log: Arc<Mutex<Vec<String>>>,
     _dir: TempDir,
 }
@@ -62,7 +62,7 @@ impl Nghttpd {
     }
 }
 
-fn have_nghttpd() -> bool {
+pub(crate) fn have_nghttpd() -> bool {
     let ok = Command::new("nghttpd").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
     if !ok {
         eprintln!("nghttpd not found: skipped");
@@ -72,7 +72,7 @@ fn have_nghttpd() -> bool {
 
 /// nghttpd on a reserved port: TLS with a self-signed certificate, or `--no-tls`; `extra`
 /// options (`--echo-upload`, `--trailer=...`).
-fn nghttpd(tls: bool, extra: &[&str]) -> Nghttpd {
+pub(crate) fn nghttpd(tls: bool, extra: &[&str]) -> Nghttpd {
     let dir = TempDir::new().expect("dir");
     std::fs::write(dir.path().join("index.html"), BODY).expect("index");
     let port = common::reserve_port();
@@ -111,12 +111,17 @@ struct Proxy {
 }
 
 fn proxy(backend: &str) -> Proxy {
+    proxy_bind(backend, "")
+}
+
+/// As `proxy`, with `bind_opts` on the frontend's `bind` line (`proto h2`).
+fn proxy_bind(backend: &str, bind_opts: &str) -> Proxy {
     let dir = TempDir::new().expect("dir");
     let fe = common::reserve_addr();
     let cfg = format!(
         "global\n  log stdout format raw local0\n  stats socket {}/stats.sock\n\
          defaults\n  mode http\n  log global\n  option httplog\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
-         frontend f\n  bind {fe}\n  default_backend b\n\
+         frontend f\n  bind {fe} {bind_opts}\n  default_backend b\n\
          backend b\n{backend}\n",
         dir.path().display()
     );
@@ -467,6 +472,49 @@ fn request_and_response_trailers_cross_h2() {
     assert_eq!(data, b"abc");
     assert!(trailers.contains("grpc-status: 0"), "the response trailer reaches the h1 client: {trailers:?}");
     assert!(wait_for(|| srv.saw("x-req-trailer: yes")), "the request trailer reached the server as HEADERS");
+}
+
+/// An h2 server's response trailer behind a TLS `alpn h2` server reaches an h1 client.
+#[test]
+fn response_trailers_cross_tls_h2_server() {
+    if !have_nghttpd() {
+        return;
+    }
+    let srv = nghttpd(true, &["--trailer=grpc-status: 0", "--no-content-length"]);
+    let p = proxy(&format!("  server s {} ssl verify none alpn h2", srv.addr));
+    let mut s = TcpStream::connect(p.fe).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    s.write_all(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\nTE: trailers\r\nConnection: close\r\n\r\n").unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let end = out.windows(4).position(|w| w == b"\r\n\r\n").expect("a head");
+    let (data, trailers) = dechunk(&out[end + 4..]);
+    assert_eq!(data, BODY.as_bytes());
+    assert!(trailers.contains("grpc-status: 0"), "the response trailer reaches the h1 client: {trailers:?}");
+}
+
+/// T549: the same through an **h2 client** (`bind ... proto h2`, nghttp as the client).
+///
+/// `HAProxy` 3.5-dev8 on the same topology (`nghttp -v http://fe/index.html`, nghttpd
+/// `--trailer='grpc-status: 0' --no-content-length` behind `proto h2`): HEADERS (flags 0x04,
+/// `:status: 200`, `trailer: grpc-status`), DATA (3 bytes), then a second HEADERS frame,
+/// flags 0x05 (END_STREAM | END_HEADERS), `grpc-status: 0`. Identical to what nghttpd sends
+/// direct. Ibex's h2 frontend drops response trailers (`tradeoff.md` 6.31 row 8): this test
+/// is red until that is fixed.
+#[test]
+fn response_trailers_reach_an_h2_client() {
+    if !have_nghttpd() || Command::new("nghttp").arg("--version").stdout(Stdio::null()).status().is_err() {
+        eprintln!("nghttpd or nghttp not found: skipped");
+        return;
+    }
+    let srv = nghttpd(false, &["--trailer=grpc-status: 0", "--no-content-length"]);
+    let p = proxy_bind(&format!("  server s {} proto h2", srv.addr), "proto h2");
+    let out = Command::new("nghttp").arg("-v").arg(format!("http://{}/index.html", p.fe)).output().expect("nghttp");
+    let log = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(log.contains("recv (stream_id=1) :status: 200"), "{log}");
+    let trailing = log.lines().skip_while(|l| !l.contains("recv DATA frame")).skip(1).collect::<Vec<_>>().join("\n");
+    assert!(trailing.contains("recv (stream_id=1) grpc-status: 0"), "a trailing HEADERS frame with grpc-status: 0 after the DATA:\n{log}");
+    assert!(trailing.contains("flags=0x05"), "the trailing HEADERS frame ends the stream:\n{log}");
 }
 
 /// The `show stat` field `field` of server `b/s`.
