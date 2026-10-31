@@ -48,7 +48,7 @@ impl Drop for Rig {
 fn start(tag: &str) -> Rig {
     let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
     let quic = common::reserve_addr();
-    let dir = std::env::temp_dir().join(format!("shq-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("shq-{tag}-{}-{}", common::h3_path_name(), std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
     let sock = dir.join("cli.sock").display().to_string();
@@ -136,7 +136,7 @@ fn rows(out: &str) -> Vec<&str> {
     l
 }
 
-#[test]
+crate::h3_both_paths! {
 fn empty_and_connections() {
     let r = start("rows");
     for arg in ["", " oneline", " all", " be", " clo"] {
@@ -172,8 +172,9 @@ fn empty_and_connections() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+}
 
-#[test]
+crate::h3_both_paths! {
 fn help_errors_and_refusals() {
     let r = start("msgs");
     let help = cli(&r.sock, "show quic help");
@@ -193,4 +194,5 @@ fn help_errors_and_refusals() {
         assert!(out.starts_with(&format!("'show quic {named}' is not supported by Ibex")), "{cmd}: {out}");
         assert!(!out.contains(HEADER), "{cmd}: {out}");
     }
+}
 }

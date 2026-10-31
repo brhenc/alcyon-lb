@@ -90,6 +90,7 @@ mod timer_overflow;
 mod tls_versions;
 mod tune_maxaccept;
 mod quic_retry;
+mod quic_tune;
 mod userlist_hashes;
 mod wait_for_body;
 mod memory_prealloc;

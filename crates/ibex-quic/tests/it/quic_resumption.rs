@@ -16,43 +16,44 @@ use std::time::{Duration, Instant};
 
 use ibex_quic::{QuicConfig, QuicEndpoint, QuicTransport, TransportEvent, ALPN_H3};
 
-/// Accepts any certificate, and counts the certificates it was asked about.
+/// Accepts any certificate, and counts the certificates it was asked about (rustls 0.24,
+/// T534: the client is Ibex's).
 #[derive(Debug)]
-struct Counting(Arc<rustls::crypto::CryptoProvider>, AtomicUsize);
+struct Counting(Arc<ibex_tls::tcp::rustls24::crypto::CryptoProvider>, AtomicUsize);
 
-impl rustls::client::danger::ServerCertVerifier for Counting {
-    fn verify_server_cert(
+impl ibex_tls::tcp::rustls24::client::danger::ServerVerifier for Counting {
+    fn verify_identity<'a>(
         &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        identity: &ibex_tls::tcp::rustls24::client::danger::ServerIdentity<'a, '_>,
+    ) -> Result<ibex_tls::tcp::rustls24::crypto::VerifiedIdentity<'a>, ibex_tls::tcp::rustls24::Error> {
         self.1.fetch_add(1, Ordering::Relaxed);
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+        Ok(ibex_tls::tcp::rustls24::crypto::VerifiedIdentity::assertion(identity.identity.clone()))
     }
 
     fn verify_tls12_signature(
         &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        input: &ibex_tls::tcp::rustls24::client::danger::SignatureVerificationInput<'_>,
+    ) -> Result<ibex_tls::tcp::rustls24::client::danger::HandshakeSignatureValid, ibex_tls::tcp::rustls24::Error> {
+        ibex_tls::tcp::rustls24::crypto::verify_tls12_signature(input, &self.0.signature_verification_algorithms)
     }
 
     fn verify_tls13_signature(
         &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        input: &ibex_tls::tcp::rustls24::client::danger::SignatureVerificationInput<'_>,
+    ) -> Result<ibex_tls::tcp::rustls24::client::danger::HandshakeSignatureValid, ibex_tls::tcp::rustls24::Error> {
+        ibex_tls::tcp::rustls24::crypto::verify_tls13_signature(input, &self.0.signature_verification_algorithms)
     }
 
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+    fn supported_verify_schemes(&self) -> Vec<ibex_tls::tcp::rustls24::crypto::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+
+    fn request_ocsp_response(&self) -> bool {
+        false
+    }
+
+    fn hash_config(&self, h: &mut dyn std::hash::Hasher) {
+        h.write(b"ibex-test:counting");
     }
 }
 
@@ -111,18 +112,18 @@ fn a_client_coming_back_resumes_its_session() {
     let server_config = QuicConfig::new().load_server_config_from_pem(pem).expect("load cert");
     let mut server = QuicEndpoint::with_server_config(server_config).expect("server endpoint");
 
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = ibex_tls::provider::of(ibex_config::TlsCryptoProvider::Ring, false, true);
     let verifier = Arc::new(Counting(Arc::clone(&provider), AtomicUsize::new(0)));
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("protocols")
+    let mut tls = ibex_tls::tcp::rustls24::ClientConfig::builder(provider)
         .dangerous()
-        .with_custom_certificate_verifier(Arc::clone(&verifier) as Arc<dyn rustls::client::danger::ServerCertVerifier>)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![ALPN_H3.to_vec()];
-    let crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls)).expect("client crypto");
+        .with_custom_certificate_verifier(Arc::clone(&verifier) as Arc<dyn ibex_tls::tcp::rustls24::client::danger::ServerVerifier>)
+        .with_no_client_auth()
+        .expect("client");
+    tls.alpn_protocols = vec![ALPN_H3.to_vec().into()];
+    let crypto = ibex_quic::crypto::QuicClientConfig::new(Arc::new(tls), ibex_config::TlsCryptoProvider::Ring).expect("client crypto");
     let config = quinn_proto::ClientConfig::new(Arc::new(crypto));
-    let mut client = quinn_proto::Endpoint::new(Arc::new(quinn_proto::EndpointConfig::default()), None, false, None);
+    let reset = Arc::new(ibex_quic::crypto::ResetKey::new().expect("reset key"));
+    let mut client = quinn_proto::Endpoint::new(Arc::new(quinn_proto::EndpointConfig::new(reset)), None, false, None);
 
     assert!(connect_once(&mut server, &mut client, &config, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 55601)));
     assert_eq!(verifier.1.load(Ordering::Relaxed), 1, "the first handshake is a full one");

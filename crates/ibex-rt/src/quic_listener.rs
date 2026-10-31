@@ -58,6 +58,22 @@ pub fn prebind(addr: SocketAddr, workers: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// The half-open connection count the workers' endpoints on `addr` share (T523): `HAProxy`
+/// counts `half_open_conn` per frontend and thread group, so its Retry threshold weighs the
+/// half-open connections of every thread. One per address, made by the first worker that
+/// asks; kept for the process's life (one `u64` per QUIC bind).
+static HALF_OPEN: std::sync::Mutex<Vec<(SocketAddr, Arc<std::sync::atomic::AtomicU64>)>> = std::sync::Mutex::new(Vec::new());
+
+fn shared_half_open(addr: SocketAddr) -> Arc<std::sync::atomic::AtomicU64> {
+    let mut all = HALF_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, c)) = all.iter().find(|(a, _)| *a == addr) {
+        return Arc::clone(c);
+    }
+    let c = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    all.push((addr, Arc::clone(&c)));
+    c
+}
+
 /// The socket [`prebind`] bound on `addr` for `worker`, if there is one.
 fn take_prebound(addr: SocketAddr, worker: usize) -> Option<DgramSocket> {
     let mut all = PREBOUND.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -117,6 +133,12 @@ pub struct QuicListener {
     /// `tune.ibex.h3-path mux` (T509): an admitted connection is served by an owner session
     /// of the engine through the h3 mux, not by the relay.
     mux: bool,
+    /// `tune.quic.fe.stream.max-total` (T525): the request streams one connection carries
+    /// before it is closed; 0 is no limit.
+    stream_max_total: u32,
+    /// Request streams done (their response acknowledged) per connection, kept only when
+    /// `stream_max_total` is set.
+    streams_done: HashMap<ConnectionId, u32>,
     /// The connections owner sessions serve, by connection.
     owned: HashMap<ConnectionId, OwnedConn>,
     /// Connections admitted since the engine last took them, each to get its owner.
@@ -245,11 +267,14 @@ impl QuicListener {
         // `bind_with_server_config` dropped `require_retry`, the Retry threshold and
         // `anti_amplification_factor`, so a stricter factor an operator asked for was
         // silently ignored.
-        let endpoint = QuicEndpoint::from_config(
+        let mut endpoint = QuicEndpoint::from_config(
             Arc::new(config.build_endpoint_config().map_err(|e| io::Error::other(e.to_string()))?),
             server_config,
             &config,
         );
+        if worker.is_some() {
+            endpoint.share_half_open(shared_half_open(addr));
+        }
         let socket = match worker.and_then(|w| take_prebound(addr, w)) {
             Some(s) => s,
             None => DgramSocket::bind(addr)?,
@@ -291,6 +316,8 @@ impl QuicListener {
             held: HashMap::new(),
             closed: Vec::new(),
             mux: false,
+            stream_max_total: 0,
+            streams_done: HashMap::new(),
             owned: HashMap::new(),
             new_owned: Vec::new(),
             wake: Vec::new(),
@@ -302,6 +329,13 @@ impl QuicListener {
     /// ([`QuicListener::take_new_owned`]), not by the relay.
     pub fn serve_by_mux(&mut self) {
         self.mux = true;
+    }
+
+    /// `tune.quic.fe.stream.max-total` (T525): a connection that has finished this many request
+    /// streams is closed with `H3_NO_ERROR` (`HAProxy` stops granting stream credit at that
+    /// number and ends the connection when they are done). 0 is no limit.
+    pub fn set_stream_max_total(&mut self, n: u32) {
+        self.stream_max_total = n;
     }
 
     /// Connections admitted since the last call, each for the engine to give an owner
@@ -792,6 +826,15 @@ impl QuicListener {
                 // A finished stream and a reset stream are both done with; the difference
                 // matters to the peer, not to our buffer bookkeeping.
                 TransportEvent::StreamFinished { conn_id, stream_id } => {
+                    // A client-initiated bidirectional stream (a request) is done once its
+                    // response is acknowledged: the last one the limit allows ends the connection.
+                    if self.stream_max_total != 0 && stream_id.0.trailing_zeros() >= 2 {
+                        let done = self.streams_done.entry(conn_id).or_default();
+                        *done += 1;
+                        if *done >= self.stream_max_total {
+                            self.endpoint.close_connection(conn_id, H3_NO_ERROR, b"");
+                        }
+                    }
                     if self.owned.get_mut(&conn_id).is_some_and(|oc| Self::acked(oc, stream_id.0)) {
                         self.owned_news(conn_id, None, None);
                     }
@@ -834,6 +877,7 @@ impl QuicListener {
                     }
                     self.h3.remove(&conn_id);
                     self.peers.remove(&conn_id);
+                    self.streams_done.remove(&conn_id);
                     for r in &mut self.relays {
                         if r.conn_id == conn_id {
                             r.done = true;
@@ -1192,6 +1236,7 @@ impl QuicListener {
         }
 
         let mut out: Vec<(ConnectionId, StreamId, Vec<u8>, bool)> = Vec::new();
+        let mut cancelled: Vec<(ConnectionId, StreamId)> = Vec::new();
         for r in &mut self.relays {
             if r.done {
                 continue;
@@ -1225,10 +1270,13 @@ impl QuicListener {
                     Ok(crate::raw::Io::WouldBlock) => break,
                     _ => {
                         // End of the engine's side: a response delimited by the close ends
-                        // here; one cut short gets a 502 if nothing of it went out yet.
+                        // here. One that never started is the request the engine dropped (a
+                        // reused server connection that closed under it, T517/T523): the
+                        // stream is reset with H3_REQUEST_CANCELLED, as the mux path resets
+                        // a stream that ends without its response and as `HAProxy` does.
                         r.done = true;
                         if r.resp.eof().is_err() && !r.resp.head_sent {
-                            frames = mux_h3::encode_response(502, &[], b"");
+                            cancelled.push((r.conn_id, r.stream_id));
                         }
                     }
                 }
@@ -1236,12 +1284,16 @@ impl QuicListener {
                     r.done = true;
                 }
             }
-            if !frames.is_empty() || r.done {
+            if (!frames.is_empty() || r.done) && !cancelled.last().is_some_and(|&(c, sid)| c == r.conn_id && sid == r.stream_id) {
                 out.push((r.conn_id, r.stream_id, frames, r.done));
             }
         }
         for (c, sid, frames, fin) in out {
             self.queue_out(c, sid, &frames, fin);
+        }
+        for (c, sid) in cancelled {
+            let _ = self.endpoint.reset_stream(c, sid, H3Error::RequestCancelled as u64);
+            self.outq.remove(&(c, sid));
         }
         let released = &mut self.released;
         self.relays.retain(|r| {

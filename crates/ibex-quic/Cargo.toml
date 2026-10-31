@@ -23,8 +23,10 @@ thiserror = { workspace = true }
 
 
 [dev-dependencies]
-# The test clients: quinn's own client on rustls 0.23 (rustls 0.24.0-dev.2 has no QUIC client).
-# Dev-only, so the features reach test builds and not the binary (resolver 2).
+# quinn's own QUIC client on rustls 0.23. No ibex-quic test uses it since T534: they run on
+# Ibex's client (`src/crypto/client.rs`, over rustls 0.24's `build_quic`). It stays until the
+# ibex-rt and ibex-proto tests, which still build quinn's rustls 0.23 client, move too. Dev-only,
+# so the features reach test builds and not the binary (resolver 2).
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
 rustls = { workspace = true }
 rcgen = "0.13"

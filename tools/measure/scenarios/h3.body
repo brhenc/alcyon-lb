@@ -1,0 +1,13 @@
+global
+    nbthread 1
+defaults
+    mode http
+    timeout client 10s
+    timeout server 10s
+    timeout connect 5s
+frontend fe
+    bind 127.0.0.1:@FE@ ssl crt @CRT@ alpn h2,http/1.1
+    bind quic4@127.0.0.1:@FE@ ssl crt @CRT@ alpn h3
+    default_backend be
+backend be
+    server s1 127.0.0.1:@BE@
