@@ -71,10 +71,7 @@ pub fn clean_value(value: &str) -> Option<String> {
         } else if contiguous && out_end == p {
             out_end = n;
         } else {
-            if contiguous {
-                out.extend_from_slice(&b[..out_end]);
-                contiguous = false;
-            }
+            // Not contiguous here: while it is, `out_end == p` and the branch above is taken.
             if !out.is_empty() {
                 out.push(b',');
             }
