@@ -517,6 +517,53 @@ fn response_trailers_reach_an_h2_client() {
     assert!(trailing.contains("flags=0x05"), "the trailing HEADERS frame ends the stream:\n{log}");
 }
 
+/// nghttp -v against an h2 frontend over a one-shot h1 server that sends `reply`: the log.
+fn nghttp_log_h1_server(reply: &'static [u8]) -> Option<String> {
+    if Command::new("nghttp").arg("--version").stdout(Stdio::null()).status().is_err() {
+        eprintln!("nghttp not found: skipped");
+        return None;
+    }
+    let ls = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = ls.local_addr().unwrap();
+    thread::spawn(move || {
+        for c in ls.incoming() {
+            let Ok(mut c) = c else { continue };
+            thread::spawn(move || {
+                let mut b = [0u8; 4096];
+                let _ = c.read(&mut b);
+                let _ = c.write_all(reply);
+                thread::sleep(Duration::from_millis(500));
+            });
+        }
+    });
+    let p = proxy_bind(&format!("  server s {addr}"), "proto h2");
+    let out = Command::new("nghttp").arg("-v").arg(format!("http://{}/x", p.fe)).output().expect("nghttp");
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// T549, measured on `HAProxy` 3.5-dev8 with the same h1 server: a chunked response `abc` +
+/// trailer `grpc-status: 0` is HEADERS (0x04), DATA `abc` (0x00), HEADERS `grpc-status: 0`
+/// (0x05).
+#[test]
+fn a_chunked_h1_response_with_trailers_reaches_an_h2_client() {
+    let Some(log) = nghttp_log_h1_server(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\ngrpc-status: 0\r\n\r\n") else { return };
+    let frames: Vec<&str> = log.lines().filter(|l| l.contains("recv HEADERS frame") || l.contains("recv DATA frame")).collect();
+    assert_eq!(frames.len(), 3, "{log}");
+    assert!(frames[0].contains("flags=0x04") && frames[1].contains("DATA frame <length=3, flags=0x00") && frames[2].contains("flags=0x05"), "{log}");
+    assert!(log.contains("recv (stream_id=1) grpc-status: 0"), "{log}");
+}
+
+/// T549, measured on `HAProxy` 3.5-dev8: an empty chunked body with a trailer is HEADERS
+/// (0x04), then HEADERS `grpc-status: 0` (0x05); no DATA frame.
+#[test]
+fn trailers_with_an_empty_body_reach_an_h2_client_without_a_data_frame() {
+    let Some(log) = nghttp_log_h1_server(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n0\r\ngrpc-status: 0\r\n\r\n") else { return };
+    let frames: Vec<&str> = log.lines().filter(|l| l.contains("recv HEADERS frame") || l.contains("recv DATA frame")).collect();
+    assert_eq!(frames.len(), 2, "{log}");
+    assert!(frames[0].contains("HEADERS") && frames[0].contains("flags=0x04") && frames[1].contains("HEADERS") && frames[1].contains("flags=0x05"), "{log}");
+    assert!(log.contains("recv (stream_id=1) grpc-status: 0"), "{log}");
+}
+
 /// The `show stat` field `field` of server `b/s`.
 fn stat(p: &Proxy, field: &str) -> String {
     let Ok(mut s) = std::os::unix::net::UnixStream::connect(p.dir.path().join("stats.sock")) else { return String::new() };
