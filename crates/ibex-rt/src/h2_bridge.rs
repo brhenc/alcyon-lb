@@ -552,7 +552,8 @@ pub fn stream_is_reset(h2: &H2MuxContext, id: u32) -> bool {
 
 /// The transaction of a stream that was reset ends here: nothing more is sent on the
 /// stream, the server connection is reset, and the log reads `400 ... CH--` waiting for
-/// the response head, `CD--` during the body, `CQ` queued (`HAProxy` 3.5-dev8, T273 B).
+/// the response head with the request not all in (`400 ... CD--` with it all in, T521),
+/// `CD--` during the body, `CQ` queued (`HAProxy` 3.5-dev8, T273 B).
 /// What is left in either buffer is dropped, as it would be taken for the next stream's.
 /// The caller ends the transaction. `false` when there is none.
 pub fn abort_reset_stream(sess: &mut TcpSession) -> bool {
@@ -561,6 +562,10 @@ pub fn abort_reset_stream(sess: &mut TcpSession) -> bool {
     };
     let response_done = txn.rsp.is_done();
     let waiting = txn.rsp == MsgState::Waiting;
+    // A request the client had sent whole is aborted in the data phase (`CD--`), one it was
+    // still sending in the headers phase (`CH--`); both 400 while no response head came
+    // (`HAProxy` 3.5-dev8 on h2, 3.5-dev7 on h2 and h3, T521).
+    let request_done = txn.req.is_done();
     txn.srv_reusable = false;
     txn.rsp = MsgState::Done;
     if !response_done {
@@ -575,7 +580,7 @@ pub fn abort_reset_stream(sess: &mut TcpSession) -> bool {
             // A reply of the proxy's own keeps the status and ending it was given.
         } else if waiting {
             sess.log.status = Some(400);
-            sess.log.term = Some(*b"CH");
+            sess.log.term = Some(if request_done { *b"CD" } else { *b"CH" });
         } else {
             sess.log.term = Some(*b"CD");
         }

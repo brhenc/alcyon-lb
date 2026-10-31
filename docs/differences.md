@@ -407,7 +407,9 @@ Measured on HAProxy 3.5-dev7 with QUIC (aioquic client) and, for h2, 3.5-dev8 (c
 - **Interim responses (`100`, `103`) to an h3 client.** HAProxy 3.5-dev7 sends the interim
   HEADERS **with the FIN**, which ends the stream: the final response never arrives (`103`
   from the server, then `200`; `expect: 100-continue`). When the server's `103` and `200` come
-  in one segment it aborts (`BUG_ON htx.c:391`, SIGILL). Ibex (mux path) follows RFC 9114 4.1:
+  in one segment it aborts (`BUG_ON htx.c:391`, SIGILL). Both are an HAProxy 3.5-dev regression
+  fixed upstream by 76454cbbf (in 3.5-dev8; 3.0/3.2 unaffected): a QUIC oracle from current master
+  forwards `103` then `200` as Ibex does. Ibex (mux path) follows RFC 9114 4.1:
   an interim HEADERS without FIN, then the final response; both in one segment are forwarded.
   The relay path (the default until slice H5) drops interim responses and response trailers.
   `%B` of such a request: HAProxy counts the interim head (`B=119` for a 103 with one `link`
@@ -422,6 +424,15 @@ Measured on HAProxy 3.5-dev7 with QUIC (aioquic client) and, for h2, 3.5-dev8 (c
 - **CONNECT** under the mux is reset with `H3_REQUEST_REJECTED` (0x10b), extended CONNECT and a
   `te` other than `trailers` with `H3_MESSAGE_ERROR` (0x10e), the connection staying usable, as
   HAProxy. The relay answers a CONNECT with a 400 and no reset.
+
+## The HTTP/3 relay has no connection timers (T521, until H5)
+
+HAProxy 3.5-dev7 ends an HTTP/3 connection with a GOAWAY and `CONNECTION_CLOSE H3_NO_ERROR` at
+`timeout http-request` from its start (no request yet) or from a partial head's stream start, and
+at `timeout http-keep-alive` (else `http-request`) from the end of its last stream
+(`qcc_refresh_timeout`). The mux path does the same (`h3_mux_drain.rs`). On the relay path (the
+default) only quinn's 30 s transport idle timeout ends a connection that sends nothing or a
+partial head (RV-16). Gone with the relay, slice H5.
 
 ## `tune.ibex.zero-spares on|off`: an Ibex-only global keyword (S1)
 

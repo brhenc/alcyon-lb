@@ -244,6 +244,25 @@ fn client_reset_while_waiting_for_the_response_head() {
     assert_next_stream_served(&mut s, &mut buf);
 }
 
+/// T521: the request whole (`POST` with END_STREAM, no body), the client resets the stream while the
+/// server has not answered: `HAProxy` 3.5-dev8 (and 3.5-dev7 on h2 and h3) logs `400 0 - -
+/// CD--`, not the `CH--` of a request cut short above.
+#[test]
+fn client_reset_of_a_whole_request_while_waiting_for_the_response_head() {
+    let (_ibex, fe, rx, log) = start(false);
+    let mut s = connect(fe);
+    let mut buf = Vec::new();
+    s.write_all(&frame(1, 5, 1, &head("POST", "/a"))).expect("head");
+    thread::sleep(Duration::from_millis(200));
+    s.write_all(&frame(3, 0, 1, &8u32.to_be_bytes())).expect("rst_stream cancel");
+    let frames = read_frames(&mut s, &mut buf, Duration::from_millis(600), 99);
+    assert!(on_stream(&frames, 1).is_empty(), "nothing on the stream the client reset: {frames:?}");
+    assert_server_aborted(&rx);
+    let line = log_line(&log);
+    assert!(line.contains(" 400 0 - - CD-- "), "{line}");
+    assert_next_stream_served(&mut s, &mut buf);
+}
+
 #[test]
 fn stream_error_after_dispatch_sends_nothing_after_the_rst() {
     let (_ibex, fe, rx, log) = start(false);

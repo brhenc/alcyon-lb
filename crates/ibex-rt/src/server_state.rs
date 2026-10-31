@@ -164,9 +164,13 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &ibex_config::Server, f: &[&str; M
     // The file's operational state is applied before its administrative one, so a server
     // stopped and in maintenance says it went DOWN; one the configuration disabled does not
     // (`srv_set_stopped` ignores a server in maintenance).
+    // An unresolved server (`init-addr none`) is already in maintenance here, but only because
+    // `HAProxy` puts it there after applying the file: the file stops a server that was up, and
+    // that is said (T522).
     if stopped && !cfg_cmaint {
         let down = ServerStatus::Down as u8;
-        if let Some((_, text)) = crate::srvlog::describe(p, i, before, down, crate::srvlog::Kind::Op, crate::srvlog::Cause::StateFile) {
+        let was = if p.server_rmaint(i) { ServerStatus::Up as u8 } else { before };
+        if let Some((_, text)) = crate::srvlog::describe(p, i, was, down, crate::srvlog::Kind::Op, crate::srvlog::Cause::StateFile) {
             crate::srvlog::stderr(false, &text);
         }
     }
