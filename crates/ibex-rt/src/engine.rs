@@ -7332,7 +7332,7 @@ fn eval_tcp_req_content_rules(
                 // T489: as `http-request do-resolve`, within the `inspect-delay`: at its end
                 // (or without one, `ACT_OPT_FINAL`) the rule gives up and nothing is asked.
                 // The rules run again from the first while they wait.
-                let held = sess.dr_wait.filter(|w| w.0 == rule_idx);
+                let held = crate::resolvers::dr_wait_unpack(sess.dr_wait).filter(|w| w.0 == rule_idx);
                 if can_wait {
                     let task = crate::resolvers::dr_task();
                     let step = with_rule_name(rc.expr.as_ref(), registry, &ctx, |name| match held {
@@ -7342,7 +7342,7 @@ fn eval_tcp_req_content_rules(
                     match step {
                         crate::resolvers::DrStep::Wait => {
                             if held.is_none() {
-                                sess.dr_wait = Some((rule_idx, std::time::Instant::now()));
+                                sess.dr_wait = crate::resolvers::dr_wait_pack(rule_idx, crate::resolvers::dr_mark());
                             }
                             return ContentEvalResult::Waiting;
                         }
@@ -7354,7 +7354,7 @@ fn eval_tcp_req_content_rules(
                     }
                 }
                 if held.is_some() {
-                    sess.dr_wait = None;
+                    sess.dr_wait = 0;
                 }
             }
             ibex_config::TcpReqContentAction::SetVarFmt { var_name, fmt: _ } => {
@@ -12478,6 +12478,7 @@ impl EngineDispatcher<'_> {
                         | ibex_config::HttpReqAction::ReplaceHeader { .. }
                         | ibex_config::HttpReqAction::ReplaceValue { .. }
                         | ibex_config::HttpReqAction::SetVar { .. }
+                        | ibex_config::HttpReqAction::DoResolve(_)
                         | ibex_config::HttpReqAction::SetVarFmt { .. }
                         | ibex_config::HttpReqAction::UnsetVar { .. }
                 );
@@ -12865,7 +12866,7 @@ impl EngineDispatcher<'_> {
                             crate::resolvers::DrStep::Wait if held.is_none_or(|w| !w.deadline.is_expired(now)) => {
                                 if held.is_none() {
                                     if let Some(t) = sess.txn.as_mut() {
-                                        t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline: now.add(DO_RESOLVE_WAIT_MS), tarpit: false, inspect: false, asked: Some(std::time::Instant::now()) });
+                                        t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline: now.add(DO_RESOLVE_WAIT_MS), tarpit: false, inspect: false, asked: Some(crate::resolvers::dr_mark()) });
                                     }
                                 }
                                 return Ok(RuleFlow::Suspend);

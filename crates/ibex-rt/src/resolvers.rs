@@ -1690,6 +1690,42 @@ fn leave_rmaint(req: &Req, fqdn: &str, proxies: &[Proxy], checks: &mut [ServerCh
 mod tests {
     use super::*;
 
+    /// T489: what `do-resolve` asks (`resolv_hostname_validation`) and the bounded cache.
+    #[test]
+    fn do_resolve_names_and_cache() {
+        let mut out = [0u8; DR_NAME_MAX];
+        assert_eq!(dr_name(b"A1.Test.", &mut out), Some(7));
+        assert_eq!(&out[..7], b"a1.test");
+        for bad in [&b""[..], b".", b"a..b", b"a b", &[b'a'; 64][..], &[b'a'; 255][..]] {
+            assert_eq!(dr_name(bad, &mut out), None, "{bad:?}");
+        }
+        let long: Vec<u8> = std::iter::repeat_n(&b"abcdefghi."[..], 25).flatten().copied().chain(*b"abcd").collect();
+        assert_eq!(dr_name(&long, &mut out), Some(254));
+        // One bucket of DR_WAYS: a fifth key evicts the oldest.
+        let mut c = Box::new(DrCache { buckets: vec![[None; DR_WAYS]; 1], seq: 0 });
+        let t0 = Instant::now();
+        let mut m = DrMsg::try_new_inner();
+        for i in 0..=DR_WAYS {
+            m.len = dr_name(format!("n{i}.test").as_bytes(), &mut m.name).expect("name");
+            m.hold = Duration::from_secs(10);
+            c.insert(&m, t0 + Duration::from_millis(u64::try_from(i).expect("i")));
+        }
+        assert!(c.find(0, false, b"n0.test").is_none());
+        assert!(c.find(0, false, b"n4.test").is_some());
+        // The same key again takes its own slot.
+        c.insert(&m, t0 + Duration::from_secs(1));
+        assert_eq!(c.buckets[0].iter().flatten().count(), DR_WAYS);
+        assert!(ibex_alloc::Poolable::footprint(&c) >= DR_WAYS * std::mem::size_of::<DrEntry>());
+        ibex_alloc::Poolable::reset(&mut c, false);
+        assert!(c.find(0, false, b"n4.test").is_none());
+        assert_eq!(dr_pick([ip("10.0.0.1"), ip("2001:db8::1")].into_iter(), false, Families::BOTH), Some(ip("2001:db8::1")));
+        assert_eq!(dr_wait_unpack(0), None);
+        assert_eq!(dr_wait_pack(300, 5), 0);
+        let m = dr_mark();
+        assert_eq!(dr_wait_unpack(dr_wait_pack(3, m)), Some((3, m)));
+        assert_eq!(dr_pick([ip("2001:db8::1")].into_iter(), true, Families::IPV4), None);
+    }
+
     /// Every `Received` bumps the counter of its name (`resolvers.c:2398-2486`).
     #[test]
     fn a_received_class_names_its_counter() {
@@ -1880,6 +1916,11 @@ pub struct DrMsg {
 }
 
 impl DrMsg {
+    #[cfg(test)]
+    fn try_new_inner() -> Box<Self> {
+        <Box<Self> as ibex_alloc::Poolable>::try_new().expect("message")
+    }
+
     /// The name, lower case as it was stored.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -1930,6 +1971,8 @@ struct DrEntry {
     /// waited for it read it by `at`).
     at: Instant,
     exp: Instant,
+    /// The cache's insert count when it came in: a waiting stream takes what came after it asked.
+    seq: u32,
 }
 
 /// Entries per bucket: a bucket is searched whole, and its oldest entry is replaced.
@@ -1938,6 +1981,8 @@ const DR_WAYS: usize = 4;
 /// A worker's `do-resolve` cache: buckets of [`DR_WAYS`] entries, sized once.
 pub struct DrCache {
     buckets: Vec<[Option<DrEntry>; DR_WAYS]>,
+    /// Answers inserted so far (wrapping).
+    seq: u32,
 }
 
 ibex_alloc::declare_pool!(
@@ -1956,7 +2001,7 @@ impl ibex_alloc::Poolable for Box<DrCache> {
 
     fn try_new() -> Option<Self> {
         let n = (DR_CACHE_SIZE.load(std::sync::atomic::Ordering::Relaxed).max(1)).div_ceil(DR_WAYS).next_power_of_two();
-        Some(Box::new(DrCache { buckets: vec![[None; DR_WAYS]; n] }))
+        Some(Box::new(DrCache { buckets: vec![[None; DR_WAYS]; n], seq: 0 }))
     }
 }
 
@@ -1992,7 +2037,8 @@ impl DrCache {
             .position(|e| e.as_ref().is_some_and(same))
             .or_else(|| b.iter().position(Option::is_none))
             .unwrap_or_else(|| (0..DR_WAYS).min_by_key(|&i| b[i].map(|e| e.at)).unwrap_or(0));
-        b[slot] = Some(DrEntry { hash: h, section: m.section, prefer_ipv4: m.prefer_ipv4, len: m.len, name: m.name, answer: m.answer, at: now, exp: now + m.hold });
+        self.seq = self.seq.wrapping_add(1);
+        b[slot] = Some(DrEntry { hash: h, section: m.section, prefer_ipv4: m.prefer_ipv4, len: m.len, name: m.name, answer: m.answer, at: now, exp: now + m.hold, seq: self.seq });
     }
 }
 
@@ -2085,11 +2131,36 @@ pub fn dr_start(section: u32, prefer_ipv4: bool, name: &[u8], task: ibex_sched::
     DrStep::Wait
 }
 
-/// A `do-resolve` rule woken after [`dr_start`] asked at `asked`: the answer if it came.
-pub fn dr_poll(section: u32, prefer_ipv4: bool, name: &[u8], asked: Instant) -> Option<Option<IpAddr>> {
+/// The mark a stream keeps when [`dr_start`] asked: [`dr_poll`] takes the answers after it.
+#[must_use]
+pub fn dr_mark() -> u32 {
+    with_cache(|c| c.seq).unwrap_or(0)
+}
+
+/// `TcpSession::dr_wait` for rule `rule` waiting since mark `mark`; 0 (nothing) when the rule
+/// index does not fit (a 255th rule waits no more than it would without the mark: it asks again).
+#[must_use]
+pub fn dr_wait_pack(rule: usize, mark: u32) -> u32 {
+    u32::try_from(rule + 1).ok().filter(|r| *r < 256).map_or(0, |r| r << 24 | (mark & 0x00ff_ffff))
+}
+
+/// The rule and mark of [`dr_wait_pack`], `None` for 0. The mark comes back as the full
+/// counter value nearest below the current one with the same low 24 bits.
+#[must_use]
+pub fn dr_wait_unpack(w: u32) -> Option<(usize, u32)> {
+    let rule = usize::try_from(w >> 24).ok().filter(|r| *r > 0)? - 1;
+    let low = w & 0x00ff_ffff;
+    let now = dr_mark();
+    Some((rule, now.wrapping_sub(now.wrapping_sub(low) & 0x00ff_ffff)))
+}
+
+/// A `do-resolve` rule woken after [`dr_start`] asked at mark `asked`: the answer if it came.
+pub fn dr_poll(section: u32, prefer_ipv4: bool, name: &[u8], asked: u32) -> Option<Option<IpAddr>> {
     let mut key = [0u8; DR_NAME_MAX];
     let len = dr_name(name, &mut key)?;
-    with_cache(|c| c.find(section, prefer_ipv4, &key[..usize::from(len)]).filter(|e| e.at >= asked).map(|e| e.answer)).flatten()
+    // Inserted after the mark, modulo the wrap (half the range is "after").
+    let after = |e: &&DrEntry| e.seq.wrapping_sub(asked).wrapping_sub(1) < u32::MAX / 2;
+    with_cache(|c| c.find(section, prefer_ipv4, &key[..usize::from(len)]).filter(after).map(|e| e.answer)).flatten()
 }
 
 /// The answer to a question this worker asked: into the cache, and the stream woken.
