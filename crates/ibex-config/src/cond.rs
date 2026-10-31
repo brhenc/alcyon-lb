@@ -38,7 +38,7 @@ fn feature(name: &str) -> bool {
     // TLS", not "OpenSSL is linked in" -- see the module comment. RUSTLS names the
     // backend so a condition can ask which one directly. THREAD is what `-vv` of the
     // reference says ("+THREAD"): Ibex runs worker threads.
-    matches!(name, "OPENSSL" | "RUSTLS" | "THREAD")
+    matches!(name, "OPENSSL" | "RUSTLS" | "THREAD" | "QUIC")
 }
 
 /// Compares dotted version strings, ignoring any `-dev`/`-rc` suffix.
@@ -720,9 +720,19 @@ mod tests {
         assert_eq!(eval("feature(THREAD) && feature(OPENSSL)"), Some(true));
     }
 
+    /// `haproxy -cc 'feature(QUIC)'` exits 0 on the QUIC-enabled reference build
+    /// (`~/reference/haproxy-quic/haproxy`, T528): Ibex serves QUIC/h3 (M2), so the 31 QUIC
+    /// reg-tests are run, not skipped. QUIC_OPENSSL_COMPAT and OPENSSL_WOLFSSL stay false there too.
+    #[test]
+    fn quic_is_reported_present() {
+        assert_eq!(eval("feature(QUIC)"), Some(true));
+        assert_eq!(eval("feature(QUIC_OPENSSL_COMPAT)"), Some(false));
+        assert_eq!(eval("feature(OPENSSL_WOLFSSL)"), Some(false));
+    }
+
     #[test]
     fn features_we_do_not_have_are_false() {
-        for f in ["LUA", "QUIC", "ZLIB", "SLZ", "LINUX_SPLICE", "OPENSSL_WOLFSSL"] {
+        for f in ["LUA", "QUIC_OPENSSL_COMPAT", "ZLIB", "SLZ", "LINUX_SPLICE", "OPENSSL_WOLFSSL"] {
             assert_eq!(eval(&format!("feature({f})")), Some(false), "{f}");
         }
     }
@@ -736,7 +746,7 @@ mod tests {
             ("feature(LUA)", false),
             (
                 "feature(QUIC) && !feature(QUIC_OPENSSL_COMPAT) && !feature(OPENSSL_WOLFSSL)",
-                false,
+                true,
             ),
             ("feature(ZLIB) || feature(SLZ)", false),
             ("feature(OPENSSL) && !ssllib_name_startswith(wolfSSL)", true),

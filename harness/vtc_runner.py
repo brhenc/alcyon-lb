@@ -1063,11 +1063,14 @@ def preprocess_haproxy_config(
             cur_section_name = sec_m.group(2) or ""
 
         # Check for bind "fd@${fe}" or bind fd@${fe}
-        bind_m = re.match(r"^(bind\s+)(?:\"(?:[a-zA-Z0-9_\$\{\}\+]*)fd@\${([a-zA-Z0-9_]+)}\"|(?:[a-zA-Z0-9_\$\{\}\+]*)fd@\${([a-zA-Z0-9_]+)})(.*)$", trimmed)
+        bind_m = re.match(r"^(bind\s+)(?:\"([a-zA-Z0-9_\$\{\}\+]*)fd@\${([a-zA-Z0-9_]+)}\"|([a-zA-Z0-9_\$\{\}\+]*)fd@\${([a-zA-Z0-9_]+)})(.*)$", trimmed)
         if bind_m:
             prefix = bind_m.group(1)
-            var_name = bind_m.group(2) or bind_m.group(3)
-            rest_opts = bind_m.group(4) or ""
+            var_name = bind_m.group(3) or bind_m.group(5)
+            rest_opts = bind_m.group(6) or ""
+            # `quic+fd@` is a UDP socket in vtest; it stays a QUIC bind (T528), not a TCP one.
+            bind_proto = macro_engine.expand(bind_m.group(2) if bind_m.group(2) is not None else bind_m.group(4))
+            bind_addr = "quic4@" if bind_proto.startswith("quic") else ""
 
             if var_name not in allocated_ports:
                 port = get_free_port()
@@ -1093,7 +1096,7 @@ def preprocess_haproxy_config(
             # the 'bind' keyword". That single rewrite accounted for 36 of 133 reg-test
             # failures, all of them the harness generating a config style neither proxy
             # would load.
-            out_lines.append(f"    bind 127.0.0.1:{port}{rest_opts}")
+            out_lines.append(f"    bind {bind_addr}127.0.0.1:{port}{rest_opts}")
             continue
 
         # Check if line is 'listen <name>' without address
@@ -1606,8 +1609,8 @@ class MockClientRunner:
                         for hk, hv in headers:
                             if hk.lower() == "host":
                                 has_host = True
-                            if hk.lower() == "content-length":
-                                has_cl = True
+                            if hk.lower() in ("content-length", "transfer-encoding"):
+                                has_cl = True  # a message that frames itself gets no second length
                             req_lines.append(f"{hk}: {hv}")
 
                         if not has_host and not nohost:
@@ -1644,6 +1647,18 @@ class MockClientRunner:
                                 )
                             if self.verbose:
                                 print(f"       {Color.DIM}[{self.client_id}] expect {expr} {op} {val} -> OK{Color.RESET}")
+
+                    elif cmd in ("chunkedlen", "chunked"):
+                        # One chunk of a chunked request body (the server side has the same two).
+                        if cmd == "chunkedlen":
+                            data = (b"0123456789abcdef" * (int(args[0]) // 16 + 1))[: int(args[0])]
+                        else:
+                            text = " ".join(args)
+                            if len(text) >= 2 and text[0] == text[-1] == '"':
+                                text = text[1:-1]
+                            data = decode_escapes(text).encode("latin1")
+                        writer.write(b"%x\r\n" % len(data) + data + b"\r\n")
+                        await writer.drain()
 
                     elif cmd == "send":
                         data_str = " ".join(args)
@@ -1844,12 +1859,40 @@ def install_exit_handlers() -> None:
         signal.signal(sig, on_signal)
 
 
+_QUIC_CLIENT_LINE = re.compile(r"(?:\bquic[46]?[@+]|\bproto\s+qmux\b|\balpn\s+h3\b)")
+_QUIC_SERVER_LINE = re.compile(r"(?:\bquic[46]?\+|\bquic[46]?@|\bproto\s+qmux\b|\balpn\s+h3\b)")
+DEFAULT_QUIC_CLIENT_BINARY = os.path.expanduser("~/reference/haproxy-quic/haproxy")
+
+
+def quic_roles(conf: str, env: Optional[Dict[str, str]] = None) -> Tuple[bool, bool]:
+    """(needs_quic_client, serves_quic) for one `haproxy` block's configuration (T528).
+
+    vtest does not speak h3, so a QUIC reg-test chains a second `haproxy` block as the client:
+    a `server`/`default-server` line to a QUIC address (`quic4@`), `ssl alpn h3` or
+    `proto qmux`. Ibex refuses those (QUIC towards servers is outside M2); a `bind` with the same
+    words is the side Ibex serves."""
+    needs = serves = False
+    if env:  # `"${VTC_SOCK_TYPE}+${h1_ssl_sock}"` after a `setenv VTC_SOCK_TYPE quic`
+        conf = re.sub(r"\$\{(\w+)\}", lambda m: env.get(m.group(1), m.group(0)), conf)
+    for raw in conf.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        word = line.split(None, 1)[0] if line else ""
+        if word in ("server", "default-server", "server-template") and _QUIC_CLIENT_LINE.search(line):
+            needs = True
+        elif word == "bind" and _QUIC_SERVER_LINE.search(line):
+            serves = True
+    return needs, serves
+
+
 class VtcExecutor:
     """Executes a parsed VTC test script against a target binary."""
 
-    def __init__(self, parser: VtcParser, target_binary: str, timeout: float = 15.0, verbose: bool = False):
+    def __init__(self, parser: VtcParser, target_binary: str, timeout: float = 15.0, verbose: bool = False,
+                 quic_client_binary: Optional[str] = None):
         self.parser = parser
         self.target_binary = os.path.abspath(target_binary)
+        # The binary that runs a `haproxy` block acting as the QUIC client (see quic_roles).
+        self.quic_client_binary = quic_client_binary
         self.timeout = timeout
         self.verbose = verbose
 
@@ -1870,6 +1913,47 @@ class VtcExecutor:
         self.proxies: Dict[str, subprocess.Popen] = {}
         self.temp_cfgs: List[str] = []
         self.groups: List[int] = []  # process groups of shell blocks, killed at the end of the test
+
+    def binary_for(self, conf: str) -> str:
+        """The binary that runs this `haproxy` block: the QUIC-capable reference for a block that
+        is itself the QUIC client, the binary under test for every other."""
+        if quic_roles(conf)[0] and self.quic_client_binary:
+            return os.path.abspath(self.quic_client_binary)
+        return self.target_binary
+
+    def _quic_client_is_target(self) -> bool:
+        """Run against the QUIC-capable reference itself (the control run): no routing."""
+        q = self.quic_client_binary
+        return bool(q) and os.path.realpath(q) == os.path.realpath(self.target_binary)
+
+    def _check_quic_routing(self, start_time: float, title: str) -> Optional["TestResult"]:
+        if self._quic_client_is_target():
+            return None
+        needs_client = False
+        env = dict(os.environ)
+        for d in self.parser.directives:
+            if d.cmd == "setenv" and len(d.args) >= 2:
+                env[d.args[0]] = d.args[1]
+            if d.cmd != "haproxy" or d.block_content is None:
+                continue
+            if any(o in ("-cli", "-mcli") for o in d.args[1:]):
+                continue
+            needs, serves = quic_roles(d.block_content, env)
+            if needs and serves:
+                return TestResult(
+                    test_name=title, file_path=self.parser.filepath, status="OUT_OF_SCOPE",
+                    elapsed_sec=time.monotonic() - start_time,
+                    error_message=f"haproxy {d.args[0]} both serves QUIC and needs the QUIC client "
+                                  "(QUIC towards servers is outside M2; one block cannot be split)")
+            needs_client = needs_client or needs
+        if needs_client and not (self.quic_client_binary and os.access(self.quic_client_binary, os.X_OK)):
+            return TestResult(
+                test_name=title, file_path=self.parser.filepath, status="FAIL",
+                elapsed_sec=time.monotonic() - start_time,
+                error_message="this test needs a QUIC client haproxy block, which Ibex refuses: set "
+                              "VTC_QUIC_CLIENT_BINARY to a QUIC-enabled haproxy "
+                              f"(got {self.quic_client_binary!r}; default {DEFAULT_QUIC_CLIENT_BINARY})")
+        return None
 
     def shell_env(self) -> Dict[str, str]:
         """Environment of `shell` blocks and `feature cmd`: vtest runs them with the
@@ -2017,6 +2101,10 @@ class VtcExecutor:
                             elapsed_sec=time.monotonic() - start_time,
                             error_message=f"Feature condition unsatisfied: {cmd_str}",
                         )
+
+            early = self._check_quic_routing(start_time, test_title)
+            if early is not None:
+                return early
 
             await asyncio.wait_for(self._run_directives(), timeout=self.timeout)
 
@@ -2286,6 +2374,7 @@ class VtcExecutor:
                     rewritten_cfg, alloc_ports = preprocess_haproxy_config(
                         block, self.macro_engine, haproxy_id
                     )
+                    binary = self.binary_for(rewritten_cfg)
 
                     # vtest writes `<tmpdir>/<id>/cfg` with three lines of its own (a
                     # `global` with two `stats socket`s) ahead of the test's block, and
@@ -2311,12 +2400,12 @@ class VtcExecutor:
                             print(f"       {Color.DIM}{_n:3d}| {_l}{Color.RESET}")
 
                     if conf_type == "-conf-OK":
-                        res = self.run_cmd([self.target_binary, "-c", "-f", cfg_path], text=True)
+                        res = self.run_cmd([binary, "-c", "-f", cfg_path], text=True)
                         if res.returncode != 0:
                             raise AssertionError(f"Config check failed (-conf-OK):\n{res.stderr}")
                         _note_assertion()
                     elif conf_type == "-conf-BAD":
-                        res = self.run_cmd([self.target_binary, "-c", "-f", cfg_path], text=True)
+                        res = self.run_cmd([binary, "-c", "-f", cfg_path], text=True)
                         if res.returncode == 0:
                             raise AssertionError(f"Config check unexpectedly succeeded (-conf-BAD) for {haproxy_id}")
                         want = (directive.expect_stderr or "").strip()
@@ -2331,7 +2420,7 @@ class VtcExecutor:
                             # in the foreground, as vtest runs it.
                             mw = [a for a in master_args if a in ("-W", "-Ws")]
                             proc = popen_tracked(
-                                [self.target_binary, *master_args, "-f", cfg_path, "-d"],
+                                [binary, *master_args, "-f", cfg_path, "-d"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                             )
@@ -2490,6 +2579,7 @@ async def run_suite(
     verbose: bool,
     fail_fast: bool = False,
     triage: Optional["TriageIndex"] = None,
+    quic_client_binary: Optional[str] = None,
 ) -> List[TestResult]:
     results: List[TestResult] = []
     triage = triage or TriageIndex()
@@ -2530,6 +2620,7 @@ async def run_suite(
             target_binary=binary_path,
             timeout=timeout,
             verbose=verbose,
+            quic_client_binary=quic_client_binary,
         )
 
         res = await executor.execute()
@@ -2638,6 +2729,10 @@ def main() -> None:
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose execution trace")
     parser.add_argument("--fail-fast", action="store_true", help="Stop suite execution on first failed test")
     parser.add_argument("--json", help="Export test results to specified JSON file")
+    parser.add_argument("--no-triage", action="store_true",
+                        help="Report the raw PASS/FAIL of every test, without data/regtests.json's "
+                             "OUT_OF_SCOPE reclassification (T528: the QUIC tests are triaged "
+                             "out, which hides what they do)")
 
     args = parser.parse_args()
 
@@ -2663,6 +2758,8 @@ def main() -> None:
             timeout=args.timeout,
             verbose=args.verbose,
             fail_fast=args.fail_fast,
+            triage=TriageIndex(os.devnull) if args.no_triage else None,
+            quic_client_binary=os.environ.get("VTC_QUIC_CLIENT_BINARY", DEFAULT_QUIC_CLIENT_BINARY),
         )
     )
     total_elapsed = time.monotonic() - suite_start
