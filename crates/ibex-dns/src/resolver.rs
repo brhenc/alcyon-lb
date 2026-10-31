@@ -498,6 +498,21 @@ impl Resolver {
     }
 }
 
+/// A name of an answer as text, lower case, its labels' bytes as they are (`resolv_dn_label_to_str`:
+/// no escaping, so `t*1.test` stays `t*1.test` and `srv_update_fqdn` can refuse it), with the
+/// final dot of a fully qualified name.
+fn name_text(n: &Name) -> String {
+    let mut out = String::new();
+    for l in n.iter() {
+        out.push_str(&String::from_utf8_lossy(&l.to_ascii_lowercase()));
+        out.push('.');
+    }
+    if !n.is_fqdn() {
+        out.pop();
+    }
+    out
+}
+
 /// `resolv_validate_dns_response` (resolvers.c:1052-1660) on a reply whose id matched `f`.
 /// Returns the verdict and the reply's question type (for the TCP fallback).
 fn validate(buf: &[u8], f: &InFlight, max_payload: usize, allow_truncated_srv: bool) -> (Verdict, u16) {
@@ -557,7 +572,7 @@ fn validate(buf: &[u8], f: &InFlight, max_payload: usize, allow_truncated_srv: b
             RData::A(ip) => Rdata::A(ip.0),
             RData::AAAA(ip) => Rdata::Aaaa(ip.0),
             RData::SRV(s) => Rdata::Srv {
-                target: s.target().to_lowercase().to_string(),
+                target: name_text(s.target()),
                 port: s.port(),
                 priority: s.priority(),
                 weight: s.weight(),
@@ -584,7 +599,7 @@ fn validate(buf: &[u8], f: &InFlight, max_payload: usize, allow_truncated_srv: b
                 RData::AAAA(ip) => std::net::IpAddr::V6(ip.0),
                 _ => continue,
             };
-            answers.push(Answer { rdata: Rdata::Additional { name: rec.name().to_lowercase().to_string(), ip }, ttl: rec.ttl() });
+            answers.push(Answer { rdata: Rdata::Additional { name: name_text(rec.name()), ip }, ttl: rec.ttl() });
         }
     }
     (Verdict::Valid(answers), qtype)

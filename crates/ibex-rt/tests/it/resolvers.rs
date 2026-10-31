@@ -1799,17 +1799,17 @@ fn ignore_weight_and_an_additional_record_for_another_name() {
     assert!(!ibex.log().iter().any(|l| l.contains("10.6.6.6")), "{:?}", ibex.log());
 }
 
-/// T487, measured on `HAProxy` 3.5-dev8 (case t487/tnx.json: `hold nx 1s`, the SRV name NX
-/// after one answer): once the resolution's tries have all failed past `hold nx`, every record
-/// goes and its slot with it: `- 0 96 2 1 - 0` (the weight stays), "entry removed from SRV
-/// record", and the proxy has no server left.
-#[test]
-fn an_srv_resolution_that_fails_past_its_hold_drops_its_records() {
+/// T487, measured on `HAProxy` 3.5-dev8 (cases t487/tnx.json, trefused.json, ttimeout.json,
+/// tservfail.json: `hold <status> 1s`, the SRV name NX, REFUSED, silent or SERVFAIL after one answer): once the
+/// resolution's tries have all failed past the hold of that status, every record goes and its
+/// slot with it: `- 0 96 2 1 - 0` (the weight stays), "entry removed from SRV record", and the
+/// proxy has no server left.
+fn an_srv_resolution_that_fails(zone: Zone, hold: &str) {
     let dns = FakeDns::start();
     dns.set(SRV, srv_zone(&[(512, 8080, "t1.test", Some([10, 1, 0, 1]))]));
-    let ibex = start(dns.addr, "  timeout resolve 300ms\n  timeout retry 200ms\n  hold nx 300ms\n", &srv_template(2, ""), "");
+    let ibex = start(dns.addr, &format!("  timeout resolve 300ms\n  timeout retry 200ms\n  hold {hold} 300ms\n"), &srv_template(2, ""), "");
     ibex.wait_srv("srv1", &format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"), 3);
-    dns.set(SRV, Zone::Nx);
+    dns.set(SRV, zone);
     ibex.wait_srv("srv1", &format!("- 0 96 2 1 - 0 {SRV}"), 5);
     ibex.wait_log("Server l/srv1 is going DOWN for maintenance (entry removed from SRV record). 0 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.", 3);
     // In the log as is, on stderr as an ALERT (`proxy 'l' ...`).
@@ -1817,4 +1817,73 @@ fn an_srv_resolution_that_fails_past_its_hold_drops_its_records() {
     let alert = format!("[ALERT]    ({}) : proxy 'l' has no server available!", ibex.child.id());
     assert!(ibex.stderr().contains(&alert), "{:?}", ibex.stderr());
     assert_eq!(ibex.srv_cols("srv2"), format!("- 0 32 1 1 - 0 {SRV}"));
+}
+
+#[test]
+fn an_srv_resolution_that_fails_past_its_hold_drops_its_records() {
+    an_srv_resolution_that_fails(Zone::Nx, "nx");
+}
+
+#[test]
+fn an_srv_resolution_refused_or_timed_out_past_its_hold_drops_its_records() {
+    an_srv_resolution_that_fails(Zone::Refused, "refused");
+    an_srv_resolution_that_fails(Zone::Silent, "timeout");
+    // SERVFAIL is `other` (case t487/tservfail.json).
+    an_srv_resolution_that_fails(Zone::ServFail, "other");
+}
+
+/// T487, measured on `HAProxy` 3.5-dev8 (case t487/tdup.json): two SRV records on one target
+/// (ports 8080, 8081), no additional records: both slots take the target, one A resolution
+/// serves them (one `A t1.test` per period), and only the first slot takes its address (srv2
+/// stays `- 0 96 1 1 t1.test 8081`, as on HAProxy).
+#[test]
+fn two_srv_records_on_one_target_share_its_resolution() {
+    let dns = FakeDns::start();
+    dns.set(SRV, srv_zone(&[(512, 8080, "t1.test", None), (256, 8081, "t1.test", None)]));
+    dns.set("t1.test", Zone::A(vec![Ipv4Addr::new(10, 1, 0, 1)]));
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n", &srv_template(3, ""), "");
+    ibex.wait_srv("srv1", &format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"), 3);
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(ibex.srv_cols("srv2"), format!("- 0 96 1 1 t1.test 8081 {SRV}"));
+    let a: Vec<Instant> = dns.queries().iter().filter(|q| q.name == "t1.test").map(|q| q.at).collect();
+    assert!(a.len() >= 2, "{a:?}");
+    assert!(a.windows(2).all(|w| w[1].duration_since(w[0]) >= Duration::from_millis(200)), "two A queries per period: {a:?}");
+}
+
+/// T487, measured on `HAProxy` 3.5-dev8 (case t487/tarx.json, `hold obsolete 1s`): the SRV record
+/// stays but its additional record goes; once that is older than `hold obsolete` the slot
+/// resolves its target on its own: `A t1.test` from then on, "IP changed from '10.1.0.1' to
+/// '10.1.0.9' by 'r/ns1'".
+#[test]
+fn an_additional_record_gone_past_hold_obsolete_gives_way_to_a_resolution() {
+    let dns = FakeDns::start();
+    dns.set(SRV, srv_zone(&[(512, 8080, "t1.test", Some([10, 1, 0, 1]))]));
+    dns.set("t1.test", Zone::A(vec![Ipv4Addr::new(10, 1, 0, 9)]));
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n  hold obsolete 600ms\n", &srv_template(2, ""), "");
+    ibex.wait_srv("srv1", &format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"), 3);
+    assert!(!dns.queries().iter().any(|q| q.name == "t1.test"), "{:?}", dns.queries());
+    dns.set(SRV, srv_zone(&[(512, 8080, "t1.test", None)]));
+    ibex.wait_srv("srv1", &format!("10.1.0.9 2 64 2 1 t1.test 8080 {SRV}"), 4);
+    ibex.wait_log("l/srv1: IP changed from '10.1.0.1' to '10.1.0.9' by 'r/ns1'.", 3);
+}
+
+/// T487, measured on `HAProxy` 3.5-dev8 (case t487/tinv.json): an SRV target with a character
+/// no host name has (`t*1.test`) is logged at every answer, "invalid fqdn 't*1.test' by 'SRV
+/// record'", and the slot keeps no target (`srv_fqdn` `-`, no `SRV_ADMF_FQDN_CHANGED`: 0) but
+/// takes the address of the additional record, the port and the weight (2); its UP line names
+/// no host: "Server l/srv1 ('(null)') is UP/READY (resolves again)."
+#[test]
+fn an_srv_target_that_is_no_host_name_is_logged_and_kept_out() {
+    let dns = FakeDns::start();
+    dns.set(SRV, srv_zone(&[(512, 8080, "t*1.test", Some([10, 1, 0, 1]))]));
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n", &srv_template(2, ""), "");
+    ibex.wait_srv("srv1", &format!("10.1.0.1 2 0 2 1 - 8080 {SRV}"), 3);
+    let inv = "invalid fqdn 't*1.test' by 'SRV record'";
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while ibex.log().iter().filter(|l| *l == inv).count() < 2 {
+        assert!(Instant::now() < deadline, "{:?}", ibex.log());
+        thread::sleep(Duration::from_millis(20));
+    }
+    ibex.wait_log("Server l/srv1 ('(null)') is UP/READY (resolves again).", 3);
+    assert!(!dns.queries().iter().any(|q| q.qtype == 1), "{:?}", dns.queries());
 }

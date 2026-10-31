@@ -1073,7 +1073,7 @@ fn srv_answer(r: &mut Resolution, answers: &[Answer], holds: &Holds, now: Instan
             it.ar = Some((*ip, now));
         }
     }
-    let mut leave: Vec<(u32, u32, Box<str>)> = Vec::new();
+    let mut leave: Vec<(u32, u32)> = Vec::new();
     let mut i = 0;
     while i < st.items.len() {
         if st.items[i].ar.is_some_and(|(_, seen)| seen + holds.obsolete < now) {
@@ -1102,9 +1102,11 @@ fn srv_answer(r: &mut Resolution, answers: &[Answer], holds: &Holds, now: Instan
         }
         i += 1;
     }
-    for (p, s, target) in leave {
+    for (p, s) in leave {
         let req = Req { proxy: p, server: s, opts: ResolveOpts::default(), attached: None };
-        leave_rmaint(&req, &target, proxies, checks, log);
+        // The slot's own name (`srv->hostname`), `(null)` when its target was refused.
+        let name = proxies.get(p as usize).and_then(|px| px.server_srv_fqdn(s as usize));
+        leave_rmaint(&req, name.as_deref().unwrap_or("(null)"), proxies, checks, log);
     }
 }
 
@@ -1112,7 +1114,7 @@ fn srv_answer(r: &mut Resolution, answers: &[Answer], holds: &Holds, now: Instan
 /// target and weight, and the address of its additional record if it has one (its own
 /// resolution is then dropped), else resolves the target.
 #[allow(clippy::too_many_arguments)]
-fn srv_fill(it: &SrvItem, p: u32, s: u32, opts: &ResolveOpts, proxies: &[Proxy], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>, leave: &mut Vec<(u32, u32, Box<str>)>) {
+fn srv_fill(it: &SrvItem, p: u32, s: u32, opts: &ResolveOpts, proxies: &[Proxy], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>, leave: &mut Vec<(u32, u32)>) {
     let (pi, si) = (p as usize, s as usize);
     let Some(px) = proxies.get(pi) else { return };
     let Some(old) = px.servers.get(si) else { return };
@@ -1138,21 +1140,22 @@ fn srv_fill(it: &SrvItem, p: u32, s: u32, opts: &ResolveOpts, proxies: &[Proxy],
             log(pi, LogLevel::Notice, &msg, true);
         }
         if px.server_rmaint(si) {
-            leave.push((p, s, it.target.clone()));
+            leave.push((p, s));
         }
     } else if old.port() != it.port {
         px.servers.set(si, SocketAddr::new(old.ip(), it.port));
     }
     if px.server_srv_fqdn(si).is_none() {
-        if it.target.is_empty() || it.target.bytes().any(|b| !(b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')) {
-            // `srv_update_fqdn`: logged, and the slot keeps no target.
+        if it.target.is_empty() || it.target.len() > 255 || it.target.bytes().any(|b| !(b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')) {
+            // `srv_update_fqdn`: logged at every answer; the slot keeps no target (nothing to
+            // resolve) but takes the weight (A.tinv).
             log(pi, LogLevel::Notice, &format!("invalid fqdn '{}' by 'SRV record'", it.target), false);
-            return;
+        } else {
+            px.set_server_srv_fqdn(si, Some(&it.target));
+            log(pi, LogLevel::Notice, &format!("{}/{srv} changed its FQDN from (null) to {} by 'SRV record'", px.name, it.target), false);
         }
-        px.set_server_srv_fqdn(si, Some(&it.target));
-        log(pi, LogLevel::Notice, &format!("{}/{srv} changed its FQDN from (null) to {} by 'SRV record'", px.name, it.target), false);
     }
-    if it.ar.is_none() {
+    if it.ar.is_none() && px.server_srv_fqdn(si).is_some() {
         acts.push(SrvAct::Link(p, s, it.target.clone(), opts.clone()));
     }
     if !opts.ignore_weight {
