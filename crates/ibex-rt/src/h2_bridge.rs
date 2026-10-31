@@ -326,7 +326,7 @@ pub fn pump_request_body_mux<M: HtxMux>(mux: &mut M, active: &mut H2ActiveStream
     };
     let body = &mut active.body;
     let (before, was_done, taken) = (body.trailer_bytes, body.done, body.consumed);
-    let changed = pump_htx_body(stream.rx_htx_mut(), body, req, M::give_data) || body.done != was_done;
+    let changed = pump_htx_body(stream.rx_htx_mut(), body, req, M::GIVE_DATA) || body.done != was_done;
     let taken = usize::try_from(body.consumed - taken).unwrap_or(usize::MAX);
     if taken > 0 {
         mux.rx_taken(id, taken);
