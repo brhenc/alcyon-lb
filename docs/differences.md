@@ -274,6 +274,16 @@ Measured on HAProxy 3.5-dev8-885761-29; pinned in `crates/ibex-rt/tests/tls_hand
   own, not queued behind the data at `MSG_PEEK` time) and so can differ from HAProxy on a
   race between the two.
 
+## An IP address as the SNI to a server is not sent (T538)
+
+In `mode http` the automatic SNI of an `ssl` server is the Host header without its port
+(`req.hdr(host),field(1,:)`); for Host `127.0.0.1:8080` that is `127.0.0.1`. HAProxy (OpenSSL)
+sends it in the ClientHello, which RFC 6066 does not allow; rustls sends no SNI for an address,
+so the server sees none (`ssl_fc_sni` empty) and picks its default certificate. The connection
+is still keyed by `127.0.0.1` for reuse, as HAProxy keys it (a Host `127.0.0.2` does not share
+it). Measured on HAProxy 3.5-dev8-885761-29; pinned in `crates/ibex-rt/tests/it/server_tls.rs`
+(`a_tls_connection_whose_sni_is_an_ip_address_*`).
+
 ## `tune.maxaccept`: the default is no limit (T295)
 
 `tune.maxaccept <n>` is accepted and applied: one listener wakeup accepts at most `n`

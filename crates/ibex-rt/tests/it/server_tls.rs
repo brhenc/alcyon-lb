@@ -149,6 +149,12 @@ fn serve(cfg: Option<Arc<ServerConfig>>) -> Server {
 /// [`serve`], expecting a PROXY v2 header in plaintext before the TLS handshake when
 /// `accept_proxy` is set, as `bind ... ssl accept-proxy` does.
 fn serve_with(cfg: Option<Arc<ServerConfig>>, accept_proxy: bool) -> Server {
+    serve_opts(cfg, accept_proxy, false)
+}
+
+/// [`serve_with`]; with `close_after_one`, a TLS connection is ended (`close_notify`, then
+/// FIN) 50 ms after its first response, as a server with a keep-alive limit of one does.
+fn serve_opts(cfg: Option<Arc<ServerConfig>>, accept_proxy: bool, close_after_one: bool) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -192,6 +198,11 @@ fn serve_with(cfg: Option<Arc<ServerConfig>>, accept_proxy: bool) -> Server {
                         while read_request(&mut tls).is_some() {
                             seen.lock().unwrap()[idx].requests += 1;
                             if tls.write_all(reply).is_err() {
+                                break;
+                            }
+                            if close_after_one {
+                                let _ = tls.flush();
+                                thread::sleep(Duration::from_millis(50));
                                 break;
                             }
                         }
@@ -490,6 +501,81 @@ fn tls_server_connections_are_reused_per_sni() {
     assert_eq!(get(front, "b.example").0, 200);
     assert!(wait_for(Duration::from_secs(1), || srv.count() == 2), "{:?}", srv.handshakes());
     assert_eq!(srv.handshakes()[1].sni.as_deref(), Some("b.example"));
+}
+
+/// T538. The automatic SNI of a request whose Host is an IP address (`127.0.0.1:<port>`, what
+/// `curl http://127.0.0.1:<port>/` sends) is that address: `HAProxy` 3.5-dev8 sends it in SNI
+/// (OpenSSL does) and keys the connection by it; rustls sends no SNI for an address. The
+/// connection must still be keyed by the name the expression gave, or no request ever finds
+/// it again. Measured on `HAProxy` 3.5-dev8 (`/tmp/t538/rig`, 2026-10-31), Host
+/// `127.0.0.1:<port>`: three requests on one client connection, 1 server connection (Ibex
+/// before T538: 3); then five clients one after the other, `safe` 5 and `aggressive`/`always` 1
+/// (Ibex before: 5 under every mode); Host `127.0.0.1` twice then `127.0.0.2`, `always`: 2.
+#[test]
+fn a_tls_connection_whose_sni_is_an_ip_address_is_kept_for_the_next_request() {
+    let p = pki();
+    let srv = serve(Some(server_config(&p.cert, &p.key, None, &[])));
+    let front = common::reserve_addr();
+    let _ibex = start(&p.dir, &config(&[(front, &format!("  server s {} ssl verify none", srv.addr))]), &[front]);
+    let host = front.to_string();
+    assert_eq!(get_keepalive(front, &[&host, &host, &host]), [200, 200, 200]);
+    assert!(wait_for(Duration::from_secs(1), || srv.handshakes().first().is_some_and(|s| s.requests == 3)), "{:?}", srv.handshakes());
+    assert_eq!(srv.count(), 1, "one server connection for one client's three requests, as HAProxy: {:?}", srv.handshakes());
+    assert_eq!(srv.handshakes()[0].sni, None, "rustls sends no SNI for an address");
+}
+
+#[test]
+fn an_idle_tls_connection_whose_sni_is_an_ip_address_follows_the_reuse_mode() {
+    let p = pki();
+    let (safe, aggressive) = (serve(Some(server_config(&p.cert, &p.key, None, &[]))), serve(Some(server_config(&p.cert, &p.key, None, &[]))));
+    let fronts = [common::reserve_addr(), common::reserve_addr()];
+    let cfg = config(&[
+        (fronts[0], &format!("  http-reuse safe\n  server s {} ssl verify none", safe.addr)),
+        (fronts[1], &format!("  http-reuse aggressive\n  server s {} ssl verify none", aggressive.addr)),
+    ]);
+    let _ibex = start(&p.dir, &cfg, &fronts);
+    // Two requests on one client connection make it one that was reused (safe), then two
+    // clients of one request each: the rig's `ka3` then `seq5`, which HAProxy serves on
+    // 6 connections under `safe` and 1 under `aggressive`.
+    for &front in &fronts {
+        assert_eq!(get_keepalive(front, &["127.0.0.1", "127.0.0.1"]), [200, 200]);
+    }
+    thread::sleep(Duration::from_millis(150));
+    for _ in 0..2 {
+        assert_eq!(get(fronts[0], "127.0.0.1").0, 200);
+        assert_eq!(get(fronts[1], "127.0.0.1").0, 200);
+        thread::sleep(Duration::from_millis(150));
+    }
+    assert_eq!(safe.count(), 3, "`safe`: a first request does not take an idle connection: {:?}", safe.handshakes());
+    assert_eq!(aggressive.count(), 1, "`aggressive`: the idle TLS connection, reused once, is taken again: {:?}", aggressive.handshakes());
+}
+
+#[test]
+fn tls_connections_for_two_ip_address_hosts_are_not_shared() {
+    let p = pki();
+    let srv = serve(Some(server_config(&p.cert, &p.key, None, &[])));
+    let front = common::reserve_addr();
+    let _ibex = start(&p.dir, &config(&[(front, &format!("  http-reuse always\n  server s {} ssl verify none", srv.addr))]), &[front]);
+    for host in ["127.0.0.1", "127.0.0.1", "127.0.0.2"] {
+        assert_eq!(get(front, host).0, 200);
+        thread::sleep(Duration::from_millis(150));
+    }
+    assert_eq!(srv.count(), 2, "127.0.0.1 shares its connection, 127.0.0.2 gets its own, as HAProxy: {:?}", srv.handshakes());
+}
+
+/// The connection the server ended while it was idle is not taken again (T434, T516): each
+/// client is answered, on a new connection. `HAProxy`: the same (`idle_conn_events.rs`).
+#[test]
+fn an_ip_address_sni_connection_its_server_ended_while_idle_is_not_reused() {
+    let p = pki();
+    let srv = serve_opts(Some(server_config(&p.cert, &p.key, None, &[])), false, true);
+    let front = common::reserve_addr();
+    let _ibex = start(&p.dir, &config(&[(front, &format!("  http-reuse always\n  server s {} ssl verify none", srv.addr))]), &[front]);
+    for _ in 0..3 {
+        assert_eq!(get(front, "127.0.0.1").0, 200);
+        thread::sleep(Duration::from_millis(300));
+    }
+    assert_eq!(srv.count(), 3, "{:?}", srv.handshakes());
 }
 
 #[test]

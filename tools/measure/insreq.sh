@@ -19,7 +19,8 @@
 #
 # The scenario body is a config with @FE@ and @BE@ for the two ports (tools/measure/scenarios/),
 # and @CRT@ for a certificate and key (IBEX_MEASURE_CRT, else a self-signed P-256 one made in
-# <outdir>).
+# <outdir>), and @TP@ for a third free port (a hop inside the proxy, as tlsbackend.body's TLS
+# server, T538).
 # The proxy under test is a `cargo build --profile release-perf --bin ibex` binary
 # (target/release-perf/ibex, T518: the budget is judged on one fat-LTO layout, not `release`).
 # Pins the proxy to CPU 4, the client to 5, the backend to 6 (as measure.py); IBEX_MEASURE_CPUS
@@ -28,20 +29,20 @@
 # `flock -x /tmp/ibex-load.lock` around a batch, and keep a batch under 15 minutes. Needs
 # $HOME/ibex-targets/gate-slot1/release/measure-bench (MEASURE_BENCH overrides).
 set -u
-if [ $# -ne 7 ]; then sed -n '5,25p' "$0"; exit 2; fi
+if [ $# -ne 7 ]; then sed -n '5,26p' "$0"; exit 2; fi
 LABEL=$1; BIN=$2; BODY=$3; CL=$4; N=$5; ROUNDS=$6; OUT=$7
 mkdir -p "$OUT" || exit 1
 BENCH=${MEASURE_BENCH:-$HOME/ibex-targets/gate-slot1/release/measure-bench}
 IFS=, read -r CPU_P CPU_C CPU_B <<< "${IBEX_MEASURE_CPUS:-4,5,6}"
 port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
-FE=$(port); BE=$(port)
+FE=$(port); BE=$(port); TP=$(port)
 CFG=$OUT/$LABEL.cfg
 CRT=${IBEX_MEASURE_CRT:-$OUT/insreq-cert.pem}
 if grep -q @CRT@ "$BODY" && [ ! -s "$CRT" ]; then
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$CRT.key" -out "$CRT.crt" \
     -subj /CN=localhost -days 30 >/dev/null 2>&1 && cat "$CRT.crt" "$CRT.key" > "$CRT" || exit 1
 fi
-sed -e "s/@FE@/$FE/g; s/@BE@/$BE/g; s#@CRT@#$CRT#g" "$BODY" > "$CFG" || exit 1
+sed -e "s/@FE@/$FE/g; s/@BE@/$BE/g; s/@TP@/$TP/g; s#@CRT@#$CRT#g" "$BODY" > "$CFG" || exit 1
 taskset -c "$CPU_B" "$BENCH" backend "$BE" >/dev/null 2>&1 & BEPID=$!
 sleep 0.3
 taskset -c "$CPU_P" "$BIN" -f "$CFG" > "$OUT/$LABEL.proxy.log" 2>&1 & P=$!
