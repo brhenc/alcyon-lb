@@ -349,15 +349,22 @@ const fn sorted_table() -> [(&'static str, &'static str, u8); 99] {
 /// else the lowest matching the name (what a linear scan of the table finds).
 #[must_use]
 pub fn static_ref(name: &str, value: &str) -> StaticRef {
-    // The first entry not below (name, value, 0): the lowest index of that pair if present.
-    let at = SORTED.partition_point(|&(n, v, _)| str_cmp(n, name) < 0 || (str_cmp(n, name) == 0 && str_cmp(v, value) < 0));
-    if let Some(&(n, v, i)) = SORTED.get(at) {
-        if n == name && v == value {
+    // `SORTED` is in (name, value, index) order, and `str`'s `Ord` is the byte order
+    // `str_cmp` sorted it by: one binary search on the name (memcmp, not the const byte
+    // loop), then a walk of that name's few entries. The first with the value is the lowest
+    // index of the pair; the lowest index of the run is the name-only reference (T539:
+    // two searches of `str_cmp` were ~1.7 % of an HTTP/3 request).
+    let first = SORTED.partition_point(|&(n, _, _)| n < name);
+    let mut lowest = None;
+    for &(n, v, i) in &SORTED[first..] {
+        if n != name {
+            break;
+        }
+        if v == value {
             return StaticRef::Full(usize::from(i));
         }
+        lowest = Some(lowest.map_or(i, |l: u8| l.min(i)));
     }
-    let first = SORTED.partition_point(|&(n, _, _)| str_cmp(n, name) < 0);
-    let lowest = SORTED[first..].iter().take_while(|&&(n, _, _)| n == name).map(|&(_, _, i)| i).min();
     lowest.map_or(StaticRef::None, |i| StaticRef::Name(usize::from(i)))
 }
 
