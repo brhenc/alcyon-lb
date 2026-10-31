@@ -16,7 +16,7 @@ use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Ser
 use crate::config::QuicConfig;
 use crate::connection::{ConnectionId, ReadStreamResult, StreamDirection, StreamId};
 use crate::error::{QuicError, Result};
-use crate::table::{ConnectionTable, HandleMap};
+use crate::table::{ConnectionTable, HandleHasher, HandleMap};
 use crate::transport::{DatagramOutcome, EcnCodepoint, QuicTransport, TransportEvent, Transmit};
 
 /// The receive block's size ([`CopyBlock`]): the listener's datagram buffer.
@@ -107,7 +107,7 @@ pub struct QuicEndpoint {
     /// and queue, and the h3 listener drains transmits ~8 times a request.
     to_poll: VecDeque<ConnectionHandle>,
     /// Membership of `to_poll`.
-    queued: HandleMap<()>,
+    queued: std::collections::HashSet<ConnectionHandle, std::hash::BuildHasherDefault<HandleHasher>>,
     /// Every connection's next deadline, ordered: the earliest is the first element. A
     /// connection is re-keyed (`refresh_timer`) only when its own timeout may have changed.
     timers: BTreeSet<(Instant, usize)>,
@@ -297,7 +297,7 @@ impl QuicEndpoint {
             timeout_polls: 0,
             transmit_polls: 0,
             to_poll: VecDeque::new(),
-            queued: HandleMap::default(),
+            queued: std::collections::HashSet::default(),
             timers: BTreeSet::new(),
             timer_of: HandleMap::default(),
             response_buf: Vec::with_capacity(2048),
@@ -395,7 +395,7 @@ impl QuicEndpoint {
 
     /// Something reached this connection: ask it for packets (`to_poll`).
     fn mark(&mut self, handle: ConnectionHandle) {
-        if self.queued.insert(handle, ()).is_none() {
+        if self.queued.insert(handle) {
             self.to_poll.push_back(handle);
         }
     }

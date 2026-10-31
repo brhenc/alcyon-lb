@@ -218,6 +218,7 @@ const PINNED: usize = 0;
 const WARMUP: usize = 1200;
 
 /// The count for `n` more requests over the count for 20 is at most [`PINNED`] a request.
+#[allow(clippy::absurd_extreme_comparisons)] // PINNED is 0 now; the bound is kept as a bound
 fn assert_pinned(what: &str, body: &[u8]) {
     let few = h3_allocations(20, body);
     let many = h3_allocations(220, body);

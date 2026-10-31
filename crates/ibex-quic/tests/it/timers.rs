@@ -233,7 +233,7 @@ fn a_silent_connection_retransmits_after_its_probe_timeout() {
     let mut buf = vec![0u8; 65535];
     let deadline = s.poll_timeout().expect("a loss-recovery deadline");
     assert!(deadline > now);
-    assert!(s.poll_transmit(deadline - Duration::from_micros(1), &mut buf).is_none(), "nothing before the timeout");
+    assert!(s.poll_transmit(deadline.checked_sub(Duration::from_micros(1)).expect("after the epoch"), &mut buf).is_none(), "nothing before the timeout");
     s.handle_timeout(deadline);
     assert!(s.poll_transmit(deadline, &mut buf).is_some(), "no retransmission after the probe timeout");
 }

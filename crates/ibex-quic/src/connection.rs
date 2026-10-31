@@ -19,9 +19,9 @@ pub struct ConnectionId {
     len: u8,
 }
 
-/// The ID's own bytes, in one write (T543): the derived `Hash` fed SipHash 29 bytes in three
+/// The ID's own bytes, in one write (T543): the derived `Hash` fed `SipHash` 29 bytes in three
 /// writes on every lookup in the listener's maps. Equal IDs have equal bytes, so `Eq` holds;
-/// the hash stays the maps' keyed SipHash, as the client chooses some of these IDs.
+/// the hash stays the maps' keyed `SipHash`, as the client chooses some of these IDs.
 impl std::hash::Hash for ConnectionId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         state.write(self.as_bytes());
@@ -247,7 +247,7 @@ mod tests {
         }
     }
 
-    /// T543: a connection ID is hashed (SipHash, the client chooses some of them) in one write
+    /// T543: a connection ID is hashed (`SipHash`, the client chooses some of them) in one write
     /// of its own bytes; the derived `Hash` fed 29 bytes in three writes (the array's length
     /// prefix, all 20 bytes, `len`), ~2-3k instructions per h3 request over the listener's maps.
     #[test]
