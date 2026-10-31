@@ -1,0 +1,1 @@
+{"servers": "  server s1 a1.test:80 resolvers r", "resolvers": "  timeout resolve 500ms", "ns_prefix": "tcp@", "zones": [[0, {"a1.test": {"a": ["10.0.0.1"]}}]], "dur": 3}

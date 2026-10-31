@@ -221,6 +221,8 @@ pub enum HttpReqAction {
         var_name: String,
         expr: String,
     },
+    /// `do-resolve(<var>,<resolvers>[,ipv4|ipv6]) <expr>` (T489, `resolv_action_do_resolve`).
+    DoResolve(crate::ast::DoResolve),
     SetVarFmt {
         var_name: String,
         fmt: String,

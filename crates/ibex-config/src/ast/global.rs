@@ -191,6 +191,21 @@ pub enum ZeroOnFree {
     Hard,
 }
 
+/// `dns-accept-family <family>[,...]` (`cfg_parse_dns_accept_family`, `resolvers.c:4227`).
+/// `auto` anywhere in the list wins: IPv4, and IPv6 while the host has a route to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsAcceptFamily {
+    pub ipv4: bool,
+    pub ipv6: bool,
+    pub auto: bool,
+}
+
+impl Default for DnsAcceptFamily {
+    fn default() -> Self {
+        Self { ipv4: false, ipv6: false, auto: true }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GlobalSection {
     /// `node <name>`: the name `show info` and the stats page report (`global.node`); `None` is the host name.
@@ -200,6 +215,12 @@ pub struct GlobalSection {
     /// `h1-case-adjust` and `h1-case-adjust-file`: `(from, to)` pairs in the order given, `from`
     /// unique (`add_hdr_case_adjust`).
     pub h1_case_adjust: Vec<(String, String)>,
+    /// `dns-accept-family`: the families the resolvers ask for and accept
+    /// (`resolv_accept_families`); the default is `auto`.
+    pub dns_accept_family: DnsAcceptFamily,
+    /// `tune.resolvers.cache-size` (Ibex-only, T489): the `do-resolve` answers each worker
+    /// keeps (default 1024).
+    pub resolvers_cache_size: Option<usize>,
     /// `http-err-codes`: the statuses that count as an error (`http_err_cnt`), if set.
     pub http_err_codes: Option<StatusCodeSet>,
     /// `http-fail-codes`: the statuses that count as a failure (`http_fail_cnt`), if set.

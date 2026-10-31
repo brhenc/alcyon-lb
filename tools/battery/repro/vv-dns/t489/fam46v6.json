@@ -1,0 +1,1 @@
+{"global": "  dns-accept-family ipv4,ipv6", "servers": "  server s1 v6only.test:80 resolvers r ", "resolvers": "  timeout resolve 1s", "zones": [[0, {"a1.test": {"a": ["10.0.0.1"]}, "both.test": {"a": ["10.0.0.1"], "aaaa": ["2001:db8::1"]}, "v6only.test": {"aaaa": ["2001:db8::6"]}}]], "dur": 2.5}

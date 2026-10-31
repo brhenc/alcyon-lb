@@ -855,6 +855,9 @@ fn parse_http_req_rule_at(
             cond,
             line: 0,
         });
+    } else if act_str == "do-resolve" || act_str.starts_with("do-resolve(") {
+        let (dr, cond) = super::resolvers::parse_do_resolve("http-request", tokens, 2)?;
+        rules.push(HttpReqRule { action: HttpReqAction::DoResolve(dr), cond, line: 0 });
     } else if act_str.starts_with("set-var(") || act_str.starts_with("set-var-fmt(") {
         let is_fmt = act_str.starts_with("set-var-fmt(");
         let var_name = act_token

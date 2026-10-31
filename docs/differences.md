@@ -197,12 +197,24 @@ Not refused, on purpose:
   `(w + 255) / 256` unless `resolve-opts ignore-weight`, the address from an additional record or
   else an A/AAAA resolution per target), `hold obsolete` removes a record that is gone, and
   `show servers state` reports `srv_fqdn`, `srv_port` and `srvrecord`. Not measured against the
-  oracle: a truncated SRV answer over UDP (`allow_truncated_srv`). Still refused: `do-resolve`, `parse-resolv-conf` and `dns-accept-family` (T489), and the address
+  oracle: a truncated SRV answer over UDP (`allow_truncated_srv`). `dns-accept-family ipv4|ipv6|auto[,...]`, `parse-resolv-conf` (the `nameserver` lines of
+  `/etc/resolv.conf` where it stands, HAProxy's warnings), `set server <b>/<s> fqdn` and
+  `http-request` / `tcp-request content` `do-resolve` are built (T489). `do-resolve`: a hit in
+  the worker's cache costs no lock and no allocation; a miss asks worker 0 (which owns the
+  sections) through the mailbox and the stream waits; a server resolution of the same name
+  younger than `hold valid` answers it, as in HAProxy. The cache is per worker (HAProxy's is the
+  resolution itself, shared), bounded by the Ibex-only `tune.resolvers.cache-size` (default
+  1024 entries, about 290 KB a worker, allocated by the first `do-resolve` a worker runs); a
+  stream waits at most 30 s for an answer worker 0 never sent. `tcp-request content
+  do-resolve` waits only within the `inspect-delay` (as HAProxy, which asks nothing without
+  one) and runs the rules before it again while it waits. `set server fqdn` on a server written
+  as an address takes the default `resolve-*` options; its `srv_admin_state` shows 64 once the
+  section takes the new name (HAProxy: at the next answer). Still refused: the address
   prefixes `mptcp@`, `unix@`, `abns@`, `quic4@`... on a `nameserver`. TCP is done (T488): a
   truncated UDP answer is asked again over TCP to the same nameserver at once (one connection per
   nameserver, opened by the first query, four queries in flight, closed after 5 s idle); `tcp@`,
   `tcp4@`, `tcp6@`, `stream+` send everything over TCP; `udp@`, `udp4@`, `udp6@`, `dgram+` are UDP
-  without fallback. HAProxy numbers the queries of a TCP stream 1, 2, 3; Ibex keeps random ids. A
+  without fallback. The queries of a TCP connection are numbered 1, 2, 3 as in HAProxy (T489). A
   TCP port nobody listens on is not a `snd_error` (measured: the queries count `sent`, the
   resolution times out), as in HAProxy. HAProxy also
   creates an implicit `default` section (from `/etc/resolv.conf`, used by its httpclient); Ibex has

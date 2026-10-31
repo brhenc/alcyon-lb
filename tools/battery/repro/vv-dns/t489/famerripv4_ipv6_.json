@@ -1,0 +1,1 @@
+{"global": "  dns-accept-family ipv4 ipv6", "servers": "  server s1 a1.test:80 resolvers r", "zones": [[0, {}]], "dur": 1, "check": true}

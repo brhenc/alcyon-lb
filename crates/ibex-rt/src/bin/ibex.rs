@@ -702,7 +702,7 @@ fn main() {
             // buffer size for HTTP/2).
             for (line, text) in &err.alerts {
                 let (file, line) = locate(&config_starts, *line);
-                ibex_rt::stderr_line!("[ALERT]    ({}) : {}", process::id(), text.replace("{at}", &format!("[{file}:{line}]")));
+                ibex_rt::stderr_line!("[ALERT]    ({}) : {}", process::id(), text.replace("{at}", &format!("[{file}:{line}]")).replace("{file}", &file));
             }
             process::exit(1);
         }
@@ -742,7 +742,7 @@ fn main() {
             }
             WarnStyle::Spaced => ibex_rt::stderr_line!("{sev} ({pid}) : config : parsing [{file}:{line}] : {}", w.text),
             WarnStyle::SpacedBlank => ibex_rt::stderr_line!("{sev} ({pid}) : config : parsing [{file}:{line}] : {}\n", w.text),
-            WarnStyle::Tight => ibex_rt::stderr_line!("{sev} ({pid}) : config : parsing [{file}:{line}]: {}", w.text),
+            WarnStyle::Tight => ibex_rt::stderr_line!("{sev} ({pid}) : config : parsing [{file}:{line}]: {}", w.text.replace("{file}", &file)),
             WarnStyle::At => ibex_rt::stderr_line!("{sev} ({pid}) : config : [{file}:{line}] : {}", w.text),
         }
         warned |= !w.alert && w.style != WarnStyle::Notice;

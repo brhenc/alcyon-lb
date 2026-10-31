@@ -31,8 +31,11 @@ pub struct Nameserver {
     pub transport: NsTransport,
     /// The address, a name in it resolved by libc while the configuration loads.
     pub addr: SocketAddr,
-    /// The line it is on, for the duplicate-name alert.
+    /// The line it is on, for the duplicate-name alert: of `/etc/resolv.conf` for one
+    /// `parse-resolv-conf` added.
     pub line: usize,
+    /// Added by `parse-resolv-conf` (named after its address, port 53).
+    pub from_resolv_conf: bool,
 }
 
 /// `hold <status> <period>`: how long the last valid answer is kept after each status.
@@ -80,4 +83,18 @@ impl ResolversSection {
             accepted_payload_size: 512,
         }
     }
+}
+
+/// A `do-resolve(<var>,<resolvers>[,<options>]) <expr>` action of `http-request` or
+/// `tcp-request content` (`resolv_parse_do_resolve`, `resolvers.c:3396`): the name `expr`
+/// gives is resolved by section `resolvers` and its address stored in `var`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoResolve {
+    pub var_name: String,
+    pub resolvers: String,
+    /// The index of that section in `Config::resolvers`, set once the configuration is read.
+    pub section_idx: u32,
+    /// `ipv4`: A first; the default (and `ipv6`) is AAAA first (`family_prio`).
+    pub prefer_ipv4: bool,
+    pub expr: String,
 }
