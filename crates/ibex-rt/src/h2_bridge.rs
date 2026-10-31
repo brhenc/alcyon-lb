@@ -144,6 +144,9 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     let mut no_mem = raw.is_empty();
     let mut slice = ibex_proto::htx::HtxSlice::new(raw);
     let parsed = p_stream.parse(head, &mut slice).is_ok();
+    if parsed {
+        keep_cookie_blanks(&d.head, &mut slice);
+    }
     let (tail, blocks) = (slice.tail_addr(), slice.num_blocks());
     // What a refused head wrote is zeroed on release like the rest (`tune.ibex.zero-buffers`).
     sess.htx_buf.note_htx(tail, blocks * ibex_proto::htx::HTX_DESC_SIZE);
@@ -521,6 +524,30 @@ pub(crate) fn pump_h2_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, r
     wrote
 }
 
+
+/// The merged `cookie` line keeps the outer blanks of its crumbs (`http_cookie_merge` trims
+/// nothing; measured on `HAProxy` 3.5-dev8, T514), but the H1 parser the HTX is made with
+/// trims a value's outer blanks: they are put back. The merged line is the head's last field
+/// (`H2ReqHead::write`).
+fn keep_cookie_blanks(head: &H2ReqHead, slice: &mut ibex_proto::htx::HtxSlice<'_>) {
+    let Some(&(a, b, c, d)) = head.fields.last() else { return };
+    let t = head.text.as_bytes();
+    let v = &t[c as usize..d as usize];
+    let lws = |x: &u8| matches!(x, b' ' | b'\t');
+    if &t[a as usize..b as usize] != b"cookie" || !(v.first().is_some_and(lws) || v.last().is_some_and(lws)) {
+        return;
+    }
+    keep_cookie_blanks_cold(slice, v);
+}
+
+#[cold]
+#[inline(never)]
+fn keep_cookie_blanks_cold(slice: &mut ibex_proto::htx::HtxSlice<'_>, v: &[u8]) {
+    let i = slice.as_ref().header_blocks_where(|n| n.eq_ignore_ascii_case(b"cookie")).last().map(|(i, _, _)| i);
+    if let Some(i) = i {
+        let _ = slice.replace_block_value(i, v);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

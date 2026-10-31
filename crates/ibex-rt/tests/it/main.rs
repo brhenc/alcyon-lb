@@ -441,6 +441,7 @@ mod set_var_ifgt_iflt;
 mod var_outputs;
 mod cli_set_var_refuses;
 mod vars_accounting;
+mod upgrade_log_bytes;
 mod url32;
 mod url_ip_port;
 mod urlp_raw;

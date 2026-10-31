@@ -362,8 +362,8 @@ impl MsgState {
         loop {
             match *self {
                 MsgState::Waiting | MsgState::Done | MsgState::Error => return used,
-                MsgState::Tunnel => return data.len(),
-                MsgState::Body(Body::UntilClose) => {
+                // A tunnel's bytes are counted as a body's (`HAProxy`'s channel totals; T514).
+                MsgState::Tunnel | MsgState::Body(Body::UntilClose) => {
                     *pay += (data.len() - used) as u64;
                     return data.len();
                 }
@@ -1637,6 +1637,8 @@ impl HeadFacts {
         };
         let mut ff = FramingFields { te: [""; 4], n_te: 0, cl: [""; 4], n_cl: 0 };
         let mut many = false;
+        // A request's `Connection: upgrade` without an `Upgrade` header goes (`conn_htx_lens`).
+        let (mut upg_hdr, mut upg_fix) = (false, (0i64, 0i64));
         let mut at = nl + 1;
         loop {
             let end = at + memchr::memchr(b'\n', &head[at..])?;
@@ -1662,29 +1664,37 @@ impl HeadFacts {
                     f.conn.first = (at, next);
                 }
                 f.conn.count += 1;
-                let (mut kept, mut chars, mut dropped) = (0, 0, false);
+                let (mut kept, mut chars, mut dropped, mut upg, mut upg_chars) = (0, 0, false, 0, 0);
                 for t in value.split(|&b| b == b',').map(ascii_trim).filter(|t| !t.is_empty()) {
                     let close = t.eq_ignore_ascii_case(b"close");
                     let keep_alive = t.eq_ignore_ascii_case(b"keep-alive");
                     f.conn_close |= close;
                     f.conn_keep_alive |= keep_alive;
                     f.conn.plain &= close || keep_alive;
-                    if close || keep_alive || t.eq_ignore_ascii_case(b"upgrade") {
+                    if close || keep_alive {
                         dropped = true;
+                    } else if t.eq_ignore_ascii_case(b"upgrade") {
+                        upg += 1;
+                        upg_chars += t.len();
                     } else {
                         kept += 1;
                         chars += t.len();
                     }
                 }
-                if dropped && kept == 0 {
+                let (keep, drop) = conn_htx_lens(value.len(), dropped, kept, chars, upg, upg_chars);
+                if request && upg > 0 {
+                    let (s, h) = conn_upgrade_fix(name.len(), keep, drop);
+                    upg_fix = (upg_fix.0 + s, upg_fix.1 + h);
+                }
+                let Some(l) = keep else {
                     // Gone from the HTX message: no block, no data.
                     f.headers -= 1;
                     at = next;
                     continue;
-                }
-                if dropped {
-                    len = chars + kept - 1;
-                }
+                };
+                len = l;
+            } else if request && name.len() == 7 && name.eq_ignore_ascii_case(b"upgrade") {
+                upg_hdr |= upgrade_value_kept(value);
             } else if name.len() == 14 && name.eq_ignore_ascii_case(b"content-length") {
                 let v = std::str::from_utf8(value).unwrap_or_default();
                 match ff.cl.get_mut(ff.n_cl) {
@@ -1706,6 +1716,10 @@ impl HeadFacts {
         if !many {
             f.framing = Some(if request { request_framing_of(ff.te(), ff.cl()) } else { response_body_framing(ff.te(), ff.cl()) });
         }
+        if !upg_hdr && upg_fix != (0, 0) {
+            f.size = f.size.saturating_add_signed(upg_fix.0);
+            f.headers = f.headers.saturating_add_signed(isize::try_from(upg_fix.1).unwrap_or(0));
+        }
         Some(f)
     }
 
@@ -1714,7 +1728,7 @@ impl HeadFacts {
     fn check(&self, head: &[u8], request: bool) {
         let text = String::from_utf8_lossy(head);
         debug_assert_eq!(Some(self.size), htx_head_size_general(head, request), "size of {text:?}");
-        debug_assert_eq!(self.cost(), head_cost_of(head, Some(self.size)), "cost of {text:?}");
+        debug_assert_eq!(self.cost(), head_cost_of(head, Some(self.size), request), "cost of {text:?}");
         debug_assert_eq!(self.wants_close(), head_wants_close_general(&text), "close of {text:?}");
         debug_assert_eq!(self.conn, scan_connection(head), "Connection of {text:?}");
         if let Some(framing) = self.framing {
@@ -1755,7 +1769,7 @@ fn htx_head_cost_and_size_of(head: &[u8], request: bool) -> (usize, Option<u64>)
         }
     }
     let size = htx_head_size(head, request);
-    (head_cost_of(head, size), size)
+    (head_cost_of(head, size, request), size)
 }
 
 /// The HTX cost of `data` bytes in `headers` header blocks, with the start line and the end
@@ -1767,21 +1781,77 @@ fn cost_of(data: usize, headers: usize) -> usize {
 /// [`head_cost`] of a head whose [`htx_head_size`] is `size`.
 #[cold]
 #[inline(never)]
-fn head_cost_of(head: &[u8], size: Option<u64>) -> usize {
+fn head_cost_of(head: &[u8], size: Option<u64>, request: bool) -> usize {
     // A `Connection` header left with no token is not in the HTX message at all, so it has
     // no block either (as `htx_head_size` leaves it out of the data).
-    let headers = head
-        .split(|&b| b == b'\n')
-        .skip(1)
-        .take_while(|l| !l.is_empty() && *l != b"\r")
-        .filter(|l| !connection_emptied(l))
-        .count();
+    let lines = || head.split(|&b| b == b'\n').skip(1).take_while(|l| !l.is_empty() && *l != b"\r");
+    let upgrade = |l: &[u8]| {
+        let l = l.strip_suffix(b"\r").unwrap_or(l);
+        l.iter().position(|&b| b == b':').is_some_and(|c| ascii_trim_end(&l[..c]).eq_ignore_ascii_case(b"upgrade") && upgrade_value_kept(&l[c + 1..]))
+    };
+    let drop_upgrade = request && !lines().any(upgrade);
+    let headers = lines().filter(|l| !connection_emptied(l, drop_upgrade)).count();
     cost_of(size.map_or(head.len(), |n| usize::try_from(n).unwrap_or(usize::MAX)), headers)
+}
+
+/// The length of a `Connection` value in HTX, of `len` bytes as written: `dropped` whether a
+/// token went, `kept` and `chars` the tokens left and their bytes, joined by `,`
+/// (`h1_parse_connection_header`). `None`: no token left, the header is gone.
+fn conn_htx_len(len: usize, dropped: bool, kept: usize, chars: usize) -> Option<usize> {
+    if !dropped {
+        Some(len)
+    } else if kept == 0 {
+        None
+    } else {
+        Some(chars + kept - 1)
+    }
+}
+
+/// A `Connection` value of `len` bytes, with `upg` `upgrade` tokens of `upg_chars` bytes
+/// beside the counts of [`conn_htx_len`] (which leave them out): its HTX length with them
+/// kept, then with them dropped. `close` and `keep-alive` always go; `upgrade` stays but in
+/// a request without an `Upgrade` header (`h1_postparse_req_hdrs`; a `101` response keeps
+/// its `Connection: Upgrade`, measured on `HAProxy` 3.5-dev8, T514).
+fn conn_htx_lens(len: usize, dropped: bool, kept: usize, chars: usize, upg: usize, upg_chars: usize) -> (Option<usize>, Option<usize>) {
+    (conn_htx_len(len, dropped, kept + upg, chars + upg_chars), conn_htx_len(len, dropped || upg > 0, kept, chars))
+}
+
+/// [`conn_htx_lens`] of a `Connection` value.
+fn conn_lens_of(value: &[u8]) -> (Option<usize>, Option<usize>) {
+    let (mut kept, mut chars, mut dropped, mut upg, mut upg_chars) = (0, 0, false, 0, 0);
+    for t in value.split(|&b| b == b',').map(ascii_trim).filter(|t| !t.is_empty()) {
+        if t.eq_ignore_ascii_case(b"close") || t.eq_ignore_ascii_case(b"keep-alive") {
+            dropped = true;
+        } else if t.eq_ignore_ascii_case(b"upgrade") {
+            upg += 1;
+            upg_chars += t.len();
+        } else {
+            kept += 1;
+            chars += t.len();
+        }
+    }
+    conn_htx_lens(value.len(), dropped, kept, chars, upg, upg_chars)
+}
+
+/// Whether an `Upgrade` value names a protocol `HAProxy`'s H1 parser keeps (`h2c` and `h2`
+/// are skipped, `h1_parse_upgrade_header`): with one, a request's `Connection: upgrade` stays.
+fn upgrade_value_kept(value: &[u8]) -> bool {
+    value.split(|&b| b == b',').map(ascii_trim).any(|t| !t.is_empty() && !t.eq_ignore_ascii_case(b"h2c") && !t.eq_ignore_ascii_case(b"h2"))
+}
+
+/// The size and header-count change of a `Connection` line of name `name_len` whose value
+/// comes to `keep` with its `upgrade` tokens and `drop` without (see [`conn_htx_lens`]), when
+/// the request has no `Upgrade` header.
+fn conn_upgrade_fix(name_len: usize, keep: Option<usize>, drop: Option<usize>) -> (i64, i64) {
+    let line = |l: Option<usize>| l.map_or((0, 0), |l| (i64::try_from(name_len + l).unwrap_or(0), 1));
+    let (k, d) = (line(keep), line(drop));
+    (d.0 - k.0, d.1 - k.1)
 }
 
 /// Whether a header line is a `Connection` whose tokens are all ones HTX drops (`close`,
 /// `keep-alive`, `upgrade`), with at least one: the header is then gone from the message.
-fn connection_emptied(line: &[u8]) -> bool {
+/// `upgrade` is dropped only with `drop_upgrade` (see [`conn_htx_lens`]).
+fn connection_emptied(line: &[u8], drop_upgrade: bool) -> bool {
     // Every header line of every head comes here: only a name starting with `c` can be
     // `connection` (the name is trimmed at its end only), so the rest go without a colon
     // search (T433: the search cost ~860 instructions per proxied request).
@@ -1794,7 +1864,7 @@ fn connection_emptied(line: &[u8]) -> bool {
     }
     let mut any = false;
     for t in line[colon + 1..].split(|&b| b == b',').map(ascii_trim).filter(|t| !t.is_empty()) {
-        if !(t.eq_ignore_ascii_case(b"close") || t.eq_ignore_ascii_case(b"keep-alive") || t.eq_ignore_ascii_case(b"upgrade")) {
+        if !(t.eq_ignore_ascii_case(b"close") || t.eq_ignore_ascii_case(b"keep-alive") || (drop_upgrade && t.eq_ignore_ascii_case(b"upgrade"))) {
             return false;
         }
         any = true;
@@ -1864,7 +1934,8 @@ fn htx_head_size_and_headers_ascii(head: &[u8], request: bool) -> Option<(u64, u
         version.len() + status.len() + ascii_trim(reason).len()
     };
     let mut size = 20 + strings as u64 + 1;
-    let mut headers = 0;
+    let mut headers = 0usize;
+    let (mut upg_hdr, mut upg_fix) = (false, (0i64, 0i64));
     for line in lines {
         if line.is_empty() {
             break;
@@ -1873,30 +1944,25 @@ fn htx_head_size_and_headers_ascii(head: &[u8], request: bool) -> Option<(u64, u
         let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
         let (name, value) = (ascii_trim_end(&line[..colon]), ascii_trim(&line[colon + 1..]));
         let len = if name.eq_ignore_ascii_case(b"connection") {
-            let known = |t: &[u8]| t.eq_ignore_ascii_case(b"close") || t.eq_ignore_ascii_case(b"keep-alive") || t.eq_ignore_ascii_case(b"upgrade");
-            let mut kept = 0;
-            let mut chars = 0;
-            let mut dropped = false;
-            for t in value.split(|&b| b == b',').map(ascii_trim).filter(|t| !t.is_empty()) {
-                if known(t) {
-                    dropped = true;
-                } else {
-                    kept += 1;
-                    chars += t.len();
-                }
+            let (keep, drop) = conn_lens_of(value);
+            if request {
+                let (s, h) = conn_upgrade_fix(name.len(), keep, drop);
+                upg_fix = (upg_fix.0 + s, upg_fix.1 + h);
             }
-            if !dropped {
-                value.len()
-            } else if kept == 0 {
+            let Some(l) = keep else {
                 headers -= 1;
                 continue;
-            } else {
-                chars + kept - 1
-            }
+            };
+            l
         } else {
+            upg_hdr |= request && name.eq_ignore_ascii_case(b"upgrade") && upgrade_value_kept(value);
             value.len()
         };
         size += (name.len() + len) as u64;
+    }
+    if !upg_hdr {
+        size = size.saturating_add_signed(upg_fix.0);
+        headers = headers.saturating_add_signed(isize::try_from(upg_fix.1).unwrap_or(0));
     }
     Some((size, headers))
 }
@@ -1919,6 +1985,7 @@ fn htx_head_size_general(head: &[u8], request: bool) -> Option<u64> {
         version.len() + status.len() + reason.trim().len()
     };
     let mut size = 20 + strings as u64 + 1;
+    let (mut upg_hdr, mut upg_fix) = (false, 0i64);
     for line in lines {
         if line.is_empty() {
             break;
@@ -1926,29 +1993,20 @@ fn htx_head_size_general(head: &[u8], request: bool) -> Option<u64> {
         let Some((name, value)) = line.split_once(':') else { continue };
         let (name, value) = (name.trim_end(), value.trim());
         let len = if name.eq_ignore_ascii_case("connection") {
-            let known = |t: &str| ["close", "keep-alive", "upgrade"].iter().any(|k| t.eq_ignore_ascii_case(k));
-            let mut kept = 0;
-            let mut chars = 0;
-            let mut dropped = false;
-            for t in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-                if known(t) {
-                    dropped = true;
-                } else {
-                    kept += 1;
-                    chars += t.len();
-                }
+            let (keep, drop) = conn_lens_of(value.as_bytes());
+            if request {
+                upg_fix += conn_upgrade_fix(name.len(), keep, drop).0;
             }
-            if !dropped {
-                value.len()
-            } else if kept == 0 {
-                continue;
-            } else {
-                chars + kept - 1
-            }
+            let Some(l) = keep else { continue };
+            l
         } else {
+            upg_hdr |= request && name.eq_ignore_ascii_case("upgrade") && upgrade_value_kept(value.as_bytes());
             value.len()
         };
         size += (name.len() + len) as u64;
+    }
+    if !upg_hdr {
+        size = size.saturating_add_signed(upg_fix);
     }
     Some(size)
 }
@@ -2238,7 +2296,7 @@ mod tests {
             (b"", false),
             (b"Host: connection: close", false),
         ] {
-            assert_eq!(connection_emptied(line), emptied, "{:?}", String::from_utf8_lossy(line));
+            assert_eq!(connection_emptied(line, true), emptied, "{:?}", String::from_utf8_lossy(line));
         }
     }
 
@@ -2573,24 +2631,7 @@ mod tests {
     /// The HTX cost of a head, as the separate size and block passes counted it before T433
     /// fused them: the reference the one-pass accounting must keep giving.
     fn reference_head_cost(head: &[u8], request: bool) -> usize {
-        fn emptied(line: &[u8]) -> bool {
-            let Some(colon) = line.iter().position(|&b| b == b':') else { return false };
-            if !ascii_trim_end(&line[..colon]).eq_ignore_ascii_case(b"connection") {
-                return false;
-            }
-            let mut any = false;
-            for t in line[colon + 1..].split(|&b| b == b',').map(ascii_trim).filter(|t| !t.is_empty()) {
-                if !(t.eq_ignore_ascii_case(b"close") || t.eq_ignore_ascii_case(b"keep-alive") || t.eq_ignore_ascii_case(b"upgrade")) {
-                    return false;
-                }
-                any = true;
-            }
-            any
-        }
-        let size = htx_head_size_general(head, request);
-        let blocks = 2 + head.split(|&b| b == b'\n').skip(1).take_while(|l| !l.is_empty() && *l != b"\r").filter(|l| !emptied(l)).count();
-        let data = size.map_or(head.len(), |n| usize::try_from(n).unwrap_or(usize::MAX));
-        data.saturating_add(40 + 8 * blocks)
+        head_cost_of(head, htx_head_size_general(head, request), request)
     }
 
     /// T433: the HTX cost and size of request and response heads, read in one pass, are the

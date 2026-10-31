@@ -43,8 +43,7 @@ fn request(fields: &[(&[u8], &[u8])]) -> Vec<u8> {
     v
 }
 
-#[test]
-fn h2_cookie_fields_are_merged_into_one_line() {
+fn exchange(rules: &str, f: &[(&[u8], &[u8])]) -> String {
     let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let be = l.local_addr().unwrap();
@@ -75,10 +74,7 @@ fn h2_cookie_fields_are_merged_into_one_line() {
         format!(
             "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 20s\n\ttimeout server 20s\n\
              frontend fe\n\tbind 127.0.0.1:{port} proto h2\n\
-             \thttp-request set-header x-hdr %[req.hdr(cookie)]\n\
-             \thttp-request set-header x-cnt %[req.hdr_cnt(cookie)]\n\
-             \thttp-request set-header x-b %[req.cook(b)]\n\
-             \tdefault_backend be\n\
+             {rules}\tdefault_backend be\n\
              backend be\n\tserver s1 {be}\n"
         ),
     )
@@ -88,16 +84,32 @@ fn h2_cookie_fields_are_merged_into_one_line() {
     let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     c.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
     c.write_all(&frame(0x04, 0, 0, &[])).unwrap();
-    let f: [(&[u8], &[u8]); 3] = [(b"cookie", b"a=1"), (b"x-y", b"z"), (b"cookie", b" b=2")];
-    c.write_all(&frame(0x01, 0x05, 1, &request(&f))).unwrap();
+    c.write_all(&frame(0x01, 0x05, 1, &request(f))).unwrap();
     thread::sleep(Duration::from_millis(1500));
     drop(c);
     common::stop(&mut child);
     let _ = std::fs::remove_file(&cfg);
     let seen = seen.lock().unwrap();
-    let got = String::from_utf8_lossy(seen.first().expect("no request reached the server")).into_owned();
+    String::from_utf8_lossy(seen.first().expect("no request reached the server")).into_owned()
+}
+
+#[test]
+fn h2_cookie_fields_are_merged_into_one_line() {
+    let rules = "\thttp-request set-header x-hdr %[req.hdr(cookie)]\n\thttp-request set-header x-cnt %[req.hdr_cnt(cookie)]\n\thttp-request set-header x-b %[req.cook(b)]\n";
+    let got = exchange(rules, &[(b"cookie", b"a=1"), (b"x-y", b"z"), (b"cookie", b" b=2")]);
     // The oracle: the cookie line follows the other fields, the values joined by "; " with
     // the leading blank of the second kept; the rules see one header.
     let want = "GET /p HTTP/1.1\r\nhost: localhost\r\nx-y: z\r\ncookie: a=1;  b=2\r\nx-hdr: a=1;  b=2\r\nx-cnt: 1\r\nx-b: 2\r\n\r\n";
+    assert_eq!(got, want);
+}
+
+/// `http_cookie_merge` trims nothing: the leading blank of the first crumb and the trailing
+/// blank of the last reach the server, also when a rule rewrote the head (T514; measured on
+/// `HAProxy` 3.5-dev8, `cookie:  a=1 ; b=2 `). The rules' `req.hdr` trims, as `HAProxy`'s.
+#[test]
+fn h2_cookie_merge_keeps_outer_blanks_after_a_rewrite() {
+    let rules = "\thttp-request set-header x-hdr [%[req.hdr(cookie)]]\n\thttp-request set-header x-b %[req.cook(b)]\n";
+    let got = exchange(rules, &[(b"cookie", b" a=1 "), (b"x-y", b"z"), (b"cookie", b"b=2 ")]);
+    let want = "GET /p HTTP/1.1\r\nhost: localhost\r\nx-y: z\r\ncookie:  a=1 ; b=2 \r\nx-hdr: [a=1 ; b=2]\r\nx-b: 2\r\n\r\n";
     assert_eq!(got, want);
 }

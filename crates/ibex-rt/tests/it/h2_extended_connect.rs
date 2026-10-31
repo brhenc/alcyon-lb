@@ -135,6 +135,11 @@ struct Proxy {
 }
 
 fn proxy(server: std::net::SocketAddr) -> Proxy {
+    proxy_fe(server, "")
+}
+
+/// [`proxy`], with `fe` (lines) in the frontend.
+fn proxy_fe(server: std::net::SocketAddr, fe: &str) -> Proxy {
     let dir = tempfile::tempdir().expect("dir");
     let addr = common::reserve_addr();
     let cfg = dir.path().join("ibex.cfg");
@@ -143,7 +148,7 @@ fn proxy(server: std::net::SocketAddr) -> Proxy {
         format!(
             "global\n  log stdout format raw local0\n\
              defaults\n  mode http\n  log global\n  option httplog\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n  timeout tunnel 5s\n  option forwardfor\n\
-             frontend fe\n  bind {addr} proto h2\n  default_backend be\n\
+             frontend fe\n  bind {addr} proto h2\n{fe}  default_backend be\n\
              backend be\n  server s1 {server}\n"
         ),
     )
@@ -341,4 +346,24 @@ fn a_tunnel_the_server_ended_first_ends_at_the_client_s_end_stream() {
     })
     .expect("next");
     assert!(matches!(rx.recv_timeout(Duration::from_secs(3)), Ok(Seen::Head(h)) if h.starts_with("GET /close HTTP/1.1")));
+}
+
+/// `%B` and `%U` of a WebSocket over extended CONNECT count the server's `101` head with its
+/// `connection: Upgrade` and the tunnel's bytes both ways (T514; measured on `HAProxy`
+/// 3.5-dev8 on this exchange: `ST=101 B=237 U=234`).
+#[test]
+fn the_log_counts_the_upgrade_head_and_the_tunnel_bytes() {
+    let (server, rx) = ws_server();
+    let p = proxy_fe(server, "  log-format \"ST=%ST B=%B U=%U\"\n");
+    let mut s = connect(&p);
+    s.write_all(&ext_connect("websocket", Some("/ws"))).expect("headers");
+    assert!(matches!(rx.recv_timeout(Duration::from_secs(3)), Ok(Seen::Head(_))));
+    read_frames(&mut s, Duration::from_secs(3), |f| f.iter().any(|f| f.ftype == 1 && f.stream == 1));
+    s.write_all(&frame(0, 0, 1, &[b'H'; 100])).expect("data");
+    assert!(matches!(rx.recv_timeout(Duration::from_secs(3)), Ok(Seen::Bytes(_))));
+    read_frames(&mut s, Duration::from_secs(3), |f| f.iter().any(|f| f.ftype == 0 && f.stream == 1));
+    s.write_all(&frame(0, 1, 1, b"")).expect("end");
+    // The probe of `wait_listening` read no request: `U=0`.
+    let line = std::iter::from_fn(|| next_log(&p, Duration::from_secs(3))).find(|l| !l.ends_with(" U=0")).expect("the stream is logged");
+    assert_eq!(line, "ST=101 B=237 U=234");
 }
