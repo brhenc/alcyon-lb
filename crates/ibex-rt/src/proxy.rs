@@ -371,6 +371,11 @@ pub struct H3Owner {
     pub conn: ibex_quic::ConnectionId,
     /// A response's DATA staged on its way to the mux, kept from one response to the next.
     pub body_scratch: Vec<u8>,
+    /// Since when no stream is served (`qcc->idle_start`): the connection's start, then each
+    /// time its last child ends. The base of its idle timers (T521).
+    pub idle_start: ibex_sched::Tick,
+    /// A timer expired and the GOAWAY is written: the next pass closes (`qcc_shutdown`).
+    pub closing: bool,
 }
 
 /// The owner's side: its children.

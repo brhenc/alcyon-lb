@@ -5682,7 +5682,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 // Its role, which keeps its children and its mux, is made now (two `Box`es a
                 // connection).
                 sess.h2_role = Some(Box::new(crate::proxy::H2Role::Owner(crate::proxy::H2Owner {
-                    h3: Some(Box::new(crate::proxy::H3Owner { mux, listener: usize_to_u32(q_idx), conn, body_scratch: Vec::new() })),
+                    h3: Some(Box::new(crate::proxy::H3Owner { mux, listener: usize_to_u32(q_idx), conn, body_scratch: Vec::new(), idle_start: self.now, closing: false })),
                     ..Default::default()
                 })));
                 let entry = SessionEntry {
@@ -6826,7 +6826,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 && (!e.sess.is_first_req || e.sess.h2_ctx.is_some())
                 // An HTTP/2 connection serving a stream is not idle (the stream is its child,
                 // T280).
-                && e.sess.h2_owner().is_none_or(|o| o.children.is_empty());
+                && e.sess.h2_owner().is_none_or(|o| o.children.is_empty())
+                // An HTTP/3 connection drains itself (`step_h3_owner`): it closes once its
+                // FINs are acknowledged; shut here, it lost the response not yet received
+                // (T521).
+                && e.sess.h3_owner().is_none();
             if !idle {
                 continue;
             }
@@ -8854,6 +8858,37 @@ fn h3_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
 
 /// [`h2_bridge_state`] for a stream of an HTTP/3 connection (T509): its reset, and the
 /// connection failing (`failed`: the mux's connection error, which closes it).
+/// The deadline of an HTTP/3 connection's owner (`qcc_refresh_timeout`, `src/mux_quic.c`),
+/// T521 (RV-16). A stream served, or one whose head is in and waits for its child: none (each
+/// stream has its own timers). Output waiting: `timeout client` from now. A stream with a
+/// partial head: `timeout http-request` from that stream's start, the oldest one's
+/// (`qcc->opening_list`); no request yet: `http-request` from the connection's start; else
+/// `http-keep-alive` (or `http-request`) from the end of the last stream. Neither set:
+/// `timeout client` from now.
+fn h3_owner_deadline(s: &crate::proxy::TcpSession, now: Tick) -> Tick {
+    use ibex_proto::htx_mux::HtxMux;
+    let Some(h3) = s.h3_owner() else { return Tick::ETERNITY };
+    let mux = &*h3.mux;
+    let client = if s.timeouts.client == 0 { Tick::ETERNITY } else { now.add(s.timeouts.client) };
+    if s.h2_owner().is_some_and(|o| !o.children.is_empty()) || mux.next_dispatch().is_some() {
+        return Tick::ETERNITY;
+    }
+    if mux.tx_pending() {
+        return client;
+    }
+    let (base, ms) = match (mux.head_partial(), mux.last_client_stream_id) {
+        // The mux keeps the owner's tick (`now.0`) as the stream's start.
+        (Some(start), _) => (Tick(u32::try_from(start).unwrap_or(now.0)), s.http_request_ms),
+        (None, None) => (h3.idle_start, s.http_request_ms),
+        (None, Some(_)) => (h3.idle_start, if s.keep_alive_ms != 0 { s.keep_alive_ms } else { s.http_request_ms }),
+    };
+    if ms == 0 {
+        client
+    } else {
+        base.add(ms)
+    }
+}
+
 fn h3_bridge_state(o: &mut SessionEntry, c: &mut SessionEntry, failed: bool) -> bool {
     let (os, cs) = (&mut o.sess, &mut c.sess);
     let Some(h3) = os.h3_owner() else { return false };
@@ -10455,9 +10490,14 @@ impl EngineDispatcher<'_> {
         }
         let Some(e) = self.sessions.get_mut(owner_idx) else { return Outcome::Done };
         // A stream ended the connection (`http-request reject`, a silent drop), the mux
-        // failed it, or a soft stop finds it idle: it closes.
+        // failed it, its timer expired (the GOAWAY went out in the last pass), or a soft stop
+        // finds it idle with every FIN acknowledged -- quinn retransmits nothing after a
+        // close, so closing once the last FIN was written lost the response whose datagrams
+        // the client had not received yet (T521): it closes.
         let ended = !matches!(e.sess.cli_state, ScState::Ready | ScState::Established);
-        if ended || failed || (idle && self.quic_listeners[q_idx].is_stopping()) {
+        let ql = &self.quic_listeners[q_idx];
+        let drained = idle && ql.is_stopping() && !ql.owner_unacked(conn);
+        if ended || failed || drained || e.sess.h3_owner().is_some_and(|h| h.closing) {
             if !failed {
                 self.quic_listeners[q_idx].owner_close(conn);
             }
@@ -10474,6 +10514,20 @@ impl EngineDispatcher<'_> {
         if moved {
             self.wake_queue.push(task);
         }
+        let exp = h3_owner_deadline(&e.sess, now);
+        if exp.is_expired(now) {
+            // `qcc_timeout_task` -> `qcc_shutdown`: a GOAWAY now, the close in the next
+            // pass, once the GOAWAY is out (quinn sends no stream data after a close).
+            if let Some(h3) = e.sess.h3_owner_mut() {
+                h3.mux.send_goaway();
+                h3.closing = true;
+                self.quic_listeners[q_idx].owner_send(conn, &mut h3.mux, |_| true);
+            }
+            self.wake_queue.push(task);
+            return Outcome::Keep;
+        }
+        e.sess.cli_exp = exp;
+        self.timer_updates.push((task, exp));
         Outcome::Keep
     }
 
@@ -10503,7 +10557,12 @@ impl EngineDispatcher<'_> {
         owner.sess.h2_owner_mut().into_iter().for_each(|o| o.children.retain(|l| l.task != child.task));
         // An HTTP/3 stream whose response is all framed is let go once its FIN is out
         // (`QuicListener::owner_send`); one that ends without it is reset and let go now.
+        let none_left = owner.sess.h2_owner().is_some_and(|o| o.children.is_empty());
         if let Some(h3) = owner.sess.h3_owner_mut() {
+            // Its idle timers run from here (`qcc->idle_start`, T521).
+            if none_left {
+                h3.idle_start = now;
+            }
             let id = child.sess.h2_child().map_or(0, |c| u64::from(c.stream.id));
             let mux = &mut *h3.mux;
             match mux.streams.get(&id).map(|st| (st.tx_fin, st.fin_sent)) {
