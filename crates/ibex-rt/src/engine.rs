@@ -6124,6 +6124,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let stream_id = d.stream.id;
             let mut sess = TcpSession::h2_child_of(&mut owner.sess, (owner_idx, owner_task), d.stream);
             sess.h3 = owner.sess.h3;
+            // An HTTP/2 owner stamps the first byte of each stream as it reads it; an HTTP/3
+            // one reads no bytes of its own. The stream's request head is in, which is where
+            // its idle time (`Ti`, since the connection's previous stream ended) stops and
+            // its own `TR` and `Ta` start (T529). Left unset, `TR` and `Ta` held the idle gap.
+            if owner.sess.h3 {
+                sess.log.first_byte_now();
+            }
             let entry = SessionEntry {
                 sess,
                 task: TaskRef::NONE,
