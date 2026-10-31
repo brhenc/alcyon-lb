@@ -4,6 +4,10 @@ use bytes::{Buf, Bytes};
 
 use crate::{VarInt, range_set::RangeSet};
 
+/// Segments a `SendBuffer` keeps room for when its data is acknowledged (Ibex T543); 16 `Bytes`
+/// are 512 bytes, held while the stream (or its reuse, `Send::free`) lives
+const RETAINED_SEGMENTS: usize = 16;
+
 /// Buffer of outgoing retransmittable stream data
 #[derive(Default, Debug)]
 pub(super) struct SendBuffer {
@@ -86,8 +90,12 @@ impl SendBuffer {
                     self.unacked_segments.pop_front();
                     self.front_trimmed = 0;
 
-                    if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
-                        self.unacked_segments.shrink_to_fit();
+                    // Shrink a deque a burst grew, but not below `RETAINED_SEGMENTS`: an emptied
+                    // deque freed here was allocated again by the next write (Ibex T543)
+                    let cap = self.unacked_segments.capacity();
+                    if cap > RETAINED_SEGMENTS && self.unacked_segments.len() * 4 < cap {
+                        self.unacked_segments
+                            .shrink_to(RETAINED_SEGMENTS.max(self.unacked_segments.len()));
                     }
                 } else {
                     front.advance(to_advance);
