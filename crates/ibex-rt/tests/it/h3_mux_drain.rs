@@ -2,7 +2,8 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! T521: how an HTTP/3 connection ends under the mux (`tune.ibex.h3-path mux`): the owner's
-//! timers, a GOAWAY from the client, the soft stop's drain. Each row measured on `HAProxy`
+//! timers, a GOAWAY from the client, the soft stop's drain, client resets, concurrent streams
+//! (rows 1-5 of the task). Each row measured on `HAProxy`
 //! 3.5-dev7 built with QUIC (`reference/haproxy-quic`, aioquic 1.3.0 client, `timeout
 //! http-request 2s`, `http-keep-alive 4s`, `client 6s`, an HTTP/1 backend, 2026-10-31):
 //!
@@ -16,12 +17,15 @@
 //! | client GOAWAY(0) or (4) during /slow, then a GET on stream 4 | stream 4 served (200); close at keep-alive after /slow |
 //! | SIGUSR1 during /slow, a GET on stream 4 after it | GOAWAY(4) at once; stream 4 RESET_STREAM 0x10b; /slow's response; close 0x100; exit |
 //! | the same, the response's datagrams dropped for 1.3 s | retransmitted: the response arrives at 3.7 s, then the close |
+//! | RESET_STREAM + STOP_SENDING 0x10c (or STOP_SENDING alone) 0.5 s into /slow | RESET_STREAM 0x10c; server connection reset; `400 0 - - CD--`; next stream 200 |
+//! | 20 GET /slow at once on one connection | all 20 answered at 2.0 s; descriptors 10 -> 31 |
 //!
 //! `HAProxy`'s client GOAWAY only marks the connection (`QC_CF_CONN_SHUT`, read for backend
 //! reuse): a frontend serves streams opened after it. Before T521 the mux owner had no timer
-//! (the 30 s transport idle timeout closed every row above, transport NO_ERROR) and a soft
-//! stop closed the connection once its last FIN was written, not acknowledged: the drop row
-//! lost its response.
+//! (the 30 s transport idle timeout closed every row above, transport NO_ERROR), a soft stop
+//! closed the connection once its last FIN was written, not acknowledged (the drop row lost
+//! its response, and so, most runs, did the plain SIGUSR1 row: the close went out with the
+//! response unsent), and a reset whole request logged `CH--`.
 
 use crate::common;
 
@@ -292,7 +296,6 @@ impl Client {
                         reset = Some(code.into_inner());
                         break true;
                     }
-                    Err(_) => break true,
                 }
             };
             let _ = chunks.finalize();
@@ -557,5 +560,34 @@ fn a_reset_from_the_client_aborts_its_stream_as_on_h2() {
         let id = cl.open(&get(b"/after"), true);
         let o = cl.outcome(id);
         assert_eq!((o.status, o.fin), (Some(200), true), "{o:?}");
+    });
+}
+
+fn fds(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd")).map_or(0, Iterator::count)
+}
+
+/// Row 5 (M2 §4.1 under the mux): 20 requests at once on one connection are served at once,
+/// each a child holding one descriptor, its server connection (`HAProxy` 3.5-dev7, the same
+/// 20 `/slow` streams from aioquic: answered together at 2.0 s, 10 -> 31 descriptors; the
+/// relay path: 3 a request, its socket pair and server connection).
+#[test]
+fn twenty_concurrent_streams_are_served_at_once_one_descriptor_each() {
+    common::on_h3_path("mux", || {
+        let ibex = ibex(backend(), "timeout client 5s");
+        let mut cl = Client::connect(ibex.quic);
+        cl.run_until(Duration::from_millis(200), |_| false);
+        let before = fds(ibex.child.id());
+        let t0 = Instant::now();
+        let ids: Vec<StreamId> = (0..20).map(|i| cl.open(&get(format!("/slow?{i}").as_bytes()), true)).collect();
+        cl.run_until(SLOW / 2, |_| false);
+        let extra = fds(ibex.child.id()).saturating_sub(before);
+        for id in ids {
+            let o = cl.outcome(id);
+            assert_eq!((o.status, o.fin), (Some(200), true), "{o:?}");
+        }
+        // One after the other they would take 20 x 1.5 s.
+        assert!(t0.elapsed() < SLOW * 3, "20 streams took {:?}", t0.elapsed());
+        assert!((20..=21).contains(&extra), "{extra} descriptors for 20 requests in flight");
     });
 }
