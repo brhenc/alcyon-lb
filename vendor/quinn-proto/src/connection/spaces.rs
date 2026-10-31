@@ -358,14 +358,18 @@ impl Retransmits {
             && !self.max_stream_id.into_iter().any(|x| x)
             && self.reset_stream.is_empty()
             && self.stop_sending.is_empty()
-            && self
-                .max_stream_data
-                .iter()
-                .all(|&id| !streams.can_send_flow_control(id))
-            && self
-                .stream_data_blocked
-                .iter()
-                .all(|&id| streams.stream_data_blocked_limit(id).is_none())
+            // The length first (Ibex T543): iterating an emptied set scans all its buckets, and
+            // this runs for every packet built and every `poll_transmit`
+            && (self.max_stream_data.is_empty()
+                || self
+                    .max_stream_data
+                    .iter()
+                    .all(|&id| !streams.can_send_flow_control(id)))
+            && (self.stream_data_blocked.is_empty()
+                || self
+                    .stream_data_blocked
+                    .iter()
+                    .all(|&id| streams.stream_data_blocked_limit(id).is_none()))
             && self.crypto.is_empty()
             && self.new_cids.is_empty()
             && self.retire_cids.is_empty()
