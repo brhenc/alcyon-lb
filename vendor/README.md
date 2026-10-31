@@ -52,3 +52,46 @@ From the fork, not from here (it has the test vectors):
 `Cargo.lock`s, copy over `vendor/ringibex` and `vendor/rustls-ringibex`, apply the three changes
 above (or drop the ones the fork now carries), update the commit here, then
 `cargo build --offline -p ibex-tls` and `cargo test -p ibex-tls --test it crypto_provider::`.
+
+## `quinn-proto` (T542)
+
+The QUIC state machine under `ibex-quic` (and quinn's rustls 0.23 test clients in the dev-deps of
+`ibex-proto`, `ibex-quic` and `ibex-rt`), vendored to patch it (user, 2026-10-31). The root
+`Cargo.toml` takes it for the whole graph with `[patch.crates-io] quinn-proto = { path =
+"vendor/quinn-proto" }`; the crates keep asking for `quinn-proto = "0.11"` with their own
+features (`default-features = false`; the dev-deps add `rustls-ring`).
+
+- **Source:** crates.io `quinn-proto` 0.11.18, the `.crate` package as published
+  (sha256 `a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc`, the `Cargo.lock`
+  checksum before vendoring; upstream git `eaec0db4bcb698f76df736d89938743c88a2ad5f`, from
+  `.cargo_vcs_info.json`). Pure Rust; no C, no build script.
+- **Left out:** the package's `Cargo.lock` (the root one is used). Everything else is as
+  published, `Cargo.toml` (normalised by cargo) and `Cargo.toml.orig` included.
+- **Licences:** `LICENSE-APACHE`, `LICENSE-MIT` (quinn's, `MIT OR Apache-2.0`).
+
+### Changes made here
+
+The first vendor commit is the pristine 0.11.18; each change below is its own commit on top
+(`git log -- vendor/quinn-proto`), each a diff that could go upstream as it is. None has.
+
+1. `src/frame.rs`, `Iter::try_next`: a run of PADDING bytes is one `Frame::Padding` (was one
+   per byte). RFC 9000 19.1: PADDING has no content, so a run is equivalent. h2load and browsers
+   pad each request packet to ~1200 bytes: ~1150 `next()` calls per packet were half of Ibex's
+   h3 per-request instructions (T539). Test: `frame::test::padding_run_is_one_frame`.
+
+### Running quinn-proto's own tests
+
+`tools/quinn-proto-tests.sh [filter]` runs its unit tests (`--lib`, 181 of them) offline, on a
+copy in /tmp: `assert_matches` and `hex-literal` (not in the registry cache) are replaced by
+local shims, `fastbloom` (feature `bloom`) and the other uncached optional dependencies are
+taken out, and `src/tests/` (the end-to-end suite: needs `rcgen` 0.14, not cached) is not
+built. With network access, upstream's full suite runs from a quinn checkout.
+
+### Updating to a new release
+
+Extract the new `.crate` (`~/.cargo/registry/cache/*/quinn-proto-<v>.crate`, after a
+`cargo fetch` of it) over `vendor/quinn-proto/` in one commit (drop its `Cargo.lock`; update
+the sha256 and git sha above), then reapply the changes above one commit each
+(`git format-patch` of each change commit, `git am`), dropping those upstream now carries.
+Then `cargo build --offline --workspace`, `tools/quinn-proto-tests.sh`, and the ibex-quic,
+ibex-proto h3 and ibex-rt h3 tests.
