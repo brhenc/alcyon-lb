@@ -3,7 +3,7 @@
 
 //! QUIC endpoint implementation encapsulating `quinn-proto`.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use quinn_proto::{ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Ser
 use crate::config::QuicConfig;
 use crate::connection::{ConnectionId, ReadStreamResult, StreamDirection, StreamId};
 use crate::error::{QuicError, Result};
-use crate::table::ConnectionTable;
+use crate::table::{ConnectionTable, HandleMap};
 use crate::transport::{DatagramOutcome, EcnCodepoint, QuicTransport, TransportEvent, Transmit};
 
 /// The receive block's size ([`CopyBlock`]): the listener's datagram buffer.
@@ -84,9 +84,9 @@ pub struct QuicEndpoint {
     endpoint: Endpoint,
     server_config: Arc<ServerConfig>,
     connection_table: ConnectionTable,
-    connections: HashMap<ConnectionHandle, quinn_proto::Connection>,
-    handle_to_primary_cid: HashMap<ConnectionHandle, ConnectionId>,
-    amplification_budgets: HashMap<ConnectionHandle, AmplificationBudget>,
+    connections: HandleMap<quinn_proto::Connection>,
+    handle_to_primary_cid: HandleMap<ConnectionId>,
+    amplification_budgets: HandleMap<AmplificationBudget>,
     anti_amplification_factor: u64,
     /// Packets quinn-proto produced that the budget then refused. Every one of these is a
     /// wasted packet number and an armed loss-recovery timer, so this is expected to be zero.
@@ -103,7 +103,7 @@ pub struct QuicEndpoint {
     /// connection is re-keyed (`refresh_timer`) only when its own timeout may have changed.
     timers: BTreeSet<(Instant, usize)>,
     /// The deadline each connection has in `timers`.
-    timer_of: HashMap<ConnectionHandle, Instant>,
+    timer_of: HandleMap<Instant>,
     response_buf: Vec<u8>,
     tx_buf: Vec<u8>,
     /// What each received datagram is copied into for quinn-proto, which takes it by value.
@@ -276,9 +276,9 @@ impl QuicEndpoint {
             endpoint,
             server_config,
             connection_table: ConnectionTable::new(),
-            connections: HashMap::new(),
-            handle_to_primary_cid: HashMap::new(),
-            amplification_budgets: HashMap::new(),
+            connections: HandleMap::default(),
+            handle_to_primary_cid: HandleMap::default(),
+            amplification_budgets: HandleMap::default(),
             anti_amplification_factor: if anti_amplification_factor == 0 { 3 } else { anti_amplification_factor },
             amplification_overshoots: 0,
             pending_transmits: VecDeque::new(),
@@ -288,7 +288,7 @@ impl QuicEndpoint {
             next_timeout: None,
             timeout_polls: 0,
             timers: BTreeSet::new(),
-            timer_of: HashMap::new(),
+            timer_of: HandleMap::default(),
             response_buf: Vec::with_capacity(2048),
             rx: CopyBlock::new(RX_BLOCK),
             tx: CopyBlock::new(TX_BLOCK),
