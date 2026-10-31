@@ -155,9 +155,9 @@ fn show_info_rates_track_connections_and_clear_counters_resets_maxima() {
 /// Starts ibex on `cfg`, waits for `tcp` to accept, then lets the probe connections age
 /// out of the rate window and clears the maxima, so every counter starts at 0.
 fn start_quiet(name: &str, cfg: &str, tcp: &[std::net::SocketAddr], sock: &std::path::Path) -> Daemon {
-    let path = std::env::temp_dir().join(format!("ibex_t320_{name}_{}.cfg", std::process::id()));
+    let path = std::env::temp_dir().join(format!("ibex_t320_{name}_{}_{}.cfg", common::h3_path_name(), std::process::id()));
     std::fs::write(&path, cfg).expect("write config");
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+    let child = common::ibex_command(env!("CARGO_BIN_EXE_ibex"))
         .arg("-f")
         .arg(&path)
         .stdout(Stdio::null())
@@ -218,7 +218,7 @@ fn rejected_connections_count_in_conn_rate_not_sess_rate() {
 /// connection reaches `listener_accept` once (`quic_accept_push_qc` -> `quic_accept_run`,
 /// `src/quic_sock.c`), which ticks `conn_per_sec` and `sess_per_sec` once each; request
 /// streams are not accepted connections.
-#[test]
+crate::h3_both_paths! {
 fn h3_requests_on_one_quic_connection_count_once() {
     let has_h3 = Command::new("curl")
         .arg("--version")
@@ -228,7 +228,7 @@ fn h3_requests_on_one_quic_connection_count_once() {
     let tcp = common::reserve_addr();
     let quic = common::reserve_addr();
     let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
-    let sock = std::env::temp_dir().join(format!("ibex_t320_h3_{}.sock", std::process::id()));
+    let sock = std::env::temp_dir().join(format!("ibex_t320_h3_{}_{}.sock", common::h3_path_name(), std::process::id()));
     let cfg = format!(
         "global\n  nbthread 2\n  stats socket {} level admin\n\
          defaults\n  mode http\n  timeout connect 1s\n  timeout client 10s\n  timeout server 10s\n\
@@ -250,6 +250,7 @@ fn h3_requests_on_one_quic_connection_count_once() {
     assert_eq!(get_rate(&info, "MaxConnRate"), 1, "MaxConnRate");
     assert_eq!(get_rate(&info, "SessRate"), 1, "SessRate");
     assert_eq!(get_rate(&info, "MaxSessRate"), 1, "MaxSessRate");
+}
 }
 
 /// T499 part 2: the rates are per-thread counters summed on read. With `nbthread 4` and eight

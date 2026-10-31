@@ -5,7 +5,7 @@
 //! `tcp-request connection` rules run once, for the connection. Measured on `HAProxy` 3.5-dev7
 //! with QUIC (`reference/haproxy-quic`), `tcp-request connection reject if { src 127.0.0.1 }`
 //! on the QUIC bind: curl gets no response (`ERR_DRAINING`, the connection closed); a rule that
-//! does not match leaves the request served. On the relay (no `IBEX_H3_PATH`) the rules run
+//! does not match leaves the request served. On the relay (`tune.ibex.h3-path relay`) the rules run
 //! per request stream, and the stream is answered 502 by the relay (T504's known gap, gone
 //! with the relay in slice H5): there the test asserts only that nothing was served.
 
