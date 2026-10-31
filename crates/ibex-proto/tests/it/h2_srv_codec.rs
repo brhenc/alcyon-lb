@@ -6,8 +6,9 @@
 //! Every request vector is the wire HAProxy 3.5-dev8 (`~/reference/haproxy/haproxy`) wrote to
 //! an h2c server (`server s1 127.0.0.1:64201 proto h2`) for the same HTTP/1.1 request,
 //! captured 2026-10-31 by a scripted h2 server that logs each frame it reads
-//! (`/tmp/t537/h2srv.py`, rig in `tasks/T537-progress.md`). Every response expectation is
-//! the HTTP/1.1 text HAProxy gave an h1 client for the same server frames.
+//! (`~/ibex-worktrees/review/t537-2026-10-31/h2srv.py`, rig in `tasks/T537-progress.md`).
+//! Every response expectation is the HTTP/1.1 text HAProxy gave an h1 client for the same
+//! server frames.
 
 #![allow(clippy::doc_markdown, clippy::many_single_char_names, clippy::type_complexity)]
 
@@ -714,4 +715,47 @@ fn a_response_taken_in_parts_is_granted_once_all_is_taken() {
     assert_eq!(c.output(), b"", "not all taken");
     c.advance_response(10);
     assert_eq!(take_out(&mut c)[..9], [0, 0, 4, 8, 0, 0, 0, 0, 1], "stream WINDOW_UPDATE");
+}
+
+#[test]
+fn a_chunk_larger_than_the_window_waits_for_it() {
+    let mut c = H2SrvCodec::new();
+    let _ = take_out(&mut c);
+    c.receive(&fr(4, 0, 0, &[0, 4, 0, 0, 0, 100])).unwrap();
+    let _ = take_out(&mut c);
+    let mut req = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nFA\r\n".to_vec();
+    req.extend(std::iter::repeat_n(b'c', 250));
+    req.extend_from_slice(b"\r\n0\r\n\r\n");
+    let first = c.send_request(&req).unwrap();
+    assert_eq!(first, req.len() - 250 - 7 + 100, "100 bytes of the chunk: the window");
+    assert_eq!(c.send_request(&req[first..]).unwrap(), 0);
+    c.receive(&fr(8, 0, 1, &1000u32.to_be_bytes())).unwrap();
+    assert_eq!(c.send_request(&req[first..]).unwrap(), req.len() - first);
+    let w = take_out(&mut c);
+    assert!(w.ends_with(&[&[0, 0, 150, 0, 0, 0, 0, 0, 1][..], &[b'c'; 150][..], &[0, 0, 0, 0, 1, 0, 0, 0, 1][..]].concat()));
+}
+
+#[test]
+fn an_error_read_while_the_session_took_the_text_comes_with_the_next_request_too() {
+    let mut c = ready();
+    let _ = request(&mut c, b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+    let big = "v".repeat(16_000);
+    let head = [st("200"), lit_long("x-a", &big), lit_long("x-b", &big), lit_long("x-c", &big)].concat();
+    let mut frames = fr(1, 0, 1, &head[..16_000]);
+    frames.extend(fr(9, 0, 1, &head[16_000..32_000]));
+    frames.extend(fr(9, 4, 1, &head[32_000..]));
+    frames.extend(fr(3, 0, 1, &[0, 0, 0, 2]));
+    c.receive(&frames).unwrap();
+    let n = c.response().len();
+    c.advance_response(n);
+    assert_eq!(c.send_request(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"), Err(SrvH2Error::Reset { code: 2, after_head: true }));
+    assert_eq!(c.send_request(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").map(|n| n > 0), Ok(true), "then the request goes");
+}
+
+#[test]
+fn a_target_with_a_colon_but_no_authority_is_a_path_and_other_streams_windows_are_ignored() {
+    let mut c = ready();
+    let w = request(&mut c, b"GET urn:x HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert_eq!(&w[9..], &[0x82, 0x87, 0x44, 5, b'u', b'r', b'n', b':', b'x', 0x66, 1, b'h']);
+    assert_eq!(c.receive(&fr(8, 0, 7, &[0, 0, 0, 1])), Ok(()));
 }
