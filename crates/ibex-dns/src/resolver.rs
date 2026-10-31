@@ -436,7 +436,10 @@ impl Resolver {
         }
         f.nb_responses += 1;
 
-        let (verdict, qtype) = validate(buf, f, max_payload);
+        // `allow_truncated_srv` (resolvers.c:2434-2436): unless the answer came over UDP from a
+        // nameserver with a TCP fallback.
+        let fallback = proto == Protocol::Udp && transport == NsTransport::Auto && self.cfg.tcp_fallback;
+        let (verdict, qtype) = validate(buf, f, max_payload, !fallback);
         let (rx, status) = match verdict {
             Verdict::Valid(answers) => {
                 let f = self.in_flight.remove(idx);
@@ -447,7 +450,7 @@ impl Resolver {
                 self.results.push_back((f.id, Ok(answers)));
                 return Received::Valid;
             }
-            Verdict::Truncated if proto == Protocol::Udp && transport == NsTransport::Auto && self.cfg.tcp_fallback => {
+            Verdict::Truncated if fallback => {
                 // resolv_send_tcp_fallback: the same question over TCP to this nameserver,
                 // without using a try.
                 f.nb_queries += 1;
@@ -495,9 +498,24 @@ impl Resolver {
     }
 }
 
+/// A name of an answer as text, lower case, its labels' bytes as they are (`resolv_dn_label_to_str`:
+/// no escaping, so `t*1.test` stays `t*1.test` and `srv_update_fqdn` can refuse it), with the
+/// final dot of a fully qualified name.
+fn name_text(n: &Name) -> String {
+    let mut out = String::new();
+    for l in n.iter() {
+        out.push_str(&String::from_utf8_lossy(&l.to_ascii_lowercase()));
+        out.push('.');
+    }
+    if !n.is_fqdn() {
+        out.pop();
+    }
+    out
+}
+
 /// `resolv_validate_dns_response` (resolvers.c:1052-1660) on a reply whose id matched `f`.
 /// Returns the verdict and the reply's question type (for the TCP fallback).
-fn validate(buf: &[u8], f: &InFlight, max_payload: usize) -> (Verdict, u16) {
+fn validate(buf: &[u8], f: &InFlight, max_payload: usize, allow_truncated_srv: bool) -> (Verdict, u16) {
     if buf.len() < HEADER {
         return (Verdict::Invalid, f.query_type);
     }
@@ -526,7 +544,8 @@ fn validate(buf: &[u8], f: &InFlight, max_payload: usize) -> (Verdict, u16) {
     {
         return (Verdict::Invalid, qtype);
     }
-    if msg.truncated() {
+    // A truncated SRV answer is still of use when it cannot be asked again over TCP.
+    if msg.truncated() && !(qtype == TYPE_SRV && allow_truncated_srv) {
         return (Verdict::Truncated, qtype);
     }
     let n = msg.answers().len();
@@ -553,7 +572,7 @@ fn validate(buf: &[u8], f: &InFlight, max_payload: usize) -> (Verdict, u16) {
             RData::A(ip) => Rdata::A(ip.0),
             RData::AAAA(ip) => Rdata::Aaaa(ip.0),
             RData::SRV(s) => Rdata::Srv {
-                target: s.target().to_string(),
+                target: name_text(s.target()),
                 port: s.port(),
                 priority: s.priority(),
                 weight: s.weight(),
@@ -570,6 +589,17 @@ fn validate(buf: &[u8], f: &InFlight, max_payload: usize) -> (Verdict, u16) {
         // A record seen twice is kept once (resolvers.c:1400-1450).
         if !answers.iter().any(|a| a.rdata == rdata) {
             answers.push(Answer { rdata, ttl: rec.ttl() });
+        }
+    }
+    // An SRV answer's additional addresses, which the caller matches to the targets.
+    if srv {
+        for rec in msg.additionals() {
+            let ip = match rec.data() {
+                RData::A(ip) => std::net::IpAddr::V4(ip.0),
+                RData::AAAA(ip) => std::net::IpAddr::V6(ip.0),
+                _ => continue,
+            };
+            answers.push(Answer { rdata: Rdata::Additional { name: name_text(rec.name()), ip }, ttl: rec.ttl() });
         }
     }
     (Verdict::Valid(answers), qtype)

@@ -1,0 +1,4 @@
+{"servers": "  server-template srv 3 _http._tcp.srv.test resolvers r", "resolvers": "  timeout resolve 1s",
+ "zones": [[0, {"_http._tcp.srv.test": {"srv": [[10,512,8080,"t1.test"],[10,256,8081,"t2.test"]]}, "t1.test": {"a": ["10.1.0.1"]}, "t2.test": {"a": ["10.1.0.2"]}}],
+           [2.5, {"_http._tcp.srv.test": {"srv": [[10,512,8080,"t1.test"]]}, "t1.test": {"a": ["10.1.0.1"]}, "t2.test": {"a": ["10.1.0.2"]}}]],
+ "dur": 5}
