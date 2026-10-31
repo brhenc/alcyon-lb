@@ -909,12 +909,84 @@ mod tests {
 pub enum ServerXprt {
     Plain,
     Tls(Box<TlsConn>),
+    /// HTTP/2 over a `Plain` or `Tls` transport, one stream at a time (T540).
+    H2(Box<crate::srv_h2::H2Layer>),
 }
 
 impl ServerXprt {
     #[must_use]
-    pub const fn is_tls(&self) -> bool {
-        matches!(self, ServerXprt::Tls(_))
+    pub fn is_tls(&self) -> bool {
+        match self {
+            ServerXprt::Plain => false,
+            ServerXprt::Tls(_) => true,
+            ServerXprt::H2(h) => h.inner.is_tls(),
+        }
+    }
+
+    /// The connection speaks HTTP/2 (`ServerXprt::H2`).
+    #[must_use]
+    pub const fn is_h2(&self) -> bool {
+        matches!(self, ServerXprt::H2(_))
+    }
+
+    /// The h2 layer, when the connection speaks HTTP/2.
+    #[must_use]
+    pub fn h2(&self) -> Option<&crate::srv_h2::H2Layer> {
+        match self {
+            ServerXprt::H2(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// This transport speaking HTTP/2 from now on (`proto h2`, or `h2` selected in ALPN).
+    ///
+    /// # Errors
+    /// Out of memory: the `h2c_srv` pool has no codec to give.
+    pub fn into_h2(self) -> io::Result<Self> {
+        match self {
+            ServerXprt::H2(_) => Ok(self),
+            inner => crate::srv_h2::H2Layer::new(inner).map(|h| ServerXprt::H2(Box::new(h))).ok_or_else(crate::buf::oom),
+        }
+    }
+
+    /// Installs the h2 layer once the TLS handshake is done with `h2` selected. True when it
+    /// did.
+    fn upgrade_if_h2(&mut self) -> io::Result<bool> {
+        if !matches!(self, ServerXprt::Tls(t) if t.handshake_done() && t.alpn() == Some(b"h2".as_slice())) {
+            return Ok(false);
+        }
+        let tls = std::mem::replace(self, ServerXprt::Plain);
+        *self = tls.into_h2()?;
+        Ok(true)
+    }
+
+    /// May carry another request as far as the transport knows: always, but for an h2
+    /// connection with a stream still open, a GOAWAY, or an error (T540).
+    #[must_use]
+    pub fn reusable(&self) -> bool {
+        match self {
+            ServerXprt::H2(h) => h.reusable(),
+            _ => true,
+        }
+    }
+
+    /// Requests sent on this connection as h2 streams; `None` for HTTP/1.1.
+    #[must_use]
+    pub fn h2_streams(&self) -> Option<u32> {
+        self.h2().map(crate::srv_h2::H2Layer::streams)
+    }
+
+    /// The request cannot move until the server grants window (h2 only): the session does
+    /// not ask to write meanwhile.
+    #[must_use]
+    pub fn send_blocked(&self) -> bool {
+        matches!(self, ServerXprt::H2(h) if h.send_blocked())
+    }
+
+    /// The h2 server's response was malformed (`PH--`).
+    #[must_use]
+    pub fn bad_response(&self) -> bool {
+        matches!(self, ServerXprt::H2(h) if h.bad_response())
     }
 
     /// What the `ssl_bc*` fetches read of the session; `None` for a plaintext connection.
@@ -923,6 +995,7 @@ impl ServerXprt {
         match self {
             ServerXprt::Plain => None,
             ServerXprt::Tls(t) => Some(facts_of(&t.ctx.tls_info)),
+            ServerXprt::H2(h) => h.inner.ssl_facts(),
         }
     }
 
@@ -931,6 +1004,7 @@ impl ServerXprt {
         match self {
             ServerXprt::Plain => None,
             ServerXprt::Tls(t) => t.alpn(),
+            ServerXprt::H2(h) => h.inner.alpn(),
         }
     }
 
@@ -944,6 +1018,7 @@ impl ServerXprt {
         match self {
             ServerXprt::Plain => None,
             ServerXprt::Tls(t) => t.key_name.as_deref().or(t.ctx.client_sni.as_deref()),
+            ServerXprt::H2(h) => h.inner.sni(),
         }
     }
 
@@ -951,6 +1026,9 @@ impl ServerXprt {
     /// ([`Self::sni`]) when it is not the name sent. Allocates only then: once per new
     /// connection with an unsendable name, never on a reused one.
     pub fn set_key_name(&mut self, name: Option<&str>) {
+        if let ServerXprt::H2(h) = self {
+            return h.inner.set_key_name(name);
+        }
         if let (ServerXprt::Tls(t), Some(name)) = (self, name.filter(|n| !n.is_empty())) {
             if t.ctx.client_sni.as_deref() != Some(name) {
                 t.key_name = Some(name.into());
@@ -964,6 +1042,7 @@ impl ServerXprt {
         match self {
             ServerXprt::Plain => false,
             ServerXprt::Tls(t) => t.handshake_failed(),
+            ServerXprt::H2(h) => h.inner.handshake_failed(),
         }
     }
 
@@ -972,6 +1051,7 @@ impl ServerXprt {
         match self {
             ServerXprt::Plain => None,
             ServerXprt::Tls(t) => Some(&t.ctx.tls_info),
+            ServerXprt::H2(h) => h.inner.tls_info(),
         }
     }
 
@@ -981,6 +1061,7 @@ impl ServerXprt {
         match self {
             ServerXprt::Plain => false,
             ServerXprt::Tls(t) => t.wants_write(),
+            ServerXprt::H2(h) => h.wants_write(),
         }
     }
 
@@ -990,6 +1071,7 @@ impl ServerXprt {
         match self {
             ServerXprt::Plain => true,
             ServerXprt::Tls(t) => t.handshake_done(),
+            ServerXprt::H2(h) => h.inner.is_ready(),
         }
     }
 
@@ -999,6 +1081,7 @@ impl ServerXprt {
         match self {
             ServerXprt::Plain => false,
             ServerXprt::Tls(t) => t.was_truncated(),
+            ServerXprt::H2(h) => h.inner.was_truncated(),
         }
     }
 
@@ -1009,7 +1092,15 @@ impl ServerXprt {
     pub fn handshake(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
         match self {
             ServerXprt::Plain => Ok(true),
-            ServerXprt::Tls(t) => t.handshake(fd),
+            ServerXprt::Tls(t) => {
+                let done = t.handshake(fd)?;
+                // `h2` selected in ALPN: the connection speaks it from now on (T540).
+                if done {
+                    self.upgrade_if_h2()?;
+                }
+                Ok(done)
+            }
+            ServerXprt::H2(h) => h.inner.handshake(fd),
         }
     }
 
@@ -1020,7 +1111,22 @@ impl ServerXprt {
     pub fn recv(&mut self, fd: BorrowedFd<'_>, dst: &mut [u8]) -> io::Result<Io> {
         match self {
             ServerXprt::Plain => raw::recv(fd, dst),
-            ServerXprt::Tls(t) => t.recv(fd, dst),
+            ServerXprt::Tls(t) => {
+                // The handshake may end in here rather than in `handshake` (T535: the h2
+                // layer installed only there gave intermittent 502s): the server's first
+                // h2 frames must not reach the session as HTTP/1.1 text.
+                if !t.handshake_done() {
+                    if !t.handshake(fd)? {
+                        return Ok(Io::WouldBlock);
+                    }
+                    if self.upgrade_if_h2()? {
+                        return self.recv(fd, dst);
+                    }
+                }
+                let ServerXprt::Tls(t) = self else { unreachable!() };
+                t.recv(fd, dst)
+            }
+            ServerXprt::H2(h) => h.recv(fd, dst),
         }
     }
 
@@ -1031,14 +1137,29 @@ impl ServerXprt {
     pub fn send(&mut self, fd: BorrowedFd<'_>, src: &[u8]) -> io::Result<Io> {
         match self {
             ServerXprt::Plain => raw::send(fd, src),
-            ServerXprt::Tls(t) => t.send(fd, src),
+            ServerXprt::Tls(t) => {
+                // As in `recv`: an HTTP/1.1 request must not go into an h2 connection.
+                if !t.handshake_done() {
+                    if !t.handshake(fd)? {
+                        return Ok(Io::WouldBlock);
+                    }
+                    if self.upgrade_if_h2()? {
+                        return self.send(fd, src);
+                    }
+                }
+                let ServerXprt::Tls(t) = self else { unreachable!() };
+                t.send(fd, src)
+            }
+            ServerXprt::H2(h) => h.send(fd, src),
         }
     }
 
     /// Sends `close_notify` so the backend server can tell a finished stream from a cut one.
     pub fn send_close_notify(&mut self, fd: BorrowedFd<'_>) {
-        if let ServerXprt::Tls(t) = self {
-            t.send_close_notify(fd);
+        match self {
+            ServerXprt::Tls(t) => t.send_close_notify(fd),
+            ServerXprt::H2(h) => h.inner.send_close_notify(fd),
+            ServerXprt::Plain => {}
         }
     }
 }
@@ -1052,6 +1173,7 @@ impl std::fmt::Debug for ServerXprt {
                 .field("handshake_done", &t.handshake_done())
                 .field("truncated", &t.was_truncated())
                 .finish(),
+            ServerXprt::H2(h) => write!(f, "ServerXprt::H2({h:?})"),
         }
     }
 }

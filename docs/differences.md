@@ -284,6 +284,34 @@ is still keyed by `127.0.0.1` for reuse, as HAProxy keys it (a Host `127.0.0.2` 
 it). Measured on HAProxy 3.5-dev8-885761-29; pinned in `crates/ibex-rt/tests/it/server_tls.rs`
 (`a_tls_connection_whose_sni_is_an_ip_address_*`).
 
+## HTTP/2 to servers: one stream per connection (T540)
+
+`server ... proto h2` (h2c, and h2 over `ssl` whatever ALPN selects) and `ssl alpn h2` /
+`alpn h2,http/1.1` (h2 when the server selects it) speak HTTP/2 through
+`ibex_proto::h2_srv::H2SrvCodec`, one stream at a time per server connection, which is
+HAProxy's behaviour under the default `http-reuse safe` (an h2 server connection private to its
+client session: 26 connections for 26 client sessions, T533 A.3 row 6). Measured on HAProxy
+3.5-dev8-885761-29; pinned in `crates/ibex-rt/tests/it/server_h2.rs`. Where it differs:
+
+- Under `aggressive` / `always` HAProxy multiplexes concurrent requests as streams of one
+  connection (A.3 row 7: 20 concurrent requests on 1 connection); Ibex opens one connection
+  per concurrent request (sequential requests share one, as HAProxy's).
+- `max-reuse` is still ignored, on h2 as on h1 (HAProxy enforces it on h2: `max-reuse 2` gives
+  connections of 3, 3 and 1 streams, A.3 row 11).
+- A refused stream (REFUSED_STREAM, a GOAWAY whose last id is below the stream) under `retry-on
+  all-retryable-errors`: HAProxy retries it on the same connection while it lives (measured: 3
+  retries on one connection, then 502 `SH--`); Ibex retries on a new connection each time (its
+  L7 retry closes the server connection). With `retry-on empty-response` both retry once on a
+  new connection; without, both answer 502 `SH--`. `retry-on refused-stream` does not exist in
+  dev8 (refused there too).
+- A GOAWAY whose last id is below the stream in progress: HAProxy waits for `timeout server` (504
+  `sH--`); Ibex ends the stream at once (502 `SH--`, retryable as above).
+- An HTTP check request without a Host (`option httpchk GET /`) goes without `:authority`, as
+  HAProxy's: a server that requires one (nghttpd) refuses it, `SOCKERR` in both.
+- `%B` of an h2 response follows HAProxy's HTX count (no reason phrase; the `transfer-encoding:
+  chunked` written for a response without a length counts 25 bytes less), measured equal for
+  bodies of 2, 19, 1000 and 40000 bytes.
+
 ## `tune.maxaccept`: the default is no limit (T295)
 
 `tune.maxaccept <n>` is accepted and applied: one listener wakeup accepts at most `n`

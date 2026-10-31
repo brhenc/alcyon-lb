@@ -88,7 +88,7 @@ const KEYWORDS: &[(&str, Ibex)] = &[
     ("pool-max-conn 5", Accepts),
     ("pool-purge-delay 5s", Accepts),
     ("proto h1", Accepts),
-    ("proto h2", Refuses),
+    ("proto h2", Accepts),
     ("proxy-v2-options ssl", Refuses),
     ("redir http://example.com", Refuses),
     ("resolve-net 10.0.0.0/8", Accepts),
@@ -119,7 +119,7 @@ const KEYWORDS: &[(&str, Ibex)] = &[
     ("check", Accepts),
     ("check-pool-conn-name foo", Accepts),
     ("check-proto h1", Accepts),
-    ("check-proto h2", Refuses),
+    ("check-proto h2", Accepts),
     ("check-reuse-pool", Accepts),
     ("check-send-proxy", Refuses),
     ("check-via-socks4", Refuses),
@@ -305,17 +305,16 @@ fn a_trailing_weight_or_maxconn_is_accepted_as_haproxy_accepts_it() {
     }
 }
 
-/// `proto` and `check-proto` name the protocol spoken to the server. Ibex speaks HTTP/1.1
-/// and has no HTTP/2 mux towards servers, so `h2` is refused (T113; until then it was a
-/// warning, and the reg-tests `checks/http-check.vtc` and
+/// `proto` and `check-proto` name the protocol spoken to the server, h2 since T540 (T113:
+/// until then `h2` was a warning, and the reg-tests `checks/http-check.vtc` and
 /// `http-messaging/http_bodyless_response.vtc` passed only because both ends ignored it).
 /// `HAProxy` refuses a protocol it has no mux for: "'proto' :  unknown MUX protocol 'h3'."
 #[test]
 fn proto_values() {
-    for line in ["proto h1", "check-proto h1"] {
+    for line in ["proto h1", "proto h2", "check-proto h1", "check-proto h2"] {
         assert!(server_line(line).is_ok(), "{line}");
     }
-    for line in ["proto h2", "check-proto h2", "proto h3", "proto fcgi", "proto spop", "check-proto bogus"] {
+    for line in ["proto h3", "proto fcgi", "proto spop", "check-proto bogus"] {
         let err = server_line(line).expect_err(line);
         assert!(err.message.contains(&format!("'{}'", keyword(line))), "{line}: {}", err.message);
     }

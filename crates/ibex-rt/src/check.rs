@@ -122,6 +122,9 @@ pub struct ServerCheckConfig {
     pub timeout: Duration,
     /// `check port` / `port`: the port the checks connect to instead of the traffic port.
     pub check_port: Option<u16>,
+    /// An HTTP check goes as an h2 stream: `check-proto h2`, or the server's `proto h2`
+    /// without a `check-proto` (T540; over TLS, `h2` selected in ALPN does it too).
+    pub h2: bool,
 }
 
 impl Default for ServerCheckConfig {
@@ -134,6 +137,7 @@ impl Default for ServerCheckConfig {
             fall: 3,
             timeout: Duration::from_millis(2000),
             check_port: None,
+            h2: false,
         }
     }
 }
@@ -2454,12 +2458,16 @@ fn check_target(check: &ServerCheckState) -> SocketAddr {
 fn connect_check(check: &mut ServerCheckState, addr: Option<SocketAddr>) -> io::Result<(OwnedFd, bool)> {
     let addr = addr.unwrap_or_else(|| check_target(check));
     let (sock, immediate) = raw::connect(addr)?;
+    let h2 = check.config.h2 && matches!(check.resolved_config.as_deref(), Some(ResolvedCheckConfig::Http(_)));
     let Some(tls) = check.tls.as_ref() else {
-        check.xprt = ServerXprt::Plain;
+        check.xprt = if h2 { ServerXprt::Plain.into_h2()? } else { ServerXprt::Plain };
         return Ok((sock, immediate));
     };
     let host = check_host(check);
     check.xprt = tls.connect(&sock, host.as_deref(), addr.ip());
+    if h2 {
+        check.xprt = std::mem::replace(&mut check.xprt, ServerXprt::Plain).into_h2()?;
+    }
     Ok((sock, false))
 }
 
