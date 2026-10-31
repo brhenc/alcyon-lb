@@ -446,6 +446,11 @@ struct TcpConn {
     pending: usize,
     /// The last query sent or reply read.
     last_use: Instant,
+    /// The id the next query takes on this connection: `HAProxy` numbers a stream's queries
+    /// 1, 2, ... (`dns_session_io_handler`, `ds->query_counter`; A.t9, A.t15c).
+    next_id: u16,
+    /// `(id on the wire, the resolution's id)` of the queries written and not answered.
+    ids: Vec<(u16, u16)>,
 }
 
 /// `DNS_STREAM_MAX_PIPELINED_REQ`.
@@ -881,7 +886,7 @@ impl Section {
                 self.drop_queued(i);
                 return;
             }
-            self.nameservers[i].tcp = Some(TcpConn { stream, up: false, out: Vec::new(), inb: Vec::new(), pending: 0, last_use: now });
+            self.nameservers[i].tcp = Some(TcpConn { stream, up: false, out: Vec::new(), inb: Vec::new(), pending: 0, last_use: now, next_id: 1, ids: Vec::with_capacity(TCP_PIPELINED) });
         }
         let ns = &mut self.nameservers[i];
         let Some(c) = ns.tcp.as_mut() else { return };
@@ -899,7 +904,13 @@ impl Section {
         let mut frames: Vec<Vec<u8>> = Vec::new();
         if !broken && c.up {
             while c.pending < TCP_PIPELINED {
-                let Some(q) = ns.queue.pop_front() else { break };
+                let Some(mut q) = ns.queue.pop_front() else { break };
+                if q.len() >= 2 {
+                    let wire = c.next_id;
+                    c.next_id = c.next_id.wrapping_add(1);
+                    c.ids.push((wire, u16::from_be_bytes([q[0], q[1]])));
+                    q[..2].copy_from_slice(&wire.to_be_bytes());
+                }
                 c.out.extend_from_slice(&u16::try_from(q.len()).unwrap_or(u16::MAX).to_be_bytes());
                 c.out.extend_from_slice(&q);
                 c.pending += 1;
@@ -934,7 +945,15 @@ impl Section {
                 if c.inb.len() < 2 + len {
                     break;
                 }
-                frames.push(c.inb[2..2 + len].to_vec());
+                let mut frame = c.inb[2..2 + len].to_vec();
+                // The reply carries the connection's id: back to the resolution's.
+                if frame.len() >= 2 {
+                    let wire = u16::from_be_bytes([frame[0], frame[1]]);
+                    if let Some(k) = c.ids.iter().position(|&(w, _)| w == wire) {
+                        frame[..2].copy_from_slice(&c.ids.swap_remove(k).1.to_be_bytes());
+                    }
+                }
+                frames.push(frame);
                 c.inb.drain(..2 + len);
                 c.pending = c.pending.saturating_sub(1);
                 c.last_use = now;

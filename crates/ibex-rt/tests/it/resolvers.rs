@@ -1225,8 +1225,9 @@ fn wait_counter(ibex: &Ibex, key: &str, secs: u64, ok: impl Fn(u64) -> bool) -> 
     }
 }
 
-/// A.t9 (T488): a truncated UDP answer is asked again over TCP, to the same nameserver, with
-/// the same id, at once; the counters `truncated` and `tcp_fallback` move together, `sent`
+/// A.t9 (T488): a truncated UDP answer is asked again over TCP, to the same nameserver, at
+/// once, numbered by the connection: 1, 2, ... (T489, oracle case t487/ttc.json: UDP ids
+/// random, TCP `id=1`, `id=2`, `id=3` on one connection); the counters `truncated` and `tcp_fallback` move together, `sent`
 /// counts both transports, and one TCP connection serves every query.
 #[test]
 fn t9_a_truncated_udp_answer_is_asked_again_over_tcp() {
@@ -1239,7 +1240,9 @@ fn t9_a_truncated_udp_answer_is_asked_again_over_tcp() {
     let (udp, tcp): (Vec<_>, Vec<_>) = q.iter().partition(|q| !q.tcp);
     assert!(!tcp.is_empty(), "{q:?}");
     assert!(!q[0].tcp, "{q:?}");
-    assert_eq!((q[1].tcp, q[1].id), (true, q[0].id), "same id, over TCP: {q:?}");
+    assert!(q[1].tcp, "over TCP: {q:?}");
+    let tcp_ids: Vec<u16> = tcp.iter().map(|q| q.id).collect();
+    assert_eq!(tcp_ids, (1..=u16::try_from(tcp.len()).expect("few")).collect::<Vec<_>>(), "TCP ids count from 1: {q:?}");
     assert!(q[1].at.duration_since(q[0].at) < Duration::from_millis(100), "at once: {q:?}");
     assert!(tcp.iter().all(|q| q.edns == 512), "{q:?}");
     assert_eq!(dns.tcp_conns.load(Ordering::Relaxed), 1);
@@ -1274,6 +1277,9 @@ fn t15c_a_tcp_nameserver_is_asked_over_tcp_only() {
     let q = dns.queries();
     assert!(q.iter().all(|q| q.tcp && q.edns == 512), "{q:?}");
     assert_eq!(dns.tcp_conns.load(Ordering::Relaxed), 1);
+    // T489, oracle case t489/tcpids.json: `id=1`, `id=2`, ... on the connection.
+    let ids: Vec<u16> = q.iter().map(|q| q.id).collect();
+    assert_eq!(ids, (1..=u16::try_from(q.len()).expect("few")).collect::<Vec<_>>(), "{q:?}");
     let c = counters(&ibex, "r", "ns1");
     assert_eq!((c["tcp_fallback"], c["truncated"], c["snd_error"]), (0, 0, 0), "{c:?}");
 }
