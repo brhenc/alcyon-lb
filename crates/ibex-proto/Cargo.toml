@@ -47,3 +47,8 @@ path = "tests/it/main.rs"
 [[test]]
 name = "htx_allocation"
 path = "tests/htx_allocation.rs"
+
+# Own process: installs a counting #[global_allocator] (T537, the h2 server codec's allocations per request)
+[[test]]
+name = "h2_srv_allocation"
+path = "tests/h2_srv_allocation.rs"

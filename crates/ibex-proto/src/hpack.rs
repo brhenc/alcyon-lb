@@ -684,6 +684,23 @@ pub fn find_table_entry(name: &str, value: &str, dynamic: &DynamicTable) -> Opti
     name_match.map(|idx| (idx, false))
 }
 
+/// One field as HAProxy's encoder writes it (`hpack_encode_header`): no dynamic table of its
+/// own, no Huffman. A name of the static table (its first index) is a literal with
+/// incremental indexing and an indexed name (`0x40 | index`), any other a literal without
+/// indexing and a new name (`0x00`); the name is written in lowercase (T537: the h2 codec
+/// towards servers, which writes HTTP/1.1 field names as HTTP/2 needs them).
+pub fn encode_field_stateless(name: &[u8], value: &[u8], dst: &mut Vec<u8>) {
+    if let Some(i) = STATIC_TABLE.iter().position(|(n, _)| n.as_bytes().eq_ignore_ascii_case(name)) {
+        encode_integer(i + 1, 6, 0x40, dst);
+    } else {
+        dst.push(0x00);
+        encode_integer(name.len(), 7, 0x00, dst);
+        dst.extend(name.iter().map(u8::to_ascii_lowercase));
+    }
+    encode_integer(value.len(), 7, 0x00, dst);
+    dst.extend_from_slice(value);
+}
+
 /// Encodes an HPACK integer with an N-bit prefix (RFC 7541 §5.1).
 pub fn encode_integer(val: usize, prefix_bits: u8, prefix_mask: u8, dst: &mut Vec<u8>) {
     let max_prefix = (1usize << prefix_bits) - 1;
