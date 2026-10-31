@@ -373,11 +373,11 @@ configuration error. Limits: key material inside rustls/ring is not covered (`tr
 ## `tune.ibex.h3-path relay|mux`: an Ibex-only global keyword (T509, temporary)
 
 Which path an HTTP/3 request stream takes into the stream engine while the h3 mux is being
-brought in (`docs/design/h3-engine-2026-10-26.md`, slices H3a to H5): `relay` (the default) is
-the HTTP/1 relay over a socket pair; `mux` makes each QUIC connection an owner session whose
-request streams are children served through the same bridge as HTTP/2 streams. Unset, the
-environment variable `IBEX_H3_PATH` (`mux` or `relay`) decides, so the h3 tests run on either
-path. HAProxy refuses the keyword as unknown. It takes exactly `relay` or `mux`. The keyword is
+brought in (`docs/design/h3-engine-2026-10-26.md`, slices H3a to H5): `mux` (the default since
+T536) makes each QUIC connection an owner session whose request streams are children served
+through the same bridge as HTTP/2 streams; `relay` is the HTTP/1 relay over a socket pair.
+Unset, the environment variable `IBEX_H3_PATH` (`mux` or `relay`) decides, then `mux`, so the
+h3 tests run on either path. HAProxy refuses the keyword as unknown. It takes exactly `relay` or `mux`. The keyword is
 deleted with the relay (slice H5).
 
 ## A QUIC connection a rule rejects is closed with `H3_NO_ERROR`, not transport `NO_ERROR` (T511)
@@ -386,16 +386,16 @@ deleted with the relay (slice H5).
 close the connection with an application CONNECTION_CLOSE, code `H3_NO_ERROR` (0x100).
 HAProxy 3.5-dev7 sends a transport CONNECTION_CLOSE with `NO_ERROR` (0x0). quinn-proto gives an
 application no transport-level close; both tell the client the connection ended without an
-error, and nothing is served either way. (On the relay path a session rule answers the
-stream 502: gone with the relay, slice H5.)
+error, and nothing is served either way. (With `tune.ibex.h3-path relay` a session rule answers
+the stream 502: gone with the relay, slice H5.)
 
-## The HTTP/3 relay never sends a stream on a reused server connection (T517, until H5)
+## With `tune.ibex.h3-path relay`, HTTP/3 never sends a stream on a reused server connection (T517, until H5)
 
 A server that answers one request per connection and closes it a moment later: on one QUIC
 connection, HAProxy 3.5-dev7 (default `retry-on conn-failure`) resets every second request
 stream (RESET_STREAM `H3_REQUEST_CANCELLED`): it takes the kept server connection, which then
 closes unanswered (`abort_keep_alive`). Ibex's mux path does the same, as do h1 and h2 on both
-(`retry_on_reused_close.rs`, `h3_mux_edges.rs`). The relay path (the default) serves every
+(`retry_on_reused_close.rs`, `h3_mux_edges.rs`). The relay path (`tune.ibex.h3-path relay`, no longer the default since T536) serves every
 stream: each stream is a new HTTP/1 session over its socket pair, and `http-reuse safe` sends a
 session's first request on a connection of its own, so no stream takes a kept one. Under
 `retry-on empty-response` both paths and HAProxy serve them all. Gone with the relay, slice H5.

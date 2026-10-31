@@ -285,7 +285,7 @@ pub struct GlobalSection {
     /// `tune.ibex.h3-path relay|mux` (Ibex-only, T509, deleted with the relay in slice H5):
     /// `Some(true)` serves HTTP/3 request streams through the h3 mux and the bridge h2
     /// streams use, `Some(false)` through the HTTP/1 relay; unset, the `IBEX_H3_PATH`
-    /// environment variable decides, then the relay.
+    /// environment variable decides, then the mux (T536).
     pub h3_mux: Option<bool>,
     /// `tune.ibex.zero-on-free off|soft|hard` (Ibex-only, T459): wipe every freed heap block. Off
     /// when unset.

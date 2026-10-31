@@ -7857,11 +7857,12 @@ fn arm_res_inspect(proxy: &Proxy, sess: &mut TcpSession) {
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 /// `tune.ibex.h3-path` (T509, Ibex-only until the relay is removed): `mux` serves HTTP/3
-/// request streams through the h3 mux and the bridge; unset, the environment variable
-/// `IBEX_H3_PATH` (`mux` or `relay`) decides, so that the h3 tests run on both paths without a
-/// configuration of their own; else the relay.
+/// request streams through the h3 mux and the bridge, `relay` through the HTTP/1 relay.
+/// Unset, the environment variable `IBEX_H3_PATH` (`mux` or `relay`) decides, so that the h3
+/// tests run on both paths without a configuration of their own; else the mux (the default
+/// since T536).
 fn h3_mux(keyword: Option<bool>) -> bool {
-    keyword.unwrap_or_else(|| std::env::var("IBEX_H3_PATH").is_ok_and(|v| v == "mux"))
+    keyword.unwrap_or_else(|| std::env::var("IBEX_H3_PATH").map_or(true, |v| v != "relay"))
 }
 
 fn register_new_session(
