@@ -127,6 +127,10 @@ pub struct H2SrvCodec {
     /// DATA bytes read and not yet granted back: on the stream, on the connection.
     rx_strm: u32,
     rx_conn: u32,
+    /// What the server may still send: on the stream (our SETTINGS, 16384, and our grants),
+    /// on the connection (65535 and our grants).
+    strm_rx_win: i64,
+    conn_rx_win: i64,
     conn_window_opened: bool,
     goaway: Option<u32>,
     /// A connection error was sent; nothing more is read or written but the GOAWAY.
@@ -176,7 +180,8 @@ impl ibex_alloc::Poolable for H2SrvCodec {
 const RSP_ROOM: usize = 32 * 1024;
 
 /// HAProxy's SETTINGS for a connection to a server, in its order.
-const SETTINGS: [(u16, u32); 4] = [(0x2, 0), (0x8, 1), (0x4, 16_384), (0x3, 100)];
+const SETTINGS: [(u16, u32); 4] = [(0x2, 0), (0x8, 1), (0x4, OUR_INITIAL_WINDOW), (0x3, 100)];
+const OUR_INITIAL_WINDOW: u32 = 16_384;
 
 /// `H2_INITIAL_WINDOW_INCREMENT`: the connection window's opening, added to the first
 /// connection WINDOW_UPDATE.
@@ -238,6 +243,8 @@ impl H2SrvCodec {
             peer_max_frame: DEFAULT_MAX_FRAME_SIZE as usize,
             rx_strm: 0,
             rx_conn: 0,
+            strm_rx_win: i64::from(OUR_INITIAL_WINDOW),
+            conn_rx_win: 65_535,
             conn_window_opened: false,
             goaway: None,
             conn_error: None,
@@ -283,6 +290,8 @@ impl H2SrvCodec {
         self.peer_max_frame = DEFAULT_MAX_FRAME_SIZE as usize;
         self.rx_strm = 0;
         self.rx_conn = 0;
+        self.strm_rx_win = i64::from(OUR_INITIAL_WINDOW);
+        self.conn_rx_win = 65_535;
         self.conn_window_opened = false;
         self.goaway = None;
         self.conn_error = None;
@@ -348,6 +357,7 @@ impl H2SrvCodec {
         if self.rx_strm > 0 && self.cur != 0 && !matches!(self.rsp_state, Rsp::Done) {
             push_frame_header(&mut self.out, 4, FrameType::WindowUpdate, 0, self.cur);
             self.out.extend_from_slice(&self.rx_strm.to_be_bytes());
+            self.strm_rx_win += i64::from(self.rx_strm);
         }
         self.rx_strm = 0;
         if self.rx_conn > 0 {
@@ -358,6 +368,7 @@ impl H2SrvCodec {
             }
             push_frame_header(&mut self.out, 4, FrameType::WindowUpdate, 0, 0);
             self.out.extend_from_slice(&inc.to_be_bytes());
+            self.conn_rx_win += i64::from(inc);
             self.rx_conn = 0;
         }
     }
@@ -556,6 +567,7 @@ impl H2SrvCodec {
         self.opened += 1;
         self.strm_win = self.peer_init_win;
         self.rx_strm = 0;
+        self.strm_rx_win = i64::from(OUR_INITIAL_WINDOW);
         self.head_req = method == b"HEAD";
         self.failed = false;
         self.rsp_state = Rsp::Waiting;
@@ -701,8 +713,6 @@ impl H2SrvCodec {
         if let Some((at, len)) = open.take() {
             let h = FrameHeader { length: len as u32, frame_type: FrameType::Data, flags: if es { frame_flags::END_STREAM } else { 0 }, stream_id: self.cur };
             self.out[at..at + FRAME_HEADER_LEN].copy_from_slice(&h.encode());
-        } else if es {
-            push_frame_header(&mut self.out, 0, FrameType::Data, frame_flags::END_STREAM, self.cur);
         }
     }
 
@@ -733,6 +743,9 @@ impl H2SrvCodec {
     }
 
     fn process(&mut self) -> Result<(), SrvH2Error> {
+        if let Some(code) = self.conn_error {
+            return Err(SrvH2Error::Connection(code));
+        }
         let mut at = 0;
         let mut stream_err = None;
         let r = loop {
@@ -780,10 +793,18 @@ impl H2SrvCodec {
                     return Err(self.conn_fail(0x1));
                 }
                 self.rx_conn = self.rx_conn.saturating_add(h.length);
+                self.conn_rx_win -= i64::from(h.length);
+                if self.conn_rx_win < 0 {
+                    return Err(self.conn_fail(0x3));
+                }
                 if h.stream_id != self.cur {
                     return self.closed_stream(h.stream_id);
                 }
                 self.rx_strm = self.rx_strm.saturating_add(h.length);
+                self.strm_rx_win -= i64::from(h.length);
+                if self.strm_rx_win < 0 {
+                    return Err(self.stream_fail(SrvH2Error::BadResponse, Some(0x3)));
+                }
                 let mut d = p;
                 if h.flags & frame_flags::PADDED != 0 {
                     let Some((&pad, rest)) = d.split_first() else { return Err(self.conn_fail(0x6)) };
@@ -946,7 +967,8 @@ impl H2SrvCodec {
         }
         let es = self.hb_flags & frame_flags::END_STREAM != 0;
         match self.rsp_state {
-            Rsp::Waiting => self.on_response_head(es),
+            // (`Done` has no current stream: not here.)
+            Rsp::Waiting | Rsp::Done => self.on_response_head(es),
             Rsp::Body { chunked, .. } => {
                 // Trailers: END_STREAM, no pseudo-header.
                 if !es || crate::h2::check_trailer_fields(self.fields.iter()).is_err() {
@@ -963,7 +985,6 @@ impl H2SrvCodec {
                 self.end_response(false);
                 Ok(())
             }
-            Rsp::Done => Err(self.stream_fail(SrvH2Error::BadResponse, Some(0x5))),
         }
     }
 

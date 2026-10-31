@@ -495,3 +495,223 @@ fn a_codec_from_the_pool_is_a_new_connections_whatever_it_was_before() {
     assert_eq!(c.output(), want.as_slice());
     assert!(c.is_idle() && c.reusable() && c.streams() == 0);
 }
+
+/// A codec with `GET /x` sent on stream 1, then `frames` read: the result.
+fn after(frames: &[Vec<u8>]) -> (H2SrvCodec, Result<(), SrvH2Error>) {
+    let mut c = ready();
+    let _ = request(&mut c, b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+    let r = c.receive(&frames.concat());
+    (c, r)
+}
+
+#[test]
+fn malformed_frames_are_connection_errors_with_their_codes() {
+    use SrvH2Error::Connection as C;
+    let h200 = || hdrs(1, &[st("200")], false);
+    let cases: Vec<(&str, Vec<Vec<u8>>, SrvH2Error)> = vec![
+        ("DATA on stream 0", vec![data(0, b"x", false)], C(1)),
+        ("HEADERS on stream 0", vec![hdrs(0, &[st("200")], true)], C(1)),
+        ("CONTINUATION alone", vec![fr(9, 4, 1, &st("200"))], C(1)),
+        ("HEADERS without END_HEADERS, then DATA", vec![fr(1, 0, 1, &st("200")), data(1, b"x", true)], C(1)),
+        ("RST_STREAM of 3 bytes", vec![fr(3, 0, 1, &[0, 0, 2])], C(6)),
+        ("RST_STREAM on stream 0", vec![fr(3, 0, 0, &[0, 0, 0, 2])], C(1)),
+        ("PING of 7 bytes", vec![fr(6, 0, 0, b"1234567")], C(6)),
+        ("PING on stream 1", vec![fr(6, 0, 1, b"12345678")], C(1)),
+        ("GOAWAY on stream 1", vec![fr(7, 0, 1, &[0; 8])], C(1)),
+        ("GOAWAY of 4 bytes", vec![fr(7, 0, 0, &[0; 4])], C(1)),
+        ("WINDOW_UPDATE of 3 bytes", vec![fr(8, 0, 0, &[0, 0, 1])], C(6)),
+        ("connection WINDOW_UPDATE of 0", vec![fr(8, 0, 0, &[0; 4])], C(1)),
+        ("connection window past 2^31-1", vec![fr(8, 0, 0, &0x7fff_ffffu32.to_be_bytes())], C(3)),
+        ("SETTINGS on stream 1", vec![fr(4, 0, 1, &[])], C(1)),
+        ("SETTINGS ACK with a payload", vec![fr(4, 1, 0, &[0, 3, 0, 0, 0, 1])], C(6)),
+        ("SETTINGS of 5 bytes", vec![fr(4, 0, 0, &[0, 3, 0, 0, 0])], C(6)),
+        ("INITIAL_WINDOW_SIZE past 2^31-1", vec![fr(4, 0, 0, &[0, 4, 0x80, 0, 0, 0])], C(3)),
+        ("MAX_FRAME_SIZE below 16384", vec![fr(4, 0, 0, &[0, 5, 0, 0, 0, 100])], C(1)),
+        ("ENABLE_PUSH 2", vec![fr(4, 0, 0, &[0, 2, 0, 0, 0, 2])], C(1)),
+        ("HPACK index 0", vec![hdrs(1, &[vec![0x80]], true)], C(9)),
+        ("HEADERS on a stream never opened", vec![hdrs(3, &[st("200")], true)], C(1)),
+        ("DATA on an even stream", vec![data(2, b"x", true)], C(1)),
+        ("HEADERS whose padding is longer than it", vec![fr(1, 4 | 8, 1, &[9, 0x88])], C(1)),
+        ("DATA PADDED without a pad length", vec![h200(), fr(0, 8, 1, &[])], C(6)),
+        ("DATA whose padding is longer than it", vec![h200(), fr(0, 8, 1, &[5, b'a'])], C(1)),
+        ("more DATA than the connection window", (0..5).map(|_| data(1, &[0; 16384], false)).collect(), C(3)),
+    ];
+    for (name, frames, want) in cases {
+        let (mut c, r) = after(&frames);
+        assert_eq!(r, Err(want), "{name}");
+        assert!(!c.reusable(), "{name}");
+        let out = take_out(&mut c);
+        let SrvH2Error::Connection(code) = want else { unreachable!() };
+        assert!(out.ends_with(&fr(7, 0, 0, &[&[0, 0, 0, 0][..], &code.to_be_bytes()].concat())), "{name}: GOAWAY last");
+        assert_eq!(c.receive(b"anything"), Err(want), "{name}: given again");
+        assert_eq!(c.send_request(b"GET / HTTP/1.1\r\n\r\n"), Err(want), "{name}");
+        c.advance_response(c.response().len());
+        assert_eq!(c.output(), b"", "{name}: nothing after the GOAWAY");
+    }
+}
+
+#[test]
+fn malformed_responses_reset_the_stream_and_the_connection_goes_on() {
+    use SrvH2Error::BadResponse as B;
+    let h200 = || hdrs(1, &[st("200")], false);
+    let cases: Vec<(&str, Vec<Vec<u8>>, u32)> = vec![
+        ("stream WINDOW_UPDATE of 0", vec![fr(8, 0, 1, &[0; 4])], 1),
+        ("stream window past 2^31-1", vec![fr(8, 0, 1, &0x7fff_ffffu32.to_be_bytes())], 3),
+        ("trailers without END_STREAM", vec![h200(), hdrs(1, &[lit("x-t", "1")], false)], 1),
+        ("a pseudo-header in the trailers", vec![h200(), hdrs(1, &[st("200")], true)], 1),
+        ("two content-lengths that differ", vec![hdrs(1, &[st("200"), lit("content-length", "1"), lit("content-length", "2")], false)], 1),
+        ("a status of two digits", vec![hdrs(1, &[st("20")], true)], 1),
+        ("101", vec![hdrs(1, &[st("101")], true)], 1),
+        ("an interim response that ends the stream", vec![hdrs(1, &[st("103")], true)], 1),
+        ("a pseudo-header after a field", vec![hdrs(1, &[lit("x-a", "1"), st("200")], true)], 1),
+        ("a request pseudo-header", vec![hdrs(1, &[st("200"), lit(":path", "/")], true)], 1),
+        ("an uppercase name", vec![hdrs(1, &[st("200"), lit("X-A", "1")], true)], 1),
+        ("content-length and END_STREAM without the body", vec![hdrs(1, &[st("200"), lit("content-length", "3")], true)], 1),
+        ("more DATA than the stream window", vec![h200(), data(1, &[0; 16384], false), data(1, b"x", false)], 3),
+    ];
+    for (name, frames, rst) in cases {
+        let (mut c, r) = after(&frames);
+        assert_eq!(r, Err(B), "{name}");
+        assert!(take_out(&mut c).ends_with(&fr(3, 0, 1, &rst.to_be_bytes())), "{name}: RST_STREAM {rst}");
+        assert!(c.is_idle() && c.reusable(), "{name}");
+        // Frames still in flight for the closed stream are dropped.
+        assert_eq!(c.receive(&data(1, b"late", true)), Ok(()), "{name}");
+        assert_eq!(c.receive(&fr(3, 0, 1, &[0, 0, 0, 8])), Ok(()), "{name}");
+        let _ = take_out(&mut c);
+        let w = request(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(&w[5..9], &[0, 0, 0, 3], "{name}: next stream");
+    }
+}
+
+#[test]
+fn ignored_frames() {
+    let (mut c, r) = after(&[
+        fr(2, 0, 1, &[0, 0, 0, 0, 16]),
+        fr(0xfa, 0, 0, b"unknown"),
+        fr(6, 1, 0, b"12345678"),
+        fr(4, 0, 0, &[0, 5, 0, 0, 0x50, 0, 0, 0x3, 0, 0, 0, 1]),
+        fr(1, 1, 1, &st("200")),
+        fr(9, 0, 1, &lit("x-a", "1")),
+        fr(9, 4, 1, &lit("content-length", "0")),
+    ]);
+    assert_eq!(r, Ok(()));
+    assert_eq!(take_rsp(&mut c), b"HTTP/1.1 200 OK\r\nx-a: 1\r\ncontent-length: 0\r\n\r\n");
+    // The server's MAX_FRAME_SIZE 20480 is used for our frames.
+    let mut req = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 20000\r\n\r\n".to_vec();
+    req.extend(std::iter::repeat_n(b'q', 20000));
+    let _ = take_out(&mut c);
+    assert_eq!(c.send_request(&req).unwrap(), req.len());
+    let w = take_out(&mut c);
+    assert_eq!(w[w.len() - 20009..][..9], [0x00, 0x4e, 0x20, 0, 1, 0, 0, 0, 3], "one DATA frame of 20000 bytes");
+}
+
+#[test]
+fn request_heads_it_cannot_write() {
+    for (req, what) in [
+        (&b"GET /\r\n\r\n"[..], "no version"),
+        (b"GET / HTTP/2.0\r\nHost: x\r\n\r\n", "not HTTP/1.x"),
+        (b" / HTTP/1.1\r\nHost: x\r\n\r\n", "no method"),
+        (b"GET / HTTP/1.1\r\nHost x\r\n\r\n", "a line without a colon"),
+        (b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1a\r\n\r\n", "content-length"),
+    ] {
+        let mut c = ready();
+        assert!(matches!(c.send_request(req), Err(SrvH2Error::Unsupported(_))), "{what}");
+        assert_eq!(c.output(), b"", "{what}: nothing written");
+        assert!(c.is_idle() && c.reusable(), "{what}");
+    }
+}
+
+#[test]
+fn absolute_targets_userinfo_empty_paths_and_other_schemes() {
+    let mut c = ready();
+    let w = request(&mut c, b"GET http://u:p@h/x HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert_eq!(&w[9..], &[0x82, 0x86, 0x41, 1, b'h', 0x44, 2, b'/', b'x'], "userinfo dropped");
+    let mut c = ready();
+    let w = request(&mut c, b"GET http://h HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert_eq!(&w[9..], &[0x82, 0x86, 0x41, 1, b'h', 0x84], "empty path: /");
+    let mut c = ready();
+    let w = request(&mut c, b"OPTIONS http://h HTTP/1.1\r\nHost: h\r\n\r\n");
+    assert_eq!(&w[9..], &[&[0x42, 7][..], b"OPTIONS", &[0x86, 0x41, 1, b'h', 0x44, 1, b'*']].concat()[..], "OPTIONS: *");
+    let mut c = ready();
+    let w = request(&mut c, b"GET ftp://h/ HTTP/1.1\r\n\r\n");
+    assert_eq!(&w[9..], &[&[0x82, 0x46, 3][..], b"ftp", &[0x41, 1, b'h', 0x84]].concat()[..], "another scheme: a literal");
+}
+
+#[test]
+fn no_request_after_goaway_or_on_a_connection_that_failed() {
+    let mut c = ready();
+    assert_eq!(c.send_request(b"").unwrap(), 0);
+    c.receive(&fr(7, 0, 0, &[0; 8])).unwrap();
+    assert_eq!(c.send_request(b"GET / HTTP/1.1\r\n\r\n"), Err(SrvH2Error::Refused), "GOAWAY read while idle");
+}
+
+#[test]
+fn a_reset_while_the_request_body_is_sent_ends_reuse() {
+    let mut c = ready();
+    let head = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc";
+    assert_eq!(c.send_request(head).unwrap(), head.len());
+    assert_eq!(c.receive(&fr(3, 0, 1, &[0, 0, 0, 2])), Err(SrvH2Error::Reset { code: 2, after_head: false }));
+    assert!(!c.reusable(), "the session still has body bytes for it");
+}
+
+#[test]
+fn a_response_larger_than_the_room_waits_for_the_session_and_its_errors_come_after() {
+    let mut c = ready();
+    let _ = request(&mut c, b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+    let big = "v".repeat(16_000);
+    let head = [st("200"), lit_long("x-a", &big), lit_long("x-b", &big), lit_long("x-c", &big)].concat();
+    let mut frames = fr(1, 0, 1, &head[..16_000]);
+    frames.extend(fr(9, 0, 1, &head[16_000..32_000]));
+    frames.extend(fr(9, 4, 1, &head[32_000..]));
+    frames.extend(fr(3, 0, 1, &[0, 0, 0, 2]));
+    c.receive(&frames).unwrap();
+    assert!(c.response().len() > 32 * 1024);
+    // Half taken: nothing more is read yet.
+    c.advance_response(100);
+    assert!(c.response().len() > 32 * 1024 - 100);
+    let n = c.response().len();
+    c.advance_response(n);
+    // The RST read once the text was taken comes back on the next call.
+    assert_eq!(c.receive(&[]), Err(SrvH2Error::Reset { code: 2, after_head: true }));
+    assert_eq!(c.receive(&[]), Ok(()));
+}
+
+/// Literal without indexing with a two-byte-or-more length.
+fn lit_long(n: &str, v: &str) -> Vec<u8> {
+    let mut b = vec![0, n.len() as u8];
+    b.extend_from_slice(n.as_bytes());
+    let mut len = v.len() - 127;
+    b.push(0x7f);
+    while len >= 128 {
+        b.push((len % 128) as u8 | 0x80);
+        len /= 128;
+    }
+    b.push(len as u8);
+    b.extend_from_slice(v.as_bytes());
+    b
+}
+
+#[test]
+fn default_and_wiped_reset() {
+    use ibex_alloc::Poolable;
+    let mut c = H2SrvCodec::default();
+    c.receive(&fr(4, 0, 0, &[])).unwrap();
+    let _ = c.send_request(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    c.reset(true);
+    let mut want = H2_CONN_PREFACE.to_vec();
+    want.extend(hex(HAPROXY_SETTINGS));
+    assert_eq!(c.output(), want.as_slice());
+    assert!(c.footprint() > 0);
+}
+
+#[test]
+fn a_response_taken_in_parts_is_granted_once_all_is_taken() {
+    let mut c = ready();
+    let _ = request(&mut c, b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+    c.receive(&[hdrs(1, &[st("200"), lit("content-length", "100")], false), data(1, &[b'a'; 50], false)].concat()).unwrap();
+    let n = c.response().len();
+    c.advance_response(n - 10);
+    assert_eq!(c.output(), b"", "not all taken");
+    c.advance_response(10);
+    assert_eq!(take_out(&mut c)[..9], [0, 0, 4, 8, 0, 0, 0, 0, 1], "stream WINDOW_UPDATE");
+}
