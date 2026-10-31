@@ -146,6 +146,11 @@ impl Drop for Ibex {
 }
 
 fn ibex(be: SocketAddr, frontend_rule: &str) -> Ibex {
+    ibex_with(be, frontend_rule, "http-reuse never")
+}
+
+/// `ibex`, with `backend_line` in the backend in place of `http-reuse never`.
+fn ibex_with(be: SocketAddr, frontend_rule: &str, backend_line: &str) -> Ibex {
     let tcp = common::reserve_addr();
     let quic = common::reserve_addr();
     let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
@@ -154,7 +159,7 @@ fn ibex(be: SocketAddr, frontend_rule: &str) -> Ibex {
         cfg,
         "global\n    nbthread 1\ndefaults\n    mode http\n    timeout client 5s\n    timeout server 5s\n    \
          timeout connect 1s\nfrontend f\n    bind {tcp}\n    bind quic4@{quic} ssl crt {crt} alpn h3\n    \
-         {frontend_rule}\n    default_backend b\nbackend b\n    http-reuse never\n    server s {be}\n"
+         {frontend_rule}\n    default_backend b\nbackend b\n    {backend_line}\n    server s {be}\n"
     )
     .expect("write cfg");
     let child = common::ibex_command(env!("CARGO_BIN_EXE_ibex"))
@@ -526,5 +531,48 @@ fn stop_sending_on_a_response_ends_its_server_connection() {
     let id = cl.open(&get(b"/after"), true);
     let o = cl.outcome(id);
     assert_eq!((o.status, o.lost.as_deref()), (Some(200), None), "{o:?}");
+}
+}
+
+/// `N` GETs one after the other on one QUIC connection: each stream's status, or `reset`
+/// (with its code when it is not H3_REQUEST_CANCELLED).
+fn sequential(cl: &mut Client, n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| {
+            let id = cl.open(&get(format!("/{i}").as_bytes()), true);
+            let o = cl.outcome(id);
+            match (o.status, o.reset) {
+                (Some(s), None) if o.fin => s.to_string(),
+                (None, Some(REQUEST_CANCELLED)) => "reset".to_string(),
+                _ => format!("{o:?}"),
+            }
+        })
+        .collect()
+}
+
+crate::h3_both_paths! {
+/// T517: the server answers one request on a connection and closes it 200 ms later; each
+/// second stream takes the kept connection and is lost on it. `HAProxy` 3.5-dev7 (default
+/// config, 40 streams): 20 x 200, 20 RESET_STREAM H3_REQUEST_CANCELLED, as on h1 and h2
+/// (`retry_on_reused_close.rs`). The relay serves every stream: it is more lenient than
+/// `HAProxy` there (`docs/differences.md`), pinned until it is removed in slice H5.
+fn a_request_lost_on_a_reused_connection_is_reset_by_default() {
+    let be = crate::retry_on_reused_close::closing_backend();
+    let ibex = ibex_with(be, "", "");
+    let mut cl = Client::connect(ibex.quic, None);
+    let want = if common::h3_mux() { crate::retry_on_reused_close::alternating() } else { crate::retry_on_reused_close::all_served() };
+    assert_eq!(sequential(&mut cl, want.len()), want);
+}
+}
+
+crate::h3_both_paths! {
+/// T517: the same under `retry-on empty-response conn-failure`: `HAProxy` 3.5-dev7 serves
+/// all 40 streams.
+fn retry_on_empty_response_serves_every_stream() {
+    let be = crate::retry_on_reused_close::closing_backend();
+    let ibex = ibex_with(be, "", "retry-on empty-response conn-failure");
+    let mut cl = Client::connect(ibex.quic, None);
+    let want = crate::retry_on_reused_close::all_served();
+    assert_eq!(sequential(&mut cl, want.len()), want);
 }
 }

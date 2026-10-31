@@ -377,6 +377,17 @@ application no transport-level close; both tell the client the connection ended 
 error, and nothing is served either way. (On the relay path a session rule answers the
 stream 502: gone with the relay, slice H5.)
 
+## The HTTP/3 relay never sends a stream on a reused server connection (T517, until H5)
+
+A server that answers one request per connection and closes it a moment later: on one QUIC
+connection, HAProxy 3.5-dev7 (default `retry-on conn-failure`) resets every second request
+stream (RESET_STREAM `H3_REQUEST_CANCELLED`): it takes the kept server connection, which then
+closes unanswered (`abort_keep_alive`). Ibex's mux path does the same, as do h1 and h2 on both
+(`retry_on_reused_close.rs`, `h3_mux_edges.rs`). The relay path (the default) serves every
+stream: each stream is a new HTTP/1 session over its socket pair, and `http-reuse safe` sends a
+session's first request on a connection of its own, so no stream takes a kept one. Under
+`retry-on empty-response` both paths and HAProxy serve them all. Gone with the relay, slice H5.
+
 ## `tune.ibex.zero-spares on|off`: an Ibex-only global keyword (S1)
 
 The header rules, samples and formats reuse per-thread spare strings and header lists (`show
