@@ -364,6 +364,15 @@ environment variable `IBEX_H3_PATH` (`mux` or `relay`) decides, so the h3 tests 
 path. HAProxy refuses the keyword as unknown. It takes exactly `relay` or `mux`. The keyword is
 deleted with the relay (slice H5).
 
+## A QUIC connection a rule rejects is closed with `H3_NO_ERROR`, not transport `NO_ERROR` (T511)
+
+`tcp-request connection reject` and `tcp-request session reject` on a QUIC bind (mux path)
+close the connection with an application CONNECTION_CLOSE, code `H3_NO_ERROR` (0x100).
+HAProxy 3.5-dev7 sends a transport CONNECTION_CLOSE with `NO_ERROR` (0x0). quinn-proto gives an
+application no transport-level close; both tell the client the connection ended without an
+error, and nothing is served either way. (On the relay path a session rule answers the
+stream 502: gone with the relay, slice H5.)
+
 ## `tune.ibex.zero-spares on|off`: an Ibex-only global keyword (S1)
 
 The header rules, samples and formats reuse per-thread spare strings and header lists (`show

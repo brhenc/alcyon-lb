@@ -18,6 +18,9 @@
 //! and a DATA frame is checked against the length when its header arrives, before any of
 //! its payload is passed on.
 //!
+//! T511 measured the framing of a body without `content-length` on `HAProxy` 3.5-dev7 built
+//! with QUIC (`reference/haproxy-quic`): chunked, see [`SMUGGLED_CHUNKED`].
+//!
 //! Each case drives a raw `quinn-proto` client against the `ibex` binary and records every
 //! byte the backend receives.
 
@@ -372,6 +375,11 @@ fn assert_all(cases: &[Case]) {
 }
 
 const SMUGGLED: &[u8] = b"5\r\nhello\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nhost: x\r\n\r\n";
+/// A body without `content-length` goes chunked, even when all of it came with the head
+/// and the stream's FIN: measured on `HAProxy` 3.5-dev7 with QUIC (aioquic, HEADERS and DATA
+/// in one STREAM frame with FIN, T511): `transfer-encoding: chunked`, one chunk.
+const SMUGGLED_CHUNKED: &[u8] = b"32\r\n5\r\nhello\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nhost: x\r\n\r\n\r\n0\r\n\r\n";
+const HELLO_CHUNKED: &[u8] = b"5\r\nhello\r\n0\r\n\r\n";
 
 crate::h3_both_paths! {
 /// RFC 9114 4.2: connection-specific fields make a request malformed, and `te` may only be
@@ -385,7 +393,7 @@ fn connection_specific_fields_never_reach_the_server() {
         case("te-on-get", "GET", &[("transfer-encoding", "chunked")], &[], Refused(400)),
         case("te-gzip-hop", "POST", &[("te", "gzip")], &[b"hello"], Refused(400)),
         case("connection", "POST", &[("connection", "keep-alive")], &[b"hello"], Refused(400)),
-        case("te-trailers", "POST", &[("te", "trailers")], &[b"hello"], Forwarded { framing: "content-length: 5", body: b"hello" }),
+        case("te-trailers", "POST", &[("te", "trailers")], &[b"hello"], Forwarded { framing: "transfer-encoding: chunked", body: HELLO_CHUNKED }),
     ]);
 }
 }
@@ -411,8 +419,8 @@ fn content_length_matches_the_data_frames() {
         case("cl-leading-zero", "POST", &[("content-length", "005")], &[b"hello"], Forwarded { framing: "content-length: 5", body: b"hello" }),
         case("cl-two-frames", "POST", &[("content-length", "5")], &[b"he", b"llo"], Forwarded { framing: "content-length: 5", body: b"hello" }),
         case("get-with-cl", "GET", &[("content-length", "5")], &[b"hello"], Forwarded { framing: "content-length: 5", body: b"hello" }),
-        case("get-with-body", "GET", &[], &[b"hello"], Forwarded { framing: "content-length: 5", body: b"hello" }),
-        case("body-no-cl", "POST", &[], &[SMUGGLED], Forwarded { framing: "content-length: 50", body: SMUGGLED }),
+        case("get-with-body", "GET", &[], &[b"hello"], Forwarded { framing: "transfer-encoding: chunked", body: HELLO_CHUNKED }),
+        case("body-no-cl", "POST", &[], &[SMUGGLED], Forwarded { framing: "transfer-encoding: chunked", body: SMUGGLED_CHUNKED }),
     ]);
 }
 }

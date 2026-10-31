@@ -10293,10 +10293,12 @@ impl EngineDispatcher<'_> {
         let Some(crate::proxy::H2Role::Owner(crate::proxy::H2Owner { children: served_by, h3: Some(h3), .. })) = e.sess.h2_role.as_deref_mut() else { return Outcome::Done };
         let served = |id: u64| served_by.iter().any(|l| u64::from(l.stream_id) == id);
         let ql = &mut self.quic_listeners[q_idx];
-        ql.owner_send(conn, &mut h3.mux, |id| !served(id));
+        // The GOAWAY of a soft stop goes out in this pass: framed after the write, it was
+        // what kept an idle owner from closing, nothing waking it to write it (T511).
         if ql.is_stopping() {
             h3.mux.send_goaway();
         }
+        ql.owner_send(conn, &mut h3.mux, |id| !served(id));
         let idle = children == 0 && !ibex_proto::htx_mux::HtxMux::tx_pending(&*h3.mux);
         let failed = h3.mux.error.is_some();
         for i in 0..children {

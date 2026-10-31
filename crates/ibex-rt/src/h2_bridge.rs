@@ -37,10 +37,8 @@ pub struct H2Dispatch {
     /// A request `HAProxy` answers 400 without contacting a server
     /// ([`ibex_proto::H2StreamCtx::bad_request`]).
     pub bad_request: bool,
-    /// The `content-length` the forwarded head gets in place of any the client wrote: a
-    /// request whose whole body came with its head and that gave none
-    /// ([`ibex_proto::HtxStream::known_body`]), or one whose length was not written once in
-    /// its canonical form (`5, 5`, `005`, twice: `HAProxy` 3.5-dev7 forwards
+    /// The `content-length` the forwarded head gets in place of the client's: one whose
+    /// length was not written once in its canonical form (`5, 5`, `005`, twice: `HAProxy` 3.5-dev7 forwards
     /// `content-length: 5`, T509).
     pub add_len: Option<u64>,
 }
@@ -105,7 +103,6 @@ pub fn dispatch_mux<M: HtxMux>(mux: &mut M, keep_request_line: bool, version: &s
     let has_data = blocks.iter().any(|b| matches!(b, HtxBlock::Data(_) | HtxBlock::RawData(_) | HtxBlock::Trailer(_)));
     let first_body = blocks.iter().position(|b| matches!(b, HtxBlock::Eoh)).map_or(blocks.len(), |i| i + 1);
     let eom = stream.rx_htx().is_eom();
-    let known = stream.known_body();
     let cl = stream.content_length();
     let bad_request = stream.bad_request();
     let head = stream.take_req_head()?;
@@ -118,9 +115,10 @@ pub fn dispatch_mux<M: HtxMux>(mux: &mut M, keep_request_line: bool, version: &s
             _ => false,
         }
     };
-    // A body all in with the head goes with its length, as `HAProxy`'s h1 side writes it
-    // (`HTX_SL_F_XFER_LEN` and a known size); one still coming goes chunked.
-    let add_len = if canonical { known.filter(|&n| n > 0 && !has_len) } else { cl };
+    // A body without `content-length` goes chunked, also when all of it came with the head
+    // (measured on `HAProxy` 3.5-dev7 with QUIC, T511); a length written another way than
+    // its digits (`005`, `5, 5`, two lines) goes as its digits.
+    let add_len = if canonical { None } else { cl };
     let chunked = !has_len && add_len.is_none() && (has_data || !eom);
     let req_htx = h2_head_size(&head).saturating_sub(u64::from(chunked));
     let request_line = (keep_request_line && head.has_line)

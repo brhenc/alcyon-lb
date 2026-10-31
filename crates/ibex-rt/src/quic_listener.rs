@@ -804,6 +804,9 @@ impl QuicListener {
         for (conn_id, st) in &mut self.h3 {
             Self::send_goaway(&mut self.endpoint, *conn_id, st);
         }
+        // Each owner (the mux path) sends its own GOAWAY and closes when idle: woken now, or
+        // one whose client went quiet sleeps through the stop until quinn's idle timeout (T511).
+        self.wake.extend(self.owned.values().filter_map(|oc| oc.owner.map(|(_, task)| task)));
         self.drain_idle_connections();
         // The GOAWAYs and closes go out now. Left for the next `pump`, they waited for an
         // unrelated wakeup -- and a closed connection's next wakeup is its drain timer, which

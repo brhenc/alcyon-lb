@@ -1217,9 +1217,6 @@ impl HtxStream for H3StreamCtx {
     fn bad_request(&self) -> bool {
         self.bad_request
     }
-    fn known_body(&self) -> Option<u64> {
-        self.known_body
-    }
     fn content_length(&self) -> Option<u64> {
         self.content_length
     }
