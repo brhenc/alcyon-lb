@@ -1167,10 +1167,11 @@ impl Section {
         for (p, s, name) in mine {
             let opts = self.unlink(p, s).unwrap_or_default();
             self.link(p, s, &name, opts, now);
-            if let Some(r) = self.resolutions.iter_mut().find(|r| r.srv.is_none() && r.reqs.iter().any(|q| q.proxy == p && q.server == s)) {
-                if r.in_flight.is_none() {
-                    r.next_at = r.next_at.min(now);
-                }
+            // `link` left the server on a resolution of the name: asked at once unless a query
+            // is in flight (`resolv_trigger_resolution`).
+            let joined = self.resolutions.iter_mut().find(|r| r.srv.is_none() && r.reqs.iter().any(|q| q.proxy == p && q.server == s));
+            if let Some(r) = joined.filter(|r| r.in_flight.is_none()) {
+                r.next_at = r.next_at.min(now);
             }
             if let Some(px) = proxies.get(p as usize) {
                 px.mark_server_fqdn_changed(s as usize);

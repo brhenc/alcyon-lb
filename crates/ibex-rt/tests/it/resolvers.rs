@@ -2386,6 +2386,29 @@ fn set_server_fqdn_joins_a_resolution_in_flight() {
     assert_eq!(asked(), 1, "{:?}", dns.queries());
 }
 
+/// A request woken while its `do-resolve` still waits (its body comes in meanwhile) waits on:
+/// the rule neither asks again nor gives up before the resolution ends.
+#[test]
+fn do_resolve_woken_by_the_body_waits_on() {
+    let dns = FakeDns::start();
+    dns.set("sil.test", Zone::Silent);
+    let ibex = start(dns.addr, "  timeout retry 300ms\n  resolve_retries 2\n", &dr_rules(",ipv4", "str(sil.test)"), "");
+    let t = Instant::now();
+    let mut c = TcpStream::connect(ibex.fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    c.write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\n").expect("send");
+    thread::sleep(Duration::from_millis(150));
+    c.write_all(b"hello").expect("body");
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    let text = String::from_utf8_lossy(&out);
+    let took = t.elapsed();
+    assert!(text.starts_with("HTTP/1.1 200"), "{text:?}");
+    assert!(took >= Duration::from_millis(550), "{took:?}");
+    let q = dns.queries();
+    assert!(q.len() == 2 && q[0].id == q[1].id, "{q:?}");
+}
+
 /// A section only servers written as addresses name runs (T489): `set server fqdn` gives one
 /// of them a name to resolve.
 #[test]
