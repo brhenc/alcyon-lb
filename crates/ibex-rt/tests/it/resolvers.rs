@@ -895,7 +895,7 @@ fn check(cfg: &str) -> (bool, String) {
 }
 
 /// The parser: an unknown section is `HAProxy`'s alert; `default-server resolvers` is
-/// inherited; a SRV name stays refused (T487).
+/// inherited; an SRV name is accepted with `resolvers`, and libc is no method for it (T487).
 #[test]
 fn the_server_keyword_is_checked() {
     let base = "resolvers r\n  nameserver ns1 127.0.0.1:53\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 1s\n  timeout server 1s\nlisten l\n  bind 127.0.0.1:0\n";
@@ -906,7 +906,9 @@ fn the_server_keyword_is_checked() {
     let (ok, err) = check(&format!("{base}  server s1 a1.test:80 resolvers r init-addr libc\n"));
     assert!(!ok && err.contains("could not resolve address 'a1.test'"), "{err}");
     let (ok, err) = check(&format!("{base}  server s1 _http._tcp.a.test resolvers r\n"));
-    assert!(!ok && err.contains("DNS SRV record name"), "{err}");
+    assert!(ok, "{err}");
+    let (ok, err) = check(&format!("{base}  server s1 _http._tcp.a.test resolvers r init-addr libc\n"));
+    assert!(!ok && err.contains("no method found to resolve address '_http._tcp.a.test'"), "{err}");
 }
 
 /// F14, A.t16: a check that ends in a layer-4 timeout asks for a resolution at once (the
@@ -1744,9 +1746,9 @@ fn t11b_without_additional_records_each_target_is_resolved() {
     let dns = FakeDns::start();
     dns.set(SRV, srv_zone(&[(512, 8080, "t1.test", None), (256, 8081, "t2.test", None)]));
     dns.set("t1.test", Zone::A(vec![Ipv4Addr::new(10, 1, 0, 1)]));
-    dns.set("t2.test", Zone::Silent);
+    dns.set("t2.test", Zone::A(vec![Ipv4Addr::new(10, 1, 0, 2)]));
     let ibex = start(dns.addr, "  timeout resolve 300ms\n", &srv_template(3, ""), "");
-    ibex.wait_srv("srv2", &format!("- 0 96 1 1 t2.test 8081 {SRV}"), 3);
+    ibex.wait_srv("srv2", &format!("10.1.0.2 2 64 1 1 t2.test 8081 {SRV}"), 3);
     ibex.wait_srv("srv1", &format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"), 3);
     ibex.wait_log("l/srv1: IP changed from '(none)' to '10.1.0.1' by 'r/ns1'.", 3);
     ibex.wait_log("Server l/srv1 ('t1.test') is UP/READY (resolves again).", 3);
@@ -1795,4 +1797,24 @@ fn ignore_weight_and_an_additional_record_for_another_name() {
     ibex.wait_log("l/srv1: IP changed from '(none)' to '10.1.0.1' by 'r/ns1'.", 3);
     assert_eq!(ibex.srv_cols("srv2"), format!("- 0 32 1 1 - 0 {SRV}"));
     assert!(!ibex.log().iter().any(|l| l.contains("10.6.6.6")), "{:?}", ibex.log());
+}
+
+/// T487, measured on `HAProxy` 3.5-dev8 (case t487/tnx.json: `hold nx 1s`, the SRV name NX
+/// after one answer): once the resolution's tries have all failed past `hold nx`, every record
+/// goes and its slot with it: `- 0 96 2 1 - 0` (the weight stays), "entry removed from SRV
+/// record", and the proxy has no server left.
+#[test]
+fn an_srv_resolution_that_fails_past_its_hold_drops_its_records() {
+    let dns = FakeDns::start();
+    dns.set(SRV, srv_zone(&[(512, 8080, "t1.test", Some([10, 1, 0, 1]))]));
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n  timeout retry 200ms\n  hold nx 300ms\n", &srv_template(2, ""), "");
+    ibex.wait_srv("srv1", &format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"), 3);
+    dns.set(SRV, Zone::Nx);
+    ibex.wait_srv("srv1", &format!("- 0 96 2 1 - 0 {SRV}"), 5);
+    ibex.wait_log("Server l/srv1 is going DOWN for maintenance (entry removed from SRV record). 0 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.", 3);
+    // In the log as is, on stderr as an ALERT (`proxy 'l' ...`).
+    assert!(ibex.log().iter().any(|l| l == "proxy l has no server available!"), "{:?}", ibex.log());
+    let alert = format!("[ALERT]    ({}) : proxy 'l' has no server available!", ibex.child.id());
+    assert!(ibex.stderr().contains(&alert), "{:?}", ibex.stderr());
+    assert_eq!(ibex.srv_cols("srv2"), format!("- 0 32 1 1 - 0 {SRV}"));
 }

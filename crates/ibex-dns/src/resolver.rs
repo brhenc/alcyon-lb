@@ -436,7 +436,10 @@ impl Resolver {
         }
         f.nb_responses += 1;
 
-        let (verdict, qtype) = validate(buf, f, max_payload);
+        // `allow_truncated_srv` (resolvers.c:2434-2436): unless the answer came over UDP from a
+        // nameserver with a TCP fallback.
+        let fallback = proto == Protocol::Udp && transport == NsTransport::Auto && self.cfg.tcp_fallback;
+        let (verdict, qtype) = validate(buf, f, max_payload, !fallback);
         let (rx, status) = match verdict {
             Verdict::Valid(answers) => {
                 let f = self.in_flight.remove(idx);
@@ -447,7 +450,7 @@ impl Resolver {
                 self.results.push_back((f.id, Ok(answers)));
                 return Received::Valid;
             }
-            Verdict::Truncated if proto == Protocol::Udp && transport == NsTransport::Auto && self.cfg.tcp_fallback => {
+            Verdict::Truncated if fallback => {
                 // resolv_send_tcp_fallback: the same question over TCP to this nameserver,
                 // without using a try.
                 f.nb_queries += 1;
@@ -497,7 +500,7 @@ impl Resolver {
 
 /// `resolv_validate_dns_response` (resolvers.c:1052-1660) on a reply whose id matched `f`.
 /// Returns the verdict and the reply's question type (for the TCP fallback).
-fn validate(buf: &[u8], f: &InFlight, max_payload: usize) -> (Verdict, u16) {
+fn validate(buf: &[u8], f: &InFlight, max_payload: usize, allow_truncated_srv: bool) -> (Verdict, u16) {
     if buf.len() < HEADER {
         return (Verdict::Invalid, f.query_type);
     }
@@ -526,7 +529,8 @@ fn validate(buf: &[u8], f: &InFlight, max_payload: usize) -> (Verdict, u16) {
     {
         return (Verdict::Invalid, qtype);
     }
-    if msg.truncated() {
+    // A truncated SRV answer is still of use when it cannot be asked again over TCP.
+    if msg.truncated() && !(qtype == TYPE_SRV && allow_truncated_srv) {
         return (Verdict::Truncated, qtype);
     }
     let n = msg.answers().len();

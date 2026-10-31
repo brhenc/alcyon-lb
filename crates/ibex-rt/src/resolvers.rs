@@ -331,7 +331,7 @@ impl SrvSlots {
         self.fqdn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(idx).cloned().flatten()
     }
 
-    fn set_fqdn(&self, idx: usize, v: Option<&str>) {
+    pub(crate) fn set_fqdn(&self, idx: usize, v: Option<&str>) {
         if let Some(f) = self.fqdn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(idx) {
             *f = v.map(Box::from);
         }
@@ -1442,7 +1442,7 @@ fn set_srv_down(r: &Resolution, k: usize, holds: &Holds, now: Instant, proxies: 
                 Cause::Nx => holds.nx,
                 Cause::Timeout => holds.timeout,
                 Cause::Refused => holds.refused,
-                Cause::NoIp | Cause::Unspec => holds.other,
+                Cause::NoIp | Cause::Unspec | Cause::NoEnt => holds.other,
             };
             if r.last_valid.is_some_and(|lv| now < lv + hold) {
                 return false;

@@ -1538,6 +1538,9 @@ pub struct ProxyIdInfo {
     /// Which servers' `srv_fqdn` the server-state file had changed from the CLI
     /// (`SRV_ADMF_FQDN_CHANGED`, 64 in `srv_admin_state`; T490); empty when none.
     pub server_fqdn_changed: Vec<bool>,
+    /// The slots of the servers whose name is an SRV record (`srvrecord`, T487): the target
+    /// each took and `SRV_ADMF_FQDN_CHANGED`; `None` when no server's name is one.
+    pub server_srv: Option<Arc<crate::resolvers::SrvSlots>>,
     /// Each server's `port` (`check port`, `default-server port`): `srv_agent_port`, and
     /// `srv_check_port` of a server with no check; empty when no server has one.
     pub server_check_ports: Vec<u16>,
@@ -1872,6 +1875,27 @@ impl Proxy {
     #[must_use]
     pub fn server_fqdn_changed(&self, idx: usize) -> bool {
         self.ids.server_fqdn_changed.get(idx).copied().unwrap_or(false)
+            || self.ids.server_srv.as_ref().is_some_and(|v| v.changed.get(idx).is_some_and(|c| c.load(Ordering::Relaxed)))
+    }
+
+    /// The SRV record the server at `idx` is a slot of (`srvrecord`), if any.
+    #[must_use]
+    pub fn server_srv_record(&self, idx: usize) -> Option<&str> {
+        self.ids.server_srv.as_ref().and_then(|v| v.record.get(idx)).and_then(Option::as_deref)
+    }
+
+    /// The target the SRV slot at `idx` took (`srv->hostname`), if it took one.
+    #[must_use]
+    pub fn server_srv_fqdn(&self, idx: usize) -> Option<Box<str>> {
+        self.ids.server_srv.as_ref().and_then(|v| v.fqdn(idx))
+    }
+
+    /// Sets (or clears) the target of the SRV slot at `idx`; setting one raises
+    /// `SRV_ADMF_FQDN_CHANGED`. A server that is no slot has no target to set.
+    pub fn set_server_srv_fqdn(&self, idx: usize, v: Option<&str>) {
+        if let Some(slots) = &self.ids.server_srv {
+            slots.set_fqdn(idx, v);
+        }
     }
 
     /// The `port` keyword of the server at `idx`, 0 without one (`srv_agent_port`).
@@ -4010,8 +4034,9 @@ fn server_rmaint(servers: &[ibex_config::Server], extras: &ibex_config::ast::Ser
 }
 
 /// The names for [`Proxy::server_fqdn`]: empty when no address was written as one.
+/// An SRV record's name is no `srv_fqdn`: the slot's target is (see [`Proxy::server_srv_fqdn`]).
 fn server_fqdns(count: usize, extras: &ibex_config::ast::ServerExtras) -> Vec<Option<Box<str>>> {
-    if extras.names.is_empty() { Vec::new() } else { (0..count).map(|i| extras.fqdn(i).map(Box::from)).collect() }
+    if extras.names.is_empty() { Vec::new() } else { (0..count).map(|i| extras.fqdn(i).filter(|f| !f.starts_with('_')).map(Box::from)).collect() }
 }
 
 /// [`ProxyIdInfo::server_fqdn_changed`].
@@ -4105,6 +4130,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_rmaint: server_rmaint(&listen.servers, &listen.server_extras),
             server_fqdns: server_fqdns(listen.servers.len(), &listen.server_extras),
             server_fqdn_changed: server_fqdn_changed(listen.servers.len(), &listen.server_extras),
+            server_srv: crate::resolvers::SrvSlots::new(listen.servers.len(), &listen.server_extras),
             server_check_ports: server_check_ports(&listen.servers),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
             server_pool: pool_cfgs(&listen.servers),
@@ -4402,6 +4428,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_rmaint: server_rmaint(&be.servers, &be.server_extras),
             server_fqdns: server_fqdns(be.servers.len(), &be.server_extras),
             server_fqdn_changed: server_fqdn_changed(be.servers.len(), &be.server_extras),
+            server_srv: crate::resolvers::SrvSlots::new(be.servers.len(), &be.server_extras),
             server_check_ports: server_check_ports(&be.servers),
             listener_ids: Vec::new(),
             server_pool: pool_cfgs(&be.servers),
@@ -13660,11 +13687,13 @@ impl EngineDispatcher<'_> {
     fn step_resolver(&mut self, idx: usize) -> Outcome {
         let Some(sec) = self.resolvers.get_mut(idx) else { return Outcome::Done };
         // Lines are rare (a change of a server's address or state): a `Vec` per change.
-        let mut lines: Vec<(usize, LogLevel, String)> = Vec::new();
-        let wait = sec.step(self.proxies, self.checks, &mut |p, level, msg| lines.push((p, level, msg.to_string())), &mut self.fdtab, &self.poller);
+        let mut lines: Vec<(usize, LogLevel, String, bool)> = Vec::new();
+        let wait = sec.step(self.proxies, self.checks, &mut |p, level, msg, stderr| lines.push((p, level, msg.to_string(), stderr)), &mut self.fdtab, &self.poller);
         let task = sec.task;
-        for (p, level, msg) in lines {
-            crate::stderr_line!("[WARNING]  ({}) : {msg}", self.pid);
+        for (p, level, msg, stderr) in lines {
+            if stderr {
+                crate::stderr_line!("[WARNING]  ({}) : {msg}", self.pid);
+            }
             self.send_log(p, level, b"", msg.as_bytes());
         }
         let ms = u32::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u32::MAX).max(1);

@@ -18,7 +18,7 @@ cfg = f"""global
   stats socket {sock} level admin
 {case.get('global','')}
 resolvers r
-  nameserver ns1 127.0.0.1:{dp}
+  nameserver ns1 {case.get('ns_prefix','')}127.0.0.1:{dp}
 {case.get('resolvers','')}
 defaults
   mode http

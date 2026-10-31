@@ -1,0 +1,4 @@
+{"servers": "  server-template srv 2 _http._tcp.srv.test resolvers r", "resolvers": "  timeout resolve 1s\n  hold nx 1s",
+ "zones": [[0, {"_http._tcp.srv.test": {"srv": [[10,512,8080,"t1.test"]], "srv_ar": true}, "t1.test": {"a": ["10.1.0.1"]}}],
+           [1.5, {"_http._tcp.srv.test": {"rcode": "nx"}, "t1.test": {"a": ["10.1.0.1"]}}]],
+ "dur": 10}

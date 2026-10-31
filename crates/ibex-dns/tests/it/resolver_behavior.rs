@@ -822,6 +822,39 @@ fn transports_choose_the_protocol_and_the_fallback() {
     assert!(sends(&mut r, t0).is_empty(), "no fallback on udp@");
 }
 
+// T487, measured on `HAProxy` 3.5-dev8 (vvdns `tc_keep`, cases t487/ttc*.json): a truncated SRV
+// answer is parsed when the nameserver has no TCP fallback (`udp@`: `allow_truncated_srv`,
+// resolvers.c:1196-1203, 2434-2436); with one it is asked again over TCP, as an A answer is.
+#[test]
+fn a_truncated_srv_answer_is_parsed_without_a_tcp_fallback() {
+    let srv_tc = |id: u16| {
+        let mut msg = Message::new();
+        msg.set_id(id);
+        msg.set_message_type(MessageType::Response);
+        msg.set_truncated(true);
+        msg.add_query(Query::query(Name::from_str("_http._tcp.srv.test").unwrap(), RecordType::SRV));
+        msg.add_answer(Record::from_rdata(Name::from_str("_http._tcp.srv.test").unwrap(), 60, RData::SRV(SRV::new(10, 512, 8080, Name::from_str("t1.test.").unwrap()))));
+        msg.to_vec().unwrap()
+    };
+    let mut c = cfg(&[NS1]);
+    c.transports = vec![NsTransport::Udp];
+    let mut r = Resolver::new(c);
+    let now = Instant::now();
+    let qid = r.query(now, "_http._tcp.srv.test", Question::Srv, Requester::Server).unwrap();
+    let id = Message::from_vec(&r.poll_transmit(now).unwrap().2).unwrap().id();
+    assert_eq!(r.handle_response(now, ns(NS1), Protocol::Udp, &srv_tc(id)), Received::Valid);
+    let (got, res) = r.poll_result().unwrap();
+    assert_eq!(got, qid);
+    let rdata: Vec<Rdata> = res.unwrap().into_iter().map(|a| a.rdata).collect();
+    assert_eq!(rdata, vec![Rdata::Srv { target: "t1.test.".into(), port: 8080, priority: 10, weight: 512 }]);
+
+    let mut r = Resolver::new(cfg(&[NS1]));
+    r.query(now, "_http._tcp.srv.test", Question::Srv, Requester::Server).unwrap();
+    let id = Message::from_vec(&r.poll_transmit(now).unwrap().2).unwrap().id();
+    assert_eq!(r.handle_response(now, ns(NS1), Protocol::Udp, &srv_tc(id)), Received::Truncated);
+    assert_eq!(r.poll_transmit(now).map(|t| t.1), Some(Protocol::Tcp));
+}
+
 // Item 4, at the retry timer (resolvers.c:2631-2640): both families, an error from one of two
 // nameservers and silence from the other: the next try is of the other type, no try used.
 #[test]

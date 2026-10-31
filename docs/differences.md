@@ -192,8 +192,12 @@ Not refused, on purpose:
   has an IPv6 route, re-probed every 30 s). Differences: every section runs on worker 0 (with the
   health checks; HAProxy spreads them over threads); a forged or malformed reply never ends a
   resolution early (the honest answer is still taken); only a layer-4 timeout of a check, not a
-  refused connect, triggers a resolution. `server-template <prefix> <n|lo-hi> <name>[:port]` expands to servers `<prefix><n>` that share one resolution (T486); `from none` is accepted, `from be:`/`from srv:` are refused, and a parameter error names `server <slot>` where HAProxy says `server-template <px>/<prefix>`. Still refused: SRV names
-  (`_...`, T487), `do-resolve`, `parse-resolv-conf` and `dns-accept-family` (T489), and the address
+  refused connect, triggers a resolution. `server-template <prefix> <n|lo-hi> <name>[:port]` expands to servers `<prefix><n>` that share one resolution (T486); `from none` is accepted, `from be:`/`from srv:` are refused, and a parameter error names `server <slot>` where HAProxy says `server-template <px>/<prefix>`. An SRV name (`_...`, T487) is
+  queried as SRV: its records fill the slots in HAProxy's key order (target, port, weight
+  `(w + 255) / 256` unless `resolve-opts ignore-weight`, the address from an additional record or
+  else an A/AAAA resolution per target), `hold obsolete` removes a record that is gone, and
+  `show servers state` reports `srv_fqdn`, `srv_port` and `srvrecord`. Not measured against the
+  oracle: a truncated SRV answer over UDP (`allow_truncated_srv`). Still refused: `do-resolve`, `parse-resolv-conf` and `dns-accept-family` (T489), and the address
   prefixes `mptcp@`, `unix@`, `abns@`, `quic4@`... on a `nameserver`. TCP is done (T488): a
   truncated UDP answer is asked again over TCP to the same nameserver at once (one connection per
   nameserver, opened by the first query, four queries in flight, closed after 5 s idle); `tcp@`,

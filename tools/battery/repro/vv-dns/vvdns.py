@@ -8,7 +8,8 @@ vvdns.py PORT ZONE.json LOG
 Built on the T481 oracle's fakedns.py, with hostile modes added. The zone file is re-read on every
 query, so a battery can change answers while the proxy runs. Per name:
   "a": [ip...], "aaaa": [ip...], "ttl": N, "rcode": "nx|refused|servfail", "nodata": true,
-  "silent": true, "delay": secs, "cname": "name", "tc_udp": true,
+  "silent": true, "delay": secs, "cname": "name", "tc_udp": true (TC over UDP, no records),
+  "tc_keep": true (TC over UDP, the records kept),
   hostile modes, each sent BEFORE the honest answer (or instead of it with "only": true):
   "spoof_port": ip   right id, right name, from another source port
   "wrong_name": ip   right id, another question name, from the right port
@@ -151,6 +152,8 @@ def honest(spec, z, qid, qtype, question, proto):
     tc = 0
     if proto == "udp" and spec.get("tc_udp"):
         tc, answers, ar = 0x0200, [], []
+    elif proto == "udp" and spec.get("tc_keep"):
+        tc = 0x0200
     return reply(qid, question, answers, rcode, tc, ar=ar)
 
 def handle(req, proto, sport, send, send_other):

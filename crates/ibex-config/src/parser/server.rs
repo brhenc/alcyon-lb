@@ -36,13 +36,8 @@ pub(crate) fn parse_server(
     let who = Some(tokens[1].text.as_str());
     if let Some(name) = &fqdn {
         let prefix = server_keywords::server_prefix(who);
-        if name.starts_with('_') {
-            return Err(ConfigError::new(
-                tokens[2].line,
-                tokens[2].col,
-                format!("{prefix}'{name}' is a DNS SRV record name, which is not supported yet (T487): Ibex resolves A and AAAA names only"),
-            ));
-        }
+        // A name starting with `_` is an SRV record (T487): `crate::resolvers` in ibex-rt
+        // queries it and its records fill the slots (`srv_fill`).
         if !address::dn_label_ok(name) {
             return Err(ConfigError::new(tokens[2].line, tokens[2].col, format!("{prefix}Can't create DNS resolution for server '{}'", tokens[1].text)));
         }

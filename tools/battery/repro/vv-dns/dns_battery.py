@@ -134,7 +134,10 @@ CASES = [
  # --- still refused after T484 (design §2.7); HAProxy accepts them
  ("refused-template", cfg(RS, "    server-template srv 3 multi.test:80 resolvers r\n"), z(), [], 2.5, "",
   "refused until T486"),
- ("refused-srv", cfg(RS, "    server-template srv 2 _http._tcp.srv.test resolvers r\n"), z(), [], 2.0, "", "refused until T487"),
+ ("srv-template", cfg(RS, "    server-template srv 2 _http._tcp.srv.test resolvers r\n"),
+  dict(z(), **{"_http._tcp.srv.test": {"srv": [[10, 512, 8080, "t1.test"], [10, 256, 8081, "t2.test"]], "srv_ar": True},
+               "t1.test": {"a": ["10.1.0.1"]}, "t2.test": {"a": ["10.1.0.2"]}}), [], 2.0, "",
+  "T487 (was refused-srv): SRV records with additional records fill the slots, A.t11"),
  ("refused-do-resolve", cfg(RS, "    http-request do-resolve(txn.ip,r,ipv4) str(a1.test)\n    server s1 127.0.0.1:%d\n" % BE),
   z(), [], 1.5, "", "refused until T489"),
  ("refused-parse-resolv-conf", cfg(RS + "    parse-resolv-conf\n", S1), z(), [], 1.5, "", "refused until T489"),

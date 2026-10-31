@@ -669,11 +669,12 @@ impl CliApplet {
                     let puid = p.server_puid(s_idx);
                     let bk_forced = u8::from(p.ids.forced_id);
                     let srv_forced = u8::from(p.server_forced_id(s_idx));
+                    let srv_fqdn = p.server_srv_fqdn(s_idx);
                     self.out_buf.extend_from_slice(
                         format!(
-                            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} 0 {} {} {} {} - {} {} - - {}\n",
+                            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} 0 {} {} {} {} {} {} {} - - {}\n",
                             p.ids.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, lastchg, check_status, check_result, check_health, check_state, bk_forced, srv_forced,
-                            p.server_fqdn(s_idx).unwrap_or("-"), port, use_ssl, check_port, agent_port
+                            srv_fqdn.as_deref().or_else(|| p.server_fqdn(s_idx)).unwrap_or("-"), port, p.server_srv_record(s_idx).unwrap_or("-"), use_ssl, check_port, agent_port
                         ).as_bytes()
                     );
                 }
