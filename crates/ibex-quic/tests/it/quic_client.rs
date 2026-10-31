@@ -244,6 +244,7 @@ fn an_ibex_client_and_server_agree_on_h3_and_carry_a_request_on_both_providers()
     for p in TlsCryptoProvider::ALL {
         let cert = new_cert();
         let client = QuicClientConfig::with_roots(roots(&cert.der), &[b"h3"], p).expect("client config");
+        assert_eq!(client.provider(), p);
         let mut pair = Pair::new(&cert, p, client);
         pair.run_until("the handshake", Pair::connected);
 

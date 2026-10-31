@@ -362,7 +362,7 @@ impl qc::Session for TlsSession {
     }
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
-        take_handshake(&mut self.events, &mut self.next_secrets, buf)
+        take_handshake_scrubbed(&mut self.events, &mut self.next_secrets, buf)
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn qc::PacketKey>>> {
@@ -413,8 +413,26 @@ fn transport_error(e: &rustls24::Error) -> TransportError {
     }
 }
 
+/// [`take_handshake`], then, when it took an event, the stack below goes (T534). A
+/// `QuicEvent` is a large enum: rustls builds one on its stack, where the secrets it derived
+/// just before still are, and pushes the whole of it, padding included, so the bytes of the
+/// variant that are not its fields can be a traffic secret's. Popping the event copies all of
+/// it onto this stack, after the handshake step's scrub: the instrumented build found
+/// `SERVER_HANDSHAKE_TRAFFIC_SECRET` there below the client (`stack_scrub.rs`). Not inlined: its
+/// frame must not hold the scrubbed region.
+#[inline(never)]
+fn take_handshake_scrubbed(events: &mut VecDeque<QuicEvent>, next_secrets: &mut Option<Secrets>, buf: &mut Vec<u8>) -> Option<Keys> {
+    let had = !events.is_empty();
+    let keys = take_handshake(events, next_secrets, buf);
+    if had {
+        ibex_alloc::scrub_stack();
+    }
+    keys
+}
+
 /// `qc::Session::write_handshake` on either side: the messages of the current level, up to
 /// the change of keys that ends it; the secrets of the next 1-RTT keys go to `next_secrets`.
+#[inline(never)]
 fn take_handshake(events: &mut VecDeque<QuicEvent>, next_secrets: &mut Option<Secrets>, buf: &mut Vec<u8>) -> Option<Keys> {
     while let Some(ev) = events.pop_front() {
         let change = match ev {

@@ -30,7 +30,7 @@ use rustls24::quic::{self as rq, QuicEvent, Secrets, Suite, Version};
 use rustls24::{ClientConfig, Connection, KeyingMaterialExporter};
 
 use super::{
-    export, initial_keys, initial_suite, interpret_version, next_keys, retry_tag_v1, take_handshake, transport_error,
+    export, initial_keys, initial_suite, interpret_version, next_keys, retry_tag_v1, take_handshake_scrubbed, transport_error,
     HandshakeData, Input,
 };
 
@@ -246,7 +246,7 @@ impl qc::Session for ClientSession {
     }
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
-        take_handshake(&mut self.events, &mut self.next_secrets, buf)
+        take_handshake_scrubbed(&mut self.events, &mut self.next_secrets, buf)
     }
 
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn qc::PacketKey>>> {
