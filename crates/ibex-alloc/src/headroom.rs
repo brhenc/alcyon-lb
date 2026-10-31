@@ -14,8 +14,12 @@
 
 /// What a thread maps beside its stack: std's alternative signal stack (`max(SIGSTKSZ,
 /// AT_MINSIGSTKSZ)` plus a guard page, 12 KiB on x86-64), glibc's guard page and static TLS,
-/// with room to spare.
-pub const THREAD_EXTRA: usize = 64 * 1024;
+/// and the first heap of the thread's own malloc arena (`M_TOP_PAD` 128 KiB plus the first
+/// request, made writable by the thread's first `malloc`, which is glibc registering a TLS
+/// destructor: when that fails glibc aborts, "failed to register TLS destructor"; T541's gate,
+/// `-m 6`, instrumented build). 1 MiB leaves room for the worker's setup as well; a start under
+/// a tiny `-m` is refused a little sooner, cleanly.
+pub const THREAD_EXTRA: usize = 1024 * 1024;
 
 /// Ok when a thread with a `stack`-byte stack fits under `RLIMIT_DATA` now: `stack` plus
 /// [`THREAD_EXTRA`] is mapped (private, writable, never touched) and unmapped again.
