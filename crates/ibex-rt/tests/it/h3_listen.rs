@@ -131,3 +131,25 @@ fn listen_serves_h3_through_its_rules_and_server() {
     assert!(lines[1].contains(" ls~ ls/<NOSRV> ") && lines[1].contains(" 403 "), "{}", lines[1]);
 }
 }
+
+/// `-c` loads a `listen`'s QUIC certificate as it does a frontend's (`validate_tls`): a missing
+/// file is reported before the process would start on it.
+#[test]
+fn check_only_loads_the_certificate_of_a_listen_quic_bind() {
+    let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
+    let run = |crt: &str| {
+        let cfg = format!(
+            "defaults\n  mode http\n  timeout connect 2s\n  timeout client 10s\n  timeout server 10s\n\
+             listen ls\n  bind quic4@127.0.0.1:0 ssl crt {crt} alpn h3\n  server s1 127.0.0.1:9\n"
+        );
+        let mut f = NamedTempFile::new().expect("tmp");
+        f.write_all(cfg.as_bytes()).expect("write cfg");
+        let out = common::ibex_command(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(f.path()).output().expect("run -c");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let (ok, err) = run(&crt);
+    assert!(ok, "valid listen QUIC bind refused by -c: {err}");
+    let (ok, err) = run("/nonexistent/t530.pem");
+    assert!(!ok, "-c accepted a listen QUIC bind whose certificate does not exist");
+    assert!(err.contains("t530.pem"), "{err}");
+}
