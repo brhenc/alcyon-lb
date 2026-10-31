@@ -2140,11 +2140,21 @@ impl Drop for SessionArena {
 }
 
 impl SessionArena {
+    /// Pre-sized for `cap` sessions; short of memory (a small `-m`), empty instead, growing on
+    /// use as `HAProxy`'s pools do: never an abort at the start (T511: under `-m 6` the
+    /// instrumented build's larger footprint left no room for the 272000 bytes asked here).
     #[must_use]
     pub fn with_capacity(cap: usize) -> Self {
+        let (mut entries, mut free) = (Vec::new(), Vec::new());
+        let cap = if entries.try_reserve_exact(cap).is_ok() && free.try_reserve_exact(cap).is_ok() {
+            cap
+        } else {
+            (entries, free) = (Vec::new(), Vec::new());
+            0
+        };
         SessionArena {
-            entries: Vec::with_capacity(cap),
-            free: Vec::with_capacity(cap),
+            entries,
+            free,
             live: 0,
             floor: cap,
             peak: 0,
@@ -5586,9 +5596,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 sess.cli_state = ScState::Established;
                 sess.cli_exp = Tick::ETERNITY;
                 sess.req_exp = Tick::ETERNITY;
-                sess.h3_owner = Some(Box::new(crate::proxy::H3Owner { mux, listener: usize_to_u32(q_idx), conn, body_scratch: Vec::new() }));
-                // Its role, which keeps its children, is made now (one `Box` a connection).
-                let _ = sess.h2_owner_mut();
+                // Its role, which keeps its children and its mux, is made now (two `Box`es a
+                // connection).
+                sess.h2_role = Some(Box::new(crate::proxy::H2Role::Owner(crate::proxy::H2Owner {
+                    h3: Some(Box::new(crate::proxy::H3Owner { mux, listener: usize_to_u32(q_idx), conn, body_scratch: Vec::new() })),
+                    ..Default::default()
+                })));
                 let entry = SessionEntry {
                     sess,
                     task: TaskRef::NONE,
@@ -6022,7 +6035,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 return;
             }
             let keep = owner.sess.keep_request_line;
-            let d = match owner.sess.h3_owner.as_deref_mut() {
+            let d = match owner.sess.h3_owner_mut() {
                 Some(h3) => crate::h2_bridge::dispatch_mux(&mut *h3.mux, keep, "HTTP/3.0"),
                 None => owner.sess.h2_ctx.as_deref_mut().and_then(|h2| crate::h2_bridge::dispatch_next(h2, keep)),
             };
@@ -6066,7 +6079,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let head = crate::h2_bridge::start_request(&mut child.sess, d);
             if let Some(h2) = owner.sess.h2_ctx.as_deref_mut() {
                 h2.give_back_head(head);
-            } else if let Some(h3) = owner.sess.h3_owner.as_deref_mut() {
+            } else if let Some(h3) = owner.sess.h3_owner_mut() {
                 ibex_proto::htx_mux::HtxMux::give_back_head(&mut *h3.mux, head);
             }
             // The stream's own `timeout client` starts with it (T300).
@@ -8668,7 +8681,7 @@ fn h2_bridge_state(o: &mut SessionEntry, c: &mut SessionEntry, proxies: &[Proxy]
 /// [`h2_bridge_moves`] for a stream of an HTTP/3 connection (T509).
 fn h3_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> bool {
     let (os, cs) = (&mut o.sess, &mut c.sess);
-    let Some(h3) = os.h3_owner.as_deref_mut() else { return false };
+    let Some(h3) = os.h3_owner_mut() else { return false };
     let Some(crate::proxy::H2Role::Child(ch)) = cs.h2_role.as_deref_mut() else { return false };
     let mux = &mut *h3.mux;
     if ch.reset || ibex_proto::htx_mux::HtxMux::is_reset(mux, u64::from(ch.stream.id)) {
@@ -8698,7 +8711,7 @@ fn h3_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
 /// connection failing (`failed`: the mux's connection error, which closes it).
 fn h3_bridge_state(o: &mut SessionEntry, c: &mut SessionEntry, failed: bool) -> bool {
     let (os, cs) = (&mut o.sess, &mut c.sess);
-    let Some(h3) = os.h3_owner.as_deref() else { return false };
+    let Some(h3) = os.h3_owner() else { return false };
     let tx_pending = ibex_proto::htx_mux::HtxMux::tx_pending(&*h3.mux);
     let reset = cs.h2_active().is_some_and(|a| ibex_proto::htx_mux::HtxMux::is_reset(&*h3.mux, u64::from(a.id)));
     let Some(crate::proxy::H2Role::Child(ch)) = cs.h2_role.as_deref_mut() else { return false };
@@ -10257,7 +10270,7 @@ impl EngineDispatcher<'_> {
     fn step_h3_owner(&mut self, owner_idx: u32, now: Tick) -> Outcome {
         let Some(e) = self.sessions.get_mut(owner_idx) else { return Outcome::Done };
         let task = e.task;
-        let Some(h3) = e.sess.h3_owner.as_deref_mut() else { return Outcome::Done };
+        let Some(h3) = e.sess.h3_owner_mut() else { return Outcome::Done };
         let (q_idx, conn) = (h3.listener as usize, h3.conn);
         let Some(ql) = self.quic_listeners.get_mut(q_idx) else { return Outcome::Done };
         if ql.owner_recv(conn, &mut h3.mux, u64::from(now.0)) == crate::quic_listener::OwnerConn::Closed {
@@ -10277,12 +10290,8 @@ impl EngineDispatcher<'_> {
             }
         }
         let Some(e) = self.sessions.get_mut(owner_idx) else { return Outcome::Done };
-        let (role, h3) = (e.sess.h2_role.as_deref(), e.sess.h3_owner.as_deref_mut());
-        let Some(h3) = h3 else { return Outcome::Done };
-        let served = |id: u64| match role {
-            Some(crate::proxy::H2Role::Owner(o)) => o.children.iter().any(|l| u64::from(l.stream_id) == id),
-            _ => false,
-        };
+        let Some(crate::proxy::H2Role::Owner(crate::proxy::H2Owner { children: served_by, h3: Some(h3), .. })) = e.sess.h2_role.as_deref_mut() else { return Outcome::Done };
+        let served = |id: u64| served_by.iter().any(|l| u64::from(l.stream_id) == id);
         let ql = &mut self.quic_listeners[q_idx];
         ql.owner_send(conn, &mut h3.mux, |id| !served(id));
         if ql.is_stopping() {
@@ -10310,7 +10319,7 @@ impl EngineDispatcher<'_> {
         }
         let max = e.sess.h2_max_children();
         if e.sess.h2_owner().map_or(0, |o| o.children.len()) < max
-            && e.sess.h3_owner.as_deref().is_some_and(|h| ibex_proto::htx_mux::HtxMux::next_dispatch(&*h.mux).is_some())
+            && e.sess.h3_owner().is_some_and(|h| ibex_proto::htx_mux::HtxMux::next_dispatch(&*h.mux).is_some())
         {
             self.h2_spawn.push((owner_idx, task));
         }
@@ -10347,7 +10356,7 @@ impl EngineDispatcher<'_> {
         owner.sess.h2_owner_mut().into_iter().for_each(|o| o.children.retain(|l| l.task != child.task));
         // An HTTP/3 stream whose response is all framed is let go once its FIN is out
         // (`QuicListener::owner_send`); one that ends without it is reset and let go now.
-        if let Some(h3) = owner.sess.h3_owner.as_deref_mut() {
+        if let Some(h3) = owner.sess.h3_owner_mut() {
             let id = child.sess.h2_child().map_or(0, |c| u64::from(c.stream.id));
             let mux = &mut *h3.mux;
             match mux.streams.get(&id).map(|st| (st.tx_fin, st.fin_sent)) {
@@ -10376,7 +10385,7 @@ impl EngineDispatcher<'_> {
                     h2.send_goaway(h2.last_client_stream_id, goaway, b"");
                 }
             }
-            if owner.sess.srv.is_some() || owner.sess.h3_owner.is_some() {
+            if owner.sess.srv.is_some() || owner.sess.h3_owner().is_some() {
                 // Another stream already gave one back: this one goes to the pool, as
                 // `HAProxy`'s streams each release theirs. The owner of an HTTP/3
                 // connection keeps none: it polls no server socket (T509).
@@ -10468,7 +10477,7 @@ impl EngineDispatcher<'_> {
         // in the poller, so a stream woken by a request after an idle second would arm a
         // `wait-for-body` of 300 ms from a second ago.
         let now = self.now;
-        let (is_h2_owner, is_h3_owner) = self.sessions.get(session_idx).map_or((false, false), |e| (e.sess.h2_ctx.is_some(), e.sess.h3_owner.is_some()));
+        let (is_h2_owner, is_h3_owner) = self.sessions.get(session_idx).map_or((false, false), |e| (e.sess.h2_ctx.is_some(), e.sess.h3_owner().is_some()));
         if is_h3_owner {
             let out = self.step_h3_owner(session_idx, now);
             if matches!(out, Outcome::Done) {

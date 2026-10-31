@@ -126,7 +126,7 @@ impl Ibex {
         );
         let mut f = NamedTempFile::new().expect("tmp");
         f.write_all(cfg.as_bytes()).expect("write cfg");
-        let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        let child = common::ibex_command(env!("CARGO_BIN_EXE_ibex"))
             .arg("-f")
             .arg(f.path())
             .stdout(Stdio::null())
@@ -195,7 +195,7 @@ fn status(resp: &str) -> &str {
     resp.lines().next().unwrap_or("").trim()
 }
 
-#[test]
+crate::h3_both_paths! {
 fn http_request_rules_run_on_h3() {
     require_curl_http3();
     let ibex = Ibex::start();
@@ -218,16 +218,18 @@ fn http_request_rules_run_on_h3() {
         ":authority becomes Host:\n{fwd}"
     );
 }
+}
 
-#[test]
+crate::h3_both_paths! {
 fn use_backend_chooses_the_backend_on_h3() {
     require_curl_http3();
     let ibex = Ibex::start();
     let r = ibex.h3("/other", &[]);
     assert!(r.contains("server=other"), "use_backend on a path ACL must route an H3 request:\n{r}");
 }
+}
 
-#[test]
+crate::h3_both_paths! {
 fn h3_requests_are_balanced_over_the_servers() {
     require_curl_http3();
     let ibex = Ibex::start();
@@ -237,8 +239,9 @@ fn h3_requests_are_balanced_over_the_servers() {
         "balance roundrobin must spread H3 requests over s1 and s2; s1 took {seen:?}"
     );
 }
+}
 
-#[test]
+crate::h3_both_paths! {
 fn http_response_rules_run_on_h3() {
     require_curl_http3();
     let ibex = Ibex::start();
@@ -248,8 +251,9 @@ fn http_response_rules_run_on_h3() {
     let deny = ibex.h3("/deny", &[]);
     assert!(!deny.contains("x-resp"), "a denied request runs no response rule (HAProxy):\n{deny}");
 }
+}
 
-#[test]
+crate::h3_both_paths! {
 fn one_log_line_per_h3_request() {
     require_curl_http3();
     let ibex = Ibex::start();
@@ -275,11 +279,12 @@ fn one_log_line_per_h3_request() {
         lines[1]
     );
 }
+}
 
+crate::h3_both_paths! {
 /// Larger than what the stream's flow-control window and send buffer take at once: before
 /// T130 `write_stream` dropped what did not fit and finished the stream, so curl got a
 /// truncated body (1 MB happened to fit; 16 MB does not).
-#[test]
 fn large_h3_responses_arrive_whole() {
     require_curl_http3();
     let ibex = Ibex::start();
@@ -294,8 +299,9 @@ fn large_h3_responses_arrive_whole() {
         assert!(out.stdout.iter().all(|&b| b == b'x'));
     }
 }
+}
 
-#[test]
+crate::h3_both_paths! {
 fn an_h3_request_body_reaches_the_server() {
     require_curl_http3();
     let ibex = Ibex::start();
@@ -305,8 +311,9 @@ fn an_h3_request_body_reaches_the_server() {
     let r = ibex.h3("/post", &["-H", "Transfer-Encoding: chunked", "--data-binary", "streamed-body"]);
     assert!(r.ends_with("streamed-body"), "{r}");
 }
+}
 
-#[test]
+crate::h3_both_paths! {
 fn a_slow_server_does_not_spin_the_loop() {
     require_curl_http3();
     let ibex = Ibex::start();
@@ -319,9 +326,10 @@ fn a_slow_server_does_not_spin_the_loop() {
     // Two seconds of waiting; a spinning loop burns ~200 ticks (at 100 Hz), an idle one a few.
     assert!(used < 40, "the loop spun while the server took 2 s: {used} ticks");
 }
+}
 
+crate::h3_both_paths! {
 /// The same rules on H1, so a failure above is about HTTP/3 and not about the configuration.
-#[test]
 fn the_same_configuration_on_h1() {
     let ibex = Ibex::start();
     let mut s = std::net::TcpStream::connect(ibex.tcp).expect("connect");
@@ -330,10 +338,11 @@ fn the_same_configuration_on_h1() {
     let _ = s.read_to_string(&mut out);
     assert!(out.starts_with("HTTP/1.1 403"), "{out}");
 }
+}
 
+crate::h3_both_paths! {
 /// A body larger than what the engine's side of the relay takes at once: the relay writes
 /// it as the engine reads, and the client's flow control holds the rest back.
-#[test]
 fn a_large_h3_request_body_reaches_the_server() {
     require_curl_http3();
     let ibex = Ibex::start();
@@ -343,12 +352,13 @@ fn a_large_h3_request_body_reaches_the_server() {
     let r = ibex.h3("/upload", &["--data-binary", &path]);
     assert!(r.ends_with("got 3000000 bytes"), "{r}");
 }
+}
 
+crate::h3_both_paths! {
 /// Concurrent requests on one connection are each a stream of their own in the engine.
 /// (curl opens them a flight apart, so this passed before the endpoint learned to accept
 /// several streams per `Opened` event; `h3_relay_streams.rs` `malformed_requests_get_a_400`
 /// is the one that opens three in a single flight.)
-#[test]
 fn parallel_h3_requests_are_all_answered() {
     require_curl_http3();
     let ibex = Ibex::start();
@@ -362,4 +372,5 @@ fn parallel_h3_requests_are_all_answered() {
         .expect("curl");
     let s = String::from_utf8_lossy(&out.stdout);
     assert_eq!(s.matches("[200]").count(), 4, "{s}\nstderr: {}", String::from_utf8_lossy(&out.stderr));
+}
 }

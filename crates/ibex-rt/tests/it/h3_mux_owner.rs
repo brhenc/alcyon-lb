@@ -17,6 +17,11 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 
 fn backend() -> std::net::SocketAddr {
+    backend_answering(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+}
+
+/// A backend that answers each connection's first request with `response` and closes it.
+fn backend_answering(response: &'static [u8]) -> std::net::SocketAddr {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = l.local_addr().expect("addr");
     thread::spawn(move || {
@@ -31,7 +36,7 @@ fn backend() -> std::net::SocketAddr {
                         Ok(n) => got.extend_from_slice(&buf[..n]),
                     }
                 }
-                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+                let _ = s.write_all(response);
             });
         }
     });
@@ -46,7 +51,10 @@ struct Ibex {
 
 impl Ibex {
     fn start(rule_src: &str) -> Self {
-        let be = backend();
+        Self::start_with(rule_src, backend())
+    }
+
+    fn start_with(rule_src: &str, be: std::net::SocketAddr) -> Self {
         let tcp = common::reserve_addr();
         let quic = common::reserve_addr();
         let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
@@ -59,7 +67,7 @@ impl Ibex {
         );
         let mut f = tempfile::NamedTempFile::new().expect("tmp");
         f.write_all(cfg.as_bytes()).expect("write cfg");
-        let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
+        let child = common::ibex_command(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn ibex");
         assert!(common::wait_listening(tcp), "ibex never started listening on {tcp}");
         Self { child, _cfg: f, quic }
     }
@@ -81,18 +89,49 @@ impl Drop for Ibex {
     }
 }
 
-#[test]
+crate::h3_both_paths! {
 fn tcp_request_connection_reject_refuses_the_quic_connection() {
     let ibex = Ibex::start("127.0.0.1");
     let got = ibex.get();
     assert!(!got.contains("ok"), "a rejected connection was served: {got:?}");
-    if std::env::var("IBEX_H3_PATH").is_ok_and(|v| v == "mux") {
+    if common::h3_mux() {
         assert!(got.ends_with("000"), "no response expected, as HAProxy: {got:?}");
     }
 }
+}
 
-#[test]
+crate::h3_both_paths! {
 fn a_tcp_request_connection_rule_that_does_not_match_serves_the_request() {
     let ibex = Ibex::start("10.9.9.9");
     assert_eq!(ibex.get(), "ok200");
+}
+}
+
+crate::h3_both_paths! {
+/// T511: a server connection that closed right after its response is not the next stream's.
+/// Two requests one after the other on one HTTP/3 connection, to a server that closes each
+/// connection once it has answered (with `connection: close`, and without: keep-alive
+/// implied, the close comes unannounced): both are served, over one QUIC connection
+/// (`num_connects` 1, then 0). `HAProxy` 3.5-dev7 with QUIC, the same backend: 200 and 200,
+/// a server connection each. (A server that closes only some milliseconds after its
+/// response, the next request already sent on the connection, has that stream reset on
+/// `HAProxy` and on the mux alike: measured, not pinned, see `tasks/T509-progress.md`.)
+fn a_server_connection_closed_after_its_response_is_not_the_next_streams() {
+    for response in [
+        &b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"[..],
+        &b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"[..],
+    ] {
+        let ibex = Ibex::start_with("10.9.9.9", backend_answering(response));
+        let port = ibex.quic.port();
+        let url = format!("https://localhost:{port}/");
+        let out = Command::new("curl")
+            .args(["-sS", "--http3-only", "-k", "--max-time", "4", "-w", " %{http_code} %{num_connects}\n", "--resolve"])
+            .arg(format!("localhost:{port}:127.0.0.1"))
+            .args([&url, &url])
+            .output()
+            .expect("curl");
+        let got = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(got, "ok 200 1\nok 200 0\n", "{:?}: stderr {}", String::from_utf8_lossy(response), String::from_utf8_lossy(&out.stderr));
+    }
+}
 }

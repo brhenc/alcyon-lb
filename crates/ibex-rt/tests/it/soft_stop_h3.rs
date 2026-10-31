@@ -65,7 +65,7 @@ impl Ibex {
         );
         let mut f = NamedTempFile::new().expect("tmp");
         f.write_all(cfg.as_bytes()).expect("write cfg");
-        let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+        let child = common::ibex_command(env!("CARGO_BIN_EXE_ibex"))
             .arg("-f")
             .arg(f.path())
             .stdout(Stdio::null())
@@ -122,9 +122,9 @@ fn curl(quic: SocketAddr, extra: &[&str], urls: &[&str]) -> Child {
         .expect("spawn curl")
 }
 
+crate::h3_both_paths! {
 /// The request the old process is serving when `-sf` signals it must be completed over its
 /// QUIC connection, and the process then leaves on its own.
-#[test]
 fn sigusr1_finishes_the_h3_request_in_flight_then_exits() {
     require_curl_http3();
     let be = slow_backend(Some(Duration::from_millis(1500)));
@@ -151,10 +151,11 @@ fn sigusr1_finishes_the_h3_request_in_flight_then_exits() {
         signalled.elapsed()
     );
 }
+}
 
+crate::h3_both_paths! {
 /// While the old process drains, a new QUIC connection is refused rather than taken: its
 /// client must go to the process that replaces this one.
-#[test]
 fn a_soft_stopping_process_refuses_new_quic_connections() {
     require_curl_http3();
     let be = slow_backend(Some(Duration::from_millis(2500)));
@@ -186,10 +187,11 @@ fn a_soft_stopping_process_refuses_new_quic_connections() {
     );
     assert!(ibex.wait_exit(Duration::from_secs(3)).is_some_and(|s| s.success()));
 }
+}
 
+crate::h3_both_paths! {
 /// `hard-stop-after` bounds a QUIC soft stop too: a request the backend never answers does
 /// not keep the process alive indefinitely.
-#[test]
 fn hard_stop_after_bounds_an_h3_soft_stop() {
     require_curl_http3();
     let be = slow_backend(None);
@@ -208,6 +210,7 @@ fn hard_stop_after_bounds_an_h3_soft_stop() {
         "hard-stop-after 700ms: the process exited after {took:?}"
     );
     let _ = client.wait_with_output();
+}
 }
 
 /// A QUIC client that completes the handshake, negotiates `h3`, sends nothing, and keeps
@@ -365,10 +368,10 @@ impl Drop for IdleClient {
     }
 }
 
+crate::h3_both_paths! {
 /// An HTTP/3 connection that is open but idle is not work in flight: the server closes it
 /// (H3_NO_ERROR, 0x100) and the process leaves, instead of waiting for the client's own idle
 /// timeout. A request in flight on another connection is what makes the stop wait at all.
-#[test]
 fn an_idle_h3_connection_does_not_hold_a_soft_stop_open() {
     require_curl_http3();
     let be = slow_backend(Some(Duration::from_millis(1500)));
@@ -405,11 +408,12 @@ fn an_idle_h3_connection_does_not_hold_a_soft_stop_open() {
         "the idle connection must be closed by the server with H3_NO_ERROR, not abandoned"
     );
 }
+}
 
+crate::h3_both_paths! {
 /// A request the listener refuses itself (here a header block too large for the HTX buffer)
 /// is answered with an error over the same connection, and that response is as owed as any
 /// other: the connection is not closed under it by a soft stop.
-#[test]
 fn an_error_response_is_delivered_and_the_stop_completes() {
     require_curl_http3();
     let be = slow_backend(Some(Duration::from_millis(0)));
@@ -423,7 +427,7 @@ fn an_error_response_is_delivered_and_the_stop_completes() {
     // out). Either error is a delivered response, which is what this test is about.
     // Through the h3 mux (`tune.ibex.h3-path mux`, T509) the HEADERS frame past `bufsize - 4`
     // is `H3_EXCESSIVE_LOAD` before any stream exists, and nothing answers it, as HAProxy.
-    let mux = std::env::var("IBEX_H3_PATH").is_ok_and(|v| v == "mux");
+    let mux = common::h3_mux();
     assert!(
         stdout.contains("__STATUS__431 __VER__3") || stdout.contains("__STATUS__400 __VER__3") || (mux && stdout.contains("__STATUS__000")),
         "an oversized request must be refused with an error over HTTP/3.\nstdout: {stdout}\nstderr: {}",
@@ -431,4 +435,5 @@ fn an_error_response_is_delivered_and_the_stop_completes() {
     );
     ibex.signal(Signal::Usr1);
     assert!(ibex.wait_exit(Duration::from_secs(3)).is_some_and(|s| s.success()));
+}
 }

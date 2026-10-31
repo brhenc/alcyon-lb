@@ -165,3 +165,59 @@ impl Drop for Ibex {
         stop(&mut self.0);
     }
 }
+
+thread_local! {
+    /// The HTTP/3 path (`relay` or `mux`) of the ibex the test on this thread starts, set by
+    /// [`h3_both_paths!`]; empty, the environment's `IBEX_H3_PATH` decides as in ibex.
+    static H3_PATH: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// Runs `test` with every ibex this thread starts through [`ibex_command`] on the HTTP/3
+/// path `path` (T511: `tune.ibex.h3-path`, through `IBEX_H3_PATH` in the child's
+/// environment).
+pub fn on_h3_path(path: &'static str, test: impl FnOnce()) {
+    H3_PATH.with(|p| p.set(path));
+    test();
+}
+
+/// The test on this thread runs its ibex with HTTP/3 streams through the mux.
+pub fn h3_mux() -> bool {
+    match H3_PATH.with(std::cell::Cell::get) {
+        "" => std::env::var("IBEX_H3_PATH").is_ok_and(|v| v == "mux"),
+        p => p == "mux",
+    }
+}
+
+/// `Command::new` for the ibex under test, on this thread's HTTP/3 path.
+pub fn ibex_command(bin: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut c = std::process::Command::new(bin);
+    let path = H3_PATH.with(std::cell::Cell::get);
+    if !path.is_empty() {
+        c.env("IBEX_H3_PATH", path);
+    }
+    c
+}
+
+/// Each test fn twice, `<name>::relay` and `<name>::mux` (T511): the HTTP/3 tests run on
+/// both paths of `tune.ibex.h3-path`, in parallel as any two tests, so the gate's coverage
+/// sees the mux's lines and the relay keeps its tests until it is removed (slice H5).
+#[macro_export]
+macro_rules! h3_both_paths {
+    ($(#[$m:meta])* fn $name:ident() $body:block) => {
+        mod $name {
+            #[allow(unused_imports)]
+            use super::*;
+            fn both_paths_body() $body
+            $(#[$m])*
+            #[test]
+            fn relay() {
+                $crate::common::on_h3_path("relay", both_paths_body);
+            }
+            $(#[$m])*
+            #[test]
+            fn mux() {
+                $crate::common::on_h3_path("mux", both_paths_body);
+            }
+        }
+    };
+}

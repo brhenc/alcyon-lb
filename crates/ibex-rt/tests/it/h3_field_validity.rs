@@ -31,7 +31,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, UdpSocket};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -112,7 +112,7 @@ fn ibex(be: SocketAddr) -> Ibex {
          default_backend b\nbackend b\n    http-reuse never\n    server s {be}\n"
     )
     .expect("write cfg");
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+    let child = common::ibex_command(env!("CARGO_BIN_EXE_ibex"))
         .arg("-f")
         .arg(cfg.path())
         .stdout(Stdio::null())
@@ -344,32 +344,36 @@ fn refused_then_served(bad: &[u8], bad_path: &[u8]) {
     assert_eq!(o.status, Some(200), "the next request on the connection must be served: {o:?}");
 }
 
+crate::h3_both_paths! {
 /// Row 1.
-#[test]
 fn a_literal_name_with_a_byte_that_is_not_utf8_resets_the_stream() {
     refused_then_served(&request(b"/r1", Some((&[b'x', b'-', E9], b"1", false))), b"/r1");
 }
+}
 
+crate::h3_both_paths! {
 /// Row 2.
-#[test]
 fn a_huffman_name_with_a_byte_that_is_not_utf8_resets_the_stream() {
     refused_then_served(&request(b"/r2", Some((&[b'x', b'-', E9], b"1", true))), b"/r2");
 }
+}
 
+crate::h3_both_paths! {
 /// Row 3: `HAProxy` forwards it; Ibex refuses the stream (`tradeoff.md` 6.24).
-#[test]
 fn a_value_with_a_byte_that_is_not_utf8_resets_the_stream_only() {
     refused_then_served(&request(b"/r3", Some((b"x-a", &[b'a', E9, b'b'], false))), b"/r3");
 }
+}
 
+crate::h3_both_paths! {
 /// Row 4: `HAProxy` forwards it; Ibex refuses the stream (`tradeoff.md` 6.24).
-#[test]
 fn a_path_with_a_byte_that_is_not_utf8_resets_the_stream_only() {
     refused_then_served(&request(&[b'/', b'r', b'4', E9], None), b"/r4");
 }
+}
 
+crate::h3_both_paths! {
 /// Row 5, in the order the oracle was measured: the request after the refused one.
-#[test]
 fn many_bad_streams_do_not_cost_the_connection() {
     let (be, _heads) = backend();
     let ibex = ibex(be);
@@ -382,9 +386,10 @@ fn many_bad_streams_do_not_cost_the_connection() {
     let id = cl.open(&request(b"/good", None));
     assert_eq!(cl.outcome(id).status, Some(200));
 }
+}
 
+crate::h3_both_paths! {
 /// Valid UTF-8 (`e` acute as C3 A9) is forwarded byte for byte, as `HAProxy` does.
-#[test]
 fn a_utf8_value_is_forwarded_byte_for_byte() {
     let (be, heads) = backend();
     let ibex = ibex(be);
@@ -394,11 +399,12 @@ fn a_utf8_value_is_forwarded_byte_for_byte() {
     let h = heads.lock().unwrap();
     assert!(h[0].windows(7).any(|w| w == b"x-a: \xc3\xa9"), "{:?}", String::from_utf8_lossy(&h[0]));
 }
+}
 
+crate::h3_both_paths! {
 /// T454 item 3: the field checks of HTTP/2 (`check_request_fields`), on HTTP/3. Every row
 /// is RESET_STREAM `H3_MESSAGE_ERROR` on the oracle (QUIC build, same client as above) and
 /// never reaches the server; each is a request the HTTP/1 head would carry differently.
-#[test]
 fn malformed_pseudo_headers_and_fields_reset_the_stream() {
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("path with #", request_with(&[(b":path", b"/a#b")])),
@@ -429,10 +435,11 @@ fn malformed_pseudo_headers_and_fields_reset_the_stream() {
     assert!(!reached(&heads, b"/"), "a refused request reached the backend: {:?}", heads.lock().unwrap());
     assert!(bad.is_empty(), "not RESET_STREAM H3_MESSAGE_ERROR:\n{}", bad.join("\n"));
 }
+}
 
+crate::h3_both_paths! {
 /// The pseudo-headers `HAProxy` accepts are still served: `OPTIONS *`, a lowercase method
 /// is not refused (measured 200), a tab in a value, `te: trailers`, and `host` for authority.
-#[test]
 fn valid_requests_with_unusual_fields_are_served() {
     let (be, heads) = backend();
     let ibex = ibex(be);
@@ -448,11 +455,12 @@ fn valid_requests_with_unusual_fields_are_served() {
     }
     assert_eq!(heads.lock().unwrap().len(), cases.len());
 }
+}
 
+crate::h3_both_paths! {
 /// A field section that does not decode (required insert count 1, no dynamic table) closes
 /// the connection with QPACK_DECOMPRESSION_FAILED (0x200), as `HAProxy` 3.5-dev7 +QUIC does
 /// (measured: connection close 0x200); and an empty `:path` is a stream reset 0x10e.
-#[test]
 fn an_undecodable_section_closes_the_connection_and_an_empty_path_resets_the_stream() {
     let (be, _heads) = backend();
     let ibex = ibex(be);
@@ -469,4 +477,5 @@ fn an_undecodable_section_closes_the_connection_and_an_empty_path_resets_the_str
     let mut cl = Client::connect(ibex.quic);
     let id = cl.open(&request_with(&[(b":path", b"")]));
     assert_eq!(cl.outcome(id).reset, Some(MESSAGE_ERROR));
+}
 }

@@ -60,7 +60,7 @@ fn run(quic_first: bool) {
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+    let mut child = common::ibex_command(env!("CARGO_BIN_EXE_ibex"))
         .arg("-f")
         .arg(f.path())
         .stdout(Stdio::null())
@@ -75,12 +75,14 @@ fn run(quic_first: bool) {
     assert_eq!(h2, "2 200", "h2 over TCP on the shared port (quic first: {quic_first})");
 }
 
-#[test]
+crate::h3_both_paths! {
 fn tcp_line_first() {
     run(false);
 }
+}
 
-#[test]
+crate::h3_both_paths! {
 fn quic_line_first() {
     run(true);
+}
 }
