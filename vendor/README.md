@@ -78,6 +78,20 @@ The first vendor commit is the pristine 0.11.18; each change below is its own co
    per byte). RFC 9000 19.1: PADDING has no content, so a run is equivalent. h2load and browsers
    pad each request packet to ~1200 bytes: ~1150 `next()` calls per packet were half of Ibex's
    h3 per-request instructions (T539). Test: `frame::test::padding_run_is_one_frame`.
+2. `src/connection/streams/{state,send,recv,mod}.rs`, `send_buffer.rs`, `range_set/btree_range_set.rs`
+   (T543, e0e30bee): a connection reuses its freed stream state. A freed `Send` is reset
+   (`Send::free`/`reinit`, `SendBuffer::reinit`, `RangeSet::clear` popping so the `BTreeMap`
+   root node stays) and kept on a per-connection `free_send` list; a freed `Recv` is taken from
+   `free_recv` at the stream's first use, not when its slot is made available (the list was
+   empty for the first ~100 streams). Both lists are bounded by the most streams the connection
+   had open at once and are freed with it. 3.9 -> 1.1 allocations per h3 request.
+3. `src/connection/send_buffer.rs` `ack` (T543, 875596f0): the segment deque shrinks only above
+   16 entries (`RETAINED_SEGMENTS`, 512 bytes) and not below; it was freed whenever the last
+   ACK emptied it and allocated again on the next write. 1.1 -> 0.08.
+4. `src/connection/{mod,spaces,packet_builder}.rs` (T543, 816391ad): up to 8 emptied
+   `Retransmits` boxes per connection (`spare_retransmits`); each packet starts with one, an
+   unused one goes back in `finish_and_track`, an acked or lost packet's is emptied and kept.
+   0.08 -> 0. Pinned by `crates/ibex-rt/tests/request_allocations_h3.rs` (GET and POST: 0).
 
 ### Running quinn-proto's own tests
 
