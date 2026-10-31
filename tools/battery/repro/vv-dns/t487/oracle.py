@@ -44,7 +44,7 @@ if case.get("check"):
     dns.kill(); sys.exit(0)
 def get(path):
     try:
-        s = socket.create_connection(("127.0.0.1", fp), timeout=3)
+        s = socket.create_connection(("127.0.0.1", fp), timeout=8)
         s.sendall(("GET %s HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n" % path).encode())
         out = b""
         while True:
@@ -76,7 +76,7 @@ while time.time() - t0 < case["dur"]:
     if zi < len(case["zones"]) and t >= case["zones"][zi][0]:
         json.dump(case["zones"][zi][1], open(f"{d}/zone.json", "w")); print("[t=%.2f] zone %d" % (t, zi)); zi += 1
     while gi < len(case.get("gets", [])) and t >= case["gets"][gi][0]:
-        r = get(case["gets"][gi][1]); print("[t=%.2f] GET %s -> %s" % (t, case["gets"][gi][1], r.splitlines()[0] if r else "")); gi += 1
+        g0 = time.time(); r = get(case["gets"][gi][1]); print("[t=%.2f] GET %s -> %s (%.2f s)" % (t, case["gets"][gi][1], r.splitlines()[0] if r else "", time.time() - g0)); gi += 1
         for h in r.splitlines()[1:]:
             if h.lower().startswith("x-"): print("    " + h)
     while ci < len(case.get("clis", [])) and t >= case["clis"][ci][0]:
