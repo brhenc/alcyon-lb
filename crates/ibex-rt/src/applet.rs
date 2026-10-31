@@ -20,7 +20,7 @@
 use crate::check::{ServerCheckState, ServerStatus};
 use crate::engine::{Proxy, SessionArena};
 use crate::fdtab::Interest;
-use crate::mailbox::{Gather, Mailboxes, Msg, SessFilter, SessSnap};
+use crate::mailbox::{Gather, Mailboxes, Msg, QuicSnap, SessFilter, SessSnap};
 use crate::stats::format_show_stat_as;
 use ibex_sched::task::TaskRef;
 use ibex_sched::Tick;
@@ -59,9 +59,38 @@ pub struct AppletContext<'a> {
 /// further command until it is answered.
 enum Pending {
     Sess(Arc<Gather<Vec<SessSnap>>>, SessOpts),
+    /// `show quic`; which connections to list.
+    Quic(Arc<Gather<Vec<QuicSnap>>>, QuicFilter),
     /// `shutdown session(s)`; `by_id` answers HAProxy's message when nothing matched.
     Shut(Arc<Gather<usize>>, bool),
 }
+
+/// Which connections `show quic` lists (`QC_CLI_FL_SHOW_*`).
+#[derive(Clone, Copy)]
+enum QuicFilter {
+    Active,
+    All,
+    Closing,
+    Backend,
+}
+
+const SHOW_QUIC_HEADER: &str = "# conn/frontend                     state   in_flight infl_p lost_p         Local Address           Foreign Address      local & remote CIDs\n";
+
+/// `show quic help`, as HAProxy answers it.
+const SHOW_QUIC_HELP: &str = "Usage: show quic [help|<format>] [<filter>]\n\
+Dumps information about QUIC connections. Available output formats:\n\
+\x20 oneline    dump a single, netstat-like line per connection (default)\n\
+\x20 stream     dump a list of streams, one per line, sorted by connection\n\
+\x20 full       dump all known information about each connection\n\
+\x20 <levels>*  only dump certain information, defined by a comma-delimited list\n\
+\x20            of levels among 'tp', 'sock', 'pktns', 'cc', or 'mux'\n\
+\x20 help       display this help\n\
+Available output filters:\n\
+\x20 all        dump all connections\n\
+\x20 clo        dump frontend closing connections\n\
+\x20 be         dump backend connections\n\
+\x20 <id>       dump only the connection matching this identifier (0x...)\n\
+Without any argument, active frontend connections are dumped using the oneline format.";
 
 /// `show sess` options (`cli_parse_show_sess`).
 #[derive(Default)]
@@ -159,7 +188,7 @@ impl CliLevel {
             }
         }
         for p in [
-            "show env", "get var", "get weight", "show sess", "show activity", "show fd", "show startup-logs",
+            "show env", "get var", "get weight", "show sess", "show quic", "show activity", "show fd", "show startup-logs",
             "show errors", "operator",
         ] {
             if is(p) {
@@ -710,6 +739,8 @@ impl CliApplet {
             } else {
                 self.is_done = true;
             }
+        } else if cmd == "show quic" || cmd.starts_with("show quic ") {
+            self.handle_show_quic(&cmd["show quic".len()..], ctx);
         } else if cmd == "show sess" || cmd.starts_with("show sess ") {
             self.handle_show_sess(&cmd["show sess".len()..], ctx);
         } else if let Some(target) = cmd.strip_prefix("shutdown sessions server ")
@@ -1305,6 +1336,89 @@ impl CliApplet {
         self.pending = Some(Pending::Sess(g, opts));
     }
 
+    /// `show quic [<format>] [<filter>]` (`cli_parse_show_quic`, `src/quic_cli.c`): the
+    /// one-line format only. The other formats answer an explicit refusal, naming them.
+    fn handle_show_quic(&mut self, rest: &str, ctx: &mut AppletContext) {
+        let args: Vec<&str> = rest.split_whitespace().collect();
+        let mut i = 0;
+        let invalid_field = "Invalid field, use 'help' for more options.";
+        let refuse = |this: &mut Self, what: &str| {
+            this.finish_msg(&format!(
+                "'show quic {what}' is not supported by Ibex: it prints more than the one-line form, which is all Ibex has."
+            ));
+        };
+        match args.first().copied() {
+            Some("oneline") => i += 1,
+            Some("help") => return self.finish_msg(SHOW_QUIC_HELP),
+            Some(a @ ("stream" | "full")) => return refuse(self, a),
+            Some(a) => {
+                // A comma list of levels: valid names are taken while they last. A word that
+                // is not one is a filter, unless a level came before it or more follows.
+                let mut fields = a.split(',');
+                let mut seen = false;
+                while let Some(f) = fields.next() {
+                    if ["tp", "sock", "pktns", "cc", "mux"].contains(&f) {
+                        seen = true;
+                    } else if seen || fields.next().is_some() {
+                        return self.finish_msg(invalid_field);
+                    } else {
+                        break;
+                    }
+                }
+                if seen {
+                    return refuse(self, a);
+                }
+            }
+            None => {}
+        }
+        let mut filter = QuicFilter::Active;
+        if let Some(&a) = args.get(i) {
+            if let Some(hex) = a.strip_prefix("0x") {
+                if u64::from_str_radix(hex, 16).is_err() {
+                    return self.finish_msg("Invalid quic_conn pointer.");
+                }
+                return refuse(self, a);
+            } else if a.starts_with("all") {
+                filter = QuicFilter::All;
+            } else if a.starts_with("clo") {
+                filter = QuicFilter::Closing;
+            } else if a.starts_with("be") {
+                filter = QuicFilter::Backend;
+            } else {
+                return self.finish_msg("Invalid argument, use 'help' for more options.");
+            }
+        }
+        let g = Gather::new(ctx.mailboxes, ctx.worker_id, ctx.task);
+        ctx.mailboxes.broadcast(|| Msg::ShowQuic(Arc::clone(&g)));
+        self.pending = Some(Pending::Quic(g, filter));
+    }
+
+    /// One connection as `dump_quic_oneline` prints it: `%p[%02u]/%-.12s ` padded to 36
+    /// columns, the state, `%9llu %6llu %6llu`, the two addresses `%15s:%-5s`, the CIDs. The
+    /// columns Ibex has no value for (bytes and packets in flight, both CIDs) print `-`.
+    fn quic_line(s: &QuicSnap, fe: &str) -> String {
+        let mut id = [0u8; 8];
+        for (d, b) in id.iter_mut().zip(s.id.as_bytes()) {
+            *d = *b;
+        }
+        let head = format!("0x{:x}[{:02}]/{} ", u64::from_be_bytes(id), s.worker, fe.chars().take(12).collect::<String>());
+        let state = match s.phase {
+            ibex_quic::ConnPhase::Handshake => "HDSHK",
+            ibex_quic::ConnPhase::Established => "ESTAB",
+            ibex_quic::ConnPhase::Closing => "CLOSE",
+        };
+        format!(
+            "{head:<36}{state}   {:>9} {:>6} {:>6}   {:>15}:{:<5}   {:>15}:{:<5} - -\n",
+            "-",
+            "-",
+            s.lost_packets,
+            s.local.ip(),
+            s.local.port(),
+            s.peer.ip(),
+            s.peer.port(),
+        )
+    }
+
     /// Answers the command waiting for the workers once all have replied; `false` while it
     /// still waits.
     fn resume_pending(&mut self, p: Pending, ctx: &AppletContext) -> bool {
@@ -1316,6 +1430,30 @@ impl CliApplet {
                 };
                 let hit = counts.iter().sum::<usize>() > 0;
                 self.finish_msg(if by_id && !hit { "No such session (use 'show sess')." } else { "" });
+                true
+            }
+            Pending::Quic(g, filter) => {
+                let Some(per_worker) = g.take() else {
+                    self.pending = Some(Pending::Quic(g, filter));
+                    return false;
+                };
+                self.out_buf.extend_from_slice(SHOW_QUIC_HEADER.as_bytes());
+                // Backend connections do not exist (no `quic4@` server), and closing ones are
+                // only those quinn-proto still holds.
+                for snap in per_worker.iter().flatten() {
+                    let closing = snap.phase == ibex_quic::ConnPhase::Closing;
+                    let wanted = match filter {
+                        QuicFilter::Active => !closing,
+                        QuicFilter::All => true,
+                        QuicFilter::Closing => closing,
+                        QuicFilter::Backend => false,
+                    };
+                    if wanted {
+                        let fe = snap.fe.and_then(|f| ctx.proxies.get(f)).map_or("UNKNOWN", |p| p.name.as_str());
+                        self.out_buf.extend_from_slice(Self::quic_line(snap, fe).as_bytes());
+                    }
+                }
+                self.finish_msg("");
                 true
             }
             Pending::Sess(g, opts) => {
@@ -1877,6 +2015,7 @@ impl CliApplet {
                       show events [-0rsn] [<sink>]               : List the event sinks, or dump a ring\n\
                       show info                                  : Dump system statistics\n\
                       show pools                                 : Report information about the memory pools usage\n\
+                      show quic [help|<format>] [<filter>]       : Dump information about QUIC connections\n\
                       show sess [help|<id>|all] [opts...]     : report the list of current streams or dump this exact stream\n\
                       show stat [<iid> <type> <sid>]             : Dump CSV proxies and servers statistics\n\
                       show table [<name>]                        : Dump stick table contents\n\

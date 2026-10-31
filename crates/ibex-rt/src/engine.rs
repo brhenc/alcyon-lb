@@ -5297,6 +5297,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         for msg in self.mailboxes.take(wid) {
             match msg {
                 crate::mailbox::Msg::ShowSess(g) => g.reply(wid, self.snapshot_streams()),
+                crate::mailbox::Msg::ShowQuic(g) => {
+                    g.reply(wid, self.quic_listeners.iter().flat_map(|ql| ql.show_infos(wid)).collect());
+                }
                 crate::mailbox::Msg::Shutdown(f, g) => {
                     let mut wake = Vec::new();
                     let n = self.shutdown_filtered(*f, &mut wake);
