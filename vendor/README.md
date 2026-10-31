@@ -52,3 +52,23 @@ From the fork, not from here (it has the test vectors):
 `Cargo.lock`s, copy over `vendor/ringibex` and `vendor/rustls-ringibex`, apply the three changes
 above (or drop the ones the fork now carries), update the commit here, then
 `cargo build --offline -p ibex-tls` and `cargo test -p ibex-tls --test it crypto_provider::`.
+
+## `quinn-proto` (T542)
+
+The QUIC state machine under `ibex-quic` (and quinn's rustls 0.23 test clients in the dev-deps of
+`ibex-proto`, `ibex-quic` and `ibex-rt`), vendored to patch it (user, 2026-10-31). The root
+`Cargo.toml` takes it for the whole graph with `[patch.crates-io] quinn-proto = { path =
+"vendor/quinn-proto" }`; the crates keep asking for `quinn-proto = "0.11"` with their own
+features (`default-features = false`; the dev-deps add `rustls-ring`).
+
+- **Source:** crates.io `quinn-proto` 0.11.18, the `.crate` package as published
+  (sha256 `a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc`, the `Cargo.lock`
+  checksum before vendoring; upstream git `eaec0db4bcb698f76df736d89938743c88a2ad5f`, from
+  `.cargo_vcs_info.json`). Pure Rust; no C, no build script.
+- **Left out:** the package's `Cargo.lock` (the root one is used). Everything else is as
+  published, `Cargo.toml` (normalised by cargo) and `Cargo.toml.orig` included.
+- **Licences:** `LICENSE-APACHE`, `LICENSE-MIT` (quinn's, `MIT OR Apache-2.0`).
+
+### Changes made here
+
+None yet in this commit: it is the pristine 0.11.18, so that every Ibex change is its own diff.
