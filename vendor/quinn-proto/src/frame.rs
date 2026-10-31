@@ -581,7 +581,7 @@ impl Iter {
                 // `next()`. RFC 9000 19.1: PADDING has no content, so a run is equivalent to
                 // one frame (a client that pads every packet to 1200 bytes made the
                 // byte-at-a-time walk half the server's per-request instructions; Ibex T542).
-                let run = self.bytes.iter().position(|&b| b != 0).unwrap_or(self.bytes.len());
+                let run = zero_run(&self.bytes);
                 self.bytes.advance(run);
                 Frame::Padding
             }
@@ -733,6 +733,22 @@ impl Iter {
     fn take_remaining(&mut self) -> Bytes {
         mem::take(&mut self.bytes)
     }
+}
+
+/// The number of zero bytes `b` starts with: 32 bytes a step while they are all zero (an
+/// OR-fold the compiler vectorises), then byte by byte. Ibex T543: a byte-at-a-time
+/// `position` over a client's ~1150 bytes of padding a packet was ~3.8k instructions per h3
+/// request (`frame::Iter::next`, IBS profile).
+fn zero_run(b: &[u8]) -> usize {
+    const BLOCK: usize = 32;
+    let mut at = 0;
+    for block in b.chunks_exact(BLOCK) {
+        if block.iter().fold(0u8, |acc, &x| acc | x) != 0 {
+            break;
+        }
+        at += BLOCK;
+    }
+    at + b[at..].iter().position(|&x| x != 0).unwrap_or(b.len() - at)
 }
 
 impl Iterator for Iter {
@@ -1028,5 +1044,23 @@ mod test {
         assert_matches!(&frames[0], Frame::Padding);
         assert_matches!(&frames[1], Frame::Ping);
         assert_matches!(&frames[2], Frame::Padding);
+    }
+
+    /// `zero_run` (Ibex T543) is the naive scan's answer for every length and every position of
+    /// the first non-zero byte, across the 32-byte block edges.
+    #[test]
+    fn zero_run_finds_the_first_nonzero_byte() {
+        for len in 0..140 {
+            let mut buf = vec![0u8; len];
+            assert_eq!(zero_run(&buf), len, "all zero, {len}");
+            for at in 0..len {
+                buf.fill(0);
+                buf[at] = 0x01;
+                if at + 1 < len {
+                    buf[at + 1..].fill(0xff);
+                }
+                assert_eq!(zero_run(&buf), at, "len {len}, first non-zero at {at}");
+            }
+        }
     }
 }
