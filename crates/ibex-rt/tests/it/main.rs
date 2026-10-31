@@ -177,6 +177,7 @@ mod h2_stream_timers;
 mod h2_unread_output_timeout;
 mod h2_unread_response_memory;
 mod duress_target;
+mod h3_backend_reuse;
 mod h3_connection_session;
 mod h3_end_to_end;
 mod h3_field_validity;

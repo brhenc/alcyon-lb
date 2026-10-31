@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -115,9 +116,19 @@ pub struct QuicEndpoint {
     force_retry: bool,
     /// `tune.quic.fe.sec.retry-threshold`: Retry once this many connections are half open.
     retry_threshold: u64,
-    /// Connections whose peer address is not validated yet (`HAProxy`'s `half_open_conn`):
-    /// those with an [`AmplificationBudget`] not `validated`.
-    half_open: u64,
+    /// Connections whose peer address is not validated yet (`HAProxy`'s `half_open_conn`),
+    /// of every endpoint sharing the counter ([`QuicEndpoint::share_half_open`]): `HAProxy`
+    /// keeps one per frontend and thread group, not per thread (T523).
+    half_open: Arc<AtomicU64>,
+    /// This endpoint's own part of `half_open`: those of its connections with an
+    /// [`AmplificationBudget`] not `validated`. Given back when the endpoint is dropped.
+    own_half_open: u64,
+}
+
+impl Drop for QuicEndpoint {
+    fn drop(&mut self) {
+        self.half_open.fetch_sub(self.own_half_open, Ordering::Relaxed);
+    }
 }
 
 /// RFC 9000 §8.1 accounting for one connection on an unvalidated path.
@@ -264,8 +275,19 @@ impl QuicEndpoint {
             refusing_new: false,
             force_retry,
             retry_threshold: QuicConfig::default().retry_threshold,
-            half_open: 0,
+            half_open: Arc::new(AtomicU64::new(0)),
+            own_half_open: 0,
         }
+    }
+
+    /// Counts this endpoint's half-open connections in `shared`, with those of every other
+    /// endpoint given the same counter, against the Retry threshold: the workers of one
+    /// frontend's QUIC bind share one, as `HAProxy`'s threads share the frontend's
+    /// `half_open_conn` (T523).
+    pub fn share_half_open(&mut self, shared: Arc<AtomicU64>) {
+        shared.fetch_add(self.own_half_open, Ordering::Relaxed);
+        self.half_open.fetch_sub(self.own_half_open, Ordering::Relaxed);
+        self.half_open = shared;
     }
 
     /// Soft stop (HAProxy's `soft_stop()`): refuse every new connection from now on while the
@@ -387,8 +409,9 @@ impl QuicEndpoint {
             match evt {
                 quinn_proto::Event::Connected => {
                     if let Some(budget) = self.amplification_budgets.get_mut(&handle) {
-                        if !budget.validated {
-                            self.half_open = self.half_open.saturating_sub(1);
+                        if !budget.validated && self.own_half_open > 0 {
+                            self.own_half_open -= 1;
+                            self.half_open.fetch_sub(1, Ordering::Relaxed);
                         }
                         budget.validated = true;
                     }
@@ -507,6 +530,14 @@ impl QuicEndpoint {
         DatagramOutcome::StatelessResponse
     }
 
+    /// One of this endpoint's half-open connections was validated or released.
+    fn half_open_done(&mut self) {
+        if self.own_half_open > 0 {
+            self.own_half_open -= 1;
+            self.half_open.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     /// Removes those of `candidates` that are drained.
     fn remove_drained(&mut self, candidates: &[ConnectionHandle]) {
         for &handle in candidates {
@@ -518,7 +549,7 @@ impl QuicEndpoint {
             self.handle_to_primary_cid.remove(&handle);
             // Released before its address was validated (`quic_conn_release`).
             if self.amplification_budgets.remove(&handle).is_some_and(|b| !b.validated) {
-                self.half_open = self.half_open.saturating_sub(1);
+                self.half_open_done();
             }
             self.connection_table.remove_connection(handle);
             self.active_handles.retain(|&h| h != handle);
@@ -588,7 +619,7 @@ impl QuicTransport for QuicEndpoint {
                     self.endpoint.ignore(incoming);
                     return Ok(DatagramOutcome::Ignored);
                 }
-                if !validated && (self.force_retry || self.half_open >= self.retry_threshold) {
+                if !validated && (self.force_retry || self.half_open.load(Ordering::Relaxed) >= self.retry_threshold) {
                     return Ok(self.send_retry(incoming));
                 }
                 let primary_cid = ConnectionId::from(*incoming.orig_dst_cid());
@@ -608,7 +639,8 @@ impl QuicTransport for QuicEndpoint {
                         // amplification limit, and not half open (`qc_new_conn`).
                         budget.validated = validated;
                         if !validated {
-                            self.half_open += 1;
+                            self.own_half_open += 1;
+                            self.half_open.fetch_add(1, Ordering::Relaxed);
                         }
                         self.amplification_budgets.insert(handle, budget);
 

@@ -10318,7 +10318,11 @@ impl EngineDispatcher<'_> {
             release_server(entry, proxies, fdtab, poller, idle_pool, false);
         } else if !untouched && entry.sess.req.is_empty() && !private {
             let keeps = entry.target_server_idx.is_some_and(|i| proxies.get(entry.srv_backend_idx).is_some_and(|p| p.ids.server_pool(i).keeps_any()));
-            if keeps && idle_pool.total() == 0 && entry.sess.srv.is_some() {
+            // An HTTP/3 request relayed over a socket pair is its session's only one: there is
+            // no next request to keep the connection for, and parked it is no other stream's
+            // (T523: 150 server connections for a burst of 200 where HAProxy opened 115).
+            let relayed = entry.sess.h3 && !entry.sess.is_h2_child();
+            if keeps && idle_pool.total() == 0 && entry.sess.srv.is_some() && !relayed {
                 entry.sess.srv_park_exp = now.add(SRV_PARK_MS);
                 // Idle, it is not one of the server's connections in use (`scur`, and
                 // what the lists' rule weighs); the peak in use is noted first, as the
@@ -13823,8 +13827,12 @@ impl EngineDispatcher<'_> {
             let low = s_idx.map_or(0, |i| proxies[be_idx].ids.server_pool(i).low_conn);
             let steal = key.as_ref().is_none_or(|k| idle_pool.may_steal(k.srv, low));
             let srv = key.as_ref().map(|k| k.srv);
-            // Every stream of an HTTP/2 frontend is "not the first request" (`SE_FL_NOT_FIRST`, `mux_h2.c`).
-            if let Some((conn, safe, registered)) = key.and_then(|k| idle_pool.take(&k, entry.sess.is_first_req && !entry.sess.is_h2_child(), proxies[be_idx].http_reuse, steal)) {
+            // Every stream of an HTTP/2 frontend is "not the first request" (`SE_FL_NOT_FIRST`, `mux_h2.c`),
+            // and so is every HTTP/3 request, the relay's included (`qcs_new`, `mux_quic.c`): one
+            // server connection per HTTP/3 request overflowed a small server's accept queue
+            // under a burst of 200 (T523).
+            let first_req = entry.sess.is_first_req && !entry.sess.is_h2_child() && !entry.sess.h3;
+            if let Some((conn, safe, registered)) = key.and_then(|k| idle_pool.take(&k, first_req, proxies[be_idx].http_reuse, steal)) {
                 entry.srv_served = if safe { 2 } else { 1 };
                 reused = Some((conn, registered));
             }
@@ -17287,6 +17295,38 @@ mod idle_poll_tests {
         }
         assert_eq!(e.idle_backend_pool.total(), 2);
         assert_eq!(e.poller.ctl_calls() - before, 0, "epoll_ctl calls for 10 requests through the lists");
+    }
+
+    /// An HTTP/3 request relayed over a socket pair (a session with no listener, T130) gives
+    /// its server connection to the server's lists with its response, also while the lists
+    /// are empty: its session carries no other request, and a connection parked on it for
+    /// `SRV_PARK_MS` is no other stream's (T523: in a burst of 200 HTTP/3 connections, 150
+    /// server connections where `HAProxy`, whose h3 stream ends with its response, opened 115).
+    #[test]
+    fn a_relayed_h3_request_parks_no_server_connection() {
+        let (srv, _conns) = backend();
+        let (mut e, _fe) = engine(srv);
+        let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        ours.set_nonblocking(true).expect("nonblocking");
+        let local: SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        e.admit_connection(0, None, theirs.into(), "127.0.0.1:50000".parse().expect("addr"), local);
+        ours.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 512];
+        let start = Instant::now();
+        while !got.ends_with(b"ok") {
+            assert!(start.elapsed() < Duration::from_secs(5), "no answer: {got:?}");
+            let _ = e.run_once();
+            if let Ok(n) = ours.read(&mut buf) {
+                got.extend_from_slice(&buf[..n]);
+            }
+        }
+        // The relay keeps its side open. Parked, the connection reaches the lists only when
+        // its park ends (`SRV_PARK_MS`, 100 ms: the next `run_once` sleeps until then).
+        let answered = Instant::now();
+        assert!(drive_until(&mut e, |e| e.idle_backend_pool.total() == 1), "never reached the lists");
+        let took = answered.elapsed();
+        assert!(took < Duration::from_millis(50), "the server connection stayed on the relayed session for {took:?}");
     }
 
     /// A server that closes a connection while it is in its lists: the close is an event
