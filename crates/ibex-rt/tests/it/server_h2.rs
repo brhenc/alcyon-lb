@@ -544,8 +544,8 @@ fn response_trailers_reach_an_h2_client() {
     assert!(trailing.contains("flags=0x05"), "the trailing HEADERS frame ends the stream:\n{log}");
 }
 
-/// nghttp -v against an h2 frontend over a one-shot h1 server that sends `reply`: the log.
-fn nghttp_log_h1_server(reply: &'static [u8]) -> Option<String> {
+/// nghttp -v against an h2 frontend over a one-shot h1 server that sends `reply`: the nghttp log and Ibex's log line.
+fn nghttp_log_h1_server(reply: &'static [u8]) -> Option<(String, String)> {
     if Command::new("nghttp").arg("--version").stdout(Stdio::null()).status().is_err() {
         eprintln!("nghttp not found: skipped");
         return None;
@@ -565,7 +565,7 @@ fn nghttp_log_h1_server(reply: &'static [u8]) -> Option<String> {
     });
     let p = proxy_bind(&format!("  server s {addr}"), "proto h2");
     let out = Command::new("nghttp").arg("-v").arg(format!("http://{}/x", p.fe)).output().expect("nghttp");
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    Some((String::from_utf8_lossy(&out.stdout).into_owned(), p.log_with("GET").clone()))
 }
 
 /// T549, measured on `HAProxy` 3.5-dev8 with the same h1 server: a chunked response `abc` +
@@ -573,18 +573,29 @@ fn nghttp_log_h1_server(reply: &'static [u8]) -> Option<String> {
 /// (0x05).
 #[test]
 fn a_chunked_h1_response_with_trailers_reaches_an_h2_client() {
-    let Some(log) = nghttp_log_h1_server(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\ngrpc-status: 0\r\n\r\n") else { return };
+    let Some((log, _)) = nghttp_log_h1_server(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\ngrpc-status: 0\r\n\r\n") else { return };
     let frames: Vec<&str> = log.lines().filter(|l| l.contains("recv HEADERS frame") || l.contains("recv DATA frame")).collect();
     assert_eq!(frames.len(), 3, "{log}");
     assert!(frames[0].contains("flags=0x04") && frames[1].contains("DATA frame <length=3, flags=0x00") && frames[2].contains("flags=0x05"), "{log}");
     assert!(log.contains("recv (stream_id=1) grpc-status: 0"), "{log}");
 }
 
+/// T554: `%B` of a response with trailers sent to an h2 client counts the trailers' names and
+/// values. `HAProxy` 3.5-dev8, `option httplog` (`proto h2` frontend, h1 server replying
+/// `HTTP/1.1 200 OK`, `transfer-encoding: chunked`, `3\r\nabc\r\n0\r\ngrpc-status: 0\r\n\r\n`,
+/// `nghttp http://fe/x`): bytes_read 74. Of that, 3 are the body and 12 (`grpc-status` + `0`)
+/// the trailer. With the trailer line (h2_bridge.rs:537) removed Ibex logs 62, so the test is red.
+#[test]
+fn bytes_read_counts_trailers_sent_to_an_h2_client() {
+    let Some((_, line)) = nghttp_log_h1_server(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\ngrpc-status: 0\r\n\r\n") else { return };
+    assert!(line.contains(" 200 74 - - "), "bytes_read 74 as HAProxy: {line:?}");
+}
+
 /// T549, measured on `HAProxy` 3.5-dev8: an empty chunked body with a trailer is HEADERS
 /// (0x04), then HEADERS `grpc-status: 0` (0x05); no DATA frame.
 #[test]
 fn trailers_with_an_empty_body_reach_an_h2_client_without_a_data_frame() {
-    let Some(log) = nghttp_log_h1_server(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n0\r\ngrpc-status: 0\r\n\r\n") else { return };
+    let Some((log, _)) = nghttp_log_h1_server(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n0\r\ngrpc-status: 0\r\n\r\n") else { return };
     let frames: Vec<&str> = log.lines().filter(|l| l.contains("recv HEADERS frame") || l.contains("recv DATA frame")).collect();
     assert_eq!(frames.len(), 2, "{log}");
     assert!(frames[0].contains("HEADERS") && frames[0].contains("flags=0x04") && frames[1].contains("HEADERS") && frames[1].contains("flags=0x05"), "{log}");
