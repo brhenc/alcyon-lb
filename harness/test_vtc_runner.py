@@ -289,6 +289,21 @@ class ClientSendCoalescing(unittest.TestCase):
                                           "-body", "0\\r\\n\\r\\nx\\x41"])])
         self.assertTrue(b"".join(got).endswith(b"\r\n\r\n0\r\n\r\nxA"), got)
 
+    def test_client_chunkedlen_and_chunked_send_chunks(self):
+        # T528: only the server side knew them; the client sent the head and nothing else.
+        A = vtc_runner.ActionItem
+        got = b"".join(self._received([A("chunkedlen", ["20"]), A("chunked", ['"hi"']), A("chunkedlen", ["0"])]))
+        self.assertEqual(got, b"14\r\n0123456789abcdef0123\r\n2\r\nhi\r\n0\r\n\r\n")
+
+    def test_txreq_with_transfer_encoding_gets_no_content_length(self):
+        # T528, quic/h3_unknown_length_req.vtc: `txreq -method POST -hdr "Transfer-Encoding: chunked"`
+        # followed by chunkedlen lines. The runner added `Content-Length: 0` to the POST, and HAProxy
+        # (the oracle too) answered 400 to a request with both.
+        A = vtc_runner.ActionItem
+        got = b"".join(self._received([A("txreq", ["-method", "POST", "-hdr", "Transfer-Encoding: chunked"])]))
+        self.assertIn(b"Transfer-Encoding: chunked", got)
+        self.assertNotIn(b"Content-Length", got)
+
 
 class HeadersOnly(unittest.TestCase):
     """`rxreqhdrs` / `rxresphdrs` stop after the head: the body is for a later `recv` (T363f,
