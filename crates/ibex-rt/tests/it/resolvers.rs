@@ -50,6 +50,9 @@ enum Zone {
     /// SRV records `(priority, weight, port, target)` and additional A records
     /// `(owner, address)` (T487); an SRV query only, NODATA for the others.
     Srv(Vec<(u16, u16, u16, String)>, Vec<(String, Ipv4Addr)>),
+    /// An SRV record of the name asked (to `t1.test:80`), then this A record to an A query:
+    /// an answer record that is no address.
+    SrvThenA(Ipv4Addr),
 }
 
 /// An SRV zone whose additional records are the targets' addresses (`ar`) or none.
@@ -228,7 +231,7 @@ fn build_reply(question: &[u8], z: &Zone, tcp: bool) -> Option<Vec<u8>> {
         Zone::Nx => 3,
         Zone::Refused => 5,
         Zone::ServFail => 2,
-        Zone::A(_) | Zone::NoData | Zone::Truncated(_) | Zone::AlwaysTruncated | Zone::Many(_) | Zone::Aaaa(_) | Zone::Dual(..) | Zone::Srv(..) => 0,
+        Zone::A(_) | Zone::NoData | Zone::Truncated(_) | Zone::AlwaysTruncated | Zone::Many(_) | Zone::Aaaa(_) | Zone::Dual(..) | Zone::Srv(..) | Zone::SrvThenA(_) => 0,
     };
     let many: Vec<Ipv4Addr>;
     let ips: &[Ipv4Addr] = match z {
@@ -270,6 +273,22 @@ fn build_reply(question: &[u8], z: &Zone, tcp: bool) -> Option<Vec<u8>> {
         for (owner, ip) in ar {
             r.extend_from_slice(&wire_name(owner));
             r.extend_from_slice(&[0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4]);
+            r.extend_from_slice(&ip.octets());
+        }
+        return Some(r);
+    }
+    if let Zone::SrvThenA(ip) = z {
+        let t = wire_name("t1.test");
+        let mut r = Vec::with_capacity(512);
+        r.extend_from_slice(&question[..2]);
+        r.extend_from_slice(&[0x81, 0x80, 0, 1, 0, if qtype == 1 { 2 } else { 1 }, 0, 0, 0, 0]);
+        r.extend_from_slice(&question[12..]);
+        r.extend_from_slice(&[0xc0, 0x0c, 0, 33, 0, 1, 0, 0, 1, 0x2c]);
+        r.extend_from_slice(&u16::try_from(6 + t.len()).expect("len").to_be_bytes());
+        r.extend_from_slice(&[0, 10, 0, 10, 0, 80]);
+        r.extend_from_slice(&t);
+        if qtype == 1 {
+            r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4]);
             r.extend_from_slice(&ip.octets());
         }
         return Some(r);
@@ -2277,13 +2296,14 @@ fn do_resolve_cache_is_bounded() {
 }
 
 /// Two requests for a name being resolved share its resolution (one id, `resolve_retries`
-/// tries); a sample that is no string (`src`) asks nothing; a binary one is a name.
+/// tries); a binary sample is a name (a sample of another type is cast to one:
+/// `do_resolve_casts_the_sample_to_a_name`).
 #[test]
 fn do_resolve_requests_share_a_pending_resolution() {
     let dns = FakeDns::start();
     dns.set("sil.test", Zone::Silent);
     let rules = format!(
-        "  http-request do-resolve(txn.ip,r,ipv4) src if {{ path /src }}\n  http-request do-resolve(txn.ip,r,ipv4) bin(61312e74657374) if {{ path /bin }}\n  \
+        "  http-request do-resolve(txn.ip,r,ipv4) bin(61312e74657374) if {{ path /bin }}\n  \
          http-request do-resolve(txn.ip,r,ipv4) path,ltrim(/),hex,hex2bin if {{ path /a1.test }}\n{}",
         dr_rules(",ipv4", "str(sil.test)").replace("do-resolve(txn.ip,r,ipv4) str(sil.test)", "do-resolve(txn.ip,r,ipv4) str(sil.test) if { path /sil }")
     );
@@ -2300,11 +2320,70 @@ fn do_resolve_requests_share_a_pending_resolution() {
     }
     let q = dns.queries();
     assert!(q.len() == 2 && q[0].id == q[1].id, "{q:?}");
-    let (body, took) = dr_get(&ibex, "/src");
-    assert!(body.is_empty() && took < Duration::from_millis(200), "{body:?} {took:?}");
-    assert_eq!(dns.queries().len(), 2);
     assert_eq!(dr_get(&ibex, "/bin").0, "10.0.0.1");
     assert_eq!(dr_get(&ibex, "/a1.test").0, "10.0.0.1");
+}
+
+/// `resolv_action_do_resolve` takes the sample as a string (`sample_fetch_as_type(...,
+/// SMP_T_STR)`): measured on `HAProxy` 3.5-dev8, `int(1)` and `bool(1)` ask `1`, `int(1),add(1)`
+/// asks `2`, `src` asks `127.0.0.1`, and the answer goes into the variable; a fetch with no
+/// value asks nothing.
+#[test]
+fn do_resolve_casts_the_sample_to_a_name() {
+    let dns = FakeDns::start();
+    dns.set("1", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 7)]));
+    dns.set("2", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 8)]));
+    dns.set("127.0.0.1", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 9)]));
+    let mut rules = String::new();
+    for (path, expr) in [("int", "int(1)"), ("bool", "bool(1)"), ("add", "int(1),add(1)"), ("src", "src"), ("hdr", "req.hdr(x-name)")] {
+        let _ = writeln!(rules, "  http-request do-resolve(txn.ip,r,ipv4) {expr} if {{ path /{path} }}");
+    }
+    rules.push_str("  http-request return status 200 content-type text/plain lf-string \"%[var(txn.ip)]\"\n");
+    let ibex = start(dns.addr, "", &rules, "");
+    assert_eq!(dr_get(&ibex, "/int").0, "10.0.0.7");
+    assert_eq!(dr_get(&ibex, "/bool").0, "10.0.0.7");
+    assert_eq!(dr_get(&ibex, "/add").0, "10.0.0.8");
+    assert_eq!(dr_get(&ibex, "/src").0, "10.0.0.9");
+    // A fetch that finds nothing asks nothing.
+    assert_eq!(dr_get(&ibex, "/hdr").0, "");
+    let names: Vec<String> = dns.queries().into_iter().map(|q| q.name).collect();
+    assert_eq!(names, ["1", "2", "127.0.0.1"]);
+}
+
+/// An answer record that is no address (an SRV record of the name asked, before its A record):
+/// the address is taken from the A/AAAA records only (`resolv_get_ip_from_response`).
+#[test]
+fn do_resolve_skips_an_answer_record_that_is_no_address() {
+    let dns = FakeDns::start();
+    dns.set("mixed.test", Zone::SrvThenA(Ipv4Addr::new(10, 0, 0, 5)));
+    let ibex = start(dns.addr, "", &dr_rules(",ipv4", "str(mixed.test)"), "");
+    assert_eq!(dr_get(&ibex, "/").0, "10.0.0.5");
+}
+
+/// `set server fqdn` onto a name whose resolution has a query in flight: the server joins it,
+/// and no query is sent for it (`resolv_trigger_resolution` leaves a running resolution be).
+/// s2's resolution, every `timeout resolve`, is the section's next step, where the request is
+/// applied; sil.test's query is in flight for the whole `timeout retry`.
+#[test]
+fn set_server_fqdn_joins_a_resolution_in_flight() {
+    let dns = FakeDns::start();
+    dns.set("sil.test", Zone::Silent);
+    let ibex = start(
+        dns.addr,
+        "  timeout resolve 300ms\n  timeout retry 5s\n  resolve_retries 1\n",
+        "  server s1 sil.test:80 resolvers r init-addr none\n  server s2 a1.test:80 resolvers r\n  server s3 10.0.0.9:80 resolvers r\n",
+        "",
+    );
+    let asked = || dns.queries().iter().filter(|q| q.name == "sil.test").count();
+    let t = Instant::now();
+    while asked() == 0 && t.elapsed() < Duration::from_secs(3) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(asked(), 1, "{:?}", dns.queries());
+    assert!(ibex.cli("set server l/s3 fqdn sil.test").starts_with("l/s3 changed its FQDN from (null) to sil.test"));
+    assert_eq!(ibex.state("s3").1, "sil.test");
+    thread::sleep(Duration::from_millis(1000));
+    assert_eq!(asked(), 1, "{:?}", dns.queries());
 }
 
 /// A section only servers written as addresses name runs (T489): `set server fqdn` gives one

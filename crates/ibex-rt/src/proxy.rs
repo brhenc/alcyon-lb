@@ -805,9 +805,10 @@ pub struct TcpSession {
     pub fc_dst: Option<SocketAddr>,
     pub tcp_inspect_done: bool,
     pub inspect_exp: Option<Tick>,
-    /// A `tcp-request content do-resolve` waits (T489): 0, or its rule + 1 in the top 8 bits
-    /// and the low 24 bits of the cache mark it asked at (`resolvers::dr_mark`). Packed: a
-    /// session is held per connection (`struct_sizes`).
+    /// A `tcp-request content do-resolve` or an `http-request do-resolve` (with its
+    /// `BodyWait::resolve`) waits (T489): 0, or its rule + 1 in the top 8 bits and the low 24
+    /// bits of the cache mark it asked at (`resolvers::dr_mark`). One field for both: a stream
+    /// waits on one rule at a time. Packed: a session is held per connection (`struct_sizes`).
     pub dr_wait: u32,
     /// The backend's `tcp-request content` rules are waiting (TCP mode): `inspect_exp` is
     /// their delay, and the backend is chosen again when it is over.

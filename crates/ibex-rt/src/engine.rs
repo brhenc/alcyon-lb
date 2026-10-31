@@ -7702,19 +7702,20 @@ fn store_var(vars: &mut VarStore, name: &str, mut val: String) {
 /// once the resolution ends (`resolve_retries` x `timeout retry`); this only bounds a lost one.
 const DO_RESOLVE_WAIT_MS: u32 = 30_000;
 
-/// The name a `do-resolve` expression gives, to `f`: a constant without a copy, else the
-/// sample's text. No name (the fetch failed, not a string): `Done(None)`.
+/// The name a `do-resolve` expression gives, to `f`: a constant string without a copy, else
+/// the sample cast to a string, as `resolv_action_do_resolve` takes it
+/// (`sample_fetch_as_type(..., SMP_T_STR)`: `int(1)` asks `1`, `src` its address). No name
+/// (the fetch failed, no cast to a string): `Done(None)`.
 fn with_rule_name(e: Option<&ibex_sample::Expr>, registry: &ibex_sample::Registry, ctx: &SampleContext, f: impl FnOnce(&[u8]) -> crate::resolvers::DrStep) -> crate::resolvers::DrStep {
     let none = crate::resolvers::DrStep::Done(None);
     let Some(e) = e else { return none };
-    if let Some(c) = e.constant(registry) {
-        return match c {
-            Sample::Str(s) => f(s.as_bytes()),
-            Sample::Bin(b) => f(b),
-            _ => none,
-        };
-    }
-    match e.eval_sample(registry, ctx) {
+    let smp = match e.constant(registry) {
+        Some(Sample::Str(s)) => return f(s.as_bytes()),
+        Some(Sample::Bin(b)) => return f(b),
+        Some(c) => Some(c.clone()),
+        None => e.eval_sample(registry, ctx),
+    };
+    match smp.and_then(|v| if matches!(v, Sample::Bin(_)) { Some(v) } else { ibex_sample::cast(v, ibex_sample::SampleType::Str) }) {
         Some(Sample::Str(s)) => f(s.as_bytes()),
         Some(Sample::Bin(b)) => f(&b),
         _ => none,
@@ -12873,7 +12874,7 @@ impl EngineDispatcher<'_> {
                         );
                         if !deadline.is_expired(now) {
                             if let Some(t) = sess.txn.as_mut() {
-                                t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline, tarpit: true, inspect: false, asked: None });
+                                t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline, tarpit: true, inspect: false, resolve: false });
                             }
                             return Ok(RuleFlow::Suspend);
                         }
@@ -13161,8 +13162,12 @@ impl EngineDispatcher<'_> {
                         // `resolv_action_do_resolve` (T489): the stream waits for the answer (its
                         // `body_wait` holds the rule), then the address goes into the variable;
                         // no answer (an error, an invalid name, the deadline) sets nothing.
-                        let held = sess.txn.as_ref().and_then(|t| t.body_wait).filter(|w| w.asked.is_some() && w.backend == be_stage && w.rule == rule_idx);
-                        let step = with_rule_name(rc.expr.as_ref(), registry, &make_ctx!(sess), |name| match held.and_then(|w| w.asked) {
+                        // The cache mark it asked at is in `TcpSession::dr_wait` (shared with `tcp-request
+                        // content do-resolve`: a stream waits on one rule at a time), not in the
+                        // `BodyWait`, which would grow every session by 8 (`struct_sizes`).
+                        let held = sess.txn.as_ref().and_then(|t| t.body_wait).filter(|w| w.resolve && w.backend == be_stage && w.rule == rule_idx);
+                        let asked = held.and(crate::resolvers::dr_wait_unpack(sess.dr_wait)).filter(|w| w.0 == rule_idx).map(|w| w.1);
+                        let step = with_rule_name(rc.expr.as_ref(), registry, &make_ctx!(sess), |name| match asked {
                             Some(asked) => crate::resolvers::dr_poll(d.section_idx, d.prefer_ipv4, name, asked).map_or(crate::resolvers::DrStep::Wait, crate::resolvers::DrStep::Done),
                             None => crate::resolvers::dr_start(d.section_idx, d.prefer_ipv4, name, my_task, std::time::Instant::now()),
                         });
@@ -13170,8 +13175,9 @@ impl EngineDispatcher<'_> {
                             crate::resolvers::DrStep::Wait if held.is_none_or(|w| !w.deadline.is_expired(now)) => {
                                 if held.is_none() {
                                     if let Some(t) = sess.txn.as_mut() {
-                                        t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline: now.add(DO_RESOLVE_WAIT_MS), tarpit: false, inspect: false, asked: Some(crate::resolvers::dr_mark()) });
+                                        t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline: now.add(DO_RESOLVE_WAIT_MS), tarpit: false, inspect: false, resolve: true });
                                     }
+                                    sess.dr_wait = crate::resolvers::dr_wait_pack(rule_idx, crate::resolvers::dr_mark());
                                 }
                                 return Ok(RuleFlow::Suspend);
                             }
@@ -13186,6 +13192,7 @@ impl EngineDispatcher<'_> {
                             if let Some(t) = sess.txn.as_mut() {
                                 t.body_wait = None;
                             }
+                            sess.dr_wait = 0;
                         }
                     }
                     ibex_config::HttpReqAction::SetVar { var_name, .. } => {
@@ -13345,7 +13352,7 @@ impl EngineDispatcher<'_> {
                         };
                         if let Some(deadline) = deadline.filter(|d| !d.is_expired(now)) {
                             if let Some(t) = sess.txn.as_mut() {
-                                t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline, tarpit: true, inspect: false, asked: None });
+                                t.body_wait = Some(crate::txn::BodyWait { backend: be_stage, rule: rule_idx, deadline, tarpit: true, inspect: false, resolve: false });
                             }
                             return Ok(RuleFlow::Suspend);
                         }
@@ -13546,7 +13553,7 @@ impl EngineDispatcher<'_> {
                 deadline: deadline.unwrap_or(Tick::ETERNITY),
                 tarpit: false,
                 inspect: true,
-                asked: None,
+                resolve: false,
             });
             entry.sess.txn.iter_mut().for_each(|txn| txn.body_wait = wait);
             if res == ContentEvalResult::Waiting {
@@ -15240,7 +15247,7 @@ fn wait_for_request_body(
     let pending = matches!(outcome, BodyWait::Pending);
     let ready = matches!(outcome, BodyWait::Ready);
     for txn in sess.txn.as_mut() {
-        txn.body_wait = pending.then_some(crate::txn::BodyWait { backend, rule, deadline, tarpit: false, inspect: false, asked: None });
+        txn.body_wait = pending.then_some(crate::txn::BodyWait { backend, rule, deadline, tarpit: false, inspect: false, resolve: false });
         if ready {
             txn.req_body = Some(std::mem::take(&mut body));
         }
