@@ -16,7 +16,11 @@ members = [
 ]
 # T460: the vendored ring fork and its rustls provider are dependencies, not members: `cargo test
 # --workspace` and clippy do not run ring's suite or lint upstream code (vendor/README.md).
-exclude = ["vendor/ringibex", "vendor/rustls-ringibex"]
+exclude = ["vendor/ringibex", "vendor/rustls-ringibex", "vendor/quinn-proto"]
+
+# T542: quinn-proto vendored and patched here (vendor/README.md); every user in the graph takes it.
+[patch.crates-io]
+quinn-proto = { path = "vendor/quinn-proto" }
 
 
 [workspace.package]

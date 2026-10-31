@@ -78,12 +78,6 @@ impl H2Layer {
         self.err == Some(SrvH2Error::BadResponse)
     }
 
-    /// The error that ended the connection for the session, if one did.
-    #[must_use]
-    pub const fn error(&self) -> Option<SrvH2Error> {
-        self.err
-    }
-
     fn fail(&mut self, e: SrvH2Error) {
         self.err.get_or_insert(e);
     }
@@ -91,7 +85,7 @@ impl H2Layer {
     /// Writes the codec's frames. `Ok(false)` when the connection is gone.
     fn flush(&mut self, fd: BorrowedFd<'_>) -> io::Result<bool> {
         while !self.codec.output().is_empty() {
-            match self.inner.send(fd, self.codec.output())? {
+            match self.inner.send_under_h2(fd, self.codec.output())? {
                 Io::Done(n) if n > 0 => self.codec.advance_output(n),
                 Io::Done(_) | Io::WouldBlock => break,
                 Io::Closed | Io::Eof => return Ok(false),
@@ -159,7 +153,7 @@ impl H2Layer {
             if self.eof || (self.codec.is_idle() && !self.codec.reusable()) {
                 return Ok(Io::Eof);
             }
-            match self.inner.recv(fd, dst)? {
+            match self.inner.recv_under_h2(fd, dst)? {
                 Io::Done(0) | Io::WouldBlock => {
                     let _ = self.flush(fd)?;
                     return Ok(Io::WouldBlock);

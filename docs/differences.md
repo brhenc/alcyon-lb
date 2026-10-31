@@ -309,6 +309,8 @@ client session: 26 connections for 26 client sessions, T533 A.3 row 6). Measured
 - `%B` of an h2 response follows HAProxy's HTX count (no reason phrase; the `transfer-encoding:
   chunked` written for a response without a length counts 25 bytes less), measured equal for
   bodies of 2, 19, 1000 and 40000 bytes.
+- CONNECT to an h2 server: HAProxy tunnels it; Ibex's codec refuses it, 502, no stream opened
+  (CONNECT and WebSocket to h2 servers: T548).
 
 ## `tune.maxaccept`: the default is no limit (T295)
 
