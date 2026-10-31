@@ -766,6 +766,54 @@ fn show_stat_follows_the_resolution() {
     assert_eq!(row(&ibex), ("no check".to_string(), "10.0.0.1:80".to_string()));
 }
 
+/// T513: a server-state file line for a server whose name has no address yet, with the
+/// operator's maintenance (33) or drain (40) under `SRV_ADMF_RMAINT`. Measured on `HAProxy`
+/// 3.5-dev8: `- 0 33` and `- 0 40` at load, both `MAINT (resolution)` in `show stat`; once the
+/// names resolve, `10.0.0.1 0 1` `MAINT` ("resolves again but remains in maintenance") and
+/// `10.0.0.2 2 8` `DRAIN` ("is UP/DRAIN (resolves again)", "remains in forced drain mode").
+/// Ibex dropped the kept state: `- 0 32` twice, then both UP/READY.
+#[test]
+fn a_state_file_keeps_the_operators_state_of_an_unresolved_server() {
+    let dns = FakeDns::start();
+    dns.set("b.test", Zone::Nx);
+    dns.set("c.test", Zone::Nx);
+    let mut state = NamedTempFile::new().expect("tmp");
+    write!(
+        state,
+        "1\n# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_uweight srv_iweight \
+         srv_time_since_last_change srv_check_status srv_check_result srv_check_health srv_check_state \
+         srv_agent_state bk_f_forced_id srv_f_forced_id srv_fqdn srv_port srvrecord srv_use_ssl \
+         srv_check_port srv_check_addr srv_agent_addr srv_agent_port\n\
+         2 l 1 s1 - 0 33 1 1 1 1 0 0 0 0 0 0 b.test 80 - 0 0 - - 0\n\
+         2 l 2 s2 - 0 40 1 1 1 1 0 0 0 0 0 0 c.test 80 - 0 0 - - 0\n"
+    )
+    .expect("write state");
+    let ibex = start(
+        dns.addr,
+        &format!("{FAST}  hold nx 500ms\n"),
+        "  load-server-state-from-file global\n  server s1 b.test:80 resolvers r init-addr none\n  server s2 c.test:80 resolvers r init-addr none\n",
+        &format!("  server-state-file {}\n", state.path().display()),
+    );
+    let status = |ibex: &Ibex, sv: &str| {
+        let stat = ibex.cli("show stat");
+        let mut lines = stat.lines();
+        let header: Vec<String> = lines.next().expect("header").trim_start_matches("# ").split(',').map(str::to_string).collect();
+        let col = header.iter().position(|c| c == "status").expect("column");
+        lines.find(|l| l.starts_with(&format!("l,{sv},"))).expect("row").split(',').nth(col).expect("status").to_string()
+    };
+    assert_eq!(ibex.state("s1").0, "- 0 33");
+    assert_eq!(ibex.state("s2").0, "- 0 40");
+    assert_eq!((status(&ibex, "s1"), status(&ibex, "s2")), ("MAINT (resolution)".to_string(), "MAINT (resolution)".to_string()));
+    dns.set("b.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 1)]));
+    dns.set("c.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 2)]));
+    ibex.wait_state("s1", "10.0.0.1 0 1", 3);
+    ibex.wait_state("s2", "10.0.0.2 2 8", 3);
+    assert_eq!((status(&ibex, "s1"), status(&ibex, "s2")), ("MAINT".to_string(), "DRAIN".to_string()));
+    ibex.wait_log("Server l/s1 ('b.test') resolves again but remains in maintenance.", 2);
+    ibex.wait_log("Server l/s2 ('c.test') is UP/DRAIN (resolves again).", 2);
+    ibex.wait_log("Server l/s2 remains in forced drain mode.", 2);
+}
+
 /// `ibex -c` on `cfg`: whether it passed, and stderr.
 fn check(cfg: &str) -> (bool, String) {
     let f = NamedTempFile::new().expect("tmp");
@@ -1146,6 +1194,29 @@ fn t15c_a_tcp_nameserver_is_asked_over_tcp_only() {
     assert_eq!(dns.tcp_conns.load(Ordering::Relaxed), 1);
     let c = counters(&ibex, "r", "ns1");
     assert_eq!((c["tcp_fallback"], c["truncated"], c["snd_error"]), (0, 0, 0), "{c:?}");
+}
+
+/// T513 (defect E of T484): two nameservers on one address, `tcp@A` and `A`, are two
+/// nameservers. `HAProxy` 3.5-dev8 asks both every time (`timeout resolve 1s`, 3.5 s: ns1
+/// `sent 4 valid 1 outdated 3`, ns2 `sent 4 valid 3 update 1 outdated 1`); Ibex sent one
+/// query and counted it on ns1.
+#[test]
+fn two_nameservers_on_one_address_are_both_asked() {
+    let dns = FakeDns::start();
+    dns.set("a1.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 1)]));
+    let ibex = start(format!("tcp@{}", dns.addr), &format!("{FAST}  nameserver ns2 {}\n", dns.addr), "  server s1 a1.test:80 resolvers r\n", "");
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    wait_counter(&ibex, "sent", 3, |v| v >= 3);
+    thread::sleep(Duration::from_millis(100));
+    let (c1, c2) = (counters(&ibex, "r", "ns1"), counters(&ibex, "r", "ns2"));
+    assert!(c2["sent"] >= 2, "ns2 is asked too: {c2:?}");
+    assert!(c1["sent"].abs_diff(c2["sent"]) <= 1, "{c1:?} {c2:?}");
+    // Each answer is counted on the nameserver that gave it: the first one valid, the
+    // other outdated.
+    assert!(c1["valid"] + c1["outdated"] >= 2 && c2["valid"] + c2["outdated"] >= 2, "{c1:?} {c2:?}");
+    assert_eq!(c1["update"] + c2["update"], 1, "{c1:?} {c2:?}");
+    let q = dns.queries();
+    assert!(q.iter().any(|q| q.tcp) && q.iter().any(|q| !q.tcp), "both transports: {q:?}");
 }
 
 /// A TCP answer of 4,000 records (about 64 KB, over `accepted_payload_size`) is taken whole.

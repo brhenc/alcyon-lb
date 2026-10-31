@@ -511,9 +511,24 @@ fn server_template_refusals_are_haproxys() {
     assert!(t("s 2 _http._tcp.x resolvers r").contains("SRV"));
     // A slot that clashes with a server already there.
     let m = refused(&backend("  server s1 127.0.0.1:80\n  server-template s 2 a.test:80"));
-    assert_eq!(m, "'server-template l/s' : another server named 's1' was already defined, please use a distinct name.");
+    assert_eq!(m, "'server-template l/s' : another server named 's1' was already defined at line 7, please use a distinct name.");
     let m = refused(&backend("  server-template s 2 a.test:80\n  server-template s 2-3 a.test:80"));
-    assert_eq!(m, "'server-template l/s' : another server named 's2' was already defined, please use a distinct name.");
+    assert_eq!(m, "'server-template l/s' : another server named 's2' was already defined at line 7, please use a distinct name.");
+}
+
+/// Two `server` lines with one name (T513): `HAProxy` refuses at the second
+/// (`[f:9] : 'server l/s1' : another server named 's1' was already defined at line 7, ...`).
+#[test]
+fn a_server_name_used_twice_is_refused_as_haproxy() {
+    let e = parse_str(&backend("  server s1 127.0.0.1:80\n  server s2 127.0.0.1:80\n  server s1 127.0.0.1:81")).expect_err("refused");
+    assert_eq!(e.message, "'server l/s1' : another server named 's1' was already defined at line 7, please use a distinct name.");
+    assert_eq!(e.line, 9);
+    // A slot of a template first, then a `server` line with its name.
+    let m = refused(&backend("  server-template s 2 127.0.0.1:80\n  server s2 127.0.0.1:81"));
+    assert_eq!(m, "'server l/s2' : another server named 's2' was already defined at line 7, please use a distinct name.");
+    // The same name in two backends is fine.
+    let two = format!("{}backend m\n  server s1 127.0.0.1:81\n", backend("  server s1 127.0.0.1:80"));
+    assert!(parse_str(&two).is_ok());
 }
 
 #[test]

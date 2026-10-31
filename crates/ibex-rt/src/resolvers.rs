@@ -575,8 +575,7 @@ impl Section {
                     Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => continue,
                     Err(_) => break,
                 };
-                let from = self.nameservers[ns_idx].addr;
-                let got = self.dns.handle_response(now, from, Protocol::Udp, &self.buf[..n]);
+                let got = self.dns.handle_response_ns(now, ns_idx, Protocol::Udp, &self.buf[..n]);
                 self.count(ns_idx, received_counter(got));
                 self.drain_results(now, Some(ns_idx), proxies, checks, log);
             }
@@ -598,8 +597,8 @@ impl Section {
         }
         self.drain_results(now, None, proxies, checks, log);
         // Sends, and the retry timer (which may end resolutions in a timeout).
-        while let Some((to, proto, bytes)) = self.dns.poll_transmit(now) {
-            let Some(i) = self.nameservers.iter().position(|n| n.addr == to) else { continue };
+        // By index: `tcp@A` and `A` are two nameservers (T513).
+        while let Some((i, proto, bytes)) = self.dns.poll_transmit_ns(now) {
             if proto == Protocol::Tcp {
                 // A.t9: on a nameserver that also speaks UDP, a TCP query is the fallback
                 // (`resolv_send_tcp_fallback`).
@@ -763,9 +762,8 @@ impl Section {
             }
         }
         let more = !ns.queue.is_empty() && !broken;
-        let from = self.nameservers[i].addr;
         for f in &frames {
-            let got = self.dns.handle_response(now, from, Protocol::Tcp, f);
+            let got = self.dns.handle_response_ns(now, i, Protocol::Tcp, f);
             self.count(i, received_counter(got));
             self.drain_results(now, Some(i), proxies, checks, log);
         }

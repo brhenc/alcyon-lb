@@ -317,6 +317,9 @@ pub struct ServerExtras {
     /// section must exist (checked at the end of the parse, as `HAProxy`'s
     /// `resolvers_finalize_config`).
     pub resolvers_refs: Vec<(u32, u32, Box<str>)>,
+    /// The line of the `server` line of each server, by name: a second server of one name is
+    /// refused (`another server named ... was already defined at line N`, T513).
+    pub name_lines: std::collections::HashMap<Box<str>, u32>,
 }
 
 impl ServerExtras {
