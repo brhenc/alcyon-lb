@@ -396,6 +396,7 @@ pub(crate) fn parse_listen_directive(
             &mut proxy.servers,
             &mut proxy.server_extras,
             proxy.default_server.as_ref(),
+            &proxy.name,
             tokens,
             kw,
         ),
@@ -710,7 +711,7 @@ pub(crate) fn parse_backend_directive(
         "redisp" => parse_redisp(kw),
         "dispatch" => parse_dispatch(kw),
         "default-server" => parse_default_server(&mut be.default_server, tokens, kw),
-        "server" => parse_server(&mut be.servers, &mut be.server_extras, be.default_server.as_ref(), tokens, kw),
+        "server" => parse_server(&mut be.servers, &mut be.server_extras, be.default_server.as_ref(), &be.name, tokens, kw),
         "server-template" => parse_server_template(&mut be.servers, &mut be.server_extras, be.default_server.as_ref(), &be.name, tokens, kw),
         "tcp-request" => parse_backend_tcp_request(be, tokens, kw),
         "http-request" => in_section(

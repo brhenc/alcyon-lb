@@ -161,7 +161,8 @@ pub struct Resolver {
     next_query_id: u64,
     cache: HashMap<Box<str>, CacheSlot>,
     in_flight: Vec<InFlight>,
-    transmits: VecDeque<(SocketAddr, Protocol, Vec<u8>)>,
+    /// By nameserver index: two nameservers may share an address (`tcp@A` and `A`, T513).
+    transmits: VecDeque<(usize, Protocol, Vec<u8>)>,
     results: VecDeque<(QueryId, Result<Vec<Answer>, DnsError>)>,
 }
 
@@ -340,13 +341,20 @@ impl Resolver {
         Ok(qid)
     }
 
-    fn transport_of(&self, ns: SocketAddr) -> NsTransport {
-        self.cfg.nameservers.iter().position(|a| *a == ns).and_then(|i| self.cfg.transports.get(i)).copied().unwrap_or_default()
+    fn transport_of(&self, ns: usize) -> NsTransport {
+        self.cfg.transports.get(ns).copied().unwrap_or_default()
     }
 
-    /// The next datagram to send. Each try goes to every nameserver, in configuration order.
-    /// Also runs the retry timer: call it at [`Self::poll_timeout`].
+    /// [`Self::poll_transmit_ns`] with the nameserver's address in place of its index.
     pub fn poll_transmit(&mut self, now: Instant) -> Option<(SocketAddr, Protocol, Vec<u8>)> {
+        let (ns, proto, buf) = self.poll_transmit_ns(now)?;
+        Some((self.cfg.nameservers[ns], proto, buf))
+    }
+
+    /// The next datagram to send, and the index in [`ResolverConfig::nameservers`] of the
+    /// nameserver it goes to. Each try goes to every nameserver, in configuration order.
+    /// Also runs the retry timer: call it at [`Self::poll_timeout`].
+    pub fn poll_transmit_ns(&mut self, now: Instant) -> Option<(usize, Protocol, Vec<u8>)> {
         if let Some(tx) = self.transmits.pop_front() {
             return Some(tx);
         }
@@ -390,16 +398,23 @@ impl Resolver {
         f.nb_tcp_fallback = 0;
         let buf = build_query(f.message_id, &f.dn, f.query_type, self.cfg.accepted_payload_size);
         let proto = |i: usize| if self.cfg.transports.get(i) == Some(&NsTransport::Tcp) { Protocol::Tcp } else { Protocol::Udp };
-        for (i, &other) in self.cfg.nameservers.iter().enumerate().skip(1) {
-            self.transmits.push_back((other, proto(i), buf.clone()));
+        for i in 1..self.cfg.nameservers.len() {
+            self.transmits.push_back((i, proto(i), buf.clone()));
         }
-        Some((self.cfg.nameservers[0], proto(0), buf))
+        Some((0, proto(0), buf))
     }
 
     /// Feeds one reply received from `from` over `proto`. The returned class is the
     /// nameserver counter `HAProxy` increments for it; only a valid answer, or an error once
     /// every nameserver has answered, moves the resolution on.
     pub fn handle_response(&mut self, now: Instant, from: SocketAddr, proto: Protocol, buf: &[u8]) -> Received {
+        let ns = self.cfg.nameservers.iter().position(|a| *a == from).unwrap_or(usize::MAX);
+        self.handle_response_ns(now, ns, proto, buf)
+    }
+
+    /// [`Self::handle_response`] for a reply from the nameserver at index `ns` of
+    /// [`ResolverConfig::nameservers`], when two of them share an address.
+    pub fn handle_response_ns(&mut self, now: Instant, ns: usize, proto: Protocol, buf: &[u8]) -> Received {
         let max_payload = match proto {
             Protocol::Udp => usize::from(self.cfg.accepted_payload_size),
             Protocol::Tcp => MAX_MSG,
@@ -407,14 +422,14 @@ impl Resolver {
         if buf.len() > max_payload {
             return Received::TooBig;
         }
-        if buf.len() < 2 || !self.cfg.nameservers.contains(&from) {
+        if buf.len() < 2 || ns >= self.cfg.nameservers.len() {
             return Received::Invalid;
         }
         let msg_id = u16::from_be_bytes([buf[0], buf[1]]);
         let Some(idx) = self.in_flight.iter().position(|f| f.message_id == msg_id) else {
             return Received::Outdated;
         };
-        let transport = self.transport_of(from);
+        let transport = self.transport_of(ns);
         let f = &mut self.in_flight[idx];
         if proto == Protocol::Tcp && transport == NsTransport::Auto && f.nb_tcp_fallback > 0 {
             f.nb_tcp_fallback -= 1;
@@ -439,7 +454,7 @@ impl Resolver {
                 f.nb_tcp_fallback += 1;
                 f.last_query = now;
                 let q = build_query(f.message_id, &f.dn, qtype, self.cfg.accepted_payload_size);
-                self.transmits.push_back((from, Protocol::Tcp, q));
+                self.transmits.push_back((ns, Protocol::Tcp, q));
                 return Received::Truncated;
             }
             Verdict::Truncated => (Received::Truncated, DnsError::Other),

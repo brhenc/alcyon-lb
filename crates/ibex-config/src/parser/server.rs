@@ -8,6 +8,7 @@ pub(crate) fn parse_server(
     servers: &mut Vec<Server>,
     extras: &mut ServerExtras,
     default_server: Option<&DefaultServerConfig>,
+    proxy: &str,
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
@@ -16,6 +17,14 @@ pub(crate) fn parse_server(
             kw.line,
             kw.col,
             "<server> expects <name> and <addr:port> as arguments.",
+        ));
+    }
+    if let Some(first) = extras.name_lines.get(tokens[1].text.as_str()) {
+        let id = &tokens[1].text;
+        return Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!("'server {proxy}/{id}' : another server named '{id}' was already defined at line {first}, please use a distinct name."),
         ));
     }
     // No port is port 0: the server connects to the stream's destination port
@@ -247,6 +256,7 @@ pub(crate) fn parse_server(
             template: None,
         });
     }
+    extras.name_lines.insert(tokens[1].text.as_str().into(), u32::try_from(kw.line).unwrap_or(u32::MAX));
     servers.push(Server {
         check_port,
         check_proto,
@@ -343,11 +353,11 @@ pub(crate) fn parse_server_template(
     let mut line: Vec<Token> = Vec::with_capacity(tokens.len());
     for n in low..=high {
         let id = format!("{prefix}{n}");
-        if servers.iter().any(|s| s.id == id) {
+        if let Some(first) = extras.name_lines.get(id.as_str()) {
             return Err(ConfigError::new(
                 tokens[1].line,
                 tokens[1].col,
-                format!("{who}another server named '{id}' was already defined, please use a distinct name."),
+                format!("{who}another server named '{id}' was already defined at line {first}, please use a distinct name."),
             ));
         }
         line.clear();
@@ -356,7 +366,7 @@ pub(crate) fn parse_server_template(
         line.push(tokens[3].clone());
         line.extend_from_slice(&tokens[rest.min(tokens.len())..]);
         let before = servers.len();
-        parse_server(servers, extras, default_server, &line, kw)?;
+        parse_server(servers, extras, default_server, proxy, &line, kw)?;
         if n == low && extras.names.last().is_some_and(|e| e.index as usize == before) {
             if let Some(e) = extras.names.last_mut() {
                 e.template = Some(prefix.as_str().into());

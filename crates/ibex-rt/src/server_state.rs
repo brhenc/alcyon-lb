@@ -147,8 +147,13 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &ibex_config::Server, f: &[&str; M
         admin = ServerStatus::Drain;
     }
     // A server left without an address (`init-addr ...,none`) is in maintenance whatever
-    // the file said: `HAProxy` sets `SRV_ADMF_RMAINT` after applying the file.
+    // the file said: `HAProxy` sets `SRV_ADMF_RMAINT` after applying the file. The state the
+    // file gave (33: FMAINT, 40: FDRAIN) is kept under it, the one the server takes back when
+    // its name resolves (T513). A `disabled` server already keeps `Maint` from the start.
     if p.server_rmaint(i) {
+        if admin != ServerStatus::Up {
+            p.set_server_rmaint(i, Some(admin));
+        }
         cur = ServerStatus::Maint as u8;
         admin = ServerStatus::Maint;
     }

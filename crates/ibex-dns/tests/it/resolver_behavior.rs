@@ -801,3 +801,29 @@ fn the_retry_timer_flips_the_type_after_a_partial_error() {
     sends(&mut r, ms(t0, 4000));
     assert_eq!(r.poll_result().unwrap().1, Err(DnsError::Timeout));
 }
+
+// T513 (defect E of T484): `tcp@A` and `A` are two nameservers on one address. The
+// transmits and the replies are keyed by index: each gets the question over its own
+// transport, and an NX from one waits for the other (A.t10 on `HAProxy` 3.5-dev8: both asked).
+#[test]
+fn two_nameservers_on_one_address_are_told_apart_by_index() {
+    let mut c = cfg(&[NS1, NS1]);
+    c.transports = vec![NsTransport::Tcp, NsTransport::Udp];
+    let mut r = Resolver::new(c);
+    let t0 = Instant::now();
+    q4(&mut r, t0, "two.test");
+    let mut tx = Vec::new();
+    while let Some((i, proto, buf)) = r.poll_transmit_ns(t0) {
+        tx.push((i, proto, Message::from_vec(&buf).unwrap().id()));
+    }
+    assert_eq!(tx.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>(), [(0, Protocol::Tcp), (1, Protocol::Udp)]);
+    let id = tx[0].2;
+    let nx = error_response(id, "two.test", RecordType::A, ResponseCode::NXDomain);
+    assert_eq!(r.handle_response_ns(t0, 0, Protocol::Tcp, &nx), Received::Nx);
+    assert!(r.poll_result().is_none(), "the second nameserver has not answered");
+    let ok = a_response(id, "two.test", Ipv4Addr::new(10, 0, 0, 9), 60);
+    assert_eq!(r.handle_response_ns(t0, 1, Protocol::Udp, &ok), Received::Valid);
+    assert_eq!(r.poll_result().unwrap().1.unwrap(), vec![a(Ipv4Addr::new(10, 0, 0, 9), 60)]);
+    // An index the section does not have is not a nameserver.
+    assert_eq!(r.handle_response_ns(t0, 2, Protocol::Udp, &ok), Received::Invalid);
+}
