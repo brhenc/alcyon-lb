@@ -183,9 +183,16 @@ pub fn on_h3_path(path: &'static str, test: impl FnOnce()) {
 /// The test on this thread runs its ibex with HTTP/3 streams through the mux.
 pub fn h3_mux() -> bool {
     match H3_PATH.with(std::cell::Cell::get) {
-        "" => std::env::var("IBEX_H3_PATH").is_ok_and(|v| v == "mux"),
+        "" => std::env::var("IBEX_H3_PATH").map_or(true, |v| v != "relay"),
         p => p == "mux",
     }
+}
+
+/// `mux` or `relay`: the HTTP/3 path of the ibex the test on this thread starts, for names
+/// (directories, sockets) that must not collide between the two copies of a [`h3_both_paths!`]
+/// test running in parallel.
+pub fn h3_path_name() -> &'static str {
+    if h3_mux() { "mux" } else { "relay" }
 }
 
 /// `Command::new` for the ibex under test, on this thread's HTTP/3 path.
