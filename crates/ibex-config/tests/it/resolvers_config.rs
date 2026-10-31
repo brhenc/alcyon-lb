@@ -159,10 +159,19 @@ fn localhost_is_what_libc_says_first() {
     assert_eq!(cfg.backends[0].servers[1].addr, std::net::SocketAddr::new(libc_first("localhost"), 0));
 }
 
+/// T487, measured on `HAProxy` (`haproxy -c`, 2026-10-31): an SRV name (`_...`) is accepted
+/// with `resolvers`, with or without a port, and with `init-addr none`; libc is no method for
+/// it, so without `resolvers` (default `init-addr last,libc`) or with `init-addr libc` there is
+/// no method left.
 #[test]
-fn srv_record_names_are_refused_until_t487() {
-    let m = refused(&backend("  server s1 _http._tcp.x:80"));
-    assert!(m.contains("SRV"), "{m}");
+fn srv_record_names_need_a_resolvers_section() {
+    let rs = "resolvers r\n  nameserver ns1 127.0.0.1:53\n";
+    let no_method = ["{at} : 'server l/s1' : no method found to resolve address '_http._tcp.x'.", "Failed to initialize server(s) addr."];
+    assert_eq!(alerts(&backend("  server s1 _http._tcp.x:80")), no_method);
+    assert_eq!(alerts(&format!("{rs}{}", backend("  server s1 _http._tcp.x resolvers r init-addr libc"))), no_method);
+    for line in ["  server s1 _http._tcp.x:80 resolvers r", "  server s1 _http._tcp.x resolvers r", "  server s1 _http._tcp.x resolvers r init-addr none"] {
+        parse_str(&format!("{rs}{}", backend(line))).unwrap_or_else(|e| panic!("{line}: {}", e.message));
+    }
 }
 
 // --- server resolve-* keywords: HAProxy's argument checks (d7-d13) ---
@@ -507,8 +516,8 @@ fn server_template_refusals_are_haproxys() {
     assert_eq!(t("s 2 a.test:80 from bogus"), "'server-template l/s' : invalid 'bogus' value for 'from' keyword.");
     assert!(t("s 2 a.test:80 from be:l").contains("from"), "refused: Ibex has no server defaults to copy from another backend");
     assert!(t("s 2 a.test:80 from srv:s1").contains("from"));
-    // SRV names stay refused until T487.
-    assert!(t("s 2 _http._tcp.x resolvers r").contains("SRV"));
+    // An SRV name is accepted (T487, `srv_record_names_need_a_resolvers_section`).
+    parse_str(&format!("resolvers r\n  nameserver ns1 127.0.0.1:53\n{}", backend("  server-template s 2 _http._tcp.x resolvers r"))).expect("accepted");
     // A slot that clashes with a server already there.
     let m = refused(&backend("  server s1 127.0.0.1:80\n  server-template s 2 a.test:80"));
     assert_eq!(m, "'server-template l/s' : another server named 's1' was already defined at line 7, please use a distinct name.");

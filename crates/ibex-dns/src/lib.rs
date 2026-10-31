@@ -82,6 +82,12 @@ pub enum Rdata {
         priority: u16,
         weight: u16,
     },
+    /// An A or AAAA record of an SRV answer's additional section (T487), `name` its owner,
+    /// lower case: after the SRV records, in the order of the reply.
+    Additional {
+        name: String,
+        ip: std::net::IpAddr,
+    },
 }
 
 /// One answer record. `ttl` is the record's TTL, kept for the `do-resolve` cache's users

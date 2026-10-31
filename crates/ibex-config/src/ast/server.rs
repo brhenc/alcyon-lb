@@ -58,6 +58,9 @@ pub struct ResolveOpts {
     pub nets: Vec<(std::net::IpAddr, u8)>,
     /// `resolve-opts allow-dup-ip` (`prevent-dup-ip`, the default, clears it).
     pub allow_dup_ip: bool,
+    /// `resolve-opts ignore-weight`: an SRV record's weight leaves the slot's alone (T487,
+    /// `resolvers::srv_answer`).
+    pub ignore_weight: bool,
 }
 
 /// One method of `init-addr` (`enum srv_initaddr`, its values `HAProxy`'s).

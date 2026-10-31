@@ -648,6 +648,8 @@ fn resolve_server_addrs(listens: &mut [ListenSection], backends: &mut [BackendSe
                         Some(Err(_)) => failed = true,
                         None => {}
                     },
+                    // An SRV name (`_...`) is no host name: libc is no method for it.
+                    M::Libc if name.starts_with('_') => {}
                     M::Libc => match address::libc_resolve(name) {
                         Some(ip) => {
                             srv.addr.set_ip(ip);
