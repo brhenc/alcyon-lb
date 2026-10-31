@@ -7878,8 +7878,8 @@ fn init_client_session(
     );
     sess.client_addr = Some(client_addr);
     sess.server_addr = Some(server_addr);
-    sess.fc_src = Some(crate::proxy::PackedAddr::new(fc_src));
-    sess.fc_dst = Some(crate::proxy::PackedAddr::new(fc_dst));
+    sess.fc_src = Some(fc_src);
+    sess.fc_dst = Some(fc_dst);
     sess.tracked_sc = tracked_sc;
     sess.h2_flood_config = global_h2_flood_config;
     let fe = &proxies[proxy_idx];
