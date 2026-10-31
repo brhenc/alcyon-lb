@@ -5,13 +5,17 @@
 # Instructions per request (perf stat instructions:u) of one proxy binary on one scenario.
 # Works for ibex and for haproxy, so the oracle can be measured with the same backend and client.
 #
-#   tools/measure/insreq.sh <label> <proxy-bin> <scenario.body> <client: mb50|ab1|ab1s|hs1|nc1> <N> <rounds> <outdir>
+#   tools/measure/insreq.sh <label> <proxy-bin> <scenario.body> <client: mb50|ab1|ab1s|hs1|nc1|h2s1|h3c1> <N> <rounds> <outdir>
 #
 #   client mb50: measure-bench, 50 keep-alive connections, N requests (what the gate uses)
 #   client ab1:  ab -k -c 1, N requests (one connection, the T447 figure)
 #   client ab1s: ab1 over TLS (https://; the scenario's frontend binds with `ssl crt`, T460)
 #   client hs1:  ab -c 1 over TLS without keep-alive: one TLS handshake per request (T460)
 #   client nc1:  ab -c 1 without keep-alive: one new TCP connection per request (T459)
+#   client h2s1: h2load -c 1 -m 1 over TLS with ALPN h2: one HTTP/2 connection, one stream at a time
+#   client h3c1: h2load -c 1 -m 1 with ALPN h3 (QUIC): one HTTP/3 connection, one stream at a time;
+#                the scenario binds `quic4@` on the same port as its TCP `ssl` bind (h3.body)
+#                (h3-engine design slice H0)
 #
 # The scenario body is a config with @FE@ and @BE@ for the two ports (tools/measure/scenarios/),
 # and @CRT@ for a certificate and key (IBEX_MEASURE_CRT, else a self-signed P-256 one made in
@@ -49,6 +53,8 @@ client() {
     ab1s) taskset -c "$CPU_C" ab -k -q -c 1 -n "$1" "https://127.0.0.1:$FE/" ;;
     hs1)  taskset -c "$CPU_C" ab -q -c 1 -n "$1" "https://127.0.0.1:$FE/" ;;
     nc1)  taskset -c "$CPU_C" ab -q -c 1 -n "$1" "http://127.0.0.1:$FE/" ;;
+    h2s1) taskset -c "$CPU_C" h2load -c 1 -m 1 --alpn-list=h2 -n "$1" "https://127.0.0.1:$FE/" ;;
+    h3c1) taskset -c "$CPU_C" h2load -c 1 -m 1 --alpn-list=h3 -n "$1" "https://127.0.0.1:$FE/" ;;
     *) echo "unknown client $CL" >&2; return 1 ;;
   esac
 }
@@ -57,6 +63,9 @@ for r in $(seq 1 "$ROUNDS"); do
   perf stat -x, -e instructions:u -p "$P" -o "$OUT/$LABEL.r$r.stat" -- \
     bash -c "$(declare -f client); BENCH=$BENCH CL=$CL FE=$FE CPU_C=$CPU_C; client $N" > "$OUT/$LABEL.r$r.client" 2>&1
   INS=$(grep instructions "$OUT/$LABEL.r$r.stat" | cut -d, -f1)
+  if grep -q '^requests:' "$OUT/$LABEL.r$r.client" && ! grep -q "requests: $N total, $N started, $N done, $N succeeded" "$OUT/$LABEL.r$r.client"; then
+    echo "$LABEL round $r: h2load did not complete every request: $(grep '^requests:' "$OUT/$LABEL.r$r.client")" >&2
+  fi
   echo "$LABEL round $r: $INS instructions, $((INS / N)) ins/req"
 done
 kill "$P"; wait "$P" 2>/dev/null; kill "$BEPID"; wait "$BEPID" 2>/dev/null
