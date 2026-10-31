@@ -46,10 +46,13 @@ def cli(c):
         return ""
 last = {}
 zi = 1
+ci = 0
 while time.time() - t0 < case["dur"]:
     t = time.time() - t0
     if zi < len(case["zones"]) and t >= case["zones"][zi][0]:
         json.dump(case["zones"][zi][1], open(f"{d}/zone.json", "w")); print("[t=%.2f] zone %d" % (t, zi)); zi += 1
+    while ci < len(case.get("clis", [])) and t >= case["clis"][ci][0]:
+        print("[t=%.2f] cli %s -> %s" % (t, case["clis"][ci][1], cli(case["clis"][ci][1]).strip())); ci += 1
     for l in cli("show servers state l").splitlines():
         f = l.split(" ")
         if len(f) > 20 and f[3] != "srv_name":
