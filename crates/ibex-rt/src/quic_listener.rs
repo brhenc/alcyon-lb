@@ -58,6 +58,22 @@ pub fn prebind(addr: SocketAddr, workers: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// The half-open connection count the workers' endpoints on `addr` share (T523): `HAProxy`
+/// counts `half_open_conn` per frontend and thread group, so its Retry threshold weighs the
+/// half-open connections of every thread. One per address, made by the first worker that
+/// asks; kept for the process's life (one `u64` per QUIC bind).
+static HALF_OPEN: std::sync::Mutex<Vec<(SocketAddr, Arc<std::sync::atomic::AtomicU64>)>> = std::sync::Mutex::new(Vec::new());
+
+fn shared_half_open(addr: SocketAddr) -> Arc<std::sync::atomic::AtomicU64> {
+    let mut all = HALF_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, c)) = all.iter().find(|(a, _)| *a == addr) {
+        return Arc::clone(c);
+    }
+    let c = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    all.push((addr, Arc::clone(&c)));
+    c
+}
+
 /// The socket [`prebind`] bound on `addr` for `worker`, if there is one.
 fn take_prebound(addr: SocketAddr, worker: usize) -> Option<DgramSocket> {
     let mut all = PREBOUND.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -251,11 +267,14 @@ impl QuicListener {
         // `bind_with_server_config` dropped `require_retry`, the Retry threshold and
         // `anti_amplification_factor`, so a stricter factor an operator asked for was
         // silently ignored.
-        let endpoint = QuicEndpoint::from_config(
+        let mut endpoint = QuicEndpoint::from_config(
             Arc::new(config.build_endpoint_config().map_err(|e| io::Error::other(e.to_string()))?),
             server_config,
             &config,
         );
+        if worker.is_some() {
+            endpoint.share_half_open(shared_half_open(addr));
+        }
         let socket = match worker.and_then(|w| take_prebound(addr, w)) {
             Some(s) => s,
             None => DgramSocket::bind(addr)?,
@@ -1217,6 +1236,7 @@ impl QuicListener {
         }
 
         let mut out: Vec<(ConnectionId, StreamId, Vec<u8>, bool)> = Vec::new();
+        let mut cancelled: Vec<(ConnectionId, StreamId)> = Vec::new();
         for r in &mut self.relays {
             if r.done {
                 continue;
@@ -1250,10 +1270,13 @@ impl QuicListener {
                     Ok(crate::raw::Io::WouldBlock) => break,
                     _ => {
                         // End of the engine's side: a response delimited by the close ends
-                        // here; one cut short gets a 502 if nothing of it went out yet.
+                        // here. One that never started is the request the engine dropped (a
+                        // reused server connection that closed under it, T517/T523): the
+                        // stream is reset with H3_REQUEST_CANCELLED, as the mux path resets
+                        // a stream that ends without its response and as `HAProxy` does.
                         r.done = true;
                         if r.resp.eof().is_err() && !r.resp.head_sent {
-                            frames = mux_h3::encode_response(502, &[], b"");
+                            cancelled.push((r.conn_id, r.stream_id));
                         }
                     }
                 }
@@ -1261,12 +1284,16 @@ impl QuicListener {
                     r.done = true;
                 }
             }
-            if !frames.is_empty() || r.done {
+            if (!frames.is_empty() || r.done) && !cancelled.last().is_some_and(|&(c, sid)| c == r.conn_id && sid == r.stream_id) {
                 out.push((r.conn_id, r.stream_id, frames, r.done));
             }
         }
         for (c, sid, frames, fin) in out {
             self.queue_out(c, sid, &frames, fin);
+        }
+        for (c, sid) in cancelled {
+            let _ = self.endpoint.reset_stream(c, sid, H3Error::RequestCancelled as u64);
+            self.outq.remove(&(c, sid));
         }
         let released = &mut self.released;
         self.relays.retain(|r| {

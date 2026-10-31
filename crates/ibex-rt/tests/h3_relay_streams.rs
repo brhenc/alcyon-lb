@@ -315,11 +315,13 @@ fn a_streamed_body_is_chunked_to_the_engine() {
 
 /// An engine that closes without answering, or answers garbage, gets the client a 502.
 #[test]
-fn no_answer_or_garbage_from_the_engine_is_a_502() {
+fn no_answer_is_a_reset_and_garbage_a_502() {
     let mut rig = Rig::new();
+    // No response byte before the engine closed: the stream is reset H3_REQUEST_CANCELLED, as the
+    // mux path and HAProxy do (T523; it was a 502).
     let id = rig.open(&headers(&[("content-length", "0")]), true);
     drop(rig.accept());
-    assert_eq!(status(&rig.response(id)), 502);
+    assert_eq!(rig.reset_code(id), Some(0x10c));
 
     let id = rig.open(&headers(&[("content-length", "0")]), true);
     let mut eng = rig.accept();
@@ -453,7 +455,8 @@ fn an_engine_that_goes_away_mid_body() {
         "the engine reads nothing, so body waits with write interest"
     );
     drop(eng);
-    assert_eq!(status(&rig.response(id)), 502);
+    // Gone before any response byte: reset H3_REQUEST_CANCELLED (T523; it was a 502).
+    assert_eq!(rig.reset_code(id), Some(0x10c));
 }
 
 /// Out of descriptors, the listener cannot open the socket pair: the client gets a 503
