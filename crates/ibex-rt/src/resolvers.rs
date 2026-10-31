@@ -301,6 +301,8 @@ pub struct Resolution {
 pub struct SrvSlots {
     /// Each server's SRV name (`srvrecord`), `None` for the others.
     pub record: Vec<Option<Box<str>>>,
+    /// The `resolvers` section each server names (`srv->resolvers`), if any (T489).
+    pub section: Vec<Option<Box<str>>>,
     pub fqdn: std::sync::Mutex<Vec<Option<Box<str>>>>,
     pub changed: Vec<std::sync::atomic::AtomicBool>,
 }
@@ -309,8 +311,14 @@ impl SrvSlots {
     /// The slots of a section's servers, `None` when no server's name is an SRV record.
     #[must_use]
     pub fn new(count: usize, extras: &ibex_config::ast::ServerExtras) -> Option<std::sync::Arc<Self>> {
-        if !extras.names.iter().any(|n| n.fqdn.starts_with('_')) {
+        if !extras.names.iter().any(|n| n.fqdn.starts_with('_')) && extras.resolvers_refs.is_empty() {
             return None;
+        }
+        let mut section = vec![None; count];
+        for (i, _, sec) in &extras.resolvers_refs {
+            if let Some(v) = section.get_mut(*i as usize) {
+                *v = Some(sec.clone());
+            }
         }
         let mut record = vec![None; count];
         for n in extras.names.iter().filter(|n| n.fqdn.starts_with('_')) {
@@ -320,6 +328,7 @@ impl SrvSlots {
         }
         Some(std::sync::Arc::new(Self {
             record,
+            section,
             fqdn: std::sync::Mutex::new(vec![None; count]),
             changed: (0..count).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
         }))
@@ -332,15 +341,34 @@ impl SrvSlots {
     }
 
     pub(crate) fn set_fqdn(&self, idx: usize, v: Option<&str>) {
-        if let Some(f) = self.fqdn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(idx) {
-            *f = v.map(Box::from);
-        }
+        self.set_name(idx, v);
         if v.is_some() {
             if let Some(c) = self.changed.get(idx) {
                 c.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
+}
+
+impl SrvSlots {
+    /// Sets the name `srv_fqdn` shows for server `idx` (`srv->hostname`), no flag raised.
+    pub(crate) fn set_name(&self, idx: usize, v: Option<&str>) {
+        if let Some(f) = self.fqdn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(idx) {
+            *f = v.map(Box::from);
+        }
+    }
+}
+
+/// `set server <b>/<s> fqdn` requests (T489) the CLI made on any worker, for the section
+/// worker to apply: `(proxy, server, name)`. Operator-rate, never on the request path.
+static FQDN_SETS: std::sync::Mutex<Vec<(u32, u32, Box<str>)>> = std::sync::Mutex::new(Vec::new());
+static FQDN_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Asks the section of server `s` of proxy `p` to resolve `name` from now on (`srv_set_fqdn`):
+/// applied at the section's next step.
+pub fn request_fqdn(p: usize, s: usize, name: &str) {
+    FQDN_SETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((usize_to_u32(p), usize_to_u32(s), name.into()));
+    FQDN_PENDING.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// An SRV resolution (`struct resolv_srvrq` per proxy, and the SRV items of the answers).
@@ -593,6 +621,17 @@ pub fn build(
     let mut by_key: HashMap<(usize, Box<str>, u16), (usize, usize)> = HashMap::new();
     for (p_idx, (servers, extras)) in sections.enumerate() {
         let Some(px) = proxies.get(p_idx) else { continue };
+        // A server written as an address with `resolvers` resolves nothing until `set server
+        // fqdn` names it one (T489): its section must run.
+        for (_, _, sec_name) in &extras.resolvers_refs {
+            if out.iter().any(|s| s.name == *sec_name) {
+                continue;
+            }
+            let Some(cfg) = config.resolvers.iter().find(|r| *r.name == **sec_name) else { continue };
+            let mut sec = Section::new(cfg, usize_to_u32(out.len()), scheduler, fdtab, poller, now)?;
+            sec.stats_idx = config.resolvers.iter().position(|r| *r.name == **sec_name).unwrap_or(0);
+            out.push(sec);
+        }
         for n in &extras.names {
             let Some(sec_name) = n.resolvers.as_deref() else { continue };
             let Some(cfg) = config.resolvers.iter().find(|r| r.name == sec_name) else { continue };
@@ -763,6 +802,9 @@ impl Section {
                 self.drain_results(now, Some(ns_idx), proxies, checks, log);
             }
             self.tcp_service(ns_idx, now, proxies, checks, log, fdtab, poller);
+        }
+        if FQDN_PENDING.load(std::sync::atomic::Ordering::Acquire) {
+            self.take_fqdn_requests(proxies, now);
         }
         // Resolutions due: one query each, to every nameserver (A.t2).
         let families = active_families(now);
@@ -1016,7 +1058,9 @@ impl Section {
                 for a in acts {
                     match a {
                         SrvAct::Link(p, s, target, opts) => self.link(p, s, &target, opts, now),
-                        SrvAct::Unlink(p, s) => self.unlink(p, s),
+                        SrvAct::Unlink(p, s) => {
+                            self.unlink(p, s);
+                        }
                     }
                 }
                 continue;
@@ -1057,15 +1101,44 @@ impl Section {
 
     /// Slot `s` of proxy `p` leaves its target's resolution, which goes back to the pool once
     /// no server is on it (`_resolv_unlink_resolution`, `resolv_free_resolution`).
-    fn unlink(&mut self, p: u32, s: u32) {
-        let Some(i) = self.resolutions.iter().position(|r| r.srv.is_none() && r.reqs.iter().any(|q| q.proxy == p && q.server == s)) else { return };
+    fn unlink(&mut self, p: u32, s: u32) -> Option<ResolveOpts> {
+        let i = self.resolutions.iter().position(|r| r.srv.is_none() && r.reqs.iter().any(|q| q.proxy == p && q.server == s))?;
         let r = &mut self.resolutions[i];
-        if let Some(k) = r.reqs.iter().position(|q| q.proxy == p && q.server == s) {
-            set_attached(r, k, None);
-            r.reqs.remove(k);
-        }
+        let k = r.reqs.iter().position(|q| q.proxy == p && q.server == s)?;
+        set_attached(r, k, None);
+        let opts = r.reqs.remove(k).opts;
         if r.reqs.is_empty() {
             RESOLUTION_POOL.give_counted(self.resolutions.remove(i));
+        }
+        Some(opts)
+    }
+
+    /// Applies the `set server fqdn` requests for this section's servers (`srv_set_fqdn`):
+    /// the server leaves its resolution and joins the new name's, asked at once. A server
+    /// written as an address had no resolution: it takes the default `resolve-*` options.
+    fn take_fqdn_requests(&mut self, proxies: &[Proxy], now: Instant) {
+        let mine: Vec<(u32, u32, Box<str>)> = {
+            let mut all = FQDN_SETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (mine, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|(p, s, _)| {
+                proxies.get(*p as usize).and_then(|px| px.server_resolvers(*s as usize)).is_some_and(|n| *n == *self.name)
+            });
+            *all = rest;
+            if all.is_empty() {
+                FQDN_PENDING.store(false, std::sync::atomic::Ordering::Release);
+            }
+            mine
+        };
+        for (p, s, name) in mine {
+            let opts = self.unlink(p, s).unwrap_or_default();
+            self.link(p, s, &name, opts, now);
+            if let Some(r) = self.resolutions.iter_mut().find(|r| r.srv.is_none() && r.reqs.iter().any(|q| q.proxy == p && q.server == s)) {
+                if r.in_flight.is_none() {
+                    r.next_at = r.next_at.min(now);
+                }
+            }
+            if let Some(px) = proxies.get(p as usize) {
+                px.mark_server_fqdn_changed(s as usize);
+            }
         }
     }
 }

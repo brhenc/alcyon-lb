@@ -2079,3 +2079,44 @@ fn parse_resolv_conf_warnings_and_failure_are_haproxys() {
         ]
     );
 }
+
+/// A.t21 (T489): `set server <b>/<s> fqdn` (`cli_parse_set_server`, `srv_update_fqdn`,
+/// `srv_set_fqdn`), measured on `HAProxy` 3.5-dev8 (cases t489/fqdn.json, fqdn2.json): the
+/// reply names the change, `srv_fqdn` shows the new name at once, the address follows the new
+/// name's answer (`by 'r/ns1'`) and `srv_admin_state` then has `SRV_ADMF_FQDN_CHANGED` (64);
+/// nothing is logged for the change itself. A server written as an address with `resolvers`
+/// starts resolving (`from (null)`). A name equal but for case or a final dot is the same
+/// resolution: the reply says changed, `srv_fqdn` stays. The refusals in `HAProxy`'s order.
+#[test]
+fn t21_set_server_fqdn_switches_the_resolution() {
+    let dns = FakeDns::start();
+    dns.set("a2.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 2)]));
+    dns.set("_http._tcp.srv.test", srv_zone(&[(256, 8080, "t1.test", Some([10, 1, 0, 1]))]));
+    let ibex = start(
+        dns.addr,
+        "  timeout resolve 300ms\n",
+        "  server s1 a1.test:80 resolvers r\n  server s2 127.0.0.1:80\n  server s3 10.0.0.9:80 resolvers r\n  server-template t 1 _http._tcp.srv.test resolvers r\n",
+        "",
+    );
+    ibex.wait_state("s1", "10.0.0.1 2 0", 3);
+    let cli = |c: &str| ibex.cli(c).trim_end().to_string();
+    assert_eq!(cli("set server l/s1 fqdn a2.test"), "l/s1 changed its FQDN from a1.test to a2.test by 'stats socket command'");
+    assert_eq!(ibex.state("s1").1, "a2.test");
+    assert_eq!(cli("set server l/s1 fqdn a2.test"), "no need to change the FDQN by 'stats socket command'");
+    assert_eq!(cli("set server l/s2 fqdn"), "set server <b>/<s> fqdn requires a FQDN.");
+    assert_eq!(cli("set server l/s2 fqdn a2.test"), "set server <b>/<s> fqdn failed because no resolution is configured.");
+    assert_eq!(cli("set server l/t1 fqdn a2.test"), "set server <b>/<s> fqdn failed because SRV resolution is configured.");
+    assert_eq!(cli("set server l/s1 fqdn a/b"), "invalid fqdn 'a/b' by 'stats socket command'");
+    assert_eq!(cli("set server l/s1 fqdn a..b"), "could not update l/s1 FQDN by 'stats socket command'");
+    ibex.wait_state("s1", "10.0.0.2 2 64", 3);
+    assert!(ibex.log().contains(&"l/s1: IP changed from '10.0.0.1' to '10.0.0.2' by 'r/ns1'.".to_string()), "{:?}", ibex.log());
+    assert!(!ibex.log().iter().any(|l| l.starts_with("l/s1 changed its FQDN")), "{:?}", ibex.log());
+    assert_eq!(cli("set server l/s1 fqdn A2.TEST"), "l/s1 changed its FQDN from a2.test to A2.TEST by 'stats socket command'");
+    assert_eq!(ibex.state("s1").1, "a2.test");
+    assert_eq!(cli("set server l/s3 fqdn a1.test"), "l/s3 changed its FQDN from (null) to a1.test by 'stats socket command'");
+    assert_eq!(ibex.state("s3").1, "a1.test");
+    ibex.wait_state("s3", "10.0.0.1 2 64", 3);
+    // The old name is no longer asked once s1 left it (s3 asks a1.test from now on).
+    let q = dns.queries();
+    assert!(q.iter().any(|q| q.name == "a2.test"), "{q:?}");
+}

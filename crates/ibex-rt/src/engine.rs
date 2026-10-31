@@ -1898,6 +1898,33 @@ impl Proxy {
         }
     }
 
+    /// The `resolvers` section the server at `idx` names, if any (`srv->resolvers`).
+    #[must_use]
+    pub fn server_resolvers(&self, idx: usize) -> Option<&str> {
+        self.ids.server_srv.as_ref().and_then(|v| v.section.get(idx)).and_then(Option::as_deref)
+    }
+
+    /// The name the server at `idx` resolves now (`srv->hostname`): the one `set server fqdn`
+    /// or an SRV record gave it, else the configuration's.
+    #[must_use]
+    pub fn server_hostname(&self, idx: usize) -> Option<Box<str>> {
+        self.server_srv_fqdn(idx).or_else(|| self.server_fqdn(idx).map(Box::from))
+    }
+
+    /// `set server fqdn`: the name `srv_fqdn` shows from now on (no flag yet).
+    pub fn set_server_hostname(&self, idx: usize, v: &str) {
+        if let Some(slots) = &self.ids.server_srv {
+            slots.set_name(idx, Some(v));
+        }
+    }
+
+    /// Raises `SRV_ADMF_FQDN_CHANGED` for the server at `idx`.
+    pub fn mark_server_fqdn_changed(&self, idx: usize) {
+        if let Some(c) = self.ids.server_srv.as_ref().and_then(|v| v.changed.get(idx)) {
+            c.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// The `port` keyword of the server at `idx`, 0 without one (`srv_agent_port`).
     #[must_use]
     pub fn server_check_port(&self, idx: usize) -> u16 {
