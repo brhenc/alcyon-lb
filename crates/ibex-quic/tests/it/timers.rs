@@ -106,3 +106,160 @@ fn expiry_visits_only_the_expired() {
     let polls = s.timeout_polls() - before;
     assert!(polls < 60 * u64::try_from(n).expect("n"), "{polls} queries for {n} connections");
 }
+
+/// One exchange at `now`: the client's datagrams to the server, the server's back, both sides'
+/// timers and endpoint events.
+fn exchange(now: Instant, s: &mut QuicEndpoint, ep: &mut quinn_proto::Endpoint, ch: quinn_proto::ConnectionHandle, c: &mut quinn_proto::Connection) {
+    let mut out = Vec::new();
+    while let Some(t) = c.poll_transmit(now, 1, &mut out) {
+        s.handle_datagram(now, from(0), None, &out[..t.size]).expect("datagram");
+        out.clear();
+    }
+    if s.poll_timeout().is_some_and(|t| t <= now) {
+        s.handle_timeout(now);
+    }
+    let mut buf = vec![0u8; 65535];
+    while let Some(t) = s.poll_transmit(now, &mut buf) {
+        let mut resp = Vec::new();
+        if let Some(quinn_proto::DatagramEvent::ConnectionEvent(_, e)) = ep.handle(now, SERVER, None, None, bytes::BytesMut::from(&buf[..t.size]), &mut resp) {
+            c.handle_event(e);
+        }
+    }
+    if c.poll_timeout().is_some_and(|t| t <= now) {
+        c.handle_timeout(now);
+    }
+    while let Some(e) = c.poll_endpoint_events() {
+        if let Some(ce) = ep.handle_event(ch, e) {
+            c.handle_event(ce);
+        }
+    }
+    while c.poll().is_some() {}
+}
+
+/// T543: the endpoint asks quinn for a packet only from a connection something happened to
+/// since it last had nothing to send (a datagram, a timer, a stream call). Before, every
+/// `poll_transmit` asked every connection: the h3 listener drains transmits ~8 times a
+/// request, and quinn's empty `poll_transmit` re-checks every space, path and queue each time.
+#[test]
+fn a_quiet_connection_is_not_asked_for_a_packet() {
+    let mut s = server();
+    let (mut ep, cfg) = create_client_endpoint();
+    let mut now = Instant::now();
+    let (ch, mut c) = ep.connect(now, (*cfg).clone(), SERVER, "localhost").expect("connect");
+    for _ in 0..50 {
+        if !c.is_handshaking() {
+            break;
+        }
+        exchange(now, &mut s, &mut ep, ch, &mut c);
+        now += Duration::from_millis(1);
+    }
+    assert!(!c.is_handshaking(), "no handshake");
+    for _ in 0..3 {
+        exchange(now, &mut s, &mut ep, ch, &mut c);
+        now += Duration::from_millis(1);
+    }
+    let mut buf = vec![0u8; 65535];
+    while s.poll_transmit(now, &mut buf).is_some() {}
+    let before = s.transmit_polls();
+    for _ in 0..10 {
+        assert!(s.poll_transmit(now, &mut buf).is_none(), "nothing to send");
+    }
+    assert_eq!(s.transmit_polls() - before, 0, "a quiet connection was asked for a packet");
+    // A stream write makes it worth asking again, and the data goes out.
+    let id = c.streams().open(quinn_proto::Dir::Bi).expect("open");
+    c.send_stream(id).write(b"x").expect("write");
+    exchange(now, &mut s, &mut ep, ch, &mut c);
+    // The endpoint accepts the stream itself and reports it.
+    let mut opened = None;
+    while let Some(ev) = s.poll_event() {
+        if let ibex_quic::transport::TransportEvent::StreamOpened { conn_id, stream_id, .. } = ev {
+            opened = Some((conn_id, stream_id));
+        }
+    }
+    let (conn_id, sid) = opened.expect("stream opened event");
+    while s.poll_transmit(now, &mut buf).is_some() {}
+    let before = s.transmit_polls();
+    s.write_stream(conn_id, sid, b"y", false).expect("write");
+    let t = s.poll_transmit(now, &mut buf);
+    assert!(t.is_some(), "the write goes out");
+    assert!(s.transmit_polls() - before >= 1);
+}
+
+/// A handshaken connection with one stream the server has written to and whose packets were
+/// all dropped; the client then goes silent. Returns the server, the time, and the server's
+/// connection count.
+fn silent_client_after_a_dropped_write() -> (QuicEndpoint, Instant) {
+    let mut s = server();
+    let (mut ep, cfg) = create_client_endpoint();
+    let mut now = Instant::now();
+    let (ch, mut c) = ep.connect(now, (*cfg).clone(), SERVER, "localhost").expect("connect");
+    for _ in 0..50 {
+        if !c.is_handshaking() {
+            break;
+        }
+        exchange(now, &mut s, &mut ep, ch, &mut c);
+        now += Duration::from_millis(1);
+    }
+    assert!(!c.is_handshaking(), "no handshake");
+    let id = c.streams().open(quinn_proto::Dir::Bi).expect("open");
+    c.send_stream(id).write(b"GET").expect("write");
+    for _ in 0..3 {
+        exchange(now, &mut s, &mut ep, ch, &mut c);
+        now += Duration::from_millis(1);
+    }
+    let mut opened = None;
+    while let Some(ev) = s.poll_event() {
+        if let ibex_quic::transport::TransportEvent::StreamOpened { conn_id, stream_id, .. } = ev {
+            opened = Some((conn_id, stream_id));
+        }
+    }
+    let (conn_id, sid) = opened.expect("stream opened event");
+    s.write_stream(conn_id, sid, b"response", true).expect("write");
+    let mut buf = vec![0u8; 65535];
+    let mut dropped = 0;
+    while s.poll_transmit(now, &mut buf).is_some() {
+        dropped += 1;
+    }
+    assert!(dropped > 0, "the response was sent (and dropped)");
+    (s, now)
+}
+
+/// T543 (T5, `to_poll`): a connection that receives nothing is still driven by its timers.
+/// Its dropped response is sent again once its probe timeout fires, with no datagram from
+/// the client in between.
+#[test]
+fn a_silent_connection_retransmits_after_its_probe_timeout() {
+    let (mut s, now) = silent_client_after_a_dropped_write();
+    let mut buf = vec![0u8; 65535];
+    let deadline = s.poll_timeout().expect("a loss-recovery deadline");
+    assert!(deadline > now);
+    assert!(s.poll_transmit(deadline.checked_sub(Duration::from_micros(1)).expect("after the epoch"), &mut buf).is_none(), "nothing before the timeout");
+    s.handle_timeout(deadline);
+    assert!(s.poll_transmit(deadline, &mut buf).is_some(), "no retransmission after the probe timeout");
+}
+
+/// T543 (T5): a connection that receives nothing closes at its idle timeout, its probes sent
+/// (and dropped) along the way.
+#[test]
+fn a_silent_connection_closes_at_its_idle_timeout() {
+    let (mut s, now) = silent_client_after_a_dropped_write();
+    let mut buf = vec![0u8; 65535];
+    let mut t = now;
+    let mut probes = 0;
+    for _ in 0..200 {
+        if s.connection_count() == 0 {
+            break;
+        }
+        let Some(next) = s.poll_timeout() else { break };
+        t = next.max(t);
+        s.handle_timeout(t);
+        while s.poll_transmit(t, &mut buf).is_some() {
+            probes += 1;
+        }
+    }
+    assert_eq!(s.connection_count(), 0, "still open at {:?}", t - now);
+    assert!(probes > 0, "no probe sent while waiting");
+    let idle = t - now;
+    assert!(idle >= Duration::from_secs(1), "closed after {idle:?}, before any idle timeout");
+    println!("[MEASUREMENT T543] silent connection: {probes} probes, closed after {idle:?}");
+}

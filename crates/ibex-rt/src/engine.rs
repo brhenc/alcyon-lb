@@ -108,10 +108,15 @@ pub struct SrvPoolCfg {
     pub max_conn: i32,
     pub low_conn: u32,
     pub purge_delay_ms: u32,
+    /// `proto h2` in `mode http`: the server's connections speak h2 (T540). Here, with the
+    /// other per-connection settings, because `Proxy`'s size is bounded (`struct_sizes.rs`).
+    pub h2: bool,
+    /// `max-reuse`: an h2 connection is reused this many times (-1: no limit).
+    pub max_reuse: i32,
 }
 
 impl SrvPoolCfg {
-    pub const DEFAULT: Self = Self { max_conn: -1, low_conn: 0, purge_delay_ms: 5000 };
+    pub const DEFAULT: Self = Self { max_conn: -1, low_conn: 0, purge_delay_ms: 5000, h2: false, max_reuse: -1 };
 
     /// Whether the server keeps idle connections at all.
     fn keeps_any(self) -> bool {
@@ -756,7 +761,7 @@ mod shared_pool_tests {
         IdleKey { srv: (0, 0), addr: "127.0.0.1:1".parse().unwrap(), name: None }
     }
 
-    const CFG: SrvPoolCfg = SrvPoolCfg { max_conn: -1, low_conn: 0, purge_delay_ms: 500 };
+    const CFG: SrvPoolCfg = SrvPoolCfg { max_conn: -1, low_conn: 0, purge_delay_ms: 500, h2: false, max_reuse: -1 };
 
     /// A connection worker 0 released is taken by worker 1 when shared, not when not, nor
     /// when `pool-low-conn` forbids it; worker 0's lock held a while is waited for (T224).
@@ -1056,7 +1061,7 @@ mod pool_tests {
         IdleKey { srv: (0, 0), addr: "127.0.0.1:1".parse().unwrap(), name: None }
     }
 
-    const CFG: SrvPoolCfg = SrvPoolCfg { max_conn: -1, low_conn: 0, purge_delay_ms: 500 };
+    const CFG: SrvPoolCfg = SrvPoolCfg { max_conn: -1, low_conn: 0, purge_delay_ms: 500, h2: false, max_reuse: -1 };
 
     /// HAProxy, eight connections idle after a burst of eight, `pool-purge-delay 500`:
     /// nothing is closed at the first two purges, then 3, 3 and 2 (the estimate 8, 8, 4, 2,
@@ -1111,11 +1116,12 @@ mod pool_tests {
     }
 }
 
-/// The idle connection settings of each server of a proxy; empty when all are the defaults.
-fn pool_cfgs(servers: &[ibex_config::Server]) -> Vec<SrvPoolCfg> {
+/// The idle connection settings of each server of a proxy, and its `proto h2` in `mode http`
+/// (`mode_http`); empty when all are the defaults.
+fn pool_cfgs(servers: &[ibex_config::Server], mode_http: bool) -> Vec<SrvPoolCfg> {
     let cfg = |s: &ibex_config::Server| {
         let p = s.pool.as_deref().copied().unwrap_or_default();
-        SrvPoolCfg { max_conn: p.max_conn, low_conn: p.low_conn, purge_delay_ms: p.purge_delay }
+        SrvPoolCfg { max_conn: p.max_conn, low_conn: p.low_conn, purge_delay_ms: p.purge_delay, h2: mode_http && s.proto_h2, max_reuse: p.max_reuse }
     };
     if servers.iter().all(|s| cfg(s) == SrvPoolCfg::DEFAULT) {
         Vec::new()
@@ -1138,8 +1144,14 @@ fn attach_server_to(
     now: Tick,
 ) {
     let tls = s_idx.and_then(|i| proxies.get(be_idx).and_then(|p| p.server_tls.get(i)).and_then(Option::as_ref));
+    // `proto h2`: h2 from the first byte, over TLS whatever ALPN selects (T540).
+    let h2 = s_idx.is_some_and(|i| proxies.get(be_idx).is_some_and(|p| p.ids.server_pool(i).h2));
     let Some(tls) = tls else {
-        sess.attach_server(srv_fd, now);
+        if h2 {
+            attach_h2(sess, srv_fd, crate::xprt::ServerXprt::Plain, now);
+        } else {
+            sess.attach_server(srv_fd, now);
+        }
         return;
     };
     let (fe, be) = (&proxies[fe_idx], &proxies[be_idx]);
@@ -1165,7 +1177,37 @@ fn attach_server_to(
             }
         });
     }
+    if h2 {
+        attach_h2(sess, srv_fd, xprt, now);
+        return;
+    }
     sess.attach_server_with_xprt(srv_fd, xprt, now);
+}
+
+/// What the HTTP/1.1 text of an h2 server's response head `head` holds that `HAProxy`'s HTX of
+/// it does not, for `%B`: the reason phrase (h2 has none: measured 49 bytes logged where an
+/// h1 server's same response logs 51) and, for the `transfer-encoding: chunked` the codec
+/// adds to a response without a length, 25 bytes (measured: nghttpd `--no-content-length`,
+/// 19, 1000 and 40000-byte bodies, `HAProxy` logs 25 bytes fewer than Ibex counts with the
+/// field in). An h2 server cannot send that field (the codec refuses it), so one in the text
+/// is the codec's.
+fn h2_htx_overcount(head: &[u8]) -> u64 {
+    let first = head.split(|&b| b == b'\n').next().unwrap_or_default();
+    let reason = first.splitn(3, |&b| b == b' ').nth(2).map_or(0, |r| r.strip_suffix(b"\r").unwrap_or(r).len());
+    let te = if head.windows(28).any(|w| w == b"\ntransfer-encoding: chunked\r") { 25 } else { 0 };
+    reason as u64 + te
+}
+
+/// Attaches a `proto h2` connection: `xprt` under the h2 layer. Without memory for its codec
+/// the connection fails as a connect failure does.
+fn attach_h2(sess: &mut TcpSession, srv_fd: OwnedFd, xprt: crate::xprt::ServerXprt, now: Tick) {
+    match xprt.into_h2() {
+        Ok(x) => sess.attach_server_with_xprt(srv_fd, x, now),
+        Err(_) => {
+            sess.attach_server(srv_fd, now);
+            sess.srv_state = ScState::Error;
+        }
+    }
 }
 
 /// The SNI a request on `sess` would send to `proxies[be_idx].servers.at(s_idx)`, for the
@@ -4244,7 +4286,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
             server_srv: crate::resolvers::SrvSlots::new(listen.servers.len(), &listen.server_extras),
             server_check_ports: server_check_ports(&listen.servers),
             listener_ids: ibex_config::ast::listener_ids(&listen.binds),
-            server_pool: pool_cfgs(&listen.servers),
+            server_pool: pool_cfgs(&listen.servers, listen.mode == Mode::Http),
             http_mode: listen.http_mode,
             persist: listen.persist,
             checkcache: listen.checkcache,
@@ -4542,7 +4584,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
             server_srv: crate::resolvers::SrvSlots::new(be.servers.len(), &be.server_extras),
             server_check_ports: server_check_ports(&be.servers),
             listener_ids: Vec::new(),
-            server_pool: pool_cfgs(&be.servers),
+            server_pool: pool_cfgs(&be.servers, be.mode == Mode::Http),
             http_mode: be.http_mode,
             persist: be.persist,
             checkcache: be.checkcache,
@@ -4657,6 +4699,7 @@ fn server_check_configs(servers: &[ibex_config::ast::Server], check_timeout: Opt
                 cfg.inter = inter;
             }
             cfg.check_port = s.check_port;
+            cfg.h2 = s.check_proto.map_or(s.proto_h2, |p| p == "h2");
             cfg.fastinter_ms = s.fastinter_ms();
             cfg.downinter_ms = s.downinter_ms();
             if let Some(fall) = s.fall {
@@ -8699,9 +8742,13 @@ fn release_server(
             && !entry.sess.send_proxy_prepended
             // A TLS session goes to the pool with its socket, once it is established.
             && entry.sess.srv_xprt.is_ready()
-            && proxies
-                .get(entry.srv_backend_idx)
-                .is_some_and(|p| p.http_reuse != ibex_config::HttpReuse::Never);
+            // An h2 connection with no stream open and no GOAWAY (T540).
+            && entry.sess.srv_xprt.reusable()
+            && proxies.get(entry.srv_backend_idx).is_some_and(|p| {
+                p.http_reuse != ibex_config::HttpReuse::Never
+                    // An h2 connection is its session's under `safe` (T540, `session_add_conn`).
+                    && !(p.http_reuse == ibex_config::HttpReuse::Safe && entry.sess.srv_xprt.is_h2())
+            });
         // Whether the server closes it later is an event on it while it is idle
         // (`IdlePool::idle_event`): nothing is probed, here or when it is taken (T434).
         // The pool is keyed by server; a server that maps the destination may have been
@@ -8732,7 +8779,11 @@ fn release_server(
             }
             entry.srv_interest = Interest::NONE;
             fdtab.set_idle(sfd);
-            if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt }, entry.srv_served >= 2, cfg, used, Instant::now()) {
+            // An h2 connection is one a first request may take under `aggressive` from its
+            // first response on: `HAProxy` keeps it in the server's available list (A.3 row 7,
+            // 1 connection for 5 clients one after the other; T540).
+            let safe = entry.srv_served >= 2 || xprt.is_h2();
+            if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt }, safe, cfg, used, Instant::now()) {
                 // Closing its only descriptor takes it out of the epoll set.
                 fdtab.remove(sfd);
                 conn.close();
@@ -10295,7 +10346,10 @@ impl EngineDispatcher<'_> {
                     Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Connect)) => 503,
                     _ => 502,
                 };
-                if status == 502 && txn.srv_reused && entry.sess.rep.is_empty() {
+                // An h2 server's malformed response is the server's fault, not a lost
+                // connection: `PH--` whether or not it was reused (T540).
+                let bad = entry.sess.srv_xprt.bad_response();
+                if status == 502 && txn.srv_reused && entry.sess.rep.is_empty() && !bad {
                     // `abort_keep_alive`: a keep-alive request lost to a network error,
                     // nothing of a response received. The client retries only if it
                     // sees the connection close unanswered.
@@ -10314,8 +10368,9 @@ impl EngineDispatcher<'_> {
                     return;
                 }
                 if status == 502 {
-                    // The server ended the connection before its response head: `SH`.
-                    entry.sess.log.term = Some(*b"SH");
+                    // The server ended the connection before its response head: `SH`; an h2
+                    // server's malformed head: `PH`, as `HAProxy` logs it.
+                    entry.sess.log.term = Some(if bad { *b"PH" } else { *b"SH" });
                 }
                 entry.sess.rep.clear();
                 reply_error(entry, proxies, status);
@@ -10383,7 +10438,18 @@ impl EngineDispatcher<'_> {
         if leftover {
             entry.sess.rep.clear();
         }
-        let reusable = (txn.srv_reusable || txn.keeps_srv) && (!txn.local || txn.keeps_srv) && !leftover && txn.req.is_done() && txn.rsp.is_done();
+        // An h2 connection only with no stream open and no GOAWAY (T540).
+        let reusable = (txn.srv_reusable || txn.keeps_srv)
+            && (!txn.local || txn.keeps_srv)
+            && !leftover
+            && txn.req.is_done()
+            && txn.rsp.is_done()
+            && entry.sess.srv_xprt.reusable()
+            // `max-reuse`, on h2 only (`HAProxy`: 2 gives connections of 3 streams; ignored on h1).
+            && entry.sess.srv_xprt.h2_streams().is_none_or(|n| {
+                let max = entry.target_server_idx.and_then(|i| proxies.get(entry.srv_backend_idx).map(|p| p.ids.server_pool(i).max_reuse));
+                max.is_none_or(|m| m < 0 || i64::from(n) <= i64::from(m))
+            });
         if reusable {
             entry.srv_served = (entry.srv_served + 1).min(2);
         }
@@ -10410,8 +10476,12 @@ impl EngineDispatcher<'_> {
         // Under `http-reuse never` the connection is the session's own (`session_add_conn`)
         // and stays on it; so does one opened with a PROXY header, whose reuse key is the
         // header (it names this client's addresses), which the pool does not key by.
+        // So is an h2 server connection under `safe` (`MX_FL_HOL_RISK` -> `session_add_conn`,
+        // `backend.c`: measured, 26 server connections for 26 client sessions, T533).
         let private = entry.sess.send_proxy_prepended
-            || proxies.get(entry.srv_backend_idx).is_some_and(|p| p.http_reuse == ibex_config::HttpReuse::Never);
+            || proxies.get(entry.srv_backend_idx).is_some_and(|p| {
+                p.http_reuse == ibex_config::HttpReuse::Never || (p.http_reuse == ibex_config::HttpReuse::Safe && entry.sess.srv_xprt.is_h2())
+            });
         // A request the proxy answered itself never took the connection attached to the
         // session (`bc_idle`, set at the previous transaction's end and cleared where a request
         // connects or takes it back): HAProxy leaves it where it is, parked or in the idle
@@ -11457,6 +11527,7 @@ impl EngineDispatcher<'_> {
                 return;
             }
         }
+        let h2_less = if entry.sess.srv_xprt.is_h2() { h2_htx_overcount(&entry.sess.rep.readable()[..total_hdr_len]) } else { 0 };
         let Some(txn) = entry.sess.txn.as_mut() else {
             return;
         };
@@ -11477,7 +11548,7 @@ impl EngineDispatcher<'_> {
         if wait.is_none() {
             entry.sess.log.data = Some(crate::txnlog::loop_now());
             // What `%B` counts of this head: the message as the server sent it.
-            txn.rsp_htx = held.as_deref().map_or(rsp_htx, |h| crate::txn::htx_head_size(h, false));
+            txn.rsp_htx = held.as_deref().map_or(rsp_htx, |h| crate::txn::htx_head_size(h, false)).map(|n| n.saturating_sub(h2_less));
         }
         let fe_caps = &proxies[fe_idx].res_capture_slots;
         if wait.is_none() && !fe_caps.is_empty() {
@@ -13903,7 +13974,9 @@ impl EngineDispatcher<'_> {
             // lists after each response and the next request takes one by the mode's rules;
             // while the lists hold nothing else, and the server keeps idle connections at
             // all (`pool-max-conn`, `pool-purge-delay`), that is this one, and the round trip is skipped.
+            // An h2 connection under `safe` is the session's own, as under `never` (T540).
             let alone = proxies[be_idx].http_reuse == ibex_config::HttpReuse::Never
+                || (proxies[be_idx].http_reuse == ibex_config::HttpReuse::Safe && entry.sess.srv_xprt.is_h2())
                 || (idle_pool.is_empty()
                     && cookie_server
                         .or(entry.target_server_idx)

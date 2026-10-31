@@ -12,6 +12,7 @@
 //! - [`PoolRegistry`]: Registry for pool tracking and `HAProxy`-compatible `show pools` CLI dumps.
 
 pub mod arena;
+pub mod headroom;
 pub use arena::{Arena, ArenaStats};
 pub mod pool;
 pub mod zero_on_free;

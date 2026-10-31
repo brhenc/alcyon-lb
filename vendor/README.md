@@ -52,3 +52,67 @@ From the fork, not from here (it has the test vectors):
 `Cargo.lock`s, copy over `vendor/ringibex` and `vendor/rustls-ringibex`, apply the three changes
 above (or drop the ones the fork now carries), update the commit here, then
 `cargo build --offline -p ibex-tls` and `cargo test -p ibex-tls --test it crypto_provider::`.
+
+## `quinn-proto` (T542)
+
+The QUIC state machine under `ibex-quic` (and quinn's rustls 0.23 test clients in the dev-deps of
+`ibex-proto`, `ibex-quic` and `ibex-rt`), vendored to patch it (user, 2026-10-31). The root
+`Cargo.toml` takes it for the whole graph with `[patch.crates-io] quinn-proto = { path =
+"vendor/quinn-proto" }`; the crates keep asking for `quinn-proto = "0.11"` with their own
+features (`default-features = false`; the dev-deps add `rustls-ring`).
+
+- **Source:** crates.io `quinn-proto` 0.11.18, the `.crate` package as published
+  (sha256 `a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc`, the `Cargo.lock`
+  checksum before vendoring; upstream git `eaec0db4bcb698f76df736d89938743c88a2ad5f`, from
+  `.cargo_vcs_info.json`). Pure Rust; no C, no build script.
+- **Left out:** the package's `Cargo.lock` (the root one is used). Everything else is as
+  published, `Cargo.toml` (normalised by cargo) and `Cargo.toml.orig` included.
+- **Licences:** `LICENSE-APACHE`, `LICENSE-MIT` (quinn's, `MIT OR Apache-2.0`).
+
+### Changes made here
+
+The first vendor commit is the pristine 0.11.18; each change below is its own commit on top
+(`git log -- vendor/quinn-proto`), each a diff that could go upstream as it is. None has.
+
+1. `src/frame.rs`, `Iter::try_next`: a run of PADDING bytes is one `Frame::Padding` (was one
+   per byte). RFC 9000 19.1: PADDING has no content, so a run is equivalent. h2load and browsers
+   pad each request packet to ~1200 bytes: ~1150 `next()` calls per packet were half of Ibex's
+   h3 per-request instructions (T539). Test: `frame::test::padding_run_is_one_frame`.
+2. `src/connection/streams/{state,send,recv,mod}.rs`, `send_buffer.rs`, `range_set/btree_range_set.rs`
+   (T543, e0e30bee): a connection reuses its freed stream state. A freed `Send` is reset
+   (`Send::free`/`reinit`, `SendBuffer::reinit`, `RangeSet::clear` popping so the `BTreeMap`
+   root node stays) and kept on a per-connection `free_send` list; a freed `Recv` is taken from
+   `free_recv` at the stream's first use, not when its slot is made available (the list was
+   empty for the first ~100 streams). Both lists are bounded by the most streams the connection
+   had open at once and are freed with it. 3.9 -> 1.1 allocations per h3 request.
+3. `src/connection/send_buffer.rs` `ack` (T543, 875596f0): the segment deque shrinks only above
+   16 entries (`RETAINED_SEGMENTS`, 512 bytes) and not below; it was freed whenever the last
+   ACK emptied it and allocated again on the next write. 1.1 -> 0.08.
+4. `src/connection/{mod,spaces,packet_builder}.rs` (T543, 816391ad): up to 8 emptied
+   `Retransmits` boxes per connection (`spare_retransmits`); each packet starts with one, an
+   unused one goes back in `finish_and_track`, an acked or lost packet's is emptied and kept.
+   0.08 -> 0. Pinned by `crates/ibex-rt/tests/request_allocations_h3.rs` (GET and POST: 0).
+5. `src/frame.rs` `zero_run` (T543, 013efdec): the end of a PADDING run is found 32 bytes a
+   step (an OR-fold the compiler vectorises), not with a byte-at-a-time `position`. Test:
+   `frame::test::zero_run_finds_the_first_nonzero_byte`.
+6. `src/connection/spaces.rs` `Retransmits::is_empty` (T543, ff26c231): the two stream sets'
+   lengths are checked before iterating them (an emptied hashbrown set scans every bucket).
+   No behaviour change. Items 5 and 6 with Ibex's `ConnectionId` hash (57b26eff): h3c1
+   121.8k -> 113.0k ins/req at 1.5 client datagrams per request (T543 progress, batch 4).
+
+### Running quinn-proto's own tests
+
+`tools/quinn-proto-tests.sh [filter]` runs its unit tests (`--lib`, 181 of them) offline, on a
+copy in /tmp: `assert_matches` and `hex-literal` (not in the registry cache) are replaced by
+local shims, `fastbloom` (feature `bloom`) and the other uncached optional dependencies are
+taken out, and `src/tests/` (the end-to-end suite: needs `rcgen` 0.14, not cached) is not
+built. With network access, upstream's full suite runs from a quinn checkout.
+
+### Updating to a new release
+
+Extract the new `.crate` (`~/.cargo/registry/cache/*/quinn-proto-<v>.crate`, after a
+`cargo fetch` of it) over `vendor/quinn-proto/` in one commit (drop its `Cargo.lock`; update
+the sha256 and git sha above), then reapply the changes above one commit each
+(`git format-patch` of each change commit, `git am`), dropping those upstream now carries.
+Then `cargo build --offline --workspace`, `tools/quinn-proto-tests.sh`, and the ibex-quic,
+ibex-proto h3 and ibex-rt h3 tests.

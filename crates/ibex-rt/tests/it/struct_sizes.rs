@@ -39,8 +39,9 @@ fn server_check_state_stays_small() {
     let n = size_of::<ibex_rt::check::ServerCheckState>();
     // 440 before T304, which moved the state of a running check into `CheckRun` (held only
     // while the check runs), shares the check parameters per backend, and keeps the indexes
-    // as `u32`.
-    assert!(n <= 200, "ServerCheckState grew to {n} bytes (bound 200): one is held per checked server, box the new field or put it in CheckRun");
+    // as `u32`. T540 added 8: `ServerXprt`'s third variant (`H2`) costs it a tag; two boxes
+    // leave no niche.
+    assert!(n <= 208, "ServerCheckState grew to {n} bytes (bound 208): one is held per checked server, box the new field or put it in CheckRun");
 }
 
 /// A session is held for every client connection, idle ones included, in the worker's
@@ -53,8 +54,11 @@ fn server_check_state_stays_small() {
 /// T489 added 8: `TcpSession::dr_wait`, a `u32` (the waiting `tcp-request content do-resolve`
 /// rule and its cache mark, packed); no padding was left, and a box would be 8 as well and an
 /// allocation per wait.
+/// T540 added 8: `ServerXprt::H2` (HTTP/2 to servers), a third variant that costs the enum a
+/// tag, two boxes leaving no niche; boxing the transport itself would be an allocation per
+/// server connection.
 #[test]
 fn session_entry_stays_small() {
     let n = size_of::<ibex_rt::engine::SessionEntry>();
-    assert!(n <= 1648, "SessionEntry grew to {n} bytes (bound 1648): one is held per client connection, box the new field");
+    assert!(n <= 1656, "SessionEntry grew to {n} bytes (bound 1656): one is held per client connection, box the new field");
 }

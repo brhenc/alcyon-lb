@@ -144,6 +144,11 @@ impl Drop for Ibex {
 /// An ibex with a QUIC bind to the backend, `frontend_extra` lines in the frontend, and
 /// every request logged as `B=%B U=%U r=%r` to the UDP socket `log`.
 fn ibex(be: SocketAddr, frontend_extra: &str) -> Ibex {
+    ibex_srv(be, frontend_extra, "")
+}
+
+/// As `ibex`, with `server_extra` on the server line (`proto h2`).
+fn ibex_srv(be: SocketAddr, frontend_extra: &str, server_extra: &str) -> Ibex {
     let tcp = common::reserve_addr();
     let quic = common::reserve_addr();
     let log = UdpSocket::bind("127.0.0.1:0").expect("log socket");
@@ -155,7 +160,7 @@ fn ibex(be: SocketAddr, frontend_extra: &str) -> Ibex {
         "global\n    nbthread 1\ndefaults\n    mode http\n    timeout client 5s\n    timeout server 5s\n    \
          timeout connect 1s\nfrontend f\n    bind {tcp}\n    bind quic4@{quic} ssl crt {crt} alpn h3\n    \
          log {} local0\n    log-format \"B=%B U=%U r=%r\"\n    {frontend_extra}\n    default_backend b\n\
-         backend b\n    http-reuse never\n    server s {be}\n",
+         backend b\n    http-reuse never\n    server s {be} {server_extra}\n",
         log.local_addr().expect("log addr")
     )
     .expect("write cfg");
@@ -572,4 +577,24 @@ fn extended_connect_is_a_message_error() {
 #[test]
 fn a_te_other_than_trailers_is_a_message_error() {
     mux(|| rejected_then_served(&request(b"GET", b"/x", &[(b"te", b"gzip")]), MESSAGE_ERROR));
+}
+
+/// T549: a response trailer from an HTTP/2 server (nghttpd `--trailer`, behind `proto h2`)
+/// reaches an h3 client as a trailing HEADERS frame with the FIN.
+#[test]
+fn response_trailers_from_an_h2_server_reach_the_h3_client() {
+    if !crate::server_h2::have_nghttpd() {
+        return;
+    }
+    mux(|| {
+        let srv = crate::server_h2::nghttpd(false, &["--trailer=grpc-status: 0", "--no-content-length"]);
+        let ibex = ibex_srv(srv.addr, "", "proto h2");
+        let mut cl = Client::connect(ibex.quic);
+        let id = cl.open(&request(b"GET", b"/index.html", &[]), true);
+        let r = cl.response(id, WAIT);
+        let shape = r.shape();
+        assert!(shape.first().is_some_and(|h| h.starts_with("H :status: 200")), "{r:?}");
+        assert_eq!(shape.last().map(String::as_str), Some("H grpc-status: 0"), "the trailing HEADERS frame: {r:?}");
+        assert!((r.fin, r.reset, r.lost.as_deref()) == (true, None, None), "{r:?}");
+    });
 }

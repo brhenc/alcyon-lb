@@ -1261,7 +1261,7 @@ impl TcpSession {
     /// Whether the server connection is TLS and its handshake is not done yet.
     #[must_use]
     pub fn srv_tls_handshaking(&self) -> bool {
-        matches!(&self.srv_xprt, ServerXprt::Tls(t) if !t.handshake_done())
+        self.srv_xprt.is_tls() && !self.srv_xprt.is_ready()
     }
 
     /// The end of the session: whatever TLS connection is still open says `close_notify` before
@@ -3256,7 +3256,7 @@ impl TcpSession {
             }
         }
         let mut head_gone = false;
-        if self.srv_state.can_write() && (window > 0 || self.srv_xprt.wants_write()) {
+        if self.srv_state.can_write() && ((window > 0 && !self.srv_xprt.send_blocked()) || self.srv_xprt.wants_write()) {
             let r = {
                 let sfd = self
                     .srv
@@ -3311,7 +3311,9 @@ impl TcpSession {
                     Err(e) if e.kind() == io::ErrorKind::InvalidData && self.srv_xprt.is_ready() => Io::Closed,
                     r => r?,
                 };
-                self.srv_cant_recv = self.mode == Mode::Http && !self.srv_xprt.is_tls() && drained(r, asked);
+                // Not for h2 either: the codec may hold frames that a full response text
+                // left unread, which no socket event announces.
+                self.srv_cant_recv = self.mode == Mode::Http && !self.srv_xprt.is_tls() && !self.srv_xprt.is_h2() && drained(r, asked);
                 r
             };
             match r {
@@ -3699,7 +3701,7 @@ impl TcpSession {
             },
             ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW => Want {
                 read: self.srv_state.can_read() && !self.rep.is_full() && self.reads_server(),
-                write: self.srv_state.can_write() && (self.req_window() > 0 || self.srv_xprt.wants_write()),
+                write: self.srv_state.can_write() && ((self.req_window() > 0 && !self.srv_xprt.send_blocked()) || self.srv_xprt.wants_write()),
             },
             _ => Want::default(),
         };

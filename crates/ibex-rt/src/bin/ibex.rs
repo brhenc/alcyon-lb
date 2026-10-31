@@ -1162,7 +1162,10 @@ fn main() {
         let ready_tx = ready_tx.clone();
         let worker_go = std::sync::Arc::clone(&go);
 
-        let spawned = std::thread::Builder::new().name(format!("ibex-w{worker_id}")).spawn(move || {
+        // The stack and std's alternative signal stack, probed together: a spawn that maps the
+        // stack and then fails the second aborts in std (T540's gate, `-m 6`).
+        let worker_stack = std::env::var("RUST_MIN_STACK").ok().and_then(|s| s.parse().ok()).unwrap_or(2 * 1024 * 1024);
+        let spawned = ibex_alloc::headroom::thread_fits(worker_stack).and_then(|()| std::thread::Builder::new().name(format!("ibex-w{worker_id}")).spawn(move || {
             // Before the ready message, so before the chroot: it opens this thread's
             // /proc/thread-self/schedstat.
             ibex_rt::watchdog::register(worker_id);
@@ -1222,7 +1225,7 @@ fn main() {
                 ibex_rt::stderr_line!("Engine error (worker {}): {}", worker_id, err);
                 process::exit(1);
             }
-        });
+        }));
         match spawned {
             Ok(t) => threads.push(t),
             Err(e) => {
