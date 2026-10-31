@@ -105,6 +105,60 @@ fn start_backend(listener: TcpListener, tls: Option<Arc<rustls::ServerConfig>>, 
     })
 }
 
+/// An h2c server (`proto h2`, T540): every request stream answered `:status 200`,
+/// `content-length: 2`, `ok`; one thread per connection.
+fn start_h2c_backend(listener: TcpListener, running: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    fn frame(out: &mut Vec<u8>, typ: u8, flags: u8, id: u32, payload: &[u8]) {
+        out.extend_from_slice(&u32::try_from(payload.len()).unwrap_or(0).to_be_bytes()[1..]);
+        out.extend_from_slice(&[typ, flags]);
+        out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+    thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking");
+        while running.load(Ordering::Relaxed) {
+            let Ok((mut s, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            s.set_nonblocking(false).expect("blocking");
+            let running = Arc::clone(&running);
+            thread::spawn(move || {
+                let mut pre = [0u8; 24];
+                if s.read_exact(&mut pre).is_err() {
+                    return;
+                }
+                let mut out = Vec::new();
+                frame(&mut out, 4, 0, 0, &[]);
+                let _ = s.write_all(&out);
+                while running.load(Ordering::Relaxed) {
+                    let mut h = [0u8; 9];
+                    if s.read_exact(&mut h).is_err() {
+                        return;
+                    }
+                    let len = usize::from(h[0]) << 16 | usize::from(h[1]) << 8 | usize::from(h[2]);
+                    let id = u32::from_be_bytes([h[5], h[6], h[7], h[8]]) & 0x7fff_ffff;
+                    let mut p = vec![0u8; len];
+                    if s.read_exact(&mut p).is_err() {
+                        return;
+                    }
+                    let mut out = Vec::new();
+                    if h[3] == 4 && h[4] & 1 == 0 {
+                        frame(&mut out, 4, 1, 0, &[]);
+                    }
+                    if (h[3] == 1 || h[3] == 0) && h[4] & 1 != 0 && id != 0 {
+                        frame(&mut out, 1, 4, id, &[0x88, 0x0f, 0x0d, 0x01, b'2']);
+                        frame(&mut out, 0, 1, id, b"ok");
+                    }
+                    if !out.is_empty() && s.write_all(&out).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    })
+}
+
 trait ReadWrite: Read + Write + Send {}
 impl<T: Read + Write + Send> ReadWrite for T {}
 
@@ -116,6 +170,11 @@ const WARM_UP: usize = 50;
 /// after `WARM_UP` requests (the handshake among them). `backend_tls`: the server line
 /// speaks TLS too (`ssl verify none`).
 fn tls_keepalive_allocations(n: usize, backend_tls: bool) -> usize {
+    keepalive_allocations(n, backend_tls, false)
+}
+
+/// [`tls_keepalive_allocations`]; with `h2c`, the server line is `proto h2` to an h2c server.
+fn keepalive_allocations(n: usize, backend_tls: bool, h2c: bool) -> usize {
     let (pem, der, key) = cert();
     let dir = tempfile::tempdir().expect("tempdir");
     let crt = dir.path().join("fe.pem");
@@ -135,8 +194,14 @@ fn tls_keepalive_allocations(n: usize, backend_tls: bool) -> usize {
                 .expect("server cert"),
         )
     });
-    let be = start_backend(srv, be_tls, Arc::clone(&running));
-    let ssl = if backend_tls { " ssl verify none no-sni-auto" } else { "" };
+    let be = if h2c { start_h2c_backend(srv, Arc::clone(&running)) } else { start_backend(srv, be_tls, Arc::clone(&running)) };
+    let ssl = if h2c {
+        " proto h2"
+    } else if backend_tls {
+        " ssl verify none no-sni-auto"
+    } else {
+        ""
+    };
     let cfg = format!(
         "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
          frontend f\n  bind {addr} ssl crt {}\n  default_backend b\nbackend b\n  server s1 {srv_addr}{ssl}\n",
@@ -222,4 +287,15 @@ fn a_tls_to_tls_keep_alive_request_allocates_nothing() {
     let many = tls_keepalive_allocations(1100, true);
     println!("[MEASUREMENT T440] TLS to TLS keep-alive allocations: 100 requests {few}, 1100 requests {many}");
     assert!(many <= few + SLACK, "1000 more TLS-to-TLS keep-alive requests made {} more allocations", many as i64 - few as i64);
+}
+
+/// T540: the server speaks h2 (`proto h2`): the h2 codec of the kept server connection, from
+/// the `h2c_srv` pool, allocates nothing per request either.
+#[test]
+fn a_keep_alive_request_to_an_h2_server_allocates_nothing() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let few = keepalive_allocations(100, false, true);
+    let many = keepalive_allocations(1100, false, true);
+    println!("[MEASUREMENT T540] TLS to h2c keep-alive allocations: 100 requests {few}, 1100 requests {many}");
+    assert!(many <= few + SLACK, "1000 more keep-alive requests to an h2 server made {} more allocations", many as i64 - few as i64);
 }
