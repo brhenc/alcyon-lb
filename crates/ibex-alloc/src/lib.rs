@@ -821,6 +821,32 @@ pub fn wipe_ssl(bytes: &mut [u8]) {
     }
 }
 
+/// [`wipe_ssl`] for a buffer the TLS code gives back to a pool on every response (T541): the
+/// same setting, but one `memset` instead of `zeroize`'s volatile byte loop (~3 instructions a
+/// byte). The stores are not dead: the bytes are handed to `black_box` afterwards.
+pub fn wipe_ssl_fast(bytes: &mut [u8]) {
+    if pool::wipe_ssl_on() {
+        bytes.fill(0);
+        std::hint::black_box(&*bytes);
+        #[cfg(feature = "test-probe")]
+        WIPED_SSL_FAST.with(|c| c.set(c.get() + bytes.len()));
+    }
+}
+
+#[cfg(feature = "test-probe")]
+thread_local! {
+    static WIPED_SSL_FAST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Bytes [`wipe_ssl_fast`] has zeroed on this thread (`test-probe`): the only way a test can see
+/// that a released TLS buffer was wiped up to its high-water mark, past its `len`, without
+/// reading a `Vec`'s spare capacity (T541 covercheck).
+#[cfg(feature = "test-probe")]
+#[must_use]
+pub fn wiped_ssl_fast_bytes() -> usize {
+    WIPED_SSL_FAST.with(std::cell::Cell::get)
+}
+
 /// How much stack [`scrub_stack`] zeroes below its caller's frame (T462).
 ///
 /// Measured by painting the stack (`ibex-tls` test `stack_scrub`, which prints each depth): the

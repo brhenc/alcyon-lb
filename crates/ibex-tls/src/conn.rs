@@ -13,8 +13,11 @@
 //!   whole record, the rest stays where rustls decrypted it ([`TlsCtx::read_plain`]), and the
 //!   caller must not add bytes to the input until [`TlsCtx::has_plain`] says it is drained
 //!   (adding may move them).
-//! - **Output** is [`TlsCtx`]'s own `Vec`, of [`TX_CAP`] bytes made once per connection, which
-//!   [`TlsCtx::write_plain`] never lets grow past that: a steady-state record allocates nothing.
+//! - **Output** is a `Vec` of [`TX_CAP`] bytes from the `tls_tx` pool, held only while the
+//!   session has ciphertext for the socket (taken when rustls has something to send, given back
+//!   by [`TlsCtx::tx_done`] when it is all on the wire, as `HAProxy` releases an empty buffer):
+//!   an idle connection holds none. [`TlsCtx::write_plain`] never lets it grow past [`TX_CAP`]:
+//!   a steady-state record allocates nothing.
 //!
 //! The handshake is rustls 0.24's typestate one. A server session starts as an acceptor so that
 //! the `ClientHello` is seen before the configuration is chosen: the certificate it gets (for
@@ -38,6 +41,25 @@ pub use rustls24::TlsInputBuffer as InputBuffer;
 /// The most ciphertext a session holds for the socket: two full records and their overhead.
 /// The output `Vec` is made with this capacity and never grows past it after the handshake.
 pub const TX_CAP: usize = 2 * (16_384 + 512);
+
+ibex_alloc::declare_pool!(
+    /// `show pools` `tls_tx`: the ciphertext a TLS session has for the socket (T541). One chunk is
+    /// [`TX_CAP`]: two records of 16,384 bytes of plaintext (the TLS maximum) and 512 bytes each
+    /// for the header, nonce/IV, MAC or tag and padding of either protocol version; a chunk that
+    /// grew (a handshake with a long certificate chain) is freed on give, not pooled.
+    static TLS_TX: Pool<Vec<u8>> = ibex_alloc::PoolSpec::new("tls_tx").size(TX_CAP).max_item(TX_CAP);
+);
+
+/// Lists the `tls_tx` pool in `show pools` from the start.
+pub fn register_pools() {
+    TLS_TX.register();
+}
+
+/// Ciphertext buffers this thread's `tls_tx` pool holds (`show pools`: cached).
+#[must_use]
+pub fn tx_pool_cached() -> usize {
+    TLS_TX.local_count()
+}
 
 /// Per-record overhead allowed for when deciding how much plaintext fits in the output: a
 /// record header, an explicit nonce (TLS 1.2) or content type (TLS 1.3), and a tag.
@@ -103,8 +125,13 @@ pub struct TlsCtx {
     pub client_sni: Option<String>,
     pub tls_info: RustlsTlsInfo,
     /// Ciphertext for the peer: `tx[tx_sent..]` is not on the wire yet.
+    /// Empty, with no capacity, while the session has none; else a `tls_tx` chunk.
     tx: Vec<u8>,
     tx_sent: usize,
+    /// `tx` came from the pool (counted in use there), not from the allocator after a refusal.
+    tx_pooled: bool,
+    /// The most `tx` held since it was taken: what [`Self::tx_release`] wipes.
+    tx_hw: usize,
     /// A record's plaintext the caller's buffer could not take, in [`TlsInput::storage`].
     plain: (usize, usize),
     /// The peer sent `close_notify`.
@@ -122,7 +149,7 @@ impl Drop for TlsCtx {
     /// The ciphertext this connection produced does not stay in the heap for the next
     /// allocation to find (`tune.ibex.ssl-zero-buffers`, see [`wipe_vec`]): the whole capacity, `clear` keeps it.
     fn drop(&mut self) {
-        wipe_vec(&mut self.tx);
+        self.tx_release();
     }
 }
 
@@ -142,8 +169,10 @@ impl TlsCtx {
             handshake_done: false,
             client_sni,
             tls_info: RustlsTlsInfo { peer_verify: VerifyResult::NotRequested, ..Default::default() },
-            tx: Vec::with_capacity(TX_CAP),
+            tx: Vec::new(),
             tx_sent: 0,
+            tx_pooled: false,
+            tx_hw: 0,
             plain: (0, 0),
             peer_closed: false,
             hello_tap: None,
@@ -163,6 +192,7 @@ impl TlsCtx {
     #[must_use]
     pub fn connect(config: &Arc<ClientConfig>, name: ServerName<'static>, sni: Option<String>) -> Self {
         let mut ctx = Self::new(false, None, sni);
+        ctx.tx_take();
         ctx.session = Self::start_client(config, name, &mut ctx.tx);
         // The key share was just generated (T462).
         ibex_alloc::scrub_stack();
@@ -211,9 +241,51 @@ impl TlsCtx {
     pub fn tx_done(&mut self, n: usize) {
         self.tx_sent = (self.tx_sent + n).min(self.tx.len());
         if self.tx_sent == self.tx.len() {
-            self.tx.clear();
-            self.tx_sent = 0;
+            self.tx_release();
         }
+    }
+
+    /// Makes `tx` a pooled chunk if it is not one. A refused take (memory is short) falls back
+    /// to an allocation of the same size, which [`Self::tx_release`] frees.
+    fn tx_take(&mut self) {
+        if self.tx.capacity() == 0 {
+            match TLS_TX.take_counted(|| Some(Vec::with_capacity(TX_CAP))) {
+                Some(v) => {
+                    self.tx = v;
+                    self.tx_pooled = true;
+                }
+                None => {
+                    self.tx = Vec::with_capacity(TX_CAP);
+                    self.tx_pooled = false;
+                }
+            }
+        }
+    }
+
+    /// Gives `tx` back, wiped (`tune.ibex.ssl-zero-buffers`) as far as it was ever written.
+    fn tx_release(&mut self) {
+        self.tx_sent = 0;
+        if self.tx.capacity() == 0 {
+            return;
+        }
+        self.tx_hw = self.tx_hw.max(self.tx.len());
+        let mut v = std::mem::take(&mut self.tx);
+        // `clear` and `drain` leave the old bytes past `len`: they are still in the capacity.
+        if self.tx_hw > v.len() {
+            v.resize(self.tx_hw, 0);
+        }
+        ibex_alloc::wipe_ssl_fast(&mut v);
+        v.clear();
+        self.tx_hw = 0;
+        if std::mem::take(&mut self.tx_pooled) {
+            TLS_TX.give_counted(v);
+        }
+    }
+
+    /// Capacity of the ciphertext buffer this session holds now (0 while it has none).
+    #[must_use]
+    pub fn tx_capacity(&self) -> usize {
+        self.tx.capacity()
     }
 
     /// Whether the session has ciphertext for the socket.
@@ -263,6 +335,15 @@ impl TlsCtx {
     /// states rustls hands back by value) is below the caller's, inside the scrubbed range.
     #[inline(never)]
     fn handshake_step(&mut self, input: &mut dyn TlsInputBuffer) -> Result<(), Error> {
+        self.tx_take();
+        let r = self.handshake_loop(input);
+        if self.tx.is_empty() {
+            self.tx_release();
+        }
+        r
+    }
+
+    fn handshake_loop(&mut self, input: &mut dyn TlsInputBuffer) -> Result<(), Error> {
         loop {
             let Some(session) = self.session.take() else { return Ok(()) };
             match session {
@@ -388,10 +469,14 @@ impl TlsCtx {
             self.plain.0 += n;
             return Ok(Plain::Data(n));
         }
+        // Nothing is queued for the peer by most reads: they get a buffer with no capacity, and
+        // what a key update or an alert wrote there moves to a pooled chunk afterwards.
+        let mut side = Vec::new();
         let r = loop {
+            let out = if self.tx.capacity() == 0 { &mut side } else { &mut self.tx };
             let r = match &mut self.session {
-                Some(Session::Server(t)) => read_traffic(t, input, dst, &mut self.tx),
-                Some(Session::Client(t)) => read_traffic(t, input, dst, &mut self.tx),
+                Some(Session::Server(t)) => read_traffic(t, input, dst, out),
+                Some(Session::Client(t)) => read_traffic(t, input, dst, out),
                 _ => return Ok(Plain::More),
             };
             // An empty record was all this read found: the next complete one may follow it
@@ -401,6 +486,11 @@ impl TlsCtx {
                 break r.map(|(p, rest, _)| (p, rest));
             }
         };
+        if !side.is_empty() {
+            self.tx_take();
+            self.tx.extend_from_slice(&side);
+            ibex_alloc::wipe_ssl_fast(&mut side);
+        }
         match r {
             Ok((Plain::Data(n), rest)) => {
                 self.plain = rest;
@@ -421,14 +511,9 @@ impl TlsCtx {
     /// # Errors
     /// The send side is closed or broken.
     pub fn write_plain(&mut self, src: &[u8]) -> Result<usize, Error> {
-        let send = match &mut self.session {
-            Some(Session::Server(t)) => t.send.as_mut(),
-            Some(Session::Client(t)) => t.send.as_mut(),
-            _ => return Err(Error::HandshakeNotComplete),
-        };
-        let Some(send) = send else { return Err(Error::General("send side closed".into())) };
         if self.tx_sent > 0 {
             // Room at the front: what is on the wire already need not be kept.
+            self.tx_hw = self.tx_hw.max(self.tx.len());
             self.tx.drain(..self.tx_sent);
             self.tx_sent = 0;
         }
@@ -437,8 +522,22 @@ impl TlsCtx {
         if n == 0 {
             return Ok(0);
         }
-        send.write(src[..n].into(), &mut self.tx)?;
-        Ok(n)
+        self.tx_take();
+        let r = match &mut self.session {
+            Some(Session::Server(t)) => Self::write_on(t.send.as_mut(), &src[..n], &mut self.tx),
+            Some(Session::Client(t)) => Self::write_on(t.send.as_mut(), &src[..n], &mut self.tx),
+            _ => Err(Error::HandshakeNotComplete),
+        };
+        if r.is_err() && self.tx.is_empty() {
+            self.tx_release();
+        }
+        r
+    }
+
+    fn write_on(send: Option<&mut SendTraffic>, src: &[u8], tx: &mut Vec<u8>) -> Result<usize, Error> {
+        let Some(send) = send else { return Err(Error::General("send side closed".into())) };
+        send.write(src.into(), tx)?;
+        Ok(src.len())
     }
 
     /// Queues `close_notify` (once; nothing during the handshake).
@@ -449,6 +548,7 @@ impl TlsCtx {
             _ => None,
         };
         if let Some(send) = send {
+            self.tx_take();
             let _ = send.close(&mut self.tx);
         }
     }

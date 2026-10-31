@@ -56,6 +56,7 @@ mod log_abort_during_connect;
 mod cold_start_timers;
 mod body_after_head_rewrite;
 mod buffer_wait;
+mod tls_tx_idle;
 mod bufsize_h2_alpn;
 mod canonical_haproxy_35_e2e;
 mod capture_converters;

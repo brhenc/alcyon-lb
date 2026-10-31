@@ -40,6 +40,7 @@ pub fn register_pools() {
     crate::logfmt::register_pools();
     crate::txnlog::register_pools();
     crate::check::register_pools();
+    ibex_tls::conn::register_pools();
     crate::stats::register_pools();
     crate::proxy::register_pools();
     crate::txn::L7Retry::register_pools();
