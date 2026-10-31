@@ -262,6 +262,12 @@ enum Script {
     BadHead,
     /// The head, part of a content-length body, then RST_STREAM.
     ResetAfterHead,
+    /// `Ok`, then the connection closed (FIN, no GOAWAY).
+    CloseAfterResponse,
+    /// `Ok`, then 50 ms later the connection reset (RST, no GOAWAY).
+    ResetAfterResponse,
+    /// RST_STREAM INTERNAL_ERROR on the request's HEADERS, its body not waited for.
+    ResetOnHeaders,
 }
 
 struct Scripted {
@@ -325,6 +331,9 @@ fn serve_h2c(mut s: TcpStream, script: Script, st: &Mutex<Vec<u32>>, idx: usize)
         if typ == 4 && flags & 1 == 0 {
             frame(&mut out, 4, 1, 0, &[]);
         }
+        if matches!(script, Script::ResetOnHeaders) && typ == 1 && id != 0 {
+            frame(&mut out, 3, 0, id, &2u32.to_be_bytes());
+        }
         // The request is whole at END_STREAM, on HEADERS or DATA.
         if (typ == 1 || typ == 0) && flags & 1 != 0 && id != 0 {
             if gone_away {
@@ -358,6 +367,24 @@ fn serve_h2c(mut s: TcpStream, script: Script, st: &Mutex<Vec<u32>>, idx: usize)
                         return;
                     }
                 }
+                Script::CloseAfterResponse => {
+                    frame(&mut out, 1, 4, id, &[0x88, 0x0f, 0x0d, 0x01, b'2']);
+                    frame(&mut out, 0, 1, id, b"ok");
+                    let _ = s.write_all(&out);
+                    // A FIN, not the RST a close with unread bytes would be.
+                    let _ = s.shutdown(std::net::Shutdown::Write);
+                    thread::sleep(Duration::from_millis(50));
+                    return;
+                }
+                Script::ResetAfterResponse => {
+                    frame(&mut out, 1, 4, id, &[0x88, 0x0f, 0x0d, 0x01, b'2']);
+                    frame(&mut out, 0, 1, id, b"ok");
+                    let _ = s.write_all(&out);
+                    thread::sleep(Duration::from_millis(50));
+                    let _ = rustix::net::sockopt::set_socket_linger(&s, Some(Duration::ZERO));
+                    return;
+                }
+                Script::ResetOnHeaders => {}
                 Script::Reset => frame(&mut out, 3, 0, id, &2u32.to_be_bytes()),
                 Script::Refuse => frame(&mut out, 3, 0, id, &7u32.to_be_bytes()),
                 Script::NoLength => {
@@ -646,4 +673,158 @@ fn proto_h2_is_accepted_and_alpn_h3_on_a_tcp_server_refused() {
     assert!(ok, "{out}");
     let (ok, out) = run("server s 127.0.0.1:1 ssl verify none alpn h3");
     assert!(!ok && out.contains("h3"), "{out}");
+}
+
+/// `proto h2` with `ssl alpn h2`: the h2 layer is put on at the connect, before the TLS
+/// handshake, so the handshake's own switch on `h2` in ALPN must not put on a second one.
+/// `HAProxy` 3.5-dev8 (measured 2026-10-31, nghttpd): 200 `----`, the check (`check-proto h2`)
+/// `L7OK`, UP. Ibex before this test: 502 `SH--` and the check `Socket error`, DOWN.
+#[test]
+fn proto_h2_with_alpn_h2_over_tls_is_one_h2_layer() {
+    if !have_nghttpd() {
+        return;
+    }
+    let srv = nghttpd(true, &[]);
+    let p = proxy(&format!(
+        "  option httpchk GET /index.html\n  http-check send hdr host localhost\n  server s {} ssl verify none alpn h2 proto h2 check check-proto h2 inter 100ms",
+        srv.addr
+    ));
+    let ok = wait_for(|| stat(&p, "check_status") == "L7OK" && stat(&p, "status") == "UP");
+    assert!(ok, "check_status {} status {}", stat(&p, "check_status"), stat(&p, "status"));
+    let (status, body, head) = get(p.fe, "/index.html");
+    assert_eq!(status, 200, "{head}");
+    assert_eq!(body, BODY.as_bytes());
+}
+
+/// The transport of a TLS connection that selected `h2`, seen through the h2 layer the
+/// handshake put on: its ALPN, its TLS facts, its key name and its truncation are the TLS
+/// connection's, and it is one layer deep.
+#[test]
+fn a_tls_h2_transport_answers_for_the_tls_under_it() {
+    use ibex_rt::ServerXprt;
+    use std::os::fd::AsFd;
+    if !have_nghttpd() {
+        return;
+    }
+    let srv = nghttpd(true, &[]);
+    let opts = ibex_tls::BackendTlsOptions { verify_required: false, alpn: vec![b"h2".to_vec()], ..Default::default() };
+    let cfg = ibex_tls::tcp::build_backend_client_config(&opts).expect("client config");
+    let sock = TcpStream::connect(srv.addr).expect("connect");
+    sock.set_nonblocking(true).expect("nonblocking");
+    let name = rustls24::pki_types::ServerName::try_from("localhost").expect("name");
+    let mut x = ibex_rt::connect_tls(&sock, cfg, name);
+    let ready = wait_for(|| x.handshake(sock.as_fd()).expect("handshake"));
+    assert!(ready, "handshake never finished");
+    assert!(matches!(x, ServerXprt::H2(_)), "h2 in ALPN puts the h2 layer on: {x:?}");
+    let dbg = format!("{x:?}");
+    assert!(dbg.starts_with("ServerXprt::H2(") && dbg.matches("ServerXprt::H2(").count() == 1, "{dbg}");
+    assert_eq!(x.alpn(), Some(b"h2".as_slice()));
+    assert!(x.tls_info().is_some(), "the TLS facts of the connection under the h2 layer");
+    assert!(!x.was_truncated());
+    x.set_key_name(Some("key.example"));
+    assert_eq!(x.sni(), Some("key.example"), "the key name reaches the TLS connection under the h2 layer");
+}
+
+/// A server that closes (FIN) or resets (RST, 50 ms after the response) its connection, with
+/// no GOAWAY: the idle connection reads its end and is dropped, the next request takes a new
+/// one. `HAProxy` 3.5-dev8 (measured 2026-10-31, the same servers in Python, `http-reuse
+/// always`): 200 `----` three times, three connections, for both.
+#[test]
+fn an_h2_connection_the_server_closed_is_not_reused() {
+    for script in [Script::CloseAfterResponse, Script::ResetAfterResponse] {
+        let srv = scripted(script);
+        let p = proxy(&format!("  http-reuse always\n  server s {} proto h2", srv.addr));
+        for _ in 0..3 {
+            assert_eq!(get(p.fe, "/x").0, 200);
+            let log = p.log_with("/x HTTP/1.1");
+            assert!(log.contains(" ---- "), "{log}");
+            thread::sleep(Duration::from_millis(200));
+        }
+        assert_eq!(*srv.streams.lock().unwrap(), [1, 1, 1]);
+    }
+}
+
+/// A server that resets the stream on the request's HEADERS while its 4 MB body is still on
+/// the way: the rest of the body is not sent into the reset stream and the client gets 502
+/// `SH--`, as from `HAProxy` 3.5-dev8 (measured 2026-10-31, `curl --data-binary` of 4 MB).
+#[test]
+fn a_reset_during_the_request_body_is_502_sh() {
+    let srv = scripted(Script::ResetOnHeaders);
+    let p = proxy(&format!("  server s {} proto h2", srv.addr));
+    let body = vec![b'z'; 4_000_000];
+    let mut req = format!("POST /x HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+    req.extend_from_slice(&body);
+    let mut s = TcpStream::connect(p.fe).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    // The proxy may answer and close before it has read the whole body.
+    let _ = s.write_all(&req);
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let (status, _, head) = split(&out);
+    assert_eq!(status, 502, "{head}");
+    let log = p.log_with("POST /x HTTP/1.1");
+    assert!(log.contains(" SH-- "), "{log}");
+}
+
+/// The TLS handshake may end in `send` or `recv` rather than in `handshake` (T535): the h2
+/// layer goes on there, so the request text goes out as h2 and the response comes back as
+/// text. An empty `send` or `recv` on the layer moves nothing.
+#[test]
+fn a_tls_handshake_that_ends_in_send_or_recv_puts_the_h2_layer_on_there() {
+    use ibex_rt::{Io, ServerXprt};
+    use std::os::fd::AsFd;
+    if !have_nghttpd() {
+        return;
+    }
+    let srv = nghttpd(true, &[]);
+    let opts = ibex_tls::BackendTlsOptions { verify_required: false, alpn: vec![b"h2".to_vec()], ..Default::default() };
+    let cfg = ibex_tls::tcp::build_backend_client_config(&opts).expect("client config");
+    let req = b"GET /index.html HTTP/1.1\r\nhost: localhost\r\n\r\n";
+    for in_send in [true, false] {
+        let sock = TcpStream::connect(srv.addr).expect("connect");
+        sock.set_nonblocking(true).expect("nonblocking");
+        let fd = sock.as_fd();
+        let name = rustls24::pki_types::ServerName::try_from("localhost").expect("name");
+        let mut x = ibex_rt::connect_tls(&sock, std::sync::Arc::clone(&cfg), name);
+        let mut buf = vec![0u8; 16384];
+        let mut sent = false;
+        let up = wait_for(|| {
+            if in_send {
+                sent = matches!(x.send(fd, req).expect("send"), Io::Done(n) if n == req.len());
+                sent
+            } else {
+                let _ = x.recv(fd, &mut buf).expect("recv");
+                matches!(x, ServerXprt::H2(_))
+            }
+        });
+        assert!(up && matches!(x, ServerXprt::H2(_)), "in_send {in_send}: {x:?}");
+        assert!(matches!(x.send(fd, b"").expect("empty send"), Io::WouldBlock), "in_send {in_send}");
+        assert!(matches!(x.recv(fd, &mut []).expect("empty recv"), Io::WouldBlock), "in_send {in_send}");
+        // Cleartext under the layer (`proto h2`) has no handshake to drive.
+        let mut clear = ServerXprt::Plain.into_h2().expect("h2c_srv pool");
+        assert!(clear.handshake(fd).expect("handshake"), "h2c is ready at once");
+        if !sent {
+            assert!(wait_for(|| matches!(x.send(fd, req).expect("send"), Io::Done(n) if n == req.len())), "the request taken");
+        }
+        let mut text = Vec::new();
+        let done = wait_for(|| {
+            if let Io::Done(n) = x.recv(fd, &mut buf).expect("recv") {
+                text.extend_from_slice(&buf[..n]);
+            }
+            text.windows(BODY.len()).any(|w| w == BODY.as_bytes())
+        });
+        assert!(done && text.starts_with(b"HTTP/1.1 200"), "in_send {in_send}: {}", String::from_utf8_lossy(&text));
+    }
+}
+
+/// CONNECT to an h2 server: the codec refuses it (no extended CONNECT yet, T548), so the
+/// request fails 502 where `HAProxy` 3.5-dev8 tunnels it (T540's measurements;
+/// docs/differences.md). The server sees no stream.
+#[test]
+fn connect_to_an_h2_server_is_refused_502() {
+    let srv = scripted(Script::Ok { goaway_after: 0 });
+    let p = proxy(&format!("  server s {} proto h2", srv.addr));
+    let (status, _, head) = exchange(p.fe, b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
+    assert_eq!(status, 502, "{head}");
+    assert!(srv.streams.lock().unwrap().iter().all(|&n| n == 0), "no stream reached the server");
 }

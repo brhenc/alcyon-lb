@@ -943,9 +943,26 @@ impl ServerXprt {
     /// # Errors
     /// Out of memory: the `h2c_srv` pool has no codec to give.
     pub fn into_h2(self) -> io::Result<Self> {
+        // Called on a fresh connection only (the connect, `upgrade_if_h2`): one layer.
+        debug_assert!(!matches!(self, ServerXprt::H2(_)), "an h2 layer on an h2 layer");
+        crate::srv_h2::H2Layer::new(self).map(|h| ServerXprt::H2(Box::new(h))).ok_or_else(crate::buf::oom)
+    }
+
+    /// [`Self::recv`] for the transport under the h2 layer: the TLS connection's own, which
+    /// does not put on another h2 layer when its handshake selects `h2` (`proto h2` with
+    /// `alpn h2` put the layer on at the connect).
+    pub(crate) fn recv_under_h2(&mut self, fd: BorrowedFd<'_>, dst: &mut [u8]) -> io::Result<Io> {
         match self {
-            ServerXprt::H2(_) => Ok(self),
-            inner => crate::srv_h2::H2Layer::new(inner).map(|h| ServerXprt::H2(Box::new(h))).ok_or_else(crate::buf::oom),
+            ServerXprt::Tls(t) => t.recv(fd, dst),
+            x => x.recv(fd, dst),
+        }
+    }
+
+    /// [`Self::send`] for the transport under the h2 layer, as [`Self::recv_under_h2`].
+    pub(crate) fn send_under_h2(&mut self, fd: BorrowedFd<'_>, src: &[u8]) -> io::Result<Io> {
+        match self {
+            ServerXprt::Tls(t) => t.send(fd, src),
+            x => x.send(fd, src),
         }
     }
 
@@ -1100,7 +1117,11 @@ impl ServerXprt {
                 }
                 Ok(done)
             }
-            ServerXprt::H2(h) => h.inner.handshake(fd),
+            // The TLS connection's own handshake, as in `recv_under_h2`.
+            ServerXprt::H2(h) => match &mut h.inner {
+                ServerXprt::Tls(t) => t.handshake(fd),
+                x => x.handshake(fd),
+            },
         }
     }
 

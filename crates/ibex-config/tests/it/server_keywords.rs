@@ -357,3 +357,19 @@ fn resolvers_naming_a_missing_section_is_refused_as_haproxy_refuses_it() {
         );
     }
 }
+
+/// `max-reuse` reads its argument as `atoi` does (`srv_parse_max_reuse`): a sign first,
+/// digits up to the first other byte, nothing (0) for text that is not a number; any negative
+/// value is no limit (-1, the default).
+#[test]
+fn max_reuse_reads_its_argument_as_atoi() {
+    let reuse = |arg: &str| {
+        let cfg = server_line(&format!("max-reuse {arg}")).expect("parses");
+        cfg.backends[0].servers[0].pool.as_ref().map_or(-1, |p| p.max_reuse)
+    };
+    assert_eq!(reuse("10"), 10);
+    assert_eq!(reuse("+3"), 3);
+    assert_eq!(reuse("7x"), 7);
+    assert_eq!(reuse("abc"), 0);
+    assert!(reuse("-1") < 0 && reuse("-5") < 0, "a negative value is no limit");
+}
