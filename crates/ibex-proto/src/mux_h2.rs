@@ -1095,6 +1095,8 @@ impl crate::htx_mux::HtxStream for H2StreamCtx {
 /// The h2 mux as the bridge drives it (T503, design section 2.4): its own methods, by a
 /// `u64` id (an h2 id is 31 bits; one past that names no stream).
 impl crate::htx_mux::HtxMux for H2MuxContext {
+    const GIVE_DATA: fn(Vec<u8>) = drop::<Vec<u8>>;
+
     type Stream = H2StreamCtx;
 
     fn stream(&self, id: u64) -> Option<&H2StreamCtx> {

@@ -2148,10 +2148,15 @@ impl ibex_alloc::Poolable for Box<L7Snapshot> {
     }
 
     fn try_new() -> Option<Self> {
-        Some(Box::new(L7Snapshot {
-            bytes: crate::buf::Buf::unallocated(crate::buf::BufClass::Standard),
-            req_state: MsgState::Waiting,
-        }))
+        Some(L7Snapshot::empty())
+    }
+}
+
+impl L7Snapshot {
+    /// A snapshot holding nothing (the box is small and unpooled memory; the copy's buffer is the
+    /// one that can be refused).
+    fn empty() -> Box<Self> {
+        Box::new(L7Snapshot { bytes: crate::buf::Buf::unallocated(crate::buf::BufClass::Standard), req_state: MsgState::Waiting })
     }
 }
 
@@ -2163,9 +2168,8 @@ impl L7Retry {
     #[cold]
     #[inline(never)]
     pub fn save(data: &[u8], req_state: MsgState) -> L7Retry {
-        let Some(mut snap) = L7_SNAPSHOT.take_raw(<Box<L7Snapshot> as ibex_alloc::Poolable>::try_new) else {
-            return L7Retry::Dead;
-        };
+        // `take_raw` of an unlimited pool whose `try_new` always succeeds gives a box.
+        let mut snap = L7_SNAPSHOT.take_raw(<Box<L7Snapshot> as ibex_alloc::Poolable>::try_new).unwrap_or_else(L7Snapshot::empty);
         if snap.bytes.alloc_if_needed() && snap.bytes.put(data) {
             snap.req_state = req_state;
             L7Retry::Saved(L7Box(Some(snap)))

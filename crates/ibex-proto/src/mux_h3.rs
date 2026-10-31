@@ -1229,12 +1229,14 @@ impl HtxStream for H3StreamCtx {
     }
 }
 
+fn give_h3_data(v: Vec<u8>) {
+    H3_DATA.give(v);
+}
+
 impl HtxMux for H3MuxContext {
     type Stream = H3StreamCtx;
 
-    fn give_data(v: Vec<u8>) {
-        H3_DATA.give(v);
-    }
+    const GIVE_DATA: fn(Vec<u8>) = give_h3_data;
 
     fn stream(&self, id: u64) -> Option<&H3StreamCtx> {
         self.streams.get(&id).map(|b| &**b)

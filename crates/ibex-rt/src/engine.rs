@@ -13185,12 +13185,9 @@ impl EngineDispatcher<'_> {
                                 }
                                 return Ok(RuleFlow::Suspend);
                             }
-                            crate::resolvers::DrStep::Wait => {}
-                            crate::resolvers::DrStep::Done(ip) => {
-                                if let Some(ip) = ip {
-                                    store_var_smp(&mut sess.vars, &d.var_name, ip_sample(ip));
-                                }
-                            }
+                            // A wait past its bound goes on with no address, like an empty answer.
+                            crate::resolvers::DrStep::Wait | crate::resolvers::DrStep::Done(None) => {}
+                            crate::resolvers::DrStep::Done(Some(ip)) => store_var_smp(&mut sess.vars, &d.var_name, ip_sample(ip)),
                         }
                         if held.is_some() {
                             if let Some(t) = sess.txn.as_mut() {

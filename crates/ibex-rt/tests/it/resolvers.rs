@@ -40,6 +40,8 @@ enum Zone {
     Truncated(Vec<Ipv4Addr>),
     /// TC on both transports.
     AlwaysTruncated,
+    /// TC over UDP, then over TCP a frame of one byte (shorter than a DNS header id).
+    ShortTcpFrame,
     /// This many A records (10.x.y.z), whatever the transport.
     Many(usize),
     /// One AAAA record, whatever the type asked.
@@ -222,16 +224,19 @@ fn parse_query(b: &[u8], tcp: bool) -> Option<(Query, usize)> {
 
 fn build_reply(question: &[u8], z: &Zone, tcp: bool) -> Option<Vec<u8>> {
     let truncated = match z {
-        Zone::Truncated(_) => !tcp,
+        Zone::Truncated(_) | Zone::ShortTcpFrame => !tcp,
         Zone::AlwaysTruncated => true,
         _ => false,
     };
+    if matches!(z, Zone::ShortTcpFrame) && tcp {
+        return Some(vec![0xff]);
+    }
     let rcode = match z {
         Zone::Silent => return None,
         Zone::Nx => 3,
         Zone::Refused => 5,
         Zone::ServFail => 2,
-        Zone::A(_) | Zone::NoData | Zone::Truncated(_) | Zone::AlwaysTruncated | Zone::Many(_) | Zone::Aaaa(_) | Zone::Dual(..) | Zone::Srv(..) | Zone::SrvThenA(_) => 0,
+        Zone::A(_) | Zone::NoData | Zone::Truncated(_) | Zone::AlwaysTruncated | Zone::ShortTcpFrame | Zone::Many(_) | Zone::Aaaa(_) | Zone::Dual(..) | Zone::Srv(..) | Zone::SrvThenA(_) => 0,
     };
     let many: Vec<Ipv4Addr>;
     let ips: &[Ipv4Addr] = match z {
@@ -1374,6 +1379,23 @@ fn a_truncated_tcp_answer_is_other() {
     let c = counters(&ibex, "r", "ns1");
     assert!(c["tcp_fallback"] >= 2 && c["valid"] == 0, "{c:?}");
     assert_eq!(dns.tcp_conns.load(Ordering::Relaxed), 1);
+    assert_eq!(ibex.state("s1").0, "10.9.9.9 2 0");
+}
+
+/// T527: a TCP reply frame of one byte has no message id to match: dropped, counted nowhere
+/// (`dns_session_io_handler` memcpy's the id and drops an unknown one; measured on
+/// 3.5-dev8-885761-29 with a nameserver that answers a 1-byte frame: `sent` and `truncated`
+/// grow, `invalid`, `outdated`, `timeout` and `valid` stay 0).
+#[test]
+fn a_one_byte_tcp_reply_frame_is_dropped_uncounted() {
+    let dns = FakeDns::start();
+    dns.set("a1.test", Zone::ShortTcpFrame);
+    let ibex = start(dns.addr, FAST, "  server s1 a1.test:80 resolvers r init-addr 10.9.9.9\n", "");
+    wait_counter(&ibex, "tcp_fallback", 3, |v| v >= 2);
+    let c = counters(&ibex, "r", "ns1");
+    for k in ["invalid", "outdated", "valid", "other"] {
+        assert_eq!(c[k], 0, "{k} in {c:?}");
+    }
     assert_eq!(ibex.state("s1").0, "10.9.9.9 2 0");
 }
 
