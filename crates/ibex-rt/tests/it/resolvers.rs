@@ -667,7 +667,16 @@ fn t4_nx_is_held_then_takes_the_server_down() {
     assert!(ids.len() >= 4 && ids[0] == ids[1] && ids[1] != ids[2] && ids[2] == ids[3], "{q:?}");
     dns.set("a1.test", Zone::A(vec![Ipv4Addr::new(10, 0, 0, 1)]));
     ibex.wait_state("s1", "10.0.0.1 2 0", 3);
-    let n = ibex.log().iter().filter(|l| *l == UP).count();
+    // The UP line is written just after the state changes: wait for it rather than count at once.
+    let t0 = Instant::now();
+    let mut n = 0;
+    while t0.elapsed() < Duration::from_secs(3) {
+        n = ibex.log().iter().filter(|l| *l == UP).count();
+        if n >= 2 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(n, 2, "{:?}", ibex.log());
 }
 
