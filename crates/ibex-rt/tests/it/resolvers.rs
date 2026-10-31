@@ -44,6 +44,28 @@ enum Zone {
     Many(usize),
     /// One AAAA record, whatever the type asked.
     Aaaa(std::net::Ipv6Addr),
+    /// SRV records `(priority, weight, port, target)` and additional A records
+    /// `(owner, address)` (T487); an SRV query only, NODATA for the others.
+    Srv(Vec<(u16, u16, u16, String)>, Vec<(String, Ipv4Addr)>),
+}
+
+/// An SRV zone whose additional records are the targets' addresses (`ar`) or none.
+fn srv_zone(recs: &[(u16, u16, &str, Option<[u8; 4]>)]) -> Zone {
+    Zone::Srv(
+        recs.iter().map(|&(w, p, t, _)| (10, w, p, t.to_string())).collect(),
+        recs.iter().filter_map(|&(_, _, t, ip)| ip.map(|ip| (t.to_string(), Ipv4Addr::from(ip)))).collect(),
+    )
+}
+
+/// `name` in DNS wire form, uncompressed.
+fn wire_name(name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for l in name.split('.').filter(|l| !l.is_empty()) {
+        out.push(u8::try_from(l.len()).expect("label"));
+        out.extend_from_slice(l.as_bytes());
+    }
+    out.push(0);
+    out
 }
 
 /// One query the fake nameserver saw.
@@ -203,7 +225,7 @@ fn build_reply(question: &[u8], z: &Zone, tcp: bool) -> Option<Vec<u8>> {
         Zone::Nx => 3,
         Zone::Refused => 5,
         Zone::ServFail => 2,
-        Zone::A(_) | Zone::NoData | Zone::Truncated(_) | Zone::AlwaysTruncated | Zone::Many(_) | Zone::Aaaa(_) => 0,
+        Zone::A(_) | Zone::NoData | Zone::Truncated(_) | Zone::AlwaysTruncated | Zone::Many(_) | Zone::Aaaa(_) | Zone::Srv(..) => 0,
     };
     let many: Vec<Ipv4Addr>;
     let ips: &[Ipv4Addr] = match z {
@@ -219,6 +241,31 @@ fn build_reply(question: &[u8], z: &Zone, tcp: bool) -> Option<Vec<u8>> {
     // An A query is answered with the A records; an AAAA one with nothing (NODATA).
     let ips = if qtype == 1 { ips } else { &[] };
     let v6 = if let Zone::Aaaa(v6) = z { Some(*v6) } else { None };
+    if let Zone::Srv(recs, ar) = z {
+        let (recs, ar): (&[_], &[_]) = if qtype == 33 { (recs, ar) } else { (&[], &[]) };
+        let mut r = Vec::with_capacity(512);
+        r.extend_from_slice(&question[..2]);
+        r.extend_from_slice(&[0x81, 0x80, 0, 1]);
+        r.extend_from_slice(&u16::try_from(recs.len()).expect("count").to_be_bytes());
+        r.extend_from_slice(&[0, 0]);
+        r.extend_from_slice(&u16::try_from(ar.len()).expect("count").to_be_bytes());
+        r.extend_from_slice(&question[12..]);
+        for (prio, weight, port, target) in recs {
+            let t = wire_name(target);
+            r.extend_from_slice(&[0xc0, 0x0c, 0, 33, 0, 1, 0, 0, 1, 0x2c]);
+            r.extend_from_slice(&u16::try_from(6 + t.len()).expect("len").to_be_bytes());
+            for v in [prio, weight, port] {
+                r.extend_from_slice(&v.to_be_bytes());
+            }
+            r.extend_from_slice(&t);
+        }
+        for (owner, ip) in ar {
+            r.extend_from_slice(&wire_name(owner));
+            r.extend_from_slice(&[0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4]);
+            r.extend_from_slice(&ip.octets());
+        }
+        return Some(r);
+    }
     let mut r = Vec::with_capacity(512);
     r.extend_from_slice(&question[..2]);
     r.extend_from_slice(&[0x81 | if truncated { 2 } else { 0 }, 0x80 | rcode, 0, 1]);
@@ -311,6 +358,31 @@ impl Ibex {
             .find(|f| f.get(3) == Some(&sv))
             .unwrap_or_else(|| panic!("no {sv} in {out:?}"));
         (format!("{} {} {}", f[4], f[5], f[6]), f[17].to_string())
+    }
+
+    /// `srv_addr srv_op_state srv_admin_state srv_uweight srv_iweight srv_fqdn srv_port
+    /// srvrecord` of `sv` in `show servers state`: the columns of design A.t11.
+    fn srv_cols(&self, sv: &str) -> String {
+        let out = self.cli("show servers state l");
+        let f: Vec<&str> = out
+            .lines()
+            .map(|l| l.split(' ').collect::<Vec<_>>())
+            .find(|f| f.get(3) == Some(&sv))
+            .unwrap_or_else(|| panic!("no {sv} in {out:?}"));
+        [4, 5, 6, 7, 8, 17, 18, 19].map(|i| f[i]).join(" ")
+    }
+
+    /// Waits up to `secs` for [`Self::srv_cols`] of `sv` to be `want`.
+    fn wait_srv(&self, sv: &str, want: &str, secs: u64) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let got = self.srv_cols(sv);
+            if got == want {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{sv} never reached '{want}', last '{got}'; log {:?}", self.log());
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Waits up to `secs` for `sv`'s state to be `want`.
@@ -1612,4 +1684,115 @@ fn the_ipv6_route_is_probed_again_after_30_s() {
     let late = q.iter().filter(|x| x.at.duration_since(q[0].at) > Duration::from_secs(30)).count();
     assert!(late >= 1, "{q:?}");
     assert_eq!(ibex.state("s1").0, "10.0.0.1 2 0");
+}
+
+const SRV: &str = "_http._tcp.srv.test";
+
+/// `server-template srv <n> _http._tcp.srv.test resolvers r<opts>`.
+fn srv_template(n: usize, opts: &str) -> String {
+    format!("  server-template srv {n} {SRV} resolvers r{opts}\n")
+}
+
+/// T487, A.t11 (`HAProxy` 3.5-dev8, `timeout resolve 1s`, `hold obsolete 2s`; here 300 ms and
+/// 1 s): a template of 3 on an SRV answer of 2 records with their additional A records. In key
+/// order (`XXH32` of the target) each record fills the first free slot: `srv1 10.1.0.1 2 64 2 1
+/// t1.test 8080`, `srv2 10.1.0.2 2 64 1 1 t2.test 8081` (weights 512 -> 2, 256 -> 1,
+/// `SRV_ADMF_FQDN_CHANGED`), `srv3 - 0 32 1 1 - 0`; no A query for a target with an
+/// additional record. The FQDN line is logged, not printed on stderr. t2 dropped: removed once
+/// not seen for `hold obsolete`, `- 0 96 1 1 - 0`, "entry removed from SRV record".
+#[test]
+fn t11_srv_records_fill_the_slots_with_their_additional_records() {
+    let (port, _, _) = two_backends();
+    let dns = FakeDns::start();
+    let two = srv_zone(&[(512, port, "t1.test", Some([127, 0, 0, 1])), (256, 8081, "t2.test", Some([10, 1, 0, 2]))]);
+    dns.set(SRV, two);
+    dns.set("t1.test", Zone::A(vec![Ipv4Addr::new(10, 9, 9, 9)]));
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n  hold obsolete 1s\n", &srv_template(3, ""), "");
+    ibex.wait_srv("srv1", &format!("127.0.0.1 2 64 2 1 t1.test {port} {SRV}"), 3);
+    assert_eq!(ibex.srv_cols("srv2"), format!("10.1.0.2 2 64 1 1 t2.test 8081 {SRV}"));
+    assert_eq!(ibex.srv_cols("srv3"), format!("- 0 32 1 1 - 0 {SRV}"));
+    ibex.wait_log(&format!("l/srv1: IP changed from '(none)' to '127.0.0.1', port changed from '+0' to '{port}' by 'DNS additional record'."), 3);
+    ibex.wait_log("l/srv2: IP changed from '(none)' to '10.1.0.2', port changed from '+0' to '8081' by 'DNS additional record'.", 3);
+    ibex.wait_log("Server l/srv1 ('t1.test') is UP/READY (resolves again).", 3);
+    ibex.wait_log("Server l/srv2 administratively READY thanks to valid DNS answer.", 3);
+    let fqdn = "l/srv1 changed its FQDN from (null) to t1.test by 'SRV record'";
+    assert!(ibex.log().iter().any(|l| l == fqdn), "no {fqdn:?} in {:?}", ibex.log());
+    assert!(!ibex.stderr().iter().any(|l| l.ends_with(fqdn)), "{fqdn:?} on stderr: {:?}", ibex.stderr());
+    assert!(dns.queries().iter().all(|q| q.qtype == 33), "{:?}", dns.queries());
+
+    dns.set(SRV, srv_zone(&[(512, port, "t1.test", Some([127, 0, 0, 1]))]));
+    let t = Instant::now();
+    ibex.wait_srv("srv2", &format!("- 0 96 1 1 - 0 {SRV}"), 4);
+    // Last seen at most 300 ms before the change, removed 1 s after.
+    assert!(t.elapsed() >= Duration::from_millis(650), "removed after {:?}", t.elapsed());
+    ibex.wait_log("Server l/srv2 is going DOWN for maintenance (entry removed from SRV record). 1 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.", 3);
+    assert_eq!(ibex.srv_cols("srv1"), format!("127.0.0.1 2 64 2 1 t1.test {port} {SRV}"));
+    // The SRV port reaches the connection.
+    let mut c = TcpStream::connect(ibex.fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    assert_eq!(get(&mut c), "127.0.0.1");
+}
+
+/// T487, A.t11b (`HAProxy` 3.5-dev8, `timeout resolve 1s`, default `hold obsolete 0`): without
+/// additional records a slot takes the target and port first (`- 0 96 2 1 t1.test 8080`), and
+/// each target gets an A resolution of its own, first asked one `timeout resolve` after the SRV
+/// answer (`SRV` at 0.38; `A t1.test`, `A t2.test`, `SRV` at 1.38): `10.1.0.1 2 64`, "IP changed
+/// ... by 'r/ns1'". A record gone is removed at the next answer without it, and its target's A
+/// queries stop.
+#[test]
+fn t11b_without_additional_records_each_target_is_resolved() {
+    let dns = FakeDns::start();
+    dns.set(SRV, srv_zone(&[(512, 8080, "t1.test", None), (256, 8081, "t2.test", None)]));
+    dns.set("t1.test", Zone::A(vec![Ipv4Addr::new(10, 1, 0, 1)]));
+    dns.set("t2.test", Zone::Silent);
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n", &srv_template(3, ""), "");
+    ibex.wait_srv("srv2", &format!("- 0 96 1 1 t2.test 8081 {SRV}"), 3);
+    ibex.wait_srv("srv1", &format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"), 3);
+    ibex.wait_log("l/srv1: IP changed from '(none)' to '10.1.0.1' by 'r/ns1'.", 3);
+    ibex.wait_log("Server l/srv1 ('t1.test') is UP/READY (resolves again).", 3);
+    let q = dns.queries();
+    let first = |name: &str| q.iter().find(|q| q.name == name).map(|q| q.at).unwrap_or_else(|| panic!("no query for {name}: {q:?}"));
+    let gap = first("t1.test").duration_since(first(SRV));
+    assert!(gap >= Duration::from_millis(250), "A t1.test {gap:?} after the first SRV query");
+    assert!(q.iter().any(|q| q.name == "t2.test" && q.qtype == 1), "{q:?}");
+    assert_eq!(ibex.srv_cols("srv3"), format!("- 0 32 1 1 - 0 {SRV}"));
+
+    dns.set(SRV, srv_zone(&[(512, 8080, "t1.test", None)]));
+    ibex.wait_srv("srv2", &format!("- 0 96 1 1 - 0 {SRV}"), 3);
+    ibex.wait_log("Server l/srv2 is going DOWN for maintenance (entry removed from SRV record). 1 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.", 3);
+    let n = dns.queries().iter().filter(|q| q.name == "t2.test").count();
+    thread::sleep(Duration::from_millis(900));
+    assert_eq!(dns.queries().iter().filter(|q| q.name == "t2.test").count(), n, "t2.test still asked");
+    assert_eq!(ibex.srv_cols("srv1"), format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"));
+}
+
+/// T487, measured on `HAProxy` 3.5-dev8 (`accepted_payload_size 8192`): 100 records
+/// `t<i>.test:900<i>` with additional records `10.2.0.<i+1>` on a template of 3: the first
+/// three in key order fill the slots, `t0`, `t35`, `t11`, the rest wait.
+#[test]
+fn an_srv_answer_of_100_records_fills_a_template_of_3_in_key_order() {
+    let dns = FakeDns::start();
+    let recs: Vec<(u16, u16, String, Option<[u8; 4]>)> =
+        (0..100u16).map(|i| (256, 9000 + i, format!("t{i}.test"), Some([10, 2, 0, u8::try_from(i + 1).expect("octet")]))).collect();
+    let refs: Vec<(u16, u16, &str, Option<[u8; 4]>)> = recs.iter().map(|(w, p, t, a)| (*w, *p, t.as_str(), *a)).collect();
+    dns.set(SRV, srv_zone(&refs));
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n  accepted_payload_size 8192\n", &srv_template(3, ""), "");
+    ibex.wait_srv("srv1", &format!("10.2.0.1 2 64 1 1 t0.test 9000 {SRV}"), 3);
+    assert_eq!(ibex.srv_cols("srv2"), format!("10.2.0.36 2 64 1 1 t35.test 9035 {SRV}"));
+    assert_eq!(ibex.srv_cols("srv3"), format!("10.2.0.12 2 64 1 1 t11.test 9011 {SRV}"));
+}
+
+/// T487, measured on `HAProxy` 3.5-dev8: `resolve-opts ignore-weight` keeps the slots' weight
+/// (1 for a weight of 512), and an additional record for a name that no SRV record targets is
+/// dropped: the target is resolved on its own (`- 0 96`, then `10.1.0.1 2 64` by 'r/ns1').
+#[test]
+fn ignore_weight_and_an_additional_record_for_another_name() {
+    let dns = FakeDns::start();
+    dns.set(SRV, Zone::Srv(vec![(10, 512, 8080, "t1.test".into())], vec![("evil.test".into(), Ipv4Addr::new(10, 6, 6, 6))]));
+    dns.set("t1.test", Zone::A(vec![Ipv4Addr::new(10, 1, 0, 1)]));
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n", &srv_template(2, " resolve-opts ignore-weight"), "");
+    ibex.wait_srv("srv1", &format!("10.1.0.1 2 64 1 1 t1.test 8080 {SRV}"), 3);
+    ibex.wait_log("l/srv1: IP changed from '(none)' to '10.1.0.1' by 'r/ns1'.", 3);
+    assert_eq!(ibex.srv_cols("srv2"), format!("- 0 32 1 1 - 0 {SRV}"));
+    assert!(!ibex.log().iter().any(|l| l.contains("10.6.6.6")), "{:?}", ibex.log());
 }

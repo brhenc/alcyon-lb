@@ -141,6 +141,49 @@ fn test_aaaa_and_srv() {
     assert_eq!(got.iter().map(|a| a.rdata.clone()).collect::<Vec<_>>(), vec![exp1, exp2]);
 }
 
+/// T487: an SRV answer's additional A/AAAA records come after its SRV records, owner first
+/// (`resolvers.c:1495-1645`); other additional types are skipped, and an A query's additional
+/// records are not read.
+#[test]
+fn an_srv_answer_carries_its_additional_addresses() {
+    let mut r = Resolver::new(cfg(&[NS1]));
+    let now = Instant::now();
+    let qid = r.query(now, "_http._tcp.example.com", Question::Srv, Requester::Server).unwrap();
+    let id = Message::from_vec(&r.poll_transmit(now).unwrap().2).unwrap().id();
+    let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+    let mut msg = Message::new();
+    msg.set_id(id);
+    msg.set_message_type(MessageType::Response);
+    msg.add_query(Query::query(Name::from_str("_http._tcp.example.com").unwrap(), RecordType::SRV));
+    msg.add_answer(Record::from_rdata(Name::from_str("_http._tcp.example.com").unwrap(), 60, RData::SRV(SRV::new(10, 512, 8080, Name::from_str("t1.example.com.").unwrap()))));
+    msg.add_additional(a_rec("t1.example.com.", Ipv4Addr::new(10, 1, 0, 1), 30));
+    msg.add_additional(cname_rec("x.example.com.", "t1.example.com."));
+    msg.add_additional(aaaa_rec("T2.example.com.", v6, 30));
+    r.handle_response(now, ns(NS1), Protocol::Udp, &msg.to_vec().unwrap());
+    let (got, res) = r.poll_result().unwrap();
+    assert_eq!(got, qid);
+    let rdata: Vec<Rdata> = res.unwrap().into_iter().map(|a| a.rdata).collect();
+    assert_eq!(
+        rdata,
+        vec![
+            Rdata::Srv { target: "t1.example.com.".into(), port: 8080, priority: 10, weight: 512 },
+            Rdata::Additional { name: "t1.example.com.".into(), ip: Ipv4Addr::new(10, 1, 0, 1).into() },
+            Rdata::Additional { name: "t2.example.com.".into(), ip: v6.into() },
+        ]
+    );
+
+    let qid = r.query(now, "a.example.com", Question::v4(), Requester::Server).unwrap();
+    let id = Message::from_vec(&r.poll_transmit(now).unwrap().2).unwrap().id();
+    let mut msg = Message::new();
+    msg.set_id(id);
+    msg.set_message_type(MessageType::Response);
+    msg.add_query(Query::query(Name::from_str("a.example.com").unwrap(), RecordType::A));
+    msg.add_answer(a_rec("a.example.com", Ipv4Addr::new(1, 2, 3, 4), 60));
+    msg.add_additional(a_rec("b.example.com.", Ipv4Addr::new(10, 1, 0, 1), 30));
+    r.handle_response(now, ns(NS1), Protocol::Udp, &msg.to_vec().unwrap());
+    assert_eq!(r.poll_result().unwrap(), (qid, Ok(vec![a(Ipv4Addr::new(1, 2, 3, 4), 60)])));
+}
+
 #[test]
 fn test_truncation_fallback_to_tcp() {
     let mut r = Resolver::new(cfg(&[NS1]));

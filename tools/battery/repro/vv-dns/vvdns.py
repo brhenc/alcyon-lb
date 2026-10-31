@@ -19,6 +19,9 @@ query, so a battery can change answers while the proxy runs. Per name:
                      "qd2" (two questions), "rdlen" (A record with rdlength 64)
   "many_a": N        the honest answer carries N A records 10.77.x.y (oversize over UDP)
   "flood": N         N unsolicited replies with random ids (never the query's), right name, address 10.6.6.6
+  "srv": [[prio, weight, port, target]...]  SRV answer (qtype SRV or ANY)
+  "srv_ar": true     with an additional A/AAAA record per target, from the target's own "a"/"aaaa"
+  "extra_ar": {name: ip}  additional A records for names that are no target (hostile)
 Unknown names: NXDOMAIN. One log line per query: t qtype qname id proto edns=size sport=port.
 """
 import json, os, random, socket, struct, sys, threading, time
@@ -67,9 +70,12 @@ def a_rr(ip, ttl=60, owner=b"\xc0\x0c"):
         return rr(owner, 28, ttl, socket.inet_pton(socket.AF_INET6, ip))
     return rr(owner, 1, ttl, socket.inet_pton(socket.AF_INET, ip))
 
-def reply(qid, question, answers, rcode=0, tc=0, qd=1, an=None, extra=b""):
-    hdr = struct.pack("!HHHHHH", qid, 0x8180 | tc | rcode, qd, len(answers) if an is None else an, 0, 0)
-    return hdr + question + b"".join(answers) + extra
+def reply(qid, question, answers, rcode=0, tc=0, qd=1, an=None, extra=b"", ar=()):
+    hdr = struct.pack("!HHHHHH", qid, 0x8180 | tc | rcode, qd, len(answers) if an is None else an, 0, len(ar))
+    return hdr + question + b"".join(answers) + extra + b"".join(ar)
+
+def srv_rr(prio, weight, port, target, ttl, owner):
+    return rr(owner, 33, ttl, struct.pack("!HHH", prio, weight, port) + enc_name(target))
 
 def parse(req):
     qid = struct.unpack("!H", req[:2])[0]
@@ -121,7 +127,7 @@ def honest(spec, z, qid, qtype, question, proto):
     if spec.get("silent") or spec.get("only"):
         return None
     rcode = {"nx": 3, "refused": 5, "servfail": 2, None: 0}[spec.get("rcode")]
-    answers = []
+    answers, ar = [], []
     ttl = spec.get("ttl", 60)
     if rcode == 0 and not spec.get("nodata"):
         owner, tgt = b"\xc0\x0c", spec
@@ -135,10 +141,17 @@ def honest(spec, z, qid, qtype, question, proto):
             answers += [a_rr("10.77.%d.%d" % (i // 250, i % 250 + 1), ttl, owner) for i in range(n)]
         if qtype in (28, 255):
             answers += [a_rr(ip, ttl, owner) for ip in tgt.get("aaaa", [])]
+        if qtype in (33, 255):
+            for prio, weight, sport, target in tgt.get("srv", []):
+                answers.append(srv_rr(prio, weight, sport, target, ttl, owner))
+                if tgt.get("srv_ar"):
+                    t = z.get(target, {})
+                    ar += [a_rr(ip, ttl, enc_name(target)) for ip in t.get("a", []) + t.get("aaaa", [])]
+            ar += [a_rr(ip, ttl, enc_name(n)) for n, ip in tgt.get("extra_ar", {}).items()]
     tc = 0
     if proto == "udp" and spec.get("tc_udp"):
-        tc, answers = 0x0200, []
-    return reply(qid, question, answers, rcode, tc)
+        tc, answers, ar = 0x0200, [], []
+    return reply(qid, question, answers, rcode, tc, ar=ar)
 
 def handle(req, proto, sport, send, send_other):
     qid, qname, qtype, question, edns = parse(req)

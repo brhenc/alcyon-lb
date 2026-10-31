@@ -443,8 +443,7 @@ fn parse_resolve_keyword(opts: &mut crate::ast::ResolveOpts, tokens: &[Token], i
                 match p {
                     "allow-dup-ip" => opts.allow_dup_ip = true,
                     "prevent-dup-ip" => opts.allow_dup_ip = false,
-                    // SRV weights (T487): nothing to ignore without SRV records.
-                    "ignore-weight" => {}
+                    "ignore-weight" => opts.ignore_weight = true,
                     _ => {
                         return Err(fail(format!(
                             ": unknown resolve-opts option '{p}', supported methods are 'allow-dup-ip', 'ignore-weight', and 'prevent-dup-ip'.."

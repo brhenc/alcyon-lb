@@ -14,12 +14,17 @@
 //! sans-IO `ibex_dns::Resolver` owns the ids, retries and validation; this module owns the
 //! schedule (`timeout resolve`), the `hold` timers and what an answer does to a server.
 //!
+//! An SRV name (`_...`, T487) is a resolution of its own whose records fill the slots of the
+//! servers that name it (`resolv_check_response`): target, port, weight, and the address of an
+//! additional record, or else an A/AAAA resolution per target made at run time.
+//!
 //! Nothing here runs on the request path. What other workers read: the server's address in
 //! `Proxy::servers` (the seqlock `set server addr` writes), its state in
 //! `Proxy::server_statuses`, and `SRV_ADMF_RMAINT` in `Proxy::server_rmaint`.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::AsRawFd;
@@ -34,6 +39,7 @@ use crate::engine::Proxy;
 
 const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
+const TYPE_SRV: u16 = 33;
 
 ibex_alloc::declare_pool!(
     /// `show pools` `resolution`: one per name and query type a `resolvers` section resolves
@@ -52,6 +58,7 @@ impl ibex_alloc::Poolable for Box<Resolution> {
     fn reset(&mut self, _wipe: bool) {
         self.items.clear();
         self.reqs.clear();
+        self.srv = None;
     }
 
     fn try_new() -> Option<Self> {
@@ -171,6 +178,8 @@ enum Cause {
     Timeout,
     Refused,
     Unspec,
+    /// `SRV_ADM_STCHGC_DNS_NOENT`: the slot's SRV record is gone.
+    NoEnt,
 }
 
 impl Cause {
@@ -182,6 +191,7 @@ impl Cause {
             Cause::Timeout => "DNS timeout status",
             Cause::Refused => "DNS refused status",
             Cause::Unspec => "unspecified DNS error",
+            Cause::NoEnt => "entry removed from SRV record",
         }
     }
 }
@@ -278,6 +288,148 @@ pub struct Resolution {
     /// When the last resolution ended (`last_resolution`).
     ended_at: Option<Instant>,
     status: Status,
+    /// An SRV resolution's slots and records (`prefer` is then [`TYPE_SRV`]; `reqs` and
+    /// `items` stay empty).
+    srv: Option<Box<SrvState>>,
+}
+
+/// The slots of the servers whose name is an SRV record, shared by every worker (T487): the
+/// target each took (`srv->hostname`, `srv_fqdn`) and whether it ever took one
+/// (`SRV_ADMF_FQDN_CHANGED`). Written by the section's worker when an answer changes a slot,
+/// read by `show servers state`.
+#[derive(Debug)]
+pub struct SrvSlots {
+    /// Each server's SRV name (`srvrecord`), `None` for the others.
+    pub record: Vec<Option<Box<str>>>,
+    pub fqdn: std::sync::Mutex<Vec<Option<Box<str>>>>,
+    pub changed: Vec<std::sync::atomic::AtomicBool>,
+}
+
+impl SrvSlots {
+    /// The slots of a section's servers, `None` when no server's name is an SRV record.
+    #[must_use]
+    pub fn new(count: usize, extras: &ibex_config::ast::ServerExtras) -> Option<std::sync::Arc<Self>> {
+        if !extras.names.iter().any(|n| n.fqdn.starts_with('_')) {
+            return None;
+        }
+        let mut record = vec![None; count];
+        for n in extras.names.iter().filter(|n| n.fqdn.starts_with('_')) {
+            if let Some(r) = record.get_mut(n.index as usize) {
+                *r = Some(n.fqdn.clone());
+            }
+        }
+        Some(std::sync::Arc::new(Self {
+            record,
+            fqdn: std::sync::Mutex::new(vec![None; count]),
+            changed: (0..count).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
+        }))
+    }
+
+    /// The target of slot `idx`.
+    #[must_use]
+    pub fn fqdn(&self, idx: usize) -> Option<Box<str>> {
+        self.fqdn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(idx).cloned().flatten()
+    }
+
+    fn set_fqdn(&self, idx: usize, v: Option<&str>) {
+        if let Some(f) = self.fqdn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(idx) {
+            *f = v.map(Box::from);
+        }
+        if v.is_some() {
+            if let Some(c) = self.changed.get(idx) {
+                c.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// An SRV resolution (`struct resolv_srvrq` per proxy, and the SRV items of the answers).
+#[derive(Debug, Default)]
+struct SrvState {
+    rqs: Vec<SrvRq>,
+    /// In key order, as `HAProxy`'s answer tree: the order the records fill the slots in.
+    items: Vec<SrvItem>,
+}
+
+/// The servers of one proxy that name the SRV record.
+#[derive(Debug)]
+struct SrvRq {
+    proxy: u32,
+    /// The slots with no record, in order (`srvrq->attached_servers`): a slot whose record goes
+    /// comes back at the end.
+    free: Vec<u32>,
+    /// The first slot's `resolve-*` options, its per-target resolutions' too.
+    opts: ResolveOpts,
+}
+
+/// One SRV record of the answers (`struct resolv_answer_item` of type SRV).
+#[derive(Debug)]
+struct SrvItem {
+    /// `XXH32` of the target in label form, seed 33.
+    key: u32,
+    /// Lower case, no final dot.
+    target: Box<str>,
+    port: u16,
+    weight: u16,
+    last_seen: Instant,
+    /// The additional record for the target (`ar_item`) and when it was last seen.
+    ar: Option<(IpAddr, Instant)>,
+    /// The slots on this record, as (proxy, server) (`attached_servers`).
+    slots: Vec<(u32, u32)>,
+}
+
+/// What an SRV answer asks of the section's other resolutions.
+#[derive(Debug)]
+enum SrvAct {
+    /// Slot (proxy, server) resolves its target on its own (`resolv_link_resolution`).
+    Link(u32, u32, Box<str>, ResolveOpts),
+    /// Slot (proxy, server) leaves its target's resolution (`_resolv_unlink_resolution`).
+    Unlink(u32, u32),
+}
+
+/// The tree key of an SRV item: `XXH32` of the target as labels (`\x02t1\x04test`).
+fn srv_key(target: &str) -> u32 {
+    let mut dn = Vec::with_capacity(target.len() + 1);
+    for l in target.split('.').filter(|l| !l.is_empty()) {
+        dn.push(u8::try_from(l.len()).unwrap_or(u8::MAX));
+        dn.extend_from_slice(l.as_bytes());
+    }
+    ibex_sample::hash::hash_xxh32(&dn, u32::from(TYPE_SRV))
+}
+
+/// A name of an answer as the slots keep it: lower case (the crate's), no final dot.
+fn srv_name(name: &str) -> &str {
+    name.strip_suffix('.').unwrap_or(name)
+}
+
+/// A new resolution of `name` (`resolv_pick_resolution`), from the pool.
+fn new_resolution(name: &str, prefer: u16, at: Instant) -> Box<Resolution> {
+    let mut res = RESOLUTION_POOL
+        .take_counted(|| {
+            Some(Box::new(Resolution {
+                name: Box::from(""),
+                prefer,
+                reqs: Vec::new(),
+                items: Vec::new(),
+                cursor: 0,
+                in_flight: None,
+                next_at: at,
+                last_valid: Some(at),
+                ended_at: None,
+                status: Status::None,
+                srv: None,
+            }))
+        })
+        .expect("a resolution");
+    res.name = name.into();
+    res.prefer = prefer;
+    res.cursor = 0;
+    res.in_flight = None;
+    res.next_at = at;
+    res.last_valid = Some(at);
+    res.ended_at = None;
+    res.status = Status::None;
+    res
 }
 
 /// A nameserver's TCP connection (`dns_stream_*`, `dns.c`): opened by the first query that
@@ -347,7 +499,8 @@ pub struct Section {
 
 /// What a step reports to the engine: a line to log on the server's proxy, at a level, also
 /// printed on stderr as `HAProxy`'s `ha_warning` does.
-pub type LogFn<'a> = dyn FnMut(usize, LogLevel, &str) + 'a;
+/// The last argument is false for a line `HAProxy` only logs (`send_log` alone).
+pub type LogFn<'a> = dyn FnMut(usize, LogLevel, &str, bool) + 'a;
 
 thread_local! {
     /// `is_inet6_reachable`: the result and when it was taken, kept 30 s
@@ -431,31 +584,42 @@ pub fn build(
                 out.len() - 1
             };
             // `resolv_link_resolution`: the type asked first, fixed now (A.t18).
-            let prefer = if !families.ipv6 || n.resolve.prefer_ipv4 { TYPE_A } else { TYPE_AAAA };
+            let srv = n.fqdn.starts_with('_');
+            let prefer = if srv {
+                TYPE_SRV
+            } else if !families.ipv6 || n.resolve.prefer_ipv4 {
+                TYPE_A
+            } else {
+                TYPE_AAAA
+            };
             let key = (sec_idx, n.fqdn.to_ascii_lowercase().into_boxed_str(), prefer);
+            if srv {
+                // The slots join the record's resolution (`find_srvrq_by_name`, one per proxy).
+                let sec = &mut out[sec_idx];
+                let p = usize_to_u32(p_idx);
+                let r = if let Some(&(_, r)) = by_key.get(&key) {
+                    r
+                } else {
+                    let mut res = new_resolution(&n.fqdn, TYPE_SRV, t0);
+                    res.srv = Some(Box::default());
+                    by_key.insert(key, (sec_idx, sec.resolutions.len()));
+                    sec.resolutions.push(res);
+                    sec.resolutions.len() - 1
+                };
+                let st = sec.resolutions[r].srv.get_or_insert_with(Box::default);
+                if let Some(rq) = st.rqs.iter_mut().find(|q| q.proxy == p) {
+                    rq.free.push(n.index);
+                } else {
+                    st.rqs.push(SrvRq { proxy: p, free: vec![n.index], opts: n.resolve.clone() });
+                }
+                continue;
+            }
             let req = Req { proxy: usize_to_u32(p_idx), server: n.index, opts: n.resolve.clone(), attached: None };
             let sec = &mut out[sec_idx];
             if let Some(&(_, r)) = by_key.get(&key) {
                 sec.resolutions[r].reqs.push(req);
             } else {
-                let mut res = RESOLUTION_POOL
-                    .take_counted(|| {
-                        Some(Box::new(Resolution {
-                            name: Box::from(""),
-                            prefer,
-                            reqs: Vec::new(),
-                            items: Vec::new(),
-                            cursor: 0,
-                            in_flight: None,
-                            next_at: t0,
-                            last_valid: Some(t0),
-                            ended_at: None,
-                            status: Status::None,
-                        }))
-                    })
-                    .expect("a resolution");
-                res.name = n.fqdn.clone();
-                res.prefer = prefer;
+                let mut res = new_resolution(&n.fqdn, prefer, t0);
                 res.reqs.push(req);
                 by_key.insert(key, (sec_idx, sec.resolutions.len()));
                 sec.resolutions.push(res);
@@ -587,7 +751,8 @@ impl Section {
             if r.in_flight.is_none() && now >= r.next_at {
                 let prefer = if r.prefer == TYPE_A { Family::Ipv4 } else { Family::Ipv6 };
                 let accept = Families { ipv4: families.ipv4 || prefer == Family::Ipv4, ipv6: families.ipv6 || prefer == Family::Ipv6 };
-                match self.dns.query(now, &r.name, Question::Addr { accept, prefer }, Requester::Server) {
+                let question = if r.prefer == TYPE_SRV { Question::Srv } else { Question::Addr { accept, prefer } };
+                match self.dns.query(now, &r.name, question, Requester::Server) {
                     Ok(q) => r.in_flight = Some(q),
                     // A name the parser let through and the crate refuses, or no id free:
                     // tried again at the next period.
@@ -809,6 +974,20 @@ impl Section {
             r.in_flight = None;
             r.next_at = now + self.holds.timeout_resolve;
             r.ended_at = Some(now);
+            if r.srv.is_some() {
+                let mut acts = Vec::new();
+                match res {
+                    Ok(answers) => srv_answer(r, &answers, &self.holds, now, proxies, checks, log, &mut acts),
+                    Err(e) => srv_error(r, &e, &self.holds, now, proxies, checks, log, &mut acts),
+                }
+                for a in acts {
+                    match a {
+                        SrvAct::Link(p, s, target, opts) => self.link(p, s, &target, opts, now),
+                        SrvAct::Unlink(p, s) => self.unlink(p, s),
+                    }
+                }
+                continue;
+            }
             match res {
                 Ok(answers) => {
                     let by = ns.map(|i| format!("{}/{}", self.name, self.nameservers[i].name));
@@ -821,6 +1000,203 @@ impl Section {
                 }
                 Err(e) => on_error(r, &e, &self.holds, now, proxies, checks, log),
             }
+        }
+    }
+
+    /// Slot `s` of proxy `p` resolves `target` (`resolv_link_resolution`): it joins the
+    /// resolution of that name, else a new one, first asked one `timeout resolve` from now
+    /// (A.t11b: the A queries go out with the next SRV query).
+    fn link(&mut self, p: u32, s: u32, target: &str, opts: ResolveOpts, now: Instant) {
+        if self.resolutions.iter().any(|r| r.reqs.iter().any(|q| q.proxy == p && q.server == s)) {
+            return;
+        }
+        let prefer = if !active_families(now).ipv6 || opts.prefer_ipv4 { TYPE_A } else { TYPE_AAAA };
+        let req = Req { proxy: p, server: s, opts, attached: None };
+        if let Some(r) = self.resolutions.iter_mut().find(|r| r.srv.is_none() && r.prefer == prefer && r.name.eq_ignore_ascii_case(target)) {
+            r.reqs.push(req);
+            return;
+        }
+        let mut res = new_resolution(target, prefer, now);
+        res.next_at = now + self.holds.timeout_resolve;
+        res.reqs.push(req);
+        self.resolutions.push(res);
+    }
+
+    /// Slot `s` of proxy `p` leaves its target's resolution, which goes back to the pool once
+    /// no server is on it (`_resolv_unlink_resolution`, `resolv_free_resolution`).
+    fn unlink(&mut self, p: u32, s: u32) {
+        let Some(i) = self.resolutions.iter().position(|r| r.srv.is_none() && r.reqs.iter().any(|q| q.proxy == p && q.server == s)) else { return };
+        let r = &mut self.resolutions[i];
+        if let Some(k) = r.reqs.iter().position(|q| q.proxy == p && q.server == s) {
+            set_attached(r, k, None);
+            r.reqs.remove(k);
+        }
+        if r.reqs.is_empty() {
+            RESOLUTION_POOL.give_counted(self.resolutions.remove(i));
+        }
+    }
+}
+
+/// `resolv_validate_dns_response` and `resolv_check_response` for an SRV resolution: the
+/// records into the items (in key order, kept when already there, the weight refreshed), the
+/// additional records onto the first record of their name without one, then in key order the
+/// obsolete records go (their slots with them) and each record fills a slot of each proxy.
+#[allow(clippy::too_many_arguments)]
+fn srv_answer(r: &mut Resolution, answers: &[Answer], holds: &Holds, now: Instant, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>) {
+    r.status = Status::Valid;
+    r.last_valid = Some(now);
+    let fam = active_families(now);
+    let Some(st) = r.srv.as_deref_mut() else { return };
+    for a in answers {
+        if let Rdata::Srv { target, port, weight, .. } = &a.rdata {
+            let target = srv_name(target);
+            let key = srv_key(target);
+            if let Some(it) = st.items.iter_mut().find(|i| i.key == key && i.port == *port && *i.target == *target) {
+                it.weight = *weight;
+                it.last_seen = now;
+            } else {
+                let at = st.items.partition_point(|i| i.key <= key);
+                st.items.insert(at, SrvItem { key, target: target.into(), port: *port, weight: *weight, last_seen: now, ar: None, slots: Vec::new() });
+            }
+        }
+    }
+    for a in answers {
+        let Rdata::Additional { name, ip } = &a.rdata else { continue };
+        if (ip.is_ipv4() && !fam.ipv4) || (ip.is_ipv6() && !fam.ipv6) {
+            continue;
+        }
+        let name = srv_name(name);
+        // Seen again (not twice in one answer), else onto the first record of the name without one.
+        if let Some(it) = st.items.iter_mut().find(|i| *i.target == *name && i.ar.is_some_and(|(v, seen)| v == *ip && seen != now)) {
+            it.ar = Some((*ip, now));
+        } else if let Some(it) = st.items.iter_mut().find(|i| *i.target == *name && i.ar.is_none()) {
+            it.ar = Some((*ip, now));
+        }
+    }
+    let mut leave: Vec<(u32, u32, Box<str>)> = Vec::new();
+    let mut i = 0;
+    while i < st.items.len() {
+        if st.items[i].ar.is_some_and(|(_, seen)| seen + holds.obsolete < now) {
+            st.items[i].ar = None;
+        }
+        if st.items[i].last_seen + holds.obsolete < now {
+            let it = st.items.remove(i);
+            for (p, s) in it.slots {
+                srv_cleanup(&mut st.rqs, p, s, proxies, checks, log, acts);
+            }
+            continue;
+        }
+        for q in 0..st.rqs.len() {
+            let p = st.rqs[q].proxy;
+            let it = &mut st.items[i];
+            let s = if let Some(&(_, s)) = it.slots.iter().find(|x| x.0 == p) {
+                s
+            } else if st.rqs[q].free.is_empty() {
+                continue;
+            } else {
+                let s = st.rqs[q].free.remove(0);
+                it.slots.push((p, s));
+                s
+            };
+            srv_fill(it, p, s, &st.rqs[q].opts, proxies, log, acts, &mut leave);
+        }
+        i += 1;
+    }
+    for (p, s, target) in leave {
+        let req = Req { proxy: p, server: s, opts: ResolveOpts::default(), attached: None };
+        leave_rmaint(&req, &target, proxies, checks, log);
+    }
+}
+
+/// `srv_found` in `resolv_check_response`: slot `s` of proxy `p` takes record `it`'s port,
+/// target and weight, and the address of its additional record if it has one (its own
+/// resolution is then dropped), else resolves the target.
+#[allow(clippy::too_many_arguments)]
+fn srv_fill(it: &SrvItem, p: u32, s: u32, opts: &ResolveOpts, proxies: &[Proxy], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>, leave: &mut Vec<(u32, u32, Box<str>)>) {
+    let (pi, si) = (p as usize, s as usize);
+    let Some(px) = proxies.get(pi) else { return };
+    let Some(old) = px.servers.get(si) else { return };
+    let srv = &px.server_ids[si];
+    if let Some((ip, _)) = it.ar {
+        acts.push(SrvAct::Unlink(p, s));
+        // `server_set_inetaddr_warn`: a port 0 is a mapped port (`+0`).
+        let ip_change = old.ip() != ip;
+        let port_change = old.port() != it.port || old.port() == 0;
+        if ip_change || port_change {
+            px.servers.set(si, SocketAddr::new(ip, it.port));
+            let mut msg = format!("{}/{srv}: ", px.name);
+            if ip_change {
+                let from = if old.ip().is_unspecified() { "(none)".to_string() } else { old.ip().to_string() };
+                let _ = write!(msg, "IP changed from '{from}' to '{ip}'");
+            }
+            if port_change {
+                let sep = if ip_change { ", " } else { "" };
+                let plus = if old.port() == 0 { "+" } else { "" };
+                let _ = write!(msg, "{sep}port changed from '{plus}{}' to '{}'", old.port(), it.port);
+            }
+            msg.push_str(" by 'DNS additional record'.");
+            log(pi, LogLevel::Notice, &msg, true);
+        }
+        if px.server_rmaint(si) {
+            leave.push((p, s, it.target.clone()));
+        }
+    } else if old.port() != it.port {
+        px.servers.set(si, SocketAddr::new(old.ip(), it.port));
+    }
+    if px.server_srv_fqdn(si).is_none() {
+        if it.target.is_empty() || it.target.bytes().any(|b| !(b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')) {
+            // `srv_update_fqdn`: logged, and the slot keeps no target.
+            log(pi, LogLevel::Notice, &format!("invalid fqdn '{}' by 'SRV record'", it.target), false);
+            return;
+        }
+        px.set_server_srv_fqdn(si, Some(&it.target));
+        log(pi, LogLevel::Notice, &format!("{}/{srv} changed its FQDN from (null) to {} by 'SRV record'", px.name, it.target), false);
+    }
+    if it.ar.is_none() {
+        acts.push(SrvAct::Link(p, s, it.target.clone(), opts.clone()));
+    }
+    if !opts.ignore_weight {
+        // A DNS weight is 0-65535, a server's 0-256 (`resolv_check_response`).
+        px.set_weight(si, u32::from(it.weight).div_ceil(256));
+    }
+}
+
+/// `resolv_srvrq_cleanup_srv`: the slot's record is gone. It enters maintenance ("entry
+/// removed from SRV record"), loses its target, address and port, leaves its target's
+/// resolution, and is free again (at the end of the list).
+#[allow(clippy::too_many_arguments)]
+fn srv_cleanup(rqs: &mut [SrvRq], p: u32, s: u32, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>) {
+    acts.push(SrvAct::Unlink(p, s));
+    let Some(px) = proxies.get(p as usize) else { return };
+    if !px.server_rmaint(s as usize) {
+        let req = Req { proxy: p, server: s, opts: ResolveOpts::default(), attached: None };
+        enter_rmaint(&req, Cause::NoEnt, proxies, checks, log);
+    }
+    px.set_server_srv_fqdn(s as usize, None);
+    px.servers.set(s as usize, SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
+    if let Some(rq) = rqs.iter_mut().find(|q| q.proxy == p) {
+        rq.free.push(s);
+    }
+}
+
+/// `srvrq_resolution_error_cb`: an SRV resolution that failed for longer than the hold of its
+/// status since the last valid answer drops every record and its slots.
+#[allow(clippy::too_many_arguments)]
+fn srv_error(r: &mut Resolution, e: &DnsError, holds: &Holds, now: Instant, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>) {
+    let (cause, hold) = match e {
+        DnsError::NxDomain => (Cause::Nx, holds.nx),
+        DnsError::Refused => (Cause::Refused, holds.refused),
+        DnsError::Timeout => (Cause::Timeout, holds.timeout),
+        DnsError::Other | DnsError::Invalid => (Cause::Unspec, holds.other),
+    };
+    r.status = Status::Error(cause);
+    if r.last_valid.is_some_and(|lv| now < lv + hold) {
+        return;
+    }
+    let Some(st) = r.srv.as_deref_mut() else { return };
+    for it in std::mem::take(&mut st.items) {
+        for (p, s) in it.slots {
+            srv_cleanup(&mut st.rqs, p, s, proxies, checks, log, acts);
         }
     }
 }
@@ -921,7 +1297,7 @@ fn server_answer(r: &mut Resolution, k: usize, by: &str, holds: &Holds, now: Ins
             px.servers.set(s, SocketAddr::new(ip, old.port()));
             let from = cur.map_or_else(|| "(none)".to_string(), |c| c.to_string());
             let srv = &px.server_ids[s];
-            log(p, LogLevel::Notice, &format!("{}/{srv}: IP changed from '{from}' to '{ip}' by '{by}'.", px.name));
+            log(p, LogLevel::Notice, &format!("{}/{srv}: IP changed from '{from}' to '{ip}' by '{by}'.", px.name), true);
             if px.server_rmaint(s) {
                 leave_rmaint(&r.reqs[k], &r.name, proxies, checks, log);
             }
@@ -1123,7 +1499,7 @@ fn enter_rmaint(req: &Req, cause: Cause, proxies: &[Proxy], checks: &mut [Server
             )
         }
     };
-    log(p, if before == ServerStatus::Up as u8 || before == ServerStatus::Drain as u8 { LogLevel::Alert } else { LogLevel::Notice }, &msg);
+    log(p, if before == ServerStatus::Up as u8 || before == ServerStatus::Drain as u8 { LogLevel::Alert } else { LogLevel::Notice }, &msg, true);
 }
 
 /// `srv_act` and `srv_bck`: the servers of `px` that take traffic.
@@ -1158,11 +1534,11 @@ fn leave_rmaint(req: &Req, fqdn: &str, proxies: &[Proxy], checks: &mut [ServerCh
         let adm = if saved == ServerStatus::Drain { "DRAIN" } else { "READY" };
         format!("{backup}Server {}/{srv} ('{fqdn}') is {op}/{adm} (resolves again).", px.name)
     };
-    log(p, LogLevel::Notice, &msg);
+    log(p, LogLevel::Notice, &msg, true);
     if saved == ServerStatus::Drain {
-        log(p, LogLevel::Notice, &format!("{backup}Server {}/{srv} remains in forced drain mode.", px.name));
+        log(p, LogLevel::Notice, &format!("{backup}Server {}/{srv} remains in forced drain mode.", px.name), true);
     }
-    log(p, LogLevel::Notice, &format!("Server {}/{srv} administratively READY thanks to valid DNS answer.", px.name));
+    log(p, LogLevel::Notice, &format!("Server {}/{srv} administratively READY thanks to valid DNS answer.", px.name), true);
 }
 
 #[cfg(test)]
@@ -1240,6 +1616,7 @@ mod tests {
             last_valid: None,
             ended_at: None,
             status: Status::None,
+            srv: None,
         }
     }
 

@@ -1,0 +1,1 @@
+{"servers": "  server-template srv 2 _http._tcp.srv.test resolvers r resolve-opts ignore-weight", "resolvers": "  timeout resolve 1s", "zones": [[0, {"_http._tcp.srv.test": {"srv": [[10, 256, 8080, "t1.test"]], "extra_ar": {"evil.test": "10.6.6.6"}}, "t1.test": {"a": ["10.1.0.1"]}}]], "dur": 2.5}

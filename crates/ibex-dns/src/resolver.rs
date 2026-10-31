@@ -553,7 +553,7 @@ fn validate(buf: &[u8], f: &InFlight, max_payload: usize) -> (Verdict, u16) {
             RData::A(ip) => Rdata::A(ip.0),
             RData::AAAA(ip) => Rdata::Aaaa(ip.0),
             RData::SRV(s) => Rdata::Srv {
-                target: s.target().to_string(),
+                target: s.target().to_lowercase().to_string(),
                 port: s.port(),
                 priority: s.priority(),
                 weight: s.weight(),
@@ -570,6 +570,17 @@ fn validate(buf: &[u8], f: &InFlight, max_payload: usize) -> (Verdict, u16) {
         // A record seen twice is kept once (resolvers.c:1400-1450).
         if !answers.iter().any(|a| a.rdata == rdata) {
             answers.push(Answer { rdata, ttl: rec.ttl() });
+        }
+    }
+    // An SRV answer's additional addresses, which the caller matches to the targets.
+    if srv {
+        for rec in msg.additionals() {
+            let ip = match rec.data() {
+                RData::A(ip) => std::net::IpAddr::V4(ip.0),
+                RData::AAAA(ip) => std::net::IpAddr::V6(ip.0),
+                _ => continue,
+            };
+            answers.push(Answer { rdata: Rdata::Additional { name: rec.name().to_lowercase().to_string(), ip }, ttl: rec.ttl() });
         }
     }
     (Verdict::Valid(answers), qtype)
