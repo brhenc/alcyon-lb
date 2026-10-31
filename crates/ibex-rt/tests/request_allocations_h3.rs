@@ -212,9 +212,10 @@ const PINNED: usize = 0;
 
 /// Requests before the counted window (T543; T512 had 5). What a connection allocates once,
 /// not a request: the first spare `Send`/`Recv`/`Retransmits` boxes, and quinn's first 1-RTT key
-/// update, which comes at a random packet in 10..1000 (`Connection::new` `key_phase_size`; the
-/// next one only near the AEAD confidentiality limit). 500 requests are well past both.
-const WARMUP: usize = 500;
+/// update, which comes at a random one of the server's own sent packets in 10..1000
+/// (`Connection::new` `key_phase_size`; the next one only near the AEAD confidentiality limit).
+/// The server sends one or two packets a request: 1200 requests are past both (500 were not).
+const WARMUP: usize = 1200;
 
 /// The count for `n` more requests over the count for 20 is at most [`PINNED`] a request.
 fn assert_pinned(what: &str, body: &[u8]) {
