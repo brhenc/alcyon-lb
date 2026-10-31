@@ -35,6 +35,34 @@ impl Send {
         })
     }
 
+    /// Release the stream's data when it is freed, keeping its allocations (Ibex T543)
+    pub(super) fn free(&mut self) {
+        self.pending.reinit();
+    }
+
+    /// Reset a freed `Send` to the state `new` gives it, for another stream (Ibex T543)
+    pub(super) fn reinit(&mut self, max_data: VarInt) {
+        // NB: when adding or removing fields, update `new` and this
+        let Self {
+            max_data: m,
+            state,
+            pending,
+            priority,
+            fin_pending,
+            connection_blocked,
+            data_blocked_limit,
+            stop_reason,
+        } = self;
+        *m = max_data.into();
+        *state = SendState::Ready;
+        pending.reinit();
+        *priority = 0;
+        *fin_pending = false;
+        *connection_blocked = false;
+        *data_blocked_limit = None;
+        *stop_reason = None;
+    }
+
     /// Whether the stream has been reset
     pub(super) fn is_reset(&self) -> bool {
         matches!(self.state, SendState::ResetSent)

@@ -138,7 +138,7 @@ impl RecvStream<'_> {
             hash_map::Entry::Occupied(s) => s,
             hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
         };
-        let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
+        let stream = get_or_insert_recv(self.state.stream_receive_window, &mut self.state.free_recv)(entry.get_mut());
 
         let (read_credits, stop_sending) = stream.stop()?;
         if stop_sending.should_transmit() {
@@ -248,7 +248,7 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, &mut self.state.free_send))
             .ok_or(WriteError::ClosedStream)?;
 
         if limit == 0 {
@@ -311,7 +311,7 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, &mut self.state.free_send))
             .ok_or(FinishError::ClosedStream)?;
 
         let was_pending = stream.is_pending();
@@ -333,7 +333,7 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, &mut self.state.free_send))
             .ok_or(ClosedStream { _private: () })?;
 
         if matches!(stream.state, SendState::ResetSent) {
@@ -362,7 +362,7 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, &mut self.state.free_send))
             .ok_or(ClosedStream { _private: () })?;
 
         stream.priority = priority;

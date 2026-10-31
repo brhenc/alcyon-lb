@@ -33,6 +33,27 @@ impl SendBuffer {
         Self::default()
     }
 
+    /// Empty the buffer for another stream, keeping its allocations (Ibex T543)
+    pub(super) fn reinit(&mut self) {
+        // NB: when adding or removing fields, update this
+        let Self {
+            unacked_segments,
+            unacked_len,
+            front_trimmed,
+            offset,
+            unsent,
+            acks,
+            retransmits,
+        } = self;
+        unacked_segments.clear();
+        *unacked_len = 0;
+        *front_trimmed = 0;
+        *offset = 0;
+        *unsent = 0;
+        acks.clear();
+        retransmits.clear();
+    }
+
     /// Append application data to the end of the stream
     pub(super) fn write(&mut self, data: Bytes) {
         self.unacked_len += data.len();
