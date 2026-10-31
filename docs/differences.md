@@ -400,6 +400,15 @@ stream: each stream is a new HTTP/1 session over its socket pair, and `http-reus
 session's first request on a connection of its own, so no stream takes a kept one. Under
 `retry-on empty-response` both paths and HAProxy serve them all. Gone with the relay, slice H5.
 
+## The HTTP/3 relay has no connection timers (T521, until H5)
+
+HAProxy 3.5-dev7 ends an HTTP/3 connection with a GOAWAY and `CONNECTION_CLOSE H3_NO_ERROR` at
+`timeout http-request` from its start (no request yet) or from a partial head's stream start, and
+at `timeout http-keep-alive` (else `http-request`) from the end of its last stream
+(`qcc_refresh_timeout`). The mux path does the same (`h3_mux_drain.rs`). On the relay path (the
+default) only quinn's 30 s transport idle timeout ends a connection that sends nothing or a
+partial head (RV-16). Gone with the relay, slice H5.
+
 ## `tune.ibex.zero-spares on|off`: an Ibex-only global keyword (S1)
 
 The header rules, samples and formats reuse per-thread spare strings and header lists (`show

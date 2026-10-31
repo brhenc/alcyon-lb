@@ -182,6 +182,7 @@ mod h3_end_to_end;
 mod h3_field_validity;
 mod quic_retry;
 mod h3_many_threads;
+mod h3_mux_drain;
 mod h3_mux_edges;
 mod h3_mux_owner;
 mod h3_proxy_path;
