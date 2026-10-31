@@ -753,3 +753,35 @@ messages for a bad argument, a bad level and a bad pointer). Differences:
   connections quinn-proto still holds closing, which are removed sooner than HAProxy's.
 * `show info` has no QUIC field on HAProxy 3.5-dev7 (the field list is identical with and without a
   `quic4@` bind), so Ibex has none either; the connection counters QUIC feeds are T504's.
+
+## `tune.quic.*` and the QUIC bind keywords (T525)
+
+Implemented, each measured on the QUIC oracle (HAProxy 3.5-dev7-e6f616-55) and tested in
+`crates/ibex-rt/tests/it/quic_knobs.rs` (both h3 paths) and `crates/ibex-config/tests/it/quic_tune.rs`:
+`tune.quic.fe.sec.retry-threshold` (T492), `tune.quic.fe.max-idle-timeout` (transport parameter and
+idle close), `tune.quic.fe.stream.max-concurrent` (`initial_max_streams_bidi`),
+`tune.quic.fe.stream.max-total` (credit is the smaller of the two; the connection is closed with
+`H3_NO_ERROR` once that many request streams are done), `tune.quic.listen` (`off`: no UDP socket for
+a `quic4@`/`quic6@` bind, its frontend's other binds are served, no message as on HAProxy), and the
+bind keyword `quic-force-retry`.
+
+Gaps in what is implemented: a client that opens stream `max-total + 1` while earlier ones are
+still in flight gets the credit quinn-proto extends as streams end (HAProxy stops extending at the
+total); the connection is closed when the last allowed stream is done either way.
+`max-concurrent` above 100 still queues at 100 on the `mux` path (`mux_h3::MAX_CONCURRENT`).
+The `quic_enabled` fetch still answers `false` whatever `tune.quic.listen` says.
+
+Refused at load, the message `'<keyword>' is not supported by Ibex.` (global) or the bind keyword
+refusal (bind): Ibex has nothing for them to tune (quinn-proto's congestion controller, pacing, GSO
+and socket-per-connection are not exposed).
+
+| keyword | HAProxy | why refused |
+|---|---|---|
+| `tune.quic.fe.cc.cubic-min-losses`, `.cc.hystart`, `.cc.max-frame-loss`, `.cc.max-win-size`, `.cc.reorder-ratio` | congestion-control tuning | quinn-proto's controllers take none of these |
+| `tune.quic.fe.sec.glitches-threshold` | close a connection that glitches too much | no QUIC glitch counter |
+| `tune.quic.fe.sock-per-conn` | a UDP socket per connection | one socket per bind and worker |
+| `tune.quic.fe.stream.data-ratio`, `tune.quic.fe.stream.rxbuf` | stream window sizing | the windows come from `tune.bufsize` (T504) |
+| `tune.quic.fe.tx.pacing`, `tune.quic.fe.tx.udp-gso` | pacing, GSO | not switchable |
+| `tune.quic.mem.tx-max`, `tune.quic.sec.stateless-reset-rate`, `tune.quic.zero-copy-fwd-send` | memory cap, reset rate limit, zero copy | not implemented |
+| `tune.quic.be.*` (`cc.*`, `max-idle-timeout`, `sec.glitches-threshold`, `stream.data-ratio`, `stream.max-concurrent`, `stream.rxbuf`, `tx.pacing`, `tx.udp-gso`) | QUIC to servers | no QUIC backend (T461) |
+| bind `quic-cc-algo`, `quic-socket`, `allow-0rtt` | congestion algorithm, socket mode, 0-RTT | refused as before |

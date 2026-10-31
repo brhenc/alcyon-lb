@@ -3945,6 +3945,9 @@ fn initial_status(s: &ibex_config::Server, unresolved: bool) -> u8 {
 /// The first address that cannot be bound.
 pub fn prebind_quic(config: &Config, workers: usize) -> io::Result<()> {
     for frontend in config.frontends.iter().filter(|f| !f.disabled) {
+        if config.global.as_ref().and_then(|g| g.quic_listen) == Some(false) {
+            break;
+        }
         for b in frontend_binds(frontend).iter().filter(|b| b.quic) {
             crate::quic_listener::prebind(b.addr, workers).map_err(|e| {
                 // HAProxy's alert (`protocol_bind_all`), without its `[file:line]`.
@@ -5003,6 +5006,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             for (bind_idx, b) in all_binds.iter().enumerate() {
                 let bind_addr = b.addr;
                 if b.quic {
+                    // `tune.quic.listen off`: `protocol_may_bind_quic` is false, a QUIC bind gets
+                    // no socket (T525); the frontend's other binds are served.
+                    if config.global.as_ref().and_then(|g| g.quic_listen) == Some(false) {
+                        continue;
+                    }
                     let tls = bind_tls_quic(&frontend.name, &frontend.binds, bind_addr)?.expect("QUIC requires TLS");
 
                     // Each request is handed to this frontend's stream engine (T130). It
@@ -5016,9 +5024,23 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     if let Some(n) = config.global.as_ref().and_then(|g| g.quic_retry_threshold) {
                         qc.retry_threshold = n;
                     }
+                    // T525: the transport parameters sent to a client. `max_streams_bidi` is the
+                    // smaller of `max-concurrent` and `max-total` (`quic_transport_params_init`).
+                    let g = config.global.as_ref();
+                    if let Some(ms) = g.and_then(|g| g.quic_max_idle_timeout) {
+                        // 0 sends no parameter: no transport idle timeout.
+                        qc.max_idle_timeout = (ms != 0).then(|| Duration::from_millis(u64::from(ms)));
+                    }
+                    let total = g.and_then(|g| g.quic_stream_max_total).unwrap_or(0);
+                    let mut streams = g.and_then(|g| g.quic_stream_max_concurrent).unwrap_or(100);
+                    if total != 0 {
+                        streams = streams.min(total);
+                    }
+                    qc.max_concurrent_bidi_streams = u64::from(streams);
                     let mut ql = crate::quic_listener::QuicListener::bind_for_worker(bind_addr, &tls, Some(qc), Some(worker_id))?;
                     ql.set_frontend(proxy_idx);
                     ql.gate_connections();
+                    ql.set_stream_max_total(total);
                     if h3_mux(config.global.as_ref().and_then(|g| g.h3_mux)) {
                         ql.serve_by_mux();
                     }
