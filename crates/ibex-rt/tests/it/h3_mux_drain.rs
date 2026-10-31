@@ -591,3 +591,63 @@ fn twenty_concurrent_streams_are_served_at_once_one_descriptor_each() {
         assert!((20..=21).contains(&extra), "{extra} descriptors for 20 requests in flight");
     });
 }
+
+/// The log line of the stream whose request line contains `what`, as the fields of
+/// `TR=%TR Tw=%Tw Tc=%Tc Tr=%Tr Ta=%Ta Th=%Th Ti=%Ti Tt=%Tt` (T529).
+fn timings(collector: &UdpSocket, what: &str) -> std::collections::HashMap<String, i64> {
+    let l = log_line_with(collector, what);
+    l.split_whitespace().filter_map(|w| w.split_once('=')).filter_map(|(k, v)| Some((k.to_owned(), v.parse().ok()?))).collect()
+}
+
+const TIMINGS_FORMAT: &str = "log-format \"TR=%TR Tw=%Tw Tc=%Tc Tr=%Tr Ta=%Ta Th=%Th Ti=%Ti Tt=%Tt %ST %{+Q}r\"";
+
+/// T529: a stream is timed from its own start, not from the end of the connection's previous
+/// stream. `HAProxy` 3.5-dev7 (QUIC), a stream reset 500 ms after it started, then a
+/// `GET /plain` 500 ms later: `TR=0 Tw=0 Tc=0 Tr=1 Ta=1 Th=0 Ti=501 Tt=502` (the idle time
+/// before the stream is `Ti`; 3.5-dev8 on h2 the same, `Ti=500`). Ibex logged `TR=501 Ta=502 Ti=-1`.
+#[test]
+fn the_stream_after_a_reset_stream_is_timed_from_its_own_start() {
+    common::on_h3_path("mux", || {
+        let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
+        let log = format!("timeout client 5s\n    log {} local0\n    {TIMINGS_FORMAT}", collector.local_addr().expect("addr"));
+        let ibex = ibex(backend(), &log);
+        let mut cl = Client::connect(ibex.quic);
+        let id = cl.open(&get(b"/slow?cancel"), true);
+        cl.run_until(Duration::from_millis(500), |_| false);
+        let code = ibex_quic::quinn_proto::VarInt::from_u32(0x10c);
+        let _ = cl.conn.send_stream(id).reset(code);
+        cl.conn.recv_stream(id).stop(code).expect("stop");
+        cl.run_until(Duration::from_millis(500), |_| false);
+        let id = cl.open(&get(b"/after"), true);
+        let o = cl.outcome(id);
+        assert_eq!((o.status, o.fin), (Some(200), true), "{o:?}");
+        let t = timings(&collector, "/after");
+        assert!(t["TR"] <= 50 && t["Ta"] <= 100 && t["Tr"] <= 50, "{t:?}");
+        assert!((400..=700).contains(&t["Ti"]) && t["Tt"] >= t["Ti"], "{t:?}");
+    });
+}
+
+/// T529: the same with no reset: stream 1 done, 500 ms idle, stream 2. `HAProxy` 3.5-dev7
+/// (QUIC): `TR=0 Ta=0 Ti=500 Tt=500`.
+#[test]
+fn the_stream_after_an_idle_gap_is_timed_from_its_own_start() {
+    common::on_h3_path("mux", || {
+        let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
+        let log = format!("timeout client 5s\n    log {} local0\n    {TIMINGS_FORMAT}", collector.local_addr().expect("addr"));
+        let ibex = ibex(backend(), &log);
+        let mut cl = Client::connect(ibex.quic);
+        let id = cl.open(&get(b"/first"), true);
+        let o = cl.outcome(id);
+        assert_eq!((o.status, o.fin), (Some(200), true), "{o:?}");
+        let first = timings(&collector, "/first");
+        // The first stream has no idle time to speak of (`Ti=0` on HAProxy).
+        assert!(first["Ti"] >= 0 && first["Ti"] <= 50 && first["TR"] <= 50, "{first:?}");
+        cl.run_until(Duration::from_millis(500), |_| false);
+        let id = cl.open(&get(b"/second"), true);
+        let o = cl.outcome(id);
+        assert_eq!((o.status, o.fin), (Some(200), true), "{o:?}");
+        let t = timings(&collector, "/second");
+        assert!(t["TR"] <= 50 && t["Ta"] <= 100, "{t:?}");
+        assert!((400..=700).contains(&t["Ti"]) && t["Tt"] >= t["Ti"], "{t:?}");
+    });
+}
