@@ -1,0 +1,5 @@
+{"servers": "  server-template srv 1 _http._tcp.srv.test resolvers r", "resolvers": "  timeout resolve 1s",
+ "zones": [[0, {"_http._tcp.srv.test": {"srv": [[10,512,8080,"t1.test"]], "srv_ar": true}, "t1.test": {"a": ["10.1.0.1"]}}],
+           [1.6, {"_http._tcp.srv.test": {"srv": [[10,512,8080,"t1.test"]], "srv_ar": true}, "t1.test": {"a": ["10.1.0.2"]}}]],
+ "clis": [[2.8, "set server l/srv1 addr 10.1.0.2 port 9000"]],
+ "dur": 5}

@@ -1887,3 +1887,38 @@ fn an_srv_target_that_is_no_host_name_is_logged_and_kept_out() {
     ibex.wait_log("Server l/srv1 ('(null)') is UP/READY (resolves again).", 3);
     assert!(!dns.queries().iter().any(|q| q.qtype == 1), "{:?}", dns.queries());
 }
+
+/// T487, measured on `HAProxy` 3.5-dev8 (cases t487/tip.json, tport.json): the additional record
+/// moves a slot the CLI moved back, logging only what differs: after `set server l/srv1 addr
+/// 10.1.0.9` "IP changed from '10.1.0.9' to '10.1.0.1' by 'DNS additional record'." (no port
+/// part); after `set server l/srv1 addr 10.1.0.1 port 9000` "port changed from '9000' to '8080'
+/// by 'DNS additional record'." (no IP part).
+#[test]
+fn an_additional_record_logs_only_the_ip_or_only_the_port_it_changes() {
+    let dns = FakeDns::start();
+    dns.set(SRV, srv_zone(&[(512, 8080, "t1.test", Some([10, 1, 0, 1]))]));
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n", &srv_template(1, ""), "");
+    ibex.wait_srv("srv1", &format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"), 3);
+    ibex.cli("set server l/srv1 addr 10.1.0.9");
+    ibex.wait_srv("srv1", &format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"), 3);
+    ibex.wait_log("l/srv1: IP changed from '10.1.0.9' to '10.1.0.1' by 'DNS additional record'.", 3);
+    ibex.cli("set server l/srv1 addr 10.1.0.1 port 9000");
+    ibex.wait_log("l/srv1: port changed from '9000' to '8080' by 'DNS additional record'.", 3);
+    assert_eq!(ibex.srv_cols("srv1"), format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"));
+}
+
+/// T487, measured on `HAProxy` 3.5-dev8 (case t487/thold.json, `hold nx 10s`): an SRV
+/// resolution that fails while its last valid answer is inside `hold nx` keeps its records:
+/// the slot stays `10.1.0.1 2 64`, no DOWN line.
+#[test]
+fn an_srv_resolution_failing_within_its_hold_keeps_its_records() {
+    let dns = FakeDns::start();
+    dns.set(SRV, srv_zone(&[(512, 8080, "t1.test", Some([10, 1, 0, 1]))]));
+    let ibex = start(dns.addr, "  timeout resolve 300ms\n  timeout retry 200ms\n  hold nx 10s\n", &srv_template(1, ""), "");
+    ibex.wait_srv("srv1", &format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"), 3);
+    dns.set(SRV, Zone::Nx);
+    thread::sleep(Duration::from_millis(2500));
+    assert!(dns.queries().iter().filter(|q| q.name == SRV).count() >= 5, "{:?}", dns.queries());
+    assert_eq!(ibex.srv_cols("srv1"), format!("10.1.0.1 2 64 2 1 t1.test 8080 {SRV}"));
+    assert!(!ibex.log().iter().any(|l| l.contains("going DOWN")), "{:?}", ibex.log());
+}
