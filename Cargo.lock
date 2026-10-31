@@ -578,6 +578,7 @@ dependencies = [
 name = "ibex-alloc"
 version = "0.1.0"
 dependencies = [
+ "rustix 0.38.44",
  "zeroize",
 ]
 
