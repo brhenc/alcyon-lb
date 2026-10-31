@@ -58,6 +58,14 @@ pub trait HtxMux {
     fn next_dispatch(&self) -> Option<u64>;
     /// A head the data path took ([`HtxStream::take_req_head`]), for the next streams.
     fn give_back_head(&mut self, head: Box<H2ReqHead>);
+    /// A DATA block's bytes the data path wrote out whole, for the next DATA frame (h3: a
+    /// pool, T512). Dropped by default.
+    fn give_data(v: Vec<u8>)
+    where
+        Self: Sized,
+    {
+        drop(v);
+    }
     /// Sends an HTTP/1 response head (status line and headers, without the blank line or
     /// with it) as the protocol's HEADERS. False if it is not a response head.
     fn send_head(&mut self, id: u64, head: &[u8], end_stream: bool) -> bool;
