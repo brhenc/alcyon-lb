@@ -1116,8 +1116,13 @@ impl H2SrvCodec {
 
     /// The trailer section that followed the content-length body of the last response, as
     /// text for `h2_bridge` (T559), once; empty for none.
-    pub fn take_late_trailers(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.late)
+    pub fn take_late_trailers(&mut self) -> Option<Box<[u8]>> {
+        if self.late.is_empty() {
+            return None;
+        }
+        let b = Box::from(self.late.as_slice());
+        self.late.clear();
+        Some(b)
     }
 
     fn end_response(&mut self, last_chunk: bool) {

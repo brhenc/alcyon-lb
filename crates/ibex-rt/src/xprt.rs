@@ -1007,12 +1007,10 @@ impl ServerXprt {
     }
 
     /// The trailers an h2 server sent after a content-length body, as a trailer section;
-    /// empty for none and for any other transport (T559).
-    pub fn take_late_trailers(&mut self) -> Vec<u8> {
-        match self {
-            ServerXprt::H2(h) => h.take_late_trailers(),
-            _ => Vec::new(),
-        }
+    /// `None` for none and for any other transport (T559).
+    pub fn take_late_trailers(&mut self) -> Option<Box<[u8]>> {
+        let ServerXprt::H2(h) = self else { return None };
+        h.take_late_trailers()
     }
 
     /// What the `ssl_bc*` fetches read of the session; `None` for a plaintext connection.

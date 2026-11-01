@@ -355,7 +355,7 @@ fn trailer_fields<'a>(section: &'a [u8], out: &mut [(&'a str, &'a str); MAX_TRAI
 }
 
 /// [`forward_response`] for any mux the bridge drives (T509), the DATA staged in `scratch`.
-pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, scratch: &mut Vec<u8>) -> bool {
+pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, scratch: &mut Vec<u8>, late_trailers: &mut Option<Box<[u8]>>) -> bool {
     let id = u64::from(stream_id);
     if txn.rsp == MsgState::Waiting || txn.rsp.is_done() {
         return false;
@@ -379,7 +379,7 @@ pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut Ht
             txn.rsp.consume(data, h + e);
             rep.consume(h + e);
             if !end_stream {
-                return forward_response_mux(mux, stream_id, txn, rep, srv_gone, scratch);
+                return forward_response_mux(mux, stream_id, txn, rep, srv_gone, scratch, late_trailers);
             }
         }
         return false;
@@ -409,8 +409,8 @@ pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut Ht
         *t += scratch.len() as u64 + u64::from(end && matches!(txn.rsp, MsgState::Body(txn::Body::Chunked(_))));
     }
     // Trailers an h2 server sent after a content-length body (T559): with the stream's end.
-    let late = if end && trailers.len() <= 2 { std::mem::take(&mut txn.late_trailers) } else { Vec::new() };
-    let trailers = if late.len() > 2 { &late[..] } else { trailers };
+    let late = if end && trailers.len() <= 2 { late_trailers.take() } else { None };
+    let trailers = late.as_deref().filter(|l| l.len() > 2).unwrap_or(trailers);
     if trailers.len() > 2 {
         // Not the blank line alone: the fields, on the stack (the common response has none).
         if !scratch.is_empty() {
@@ -448,7 +448,7 @@ pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut Ht
 /// The response of a stream, as HEADERS then DATA frames, as much as the client's
 /// flow-control windows take. `srv_gone`: the server side has ended. `true` when the
 /// response was cut short by the server and the stream reset for it (`SD`).
-pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool) -> bool {
+pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, late_trailers: &mut Option<Box<[u8]>>) -> bool {
     if txn.rsp == MsgState::Waiting || txn.rsp.is_done() {
         return false;
     }
@@ -475,7 +475,7 @@ pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn
             // its own, a poller round later, it is a second write, and a second small
             // segment Nagle holds until the client's delayed ACK, ~40 ms a request (T186).
             if !end_stream {
-                return forward_response(h2, stream_id, txn, rep, srv_gone);
+                return forward_response(h2, stream_id, txn, rep, srv_gone, late_trailers);
             }
         }
         return false;
@@ -529,8 +529,8 @@ pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn
         *t += out.len() as u64 + u64::from(end && matches!(txn.rsp, MsgState::Body(txn::Body::Chunked(_))));
     }
     // Trailers an h2 server sent after a content-length body (T559): with the stream's end.
-    let late = if end && trailers.len() <= 2 { std::mem::take(&mut txn.late_trailers) } else { Vec::new() };
-    let trailers = if late.len() > 2 { &late[..] } else { trailers };
+    let late = if end && trailers.len() <= 2 { late_trailers.take() } else { None };
+    let trailers = late.as_deref().filter(|l| l.len() > 2).unwrap_or(trailers);
     if trailers.len() > 2 {
         if !out.is_empty() {
             h2.send_data(stream_id, &out, false);
@@ -866,7 +866,7 @@ mod tests {
         let mut rep = Buf::with_capacity(256);
         assert!(rep.put(b"HTTP/1.1 204 No Content\r\nx-a: b\r\n\r\n"));
         let tx = h2.tx_buf.len();
-        assert!(!forward_response(&mut h2, 1, &mut txn, &mut rep, false));
+        assert!(!forward_response(&mut h2, 1, &mut txn, &mut rep, false, &mut None));
         assert!(rep.is_empty(), "the head was taken");
         let frame = &h2.tx_buf[tx..];
         assert!(frame.len() > 9, "a frame was queued");
@@ -884,7 +884,7 @@ mod tests {
         let head = b"garbage\r\n\r\n";
         assert!(rep.put(head));
         let tx = h2.tx_buf.len();
-        assert!(!forward_response(&mut h2, 1, &mut txn, &mut rep, false));
+        assert!(!forward_response(&mut h2, 1, &mut txn, &mut rep, false, &mut None));
         assert_eq!(rep.readable(), head, "nothing of it was taken");
         assert_eq!(txn.rsp, MsgState::Head { left: 0, body: txn::Framing::Length(5) });
         assert_eq!(h2.tx_buf.len(), tx, "no frame");
