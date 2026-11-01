@@ -443,3 +443,65 @@ fn a_keepalive_stream_run_checks_timers_only_when_one_is_due() {
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
 }
+
+/// L2 for HTTP/3 (T586): the owner of a QUIC connection and its stream wake each other in
+/// the pass they run in, as an HTTP/2 owner does: the stream's response is framed and
+/// handed to quinn in the pass it came, not a pass later. The engine runs on a thread of
+/// its own here (the client drives quinn by hand); its passes are read from the counter it
+/// publishes after each.
+#[test]
+#[cfg(debug_assertions)]
+fn an_h3_owner_and_its_stream_wake_each_other_in_the_same_pass() {
+    use crate::h3_mux_drain::{get, Client as H3Client};
+    use std::sync::atomic::AtomicU64;
+    const N: u64 = 40;
+    let srv = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let srv_addr = srv.local_addr().expect("addr");
+    let quic = common::reserve_addr();
+    let running = Arc::new(AtomicBool::new(true));
+    let be = backend(srv, Arc::clone(&running));
+    let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind quic4@{quic} ssl crt {crt} alpn h3\n  default_backend be\n\
+         backend be\n  server s1 {srv_addr}\n"
+    );
+    let passes = Arc::new(AtomicU64::new(0));
+    let eng = {
+        let (running, passes) = (Arc::clone(&running), Arc::clone(&passes));
+        thread::spawn(move || {
+            let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+            while running.load(Ordering::Relaxed) {
+                let _ = engine.run_once();
+                passes.store(on_this_thread()[Op::Pass as usize], Ordering::Relaxed);
+            }
+        })
+    };
+    thread::sleep(Duration::from_millis(100));
+    let mut c = H3Client::connect(quic);
+    let mut one = || {
+        let id = c.open(&get(b"/"), true);
+        let o = c.outcome(id);
+        assert_eq!(o.status, Some(200), "{o:?}");
+    };
+    for _ in 0..10 {
+        one();
+    }
+    // The ACKs and timers of the warm-up settle.
+    thread::sleep(Duration::from_millis(50));
+    let p0 = passes.load(Ordering::Relaxed);
+    let mut runs = 0u64;
+    let started = Instant::now();
+    for _ in 0..N {
+        one();
+        runs += 1;
+    }
+    let p1 = passes.load(Ordering::Relaxed);
+    #[allow(clippy::cast_precision_loss)]
+    let per = (p1 - p0) as f64 / runs as f64;
+    println!("h3: {per:.2} passes a request ({:?} for {N})", started.elapsed());
+    running.store(false, Ordering::Relaxed);
+    let _ = eng.join();
+    let _ = be.join();
+    assert!(per <= 4.6, "{per:.2} passes an HTTP/3 request: the owner and its stream wake each other a pass late");
+}

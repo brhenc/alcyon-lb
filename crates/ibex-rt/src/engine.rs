@@ -11154,9 +11154,9 @@ impl EngineDispatcher<'_> {
         }
         let Some(owner) = owner else { return };
         let owner_task = owner.task;
-        // An HTTP/3 owner runs once a pass: what it frames leaves at the end of the pass, and
-        // a close in a second run would drop the GOAWAY of the first (T558).
-        let owner_h3 = owner.sess.h3_owner().is_some();
+        // An HTTP/3 owner runs in this pass too (L2): its own closes (a GOAWAY framed, then
+        // `closing`) still wait for the next pass (`step_h3_owner`, T558), so a second run
+        // in this one closes on nothing quinn has not written.
         owner.sess.h2_owner_mut().into_iter().for_each(|o| o.children.retain(|l| l.task != child.task));
         // An HTTP/3 stream whose response is all framed is let go once its FIN is out
         // (`QuicListener::owner_send`); one that ends without it is reset and let go now.
@@ -11233,11 +11233,7 @@ impl EngineDispatcher<'_> {
             owner.sess.srv_state = ScState::Closed;
             owner.sess.ending.get_or_insert(child.sess.ending.unwrap_or(crate::proxy::Ending::Complete));
         }
-        if owner_h3 {
-            self.wake_queue.push(owner_task);
-        } else {
-            self.wake_now.push(owner_task);
-        }
+        self.wake_now.push(owner_task);
     }
 
     /// An HTTP/2 connection is freed with streams still served: each forgets it (its index
@@ -11619,8 +11615,7 @@ impl EngineDispatcher<'_> {
             // A stream of an HTTP/2 connection has its owner run after it: the owner moves
             // what it produced (its response, room for more of its request) and sees how it
             // ended (T280).
-            // An HTTP/3 owner runs once a pass (see `h2_child_released`): it is woken for the
-            // next one.
+            // An HTTP/3 owner too (L2): its second run in a pass sends what this one moved.
             if let Some((_, owner_task)) = entry.sess.h2_child().and_then(|c| c.owner) {
                 owner_wake = Some(owner_task);
             }
@@ -11643,12 +11638,7 @@ impl EngineDispatcher<'_> {
         };
 
         if let Some(owner_task) = owner_wake {
-            let owner_h3 = self.sessions.get(session_idx).and_then(|e| e.sess.h2_child()).and_then(|c| c.owner).and_then(|(i, _)| self.sessions.get(i)).is_some_and(|o| o.sess.h3_owner().is_some());
-            if owner_h3 {
-                self.wake_queue.push(owner_task);
-            } else {
-                self.wake_now.push(owner_task);
-            }
+            self.wake_now.push(owner_task);
         }
         if let Some((fe, line)) = connect_line {
             self.send_log_line(fe, line.as_bytes());
