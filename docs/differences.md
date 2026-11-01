@@ -426,6 +426,17 @@ Unset, the environment variable `IBEX_H3_PATH` (`mux` or `relay`) decides, then 
 h3 tests run on either path. HAProxy refuses the keyword as unknown. It takes exactly `relay` or `mux`. The keyword is
 deleted with the relay (slice H5).
 
+## `tune.ibex.quic-ack-frequency on|off` and two parameters: Ibex-only global keywords (Q0)
+
+`on` (default `off`) makes the server send an ACK_FREQUENCY frame (draft-ietf-quic-ack-frequency) to
+a QUIC peer that advertises `min_ack_delay`, asking it to acknowledge less often so fewer ACK-only
+datagrams arrive. `tune.ibex.quic-ack-frequency-threshold <n>` (0 to 255, default 2) is how many
+ack-eliciting packets the peer may receive before it acknowledges at once;
+`tune.ibex.quic-ack-frequency-max-delay <time>` (1ms to 16383ms, default 25ms) is how long it may
+delay an acknowledgement. A value out of range is refused at parse time. It only asks the peer: a
+hostile client can ignore it, so it is not ACK-flood protection by itself. Off, nothing is sent,
+as HAProxy 3.5-dev10, which does not send ACK_FREQUENCY; HAProxy refuses all three keywords as unknown.
+
 ## A QUIC connection a rule rejects is closed with `H3_NO_ERROR`, not transport `NO_ERROR` (T511)
 
 `tcp-request connection reject` and `tcp-request session reject` on a QUIC bind (mux path)

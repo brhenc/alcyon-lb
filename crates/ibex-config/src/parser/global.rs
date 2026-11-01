@@ -516,6 +516,42 @@ pub(crate) fn parse_global_directive(
             });
             Ok(())
         }
+        // Q0 (Ibex-only): reach `QuicConfig::ack_frequency` in `engine.rs`, where the QUIC
+        // listener is built, and from there `quinn_proto::TransportConfig`.
+        "tune.ibex.quic-ack-frequency" => {
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text)));
+            }
+            global.quic_ack_frequency = Some(match tokens.get(1).map(|t| t.text.as_str()) {
+                Some("on") => true,
+                Some("off") => false,
+                Some(other) => return Err(ConfigError::new(kw.line, kw.col, format!("'{}' expects 'on' or 'off', got '{other}'.", kw.text))),
+                None => return Err(ConfigError::new(kw.line, kw.col, format!("'{}' expects 'on' or 'off'.", kw.text))),
+            });
+            Ok(())
+        }
+        "tune.ibex.quic-ack-frequency-threshold" => {
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text)));
+            }
+            let n = tokens.get(1).and_then(|t| t.text.parse::<u32>().ok()).filter(|n| *n <= 255);
+            let Some(n) = n else {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' expects an integer from 0 to 255.", kw.text)));
+            };
+            global.quic_ack_frequency_threshold = Some(n);
+            Ok(())
+        }
+        "tune.ibex.quic-ack-frequency-max-delay" => {
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text)));
+            }
+            let ms = tokens.get(1).and_then(|t| parse_time_ms_err(&t.text).ok()).filter(|ms| (1..=16383).contains(ms));
+            let Some(ms) = ms else {
+                return Err(ConfigError::new(kw.line, kw.col, format!("'{}' expects a time from 1ms to 16383ms.", kw.text)));
+            };
+            global.quic_ack_frequency_max_delay_ms = Some(ms);
+            Ok(())
+        }
         "tune.ibex.crypto-provider" => {
             const WANT: &str = "'tune.ibex.crypto-provider' expects 'ring' or 'ring-ibex'";
             let Some(arg) = tokens.get(1) else {

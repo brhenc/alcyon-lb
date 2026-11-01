@@ -879,9 +879,10 @@ fn a_handshake_is_not_retransmitted_sooner_than_the_initial_rtt() {
 /// Q0 (docs/design/quic-transport-2026-11-01.md §3): the server asks an established client to
 /// acknowledge less often (ACK_FREQUENCY, draft-ietf-quic-ack-frequency). The client here
 /// advertises `min_ack_delay`, as every client that implements the extension does.
-#[test]
-fn the_server_asks_the_client_for_fewer_acks() {
-    let server_config = QuicConfig::new()
+/// Runs a handshake and then 1 s of idle connection against a server built from `config`;
+/// returns how many ACK_FREQUENCY frames the client received and whether it is established.
+fn ack_frequency_frames_received(config: QuicConfig, stop_at_first: bool) -> (u64, bool) {
+    let server_config = config
         .load_server_config_from_pem(cert_path())
         .expect("load cert");
     let mut server = QuicEndpoint::with_server_config(server_config).expect("server endpoint");
@@ -936,9 +937,27 @@ fn the_server_asks_the_client_for_fewer_acks() {
         }
         while client_conn.poll().is_some() {}
         while server.poll_event().is_some() {}
-        if client_conn.stats().frame_rx.ack_frequency > 0 {
-            return;
+        if stop_at_first && client_conn.stats().frame_rx.ack_frequency > 0 {
+            break;
         }
     }
-    panic!("the server never sent ACK_FREQUENCY: {:?}", client_conn.stats().frame_rx);
+    (client_conn.stats().frame_rx.ack_frequency, !client_conn.is_handshaking())
+}
+
+#[test]
+fn the_server_asks_the_client_for_fewer_acks_when_the_setting_is_on() {
+    let mut config = QuicConfig::new();
+    config.ack_frequency = Some((2, Duration::from_millis(25)));
+    let (frames, established) = ack_frequency_frames_received(config, true);
+    assert!(established);
+    assert!(frames > 0, "the server never sent ACK_FREQUENCY");
+}
+
+/// The default: the setting is off, the server sends no ACK_FREQUENCY and the connection works.
+#[test]
+fn the_server_sends_no_ack_frequency_by_default() {
+    assert_eq!(QuicConfig::new().ack_frequency, None);
+    let (frames, established) = ack_frequency_frames_received(QuicConfig::new(), false);
+    assert!(established, "the handshake did not complete");
+    assert_eq!(frames, 0, "ACK_FREQUENCY sent with the setting off");
 }
