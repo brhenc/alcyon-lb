@@ -27,6 +27,7 @@ pub mod version {
 }
 
 pub mod applet;
+pub mod cli_unknown;
 pub mod buf;
 pub mod buf_wait;
 pub mod prealloc;

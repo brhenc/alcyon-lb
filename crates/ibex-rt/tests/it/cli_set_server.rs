@@ -288,10 +288,9 @@ fn set_server_state_shows_in_show_servers_state_and_show_stat() {
 #[test]
 fn unknown_commands_still_say_so() {
     let (ibex, _fe) = start(&conf("  server s1 {s1}\n"));
-    assert_eq!(
-        cli(&ibex, "frobnicate"),
-        "Unknown command. Please enter 'help' for a list of valid commands.\n\n".replace("\n\n", "\n")
-    );
+    // HAProxy lists the nearest commands (T597; the lists are in `cli_unknown_command`).
+    let got = cli(&ibex, "frobnicate");
+    assert!(got.starts_with("Unknown command: 'frobnicate', but maybe one of the following ones is a better match:\n"), "{got}");
 }
 
 fn conf_level(level: &str) -> String {
