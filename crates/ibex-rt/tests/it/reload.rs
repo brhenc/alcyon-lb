@@ -615,6 +615,55 @@ fn a_reload_that_fails_after_loading_its_config_leaves_the_pidfile_alone() {
     old.stop();
 }
 
+/// A reload's private handover directory is named after the reloading process's PID
+/// (`$TMPDIR/ibex-reload-<pid>-0`). The old process exits without removing it, so after a
+/// PID wrap a process gets the PID of one that reloaded earlier and finds the stale
+/// directory there (T565: 7,984 of them in /tmp after a day of tests; `h3_reload` failed
+/// "no new process took over" on `File exists`). The reload must go ahead regardless.
+#[test]
+fn a_reload_survives_a_stale_handover_directory_from_a_previous_process_with_its_pid() {
+    let be = backend();
+    let fe = common::reserve_addr();
+    let sock = short_sock("staledir");
+    let cfg = write_cfg(&config(fe, be, &sock, ""));
+    let mut sink = NotifySink::new("staledir");
+    let pidfile = short_sock("staledir").with_extension("pid");
+
+    let mut old = start_notified(cfg.path(), &sink, &pidfile);
+    sink.wait_for("READY=1", Duration::from_secs(5)).expect("initial READY=1");
+    wait_listening(fe);
+    let old_pid = old.pid();
+    let stale = std::env::temp_dir().join(format!("ibex-reload-{old_pid}-0"));
+    let _ = std::fs::remove_dir_all(&stale);
+    std::fs::create_dir(&stale).expect("stale handover directory");
+    std::fs::write(stale.join("s"), b"").expect("stale socket file");
+
+    old.signal(Signal::Usr2);
+    let handed = sink.wait_until(
+        |m| m.contains("READY=1") && mainpid(m).is_some_and(|p| p != old_pid),
+        Duration::from_secs(5),
+    );
+    let new_pid = handed.as_deref().and_then(mainpid);
+    let _ = std::fs::remove_dir_all(&stale);
+    let new_pid = new_pid.unwrap_or_else(|| panic!("no new process took over despite the stale directory; saw {:?}", sink.seen));
+    assert!(old.wait_exit(Duration::from_secs(5)).is_some(), "old process must stop");
+    // The new process's own handover directories must not be left behind either: it
+    // reloads once more and the directory of that reload is gone once it has served.
+    assert_eq!(read_pidfile(&pidfile), Some(new_pid));
+    let dir = std::env::temp_dir().join(format!("ibex-reload-{new_pid}-0"));
+    send_signal(new_pid, Signal::Usr2);
+    let handed = sink.wait_until(
+        |m| m.contains("READY=1") && mainpid(m).is_some_and(|p| p != new_pid && p != old_pid),
+        Duration::from_secs(5),
+    );
+    let third = handed.as_deref().and_then(mainpid).unwrap_or_else(|| panic!("second reload; saw {:?}", sink.seen));
+    assert!(wait_gone(new_pid, Duration::from_secs(5)), "second process must stop");
+    assert!(!dir.exists(), "{} left behind by a process that reloaded and exited", dir.display());
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&pidfile);
+    stop_pid(third);
+}
+
 /// Without `-W` / `-Ws`, `SIGUSR2` is ignored, as in `HAProxy`'s standalone mode
 /// (`src/haproxy.c:2606`). Before the handler existed it was the default action: the
 /// process died.

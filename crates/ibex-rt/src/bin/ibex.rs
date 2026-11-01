@@ -1393,9 +1393,22 @@ impl Reload {
     fn start(respawn: &Respawn) -> io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ibex-reload-{}-{seq}", process::id()));
-        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        // The name carries our PID, and a process that had it before us may have left its
+        // directory behind (T565: one that exited while draining never removed it, and
+        // after a PID wrap the next process with that PID could not reload: `File exists`).
+        // A leftover is removed first; a name that still cannot be created (someone
+        // else's, in a sticky /tmp) gives way to the next sequence number.
+        let mut tries = 0;
+        let dir = loop {
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("ibex-reload-{}-{seq}", process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => break dir,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries < 8 => tries += 1,
+                Err(e) => return Err(e),
+            }
+        };
         let sock = dir.join("s");
         let listener = std::os::unix::net::UnixListener::bind(&sock)?;
         listener.set_nonblocking(true)?;
@@ -1423,10 +1436,7 @@ impl Reload {
             return;
         }
         if self.pending.is_none() {
-            let Ok((stream, _)) = self.listener.accept() else { return };
-            if stream.set_nonblocking(true).is_err() {
-                return;
-            }
+            let Ok(stream) = self.listener.accept().and_then(|(s, _)| s.set_nonblocking(true).map(|()| s)) else { return };
             self.pending = Some((stream, Vec::new()));
         }
         let Some((stream, line)) = self.pending.as_mut() else { return };
@@ -1447,8 +1457,8 @@ impl Reload {
                         break;
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                // Interrupted: the next call, 20 ms on, reads again.
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => return,
                 Err(_) => {
                     self.pending = None;
                     return;
@@ -1464,12 +1474,19 @@ impl Reload {
         if let Err(e) = ibex_rt::handover::serve_getsocks(&stream) {
             ibex_rt::stderr_line!("[ALERT] could not hand the listening sockets over: {e}");
         }
+        // The new process has what it came for: the directory goes now, not at an exit
+        // that `process::exit` never drops it at.
+        self.remove_dir();
+    }
+
+    fn remove_dir(&self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
 impl Drop for Reload {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        self.remove_dir();
     }
 }
 
@@ -1496,6 +1513,7 @@ fn supervise(
             // HAProxy's worker is killed by SIGTERM on the spot; the master, which is what
             // systemd supervises, then exits 0. Connections are dropped, not drained.
             ibex_rt::systemd::notify_stopping_once();
+            drop(reload.take());
             process::exit(0);
         }
         if let Some(pp) = master_ppid {
@@ -1556,6 +1574,7 @@ fn supervise(
     for t in threads {
         let _ = t.join();
     }
+    drop(reload.take());
     process::exit(0);
 }
 
@@ -1608,5 +1627,62 @@ mod tests {
         let _ = r.child.kill();
         let _ = r.child.wait();
         assert!(out.ends_with(b"END\n"), "the late _getsocks was not answered: {out:?}");
+    }
+
+    /// A `_getsocks` client that closes before its line, one whose read fails, and one
+    /// that sends 64 bytes without a newline are each dropped without the reload being
+    /// counted as served; the next client is answered.
+    #[test]
+    fn a_getsocks_client_that_closes_babbles_or_resets_is_dropped_and_the_next_is_answered() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        ibex_rt::handover::enable_expose();
+        let dir = std::env::temp_dir().join(format!("ibex-t565b-{}", process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let sock = dir.join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let child = std::process::Command::new("sleep").arg("30").spawn().expect("spawn");
+        let mut r = Reload { child, listener, dir: dir.clone(), served: false, pending: None };
+        let serve = |r: &mut Reload| {
+            for _ in 0..5 {
+                r.serve_pending();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        // 1. Closes after a partial line: dropped (read returns 0).
+        let mut c = UnixStream::connect(&sock).expect("connect");
+        c.write_all(b"_get").expect("write");
+        serve(&mut r);
+        assert!(r.pending.is_some() && !r.served, "partial line kept pending");
+        drop(c);
+        serve(&mut r);
+        assert!(r.pending.is_none() && !r.served, "a closed client is dropped");
+        // 2. Closes with unread data from us in its queue: our read fails (ECONNRESET).
+        let mut c = UnixStream::connect(&sock).expect("connect");
+        c.write_all(b"_get").expect("write");
+        serve(&mut r);
+        (&r.pending.as_ref().expect("pending").0).write_all(b"x").expect("write to client");
+        drop(c);
+        serve(&mut r);
+        assert!(r.pending.is_none() && !r.served, "a reset client is dropped");
+        // 3. More than 64 bytes and no newline: dropped.
+        let mut c = UnixStream::connect(&sock).expect("connect");
+        c.write_all(&[b'a'; 100]).expect("write");
+        serve(&mut r);
+        assert!(r.pending.is_none() && !r.served, "a babbling client is dropped");
+        let mut out = Vec::new();
+        assert_eq!(c.read_to_end(&mut out).ok(), Some(0), "the babbling client is closed, not answered: {out:?}");
+        // 4. The next one is answered.
+        let mut c = UnixStream::connect(&sock).expect("connect");
+        c.write_all(b"_getsocks\n").expect("write");
+        serve(&mut r);
+        assert!(r.served);
+        let mut out = Vec::new();
+        let _ = c.read_to_end(&mut out);
+        assert!(out.ends_with(b"END\n"), "the next _getsocks was not answered: {out:?}");
+        let _ = r.child.kill();
+        let _ = r.child.wait();
     }
 }
