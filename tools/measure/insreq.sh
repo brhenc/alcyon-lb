@@ -44,8 +44,8 @@
 # and kernel instructions over each round (one perf stat, two events, T568) and prints
 # instructions per request. Per round: `<L> round N: <U> instructions, <u> ins/req[, D client
 # dgrams/req]` (user space; the line parsers read), then `<L> round N kernel: <K> instructions,
-# <k> ins/req, total <t> ins/req`; at the end `<L> summary (min of R): user u, kernel k, total t
-# ins/req`. If perf may not count :k (perf_event_paranoid), the kernel lines read `kernel: n/a`,
+# <k> ins/req, total <t> ins/req`; at the end `<L> summary (min total of R): user u, kernel k, total t
+# ins/req` (the round with the least total, its own user and kernel). If perf may not count :k (perf_event_paranoid), the kernel lines read `kernel: n/a`,
 # with one warning, and the run goes on. The h3fit mode counts user space only. Takes no lock: hold
 # `flock -x /tmp/ibex-load.lock` around a batch, and keep a batch under 15 minutes. Needs
 # $HOME/ibex-targets/gate-slot1/release/measure-bench (MEASURE_BENCH overrides; for an h3 POST one
@@ -153,6 +153,7 @@ if jsonl:
 PY
 else
   client 2000 > "$OUT/$LABEL.warm.out" 2>&1
+  : > "$OUT/$LABEL.rounds"
   for r in $(seq 1 "$ROUNDS"); do
     read -r INS D K < <(round "r$r")
     if [ "$D" = - ]; then
@@ -160,20 +161,14 @@ else
     else
       echo "$LABEL round $r: $INS instructions, $((INS / N)) ins/req, $D client dgrams/req"
     fi
-    UMIN=$(( ${UMIN:-$INS} < INS ? ${UMIN:-$INS} : INS ))
+    echo "$INS $K" >> "$OUT/$LABEL.rounds"
     if [ "$K" = - ]; then
       echo "$LABEL round $r kernel: n/a"
     else
       echo "$LABEL round $r kernel: $K instructions, $((K / N)) ins/req, total $(((INS + K) / N)) ins/req"
-      KMIN=$(( ${KMIN:-$K} < K ? ${KMIN:-$K} : K ))
-      T=$((INS + K)); TMIN=$(( ${TMIN:-$T} < T ? ${TMIN:-$T} : T ))
     fi
   done
-  if [ "${K:--}" = - ]; then
-    echo "$LABEL summary (min of $ROUNDS): user $((UMIN / N)), kernel n/a, total n/a ins/req"
-  else
-    echo "$LABEL summary (min of $ROUNDS): user $((UMIN / N)), kernel $((KMIN / N)), total $((TMIN / N)) ins/req"
-  fi
+  python3 "$(dirname "$0")/insreq_stat.py" summary "$LABEL" "$N" "$OUT/$LABEL.rounds"
 fi
 kill "$P"; wait "$P" 2>/dev/null; kill "$BEPID"; wait "$BEPID" 2>/dev/null
 echo "$LABEL done (proxy pid $P and backend pid $BEPID stopped)"
