@@ -53,7 +53,7 @@ pub use ibex_crypt::CryptHash;
 pub use cast::{can_cast, cast};
 pub use expr::Expr;
 pub use matcher::{IntOp, IntRange, Matcher};
-pub use registry::{set_debug_sink, take_debug_destinations, DebugSinkFn, 
+pub use registry::{name_lookups_on_this_thread, set_debug_sink, take_debug_destinations, DebugSinkFn, 
     check_converter_args, check_dump_all_vars_args, get_proc_var, not_implemented, not_implemented_message, sample_registry, set_proc_var, unset_proc_var, var_conds_hold, ConvDesc,
     ConvFn, CtxConvDesc, CtxConvFn, FetchDesc, FetchFn, FrontendCounter, ProxyState, Registry,
     ServerState, SampleContext, ConnErr, SslFacts, StickData, StickGpc, StickOp, StickState, StreamFacts, StreamTimeouts, TimeoutKind, CURRENT_VARS, CPU_USAGE_SOURCE, STOPPING, THREAD_ID, GLOBAL_PROC_VARS, SAMPLE_REGISTRY,

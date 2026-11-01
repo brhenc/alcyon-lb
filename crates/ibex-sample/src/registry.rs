@@ -683,6 +683,48 @@ pub type MultiFetchFn = fn(&SampleContext, &[String]) -> Vec<Sample>;
 /// ACL iterates on most (the headers).
 pub type VisitFetchFn = fn(&SampleContext, &[String], &mut dyn FnMut(Sample) -> bool);
 
+thread_local! {
+    static LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn note_lookup() {
+    #[cfg(debug_assertions)]
+    LOOKUPS.with(|n| n.set(n.get() + 1));
+}
+
+/// How many by-name lookups (`fetches.get`, `converters.get`, ...) this thread has made
+/// (debug builds only; always 0 in release): a test reads it around an evaluation to show
+/// that a compiled expression ([`Compiled`]) looks up no name (T574).
+#[must_use]
+pub fn name_lookups_on_this_thread() -> u64 {
+    LOOKUPS.with(std::cell::Cell::get)
+}
+
+/// A converter resolved to its function.
+#[derive(Clone, Copy)]
+enum ConvRef {
+    Plain(ConvFn),
+    WithCtx(CtxConvFn),
+}
+
+/// The fetch and converters of an expression resolved once to function pointers, so the
+/// data path looks up no name (T574, `HAProxy`'s `sample_expr` holding `fetch->process` and
+/// `conv->process`).
+#[derive(Clone)]
+pub struct Compiled {
+    single: Option<FetchFn>,
+    multi: Option<MultiFetchFn>,
+    visit: Option<VisitFetchFn>,
+    convs: Vec<(TypeSpec, ConvRef)>,
+}
+
+impl std::fmt::Debug for Compiled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Compiled").field("converters", &self.convs.len()).finish_non_exhaustive()
+    }
+}
+
 /// Central registry of sample fetches and converters.
 pub struct Registry {
     fetches: HashMap<&'static str, FetchDesc>,
@@ -1307,6 +1349,7 @@ impl Registry {
 
     #[must_use]
     pub fn get_fetch(&self, name: &str) -> Option<&FetchDesc> {
+        note_lookup();
         self.fetches.get(name)
     }
 
@@ -1314,12 +1357,14 @@ impl Registry {
     /// ones that do.
     #[must_use]
     pub fn get_converter(&self, name: &str) -> Option<&ConvDesc> {
+        note_lookup();
         self.converters.get(name)
     }
 
     /// A converter that reads the runtime state (`nbsrv`, `srv_is_up`, ...).
     #[must_use]
     pub fn get_ctx_converter(&self, name: &str) -> Option<&CtxConvDesc> {
+        note_lookup();
         self.ctx_converters.get(name)
     }
 
@@ -6402,39 +6447,15 @@ impl Registry {
         mut smp: Sample,
         converters: &[(S, Vec<String>)],
     ) -> Option<Sample> {
-        /// A converter, and whether it reads the context.
-        enum Conv {
-            Plain(ConvFn),
-            WithCtx(CtxConvFn),
-        }
         for (c_name, c_args) in converters {
             let c_name = c_name.as_ref();
             let (in_type, func) = if let Some(d) = self.get_converter(c_name) {
-                (d.in_type, Conv::Plain(d.func))
+                (d.in_type, ConvRef::Plain(d.func))
             } else {
                 let d = self.get_ctx_converter(c_name)?;
-                (d.in_type, Conv::WithCtx(d.func))
+                (d.in_type, ConvRef::WithCtx(d.func))
             };
-
-            // Apply implicit cast if input type doesn't match
-            if !in_type.matches(smp.sample_type()) {
-                if let TypeSpec::Exact(target_ty) = in_type {
-                    smp = cast(smp, target_ty)?;
-                } else if in_type == TypeSpec::Addr {
-                    if let Some(v4) = cast(smp.clone(), SampleType::Ipv4) {
-                        smp = v4;
-                    } else {
-                        smp = cast(smp, SampleType::Ipv6)?;
-                    }
-                } else {
-                    return None;
-                }
-            }
-
-            smp = match func {
-                Conv::Plain(f) => f(smp, c_args)?,
-                Conv::WithCtx(f) => f(ctx, smp, c_args)?,
-            };
+            smp = run_conv(ctx, smp, in_type, func, c_args)?;
         }
 
         Some(smp)
@@ -6485,6 +6506,7 @@ impl Registry {
         ctx: &SampleContext,
         stop_at_failure: bool,
     ) -> Vec<Sample> {
+        note_lookup();
         let initial_samples = if let Some(mf) = self.multi_fetches.get(fetch_name) {
             mf(ctx, fetch_args)
         } else if let Some(f_desc) = self.get_fetch(fetch_name) {
@@ -6521,6 +6543,7 @@ impl Registry {
             any |= f(&smp);
             crate::spare::give_sample(smp);
         };
+        note_lookup();
         if let Some(visit) = self.multi_visits.get(fetch_name) {
             visit(ctx, fetch_args, &mut |smp| match self.apply_converters_g(ctx, smp, converters) {
                 Some(res) => {
@@ -6571,6 +6594,123 @@ impl Registry {
             return self.apply_converters_g(ctx, smp, converters);
         }
         self.eval_all_g(fetch_name, fetch_args, converters, ctx).into_iter().next()
+    }
+}
+
+/// One converter step: the implicit cast of the input to the converter's input type, then the
+/// converter.
+fn run_conv(ctx: &SampleContext, mut smp: Sample, in_type: TypeSpec, func: ConvRef, c_args: &[String]) -> Option<Sample> {
+    if !in_type.matches(smp.sample_type()) {
+        if let TypeSpec::Exact(target_ty) = in_type {
+            smp = cast(smp, target_ty)?;
+        } else if in_type == TypeSpec::Addr {
+            if let Some(v4) = cast(smp.clone(), SampleType::Ipv4) {
+                smp = v4;
+            } else {
+                smp = cast(smp, SampleType::Ipv6)?;
+            }
+        } else {
+            return None;
+        }
+    }
+    match func {
+        ConvRef::Plain(f) => f(smp, c_args),
+        ConvRef::WithCtx(f) => f(ctx, smp, c_args),
+    }
+}
+
+impl Registry {
+    /// Resolves a fetch and its converters to function pointers, once. `None` if the fetch or
+    /// a converter is unknown (the by-name path then gives its usual empty answer).
+    #[must_use]
+    pub(crate) fn compile<S: AsRef<str>>(&self, fetch_name: &str, converters: &[(S, Vec<String>)]) -> Option<Compiled> {
+        let single = self.get_fetch(fetch_name).map(|d| d.func);
+        let multi = self.multi_fetches.get(fetch_name).copied();
+        let visit = self.multi_visits.get(fetch_name).copied();
+        if single.is_none() && multi.is_none() {
+            return None;
+        }
+        let mut convs = Vec::with_capacity(converters.len());
+        for (name, _) in converters {
+            let name = name.as_ref();
+            if let Some(d) = self.get_converter(name) {
+                convs.push((d.in_type, ConvRef::Plain(d.func)));
+            } else {
+                let d = self.get_ctx_converter(name)?;
+                convs.push((d.in_type, ConvRef::WithCtx(d.func)));
+            }
+        }
+        Some(Compiled { single, multi, visit, convs })
+    }
+
+    fn apply_c<S>(c: &Compiled, ctx: &SampleContext, mut smp: Sample, converters: &[(S, Vec<String>)]) -> Option<Sample> {
+        for ((in_type, func), (_, args)) in c.convs.iter().zip(converters) {
+            smp = run_conv(ctx, smp, *in_type, *func, args)?;
+        }
+        Some(smp)
+    }
+
+    /// [`Self::eval_all_g`] through a compiled expression: no name is looked up.
+    pub(crate) fn eval_all_c<S>(c: &Compiled, fetch_args: &[String], converters: &[(S, Vec<String>)], ctx: &SampleContext) -> Vec<Sample> {
+        let initial: Vec<Sample> = if let Some(mf) = c.multi {
+            mf(ctx, fetch_args)
+        } else if let Some(f) = c.single {
+            f(ctx, fetch_args).into_iter().collect()
+        } else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(initial.len());
+        for smp in initial {
+            if let Some(res) = Self::apply_c(c, ctx, smp, converters) {
+                out.push(res);
+            }
+        }
+        out
+    }
+
+    /// [`Self::any_acl`] through a compiled expression: no name is looked up.
+    pub(crate) fn any_acl_c<S>(
+        c: &Compiled,
+        fetch_args: &[String],
+        converters: &[(S, Vec<String>)],
+        ctx: &SampleContext,
+        mut f: impl FnMut(&Sample) -> bool,
+    ) -> bool {
+        let mut any = false;
+        let mut see = |smp: Sample| {
+            any |= f(&smp);
+            crate::spare::give_sample(smp);
+        };
+        if let Some(visit) = c.visit {
+            visit(ctx, fetch_args, &mut |smp| match Self::apply_c(c, ctx, smp, converters) {
+                Some(res) => {
+                    see(res);
+                    true
+                }
+                None => false,
+            });
+        } else if let Some(mf) = c.multi {
+            for smp in mf(ctx, fetch_args) {
+                match Self::apply_c(c, ctx, smp, converters) {
+                    Some(res) => see(res),
+                    None => break,
+                }
+            }
+        } else if let Some(func) = c.single {
+            if let Some(res) = func(ctx, fetch_args).and_then(|smp| Self::apply_c(c, ctx, smp, converters)) {
+                see(res);
+            }
+        }
+        any
+    }
+
+    /// [`Self::eval_g`] through a compiled expression: no name is looked up.
+    pub(crate) fn eval_c<S>(c: &Compiled, fetch_args: &[String], converters: &[(S, Vec<String>)], ctx: &SampleContext) -> Option<Sample> {
+        if let Some(func) = c.single {
+            let smp = func(ctx, fetch_args)?;
+            return Self::apply_c(c, ctx, smp, converters);
+        }
+        Self::eval_all_c(c, fetch_args, converters, ctx).into_iter().next()
     }
 }
 
