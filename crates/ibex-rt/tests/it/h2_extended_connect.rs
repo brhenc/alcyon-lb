@@ -146,7 +146,7 @@ fn proxy_fe(server: std::net::SocketAddr, fe: &str) -> Proxy {
     std::fs::write(
         &cfg,
         format!(
-            "global\n  log stdout format raw local0\n\
+            "global\n  tune.ibex.h1-lowercase-headers on\n  log stdout format raw local0\n\
              defaults\n  mode http\n  log global\n  option httplog\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n  timeout tunnel 5s\n  option forwardfor\n\
              frontend fe\n  bind {addr} proto h2\n{fe}  default_backend be\n\
              backend be\n  server s1 {server}\n"

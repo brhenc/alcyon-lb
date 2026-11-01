@@ -169,6 +169,8 @@ impl CanonicalHarness {
         // served plaintext. That is precisely the downgrade `bind_tls` now refuses, so
         // the option has to go rather than be tolerated.
         let adapted = raw_cfg
+            // The names as HAProxy writes them (X5).
+            .replacen("\nglobal\n", "\nglobal\n    tune.ibex.h1-lowercase-headers on\n", 1)
             .replace("0.0.0.0:8443", &fe_addr.to_string())
             .replace(
                 "bind [::]:8443 ssl crt /etc/ibex/certs/ alpn h2,http/1.1 accept-proxy\n",

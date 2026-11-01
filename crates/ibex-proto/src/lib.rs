@@ -70,6 +70,7 @@ pub mod endpoint;
 pub mod exp;
 pub mod ffi_h1;
 pub mod h1;
+pub mod h1_encode;
 pub mod parser;
 pub mod response_head;
 pub mod h2;

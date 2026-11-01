@@ -1446,6 +1446,7 @@ mod tests {
             abortonclose: true,
             h1_adjust: 0,
             h1_case: std::sync::Arc::default(),
+            h1_lower: false,
             error_files: std::collections::HashMap::new(),
             error_replies: std::collections::HashMap::new(),
             log_tag: None,

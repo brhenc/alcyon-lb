@@ -40,7 +40,7 @@ fn exchange(req: &[u8], resp: &'static [u8]) -> (String, String) {
     std::fs::write(
         &cfg,
         format!(
-            "global\n\tlog stdout format raw local0\n\
+            "global\n  tune.ibex.h1-lowercase-headers on\n\tlog stdout format raw local0\n\
              defaults\n\tmode http\n\tlog global\n\ttimeout connect 3s\n\ttimeout client 5s\n\ttimeout server 5s\n\ttimeout tunnel 5s\n\
              frontend fe\n\tbind 127.0.0.1:{port}\n\tlog-format \"ST=%ST U=%U\"\n\tdefault_backend be\n\
              backend be\n\tserver s1 {be}\n"

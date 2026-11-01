@@ -108,7 +108,7 @@ impl Rig {
         let heads: Heads = Arc::default();
         let be = Some(backend(srv, Arc::clone(&running), Arc::clone(&heads)));
         let cfg = format!(
-            "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+            "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
              frontend fe\n  bind {fe}\n{fe_lines}  default_backend be\nbackend be\n{be_lines}  server s1 {srv_addr}\n"
         );
         let engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");

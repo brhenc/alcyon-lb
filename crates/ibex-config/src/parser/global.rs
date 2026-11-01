@@ -440,6 +440,23 @@ pub(crate) fn parse_global_directive(
             });
             Ok(())
         }
+        // X5 (Ibex-only): reaches `Proxy::h1_lower` (engine.rs, `build_proxies`), read where a
+        // forwarded head's names are written (`rewrite_header_names_before`) and handed to the
+        // h1 encoder as `H1EncodeOpts::lowercase`.
+        "tune.ibex.h1-lowercase-headers" => {
+            let Some(arg) = tokens.get(1) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'tune.ibex.h1-lowercase-headers' expects 'on' or 'off'."));
+            };
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'tune.ibex.h1-lowercase-headers' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            global.h1_lowercase_headers = Some(match arg.text.as_str() {
+                "on" => true,
+                "off" => false,
+                other => return Err(ConfigError::new(arg.line, arg.col, format!("'tune.ibex.h1-lowercase-headers' expects 'on' or 'off', got '{other}'."))),
+            });
+            Ok(())
+        }
         "tune.ibex.zero-buffers" => {
             let Some(arg) = tokens.get(1) else {
                 return Err(ConfigError::new(kw.line, kw.col, "'tune.ibex.zero-buffers' expects 'on' or 'off'."));

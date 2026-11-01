@@ -281,6 +281,8 @@ fn legacy_cliexp_srvexp_rewriting_no_longer_applies() {
             ],
             ..Default::default()
         }],
+        // The names as HAProxy writes them (`tune.ibex.h1-lowercase-headers on`, X5).
+        global: Some(ibex_config::ast::GlobalSection { h1_lowercase_headers: Some(true), ..Default::default() }),
         ..Default::default()
     };
 

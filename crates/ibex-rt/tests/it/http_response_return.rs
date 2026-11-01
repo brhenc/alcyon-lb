@@ -91,7 +91,7 @@ fn server() -> (SocketAddr, Arc<AtomicUsize>) {
     (addr, accepted)
 }
 
-const HEAD: &str = "global\n  log {log} local0\ndefaults\n  mode http\n  log global\n  option httplog\n  \
+const HEAD: &str = "global\n  tune.ibex.h1-lowercase-headers on\n  log {log} local0\ndefaults\n  mode http\n  log global\n  option httplog\n  \
     timeout client 5s\n  timeout server 5s\n  timeout connect 2s\n";
 
 /// `rules` are the lines of a backend that follows the standard frontend.

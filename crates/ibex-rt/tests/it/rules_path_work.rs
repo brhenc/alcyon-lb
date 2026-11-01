@@ -98,7 +98,7 @@ fn work_with(rules: &str, clients: usize, rounds: usize) -> ([u64; 4], String, S
     let running = Arc::new(AtomicBool::new(true));
     let be = backend(srv, Arc::clone(&running));
     let cfg = format!(
-        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+        "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
          frontend fe\n  bind {fe}\n{rules}  default_backend be\nbackend be\n  server s1 {srv_addr}\n"
     );
     let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");

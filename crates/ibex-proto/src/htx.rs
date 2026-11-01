@@ -67,7 +67,7 @@ pub fn latin1_to_text(value: &[u8]) -> String {
 }
 
 /// The bytes a value of [`HTX_BLK_FL_LATIN1`] stands for, written at `cursor`.
-fn write_latin1(out: &mut [u8], cursor: usize, text: &[u8]) -> Result<usize, HtxError> {
+pub(crate) fn write_latin1(out: &mut [u8], cursor: usize, text: &[u8]) -> Result<usize, HtxError> {
     // Held as text this crate wrote.
     let Ok(text) = utf8(text) else { return write_slice(out, cursor, text) };
     write_slice(out, cursor, &ibex_regex::bytetext::text_to_bytes(text))

@@ -210,8 +210,9 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     // `%U` counts the `content-length` the HTX holds, one canonical value in place of the
     // client's (`005`, `5, 5`, a repeat: `HAProxy` 3.5-dev8 forwards and counts `5`).
     let mut req_htx = d.req_htx;
+    let has_len = d.head.get_header("content-length").is_some();
     if parsed {
-        if d.head.get_header("content-length").is_some() {
+        if has_len {
             let client: usize = d.head.headers().filter(|(n, _)| n.eq_ignore_ascii_case(b"content-length")).map(|(n, v)| n.len() + v.len()).sum();
             let kept: usize = slice.as_ref().header_blocks_where(|n| n.eq_ignore_ascii_case(b"content-length")).map(|(_, n, v)| n.len() + v.len()).sum();
             req_htx = (req_htx + kept as u64).saturating_sub(client as u64);
@@ -235,22 +236,26 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     }
     no_mem |= !sess.req.alloc_if_needed();
     if parsed {
-        // The head written once, from the HTX, as a rule's edit writes it (`write_req_head`).
+        // The head written once, from the HTX, by the h1 encoder (X5): a request without a
+        // length goes chunked, `transfer-encoding: chunked` after the other headers, which
+        // no rule sees (`h1_make_eoh`). The names are the client's, in lower case (HTTP/2,
+        // HTTP/3), so `tune.ibex.h1-lowercase-headers` has nothing to change here; the mode
+        // is keep-alive, as the server side starts (the `connection` header is the
+        // engine's, `rewrite_request_connection`).
+        use ibex_proto::h1_encode::{h1_encode_head, H1Dir, H1EncodeOpts, SlFlags};
+        let sl = SlFlags::XFER_LEN
+            | if chunked {
+                SlFlags::NONE
+            } else if has_len {
+                SlFlags::CLEN
+            } else {
+                SlFlags::BODYLESS
+            };
         let w = sess.req.writable();
         // The buffer is sized for the head (`out_len`); one it does not fit fails the stream
         // as a buffer that cannot be had does, rather than going out cut short.
-        let n = slice.as_ref().write_h1_wire(w).unwrap_or(0);
+        let n = h1_encode_head(slice.as_ref(), &H1EncodeOpts::new(H1Dir::Request, sl, false), w).map_or(0, |e| e.len);
         no_mem |= n == 0;
-        // A request without a length goes chunked, the header after the others, which no
-        // rule sees; without room for it the stream fails, not the framing.
-        let te = chunked && n >= 2 && w.len() >= n - 2 + TE.len();
-        no_mem |= chunked && !te;
-        let n = if te {
-            w[n - 2..n - 2 + TE.len()].copy_from_slice(TE);
-            n - 2 + TE.len()
-        } else {
-            n
-        };
         sess.req.commit(n);
     } else {
         let wire = text_wire(&d.head, key.as_deref(), chunked, d.add_len);
@@ -286,9 +291,6 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     }
     d.head
 }
-
-/// The last header of a request sent chunked, and the blank line.
-const TE: &[u8] = b"transfer-encoding: chunked\r\n\r\n";
 
 /// `src` into `dst`, as much as fits: the bytes copied.
 fn copy_into(dst: &mut [u8], src: &[u8]) -> usize {

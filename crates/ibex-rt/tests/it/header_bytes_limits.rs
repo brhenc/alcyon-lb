@@ -105,7 +105,7 @@ fn start() -> Proxy {
     let mut cfg = NamedTempFile::new().expect("tmp");
     write!(
         cfg,
-        "global\n  log stdout format raw local0\n\
+        "global\n  tune.ibex.h1-lowercase-headers on\n  log stdout format raw local0\n\
          defaults\n  mode http\n  log global\n  option httplog\n  timeout connect 2s\n  \
          timeout client 5s\n  timeout server 5s\n\
          frontend f\n  bind {fe}\n  default_backend b\n\

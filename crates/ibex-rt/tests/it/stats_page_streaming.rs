@@ -68,7 +68,7 @@ fn start_full(tag: &str, global: &str, nb: usize, per: usize, tls: bool, quic: b
     let sock = format!("/tmp/ibex-t572-{tag}-{}.sock", std::process::id());
     let cfg = std::env::temp_dir().join(format!("ibex-t572-{tag}-{}.cfg", std::process::id()));
     let mut c = format!(
-        "global\n    nbthread 1\n{global}    stats socket {sock} level admin\ndefaults\n    mode http\n    timeout client 30s\n    timeout server 30s\n    timeout connect 5s\n\
+        "global\n  tune.ibex.h1-lowercase-headers on\n    nbthread 1\n{global}    stats socket {sock} level admin\ndefaults\n    mode http\n    timeout client 30s\n    timeout server 30s\n    timeout connect 5s\n\
          frontend st\n    bind {st}\n    stats enable\n    stats uri /s\n\
          frontend ping\n    bind {ping}\n    http-request return status 200 content-type text/plain string ok\n"
     );

@@ -33,7 +33,7 @@ fn seen_by_server(extra: &str, req: &[u8]) -> String {
         String::from_utf8_lossy(&got).into_owned()
     });
     let cfg = format!(
-        "global\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 2s\n  timeout server 2s\n\
+        "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 2s\n  timeout server 2s\n\
          frontend f\n  bind {fe}\n  default_backend b\nbackend b\n{extra}  server s {be}\n"
     );
     let mut f = NamedTempFile::new().expect("tmp");
