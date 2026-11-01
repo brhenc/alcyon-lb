@@ -480,4 +480,38 @@ mod tests {
         assert_eq!(l.len(), 1, "{l:?}");
         assert!(l[0].starts_with("Server b/s1 is UP, reason: Layer4 check passed"), "{l:?}");
     }
+
+    /// `ehlth`/`dhlth` on another worker are queued and taken in by the owner in order; an
+    /// op for a check that is not in the slice the owner passes stays queued for it.
+    #[test]
+    fn check_enable_from_a_worker_without_the_check_and_ops_of_other_checks() {
+        let c = "defaults\n    mode http\nbackend b\n    server s1 127.0.0.1:1 check\n    server s2 127.0.0.1:1 check\n    server s3 127.0.0.1:1\n";
+        let config = ibex_config::parse_str(c).expect("config");
+        let proxies = crate::engine::Engine::build_shared_state(&config).expect("proxies");
+        let p = proxies.iter().position(|x| x.name == "b").expect("b");
+        let mk = |s: usize| {
+            let cfg = proxies[p].server_check_configs[s].clone().expect("check");
+            ServerCheckState::new(p, s, proxies[p].servers.get(s).expect("addr"), cfg, ibex_sched::Tick(1))
+        };
+        let (mut c1, mut c2) = (mk(0), mk(1));
+        assert!(!set_check_enabled(&proxies, &mut [], p, 2, false, ibex_sched::Tick(1)), "s3 has no check");
+
+        // `hdown` on s2 elsewhere; s1's check step leaves it queued for s2's.
+        apply_health(&proxies, &mut [], p, 1, false, Cause::Web);
+        publish_check(&proxies, &mut c1);
+        assert_eq!(c2.status, ServerStatus::Up);
+        adopt_for(&proxies, &mut c2);
+        assert_eq!(c2.status, ServerStatus::Down);
+
+        assert!(set_check_enabled(&proxies, &mut [], p, 0, false, ibex_sched::Tick(1)));
+        assert!(c1.enabled);
+        adopt_for(&proxies, &mut c1);
+        assert!(!c1.enabled);
+        // The owner's own `enable health` takes the queue in first, then reschedules.
+        assert!(set_check_enabled(&proxies, &mut [], p, 0, false, ibex_sched::Tick(1)));
+        assert!(set_check_enabled(&proxies, std::slice::from_mut(&mut c1), p, 0, true, ibex_sched::Tick(7)));
+        assert!(c1.enabled);
+        assert_eq!(c1.next_check, ibex_sched::Tick(7));
+        drop(lines(&proxies));
+    }
 }
