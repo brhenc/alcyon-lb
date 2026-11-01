@@ -35,9 +35,9 @@ pub trait HtxStream {
     fn rx_buffered(&self) -> usize;
     /// Reset by the client or by the mux.
     fn is_reset(&self) -> bool;
-    /// The request head, as HTTP/1.1 (T437), until the data path takes it.
+    /// The request head as its checked fields (T437, E1), until the data path takes it.
     fn req_head(&self) -> Option<&H2ReqHead>;
-    fn take_req_head(&mut self) -> Option<Box<H2ReqHead>>;
+    fn take_req_fields(&mut self) -> Option<Box<H2ReqHead>>;
     /// A request `HAProxy` takes and answers 400.
     fn bad_request(&self) -> bool;
     /// The request's `content-length`, as the mux read it (one value, however the client
@@ -56,7 +56,7 @@ pub trait HtxMux {
     /// The lowest stream with its whole head that no child serves yet, if one may be
     /// served now.
     fn next_dispatch(&self) -> Option<u64>;
-    /// A head the data path took ([`HtxStream::take_req_head`]), for the next streams.
+    /// A head the data path took ([`HtxStream::take_req_fields`]), for the next streams.
     fn give_back_head(&mut self, head: Box<H2ReqHead>);
     /// A DATA block's bytes the data path wrote out whole, for the next DATA frame (h3: a
     /// pool, T512); an

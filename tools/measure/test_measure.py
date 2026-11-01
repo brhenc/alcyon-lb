@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from measure import (check_regressions, MetricDelta, Verdict, reference_sha, split_modes,
-                     parse_insreq, min_ins_per_req, host_problems)
+                     parse_insreq, min_ins_per_req, host_problems, load_previous_measurements)
 
 
 def _git(repo, *args):
@@ -190,6 +190,15 @@ class TestRegressionDetector(unittest.TestCase):
         deltas, verdict = check_regressions(current, previous)
         self.assertEqual(verdict, Verdict.FAIL)
         self.assertTrue(any(d.name == "binary_bytes" and d.is_regression for d in deltas))
+
+    def test_insreq_h3_rows_are_not_the_previous_gate_record(self):
+        # T555: insreq.sh's h3 rows (`"kind": "insreq-h3"`) share data/measurements.jsonl;
+        # the gate's history is its own rows only.
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "m.jsonl"
+            p.write_text('{"rps_1conn": 1}\n{"kind": "insreq-h3", "h3_fit": 2}\n')
+            self.assertEqual(load_previous_measurements(p), [{"rps_1conn": 1}])
 
     def test_no_previous_run_is_baseline_pass(self):
         current = {"allocs_per_request": 5, "rps_1conn": 10000}

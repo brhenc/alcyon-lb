@@ -15,11 +15,11 @@ needs `fixed_on`; `fixed` (time) feeds the mean time to fix. Check with
 never an open finding. Then `python3 tools/findings.py --md` and commit the CSVs and this file.
 
 ```
-== (a) open findings: 14 of 85
+== (a) open findings: 15 of 87
 severity      crash       dos    parity     flaky  total
 critical          0         0         0         0      0
 high              0         0         0         0      0
-medium            1         1         2         0      4
+medium            1         2         2         0      5
 low               0         3         6         1     10
 
 == (b) new findings per method per day
@@ -32,13 +32,13 @@ day               vv-battery           vv-soak          vv-probe           redte
 2026-10-19                 0                 0                 2                 0                 0                 0                 1                 0
 2026-10-25                 1                 0                 4                 0                 0                 0                 0                 0
 2026-10-31                 0                 0                 1                 0                 0                 0                 0                 0
-2026-11-01                 1                 1                 1                 0                 0                 0                 0                 0
+2026-11-01                 2                 1                 2                 0                 0                 0                 0                 0
 
 == (c) clean hours since the method's last new finding (runs on the main lineage)
 method               hours  last finding     runs
-vv-battery             0.0  2026-11-01 00:02 0
+vv-battery             0.0  2026-11-01 02:27 0
 vv-soak                0.0  2026-11-01 00:18 0
-vv-probe               0.0  2026-11-01 00:10 0
+vv-probe               0.0  2026-11-01 05:16 0
 vv-recheck             1.0  never            7
 redteam                5.6  2026-10-12 12:31 37
 fuzz-libfuzzer         3.0  2026-10-10 22:18 4
@@ -47,5 +47,5 @@ review                 0.0  2026-10-19 06:17 0
 gate                   0.0  2026-10-11 08:20 0
 
 == (d) mean time found -> fixed
-16.6 h over 43 findings with both timestamps (70 fixed in all)
+16.3 h over 44 findings with both timestamps (71 fixed in all)
 ```

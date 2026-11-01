@@ -25,7 +25,7 @@
 //! - the response as HTTP/1.1 text: `HTTP/1.1 <status> <reason>` (HAProxy's reasons), the
 //!   fields, `content-length` kept, else `transfer-encoding: chunked` (also for a response
 //!   whose HEADERS ends the stream), chunk sizes in uppercase hex, trailers in the last chunk
-//!   and dropped after a content-length body, 1xx passed on, 204/304/HEAD bodyless.
+//!   and, after a content-length body, kept for an h2 or h3 client ([`H2SrvCodec::take_late_trailers`]; the body's last byte waits for the stream's end) and dropped for an h1 one, 1xx passed on, 204/304/HEAD bodyless.
 //!
 //! Memory: per connection, from the `h2c_srv` pool ([`H2SrvCodec::take`]); a warm codec keeps
 //! its buffers and HPACK table and allocates nothing per request.
@@ -37,6 +37,12 @@ ibex_alloc::declare_pool!(
     /// `show pools` `h2c_srv`: the h2 codec of a connection to a server (HAProxy's `h2c` +
     /// `h2s` of a backend connection), with its buffers and HPACK table.
     static H2C_SRV: Pool<H2SrvCodec> = ibex_alloc::PoolSpec::new("h2c_srv");
+);
+
+ibex_alloc::declare_pool!(
+    /// `show pools` `h2_trailers`: the trailer section an h2 server sent after a content-length
+    /// body, on its way to an h2 or h3 client (T559). Rare; bounded by the HPACK block limit.
+    static H2_TRAILERS: Pool<Vec<u8>> = ibex_alloc::PoolSpec::new("h2_trailers").max_item(16384);
 );
 
 /// Why a request or its response cannot go on.
@@ -140,6 +146,12 @@ pub struct H2SrvCodec {
     stream_error: Option<SrvH2Error>,
     /// The last stream ended on an error.
     failed: bool,
+    /// T559: the last DATA byte of a content-length body, held back until the stream ends so
+    /// that trailers after it can be told to the session first ([`Self::take_late_trailers`]).
+    held: Option<u8>,
+    /// The trailer section (`name: value\r\n` lines, the blank line) that followed a
+    /// content-length body, for a client that can carry it; an h1 client never asks.
+    late: Vec<u8>,
     /// No new stream on this connection.
     no_reuse: bool,
 }
@@ -158,12 +170,13 @@ impl ibex_alloc::Poolable for H2SrvCodec {
             + self.rsp.capacity()
             + self.hblock.capacity()
             + self.scratch.capacity()
+            + self.late.capacity()
             + self.dec.dynamic_table.size()
     }
 
     fn reset(&mut self, wipe: bool) {
         if wipe {
-            for v in [&mut self.out, &mut self.inb, &mut self.rsp, &mut self.hblock, &mut self.scratch] {
+            for v in [&mut self.out, &mut self.inb, &mut self.rsp, &mut self.hblock, &mut self.scratch, &mut self.late] {
                 ibex_alloc::wipe_vec(v);
             }
         }
@@ -250,6 +263,8 @@ impl H2SrvCodec {
             conn_error: None,
             stream_error: None,
             failed: false,
+            held: None,
+            late: Vec::new(),
             no_reuse: false,
         };
         c.restart();
@@ -270,6 +285,8 @@ impl H2SrvCodec {
         self.inb.clear();
         self.rsp.clear();
         self.rsp_off = 0;
+        self.held = None;
+        self.late.clear();
         self.hblock.clear();
         self.hb_stream = 0;
         self.hb_flags = 0;
@@ -570,6 +587,8 @@ impl H2SrvCodec {
         self.strm_rx_win = i64::from(OUR_INITIAL_WINDOW);
         self.head_req = method == b"HEAD";
         self.failed = false;
+        self.held = None;
+        self.late.clear();
         self.rsp_state = Rsp::Waiting;
         self.req = body;
         let es = if body == ReqBody::Done { frame_flags::END_STREAM } else { 0 };
@@ -971,17 +990,27 @@ impl H2SrvCodec {
             Rsp::Waiting | Rsp::Done => self.on_response_head(es),
             Rsp::Body { chunked, .. } => {
                 // Trailers: END_STREAM, no pseudo-header.
-                if !es || crate::h2::check_trailer_fields(self.fields.iter()).is_err() {
+                if !es || crate::h2::check_trailer_fields(self.fields.iter_text()).is_err() {
                     return Err(self.stream_fail(SrvH2Error::BadResponse, Some(0x1)));
                 }
                 if chunked {
                     self.rsp.extend_from_slice(b"0\r\n");
-                    for (n, v) in self.fields.iter() {
+                    for (n, v) in self.fields.iter_text() {
                         push_field(&mut self.rsp, n, v);
                     }
                     self.rsp.extend_from_slice(b"\r\n");
                 }
-                // After a content-length body HAProxy's h1 side drops the trailers (measured).
+                // After a content-length body HAProxy's h1 side drops the trailers (measured),
+                // an h2 or h3 client gets them (T559): kept for `take_late_trailers`, and the
+                // last body byte goes out only now, so they are known before the body is.
+                if !chunked {
+                    self.late.clear();
+                    for (n, v) in self.fields.iter_text() {
+                        push_field(&mut self.late, n, v);
+                    }
+                    self.late.extend_from_slice(b"\r\n");
+                }
+                self.release_held();
                 self.end_response(false);
                 Ok(())
             }
@@ -992,8 +1021,8 @@ impl H2SrvCodec {
         let mut status: Option<u16> = None;
         let mut regular = false;
         let mut cl: Option<u64> = None;
-        let mut bad = crate::h2::check_response_fields(self.fields.iter()).is_err();
-        for (n, v) in self.fields.iter() {
+        let mut bad = crate::h2::check_response_fields(self.fields.iter_text()).is_err();
+        for (n, v) in self.fields.iter_text() {
             if let Some(p) = n.strip_prefix(':') {
                 bad |= p != "status" || regular || status.is_some();
                 let b = v.as_bytes();
@@ -1026,7 +1055,7 @@ impl H2SrvCodec {
         r.push(b' ');
         r.extend_from_slice(crate::actions::status_reason_phrase(status).as_bytes());
         r.extend_from_slice(b"\r\n");
-        for (n, v) in self.fields.iter().filter(|(n, _)| !n.starts_with(':')) {
+        for (n, v) in self.fields.iter_text().filter(|(n, _)| !n.starts_with(':')) {
             push_field(r, n, v);
         }
         if chunked {
@@ -1062,10 +1091,16 @@ impl H2SrvCodec {
                 self.rsp.extend_from_slice(d);
                 self.rsp.extend_from_slice(b"\r\n");
             } else {
-                self.rsp.extend_from_slice(d);
+                // The body's last byte waits for the stream's end (T559).
+                let last = !es && matches!(self.rsp_state, Rsp::Body { left: Some(0), .. });
+                self.rsp.extend_from_slice(&d[..d.len() - usize::from(last)]);
+                if last {
+                    self.held = d.last().copied();
+                }
             }
         }
         if es {
+            self.release_held();
             if let Rsp::Body { left: Some(l), .. } = self.rsp_state {
                 if l > 0 {
                     return Err(self.stream_fail(SrvH2Error::BadResponse, Some(0x1)));
@@ -1078,6 +1113,28 @@ impl H2SrvCodec {
 
     /// END_STREAM read: the last chunk when chunked, the stream closed when the request is
     /// all sent, else the request is cut (RST_STREAM CANCEL) and the connection not reused.
+    /// Writes the body byte [`Self::held`] back, the stream having ended.
+    fn release_held(&mut self) {
+        if let Some(b) = self.held.take() {
+            self.rsp.push(b);
+        }
+    }
+
+    /// The trailer section that followed the content-length body of the last response, as
+    /// text for `h2_bridge` (T559), once; empty for none.
+    pub fn take_late_trailers(&mut self) -> Option<ibex_alloc::PoolBox<Vec<u8>>> {
+        if self.late.is_empty() {
+            return None;
+        }
+        // No buffer to be had: the trailers are dropped, as for an h1 client.
+        let b = H2_TRAILERS.take().map(|mut b| {
+            b.extend_from_slice(&self.late);
+            b
+        });
+        self.late.clear();
+        b
+    }
+
     fn end_response(&mut self, last_chunk: bool) {
         if last_chunk {
             self.rsp.extend_from_slice(b"0\r\n\r\n");

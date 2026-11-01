@@ -21,8 +21,55 @@ pub(super) struct Send {
     pub(super) stop_reason: Option<VarInt>,
 }
 
+/// What a `Send` is held in: a pool object with `ibex-pools`, else a `Box` (and the connection
+/// keeps `SendSpares` of them)
+#[cfg(feature = "ibex-pools")]
+pub(super) type SendBox = ibex_alloc::PoolBox<Box<Send>>;
+#[cfg(not(feature = "ibex-pools"))]
+pub(super) type SendBox = Box<Send>;
+/// The connection's own list of freed `Send`s; with `ibex-pools` the pool is the list
+#[cfg(feature = "ibex-pools")]
+pub(super) type SendSpares = ();
+#[cfg(not(feature = "ibex-pools"))]
+pub(super) type SendSpares = Vec<SendBox>;
+
+#[cfg(feature = "ibex-pools")]
+ibex_alloc::declare_pool!(static SEND_POOL: Pool<Box<Send>> = ibex_alloc::PoolSpec::new("quic_send").size(std::mem::size_of::<Send>()););
+
+#[cfg(feature = "ibex-pools")]
+impl ibex_alloc::Poolable for Box<Send> {
+    fn footprint(&self) -> usize {
+        std::mem::size_of::<Send>() + self.pending.footprint()
+    }
+    fn reset(&mut self, _wipe: bool) {
+        // The segments are the application's `Bytes`, shared: dropping them is all there is
+        self.free();
+    }
+    fn try_new() -> Option<Self> {
+        Some(Send::blank())
+    }
+}
+
 impl Send {
-    pub(super) fn new(max_data: VarInt) -> Box<Self> {
+    /// An unused one; `reinit` gives it its stream's limits
+    #[cfg(feature = "ibex-pools")]
+    fn blank() -> Box<Self> {
+        Self::boxed(VarInt::from_u32(0))
+    }
+
+    #[cfg(feature = "ibex-pools")]
+    pub(super) fn new(max_data: VarInt) -> SendBox {
+        let mut s = crate::ibex_pools::take(&SEND_POOL);
+        s.reinit(max_data);
+        s
+    }
+
+    #[cfg(not(feature = "ibex-pools"))]
+    pub(super) fn new(max_data: VarInt) -> SendBox {
+        Self::boxed(max_data)
+    }
+
+    fn boxed(max_data: VarInt) -> Box<Self> {
         Box::new(Self {
             max_data: max_data.into(),
             state: SendState::Ready,

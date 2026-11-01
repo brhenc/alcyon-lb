@@ -108,7 +108,7 @@ fn a_get_becomes_a_head_and_the_end_of_the_message() {
     let head = st.req_head().expect("head");
     assert_eq!(head.method(), "GET");
     assert_eq!(head.uri(), "/plain");
-    assert_eq!(head.get_header("host"), Some("localhost"));
+    assert_eq!(head.get_header("host"), Some(&b"localhost"[..]));
     assert_eq!(head.abs_prefix(), Some("https://localhost"));
     assert_eq!(signals(&mut m), vec![]);
     assert_eq!(m.head_partial(), None);
@@ -607,10 +607,10 @@ fn the_trait_serves_a_stream_as_the_bridge_will() {
         let id = m.next_dispatch()?;
         let st = m.stream_mut(id)?;
         st.set_dispatched();
-        let head = st.take_req_head()?;
+        let head = st.take_req_fields()?;
         assert!(st.req_head().is_none());
         assert!(!st.is_reset() && !st.bad_request() && st.rx_buffered() == 0);
-        let wire = String::from_utf8_lossy(head.wire()).into_owned();
+        let wire = String::from_utf8_lossy(&head.to_wire()).into_owned();
         assert!(wire.starts_with("GET /plain HTTP/1.1\r\n"), "{wire}");
         m.give_back_head(head);
         assert!(m.send_head(id, b"HTTP/1.1 200 OK", false));

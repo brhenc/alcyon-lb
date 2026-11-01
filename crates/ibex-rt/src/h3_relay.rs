@@ -105,7 +105,7 @@ pub fn request_head(field_section: &[u8], known_body: Option<u64>) -> Result<Req
     // token, a value with CR, LF or NUL, `:path`, `:authority`, `host`, `:scheme` and
     // `:method` that `HAProxy` refuses, connection-specific fields. T454: a byte that is not
     // UTF-8 is a NUL by now (`qpack::text_of`), so it ends here.
-    match ibex_proto::h2::check_request_fields(fields.iter().map(|f| (f.name.as_str(), f.value.as_str())), false) {
+    match ibex_proto::h2::check_request_fields(fields.iter().map(|f| (f.name.as_bytes(), f.value.as_bytes())), false) {
         Ok(false) => {}
         Ok(true) | Err(_) => return Err(HeadError::Message),
     }
