@@ -65,7 +65,7 @@ fn quinn_streams_and_retransmits_are_pool_objects() {
             client_connected |= matches!(e, quinn_proto::Event::Connected);
         }
         while let Some(e) = server.poll_event() {
-            if let TransportEvent::HandshakeComplete { conn_id: id, .. } = e {
+            if let TransportEvent::HandshakeComplete { conn: id, .. } = e {
                 conn_id = Some(id);
             }
         }

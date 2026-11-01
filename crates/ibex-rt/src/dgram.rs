@@ -50,6 +50,13 @@ impl DgramSocket {
         Ok(Self { fd })
     }
 
+    /// A socket handed over by the old process of a reload (`-x`, T558): bound, non-blocking
+    /// and with its options set, by the process that made it.
+    #[must_use]
+    pub fn from_inherited(fd: OwnedFd) -> Self {
+        Self { fd }
+    }
+
     #[must_use]
     /// Connects the socket to `peer`, so the kernel delivers only that peer's datagrams to it
     /// and prefers it to every unconnected socket sharing the port.

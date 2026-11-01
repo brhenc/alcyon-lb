@@ -368,7 +368,7 @@ pub struct H3Owner {
     pub mux: ibex_alloc::PoolBox<ibex_proto::mux_h3::H3MuxContext>,
     /// The index of the QUIC listener in the engine's list.
     pub listener: u32,
-    pub conn: ibex_quic::ConnectionId,
+    pub conn: ibex_quic::ConnHandle,
     /// A response's DATA staged on its way to the mux, kept from one response to the next.
     pub body_scratch: Vec<u8>,
     /// Since when no stream is served (`qcc->idle_start`): the connection's start, then each
@@ -376,6 +376,10 @@ pub struct H3Owner {
     pub idle_start: ibex_sched::Tick,
     /// A timer expired and the GOAWAY is written: the next pass closes (`qcc_shutdown`).
     pub closing: bool,
+    /// During a soft stop, until when a connection that has sent no request yet waits for
+    /// its first one before its GOAWAY(0) and close (T558): set the first time the owner
+    /// runs in the stop, [`crate::engine::H3_STOP_FIRST_REQUEST_MS`] after it.
+    pub stop_grace: Option<ibex_sched::Tick>,
 }
 
 /// The owner's side: its children.
