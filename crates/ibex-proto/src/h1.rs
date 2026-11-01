@@ -223,6 +223,18 @@ impl ParsedLine {
 #[cfg(debug_assertions)]
 thread_local! {
     static REQUEST_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static REQUEST_COPIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Of [`request_parses`], those [`H1Parser::parse`] made, copying the head's fields into the
+/// HTX, rather than [`H1Parser::index_head_in_place`] (debug builds; 0 in release): X2 pins that
+/// an HTTP/1 request head on the proxy's path is indexed where it is.
+#[must_use]
+pub fn copied_request_parses() -> u64 {
+    #[cfg(debug_assertions)]
+    return REQUEST_COPIES.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
 }
 
 /// Request heads [`H1Parser::parse`] has started on this thread (debug builds; 0 in release):
@@ -387,6 +399,7 @@ impl H1Parser {
         #[cfg(debug_assertions)]
         if !self.is_response && self.phase == H1Phase::StartLine {
             REQUEST_PARSES.with(|c| c.set(c.get() + 1));
+            REQUEST_COPIES.with(|c| c.set(c.get() + 1));
         }
         let mut cursor = 0;
 

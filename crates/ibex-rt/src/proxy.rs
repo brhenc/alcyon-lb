@@ -760,6 +760,10 @@ pub struct TcpSession {
     pub htx_buf: Buf,
     pub htx_tail: usize,
     pub htx_blocks: usize,
+    /// The length of an HTTP/1 request head indexed in place in `htx_buf` (X2): the head is
+    /// copied to its front, the rest is the reserve ([`Self::htx_region`]); 0 for an HTX built
+    /// from fields.
+    pub htx_head: u32,
     pub has_htx: bool,
     /// The HTX was edited since the head in `req` was written from it (or parsed): `req`'s
     /// head is then stale, and the server send writes it out of the HTX once (X2).
@@ -1471,6 +1475,7 @@ impl TcpSession {
             htx_buf: Buf::unallocated(crate::buf::BufClass::Standard),
             htx_tail: 0,
             htx_blocks: 0,
+            htx_head: 0,
             has_htx: false,
             htx_modified: false,
             req_ws: None,
@@ -1599,17 +1604,22 @@ impl TcpSession {
         }
         let tail = self.htx_tail;
         let blocks = self.htx_blocks;
-        let mut slice = ibex_proto::htx::HtxSlice::with_offsets(
-            self.htx_buf.htx_slice_mut(),
-            tail,
-            blocks,
-        );
+        let region = self.htx_region();
+        let mut slice = ibex_proto::htx::HtxSlice::over_received_with(self.htx_buf.htx_slice_mut(), region, tail, blocks);
         let res = f(&mut slice);
         self.htx_tail = slice.tail_addr();
         self.htx_blocks = slice.num_blocks();
         self.htx_buf.note_htx(self.htx_tail, self.htx_blocks * ibex_proto::htx::HTX_DESC_SIZE);
         self.htx_modified = true;
         Some(res)
+    }
+
+    /// Where the HTX lies in `htx_buf`: a request head indexed in place at its front and the
+    /// reserve after it ([`Self::htx_head`]), or an HTX of its own memory.
+    #[must_use]
+    pub fn htx_region(&self) -> ibex_proto::htx::HtxRegion {
+        let n = self.htx_head as usize;
+        ibex_proto::htx::HtxRegion { head_start: 0, head_end: n, reserve_start: n }
     }
 
     /// [`Self::with_htx_mut`] for an edit made to the request buffer's head too (a line cut
@@ -1657,6 +1667,7 @@ impl TcpSession {
 
     pub fn clear_htx(&mut self) {
         self.has_htx = false;
+        self.htx_head = 0;
         self.htx_tail = 0;
         self.htx_blocks = 0;
         self.htx_modified = false;
@@ -2568,28 +2579,53 @@ impl TcpSession {
         // and the FFI one needs a feature `ibex-rt` does not have), so a boxed one would be a
         // branch no run can take; a kind added later must come with its way in.
         debug_assert_eq!(self.parser_kind, ibex_proto::parser::ParserKind::H1, "only the built-in parser is wired");
-        let mut h1_parser = ibex_proto::H1Parser::new(false);
-        let stream: &mut dyn ibex_proto::parser::HttpStream = &mut h1_parser;
-        stream.set_accept_unsafe_request(self.accept_unsafe_request);
-        // The head HAProxy holds in `tune.bufsize` may not fit this HTX, whose descriptors
-        // are twice as large: the buffer is made large enough for the head and one
-        // descriptor per line (and the two of the start line and the end of the head).
-        self.htx_tail = 0;
-        self.htx_blocks = 0;
-        let lines = self.req.readable()[..head_len].iter().filter(|&&b| b == b'\n').count();
-        // One more line for a `Sec-WebSocket-Key` the proxy may write.
-        self.htx_reserve(head_len + 64 + ibex_proto::htx::HTX_DESC_SIZE * (lines + 3));
-        if !self.htx_buf.is_allocated() {
-            return Err(crate::buf::oom());
-        }
-        let raw = self.htx_buf.htx_slice_mut();
-        let mut slice = ibex_proto::htx::HtxSlice::new(raw);
-        if let Err(e) = stream.parse(&self.req.readable()[..head_len], &mut slice) {
-            // What a refused head wrote is zeroed on release like any other.
+        let new_parser = |unsafe_ok: bool| {
+            let mut p = ibex_proto::H1Parser::new(false);
+            ibex_proto::parser::HttpStream::set_accept_unsafe_request(&mut p, unsafe_ok);
+            p
+        };
+        let mut h1_parser = new_parser(self.accept_unsafe_request);
+        // X2: the head is copied once, whole, to the front of the HTX buffer and indexed there
+        // in place (`index_head_in_place`): its blocks are descriptors over those bytes, names
+        // as they came in; only what the parser changes, and what the rules add, goes after it.
+        // The buffer holds the head and a descriptor per counted line (`MAX_REQUEST_HEADERS`,
+        // the start line, the end of the head, a `Sec-WebSocket-Key` the proxy may write); a
+        // head of more lines (uncounted `Connection` lines) is sized by its lines and indexed
+        // again.
+        use ibex_proto::htx::{HtxRegion, HtxSlice, HTX_DESC_SIZE};
+        let region = HtxRegion { head_start: 0, head_end: head_len, reserve_start: head_len };
+        let mut lines = usize::from(ibex_proto::h1::MAX_REQUEST_HEADERS) + 3;
+        let mut sized = false;
+        let (tail, blocks) = loop {
+            self.clear_htx();
+            self.htx_reserve(head_len + 64 + HTX_DESC_SIZE * lines);
+            if !self.htx_buf.is_allocated() {
+                return Err(crate::buf::oom());
+            }
+            let raw = self.htx_buf.htx_slice_mut();
+            raw[..head_len].copy_from_slice(&self.req.readable()[..head_len]);
+            let mut slice = HtxSlice::over_received(raw, region).map_err(|_| crate::buf::oom())?;
+            let r = h1_parser.index_head_in_place(&mut slice);
             let (tail, blocks) = (slice.tail_addr(), slice.num_blocks());
-            self.htx_buf.note_htx(tail, blocks * ibex_proto::htx::HTX_DESC_SIZE);
-            return Err(e.into());
-        }
+            // What a refused head wrote is zeroed on release like any other.
+            self.htx_buf.note_htx(tail, blocks * HTX_DESC_SIZE);
+            match r {
+                Ok(n) if n == head_len => break (tail, blocks),
+                // Once: an `OutOfMemory` with the head's own lines counted is the parser's (a
+                // name longer than a block holds), refused as the copying parse refuses it.
+                Err(e) if e.kind() == io::ErrorKind::OutOfMemory && !sized => {
+                    sized = true;
+                    lines = self.req.readable()[..head_len].iter().filter(|&&b| b == b'\n').count() + 3;
+                    h1_parser = new_parser(self.accept_unsafe_request);
+                }
+                Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "request head not whole")),
+                Err(e) => return Err(e),
+            }
+        };
+        self.htx_head = u32::try_from(head_len).unwrap_or(u32::MAX);
+        let raw = self.htx_buf.htx_slice_mut();
+        let mut slice = HtxSlice::over_received_with(raw, region, tail, blocks);
+        let stream: &mut dyn ibex_proto::parser::HttpStream = &mut h1_parser;
         let mut close = stream.connection_close();
         let head_rewritten = stream.head_rewritten();
         // `Content-Length` beside `Transfer-Encoding`: forwarded as HAProxy does

@@ -163,6 +163,26 @@ fn a_request_head_is_written_at_most_once() {
     assert_eq!(n, N, "head writes for {N} requests of the rules scenario with forwardfor: one each");
 }
 
+/// The HTTP/1 request head is indexed where it is ([`ibex_proto::h1::H1Parser::index_head_in_place`]):
+/// its fields are descriptors over the received bytes, not copied into the HTX one by one.
+#[test]
+fn a_request_head_is_indexed_not_copied() {
+    const N: u64 = 10;
+    let mut rig = Rig::new("", RULES);
+    let mut c = rig.connect();
+    let req = b"GET /api/x HTTP/1.1\r\nHost: localhost\r\nX-Junk: 1\r\nAccept: */*\r\n\r\n";
+    let _ = rig.request(&mut c, req);
+    let (parses, copies) = (ibex_proto::h1::request_parses(), ibex_proto::h1::copied_request_parses());
+    for _ in 0..N {
+        let rsp = rig.request(&mut c, req);
+        assert!(rsp.starts_with("HTTP/1.1 200"), "response: {rsp:?}");
+    }
+    assert_eq!(ibex_proto::h1::request_parses() - parses, N, "request heads parsed");
+    assert_eq!(ibex_proto::h1::copied_request_parses() - copies, 0, "request heads parsed by copying their fields");
+    let seen = String::from_utf8_lossy(&rig.last_seen()).to_ascii_lowercase();
+    assert!(seen.contains("x-forwarded-proto: http\r\n") && !seen.contains("x-junk"), "request the server saw: {seen:?}");
+}
+
 /// D-E, default `off`: a head no rule edited reaches the server as the bytes that arrived,
 /// names in the case they came in; `on` lowercases them, as `HAProxy`.
 #[test]

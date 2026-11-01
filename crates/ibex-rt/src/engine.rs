@@ -16161,11 +16161,16 @@ fn del_req_header(sess: &mut TcpSession, name: &str) {
 /// rules before it count and a header a rule removed gives its room back.
 fn req_htx_init(sess: &TcpSession) {
     let size = sess.bufsize.saturating_sub(40);
-    let hdrs: usize = sess.htx_slice().map_or(0, |h| h.headers().map(|(k, v)| htx_hdr_size(k, v)).sum());
+    // Read off the descriptors (no value is looked at); the line from its block.
+    let (hdrs, line) = sess.htx_slice().map_or((0, 3 + 1), |h| {
+        let hdrs = (0..h.num_blocks()).map(|i| h.read_desc(i)).filter(|d| d.blk_type == ibex_proto::htx::HtxBlockType::Header).map(|d| 8 + usize::from(d.name_len) + d.value_len as usize).sum();
+        (hdrs, h.req_line_bytes().map_or(3 + 1, |r| r.method.len() + r.uri.len()))
+    });
     let data = sess.req.readable();
-    let head_len = crate::proxy::find_eoh(data).map_or(data.len(), |(h, e)| h + e);
+    // The head as it is in the buffer (an edited one is written at the send): what follows it is the body.
+    let head_len = sess.req.eoh().map_or(data.len(), |(h, e)| h + e);
     let body = data.len().saturating_sub(head_len);
-    let line = 8 + 20 + sess.req_method.as_deref().map_or(3, str::len) + sess.req_uri.as_deref().map_or(1, str::len) + 8;
+    let line = 8 + 20 + line + 8;
     let head = line + hdrs + 9;
     let reserve = sess.maxrewrite.min(sess.bufsize / 2);
     // The body is clamped once, against the head as it was read; a rewrite after that has
