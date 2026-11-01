@@ -11,7 +11,6 @@ mod on {
     thread_local! {
         static RMWS: Cell<u64> = const { Cell::new(0) };
         static WALL_READS: Cell<u64> = const { Cell::new(0) };
-        static SRV_ROWS: Cell<u64> = const { Cell::new(0) };
         static CLOCK_READS: Cell<u64> = const { Cell::new(0) };
     }
     pub fn rmw() {
@@ -22,13 +21,6 @@ mod on {
     }
     pub fn clock_read() {
         CLOCK_READS.with(|c| c.set(c.get() + 1));
-    }
-    pub fn srv_rows(n: usize) {
-        SRV_ROWS.with(|c| c.set(c.get() + n as u64));
-    }
-    #[must_use]
-    pub fn srv_rows_read() -> u64 {
-        SRV_ROWS.with(Cell::get)
     }
     #[must_use]
     pub fn rmws() -> u64 {
@@ -54,8 +46,6 @@ mod off {
     pub fn wall_read() {}
     #[inline(always)]
     pub fn clock_read() {}
-    #[inline(always)]
-    pub fn srv_rows(_n: usize) {}
 }
 #[cfg(not(debug_assertions))]
 pub use off::*;

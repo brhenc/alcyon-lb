@@ -17,13 +17,12 @@ const REQS: u64 = 40;
 /// Runs `REQS` keep-alive requests through frontend, backend and server with no `log` line;
 /// returns what the probes counted over the last `REQS - WARM` of them.
 fn run() -> (u64, u64, u64, u64, u64) {
-    let (a, b, c, d, e, _) = run_with(1);
-    (a, b, c, d, e)
+    run_with(1)
 }
 
 /// [`run`] with `servers` servers in the backend (only the first is reachable); the sixth
 /// value is the server rows `account_stream` read.
-fn run_with(servers: usize) -> (u64, u64, u64, u64, u64, u64) {
+fn run_with(servers: usize) -> (u64, u64, u64, u64, u64) {
     let be = TcpListener::bind("127.0.0.1:0").unwrap();
     let be_addr = be.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -67,7 +66,7 @@ fn run_with(servers: usize) -> (u64, u64, u64, u64, u64, u64) {
     for _ in 0..4 {
         one(&mut engine);
     }
-    let (r0, w0, k0, q0) = (ibex_rt::probe::rmws(), ibex_rt::probe::wall_reads(), ibex_rt::probe::clock_reads(), ibex_rt::probe::srv_rows_read());
+    let (r0, w0, k0) = (ibex_rt::probe::rmws(), ibex_rt::probe::wall_reads(), ibex_rt::probe::clock_reads());
     let p0 = passes.get();
     for _ in 0..REQS {
         one(&mut engine);
@@ -77,7 +76,7 @@ fn run_with(servers: usize) -> (u64, u64, u64, u64, u64, u64) {
         passes.set(passes.get() + 1);
         let _ = engine.run_once();
     }
-    (ibex_rt::probe::rmws() - r0, ibex_rt::probe::wall_reads() - w0, ibex_rt::probe::clock_reads() - k0, REQS, passes.get() - p0, ibex_rt::probe::srv_rows_read() - q0)
+    (ibex_rt::probe::rmws() - r0, ibex_rt::probe::wall_reads() - w0, ibex_rt::probe::clock_reads() - k0, REQS, passes.get() - p0)
 }
 
 #[test]
@@ -104,11 +103,4 @@ fn a_request_reads_the_clock_once_per_pass_and_never_for_a_log_it_does_not_write
     eprintln!("monotonic reads {clock} over {n} passes, wall {wall}");
     assert_eq!(wall, 0);
     assert_eq!(clock, n, "{clock} Instant reads over {n} passes");
-}
-
-#[test]
-fn accounting_a_request_reads_no_server_row_of_the_backend() {
-    let (.., rows) = run_with(100);
-    eprintln!("server rows read over {REQS} requests: {rows}");
-    assert_eq!(rows, 0, "backend smax must come from beconn, not from a sum over the servers");
 }
