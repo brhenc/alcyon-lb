@@ -437,6 +437,35 @@ delay an acknowledgement. A value out of range is refused at parse time. It only
 hostile client can ignore it, so it is not ACK-flood protection by itself. Off, nothing is sent,
 as HAProxy 3.5-dev10, which does not send ACK_FREQUENCY; HAProxy refuses all three keywords as unknown.
 
+## QUIC peers that ignore ACK_FREQUENCY: `ibex_fc_quic_ack_*`, `show quic ibex-acks`, `QuicAck*` (T569)
+
+Ibex extensions; HAProxy 3.5-dev10 has no equivalent (it sends no ACK_FREQUENCY, and neither its
+`quic_*` stats nor its fetches count a peer's ACK-only packets). Per QUIC connection, the vendored
+quinn-proto counts (`AckStats`, vendor change 8) the ack-eliciting 1-RTT packets sent, the 1-RTT
+packets received with an ACK frame and nothing ack-eliciting ("ACK-only"), and, once the peer has
+acknowledged an ACK_FREQUENCY frame (`tune.ibex.quic-ack-frequency on` and a peer that advertises
+`min_ack_delay`), the "excess": ACK-only packets that acknowledge at most the threshold's number of
+new ack-eliciting packets, all sent after that frame, sooner than the requested `max_ack_delay`
+(less 1 ms) after the first of them was sent, with no gap (a packet missing or acknowledged late,
+which draft-ietf-quic-ack-frequency 6.2 lets the peer acknowledge at once) and none of them an
+IMMEDIATE_ACK packet. Each of those would have let a compliant peer acknowledge; an ACK-only packet
+none explains is one it should not have sent. The bar is lenient: ECN-CE marks (which also allow an
+immediate ACK) are not seen, and are not needed as Ibex sends no ECN. A peer that never acknowledged
+an ACK_FREQUENCY frame is never judged: its excess has no value.
+
+- Fetches, on an HTTP/3 stream (mux path; no sample elsewhere, the relay path included), as the
+  stream's request head found them: `ibex_fc_quic_ack_eliciting_sent`, `ibex_fc_quic_ack_only_rcvd`,
+  `ibex_fc_quic_ack_ratio` (ACK-only received per 1000 ack-eliciting sent; no sample before one is
+  sent), `ibex_fc_quic_ack_excess` (no sample for a peer that is not judged). For example
+  `http-request deny if { ibex_fc_quic_ack_excess gt 100 }`, or `track-sc0` and a `gpc` on it.
+- `show quic ibex-acks [all|clo]`: the one-line head, then `ack_elic_sent ack_only_rcvd ratio_pm
+  ackf_thr ackf_excess` per connection (`-` for a peer that is not judged).
+- `show info`, with `tune.ibex.quic-ack-frequency on` only (as the zero-on-free lines, not in
+  `typed`/`json`): `QuicAckElicitingSent`, `QuicAckOnlyRcvd`, `QuicAckFreqExcess`, summed over
+  the connections that ended (a live one's are in `show quic ibex-acks`).
+
+No setting closes a connection on these counts: a rule does it (`http-request deny`/`reject`).
+
 ## A QUIC connection a rule rejects is closed with `H3_NO_ERROR`, not transport `NO_ERROR` (T511)
 
 `tcp-request connection reject` and `tcp-request session reject` on a QUIC bind (mux path)

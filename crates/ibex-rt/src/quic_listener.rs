@@ -621,6 +621,17 @@ impl QuicListener {
         self.conns.iter().flatten().filter_map(|c| c.h3.as_ref()).flat_map(|st| st.req.values()).map(Vec::len).sum()
     }
 
+    /// How the peer of `conn` acknowledges (T569), for the `ibex_fc_quic_ack_*` fetches of
+    /// the stream the engine dispatches next; `None` once the connection is gone.
+    #[must_use]
+    pub fn ack_facts(&self, conn: ConnHandle) -> Option<ibex_sample::QuicAckFacts> {
+        self.endpoint.ack_stats(conn).map(|a| ibex_sample::QuicAckFacts {
+            ack_eliciting_sent: a.ack_eliciting_sent,
+            ack_only_rcvd: a.ack_only_received,
+            excess: a.ack_frequency_threshold.map(|_| a.ack_frequency_excess),
+        })
+    }
+
     /// The connections for `show quic` (T524), read-only. The local address is the listener's
     /// port with the IP the client reached when the kernel said so.
     #[must_use]
@@ -636,6 +647,7 @@ impl QuicListener {
                 local: SocketAddr::new(i.local_ip.unwrap_or(self.addr.ip()), self.addr.port()),
                 peer: i.remote,
                 lost_packets: i.lost_packets,
+                acks: i.acks,
             })
             .collect()
     }

@@ -475,6 +475,9 @@ pub struct H2Child {
     /// ends the connection's usefulness while the other streams finish.
     pub goaway: Option<ibex_proto::h2::H2Error>,
     pub tls: Option<Arc<ibex_tls::RustlsTlsInfo>>,
+    /// T569: how the QUIC peer of an HTTP/3 stream acknowledged when its request head was
+    /// dispatched (`spawn_h2_children`): what the `ibex_fc_quic_ack_*` fetches read.
+    pub quic_acks: Option<ibex_sample::QuicAckFacts>,
     /// The connection's session variables as the stream got them: what it changed of them
     /// goes back to the connection, and only that, as other streams may have set others.
     pub sess_vars_at_start: ibex_sample::VarStore,
@@ -496,6 +499,17 @@ pub fn ssl_fc<'a>(xprt: &'a ClientXprt, role: Option<&'a H2Role>) -> ibex_sample
     match role {
         Some(H2Role::Child(H2Child { tls: Some(info), .. })) => crate::xprt::facts_of(info),
         _ => xprt.ssl_facts(),
+    }
+}
+
+/// T569: the QUIC acknowledgement counts of an HTTP/3 stream ([`H2Child::quic_acks`]), `None`
+/// for any other session.
+#[must_use]
+#[inline]
+pub fn quic_acks(role: Option<&H2Role>) -> Option<ibex_sample::QuicAckFacts> {
+    match role {
+        Some(H2Role::Child(c)) => c.quic_acks,
+        _ => None,
     }
 }
 
@@ -1203,6 +1217,7 @@ impl TcpSession {
             rst: None,
             goaway: None,
             tls,
+            quic_acks: None,
             sess_vars_at_start: {
                 let mut v = ibex_sample::VarStore::new();
                 v.copy_scope_from(&owner.vars, ibex_sample::VarScope::Sess);
