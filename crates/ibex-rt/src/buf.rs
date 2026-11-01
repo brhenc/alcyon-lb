@@ -986,6 +986,38 @@ impl Buf {
         self.mark();
     }
 
+    /// Puts the head `write` writes (into the memory it is given, returning its length, `None`
+    /// when it does not fit) in place of the first `old` readable bytes, what follows them kept
+    /// behind it (X2: the request head written once at the server send). The head is written
+    /// straight into the buffer: over the old one when nothing follows it, else into the free
+    /// memory after the data and moved to the front with the rest, so there is no scratch copy
+    /// and no `memset`. False when it does not fit; the bytes are then the caller's to write
+    /// another way ([`Self::replace_prefix`]), the first `old` possibly overwritten.
+    pub fn replace_head_with(&mut self, old: usize, write: impl FnOnce(&mut [u8]) -> Option<usize>) -> bool {
+        self.eoh.set(EOH_UNKNOWN);
+        if !self.alloc_if_needed() {
+            return false;
+        }
+        let old = old.min(self.len);
+        let rest = self.len - old;
+        if rest == 0 {
+            let Some(n) = write(&mut self.data[..]) else { return false };
+            self.head = 0;
+            self.len = n;
+            self.hwm = self.hwm.max(to_mark(n));
+            return true;
+        }
+        let (start, end) = (self.head, self.head + self.len);
+        let Some(n) = write(&mut self.data[end..]) else { return false };
+        self.hwm = self.hwm.max(to_mark(end + n));
+        // [old | rest | new] -> [old | new | rest] -> [new | rest] at the front.
+        self.data[start + old..end + n].rotate_right(n);
+        self.data.copy_within(start + old..end + n, 0);
+        self.head = 0;
+        self.len = n + rest;
+        true
+    }
+
     /// Injects or updates an HTTP header in the readable portion of the buffer.
     ///
     /// Compacts the buffer if necessary so readable data starts at index 0 and maximum

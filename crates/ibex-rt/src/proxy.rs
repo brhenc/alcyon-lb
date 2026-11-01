@@ -761,6 +761,8 @@ pub struct TcpSession {
     pub htx_tail: usize,
     pub htx_blocks: usize,
     pub has_htx: bool,
+    /// The HTX was edited since the head in `req` was written from it (or parsed): `req`'s
+    /// head is then stale, and the server send writes it out of the HTX once (X2).
     pub htx_modified: bool,
     /// What the request in flight asked for of a websocket upgrade, for its response
     /// (`crate::websocket`); `None` for one that asked for no upgrade.
@@ -1608,6 +1610,19 @@ impl TcpSession {
         self.htx_buf.note_htx(self.htx_tail, self.htx_blocks * ibex_proto::htx::HTX_DESC_SIZE);
         self.htx_modified = true;
         Some(res)
+    }
+
+    /// [`Self::with_htx_mut`] for an edit made to the request buffer's head too (a line cut
+    /// out of it or put in with its block): the head there stays the HTX's, and nothing is
+    /// written out of the HTX at the send for it (X2).
+    pub fn with_htx_synced<F, R>(&mut self, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut ibex_proto::htx::HtxSlice<'_>) -> R,
+    {
+        let was = self.htx_modified;
+        let r = self.with_htx_mut(f);
+        self.htx_modified = was;
+        r
     }
 
     /// Makes sure the HTX holds `bytes` more of header (and its descriptor). This HTX is
@@ -3177,6 +3192,10 @@ impl TcpSession {
                 // `close` in the head is one a rule wrote (T439).
                 // (`validate_request_head` leaves `has_htx` set on every `Ok`.)
                 self.strip_request_connection(conn_scan.filter(|_| self.cliexp.is_empty()));
+                // The head in the buffer is the HTX's from here (written again from it above when
+                // the parse changed it, and every edit since made to both): the send passes it
+                // as it is unless the rules edit it (X2, `engine::encode_if_modified`).
+                self.htx_modified = false;
                 let line = self.req.readable().split(|&b| b == b'\n').next().map_or(&[][..], <[u8]>::trim_ascii_end);
                 let ver = &line[line.len().saturating_sub(8)..];
                 // A chunked HTTP/1.0 request closes the connection after its response, whatever

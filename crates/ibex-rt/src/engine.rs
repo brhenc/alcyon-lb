@@ -60,12 +60,6 @@ use ibex_sample::vars::VarStore;
 thread_local! {
     pub static WORKER_ID: Cell<usize> = const { Cell::new(0) };
     static STRICT_MODE: Cell<bool> = const { Cell::new(true) };
-    /// The request rules are editing the head of the request they run for: the head is written
-    /// out of the HTX into the request buffer once, when they are done (or before a rule that
-    /// reads the buffer), not after each edit ([`hold_req_rebuild`]). `.1`: an edit was made
-    /// since, the buffer's head is not the HTX's yet. A rule pass runs to its end for one
-    /// session before the thread does anything else.
-    static REQ_REBUILD: Cell<(bool, bool)> = const { Cell::new((false, false)) };
     /// The line of the `http-response` rule that last ended the rules (`allow`, `deny`,
     /// `redirect`), left by `run_res_rules` for its caller to take.
     static LAST_RULE: Cell<Option<u32>> = const { Cell::new(None) };
@@ -5101,11 +5095,6 @@ fn append_forwarded_element(sess: &mut TcpSession, element: &str) -> bool {
                     let _ = htx.add_header("forwarded", v);
                 }
             });
-            let mut hdrs = sess.req_headers.take().unwrap_or_default();
-            hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("forwarded"));
-            hdrs.extend(values.into_iter().map(|v| ("forwarded".to_string(), v)));
-            sess.req_headers = Some(hdrs);
-            rebuild_req_buffer(sess);
         }
     }
     true
@@ -13573,22 +13562,6 @@ impl EngineDispatcher<'_> {
                     note_last_rule(sess, rule.line);
                 }
 
-                // Only the edits that read nothing of the request buffer go on holding its head.
-                let edit_only = matches!(
-                    rule.action,
-                    ibex_config::HttpReqAction::SetHeader { .. }
-                        | ibex_config::HttpReqAction::AddHeader { .. }
-                        | ibex_config::HttpReqAction::DelHeader { .. }
-                        | ibex_config::HttpReqAction::ReplaceHeader { .. }
-                        | ibex_config::HttpReqAction::ReplaceValue { .. }
-                        | ibex_config::HttpReqAction::SetVar { .. }
-                        | ibex_config::HttpReqAction::DoResolve(_)
-                        | ibex_config::HttpReqAction::SetVarFmt { .. }
-                        | ibex_config::HttpReqAction::UnsetVar { .. }
-                );
-                if !edit_only {
-                    flush_req_rebuild(sess, true);
-                }
 
                 match &rule.action {
                     ibex_config::HttpReqAction::Return {
@@ -14204,13 +14177,9 @@ impl EngineDispatcher<'_> {
             }
             Ok(RuleFlow::Next)
         };
-        // A pass over a rule list writes the head it edited once, when it ends however it ends.
-        let eval_http_rules = |rules: &[ibex_config::HttpReqRule], compiled: &[crate::rule_compiled::Rule], acls: &ibex_sample::Acls, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize, be_stage: bool, start: usize| -> Result<RuleFlow, u16> {
-            hold_req_rebuild();
-            let flow = eval_http_rules_held(rules, compiled, acls, sess, be_retries, fe_name, be_name, pages_idx, be_stage, start);
-            release_req_rebuild(sess);
-            flow
-        };
+        // The rules edit the HTX alone: the head is written out of it once, at the server send
+        // (`encode_if_modified`, X2).
+        let eval_http_rules = eval_http_rules_held;
 
         // Execute frontend rules
         if !resume_be && !proxies[proxy_idx].http_req_rules.is_empty() {
@@ -14496,8 +14465,10 @@ impl EngineDispatcher<'_> {
         // `stick match` after those (`SF_ASSIGNED`); the keys to store are queued either way.
         let assigned = cookie_server.is_some();
         let cookie_server = cookie_server.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned));
-        // The head is final: its header names go to the server in lower case, as `HAProxy`
-        // writes them (HTX). The request line and the values are the client's.
+        // The head is final: written out of its HTX if anything edited it (X2), once.
+        encode_if_modified(&mut entry.sess);
+        // Its header names go to the server in lower case, as `HAProxy` writes them (HTX). The
+        // request line and the values are the client's.
         let srv_table = (proxies[be_idx].h1_adjust & ibex_config::H1_ADJ_SERVER != 0).then(|| &*proxies[be_idx].h1_case);
         // In the case they came in when `tune.ibex.h1-lowercase-headers` is off (D-E, X5).
         let lower = proxies[be_idx].h1_lower;
@@ -15824,22 +15795,27 @@ fn rewrite_request_connection(sess: &mut TcpSession, opt_close: bool) {
         forced || rule_close || (opt_close && !kal)
     };
     // One look at the head, no copy. The usual request has no `Connection`, or one that is
-    // all `keep-alive` and `close` and goes whole, cut out of the head where it is.
-    let scan = sess.req.eoh().map(|(h, e)| crate::txn::scan_connection(&sess.req.readable()[..h + e]));
-    let scan = scan.unwrap_or_default();
-    if scan.count == 0 || (scan.count == 1 && scan.plain) {
+    // all `keep-alive` and `close` and goes whole, cut out of the head where it is. The text is
+    // read only while it is the HTX (nothing edited it); an edited head is read from its HTX
+    // and written at the send (X2).
+    let synced = req_text_is_htx(sess);
+    let scan = if synced {
+        sess.req.eoh().map(|(h, e)| crate::txn::scan_connection(&sess.req.readable()[..h + e])).unwrap_or_default()
+    } else {
+        let n = sess.htx_slice().map_or(0, |h| h.header_blocks_where(|n| n.eq_ignore_ascii_case(b"connection")).count());
+        crate::txn::ConnScan { count: n, ..Default::default() }
+    };
+    if scan.count == 0 || (synced && scan.count == 1 && scan.plain) {
         if scan.count == 1 {
             // The client's `close` went before the rules (`strip_request_connection`): one
             // here is a rule's, and the server is asked to close (`h1_set_srv_conn_mode`, T439).
             let v = sess.htx_slice().and_then(|h| h.get_header("connection"));
             let (rule_close, rule_kal) = (v.is_some_and(|v| crate::txn::connection_has(v, "close")), v.is_some_and(|v| crate::txn::connection_has(v, "keep-alive")));
             let close = kept(sess, rule_close, rule_kal);
-            sess.with_htx_mut(|htx| {
+            // The line and its block go together: the text stays the HTX.
+            sess.with_htx_synced(|htx| {
                 let _ = htx.remove_header("connection");
             });
-            if let Some(hdrs) = sess.req_headers.as_mut() {
-                hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("connection"));
-            }
             sess.req.cut(scan.first.0, scan.first.1);
             if let Some(tok) = crate::txn::request_connection_token(close, http11, false) {
                 add_req_header(sess, "Connection", tok);
@@ -15888,13 +15864,7 @@ fn reread_request_framing(sess: &mut TcpSession) -> bool {
         if framed || sess.htx_slice().and_then(|h| h.get_header_bytes(name.as_bytes())).is_none() {
             continue;
         }
-        sess.with_htx_mut(|htx| {
-            let _ = htx.remove_header(name);
-        });
-        // The copy of the headers, when the session keeps one (the rules that edit a header
-        // make it; a head nothing has edited does not have one).
-        sess.req_headers.as_mut().into_iter().for_each(|hdrs| hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name)));
-        rebuild_req_buffer(sess);
+        del_req_header(sess, name);
     }
     // Framed when it was parsed and by nothing now (a rule removed the header): `HAProxy`
     // writes `content-length: 0` and skips the payload (`h1_make_eoh`, T442). With no
@@ -15933,14 +15903,7 @@ fn reread_request_length(sess: &mut TcpSession) -> bool {
     };
     if count > 1 {
         let value = sess.htx_slice().and_then(|h| h.get_header_bytes(b"content-length")).map(|v| String::from_utf8_lossy(v).into_owned()).unwrap_or_default();
-        sess.with_htx_mut(|htx| {
-            let _ = htx.set_header("content-length", &value);
-        });
-        if let Some(hdrs) = sess.req_headers.as_mut() {
-            let mut seen = false;
-            hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length") || !std::mem::replace(&mut seen, true));
-        }
-        rebuild_req_buffer(sess);
+        set_req_header(sess, "content-length", &value);
     }
     if len > body {
         if let Some(t) = sess.txn.as_mut() {
@@ -15954,17 +15917,17 @@ fn reread_request_length(sess: &mut TcpSession) -> bool {
 }
 
 fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
-    sess.with_htx_mut(|htx| {
-        let _ = htx.set_header(name, val);
-    });
-    let mut hdrs = sess.req_headers.take().unwrap_or_default();
-    if let Some(pos) = hdrs.iter().position(|(k, _)| k.eq_ignore_ascii_case(name)) {
-        hdrs[pos].1 = val.to_string();
-    } else {
-        hdrs.push((name.to_string(), val.to_string()));
+    if sess.has_htx {
+        sess.with_htx_mut(|htx| {
+            let _ = htx.set_header(name, val);
+        });
+        return;
     }
+    let mut hdrs = sess.req_headers.take().unwrap_or_default();
+    hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+    hdrs.push((name.to_string(), val.to_string()));
     sess.req_headers = Some(hdrs);
-    rebuild_req_buffer(sess);
+    sess.htx_modified = true;
 }
 
 /// [`add_req_header`] for a header `HAProxy` adds with `http_add_header` and fails the request
@@ -15987,7 +15950,7 @@ fn add_req_header_fit(sess: &mut TcpSession, name: &str, val: &str) -> bool {
 /// so the line goes in where it belongs, with the HTX block; nothing is written out again. A
 /// request that edits go through [`add_req_header`].
 fn add_req_connection(sess: &mut TcpSession, tok: &str) {
-    let plain_h1 = !REQ_REBUILD.get().0 && sess.has_htx && sess.req_headers.is_none() && sess.h2_active().is_none() && !sess.h3;
+    let plain_h1 = req_text_is_htx(sess) && sess.h2_active().is_none() && !sess.h3;
     let mut line = [0u8; 40];
     let parts: [&[u8]; 3] = [b"connection: ", tok.as_bytes(), b"\r\n"];
     let mut n = 0;
@@ -15995,33 +15958,35 @@ fn add_req_connection(sess: &mut TcpSession, tok: &str) {
         line[n..n + p.len()].copy_from_slice(p);
         n += p.len();
     }
-    // In place when the head is the HTX alone, ends in CRLF and has room; otherwise (an HTTP/2
-    // request, a copy of the headers, a head held for edits) the HTX and the head are written out.
+    // In place when the head is the HTX alone, ends in CRLF and has room (the line and its
+    // block together: the text stays the HTX); otherwise (an HTTP/2 request, a head an edit
+    // left to the send) the HTX alone.
     let in_place = plain_h1 && sess.req.insert_last_header(&line[..n]);
     if in_place {
-        let _ = sess.with_htx_mut(|htx| htx.add_header("Connection", tok));
+        let _ = sess.with_htx_synced(|htx| htx.add_header("Connection", tok));
     } else {
         add_req_header(sess, "Connection", tok);
     }
 }
 
 fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {
-    sess.with_htx_mut(|htx| {
-        let _ = htx.add_header(name, val);
-    });
-    if mirrors_req_headers(sess) {
-        let mut hdrs = sess.req_headers.take().unwrap_or_default();
-        hdrs.push((name.to_string(), val.to_string()));
-        sess.req_headers = Some(hdrs);
+    if sess.has_htx {
+        sess.with_htx_mut(|htx| {
+            let _ = htx.add_header(name, val);
+        });
+        return;
     }
-    rebuild_req_buffer(sess);
+    let mut hdrs = sess.req_headers.take().unwrap_or_default();
+    hdrs.push((name.to_string(), val.to_string()));
+    sess.req_headers = Some(hdrs);
+    sess.htx_modified = true;
 }
 
-/// Whether the request's parsed header list (`req_headers`) follows its edits: when there is
-/// one (HTTP/2, or a rule that copied it out), or no HTX to edit. An HTTP/1 request that
-/// has its HTX is read and written from that alone, so its edits copy nothing (T437).
-fn mirrors_req_headers(sess: &TcpSession) -> bool {
-    sess.req_headers.is_some() || !sess.has_htx
+/// Whether the head in the request buffer is the HTX's (an HTTP/1 head nothing has edited
+/// since it was parsed, or an HTTP/2 one as the bridge wrote it): a text edit may then be
+/// made to both. An edited head is the HTX's alone until the send writes it (X2).
+fn req_text_is_htx(sess: &TcpSession) -> bool {
+    sess.has_htx && !sess.htx_modified
 }
 
 /// What a pass over a list of `http-request` rules came to.
@@ -16162,25 +16127,25 @@ fn txn_req_body(sess: &TcpSession) -> Option<&[u8]> {
 
 fn del_req_header(sess: &mut TcpSession, name: &str) {
     // `-m beg|end|sub|reg` names a set of headers: remove each that matches.
+    if !sess.has_htx {
+        let mut hdrs = sess.req_headers.take().unwrap_or_default();
+        hdrs.retain(|(k, _)| !header_name_matches(k, name));
+        sess.req_headers = Some(hdrs);
+        sess.htx_modified = true;
+        return;
+    }
     if name.starts_with('\0') {
-        let names: Vec<String> =
-            sess.htx_slice().map_or_else(Vec::new, |h| h.headers().map(|(k, _)| k.to_string()).filter(|k| header_name_matches(k, name)).collect());
-        sess.with_htx_mut(|htx| {
-            for n in &names {
-                let _ = htx.remove_header(n);
-            }
-        });
-    } else {
+        // Tombstoned by block: the indices of the others stay.
+        let blocks: Vec<usize> = sess.htx_slice().map_or_else(Vec::new, |h| h.header_blocks().filter(|(_, k, _)| header_name_matches(k, name)).map(|(i, _, _)| i).collect());
+        if !blocks.is_empty() {
+            sess.with_htx_mut(|htx| blocks.iter().for_each(|&i| htx.remove_block(i)));
+        }
+    } else if sess.htx_slice().is_some_and(|h| h.get_header_bytes(name.as_bytes()).is_some()) {
+        // A header the request does not have leaves its head as it was.
         sess.with_htx_mut(|htx| {
             let _ = htx.remove_header(name);
         });
     }
-    if mirrors_req_headers(sess) {
-        let mut hdrs = sess.req_headers.take().unwrap_or_default();
-        hdrs.retain(|(k, _)| !header_name_matches(k, name));
-        sess.req_headers = Some(hdrs);
-    }
-    rebuild_req_buffer(sess);
 }
 
 /// Sizes the HTX message the `http-request` rules rewrite, as `HAProxy` holds the request
@@ -16230,7 +16195,7 @@ fn req_set_uri(sess: &mut TcpSession, uri: String) -> bool {
         let _ = htx.set_uri(&uri);
     });
     sess.req_uri.set(&uri);
-    rebuild_req_buffer(sess);
+    sess.htx_modified = true;
     true
 }
 
@@ -16245,7 +16210,7 @@ fn req_set_method(sess: &mut TcpSession, method: String) -> bool {
         let _ = htx.set_method(&method);
     });
     sess.req_method.set(&method);
-    rebuild_req_buffer(sess);
+    sess.htx_modified = true;
     true
 }
 
@@ -16347,8 +16312,6 @@ fn req_update_host(sess: &mut TcpSession) -> bool {
             let _ = htx.replace_block_value(*i, auth.as_bytes());
         }
     });
-    sess.req_headers = sess.htx_slice().map(|h| h.headers().map(|(k, v)| (k.to_string(), v.to_string())).collect());
-    rebuild_req_buffer(sess);
     ok
 }
 
@@ -16439,13 +16402,14 @@ fn rewrite_req_header_values(sess: &mut TcpSession, name: &str, regex: &str, rep
     }
     // Each value is written at the end of the HTX, the old ones staying where they were until
     // the message is defragmented.
-    sess.htx_reserve(edits.iter().map(|(_, old, new)| old.len() + new.len() + 64).sum());
-    sess.with_htx_mut(|htx| {
-        for (i, _, new) in &edits {
-            let _ = htx.replace_block_value(*i, new.as_bytes());
-        }
-    });
-    rebuild_req_buffer(sess);
+    if !edits.is_empty() {
+        sess.htx_reserve(edits.iter().map(|(_, old, new)| old.len() + new.len() + 64).sum());
+        sess.with_htx_mut(|htx| {
+            for (i, _, new) in &edits {
+                let _ = htx.replace_block_value(*i, new.as_bytes());
+            }
+        });
+    }
     // `http_replace_header(_value)(.., update_authority = 1)`: the last value written.
     if name.eq_ignore_ascii_case("host") {
         if let Some((_, _, last)) = edits.last() {
@@ -16507,50 +16471,30 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
             }
         }
     });
-    // The parsed list is what `req.hdr` fetches read: it follows the head.
-    sess.req_headers = sess.htx_slice().map(|h| h.headers().map(|(k, v)| (k.to_string(), v.to_string())).collect());
-    rebuild_req_buffer(sess);
     srv
 }
 
-/// Writes the request head out of its HTX into the request buffer, or, while the rules hold it
-/// ([`hold_req_rebuild`]), notes that it is due: a run of header edits writes the head once.
-fn rebuild_req_buffer(sess: &mut TcpSession) {
-    if REQ_REBUILD.get().0 {
-        REQ_REBUILD.set((true, true));
-        return;
-    }
-    write_req_head(sess);
-}
-
-/// From here to [`release_req_rebuild`], the head edits only change the HTX (S7: five header
-/// rules were five rebuilds, each an 8 KiB `memset`, a `memmove` and the request line split
-/// again).
-fn hold_req_rebuild() {
-    REQ_REBUILD.set((true, false));
-}
-
-/// The head written out if an edit is due, before anything reads the request buffer; `hold`
-/// to go on holding after.
-fn flush_req_rebuild(sess: &mut TcpSession, hold: bool) {
-    let (_, due) = REQ_REBUILD.replace((false, false));
-    if due {
+/// X2: the request head goes to the server as it is in the request buffer when nothing edited
+/// it since it was parsed (the bytes that arrived, D-E), and is written out of its HTX once,
+/// here, when something did: the rules, `option forwardfor`, the `Connection` the server side
+/// calls for, the cookies. Called once, just before the server is picked; nothing edits the
+/// head after it.
+fn encode_if_modified(sess: &mut TcpSession) {
+    if sess.htx_modified {
         write_req_head(sess);
+        sess.htx_modified = false;
     }
-    REQ_REBUILD.set((hold, false));
-}
-
-/// [`flush_req_rebuild`], and no more holding.
-fn release_req_rebuild(sess: &mut TcpSession) {
-    flush_req_rebuild(sess, false);
 }
 
 fn write_req_head(sess: &mut TcpSession) {
     let Some((hdr_len, eoh_len)) = sess.req.eoh() else {
         return;
     };
+    let old = hdr_len + eoh_len;
     ibex_sample::work::note(ibex_sample::work::Op::ReqRebuild, 1);
-    if let Some(htx) = sess.htx_slice() {
+    if sess.has_htx {
+        // The HTX is in its own buffer: the request buffer is written while it is read.
+        let htx = ibex_proto::htx::HtxSliceRef::new(sess.htx_buf.raw_slice(), sess.htx_blocks);
         if sess.h2_active().is_some_and(|a| a.chunk_out) {
             let mut wire = htx.write_h1_wire_vec();
             // An HTTP/2 request without a length goes out chunked: the header is written with
@@ -16560,15 +16504,11 @@ fn write_req_head(sess: &mut TcpSession) {
                     wire = crate::h2_bridge::chunked_head(&wire, h);
                 }
             }
-            sess.req.replace_prefix(hdr_len + eoh_len, &wire);
-        } else {
-            // Through the stack when the head fits; the head is only larger than this with a
-            // Vec (`write_h1_wire_vec` grows until it fits).
-            let mut stack = [0u8; 8192];
-            match htx.write_h1_wire(&mut stack) {
-                Ok(n) => sess.req.replace_prefix(hdr_len + eoh_len, &stack[..n]),
-                Err(_) => sess.req.replace_prefix(hdr_len + eoh_len, &htx.write_h1_wire_vec()),
-            }
+            sess.req.replace_prefix(old, &wire);
+        } else if !sess.req.replace_head_with(old, |out| htx.write_h1_wire(out).ok()) {
+            // Larger than the buffer's free memory: through a `Vec` (`write_h1_wire_vec`
+            // grows until it fits), which the buffer then grows for.
+            sess.req.replace_prefix(old, &htx.write_h1_wire_vec());
         }
     } else {
         let method = sess.req_method.as_deref().unwrap_or("GET");
@@ -16580,8 +16520,7 @@ fn write_req_head(sess: &mut TcpSession) {
             }
         }
         new_hdr.push_str("\r\n");
-        sess.req
-            .replace_prefix(hdr_len + eoh_len, new_hdr.as_bytes());
+        sess.req.replace_prefix(old, new_hdr.as_bytes());
     }
 }
 
