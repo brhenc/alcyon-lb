@@ -841,6 +841,13 @@ const BENCH_RSP: &[u8] = b"HTTP/1.1 200 OK\r\nServer: be\r\nContent-Length: 2\r\
 /// three warm-up requests; every response must start with `status` and end with `tail`. The
 /// allocations, and the reallocations (a `malloc` too, to libc).
 fn keepalive_allocations_with(fe_lines: &str, rsp: &'static [u8], n: usize, status: &[u8], tail: &[u8]) -> (usize, usize) {
+    let (a, r, _) = keepalive_run(fe_lines, rsp, n, status, tail);
+    (a, r)
+}
+
+/// [`keepalive_allocations_with`], and the by-name variable lookups the `n` requests made on
+/// this thread (the engine runs on it: `Engine::run_once`).
+fn keepalive_run(fe_lines: &str, rsp: &'static [u8], n: usize, status: &[u8], tail: &[u8]) -> (usize, usize, u64) {
     let (srv, srv_addr) = loopback0();
     let addr = common::reserve_addr();
     let running = Arc::new(AtomicBool::new(true));
@@ -856,9 +863,11 @@ fn keepalive_allocations_with(fe_lines: &str, rsp: &'static [u8], n: usize, stat
         drive_request_expecting(&mut client, &mut engine, status, tail);
     }
     let before = ibex_alloc::alloc_counters();
+    let lookups = ibex_sample::vars::name_lookups_on_this_thread();
     for _ in 0..n {
         drive_request_expecting(&mut client, &mut engine, status, tail);
     }
+    let lookups = ibex_sample::vars::name_lookups_on_this_thread() - lookups;
     let diff = before.diff(&ibex_alloc::alloc_counters());
     drop(client);
     for _ in 0..5 {
@@ -866,7 +875,34 @@ fn keepalive_allocations_with(fe_lines: &str, rsp: &'static [u8], n: usize, stat
     }
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
-    (diff.alloc_count, diff.realloc_count)
+    (diff.alloc_count, diff.realloc_count, lookups)
+}
+
+/// T595: a `set-var` whose name the configuration gives is resolved to its number at load: the
+/// requests look up no variable name (no `NAMES` lock, no hash). Debug builds count the lookups.
+#[cfg(debug_assertions)]
+#[test]
+fn set_var_with_a_configured_name_looks_up_no_name_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_, _, n) = keepalive_run(SURVEY_RULES, BENCH_RSP, 50, b"HTTP/1.1 200", b"\r\n\r\nok");
+    let (_, _, c) = keepalive_run(
+        "  http-request set-var(txn.q,ifnotset) path\n  http-request set-var(sess.k) int(1)\n  http-request unset-var(txn.q)\n",
+        BENCH_RSP,
+        50,
+        b"HTTP/1.1 200",
+        b"\r\n\r\nok",
+    );
+    let (_, _, f) = keepalive_run(
+        "  http-request set-var(txn.v) path\n  http-request set-header X-V %[var(txn.v)]\n  http-request set-header X-W %[var(txn.none,\"d\")]\n",
+        BENCH_RSP,
+        50,
+        b"HTTP/1.1 200",
+        b"\r\n\r\nok",
+    );
+    assert_eq!(f, 0, "{f} by-name variable lookups in 50 requests reading var(txn.v)");
+    println!("[MEASUREMENT T595] variable name lookups over 50 requests: survey rules {n}, conditions/sess/unset {c}");
+    assert_eq!(n, 0, "{n} by-name variable lookups in 50 requests through set-var(txn.p)");
+    assert_eq!(c, 0, "{c} by-name variable lookups in 50 requests (conditions, sess, unset-var)");
 }
 
 /// T436 A: a steady-state keep-alive request proxied to a server allocates nothing. Measured

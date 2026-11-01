@@ -318,9 +318,28 @@ pub struct Rule {
     /// its `error_page` when that is a template.
     pub reply: Option<std::sync::Arc<Reply>>,
     pub page: Option<std::sync::Arc<Reply>>,
+    /// The variable of a `set-var`, `set-var-fmt` or `unset-var`, resolved to its number at
+    /// load (T595): the request path looks up no name.
+    pub var: Option<ibex_sample::vars::VarRef>,
 }
 
 impl Rule {
+    /// The variable `spec` (`name[,<cond>...]`) this rule names. A rule built without it (a
+    /// test) resolves it here, by name.
+    #[must_use]
+    pub fn var(&self, spec: &str) -> std::borrow::Cow<'_, ibex_sample::vars::VarRef> {
+        match &self.var {
+            Some(v) => std::borrow::Cow::Borrowed(v),
+            None => std::borrow::Cow::Owned(ibex_sample::vars::VarRef::resolve(spec)),
+        }
+    }
+
+    /// The rule with its variable `spec` resolved.
+    fn with_var(mut self, spec: &str) -> Self {
+        self.var = Some(ibex_sample::vars::VarRef::resolve(spec));
+        self
+    }
+
     fn new(cond: Option<&AclCondition>, acls: &Acls, expr: Option<&str>, fmt: Option<(&str, bool)>) -> Self {
         Self {
             cond: cond.map(|c| Cond::compile(c, acls)),
@@ -329,6 +348,7 @@ impl Rule {
             fmt2: None,
             reply: None,
             page: None,
+            var: None,
         }
     }
 
@@ -401,7 +421,11 @@ pub fn http_req(rules: &[ibex_config::HttpReqRule], acls: &Acls) -> Vec<Rule> {
                 | HttpReqAction::Tarpit { lf_string, error_page, .. } => (lf_string.as_deref(), error_page.as_ref()),
                 _ => (None, None),
             };
-            Rule::new(r.cond.as_ref(), acls, expr, fmt).with_fmt2(cookie).with_reply(lf, page)
+            let rule = Rule::new(r.cond.as_ref(), acls, expr, fmt).with_fmt2(cookie).with_reply(lf, page);
+            match &r.action {
+                HttpReqAction::SetVar { var_name, .. } | HttpReqAction::SetVarFmt { var_name, .. } | HttpReqAction::UnsetVar { var_name } => rule.with_var(var_name),
+                _ => rule,
+            }
         })
         .collect()
 }
@@ -410,10 +434,12 @@ pub fn http_req(rules: &[ibex_config::HttpReqRule], acls: &Acls) -> Vec<Rule> {
 /// actions under names that start with a NUL (`\0set-var:<name>` and its expression, ...);
 /// of those, `set-var` has an expression and `set-var-fmt` a format.
 fn res_header(cond: Option<&AclCondition>, acls: &Acls, name: &str, fmt: &str) -> Rule {
-    if name.starts_with("\0set-var:") || name.starts_with("\0hdrs-bin:") {
+    if let Some(spec) = name.strip_prefix("\0set-var:") {
+        Rule::new(cond, acls, Some(fmt), None).with_var(spec)
+    } else if name.starts_with("\0hdrs-bin:") {
         Rule::new(cond, acls, Some(fmt), None)
-    } else if name.starts_with("\0set-var-fmt:") {
-        Rule::new(cond, acls, None, Some((fmt, false)))
+    } else if let Some(spec) = name.strip_prefix("\0set-var-fmt:") {
+        Rule::new(cond, acls, None, Some((fmt, false))).with_var(spec)
     } else if name.starts_with("\0replace-header:") || name.starts_with("\0replace-value:") {
         // `<regex>\t<replacement>`: the replacement is a format.
         Rule::new(cond, acls, None, fmt.split_once('\t').map(|(_, repl)| (repl, true)))
@@ -525,7 +551,11 @@ pub fn tcp_req_session(rules: &[ibex_config::TcpReqSessionRule], acls: &Acls) ->
                 TcpReqSessionAction::SetVarFmt { fmt, .. } => (None, Some((fmt.as_str(), false))),
                 _ => (None, None),
             };
-            Rule::new(r.cond.as_ref(), acls, expr, fmt)
+            let rule = Rule::new(r.cond.as_ref(), acls, expr, fmt);
+            match &r.action {
+                TcpReqSessionAction::SetVar { var_name, .. } | TcpReqSessionAction::SetVarFmt { var_name, .. } | TcpReqSessionAction::UnsetVar { var_name } => rule.with_var(var_name),
+                _ => rule,
+            }
         })
         .collect()
 }
@@ -553,7 +583,11 @@ pub fn tcp_req_content(rules: &[ibex_config::TcpReqContentRule], acls: &Acls) ->
                 TcpReqContentAction::SetVarFmt { fmt, .. } => (None, Some((fmt.as_str(), false))),
                 _ => (None, None),
             };
-            Rule::new(r.cond.as_ref(), acls, expr, fmt)
+            let rule = Rule::new(r.cond.as_ref(), acls, expr, fmt);
+            match &r.action {
+                TcpReqContentAction::SetVar { var_name, .. } | TcpReqContentAction::SetVarFmt { var_name, .. } | TcpReqContentAction::UnsetVar { var_name } => rule.with_var(var_name),
+                _ => rule,
+            }
         })
         .collect()
 }
@@ -564,8 +598,9 @@ pub fn tcp_res_content(rules: &[ibex_config::TcpResContentRule], acls: &Acls) ->
     rules
         .iter()
         .map(|r| match &r.action {
-            TcpResAction::SetVar { expr, .. } => Rule::new(r.cond.as_ref(), acls, Some(expr), None),
-            TcpResAction::SetVarFmt { fmt, .. } => Rule::new(r.cond.as_ref(), acls, None, Some((fmt, false))),
+            TcpResAction::SetVar { expr, var_name } => Rule::new(r.cond.as_ref(), acls, Some(expr), None).with_var(var_name),
+            TcpResAction::SetVarFmt { fmt, var_name } => Rule::new(r.cond.as_ref(), acls, None, Some((fmt, false))).with_var(var_name),
+            TcpResAction::UnsetVar { var_name } => Rule::new(r.cond.as_ref(), acls, None, None).with_var(var_name),
             _ => Rule::new(r.cond.as_ref(), acls, None, None),
         })
         .collect()
@@ -688,5 +723,21 @@ mod tests {
                 assert_eq!(fast, line, "{fmt:?} (http {http})");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod var_ref_tests {
+    use super::Rule;
+
+    /// A rule compiled from the configuration carries its variable resolved; one built
+    /// without it (as unit tests build rules) resolves it on demand, to the same variable.
+    #[test]
+    fn a_rule_without_a_resolved_variable_resolves_it_by_name() {
+        let bare = Rule::default();
+        let compiled = Rule::default().with_var("txn.p,ifnotset");
+        assert_eq!(bare.var("txn.p,ifnotset").name(), compiled.var("txn.p,ifnotset").name());
+        assert!(matches!(bare.var("txn.p"), std::borrow::Cow::Owned(_)));
+        assert!(matches!(compiled.var("txn.p,ifnotset"), std::borrow::Cow::Borrowed(_)));
     }
 }

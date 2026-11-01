@@ -310,7 +310,12 @@ impl Expr {
             }
         };
 
-        let compiled = crate::sample_registry().compile(&fetch_name, &converters);
+        let mut compiled = crate::sample_registry().compile(&fetch_name, &converters);
+        if fetch_name == "var" {
+            if let (Some(c), Some(name)) = (compiled.as_mut(), fetch_args.first()) {
+                c.resolve_var(name);
+            }
+        }
         Ok(Expr {
             fetch_name,
             fetch_args,
