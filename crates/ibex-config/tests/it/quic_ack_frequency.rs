@@ -37,6 +37,8 @@ fn bad_values_are_refused_with_a_message() {
         ("tune.ibex.quic-ack-frequency auto\n", "expects 'on' or 'off', got 'auto'"),
         ("tune.ibex.quic-ack-frequency on now\n", "cannot handle unexpected argument 'now'"),
         ("tune.ibex.quic-ack-frequency-threshold\n", "expects an integer from 0 to 255"),
+        ("tune.ibex.quic-ack-frequency-threshold 2 3\n", "cannot handle unexpected argument '3'"),
+        ("tune.ibex.quic-ack-frequency-max-delay 25ms 30ms\n", "cannot handle unexpected argument '30ms'"),
         ("tune.ibex.quic-ack-frequency-threshold -1\n", "expects an integer from 0 to 255"),
         ("tune.ibex.quic-ack-frequency-threshold 256\n", "expects an integer from 0 to 255"),
         ("tune.ibex.quic-ack-frequency-threshold two\n", "expects an integer from 0 to 255"),
