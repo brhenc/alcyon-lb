@@ -856,7 +856,11 @@ impl QuicListener {
                         d.truncated = true;
                     }
                 }
+                // The peer is held here, and the kernel sends its 4-tuple to this socket whatever
+                // it opens: a new connection from it is served, not refused (T567).
+                self.endpoint.serve_pinned_peer(true);
                 Self::dispatch(&mut self.endpoint, now, &dgram_bufs, got);
+                self.endpoint.serve_pinned_peer(false);
                 total += got;
             }
         }
