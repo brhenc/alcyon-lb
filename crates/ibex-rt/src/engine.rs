@@ -11148,8 +11148,11 @@ impl EngineDispatcher<'_> {
 
             // Step 3.5: the HTTP transaction -- rules, routing, the response head, and its end.
             let mut pending_admin = None;
-            if entry.sess.scrape().is_some() {
-                crate::promex::pump(&mut entry.sess, self.proxies, self.checks, self.pid);
+            // A Prometheus scrape or a stats page being produced: one test for both.
+            match entry.sess.pending_resp.as_deref() {
+                Some(crate::proxy::PendingOut::Scrape(_)) => crate::promex::pump(&mut entry.sess, self.proxies, self.checks, self.pid),
+                Some(crate::proxy::PendingOut::Stats(_)) => stats_pump(&mut entry.sess, self.proxies, self.checks, self.pid),
+                _ => {}
             }
             if entry.sess.mode == Mode::Http && !entry.sess.is_done() {
                 pending_admin = Self::http_step(
@@ -12544,7 +12547,7 @@ impl EngineDispatcher<'_> {
 
     /// The stats page's URI prefix as the redirect and the banner's link name it, with the
     /// flags of the request that stay (`;up`, and `;norefresh` when the page refreshes).
-    fn stats_self_link(proxies: &Proxies, serving: usize, req_uri: &str) -> String {
+    fn stats_self_link(proxies: &[Proxy], serving: usize, req_uri: &str) -> String {
         let cfg = &proxies[serving].stats_config;
         let prefix = cfg.uri.as_deref().unwrap_or("/haproxy?stats");
         let rest = req_uri.get(prefix.len()..).unwrap_or("");
@@ -12577,15 +12580,15 @@ impl EngineDispatcher<'_> {
         stats_write_reply(entry, proxies, resp.as_bytes());
     }
 
-    /// The HTML page, with the banner a `;st=<CODE>` in the URI asks for.
-    fn stats_page(proxies: &Proxies, checks: &[ServerCheckState], pid: u32, serving: usize, req_uri: &str) -> String {
-        let cfg = &proxies[serving].stats_config;
-        let html = crate::stats_html::render_stats_html_for(proxies, checks, pid, cfg);
-        let prefix = cfg.uri.as_deref().unwrap_or("/haproxy?stats");
-        match crate::stats_post::StCode::from_uri(req_uri.get(prefix.len()..).unwrap_or("")) {
-            Some(code) => crate::stats_post::with_banner(html, &code.banner(&Self::stats_self_link(proxies, serving, req_uri))),
-            None => html,
-        }
+    /// The banner a `;st=<CODE>` in the URI asks the HTML page for.
+    fn stats_st_code(proxies: &Proxies, serving: usize, req_uri: &str) -> Option<crate::stats_post::StCode> {
+        let prefix = proxies[serving].stats_config.uri.as_deref().unwrap_or("/haproxy?stats");
+        crate::stats_post::StCode::from_uri(req_uri.get(prefix.len()..).unwrap_or(""))
+    }
+
+    /// The text of that banner, linking back to the page as the request asked for it.
+    pub(crate) fn stats_banner(proxies: &[Proxy], serving: usize, req_uri: &str, code: crate::stats_post::StCode) -> String {
+        code.banner(&Self::stats_self_link(proxies, serving, req_uri))
     }
 
     /// The request's header lines, from the HTX message or, without one, the parsed list.
@@ -12720,15 +12723,15 @@ impl EngineDispatcher<'_> {
 
         // 1. CSV telemetry
         if req_uri.contains(";csv") || req_uri.ends_with("/csv") {
-            let csv = crate::stats::format_show_stat(proxies, checks, pid);
-            stats_write_page(entry, proxies, "text/plain", &refresh, csv.as_bytes());
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::csv(proxies, checks));
+            stats_stream_page(entry, proxies, checks, pid, serving, "text/plain", &refresh, page);
             return None;
         }
 
         // 2. JSON API data for live auto-refresh
         if req_uri.contains("/api/data") || req_uri.ends_with("/data") {
-            let json = crate::stats_html::render_stats_json(proxies, checks, pid);
-            stats_write_page(entry, proxies, "application/json", &refresh, json.as_bytes());
+            let page = crate::stats_stream::Page::Json(crate::stats_html::JsonCursor::new(checks));
+            stats_stream_page(entry, proxies, checks, pid, serving, "application/json", &refresh, page);
             return None;
         }
 
@@ -12833,14 +12836,14 @@ impl EngineDispatcher<'_> {
                 return Some(cmd);
             }
 
-            let html = Self::stats_page(proxies, checks, pid, serving, req_uri);
-            stats_write_page(entry, proxies, "text/html", &refresh, html.as_bytes());
+            let page = crate::stats_stream::Page::Html(crate::stats_html::HtmlCursor::new(checks), Self::stats_st_code(proxies, serving, req_uri));
+            stats_stream_page(entry, proxies, checks, pid, serving, "text/html", &refresh, page);
             return Some(cmd);
         }
 
         // 4. Default: Render full HTML dashboard
-        let html = Self::stats_page(proxies, checks, pid, serving, req_uri);
-        stats_write_page(entry, proxies, "text/html", &refresh, html.as_bytes());
+        let page = crate::stats_stream::Page::Html(crate::stats_html::HtmlCursor::new(checks), Self::stats_st_code(proxies, serving, req_uri));
+        stats_stream_page(entry, proxies, checks, pid, serving, "text/html", &refresh, page);
         None
     }
 
@@ -16714,9 +16717,10 @@ fn stick_bytes_due(sess: &TcpSession, last: bool) -> (u64, u64) {
 /// A rule that fails turns the reply into the 500 page, which goes through the rules once
 /// more; if they fail on that too, or the failed reply was already a 500, the 500 goes out
 /// without them (`http_reply_and_close`, `TX_CONST_REPLY`).
-/// Sends a stats page body (HTML, CSV, JSON) as HAProxy's applet does (T566, measured on
-/// 3.5-dev8): to an HTTP/1.1 client it is `transfer-encoding: chunked`, one chunk, and the
-/// connection stays open (the generic response logic adds `connection: close` when the client
+/// Sends a stats answer built whole (the admin API's JSON reply, a page to an HTTP/2 client
+/// or to a HEAD; the pages themselves are streamed by [`stats_stream_page`]) framed as
+/// HAProxy's applet frames the page (T566, measured on 3.5-dev8): to an HTTP/1.1 client it is
+/// `transfer-encoding: chunked`, here one chunk, and the connection stays open (the generic response logic adds `connection: close` when the client
 /// asked for it); to an HTTP/1.0 client it has no length, says `connection: close` and the
 /// connection is closed after the body.
 fn stats_write_page(entry: &mut SessionEntry, proxies: &[Proxy], content_type: &str, refresh: &str, body: &[u8]) {
@@ -16737,9 +16741,95 @@ fn stats_write_page(entry: &mut SessionEntry, proxies: &[Proxy], content_type: &
     stats_write_reply(entry, proxies, &out);
 }
 
+/// Sends a stats page (HTML, CSV, JSON) as HAProxy's stats applet does (T572): the head
+/// now, framed as [`stats_write_page`] frames it, and the body a buffer at a time from
+/// `page`, by [`stats_pump`] on every pass over the session while the client reads. The page
+/// is never built whole. A HEAD gets the head alone; an HTTP/2 client, whose replies go out
+/// as one message, gets the page built whole.
+#[allow(clippy::too_many_arguments)]
+fn stats_stream_page(
+    entry: &mut SessionEntry,
+    proxies: &[Proxy],
+    checks: &[ServerCheckState],
+    pid: u32,
+    serving: usize,
+    content_type: &str,
+    refresh: &str,
+    page: crate::stats_stream::Page,
+) {
+    let head_only = entry.sess.txn.as_ref().is_some_and(|t| t.client_head);
+    let uri = entry.sess.req_uri.as_deref().unwrap_or("").to_string();
+    let banner = |c: crate::stats_post::StCode| EngineDispatcher::stats_banner(proxies, serving, &uri, c);
+    let ctx = crate::stats_stream::Ctx { proxies, checks, pid, cfg: &proxies[serving].stats_config, banner: &banner };
+    if head_only || entry.sess.is_h2() {
+        let body = if head_only { String::new() } else { crate::stats_stream::render_all(page, &ctx) };
+        stats_write_page(entry, proxies, content_type, refresh, body.as_bytes());
+        return;
+    }
+    let http11 = entry.sess.txn.as_ref().is_none_or(|t| t.req_http11);
+    let framing = if http11 { "transfer-encoding: chunked" } else { "connection: close" };
+    let head = format!("HTTP/1.1 200 OK\r\ncache-control: no-cache\r\ncontent-type: {content_type}\r\n{refresh}{framing}\r\n\r\n");
+    if !stats_write_reply(entry, proxies, head.as_bytes()) {
+        return;
+    }
+    let sess = &mut entry.sess;
+    let mut d = crate::stats_stream::Dump::new(page, http11, u32::try_from(serving).unwrap_or(0));
+    if let Some(crate::proxy::PendingOut::Raw(v, off)) = sess.pending_resp.as_deref_mut() {
+        // The head is waiting for a buffer (`tune.buffers.limit`): the body joins it, built
+        // whole, as any other reply waits.
+        let mut buf = vec![0u8; 1 << 16];
+        while !d.finished {
+            let n = crate::stats_stream::fill(&mut d, &ctx, &mut buf);
+            v.extend_from_slice(&buf[..n]);
+        }
+        let left = (v.len() - *off + sess.rep.readable().len()) as u64;
+        if let Some(t) = sess.txn.as_mut() {
+            t.rsp = if http11 { crate::txn::MsgState::head(crate::txn::Framing::Chunked) } else { crate::txn::MsgState::Body(crate::txn::Body::Length(left)) };
+        }
+        return;
+    }
+    if let Some(t) = sess.txn.as_mut() {
+        t.rsp = crate::txn::MsgState::head(if http11 { crate::txn::Framing::Chunked } else { crate::txn::Framing::UntilClose });
+    }
+    sess.set_stats_dump(Some(d));
+    stats_pump(sess, proxies, checks, pid);
+}
+
+/// Fills the session's response buffer with the next part of its stats page, if the buffer
+/// has room; called on every pass over the session while it has one. An unframed page (to
+/// an HTTP/1.0 client) ends with the bytes still in the buffer once the last is written.
+fn stats_pump(sess: &mut crate::proxy::TcpSession, proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) {
+    let Some(mut d) = sess.stats_dump() else { return };
+    if !d.finished {
+        let serving = (d.serving as usize).min(proxies.len().saturating_sub(1));
+        let Some(cfg) = proxies.get(serving).map(|p| &p.stats_config) else {
+            sess.set_stats_dump(None);
+            return;
+        };
+        let uri = sess.req_uri.as_deref().unwrap_or("");
+        let banner = |c: crate::stats_post::StCode| EngineDispatcher::stats_banner(proxies, serving, uri, c);
+        let ctx = crate::stats_stream::Ctx { proxies, checks, pid, cfg, banner: &banner };
+        // `writable` compacts a buffer whose consumed head leaves the tail exhausted.
+        let n = crate::stats_stream::fill(&mut d, &ctx, sess.rep.writable());
+        sess.rep.commit(n);
+    }
+    if d.finished {
+        if !d.chunked() {
+            let left = sess.rep.readable().len() as u64;
+            if let Some(t) = sess.txn.as_mut() {
+                t.rsp = if left == 0 { crate::txn::MsgState::Done } else { crate::txn::MsgState::Body(crate::txn::Body::Length(left)) };
+            }
+        }
+        sess.set_stats_dump(None);
+    } else {
+        sess.set_stats_dump(Some(d));
+    }
+}
+
 /// A stats page answer, with the `http-after-response` rules of its frontend and backend
-/// applied as they are to any other response.
-fn stats_write_reply(entry: &mut SessionEntry, proxies: &[Proxy], raw: &[u8]) {
+/// applied as they are to any other response. `false` when a rule failed and the 500 page
+/// went instead.
+fn stats_write_reply(entry: &mut SessionEntry, proxies: &[Proxy], raw: &[u8]) -> bool {
     let (fe, be) = (entry.proxy_idx, entry.backend_idx);
     // The page is streamed by the applet, not held in the HTX message the rules edit: they
     // see the head alone.
@@ -16749,10 +16839,14 @@ fn stats_write_reply(entry: &mut SessionEntry, proxies: &[Proxy], raw: &[u8]) {
             let mut out = head.into_owned();
             out.extend_from_slice(&raw[head_len..]);
             entry.sess.write_reply(&out);
+            true
         }
         // A rule that fails (strict mode, a rewrite that does not fit) makes the reply the 500
         // page, as it does any other (`http_reply_and_close`).
-        Err(()) => reply_error(entry, proxies, 500),
+        Err(()) => {
+            reply_error(entry, proxies, 500);
+            false
+        }
     }
 }
 

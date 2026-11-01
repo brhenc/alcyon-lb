@@ -1103,7 +1103,8 @@ pub fn format_show_stat_filtered(
     format_show_stat_as(proxies, checks, pid, iid_filter, type_filter, sid_filter, StatFormat::Csv)
 }
 
-/// [`format_show_stat_filtered`] in the given format: CSV, `typed` lines or JSON.
+/// [`format_show_stat_filtered`] in the given format: CSV, `typed` lines or JSON. The rows of
+/// a [`StatCursor`], all at once: what the stats page and the CLI send a buffer at a time.
 #[must_use]
 pub fn format_show_stat_as(
     proxies: &[Proxy],
@@ -1115,63 +1116,210 @@ pub fn format_show_stat_as(
     fmt: StatFormat,
 ) -> String {
     let mut out = String::with_capacity(4096);
-    if fmt == StatFormat::Csv {
-        out.push_str(&stats_csv_header());
+    let mut cur = StatCursor::new(proxies, checks, fmt, iid_filter, type_filter, sid_filter);
+    while cur.next_unit(proxies, checks, pid, &mut out) {}
+    out
+}
+
+/// Where a `show stat` dump stands between two buffers of output (T572), as `HAProxy`'s stats
+/// applet keeps it in its context (`ctx->obj1`, `obj2`, `px_st`): the step, the proxy and
+/// the server. A few integers: the dump holds no output of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatCursor {
+    fmt: StatFormat,
+    iid: Option<i32>,
+    typ: Option<i32>,
+    sid: Option<i32>,
+    step: u8,
+    /// The proxy being dumped, and its declaration rank to find it again if the list moved.
+    px: u32,
+    decl: u32,
+    /// The next server of `px`.
+    s: u32,
+    /// Rows written (JSON separates them).
+    rows: u32,
+    /// The proxies are in declaration order (the next one is the next index), and the checks
+    /// in (proxy, server) order (a server's is found by bisection): seen at the start.
+    sorted: bool,
+    checks_sorted: bool,
+}
+
+const ST_HEADER: u8 = 0;
+const ST_PROXY: u8 = 1;
+const ST_FRONTEND: u8 = 2;
+const ST_SERVERS: u8 = 3;
+const ST_BACKEND: u8 = 4;
+const ST_END: u8 = 5;
+const ST_DONE: u8 = 6;
+
+impl StatCursor {
+    #[must_use]
+    pub fn new(
+        proxies: &[Proxy],
+        checks: &[ServerCheckState],
+        fmt: StatFormat,
+        iid: Option<i32>,
+        typ: Option<i32>,
+        sid: Option<i32>,
+    ) -> StatCursor {
+        StatCursor {
+            fmt,
+            iid,
+            typ,
+            sid,
+            step: ST_HEADER,
+            px: u32::MAX,
+            decl: 0,
+            s: 0,
+            rows: 0,
+            sorted: proxies.windows(2).all(|w| w[0].ids.decl < w[1].ids.decl),
+            checks_sorted: checks.windows(2).all(|w| (w[0].proxy(), w[0].server()) < (w[1].proxy(), w[1].server())),
+        }
     }
 
-    let match_type = |type_val: i32| -> bool {
-        match type_filter {
+    /// The whole of `show stat`, as [`format_show_stat`] gives it.
+    #[must_use]
+    pub fn csv(proxies: &[Proxy], checks: &[ServerCheckState]) -> StatCursor {
+        StatCursor::new(proxies, checks, StatFormat::Csv, None, None, None)
+    }
+
+    #[must_use]
+    pub const fn finished(&self) -> bool {
+        self.step == ST_DONE
+    }
+
+    fn type_wanted(&self, t: i32) -> bool {
+        match self.typ {
             None | Some(-1 | 33_554_431 | 0x00FF_FFFF) => true,
-            Some(t) => (t & (1 << type_val)) != 0,
+            Some(m) => (m & (1 << t)) != 0,
         }
-    };
+    }
 
-    // `HAProxy` lists the proxies in the order the sections were written.
-    let mut order: Vec<usize> = (0..proxies.len()).collect();
-    order.sort_by_key(|&i| proxies[i].ids.decl);
-    for p_idx in order {
-        let proxy = &proxies[p_idx];
-        let iid = proxy.ids.iid;
-        if let Some(f_iid) = iid_filter {
-            if f_iid != -1 && u32::try_from(f_iid).ok() != Some(iid) {
-                continue;
-            }
+    /// The proxy rows (frontend and backend) are in when no server id or `-1`/`0` is asked.
+    fn proxy_rows_wanted(&self) -> bool {
+        self.sid.is_none() || self.sid == Some(-1) || self.sid == Some(0)
+    }
+
+    /// The proxy after the one of declaration rank `after` (the first with `None`), in the
+    /// order the sections were written, as `HAProxy` lists them.
+    fn next_proxy(&self, proxies: &[Proxy], hint: usize, after: Option<u32>) -> Option<usize> {
+        if self.sorted {
+            let i = match after {
+                None => 0,
+                Some(d) if proxies.get(hint).is_some_and(|p| p.ids.decl == d) => hint + 1,
+                Some(d) => proxies.partition_point(|p| p.ids.decl <= d),
+            };
+            return (i < proxies.len()).then_some(i);
         }
+        proxies.iter().enumerate().filter(|(_, p)| after.is_none_or(|d| p.ids.decl > d)).min_by_key(|(_, p)| p.ids.decl).map(|(i, _)| i)
+    }
 
-        if proxy.has_frontend
-            && match_type(0)
-            && (sid_filter.is_none() || sid_filter == Some(-1) || sid_filter == Some(0))
-        {
-            write_frontend_row(&mut out, fmt, proxy, pid, iid);
+    fn check_of<'c>(&self, checks: &'c [ServerCheckState], p: usize, s: usize) -> Option<&'c ServerCheckState> {
+        if self.checks_sorted {
+            let i = checks.partition_point(|c| (c.proxy(), c.server()) < (p, s));
+            checks.get(i).filter(|c| c.proxy() == p && c.server() == s)
+        } else {
+            checks.iter().find(|c| c.proxy() == p && c.server() == s)
         }
+    }
 
-        if match_type(2) {
-            for (s_idx, _) in proxy.servers.iter().enumerate() {
-                let sid = proxy.server_puid(s_idx);
-                if let Some(f_sid) = sid_filter {
-                    if f_sid != -1 && u32::try_from(f_sid).ok() != Some(sid) {
-                        continue;
+    /// Writes the next unit of the dump to `out` -- the header, one row, or the end -- and
+    /// returns `true`; `false` once the dump is over (nothing written).
+    pub fn next_unit(&mut self, proxies: &[Proxy], checks: &[ServerCheckState], pid: u32, out: &mut String) -> bool {
+        let start = out.len();
+        loop {
+            match self.step {
+                ST_HEADER => {
+                    self.step = ST_PROXY;
+                    if self.fmt == StatFormat::Csv {
+                        out.push_str(&stats_csv_header());
+                        return true;
                     }
                 }
-                let check_state = checks
-                    .iter()
-                    .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-                write_server_row(&mut out, fmt, proxy, s_idx, check_state, pid, iid, sid);
+                ST_PROXY => {
+                    let after = (self.px != u32::MAX).then_some(self.decl);
+                    let Some(i) = self.next_proxy(proxies, self.px as usize, after) else {
+                        self.step = ST_END;
+                        continue;
+                    };
+                    let p = &proxies[i];
+                    self.px = u32::try_from(i).unwrap_or(u32::MAX);
+                    self.decl = p.ids.decl;
+                    self.s = 0;
+                    let skip = self.iid.is_some_and(|f| f != -1 && u32::try_from(f).ok() != Some(p.ids.iid));
+                    self.step = if skip { ST_PROXY } else { ST_FRONTEND };
+                }
+                step => {
+                    // The proxy list may have changed since the last buffer: the proxy is
+                    // found again by its rank, or the dump goes on with the next one.
+                    let i = self.px as usize;
+                    if step != ST_END && step != ST_DONE && proxies.get(i).is_none_or(|p| p.ids.decl != self.decl) {
+                        match proxies.iter().position(|p| p.ids.decl == self.decl) {
+                            Some(j) => self.px = u32::try_from(j).unwrap_or(u32::MAX),
+                            None => {
+                                self.step = ST_PROXY;
+                                continue;
+                            }
+                        }
+                    }
+                    let i = self.px as usize;
+                    match step {
+                        ST_FRONTEND => {
+                            self.step = ST_SERVERS;
+                            let p = &proxies[i];
+                            if p.has_frontend && self.type_wanted(0) && self.proxy_rows_wanted() {
+                                write_frontend_row(out, self.fmt, p, pid, p.ids.iid);
+                                break;
+                            }
+                        }
+                        ST_SERVERS => {
+                            let p = &proxies[i];
+                            let s = self.s as usize;
+                            if !self.type_wanted(2) || s >= p.servers.len() {
+                                self.step = ST_BACKEND;
+                                continue;
+                            }
+                            self.s += 1;
+                            let sid = p.server_puid(s);
+                            if self.sid.is_some_and(|f| f != -1 && u32::try_from(f).ok() != Some(sid)) {
+                                continue;
+                            }
+                            write_server_row(out, self.fmt, p, s, self.check_of(checks, i, s), pid, p.ids.iid, sid);
+                            break;
+                        }
+                        ST_BACKEND => {
+                            self.step = ST_PROXY;
+                            let p = &proxies[i];
+                            if p.has_backend && self.type_wanted(1) && self.proxy_rows_wanted() {
+                                write_backend_row(out, self.fmt, p, pid, p.ids.iid);
+                                break;
+                            }
+                        }
+                        ST_END => {
+                            self.step = ST_DONE;
+                            if self.fmt == StatFormat::Json {
+                                out.push_str(if self.rows == 0 { "[]\n" } else { "]\n" });
+                                return true;
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
             }
         }
-
-        if proxy.has_backend
-            && match_type(1)
-            && (sid_filter.is_none() || sid_filter == Some(-1) || sid_filter == Some(0))
-        {
-            write_backend_row(&mut out, fmt, proxy, pid, iid);
+        // A row. JSON wraps them in `[...]`, separated by commas: the row writer put a comma
+        // before this one if `out` held something; it is made the right separator.
+        if self.fmt == StatFormat::Json {
+            let sep = if self.rows == 0 { "[" } else { "," };
+            if start > 0 && out.as_bytes().get(start) == Some(&b',') {
+                out.replace_range(start..=start, sep);
+            } else {
+                out.insert_str(start, sep);
+            }
         }
+        self.rows += 1;
+        true
     }
-
-    if fmt == StatFormat::Json {
-        return format!("[{out}]\n");
-    }
-    out
 }
 
 #[cfg(test)]

@@ -550,6 +550,8 @@ pub enum PendingOut {
     Raw(Vec<u8>, usize),
     /// A Prometheus scrape being produced.
     Scrape(crate::promex::Cursor),
+    /// A stats page being produced, a buffer at a time (`crate::stats_stream`, T572).
+    Stats(crate::stats_stream::Dump),
 }
 
 impl PendingOut {
@@ -557,6 +559,7 @@ impl PendingOut {
         match self {
             PendingOut::Raw(d, o) => *o < d.len(),
             PendingOut::Scrape(_) => true,
+            PendingOut::Stats(d) => !d.finished,
         }
     }
 }
@@ -2172,6 +2175,43 @@ impl TcpSession {
         }
     }
 
+    /// The stats page being produced, if any.
+    #[must_use]
+    pub fn stats_dump(&self) -> Option<crate::stats_stream::Dump> {
+        match self.pending_resp.as_deref() {
+            Some(PendingOut::Stats(d)) => Some(*d),
+            _ => None,
+        }
+    }
+
+    /// Sets (or ends) the stats page being produced; the box is a scrape's (pool `scrape_box`).
+    pub fn set_stats_dump(&mut self, d: Option<crate::stats_stream::Dump>) {
+        match (d, self.pending_resp.as_deref_mut()) {
+            (Some(d), Some(PendingOut::Stats(slot))) => *slot = d,
+            (Some(d), _) => {
+                let mut b = SCRAPE_BOXES.take_raw(<Box<PendingOut> as ibex_alloc::Poolable>::try_new).unwrap_or_else(|| Box::new(PendingOut::Stats(d)));
+                *b = PendingOut::Stats(d);
+                self.pending_resp = Some(b);
+            }
+            (None, Some(PendingOut::Stats(_))) => {
+                if let Some(b) = self.pending_resp.take() {
+                    SCRAPE_BOXES.give(b);
+                }
+            }
+            (None, _) => {}
+        }
+    }
+
+    /// Ends a scrape or a stats page still being produced; the box goes back to its pool.
+    /// One test of `pending_resp` for both, on every request.
+    fn end_dump(&mut self) {
+        if matches!(self.pending_resp.as_deref(), Some(PendingOut::Scrape(_) | PendingOut::Stats(_))) {
+            if let Some(b) = self.pending_resp.take() {
+                SCRAPE_BOXES.give(b);
+            }
+        }
+    }
+
     /// Answers a Prometheus scrape: the head now, the body as [`crate::promex::pump`] fills
     /// `rep` (chunked, like a server's response relayed). A `HEAD` gets the head alone.
     pub fn start_scrape(&mut self) {
@@ -2194,7 +2234,7 @@ impl TcpSession {
         self.req_method.reset();
         self.req_body_htx.set(None);
         self.req_uri.reset();
-        self.set_scrape(None);
+        self.end_dump();
         self.req_headers = None;
         self.clear_htx();
         self.vars.clear_txn();
