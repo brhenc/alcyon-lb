@@ -15,6 +15,8 @@
 use std::borrow::Cow;
 
 /// What the response head is.
+// `Valid` carries the index on the stack (E2): a box would be an allocation a response.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum ResponseHead {
     /// `HAProxy` refuses it: a 502 to the client, `PH--`.
@@ -27,7 +29,152 @@ pub enum ResponseHead {
         /// The server connection must close after this response (`H1_MF_CONN_CLO`): both
         /// `Transfer-Encoding` and `Content-Length`, or `Transfer-Encoding` in HTTP/1.0.
         close_server: bool,
+        /// The head as parsed, for the readings after this one (E2): only for a head left
+        /// as it came (`rewrite` is `None`), all ASCII, of at most [`RSP_FIELDS`] fields.
+        index: Option<RspHead>,
     },
+}
+
+/// The most fields a [`RspHead`] indexes: a head with more is read the long way.
+pub const RSP_FIELDS: usize = 32;
+
+/// One field of a [`RspHead`]: the line `name: value\r\n` at `at..end` of the head, the
+/// colon at `colon`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RspField {
+    pub at: u32,
+    pub colon: u32,
+    pub end: u32,
+}
+
+impl RspField {
+    /// The name as it is in `head` (the head the field was indexed in).
+    #[must_use]
+    pub fn name<'a>(&self, head: &'a [u8]) -> &'a [u8] {
+        &head[self.at as usize..self.colon as usize]
+    }
+
+    /// The value: the line is `name: value\r\n`, nothing to trim.
+    #[must_use]
+    pub fn value<'a>(&self, head: &'a [u8]) -> &'a [u8] {
+        &head[self.colon as usize + 2..self.end as usize - 2]
+    }
+}
+
+/// A response head parsed once (E2, `docs/design/quic-transport-2026-11-01.md` section 3):
+/// what the proxy reads of it after [`check_response_head`] (the status, the version, the
+/// field lines) without walking its bytes again. A head the index holds is canonical: a
+/// `version SP code SP reason CRLF` start line and `name: value CRLF` lines, ASCII. The
+/// offsets are of the head it was made from; an edit of the head keeps them only through
+/// [`RspHead::cut_line`] and [`RspHead::add_line`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RspHead {
+    /// The status code.
+    pub status: u16,
+    /// `H1_MF_VER_11` ([`is_http11`] of the start line).
+    pub http11: bool,
+    /// A field is named `Upgrade`: the websocket reading has something to read.
+    pub upgrade: bool,
+    /// The start line, its CRLF included.
+    pub start: u32,
+    /// The head, its blank line included.
+    pub len: u32,
+    n: u8,
+    fields: [RspField; RSP_FIELDS],
+}
+
+impl RspHead {
+    fn new() -> Self {
+        Self { status: 0, http11: false, upgrade: false, start: 0, len: 0, n: 0, fields: [RspField::default(); RSP_FIELDS] }
+    }
+
+    /// The field lines, in order.
+    #[must_use]
+    pub fn fields(&self) -> &[RspField] {
+        &self.fields[..usize::from(self.n)]
+    }
+
+    /// The line at `at..next` was cut from the head: false if it is no field line of it.
+    pub fn cut_line(&mut self, at: usize, next: usize) -> bool {
+        let n = usize::from(self.n);
+        let Some(i) = self.fields[..n].iter().position(|f| f.at as usize == at && f.end as usize == next) else {
+            return false;
+        };
+        let gone = u32::try_from(next - at).unwrap_or(u32::MAX);
+        self.fields.copy_within(i + 1..n, i);
+        self.n -= 1;
+        for f in &mut self.fields[i..n - 1] {
+            f.at -= gone;
+            f.colon -= gone;
+            f.end -= gone;
+        }
+        self.len -= gone;
+        true
+    }
+
+    /// A line `name: value\r\n` of `len` bytes, its colon `colon` bytes in, was put after
+    /// the last field line: false if the index has no room for it (it is then stale).
+    pub fn add_line(&mut self, colon: usize, len: usize) -> bool {
+        let n = usize::from(self.n);
+        let (Ok(colon), Ok(len)) = (u32::try_from(colon), u32::try_from(len)) else { return false };
+        if n == RSP_FIELDS {
+            return false;
+        }
+        let at = self.len - 2;
+        self.fields[n] = RspField { at, colon: at + colon, end: at + len };
+        self.n += 1;
+        self.len += len;
+        true
+    }
+}
+
+/// An HTTP/1 response head (status line and fields, the blank line or not) as the h2 and
+/// h3 muxes write it to their clients: the status (the second word of the first line), and
+/// each line with a colon as its name (UTF-8, blanks trimmed) and its value as octets
+/// (blanks trimmed), as `HAProxy` sends a value whatever bytes it holds (E2: Ibex read the
+/// head as lossy text, and a byte that is not UTF-8 went as U+FFFD). `None`: no status.
+#[must_use]
+pub fn mux_head_lines(head: &[u8]) -> Option<(u16, impl Iterator<Item = (&str, &[u8])>)> {
+    count_head_scan();
+    mux_head_lines_uncounted(head)
+}
+
+/// [`mux_head_lines`], not counted as a pass over the head (what a debug build checks an
+/// index against).
+#[must_use]
+pub fn mux_head_lines_uncounted(head: &[u8]) -> Option<(u16, impl Iterator<Item = (&str, &[u8])>)> {
+    let mut lines = head.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let code = lines.next()?.split(u8::is_ascii_whitespace).filter(|w| !w.is_empty()).nth(1)?;
+    let status = std::str::from_utf8(code).ok()?.parse::<u16>().ok()?;
+    Some((
+        status,
+        lines.filter_map(|l| {
+            let colon = l.iter().position(|&b| b == b':')?;
+            Some((std::str::from_utf8(l[..colon].trim_ascii()).ok()?, l[colon + 1..].trim_ascii()))
+        }),
+    ))
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static HEAD_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A pass over the bytes of a response head was made (debug builds; nothing in release):
+/// a test pins that a response head is walked once (E2).
+#[inline]
+pub fn count_head_scan() {
+    #[cfg(debug_assertions)]
+    HEAD_SCANS.with(|c| c.set(c.get() + 1));
+}
+
+/// The passes [`count_head_scan`] counted on this thread (0 in release builds).
+#[must_use]
+pub fn head_scans() -> u64 {
+    #[cfg(debug_assertions)]
+    return HEAD_SCANS.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
 }
 
 /// A head written again.
@@ -62,6 +209,10 @@ const fn is_crlf(c: u8) -> bool {
 /// One header as parsed: the name as written, the value cleaned (folds joined with spaces,
 /// blanks around it trimmed), and whether the line was already `name: value\r\n`.
 struct Header<'a> {
+    /// The line starts here, the colon is at `colon`, the next line at `end`.
+    at: usize,
+    colon: usize,
+    end: usize,
     name: &'a [u8],
     value: Cow<'a, [u8]>,
     canonical: bool,
@@ -243,13 +394,14 @@ fn parse<'a>(h: &'a [u8], accept_unsafe: bool, mut header: impl FnMut(Option<Hea
             return None;
         }
         let name = &h[n0..i];
+        let colon = i;
         i += 1;
         let (value, canonical) = parse_value(h, &mut i, accept_unsafe)?;
         lines += usize::from(!crate::h1::uncounted(name, &value));
         if lines > MAX_RESPONSE_HEADERS {
             return None;
         }
-        header(if bad_name { None } else { Some(Header { name, value, canonical }) });
+        header(if bad_name { None } else { Some(Header { at: n0, colon, end: i, name, value, canonical }) });
     }
     Some(Parsed { version, code, status: u16::try_from(status).ok()?, reason, canonical_start })
 }
@@ -354,6 +506,9 @@ fn fast_check(head: &[u8], accept_unsafe: bool) -> Option<ResponseHead> {
     let (mut conn_upg, mut upg_ws, mut ws_accept) = (false, false, false);
     let (mut te_count, mut first_te_chunked) = (0usize, false);
     let mut give_up = false;
+    let mut ix = RspHead::new();
+    // Indexed only when the offsets fit and every byte is ASCII.
+    let mut indexed = u32::try_from(head.len()).is_ok() && head.is_ascii();
     let p = parse(head, accept_unsafe, |h| {
         if give_up {
             return;
@@ -362,6 +517,19 @@ fn fast_check(head: &[u8], accept_unsafe: bool) -> Option<ResponseHead> {
             give_up = true;
             return;
         };
+        if indexed {
+            let n = usize::from(ix.n);
+            if n < RSP_FIELDS {
+                // In range: the head's length fits `u32`.
+                #[allow(clippy::cast_possible_truncation)]
+                let f = RspField { at: h.at as u32, colon: h.colon as u32, end: h.end as u32 };
+                ix.fields[n] = f;
+                ix.n += 1;
+                ix.upgrade |= h.name.eq_ignore_ascii_case(b"upgrade");
+            } else {
+                indexed = false;
+            }
+        }
         if h.name.eq_ignore_ascii_case(b"transfer-encoding") {
             if parse_te(&h.value, &mut xfer_enc, &mut te_chunked, &mut chnk, &mut te_other).is_err() && !accept_unsafe {
                 give_up = true;
@@ -404,12 +572,24 @@ fn fast_check(head: &[u8], accept_unsafe: bool) -> Option<ResponseHead> {
     if te_count > 0 && (!keep_te || te_count > 1 || !first_te_chunked) {
         return None;
     }
-    Some(ResponseHead::Valid { status: p.status, rewrite: None, close_server })
+    let index = indexed.then(|| {
+        ix.status = p.status;
+        ix.http11 = http11;
+        // A canonical start line ends with its CRLF at the first line feed.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            ix.start = (p.reason.as_ptr() as usize - head.as_ptr() as usize + p.reason.len() + 2) as u32;
+            ix.len = head.len() as u32;
+        }
+        ix
+    });
+    Some(ResponseHead::Valid { status: p.status, rewrite: None, close_server, index })
 }
 
 /// Parses a response head (the bytes up to and including the empty line that ends it).
 #[must_use]
 pub fn check_response_head(head: &[u8], accept_unsafe: bool) -> ResponseHead {
+    count_head_scan();
     fast_check(head, accept_unsafe).unwrap_or_else(|| full_check(head, accept_unsafe))
 }
 
@@ -531,7 +711,7 @@ fn full_check(head: &[u8], accept_unsafe: bool) -> ResponseHead {
         }
     }
     if !dirty {
-        return ResponseHead::Valid { status: p.status, rewrite: None, close_server };
+        return ResponseHead::Valid { status: p.status, rewrite: None, close_server, index: None };
     }
     let render = |reason: &[u8], values: &[Option<Cow<'_, [u8]>>]| {
         let mut o = Vec::with_capacity(head.len() + 16);
@@ -554,12 +734,65 @@ fn full_check(head: &[u8], accept_unsafe: bool) -> ResponseHead {
     };
     let reason: &[u8] = if p.reason.is_empty() { crate::actions::status_reason_phrase(p.status).as_bytes() } else { p.reason };
     let rewrite = Rewrite { head: render(reason, &out), held: render(p.reason, &held) };
-    ResponseHead::Valid { status: p.status, rewrite: Some(rewrite), close_server }
+    ResponseHead::Valid { status: p.status, rewrite: Some(rewrite), close_server, index: None }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn index(head: &[u8]) -> Option<RspHead> {
+        match check_response_head(head, false) {
+            ResponseHead::Valid { index, .. } => index,
+            ResponseHead::Invalid => None,
+        }
+    }
+
+    /// E2: a head left as it came is indexed (status, version, its field lines), and the
+    /// index follows a line cut out of it and one put in before the blank line. A head that
+    /// is written again, is not ASCII, or has more fields than the index holds, is not.
+    #[test]
+    fn a_head_left_as_it_came_is_indexed() {
+        let head = b"HTTP/1.1 200 OK\r\nX-A: a\r\nConnection: keep-alive\r\nContent-Length: 2\r\nX-E: \r\n\r\n";
+        let mut ix = index(head).expect("indexed");
+        assert_eq!((ix.status, ix.http11, ix.upgrade, ix.start, ix.len as usize), (200, true, false, 17, head.len()));
+        let fields = |ix: &RspHead, h: &[u8]| ix.fields().iter().map(|f| (f.name(h).to_vec(), f.value(h).to_vec())).collect::<Vec<_>>();
+        assert_eq!(
+            fields(&ix, head),
+            [(&b"X-A"[..], &b"a"[..]), (b"Connection", b"keep-alive"), (b"Content-Length", b"2"), (b"X-E", b"")].map(|(n, v)| (n.to_vec(), v.to_vec()))
+        );
+        let c = ix.fields()[1];
+        let mut cut = head[..c.at as usize].to_vec();
+        cut.extend_from_slice(&head[c.end as usize..]);
+        assert!(ix.cut_line(c.at as usize, c.end as usize));
+        assert!(!ix.cut_line(c.at as usize, c.end as usize + 1));
+        let line = b"connection: close\r\n";
+        let mut added = cut[..cut.len() - 2].to_vec();
+        added.extend_from_slice(line);
+        added.extend_from_slice(b"\r\n");
+        assert!(ix.add_line(10, line.len()));
+        assert_eq!(ix.len as usize, added.len());
+        assert_eq!(fields(&ix, &added), fields(&index(&added).expect("indexed"), &added));
+        assert!(index(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n").expect("indexed").upgrade);
+        assert_eq!(index(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").map(|ix| ix.http11), Some(false));
+        for head in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 02\r\n\r\n"[..],
+            b"HTTP/1.1 200 OK\r\nX-A: caf\xc3\xa9\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX-A: a\xffb\r\n\r\n",
+        ] {
+            assert_eq!(index(head), None, "{}", head.escape_ascii());
+        }
+        let mut many = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for i in 0..=RSP_FIELDS {
+            many.extend_from_slice(format!("X-{i}: v\r\n").as_bytes());
+        }
+        many.extend_from_slice(b"\r\n");
+        assert_eq!(index(&many), None);
+        let mut full = RspHead::new();
+        full.n = u8::try_from(RSP_FIELDS).unwrap();
+        full.len = 4;
+        assert!(!full.add_line(10, 19));
+    }
 
     fn valid(head: &[u8], accept: bool) -> Option<Option<Vec<u8>>> {
         match check_response_head(head, accept) {
@@ -698,7 +931,10 @@ mod tests {
         ];
         for &head in heads {
             for accept in [false, true] {
-                if let Some(fast) = fast_check(head, accept) {
+                if let Some(mut fast) = fast_check(head, accept) {
+                    if let ResponseHead::Valid { index, .. } = &mut fast {
+                        *index = None;
+                    }
                     assert_eq!(fast, full_check(head, accept), "{} accept={accept}", head.escape_ascii());
                     assert!(matches!(fast, ResponseHead::Valid { rewrite: None, .. }));
                 } else {

@@ -350,6 +350,12 @@ const fn sorted_table() -> [(&'static str, &'static str, u8); 99] {
 /// else the lowest matching the name (what a linear scan of the table finds).
 #[must_use]
 pub fn static_ref(name: &str, value: &str) -> StaticRef {
+    static_ref_octets(name, value.as_bytes())
+}
+
+/// [`static_ref`] of a value that is octets (a response field as the server sent it, E2).
+#[must_use]
+pub fn static_ref_octets(name: &str, value: &[u8]) -> StaticRef {
     // `SORTED` is in (name, value, index) order, and `str`'s `Ord` is the byte order
     // `str_cmp` sorted it by: one binary search on the name (memcmp, not the const byte
     // loop), then a walk of that name's few entries. The first with the value is the lowest
@@ -361,7 +367,7 @@ pub fn static_ref(name: &str, value: &str) -> StaticRef {
         if n != name {
             break;
         }
-        if v == value {
+        if v.as_bytes() == value {
             return StaticRef::Full(usize::from(i));
         }
         lowest = Some(lowest.map_or(i, |l: u8| l.min(i)));

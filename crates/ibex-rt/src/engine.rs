@@ -8928,7 +8928,7 @@ fn h2_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     }
     let before = (cs.rep.len(), t.rsp);
     let srv_gone = matches!(cs.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-    if crate::h2_bridge::forward_response(h2, ch.stream.id, t, &mut cs.rep, srv_gone, &mut ch.late_trailers) {
+    if crate::h2_bridge::forward_response(h2, ch.stream.id, t, &mut cs.rep, srv_gone, &mut ch.late_trailers, &mut ch.rsp_head) {
         cs.log.term = Some(*b"SD");
         moved = true;
     }
@@ -9000,7 +9000,7 @@ fn h3_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     }
     let before = (cs.rep.len(), t.rsp);
     let srv_gone = matches!(cs.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-    if crate::h2_bridge::forward_response_mux(mux, ch.stream.id, t, &mut cs.rep, srv_gone, &mut h3.body_scratch, &mut ch.late_trailers) {
+    if crate::h2_bridge::forward_response_mux(mux, ch.stream.id, t, &mut cs.rep, srv_gone, &mut h3.body_scratch, &mut ch.late_trailers, &mut ch.rsp_head) {
         cs.log.term = Some(*b"SD");
         moved = true;
     }
@@ -9592,13 +9592,20 @@ cache-control: no-cache\r\ncontent-type: text/html\r\n\r\n\
 
 /// Adds `Connection: <token>` as the last header of the head at the front of `buf`, with the
 /// line ends the head has. The head is copied through the stack (no allocation) when it fits.
-fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str) {
-    let Some((eoh_pos, eoh_len)) = buf.eoh() else { return };
-    let crlf = buf.readable()[..eoh_pos + eoh_len].windows(2).any(|w| w == b"\r\n");
+/// `canonical`: the head is one [`ibex_proto::response_head::RspHead`] indexes (CRLF line
+/// ends, names in lower case), and the line goes in as `connection: <token>\r\n`. The length
+/// of the line put in, `None` when it went in another way.
+fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str, canonical: bool) -> Option<usize> {
+    let (eoh_pos, eoh_len) = buf.eoh()?;
+    let crlf = canonical || {
+        ibex_proto::response_head::count_head_scan();
+        buf.readable()[..eoh_pos + eoh_len].windows(2).any(|w| w == b"\r\n")
+    };
     // `token` is `close` or `keep-alive`: the line is 24 bytes at most.
     let mut line = [0u8; 40];
     let mut n = 0;
-    for part in [b"Connection: ".as_slice(), token.as_bytes(), if crlf { b"\r\n" } else { b"\n" }] {
+    let name: &[u8] = if canonical { b"connection: " } else { b"Connection: " };
+    for part in [name, token.as_bytes(), if crlf { b"\r\n" } else { b"\n" }] {
         line[n..n + part.len()].copy_from_slice(part);
         n += part.len();
     }
@@ -9615,8 +9622,10 @@ fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str) {
         stack_hdr[at..at + inject.len()].copy_from_slice(inject);
         stack_hdr[at + inject.len()..total_new].copy_from_slice(&readable[at..total_old]);
         buf.replace_prefix(total_old, &stack_hdr[..total_new]);
+        Some(inject.len())
     } else {
-        buf.inject_http_header("Connection", token);
+        buf.inject_http_header(if canonical { "connection" } else { "Connection" }, token);
+        None
     }
 }
 
@@ -9972,8 +9981,9 @@ impl EngineDispatcher<'_> {
                 if Self::l7_retry(entry, proxies, fdtab, poller, now) {
                     continue;
                 }
-                Self::apply_http_response_rules(entry, proxies, now);
-                Self::write_response_head_names(entry, proxies);
+                if !Self::apply_http_response_rules(entry, proxies, now) {
+                    Self::write_response_head_names(entry, proxies);
+                }
             }
             if Self::l7_retry_failure(entry, proxies, fdtab, poller, now) {
                 continue;
@@ -11458,11 +11468,24 @@ impl EngineDispatcher<'_> {
             return;
         }
         let table = client_case_table(&proxies[entry.proxy_idx]);
+        ibex_proto::response_head::count_head_scan();
         entry.sess.rep.edit_keeping_lines(|head, eoh| rewrite_header_names_before(head, eoh, table));
     }
 
+    /// The response head's rules, framing and `Connection`. True when the head's names are
+    /// in lower case already, from its index (E2), and [`Self::write_response_head_names`]
+    /// has nothing to do.
+    fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &[Proxy], now: Tick) -> bool {
+        if let Some(c) = entry.sess.h2_child_mut() {
+            c.rsp_head = None;
+        }
+        let mut lowered = false;
+        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered);
+        lowered
+    }
+
     #[allow(clippy::too_many_lines)]
-    fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &[Proxy], now: Tick) {
+    fn apply_http_response_rules_in(entry: &mut SessionEntry, proxies: &[Proxy], now: Tick, lowered: &mut bool) {
         let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
         // Empty lines ahead of a status line are skipped (`H1_MSG_RPBEFORE`), so that the
         // end of the head is not looked for in them (T275).
@@ -11494,6 +11517,8 @@ impl EngineDispatcher<'_> {
         let mut close_server = false;
         // What `%B` counts of the head: what HTX holds of it.
         let mut held: Option<Vec<u8>> = None;
+        // The head as parsed, while nothing has edited it (E2).
+        let mut index: Option<ibex_proto::response_head::RspHead> = None;
         if entry.sess.txn.as_ref().is_some_and(|t| t.rsp_wait.is_none()) {
             let accept = proxies[be_idx].stats_config.accept_unsafe_response;
             match ibex_proto::response_head::check_response_head(&entry.sess.rep.readable()[..total_hdr_len], accept) {
@@ -11504,16 +11529,29 @@ impl EngineDispatcher<'_> {
                     reply_error(entry, proxies, 502);
                     return;
                 }
-                ibex_proto::response_head::ResponseHead::Valid { status, rewrite, close_server: close } => {
+                ibex_proto::response_head::ResponseHead::Valid { status, rewrite, close_server: close, index: ix } => {
                     close_server = close;
+                    index = ix;
                     if let Some(r) = rewrite {
                         entry.sess.rep.replace_prefix(total_hdr_len, &r.head);
                         total_hdr_len = r.head.len();
                         held = Some(r.held);
                     }
-                    // The websocket handshake against what the request asked for (T281).
+                    // The websocket handshake against what the request asked for (T281):
+                    // nothing to read in a head with no `Upgrade` field but a `101`.
                     let req_ws = entry.sess.req_ws.as_deref().copied().unwrap_or_default();
-                    match crate::websocket::check_response(&entry.sess.rep.readable()[..total_hdr_len], status, &req_ws, accept) {
+                    let verdict = match &index {
+                        Some(ix) if status != 101 && !ix.upgrade => crate::websocket::Verdict::Keep,
+                        _ => crate::websocket::check_response(&entry.sess.rep.readable()[..total_hdr_len], status, &req_ws, accept),
+                    };
+                    #[cfg(debug_assertions)]
+                    if index.is_some() {
+                        debug_assert_eq!(verdict, crate::websocket::check_response_uncounted(&entry.sess.rep.readable()[..total_hdr_len], status, &req_ws, accept));
+                    }
+                    if !matches!(verdict, crate::websocket::Verdict::Keep) {
+                        index = None;
+                    }
+                    match verdict {
                         crate::websocket::Verdict::Keep => {}
                         crate::websocket::Verdict::Refuse => {
                             entry.sess.rep.clear();
@@ -11534,14 +11572,22 @@ impl EngineDispatcher<'_> {
         // every head on the fast path) and the borrow ends before `rep` is edited.
         // One pass over the head for what follows reads of it (T436); a head the facts are not
         // read from is read the old way, a pass for each.
-        let rsp_facts = crate::txn::HeadFacts::scan(&entry.sess.rep.readable()[..total_hdr_len], false);
+        let rsp_facts = match &index {
+            Some(ix) => crate::txn::HeadFacts::of_response(&entry.sess.rep.readable()[..total_hdr_len], ix),
+            None => crate::txn::HeadFacts::scan(&entry.sess.rep.readable()[..total_hdr_len], false),
+        };
         let (status, framing, srv_has_close, srv_http11) = {
             let raw = &entry.sess.rep.readable()[..total_hdr_len];
             let method = entry.sess.req_method.as_deref();
             if let Some(f) = rsp_facts {
-                let status = crate::txn::status_of_line(&raw[..memchr::memchr(b'\n', raw).unwrap_or(raw.len())]);
+                let (status, http11) = match &index {
+                    Some(ix) => (ix.status, ix.http11),
+                    None => (crate::txn::status_of_line(&raw[..memchr::memchr(b'\n', raw).unwrap_or(raw.len())]), ibex_proto::response_head::is_http11(raw)),
+                };
+                #[cfg(debug_assertions)]
+                debug_assert_eq!((status, http11), (crate::txn::status_of_line(&raw[..memchr::memchr(b'\n', raw).unwrap_or(raw.len())]), ibex_proto::response_head::is_http11(raw)));
                 let framing = f.response_framing(method, status).unwrap_or_else(|| crate::txn::response_framing(&String::from_utf8_lossy(raw), method, status));
-                (status, framing, f.wants_close(), ibex_proto::response_head::is_http11(raw))
+                (status, framing, f.wants_close(), http11)
             } else {
                 let head = String::from_utf8_lossy(raw);
                 let status = crate::txn::status_of(&head);
@@ -11732,6 +11778,18 @@ impl EngineDispatcher<'_> {
             || !proxies[be_idx].srvexp.is_empty();
 
         if !has_rules {
+            // The names in lower case, as `HAProxy` writes what went through HTX, from the
+            // index: nothing has edited the head since it was made (E2). With an
+            // `h1-case-adjust` table for the client, `write_response_head_names` does it.
+            let mut index = index.filter(|ix| ix.len as usize == total_hdr_len && client_case_table(&proxies[fe_idx]).is_none());
+            if let Some(ix) = &index {
+                entry.sess.rep.edit_keeping_lines(|head, _| {
+                    for f in ix.fields() {
+                        head[f.at as usize..f.colon as usize].make_ascii_lowercase();
+                    }
+                });
+                *lowered = true;
+            }
             // `keep-alive` and `close` out of the server's `Connection`, the one this
             // connection's state calls for in (`h1_update_res_conn_value`).
             let (h, e) = entry.sess.rep.eoh().unwrap_or_default();
@@ -11753,15 +11811,28 @@ impl EngineDispatcher<'_> {
                 // `close`; the head is edited where it is, with no copy.
                 if scan.count == 1 {
                     entry.sess.rep.cut(scan.first.0, scan.first.1);
+                    if index.as_mut().is_some_and(|ix| !ix.cut_line(scan.first.0, scan.first.1)) {
+                        index = None;
+                    }
                 }
                 if let Some(tok) = token {
-                    inject_connection_token_zero_alloc(&mut entry.sess.rep, tok);
+                    // A head the index holds ends with CRLF, and its names are lower case.
+                    let line = inject_connection_token_zero_alloc(&mut entry.sess.rep, tok, index.is_some());
+                    if index.as_mut().is_some_and(|ix| !line.is_some_and(|l| ix.add_line("connection".len(), l))) {
+                        index = None;
+                    }
                 }
             } else {
                 let head = ibex_regex::bytetext::bytes_to_text(&entry.sess.rep.readable()[..h + e]);
                 if let Some(new) = crate::txn::rewrite_response_connection(&head, client_close, req_http11, tunnel) {
                     entry.sess.rep.replace_prefix(h + e, &ibex_regex::bytetext::text_to_bytes(&new));
+                    index = None;
+                    *lowered = false;
                 }
+            }
+            // What an HTTP/2 or HTTP/3 client's HEADERS are written from.
+            if let Some(c) = entry.sess.h2_child_mut() {
+                c.rsp_head = index;
             }
             set_rsp(entry);
             return;
@@ -17224,7 +17295,7 @@ mod registry_tests {
             let mut b = crate::buf::Buf::standard();
             b.writable()[..raw.len()].copy_from_slice(raw);
             b.commit(raw.len());
-            super::inject_connection_token_zero_alloc(&mut b, tok);
+            super::inject_connection_token_zero_alloc(&mut b, tok, false);
             String::from_utf8(b.readable().to_vec()).unwrap()
         };
         assert_eq!(

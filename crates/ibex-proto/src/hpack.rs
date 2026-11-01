@@ -711,13 +711,19 @@ fn static_name_run(name: &[u8]) -> Option<(u8, u8)> {
 /// Returns `(index, exact_match)`.
 #[must_use]
 pub fn find_table_entry(name: &str, value: &str, dynamic: &DynamicTable) -> Option<(usize, bool)> {
+    find_table_entry_octets(name, value.as_bytes(), dynamic)
+}
+
+/// [`find_table_entry`] of a value that is octets.
+#[must_use]
+pub fn find_table_entry_octets(name: &str, value: &[u8], dynamic: &DynamicTable) -> Option<(usize, bool)> {
     let mut name_match = None;
 
     // The static table first: the run of entries of this name (they are adjacent), the
     // first of them with the value, else the first of them.
     if let Some((first, count)) = static_name_run(name.as_bytes()) {
         let (first, count) = (usize::from(first), usize::from(count));
-        if let Some(k) = STATIC_TABLE[first - 1..first - 1 + count].iter().position(|&(_, v)| v == value) {
+        if let Some(k) = STATIC_TABLE[first - 1..first - 1 + count].iter().position(|&(_, v)| v.as_bytes() == value) {
             return Some((first + k, true));
         }
         name_match = Some(first);
@@ -727,7 +733,7 @@ pub fn find_table_entry(name: &str, value: &str, dynamic: &DynamicTable) -> Opti
     for (i, entry) in dynamic.entries.iter().enumerate() {
         let full_idx = STATIC_TABLE_LEN + 1 + i;
         if entry.name.eq_ignore_ascii_case(name.as_bytes()) {
-            if entry.value == value.as_bytes() {
+            if entry.value == value {
                 return Some((full_idx, true));
             }
             if name_match.is_none() {
@@ -826,7 +832,11 @@ pub fn decode_integer(prefix_bits: u8, src: &[u8], offset: &mut usize) -> Result
 
 /// Encodes a string literal (RFC 7541 §5.2) with or without Huffman compression.
 pub fn encode_string_literal(s: &str, use_huffman: bool, dst: &mut Vec<u8>) {
-    let bytes = s.as_bytes();
+    encode_octets_literal(s.as_bytes(), use_huffman, dst);
+}
+
+/// [`encode_string_literal`] of octets.
+pub fn encode_octets_literal(bytes: &[u8], use_huffman: bool, dst: &mut Vec<u8>) {
     if use_huffman {
         let huff_len = huffman_len(bytes);
         if huff_len < bytes.len() {
@@ -1134,22 +1144,28 @@ impl HpackEncoder {
 
     /// Appends one field to `out`, as [`Self::encode`] encodes each of its list.
     pub fn encode_field(&mut self, name: &str, value: &str, out: &mut Vec<u8>) {
-        if let Some((idx, exact)) = find_table_entry(name, value, &self.dynamic_table) {
+        self.encode_field_octets(name, value.as_bytes(), out);
+    }
+
+    /// [`Self::encode_field`] of a value that is octets, not necessarily UTF-8 text: a
+    /// response field goes to the client as the server sent it (E2).
+    pub fn encode_field_octets(&mut self, name: &str, value: &[u8], out: &mut Vec<u8>) {
+        if let Some((idx, exact)) = find_table_entry_octets(name, value, &self.dynamic_table) {
             if exact {
                 // Indexed Header Field: 1xxxxxxx (7-bit prefix)
                 encode_integer(idx, 7, 0x80, out);
             } else {
                 // Literal with Incremental Indexing - Indexed Name: 01xxxxxx (6-bit prefix)
                 encode_integer(idx, 6, 0x40, out);
-                encode_string_literal(value, self.use_huffman, out);
-                self.dynamic_table.insert_copy(name.as_bytes(), value.as_bytes());
+                encode_octets_literal(value, self.use_huffman, out);
+                self.dynamic_table.insert_copy(name.as_bytes(), value);
             }
         } else {
             // Literal with Incremental Indexing - New Name: 01000000
             out.push(0x40);
             encode_string_literal(name, self.use_huffman, out);
-            encode_string_literal(value, self.use_huffman, out);
-            self.dynamic_table.insert_copy(name.as_bytes(), value.as_bytes());
+            encode_octets_literal(value, self.use_huffman, out);
+            self.dynamic_table.insert_copy(name.as_bytes(), value);
         }
     }
 

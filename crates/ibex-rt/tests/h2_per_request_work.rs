@@ -432,3 +432,29 @@ fn an_h2_request_head_is_parsed_once() {
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
 }
+
+/// E2 (`docs/design/quic-transport-2026-11-01.md` section 3): a response head is walked once.
+/// `check_response_head` indexes it, and what the engine reads of it after (the websocket
+/// check, the head's facts, the names it lowers, the `Connection` it writes) and the HEADERS
+/// the client gets are read from that index. Before E2 each of them walked the head again:
+/// six passes for an h2 client (`count_head_scan`, debug builds).
+#[test]
+fn a_response_head_is_scanned_once() {
+    const N: u64 = 20;
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut engine, fe, running, be) = setup();
+    let mut c = Client::connect(&mut engine, fe);
+    c.get(&mut engine);
+    let s0 = ibex_proto::response_head::head_scans();
+    for _ in 0..N {
+        c.get(&mut engine);
+    }
+    let scans = ibex_proto::response_head::head_scans() - s0;
+    println!("{N} h2 responses: {scans} passes over their heads");
+    if cfg!(debug_assertions) {
+        assert_eq!(scans, N, "{N} h2 responses walked their heads {scans} times");
+    }
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}

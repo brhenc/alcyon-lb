@@ -1637,24 +1637,20 @@ pub struct HeadFacts {
     pub framing: Option<Framing>,
 }
 
-impl HeadFacts {
-    /// The facts of `head` (start line through the blank line), a request head or a response
-    /// head; `None` for a head they are not read from (see [`HeadFacts`]).
-    #[must_use]
-    pub fn scan(head: &[u8], request: bool) -> Option<Self> {
-        let facts = Self::scan_plain(head, request);
-        #[cfg(debug_assertions)]
-        if let Some(f) = facts {
-            f.check(head, request);
-        }
-        facts
-    }
+/// [`HeadFacts`] as they are read, a field line at a time.
+struct FactsScan<'h> {
+    f: HeadFacts,
+    ff: FramingFields<'h>,
+    many: bool,
+    request: bool,
+    // A request's `Connection: upgrade` without an `Upgrade` header goes (`conn_htx_lens`).
+    upg_hdr: bool,
+    upg_fix: (i64, i64),
+}
 
-    fn scan_plain(head: &[u8], request: bool) -> Option<Self> {
-        if !head.is_ascii() {
-            return None;
-        }
-        let nl = memchr::memchr(b'\n', head)?;
+impl<'h> FactsScan<'h> {
+    /// From the start line, `head[..nl]` (`nl` its line feed).
+    fn start(head: &'h [u8], nl: usize, request: bool) -> Option<Self> {
         let first_raw = &head[..nl];
         let first = first_raw.strip_suffix(b"\r").unwrap_or(first_raw);
         let strings = if request {
@@ -1668,19 +1664,117 @@ impl HeadFacts {
             let (status, reason) = rest.split_at(rest.len().min(3));
             version.len() + status.len() + ascii_trim(reason).len()
         };
-        let mut f = HeadFacts {
-            size: 20 + strings as u64 + 1,
-            headers: 0,
-            conn_close: false,
-            conn_keep_alive: false,
-            http10: first_raw.windows(8).any(|w| w == b"HTTP/1.0"),
-            conn: ConnScan { plain: true, ..ConnScan::default() },
-            framing: None,
-        };
-        let mut ff = FramingFields { te: [""; 4], n_te: 0, cl: [""; 4], n_cl: 0 };
-        let mut many = false;
-        // A request's `Connection: upgrade` without an `Upgrade` header goes (`conn_htx_lens`).
-        let (mut upg_hdr, mut upg_fix) = (false, (0i64, 0i64));
+        Some(Self {
+            f: HeadFacts {
+                size: 20 + strings as u64 + 1,
+                headers: 0,
+                conn_close: false,
+                conn_keep_alive: false,
+                http10: first_raw.windows(8).any(|w| w == b"HTTP/1.0"),
+                conn: ConnScan { plain: true, ..ConnScan::default() },
+                framing: None,
+            },
+            ff: FramingFields { te: [""; 4], n_te: 0, cl: [""; 4], n_cl: 0 },
+            many: false,
+            request,
+            upg_hdr: false,
+            upg_fix: (0, 0),
+        })
+    }
+
+    /// The field line `at..next`: `name`, and `value` trimmed.
+    fn field(&mut self, at: usize, next: usize, name: &[u8], value: &'h [u8]) {
+        let (f, ff, request) = (&mut self.f, &mut self.ff, self.request);
+        f.headers += 1;
+        let mut len = value.len();
+        if name.len() == 10 && name.eq_ignore_ascii_case(b"connection") {
+            if f.conn.count == 0 {
+                f.conn.first = (at, next);
+            }
+            f.conn.count += 1;
+            let (mut kept, mut chars, mut dropped, mut upg, mut upg_chars) = (0, 0, false, 0, 0);
+            for t in value.split(|&b| b == b',').map(ascii_trim).filter(|t| !t.is_empty()) {
+                let close = t.eq_ignore_ascii_case(b"close");
+                let keep_alive = t.eq_ignore_ascii_case(b"keep-alive");
+                f.conn_close |= close;
+                f.conn_keep_alive |= keep_alive;
+                f.conn.plain &= close || keep_alive;
+                if close || keep_alive {
+                    dropped = true;
+                } else if t.eq_ignore_ascii_case(b"upgrade") {
+                    upg += 1;
+                    upg_chars += t.len();
+                } else {
+                    kept += 1;
+                    chars += t.len();
+                }
+            }
+            let (keep, drop) = conn_htx_lens(value.len(), dropped, kept, chars, upg, upg_chars);
+            if request && upg > 0 {
+                let (s, h) = conn_upgrade_fix(name.len(), keep, drop);
+                self.upg_fix = (self.upg_fix.0 + s, self.upg_fix.1 + h);
+            }
+            let Some(l) = keep else {
+                // Gone from the HTX message: no block, no data.
+                f.headers -= 1;
+                return;
+            };
+            len = l;
+        } else if request && name.len() == 7 && name.eq_ignore_ascii_case(b"upgrade") {
+            self.upg_hdr |= upgrade_value_kept(value);
+        } else if name.len() == 14 && name.eq_ignore_ascii_case(b"content-length") {
+            let v = std::str::from_utf8(value).unwrap_or_default();
+            match ff.cl.get_mut(ff.n_cl) {
+                Some(slot) => *slot = v,
+                None => self.many = true,
+            }
+            ff.n_cl += 1;
+        } else if name.len() == 17 && name.eq_ignore_ascii_case(b"transfer-encoding") {
+            let v = std::str::from_utf8(value).unwrap_or_default();
+            match ff.te.get_mut(ff.n_te) {
+                Some(slot) => *slot = v,
+                None => self.many = true,
+            }
+            ff.n_te += 1;
+        }
+        f.size += (name.len() + len) as u64;
+    }
+
+    fn finish(self) -> HeadFacts {
+        let Self { mut f, ff, many, request, upg_hdr, upg_fix } = self;
+        if !many {
+            f.framing = Some(if request { request_framing_of(ff.te(), ff.cl()) } else { response_body_framing(ff.te(), ff.cl()) });
+        }
+        if !upg_hdr && upg_fix != (0, 0) {
+            f.size = f.size.saturating_add_signed(upg_fix.0);
+            f.headers = f.headers.saturating_add_signed(isize::try_from(upg_fix.1).unwrap_or(0));
+        }
+        f
+    }
+}
+
+impl HeadFacts {
+    /// The facts of `head` (start line through the blank line), a request head or a response
+    /// head; `None` for a head they are not read from (see [`HeadFacts`]).
+    #[must_use]
+    pub fn scan(head: &[u8], request: bool) -> Option<Self> {
+        if !request {
+            ibex_proto::response_head::count_head_scan();
+        }
+        let facts = Self::scan_plain(head, request);
+        #[cfg(debug_assertions)]
+        if let Some(f) = facts {
+            f.check(head, request);
+        }
+        facts
+    }
+
+    fn scan_plain(head: &[u8], request: bool) -> Option<Self> {
+        if !head.is_ascii() {
+            return None;
+        }
+        let nl = memchr::memchr(b'\n', head)?;
+        let mut scan = FactsScan::start(head, nl, request)?;
         let mut at = nl + 1;
         loop {
             let end = at + memchr::memchr(b'\n', &head[at..])?;
@@ -1698,71 +1792,31 @@ impl HeadFacts {
             if name.first().is_none_or(|&b| ws(b)) || name.last().is_some_and(|&b| ws(b)) {
                 return None; // a fold, or blanks around the name
             }
-            let value = ascii_trim(&line[colon + 1..]);
-            f.headers += 1;
-            let mut len = value.len();
-            if name.len() == 10 && name.eq_ignore_ascii_case(b"connection") {
-                if f.conn.count == 0 {
-                    f.conn.first = (at, next);
-                }
-                f.conn.count += 1;
-                let (mut kept, mut chars, mut dropped, mut upg, mut upg_chars) = (0, 0, false, 0, 0);
-                for t in value.split(|&b| b == b',').map(ascii_trim).filter(|t| !t.is_empty()) {
-                    let close = t.eq_ignore_ascii_case(b"close");
-                    let keep_alive = t.eq_ignore_ascii_case(b"keep-alive");
-                    f.conn_close |= close;
-                    f.conn_keep_alive |= keep_alive;
-                    f.conn.plain &= close || keep_alive;
-                    if close || keep_alive {
-                        dropped = true;
-                    } else if t.eq_ignore_ascii_case(b"upgrade") {
-                        upg += 1;
-                        upg_chars += t.len();
-                    } else {
-                        kept += 1;
-                        chars += t.len();
-                    }
-                }
-                let (keep, drop) = conn_htx_lens(value.len(), dropped, kept, chars, upg, upg_chars);
-                if request && upg > 0 {
-                    let (s, h) = conn_upgrade_fix(name.len(), keep, drop);
-                    upg_fix = (upg_fix.0 + s, upg_fix.1 + h);
-                }
-                let Some(l) = keep else {
-                    // Gone from the HTX message: no block, no data.
-                    f.headers -= 1;
-                    at = next;
-                    continue;
-                };
-                len = l;
-            } else if request && name.len() == 7 && name.eq_ignore_ascii_case(b"upgrade") {
-                upg_hdr |= upgrade_value_kept(value);
-            } else if name.len() == 14 && name.eq_ignore_ascii_case(b"content-length") {
-                let v = std::str::from_utf8(value).unwrap_or_default();
-                match ff.cl.get_mut(ff.n_cl) {
-                    Some(slot) => *slot = v,
-                    None => many = true,
-                }
-                ff.n_cl += 1;
-            } else if name.len() == 17 && name.eq_ignore_ascii_case(b"transfer-encoding") {
-                let v = std::str::from_utf8(value).unwrap_or_default();
-                match ff.te.get_mut(ff.n_te) {
-                    Some(slot) => *slot = v,
-                    None => many = true,
-                }
-                ff.n_te += 1;
-            }
-            f.size += (name.len() + len) as u64;
+            scan.field(at, next, name, ascii_trim(&line[colon + 1..]));
             at = next;
         }
-        if !many {
-            f.framing = Some(if request { request_framing_of(ff.te(), ff.cl()) } else { response_body_framing(ff.te(), ff.cl()) });
+        Some(scan.finish())
+    }
+
+    /// The facts of a response head [`ibex_proto::response_head::check_response_head`] has
+    /// indexed (E2): its field lines are read from the index, not looked for again. `None`
+    /// for a head the index is not of (its length differs).
+    #[must_use]
+    pub fn of_response(head: &[u8], index: &ibex_proto::response_head::RspHead) -> Option<Self> {
+        if index.len as usize != head.len() {
+            return None;
         }
-        if !upg_hdr && upg_fix != (0, 0) {
-            f.size = f.size.saturating_add_signed(upg_fix.0);
-            f.headers = f.headers.saturating_add_signed(isize::try_from(upg_fix.1).unwrap_or(0));
+        let mut scan = FactsScan::start(head, index.start as usize - 1, false)?;
+        for f in index.fields() {
+            scan.field(f.at as usize, f.end as usize, f.name(head), ascii_trim(f.value(head)));
         }
-        Some(f)
+        let facts = scan.finish();
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(Some(facts), Self::scan_plain(head, false), "indexed facts of {:?}", String::from_utf8_lossy(head));
+            facts.check(head, false);
+        }
+        Some(facts)
     }
 
     /// The facts against the readings they stand for, each of which reads the head again.

@@ -749,3 +749,17 @@ fn data_after_a_block_the_bridge_emptied_is_a_block_of_its_own() {
     let blocks = m.stream(0).expect("stream").rx_htx().blocks();
     assert!(matches!(&blocks[at + 1], HtxBlock::Data(d) if d == b"def"), "{blocks:?}");
 }
+
+/// A response field value that is not UTF-8 goes to an h3 client as its octets, as `HAProxy`
+/// sends it to an h2 one (3.5-dev8; its h3 mux writes the HTX value as it is too). Ibex
+/// sent U+FFFD for each (found by E2).
+#[test]
+fn a_response_value_that_is_not_utf8_goes_to_the_h3_client_as_its_octets() {
+    let mut m = mux();
+    m.recv(0, &headers(GET), true, 0).expect("request");
+    assert!(m.send_head(0, b"HTTP/1.1 200 OK\r\nX-A: a\xff\xfeb\r\ncontent-length: 2", false));
+    let f = frames(m.tx_bytes(0));
+    let fs = &f[0].1;
+    assert!(fs.windows(4).any(|w| w == b"a\xff\xfeb"), "{}", fs.escape_ascii());
+    assert!(!fs.windows(3).any(|w| w == "\u{fffd}".as_bytes()), "{}", fs.escape_ascii());
+}

@@ -426,8 +426,30 @@ fn trailer_fields<'a>(section: &'a [u8], out: &mut [(&'a str, &'a str); MAX_TRAI
     n
 }
 
+/// The fields of a response head the engine indexed and kept up to date (E2), for the
+/// client's HEADERS: what the mux read of the head as text, without reading it.
+fn indexed_fields<'h>(head: &'h [u8], ix: &'h ibex_proto::response_head::RspHead) -> impl Iterator<Item = (&'h str, &'h [u8])> {
+    #[cfg(debug_assertions)]
+    {
+        // What the mux's own reading of the head gives (`send_h1_head`), names lowered.
+        // Compared without allocating: the allocation tests count debug builds.
+        let mut new = ix.fields().iter().map(|f| (f.name(head), f.value(head).trim_ascii()));
+        let same = ibex_proto::response_head::mux_head_lines_uncounted(head).is_some_and(|(status, mut lines)| {
+            status == ix.status
+                && lines.all(|(n, v)| new.next().is_some_and(|(nn, nv)| n.as_bytes().eq_ignore_ascii_case(nn) && !nn.iter().any(u8::is_ascii_uppercase) && v == nv))
+                && new.next().is_none()
+        });
+        debug_assert!(same, "stale response head index of {:?}", String::from_utf8_lossy(head));
+    }
+    ix.fields().iter().filter_map(move |f| {
+        // A name is a token: ASCII.
+        Some((std::str::from_utf8(f.name(head)).ok()?, f.value(head).trim_ascii()))
+    })
+}
+
 /// [`forward_response`] for any mux the bridge drives (T509), the DATA staged in `scratch`.
-pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, scratch: &mut Vec<u8>, late_trailers: &mut Option<ibex_alloc::PoolBox<Vec<u8>>>) -> bool {
+#[allow(clippy::too_many_arguments)]
+pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, scratch: &mut Vec<u8>, late_trailers: &mut Option<ibex_alloc::PoolBox<Vec<u8>>>, rsp_head: &mut Option<ibex_proto::response_head::RspHead>) -> bool {
     let id = u64::from(stream_id);
     if txn.rsp == MsgState::Waiting || txn.rsp.is_done() {
         return false;
@@ -447,11 +469,15 @@ pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut Ht
     if let MsgState::Head { body, .. } = txn.rsp {
         let Some((h, e)) = find_eoh(data) else { return false };
         let end_stream = matches!(body, txn::Framing::None | txn::Framing::Length(0));
-        if mux.send_head(id, &data[..h], end_stream) {
+        let sent = match rsp_head.take().filter(|ix| ix.len as usize == h + e) {
+            Some(ix) => mux.send_head_fields(id, ix.status, indexed_fields(&data[..h + e], &ix), end_stream),
+            None => mux.send_head(id, &data[..h], end_stream),
+        };
+        if sent {
             txn.rsp.consume(data, h + e);
             rep.consume(h + e);
             if !end_stream {
-                return forward_response_mux(mux, stream_id, txn, rep, srv_gone, scratch, late_trailers);
+                return forward_response_mux(mux, stream_id, txn, rep, srv_gone, scratch, late_trailers, rsp_head);
             }
         }
         return false;
@@ -520,7 +546,7 @@ pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut Ht
 /// The response of a stream, as HEADERS then DATA frames, as much as the client's
 /// flow-control windows take. `srv_gone`: the server side has ended. `true` when the
 /// response was cut short by the server and the stream reset for it (`SD`).
-pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, late_trailers: &mut Option<ibex_alloc::PoolBox<Vec<u8>>>) -> bool {
+pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, late_trailers: &mut Option<ibex_alloc::PoolBox<Vec<u8>>>, rsp_head: &mut Option<ibex_proto::response_head::RspHead>) -> bool {
     if txn.rsp == MsgState::Waiting || txn.rsp.is_done() {
         return false;
     }
@@ -540,14 +566,18 @@ pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn
         // DATA, as much as the client's windows take at a time.
         let Some((h, e)) = find_eoh(data) else { return false };
         let end_stream = matches!(body, txn::Framing::None | txn::Framing::Length(0));
-        if h2.send_h1_head(stream_id, &data[..h], end_stream) {
+        let sent = match rsp_head.take().filter(|ix| ix.len as usize == h + e) {
+            Some(ix) => h2.send_head_fields(stream_id, ix.status, indexed_fields(&data[..h + e], &ix), end_stream),
+            None => h2.send_h1_head(stream_id, &data[..h], end_stream),
+        };
+        if sent {
             txn.rsp.consume(data, h + e);
             rep.consume(h + e);
             // The body that came with the head goes out with it, in the same write: on
             // its own, a poller round later, it is a second write, and a second small
             // segment Nagle holds until the client's delayed ACK, ~40 ms a request (T186).
             if !end_stream {
-                return forward_response(h2, stream_id, txn, rep, srv_gone, late_trailers);
+                return forward_response(h2, stream_id, txn, rep, srv_gone, late_trailers, rsp_head);
             }
         }
         return false;
@@ -979,7 +1009,7 @@ mod tests {
         let mut rep = Buf::with_capacity(256);
         assert!(rep.put(b"HTTP/1.1 204 No Content\r\nx-a: b\r\n\r\n"));
         let tx = h2.tx_buf.len();
-        assert!(!forward_response(&mut h2, 1, &mut txn, &mut rep, false, &mut None));
+        assert!(!forward_response(&mut h2, 1, &mut txn, &mut rep, false, &mut None, &mut None));
         assert!(rep.is_empty(), "the head was taken");
         let frame = &h2.tx_buf[tx..];
         assert!(frame.len() > 9, "a frame was queued");
@@ -997,7 +1027,7 @@ mod tests {
         let head = b"garbage\r\n\r\n";
         assert!(rep.put(head));
         let tx = h2.tx_buf.len();
-        assert!(!forward_response(&mut h2, 1, &mut txn, &mut rep, false, &mut None));
+        assert!(!forward_response(&mut h2, 1, &mut txn, &mut rep, false, &mut None, &mut None));
         assert_eq!(rep.readable(), head, "nothing of it was taken");
         assert_eq!(txn.rsp, MsgState::Head { left: 0, body: txn::Framing::Length(5) });
         assert_eq!(h2.tx_buf.len(), tx, "no frame");

@@ -356,6 +356,9 @@ impl ClientSide {
 /// that accepted the socket: the mux, the socket, the connection's timers) and its `h2s` +
 /// `struct stream` (a child: one entry per stream being served, with its own transaction,
 /// server connection and log line).
+// Boxed in the session, the box kept from one stream to the next (`H2ChildSpare`); a child
+// is the larger for its response head's index (E2).
+#[allow(clippy::large_enum_variant)]
 pub enum H2Role {
     Owner(H2Owner),
     Child(H2Child),
@@ -447,6 +450,11 @@ pub struct H2Child {
     /// with the end of the stream (T559; an h1 client never has them). Here and not in the
     /// transaction: the session entry stays small.
     pub late_trailers: Option<ibex_alloc::PoolBox<Vec<u8>>>,
+    /// The response head as [`ibex_proto::response_head::check_response_head`] indexed it,
+    /// kept up to date through the edits the engine made since, its names in lower case:
+    /// what the client's HEADERS are written from (E2). `None`: the head is read again.
+    /// Here and not in the transaction: the session entry stays small.
+    pub rsp_head: Option<ibex_proto::response_head::RspHead>,
     /// The client (or the mux) reset the stream.
     pub reset: bool,
     /// The transaction ended through `end_txn` and the connection goes on: the entry is
@@ -1181,6 +1189,7 @@ impl TcpSession {
             owner: Some(owner_ref),
             stream,
             late_trailers: None,
+            rsp_head: None,
             reset: false,
             finished: false,
             conn_end: None,
