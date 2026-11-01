@@ -77,7 +77,7 @@ use spaces::{
 };
 
 mod stats;
-pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
+pub use stats::{AckStats, ConnectionStats, FrameStats, PathStats, UdpStats};
 
 mod streams;
 #[cfg(fuzzing)]
@@ -985,6 +985,7 @@ impl Connection {
             if self.peer_supports_ack_frequency() {
                 buf.write(frame::FrameType::IMMEDIATE_ACK);
                 self.stats.frame_tx.immediate_ack += 1;
+                self.ack_frequency.immediate_ack_pn = Some(builder.exact_number);
             }
 
             builder.pad_to(probe_size);
@@ -1294,6 +1295,11 @@ impl Connection {
         Datagrams { conn: self }
     }
 
+    /// How the peer acknowledges 1-RTT packets: [`ConnectionStats::ack`], without copying the rest
+    pub fn ack_stats(&self) -> AckStats {
+        self.stats.ack
+    }
+
     /// Returns connection statistics
     pub fn stats(&self) -> ConnectionStats {
         let mut stats = self.stats;
@@ -1480,6 +1486,22 @@ impl Connection {
         if ack.largest >= self.spaces[space].next_packet_number {
             return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
         }
+        // Judge the peer's acknowledgement against the ACK_FREQUENCY frame it acknowledged:
+        // the packets sent above the largest one acknowledged before, to tell a gap
+        let judge = match (space, self.ack_frequency.acked_frame_pn) {
+            (SpaceId::Data, Some(frame_pn)) => {
+                let prev = self.spaces[space].largest_acked_packet.unwrap_or(0);
+                let above = match prev < ack.largest {
+                    true => self.spaces[space]
+                        .sent_packets
+                        .range(prev + 1..=ack.largest)
+                        .count(),
+                    false => 0,
+                };
+                Some((frame_pn, prev, above))
+            }
+            _ => None,
+        };
         let new_largest = {
             let space = &mut self.spaces[space];
             if space.largest_acked_packet.is_none_or(|pn| ack.largest > pn) {
@@ -1510,8 +1532,24 @@ impl Connection {
         }
 
         let mut ack_eliciting_acked = false;
+        // For `judge`: new ack-eliciting packets, the time the first was sent, whether one was
+        // sent before the frame took effect or asked for an immediate ACK, packets acknowledged
+        // above and below the previous largest
+        let (mut eliciting, mut first_sent, mut explained) = (0u64, None, false);
+        let (mut new_above, mut new_below) = (0usize, false);
         for packet in newly_acked.elts() {
+            if let Some((frame_pn, prev, _)) = judge {
+                match packet > prev {
+                    true => new_above += 1,
+                    false => new_below = true,
+                }
+                explained |= packet <= frame_pn || self.ack_frequency.immediate_ack_pn == Some(packet);
+            }
             if let Some(info) = self.spaces[space].take(packet) {
+                if judge.is_some() && info.ack_eliciting {
+                    eliciting += 1;
+                    first_sent.get_or_insert(info.time_sent);
+                }
                 if let Some(acked) = info.largest_acked {
                     // Assume ACKs for all packets below the largest acknowledged in `packet` have
                     // been received. This can cause the peer to spuriously retransmit if some of
@@ -1531,10 +1569,31 @@ impl Connection {
                 }
 
                 // Notify ack frequency that a packet was acked, because it might contain an ACK_FREQUENCY frame
-                self.ack_frequency.on_acked(packet);
+                if self.ack_frequency.on_acked(packet) {
+                    self.stats.ack.ack_frequency_threshold = self
+                        .config
+                        .ack_frequency_config
+                        .as_ref()
+                        .map(|c| c.ack_eliciting_threshold.into_inner());
+                }
 
                 self.on_packet_acked(now, info);
             }
+        }
+
+        if let Some((_, _, above)) = judge {
+            // The threshold, the delay (the peer's timer started when the first arrived, after
+            // it was sent), a gap the peer saw (RFC 9000 13.2.1, draft-ietf-quic-ack-frequency
+            // 6.2) and an IMMEDIATE_ACK each explain an acknowledgement
+            let threshold = self.stats.ack.ack_frequency_threshold.unwrap_or(u64::MAX);
+            let delay = self
+                .ack_frequency
+                .max_ack_delay_for_pto()
+                .saturating_sub(TIMER_GRANULARITY);
+            let soon = first_sent.is_some_and(|t| now.saturating_duration_since(t) < delay);
+            let gap = new_below || new_above != above;
+            self.ack_frequency.unexplained_ack |=
+                eliciting > 0 && eliciting <= threshold && soon && !gap && !explained;
         }
 
         self.path.congestion.on_end_acks(
@@ -2765,6 +2824,8 @@ impl Connection {
         let mut close = None;
         let payload_len = payload.len();
         let mut ack_eliciting = false;
+        let mut ack = false;
+        self.ack_frequency.unexplained_ack = false;
         for result in frame::Iter::new(payload)? {
             let frame = result?;
             let span = match frame {
@@ -2822,8 +2883,9 @@ impl Connection {
                         self.spaces[SpaceId::Data].pending.max_data = true;
                     }
                 }
-                Frame::Ack(ack) => {
-                    self.on_ack_received(now, SpaceId::Data, ack)?;
+                Frame::Ack(frame) => {
+                    ack = true;
+                    self.on_ack_received(now, SpaceId::Data, frame)?;
                 }
                 Frame::Padding | Frame::Ping => {}
                 Frame::Close(reason) => {
@@ -3028,6 +3090,13 @@ impl Connection {
             }
         }
 
+        if ack && !ack_eliciting {
+            self.stats.ack.ack_only_received += 1;
+            if self.ack_frequency.unexplained_ack {
+                self.stats.ack.ack_frequency_excess += 1;
+            }
+        }
+
         let space = &mut self.spaces[SpaceId::Data];
         if space
             .pending_acks
@@ -3202,6 +3271,7 @@ impl Connection {
             buf.write(frame::FrameType::IMMEDIATE_ACK);
             sent.non_retransmits = true;
             self.stats.frame_tx.immediate_ack += 1;
+            self.ack_frequency.immediate_ack_pn = Some(pn);
         }
 
         // ACK

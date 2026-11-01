@@ -18,6 +18,17 @@ pub(super) struct AckFrequencyState {
     //
     last_ack_frequency_frame: Option<u64>,
     pub(super) max_ack_delay: Duration,
+
+    //
+    // Judging the peer's acknowledgements (`AckStats`)
+    //
+    /// The packet number of the first ACK_FREQUENCY frame the peer acknowledged
+    pub(super) acked_frame_pn: Option<u64>,
+    /// The packet number of the last packet sent with an IMMEDIATE_ACK frame
+    pub(super) immediate_ack_pn: Option<u64>,
+    /// The ACK frames of the packet being processed acknowledge new packets that neither the
+    /// threshold, the delay, a gap nor an IMMEDIATE_ACK explains
+    pub(super) unexplained_ack: bool,
 }
 
 impl AckFrequencyState {
@@ -29,6 +40,10 @@ impl AckFrequencyState {
 
             last_ack_frequency_frame: None,
             max_ack_delay: default_max_ack_delay,
+
+            acked_frame_pn: None,
+            immediate_ack_pn: None,
+            unexplained_ack: false,
         }
     }
 
@@ -102,13 +117,16 @@ impl AckFrequencyState {
     }
 
     /// Notifies the [`AckFrequencyState`] that a packet has been ACKed
-    pub(super) fn on_acked(&mut self, pn: u64) {
+    ///
+    /// Returns `true` the first time a packet with an ACK_FREQUENCY frame is
+    pub(super) fn on_acked(&mut self, pn: u64) -> bool {
         match self.in_flight_ack_frequency_frame {
             Some((number, requested_max_ack_delay)) if number == pn => {
                 self.in_flight_ack_frequency_frame = None;
                 self.peer_max_ack_delay = requested_max_ack_delay;
+                self.acked_frame_pn.get_or_insert(pn) == &pn
             }
-            _ => {}
+            _ => false,
         }
     }
 
