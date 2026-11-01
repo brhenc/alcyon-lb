@@ -925,6 +925,11 @@ impl QuicListener {
     /// Advances the transport timers for loss recovery and idle timeout.
     pub fn handle_timeout(&mut self, now: Instant) {
         self.endpoint.handle_timeout(now);
+        // A connection this timer drained (after a close of ours) is forgotten, and its
+        // `ConnectionClosed` queued, now: left to the next `poll_timeout`, no `serve` followed
+        // it and the event waited for an unrelated datagram, the slot and its counters with it
+        // (T562: an idle h3 connection closed at `timeout client`).
+        self.endpoint.update_next_timeout();
     }
 
     /// Returns the next earliest timer expiry instant: the connections something reached since

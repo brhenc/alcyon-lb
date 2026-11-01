@@ -9038,7 +9038,15 @@ fn h3_owner_deadline(s: &crate::proxy::TcpSession, now: Tick) -> Tick {
         (None, Some(_)) => (h3.idle_start, if s.keep_alive_ms != 0 { s.keep_alive_ms } else { s.http_request_ms }),
     };
     if ms == 0 {
-        client
+        // `timeout client` as the fallback (T562): HAProxy computes it from `now` only when the
+        // mux is woken by a stream event, so on a quiet connection (PINGs wake no mux) it runs
+        // out. Recomputed from `now` at every owner step it would slide for ever; anchor it at
+        // `idle_start` unless a stream's head is in progress.
+        if mux.head_partial().is_none() && s.timeouts.client != 0 {
+            h3.idle_start.add(s.timeouts.client)
+        } else {
+            client
+        }
     } else {
         base.add(ms)
     }

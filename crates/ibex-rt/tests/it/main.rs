@@ -199,6 +199,7 @@ mod h3_mux_owner;
 mod h3_mux_trailers;
 mod h3_owner_close_counters;
 mod h2_interim_responses;
+mod h3_idle_timeout;
 mod h3_listen;
 mod h3_proxy_path;
 mod h3_same_port;
