@@ -172,14 +172,14 @@ fn a_quiet_connection_is_not_asked_for_a_packet() {
     // The endpoint accepts the stream itself and reports it.
     let mut opened = None;
     while let Some(ev) = s.poll_event() {
-        if let ibex_quic::transport::TransportEvent::StreamOpened { conn_id, stream_id, .. } = ev {
-            opened = Some((conn_id, stream_id));
+        if let ibex_quic::transport::TransportEvent::StreamOpened { conn, stream_id, .. } = ev {
+            opened = Some((conn, stream_id));
         }
     }
-    let (conn_id, sid) = opened.expect("stream opened event");
+    let (conn, sid) = opened.expect("stream opened event");
     while s.poll_transmit(now, &mut buf).is_some() {}
     let before = s.transmit_polls();
-    s.write_stream(conn_id, sid, b"y", false).expect("write");
+    s.write_stream(conn, sid, b"y", false).expect("write");
     let t = s.poll_transmit(now, &mut buf);
     assert!(t.is_some(), "the write goes out");
     assert!(s.transmit_polls() - before >= 1);
@@ -209,12 +209,12 @@ fn silent_client_after_a_dropped_write() -> (QuicEndpoint, Instant) {
     }
     let mut opened = None;
     while let Some(ev) = s.poll_event() {
-        if let ibex_quic::transport::TransportEvent::StreamOpened { conn_id, stream_id, .. } = ev {
-            opened = Some((conn_id, stream_id));
+        if let ibex_quic::transport::TransportEvent::StreamOpened { conn, stream_id, .. } = ev {
+            opened = Some((conn, stream_id));
         }
     }
-    let (conn_id, sid) = opened.expect("stream opened event");
-    s.write_stream(conn_id, sid, b"response", true).expect("write");
+    let (conn, sid) = opened.expect("stream opened event");
+    s.write_stream(conn, sid, b"response", true).expect("write");
     let mut buf = vec![0u8; 65535];
     let mut dropped = 0;
     while s.poll_transmit(now, &mut buf).is_some() {
@@ -262,4 +262,173 @@ fn a_silent_connection_closes_at_its_idle_timeout() {
     let idle = t - now;
     assert!(idle >= Duration::from_secs(1), "closed after {idle:?}, before any idle timeout");
     println!("[MEASUREMENT T543] silent connection: {probes} probes, closed after {idle:?}");
+}
+
+/// A handshaken connection with a client request stream the server has seen opened: the
+/// server, the client side, the time and the server's name for the connection and stream.
+fn opened_request() -> (QuicEndpoint, quinn_proto::Endpoint, quinn_proto::ConnectionHandle, quinn_proto::Connection, Instant, StreamOf) {
+    let mut s = server();
+    let (mut ep, cfg) = create_client_endpoint();
+    let mut now = Instant::now();
+    let (ch, mut c) = ep.connect(now, (*cfg).clone(), SERVER, "localhost").expect("connect");
+    for _ in 0..50 {
+        if !c.is_handshaking() {
+            break;
+        }
+        exchange(now, &mut s, &mut ep, ch, &mut c);
+        now += Duration::from_millis(1);
+    }
+    assert!(!c.is_handshaking(), "no handshake");
+    let id = c.streams().open(quinn_proto::Dir::Bi).expect("open");
+    c.send_stream(id).write(b"GET").expect("write");
+    exchange(now, &mut s, &mut ep, ch, &mut c);
+    let mut opened = None;
+    while let Some(ev) = s.poll_event() {
+        if let ibex_quic::transport::TransportEvent::StreamOpened { conn, stream_id, .. } = ev {
+            opened = Some((conn, stream_id));
+        }
+    }
+    let opened = opened.expect("stream opened event");
+    // The server's side of the exchange, so the request below starts from a quiet connection.
+    let mut buf = vec![0u8; 65535];
+    while s.poll_transmit(now, &mut buf).is_some() {}
+    let _ = s.poll_timeout();
+    (s, ep, ch, c, now, opened)
+}
+
+type StreamOf = (ibex_quic::ConnHandle, ibex_quic::StreamId);
+
+/// Q1 (`quic-transport-2026-11-01.md` §3): the connection is found by its ID once, where a
+/// datagram is routed; the stream calls of a request name it by handle and look nothing up.
+#[test]
+fn a_request_routes_its_connection_once() {
+    let (mut s, _ep, _ch, mut c, now, (conn, sid)) = opened_request();
+    let before = s.cid_lookups();
+    let mut scratch = [0u8; 64];
+    let r = s.read_stream(conn, sid, &mut scratch).expect("read");
+    assert_eq!(&scratch[..r.bytes_read], b"GET");
+    s.write_stream(conn, sid, b"200", false).expect("write");
+    s.finish_stream(conn, sid).expect("finish");
+    assert_eq!(s.cid_lookups() - before, 0, "the stream calls looked the connection up by its ID");
+    // A datagram is routed once.
+    c.send_stream(quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0)).write(b"x").expect("write");
+    let mut out = Vec::new();
+    let mut dgrams = 0;
+    while let Some(t) = c.poll_transmit(now, 1, &mut out) {
+        s.handle_datagram(now, from(0), None, &out[..t.size]).expect("datagram");
+        dgrams += 1;
+        out.clear();
+    }
+    assert!(dgrams > 0);
+    assert_eq!(s.cid_lookups() - before, dgrams, "one routing per datagram");
+}
+
+/// Q1: one loop pass -- the request's datagrams, the stream calls, every packet out -- asks
+/// the connection for its deadline once, when the loop asks for the next timeout; asking
+/// again with nothing done in between asks nobody.
+#[test]
+fn a_pass_computes_the_timeout_once() {
+    let (mut s, _ep, _ch, mut c, now, (conn, sid)) = opened_request();
+    let before = s.timeout_polls();
+    c.send_stream(quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0)).write(b" / more").expect("write");
+    let _ = c.send_stream(quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0)).finish();
+    let mut out = Vec::new();
+    let mut dgrams = 0;
+    while let Some(t) = c.poll_transmit(now, 1, &mut out) {
+        s.handle_datagram(now, from(0), None, &out[..t.size]).expect("datagram");
+        dgrams += 1;
+        out.clear();
+    }
+    assert!(dgrams > 0);
+    let mut scratch = [0u8; 64];
+    let _ = s.read_stream(conn, sid, &mut scratch).expect("read");
+    s.write_stream(conn, sid, b"response", true).expect("write");
+    let mut buf = vec![0u8; 65535];
+    let mut sent = 0;
+    while s.poll_transmit(now, &mut buf).is_some() {
+        sent += 1;
+    }
+    assert!(sent > 0, "the response went out");
+    assert!(s.poll_timeout().is_some(), "a deadline (idle, loss recovery)");
+    assert_eq!(s.timeout_polls() - before, 1, "{dgrams} datagrams in, {sent} packets out");
+    let again = s.timeout_polls();
+    let _ = s.poll_timeout();
+    assert_eq!(s.timeout_polls() - again, 0, "nothing happened, nobody asked");
+}
+
+/// A new half-open connection from `port`'s first flight; its handle.
+fn half_open(s: &mut QuicEndpoint, now: Instant, port: usize) -> ibex_quic::ConnHandle {
+    for d in first_flight(now) {
+        s.handle_datagram(now, from(port), None, &d).expect("datagram");
+    }
+    let mut conn = None;
+    while let Some(ev) = s.poll_event() {
+        if let ibex_quic::transport::TransportEvent::NewConnection { conn: c, .. } = ev {
+            conn = Some(c);
+        }
+    }
+    conn.expect("new connection")
+}
+
+/// Fires timers until `conn`'s connection is lost (its handshake times out), without the
+/// `poll_timeout` that would forget it: the next connection quinn accepts gets its index.
+fn time_out(s: &mut QuicEndpoint, conn: ibex_quic::ConnHandle, mut t: Instant) -> Option<Instant> {
+    let mut buf = vec![0u8; 65535];
+    for _ in 0..200 {
+        t = s.deadline_of(conn).expect("a deadline").max(t);
+        s.handle_timeout(t);
+        while s.poll_transmit(t, &mut buf).is_some() {}
+        while let Some(ev) = s.poll_event() {
+            if matches!(ev, ibex_quic::transport::TransportEvent::ConnectionClosed { conn: c, .. } if c == conn) {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+/// Q1 (§5 (i)): quinn hands a gone connection's index to the next one; the handle of the gone
+/// one has the old generation and finds nothing, and does not reach the new one.
+#[test]
+fn a_stale_handle_finds_nothing_once_its_slot_is_reused() {
+    let mut s = server();
+    let now = Instant::now();
+    let old = half_open(&mut s, now, 0);
+    let t = time_out(&mut s, old, now).expect("timed out");
+    let new = half_open(&mut s, t, 1);
+    assert_eq!(new.index(), old.index(), "quinn reuses the index");
+    assert_ne!(new.generation(), old.generation());
+    assert_eq!(s.connection_count(), 1, "the drained one was forgotten when its index was reused");
+    let err = s.write_stream(old, ibex_quic::StreamId(0), b"x", true).expect_err("a stale handle");
+    assert!(err.to_string().contains(&old.to_string()), "{err}");
+    assert!(s.alpn(old).is_none() && s.server_name(old).is_none());
+    s.close_connection(old, 0, b"");
+    assert!(s.deadline_of(new).is_some(), "the new connection was not closed by the stale handle");
+    assert_eq!(s.poll_timeout(), s.deadline_of(new));
+}
+
+/// Q1: the earliest deadline is kept without re-keying every connection; when the connection
+/// that holds it goes (here: its handshake times out), the earliest is found again among the
+/// others, by the one scan that costs no connection a query.
+#[test]
+fn the_earliest_deadline_is_found_again_when_its_holder_goes() {
+    let mut s = server();
+    let t0 = Instant::now();
+    let first = half_open(&mut s, t0, 0);
+    let second = half_open(&mut s, t0 + Duration::from_millis(50), 1);
+    let third = half_open(&mut s, t0 + Duration::from_millis(100), 2);
+    let d1 = s.deadline_of(first).expect("first");
+    let d2 = s.deadline_of(second).expect("second");
+    let d3 = s.deadline_of(third).expect("third");
+    assert!(d1 < d2 && d2 < d3);
+    assert_eq!(s.poll_timeout(), Some(d1));
+    // The timers that fire on the way (probes) move the other two too: the earliest is
+    // whichever of theirs comes first, found without asking either again.
+    let gone = time_out(&mut s, first, t0).expect("timed out");
+    let want = s.deadline_of(second).into_iter().chain(s.deadline_of(third)).min();
+    let polls = s.timeout_polls();
+    assert_eq!(s.poll_timeout(), want, "the holder went");
+    assert_eq!(s.timeout_polls(), polls, "found by the scan, nobody asked");
+    assert!(want.is_some() && want > Some(gone));
+    assert!(s.deadline_of(first).is_none() && s.connection_count() == 2);
 }

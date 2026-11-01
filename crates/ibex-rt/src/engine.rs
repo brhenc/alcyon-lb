@@ -5951,7 +5951,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // it would delay loss recovery; the shortest of the two wins.
         let poll_timeout = self
             .quic_listeners
-            .iter()
+            .iter_mut()
             .filter_map(crate::quic_listener::QuicListener::poll_timeout)
             .fold(poll_timeout, |acc, deadline| {
                 acc.min(deadline.saturating_duration_since(now_inst))
@@ -6108,8 +6108,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             if timer_due {
                 ql.handle_timeout(inst);
             }
+            // Sent at the end of the pass, with what the owner sessions write (Q1).
             if ql.take_ready() || timer_due {
-                let _ = ql.pump(inst);
+                let _ = ql.serve(inst);
             }
         }
         self.admit_quic_connections();
@@ -6191,8 +6192,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         for (owner_idx, owner_task) in h2_spawn.drain(..) {
             self.spawn_h2_children(owner_idx, owner_task, &mut wake_queue);
         }
-        // What the owners of HTTP/3 connections wrote goes out now (T509). The clock is read
-        // only when one did: once per pass is a fifth of an h1 request's added cost otherwise.
+        // What the owners of HTTP/3 connections wrote goes out now (T509), with what the
+        // listener's own pass (`serve`) left to send: one send a pass (Q1). The clock is read
+        // only when there is one: once per pass is a fifth of an h1 request's added cost otherwise.
         for ql in &mut self.quic_listeners {
             if ql.take_dirty() {
                 let _ = ql.send_batch(Instant::now());

@@ -368,7 +368,7 @@ pub struct H3Owner {
     pub mux: ibex_alloc::PoolBox<ibex_proto::mux_h3::H3MuxContext>,
     /// The index of the QUIC listener in the engine's list.
     pub listener: u32,
-    pub conn: ibex_quic::ConnectionId,
+    pub conn: ibex_quic::ConnHandle,
     /// A response's DATA staged on its way to the mux, kept from one response to the next.
     pub body_scratch: Vec<u8>,
     /// Since when no stream is served (`qcc->idle_start`): the connection's start, then each
