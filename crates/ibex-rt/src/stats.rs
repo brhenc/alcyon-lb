@@ -641,6 +641,31 @@ fn show_info_pairs(
     p.v
 }
 
+/// T587: the acknowledgement counts of the QUIC connections that ended, per frontend (proxy
+/// index), for `show quic ibex-acks-fe`. An Ibex extension: it is not a column of the CSV nor a
+/// Prometheus family, so that both keep HAProxy's schema.
+static FE_ACK_TOTALS: std::sync::Mutex<Vec<(usize, std::sync::Arc<ibex_quic::AckTotals>)>> = std::sync::Mutex::new(Vec::new());
+
+/// The ended-connection counts of frontend `proxy_idx`, made on first use; every worker's
+/// listener of the frontend adds to the same one.
+pub fn fe_ack_totals(proxy_idx: usize) -> std::sync::Arc<ibex_quic::AckTotals> {
+    let mut v = FE_ACK_TOTALS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, t)) = v.iter().find(|(i, _)| *i == proxy_idx) {
+        return std::sync::Arc::clone(t);
+    }
+    let t = std::sync::Arc::new(ibex_quic::AckTotals::new());
+    v.push((proxy_idx, std::sync::Arc::clone(&t)));
+    t
+}
+
+/// Every frontend with a QUIC listener and its ended-connection counts (sent, ACK-only
+/// received, excess).
+pub fn fe_ack_totals_all() -> Vec<(usize, u64, u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = FE_ACK_TOTALS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    v.iter().map(|(i, t)| (*i, t.ack_eliciting_sent.load(Relaxed), t.ack_only_rcvd.load(Relaxed), t.excess.load(Relaxed))).collect()
+}
+
 /// `tune.ibex.quic-ack-frequency on` (T569), set once the QUIC configuration is built: `show
 /// info` then prints the `QuicAck*` lines.
 pub static QUIC_ACK_FREQUENCY_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

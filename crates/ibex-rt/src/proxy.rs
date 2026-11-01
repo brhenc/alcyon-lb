@@ -475,9 +475,6 @@ pub struct H2Child {
     /// ends the connection's usefulness while the other streams finish.
     pub goaway: Option<ibex_proto::h2::H2Error>,
     pub tls: Option<Arc<ibex_tls::RustlsTlsInfo>>,
-    /// T569: how the QUIC peer of an HTTP/3 stream acknowledged when its request head was
-    /// dispatched (`spawn_h2_children`): what the `ibex_fc_quic_ack_*` fetches read.
-    pub quic_acks: Option<ibex_sample::QuicAckFacts>,
     /// The connection's session variables as the stream got them: what it changed of them
     /// goes back to the connection, and only that, as other streams may have set others.
     pub sess_vars_at_start: ibex_sample::VarStore,
@@ -502,15 +499,14 @@ pub fn ssl_fc<'a>(xprt: &'a ClientXprt, role: Option<&'a H2Role>) -> ibex_sample
     }
 }
 
-/// T569: the QUIC acknowledgement counts of an HTTP/3 stream ([`H2Child::quic_acks`]), `None`
-/// for any other session.
-#[must_use]
-#[inline]
-pub fn quic_acks(role: Option<&H2Role>) -> Option<ibex_sample::QuicAckFacts> {
-    match role {
-        Some(H2Role::Child(c)) => c.quic_acks,
-        _ => None,
-    }
+/// T569/T587: where an HTTP/3 stream finds how its QUIC peer acknowledges: the listener and
+/// connection to ask again (a response rule sees the packets sent meanwhile), and the counts as
+/// last read (`ibex_fc_quic_ack_*`). `None` on a session that is not an HTTP/3 stream.
+#[derive(Clone, Copy, Debug)]
+pub struct QuicAckSrc {
+    pub listener: u32,
+    pub conn: ibex_quic::ConnHandle,
+    pub facts: Option<ibex_sample::QuicAckFacts>,
 }
 
 /// A backend connection's `conn->err_code` (`CO_ER_*`, numbered as in
@@ -908,6 +904,8 @@ pub struct TcpSession {
     /// request, over TLS, logged as `HTTP/3.0` with the URI `HAProxy` builds from
     /// `:scheme` and `:authority`.
     pub h3: bool,
+    /// T587: the QUIC connection of an HTTP/3 stream, for the `ibex_fc_quic_ack_*` fetches.
+    pub quic_ack: Option<QuicAckSrc>,
 }
 
 /// The HTTP/2 stream a session is serving: its id, how much of its request body has been
@@ -1217,7 +1215,6 @@ impl TcpSession {
             rst: None,
             goaway: None,
             tls,
-            quic_acks: None,
             sess_vars_at_start: {
                 let mut v = ibex_sample::VarStore::new();
                 v.copy_scope_from(&owner.vars, ibex_sample::VarScope::Sess);
@@ -1468,6 +1465,7 @@ impl TcpSession {
             keep_request_line: false,
             accept_unsafe_request: false,
             h3: false,
+            quic_ack: None,
         };
         s.arm_client(now);
         s
