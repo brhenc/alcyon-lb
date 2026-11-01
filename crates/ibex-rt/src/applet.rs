@@ -186,7 +186,7 @@ impl CliLevel {
         let is = |p: &str| cmd == p || cmd.starts_with(&format!("{p} "));
         for p in [
             "show info", "show stat", "show servers state", "show table", "show pools", "show version",
-            "show cli", "show resolvers", "show events", "show servers conn", "help", "prompt", "quit",
+            "show cli", "show resolvers", "show schema json", "show events", "show servers conn", "help", "prompt", "quit",
             "set severity-output", "set timeout", "user",
             // Checked by its handler: without `expert-mode on`, which only an admin can
             // set, it answers "restricted to expert mode only" whatever the level.
@@ -729,6 +729,9 @@ impl CliApplet {
             } else {
                 self.is_done = true;
             }
+        } else if cmd == "show schema json" || cmd.starts_with("show schema json ") {
+            // The schema of `show stat json` / `show info json`, as the stats page's `;json-schema`.
+            self.finish_msg(include_str!("stats_json_schema.json").trim_end_matches('\n'));
         } else if cmd == "show stat" || cmd.starts_with("show stat ") {
             self.handle_show_stat(cmd, ctx);
         } else if cmd == "show table" || cmd.starts_with("show table ") {
@@ -2081,6 +2084,7 @@ impl CliApplet {
                       show info                                  : Dump system statistics\n\
                       show pools                                 : Report information about the memory pools usage\n\
                       show quic [help|<format>] [<filter>]       : Dump information about QUIC connections\n\
+                      show schema json                        : report schema used for stats\n\
                       show sess [help|<id>|all] [opts...]     : report the list of current streams or dump this exact stream\n\
                       show stat [<iid> <type> <sid>]             : Dump CSV proxies and servers statistics\n\
                       show table [<name>]                        : Dump stick table contents\n\

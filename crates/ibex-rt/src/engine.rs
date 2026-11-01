@@ -1851,6 +1851,8 @@ pub struct Proxy {
     pub addr: SocketAddr,
     pub mode: Mode,
     pub balance: BalanceAlgorithm,
+    /// A `balance` line was given; `show stat`'s `algo` is `unknown` without one.
+    pub balance_set: bool,
     pub timeouts: Timeouts,
     pub retries: u16,
     pub redisp: bool,
@@ -4421,6 +4423,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         addr: listen.addr,
         mode: listen.mode,
         balance: listen.balance,
+        balance_set: listen.balance_set,
         timeouts,
         retries,
         redisp: listen.redisp,
@@ -4569,6 +4572,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         )),
         mode: fe.mode,
         balance: BalanceAlgorithm::RoundRobin,
+        balance_set: false,
         timeouts,
         retries: 3,
         redisp: false,
@@ -4721,6 +4725,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0),
         mode: be.mode,
         balance: be.balance,
+        balance_set: be.balance_set,
         timeouts,
         retries,
         redisp: be.redisp,
@@ -12862,6 +12867,13 @@ impl EngineDispatcher<'_> {
         if req_uri.contains(";json") {
             let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Json, proxies[serving].stats_config.show_legends));
             stats_stream_page(entry, proxies, checks, pid, serving, "application/json", &refresh, page);
+            return None;
+        }
+
+        // `;typed` (`stats-html.c`): the CLI's `show stat typed` rows; after `;json`, before `;csv`.
+        if req_uri.contains(";typed") {
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Typed, proxies[serving].stats_config.show_legends));
+            stats_stream_page(entry, proxies, checks, pid, serving, "text/plain", &refresh, page);
             return None;
         }
 

@@ -491,3 +491,4 @@ mod zero_on_free;
 mod memory_prealloc;
 mod connection_flags;
 mod stats_json_page;
+mod stats_typed_page;
