@@ -206,3 +206,67 @@ fn a_connection_deferred_across_a_soft_stop_is_accepted_and_pinned() {
     assert_eq!((connected, refused), (N, 0), "connected, refused of {N} read before the stop");
     assert_eq!(server.pinned_borrowed_fds().len(), N, "each is pinned");
 }
+
+/// quinn refuses the deferred accept of a client whose ClientHello offers no protocol the
+/// bind speaks (`h2` to an `alpn h3` bind: rustls's `no_application_protocol`): its client
+/// gets the CONNECTION_CLOSE quinn writes, not silence, and the connection is no longer half
+/// open. With `retry-threshold 1`, a next client is answered by its server Initial, not a
+/// Retry.
+#[test]
+fn a_refused_deferred_accept_closes_its_client_and_is_no_longer_half_open() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let crt = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem"));
+    let (certs, key) = ibex_tls::config::load_cert_file(crt).expect("cert");
+    let tls = ibex_tls::tcp::BindTls::single_tls13(certs, key, vec![b"h3".to_vec()]).expect("tls");
+    let qc = ibex_quic::QuicConfig::new().with_retry_threshold(1);
+    let mut server = ibex_rt::quic_listener::QuicListener::bind("127.0.0.1:0".parse().expect("addr"), &tls, Some(qc)).expect("bind");
+    server.set_frontend(0);
+
+    let mut ctls = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(Any)).with_no_client_auth();
+    ctls.alpn_protocols = vec![b"h2".to_vec()];
+    let cfg = ClientConfig::new(Arc::new(QuicClientConfig::try_from(ctls).expect("client config")));
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+    sock.set_nonblocking(true).expect("nonblocking");
+    let mut ep = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+    let (_, mut conn) = ep.connect(Instant::now(), cfg, server.addr(), "localhost").expect("connect");
+    let mut out = Vec::new();
+    while let Some(t) = conn.poll_transmit(Instant::now(), 1, &mut out) {
+        sock.send_to(&out[..t.size], server.addr()).expect("send");
+        out.clear();
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    server.pump(Instant::now()).expect("pump");
+    std::thread::sleep(Duration::from_millis(20));
+
+    let mut buf = vec![0u8; 65536];
+    let mut got = 0;
+    while let Ok((n, from)) = sock.recv_from(&mut buf) {
+        got += 1;
+        let mut resp = Vec::new();
+        if let Some(ibex_quic::quinn_proto::DatagramEvent::ConnectionEvent(_, e)) = ep.handle(Instant::now(), from, None, None, buf[..n].into(), &mut resp) {
+            conn.handle_event(e);
+        }
+    }
+    assert!(got > 0, "the refused client heard nothing");
+    let mut lost = None;
+    while let Some(ev) = conn.poll() {
+        if let ibex_quic::quinn_proto::Event::ConnectionLost { reason } = ev {
+            lost = Some(reason);
+        }
+    }
+    assert!(
+        matches!(lost, Some(ibex_quic::quinn_proto::ConnectionError::ConnectionClosed(_))),
+        "the client was closed by the server: {lost:?}"
+    );
+
+    // Half open again, the next client would get a Retry.
+    let next = clients(1, server.addr());
+    let (nsock, initial, _, _) = &next[0];
+    nsock.send_to(initial, server.addr()).expect("send");
+    std::thread::sleep(Duration::from_millis(20));
+    server.pump(Instant::now()).expect("pump");
+    std::thread::sleep(Duration::from_millis(20));
+    let n = nsock.recv(&mut buf).expect("an answer");
+    assert!(n > 0 && buf[0] & 0x80 != 0, "a long-header answer");
+    assert_eq!((buf[0] >> 4) & 3, 0, "an Initial, not a Retry (type 3): the refused one is not half open");
+}

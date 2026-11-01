@@ -413,7 +413,7 @@ impl QuicEndpoint {
                 segment_size: tx.segment_size,
                 ecn: tx.ecn.map(EcnCodepoint::from),
             },
-            data: self.response_buf.clone(),
+            data: std::mem::take(&mut self.response_buf),
         });
     }
 
@@ -475,9 +475,11 @@ impl QuicEndpoint {
                         segment_size: None,
                         ecn: None,
                     };
+                    // The buffer itself, not a copy of it: `response_buf` is cleared before
+                    // each use and grows again from empty.
                     self.pending_transmits.push_back(TransmitEntry {
                         transmit: tx,
-                        data: self.response_buf.clone(),
+                        data: std::mem::take(&mut self.response_buf),
                     });
                 }
                 DatagramOutcome::Ignored
