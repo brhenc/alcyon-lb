@@ -598,3 +598,23 @@ fn response_trailers_from_an_h2_server_reach_the_h3_client() {
         assert!((r.fin, r.reset, r.lost.as_deref()) == (true, None, None), "{r:?}");
     });
 }
+
+/// T559 (VV-28): trailers after a content-length body (nghttpd `--trailer` keeps its
+/// `content-length`) reach an h3 client as a trailing HEADERS frame with the FIN, as for h2.
+#[test]
+fn trailers_after_a_content_length_body_reach_the_h3_client() {
+    if !crate::server_h2::have_nghttpd() {
+        return;
+    }
+    mux(|| {
+        let srv = crate::server_h2::nghttpd(false, &["--trailer=grpc-status: 0"]);
+        let ibex = ibex_srv(srv.addr, "", "proto h2");
+        let mut cl = Client::connect(ibex.quic);
+        let id = cl.open(&request(b"GET", b"/index.html", &[]), true);
+        let r = cl.response(id, WAIT);
+        let shape = r.shape();
+        assert!(shape.first().is_some_and(|h| h.starts_with("H :status: 200")), "{r:?}");
+        assert_eq!(shape.last().map(String::as_str), Some("H grpc-status: 0"), "the trailing HEADERS frame: {r:?}");
+        assert!((r.fin, r.reset, r.lost.as_deref()) == (true, None, None), "{r:?}");
+    });
+}

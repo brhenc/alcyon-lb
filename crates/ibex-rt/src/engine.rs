@@ -93,6 +93,9 @@ pub struct IdleKey {
 pub struct IdleConn {
     pub fd: OwnedFd,
     pub xprt: crate::xprt::ServerXprt,
+    /// Its local address (`%bi`/`%bp`), read when it was opened: the stream that takes it
+    /// again has it without a `getsockname` (T550 Q8).
+    pub src: Option<SocketAddr>,
 }
 
 impl IdleConn {
@@ -754,7 +757,7 @@ mod shared_pool_tests {
         let (a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
         // Non-blocking, as every server socket is: an event's read must not wait.
         a.set_nonblocking(true).expect("nonblocking");
-        (IdleConn { fd: OwnedFd::from(a), xprt: crate::xprt::ServerXprt::Plain }, b)
+        (IdleConn { fd: OwnedFd::from(a), xprt: crate::xprt::ServerXprt::Plain, src: None }, b)
     }
 
     fn key() -> IdleKey {
@@ -1054,7 +1057,7 @@ mod pool_tests {
     use super::*;
 
     fn conn() -> IdleConn {
-        IdleConn { fd: OwnedFd::from(std::fs::File::open("/dev/null").expect("open")), xprt: crate::xprt::ServerXprt::Plain }
+        IdleConn { fd: OwnedFd::from(std::fs::File::open("/dev/null").expect("open")), xprt: crate::xprt::ServerXprt::Plain, src: None }
     }
 
     fn key() -> IdleKey {
@@ -1107,7 +1110,7 @@ mod pool_tests {
         let mut pool = WorkerPool::default();
         // A socket pair: the idle connection must look alive to be taken.
         let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
-        let c = IdleConn { fd: OwnedFd::from(a), xprt: crate::xprt::ServerXprt::Plain };
+        let c = IdleConn { fd: OwnedFd::from(a), xprt: crate::xprt::ServerXprt::Plain, src: None };
         assert!(pool.keep(key(), c, false, CFG, 3, t0).is_ok());
         assert!(pool.take(&key(), false, ibex_config::HttpReuse::Safe).is_some());
         pool.purge(t0 + Duration::from_millis(500), |_| 0);
@@ -5637,8 +5640,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// # Errors
     /// Returns an error if polling epoll fails.
     pub fn run_once(&mut self) -> io::Result<usize> {
-        let now = self.current_tick();
-        self.step(now)
+        let at = Instant::now();
+        self.step_at(self.tick_at(at), at)
     }
 
     /// Registers any backend socket a QUIC listener has opened since the last pass.
@@ -5911,6 +5914,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     }
 
     pub fn step(&mut self, now: Tick) -> io::Result<usize> {
+        self.step_at(now, Instant::now())
+    }
+
+    /// [`Self::step`] with the clock already read: `now_inst` is the instant `now` was taken
+    /// from, what the deadlines before the poller are measured against.
+    fn step_at(&mut self, now: Tick, now_inst: Instant) -> io::Result<usize> {
         self.now = now;
         crate::watchdog::progress();
         crate::watchdog::set_streams(self.sessions.live());
@@ -5947,10 +5956,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
         // A QUIC transport's next deadline can be sooner than the scheduler's. Waiting past
         // it would delay loss recovery; the shortest of the two wins.
-        let now_inst = Instant::now();
         let poll_timeout = self
             .quic_listeners
-            .iter()
+            .iter_mut()
             .filter_map(crate::quic_listener::QuicListener::poll_timeout)
             .fold(poll_timeout, |acc, deadline| {
                 acc.min(deadline.saturating_duration_since(now_inst))
@@ -6100,14 +6108,16 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // has expired. `poll_timeout` is asked rather than calling `handle_timeout` on each
         // wakeup, because a transport told the time has advanced when it has not will arm and
         // fire loss-recovery timers that are not due.
-        let inst = Instant::now();
+        // The pass's clock: read once after the poller, as everything since.
+        let inst = pass_start;
         for ql in &mut self.quic_listeners {
             let timer_due = ql.poll_timeout().is_some_and(|d| d <= inst);
             if timer_due {
                 ql.handle_timeout(inst);
             }
+            // Sent at the end of the pass, with what the owner sessions write (Q1).
             if ql.take_ready() || timer_due {
-                let _ = ql.pump(inst);
+                let _ = ql.serve(inst);
             }
         }
         self.admit_quic_connections();
@@ -6189,8 +6199,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         for (owner_idx, owner_task) in h2_spawn.drain(..) {
             self.spawn_h2_children(owner_idx, owner_task, &mut wake_queue);
         }
-        // What the owners of HTTP/3 connections wrote goes out now (T509). The clock is read
-        // only when one did: once per pass is a fifth of an h1 request's added cost otherwise.
+        // What the owners of HTTP/3 connections wrote goes out now (T509), with what the
+        // listener's own pass (`serve`) left to send: one send a pass (Q1). The clock is read
+        // only when there is one: once per pass is a fifth of an h1 request's added cost otherwise.
         for ql in &mut self.quic_listeners {
             if ql.take_dirty() {
                 let _ = ql.send_batch(Instant::now());
@@ -6775,8 +6786,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     break;
                 }
             }
-            let now = self.current_tick();
-            let ran = self.step(now)?;
+            // One clock read before the poller (`now` and the deadlines it waits for) and
+            // one after it (`pass_start`), as HAProxy's two `clock_update_date` (T550 Q2).
+            let at = Instant::now();
+            let ran = self.step_at(self.tick_at(at), at)?;
             quiet = ran == 0 && self.scheduler.run_queue_len() == 0;
         }
         Ok(())
@@ -8802,7 +8815,7 @@ fn release_server(
             // first response on: `HAProxy` keeps it in the server's available list (A.3 row 7,
             // 1 connection for 5 clients one after the other; T540).
             let safe = entry.srv_served >= 2 || xprt.is_h2();
-            if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt }, safe, cfg, used, Instant::now()) {
+            if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt, src: entry.sess.bc_src }, safe, cfg, used, crate::txnlog::loop_now()) {
                 // Closing its only descriptor takes it out of the epoll set.
                 fdtab.remove(sfd);
                 conn.close();
@@ -8907,7 +8920,7 @@ fn h2_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     }
     let before = (cs.rep.len(), t.rsp);
     let srv_gone = matches!(cs.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-    if crate::h2_bridge::forward_response(h2, ch.stream.id, t, &mut cs.rep, srv_gone) {
+    if crate::h2_bridge::forward_response(h2, ch.stream.id, t, &mut cs.rep, srv_gone, &mut ch.late_trailers) {
         cs.log.term = Some(*b"SD");
         moved = true;
     }
@@ -8979,7 +8992,7 @@ fn h3_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     }
     let before = (cs.rep.len(), t.rsp);
     let srv_gone = matches!(cs.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-    if crate::h2_bridge::forward_response_mux(mux, ch.stream.id, t, &mut cs.rep, srv_gone, &mut h3.body_scratch) {
+    if crate::h2_bridge::forward_response_mux(mux, ch.stream.id, t, &mut cs.rep, srv_gone, &mut h3.body_scratch, &mut ch.late_trailers) {
         cs.log.term = Some(*b"SD");
         moved = true;
     }
@@ -14092,10 +14105,10 @@ impl EngineDispatcher<'_> {
         }
 
         count_connect(proxies, be_idx, s_idx, reused.is_some());
-        if let Some((IdleConn { fd: srv_fd, xprt }, registered)) = reused {
+        if let Some((IdleConn { fd: srv_fd, xprt, src }, registered)) = reused {
             let sfd = srv_fd.as_raw_fd();
             entry.srv_raw_fd = Some(sfd);
-            entry.sess.attach_server_with_xprt(srv_fd, xprt, now);
+            entry.sess.attach_server_from(srv_fd, xprt, src, now);
             entry.sess.server_connected(now);
             if let Some(txn) = entry.sess.txn.as_mut() {
                 txn.srv_reused = true;

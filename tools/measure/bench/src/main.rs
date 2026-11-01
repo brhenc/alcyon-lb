@@ -17,17 +17,14 @@ fn run_backend(port: &str) {
             s.set_nodelay(true).ok();
             thread::spawn(move || {
                 let mut buf = [0u8; 4096];
+                let mut pending = Vec::new();
                 let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
                 while let Ok(n) = s.read(&mut buf) {
                     if n == 0 {
                         break;
                     }
-                    let reqs = buf[..n]
-                        .windows(4)
-                        .filter(|w| *w == b"\r\n\r\n")
-                        .count()
-                        .max(1);
-                    for _ in 0..reqs {
+                    pending.extend_from_slice(&buf[..n]);
+                    for _ in 0..complete_requests(&mut pending) {
                         if s.write_all(resp).is_err() {
                             return;
                         }
@@ -36,6 +33,30 @@ fn run_backend(port: &str) {
             });
         }
     }
+}
+
+/// Takes the complete requests (head and `content-length` body) off the front of `pending` and
+/// returns how many there were; a partial one stays for the next read (T555: a body in a read
+/// of its own was answered as a request).
+fn complete_requests(pending: &mut Vec<u8>) -> usize {
+    let mut n = 0;
+    while let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+        let head = &pending[..end];
+        let len = head
+            .split(|&b| b == b'\n')
+            .find_map(|l| {
+                let l = std::str::from_utf8(l).ok()?.trim();
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok()).flatten()
+            })
+            .unwrap_or(0);
+        if pending.len() < end + 4 + len {
+            break;
+        }
+        pending.drain(..end + 4 + len);
+        n += 1;
+    }
+    n
 }
 
 fn run_client(addr: &str, conns: usize, duration_secs: u64) {

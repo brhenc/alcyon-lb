@@ -147,7 +147,7 @@ impl QuicListener {
 
     /// Returns the next earliest timer expiry instant.
     #[must_use]
-    pub fn poll_timeout(&self) -> Option<Instant> {
+    pub fn poll_timeout(&mut self) -> Option<Instant> {
         self.endpoint.poll_timeout()
     }
 

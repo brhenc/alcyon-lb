@@ -138,7 +138,6 @@ fn h3_requests_across_reloads_are_all_served() {
 /// or the kernel gives it the route's source (127.0.0.1), the client's datagrams do not
 /// match it, and they go to the listening socket, which the old process no longer reads.
 #[test]
-#[ignore = "needs T552 (VV-27): on main a wildcard QUIC bind answers 127.0.0.2 from 127.0.0.1 and serves nothing"]
 fn h3_requests_across_reloads_on_a_wildcard_bind_are_all_served() {
     across_reloads(true);
 }

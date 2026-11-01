@@ -368,7 +368,7 @@ pub struct H3Owner {
     pub mux: ibex_alloc::PoolBox<ibex_proto::mux_h3::H3MuxContext>,
     /// The index of the QUIC listener in the engine's list.
     pub listener: u32,
-    pub conn: ibex_quic::ConnectionId,
+    pub conn: ibex_quic::ConnHandle,
     /// A response's DATA staged on its way to the mux, kept from one response to the next.
     pub body_scratch: Vec<u8>,
     /// Since when no stream is served (`qcc->idle_start`): the connection's start, then each
@@ -443,6 +443,10 @@ pub struct H2Child {
     /// The owner's entry and task; `None` once the owner is gone.
     pub owner: Option<(u32, ibex_sched::TaskRef)>,
     pub stream: H2ActiveStream,
+    /// Trailers an h2 server sent after a content-length body: sent to this h2 or h3 client
+    /// with the end of the stream (T559; an h1 client never has them). Here and not in the
+    /// transaction: the session entry stays small.
+    pub late_trailers: Option<ibex_alloc::PoolBox<Vec<u8>>>,
     /// The client (or the mux) reset the stream.
     pub reset: bool,
     /// The transaction ended through `end_txn` and the connection goes on: the entry is
@@ -1146,7 +1150,7 @@ impl TcpSession {
         c.server_addr = owner.server_addr;
         c.fc_src = owner.fc_src;
         c.fc_dst = owner.fc_dst;
-        c.created_at = Instant::now();
+        c.created_at = crate::txnlog::loop_now();
         c.bufsize = owner.bufsize;
         c.maxrewrite = owner.maxrewrite;
         // The `tcp-request content` rules the owner armed for the next request run on this
@@ -1176,6 +1180,7 @@ impl TcpSession {
         let role = H2Role::Child(H2Child {
             owner: Some(owner_ref),
             stream,
+            late_trailers: None,
             reset: false,
             finished: false,
             conn_end: None,
@@ -1402,7 +1407,7 @@ impl TcpSession {
             cli_cant_recv: false,
             passes_ran_out: false,
             cli_failed: false,
-            created_at: Instant::now(),
+            created_at: crate::txnlog::loop_now(),
             bufsize: crate::buf::get_bufsize(),
             maxrewrite: 1024,
             pending_resp: None,
@@ -1733,8 +1738,15 @@ impl TcpSession {
 
     /// Attaches a server-side connection with a specific transport (`ServerXprt`).
     pub fn attach_server_with_xprt(&mut self, fd: OwnedFd, xprt: ServerXprt, now: Tick) {
+        let src = crate::raw::local_addr(std::os::fd::AsFd::as_fd(&fd));
+        self.attach_server_from(fd, xprt, src, now);
+    }
+
+    /// [`Self::attach_server_with_xprt`] for a connection whose local address `src` is known
+    /// already: one taken from the idle pool, which kept it (T550 Q8).
+    pub fn attach_server_from(&mut self, fd: OwnedFd, xprt: ServerXprt, src: Option<std::net::SocketAddr>, now: Tick) {
         self.log.queue.get_or_insert_with(crate::txnlog::loop_now);
-        self.bc_src = crate::raw::local_addr(std::os::fd::AsFd::as_fd(&fd));
+        self.bc_src = src;
         self.srv = Some(fd);
         self.srv_xprt = xprt;
         self.srv_cant_recv = false;
@@ -3343,6 +3355,11 @@ impl TcpSession {
                     self.dechunk_rep(self.rep.len() - n);
                     self.rewrite_rep_chunk_framing();
                     self.log.bytes_from_server += n as u64;
+                    // Trailers after a content-length body (T559): the codec has them when
+                    // the body's last byte came; `h2_bridge` sends them to an h2/h3 client.
+                    if let (Some(late), Some(H2Role::Child(ch))) = (self.srv_xprt.take_late_trailers(), self.h2_role.as_deref_mut()) {
+                        ch.late_trailers = Some(late);
+                    }
                     changed = true;
                 }
                 Io::Done(_) | Io::WouldBlock => {}

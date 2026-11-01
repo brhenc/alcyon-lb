@@ -623,3 +623,62 @@ fn a_listener_without_a_frontend_refuses_to_run() {
     let err = server.pump(Instant::now()).expect_err("no frontend");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
+
+/// Q1: a gated connection that the client closes before the engine has counted it
+/// (`take_handshaken`) leaves the list unseen: it is in no count, and not reported closed,
+/// since it was never counted. A connection that stays is listed once.
+#[test]
+fn a_connection_closed_before_the_engine_counts_it_is_in_no_count() {
+    let gated = |s: &mut QuicListener| {
+        s.set_frontend(0);
+        s.gate_connections();
+    };
+    // The server completes its side once the client's Finished arrives: a few rounds.
+    let mut kept = Rig::with(gated);
+    for _ in 0..10 {
+        kept.step();
+    }
+    assert_eq!(kept.server.take_handshaken().len(), 1, "a handshaken connection is listed");
+    // Its read guard of `FDS` goes before the next rig takes one: a writer waiting between
+    // the two would deadlock them.
+    drop(kept);
+
+    let mut rig = Rig::with(gated);
+    for _ in 0..10 {
+        rig.step();
+    }
+    rig.conn.close(Instant::now(), VarInt::from_u32(0x100), Vec::new().into());
+    assert!(rig.run_until(|r| ibex_quic::QuicTransport::connection_count(r.server.transport()) == 0), "the server kept the connection");
+    assert!(rig.server.take_handshaken().is_empty(), "a closed connection was left to count");
+    assert!(rig.server.take_closed().is_empty(), "an uncounted connection was reported closed");
+    assert!(!rig.server.has_waiting());
+}
+
+/// A client that stops a response written in full but not yet acknowledged (`STOP_SENDING`
+/// before its ACK) ends that stream only: the listener owes it nothing more (a soft stop
+/// would not wait for it), and the connection serves the next request.
+#[test]
+fn a_response_stopped_before_its_ack_ends_and_the_next_request_is_served() {
+    let mut rig = Rig::new();
+    let id = rig.open(&headers(&[("content-length", "0")]), true);
+    let mut eng = rig.accept();
+    engine_read(&mut eng, &mut rig, b"\r\n\r\n");
+    eng.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").expect("answer");
+    // The server alone: it reads the answer and writes it whole to the stream; the client has
+    // not read it (nor acknowledged it) when it asks the server to stop sending.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(1));
+        rig.server.pump(Instant::now()).expect("pump");
+    }
+    rig.conn.recv_stream(id).stop(VarInt::from_u32(0x10c)).expect("stop");
+    assert!(engine_sees_eof(&mut eng, &mut rig), "the relay let the stream go");
+
+    let id = rig.open(&headers(&[("content-length", "0")]), true);
+    let mut eng = rig.accept();
+    engine_read(&mut eng, &mut rig, b"\r\n\r\n");
+    eng.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").expect("answer");
+    let resp = rig.response(id);
+    assert_eq!(status(&resp), 200);
+    assert_eq!(frame_payload(&resp, 1), b"ok");
+    assert!(!rig.lost, "the connection was closed");
+}

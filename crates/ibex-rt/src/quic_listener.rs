@@ -9,7 +9,7 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use crate::dgram::{DgramBuf, DgramOut, DgramSocket};
 use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
@@ -17,7 +17,7 @@ use std::os::fd::{AsFd, AsRawFd as _, OwnedFd};
 use ibex_proto::h3::H3Error;
 use ibex_proto::mux_h3;
 use ibex_quic::{
-    ConnectionId, QuicConfig, QuicEndpoint, QuicTransport, StreamDirection, StreamId,
+    ConnHandle, QuicConfig, QuicEndpoint, QuicTransport, StreamDirection, StreamId,
     TransportEvent,
 };
 
@@ -105,7 +105,10 @@ pub struct QuicListener {
     recv_raw_bufs: Vec<Vec<u8>>,
     recv_cmsg_bufs: Vec<Vec<u8>>,
     send_raw_bufs: Vec<Vec<u8>>,
-    h3: HashMap<ConnectionId, H3State>,
+    /// Each connection's state, in the slot of its handle's index (Q1, design
+    /// `quic-transport-2026-11-01.md` §5 (i)): no hashing on the request path. A slot whose
+    /// handle has another generation belongs to a connection that is gone.
+    conns: Vec<Option<ConnSlot>>,
     /// Set by the engine: each request is handed to the frontend's stream engine.
     frontend: Option<usize>,
     /// Request streams handed to the engine, one per socket pair.
@@ -114,15 +117,13 @@ pub struct QuicListener {
     accepted: Vec<AcceptedStream>,
     /// HTTP/3 bytes the stream has not taken yet, and whether the stream ends after them.
     /// Flow control may take a response a part at a time.
-    outq: HashMap<(ConnectionId, StreamId), OutQ>,
+    outq: HashMap<(ConnHandle, StreamId), OutQ>,
     /// Read buffer of `pump`, kept between passes.
     scratch: Vec<u8>,
     /// Set by a soft stop: no new connection, and a connection is closed once it is idle.
     stopping: bool,
     /// The listening socket is the next process's now (handed over, T558): not read.
     deaf: bool,
-    /// Where each live connection's peer is, so a soft stop can pin its datagrams here.
-    peers: HashMap<ConnectionId, SocketAddr>,
     /// Soft stop only: one connected UDP socket per peer still being served. See
     /// [`QuicListener::begin_soft_stop`].
     pinned: Vec<(SocketAddr, DgramSocket)>,
@@ -135,34 +136,65 @@ pub struct QuicListener {
     /// at once.
     gated: bool,
     /// Connections whose handshake completed since the engine last counted them.
-    handshaken: Vec<ConnectionId>,
+    handshaken: Vec<ConnHandle>,
     /// Counted by the engine, held by `maxconn` until it admits them, oldest first.
-    waiting: VecDeque<ConnectionId>,
-    /// `handshaken` and `waiting`: connections not served yet.
-    pending: HashSet<ConnectionId>,
-    /// Connections admitted as sessions.
-    admitted: HashSet<ConnectionId>,
-    /// Stream events of a connection that was not admitted yet, replayed when it is.
-    held: HashMap<ConnectionId, Vec<(StreamId, bool)>>,
+    waiting: VecDeque<ConnHandle>,
     /// Connections that ended since the engine last looked, and whether each was admitted.
-    closed: Vec<(ConnectionId, bool)>,
+    closed: Vec<(ConnHandle, bool)>,
     /// `tune.ibex.h3-path mux` (T509): an admitted connection is served by an owner session
     /// of the engine through the h3 mux, not by the relay.
     mux: bool,
     /// `tune.quic.fe.stream.max-total` (T525): the request streams one connection carries
     /// before it is closed; 0 is no limit.
     stream_max_total: u32,
-    /// Request streams done (their response acknowledged) per connection, kept only when
-    /// `stream_max_total` is set.
-    streams_done: HashMap<ConnectionId, u32>,
-    /// The connections owner sessions serve, by connection.
-    owned: HashMap<ConnectionId, OwnedConn>,
     /// Connections admitted since the engine last took them, each to get its owner.
-    new_owned: Vec<ConnectionId>,
+    new_owned: Vec<ConnHandle>,
     /// Owners with transport news since the engine last woke them.
     wake: Vec<ibex_sched::TaskRef>,
     /// An owner wrote to the transport since the last `send_batch`.
     dirty: bool,
+}
+
+/// What the listener keeps of one connection (Q1: the maps by connection ID it replaces).
+struct ConnSlot {
+    conn: ConnHandle,
+    /// Where its peer is, so a soft stop can pin its datagrams here.
+    peer: Option<SocketAddr>,
+    /// The relay path's HTTP/3 state.
+    h3: Option<H3State>,
+    /// Handshaken or waiting: not served yet.
+    pending: bool,
+    /// Admitted as a session.
+    admitted: bool,
+    /// Stream events while it was not admitted yet, replayed when it is.
+    held: Vec<(StreamId, bool)>,
+    /// Request streams done (their response acknowledged), counted only when
+    /// `stream_max_total` is set.
+    streams_done: u32,
+    /// Served by an owner session.
+    owned: Option<OwnedConn>,
+}
+
+impl ConnSlot {
+    const fn new(conn: ConnHandle) -> Self {
+        Self { conn, peer: None, h3: None, pending: false, admitted: false, held: Vec::new(), streams_done: 0, owned: None }
+    }
+}
+
+/// The slot of `conn`, if it is that connection's.
+fn slot_of(conns: &mut [Option<ConnSlot>], conn: ConnHandle) -> Option<&mut ConnSlot> {
+    conns.get_mut(conn.index())?.as_mut().filter(|s| s.conn == conn)
+}
+
+/// The relay path's HTTP/3 state of `conn`, made if it has none; `None` once the connection
+/// is gone (its slot is made at `NewConnection` only).
+fn h3_of(conns: &mut [Option<ConnSlot>], conn: ConnHandle) -> Option<&mut H3State> {
+    Some(slot_of(conns, conn)?.h3.get_or_insert_with(H3State::default))
+}
+
+/// The owned state of `conn`, if an owner session serves it.
+fn owned_of(conns: &mut [Option<ConnSlot>], conn: ConnHandle) -> Option<&mut OwnedConn> {
+    slot_of(conns, conn)?.owned.as_mut()
 }
 
 /// A connection an owner session serves (T509): what the transport said of it since the
@@ -197,7 +229,7 @@ pub enum OwnerConn {
 struct Relay {
     /// Our end of the socket pair.
     fd: OwnedFd,
-    conn_id: ConnectionId,
+    conn: ConnHandle,
     stream_id: StreamId,
     /// Frames from the client not yet converted.
     rx: Vec<u8>,
@@ -316,7 +348,7 @@ impl QuicListener {
             recv_raw_bufs,
             recv_cmsg_bufs,
             send_raw_bufs,
-            h3: HashMap::new(),
+            conns: Vec::new(),
             frontend: None,
             relays: Vec::new(),
             accepted: Vec::new(),
@@ -324,20 +356,14 @@ impl QuicListener {
             scratch: Vec::new(),
             stopping: false,
             deaf: false,
-            peers: HashMap::new(),
             pinned: Vec::new(),
             released: Vec::new(),
             gated: false,
             handshaken: Vec::new(),
             waiting: VecDeque::new(),
-            pending: HashSet::new(),
-            admitted: HashSet::new(),
-            held: HashMap::new(),
             closed: Vec::new(),
             mux: false,
             stream_max_total: 0,
-            streams_done: HashMap::new(),
-            owned: HashMap::new(),
             new_owned: Vec::new(),
             wake: Vec::new(),
             dirty: false,
@@ -359,14 +385,14 @@ impl QuicListener {
 
     /// Connections admitted since the last call, each for the engine to give an owner
     /// session ([`QuicListener::set_owner`]).
-    pub fn take_new_owned(&mut self) -> Vec<ConnectionId> {
+    pub fn take_new_owned(&mut self) -> Vec<ConnHandle> {
         std::mem::take(&mut self.new_owned)
     }
 
     /// The owner session of `conn_id` is entry `idx`, task `task`: it is woken with the
     /// transport's news of the connection.
-    pub fn set_owner(&mut self, conn_id: ConnectionId, idx: u32, task: ibex_sched::TaskRef) {
-        if let Some(oc) = self.owned.get_mut(&conn_id) {
+    pub fn set_owner(&mut self, conn: ConnHandle, idx: u32, task: ibex_sched::TaskRef) {
+        if let Some(oc) = owned_of(&mut self.conns, conn) {
             oc.owner = Some((idx, task));
             if !oc.read.is_empty() || oc.closed {
                 self.wake.push(task);
@@ -403,15 +429,15 @@ impl QuicListener {
 
     /// The peer of a connection, or the listener's own address.
     #[must_use]
-    pub fn peer_of(&self, conn_id: ConnectionId) -> SocketAddr {
-        self.peers.get(&conn_id).copied().unwrap_or(self.addr)
+    pub fn peer_of(&self, conn: ConnHandle) -> SocketAddr {
+        self.conns.get(conn.index()).and_then(Option::as_ref).filter(|s| s.conn == conn).and_then(|s| s.peer).unwrap_or(self.addr)
     }
 
     /// The owner of `conn_id` reads what the client sent into its mux (T509): `STOP_SENDING`s,
     /// then each stream with news, as far as the mux has room for it (§2.3: the client's
     /// window holds the rest back). Our control stream is opened on the first pass.
-    pub fn owner_recv(&mut self, conn_id: ConnectionId, mux: &mut mux_h3::H3MuxContext, now: u64) -> OwnerConn {
-        let Some(oc) = self.owned.get_mut(&conn_id) else { return OwnerConn::Closed };
+    pub fn owner_recv(&mut self, conn_id: ConnHandle, mux: &mut mux_h3::H3MuxContext, now: u64) -> OwnerConn {
+        let Some(oc) = owned_of(&mut self.conns, conn_id) else { return OwnerConn::Closed };
         if oc.closed {
             return OwnerConn::Closed;
         }
@@ -466,8 +492,8 @@ impl QuicListener {
     /// connection error as the close, then each stream's bytes and FIN round robin, as
     /// much as quinn takes. A stream whose FIN went out and that `done` says no child serves
     /// any more is let go.
-    pub fn owner_send(&mut self, conn_id: ConnectionId, mux: &mut mux_h3::H3MuxContext, done: impl Fn(u64) -> bool) {
-        if !self.owned.contains_key(&conn_id) {
+    pub fn owner_send(&mut self, conn_id: ConnHandle, mux: &mut mux_h3::H3MuxContext, done: impl Fn(u64) -> bool) {
+        if owned_of(&mut self.conns, conn_id).is_none() {
             return;
         }
         self.dirty = true;
@@ -490,7 +516,7 @@ impl QuicListener {
             mux.tx_written(id, n);
             if mux.fin_due(id) {
                 if self.endpoint.finish_stream(conn_id, StreamId(id)).is_ok() {
-                    if let Some(oc) = self.owned.get_mut(&conn_id) {
+                    if let Some(oc) = owned_of(&mut self.conns, conn_id) {
                         oc.unacked.push(id);
                     }
                 }
@@ -506,8 +532,13 @@ impl QuicListener {
 
     /// Whether a FIN written on connection `conn_id` waits for its acknowledgement.
     #[must_use]
-    pub fn owner_unacked(&self, conn_id: ConnectionId) -> bool {
-        self.owned.get(&conn_id).is_some_and(|oc| !oc.unacked.is_empty())
+    pub fn owner_unacked(&self, conn_id: ConnHandle) -> bool {
+        self.conns
+            .get(conn_id.index())
+            .and_then(Option::as_ref)
+            .filter(|s| s.conn == conn_id)
+            .and_then(|s| s.owned.as_ref())
+            .is_some_and(|oc| !oc.unacked.is_empty())
     }
 
     /// Stream `id` of an owned connection needs no acknowledgement any more (its FIN was, or
@@ -519,16 +550,20 @@ impl QuicListener {
     }
 
     /// Closes connection `conn_id`, its owner gone or ending it (`H3_NO_ERROR`).
-    pub fn owner_close(&mut self, conn_id: ConnectionId) {
-        if self.owned.remove(&conn_id).is_some_and(|oc| !oc.closed) {
+    pub fn owner_close(&mut self, conn_id: ConnHandle) {
+        let Some(oc) = slot_of(&mut self.conns, conn_id).and_then(|s| s.owned.take()) else { return };
+        if oc.closed {
+            // The connection had ended: its slot was kept for the owner only.
+            self.conns[conn_id.index()] = None;
+        } else {
             self.endpoint.close_connection(conn_id, H3_NO_ERROR, b"");
             self.dirty = true;
         }
     }
 
     /// Records transport news of an owned connection for its owner, and wakes it.
-    fn owned_news(&mut self, conn_id: ConnectionId, read: Option<u64>, stopped: Option<(u64, u64)>) -> bool {
-        let Some(oc) = self.owned.get_mut(&conn_id) else { return false };
+    fn owned_news(&mut self, conn_id: ConnHandle, read: Option<u64>, stopped: Option<(u64, u64)>) -> bool {
+        let Some(oc) = owned_of(&mut self.conns, conn_id) else { return false };
         if let Some(id) = read.filter(|id| !oc.read.contains(id)) {
             oc.read.push(id);
         }
@@ -558,7 +593,7 @@ impl QuicListener {
     #[doc(hidden)]
     #[must_use]
     pub fn pending_request_bytes(&self) -> usize {
-        self.h3.values().flat_map(|st| st.req.values()).map(Vec::len).sum()
+        self.conns.iter().flatten().filter_map(|c| c.h3.as_ref()).flat_map(|st| st.req.values()).map(Vec::len).sum()
     }
 
     /// The connections for `show quic` (T524), read-only. The local address is the listener's
@@ -588,7 +623,7 @@ impl QuicListener {
 
     /// Connections that completed their handshake since the last call, now waiting for
     /// admission, for the engine to count (or [`QuicListener::refuse`]).
-    pub fn take_handshaken(&mut self) -> Vec<ConnectionId> {
+    pub fn take_handshaken(&mut self) -> Vec<ConnHandle> {
         let new = std::mem::take(&mut self.handshaken);
         self.waiting.extend(new.iter().copied());
         new
@@ -596,9 +631,11 @@ impl QuicListener {
 
     /// Closes a connection the engine will not count (`global maxconn` is reached, as
     /// `HAProxy`'s listener refuses it).
-    pub fn refuse(&mut self, conn_id: ConnectionId) {
-        self.pending.remove(&conn_id);
-        self.held.remove(&conn_id);
+    pub fn refuse(&mut self, conn_id: ConnHandle) {
+        if let Some(slot) = slot_of(&mut self.conns, conn_id) {
+            slot.pending = false;
+            slot.held = Vec::new();
+        }
         self.waiting.retain(|c| *c != conn_id);
         self.endpoint.close_connection(conn_id, H3_NO_ERROR, b"");
     }
@@ -613,33 +650,37 @@ impl QuicListener {
     /// while it waited.
     pub fn admit_next(&mut self) {
         let Some(conn_id) = self.waiting.pop_front() else { return };
-        self.pending.remove(&conn_id);
-        self.admitted.insert(conn_id);
+        // A connection that ended while it waited left `waiting` then.
+        let Some(slot) = slot_of(&mut self.conns, conn_id) else { return };
+        slot.pending = false;
+        slot.admitted = true;
+        let held = std::mem::take(&mut slot.held);
         if self.mux {
             // Its owner reads the streams it opened while it waited (T509).
             let mut oc = OwnedConn::default();
-            for (stream_id, _) in self.held.remove(&conn_id).unwrap_or_default() {
+            for (stream_id, _) in held {
                 if !oc.read.contains(&stream_id.0) {
                     oc.read.push(stream_id.0);
                 }
             }
-            self.owned.insert(conn_id, oc);
+            slot.owned = Some(oc);
             self.new_owned.push(conn_id);
             return;
         }
         self.open_control_stream(conn_id);
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.resize(64 * 1024, 0);
-        for (stream_id, opened) in self.held.remove(&conn_id).unwrap_or_default() {
+        for (stream_id, opened) in held {
             self.stream_event(conn_id, stream_id, opened, &mut scratch);
         }
         self.scratch = scratch;
         self.flush_out();
-        let _ = self.send_batch(Instant::now());
+        // Sent with the rest of the pass's datagrams (Q1: one send per pass).
+        self.dirty = true;
     }
 
     /// Connections that ended since the last call, with whether each had been admitted.
-    pub fn take_closed(&mut self) -> Vec<(ConnectionId, bool)> {
+    pub fn take_closed(&mut self) -> Vec<(ConnHandle, bool)> {
         std::mem::take(&mut self.closed)
     }
 
@@ -655,7 +696,7 @@ impl QuicListener {
     #[must_use]
     pub fn io_fds(&self) -> Vec<(std::os::fd::BorrowedFd<'_>, bool, bool)> {
         let relays = self.relays.iter().map(|r| {
-            let backlog = self.outq.get(&(r.conn_id, r.stream_id)).map_or(0, |q| q.buf.len() - q.off);
+            let backlog = self.outq.get(&(r.conn, r.stream_id)).map_or(0, |q| q.buf.len() - q.off);
             (r.fd.as_fd(), !r.done && backlog < RELAY_BACKLOG, !r.to_engine.is_empty())
         });
         relays.collect()
@@ -736,6 +777,11 @@ impl QuicListener {
     /// Returns an error if a non-transient socket write error occurs.
     pub fn send_batch(&mut self, now: Instant) -> io::Result<usize> {
         let mut total_sent = 0;
+        // HAProxy's `quic_lstnr_may_set_src`: the source address goes with each datagram only
+        // on a wildcard bind, where the kernel would otherwise pick the route's source and a
+        // client that reached another local address drops the reply (T552, VV-27). A bind to
+        // one address sends no control message.
+        let wildcard = self.addr.ip().is_unspecified();
 
         loop {
             // What each datagram needs once its bytes are in `send_raw_bufs[i]`: on the stack,
@@ -757,7 +803,7 @@ impl QuicListener {
                 (Some((size, dst, src)), Some(buf)) => {
                     let mut msg = DgramOut::new(&buf[..size]);
                     msg.dst_addr = Some(dst);
-                    msg.src_addr = src;
+                    msg.src_addr = if wildcard { src } else { None };
                     msg
                 }
                 _ => DgramOut::new(&[]),
@@ -778,15 +824,15 @@ impl QuicListener {
         self.endpoint.handle_timeout(now);
     }
 
-    /// Returns the next earliest timer expiry instant.
-    #[must_use]
-    pub fn poll_timeout(&self) -> Option<Instant> {
+    /// Returns the next earliest timer expiry instant: the connections something reached since
+    /// the last call are asked for theirs now, once each (Q1).
+    pub fn poll_timeout(&mut self) -> Option<Instant> {
         let t = self.endpoint.poll_timeout();
         if !self.stopping {
             return t;
         }
         // The end of a fresh connection's wait for its first request (T558).
-        let fresh = self.h3.values().filter(|st| st.next_request == 0).filter_map(|st| st.fresh_until).min();
+        let fresh = self.conns.iter().flatten().filter_map(|s| s.h3.as_ref()).filter(|st| st.next_request == 0).filter_map(|st| st.fresh_until).min();
         match (t, fresh) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -821,19 +867,33 @@ impl QuicListener {
     /// # Errors
     /// Returns an error if a non-transient socket error occurs.
     pub fn pump(&mut self, now: Instant) -> io::Result<()> {
+        self.serve(now)?;
+        self.send_batch(now)?;
+        Ok(())
+    }
+
+    /// [`QuicListener::pump`] without the send: the engine sends once a pass, after the owner
+    /// sessions ran (Q1), so what they wrote and the acknowledgements of what was read leave
+    /// together. [`QuicListener::take_dirty`] is true after it.
+    ///
+    /// # Errors
+    /// As [`QuicListener::pump`].
+    #[allow(clippy::too_many_lines)]
+    pub fn serve(&mut self, now: Instant) -> io::Result<()> {
         // Every request goes to a frontend's stream engine (T463): a listener without one
         // is a bug in whoever built it, and answering anyway would hide it.
         if self.frontend.is_none() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "QUIC listener has no frontend"));
         }
         self.recv_batch(now)?;
+        self.dirty = true;
 
         // Reused across passes: a relay reads the engine's response through it, 64 KB a time.
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.resize(64 * 1024, 0);
         while let Some(ev) = self.endpoint.poll_event() {
             match ev {
-                TransportEvent::HandshakeComplete { conn_id, alpn, .. } => {
+                TransportEvent::HandshakeComplete { conn, alpn, .. } => {
                     // Only speak HTTP/3 if that is what was negotiated. Anything else is a
                     // connection we have no layer for, and pretending otherwise would send
                     // a client frames it never asked for.
@@ -843,91 +903,114 @@ impl QuicListener {
                         // one session however many request streams it carries.
                         crate::engine::count_global_conn();
                         if self.gated {
-                            self.handshaken.push(conn_id);
-                            self.pending.insert(conn_id);
+                            self.handshaken.push(conn);
+                            if let Some(slot) = slot_of(&mut self.conns, conn) {
+                                slot.pending = true;
+                            }
                         } else {
                             crate::engine::count_global_sess();
-                            self.open_control_stream(conn_id);
+                            self.open_control_stream(conn);
                         }
                     }
                 }
-                TransportEvent::NewConnection { conn_id, remote } => {
-                    self.peers.insert(conn_id, remote);
+                TransportEvent::NewConnection { conn, remote, .. } => {
+                    // A new connection in this slot: what a gone one left there goes.
+                    let i = conn.index();
+                    if self.conns.len() <= i {
+                        self.conns.resize_with(i + 1, || None);
+                    }
+                    let mut slot = ConnSlot::new(conn);
+                    slot.peer = Some(remote);
+                    self.conns[i] = Some(slot);
                     // One the stop did not know of (none is accepted after it, but an Initial
                     // read before it may surface here): pinned too, or its datagrams may be
                     // hashed to the next process.
                     if self.stopping && !self.pinned.iter().any(|(p, _)| *p == remote) {
-                        let local = self.endpoint.connection_infos().into_iter().find(|i| i.id == conn_id).and_then(|i| i.local_ip);
+                        let local = self.endpoint.local_ip_of(conn);
                         self.pin(remote, local);
                     }
                 }
-                TransportEvent::StreamOpened { conn_id, stream_id, dir } => {
-                    self.stream_event(conn_id, stream_id, dir == StreamDirection::Bidirectional, &mut scratch);
+                TransportEvent::StreamOpened { conn, stream_id, dir } => {
+                    self.stream_event(conn, stream_id, dir == StreamDirection::Bidirectional, &mut scratch);
                 }
-                TransportEvent::StreamReadable { conn_id, stream_id } => {
-                    self.stream_event(conn_id, stream_id, false, &mut scratch);
+                TransportEvent::StreamReadable { conn, stream_id } => {
+                    self.stream_event(conn, stream_id, false, &mut scratch);
                 }
                 // A finished stream and a reset stream are both done with; the difference
                 // matters to the peer, not to our buffer bookkeeping.
-                TransportEvent::StreamFinished { conn_id, stream_id } => {
+                TransportEvent::StreamFinished { conn, stream_id } => {
+                    let Some(slot) = slot_of(&mut self.conns, conn) else { continue };
                     // A client-initiated bidirectional stream (a request) is done once its
                     // response is acknowledged: the last one the limit allows ends the connection.
+                    let mut close = false;
                     if self.stream_max_total != 0 && stream_id.0.trailing_zeros() >= 2 {
-                        let done = self.streams_done.entry(conn_id).or_default();
-                        *done += 1;
-                        if *done >= self.stream_max_total {
-                            self.endpoint.close_connection(conn_id, H3_NO_ERROR, b"");
-                        }
+                        slot.streams_done += 1;
+                        close = slot.streams_done >= self.stream_max_total;
                     }
-                    if self.owned.get_mut(&conn_id).is_some_and(|oc| Self::acked(oc, stream_id.0)) {
-                        self.owned_news(conn_id, None, None);
-                    }
-                    if let Some(st) = self.h3.get_mut(&conn_id) {
+                    let acked = slot.owned.as_mut().is_some_and(|oc| Self::acked(oc, stream_id.0));
+                    if let Some(st) = slot.h3.as_mut() {
                         st.req.remove(&stream_id);
                         st.unacked.retain(|s| *s != stream_id);
+                    }
+                    if close {
+                        self.endpoint.close_connection(conn, H3_NO_ERROR, b"");
+                    }
+                    if acked {
+                        self.owned_news(conn, None, None);
                     }
                 }
                 // The client asked us to stop sending the response. (A reset of its request
                 // arrives as a read error instead, in `on_readable`.)
-                TransportEvent::StreamStopped { conn_id, stream_id, error_code } => {
-                    if let Some(oc) = self.owned.get_mut(&conn_id) {
+                TransportEvent::StreamStopped { conn, stream_id, error_code } => {
+                    if let Some(oc) = owned_of(&mut self.conns, conn) {
                         Self::acked(oc, stream_id.0);
                     }
-                    if !self.owned_news(conn_id, None, Some((stream_id.0, error_code))) {
-                        self.abandon_stream(conn_id, stream_id);
+                    if !self.owned_news(conn, None, Some((stream_id.0, error_code))) {
+                        self.abandon_stream(conn, stream_id);
                     }
                 }
                 // Room on a stream an owner writes: it writes the rest (T509).
-                TransportEvent::StreamWritable { conn_id, .. } => {
-                    self.owned_news(conn_id, None, None);
+                TransportEvent::StreamWritable { conn, .. } => {
+                    self.owned_news(conn, None, None);
                 }
-                TransportEvent::ConnectionClosed { conn_id, .. } => {
-                    if let Some(oc) = self.owned.get_mut(&conn_id) {
-                        oc.closed = true;
-                        if let Some((_, task)) = oc.owner {
-                            self.wake.push(task);
+                TransportEvent::ConnectionClosed { conn, .. } => {
+                    let i = conn.index();
+                    if let Some(slot) = slot_of(&mut self.conns, conn) {
+                        if let Some(oc) = slot.owned.as_mut() {
+                            oc.closed = true;
+                            if let Some((_, task)) = oc.owner {
+                                self.wake.push(task);
+                            }
                         }
-                    }
-                    if self.admitted.remove(&conn_id) {
-                        self.closed.push((conn_id, true));
-                    } else if self.pending.remove(&conn_id) {
-                        self.held.remove(&conn_id);
-                        if let Some(i) = self.waiting.iter().position(|c| *c == conn_id) {
-                            self.waiting.remove(i);
-                            self.closed.push((conn_id, false));
+                        if std::mem::take(&mut slot.admitted) {
+                            self.closed.push((conn, true));
+                        } else if std::mem::take(&mut slot.pending) {
+                            slot.held = Vec::new();
+                            if let Some(i) = self.waiting.iter().position(|c| *c == conn) {
+                                self.waiting.remove(i);
+                                self.closed.push((conn, false));
+                            } else {
+                                self.handshaken.retain(|c| *c != conn);
+                            }
+                        }
+                        // Its owner, if any, still has to see it closed (`owner_close`
+                        // frees the slot then).
+                        if slot.owned.is_some() {
+                            slot.h3 = None;
+                            slot.peer = None;
+                            slot.streams_done = 0;
                         } else {
-                            self.handshaken.retain(|c| *c != conn_id);
+                            self.conns[i] = None;
                         }
                     }
-                    self.h3.remove(&conn_id);
-                    self.peers.remove(&conn_id);
-                    self.streams_done.remove(&conn_id);
                     for r in &mut self.relays {
-                        if r.conn_id == conn_id {
+                        if r.conn == conn {
                             r.done = true;
                         }
                     }
-                    self.outq.retain(|(c, _), _| *c != conn_id);
+                    if !self.outq.is_empty() {
+                        self.outq.retain(|(c, _), _| *c != conn);
+                    }
                     self.release_pinned();
                 }
                 _ => {}
@@ -940,7 +1023,6 @@ impl QuicListener {
             self.drain_idle_connections();
         }
         self.scratch = scratch;
-        self.send_batch(now)?;
         Ok(())
     }
 
@@ -960,16 +1042,18 @@ impl QuicListener {
         // A connection with no request yet gets its GOAWAY after its first one, or at the end
         // of its grace (`drain_idle_connections`, T558).
         let fresh_until = Instant::now() + STOP_FIRST_REQUEST;
-        for (conn_id, st) in &mut self.h3 {
-            if st.next_request == 0 {
-                st.fresh_until = Some(fresh_until);
-            } else {
-                Self::send_goaway(&mut self.endpoint, *conn_id, st);
+        for slot in self.conns.iter_mut().flatten() {
+            if let Some(st) = slot.h3.as_mut() {
+                if st.next_request == 0 {
+                    st.fresh_until = Some(fresh_until);
+                } else {
+                    Self::send_goaway(&mut self.endpoint, slot.conn, st);
+                }
             }
         }
         // Each owner (the mux path) sends its own GOAWAY and closes when idle: woken now, or
         // one whose client went quiet sleeps through the stop until quinn's idle timeout (T511).
-        self.wake.extend(self.owned.values().filter_map(|oc| oc.owner.map(|(_, task)| task)));
+        self.wake.extend(self.conns.iter().flatten().filter_map(|s| s.owned.as_ref()?.owner.map(|(_, task)| task)));
         self.drain_idle_connections();
         // The GOAWAYs and closes go out now. Left for the next `pump`, they waited for an
         // unrelated wakeup -- and a closed connection's next wakeup is its drain timer, which
@@ -988,9 +1072,9 @@ impl QuicListener {
     /// tuple before the reuseport group is consulted, which is what keeps those datagrams
     /// here. HAProxy does the same in `quic-socket connection` mode (`quic_sock.c`).
     fn pin_peers(&mut self) {
-        let infos = self.endpoint.connection_infos();
+        let endpoint = &self.endpoint;
         let mut want: Vec<(SocketAddr, Option<std::net::IpAddr>)> =
-            infos.iter().filter(|i| self.peers.contains_key(&i.id)).map(|i| (i.remote, i.local_ip)).collect();
+            self.conns.iter().flatten().filter_map(|s| Some((s.peer?, endpoint.local_ip_of(s.conn)))).collect();
         want.sort();
         want.dedup_by_key(|w| w.0);
         for (peer, local) in want {
@@ -1014,7 +1098,10 @@ impl QuicListener {
 
     /// Drops the pinned socket of a peer with no connection left.
     fn release_pinned(&mut self) {
-        let live: Vec<SocketAddr> = self.peers.values().copied().collect();
+        if self.pinned.is_empty() {
+            return;
+        }
+        let live: Vec<SocketAddr> = self.conns.iter().flatten().filter_map(|s| s.peer).collect();
         let released = &mut self.released;
         self.pinned.retain(|(peer, sock)| {
             let keep = live.contains(peer);
@@ -1051,7 +1138,7 @@ impl QuicListener {
     }
 
     /// Sends GOAWAY once on a connection's control stream.
-    fn send_goaway(endpoint: &mut QuicEndpoint, conn_id: ConnectionId, st: &mut H3State) {
+    fn send_goaway(endpoint: &mut QuicEndpoint, conn_id: ConnHandle, st: &mut H3State) {
         if let (Some(control), false) = (st.control, std::mem::replace(&mut st.draining, true)) {
             let bytes = mux_h3::encode_goaway(st.next_request);
             let _ = endpoint.write_stream(conn_id, control, &bytes, false);
@@ -1063,24 +1150,27 @@ impl QuicListener {
     fn drain_idle_connections(&mut self) {
         let mut idle = Vec::new();
         let now = Instant::now();
-        for (conn_id, st) in &mut self.h3 {
+        for slot in self.conns.iter_mut().flatten() {
+            let Some(st) = slot.h3.as_mut() else { continue };
             if st.next_request == 0 && st.fresh_until.is_some_and(|t| now < t) {
                 continue;
             }
             // Its wait is over (a request came, or the time is up): no timer for it any more.
             st.fresh_until = None;
-            Self::send_goaway(&mut self.endpoint, *conn_id, st);
+            Self::send_goaway(&mut self.endpoint, slot.conn, st);
         }
-        for (conn_id, st) in &self.h3 {
+        for slot in self.conns.iter().flatten() {
+            let Some(st) = slot.h3.as_ref() else { continue };
             if st.fresh_until.is_some() {
                 continue;
             }
+            let conn_id = slot.conn;
             let owes = !st.unacked.is_empty()
                 || st.req.values().any(|b| !b.is_empty())
-                || self.relays.iter().any(|r| r.conn_id == *conn_id)
-                || self.outq.keys().any(|(c, _)| c == conn_id);
+                || self.relays.iter().any(|r| r.conn == conn_id)
+                || self.outq.keys().any(|(c, _)| *c == conn_id);
             if !owes {
-                idle.push(*conn_id);
+                idle.push(conn_id);
             }
         }
         for conn_id in idle {
@@ -1089,12 +1179,12 @@ impl QuicListener {
     }
 
     /// Queues a whole response; [`QuicListener::flush_out`] writes it as flow control allows.
-    fn respond(&mut self, conn_id: ConnectionId, stream_id: StreamId, resp: &[u8]) {
+    fn respond(&mut self, conn_id: ConnHandle, stream_id: StreamId, resp: &[u8]) {
         self.queue_out(conn_id, stream_id, resp, true);
     }
 
     /// Queues HTTP/3 bytes for a stream, and its end when `fin`.
-    fn queue_out(&mut self, conn_id: ConnectionId, stream_id: StreamId, bytes: &[u8], fin: bool) {
+    fn queue_out(&mut self, conn_id: ConnHandle, stream_id: StreamId, bytes: &[u8], fin: bool) {
         let q = self.outq.entry((conn_id, stream_id)).or_default();
         if q.off > 0 && q.off == q.buf.len() {
             q.buf.clear();
@@ -1118,7 +1208,7 @@ impl QuicListener {
         }
         for (conn_id, stream_id) in finished {
             self.outq.remove(&(conn_id, stream_id));
-            if let Some(st) = self.h3.get_mut(&conn_id) {
+            if let Some(st) = slot_of(&mut self.conns, conn_id).and_then(|s| s.h3.as_mut()) {
                 st.unacked.push(stream_id);
             }
         }
@@ -1128,19 +1218,21 @@ impl QuicListener {
     ///
     /// RFC 9114 §6.2.1 requires the control stream be opened before any request is answered,
     /// and that SETTINGS be its first frame.
-    fn open_control_stream(&mut self, conn_id: ConnectionId) {
-        let st = self.h3.entry(conn_id).or_default();
+    fn open_control_stream(&mut self, conn_id: ConnHandle) {
+        let Some(st) = h3_of(&mut self.conns, conn_id) else { return };
         if st.control.is_some() {
             return;
         }
         let Ok(sid) = self.endpoint.open_stream(conn_id, StreamDirection::Unidirectional) else {
             return;
         };
-        let st = self.h3.entry(conn_id).or_default();
-        st.control = Some(sid);
-        // Its handshake ended during a soft stop: it waits for its first request (T558).
-        if self.stopping {
-            st.fresh_until = Some(Instant::now() + STOP_FIRST_REQUEST);
+        let stopping = self.stopping;
+        if let Some(st) = h3_of(&mut self.conns, conn_id) {
+            st.control = Some(sid);
+            // Its handshake ended during a soft stop: it waits for its first request (T558).
+            if stopping {
+                st.fresh_until = Some(Instant::now() + STOP_FIRST_REQUEST);
+            }
         }
         let bytes = mux_h3::encode_control_stream_open();
         let _ = self.endpoint.write_stream(conn_id, sid, &bytes, false);
@@ -1149,16 +1241,16 @@ impl QuicListener {
     /// A stream opened (`opened`) or became readable. On a connection the engine has not
     /// admitted yet it is kept until it is: nothing is read, so the client's flow control
     /// holds the request back.
-    fn stream_event(&mut self, conn_id: ConnectionId, stream_id: StreamId, opened: bool, scratch: &mut [u8]) {
-        if self.pending.contains(&conn_id) {
-            self.held.entry(conn_id).or_default().push((stream_id, opened));
+    fn stream_event(&mut self, conn_id: ConnHandle, stream_id: StreamId, opened: bool, scratch: &mut [u8]) {
+        if let Some(slot) = slot_of(&mut self.conns, conn_id).filter(|s| s.pending) {
+            slot.held.push((stream_id, opened));
             return;
         }
         if self.owned_news(conn_id, Some(stream_id.0), None) {
             return;
         }
+        let Some(st) = h3_of(&mut self.conns, conn_id) else { return };
         if opened {
-            let st = self.h3.entry(conn_id).or_default();
             st.req.entry(stream_id).or_default();
             st.next_request = st.next_request.max(stream_id.0 + 4);
         }
@@ -1169,8 +1261,8 @@ impl QuicListener {
     }
 
     /// Reads whatever is available on a stream and, on a request stream, answers it.
-    fn on_readable(&mut self, conn_id: ConnectionId, stream_id: StreamId, scratch: &mut [u8]) {
-        let relay = self.relays.iter().position(|r| r.conn_id == conn_id && r.stream_id == stream_id);
+    fn on_readable(&mut self, conn_id: ConnHandle, stream_id: StreamId, scratch: &mut [u8]) {
+        let relay = self.relays.iter().position(|r| r.conn == conn_id && r.stream_id == stream_id);
         // A request body the engine has not taken yet stays in the stream, so the client's
         // flow-control window, not our memory, holds the rest back. `advance_relays` reads
         // again once the engine has caught up.
@@ -1223,7 +1315,7 @@ impl QuicListener {
             return;
         }
 
-        let st = self.h3.entry(conn_id).or_default();
+        let Some(st) = h3_of(&mut self.conns, conn_id) else { return };
         if st.answered.contains(&stream_id) {
             return;
         }
@@ -1253,12 +1345,13 @@ impl QuicListener {
 
     /// The client reset the request or asked us to stop sending the response: the engine's
     /// stream is cut, which it sees as the client going away.
-    fn abandon_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
-        let st = self.h3.entry(conn_id).or_default();
-        st.req.remove(&stream_id);
-        st.unacked.retain(|s| *s != stream_id);
+    fn abandon_stream(&mut self, conn_id: ConnHandle, stream_id: StreamId) {
+        // Its request and its wait for an acknowledgement go (a connection the relay never
+        // gave HTTP/3 state has neither). One expression: there is no other branch to take.
+        let st = slot_of(&mut self.conns, conn_id).and_then(|s| s.h3.as_mut());
+        st.map(|st| (st.req.remove(&stream_id), st.unacked.retain(|s| *s != stream_id)));
         for r in &mut self.relays {
-            if r.conn_id == conn_id && r.stream_id == stream_id {
+            if r.conn == conn_id && r.stream_id == stream_id {
                 r.done = true;
             }
         }
@@ -1267,7 +1360,7 @@ impl QuicListener {
 
     /// Hands a request whose HEADERS arrived to the engine: converts it to its HTTP/1 head
     /// and opens the socket pair the engine adopts as a client connection.
-    fn start_relay(&mut self, conn_id: ConnectionId, stream_id: StreamId, buf: &[u8], fin: bool) {
+    fn start_relay(&mut self, conn_id: ConnHandle, stream_id: StreamId, buf: &[u8], fin: bool) {
         let Ok(Some((section, after))) = crate::h3_relay::first_headers(buf) else {
             self.respond(conn_id, stream_id, &mux_h3::encode_response(400, &[], b""));
             return;
@@ -1297,7 +1390,7 @@ impl QuicListener {
         };
         let mut relay = Relay {
             fd: ours,
-            conn_id,
+            conn: conn_id,
             stream_id,
             rx: rest,
             body: crate::h3_relay::BodyState::new(head.body),
@@ -1310,7 +1403,7 @@ impl QuicListener {
             self.respond(conn_id, stream_id, &resp);
             return;
         }
-        let peer = self.peers.get(&conn_id).copied().unwrap_or(self.addr);
+        let peer = self.peer_of(conn_id);
         self.accepted.push(AcceptedStream { fd: theirs, peer, local: self.addr });
         self.relays.push(relay);
     }
@@ -1318,18 +1411,18 @@ impl QuicListener {
     /// Moves request bytes to the engine and the engine's response to the client.
     fn advance_relays(&mut self, scratch: &mut [u8]) {
         // Request bodies held back by `on_readable` while the engine was behind.
-        let waiting: Vec<(ConnectionId, StreamId)> = self
+        let waiting: Vec<(ConnHandle, StreamId)> = self
             .relays
             .iter()
             .filter(|r| !r.client_fin && !r.done && r.to_engine.len() < RELAY_BACKLOG)
-            .map(|r| (r.conn_id, r.stream_id))
+            .map(|r| (r.conn, r.stream_id))
             .collect();
         for (c, sid) in waiting {
             self.on_readable(c, sid, scratch);
         }
 
-        let mut out: Vec<(ConnectionId, StreamId, Vec<u8>, bool)> = Vec::new();
-        let mut cancelled: Vec<(ConnectionId, StreamId)> = Vec::new();
+        let mut out: Vec<(ConnHandle, StreamId, Vec<u8>, bool)> = Vec::new();
+        let mut cancelled: Vec<(ConnHandle, StreamId)> = Vec::new();
         for r in &mut self.relays {
             if r.done {
                 continue;
@@ -1348,7 +1441,7 @@ impl QuicListener {
                     }
                 }
             }
-            let backlog = self.outq.get(&(r.conn_id, r.stream_id)).map_or(0, |q| q.buf.len() - q.off);
+            let backlog = self.outq.get(&(r.conn, r.stream_id)).map_or(0, |q| q.buf.len() - q.off);
             let mut frames = Vec::new();
             while backlog + frames.len() < RELAY_BACKLOG && !r.done {
                 match crate::raw::recv(r.fd.as_fd(), scratch) {
@@ -1369,7 +1462,7 @@ impl QuicListener {
                         // a stream that ends without its response and as `HAProxy` does.
                         r.done = true;
                         if r.resp.eof().is_err() && !r.resp.head_sent {
-                            cancelled.push((r.conn_id, r.stream_id));
+                            cancelled.push((r.conn, r.stream_id));
                         }
                     }
                 }
@@ -1377,8 +1470,8 @@ impl QuicListener {
                     r.done = true;
                 }
             }
-            if (!frames.is_empty() || r.done) && !cancelled.last().is_some_and(|&(c, sid)| c == r.conn_id && sid == r.stream_id) {
-                out.push((r.conn_id, r.stream_id, frames, r.done));
+            if (!frames.is_empty() || r.done) && !cancelled.last().is_some_and(|&(c, sid)| c == r.conn && sid == r.stream_id) {
+                out.push((r.conn, r.stream_id, frames, r.done));
             }
         }
         for (c, sid, frames, fin) in out {

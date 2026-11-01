@@ -52,6 +52,19 @@ the same inbound load, Ibex is at **125.1k = 1.70x HAProxy**. insreq's "min of r
 the round with the fewest ACKs: 120.2k = 1.63x. h2load prints the datagram counts in each
 `<label>.rN.client` (`UDP datagram: N sent, M received`). Read them next to every h3 figure.
 
+**(b') Method since T555 (2026-11-01): h3 is measured with `insreq.sh ... h3fit`, not h3c1.**
+`tools/measure/h3bench` is a quinn-proto client with its ACK policy fixed: `h3best` sends no
+ACK-only datagram (1.000 client datagrams/req), `h3worst` answers every server datagram at once
+(2.02/req to HAProxy dev10; the realistic one: curl 8.18/ngtcp2 sends 1.99/req and h2load
+1.96/req to HAProxy, counted in a pcap). Each round runs both, and **the h3 figure is the line
+through the two points read at 1.97 client datagrams/req** (user decision D6: HAProxy's packet
+rate), the median over rounds; min-of-rounds is retired for h3. The client's count is pinned by
+`crates/ibex-rt/tests/it/h3_bench_client.rs`. Two differences from h2load make h3fit figures
+lower than the h3c1 ones in this report, for both proxies: h3bench's request packets are
+~70 bytes (as curl's), h2load pads each to 1200 (decryption and PADDING parsing per request), and
+its request carries four fields (no `user-agent`). Compare h3fit with h3fit only. Stability and
+first figures: `tasks/T555-progress.md`.
+
 (c) strace undercounts h3 datagrams. It slows the proxy enough that the client coalesces its
 ACKs: 1.007 rx datagrams per request under strace, 1.91 per request from h2load's counter and
 from uprobes on `handle_datagram`. T539's census table (~1008 per 1000 requests) has the same
