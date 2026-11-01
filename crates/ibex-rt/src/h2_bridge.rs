@@ -408,6 +408,9 @@ pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut Ht
     if let Some(t) = txn.rsp_htx.as_mut().filter(|_| !txn.local) {
         *t += scratch.len() as u64 + u64::from(end && matches!(txn.rsp, MsgState::Body(txn::Body::Chunked(_))));
     }
+    // Trailers an h2 server sent after a content-length body (T559): with the stream's end.
+    let late = if end && trailers.len() <= 2 { std::mem::take(&mut txn.late_trailers) } else { Vec::new() };
+    let trailers = if late.len() > 2 { &late[..] } else { trailers };
     if trailers.len() > 2 {
         // Not the blank line alone: the fields, on the stack (the common response has none).
         if !scratch.is_empty() {
@@ -525,6 +528,9 @@ pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn
         // the proxy made in place of the server's response.
         *t += out.len() as u64 + u64::from(end && matches!(txn.rsp, MsgState::Body(txn::Body::Chunked(_))));
     }
+    // Trailers an h2 server sent after a content-length body (T559): with the stream's end.
+    let late = if end && trailers.len() <= 2 { std::mem::take(&mut txn.late_trailers) } else { Vec::new() };
+    let trailers = if late.len() > 2 { &late[..] } else { trailers };
     if trailers.len() > 2 {
         if !out.is_empty() {
             h2.send_data(stream_id, &out, false);

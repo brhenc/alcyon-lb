@@ -2114,6 +2114,9 @@ pub struct HttpTxn {
     /// has been measured, or where it is not (an HTTP/2 client's request).
     pub req_htx: Option<u64>,
     pub rsp_htx: Option<u64>,
+    /// Trailers an h2 server sent after a content-length body: sent to an h2 or h3 client
+    /// with the end of the stream, dropped for an h1 one (T559).
+    pub late_trailers: Vec<u8>,
     /// What framed the request and the response when they were parsed, read again after
     /// their rules (T439); `None` for a request that did not come in HTTP/1.
     pub req_len_hdrs: Option<LenHdrs>,
@@ -2272,6 +2275,7 @@ impl HttpTxn {
             ck: crate::cookie::CookieTxn::default(),
             req_htx: None,
             rsp_htx: None,
+            late_trailers: Vec::new(),
             req_len_hdrs: None,
             rsp_len_hdrs: LenHdrs::default(),
             req_body_dropped: false,

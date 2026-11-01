@@ -3339,6 +3339,14 @@ impl TcpSession {
                     self.dechunk_rep(self.rep.len() - n);
                     self.rewrite_rep_chunk_framing();
                     self.log.bytes_from_server += n as u64;
+                    // Trailers after a content-length body (T559): the codec has them when
+                    // the body's last byte came; `h2_bridge` sends them to an h2/h3 client.
+                    if self.srv_xprt.is_h2() {
+                        let late = self.srv_xprt.take_late_trailers();
+                        if let (false, Some(t)) = (late.is_empty(), self.txn.as_mut()) {
+                            t.late_trailers = late;
+                        }
+                    }
                     changed = true;
                 }
                 Io::Done(_) | Io::WouldBlock => {}
