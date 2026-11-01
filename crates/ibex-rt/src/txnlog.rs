@@ -26,6 +26,8 @@ pub struct StreamLog {
     pub first_byte: Option<Instant>,
     /// The request head was complete (`request_ts`).
     pub request: Option<Instant>,
+    /// [`StreamLog::date`], once worked out ((0, 0): not yet).
+    date_cache: std::cell::Cell<(i64, u32)>,
     /// The connection to a server was first attempted (`t_queue`).
     pub queue: Option<Instant>,
     /// The index of the server the stream chose in `srv_backend_idx`, kept while no connection
@@ -174,6 +176,17 @@ impl StreamLog {
     /// stream nobody logs or fetches the date of costs no `SystemTime::now` (T579, C1).
     #[must_use]
     pub fn date(&self) -> (i64, u32) {
+        // Seconds 0 (1970) marks it not worked out yet.
+        let d = self.date_cache.get();
+        if d.0 != 0 {
+            return d;
+        }
+        let d = self.date_uncached();
+        self.date_cache.set(d);
+        d
+    }
+
+    fn date_uncached(&self) -> (i64, u32) {
         let (at, wall) = WALL_BASE.with(|c| match c.get() {
             Some(b) if loop_now().saturating_duration_since(b.0) < std::time::Duration::from_secs(1) => b,
             _ => {
@@ -197,6 +210,7 @@ impl StreamLog {
     pub fn start(bytes_in: u64, bytes_out: u64) -> StreamLog {
         StreamLog {
             start: loop_now(),
+            date_cache: std::cell::Cell::new((0, 0)),
             first_byte: None,
             request: None,
             queue: None,
