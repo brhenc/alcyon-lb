@@ -63,7 +63,7 @@ fn start() -> Proxy {
     let mut cfg = NamedTempFile::new().expect("tmp");
     write!(
         cfg,
-        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 10s\n  timeout server 10s\n\
+        "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n  mode http\n  timeout connect 2s\n  timeout client 10s\n  timeout server 10s\n\
          frontend f\n  bind {fe}\n  default_backend b\n\
          frontend s\n  bind {sentinel}\n  http-request return status 200\n\
          backend b\n  server s {be}\n"

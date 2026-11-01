@@ -117,7 +117,7 @@ fn request_trailers_are_forwarded_as_haproxy_writes_them() {
     });
     let fe = common::reserve_addr();
     let cfg = format!(
-        "global\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nlisten fe\n  bind {fe}\n  server s {be_addr}\n"
+        "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nlisten fe\n  bind {fe}\n  server s {be_addr}\n"
     );
     let _p = start("req", &cfg, &[fe]);
     for (sent, want) in REWRITTEN {
@@ -159,7 +159,7 @@ fn response_trailers_are_forwarded_as_haproxy_writes_them() {
     });
     let fe = common::reserve_addr();
     let cfg = format!(
-        "global\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nlisten fe\n  bind {fe}\n  server s {be_addr}\n"
+        "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nlisten fe\n  bind {fe}\n  server s {be_addr}\n"
     );
     let _p = start("rsp", &cfg, &[fe]);
     for (sent, want) in REWRITTEN {
@@ -180,7 +180,7 @@ fn response_trailers_are_forwarded_as_haproxy_writes_them() {
 fn request_trailer_sections_are_accepted_or_refused_as_haproxy_does() {
     let fe = common::reserve_addr();
     let cfg = format!(
-        "global\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nlisten fe\n  bind {fe}\n  option http-buffer-request\n  http-request return status 200\n"
+        "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nlisten fe\n  bind {fe}\n  option http-buffer-request\n  http-request return status 200\n"
     );
     let _p = start("acc", &cfg, &[fe]);
     for sent in REFUSED {
@@ -218,7 +218,7 @@ fn transfer_encoding_and_content_length_are_judged_as_haproxy_does() {
     });
     let fe = common::reserve_addr();
     let cfg = format!(
-        "global\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nlisten fe\n  bind {fe}\n  server s {be_addr}\n"
+        "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nlisten fe\n  bind {fe}\n  server s {be_addr}\n"
     );
     let _p = start("te", &cfg, &[fe]);
     // (name, request, status, what the server is sent up to its blank line, lines separated by '|')

@@ -78,7 +78,7 @@ fn exchange(rules: &str, req: &[u8], resp: &'static [u8]) -> (Vec<String>, Strin
     let (srv, got) = server(resp);
     let fe = common::reserve_addr();
     let text = format!(
-        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+        "global\n  tune.ibex.h1-lowercase-headers on\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
          frontend f\n  bind {fe}\n{rules}  default_backend b\nbackend b\n  server s1 {srv}\n"
     );
     let mut f = NamedTempFile::new().expect("tmp");

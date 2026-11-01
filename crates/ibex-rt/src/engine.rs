@@ -2022,6 +2022,9 @@ pub struct Proxy {
     /// The global `h1-case-adjust` table: lower-case name to the name to write. Set on every
     /// proxy that has a bit in `h1_adjust`; empty otherwise.
     pub h1_case: Arc<std::collections::HashMap<String, String>>,
+    /// `tune.ibex.h1-lowercase-headers on` (global, X5, D-E): the header names of a head this
+    /// proxy forwards go in lower case, as `HAProxy` writes them; off, in the case they came in.
+    pub h1_lower: bool,
     /// Custom error pages (`errorfile`/`errorfiles`), keyed by status code.
     pub error_files: HashMap<u16, Vec<u8>>,
     /// `http-error` overrides, keyed by status code; consulted before `error_files`.
@@ -4595,6 +4598,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         abortonclose: listen.abortonclose.unwrap_or(true),
         h1_adjust: listen.h1_adjust,
         h1_case: Arc::default(),
+        h1_lower: false,
         error_files: listen.error_files.clone(),
         error_replies: listen.error_replies.clone(),
         log_tag: listen.log_tag.as_deref().map(syslog_tag),
@@ -4740,6 +4744,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         abortonclose: true,
         h1_adjust: fe.h1_adjust,
         h1_case: Arc::default(),
+        h1_lower: false,
         error_files: fe.error_files.clone(),
         error_replies: fe.error_replies.clone(),
         log_tag: fe.log_tag.as_deref().map(syslog_tag),
@@ -4895,6 +4900,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         abortonclose: be.abortonclose.unwrap_or(true),
         h1_adjust: be.h1_adjust,
         h1_case: Arc::default(),
+        h1_lower: false,
         error_files: be.error_files.clone(),
         error_replies: be.error_replies.clone(),
         log_tag: be.log_tag.as_deref().map(syslog_tag),
@@ -5203,6 +5209,11 @@ impl Engine {
         Arc::new(config.global.iter().flat_map(|g| g.h1_case_adjust.iter().cloned()).collect());
     for p in proxies.iter_mut().filter(|p| p.h1_adjust & (ibex_config::H1_ADJ_CLIENT | ibex_config::H1_ADJ_SERVER) != 0) {
         p.h1_case = Arc::clone(&h1_table);
+    }
+    // `tune.ibex.h1-lowercase-headers` (X5): read where a forwarded head's names are written.
+    let h1_lower = config.global.as_ref().and_then(|g| g.h1_lowercase_headers).unwrap_or(false);
+    for p in &mut proxies {
+        p.h1_lower = h1_lower;
     }
     crate::track::attach(&mut proxies, config);
     link_declaration_order(&mut proxies);
@@ -11886,8 +11897,12 @@ impl EngineDispatcher<'_> {
             return;
         }
         let table = client_case_table(&proxies[entry.proxy_idx]);
+        let lower = names_lower(&entry.sess, &proxies[entry.proxy_idx]);
+        if !lower && table.is_none() {
+            return;
+        }
         ibex_proto::response_head::count_head_scan();
-        entry.sess.rep.edit_keeping_lines(|head, eoh| rewrite_header_names_before(head, eoh, table));
+        entry.sess.rep.edit_keeping_lines(|head, eoh| rewrite_header_names_before(head, eoh, table, lower));
     }
 
     /// The response head's rules, framing and `Connection`. True when the head's names are
@@ -12200,12 +12215,16 @@ impl EngineDispatcher<'_> {
             // index: nothing has edited the head since it was made (E2). With an
             // `h1-case-adjust` table for the client, `write_response_head_names` does it.
             let mut index = index.filter(|ix| ix.len as usize == total_hdr_len && client_case_table(&proxies[fe_idx]).is_none());
+            // Off (`tune.ibex.h1-lowercase-headers`, the default), the names stay as they came:
+            // nothing to write, and nothing left for `write_response_head_names` either.
             if let Some(ix) = &index {
-                entry.sess.rep.edit_keeping_lines(|head, _| {
-                    for f in ix.fields() {
-                        head[f.at as usize..f.colon as usize].make_ascii_lowercase();
-                    }
-                });
+                if names_lower(&entry.sess, &proxies[fe_idx]) {
+                    entry.sess.rep.edit_keeping_lines(|head, _| {
+                        for f in ix.fields() {
+                            head[f.at as usize..f.colon as usize].make_ascii_lowercase();
+                        }
+                    });
+                }
                 *lowered = true;
             }
             // `keep-alive` and `close` out of the server's `Connection`, the one this
@@ -14427,7 +14446,11 @@ impl EngineDispatcher<'_> {
         // The head is final: its header names go to the server in lower case, as `HAProxy`
         // writes them (HTX). The request line and the values are the client's.
         let srv_table = (proxies[be_idx].h1_adjust & ibex_config::H1_ADJ_SERVER != 0).then(|| &*proxies[be_idx].h1_case);
-        entry.sess.req.edit_keeping_lines(|head, eoh| rewrite_header_names_before(head, eoh, srv_table));
+        // In the case they came in when `tune.ibex.h1-lowercase-headers` is off (D-E, X5).
+        let lower = proxies[be_idx].h1_lower;
+        if lower || srv_table.is_some() {
+            entry.sess.req.edit_keeping_lines(|head, eoh| rewrite_header_names_before(head, eoh, srv_table, lower));
+        }
         Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, cookie_server)
     }
 
@@ -17334,12 +17357,14 @@ fn lowercase_header_names(buf: &mut [u8]) {
 /// case the table gives. `from` and `to` differ in case only, so the head keeps its length.
 fn rewrite_header_names(buf: &mut [u8], table: Option<&std::collections::HashMap<String, String>>) {
     let eoh = crate::proxy::find_eoh(buf);
-    rewrite_header_names_before(buf, eoh, table);
+    rewrite_header_names_before(buf, eoh, table, true);
 }
 
 /// [`rewrite_header_names`] of a head whose end is `eoh` (`find_eoh` of `buf`). Only the
-/// case of name bytes changes: no line end moves.
-fn rewrite_header_names_before(buf: &mut [u8], eoh: Option<(usize, usize)>, table: Option<&std::collections::HashMap<String, String>>) {
+/// case of name bytes changes: no line end moves. Without `lower`
+/// (`tune.ibex.h1-lowercase-headers off`) only the names `table` holds are written, the
+/// others left in the case they came in.
+fn rewrite_header_names_before(buf: &mut [u8], eoh: Option<(usize, usize)>, table: Option<&std::collections::HashMap<String, String>>, lower: bool) {
     let head = eoh.map_or(0, |(h, _)| h);
     let mut at = memchr::memchr(b'\n', &buf[..head]).map_or(head, |i| i + 1);
     while at < head {
@@ -17347,15 +17372,28 @@ fn rewrite_header_names_before(buf: &mut [u8], eoh: Option<(usize, usize)>, tabl
         // A folded line has no name of its own: nothing of it is lower-cased.
         let folded = matches!(buf[at], b' ' | b'\t');
         let colon = memchr::memchr(b':', &buf[at..end]).filter(|_| !folded).map_or(at, |i| at + i);
-        buf[at..colon].make_ascii_lowercase();
-        // The name is read as text only when there is a table to look it up in (T433).
-        if let Some(to) = table.and_then(|t| t.get(std::str::from_utf8(&buf[at..colon]).ok()?)) {
+        let to = if lower {
+            buf[at..colon].make_ascii_lowercase();
+            // The name is read as text only when there is a table to look it up in (T433).
+            table.and_then(|t| t.get(std::str::from_utf8(&buf[at..colon]).ok()?))
+        } else {
+            let name = &buf[at..colon];
+            table.and_then(|t| t.iter().find(|(k, _)| k.as_bytes().eq_ignore_ascii_case(name)).map(|(_, v)| v))
+        };
+        if let Some(to) = to {
             if to.len() == colon - at {
                 buf[at..colon].copy_from_slice(to.as_bytes());
             }
         }
         at = end;
     }
+}
+
+/// The response's names go to the client in lower case: `tune.ibex.h1-lowercase-headers on`,
+/// or a client that is not HTTP/1 (an h2/h3 stream's child: HTTP/2 and HTTP/3 names are lower
+/// case, and the mux reads them from the head so, `indexed_fields`).
+fn names_lower(sess: &TcpSession, fe: &Proxy) -> bool {
+    fe.h1_lower || sess.is_h2_child()
 }
 
 /// The table to write the names of a message for the client from: the frontend has

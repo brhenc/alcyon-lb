@@ -396,7 +396,7 @@ fn run_counted(rules: &str, parts: &[&[u8]], resp: &'static [u8]) -> (Vec<String
         out
     });
     let cfg = format!(
-        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\nfrontend f\n  bind {fe}\n{rules}  default_backend b\nbackend b\n  server s1 {be}\n"
+        "global\n  tune.ibex.h1-lowercase-headers on\n  nbthread 1\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\nfrontend f\n  bind {fe}\n{rules}  default_backend b\nbackend b\n  server s1 {be}\n"
     );
     let mut f = NamedTempFile::new().expect("config");
     f.write_all(cfg.as_bytes()).expect("write config");
@@ -543,7 +543,7 @@ fn h2_post(rules: &str) -> Vec<String> {
     let be = backend(OK, Arc::clone(&got));
     let fe = common::reserve_addr();
     let cfg = format!(
-        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\nfrontend f\n  bind {fe} proto h2\n  {rules}\n  default_backend b\nbackend b\n  server s1 {be}\n"
+        "global\n  tune.ibex.h1-lowercase-headers on\n  nbthread 1\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\nfrontend f\n  bind {fe} proto h2\n  {rules}\n  default_backend b\nbackend b\n  server s1 {be}\n"
     );
     let mut f = NamedTempFile::new().expect("config");
     f.write_all(cfg.as_bytes()).expect("write config");

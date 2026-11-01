@@ -431,7 +431,7 @@ fn start(defaults: &str, backend: &str, responses: Arc<Vec<&'static [u8]>>) -> P
     let mut cfg = NamedTempFile::new().expect("tmp");
     write!(
         cfg,
-        "global\n  log stdout format raw local0\n  stats socket {}\n\
+        "global\n  tune.ibex.h1-lowercase-headers on\n  log stdout format raw local0\n  stats socket {}\n\
          defaults\n  mode http\n  log global\n  option httplog\n  {defaults}\n  timeout connect 2s\n  \
          timeout client 5s\n  timeout server 5s\n\
          frontend f\n  bind {fe}\n  bind {h2} proto h2\n  default_backend b\n\

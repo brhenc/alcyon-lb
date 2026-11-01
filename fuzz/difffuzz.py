@@ -146,7 +146,11 @@ class Pair:
         for i, (name, binp) in enumerate((('haproxy', ha), ('ibex', ib))):
             fe, be = base + 2 * i, base + 2 * i + 1
             f = f'{tmp}/{name}-{base}.cfg'
-            open(f, 'w').write(CFG.format(fe=fe, be=be))
+            cfg = CFG.format(fe=fe, be=be)
+            if name == 'ibex':
+                # Header names as HAProxy writes them (X5, D-E: Ibex's default keeps their case).
+                cfg = cfg.replace('global\n', 'global\n  tune.ibex.h1-lowercase-headers on\n', 1)
+            open(f, 'w').write(cfg)
             bk = Backend(be)
             p = subprocess.Popen([binp, '-f', f], stdout=open(f'{tmp}/{name}-{base}.log', 'w'),
                                  stderr=subprocess.STDOUT, start_new_session=True)

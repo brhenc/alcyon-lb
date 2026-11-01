@@ -131,7 +131,7 @@ fn req_cfg(addr: SocketAddr) -> String {
     // fetch that gives nothing (the rule changes nothing). Measured on the same oracle.
     rules_extra(&mut rules);
     format!(
-        "global\n  stats socket {{sock}} level admin\n{DEFAULTS}frontend fe\n  bind {addr}\n  http-request strict-mode off if {{ path_beg /soft }}\n{rules}  http-request return status 200 content-type text/plain lf-string \"%[req.hdrs]\"\n"
+        "global\n  tune.ibex.h1-lowercase-headers on\n  stats socket {{sock}} level admin\n{DEFAULTS}frontend fe\n  bind {addr}\n  http-request strict-mode off if {{ path_beg /soft }}\n{rules}  http-request return status 200 content-type text/plain lf-string \"%[req.hdrs]\"\n"
     )
 }
 
@@ -231,7 +231,7 @@ fn res_cfg(addr: SocketAddr, be: SocketAddr) -> String {
         rule("deltrunc", "del-headers-bin", "03782d61".into(), "");
     }
     format!(
-        "global\n  stats socket {{sock}} level admin\n{DEFAULTS}frontend fe\n  bind {addr}\n  http-request set-var(txn.t) req.hdr(x-t)\n  default_backend be\nbackend be\n  server s1 {be}\n{rules}"
+        "global\n  tune.ibex.h1-lowercase-headers on\n  stats socket {{sock}} level admin\n{DEFAULTS}frontend fe\n  bind {addr}\n  http-request set-var(txn.t) req.hdr(x-t)\n  default_backend be\nbackend be\n  server s1 {be}\n{rules}"
     )
 }
 
@@ -318,7 +318,7 @@ fn big_cfg(addr: SocketAddr, be: SocketAddr, n: usize) -> String {
     let bin: String = list.iter().map(|b| format!("{b:02x}")).collect();
     let rules = format!("  http-response add-headers-bin bin({bin}) if {{ var(txn.t) -m str many }}\n").repeat(n);
     format!(
-        "global\n  stats socket {{sock}} level admin\n  tune.bufsize 4096\n{DEFAULTS}frontend fe\n  bind {addr}\n  http-request set-var(txn.t) req.hdr(x-t)\n  default_backend be\nbackend be\n  server s1 {be}\n{rules}"
+        "global\n  tune.ibex.h1-lowercase-headers on\n  stats socket {{sock}} level admin\n  tune.bufsize 4096\n{DEFAULTS}frontend fe\n  bind {addr}\n  http-request set-var(txn.t) req.hdr(x-t)\n  default_backend be\nbackend be\n  server s1 {be}\n{rules}"
     )
 }
 

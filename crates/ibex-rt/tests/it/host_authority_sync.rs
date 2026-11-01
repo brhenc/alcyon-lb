@@ -27,7 +27,7 @@ fn upstream_head_in(tag: &str, global: &str, rule: &str, req: &str) -> String {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("c.cfg");
     let cfg = format!(
-        "global\n{global}defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {bind}\n  {rule}\n  default_backend be\nbackend be\n  server s1 127.0.0.1:{sp}\n"
+        "global\n  tune.ibex.h1-lowercase-headers on\n{global}defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {bind}\n  {rule}\n  default_backend be\nbackend be\n  server s1 127.0.0.1:{sp}\n"
     );
     std::fs::write(&path, cfg).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
@@ -115,7 +115,7 @@ fn status_in(tag: &str, global: &str, rule: &str, req: &str) -> String {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("c.cfg");
     let cfg = format!(
-        "global\n{global}defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {bind}\n  {rule}\n  default_backend be\nbackend be\n  server s1 127.0.0.1:9\n"
+        "global\n  tune.ibex.h1-lowercase-headers on\n{global}defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {bind}\n  {rule}\n  default_backend be\nbackend be\n  server s1 127.0.0.1:9\n"
     );
     std::fs::write(&path, cfg).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();

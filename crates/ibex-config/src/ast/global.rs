@@ -295,6 +295,10 @@ pub struct GlobalSection {
     pub pool_low_fd_ratio: Option<u8>,
     /// The `tune.vars.*` limits (T364 S5).
     pub vars_limits: VarsLimits,
+    /// `tune.ibex.h1-lowercase-headers on|off` (Ibex-only, X5, D-E): `Some(true)` writes every
+    /// header name of a forwarded HTTP/1 head in lower case, as HAProxy (whose HTX names are);
+    /// off when unset: a name goes in the case it came in (or a rule wrote it in).
+    pub h1_lowercase_headers: Option<bool>,
     /// `tune.ibex.zero-buffers on|off` (Ibex-only): zero a buffer's used bytes when it is released. Off when unset.
     pub zero_buffers: Option<bool>,
     /// `tune.ibex.zero-spares on|off` (Ibex-only): zero a spare string's or list's used bytes when

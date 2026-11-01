@@ -164,7 +164,7 @@ const HTTP_OK: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: clo
 
 fn tcp_inspect_cfg(port: u16, backend_port: u16) -> String {
     format!(
-        "defaults\n\tmode tcp\n\ttimeout connect 3s\n\ttimeout client 5s\n\t\
+        "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n\tmode tcp\n\ttimeout connect 3s\n\ttimeout client 5s\n\t\
          timeout server 5s\n\n\
          frontend fe\n\tbind 127.0.0.1:{port}\n\t\
          tcp-request inspect-delay 1s\n\t\
@@ -258,7 +258,7 @@ fn fc_src_follows_set_src_at_the_connection_layer() {
     let cfg = write_cfg(
         "fc_src.cfg",
         &format!(
-            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 5s\n\t\
+            "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 5s\n\t\
              timeout server 5s\n\n\
              frontend fe\n\tbind 127.0.0.1:{port}\n\t\
              tcp-request connection set-src ipv4(10.11.12.13)\n\t\
@@ -315,7 +315,7 @@ fn a_transaction_variable_does_not_leak_into_the_next_request() {
     let cfg = write_cfg(
         "txn_leak.cfg",
         &format!(
-            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 5s\n\t\
+            "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 5s\n\t\
              timeout server 5s\n\n\
              frontend fe\n\tbind 127.0.0.1:{port}\n\t\
              http-request set-var(txn.leak) str(tainted) if {{ path -m beg /taint }}\n\t\
@@ -373,7 +373,7 @@ fn a_track_sc_rule_naming_an_undefined_table_is_refused() {
     let cfg = write_cfg(
         "track_undef.cfg",
         &format!(
-            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 5s\n\t\
+            "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 5s\n\t\
              timeout server 5s\n\n\
              frontend fe\n\tbind 127.0.0.1:{port}\n\t\
              tcp-request content track-sc0 src table no_such_table\n\t\
@@ -408,7 +408,7 @@ fn backend_tcp_request_content_rules_are_evaluated() {
     let cfg = write_cfg(
         "be_content.cfg",
         &format!(
-            "defaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 5s\n\t\
+            "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n\tmode http\n\ttimeout connect 3s\n\ttimeout client 5s\n\t\
              timeout server 5s\n\n\
              frontend fe\n\tbind 127.0.0.1:{port}\n\tdefault_backend be\n\n\
              backend be\n\t\
@@ -460,7 +460,7 @@ fn inspect_delay_is_a_maximum_not_a_fixed_wait() {
     let cfg = write_cfg(
         "inspect_latency.cfg",
         &format!(
-            "defaults\n\tmode tcp\n\ttimeout connect 3s\n\ttimeout client 20s\n\t\
+            "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n\tmode tcp\n\ttimeout connect 3s\n\ttimeout client 20s\n\t\
              timeout server 20s\n\n\
              frontend fe\n\tbind 127.0.0.1:{port}\n\t\
              tcp-request inspect-delay 5s\n\t\

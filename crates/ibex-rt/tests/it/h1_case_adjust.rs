@@ -38,7 +38,7 @@ fn exchange(global: &str, fe: &str, be: &str) -> (String, String) {
         String::from_utf8_lossy(&got).into_owned()
     });
     let cfg = format!(
-        "global\n{global}\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 2s\n  timeout server 2s\n\
+        "global\n  tune.ibex.h1-lowercase-headers on\n{global}\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 2s\n  timeout server 2s\n\
          frontend f\n  bind {fa}\n{fe}  default_backend b\nbackend b\n{be}  server s {ba}\n"
     );
     let mut f = NamedTempFile::new().expect("tmp");
@@ -62,7 +62,7 @@ fn exchange(global: &str, fe: &str, be: &str) -> (String, String) {
 
 fn check(cfg: &str) -> (Option<i32>, String) {
     let mut f = NamedTempFile::new().expect("tmp");
-    f.write_all(format!("global\n{cfg}\ndefaults\n  mode http\n  timeout client 1s\n  timeout server 1s\n  timeout connect 1s\nfrontend f\n  bind 127.0.0.1:1\n").as_bytes()).unwrap();
+    f.write_all(format!("global\n  tune.ibex.h1-lowercase-headers on\n{cfg}\ndefaults\n  mode http\n  timeout client 1s\n  timeout server 1s\n  timeout connect 1s\nfrontend f\n  bind 127.0.0.1:1\n").as_bytes()).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-c").arg("-f").arg(f.path()).output().expect("ibex -c");
     (out.status.code(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
 }
