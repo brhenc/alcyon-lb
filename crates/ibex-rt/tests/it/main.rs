@@ -55,6 +55,7 @@ mod bind_options_per_bind;
 mod listen_backlog;
 mod log_abort_during_connect;
 mod local_reply_connection;
+mod local_reply_over_buffer;
 mod stats_page_framing;
 mod stats_page_headers;
 mod stats_page_streaming;

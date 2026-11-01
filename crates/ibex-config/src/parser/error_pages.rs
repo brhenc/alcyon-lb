@@ -9,6 +9,44 @@ use std::collections::HashMap;
 
 use super::*;
 
+thread_local! {
+    /// `tune.bufsize` as the parse has read it so far (`global` comes first): what a reply
+    /// file or an errorfile is measured against.
+    static BUFSIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(16384) };
+}
+
+/// Starts a parse with `HAProxy`'s default buffer size.
+pub(crate) fn reset_bufsize() {
+    BUFSIZE.with(|c| c.set(16384));
+}
+
+/// `tune.bufsize` was set (already rounded).
+pub(crate) fn set_bufsize(n: usize) {
+    BUFSIZE.with(|c| c.set(n));
+}
+
+fn bufsize() -> usize {
+    BUFSIZE.with(std::cell::Cell::get)
+}
+
+/// The body of a `file`/`lf-file` argument of `return`/`deny`/`http-error`
+/// (`http_load_file`/`http_parse_http_reply`): it must open, and fit the buffer. `rule` is
+/// whether a rule is being parsed, whose messages end with a dot.
+fn load_reply_file(tok: &Token, rule: bool) -> Result<String, ConfigError> {
+    let dot = if rule { "." } else { "" };
+    let path = &tok.text;
+    let bytes = std::fs::read(path)
+        .map_err(|_| ConfigError::new(tok.line, tok.col, format!("error opening file '{path}'{dot}")))?;
+    if bytes.len() > bufsize() {
+        return Err(ConfigError::new(
+            tok.line,
+            tok.col,
+            format!("file '{path}' exceeds the buffer size ({} > {}){dot}", bytes.len(), bufsize()),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// Reads the full contents of an `errorfile <code> <file>`-style file argument, exactly as
 /// `HAProxy` does: the file must exist and be readable at config time (files are read before
 /// any chroot), and its bytes are kept verbatim -- an empty file (`/dev/null` is the
@@ -32,12 +70,19 @@ pub(crate) fn load_errorfile_bytes(path_tok: &Token) -> Result<Vec<u8>, ConfigEr
 /// header lines, the blank line -- and an interim status. The messages are `HAProxy`'s,
 /// without the parser's error offset. Ibex loaded such a file and sent its bytes as the
 /// reply, a status line no client can read.
+const HTX_OVERHEAD: usize = 78;
+
 fn check_errorfile(bytes: &[u8]) -> Result<(), String> {
     const UNPARSABLE: &str = "unable to parse headers";
     if bytes.is_empty() {
         return Ok(());
     }
     let text = String::from_utf8_lossy(bytes);
+    // `http_str_to_htx` parses what fits the buffer (a longer file is cut at it) into an
+    // HTX message, whose own bookkeeping takes the first 78 bytes of it (measured: with the
+    // default 16384, a `HTTP/1.0 400 Bad` file of 16306 bytes is refused, 16305 accepted;
+    // 1970 and 1969 at `tune.bufsize 2048`).
+    let fits = bytes.len() + HTX_OVERHEAD < bufsize();
     let end = [text.find("\r\n\r\n"), text.find("\n\n")].into_iter().flatten().min().ok_or(UNPARSABLE)?;
     let mut lines = text[..end].split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
     let mut status_line = lines.next().unwrap_or_default().splitn(3, ' ');
@@ -56,6 +101,11 @@ fn check_errorfile(bytes: &[u8]) -> Result<(), String> {
     let status: u16 = code.parse().unwrap_or(0);
     if status == 100 || (102..200).contains(&status) {
         return Err(format!("invalid http status code for an error message ({status})"));
+    }
+    if !fits {
+        let head = end + if text[end..].starts_with("\r\n\r\n") { 4 } else { 2 };
+        let what = if head + HTX_OVERHEAD >= bufsize() { "headers" } else { "payload" };
+        return Err(format!("unable to add {what} into the HTX message"));
     }
     Ok(())
 }
@@ -291,14 +341,12 @@ pub(crate) fn parse_error_body_args(
                 i += 2;
             }
             "lf-file" if i + 1 < limit => {
-                let path = &tokens[i + 1].text;
                 body = Some((&tokens[i], true, true));
-                lf_string = Some(std::fs::read_to_string(path).unwrap_or_default());
+                lf_string = Some(load_reply_file(&tokens[i + 1], owner.is_some())?);
                 i += 2;
             }
             "file" if i + 1 < limit => {
-                let path = &tokens[i + 1].text;
-                let text = std::fs::read_to_string(path).unwrap_or_default();
+                let text = load_reply_file(&tokens[i + 1], owner.is_some())?;
                 body = Some((&tokens[i], false, !text.is_empty()));
                 lf_string = Some(text.replace('%', "%%"));
                 i += 2;

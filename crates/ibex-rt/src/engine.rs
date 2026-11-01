@@ -11299,6 +11299,11 @@ impl EngineDispatcher<'_> {
                     let d = *d;
                     stats_pump(&mut entry.sess, d, self.proxies, self.checks, self.pid);
                 }
+                // A local reply larger than one buffer, on an HTTP/2 stream (T589): the rest
+                // of it follows as the stream's buffer empties.
+                Some(crate::proxy::PendingOut::Raw(..)) if entry.sess.is_h2_child() => {
+                    entry.sess.drain_pending_raw_h2();
+                }
                 _ => {}
             }
             // T587: an HTTP/3 stream's response head is in: the response rules and the log see the

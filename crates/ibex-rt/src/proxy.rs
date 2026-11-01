@@ -2399,6 +2399,24 @@ impl TcpSession {
         self.wait_for_buffer(crate::buf_wait::Class::SeRx)
     }
 
+    /// T589: the part of a reply that did not fit `rep` (`PendingOut::Raw`), moved into it as
+    /// room appears, for a stream of an HTTP/2 connection, whose `process_cli_io` returns at
+    /// once; the engine calls it at step 3.5 on each pass, as it pumps a stats page. `writable`
+    /// takes a buffer back if the empty one was released (a stream with none gets no room
+    /// and tries again on the next pass, as a stats page does) and compacts a used-up tail.
+    pub fn drain_pending_raw_h2(&mut self) {
+        if let Some(PendingOut::Raw(ref data, ref mut offset)) = self.pending_resp.as_deref_mut() {
+            let room = self.rep.writable();
+            let n = room.len().min(data.len() - *offset);
+            room[..n].copy_from_slice(&data[*offset..*offset + n]);
+            self.rep.commit(n);
+            *offset += n;
+            if *offset >= data.len() {
+                self.pending_resp = None;
+            }
+        }
+    }
+
     #[cold]
     #[inline(never)]
     fn wait_for_buffer(&mut self, class: crate::buf_wait::Class) -> io::Result<bool> {

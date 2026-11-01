@@ -137,6 +137,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // preprocessor module existed, was unit-tested, and was reached by nothing, so `.if`
     // still failed with "unknown keyword" and the harness went on stripping the blocks
     // itself.
+    error_pages::reset_bufsize();
     let lexed = lex(input);
     if let Some((line, (col, msg))) = lexed.iter().find_map(|l| Some((l.line_number, l.error.clone()?))) {
         return Err(ConfigError::new(line, col, msg));

@@ -591,6 +591,7 @@ pub(crate) fn parse_global_directive(
             }
             let rounded = (raw_size + 15) & !15;
             global.bufsize = Some(rounded);
+            super::error_pages::set_bufsize(rounded);
             Ok(())
         }
         "tune.bufsize.small" => {
