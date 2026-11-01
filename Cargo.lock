@@ -1131,6 +1131,7 @@ version = "0.11.18"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
+ "ibex-alloc",
  "lru-slab",
  "rand 0.10.3",
  "rand_pcg",

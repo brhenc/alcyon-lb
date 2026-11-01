@@ -43,6 +43,10 @@ fn pem() -> String {
 }
 
 fn config(name: &str, port: u16, tls: bool, global_extra: &str) -> (String, String) {
+    config_threads(name, port, tls, global_extra, 1)
+}
+
+fn config_threads(name: &str, port: u16, tls: bool, global_extra: &str, nbthread: usize) -> (String, String) {
     std::fs::create_dir_all(DIR).unwrap();
     let sock = format!("{DIR}/{name}-{}.sock", std::process::id());
     let ssl = if tls { format!(" ssl crt {}", pem()) } else { String::new() };
@@ -50,7 +54,7 @@ fn config(name: &str, port: u16, tls: bool, global_extra: &str) -> (String, Stri
     std::fs::write(
         &cfg,
         format!(
-            "global\n  nbthread 1\n  stats socket {sock} level admin\n{global_extra}\
+            "global\n  nbthread {nbthread}\n  stats socket {sock} level admin\n{global_extra}\
              defaults\n  mode http\n  timeout client 5s\n  timeout connect 5s\n  timeout server 5s\n\
              frontend f\n  bind 127.0.0.1:{port}{ssl}\n  http-request return status 200 content-type text/plain string ok\n"
         ),
@@ -259,6 +263,58 @@ fn a_tiny_m_serves_or_refuses_cleanly() {
         if let Some(st) = exited {
             assert_eq!(st.code(), Some(1), "-m {megs}: {st:?} stderr: {err}");
             assert!(err.contains("[ALERT]") && err.contains("thread"), "-m {megs}: stderr: {err}");
+        }
+    }
+}
+
+/// T557 (VV-29): under `-m` at 16 and 32 threads the start aborted (exit 134, a core): "memory
+/// allocation of 86400 bytes failed" in a worker's setup, or "failed to allocate an alternative
+/// stack", and not every time (workers were spawned without waiting, so one worker's setup raced
+/// the probe for the next). The start must serve or be refused with an `[ALERT]` naming `-m` and
+/// the threads, exit 1. `HAProxy` 3.5-dev8 at 16/32 threads under `-m 4` or `64` stays up and serves
+/// nothing (V&V 2026-11-01 00:25): refusing loudly is a deliberate divergence (tradeoff.md).
+#[test]
+fn many_threads_under_m_serve_or_refuse_cleanly() {
+    for nbthread in [16usize, 32] {
+        for megs in [8u32, 64, 128, 192, 384, 512, 768] {
+            for round in 0..3 {
+                let port = common::reserve_port();
+                let name = format!("thr{nbthread}m{megs}r{round}");
+                let (cfg, sock) = config_threads(&name, port, false, "", nbthread);
+                let errfile = format!("{DIR}/{name}-{}.err", std::process::id());
+                let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+                    .args(["-m", &megs.to_string(), "-f", &cfg])
+                    .stdout(Stdio::null())
+                    .stderr(std::fs::File::create(&errfile).unwrap())
+                    .spawn()
+                    .expect("spawn ibex");
+                let mut run = Run { child, sock };
+                let addr = format!("127.0.0.1:{port}").parse().unwrap();
+                let start = std::time::Instant::now();
+                let (exited, served) = loop {
+                    if let Some(st) = run.child.try_wait().unwrap() {
+                        break (Some(st), false);
+                    }
+                    if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100)).is_ok() {
+                        break (None, true);
+                    }
+                    if start.elapsed().as_secs() > 20 {
+                        break (None, false);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                };
+                let err = std::fs::read_to_string(&errfile).unwrap();
+                let _ = std::fs::remove_file(&errfile);
+                let at = format!("nbthread {nbthread} -m {megs} round {round}");
+                assert!(!err.contains("panicked") && !err.contains("memory allocation") && !err.contains("alternative stack"), "{at}: stderr: {err}");
+                match exited {
+                    Some(st) => {
+                        assert_eq!(st.code(), Some(1), "{at}: {st:?} stderr: {err}");
+                        assert!(err.contains("[ALERT]") && err.contains("-m") && err.contains("thread"), "{at}: stderr: {err}");
+                    }
+                    None => assert!(served, "{at}: neither served nor exited in 20 s; stderr: {err}"),
+                }
+            }
         }
     }
 }

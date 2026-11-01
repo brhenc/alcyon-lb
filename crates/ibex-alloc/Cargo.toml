@@ -9,7 +9,7 @@ autotests = false
 [dependencies]
 zeroize = "1"
 # `headroom::thread_fits`: an anonymous mapping, probed and unmapped (T540 fix).
-rustix = { version = "0.38", features = ["mm"] }
+rustix = { version = "0.38", features = ["mm", "process"] }
 
 [features]
 # Test-only (T462): `stack_probe`, which reads and paints the stack below the caller. Turned on by
