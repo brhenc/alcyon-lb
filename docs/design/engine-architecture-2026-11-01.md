@@ -738,3 +738,33 @@ lock from the path; every slice reports its ins/req before and after, user and k
   with PGO 0.82x / 1.02x / 0.89x / 0.99x.
 - **Order**: 4 gate slots, <= 2 large `engine.rs` slices (3 in weeks 3-4); critical path
   X1 -> X2 -> X4 -> O1b -> O1c, weeks 1-6, landing re-measure week 7 (was 4-5 + 6).
+
+### 6.3 Fast run (user, 2026-11-01 evening): the schedule in hours, not weeks
+
+User: "debloat your estimates… without safety factors… doing things in parallel doesn't mean we
+have to repeat work that can be run on one code junction… ok with a bit fuzzier result for the
+moment." §4.6's week table is replaced by this; §4's slice rows and budgets stand. Starting point
+`ibex-rc4`.
+
+- **Measured durations, 2026-11-01:** X0 (sized ~1 day) 45 min; R1/T574 (M) ~25 min of agent time
+  including two measured builds; gate 4-10 min since T570; release-perf build ~7 min cold, serial.
+  A slice is ~1.5-3 h of wall time (agent, gate, review); an Opus L slice (X2, O1b) up to ~4 h.
+- **How:** every slice agent gets `~/ibex-worktrees/review/programme-brief.md`. The row is the spec
+  (no re-profiling or re-measuring HAProxy). It measures once at the end, min of 3, against a
+  shared base per main sha (`tools/measure/perfbase.sh`, T576). No board and no PGO per slice;
+  one PGO measurement and one landing re-measure at the end of the run. A track's slices run in
+  one worktree, one after another (one build tree, no rebase between them).
+- **Waves** (a slice starts when its dependency merges, not on a date):
+
+| wave | in flight (disjoint files) |
+|---|---|
+| 1 | K1 + parse-bytes (T575), L1 → L2 → L3 (one worktree), O2, C1 + C2, (T572 stats, T576 tools) |
+| 2 | X1 (after T575: same parser files), then X2 ∥ X3 |
+| 3 | X4, R2 (after X2), O1a (after X2) |
+| 4 | O1b (after O1a, X4), R4 (after O1a), IO1 only if keepalive > 1.0x here (D-16) |
+| 5 | O1c, X6/X7/X8 fillers, landing re-measure + PGO column |
+
+- **Critical path:** X1 → X2 → X4 → O1b → O1c, five slices at ~2.5-4 h = **~15-20 h** wall time
+  if each starts when its parent merges; the run end to end **~18-24 h**, with fix rounds after a
+  red gate as the uncertainty (each ~1 h). Remaining decisions (D-12..D-18) are taken at the
+  recommendation unless the user says otherwise.
