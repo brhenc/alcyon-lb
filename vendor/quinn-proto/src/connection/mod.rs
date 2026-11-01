@@ -72,7 +72,9 @@ mod spaces;
 pub use spaces::Retransmits;
 #[cfg(not(fuzzing))]
 use spaces::Retransmits;
-use spaces::{PacketNumberFilter, PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
+use spaces::{
+    PacketNumberFilter, PacketSpace, RetransmitsSpares, SendableFrames, SentPacket, ThinRetransmits,
+};
 
 mod stats;
 pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
@@ -182,7 +184,7 @@ pub struct Connection {
     prev_crypto: Option<PrevCrypto>,
     /// Emptied `Retransmits` boxes of acknowledged or lost packets, for the next packets'
     /// control frames (Ibex T543)
-    spare_retransmits: Vec<Box<Retransmits>>,
+    spare_retransmits: RetransmitsSpares,
     /// 1-RTT keys to be used for the next key update
     ///
     /// These are generated in advance to prevent timing attacks and/or DoS by third-party attackers
@@ -320,7 +322,7 @@ impl Connection {
             spaces: [initial_space, PacketSpace::new(now), PacketSpace::new(now)],
             highest_space: SpaceId::Initial,
             prev_crypto: None,
-            spare_retransmits: Vec::new(),
+            spare_retransmits: Default::default(),
             next_crypto: None,
             accepted_0rtt: false,
             permit_idle_reset: true,

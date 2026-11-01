@@ -42,6 +42,9 @@ mod bloom_token_log;
 #[cfg(feature = "bloom")]
 pub use bloom_token_log::BloomTokenLog;
 
+#[cfg(feature = "ibex-pools")]
+mod ibex_pools;
+
 mod connection;
 pub use crate::connection::{
     Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats, Datagrams, Event,
