@@ -704,6 +704,12 @@ def parse_insreq(out: str) -> List[int]:
     return counts
 
 
+def parse_insreq_kernel(out: str) -> List[int]:
+    """The per-round kernel instruction counts (T568: `round N kernel: <n> instructions`);
+    empty when the host does not let perf count instructions:k (`kernel: n/a`)."""
+    return [int(m.group(1)) for m in re.finditer(r"round \d+ kernel: (\d+) instructions", out)]
+
+
 def min_ins_per_req(counts: List[int], n: int) -> int:
     return min(counts) // n
 
@@ -727,7 +733,9 @@ def measure_ins_per_req(cand_bin: Path, ref_bin: Path, target_dir: Path,
                     p = subprocess.run(["bash", str(insreq), f"{sc}-{client}-{side}", str(binary),
                                         str(body), client, str(n), str(rounds), out],
                                        capture_output=True, text=True, env=env)
-                    res[f"{sc}_{client}_{side}"] = [c // n for c in parse_insreq(p.stdout + p.stderr)]
+                    o = p.stdout + p.stderr
+                    res[f"{sc}_{client}_{side}"] = [c // n for c in parse_insreq(o)]
+                    res[f"{sc}_{client}_{side}_kernel"] = [c // n for c in parse_insreq_kernel(o)]
     return res
 
 
@@ -1286,6 +1294,18 @@ def main() -> int:
         record[f"ins_per_req_{sc}_ref_samples"] = ins[f"{sc}_ab1_ref"]
         record[f"ins_per_req_{sc}_mb50"] = min(ins[f"{sc}_mb50_cand"])  # reported, not judged
         record[f"ins_per_req_{sc}_mb50_ref"] = min(ins[f"{sc}_mb50_ref"])
+        # T568: kernel instructions beside the user-space ones, recorded, not judged. Old rows
+        # lack the keys; a host that forbids instructions:k records none.
+        kc, kr = ins[f"{sc}_ab1_cand_kernel"], ins[f"{sc}_ab1_ref_kernel"]
+        if kc and kr:
+            record[f"ins_per_req_{sc}_kernel"] = min(kc)
+            record[f"ins_per_req_{sc}_kernel_ref"] = min(kr)
+            record[f"ins_per_req_{sc}_kernel_samples"] = kc
+            record[f"ins_per_req_{sc}_kernel_ref_samples"] = kr
+            print(f"      kernel instructions/req {sc}, ab1 (reported, min of {INS_ROUNDS}): this build "
+                  f"{kc}; reference {kr}")
+        else:
+            print(f"      kernel instructions/req {sc}: n/a (perf cannot count instructions:k here)")
         print(f"      instructions/req {sc}, ab1 (judged, min of {INS_ROUNDS}): this build "
               f"{ins[sc + '_ab1_cand']}; reference {ins[sc + '_ab1_ref']}; "
               f"mb50 (reported): {record[f'ins_per_req_{sc}_mb50']:,} vs {record[f'ins_per_req_{sc}_mb50_ref']:,}")

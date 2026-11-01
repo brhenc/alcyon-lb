@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #
-# Instructions per request (perf stat instructions:u) of one proxy binary on one scenario.
+# Instructions per request (perf stat instructions:u and instructions:k) of one proxy binary on one scenario.
 # Works for ibex and for haproxy, so the oracle can be measured with the same backend and client.
 #
 #   tools/measure/insreq.sh <label> <proxy-bin> <scenario.body> <client> <N> <rounds> <outdir>
@@ -41,13 +41,18 @@
 # (target/release-perf/ibex, T518: the budget is judged on one fat-LTO layout, not `release`).
 # Pins the proxy to CPU 4, the client to 5, the backend to 6 (as measure.py); IBEX_MEASURE_CPUS
 # "a,b,c" overrides. Warms up with 2000 requests, then counts the proxy process's user-space
-# instructions over each round and prints instructions per request. Takes no lock: hold
+# and kernel instructions over each round (one perf stat, two events, T568) and prints
+# instructions per request. Per round: `<L> round N: <U> instructions, <u> ins/req[, D client
+# dgrams/req]` (user space; the line parsers read), then `<L> round N kernel: <K> instructions,
+# <k> ins/req, total <t> ins/req`; at the end `<L> summary (min of R): user u, kernel k, total t
+# ins/req`. If perf may not count :k (perf_event_paranoid), the kernel lines read `kernel: n/a`,
+# with one warning, and the run goes on. The h3fit mode counts user space only. Takes no lock: hold
 # `flock -x /tmp/ibex-load.lock` around a batch, and keep a batch under 15 minutes. Needs
 # $HOME/ibex-targets/gate-slot1/release/measure-bench (MEASURE_BENCH overrides; for an h3 POST one
 # built since T555, which frames a body that arrives in a read of its own), and for h3best,
 # h3worst, h3fit $HOME/ibex-targets/h3bench/release/h3bench (H3BENCH overrides; built if missing).
 set -u
-if [ $# -ne 7 ]; then sed -n '5,48p' "$0"; exit 2; fi
+if [ $# -ne 7 ]; then sed -n '5,56p' "$0"; exit 2; fi
 LABEL=$1; BIN=$2; BODY=$3; CL=$4; N=$5; ROUNDS=$6; OUT=$7
 mkdir -p "$OUT" || exit 1
 BENCH=${MEASURE_BENCH:-$HOME/ibex-targets/gate-slot1/release/measure-bench}
@@ -89,24 +94,31 @@ client() {
     *) echo "unknown client $CL" >&2; return 1 ;;
   esac
 }
-# One counted round of client $CL: "<instructions> <client datagrams/req or ->", files $OUT/$LABEL.$1.*
+# Kernel instructions need perf_event_paranoid <= 1 or CAP_PERFMON; probe once, never fail.
+EVENTS=instructions:u,instructions:k
+if ! perf stat -x, -e instructions:k -- true 2>&1 | grep -q '^[0-9]'; then
+  echo "$LABEL: warning: perf cannot count instructions:k here (perf_event_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null)); kernel: n/a" >&2
+  EVENTS=instructions:u
+fi
+# One counted round of client $CL: "<user instructions> <client datagrams/req or -> <kernel instructions or ->", files $OUT/$LABEL.$1.*
 round() {
-  perf stat -x, -e instructions:u -p "$P" -o "$OUT/$LABEL.$1.stat" -- \
+  perf stat -x, -e "$EVENTS" -p "$P" -o "$OUT/$LABEL.$1.stat" -- \
     bash -c "$(declare -f client); BENCH=$BENCH H3BENCH=$H3BENCH H3M=$H3M CL=$CL FE=$FE CPU_C=$CPU_C; client $N" > "$OUT/$LABEL.$1.client" 2>&1
-  INS=$(grep instructions "$OUT/$LABEL.$1.stat" | cut -d, -f1)
+  read -r INS KINS < <(python3 "$(dirname "$0")/insreq_stat.py" "$OUT/$LABEL.$1.stat")
+  [ -n "${INS:-}" ] || { echo "$LABEL $1: perf stat counted no instructions:u" >&2; INS=0; KINS=-; }
   if grep -q '^requests:' "$OUT/$LABEL.$1.client" && ! grep -q "requests: $N total, $N started, $N done, $N succeeded" "$OUT/$LABEL.$1.client"; then
     echo "$LABEL $1: the client did not complete every request: $(grep '^requests:' "$OUT/$LABEL.$1.client")" >&2
   fi
   D=$(sed -n 's/^h3bench: .* client \([0-9.]*\) datagrams\/req.*/\1/p' "$OUT/$LABEL.$1.client")
-  echo "$INS ${D:--}"
+  echo "$INS ${D:--} ${KINS:--}"
 }
 if [ "$CL" = h3fit ]; then
   CL=h3best client 2000 > "$OUT/$LABEL.warm-best.out" 2>&1
   CL=h3worst client 2000 > "$OUT/$LABEL.warm-worst.out" 2>&1
   : > "$OUT/$LABEL.fit"
   for r in $(seq 1 "$ROUNDS"); do
-    read -r IB DB < <(CL=h3best round "r$r.best")
-    read -r IW DW < <(CL=h3worst round "r$r.worst")
+    read -r IB DB _ < <(CL=h3best round "r$r.best")
+    read -r IW DW _ < <(CL=h3worst round "r$r.worst")
     python3 - "$LABEL" "$r" "$N" "$IB" "$DB" "$IW" "$DW" "$FIT_RATE" <<'PY' | tee -a "$OUT/$LABEL.fit"
 import sys
 label, r, n, ib, db, iw, dw, rate = sys.argv[1:]
@@ -142,13 +154,26 @@ PY
 else
   client 2000 > "$OUT/$LABEL.warm.out" 2>&1
   for r in $(seq 1 "$ROUNDS"); do
-    read -r INS D < <(round "r$r")
+    read -r INS D K < <(round "r$r")
     if [ "$D" = - ]; then
       echo "$LABEL round $r: $INS instructions, $((INS / N)) ins/req"
     else
       echo "$LABEL round $r: $INS instructions, $((INS / N)) ins/req, $D client dgrams/req"
     fi
+    UMIN=$(( ${UMIN:-$INS} < INS ? ${UMIN:-$INS} : INS ))
+    if [ "$K" = - ]; then
+      echo "$LABEL round $r kernel: n/a"
+    else
+      echo "$LABEL round $r kernel: $K instructions, $((K / N)) ins/req, total $(((INS + K) / N)) ins/req"
+      KMIN=$(( ${KMIN:-$K} < K ? ${KMIN:-$K} : K ))
+      T=$((INS + K)); TMIN=$(( ${TMIN:-$T} < T ? ${TMIN:-$T} : T ))
+    fi
   done
+  if [ "${K:--}" = - ]; then
+    echo "$LABEL summary (min of $ROUNDS): user $((UMIN / N)), kernel n/a, total n/a ins/req"
+  else
+    echo "$LABEL summary (min of $ROUNDS): user $((UMIN / N)), kernel $((KMIN / N)), total $((TMIN / N)) ins/req"
+  fi
 fi
 kill "$P"; wait "$P" 2>/dev/null; kill "$BEPID"; wait "$BEPID" 2>/dev/null
 echo "$LABEL done (proxy pid $P and backend pid $BEPID stopped)"
