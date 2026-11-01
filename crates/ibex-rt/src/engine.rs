@@ -9640,6 +9640,10 @@ fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str, ca
         n += part.len();
     }
     let inject = &line[..n];
+    // The usual head ends in CRLF CRLF: the line goes in where it is (no scratch copy).
+    if crlf && eoh_len == 4 && buf.insert_last_header(inject) {
+        return Some(inject.len());
+    }
     let total_old = eoh_pos + eoh_len;
     let total_new = total_old + inject.len();
     // `find_eoh` points at the start of the blank-line pair; the last header's own
@@ -15337,7 +15341,7 @@ fn rewrite_request_connection(sess: &mut TcpSession, opt_close: bool) {
         }
         let close = kept(sess, false, false);
         if let Some(tok) = crate::txn::request_connection_token(close, http11, false) {
-            add_req_header(sess, "Connection", tok);
+            add_req_connection(sess, tok);
         }
         return;
     }
@@ -15467,6 +15471,35 @@ fn add_req_header_fit(sess: &mut TcpSession, name: &str, val: &str) -> bool {
     sess.htx_reserve(name.len() + val.len());
     add_req_header(sess, name, val);
     true
+}
+
+/// `Connection: <tok>` as the last header of the request, for the token the server connection's
+/// state calls for (`h1_make_headers` writes it from the connection-mode flags, `HAProxy`'s
+/// `H1_MF_CONN_KAL`/`H1_MF_CONN_CLO`). The head the client sent is in the request buffer as it
+/// is (the client's own tokens went at the parse, [`crate::proxy`]'s `strip_request_connection`),
+/// so the line goes in where it belongs, with the HTX block; nothing is written out again. A
+/// request that edits go through [`add_req_header`].
+fn add_req_connection(sess: &mut TcpSession, tok: &str) {
+    let plain_h1 = !REQ_REBUILD.get().0 && sess.has_htx && sess.req_headers.is_none() && sess.h2_active().is_none() && !sess.h3;
+    if plain_h1 {
+        let added = sess.with_htx_mut(|htx| htx.add_header("Connection", tok).is_ok()).unwrap_or(false);
+        if added {
+            let mut line = [0u8; 40];
+            let parts: [&[u8]; 3] = [b"connection: ", tok.as_bytes(), b"\r\n"];
+            let mut n = 0;
+            for p in parts {
+                line[n..n + p.len()].copy_from_slice(p);
+                n += p.len();
+            }
+            if sess.req.insert_last_header(&line[..n]) {
+                return;
+            }
+            // No room, or a head ending another way: write it out of the HTX.
+            rebuild_req_buffer(sess);
+            return;
+        }
+    }
+    add_req_header(sess, "Connection", tok);
 }
 
 fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {

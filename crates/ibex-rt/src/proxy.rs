@@ -2376,9 +2376,10 @@ impl TcpSession {
         }
         let ka = |w: &str| w.eq_ignore_ascii_case("close") || w.eq_ignore_ascii_case("keep-alive");
         // The usual one: all of it goes (with no allocation), cut out of the head where it is.
+        // A lone `keep-alive` or `close` (the parse saw it: plain, no list) is gone whole.
         if conn.count == 1
             && conn.plain
-            && self.htx_slice().and_then(|htx| htx.get_header("connection")).is_some_and(|v| ibex_sample::h1_drop_items(v, ka).is_empty())
+            && (!conn.commas || self.htx_slice().and_then(|htx| htx.get_header("connection")).is_some_and(|v| ibex_sample::h1_drop_items(v, ka).is_empty()))
         {
             self.with_htx_mut(|htx| {
                 let _ = htx.remove_header("connection");

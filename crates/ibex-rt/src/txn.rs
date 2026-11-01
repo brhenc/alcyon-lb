@@ -1347,6 +1347,9 @@ pub struct ConnScan {
     pub plain: bool,
     /// Where the first one is: from the start of its line to the start of the next.
     pub first: (usize, usize),
+    /// A value of one of them holds a comma (a list): a plain header without one is a single
+    /// `keep-alive` or `close`, which goes whole with nothing left to look at.
+    pub commas: bool,
 }
 
 /// Looks for the `Connection` headers of a head (one pass over the bytes, no allocation).
@@ -1367,6 +1370,7 @@ pub fn scan_connection(head: &[u8]) -> ConnScan {
                 }
                 out.count += 1;
                 out.plain &= std::str::from_utf8(&rest[1..]).is_ok_and(connection_is_plain);
+                out.commas |= rest.contains(&b',');
             }
         }
         if matches!(line[0], b'\r' | b'\n') {
@@ -1692,6 +1696,7 @@ impl<'h> FactsScan<'h> {
                 f.conn.first = (at, next);
             }
             f.conn.count += 1;
+            f.conn.commas |= value.contains(&b',');
             let (mut kept, mut chars, mut dropped, mut upg, mut upg_chars) = (0, 0, false, 0, 0);
             for t in value.split(|&b| b == b',').map(ascii_trim).filter(|t| !t.is_empty()) {
                 let close = t.eq_ignore_ascii_case(b"close");
