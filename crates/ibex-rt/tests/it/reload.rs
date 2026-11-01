@@ -414,7 +414,16 @@ fn stop_pid(pid: u32) {
 }
 
 fn start_notified(cfg: &Path, sink: &NotifySink, pidfile: &Path) -> Proc {
-    let child = Command::new(env!("CARGO_BIN_EXE_ibex"))
+    start_notified_in(cfg, sink, pidfile, None)
+}
+
+/// The same, with `TMPDIR` (where the reload's handover directory goes) set for the process.
+fn start_notified_in(cfg: &Path, sink: &NotifySink, pidfile: &Path, tmpdir: Option<&Path>) -> Proc {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ibex"));
+    if let Some(t) = tmpdir {
+        cmd.env("TMPDIR", t);
+    }
+    let child = cmd
         .arg("-Ws")
         .arg("-f")
         .arg(cfg)
@@ -610,6 +619,125 @@ fn a_reload_that_fails_after_loading_its_config_leaves_the_pidfile_alone() {
          process still serving"
     );
     assert!(old.wait_exit(Duration::from_millis(300)).is_none(), "old process stopped");
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&pidfile);
+    old.stop();
+}
+
+/// A reload's private handover directory is named after the reloading process's PID
+/// (`$TMPDIR/ibex-reload-<pid>-0`). The old process exits without removing it, so after a
+/// PID wrap a process gets the PID of one that reloaded earlier and finds the stale
+/// directory there (T565: 7,984 of them in /tmp after a day of tests; `h3_reload` failed
+/// "no new process took over" on `File exists`). The reload must go ahead regardless.
+#[test]
+fn a_reload_survives_a_stale_handover_directory_from_a_previous_process_with_its_pid() {
+    let be = backend();
+    let fe = common::reserve_addr();
+    let sock = short_sock("staledir");
+    let cfg = write_cfg(&config(fe, be, &sock, ""));
+    let mut sink = NotifySink::new("staledir");
+    let pidfile = short_sock("staledir").with_extension("pid");
+
+    let mut old = start_notified(cfg.path(), &sink, &pidfile);
+    sink.wait_for("READY=1", Duration::from_secs(5)).expect("initial READY=1");
+    wait_listening(fe);
+    let old_pid = old.pid();
+    let stale = std::env::temp_dir().join(format!("ibex-reload-{old_pid}-0"));
+    let _ = std::fs::remove_dir_all(&stale);
+    std::fs::create_dir(&stale).expect("stale handover directory");
+    std::fs::write(stale.join("s"), b"").expect("stale socket file");
+
+    old.signal(Signal::Usr2);
+    let handed = sink.wait_until(
+        |m| m.contains("READY=1") && mainpid(m).is_some_and(|p| p != old_pid),
+        Duration::from_secs(5),
+    );
+    let new_pid = handed.as_deref().and_then(mainpid);
+    let _ = std::fs::remove_dir_all(&stale);
+    let new_pid = new_pid.unwrap_or_else(|| panic!("no new process took over despite the stale directory; saw {:?}", sink.seen));
+    assert!(old.wait_exit(Duration::from_secs(5)).is_some(), "old process must stop");
+    // The new process's own handover directories must not be left behind either: it
+    // reloads once more and the directory of that reload is gone once it has served.
+    assert_eq!(read_pidfile(&pidfile), Some(new_pid));
+    let dir = std::env::temp_dir().join(format!("ibex-reload-{new_pid}-0"));
+    send_signal(new_pid, Signal::Usr2);
+    let handed = sink.wait_until(
+        |m| m.contains("READY=1") && mainpid(m).is_some_and(|p| p != new_pid && p != old_pid),
+        Duration::from_secs(5),
+    );
+    let third = handed.as_deref().and_then(mainpid).unwrap_or_else(|| panic!("second reload; saw {:?}", sink.seen));
+    assert!(wait_gone(new_pid, Duration::from_secs(5)), "second process must stop");
+    assert!(!dir.exists(), "{} left behind by a process that reloaded and exited", dir.display());
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&pidfile);
+    stop_pid(third);
+}
+
+/// A stale handover directory that cannot be removed (someone else's, or here one holding
+/// an unreadable subdirectory) gives way to the next sequence number: the reload still
+/// happens, in `ibex-reload-<pid>-1`. Coverage of the retry arm in `Reload::start`.
+#[test]
+fn a_stale_handover_directory_that_cannot_be_removed_gives_way_to_the_next_name() {
+    use std::os::unix::fs::PermissionsExt;
+    let be = backend();
+    let fe = common::reserve_addr();
+    let sock = short_sock("stuckdir");
+    let cfg = write_cfg(&config(fe, be, &sock, ""));
+    let mut sink = NotifySink::new("stuckdir");
+    let pidfile = short_sock("stuckdir").with_extension("pid");
+    let tmp = tempfile::tempdir().expect("tmpdir");
+
+    let mut old = start_notified_in(cfg.path(), &sink, &pidfile, Some(tmp.path()));
+    sink.wait_for("READY=1", Duration::from_secs(5)).expect("initial READY=1");
+    wait_listening(fe);
+    let old_pid = old.pid();
+    let stale = tmp.path().join(format!("ibex-reload-{old_pid}-0"));
+    let blocker = stale.join("blocker");
+    std::fs::create_dir_all(&blocker).expect("stale handover directory");
+    std::fs::write(blocker.join("f"), b"").expect("file in the blocker");
+    std::fs::set_permissions(&blocker, std::fs::Permissions::from_mode(0o000)).expect("chmod 0");
+    assert!(std::fs::remove_dir_all(&stale).is_err(), "the stale directory must be unremovable for this test to mean anything");
+
+    old.signal(Signal::Usr2);
+    let handed = sink.wait_until(
+        |m| m.contains("READY=1") && mainpid(m).is_some_and(|p| p != old_pid),
+        Duration::from_secs(5),
+    );
+    let new_pid = handed.as_deref().and_then(mainpid);
+    // Still there: the reload could only have gone through `ibex-reload-<pid>-1`.
+    let stale_kept = stale.is_dir();
+    let _ = std::fs::set_permissions(&blocker, std::fs::Permissions::from_mode(0o700));
+    let _ = std::fs::remove_dir_all(&stale);
+    let new_pid = new_pid.unwrap_or_else(|| panic!("no new process took over despite the stuck directory; saw {:?}", sink.seen));
+    assert!(stale_kept, "the unremovable directory was removed: the test did not exercise the retry");
+    assert!(old.wait_exit(Duration::from_secs(5)).is_some(), "old process must stop");
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&pidfile);
+    stop_pid(new_pid);
+}
+
+/// No usable temporary directory at all: the reload fails cleanly ("Reload failed!" to
+/// systemd, the ALERT on stderr) and the old process keeps serving. Coverage of the error
+/// arm in `Reload::start`.
+#[test]
+fn a_reload_without_a_temporary_directory_fails_and_leaves_the_old_process_serving() {
+    let be = backend();
+    let fe = common::reserve_addr();
+    let sock = short_sock("notmpdir");
+    let cfg = write_cfg(&config(fe, be, &sock, ""));
+    let mut sink = NotifySink::new("notmpdir");
+    let pidfile = short_sock("notmpdir").with_extension("pid");
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let missing = tmp.path().join("missing");
+
+    let mut old = start_notified_in(cfg.path(), &sink, &pidfile, Some(&missing));
+    sink.wait_for("READY=1", Duration::from_secs(5)).expect("initial READY=1");
+    wait_listening(fe);
+    old.signal(Signal::Usr2);
+    assert!(sink.wait_for("Reload failed", Duration::from_secs(5)).is_some(), "the reload must be reported as failed; saw {:?}", sink.seen);
+    assert_eq!(read_pidfile(&pidfile), Some(old.pid()));
+    assert!(old.wait_exit(Duration::from_millis(300)).is_none(), "old process stopped");
+    wait_listening(fe);
     let _ = std::fs::remove_file(&sock);
     let _ = std::fs::remove_file(&pidfile);
     old.stop();

@@ -98,6 +98,40 @@ impl Drop for Chain {
     }
 }
 
+/// What a failed run leaves behind: the chain's stderr (every process of a reload chain
+/// inherits it) and `ps` of the processes still there, printed when the test panics, and
+/// always when `IBEX_TEST_DIAG` is set. The log stays in the test's temporary directory
+/// otherwise, which goes with it.
+struct Diag {
+    errlog: std::path::PathBuf,
+    pidfile: std::path::PathBuf,
+    dumped: std::cell::Cell<bool>,
+}
+
+impl Drop for Diag {
+    fn drop(&mut self) {
+        if (thread::panicking() || std::env::var_os("IBEX_TEST_DIAG").is_some()) && !self.dumped.get() {
+            self.dump();
+        }
+    }
+}
+
+impl Diag {
+    /// Printed before the "took over" assertion, while the chain is still there.
+    fn dump(&self) {
+        self.dumped.set(true);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        eprintln!("--- T565 diag at {now:.3}: pidfile {:?}", std::fs::read_to_string(&self.pidfile).map(|s| s.trim().to_string()));
+        let ps = Command::new("ps").args(["-eo", "pid,ppid,stat,etimes,wchan:20,args"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        for l in ps.lines().filter(|l| l.contains("/ibex -W") || l.contains("/ibex -f") || l.contains("-sf ")) {
+            eprintln!("ps: {l}");
+        }
+        eprintln!("--- {} (every process of the chain):", self.errlog.display());
+        eprint!("{}", std::fs::read_to_string(&self.errlog).unwrap_or_default());
+        eprintln!("--- end of diag");
+    }
+}
+
 /// One request on a new QUIC connection: curl's status line, or what went wrong.
 fn curl(quic: SocketAddr, path: &str) -> Result<(), String> {
     let ip = if quic.ip().is_unspecified() { "127.0.0.2".to_string() } else { quic.ip().to_string() };
@@ -155,6 +189,11 @@ fn across_reloads(wildcard: bool) {
     let dir = tempfile::tempdir().expect("tmpdir");
     let cfg = dir.path().join("c.cfg");
     let pidfile = dir.path().join("p.pid");
+    // Every process of the chain inherits this stderr (T565): on a failure the master log
+    // and the chain's `ps` are printed, so a reload that stalls says where it stalled.
+    let errlog = dir.path().join("ibex.err");
+    let stderr = std::fs::File::create(&errlog).expect("stderr log");
+    let diag = Diag { errlog: errlog.clone(), pidfile: pidfile.clone(), dumped: std::cell::Cell::new(false) };
     std::fs::write(
         &cfg,
         format!(
@@ -173,7 +212,7 @@ fn across_reloads(wildcard: bool) {
             .arg("-p")
             .arg(&pidfile)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .expect("spawn ibex"),
     );
@@ -218,6 +257,9 @@ fn across_reloads(wildcard: bool) {
         if !chain.0.contains(&serving) {
             chain.0.push(serving);
         }
+        if serving == old {
+            diag.dump();
+        }
         assert_ne!(serving, old, "reload {i}: no new process took over within 20 s");
     }
     thread::sleep(Duration::from_millis(1500));
@@ -228,6 +270,7 @@ fn across_reloads(wildcard: bool) {
     }
     drop(chain);
     common::stop(&mut first.0);
+    drop(diag);
 
     let errors = errors.lock().expect("lock").clone();
     let n = served.load(Ordering::Relaxed);
