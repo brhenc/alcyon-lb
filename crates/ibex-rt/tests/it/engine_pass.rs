@@ -88,3 +88,12 @@ fn a_request_with_no_log_target_builds_no_log_line() {
     eprintln!("wall clock reads over {n} requests: {wall}");
     assert!(wall <= 1, "{wall} SystemTime reads over {n} requests with no log target");
 }
+
+#[test]
+fn a_request_reads_the_clock_once_per_pass_and_never_for_a_log_it_does_not_write() {
+    let (_, wall, clock, _, n) = run();
+    // Each request takes a few passes; `run` runs at least 3 per request. One read a pass.
+    eprintln!("monotonic reads {clock} over {n} passes, wall {wall}");
+    assert_eq!(wall, 0);
+    assert_eq!(clock, n, "{clock} Instant reads over {n} passes");
+}

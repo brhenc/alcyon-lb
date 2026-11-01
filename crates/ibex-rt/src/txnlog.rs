@@ -137,18 +137,30 @@ pub fn server_slot(idx: usize) -> Option<std::num::NonZeroU32> {
 thread_local! {
     /// The loop's clock for this pass (`now_ns`, refreshed by `clock_update_date` after the poller).
     static LOOP_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// The same instant as [`crate::statcnt::now_ms`] reads it (0: not set), worked out once a pass.
+    static LOOP_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The pass's `now_ms`, 0 where no loop runs.
+#[must_use]
+pub fn loop_ms() -> u64 {
+    LOOP_MS.with(std::cell::Cell::get)
 }
 
 /// Sets the thread's clock for the pass that is starting (once per loop iteration, after the poller).
 pub fn set_loop_now(t: Instant) {
     LOOP_NOW.with(|c| c.set(Some(t)));
+    LOOP_MS.with(|c| c.set(crate::statcnt::ms_at(t)));
 }
 
 /// The time every log timer is stamped from: the loop's per-iteration clock, as `HAProxy`'s
 /// `now_ns`, so two events of one pass carry one timestamp. A clock read where no loop runs.
 #[must_use]
 pub fn loop_now() -> Instant {
-    LOOP_NOW.with(std::cell::Cell::get).unwrap_or_else(Instant::now)
+    LOOP_NOW.with(std::cell::Cell::get).unwrap_or_else(|| {
+        crate::probe::clock_read();
+        Instant::now()
+    })
 }
 
 thread_local! {

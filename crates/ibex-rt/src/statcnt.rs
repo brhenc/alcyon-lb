@@ -195,8 +195,17 @@ impl TxnCounters {
 /// where no loop runs). The rate counters of a request read it five times (T550 Q2).
 #[must_use]
 pub fn now_ms() -> u64 {
+    match crate::txnlog::loop_ms() {
+        0 => ms_at(crate::txnlog::loop_now()),
+        ms => ms,
+    }
+}
+
+/// [`now_ms`] for the instant `t`.
+#[must_use]
+pub fn ms_at(t: Instant) -> u64 {
     static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
-    crate::txnlog::loop_now().saturating_duration_since(*EPOCH).as_millis() as u64 + 1
+    t.saturating_duration_since(*EPOCH).as_millis() as u64 + 1
 }
 
 /// A proxy's counters: as a frontend, as a backend, and one set per server.

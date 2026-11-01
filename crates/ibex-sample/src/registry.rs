@@ -3686,13 +3686,7 @@ impl Registry {
                     .first()
                     .and_then(|s| s.parse::<u32>().ok())
                     .unwrap_or(u32::MAX);
-                let seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos();
-                // The low 32 bits of the clock: the truncation is the point.
-                #[allow(clippy::cast_possible_truncation)]
-                let seed_u32 = seed as u32;
+                let seed_u32 = next_seed();
                 let r = i64::from(full_hash(seed_u32) % max.max(1));
                 Some(Sample::Sint(r))
             },
@@ -9761,4 +9755,25 @@ mod compiled_multi_only {
         assert_eq!(Registry::eval_c(&c, &[], none, &ctx), Some(Sample::Sint(7)));
         assert_eq!(Registry::eval_all_c(&c, &[], none, &ctx), vec![Sample::Sint(7), Sample::Sint(8)]);
     }
+}
+
+thread_local! {
+    /// The `rand` fetch's state: a counter seeded from the clock once per thread.
+    static RAND_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The next 32 random bits of this thread (splitmix64): no clock read per call (T579, C2).
+fn next_seed() -> u32 {
+    RAND_STATE.with(|c| {
+        let mut s = c.get();
+        if s == 0 {
+            s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64 | 1;
+        }
+        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        c.set(s);
+        let mut z = s;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)) as u32
+    })
 }

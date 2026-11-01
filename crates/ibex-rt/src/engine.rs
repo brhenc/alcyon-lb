@@ -5649,8 +5649,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// # Errors
     /// Returns an error if polling epoll fails.
     pub fn run_once(&mut self) -> io::Result<usize> {
-        crate::probe::clock_read();
-        let at = Instant::now();
+        let at = crate::txnlog::loop_now();
         self.step_at(self.tick_at(at), at)
     }
 
@@ -6804,9 +6803,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     break;
                 }
             }
-            // One clock read before the poller (`now` and the deadlines it waits for) and
-            // one after it (`pass_start`), as HAProxy's two `clock_update_date` (T550 Q2).
-            let at = Instant::now();
+            // One clock read a pass, after the poller (`pass_start`): the deadlines the poller
+            // waits for are measured from the previous pass's, as HAProxy's `now_ms` is (T579, C2).
+            let at = crate::txnlog::loop_now();
             let ran = self.step_at(self.tick_at(at), at)?;
             quiet = ran == 0 && self.scheduler.run_queue_len() == 0;
         }
