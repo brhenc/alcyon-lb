@@ -59,6 +59,7 @@ pub mod srvlog;
 pub mod track;
 pub mod server_state;
 pub mod txn;
+pub mod probe;
 pub mod txnlog;
 pub mod websocket;
 pub mod quic_listener;

@@ -12,6 +12,24 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
+/// A counted add: the shared-memory read-modify-write of the stream accounting
+/// ([`crate::probe`] counts them in a debug build).
+#[inline]
+pub fn add(a: &AtomicU64, v: u64) {
+    crate::probe::rmw();
+    a.fetch_add(v, Ordering::Relaxed);
+}
+
+/// A counted maximum.
+#[inline]
+pub fn max(a: &AtomicU32, v: u32) {
+    // A maximum is beaten rarely: one plain load, no locked instruction, when it is not.
+    if v > a.load(Ordering::Relaxed) {
+        crate::probe::rmw();
+        a.fetch_max(v, Ordering::Relaxed);
+    }
+}
+
 /// Samples a running average spans (`TIME_STATS_SAMPLES`).
 const SAMPLES: u64 = 512;
 
@@ -31,7 +49,7 @@ impl TimeStat {
         let s = self.sum.load(Ordering::Relaxed);
         let decay = if window > 0 { (s + window - 1) / window } else { 0 };
         self.sum.store(s - decay + ms, Ordering::Relaxed);
-        self.max.fetch_max(u32::try_from(ms).unwrap_or(u32::MAX), Ordering::Relaxed);
+        max(&self.max, u32::try_from(ms).unwrap_or(u32::MAX));
     }
 
     /// The average, rounded up as `swrate_avg` does.
@@ -112,7 +130,7 @@ impl TxnCounters {
             500..=599 => 4,
             _ => 5,
         };
-        self.hrsp[class].fetch_add(1, Ordering::Relaxed);
+        add(&self.hrsp[class], 1);
     }
 
     /// Seconds since `stamp` (a [`now_ms`] value), or `None` when it was never set.

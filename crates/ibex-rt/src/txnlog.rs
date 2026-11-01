@@ -22,8 +22,6 @@ static STREAM_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct StreamLog {
     /// `accept_ts`: the stream's start.
     pub start: Instant,
-    /// `accept_date`: the same moment, as unix seconds and milliseconds.
-    pub date: (i64, u32),
     /// The first byte of the request arrived (end of `t_idle`).
     pub first_byte: Option<Instant>,
     /// The request head was complete (`request_ts`).
@@ -153,14 +151,40 @@ pub fn loop_now() -> Instant {
     LOOP_NOW.with(std::cell::Cell::get).unwrap_or_else(Instant::now)
 }
 
+thread_local! {
+    /// A wall-clock reading and the monotonic instant it was taken at, renewed once a second.
+    static WALL_BASE: std::cell::Cell<Option<(Instant, SystemTime)>> = const { std::cell::Cell::new(None) };
+}
+
 impl StreamLog {
+    /// `accept_date`: the stream's start as unix seconds and milliseconds. Worked out from a
+    /// wall-clock base read at most once a second, and only when something asks for it: a
+    /// stream nobody logs or fetches the date of costs no `SystemTime::now` (T579, C1).
+    #[must_use]
+    pub fn date(&self) -> (i64, u32) {
+        let (at, wall) = WALL_BASE.with(|c| match c.get() {
+            Some(b) if loop_now().saturating_duration_since(b.0) < std::time::Duration::from_secs(1) => b,
+            _ => {
+                crate::probe::wall_read();
+                let b = (loop_now(), SystemTime::now());
+                c.set(Some(b));
+                b
+            }
+        });
+        let d = if self.start >= at {
+            wall + self.start.duration_since(at)
+        } else {
+            wall - at.duration_since(self.start)
+        };
+        let d = d.duration_since(UNIX_EPOCH).unwrap_or_default();
+        (i64::try_from(d.as_secs()).unwrap_or(0), d.subsec_millis())
+    }
+
     /// A stream starting now, on a session whose counters read `bytes_in`/`bytes_out`.
     #[must_use]
     pub fn start(bytes_in: u64, bytes_out: u64) -> StreamLog {
-        let date = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         StreamLog {
             start: loop_now(),
-            date: (i64::try_from(date.as_secs()).unwrap_or(0), date.subsec_millis()),
             first_byte: None,
             request: None,
             queue: None,

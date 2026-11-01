@@ -3123,10 +3123,11 @@ fn stream_facts(sess: &TcpSession, status: Option<u16>, timers: bool) -> ibex_sa
 /// (`accept_date + t_idle + t_handshake`, `tcp_sample.c`), as unix seconds and
 /// milliseconds; the accept date while no byte has come.
 fn request_date(log: &crate::txnlog::StreamLog) -> (i64, u32) {
-    let Some(fb) = log.first_byte else { return log.date };
+    let date = log.date();
+    let Some(fb) = log.first_byte else { return date };
     let d = fb.saturating_duration_since(log.start);
-    let ms = log.date.1 + d.subsec_millis();
-    let secs = log.date.0.saturating_add(i64::try_from(d.as_secs()).unwrap_or(i64::MAX)).saturating_add(i64::from(ms / 1000));
+    let ms = date.1 + d.subsec_millis();
+    let secs = date.0.saturating_add(i64::try_from(d.as_secs()).unwrap_or(i64::MAX)).saturating_add(i64::from(ms / 1000));
     (secs, ms % 1000)
 }
 
@@ -3159,7 +3160,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         captures_req_hdr: Some(&s.log.req_captures),
         captures_res_hdr: Some(&s.log.res_captures),
         unique_id: s.log.unique_id.as_deref(),
-        accept_date: Some(s.log.date),
+        accept_date: Some(s.log.date()),
         request_date: Some(request_date(&s.log)),
         last_rule: last_rule_at(s.log.last_rule),
         prio: (s.log.prio_class, s.log.prio_offset),
@@ -3308,7 +3309,7 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         ssl_version: crate::proxy::ssl_fc(&s.cli_xprt, s.h2_role.as_deref()).protocol,
         backend: &be.name,
         backend_http: be.mode == Mode::Http,
-        accept_date: l.date,
+        accept_date: l.date(),
         t_handshake: 0,
         t_idle: l.ms(l.first_byte),
         t_request: l.ms(l.request),
@@ -3356,7 +3357,7 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     // HTTP only once a request was parsed (`stream_new`); a probe, an unparsable request,
     // a 408 or garbage to an h2 bind never had one.
     if !http || entry.sess.log.request.is_some() {
-        crate::stats::CUM_STREAMS.fetch_add(1, Ordering::Relaxed);
+        crate::statcnt::add(&crate::stats::CUM_STREAMS, 1);
     }
     // Only what the counters need of the log line's data: the whole `LogData` costs a
     // measurable share of a request (T172).
@@ -3383,16 +3384,16 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
 
     let fe = &proxies[entry.proxy_idx].txn_counters().fe;
     if http {
-        fe.req_tot.fetch_add(1, Ordering::Relaxed);
+        crate::statcnt::add(&fe.req_tot, 1);
         if !keepalive_lost {
             fe.count_status(status);
         }
         if entry.sess.log.request.is_none() {
-            fe.ereq.fetch_add(1, Ordering::Relaxed);
+            crate::statcnt::add(&fe.ereq, 1);
         }
     }
-    fe.bin.fetch_add(bin, Ordering::Relaxed);
-    fe.bout.fetch_add(bout, Ordering::Relaxed);
+    crate::statcnt::add(&fe.bin, bin);
+    crate::statcnt::add(&fe.bout, bout);
 
     if !routed {
         return;
@@ -3403,11 +3404,11 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     // retries that failed on other servers, or on this one, were counted there already
     // ([`count_failed_attempt`]); this is the last attempt.
     let one = |c: &crate::statcnt::TxnCounters, server: bool| {
-        c.stot.fetch_add(1, Ordering::Relaxed);
-        c.bin.fetch_add(bin, Ordering::Relaxed);
-        c.bout.fetch_add(bout, Ordering::Relaxed);
+        crate::statcnt::add(&c.stot, 1);
+        crate::statcnt::add(&c.bin, bin);
+        crate::statcnt::add(&c.bout, bout);
         if http && (!server || answered) && !keepalive_lost {
-            c.req_tot.fetch_add(1, Ordering::Relaxed);
+            crate::statcnt::add(&c.req_tot, 1);
             c.count_status(status);
         }
         // Which side's fault, as `HAProxy`'s termination code counts it (measured on
@@ -3431,13 +3432,13 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
         };
         // Most streams end cleanly: skip the locked add of a zero.
         if abrt_cli != 0 {
-            c.cli_abrt.fetch_add(abrt_cli, Ordering::Relaxed);
+            crate::statcnt::add(&c.cli_abrt, abrt_cli);
         }
         if abrt_srv != 0 {
-            c.srv_abrt.fetch_add(abrt_srv, Ordering::Relaxed);
+            crate::statcnt::add(&c.srv_abrt, abrt_srv);
         }
         if eresp != 0 {
-            c.eresp.fetch_add(eresp, Ordering::Relaxed);
+            crate::statcnt::add(&c.eresp, eresp);
         }
         // `econ` is counted where the last connect fails (`server_connect_failed`), as
         // `HAProxy` counts it in `back_handle_st_cer`, whatever the termination code.
@@ -3455,26 +3456,26 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
         c.sess_rate.tick_at(now);
         let rate = u32::try_from(c.sess_rate.rate_at(now)).unwrap_or(u32::MAX);
         if rate > c.rate_max.load(Ordering::Relaxed) {
-            c.rate_max.fetch_max(rate, Ordering::Relaxed);
+            crate::statcnt::max(&c.rate_max, rate);
         }
     };
     let be = &proxies[be_idx];
     let c = &be.txn_counters().be;
     let picked = srv_idx.is_some() && entry.sess.lb_picked;
     if picked {
-        c.lbtot.fetch_add(1, Ordering::Relaxed);
+        crate::statcnt::add(&c.lbtot, 1);
     }
     one(c, false);
     let on_server: u32 = be.server_actconn.iter().map(|a| a.load(Ordering::Relaxed)).sum();
-    c.smax.fetch_max(on_server, Ordering::Relaxed);
+    crate::statcnt::max(&c.smax, on_server);
     let srv = srv_idx.and_then(|i| Some((i, proxies[srv_be].txn_counters().srv.get(i)?)));
     for (i, c) in srv {
         if picked {
-            c.lbtot.fetch_add(1, Ordering::Relaxed);
+            crate::statcnt::add(&c.lbtot, 1);
         }
         one(c, true);
         let now_on = proxies[srv_be].server_actconn.get(i).map_or(0, |a| a.load(Ordering::Relaxed));
-        c.smax.fetch_max(now_on, Ordering::Relaxed);
+        crate::statcnt::max(&c.smax, now_on);
     }
 }
 
@@ -3732,7 +3733,7 @@ fn proxy_header_error_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) ->
             let mut line = fe.log_format_sd().map_or_else(Vec::new, |sd| sd.render_bytes(&data, sample_registry(), &ctx));
             let sd_len = u32::try_from(line.len()).unwrap_or(0);
             let listener = s.so_name.as_deref().map_or_else(|| s.so_id.unwrap_or(0).to_string(), str::to_string);
-            line.extend_from_slice(crate::logfmt::connection_error_line(s.client_addr, s.log.date, &fe.name, &listener, &failure.message).as_bytes());
+            line.extend_from_slice(crate::logfmt::connection_error_line(s.client_addr, s.log.date(), &fe.name, &listener, &failure.message).as_bytes());
             (line, sd_len)
         }
     };
@@ -5648,6 +5649,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// # Errors
     /// Returns an error if polling epoll fails.
     pub fn run_once(&mut self) -> io::Result<usize> {
+        crate::probe::clock_read();
         let at = Instant::now();
         self.step_at(self.tick_at(at), at)
     }
@@ -6038,6 +6040,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // otherwise have its deadlines early by the time the engine was idle (up to the 100
         // ms poll bound). One clock read per loop pass, as HAProxy's `tv_update_date` after
         // its poller. The timers that expired during the wait are woken by it too.
+        crate::probe::clock_read();
         let pass_start = Instant::now();
         // `tune.ibex.zero-on-free soft`: this thread's quarantine, emptied when the poller found
         // nothing to do, else what passed the age bound and a small budget. One load when off.
@@ -7251,7 +7254,7 @@ fn eval_tcp_req_session_rules(
         ssl_bc: sess.srv_xprt.ssl_facts(),
         act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
-        accept_date: Some(sess.log.date),
+        accept_date: Some(sess.log.date()),
         captures_req_hdr: Some(&sess.log.req_captures),
         captures_res_hdr: Some(&sess.log.res_captures),
         ..Default::default()
@@ -7473,7 +7476,7 @@ fn eval_tcp_req_content_rules(
         req_headers: sess.req_headers.as_deref(),
         act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
-        accept_date: Some(sess.log.date),
+        accept_date: Some(sess.log.date()),
         last_rule: last_rule_at(sess.log.last_rule),
         prio: (sess.log.prio_class, sess.log.prio_offset),
         captures_req_hdr: Some(&sess.log.req_captures),
@@ -7757,7 +7760,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         raw_res: Some(rep_bytes),
         act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
         unique_id: sess.log.unique_id.as_deref(),
-        accept_date: Some(sess.log.date),
+        accept_date: Some(sess.log.date()),
         captures_req_hdr: Some(&sess.log.req_captures),
         captures_res_hdr: Some(&sess.log.res_captures),
         bc_err: sess.bc_err.copied(),
@@ -9670,7 +9673,7 @@ impl EngineDispatcher<'_> {
             req_headers: sess.req_headers.as_deref(),
             act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
             unique_id: sess.log.unique_id.as_deref(),
-            accept_date: Some(sess.log.date),
+            accept_date: Some(sess.log.date()),
             captures_req_hdr: Some(&sess.log.req_captures),
             captures_res_hdr: Some(&sess.log.res_captures),
             ..Default::default()
@@ -12005,7 +12008,7 @@ impl EngineDispatcher<'_> {
             res_version: Some(&proto_version),
             res_body: has_wait.then_some(res_body.as_slice()),
             unique_id: entry.sess.log.unique_id.as_deref(),
-            accept_date: Some(entry.sess.log.date),
+            accept_date: Some(entry.sess.log.date()),
             stream: Some(stream_facts(&entry.sess, Some(status), order.iter().any(|&px| proxies[px].rules.res_stream))),
             bc_err: entry.sess.bc_err.copied(),
             bc_reused: Some(entry.sess.txn.as_ref().is_some_and(|t| t.srv_reused)),
@@ -12945,7 +12948,7 @@ impl EngineDispatcher<'_> {
             fe_id: Some(proxies[proxy_idx].ids.iid),
             act_conn: proxies[proxy_idx].counters().act_conn.load(Ordering::Relaxed),
             unique_id: entry.sess.log.unique_id.as_deref(),
-            accept_date: Some(entry.sess.log.date),
+            accept_date: Some(entry.sess.log.date()),
             captures_req_hdr: Some(&entry.sess.log.req_captures),
             captures_res_hdr: Some(&entry.sess.log.res_captures),
             ..Default::default()
@@ -13042,7 +13045,7 @@ impl EngineDispatcher<'_> {
                         be_id: be_name.and_then(|n| proxies.iter().find(|p| p.has_backend && p.name == n)).map(|p| p.ids.iid),
                         captures_req_hdr: Some(&$s.log.req_captures),
                         unique_id: $s.log.unique_id.as_deref(),
-                        accept_date: Some($s.log.date),
+                        accept_date: Some($s.log.date()),
                         request_date: Some(request_date(&$s.log)),
                         last_rule: last_rule_at($s.log.last_rule),
                         prio: ($s.log.prio_class, $s.log.prio_offset),
@@ -16927,7 +16930,7 @@ fn after_res_on_reply<'r>(
             cur_max_retries: Some(sess.max_retries),
             res_version: Some(&version),
             unique_id: sess.log.unique_id.as_deref(),
-            accept_date: Some(sess.log.date),
+            accept_date: Some(sess.log.date()),
             stream: Some(stream_facts(sess, Some(status), true)),
             captures_req_hdr: Some(&sess.log.req_captures),
             captures_res_hdr: Some(&res_caps_in),
