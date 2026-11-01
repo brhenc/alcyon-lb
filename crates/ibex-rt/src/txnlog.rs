@@ -22,12 +22,12 @@ static STREAM_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct StreamLog {
     /// `accept_ts`: the stream's start.
     pub start: Instant,
-    /// `accept_date`: the same moment, as unix seconds and milliseconds.
-    pub date: (i64, u32),
     /// The first byte of the request arrived (end of `t_idle`).
     pub first_byte: Option<Instant>,
     /// The request head was complete (`request_ts`).
     pub request: Option<Instant>,
+    /// [`StreamLog::date`], once worked out ((0, 0): not yet).
+    date_cache: std::cell::Cell<(i64, u32)>,
     /// The connection to a server was first attempted (`t_queue`).
     pub queue: Option<Instant>,
     /// The index of the server the stream chose in `srv_backend_idx`, kept while no connection
@@ -139,28 +139,78 @@ pub fn server_slot(idx: usize) -> Option<std::num::NonZeroU32> {
 thread_local! {
     /// The loop's clock for this pass (`now_ns`, refreshed by `clock_update_date` after the poller).
     static LOOP_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// The same instant as [`crate::statcnt::now_ms`] reads it (0: not set), worked out once a pass.
+    static LOOP_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The pass's `now_ms`, 0 where no loop runs.
+#[must_use]
+pub fn loop_ms() -> u64 {
+    LOOP_MS.with(std::cell::Cell::get)
 }
 
 /// Sets the thread's clock for the pass that is starting (once per loop iteration, after the poller).
 pub fn set_loop_now(t: Instant) {
     LOOP_NOW.with(|c| c.set(Some(t)));
+    LOOP_MS.with(|c| c.set(crate::statcnt::ms_at(t)));
 }
 
 /// The time every log timer is stamped from: the loop's per-iteration clock, as `HAProxy`'s
 /// `now_ns`, so two events of one pass carry one timestamp. A clock read where no loop runs.
 #[must_use]
 pub fn loop_now() -> Instant {
-    LOOP_NOW.with(std::cell::Cell::get).unwrap_or_else(Instant::now)
+    LOOP_NOW.with(std::cell::Cell::get).unwrap_or_else(|| {
+        crate::probe::clock_read();
+        Instant::now()
+    })
+}
+
+thread_local! {
+    /// A wall-clock reading and the monotonic instant it was taken at, renewed once a second.
+    static WALL_BASE: std::cell::Cell<Option<(Instant, SystemTime)>> = const { std::cell::Cell::new(None) };
 }
 
 impl StreamLog {
+    /// `accept_date`: the stream's start as unix seconds and milliseconds. Worked out from a
+    /// wall-clock base read at most once a second, and only when something asks for it: a
+    /// stream nobody logs or fetches the date of costs no `SystemTime::now` (T579, C1).
+    #[must_use]
+    pub fn date(&self) -> (i64, u32) {
+        // Seconds 0 (1970) marks it not worked out yet.
+        let d = self.date_cache.get();
+        if d.0 != 0 {
+            return d;
+        }
+        let d = self.date_uncached();
+        self.date_cache.set(d);
+        d
+    }
+
+    fn date_uncached(&self) -> (i64, u32) {
+        let (at, wall) = WALL_BASE.with(|c| match c.get() {
+            Some(b) if loop_now().saturating_duration_since(b.0) < std::time::Duration::from_secs(1) => b,
+            _ => {
+                crate::probe::wall_read();
+                let b = (loop_now(), SystemTime::now());
+                c.set(Some(b));
+                b
+            }
+        });
+        let d = if self.start >= at {
+            wall + self.start.duration_since(at)
+        } else {
+            wall - at.duration_since(self.start)
+        };
+        let d = d.duration_since(UNIX_EPOCH).unwrap_or_default();
+        (i64::try_from(d.as_secs()).unwrap_or(0), d.subsec_millis())
+    }
+
     /// A stream starting now, on a session whose counters read `bytes_in`/`bytes_out`.
     #[must_use]
     pub fn start(bytes_in: u64, bytes_out: u64) -> StreamLog {
-        let date = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         StreamLog {
             start: loop_now(),
-            date: (i64::try_from(date.as_secs()).unwrap_or(0), date.subsec_millis()),
+            date_cache: std::cell::Cell::new((0, 0)),
             first_byte: None,
             request: None,
             queue: None,

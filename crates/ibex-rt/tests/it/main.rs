@@ -451,6 +451,7 @@ mod tls_e2e;
 mod tls_close_notify;
 mod tls_handshake_close;
 mod tls_handshake_log;
+mod engine_pass;
 mod tls_handshake_per_pass;
 mod tls_resumption_many_clients;
 mod tls_xprt;
