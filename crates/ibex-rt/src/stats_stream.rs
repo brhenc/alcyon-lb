@@ -101,6 +101,41 @@ fn next_unit(page: &mut Page, ctx: &Ctx<'_>, out: &mut String) -> bool {
     }
 }
 
+/// The whole units that fit in `room`, written at its start (a cut one when even the first
+/// does not fit); how many bytes. `unit` is the scratch string each is made in.
+fn fill_units(d: &mut Dump, ctx: &Ctx<'_>, unit: &mut String, room: &mut [u8]) -> usize {
+    let mut w = 0usize;
+    loop {
+        let (base, skip) = match d.split.take() {
+            Some((p, off)) => (p, off as usize),
+            None => (d.page, 0),
+        };
+        d.page = base;
+        unit.clear();
+        if !next_unit(&mut d.page, ctx, unit) {
+            d.units_done = true;
+            return w;
+        }
+        let data = unit.as_bytes().get(skip..).unwrap_or_default();
+        if w + data.len() <= room.len() {
+            room[w..w + data.len()].copy_from_slice(data);
+            w += data.len();
+            continue;
+        }
+        if w == 0 {
+            // Larger than the whole room: the part that fits now, the rest next time.
+            let n = room.len();
+            room.copy_from_slice(&data[..n]);
+            d.split = Some((base, u32::try_from(skip + n).unwrap_or(u32::MAX)));
+            return n;
+        }
+        // For the next buffer, from where it started. (Never the rest of a cut unit: that
+        // comes first, into an empty room.)
+        d.page = base;
+        return w;
+    }
+}
+
 /// Fills `dst` with the next part of the dump -- whole units, as many as fit, as one chunk
 /// when the dump is chunked, followed by the last chunk once the units are over and it
 /// fits -- and returns how many bytes it wrote. 0 when `dst` is too small to be worth it or
@@ -115,38 +150,7 @@ pub fn fill(d: &mut Dump, ctx: &Ctx<'_>, dst: &mut [u8]) -> usize {
     }
     let (pre, post) = if d.chunked { (CHUNK_PRE, CHUNK_POST) } else { (0, 0) };
     let room = dst.len() - pre - post;
-    let mut w = 0usize;
-    if !d.units_done {
-        crate::reuse::with_string(|unit| loop {
-            let (base, skip) = match d.split.take() {
-                Some((p, off)) => (p, off as usize),
-                None => (d.page, 0),
-            };
-            d.page = base;
-            unit.clear();
-            if !next_unit(&mut d.page, ctx, unit) {
-                d.units_done = true;
-                break;
-            }
-            let data = unit.as_bytes().get(skip..).unwrap_or_default();
-            if w + data.len() <= room {
-                dst[pre + w..pre + w + data.len()].copy_from_slice(data);
-                w += data.len();
-                continue;
-            }
-            if w == 0 {
-                // Larger than the whole room: the part that fits now, the rest next time.
-                dst[pre..pre + room].copy_from_slice(&data[..room]);
-                w = room;
-                d.split = Some((base, u32::try_from(skip + room).unwrap_or(u32::MAX)));
-            } else {
-                // For the next buffer, from where it started. (Never the rest of a cut unit: that
-                // comes first, into an empty room.)
-                d.page = base;
-            }
-            break;
-        });
-    }
+    let w = if d.units_done { 0 } else { crate::reuse::with_string(|unit| fill_units(d, ctx, unit, &mut dst[pre..pre + room])) };
     let mut n = 0;
     if w > 0 {
         if d.chunked {

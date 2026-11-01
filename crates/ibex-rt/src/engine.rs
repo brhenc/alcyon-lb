@@ -16811,14 +16811,12 @@ fn stats_stream_page(
             v.extend_from_slice(&buf[..n]);
         }
         let left = (v.len() - *off + sess.rep.readable().len()) as u64;
-        if let Some(t) = sess.txn.as_mut() {
-            t.rsp = if http11 { crate::txn::MsgState::head(crate::txn::Framing::Chunked) } else { crate::txn::MsgState::Body(crate::txn::Body::Length(left)) };
-        }
+        let rsp = if http11 { crate::txn::MsgState::head(crate::txn::Framing::Chunked) } else { crate::txn::MsgState::Body(crate::txn::Body::Length(left)) };
+        if let Some(t) = sess.txn.as_mut() { t.rsp = rsp; }
         return;
     }
-    if let Some(t) = sess.txn.as_mut() {
-        t.rsp = crate::txn::MsgState::head(if http11 { crate::txn::Framing::Chunked } else { crate::txn::Framing::UntilClose });
-    }
+    let rsp = crate::txn::MsgState::head(if http11 { crate::txn::Framing::Chunked } else { crate::txn::Framing::UntilClose });
+    if let Some(t) = sess.txn.as_mut() { t.rsp = rsp; }
     stats_pump(sess, d, proxies, checks, pid);
 }
 
@@ -16840,9 +16838,8 @@ fn stats_pump(sess: &mut crate::proxy::TcpSession, mut d: crate::stats_stream::D
     }
     if !d.chunked() {
         let left = sess.rep.readable().len() as u64;
-        if let Some(t) = sess.txn.as_mut() {
-            t.rsp = if left == 0 { crate::txn::MsgState::Done } else { crate::txn::MsgState::Body(crate::txn::Body::Length(left)) };
-        }
+        let rsp = if left == 0 { crate::txn::MsgState::Done } else { crate::txn::MsgState::Body(crate::txn::Body::Length(left)) };
+        if let Some(t) = sess.txn.as_mut() { t.rsp = rsp; }
     }
     sess.end_dump();
 }
