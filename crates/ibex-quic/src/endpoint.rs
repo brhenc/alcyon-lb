@@ -420,6 +420,15 @@ impl QuicEndpoint {
         self.timeout_polls
     }
 
+    /// The deadline quinn gave connection `conn` when last asked (after asking the ones
+    /// something reached since), for tests to check `poll_timeout` against.
+    #[doc(hidden)]
+    pub fn deadline_of(&mut self, conn: ConnHandle) -> Option<Instant> {
+        self.update_next_timeout();
+        self.live(conn)?;
+        self.deadlines.get(conn.index()).copied().flatten()
+    }
+
     /// Number of connection lookups by connection ID (see the `cid_lookups` field).
     #[must_use]
     pub const fn cid_lookups(&self) -> u64 {
@@ -477,13 +486,18 @@ impl QuicEndpoint {
     /// Asks each connection something reached since the last call for its deadline, once,
     /// and keeps the earliest of all of them (Q1). Costs one `poll_timeout` of quinn per such
     /// connection; a scan of the deadlines (no connection asked) only when the connection
-    /// with the earliest one moved it later or went.
+    /// with the earliest one moved it later or went. A connection quinn has drained is
+    /// forgotten here: whatever drained it (a datagram, a timer, a packet sent) touched it.
     pub fn update_next_timeout(&mut self) {
-        let mut rescan = std::mem::take(&mut self.rescan);
-        for idx in self.timer_stale.drain(..) {
+        let mut stale = std::mem::take(&mut self.timer_stale);
+        for &idx in &stale {
             let i = idx as usize;
             let Some(live) = self.slots.get_mut(i).and_then(|s| s.live.as_mut()) else { continue };
             live.timer_stale = false;
+            if live.conn.is_drained() {
+                self.remove_slot(i);
+                continue;
+            }
             self.timeout_polls += 1;
             let new = live.conn.poll_timeout();
             let Some(slot) = self.deadlines.get_mut(i) else { continue };
@@ -493,17 +507,27 @@ impl QuicEndpoint {
             }
             match (new, self.next_timeout) {
                 (Some(n), Some(t)) if n < t => self.next_timeout = Some(n),
-                (Some(n), None) if !rescan => self.next_timeout = Some(n),
+                (Some(n), None) if !self.rescan => self.next_timeout = Some(n),
                 _ => {}
             }
             // It held the earliest and moved it later, or has none any more.
-            if old.is_some() && old == self.next_timeout && new != old {
-                rescan = true;
-            }
+            self.rescan |= old.is_some() && old == self.next_timeout;
         }
-        if rescan {
+        stale.clear();
+        self.timer_stale = stale;
+        if std::mem::take(&mut self.rescan) {
             let deadlines = &self.deadlines;
             self.next_timeout = self.active_handles.iter().filter_map(|&i| deadlines.get(i as usize).copied().flatten()).min();
+        }
+    }
+
+    /// Hands what the connection has for quinn's endpoint (new CIDs, retired ones, drained) to
+    /// it, and the endpoint's answers back.
+    fn forward_endpoint_events(endpoint: &mut Endpoint, handle: ConnectionHandle, conn: &mut quinn_proto::Connection) {
+        while let Some(ep_evt) = conn.poll_endpoint_events() {
+            if let Some(conn_evt) = endpoint.handle_event(handle, ep_evt) {
+                conn.handle_event(conn_evt);
+            }
         }
     }
 
@@ -515,12 +539,7 @@ impl QuicEndpoint {
         let Some(live) = self.slots.get_mut(idx).and_then(|s| s.live.as_mut()) else {
             return;
         };
-        // Drain endpoint events and feed back
-        while let Some(ep_evt) = live.conn.poll_endpoint_events() {
-            if let Some(conn_evt) = self.endpoint.handle_event(handle, ep_evt) {
-                live.conn.handle_event(conn_evt);
-            }
-        }
+        Self::forward_endpoint_events(&mut self.endpoint, handle, &mut live.conn);
 
         // Drain connection events
         while let Some(evt) = live.conn.poll() {
@@ -653,15 +672,6 @@ impl QuicEndpoint {
         }
     }
 
-    /// Removes those of `candidates` (slot indices) that are drained.
-    fn remove_drained(&mut self, candidates: &[u32]) {
-        for &idx in candidates {
-            if self.slots.get(idx as usize).and_then(|s| s.live.as_ref()).is_some_and(|l| l.conn.is_drained()) {
-                self.remove_slot(idx as usize);
-            }
-        }
-    }
-
     /// Forgets the connection in slot `idx`: its deadline, its half-open count, its place in
     /// `active_handles`. Its `to_poll` entry, if any, is skipped by its generation later.
     fn remove_slot(&mut self, idx: usize) {
@@ -671,10 +681,8 @@ impl QuicEndpoint {
             self.half_open_done();
         }
         if let Some(d) = self.deadlines.get_mut(idx) {
-            if d.is_some() && *d == self.next_timeout {
-                self.rescan = true;
-            }
-            *d = None;
+            // It held the earliest: found again at the next `poll_timeout`.
+            self.rescan |= d.take().is_some_and(|t| Some(t) == self.next_timeout);
         }
         #[allow(clippy::cast_possible_truncation)]
         self.active_handles.retain(|&h| h as usize != idx);
@@ -884,11 +892,7 @@ impl QuicTransport for QuicEndpoint {
                 let size = tx.size.min(out.len()).min(self.tx_buf.len());
 
                 // Drive any endpoint events produced during transmit
-                while let Some(ep_evt) = live.conn.poll_endpoint_events() {
-                    if let Some(conn_evt) = self.endpoint.handle_event(ConnectionHandle(idx), ep_evt) {
-                        live.conn.handle_event(conn_evt);
-                    }
-                }
+                Self::forward_endpoint_events(&mut self.endpoint, ConnectionHandle(idx), &mut live.conn);
 
                 // The packet moved the connection's deadline, whether or not it is sent.
                 Self::stale_live(&mut self.timer_stale, c, live);
@@ -939,18 +943,16 @@ impl QuicTransport for QuicEndpoint {
         expired.extend(self.active_handles.iter().copied().filter(|&i| deadlines.get(i as usize).copied().flatten().is_some_and(|t| t <= now)));
         // The earliest is among them: found again at the next `poll_timeout`.
         self.rescan = true;
+        // Their deadlines stay until `poll_timeout` asks them again (`touch`), and one drained
+        // is forgotten then.
         for &i in &expired {
             let idx = i as usize;
-            if let Some(d) = self.deadlines.get_mut(idx) {
-                *d = None;
-            }
             let c = self.handle_at(idx);
             if let Some(live) = self.touch(c) {
                 live.conn.handle_timeout(now);
             }
             self.drive_connection(idx, now);
         }
-        self.remove_drained(&expired);
         self.expired = expired;
     }
 
@@ -965,11 +967,6 @@ impl QuicTransport for QuicEndpoint {
             .open(dir.into())
             .map(StreamId::from)
             .ok_or(QuicError::StreamLimit)
-    }
-
-    fn accept_stream(&mut self, conn: ConnHandle, dir: StreamDirection) -> Option<StreamId> {
-        let live = self.touch(conn)?;
-        live.conn.streams().accept(dir.into()).map(StreamId::from)
     }
 
     fn read_stream(

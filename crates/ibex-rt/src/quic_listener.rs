@@ -170,22 +170,10 @@ fn slot_of(conns: &mut [Option<ConnSlot>], conn: ConnHandle) -> Option<&mut Conn
     conns.get_mut(conn.index())?.as_mut().filter(|s| s.conn == conn)
 }
 
-/// The slot of `conn`, made (over a gone connection's) if it has none.
-fn slot_or_new(conns: &mut Vec<Option<ConnSlot>>, conn: ConnHandle) -> &mut ConnSlot {
-    let i = conn.index();
-    if conns.len() <= i {
-        conns.resize_with(i + 1, || None);
-    }
-    let slot = &mut conns[i];
-    if slot.as_ref().is_none_or(|s| s.conn != conn) {
-        *slot = Some(ConnSlot::new(conn));
-    }
-    slot.get_or_insert_with(|| ConnSlot::new(conn))
-}
-
-/// The relay path's HTTP/3 state of `conn`, made if it has none.
-fn h3_of(conns: &mut Vec<Option<ConnSlot>>, conn: ConnHandle) -> &mut H3State {
-    slot_or_new(conns, conn).h3.get_or_insert_with(H3State::default)
+/// The relay path's HTTP/3 state of `conn`, made if it has none; `None` once the connection
+/// is gone (its slot is made at `NewConnection` only).
+fn h3_of(conns: &mut [Option<ConnSlot>], conn: ConnHandle) -> Option<&mut H3State> {
+    Some(slot_of(conns, conn)?.h3.get_or_insert_with(H3State::default))
 }
 
 /// The owned state of `conn`, if an owner session serves it.
@@ -544,15 +532,13 @@ impl QuicListener {
 
     /// Closes connection `conn_id`, its owner gone or ending it (`H3_NO_ERROR`).
     pub fn owner_close(&mut self, conn_id: ConnHandle) {
-        let Some(slot) = slot_of(&mut self.conns, conn_id) else { return };
-        match slot.owned.take() {
-            Some(oc) if !oc.closed => {
-                self.endpoint.close_connection(conn_id, H3_NO_ERROR, b"");
-                self.dirty = true;
-            }
+        let Some(oc) = slot_of(&mut self.conns, conn_id).and_then(|s| s.owned.take()) else { return };
+        if oc.closed {
             // The connection had ended: its slot was kept for the owner only.
-            Some(_) => self.conns[conn_id.index()] = None,
-            None => {}
+            self.conns[conn_id.index()] = None;
+        } else {
+            self.endpoint.close_connection(conn_id, H3_NO_ERROR, b"");
+            self.dirty = true;
         }
     }
 
@@ -645,7 +631,8 @@ impl QuicListener {
     /// while it waited.
     pub fn admit_next(&mut self) {
         let Some(conn_id) = self.waiting.pop_front() else { return };
-        let slot = slot_or_new(&mut self.conns, conn_id);
+        // A connection that ended while it waited left `waiting` then.
+        let Some(slot) = slot_of(&mut self.conns, conn_id) else { return };
         slot.pending = false;
         slot.admitted = true;
         let held = std::mem::take(&mut slot.held);
@@ -875,7 +862,9 @@ impl QuicListener {
                         crate::engine::count_global_conn();
                         if self.gated {
                             self.handshaken.push(conn);
-                            slot_or_new(&mut self.conns, conn).pending = true;
+                            if let Some(slot) = slot_of(&mut self.conns, conn) {
+                                slot.pending = true;
+                            }
                         } else {
                             crate::engine::count_global_sess();
                             self.open_control_stream(conn);
@@ -1136,14 +1125,16 @@ impl QuicListener {
     /// RFC 9114 §6.2.1 requires the control stream be opened before any request is answered,
     /// and that SETTINGS be its first frame.
     fn open_control_stream(&mut self, conn_id: ConnHandle) {
-        let st = h3_of(&mut self.conns, conn_id);
+        let Some(st) = h3_of(&mut self.conns, conn_id) else { return };
         if st.control.is_some() {
             return;
         }
         let Ok(sid) = self.endpoint.open_stream(conn_id, StreamDirection::Unidirectional) else {
             return;
         };
-        h3_of(&mut self.conns, conn_id).control = Some(sid);
+        if let Some(st) = h3_of(&mut self.conns, conn_id) {
+            st.control = Some(sid);
+        }
         let bytes = mux_h3::encode_control_stream_open();
         let _ = self.endpoint.write_stream(conn_id, sid, &bytes, false);
     }
@@ -1159,8 +1150,8 @@ impl QuicListener {
         if self.owned_news(conn_id, Some(stream_id.0), None) {
             return;
         }
+        let Some(st) = h3_of(&mut self.conns, conn_id) else { return };
         if opened {
-            let st = h3_of(&mut self.conns, conn_id);
             st.req.entry(stream_id).or_default();
             st.next_request = st.next_request.max(stream_id.0 + 4);
         }
@@ -1225,7 +1216,7 @@ impl QuicListener {
             return;
         }
 
-        let st = h3_of(&mut self.conns, conn_id);
+        let Some(st) = h3_of(&mut self.conns, conn_id) else { return };
         if st.answered.contains(&stream_id) {
             return;
         }
@@ -1256,9 +1247,10 @@ impl QuicListener {
     /// The client reset the request or asked us to stop sending the response: the engine's
     /// stream is cut, which it sees as the client going away.
     fn abandon_stream(&mut self, conn_id: ConnHandle, stream_id: StreamId) {
-        let st = h3_of(&mut self.conns, conn_id);
-        st.req.remove(&stream_id);
-        st.unacked.retain(|s| *s != stream_id);
+        if let Some(st) = slot_of(&mut self.conns, conn_id).and_then(|s| s.h3.as_mut()) {
+            st.req.remove(&stream_id);
+            st.unacked.retain(|s| *s != stream_id);
+        }
         for r in &mut self.relays {
             if r.conn == conn_id && r.stream_id == stream_id {
                 r.done = true;

@@ -200,8 +200,6 @@ pub trait QuicTransport {
     /// or `QuicError::ConnectionNotFound` if the connection does not exist.
     fn open_stream(&mut self, conn: ConnHandle, dir: StreamDirection) -> Result<StreamId>;
 
-    /// Accept a stream opened by the peer on a connection.
-    fn accept_stream(&mut self, conn: ConnHandle, dir: StreamDirection) -> Option<StreamId>;
 
     /// Read data from a stream into the provided buffer.
     ///

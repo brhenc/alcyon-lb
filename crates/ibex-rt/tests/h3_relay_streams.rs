@@ -623,3 +623,33 @@ fn a_listener_without_a_frontend_refuses_to_run() {
     let err = server.pump(Instant::now()).expect_err("no frontend");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
+
+/// Q1: a gated connection that the client closes before the engine has counted it
+/// (`take_handshaken`) leaves the list unseen: it is in no count, and not reported closed,
+/// since it was never counted. A connection that stays is listed once.
+#[test]
+fn a_connection_closed_before_the_engine_counts_it_is_in_no_count() {
+    let gated = |s: &mut QuicListener| {
+        s.set_frontend(0);
+        s.gate_connections();
+    };
+    // The server completes its side once the client's Finished arrives: a few rounds.
+    let mut kept = Rig::with(gated);
+    for _ in 0..10 {
+        kept.step();
+    }
+    assert_eq!(kept.server.take_handshaken().len(), 1, "a handshaken connection is listed");
+    // Its read guard of `FDS` goes before the next rig takes one: a writer waiting between
+    // the two would deadlock them.
+    drop(kept);
+
+    let mut rig = Rig::with(gated);
+    for _ in 0..10 {
+        rig.step();
+    }
+    rig.conn.close(Instant::now(), VarInt::from_u32(0x100), Vec::new().into());
+    assert!(rig.run_until(|r| ibex_quic::QuicTransport::connection_count(r.server.transport()) == 0), "the server kept the connection");
+    assert!(rig.server.take_handshaken().is_empty(), "a closed connection was left to count");
+    assert!(rig.server.take_closed().is_empty(), "an uncounted connection was reported closed");
+    assert!(!rig.server.has_waiting());
+}

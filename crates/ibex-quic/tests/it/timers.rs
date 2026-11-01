@@ -355,3 +355,80 @@ fn a_pass_computes_the_timeout_once() {
     let _ = s.poll_timeout();
     assert_eq!(s.timeout_polls() - again, 0, "nothing happened, nobody asked");
 }
+
+/// A new half-open connection from `port`'s first flight; its handle.
+fn half_open(s: &mut QuicEndpoint, now: Instant, port: usize) -> ibex_quic::ConnHandle {
+    for d in first_flight(now) {
+        s.handle_datagram(now, from(port), None, &d).expect("datagram");
+    }
+    let mut conn = None;
+    while let Some(ev) = s.poll_event() {
+        if let ibex_quic::transport::TransportEvent::NewConnection { conn: c, .. } = ev {
+            conn = Some(c);
+        }
+    }
+    conn.expect("new connection")
+}
+
+/// Fires timers until `conn`'s connection is lost (its handshake times out), without the
+/// `poll_timeout` that would forget it: the next connection quinn accepts gets its index.
+fn time_out(s: &mut QuicEndpoint, conn: ibex_quic::ConnHandle, mut t: Instant) -> Option<Instant> {
+    let mut buf = vec![0u8; 65535];
+    for _ in 0..200 {
+        t = s.deadline_of(conn).expect("a deadline").max(t);
+        s.handle_timeout(t);
+        while s.poll_transmit(t, &mut buf).is_some() {}
+        while let Some(ev) = s.poll_event() {
+            if matches!(ev, ibex_quic::transport::TransportEvent::ConnectionClosed { conn: c, .. } if c == conn) {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+/// Q1 (§5 (i)): quinn hands a gone connection's index to the next one; the handle of the gone
+/// one has the old generation and finds nothing, and does not reach the new one.
+#[test]
+fn a_stale_handle_finds_nothing_once_its_slot_is_reused() {
+    let mut s = server();
+    let now = Instant::now();
+    let old = half_open(&mut s, now, 0);
+    let t = time_out(&mut s, old, now).expect("timed out");
+    let new = half_open(&mut s, t, 1);
+    assert_eq!(new.index(), old.index(), "quinn reuses the index");
+    assert_ne!(new.generation(), old.generation());
+    assert_eq!(s.connection_count(), 1, "the drained one was forgotten when its index was reused");
+    let err = s.write_stream(old, ibex_quic::StreamId(0), b"x", true).expect_err("a stale handle");
+    assert!(err.to_string().contains(&old.to_string()), "{err}");
+    assert!(s.alpn(old).is_none() && s.server_name(old).is_none());
+    s.close_connection(old, 0, b"");
+    assert!(s.deadline_of(new).is_some(), "the new connection was not closed by the stale handle");
+    assert_eq!(s.poll_timeout(), s.deadline_of(new));
+}
+
+/// Q1: the earliest deadline is kept without re-keying every connection; when the connection
+/// that holds it goes (here: its handshake times out), the earliest is found again among the
+/// others, by the one scan that costs no connection a query.
+#[test]
+fn the_earliest_deadline_is_found_again_when_its_holder_goes() {
+    let mut s = server();
+    let t0 = Instant::now();
+    let first = half_open(&mut s, t0, 0);
+    let second = half_open(&mut s, t0 + Duration::from_millis(50), 1);
+    let third = half_open(&mut s, t0 + Duration::from_millis(100), 2);
+    let d1 = s.deadline_of(first).expect("first");
+    let d2 = s.deadline_of(second).expect("second");
+    let d3 = s.deadline_of(third).expect("third");
+    assert!(d1 < d2 && d2 < d3);
+    assert_eq!(s.poll_timeout(), Some(d1));
+    // The timers that fire on the way (probes) move the other two too: the earliest is
+    // whichever of theirs comes first, found without asking either again.
+    let gone = time_out(&mut s, first, t0).expect("timed out");
+    let want = s.deadline_of(second).into_iter().chain(s.deadline_of(third)).min();
+    let polls = s.timeout_polls();
+    assert_eq!(s.poll_timeout(), want, "the holder went");
+    assert_eq!(s.timeout_polls(), polls, "found by the scan, nobody asked");
+    assert!(want.is_some() && want > Some(gone));
+    assert!(s.deadline_of(first).is_none() && s.connection_count() == 2);
+}
