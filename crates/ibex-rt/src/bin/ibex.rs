@@ -1385,6 +1385,8 @@ struct Reload {
     listener: std::os::unix::net::UnixListener,
     dir: PathBuf,
     served: bool,
+    /// An accepted connection and the part of its request line received so far.
+    pending: Option<(std::os::unix::net::UnixStream, Vec<u8>)>,
 }
 
 impl Reload {
@@ -1407,27 +1409,56 @@ impl Reload {
             cmd.env("NOTIFY_SOCKET", n);
         }
         let child = cmd.spawn()?;
-        Ok(Self { child, listener, dir, served: false })
+        Ok(Self { child, listener, dir, served: false, pending: None })
     }
 
-    /// Answers the new process's `_getsocks`, once, if it has connected.
+    /// Answers the new process's `_getsocks`, once, when it has sent the whole request.
+    ///
+    /// Never waits: a new process starved of CPU can connect and send its line seconds
+    /// later (T565), and the old one goes on serving meanwhile; the partial line is kept
+    /// and completed on a later call. A connection that closes without a full request is
+    /// dropped and the next one is accepted.
     fn serve_pending(&mut self) {
         if self.served {
             return;
         }
-        let Ok((stream, _)) = self.listener.accept() else { return };
+        if self.pending.is_none() {
+            let Ok((stream, _)) = self.listener.accept() else { return };
+            if stream.set_nonblocking(true).is_err() {
+                return;
+            }
+            self.pending = Some((stream, Vec::new()));
+        }
+        let Some((stream, line)) = self.pending.as_mut() else { return };
+        let mut byte = [0u8; 64];
+        loop {
+            match io::Read::read(&mut &*stream, &mut byte) {
+                Ok(0) => {
+                    self.pending = None;
+                    return;
+                }
+                Ok(n) => {
+                    line.extend_from_slice(&byte[..n]);
+                    if line.len() > 64 {
+                        self.pending = None;
+                        return;
+                    }
+                    if line.contains(&b'\n') {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    self.pending = None;
+                    return;
+                }
+            }
+        }
+        let Some((stream, line)) = self.pending.take() else { return };
         self.served = true;
         let _ = stream.set_nonblocking(false);
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-        let mut line = Vec::new();
-        let mut byte = [0u8; 1];
-        while let Ok(1) = io::Read::read(&mut &stream, &mut byte) {
-            if byte[0] == b'\n' {
-                break;
-            }
-            line.push(byte[0]);
-        }
-        if line != b"_getsocks" {
+        if line.strip_suffix(b"\n") != Some(b"_getsocks") {
             return;
         }
         if let Err(e) = ibex_rt::handover::serve_getsocks(&stream) {
@@ -1543,5 +1574,39 @@ mod tests {
     fn a_watchdog_that_cannot_start_fails_the_start() {
         assert!(!start_watchdog(|_, _| Err(std::io::Error::from_raw_os_error(11)), std::time::Duration::from_millis(10), false));
         assert!(start_watchdog(|_, _| Ok(()), std::time::Duration::from_millis(10), false));
+    }
+    #[test]
+    fn a_slow_getsocks_is_still_answered() {
+        // The new process of a reload can be starved for seconds between connecting and
+        // sending its request (T565): the old process must keep serving the reload until it
+        // gets the whole line, not give up on the first look.
+        use std::io::{Read, Write};
+        ibex_rt::handover::enable_expose();
+        let dir = std::env::temp_dir().join(format!("ibex-t565-{}", process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let sock = dir.join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let child = std::process::Command::new("sleep").arg("30").spawn().expect("spawn");
+        let mut r = Reload { child, listener, dir: dir.clone(), served: false, pending: None };
+        let client = std::thread::spawn(move || {
+            let mut s = std::os::unix::net::UnixStream::connect(&sock).expect("connect");
+            s.write_all(b"_get").expect("write");
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            s.write_all(b"socks\n").expect("write");
+            let mut out = Vec::new();
+            let _ = s.read_to_end(&mut out);
+            out
+        });
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(6) {
+            r.serve_pending();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let out = client.join().expect("client");
+        let _ = r.child.kill();
+        let _ = r.child.wait();
+        assert!(out.ends_with(b"END\n"), "the late _getsocks was not answered: {out:?}");
     }
 }
