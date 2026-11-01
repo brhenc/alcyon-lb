@@ -28,6 +28,14 @@
 # own, and not touching keeps the suite's build fresh, which is what lets covercheck rerun
 # alone on the suite's profiles (T267).
 #
+# T570: a slot's target must not grow with every gate. Every gate touches all sources, so
+# incremental compilation only ever added a session (51 GB in one slot) and every worktree has
+# its own hashed copies of the workspace crates (190 copies of each). The gate therefore builds
+# with CARGO_INCREMENTAL=0, deletes the slot's */incremental, and, when it touched the sources
+# for a full run (so every workspace crate is rebuilt), deletes *.profraw from before the run
+# and, after that run passes, the workspace crates' debug artifacts (deps, .fingerprint, build)
+# it did not rebuild. Third-party artifacts and release builds stay. Only the slot's target.
+#
 # --exclusive (the supervisor's measuring gate on main) takes every slot, in order, after
 # announcing itself on /tmp/ibex-gate.exclusive.lock so non-exclusive gates stop taking
 # slots that free up meanwhile. Without --exclusive, IBEX_GATE_SKIP_MEASURE=1 is forced.
@@ -204,7 +212,8 @@ run_closed() {
 }
 
 # --- run ------------------------------------------------------------------------------
-export CARGO_TARGET_DIR IBEX_GATE_SLOT
+export CARGO_TARGET_DIR IBEX_GATE_SLOT CARGO_INCREMENTAL
+CARGO_INCREMENTAL=0
 CARGO_TARGET_DIR=$(slot_target "$SLOT")
 # Per-slot ports for stages with fixed ones (diff-fuzz): two gates side by side collided on
 # 18400 (2026-11-01, "Address already in use").
@@ -242,8 +251,42 @@ if [ -f "$MARK" ] && [ "$(cat "$MARK")" = "$REPO" ] && ! built_since; then
 else
   echo "gate: touching sources: this slot's target was last built from another worktree, or by an unfinished gate"
   git ls-files -z -- '*.rs' '*.toml' | run_closed xargs -0 touch
+  TOUCHED=1
 fi
 rm -f "$MARK"   # an interrupted gate leaves no mark
+
+# T570: no incremental sessions (the build is non-incremental now); profiles of an earlier
+# run would count lines its tests ran, and only a full run on touched sources rebuilds and
+# reruns everything (a covercheck-only rerun needs the suite's profiles).
+rm -rf "$CARGO_TARGET_DIR/debug/incremental" "$CARGO_TARGET_DIR"/llvm-cov-target/*/incremental \
+       "$CARGO_TARGET_DIR"/*/incremental
+FULL=0
+[ ${#CHECKIN_ARGS[@]} -eq 0 ] && [ "${TOUCHED:-0}" = 1 ] && FULL=1
+RUN_REF=$CARGO_TARGET_DIR/.gate-run-start
+: > "$RUN_REF"
+if [ $FULL = 1 ]; then
+  find "$CARGO_TARGET_DIR" -name '*.profraw' -delete 2>/dev/null
+fi
+
+# Deletes the workspace crates' debug artifacts older than the start of this run.
+prune_stale() {
+  local names rx d
+  names=$(cargo metadata --no-deps --format-version 1 --offline 2>/dev/null | python3 -I -c '
+import json, sys
+m = json.load(sys.stdin)
+n = {t["name"].replace("-", "_") for p in m["packages"] for t in p["targets"]}
+n |= {p["name"].replace("-", "_") for p in m["packages"]}
+n -= {"build_script_build", "build_script_main"}
+print("|".join(sorted(n)))') || return 0
+  [ -n "$names" ] || return 0
+  rx="(lib)?($names)-[0-9a-f]{16}(\\..*)?"
+  for d in "$CARGO_TARGET_DIR/debug" "$CARGO_TARGET_DIR/llvm-cov-target/debug"; do
+    [ -d "$d" ] || continue
+    find "$d/deps" "$d/.fingerprint" "$d/build" -mindepth 1 -maxdepth 1 ! -newer "$RUN_REF" \
+      -regextype posix-extended -regex ".*/$(sed 's/_/[-_]/g' <<<"$rx")" \
+      -exec rm -rf {} + 2>/dev/null
+  done
+}
 
 if [ -n "${IBEX_GATE_CMD:-}" ]; then
   run_closed env "${EXTRA_ENV[@]}" bash -c "$IBEX_GATE_CMD" gate "${CHECKIN_ARGS[@]}"
@@ -251,6 +294,12 @@ else
   run_closed env "${EXTRA_ENV[@]}" ./tools/checkin.sh "${CHECKIN_ARGS[@]}"
 fi
 RC=$?
+if [ $RC -eq 0 ] && [ $FULL = 1 ]; then
+  n0=$(du -sk "$CARGO_TARGET_DIR" 2>/dev/null | cut -f1)
+  prune_stale
+  echo "gate: pruned stale workspace artifacts: $(( (n0 - $(du -sk "$CARGO_TARGET_DIR" 2>/dev/null | cut -f1)) / 1024 )) MB freed"
+fi
+rm -f "$RUN_REF"
 echo "$REPO" > "$MARK"
 echo "gate: $(ts) rc=$RC slot=$SLOT_LABEL"
 exit $RC

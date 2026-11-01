@@ -10,7 +10,7 @@
 #                                 run the disowned-child case against the old form,
 #                                 `flock <lock> <cmd>`, which it must fail
 #
-# Cases: disowned, overlap, serial, exclusive, disk, report, env, rc, args, touch (default: all).
+# Cases: disowned, overlap, serial, exclusive, disk, report, env, rc, args, touch, prune (default: all).
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
 GATE=$(pwd)/tools/gate.sh
@@ -195,7 +195,57 @@ t_touch() {
   else bad "touch: other marker"; echo "$o"; fi
 }
 
-CASES=${*:-disowned overlap serial exclusive disk report env rc args touch}
+t_prune() {
+  # T570: a slot's target must not grow with every gate. The gate builds non-incrementally,
+  # removes the slot's incremental sessions once, deletes old profiles before a full run, and
+  # after a successful full gate that rebuilt the workspace deletes the workspace crates'
+  # debug artifacts it did not rebuild. Third-party artifacts and release builds stay.
+  local t=$W/targets/gate-slot1 o d old
+  rm -rf "$t"
+  for d in debug llvm-cov-target/debug; do
+    mkdir -p "$t/$d/incremental/ibex_proto-1abc" "$t/$d/deps" "$t/$d/.fingerprint/ibex-proto-0123456789abcdef" \
+             "$t/$d/build/ibex-proto-0123456789abcdef"
+    : > "$t/$d/incremental/ibex_proto-1abc/s"
+    : > "$t/$d/deps/libibex_proto-0123456789abcdef.rlib"
+    : > "$t/$d/deps/libibex_proto-fedcba9876543210.rlib"
+    : > "$t/$d/deps/libserde-0123456789abcdef.rlib"
+    : > "$t/$d/deps/it-0123456789abcdef"
+  done
+  mkdir -p "$t/release/deps"; : > "$t/release/deps/libibex_proto-0123456789abcdef.rlib"
+  : > "$t/llvm-cov-target/old-1.profraw"; : > "$t/llvm-cov-target/doctest-profiles-x.profraw"
+  # Everything above is old; the fake gate "rebuilds" one proto rlib and the it binary.
+  find "$t" -exec touch -d '2020-01-01' {} +
+  local cmd='for d in debug llvm-cov-target/debug; do : > $CARGO_TARGET_DIR/$d/deps/libibex_proto-fedcba9876543210.rlib; : > $CARGO_TARGET_DIR/$d/deps/it-0123456789abcdef; done; echo "INC=$CARGO_INCREMENTAL"; : > $CARGO_TARGET_DIR/llvm-cov-target/new.profraw'
+  o=$(IBEX_GATE_SLOTS=1 IBEX_GATE_CMD="$cmd" "$GATE" 2>&1)
+  if grep -q '^INC=0$' <<<"$o"; then ok "prune: the gate builds with CARGO_INCREMENTAL=0"
+  else bad "prune: CARGO_INCREMENTAL"; echo "$o"; fi
+  if [ ! -e "$t/debug/incremental" ] && [ ! -e "$t/llvm-cov-target/debug/incremental" ]; then
+    ok "prune: incremental sessions removed"
+  else bad "prune: incremental dirs survive"; fi
+  if [ ! -e "$t/llvm-cov-target/old-1.profraw" ] && [ ! -e "$t/llvm-cov-target/doctest-profiles-x.profraw" ] \
+     && [ -e "$t/llvm-cov-target/new.profraw" ]; then ok "prune: old profiles deleted before the run, the run's kept"
+  else bad "prune: profraw"; ls "$t/llvm-cov-target"; fi
+  old=0
+  for d in debug llvm-cov-target/debug; do
+    [ -e "$t/$d/deps/libibex_proto-0123456789abcdef.rlib" ] && old=1
+    [ -e "$t/$d/.fingerprint/ibex-proto-0123456789abcdef" ] && old=1
+    [ -e "$t/$d/build/ibex-proto-0123456789abcdef" ] && old=1
+    [ -e "$t/$d/deps/libibex_proto-fedcba9876543210.rlib" ] || old=1
+    [ -e "$t/$d/deps/it-0123456789abcdef" ] || old=1
+    [ -e "$t/$d/deps/libserde-0123456789abcdef.rlib" ] || old=1
+  done
+  if [ $old -eq 0 ] && [ -e "$t/release/deps/libibex_proto-0123456789abcdef.rlib" ]; then
+    ok "prune: stale workspace artifacts gone; fresh, third-party and release ones kept"
+  else bad "prune: artifacts"; find "$t" -type f | sort; fi
+  # A failed gate, and a partial one (--only), prune nothing.
+  : > "$t/debug/deps/libibex_proto-aaaaaaaaaaaaaaaa.rlib"; touch -d 2020-01-01 "$t/debug/deps/libibex_proto-aaaaaaaaaaaaaaaa.rlib"
+  IBEX_GATE_SLOTS=1 IBEX_GATE_CMD='exit 1' "$GATE" >/dev/null 2>&1
+  IBEX_GATE_SLOTS=1 IBEX_GATE_CMD=true "$GATE" --only suite >/dev/null 2>&1
+  if [ -e "$t/debug/deps/libibex_proto-aaaaaaaaaaaaaaaa.rlib" ]; then ok "prune: a failed or partial gate prunes nothing"
+  else bad "prune: pruned after a failed/partial gate"; fi
+}
+
+CASES=${*:-disowned overlap serial exclusive disk report env rc args touch prune}
 for c in $CASES; do "t_$c"; done
 echo "test_gate: $PASS passed, $FAIL failed"
 [ $FAIL -eq 0 ]
