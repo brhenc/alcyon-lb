@@ -574,11 +574,11 @@ fn an_h2_response_cut_short_by_a_buffer_that_cannot_be_had_resets_its_stream_onl
             match rx[3] {
                 0x4 if rx[4] & 1 == 0 => sock.write_all(b"\x00\x00\x00\x04\x01\x00\x00\x00\x00").expect("SETTINGS ACK"),
                 0x0 if sid == 1 && !refused => {
-                    // The response has begun and its first bytes are out, its buffer given back;
-                    // the buffer for the rest is refused (after the stream has let its own go).
-                    for _ in 0..2 {
-                        let _ = engine.run_once();
-                    }
+                    // The response has begun and its first bytes are out, its buffer given back
+                    // in the pass that sent them (the stream and its owner hand each other the
+                    // work in one pass, L2); the buffer for the rest is refused. No pass more is
+                    // run first: with nothing left to do it waits in the poller until the rest
+                    // comes, and the rest was read before the refusal was in place.
                     ibex_alloc::drain_local_pools();
                     refuse_allocs_of(BUFSIZE, 0, 2);
                     refused = true;

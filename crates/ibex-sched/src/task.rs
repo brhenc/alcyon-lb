@@ -81,6 +81,10 @@ pub enum Kind {
     Synthetic = 5,
     /// A `resolvers` section's DNS I/O and timers (`process_resolvers`).
     Resolver = 6,
+    /// The engine's periodic upkeep, one task per concern (idle-connection purge, buffer
+    /// trim, stick-table expiry, the pools' publish), run when its timer expires as
+    /// `HAProxy`'s `srv_cleanup_idle_conns` and `process_table_expire` tasks are.
+    Housekeeping = 7,
 }
 
 impl Kind {
@@ -95,6 +99,7 @@ impl Kind {
             4 => Some(Kind::Listener),
             5 => Some(Kind::Synthetic),
             6 => Some(Kind::Resolver),
+            7 => Some(Kind::Housekeeping),
             _ => None,
         }
     }
@@ -170,6 +175,11 @@ pub mod state {
     pub const WOKEN_MSG: u32 = 1 << 10;
     /// Woken for any reason.
     pub const WOKEN_ANY: u32 = WOKEN_TIMER | WOKEN_IO | WOKEN_MSG;
+    /// Woken by another task of the pass for this pass ([`crate::Dispatch::pop_wake_now`]):
+    /// it may run a second time in it.
+    pub const WOKEN_NOW: u32 = 1 << 11;
+    /// Ran twice in the current pass: a third run waits for the next.
+    pub const RERAN: u32 = 1 << 12;
 }
 
 /// A unit of schedulable work. Exactly 32 bytes.
