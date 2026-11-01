@@ -6603,14 +6603,13 @@ fn run_conv(ctx: &SampleContext, mut smp: Sample, in_type: TypeSpec, func: ConvR
     if !in_type.matches(smp.sample_type()) {
         if let TypeSpec::Exact(target_ty) = in_type {
             smp = cast(smp, target_ty)?;
-        } else if in_type == TypeSpec::Addr {
-            if let Some(v4) = cast(smp.clone(), SampleType::Ipv4) {
-                smp = v4;
-            } else {
-                smp = cast(smp, SampleType::Ipv6)?;
-            }
         } else {
-            return None;
+            // Only `Exact` and `Addr` can refuse a type (`TypeSpec::matches`).
+            debug_assert_eq!(in_type, TypeSpec::Addr);
+            smp = match cast(smp.clone(), SampleType::Ipv4) {
+                Some(v4) => v4,
+                None => cast(smp, SampleType::Ipv6)?,
+            };
         }
     }
     match func {
@@ -6652,12 +6651,10 @@ impl Registry {
 
     /// [`Self::eval_all_g`] through a compiled expression: no name is looked up.
     pub(crate) fn eval_all_c<S>(c: &Compiled, fetch_args: &[String], converters: &[(S, Vec<String>)], ctx: &SampleContext) -> Vec<Sample> {
-        let initial: Vec<Sample> = if let Some(mf) = c.multi {
-            mf(ctx, fetch_args)
-        } else if let Some(f) = c.single {
-            f(ctx, fetch_args).into_iter().collect()
-        } else {
-            return Vec::new();
+        // `compile` gives a multi or a single fetch, never neither.
+        let initial: Vec<Sample> = match c.multi {
+            Some(mf) => mf(ctx, fetch_args),
+            None => c.single.and_then(|f| f(ctx, fetch_args)).into_iter().collect(),
         };
         let mut out = Vec::with_capacity(initial.len());
         for smp in initial {
@@ -6696,21 +6693,18 @@ impl Registry {
                     None => break,
                 }
             }
-        } else if let Some(func) = c.single {
-            if let Some(res) = func(ctx, fetch_args).and_then(|smp| Self::apply_c(c, ctx, smp, converters)) {
-                see(res);
-            }
+        } else if let Some(res) = c.single.and_then(|func| func(ctx, fetch_args)).and_then(|smp| Self::apply_c(c, ctx, smp, converters)) {
+            see(res);
         }
         any
     }
 
     /// [`Self::eval_g`] through a compiled expression: no name is looked up.
     pub(crate) fn eval_c<S>(c: &Compiled, fetch_args: &[String], converters: &[(S, Vec<String>)], ctx: &SampleContext) -> Option<Sample> {
-        if let Some(func) = c.single {
-            let smp = func(ctx, fetch_args)?;
-            return Self::apply_c(c, ctx, smp, converters);
+        match c.single {
+            Some(func) => Self::apply_c(c, ctx, func(ctx, fetch_args)?, converters),
+            None => Self::eval_all_c(c, fetch_args, converters, ctx).into_iter().next(),
         }
-        Self::eval_all_c(c, fetch_args, converters, ctx).into_iter().next()
     }
 }
 

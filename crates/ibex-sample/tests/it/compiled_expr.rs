@@ -44,3 +44,25 @@ fn the_compiled_path_gives_the_by_name_answers() {
     assert!(!m);
     assert_eq!(smp, Some(Sample::Sint(3)));
 }
+
+#[test]
+fn a_multi_only_fetch_gives_its_first_sample_through_the_compiled_path() {
+    // `req.ssl_alpn` has no single-sample fetch: the compiled path falls back to the list.
+    let (n, m, smp) = lookups_in_one_eval("req.ssl_alpn -m found");
+    assert_eq!(n, 0);
+    assert!(!m);
+    assert_eq!(smp, None);
+}
+
+#[test]
+fn an_expression_with_an_unknown_fetch_is_not_compiled_and_still_evaluates() {
+    let reg = Registry::new();
+    let ctx = SampleContext::default();
+    let e = Expr::parse("t574_no_such_fetch -m found").unwrap();
+    assert!(!format!("{e:?}").contains("Compiled"));
+    assert!(e.eval_all_samples(&reg, &ctx).is_empty());
+    assert_eq!(e.eval_sample(&reg, &ctx), None);
+    assert!(!e.eval(&reg, &ctx));
+    let known = Expr::parse("str(abc),upper -m str ABC").unwrap();
+    assert!(format!("{known:?}").contains("Compiled"), "{known:?}");
+}
