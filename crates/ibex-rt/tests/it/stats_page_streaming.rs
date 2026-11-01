@@ -37,6 +37,11 @@ struct Setup {
     ping: SocketAddr,
     sock: String,
     cfg: std::path::PathBuf,
+    /// The stats frontend behind TLS (`alpn h2`), when asked for, and the directory of its
+    /// certificate.
+    tls: Option<(SocketAddr, tempfile::TempDir, Vec<u8>)>,
+    /// The stats frontend's QUIC address (`alpn h3`), when asked for.
+    quic: Option<SocketAddr>,
 }
 
 impl Drop for Setup {
@@ -53,6 +58,12 @@ fn start(tag: &str) -> Setup {
 
 /// [`start`] with more `global` lines and `nb` backends of `per` servers.
 fn start_with(tag: &str, global: &str, nb: usize, per: usize) -> Setup {
+    start_full(tag, global, nb, per, false, false)
+}
+
+/// [`start_with`], and the stats frontend behind TLS too (`alpn h2,http/1.1`) when `tls`, on
+/// QUIC (`alpn h3`) when `quic`.
+fn start_full(tag: &str, global: &str, nb: usize, per: usize, tls: bool, quic: bool) -> Setup {
     let (st, ping) = (common::reserve_addr(), common::reserve_addr());
     let sock = format!("/tmp/ibex-t572-{tag}-{}.sock", std::process::id());
     let cfg = std::env::temp_dir().join(format!("ibex-t572-{tag}-{}.cfg", std::process::id()));
@@ -61,6 +72,21 @@ fn start_with(tag: &str, global: &str, nb: usize, per: usize) -> Setup {
          frontend st\n    bind {st}\n    stats enable\n    stats uri /s\n\
          frontend ping\n    bind {ping}\n    http-request return status 200 content-type text/plain string ok\n"
     );
+    let tls = tls.then(|| {
+        let dir = tempfile::tempdir().expect("dir");
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        let pem = dir.path().join("c.pem");
+        std::fs::write(&pem, format!("{}{}", ck.cert.pem(), ck.key_pair.serialize_pem())).expect("pem");
+        let addr = common::reserve_addr();
+        c.push_str(&format!("frontend sttls\n    bind {addr} ssl crt {} alpn h2,http/1.1\n    stats enable\n    stats uri /s\n", pem.display()));
+        (addr, dir, ck.cert.der().to_vec())
+    });
+    let quic = quic.then(|| {
+        let addr = common::reserve_addr();
+        let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
+        c.push_str(&format!("frontend stquic\n    bind quic4@{addr} ssl crt {crt} alpn h3\n    stats enable\n    stats uri /s\n"));
+        addr
+    });
     for b in 0..nb {
         c.push_str(&format!("backend b{b}\n"));
         for s in 0..per {
@@ -69,7 +95,7 @@ fn start_with(tag: &str, global: &str, nb: usize, per: usize) -> Setup {
     }
     std::fs::write(&cfg, c).expect("write cfg");
     let child = Command::new(env!("CARGO_BIN_EXE_ibex")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Ibex).expect("spawn ibex");
-    let setup = Setup { child, st, ping, sock, cfg };
+    let setup = Setup { child, st, ping, sock, cfg, tls, quic };
     let deadline = Instant::now() + Duration::from_secs(60);
     while TcpStream::connect(ping).is_err() || UnixStream::connect(&setup.sock).is_err() {
         assert!(Instant::now() < deadline, "ibex never started listening");
@@ -327,4 +353,376 @@ fn an_h2_client_gets_the_whole_page() {
     }
     let data = String::from_utf8_lossy(&data);
     assert!(data.starts_with("# pxname,") && data.ends_with(",\n") && data.lines().count() == 3 + 2 * 4, "{data:?}");
+}
+
+// HTTP/2 (T580). HAProxy streams the applet's output to an h2 stream as it streams it to an
+// HTTP/1.1 client: the stats applet fills the channel buffer and `h2_snd_buf` sends what is
+// there as DATA frames, within the stream's and the connection's windows. Measured on
+// 3.5-dev8 over h2c (client windows open), 10,000 servers: the HTML page, 20.8 MB, in 1453 DATA
+// frames of at most 16336 bytes, the process grows by 200 kB, and a plain request on the same
+// thread waits at most 0.3 ms meanwhile. Ibex before T580 built the page whole (+127 MB, that
+// request held 88 ms) and then sent its first buffer alone: 16315 bytes, and the stream reset
+// at `timeout client` (release-perf, `/tmp/t580/measure_h2.py`).
+
+/// The HEADERS frame of a request on stream `sid` (END_STREAM, END_HEADERS): `GET` (or `HEAD`)
+/// `path`, `:scheme http`, `:authority x`, no Huffman.
+fn h2_request(sid: u32, head: bool, path: &str) -> Vec<u8> {
+    let mut h = if head { vec![0x02, 4, b'H', b'E', b'A', b'D'] } else { vec![0x82] };
+    h.extend_from_slice(&[0x86, 0x04, u8::try_from(path.len()).expect("short path")]);
+    h.extend_from_slice(path.as_bytes());
+    h.extend_from_slice(&[0x01, 1, b'x']);
+    h2_frame(0x01, 0x05, sid, &h)
+}
+
+/// A response read off an HTTP/2 stream.
+struct H2Response {
+    /// The first byte of its header block: 0x88 is `:status 200` from the static table.
+    status_byte: u8,
+    /// END_STREAM on its HEADERS: the head alone.
+    head_ended: bool,
+    body: Vec<u8>,
+    /// The size of each DATA frame.
+    sizes: Vec<usize>,
+}
+
+/// An HTTP/2 client over `S` (h2c with prior knowledge, or TLS with ALPN `h2`), enough for the
+/// stats page: the windows it gives the server are the test's to give.
+struct H2<S: Read + Write> {
+    s: S,
+    raw: Vec<u8>,
+}
+
+impl<S: Read + Write> H2<S> {
+    /// The preface and SETTINGS, with `SETTINGS_INITIAL_WINDOW_SIZE` when `window` says.
+    fn open(mut s: S, window: Option<u32>) -> Self {
+        s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+        let settings = window.map_or_else(Vec::new, |w| [&[0u8, 4][..], &w.to_be_bytes()].concat());
+        s.write_all(&h2_frame(0x04, 0, 0, &settings)).expect("settings");
+        H2 { s, raw: Vec::new() }
+    }
+
+    /// The next frame (type, flags, stream, payload); the server's SETTINGS are acknowledged.
+    /// `None` when nothing came within the socket's read timeout.
+    fn frame(&mut self) -> Option<(u8, u8, u32, Vec<u8>)> {
+        let mut tmp = vec![0u8; 65536];
+        loop {
+            if self.raw.len() >= 9 {
+                let len = usize::from(self.raw[0]) << 16 | usize::from(self.raw[1]) << 8 | usize::from(self.raw[2]);
+                if self.raw.len() >= 9 + len {
+                    let f: Vec<u8> = self.raw.drain(..9 + len).collect();
+                    let (ty, fl, sid) = (f[3], f[4], u32::from_be_bytes([f[5], f[6], f[7], f[8]]) & 0x7fff_ffff);
+                    if ty == 0x04 && fl & 1 == 0 {
+                        self.s.write_all(&h2_frame(0x04, 1, 0, &[])).expect("settings ack");
+                    }
+                    assert!(ty != 0x07, "GOAWAY: {:?}", &f[9..]);
+                    return Some((ty, fl, sid, f[9..].to_vec()));
+                }
+            }
+            match self.s.read(&mut tmp) {
+                Ok(0) => panic!("the connection closed"),
+                Ok(n) => self.raw.extend_from_slice(&tmp[..n]),
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => return None,
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+    }
+
+    /// Opens `n` more bytes of the window of stream `sid` (0: the connection's).
+    fn window(&mut self, sid: u32, n: u32) {
+        self.s.write_all(&h2_frame(0x08, 0, sid, &n.to_be_bytes())).expect("window update");
+    }
+
+    /// Reads stream `sid` to its end, giving back the window of each DATA frame as it comes.
+    fn read_stream(&mut self, sid: u32) -> H2Response {
+        let mut r = H2Response { status_byte: 0, head_ended: false, body: Vec::new(), sizes: Vec::new() };
+        loop {
+            let (ty, fl, id, p) = self.frame().unwrap_or_else(|| panic!("stream {sid}: nothing more after {} bytes", r.body.len()));
+            if id != sid {
+                continue;
+            }
+            match ty {
+                0x01 => {
+                    r.status_byte = p[0];
+                    if fl & 1 != 0 {
+                        r.head_ended = true;
+                        return r;
+                    }
+                }
+                0x00 => {
+                    if !p.is_empty() {
+                        let n = u32::try_from(p.len()).expect("frame");
+                        self.window(sid, n);
+                        self.window(0, n);
+                    }
+                    r.sizes.push(p.len());
+                    r.body.extend_from_slice(&p);
+                    if fl & 1 != 0 {
+                        return r;
+                    }
+                }
+                0x03 => panic!("stream {sid} reset: {p:?} after {} bytes", r.body.len()),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A TLS connection to the stats frontend that negotiated `h2`.
+fn tls_h2(s: &Setup) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (addr, _, der) = s.tls.as_ref().expect("a TLS frontend");
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(rustls::pki_types::CertificateDer::from(der.clone())).expect("root");
+    let mut conf = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    conf.alpn_protocols = vec![b"h2".to_vec()];
+    let conn = rustls::ClientConnection::new(std::sync::Arc::new(conf), rustls::pki_types::ServerName::try_from("localhost").expect("name")).expect("client");
+    let sock = TcpStream::connect(addr).expect("connect tls");
+    sock.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+    let mut t = rustls::StreamOwned::new(conn, sock);
+    while t.conn.is_handshaking() {
+        t.conn.complete_io(&mut t.sock).expect("handshake");
+    }
+    assert_eq!(t.conn.alpn_protocol(), Some(&b"h2"[..]));
+    t
+}
+
+/// The HTML page and `;csv` over HTTP/2: what the dump adds while the client reads nothing,
+/// the plain request meanwhile, then the page read whole in DATA frames no larger than a
+/// buffer, and `;csv` on the next stream of the same connection.
+fn h2_page_streamed<S: Read + Write>(s: &Setup, h: &mut H2<S>, what: &str) -> Vec<String> {
+    // The TLS frontend is one more row.
+    let rows = 3 + BACKENDS * (PER + 1) + usize::from(s.tls.is_some());
+    let (lat, grew) = while_unread(s, &mut h.s, &h2_request(1, false, "/s"));
+    let r = h.read_stream(1);
+    let body = String::from_utf8_lossy(&r.body);
+    let mut bad = Vec::new();
+    if grew > GROWTH_KB {
+        bad.push(format!("{what}: the process grew by {grew} kB while the page waited for its client ({} kB of page)", body.len() / 1024));
+    }
+    if lat > Duration::from_millis(LATENCY_MS) {
+        bad.push(format!("{what}: a plain request on the same thread waited {lat:?} while the page dumped"));
+    }
+    if r.sizes.len() < body.len() / BUFSIZE || r.sizes.iter().any(|&n| n > BUFSIZE) {
+        bad.push(format!("{what}: {} DATA frames, the largest {} bytes, for {} bytes", r.sizes.len(), r.sizes.iter().max().unwrap_or(&0), body.len()));
+    }
+    if r.status_byte != 0x88 || !body.starts_with("<!DOCTYPE html>") || !body.ends_with("</html>\n") || body.matches("<tr id=\"srv-row-").count() != BACKENDS * PER {
+        bad.push(format!("{what}: the page is not whole: status byte {:#x}, {} bytes, {} server rows", r.status_byte, body.len(), body.matches("<tr id=\"srv-row-").count()));
+    }
+    h.s.write_all(&h2_request(3, false, "/s;csv")).expect("send csv");
+    let r = h.read_stream(3);
+    let csv = String::from_utf8_lossy(&r.body);
+    if !csv.starts_with("# pxname,") || csv.lines().count() != rows || r.sizes.iter().any(|&n| n > BUFSIZE) {
+        bad.push(format!("{what} ;csv: {} lines in {} DATA frames, the largest {}", csv.lines().count(), r.sizes.len(), r.sizes.iter().max().unwrap_or(&0)));
+    }
+    bad
+}
+
+#[test]
+fn h2c_page_is_streamed_with_bounded_memory() {
+    let s = start("h2c");
+    let c = TcpStream::connect(s.st).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+    let mut h = H2::open(c, None);
+    let bad = h2_page_streamed(&s, &mut h, "h2c");
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+#[test]
+fn h2_tls_page_is_streamed_with_bounded_memory() {
+    let s = start_full("h2tls", "", BACKENDS, PER, true, false);
+    let mut h = H2::open(tls_h2(&s), None);
+    // The preface and SETTINGS are out before the dump is timed.
+    h.s.flush().expect("flush");
+    let bad = h2_page_streamed(&s, &mut h, "h2 over TLS");
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// A client whose window is closed (`SETTINGS_INITIAL_WINDOW_SIZE` 0) while it reads all that
+/// comes: the page waits in no more than a buffer, another stream of the connection is
+/// answered meanwhile, and the dump goes on as the window opens.
+#[test]
+fn an_h2_page_waits_for_a_closed_window_in_a_buffer() {
+    let s = start("h2win");
+    let c = TcpStream::connect(s.st).expect("connect");
+    c.set_read_timeout(Some(Duration::from_millis(100))).expect("timeout");
+    let mut h = H2::open(c, Some(0));
+    while h.frame().is_some() {}
+    let pid = s.child.id();
+    let base = reset_peak(pid);
+    let t = Instant::now();
+    // The page, then a request the frontend answers itself (no backend: 503).
+    h.s.write_all(&[h2_request(1, false, "/s"), h2_request(3, false, "/other")].concat()).expect("send");
+    let (mut other, mut data_1, mut head_1) = (None, 0, false);
+    let until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < until {
+        match h.frame() {
+            Some((0x01, _, 3, _)) if other.is_none() => other = Some(t.elapsed()),
+            Some((0x01, _, 1, _)) => head_1 = true,
+            Some((0x00, _, 1, p)) => data_1 += p.len(),
+            _ => {}
+        }
+    }
+    let grew = status_kb(pid, "VmHWM").saturating_sub(base);
+    let mut bad = Vec::new();
+    if grew > GROWTH_KB {
+        bad.push(format!("the process grew by {grew} kB while the page waited for a window"));
+    }
+    match other {
+        Some(d) if d <= Duration::from_millis(LATENCY_MS) => {}
+        d => bad.push(format!("the other stream's answer came after {d:?}")),
+    }
+    if !head_1 || data_1 != 0 {
+        bad.push(format!("closed window: HEADERS {head_1}, {data_1} bytes of DATA"));
+    }
+    h.s.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+    h.window(1, 65535);
+    let r = h.read_stream(1);
+    let body = String::from_utf8_lossy(&r.body);
+    if !body.ends_with("</html>\n") || body.matches("<tr id=\"srv-row-").count() != BACKENDS * PER {
+        bad.push(format!("after the window opened: {} bytes, {} server rows", body.len(), body.matches("<tr id=\"srv-row-").count()));
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Each page over HTTP/2 is the page an HTTP/1.1 client gets, once the numbers that move
+/// between two requests (counters, times) are set aside.
+#[test]
+fn the_h2_pages_are_the_h1_pages() {
+    let s = start_with("h2eq", "", 3, 5);
+    let norm = |b: &[u8]| {
+        let t = String::from_utf8_lossy(b);
+        let mut out = String::with_capacity(t.len());
+        let mut digit = false;
+        for ch in t.chars() {
+            if !ch.is_ascii_digit() {
+                out.push(ch);
+            } else if !digit {
+                out.push('0');
+            }
+            digit = ch.is_ascii_digit();
+        }
+        out
+    };
+    let c = TcpStream::connect(s.st).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let mut h = H2::open(c, None);
+    let mut a = TcpStream::connect(s.st).expect("connect");
+    let mut bad = Vec::new();
+    for (sid, path) in [(1, "/s"), (3, "/s;csv"), (5, "/s;json"), (7, "/s;up"), (9, "/s;norefresh")] {
+        a.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).expect("send h1");
+        let (h1, _) = read_chunked(&mut a);
+        h.s.write_all(&h2_request(sid, false, path)).expect("send h2");
+        let h2 = h.read_stream(sid).body;
+        if h1.len() < 100 || norm(&h1) != norm(&h2) {
+            bad.push(format!("{path}: HTTP/1.1 {} bytes, HTTP/2 {} bytes", h1.len(), h2.len()));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// `show pools`' `scrape_box` line: (allocated, of them in thread caches).
+fn scrape_boxes(sock: &str) -> (u64, u64) {
+    let mut c = UnixStream::connect(sock).expect("cli");
+    c.write_all(b"show pools\n").expect("send");
+    let mut out = String::new();
+    let _ = c.read_to_string(&mut out);
+    let l = out.lines().find(|l| l.contains("Pool scrape_box ")).unwrap_or_else(|| panic!("no scrape_box in {out}"));
+    let num = |after: &str| l.split(after).nth(1).and_then(|t| t.trim_start().split(|c: char| !c.is_ascii_digit()).next()).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{l}"));
+    (num(") : "), num("(~"))
+}
+
+/// A client that resets its stream while the page dumps ends the dump: the stream's box goes
+/// back to its pool (a box taken from a pool is outside its accounting until it is given
+/// back: dropped, it never shows), and the connection's next stream gets its page.
+#[test]
+fn an_h2_stream_reset_mid_dump_ends_the_dump() {
+    let s = start("h2rst");
+    let c = TcpStream::connect(s.st).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+    let mut h = H2::open(c, None);
+    h.s.write_all(&h2_request(1, false, "/s")).expect("send");
+    loop {
+        if let Some((0x00, _, 1, p)) = h.frame() {
+            if !p.is_empty() {
+                break;
+            }
+        }
+    }
+    // CANCEL.
+    h.s.write_all(&h2_frame(0x03, 0, 1, &8u32.to_be_bytes())).expect("rst");
+    std::thread::sleep(Duration::from_millis(300));
+    let (alloc, cached) = scrape_boxes(&s.sock);
+    h.s.write_all(&h2_request(3, false, "/s;csv")).expect("send csv");
+    let r = h.read_stream(3);
+    let csv = String::from_utf8_lossy(&r.body);
+    assert!(csv.lines().count() == 3 + BACKENDS * (PER + 1) && alloc >= 1 && cached == alloc, "{} lines; scrape_box after the reset: {alloc} allocated, {cached} in caches", csv.lines().count());
+}
+
+/// A HEAD over HTTP/2 gets the head alone: HEADERS with the end of the stream.
+#[test]
+fn an_h2_head_gets_the_head_alone() {
+    let s = start_with("h2head", "", 2, 3);
+    let c = TcpStream::connect(s.st).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let mut h = H2::open(c, None);
+    for (sid, path) in [(1, "/s"), (3, "/s;csv")] {
+        h.s.write_all(&h2_request(sid, true, path)).expect("send");
+        let r = h.read_stream(sid);
+        assert!(r.status_byte == 0x88 && r.head_ended && r.body.is_empty(), "{path}: status byte {:#x}, ended {}, {} bytes", r.status_byte, r.head_ended, r.body.len());
+    }
+    // Any reply the proxy makes itself: HAProxy 3.5-dev8 sends `return`'s HEADERS with the end
+    // of the stream and no DATA.
+    let c = TcpStream::connect(s.ping).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let mut h = H2::open(c, None);
+    h.s.write_all(&h2_request(1, true, "/p")).expect("send");
+    let r = h.read_stream(1);
+    assert!(r.status_byte == 0x88 && r.head_ended && r.body.is_empty(), "return: ended {}, {} bytes", r.head_ended, r.body.len());
+    // A DATA frame after the end of the stream would come before the next stream's answer.
+    h.s.write_all(&h2_request(3, false, "/p")).expect("send");
+    let r = h.read_stream(3);
+    assert!(r.body == b"ok", "the next stream: {:?}", r.body);
+}
+
+/// HTTP/3 streams the page as HTTP/2 does: its stream's response goes out of the same `rep`
+/// as DATA frames (`h3_bridge_moves`). It already did before T580 (an HTTP/3 stream is not
+/// `is_h2()`, so it took the HTTP/1.1 path, chunked in `rep`): this one guards it. curl reads as fast as it can: the process grows by the
+/// QUIC send buffers, not by the page, and the plain request is answered meanwhile. Skipped
+/// where curl has no HTTP/3.
+#[test]
+fn h3_page_is_streamed_with_bounded_memory() {
+    let has_h3 = Command::new("curl").arg("-V").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("HTTP3"));
+    if !has_h3 {
+        eprintln!("curl on this host has no HTTP3 support; skipping");
+        return;
+    }
+    let s = start_full("h3", "", BACKENDS, PER, false, true);
+    let port = s.quic.expect("quic").port();
+    let out = std::env::temp_dir().join(format!("ibex-t580-h3-{}.html", std::process::id()));
+    let pid = s.child.id();
+    let base = reset_peak(pid);
+    let curl = Command::new("curl")
+        .args(["-sS", "--http3-only", "-k", "--max-time", "60", "--resolve", &format!("localhost:{port}:127.0.0.1"), &format!("https://localhost:{port}/s"), "-o"])
+        .arg(&out)
+        .args(["-w", "%{http_code} %{http_version}"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("run curl");
+    std::thread::sleep(Duration::from_millis(50));
+    let lat = ping(s.ping);
+    let done = curl.wait_with_output().expect("curl");
+    let grew = status_kb(pid, "VmHWM").saturating_sub(base);
+    let body = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    let mut bad = Vec::new();
+    if String::from_utf8_lossy(&done.stdout) != "200 3" || !body.ends_with("</html>\n") || body.matches("<tr id=\"srv-row-").count() != BACKENDS * PER {
+        bad.push(format!("curl: {:?}, {} bytes, {} server rows", String::from_utf8_lossy(&done.stdout), body.len(), body.matches("<tr id=\"srv-row-").count()));
+    }
+    if grew > 2 * GROWTH_KB {
+        bad.push(format!("the process grew by {grew} kB while the page went out over HTTP/3 ({} kB of page)", body.len() / 1024));
+    }
+    if lat > Duration::from_millis(LATENCY_MS) {
+        bad.push(format!("a plain request on the same thread waited {lat:?} while the page went out over HTTP/3"));
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }

@@ -81,8 +81,9 @@ impl Dump {
     }
 }
 
-/// The body of `page` built whole, unframed: for a reply that goes out as one message (an
-/// HTTP/2 client's).
+/// The body of `page` built whole, unframed: what the streamed page must add up to. Nothing
+/// sends a page built whole since HTTP/2 streams too (T580).
+#[cfg(test)]
 #[must_use]
 pub fn render_all(page: Page, ctx: &Ctx<'_>) -> String {
     let mut page = page;

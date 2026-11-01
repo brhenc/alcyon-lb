@@ -2449,8 +2449,11 @@ impl SessionArena {
     }
 
     pub fn free(&mut self, idx: u32) -> Option<SessionEntry> {
-        let entry = self.entries.get_mut(idx as usize)?.take();
-        if entry.is_some() {
+        let mut entry = self.entries.get_mut(idx as usize)?.take();
+        if let Some(e) = entry.as_mut() {
+            // A scrape or stats page cut short (the client left, its HTTP/2 stream was reset)
+            // gives its box back to the pool, which does not count it while it is out (T580).
+            e.sess.end_dump();
             self.live -= 1;
             self.free.push(idx);
         }
@@ -16928,8 +16931,7 @@ fn stats_write_page(entry: &mut SessionEntry, proxies: &[Proxy], content_type: &
 /// Sends a stats page (HTML, CSV, JSON) as HAProxy's stats applet does (T572): the head
 /// now, framed as [`stats_write_page`] frames it, and the body a buffer at a time from
 /// `page`, by [`stats_pump`] on every pass over the session while the client reads. The page
-/// is never built whole. A HEAD gets the head alone; an HTTP/2 client, whose replies go out
-/// as one message, gets the page built whole.
+/// is never built whole, over HTTP/2 and HTTP/3 neither (T580). A HEAD gets the head alone.
 #[allow(clippy::too_many_arguments)]
 fn stats_stream_page(
     entry: &mut SessionEntry,
@@ -16945,14 +16947,18 @@ fn stats_stream_page(
     let uri = entry.sess.req_uri.as_deref().unwrap_or("").to_string();
     let banner = |c: crate::stats_post::StCode| EngineDispatcher::stats_banner(proxies, serving, &uri, c);
     let ctx = crate::stats_stream::Ctx { proxies, checks, pid, cfg: &proxies[serving].stats_config, banner: &banner };
-    if head_only || entry.sess.is_h2() {
-        let body = if head_only { String::new() } else { crate::stats_stream::render_all(page, &ctx) };
-        stats_write_page(entry, proxies, content_type, refresh, body.as_bytes());
+    if head_only {
+        stats_write_page(entry, proxies, content_type, refresh, b"");
         return;
     }
-    let http11 = entry.sess.txn.as_ref().is_none_or(|t| t.req_http11);
-    let framing = if http11 { "transfer-encoding: chunked" } else { "connection: close" };
-    let head = format!("HTTP/1.1 200 OK\r\ncache-control: no-cache\r\ncontent-type: {content_type}\r\n{refresh}{framing}\r\n\r\n");
+    // An HTTP/2 stream's body is chunked in `rep` as a server's is, and the forwarder turns
+    // the chunks into DATA frames as the windows take them (T580); the head says nothing of
+    // the framing, which is the protocol's. (An HTTP/3 stream is not `is_h2()`: it takes the
+    // HTTP/1.1 head, whose `transfer-encoding` its mux drops, and the same chunks.)
+    let h2 = entry.sess.is_h2();
+    let http11 = h2 || entry.sess.txn.as_ref().is_none_or(|t| t.req_http11);
+    let framing = if h2 { "" } else if http11 { "transfer-encoding: chunked\r\n" } else { "connection: close\r\n" };
+    let head = format!("HTTP/1.1 200 OK\r\ncache-control: no-cache\r\ncontent-type: {content_type}\r\n{refresh}{framing}\r\n");
     if !stats_write_reply(entry, proxies, head.as_bytes()) {
         return;
     }
