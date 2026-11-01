@@ -207,6 +207,19 @@ pub struct ConnErr<'a> {
     pub ssl_text: Option<&'a str>,
 }
 
+/// T569: how the QUIC peer of an HTTP/3 stream acknowledges (quinn-proto's `AckStats`), as the
+/// stream's request head found it: what the `ibex_fc_quic_ack_*` fetches read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuicAckFacts {
+    /// Ack-eliciting 1-RTT packets sent to the peer.
+    pub ack_eliciting_sent: u64,
+    /// 1-RTT packets received from it with an ACK frame and nothing ack-eliciting.
+    pub ack_only_rcvd: u64,
+    /// ACK-only packets ACK_FREQUENCY does not explain; `None` while the peer has acknowledged
+    /// no ACK_FREQUENCY frame (it does not support it, or `tune.ibex.quic-ack-frequency` is off).
+    pub excess: Option<u64>,
+}
+
 /// Runtime context passed into sample fetch functions during evaluation.
 #[derive(Debug, Clone, Default)]
 pub struct SampleContext<'a> {
@@ -304,6 +317,9 @@ pub struct SampleContext<'a> {
     /// The server connection's TLS session, for `ssl_bc*`; `None` where there is no TLS
     /// server connection (a plaintext one, or none yet).
     pub ssl_bc: Option<SslFacts<'a>>,
+    /// T569: the QUIC connection's acknowledgement counts, on an HTTP/3 stream; `None`
+    /// elsewhere, and the `ibex_fc_quic_ack_*` fetches then give no sample.
+    pub quic_acks: Option<QuicAckFacts>,
     /// The proxies' live state, for the fetches and converters that read it (`nbsrv`,
     /// `srv_is_up`, `srv_conn`, `fe_exists`, `in_table`, ...). `None` where the caller
     /// has none to give, and those fetches then return no sample -- never a guess.
@@ -3760,6 +3776,32 @@ impl Registry {
         for name in ["cpu_usage_proc", "cpu_usage_thr", "cpu_usage_grp"] {
             self.register_fetch(FetchDesc { name, out_type: SampleType::Sint, func: |_ctx, _args| Some(Sample::Sint(cpu_usage_pct())) });
         }
+        // T569 (Ibex extensions, docs/differences.md; HAProxy 3.5-dev10 has no equivalent): the
+        // client QUIC connection's acknowledgements, as its stream's request head found them.
+        self.register_fetch(FetchDesc {
+            name: "ibex_fc_quic_ack_eliciting_sent",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.quic_acks.map(|a| Sample::Sint(u64_to_sint(a.ack_eliciting_sent))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "ibex_fc_quic_ack_only_rcvd",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.quic_acks.map(|a| Sample::Sint(u64_to_sint(a.ack_only_rcvd))),
+        });
+        // ACK-only packets received per 1000 ack-eliciting packets sent; none before one is sent.
+        self.register_fetch(FetchDesc {
+            name: "ibex_fc_quic_ack_ratio",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| {
+                let a = ctx.quic_acks.filter(|a| a.ack_eliciting_sent > 0)?;
+                Some(Sample::Sint(u64_to_sint(a.ack_only_rcvd.saturating_mul(1000) / a.ack_eliciting_sent)))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "ibex_fc_quic_ack_excess",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.quic_acks.and_then(|a| a.excess).map(|e| Sample::Sint(u64_to_sint(e))),
+        });
         // T331: `quic_enabled`: always 0, Ibex has no QUIC.
         self.register_fetch(FetchDesc {
             name: "quic_enabled",
@@ -8959,6 +9001,10 @@ mod oracle_tests {
     const NOT_IN_HAPROXY_FETCHES: &[&str] = &[
         // Ibex-only by decision (user, 2026-10-18; T344): the JA4 TLS client fingerprint.
         "ssl_fc_ja4",
+        // Ibex-only by decision (user, 2026-11-01; T569): a QUIC peer's ACK-only packets and
+        // those ACK_FREQUENCY does not explain. HAProxy 3.5-dev10 has no equivalent.
+        "ibex_fc_quic_ack_eliciting_sent", "ibex_fc_quic_ack_only_rcvd", "ibex_fc_quic_ack_ratio",
+        "ibex_fc_quic_ack_excess",
         "be_client_timeout", "fe_connect_timeout", "fe_queue_timeout",
         "fe_server_timeout", "fe_tunnel_timeout", "req.uri", "res.proto_http", "res.status",
         "res_ver",

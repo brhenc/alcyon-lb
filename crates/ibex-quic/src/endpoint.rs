@@ -206,7 +206,22 @@ pub struct ConnInfo {
     pub local_ip: Option<std::net::IpAddr>,
     pub state: ConnPhase,
     pub lost_packets: u64,
+    /// How the peer acknowledges (T569, `show quic ibex-acks`).
+    pub acks: quinn_proto::AckStats,
 }
+
+/// T569: the acknowledgement counts (quinn-proto's `AckStats`) of every connection that ended,
+/// over the process: what the `QuicAck*` lines of `show info` print. Added once per connection,
+/// when its slot is freed, not per packet.
+pub struct AckTotals {
+    pub ack_eliciting_sent: AtomicU64,
+    pub ack_only_rcvd: AtomicU64,
+    /// Only the connections whose peer acknowledged an ACK_FREQUENCY frame add to it.
+    pub excess: AtomicU64,
+}
+
+pub static ACK_TOTALS: AckTotals =
+    AckTotals { ack_eliciting_sent: AtomicU64::new(0), ack_only_rcvd: AtomicU64::new(0), excess: AtomicU64::new(0) };
 
 /// RFC 9000 §8.1 accounting for one connection on an unvalidated path.
 ///
@@ -522,6 +537,7 @@ impl QuicEndpoint {
                     local_ip: c.local_ip(),
                     state,
                     lost_packets: c.stats().path.lost_packets,
+                    acks: c.ack_stats(),
                 })
             })
             .collect()
@@ -583,6 +599,13 @@ impl QuicEndpoint {
     #[must_use]
     pub const fn cid_lookups(&self) -> u64 {
         self.cid_lookups
+    }
+
+    /// How the peer of `conn` acknowledges (T569): what the `ibex_fc_quic_ack_*` fetches of
+    /// its streams read. `None` once it is gone.
+    #[must_use]
+    pub fn ack_stats(&self, conn: ConnHandle) -> Option<quinn_proto::AckStats> {
+        self.live(conn).map(|l| l.conn.ack_stats())
     }
 
     /// The live connection `conn` names, if its slot is still at that generation.
@@ -829,6 +852,10 @@ impl QuicEndpoint {
     fn remove_slot(&mut self, idx: usize) {
         let handle = self.handle_at(idx);
         let Some(live) = self.slots.get_mut(idx).and_then(|s| s.live.take()) else { return };
+        let acks = live.conn.ack_stats();
+        ACK_TOTALS.ack_eliciting_sent.fetch_add(acks.ack_eliciting_sent, Ordering::Relaxed);
+        ACK_TOTALS.ack_only_rcvd.fetch_add(acks.ack_only_received, Ordering::Relaxed);
+        ACK_TOTALS.excess.fetch_add(acks.ack_frequency_excess, Ordering::Relaxed);
         // Drained after a close of ours: quinn said nothing, so the end is reported here, the
         // one place every connection leaves by (T561).
         if !live.reported {

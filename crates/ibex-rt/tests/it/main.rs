@@ -191,6 +191,7 @@ mod h3_connection_session;
 mod h3_end_to_end;
 mod h3_field_validity;
 mod quic_retry;
+mod quic_ack_frequency_compliance;
 mod quic_knobs;
 mod quic_handshake_burst;
 mod h3_many_threads;

@@ -107,6 +107,8 @@ pub struct QuicSnap {
     pub local: std::net::SocketAddr,
     pub peer: std::net::SocketAddr,
     pub lost_packets: u64,
+    /// How the peer acknowledges (T569, `show quic ibex-acks`).
+    pub acks: ibex_quic::quinn_proto::AckStats,
 }
 
 /// The id `show sess` prints for stream `idx` of worker `wid`'s arena, and `shutdown

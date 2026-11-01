@@ -159,6 +159,28 @@ pub struct PathStats {
     pub current_mtu: u16,
 }
 
+/// How the peer acknowledges this endpoint's application data (1-RTT) packets
+///
+/// `ack_only_received` per `ack_eliciting_sent` is how often the peer sends a packet only to
+/// acknowledge; `ack_frequency_excess` counts those ACK_FREQUENCY does not explain once the peer
+/// has acknowledged one.
+#[derive(Debug, Default, Copy, Clone)]
+#[non_exhaustive]
+pub struct AckStats {
+    /// Ack-eliciting 1-RTT packets sent
+    pub ack_eliciting_sent: u64,
+    /// 1-RTT packets received that carried an ACK frame and nothing ack-eliciting
+    pub ack_only_received: u64,
+    /// The Ack-Eliciting Threshold of the ACK_FREQUENCY frame the peer acknowledged, `None` while
+    /// it has acknowledged none (it does not support the extension, or none was sent)
+    pub ack_frequency_threshold: Option<u64>,
+    /// ACK-only packets received after that, for packets sent after that frame, that acknowledge
+    /// at most `ack_frequency_threshold` new ack-eliciting packets sooner than the requested
+    /// `max_ack_delay`, with no gap and no IMMEDIATE_ACK among them: neither the threshold, the
+    /// delay, reordering, loss nor a request explains them
+    pub ack_frequency_excess: u64,
+}
+
 /// Connection statistics
 #[derive(Debug, Default, Copy, Clone)]
 #[non_exhaustive]
@@ -173,4 +195,6 @@ pub struct ConnectionStats {
     pub frame_rx: FrameStats,
     /// Statistics related to the current transmission path
     pub path: PathStats,
+    /// How the peer acknowledges 1-RTT packets
+    pub ack: AckStats,
 }

@@ -30,7 +30,7 @@ pub use config::{load_pem_cert_and_key, QuicConfig, ALPN_H3};
 pub use connection::{
     ConnHandle, ConnectionId, QuicConnectionState, ReadStreamResult, StreamDirection, StreamId, MAX_CID_LEN,
 };
-pub use endpoint::{ConnInfo, ConnPhase, QuicEndpoint};
+pub use endpoint::{AckTotals, ConnInfo, ConnPhase, QuicEndpoint, ACK_TOTALS};
 pub use error::{QuicError, Result};
 pub use listener::QuicListener;
 pub use table::ConnectionTable;

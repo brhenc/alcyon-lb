@@ -106,6 +106,15 @@ The first vendor commit is the pristine 0.11.18; each change below is its own co
    A `Retransmits` is taken when the first control frame needs it, no longer one per packet.
    Unconditional, upstreamable: `SendBuffer.acks` is an `ArrayRangeSet` (`ArrayRangeSet::clear`).
    `QP_FEATURES=ibex-pools tools/quinn-proto-tests.sh` runs the unit tests with the pools.
+8. T569 (upstreamable: yes): `src/connection/{stats,mod,ack_frequency,packet_builder}.rs`,
+   `ConnectionStats::ack` (`AckStats`, also `Connection::ack_stats`, which copies only it): the
+   ack-eliciting 1-RTT packets sent, the 1-RTT packets received with an ACK and nothing
+   ack-eliciting, the threshold of the first ACK_FREQUENCY frame the peer acknowledged, and the
+   ACK-only packets after it that neither that threshold, the requested `max_ack_delay`, a gap nor
+   an IMMEDIATE_ACK explains (`on_ack_received` judges, `process_payload` counts; the judging runs
+   only once a frame was acknowledged, so a connection without ACK_FREQUENCY pays two counter
+   increments). Test: `crates/ibex-rt/tests/it/quic_ack_frequency_compliance.rs`
+   (quinn-proto's own end-to-end suite is not built here).
 
 ### Running quinn-proto's own tests
 

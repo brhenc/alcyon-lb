@@ -3251,6 +3251,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         is_first_req: s.is_first_req,
         proxy_tlvs: s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&s.cli_xprt, s.h2_role.as_deref()),
+        quic_acks: crate::proxy::quic_acks(s.h2_role.as_deref()),
         fc_http_major: s.fc_http_major(),
         bc_http_major: s.bc_http_major(),
         req_version: s.client_version(),
@@ -4075,6 +4076,7 @@ fn open_quic_bind(
     }
     // Q0: `tune.ibex.quic-ack-frequency` and its two parameters (default off, 2, 25 ms) reach
     // `QuicConfig::ack_frequency`, then `TransportConfig::ack_frequency_config`.
+    crate::stats::QUIC_ACK_FREQUENCY_ON.store(g.and_then(|g| g.quic_ack_frequency) == Some(true), Ordering::Relaxed);
     if g.and_then(|g| g.quic_ack_frequency) == Some(true) {
         let threshold = g.and_then(|g| g.quic_ack_frequency_threshold).unwrap_or(2);
         let delay = g.and_then(|g| g.quic_ack_frequency_max_delay_ms).unwrap_or(25);
@@ -6373,6 +6375,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let stream_id = d.stream.id;
             let mut sess = TcpSession::h2_child_of(&mut owner.sess, (owner_idx, owner_task), d.stream);
             sess.h3 = owner.sess.h3;
+            // T569: the connection's acknowledgement counts as this request found them.
+            if let (Some(h3), Some(c)) = (owner.sess.h3_owner(), sess.h2_child_mut()) {
+                c.quic_acks = self.quic_listeners.get(h3.listener as usize).and_then(|ql| ql.ack_facts(h3.conn));
+            }
             // An HTTP/2 owner stamps the first byte of each stream as it reads it; an HTTP/3
             // one reads no bytes of its own. The stream's request head is in, which is where
             // its idle time (`Ti`, since the connection's previous stream ended) stops and
@@ -7360,6 +7366,7 @@ fn eval_tcp_req_session_rules(
         fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
+        quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
         req_version: sess.client_version(),
         ssl_bc: sess.srv_xprt.ssl_facts(),
         act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
@@ -7571,6 +7578,7 @@ fn eval_tcp_req_content_rules(
         fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
+        quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
         fc_http_major: sess.fc_http_major(),
         bc_http_major: sess.bc_http_major(),
         req_version: sess.client_version(),
@@ -7862,6 +7870,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
+        quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
         fc_http_major: sess.fc_http_major(),
         bc_http_major: sess.bc_http_major(),
         req_version: sess.client_version(),
@@ -9769,6 +9778,7 @@ impl EngineDispatcher<'_> {
             is_first_req: sess.is_first_req,
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
+            quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
             fc_http_major: sess.fc_http_major(),
             bc_http_major: sess.bc_http_major(),
             req_version: sess.client_version(),
@@ -12111,6 +12121,7 @@ impl EngineDispatcher<'_> {
             is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             ssl_fc: crate::proxy::ssl_fc(&entry.sess.cli_xprt, entry.sess.h2_role.as_deref()),
+            quic_acks: crate::proxy::quic_acks(entry.sess.h2_role.as_deref()),
             fc_http_major: entry.sess.fc_http_major(),
             bc_http_major: entry.sess.bc_http_major(),
             req_version: entry.sess.client_version(),
@@ -12584,6 +12595,7 @@ impl EngineDispatcher<'_> {
             fc_dst: sess.fc_dst(),
             is_first_req: sess.is_first_req,
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
+            quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
             fc_http_major: sess.fc_http_major(),
             req_version: sess.client_version(),
             req_uri: sess.req_uri.as_deref(),
@@ -13054,6 +13066,7 @@ impl EngineDispatcher<'_> {
             is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             ssl_fc: crate::proxy::ssl_fc(&entry.sess.cli_xprt, entry.sess.h2_role.as_deref()),
+            quic_acks: crate::proxy::quic_acks(entry.sess.h2_role.as_deref()),
             fc_http_major: entry.sess.fc_http_major(),
             bc_http_major: entry.sess.bc_http_major(),
             req_version: entry.sess.client_version(),
@@ -13150,6 +13163,7 @@ impl EngineDispatcher<'_> {
                         is_first_req: $s.is_first_req,
                         proxy_tlvs: $s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
                         ssl_fc: crate::proxy::ssl_fc(&$s.cli_xprt, $s.h2_role.as_deref()),
+                        quic_acks: crate::proxy::quic_acks($s.h2_role.as_deref()),
                         fc_http_major: $s.fc_http_major(),
                         bc_http_major: $s.bc_http_major(),
                         req_version: $s.client_version(),
@@ -17142,6 +17156,7 @@ fn after_res_on_reply<'r>(
             is_first_req: sess.is_first_req,
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
+            quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
             fc_http_major: sess.fc_http_major(),
             bc_http_major: sess.bc_http_major(),
             req_version: sess.client_version(),
@@ -17216,6 +17231,7 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Pr
                     fc_dst: sess.fc_dst(),
                     is_first_req: sess.is_first_req,
                     ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
+                    quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
                     fc_http_major: sess.fc_http_major(),
                     bc_http_major: sess.bc_http_major(),
                     req_version: sess.client_version(),

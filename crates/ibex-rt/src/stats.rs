@@ -636,8 +636,28 @@ fn show_info_pairs(
     let mut p = InfoPairs::default();
     fill_info_pairs(&mut p, start_time, pid, total_tasks, run_queue_len, active_conns, max_conns, cum_conns, cum_reqs);
     zero_on_free_pairs(&mut p);
+    quic_ack_pairs(&mut p);
     p.v.truncate(p.n);
     p.v
+}
+
+/// `tune.ibex.quic-ack-frequency on` (T569), set once the QUIC configuration is built: `show
+/// info` then prints the `QuicAck*` lines.
+pub static QUIC_ACK_FREQUENCY_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// T569, with `tune.ibex.quic-ack-frequency on`: Ibex-only lines at the end of `show info`
+/// (`typed` and `json` leave them out, as `zero_on_free_pairs`): the acknowledgement counts of
+/// the QUIC connections that ended (`ibex_quic::ACK_TOTALS`; a live one's are in `show quic
+/// ibex-acks`). HAProxy 3.5-dev10 has no equivalent.
+fn quic_ack_pairs(p: &mut InfoPairs) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !QUIC_ACK_FREQUENCY_ON.load(Relaxed) {
+        return;
+    }
+    let t = &ibex_quic::ACK_TOTALS;
+    p.put("QuicAckElicitingSent", format_args!("{}", t.ack_eliciting_sent.load(Relaxed)));
+    p.put("QuicAckOnlyRcvd", format_args!("{}", t.ack_only_rcvd.load(Relaxed)));
+    p.put("QuicAckFreqExcess", format_args!("{}", t.excess.load(Relaxed)));
 }
 
 /// `tune.ibex.zero-on-free` (T459), when it is not `off`: Ibex-only lines at the end of `show

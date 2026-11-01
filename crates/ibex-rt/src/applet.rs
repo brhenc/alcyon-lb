@@ -59,9 +59,16 @@ pub struct AppletContext<'a> {
 enum Pending {
     Sess(Arc<Gather<Vec<SessSnap>>>, SessOpts),
     /// `show quic`; which connections to list.
-    Quic(Arc<Gather<Vec<QuicSnap>>>, QuicFilter),
+    Quic(Arc<Gather<Vec<QuicSnap>>>, QuicShow),
     /// `shutdown session(s)`; `by_id` answers HAProxy's message when nothing matched.
     Shut(Arc<Gather<usize>>, bool),
+}
+
+/// What a `show quic` waiting for the workers prints: which connections, and (T569, `ibex-acks`)
+/// their acknowledgement counts instead of the one-line form.
+struct QuicShow {
+    filter: QuicFilter,
+    acks: bool,
 }
 
 /// Which connections `show quic` lists (`QC_CLI_FL_SHOW_*`).
@@ -74,6 +81,9 @@ enum QuicFilter {
 }
 
 const SHOW_QUIC_HEADER: &str = "# conn/frontend                     state   in_flight infl_p lost_p         Local Address           Foreign Address      local & remote CIDs\n";
+
+/// `show quic ibex-acks` (T569, an Ibex extension), the columns of [`CliApplet::quic_acks_line`].
+const SHOW_QUIC_ACKS_HEADER: &str = "# conn/frontend                     state   ack_elic_sent ack_only_rcvd ratio_pm ackf_thr ackf_excess\n";
 
 /// `show quic help`, as HAProxy answers it.
 const SHOW_QUIC_HELP: &str = "Usage: show quic [help|<format>] [<filter>]\n\
@@ -1376,8 +1386,14 @@ impl CliApplet {
                 "'show quic {what}' is not supported by Ibex: it prints more than the one-line form, which is all Ibex has."
             ));
         };
+        let mut acks = false;
         match args.first().copied() {
             Some("oneline") => i += 1,
+            // T569, an Ibex extension: how each connection's peer acknowledges.
+            Some("ibex-acks") => {
+                acks = true;
+                i += 1;
+            }
             Some("help") => return self.finish_msg(SHOW_QUIC_HELP),
             Some(a @ ("stream" | "full")) => return refuse(self, a),
             Some(a) => {
@@ -1419,7 +1435,7 @@ impl CliApplet {
         }
         let g = Gather::new(ctx.mailboxes, ctx.worker_id, ctx.task);
         ctx.mailboxes.broadcast(|| Msg::ShowQuic(Arc::clone(&g)));
-        self.pending = Some(Pending::Quic(g, filter));
+        self.pending = Some(Pending::Quic(g, QuicShow { filter, acks }));
     }
 
     /// One connection as `dump_quic_oneline` prints it: `%p[%02u]/%-.12s ` padded to 36
@@ -1448,6 +1464,24 @@ impl CliApplet {
         )
     }
 
+    /// T569: one connection for `show quic ibex-acks`: the head as [`Self::quic_line`], the state,
+    /// the ack-eliciting packets sent, the ACK-only packets received, those per 1000 sent, the
+    /// Ack-Eliciting Threshold the peer acknowledged (`-`: none, it is never judged) and the
+    /// ACK-only packets that threshold does not explain (`-` likewise).
+    fn quic_acks_line(s: &QuicSnap, fe: &str) -> String {
+        // The head (padded to 36 columns, never longer: 35 at most) and the state with its
+        // three blanks, as the one-line form prints them.
+        let one = Self::quic_line(s, fe);
+        let lead = one.get(..44).unwrap_or(&one);
+        let a = &s.acks;
+        let ratio = if a.ack_eliciting_sent == 0 { "-".to_string() } else { (a.ack_only_received.saturating_mul(1000) / a.ack_eliciting_sent).to_string() };
+        let (thr, excess) = match a.ack_frequency_threshold {
+            Some(t) => (t.to_string(), a.ack_frequency_excess.to_string()),
+            None => ("-".to_string(), "-".to_string()),
+        };
+        format!("{lead}{:>13} {:>13} {:>8} {:>8} {:>11}\n", a.ack_eliciting_sent, a.ack_only_received, ratio, thr, excess)
+    }
+
     /// Answers the command waiting for the workers once all have replied; `false` while it
     /// still waits.
     fn resume_pending(&mut self, p: Pending, ctx: &AppletContext) -> bool {
@@ -1466,7 +1500,8 @@ impl CliApplet {
                     self.pending = Some(Pending::Quic(g, filter));
                     return false;
                 };
-                self.out_buf.extend_from_slice(SHOW_QUIC_HEADER.as_bytes());
+                let QuicShow { filter, acks } = filter;
+                self.out_buf.extend_from_slice(if acks { SHOW_QUIC_ACKS_HEADER } else { SHOW_QUIC_HEADER }.as_bytes());
                 // Backend connections do not exist (no `quic4@` server), and closing ones are
                 // only those quinn-proto still holds.
                 for snap in per_worker.iter().flatten() {
@@ -1479,7 +1514,8 @@ impl CliApplet {
                     };
                     if wanted {
                         let fe = snap.fe.and_then(|f| ctx.proxies.get(f)).map_or("UNKNOWN", |p| p.name.as_str());
-                        self.out_buf.extend_from_slice(Self::quic_line(snap, fe).as_bytes());
+                        let line = if acks { Self::quic_acks_line(snap, fe) } else { Self::quic_line(snap, fe) };
+                        self.out_buf.extend_from_slice(line.as_bytes());
                     }
                 }
                 self.finish_msg("");
