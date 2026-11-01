@@ -196,6 +196,7 @@ mod h3_default_path;
 mod h3_wildcard_source;
 mod h3_mux_owner;
 mod h3_mux_trailers;
+mod h3_owner_close_counters;
 mod h2_interim_responses;
 mod h3_idle_timeout;
 mod h3_listen;
