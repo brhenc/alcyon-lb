@@ -650,22 +650,76 @@ pub fn lookup_table(idx: usize, dynamic: &DynamicTable) -> Option<(&str, &str)> 
     }
 }
 
+/// The static table's entries named `name` (in any case): the 1-based index of the first and
+/// how many there are (the entries of one name are adjacent). A `match` on the length and the
+/// first byte, then one or a few comparisons, where a scan of the 61 names was 1.9k
+/// instructions of an h2 request (T550 Q3). `tests::the_static_name_match_is_the_scan` holds
+/// it to the table.
+fn static_name_run(name: &[u8]) -> Option<(u8, u8)> {
+    let first = name.first()?.to_ascii_lowercase();
+    let cands: &[(&[u8], u8, u8)] = match (name.len(), first) {
+        (3, b'a') => &[(b"age", 21, 1)],
+        (3, b'v') => &[(b"via", 60, 1)],
+        (4, b'd') => &[(b"date", 33, 1)],
+        (4, b'e') => &[(b"etag", 34, 1)],
+        (4, b'f') => &[(b"from", 37, 1)],
+        (4, b'h') => &[(b"host", 38, 1)],
+        (4, b'l') => &[(b"link", 45, 1)],
+        (4, b'v') => &[(b"vary", 59, 1)],
+        (5, b':') => &[(b":path", 4, 2)],
+        (5, b'a') => &[(b"allow", 22, 1)],
+        (5, b'r') => &[(b"range", 50, 1)],
+        (6, b'a') => &[(b"accept", 19, 1)],
+        (6, b'c') => &[(b"cookie", 32, 1)],
+        (6, b'e') => &[(b"expect", 35, 1)],
+        (6, b's') => &[(b"server", 54, 1)],
+        (7, b':') => &[(b":method", 2, 2), (b":scheme", 6, 2), (b":status", 8, 7)],
+        (7, b'e') => &[(b"expires", 36, 1)],
+        (7, b'r') => &[(b"referer", 51, 1), (b"refresh", 52, 1)],
+        (8, b'i') => &[(b"if-match", 39, 1), (b"if-range", 42, 1)],
+        (8, b'l') => &[(b"location", 46, 1)],
+        (10, b':') => &[(b":authority", 1, 1)],
+        (10, b's') => &[(b"set-cookie", 55, 1)],
+        (10, b'u') => &[(b"user-agent", 58, 1)],
+        (11, b'r') => &[(b"retry-after", 53, 1)],
+        (12, b'c') => &[(b"content-type", 31, 1)],
+        (12, b'm') => &[(b"max-forwards", 47, 1)],
+        (13, b'a') => &[(b"accept-ranges", 18, 1), (b"authorization", 23, 1)],
+        (13, b'c') => &[(b"cache-control", 24, 1), (b"content-range", 30, 1)],
+        (13, b'i') => &[(b"if-none-match", 41, 1)],
+        (13, b'l') => &[(b"last-modified", 44, 1)],
+        (14, b'a') => &[(b"accept-charset", 15, 1)],
+        (14, b'c') => &[(b"content-length", 28, 1)],
+        (15, b'a') => &[(b"accept-encoding", 16, 1), (b"accept-language", 17, 1)],
+        (16, b'c') => &[(b"content-encoding", 26, 1), (b"content-language", 27, 1), (b"content-location", 29, 1)],
+        (16, b'w') => &[(b"www-authenticate", 61, 1)],
+        (17, b'i') => &[(b"if-modified-since", 40, 1)],
+        (17, b't') => &[(b"transfer-encoding", 57, 1)],
+        (18, b'p') => &[(b"proxy-authenticate", 48, 1)],
+        (19, b'c') => &[(b"content-disposition", 25, 1)],
+        (19, b'i') => &[(b"if-unmodified-since", 43, 1)],
+        (19, b'p') => &[(b"proxy-authorization", 49, 1)],
+        (25, b's') => &[(b"strict-transport-security", 56, 1)],
+        (27, b'a') => &[(b"access-control-allow-origin", 20, 1)],
+        _ => return None,
+    };
+    cands.iter().find(|c| c.0.eq_ignore_ascii_case(name)).map(|c| (c.1, c.2))
+}
+
 /// Find matching static or dynamic table entry by name and value.
 /// Returns `(index, exact_match)`.
 #[must_use]
 pub fn find_table_entry(name: &str, value: &str, dynamic: &DynamicTable) -> Option<(usize, bool)> {
     let mut name_match = None;
 
-    // Search static table first
-    for (i, &(s_name, s_val)) in STATIC_TABLE.iter().enumerate() {
-        if s_name.eq_ignore_ascii_case(name) {
-            if s_val == value {
-                return Some((i + 1, true));
-            }
-            if name_match.is_none() {
-                name_match = Some(i + 1);
-            }
+    // The static table first: the run of entries of this name (they are adjacent), the
+    // first of them with the value, else the first of them.
+    if let Some((first, count)) = static_name_run(name.as_bytes()) {
+        let (first, count) = (usize::from(first), usize::from(count));
+        if let Some(k) = STATIC_TABLE[first - 1..first - 1 + count].iter().position(|&(_, v)| v == value) {
+            return Some((first + k, true));
         }
+        name_match = Some(first);
     }
 
     // Search dynamic table next
@@ -690,8 +744,8 @@ pub fn find_table_entry(name: &str, value: &str, dynamic: &DynamicTable) -> Opti
 /// indexing and a new name (`0x00`); the name is written in lowercase (T537: the h2 codec
 /// towards servers, which writes HTTP/1.1 field names as HTTP/2 needs them).
 pub fn encode_field_stateless(name: &[u8], value: &[u8], dst: &mut Vec<u8>) {
-    if let Some(i) = STATIC_TABLE.iter().position(|(n, _)| n.as_bytes().eq_ignore_ascii_case(name)) {
-        encode_integer(i + 1, 6, 0x40, dst);
+    if let Some((i, _)) = static_name_run(name) {
+        encode_integer(usize::from(i), 6, 0x40, dst);
     } else {
         dst.push(0x00);
         encode_integer(name.len(), 7, 0x00, dst);
@@ -1103,6 +1157,62 @@ impl HpackEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scan of the static table the `match` replaced (T550 Q3): the first entry of the
+    /// name and the value, else the first of the name.
+    fn scan(name: &str, value: &str) -> Option<(usize, bool)> {
+        let mut name_match = None;
+        for (i, &(n, v)) in STATIC_TABLE.iter().enumerate() {
+            if n.eq_ignore_ascii_case(name) {
+                if v == value {
+                    return Some((i + 1, true));
+                }
+                name_match = name_match.or(Some(i + 1));
+            }
+        }
+        name_match.map(|i| (i, false))
+    }
+
+    /// Every name and value of the table, in three cases, with a value of another entry and
+    /// none, and names it does not hold (one byte off, a prefix, longer, empty): the same
+    /// answer as the scan, for the stateful and the stateless encoder.
+    #[test]
+    fn the_static_name_match_is_the_scan() {
+        let empty = DynamicTable::new(0);
+        let mut names: Vec<String> = Vec::new();
+        for &(n, _) in &STATIC_TABLE {
+            names.push(n.to_string());
+            names.push(n.to_ascii_uppercase());
+            names.push(n.chars().enumerate().map(|(i, c)| if i % 2 == 0 { c.to_ascii_uppercase() } else { c }).collect());
+            names.push(format!("{n}x"));
+            names.push(n[..n.len() - 1].to_string());
+            let mut off = n.as_bytes().to_vec();
+            let last = off.len() - 1;
+            off[last] ^= 1;
+            names.push(String::from_utf8(off).unwrap());
+            names.push(format!("x{}", &n[1..]));
+        }
+        names.extend(["", "x", "te", "connection", ":protocol", "keep-alive", "\u{e9}tag"].map(String::from));
+        let mut values: Vec<&str> = STATIC_TABLE.iter().map(|&(_, v)| v).collect();
+        values.extend(["", "GET", "get", "200", "nope", "/index.htm"]);
+        for n in &names {
+            for v in &values {
+                assert_eq!(find_table_entry(n, v, &empty), scan(n, v), "{n:?} {v:?}");
+            }
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            encode_field_stateless(n.as_bytes(), b"v", &mut a);
+            if let Some((i, _)) = scan(n, "\u{0}") {
+                encode_integer(i, 6, 0x40, &mut b);
+            } else {
+                b.push(0x00);
+                encode_integer(n.len(), 7, 0x00, &mut b);
+                b.extend(n.bytes().map(|c| c.to_ascii_lowercase()));
+            }
+            encode_integer(1, 7, 0x00, &mut b);
+            b.push(b'v');
+            assert_eq!(a, b, "{n:?}");
+        }
+    }
     use proptest::prelude::*;
 
     /// T451: a string that is not UTF-8 is no compression error. Each byte that is not
