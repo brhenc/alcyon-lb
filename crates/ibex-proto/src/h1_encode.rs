@@ -548,13 +548,11 @@ pub fn h1_encode_head(htx: HtxSliceRef<'_>, o: &H1EncodeOpts<'_>, out: &mut [u8]
 
     // `h1_make_eoh`: a length or `transfer-encoding` a rule removed.
     if (m & M_CLEN != 0 && s & S_HAVE_CLEN == 0) || (m & M_CHNK != 0 && s & S_HAVE_CHNK == 0) {
-        if s & (S_HAVE_CLEN | S_HAVE_CHNK) != 0 {
-            if s & S_HAVE_CLEN == 0 {
-                body_len = 0;
-                m &= !M_CLEN;
-            } else {
-                m &= !(M_XFER_ENC | M_CHNK);
-            }
+        // One of the two written: the length frames it. (HAProxy also has the other case, a
+        // length removed beside a written `transfer-encoding`; the start line never has both
+        // `CHNK` and `CLEN` here, `CHNK` wins at the line, so it cannot happen.)
+        if s & S_HAVE_CLEN != 0 {
+            m &= !(M_XFER_ENC | M_CHNK);
         } else if resp {
             m &= !(M_XFER_LEN | M_XFER_ENC | M_CLEN | M_CHNK);
             s &= !(S_HAVE_CLEN | S_HAVE_CHNK);

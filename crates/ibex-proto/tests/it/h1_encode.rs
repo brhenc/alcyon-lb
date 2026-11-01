@@ -561,6 +561,11 @@ fn connection_and_upgrade_lists_are_cleaned_as_haproxy_cleans_them() {
     assert_eq!(r.want, ConnMode::Close, "the client's close asks the server to close");
     let (h, _) = enc(REQ, GET11, &[("connection", "keep-alive")], |_| {}).unwrap();
     assert_eq!(h, "GET / HTTP/1.1\r\n\r\n", "a list of the encoder's tokens only goes");
+    let (h, _) = enc(REQ, GET11, &[("connection", "x , close")], |_| {}).unwrap();
+    assert_eq!(h, "GET / HTTP/1.1\r\nconnection: x \r\nconnection: close\r\n\r\n", "kept as it came up to its comma");
+    // A handshake without a key, and none given: none written.
+    let (h, _) = enc(REQ, GET11, &[("connection", "upgrade"), ("upgrade", "websocket")], |_| {}).unwrap();
+    assert_eq!(h, "GET / HTTP/1.1\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n");
     let (h, _) = enc(REQ, GET11, &[("upgrade", "h2c")], |_| {}).unwrap();
     assert_eq!(h, "GET / HTTP/1.1\r\n\r\n");
     let (h, _) = enc(REQ, GET11, &[("upgrade", "h2c, websocket, h2")], |_| {}).unwrap();
@@ -693,6 +698,27 @@ fn the_other_fields_and_what_is_refused() {
     let mut out = vec![0u8; 512];
     let r = h1_encode_head(ibex_proto::htx::HtxSliceRef::new(&buf, blocks), &o, &mut out).unwrap();
     assert_eq!(&out[..r.len], b"GET / HTTP/1.1\r\nx-l: caf\xe9\r\nx-kept: 2\r\n\r\n");
+    // A status line without a reason (no space after the code): the status's reason.
+    let mut raw = vec![0u8; 256];
+    raw[..12].copy_from_slice(b"HTTP/1.1 204");
+    let descs = [
+        ibex_proto::HtxBlockDesc { blk_type: ibex_proto::HtxBlockType::ResLine, flags: 0, name_len: 204, addr: 0, value_len: 12, aux: 0 },
+        ibex_proto::HtxBlockDesc { blk_type: ibex_proto::HtxBlockType::Eoh, flags: 0, name_len: 0, addr: 12, value_len: 0, aux: 0 },
+    ];
+    for (i, d) in descs.iter().enumerate() {
+        let at = raw.len() - (i + 1) * ibex_proto::htx::HTX_DESC_SIZE;
+        d.write_bytes((&mut raw[at..at + ibex_proto::htx::HTX_DESC_SIZE]).try_into().unwrap());
+    }
+    let r = h1_encode_head(ibex_proto::htx::HtxSliceRef::new(&raw, 2), &H1EncodeOpts::new(RSP, SlFlags::XFER_LEN | SlFlags::BODYLESS, true), &mut out).unwrap();
+    assert_eq!(&out[..r.len], b"HTTP/1.1 204 No Content\r\n\r\n");
+    // A body block before the end of the head is not a head.
+    let mut buf2 = vec![0u8; 1024];
+    let mut s = HtxSlice::new(&mut buf2);
+    s.push_req_line_ascii(b"GET", b"/", b"HTTP/1.1").unwrap();
+    s.push_data(b"x").unwrap();
+    s.push_eoh().unwrap();
+    let n = s.num_blocks();
+    assert!(h1_encode_head(ibex_proto::htx::HtxSliceRef::new(&buf2, n), &o, &mut out).is_err(), "data before the EOH");
     // Without its EOH (the blocks before it) the head is not whole.
     assert!(h1_encode_head(ibex_proto::htx::HtxSliceRef::new(&buf, blocks_without_eoh), &o, &mut out).is_err(), "no EOH");
     assert!(h1_encode_head(ibex_proto::htx::HtxSliceRef::new(&buf, 0), &o, &mut out).is_err(), "an empty HTX");
