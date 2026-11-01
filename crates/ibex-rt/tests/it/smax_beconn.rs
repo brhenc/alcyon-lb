@@ -31,7 +31,7 @@ impl Drop for Proc {
 fn start(tag: &str, servers: &str, fe: std::net::SocketAddr) -> Proc {
     let sock = PathBuf::from(format!("/tmp/ibex-smax-{}-{tag}.sock", std::process::id()));
     let cfg = format!(
-        "global\n  stats socket {} level admin\n\
+        "global\n  nbthread 1\n  stats socket {} level admin\n\
          defaults\n  mode http\n  timeout client 5s\n  timeout connect 2s\n  timeout server 5s\n\
          frontend f\n  bind {fe}\n  default_backend b\n\
          backend b\n  balance roundrobin\n{servers}",
@@ -92,8 +92,9 @@ fn backend_scur_and_smax_count_held_streams_and_return_to_zero() {
         c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
         clients.push(c);
     }
-    // Which server took which request is the balancer's business (HAProxy's roundrobin gave
-    // 3/2/1 here, Ibex 2/2/2): the rows must agree with what each server accepted.
+    // T585: with the default nbthread (CPU count) HAProxy's fwrr gave 3/2/1 here, because each
+    // thread walks its own position; with `nbthread 1` (set in the config) HAProxy and Ibex both
+    // give 2/2/2 (HAProxy, 3 runs). The rows must agree with what each server accepted.
     let mut held: Vec<(usize, TcpStream)> = Vec::new();
     for l in &ls {
         l.set_nonblocking(true).unwrap();
@@ -112,6 +113,7 @@ fn backend_scur_and_smax_count_held_streams_and_return_to_zero() {
     }
     assert_eq!(held.len(), 6);
     let counts: Vec<u64> = (0..3).map(|i| held.iter().filter(|h| h.0 == i).count() as u64).collect();
+    assert_eq!(counts, [2, 2, 2], "roundrobin spread at nbthread 1");
     let per = |i: usize| counts[i];
     let r = settle(&p.sock, |r| get(r, "BACKEND").0 == 6);
     assert_eq!(get(&r, "BACKEND"), (6, 6));
