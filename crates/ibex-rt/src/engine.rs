@@ -2245,10 +2245,15 @@ impl Proxy {
     #[must_use]
     pub fn queue_headroom(&self) -> usize {
         self.eligible_server_indices().into_iter().fold(0usize, |free, i| {
-            let room = self.server_maxconn.get(i).filter(|&mc| mc > 0).map_or(usize::MAX, |mc| {
-                mc.saturating_sub(self.server_actconn.get(i).map_or(0, |a| a.load(Ordering::Relaxed))) as usize
-            });
-            free.saturating_add(room)
+            free.saturating_add(self.server_headroom(i))
+        })
+    }
+
+    /// How many queued requests assigned server `idx` can take now (`usize::MAX`: no limit).
+    #[must_use]
+    pub fn server_headroom(&self, idx: usize) -> usize {
+        self.server_maxconn.get(idx).filter(|&mc| mc > 0).map_or(usize::MAX, |mc| {
+            mc.saturating_sub(self.server_actconn.get(idx).map_or(0, |a| a.load(Ordering::Relaxed))) as usize
         })
     }
 
@@ -6112,7 +6117,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             return;
         }
         let proxies = &self.proxies;
-        let due = crate::proxy::QueueWait::take_due(|be| proxies.get(be).map_or(0, Proxy::queue_headroom));
+        let due = crate::proxy::QueueWait::take_due(|be, srv| proxies.get(be).map_or(0, |p| srv.map_or_else(|| p.queue_headroom(), |i| p.server_headroom(i))));
         if !due.is_empty() {
             LAST_WAKE.set(Some(self.now));
         }
@@ -8869,7 +8874,7 @@ pub fn shutdown_session_entry(
             proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
             crate::globalconn::release();
         }
-        if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.sess.srv_park_exp.is_set()) {
+        if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.sess.srv_uncounted()) {
             let be_idx = entry.srv_backend_idx;
             if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
                 proxies[be_idx].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
@@ -9134,8 +9139,8 @@ fn release_server(
     idle_pool: &mut IdlePool,
     reusable: bool,
 ) {
-    // A parked connection has already left the server's count of connections in use.
-    let parked = entry.sess.srv_park_exp.is_set();
+    // A parked or kept connection has already left the server's count of connections in use.
+    let parked = entry.sess.srv_uncounted();
     let mut actconn_released = false;
     if let Some(srv_fd) = entry.sess.srv.take() {
         let sfd = srv_fd.as_raw_fd();
@@ -9203,6 +9208,7 @@ fn release_server(
     }
     entry.srv_raw_fd = None;
     entry.sess.srv_park_exp = Tick::ETERNITY;
+    entry.sess.srv_kept = false;
     entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
     if !actconn_released {
         release_server_actconn(entry, proxies, parked);
@@ -9242,6 +9248,7 @@ fn move_server(from: &mut SessionEntry, to: &mut SessionEntry, fdtab: &mut FdTab
     t.srv_xprt = std::mem::replace(&mut f.srv_xprt, crate::xprt::ServerXprt::Plain);
     t.srv_state = std::mem::replace(&mut f.srv_state, ScState::Init);
     t.srv_park_exp = std::mem::replace(&mut f.srv_park_exp, Tick::ETERNITY);
+    t.srv_kept = std::mem::take(&mut f.srv_kept);
     t.srv_exp = std::mem::replace(&mut f.srv_exp, Tick::ETERNITY);
     t.conn_exp = std::mem::replace(&mut f.conn_exp, Tick::ETERNITY);
     t.srv_cant_recv = f.srv_cant_recv;
@@ -9618,13 +9625,18 @@ fn retry_server_connect(
     release_failed_server(entry, fdtab, poller);
     entry.sess.srv = None;
 
+    // The slot the failed attempt held stays the stream's while it retries the same server,
+    // the turnaround included (`s->srv_conn` is kept: `assign_server_and_queue` returns at
+    // once for it); it goes back only when the stream leaves the server (T592). Given back
+    // and taken again, another worker took it in between, and the server held one more
+    // than its `maxconn`.
     let old_idx = entry.target_server_idx.take();
-    if let Some(old_idx) = old_idx {
-        let old_be = entry.srv_backend_idx;
-        if old_be < proxies.len() && old_idx < proxies[old_be].server_actconn.len() {
-            proxies[old_be].server_actconn[old_idx].fetch_sub(1, Ordering::Relaxed);
+    let old_be = entry.srv_backend_idx;
+    let give_back_old = || {
+        if let Some(a) = old_idx.and_then(|i| proxies.get(old_be)?.server_actconn.get(i)) {
+            a.fetch_sub(1, Ordering::Relaxed);
         }
-    }
+    };
 
     let be_idx = EngineDispatcher::resolve_backend(entry, proxies).unwrap_or(entry.proxy_idx);
     entry.backend_idx = be_idx;
@@ -9722,6 +9734,7 @@ fn retry_server_connect(
     }
 
     let Some(target_addr) = target else {
+        give_back_old();
         entry.sess.srv_state = ScState::Error;
         return false;
     };
@@ -9731,6 +9744,8 @@ fn retry_server_connect(
     // connect when it is over. A connect refused at once is retried at once.
     if wait && !resuming && entry.sess.target_addr == Some(target_addr) {
         entry.sess.retry_after = now.add(entry.sess.retry_delay_ms());
+        // Waiting, the stream keeps its server and the slot on it.
+        entry.target_server_idx = old_idx;
         return false;
     }
 
@@ -9738,9 +9753,15 @@ fn retry_server_connect(
         .servers
         .iter()
         .position(|s| s == target_addr);
-    if let Some(idx) = s_idx {
-        if idx < proxies[be_idx].server_actconn.len() {
-            proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);
+    if s_idx.is_none() || s_idx != old_idx || be_idx != old_be {
+        give_back_old();
+        // Another server: its slot is taken as a pick's (T590). One that another worker
+        // filled since the balancer offered it is this attempt failing at once, and the
+        // next retry asks again.
+        if let Some(idx) = s_idx {
+            if proxies[be_idx].take_server_slot(idx, true).is_none() {
+                return true;
+            }
         }
     }
     entry.target_server_idx = s_idx;
@@ -9907,7 +9928,7 @@ fn cleanup_done(
     // in `maxconn` and its tracked counters are its owner's, which settles them when it
     // ends. Only its server connection is its own (T280).
     let Some(cfd) = entry.sess.cli_fd() else {
-        if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.actconn_reclaimed && !entry.sess.srv_park_exp.is_set()) {
+        if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.actconn_reclaimed && !entry.sess.srv_uncounted()) {
             let be_idx = entry.srv_backend_idx;
             if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
                 proxies[be_idx].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
@@ -9924,7 +9945,7 @@ fn cleanup_done(
         proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
         crate::globalconn::release();
 
-        if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.sess.srv_park_exp.is_set()) {
+        if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.sess.srv_uncounted()) {
             let be_idx = entry.srv_backend_idx;
             if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
                 proxies[be_idx].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
@@ -10308,10 +10329,11 @@ impl EngineDispatcher<'_> {
         }
 
         let mut admin = None;
-        // A request in the queue goes on when a slot is free, or ends when its time is up.
+        // A request in the queue goes on when a slot is free, or ends when its time is up;
+        // one assigned a server waits for that one.
         if entry.sess.queue.is_some() {
-            let be_idx = entry.backend_idx;
-            admin = Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, None);
+            let (be_idx, srv) = (entry.backend_idx, entry.sess.queue.server());
+            admin = Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, srv);
         }
         if entry.sess.txn.as_ref().is_some_and(|t| !t.req_rules_done) && entry.sess.tcp_inspect_done {
             if let Some(t) = entry.sess.txn.as_mut() {
@@ -10936,6 +10958,16 @@ impl EngineDispatcher<'_> {
             } else {
                 release_server(entry, proxies, fdtab, poller, idle_pool, true);
             }
+        }
+        // A connection still on the session is kept for its next request (`http-reuse
+        // never`, a PROXY header, h2 under `safe`, the next request already read): the
+        // stream that used it is over, and so is its slot on the server (`served` counts
+        // streams, `sess_change_server(s, NULL)` in `stream_free`). Counted in use until the
+        // session ended, a `maxconn 1` server queued that client's next request behind its
+        // own idle connection (T592).
+        if !untouched && entry.sess.srv.is_some() && !entry.sess.srv_uncounted() {
+            entry.sess.srv_kept = true;
+            server_actconn_add(entry, proxies, false);
         }
         // A stream of an HTTP/2 connection ends with its transaction: its entry is freed, and
         // a server connection it kept here goes to its owner for the next stream, with what
@@ -14477,15 +14509,19 @@ impl EngineDispatcher<'_> {
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
         entry.sess.lb_picked = cookie_server.is_none();
         // The server's slot is taken with the pick (T590): checked apart, two workers both
-        // took a `maxconn 1` server's last one. A server persistence names takes it whether
-        // or not it is full, as before.
+        // took a `maxconn 1` server's last one. A server persistence or `use-server` names
+        // (`SF_ASSIGNED`) takes one too, or the request waits for it (`pendconn_add` with the
+        // server set, `assign_server_and_queue`): it connected past the server's `maxconn`
+        // before (T592).
         // Only a server with a `maxconn` is counted here; the others are counted once their
         // connection is in use, below (T224). `counted`: the slot is counted already.
         let be = &proxies[be_idx];
         let pick = || be.pick_and_take(false, || be.select_server_with_key_idx(source_ip, entry.sess.req_uri.as_deref()));
-        let mut full = false;
+        let mut full;
         let target = if let Some(idx) = cookie_server {
-            Some(((Some(idx), be.servers.at(idx)), false))
+            let t = be.take_server_slot(idx, false).map(|counted| ((Some(idx), be.servers.at(idx)), counted));
+            full = t.is_none();
+            t
         } else {
             // No pick while a server looked full, and no longer full when asked, is a slot
             // another worker freed in between: asked again rather than refused (`SRV_STATUS_FULL`
@@ -14502,7 +14538,7 @@ impl EngineDispatcher<'_> {
 
         let Some(((picked_idx, target_addr), counted)) = target else {
             if full {
-                return Self::wait_in_queue(entry, proxies, now, be_idx);
+                return Self::wait_in_queue(entry, proxies, now, be_idx, cookie_server);
             }
             proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
             // No server to connect to: `SC`, whatever the stream's progress.
@@ -14555,10 +14591,12 @@ impl EngineDispatcher<'_> {
                 // The connection is already there, so `%Tw` and `%Tc` are both 0, not
                 // -1 and the time from the request to now.
                 entry.sess.log.queue.get_or_insert_with(crate::txnlog::loop_now);
-                // A parked connection is in use again: the slot taken with the pick, or one
-                // counted now. One that was not parked holds its own, and the pick's goes back.
-                if entry.sess.srv_park_exp.is_set() {
+                // A parked or kept connection is in use again: the slot taken with the pick,
+                // or one counted now (T592). One that was neither holds its own, and the
+                // pick's goes back.
+                if entry.sess.srv_uncounted() {
                     entry.sess.srv_park_exp = Tick::ETERNITY;
+                    entry.sess.srv_kept = false;
                     if !counted {
                         server_actconn_add(entry, proxies, true);
                     }
@@ -14577,6 +14615,8 @@ impl EngineDispatcher<'_> {
             }
             release_server(entry, proxies, fdtab, poller, idle_pool, true);
         }
+        // The connection opened or taken from here is the stream's, in use.
+        entry.sess.srv_kept = false;
 
         let s_idx = picked_idx;
         entry.target_server_idx = s_idx;
@@ -14715,7 +14755,7 @@ impl EngineDispatcher<'_> {
 
     /// The request found every server full: it waits for a slot, or, once there, gives up
     /// when `timeout queue` is over (`503`, `sQ`; `econ` counts it, as for a failed connect).
-    fn wait_in_queue(entry: &mut SessionEntry, proxies: &Proxies, now: Tick, be_idx: usize) -> Option<crate::stats_html::AdminAction> {
+    fn wait_in_queue(entry: &mut SessionEntry, proxies: &Proxies, now: Tick, be_idx: usize, srv: Option<usize>) -> Option<crate::stats_html::AdminAction> {
         if let Some(deadline) = entry.sess.queue.deadline() {
             if deadline.is_expired(now) {
                 entry.sess.queue.leave();
@@ -14728,7 +14768,7 @@ impl EngineDispatcher<'_> {
         }
         let ms = entry.sess.queue_ms();
         let deadline = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
-        entry.sess.log.be_queue = entry.sess.queue.enter(entry.task, be_idx, proxies[be_idx].stats.clone(), deadline);
+        entry.sess.log.be_queue = entry.sess.queue.enter(entry.task, be_idx, srv, proxies[be_idx].stats.clone(), deadline);
         None
     }
 
