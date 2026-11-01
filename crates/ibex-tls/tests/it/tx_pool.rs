@@ -159,3 +159,40 @@ fn on_free_wipes_when_the_pool_frees_not_on_give_back() {
     p.srv.tx_done(hw);
     assert_eq!(ibex_alloc::wiped_ssl_fast_bytes() - wiped, hw, "on: wiped at the give-back");
 }
+
+/// `show pools` for `tls_tx`: (allocated, used).
+fn tls_tx_line() -> (usize, usize) {
+    let dump = ibex_alloc::global_pool_registry().show_pools(&[]);
+    let line = dump.lines().find(|l| l.starts_with("  - Pool tls_tx (")).expect("tls_tx listed");
+    let num = |after: &str, before: &str| -> usize {
+        let s = &line[line.find(after).expect(after) + after.len()..];
+        s[..s.find(before).expect(before)].trim().parse().expect("number")
+    };
+    (num(") : ", " allocated"), num("bytes), ", " used"))
+}
+
+/// The pool's constructor (`TxChunk::try_new`) runs on a miss: with this thread's cache empty,
+/// the session's first take builds a chunk, it works, and it goes back to the pool on release.
+#[test]
+fn a_take_from_an_empty_pool_builds_a_chunk_that_works_and_returns() {
+    use ibex_tls::conn::{tx_pool_cached, TX_CAP};
+    ibex_tls::conn::register_pools();
+    ibex_alloc::drain_local_pools();
+    assert_eq!(tx_pool_cached(), 0, "the pool is empty: the take is a miss");
+    let mut p = pair(); // the client's ClientHello takes a chunk
+    assert!(p.cli.tx_capacity() >= TX_CAP, "a chunk of the pool's size");
+    assert_eq!(tx_pool_cached(), 0, "taken, not cached");
+    // The counts are the process's (tests of this binary run on other threads): at least ours.
+    let (alloc1, used1) = tls_tx_line();
+    assert!(alloc1 >= 1 && used1 >= 1, "show pools: allocated {alloc1}, used {used1}");
+    let hello = p.cli.pending_tx().to_vec();
+    assert!(!hello.is_empty(), "the chunk holds the ClientHello");
+    p.sin.extend(&hello, &p.srv);
+    p.cli.tx_done(hello.len());
+    p.complete();
+    assert_eq!(p.send_to_server(b"GET / HTTP/1.1\r\n\r\n"), b"GET / HTTP/1.1\r\n\r\n");
+    drop(p);
+    assert!(tx_pool_cached() >= 1, "back in the pool");
+    let (alloc2, _) = tls_tx_line();
+    assert!(alloc2 >= 1, "show pools: kept, not freed");
+}
