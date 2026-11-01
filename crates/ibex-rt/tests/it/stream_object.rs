@@ -138,3 +138,34 @@ fn a_round_robin_pick_syncs_with_the_servers_only_when_one_changed() {
     assert!(px.select_server_idx().is_some_and(|(i, _)| i == Some(0)), "a weight change is seen by the next pick");
     assert_eq!(on_this_thread()[Op::LbSync as usize] - before, 1);
 }
+
+#[test]
+fn balance_source_and_the_other_algorithms_pick_by_index_without_a_list() {
+    use ibex_config::BalanceAlgorithm;
+    let (a, b): (SocketAddr, SocketAddr) = ("127.0.0.1:1".parse().unwrap(), "127.0.0.1:2".parse().unwrap());
+    let engine = |balance| {
+        let config = Config {
+            backends: vec![BackendSection {
+                name: "be".into(),
+                mode: Mode::Http,
+                balance,
+                servers: vec![Server::new("s1", a), Server::new("s2", b)],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        Engine::new(&config, 8).expect("Engine::new")
+    };
+    let e = engine(BalanceAlgorithm::Source);
+    let px = &e.proxies[0];
+    let v4 = Some(std::net::IpAddr::from([10, 0, 0, 3]));
+    let v6 = Some(std::net::IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 5]));
+    assert_eq!(px.select_server_with_key_idx(v4, None).map(|p| p.0), Some(Some(1)));
+    assert_eq!(px.select_server_with_key_idx(v6, None).map(|p| p.0), Some(Some(1)));
+    let no_ip: Vec<_> = (0..4).map(|_| px.select_server_with_key_idx(None, None).and_then(|p| p.0)).collect();
+    assert_eq!(no_ip.iter().filter(|i| **i == Some(0)).count(), 2, "{no_ip:?}");
+    for algo in [BalanceAlgorithm::Leastconn, BalanceAlgorithm::StaticRr, BalanceAlgorithm::First] {
+        let e = engine(algo);
+        assert!(e.proxies[0].select_server_idx().is_some_and(|(i, _)| i.is_some()));
+    }
+}

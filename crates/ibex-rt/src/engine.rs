@@ -557,7 +557,7 @@ impl IdlePools {
     /// Worker `wid`'s handle.
     #[must_use]
     pub fn worker(self: &Arc<Self>, wid: usize) -> IdlePool {
-        IdlePool { pools: Arc::clone(self), wid: wid % self.slots.len(), next_purge: None }
+        IdlePool { pools: Arc::clone(self), wid: wid % self.slots.len(), next_purge: None, sized: false }
     }
 
     fn lock(slot: &IdleSlot) -> std::sync::MutexGuard<'_, WorkerPool> {
@@ -576,6 +576,9 @@ pub struct IdlePool {
     /// When this worker's purge next has work: kept here so that a step with nothing to purge
     /// does not take the lock.
     next_purge: Option<Instant>,
+    /// [`IdlePool::ensure_sized`] has run: done when the first connection goes idle, so that a
+    /// worker that never keeps one holds no table.
+    sized: bool,
 }
 
 impl IdlePool {
@@ -604,6 +607,15 @@ impl IdlePool {
     /// Sizes the pool for backends with `servers[b]` servers each, so that their lists and
     /// counts are found by index (O2). Called before the engine runs; the first worker to
     /// call fixes the counts' table, which every worker's engine builds alike.
+    fn ensure_sized(&mut self, proxies: &[Proxy]) {
+        if !self.sized {
+            self.sized = true;
+            let counts: Vec<usize> = proxies.iter().map(|p| p.servers.len()).collect();
+            self.size(&counts);
+        }
+    }
+
+    /// Sizes the pool for backends with `servers[b]` servers each (see [`IdlePool::ensure_sized`]).
     pub fn size(&mut self, servers: &[usize]) {
         // The tables cost ~24 bytes a server in all (a configuration of 60k backends is held to
         // a memory bound the tables would break): past this many, the hashed path serves.
@@ -2138,11 +2150,7 @@ impl Proxy {
     /// The `k`th of [`Proxy::eligible_server_indices`], without listing them.
     fn eligible_nth(&self, k: usize) -> Option<usize> {
         let mut it = (0..self.servers.len()).filter(|&i| self.is_eligible_active(i));
-        match it.nth(k) {
-            Some(i) => Some(i),
-            None if k == 0 => crate::lb::first_backup(self),
-            None => None,
-        }
+        it.nth(k).or_else(|| crate::lb::first_backup(self).filter(|_| k == 0))
     }
 
     /// Whether no server can take a connection only because each one that is UP is at its
@@ -2177,51 +2185,15 @@ impl Proxy {
         if self.servers.is_empty() {
             return self.dispatch.map(|a| (None, a));
         }
-        match self.balance {
-            BalanceAlgorithm::Leastconn => {
-                if let Some(idx) = crate::lb::leastconn(self) {
-                    Some((Some(idx), self.servers.at(idx)))
-                } else {
-                    self.dispatch.map(|a| (None, a))
-                }
-            }
-            BalanceAlgorithm::StaticRr => {
-                if let Some(idx) = crate::lb::static_rr(self) {
-                    Some((Some(idx), self.servers.at(idx)))
-                } else {
-                    self.dispatch.map(|a| (None, a))
-                }
-            }
-            BalanceAlgorithm::First => {
-                if let Some(idx) = crate::lb::first(self) {
-                    Some((Some(idx), self.servers.at(idx)))
-                } else {
-                    self.dispatch.map(|a| (None, a))
-                }
-            }
-            BalanceAlgorithm::Random(draws) => {
-                if let Some(idx) = crate::lb::random(self, draws) {
-                    Some((Some(idx), self.servers.at(idx)))
-                } else {
-                    self.dispatch.map(|a| (None, a))
-                }
-            }
-            BalanceAlgorithm::RoundRobin => {
-                if let Some(idx) = crate::lb::round_robin(self) {
-                    Some((Some(idx), self.servers.at(idx)))
-                } else {
-                    self.dispatch.map(|a| (None, a))
-                }
-            }
-            _ => {
-                let n = self.eligible_count();
-                if n == 0 {
-                    return self.dispatch.map(|a| (None, a));
-                }
-                let Some(chosen_idx) = self.eligible_nth(self.next_server_idx.fetch_add(1, Ordering::Relaxed) % n) else { return self.dispatch.map(|a| (None, a)) };
-                Some((Some(chosen_idx), self.servers.at(chosen_idx)))
-            }
-        }
+        let picked = match self.balance {
+            BalanceAlgorithm::Leastconn => crate::lb::leastconn(self),
+            BalanceAlgorithm::StaticRr => crate::lb::static_rr(self),
+            BalanceAlgorithm::First => crate::lb::first(self),
+            BalanceAlgorithm::Random(draws) => crate::lb::random(self, draws),
+            BalanceAlgorithm::RoundRobin => crate::lb::round_robin(self),
+            _ => self.eligible_count().checked_sub(1).and_then(|last| self.eligible_nth(self.next_server_idx.fetch_add(1, Ordering::Relaxed) % (last + 1))),
+        };
+        picked.map(|idx| (Some(idx), self.servers.at(idx))).or(self.dispatch.map(|a| (None, a)))
     }
 
     /// Selects the target backend server with load balancing algorithm (Source IP hash or round-robin),
@@ -2245,22 +2217,14 @@ impl Proxy {
             }
             BalanceAlgorithm::Source => {
                 let n = self.eligible_count();
-                if n == 0 {
-                    return self.dispatch.map(|a| (None, a));
-                }
-                if let Some(ip) = source_ip {
-                    let hash: usize = match ip {
-                        IpAddr::V4(v4) => u32::from(v4) as usize,
-                        IpAddr::V6(v6) => v6
-                            .octets()
-                            .iter()
-                            .fold(0usize, |acc, &b| acc.wrapping_add(b as usize)),
-                    };
-                    let chosen_idx = self.eligible_nth(hash % n)?;
-                    return Some((Some(chosen_idx), self.servers.at(chosen_idx)));
-                }
-                let chosen_idx = self.eligible_nth(self.next_server_idx.fetch_add(1, Ordering::Relaxed) % n)?;
-                Some((Some(chosen_idx), self.servers.at(chosen_idx)))
+                let slot = match source_ip {
+                    // The sum of the address bytes (v6) or the address (v4), modulo the servers.
+                    Some(IpAddr::V4(v4)) => u32::from(v4) as usize,
+                    Some(IpAddr::V6(v6)) => v6.octets().iter().fold(0usize, |acc, &b| acc.wrapping_add(b as usize)),
+                    None => self.next_server_idx.fetch_add(1, Ordering::Relaxed),
+                };
+                let picked = n.checked_sub(1).and_then(|last| self.eligible_nth(slot % (last + 1)));
+                picked.map(|idx| (Some(idx), self.servers.at(idx))).or(self.dispatch.map(|a| (None, a)))
             }
             BalanceAlgorithm::Uri => {
                 let u = uri.unwrap_or("/");
@@ -5414,7 +5378,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             mailboxes,
             mailbox_wid: 0,
         };
-        engine.size_idle_pool();
         Ok(engine)
     }
 
@@ -5507,19 +5470,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
     }
 
-    /// Sizes the idle pool for this engine's backends' servers (O2).
-    fn size_idle_pool(&mut self) {
-        let counts: Vec<usize> = self.proxies.iter().map(|p| p.servers.len()).collect();
-        self.idle_backend_pool.size(&counts);
-    }
-
     /// Makes this engine worker `wid` of `pools`, the idle server connections all workers
     /// share (`tune.idle-pool.shared`). Called before the engine runs: a worker alone keeps
     /// a pool of its own. Its slot shares its epoll descriptor, which a worker that takes
     /// one of its idle connections takes it out of (T434).
     pub fn share_idle_pools(&mut self, pools: &Arc<IdlePools>, wid: usize) {
         self.idle_backend_pool = pools.worker(wid);
-        self.size_idle_pool();
         self.idle_backend_pool.attach_poller(self.poller.shared_epfd());
     }
 
@@ -8974,6 +8930,7 @@ fn release_server(
             // first response on: `HAProxy` keeps it in the server's available list (A.3 row 7,
             // 1 connection for 5 clients one after the other; T540).
             let safe = entry.srv_served >= 2 || xprt.is_h2();
+            idle_pool.ensure_sized(proxies);
             if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt, src: entry.sess.bc_src }, safe, cfg, used, crate::txnlog::loop_now()) {
                 // Closing its only descriptor takes it out of the epoll set.
                 fdtab.remove(sfd);
@@ -10708,6 +10665,7 @@ impl EngineDispatcher<'_> {
                 // (`keeps` above holds only with a server, so there is one.)
                 let i = entry.target_server_idx.unwrap_or_default();
                 let used = proxies.get(entry.srv_backend_idx).and_then(|p| p.server_actconn.get(i)).map_or(0, |a| a.load(Ordering::Relaxed));
+                idle_pool.ensure_sized(proxies);
                 idle_pool.note_used((entry.srv_backend_idx, i), used);
                 server_actconn_add(entry, proxies, false);
             } else {
@@ -14265,6 +14223,7 @@ impl EngineDispatcher<'_> {
 
         let mut reused = None;
         entry.srv_served = 0;
+        idle_pool.ensure_sized(proxies);
         if proxies[be_idx].http_reuse != ibex_config::HttpReuse::Never && idle_pool.may_find() {
             let sni = server_sni(&entry.sess, proxies, entry.proxy_idx, be_idx, s_idx);
             let key = idle_key(target_addr, be_idx, s_idx, sni);
@@ -17942,7 +17901,7 @@ mod idle_poll_tests {
         assert!(drive_until(&mut a, |a| a.idle_backend_pool.total() == 1), "idle on worker 0");
         let raw = {
             let pool = IdlePools::lock(&pools.slots[0]);
-            let p = pool.servers.values().find_map(|s| s.conns.front()).expect("the idle connection");
+            let p = pool.slab.iter().map(|e| &e.1).chain(pool.servers.values()).find_map(|s| s.conns.front()).expect("the idle connection");
             assert!(a.poller.is_registered(p.conn.fd.as_fd()), "an idle connection stays in its worker's epoll set");
             p.conn.fd.as_raw_fd()
         };
