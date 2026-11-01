@@ -355,7 +355,7 @@ fn trailer_fields<'a>(section: &'a [u8], out: &mut [(&'a str, &'a str); MAX_TRAI
 }
 
 /// [`forward_response`] for any mux the bridge drives (T509), the DATA staged in `scratch`.
-pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, scratch: &mut Vec<u8>, late_trailers: &mut Option<Box<[u8]>>) -> bool {
+pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, scratch: &mut Vec<u8>, late_trailers: &mut Option<ibex_alloc::PoolBox<Vec<u8>>>) -> bool {
     let id = u64::from(stream_id);
     if txn.rsp == MsgState::Waiting || txn.rsp.is_done() {
         return false;
@@ -410,7 +410,7 @@ pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut Ht
     }
     // Trailers an h2 server sent after a content-length body (T559): with the stream's end.
     let late = if end && trailers.len() <= 2 { late_trailers.take() } else { None };
-    let trailers = late.as_deref().filter(|l| l.len() > 2).unwrap_or(trailers);
+    let trailers = late.as_deref().filter(|l| l.len() > 2).map_or(trailers, Vec::as_slice);
     if trailers.len() > 2 {
         // Not the blank line alone: the fields, on the stack (the common response has none).
         if !scratch.is_empty() {
@@ -448,7 +448,7 @@ pub fn forward_response_mux<M: HtxMux>(mux: &mut M, stream_id: u32, txn: &mut Ht
 /// The response of a stream, as HEADERS then DATA frames, as much as the client's
 /// flow-control windows take. `srv_gone`: the server side has ended. `true` when the
 /// response was cut short by the server and the stream reset for it (`SD`).
-pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, late_trailers: &mut Option<Box<[u8]>>) -> bool {
+pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn, rep: &mut Buf, srv_gone: bool, late_trailers: &mut Option<ibex_alloc::PoolBox<Vec<u8>>>) -> bool {
     if txn.rsp == MsgState::Waiting || txn.rsp.is_done() {
         return false;
     }
@@ -530,7 +530,7 @@ pub fn forward_response(h2: &mut H2MuxContext, stream_id: u32, txn: &mut HttpTxn
     }
     // Trailers an h2 server sent after a content-length body (T559): with the stream's end.
     let late = if end && trailers.len() <= 2 { late_trailers.take() } else { None };
-    let trailers = late.as_deref().filter(|l| l.len() > 2).unwrap_or(trailers);
+    let trailers = late.as_deref().filter(|l| l.len() > 2).map_or(trailers, Vec::as_slice);
     if trailers.len() > 2 {
         if !out.is_empty() {
             h2.send_data(stream_id, &out, false);

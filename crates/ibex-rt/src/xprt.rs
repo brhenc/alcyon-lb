@@ -1008,7 +1008,7 @@ impl ServerXprt {
 
     /// The trailers an h2 server sent after a content-length body, as a trailer section;
     /// `None` for none and for any other transport (T559).
-    pub fn take_late_trailers(&mut self) -> Option<Box<[u8]>> {
+    pub fn take_late_trailers(&mut self) -> Option<ibex_alloc::PoolBox<Vec<u8>>> {
         let ServerXprt::H2(h) = self else { return None };
         h.take_late_trailers()
     }

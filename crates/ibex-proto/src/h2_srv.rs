@@ -39,6 +39,12 @@ ibex_alloc::declare_pool!(
     static H2C_SRV: Pool<H2SrvCodec> = ibex_alloc::PoolSpec::new("h2c_srv");
 );
 
+ibex_alloc::declare_pool!(
+    /// `show pools` `h2_trailers`: the trailer section an h2 server sent after a content-length
+    /// body, on its way to an h2 or h3 client (T559). Rare; bounded by the HPACK block limit.
+    static H2_TRAILERS: Pool<Vec<u8>> = ibex_alloc::PoolSpec::new("h2_trailers").max_item(16384);
+);
+
 /// Why a request or its response cannot go on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrvH2Error {
@@ -1116,13 +1122,17 @@ impl H2SrvCodec {
 
     /// The trailer section that followed the content-length body of the last response, as
     /// text for `h2_bridge` (T559), once; empty for none.
-    pub fn take_late_trailers(&mut self) -> Option<Box<[u8]>> {
+    pub fn take_late_trailers(&mut self) -> Option<ibex_alloc::PoolBox<Vec<u8>>> {
         if self.late.is_empty() {
             return None;
         }
-        let b = Box::from(self.late.as_slice());
+        // No buffer to be had: the trailers are dropped, as for an h1 client.
+        let b = H2_TRAILERS.take().map(|mut b| {
+            b.extend_from_slice(&self.late);
+            b
+        });
         self.late.clear();
-        Some(b)
+        b
     }
 
     fn end_response(&mut self, last_chunk: bool) {

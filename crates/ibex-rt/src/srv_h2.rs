@@ -79,7 +79,7 @@ impl H2Layer {
     }
 
     /// The trailer section that followed the last response's content-length body (T559).
-    pub fn take_late_trailers(&mut self) -> Option<Box<[u8]>> {
+    pub fn take_late_trailers(&mut self) -> Option<ibex_alloc::PoolBox<Vec<u8>>> {
         self.codec.take_late_trailers()
     }
 

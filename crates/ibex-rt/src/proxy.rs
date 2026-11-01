@@ -442,7 +442,7 @@ pub struct H2Child {
     /// Trailers an h2 server sent after a content-length body: sent to this h2 or h3 client
     /// with the end of the stream (T559; an h1 client never has them). Here and not in the
     /// transaction: the session entry stays small.
-    pub late_trailers: Option<Box<[u8]>>,
+    pub late_trailers: Option<ibex_alloc::PoolBox<Vec<u8>>>,
     /// The client (or the mux) reset the stream.
     pub reset: bool,
     /// The transaction ended through `end_txn` and the connection goes on: the entry is
