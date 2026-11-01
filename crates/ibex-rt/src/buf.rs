@@ -536,6 +536,32 @@ impl Buf {
         &mut self.data
     }
 
+    /// X1 (`docs/design/htx-engine-2026-11-01.md` section 2.1): the memory for an HTX over the
+    /// first `head_len` readable bytes (the received head), with the last `reserve` bytes of
+    /// the memory as its reserve: [`ibex_proto::htx::HtxSlice::over_received`] of what this
+    /// returns. Readable bytes that reach into the reserve are moved to the front first;
+    /// `None` when they do not fit before it even so, when `head_len` is more than is
+    /// readable, or when the buffer has no memory. The caller records what it wrote with
+    /// [`Self::note_htx`] (`tail_addr`, descriptor bytes), and while the HTX lives, writes
+    /// no more than `region.reserve_start` minus the readable end into [`Self::writable`]:
+    /// the reserve is not this buffer's free space then (X2).
+    pub fn htx_over_head(&mut self, head_len: usize, reserve: usize) -> Option<(&mut [u8], ibex_proto::htx::HtxRegion)> {
+        if self.data.is_empty() || head_len > self.len || reserve > self.data.len() {
+            return None;
+        }
+        let reserve_start = self.data.len() - reserve;
+        if self.head + self.len > reserve_start {
+            if self.len > reserve_start {
+                return None;
+            }
+            self.compact();
+        }
+        // An edit may rewrite the head's bytes (a shorter value, a defrag).
+        self.eoh.set(EOH_UNKNOWN);
+        let region = ibex_proto::htx::HtxRegion { head_start: self.head, head_end: self.head + head_len, reserve_start };
+        Some((&mut self.data, region))
+    }
+
     /// Records that an HTX of `tail` data bytes and `desc_bytes` of descriptors is in the
     /// memory ([`Self::htx_slice_mut`]).
     pub fn note_htx(&mut self, tail: usize, desc_bytes: usize) {
@@ -1031,6 +1057,38 @@ impl Buf {
 #[cfg(test)]
 mod tests {
     use super::Buf;
+
+    /// X1: the head of the readable bytes indexed in place, its descriptors in the reserve at
+    /// the end of the memory; the body between them is not touched, and readable bytes that
+    /// reach into the reserve are moved to the front first.
+    #[test]
+    fn a_received_head_is_indexed_over_the_buffer_with_the_reserve_at_its_end() {
+        let head = b"GET / HTTP/1.1\r\nHost: h\r\nX-MiXed: v\r\n\r\n";
+        let mut b = Buf::with_capacity(256);
+        // 100 bytes read and consumed: the head starts at 100 and its body reaches past 192.
+        b.ensure_writable(100)[..100].fill(b'z');
+        b.commit(100);
+        b.consume(99);
+        let w = b.ensure_writable(head.len() + 60);
+        w[..head.len()].copy_from_slice(head);
+        w[head.len()..head.len() + 60].fill(b'B');
+        b.commit(head.len() + 60);
+        b.consume(1);
+        assert!(b.htx_over_head(head.len() + 61, 64).is_none(), "the head is longer than the readable bytes");
+        assert!(b.htx_over_head(head.len(), 256).is_none(), "the reserve leaves no room for the bytes");
+        assert_eq!(b.htx_over_head(head.len(), 16).map(|(_, r)| r.head_start), Some(100), "room enough: not moved");
+        let (mem, region) = b.htx_over_head(head.len(), 128).expect("fits once compacted");
+        assert_eq!((region.head_start, region.head_end, region.reserve_start), (0, head.len(), 128));
+        let mut htx = ibex_proto::htx::HtxSlice::over_received(mem, region).unwrap();
+        let mut p = ibex_proto::H1Parser::new(false);
+        assert_eq!(p.index_head_in_place(&mut htx).unwrap(), head.len());
+        assert_eq!(htx.as_ref().get_header_bytes(b"x-mixed"), Some(&b"v"[..]));
+        assert_eq!(htx.headers().map(|(n, _)| n).collect::<Vec<_>>(), ["Host", "X-MiXed"]);
+        let (tail, descs) = (htx.tail_addr(), htx.num_blocks() * ibex_proto::htx::HTX_DESC_SIZE);
+        b.note_htx(tail, descs);
+        assert_eq!(&b.readable()[..head.len()], head);
+        assert_eq!(&b.readable()[head.len()..], &[b'B'; 60][..]);
+    }
 
     /// T183: a buffer of a pooled class holds memory only between a write and the release
     /// that follows its draining; its capacity is its class's either way.

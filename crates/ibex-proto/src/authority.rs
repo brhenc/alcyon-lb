@@ -142,11 +142,8 @@ fn host_value<'a>(view: &HtxSliceRef<'a>, i: usize) -> Option<&'a [u8]> {
         return None;
     }
     let desc = view.read_desc(i);
-    let (start, name_len, value_len) = (desc.addr as usize, desc.name_len as usize, desc.value_len as usize);
     let buf = view.buf();
-    buf[start..start + name_len]
-        .eq_ignore_ascii_case(b"host")
-        .then(|| &buf[start + name_len..start + name_len + value_len])
+    buf[desc.name_range()].eq_ignore_ascii_case(b"host").then(|| &buf[desc.value_range()])
 }
 
 /// Applies the three steps to a parsed request head. Returns whether it was rewritten,

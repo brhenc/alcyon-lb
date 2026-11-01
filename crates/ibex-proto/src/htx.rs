@@ -141,6 +141,43 @@ impl HtxBlockDesc {
         }
     }
 
+    /// Where a header's or trailer's name is.
+    #[must_use]
+    #[inline]
+    pub fn name_range(&self) -> std::ops::Range<usize> {
+        self.addr as usize..self.addr as usize + self.name_len as usize
+    }
+
+    /// Where the value is: after the name and `aux` bytes for a header or a trailer (`aux` is
+    /// the received `:` and blanks of a field indexed in place, X1, and 0 when it is packed),
+    /// at `addr` for any other block.
+    #[must_use]
+    #[inline]
+    pub fn value_range(&self) -> std::ops::Range<usize> {
+        let start = match self.blk_type {
+            HtxBlockType::Header | HtxBlockType::Trailer => self.addr as usize + self.name_len as usize + self.aux as usize,
+            _ => self.addr as usize,
+        };
+        start..start + self.value_len as usize
+    }
+
+    /// The bytes from `addr` the block covers: name, gap and value of a field.
+    #[must_use]
+    #[inline]
+    pub fn span(&self) -> usize {
+        self.value_range().end - self.addr as usize
+    }
+
+    /// The payload bytes of the block: name and value of a field (not the gap between them).
+    #[must_use]
+    #[inline]
+    pub fn payload_len(&self) -> usize {
+        match self.blk_type {
+            HtxBlockType::Header | HtxBlockType::Trailer => self.name_len as usize + self.value_len as usize,
+            _ => self.value_len as usize,
+        }
+    }
+
     pub fn write_bytes(&self, out: &mut [u8; HTX_DESC_SIZE]) {
         out[0] = self.blk_type as u8;
         out[1] = self.flags;
@@ -689,11 +726,7 @@ fn replace_block_value_raw(
     let old_val_len = desc.value_len as usize;
 
     if new_value.len() <= old_val_len {
-        let addr = desc.addr as usize;
-        let val_start = match desc.blk_type {
-            HtxBlockType::Header | HtxBlockType::Trailer => addr + desc.name_len as usize,
-            _ => addr,
-        };
+        let val_start = desc.value_range().start;
         buf[val_start..val_start + new_value.len()].copy_from_slice(new_value);
         desc.value_len = new_value.len() as u32;
         write_desc_at(buf, num_blocks, index, &desc);
@@ -725,6 +758,9 @@ fn replace_block_value_raw(
         *tail_addr += needed;
         desc.addr = new_addr as u32;
         desc.value_len = new_value.len() as u32;
+        if matches!(desc.blk_type, HtxBlockType::Header | HtxBlockType::Trailer) {
+            desc.aux = 0;
+        }
         write_desc_at(buf, num_blocks, index, &desc);
         Ok(())
     }
@@ -883,10 +919,8 @@ impl<'a> HtxSliceRef<'a> {
     pub fn get_header_bytes(&self, name: &[u8]) -> Option<&'a [u8]> {
         (0..self.num_blocks).find_map(|i| {
             let desc = self.read_desc(i);
-            let name_start = desc.addr as usize;
-            let name_end = name_start + desc.name_len as usize;
-            (desc.blk_type == HtxBlockType::Header && self.buf[name_start..name_end].eq_ignore_ascii_case(name))
-                .then(|| &self.buf[name_end..name_end + desc.value_len as usize])
+            (desc.blk_type == HtxBlockType::Header && self.buf[desc.name_range()].eq_ignore_ascii_case(name))
+                .then(|| &self.buf[desc.value_range()])
         })
     }
 
@@ -895,13 +929,9 @@ impl<'a> HtxSliceRef<'a> {
         for i in 0..self.num_blocks {
             let desc = self.read_desc(i);
             if desc.blk_type == HtxBlockType::Trailer {
-                let name_start = desc.addr as usize;
-                let name_end = name_start + desc.name_len as usize;
-                let hdr_name = utf8(&self.buf[name_start..name_end]).ok()?;
+                let hdr_name = utf8(&self.buf[desc.name_range()]).ok()?;
                 if hdr_name.eq_ignore_ascii_case(name) {
-                    let val_start = name_end;
-                    let val_end = val_start + desc.value_len as usize;
-                    return utf8(&self.buf[val_start..val_end]).ok();
+                    return utf8(&self.buf[desc.value_range()]).ok();
                 }
             }
         }
@@ -954,15 +984,12 @@ impl<'a> HtxSliceRef<'a> {
         for i in 0..self.num_blocks {
             let desc = self.read_desc(i);
             if desc.blk_type == HtxBlockType::Header {
-                let name_start = desc.addr as usize;
-                let name_end = name_start + desc.name_len as usize;
-                let val_end = name_end + desc.value_len as usize;
-                cursor = write_slice(out, cursor, &self.buf[name_start..name_end])?;
+                cursor = write_slice(out, cursor, &self.buf[desc.name_range()])?;
                 cursor = write_slice(out, cursor, b": ")?;
                 cursor = if desc.flags & HTX_BLK_FL_LATIN1 == 0 {
-                    write_slice(out, cursor, &self.buf[name_end..val_end])?
+                    write_slice(out, cursor, &self.buf[desc.value_range()])?
                 } else {
-                    write_latin1(out, cursor, &self.buf[name_end..val_end])?
+                    write_latin1(out, cursor, &self.buf[desc.value_range()])?
                 };
                 cursor = write_slice(out, cursor, b"\r\n")?;
             }
@@ -984,12 +1011,9 @@ impl<'a> HtxSliceRef<'a> {
             let desc = self.read_desc(i);
             if desc.blk_type == HtxBlockType::Trailer {
                 has_trailers = true;
-                let name_start = desc.addr as usize;
-                let name_end = name_start + desc.name_len as usize;
-                let val_end = name_end + desc.value_len as usize;
-                cursor = write_slice(out, cursor, &self.buf[name_start..name_end])?;
+                cursor = write_slice(out, cursor, &self.buf[desc.name_range()])?;
                 cursor = write_slice(out, cursor, b": ")?;
-                cursor = write_slice(out, cursor, &self.buf[name_end..val_end])?;
+                cursor = write_slice(out, cursor, &self.buf[desc.value_range()])?;
                 cursor = write_slice(out, cursor, b"\r\n")?;
             }
         }
@@ -1044,13 +1068,8 @@ impl<'a> HtxSliceRef<'a> {
         for i in 0..self.num_blocks {
             let desc = self.read_desc(i);
             if desc.blk_type != HtxBlockType::Unused {
-                let p_len = match desc.blk_type {
-                    HtxBlockType::Header | HtxBlockType::Trailer => {
-                        desc.name_len as usize + desc.value_len as usize
-                    }
-                    _ => desc.value_len as usize,
-                };
-                let end = desc.addr as usize + p_len;
+                let p_len = desc.payload_len();
+                let end = desc.addr as usize + desc.span();
                 if end > max_end {
                     max_end = end;
                 }
@@ -1088,12 +1107,8 @@ impl<'a> HtxSliceRef<'a> {
         (0..self.num_blocks).filter_map(move |i| {
             let desc = self.read_desc(i);
             if desc.blk_type == HtxBlockType::Header {
-                let name_start = desc.addr as usize;
-                let name_end = name_start + desc.name_len as usize;
-                let val_start = name_end;
-                let val_end = val_start + desc.value_len as usize;
-                let name = utf8(&self.buf[name_start..name_end]).ok()?;
-                let val = utf8(&self.buf[val_start..val_end]).ok()?;
+                let name = utf8(&self.buf[desc.name_range()]).ok()?;
+                let val = utf8(&self.buf[desc.value_range()]).ok()?;
                 Some((name, val))
             } else {
                 None
@@ -1110,14 +1125,11 @@ impl<'a> HtxSliceRef<'a> {
             if desc.blk_type != HtxBlockType::Header {
                 return None;
             }
-            let name_start = desc.addr as usize;
-            let name_end = name_start + desc.name_len as usize;
-            if !keep(&self.buf[name_start..name_end]) {
+            if !keep(&self.buf[desc.name_range()]) {
                 return None;
             }
-            let val_end = name_end + desc.value_len as usize;
-            let name = utf8(&self.buf[name_start..name_end]).ok()?;
-            let val = utf8(&self.buf[name_end..val_end]).ok()?;
+            let name = utf8(&self.buf[desc.name_range()]).ok()?;
+            let val = utf8(&self.buf[desc.value_range()]).ok()?;
             Some((i, name, val))
         })
     }
@@ -1131,11 +1143,8 @@ impl<'a> HtxSliceRef<'a> {
             if desc.blk_type != HtxBlockType::Header {
                 return None;
             }
-            let name_start = desc.addr as usize;
-            let name_end = name_start + desc.name_len as usize;
-            let val_end = name_end + desc.value_len as usize;
-            let name = utf8(&self.buf[name_start..name_end]).ok()?;
-            let val = utf8(&self.buf[name_end..val_end]).ok()?;
+            let name = utf8(&self.buf[desc.name_range()]).ok()?;
+            let val = utf8(&self.buf[desc.value_range()]).ok()?;
             Some((i, name, val))
         })
     }
@@ -1144,12 +1153,8 @@ impl<'a> HtxSliceRef<'a> {
         (0..self.num_blocks).filter_map(move |i| {
             let desc = self.read_desc(i);
             if desc.blk_type == HtxBlockType::Trailer {
-                let name_start = desc.addr as usize;
-                let name_end = name_start + desc.name_len as usize;
-                let val_start = name_end;
-                let val_end = val_start + desc.value_len as usize;
-                let name = utf8(&self.buf[name_start..name_end]).ok()?;
-                let val = utf8(&self.buf[val_start..val_end]).ok()?;
+                let name = utf8(&self.buf[desc.name_range()]).ok()?;
+                let val = utf8(&self.buf[desc.value_range()]).ok()?;
                 Some((name, val))
             } else {
                 None
@@ -1158,7 +1163,16 @@ impl<'a> HtxSliceRef<'a> {
     }
 
     pub fn check_invariants(&self, tail_addr: usize) -> Result<(), String> {
+        self.check_invariants_in(tail_addr, HtxRegion::default())
+    }
+
+    /// [`Self::check_invariants`] of an HTX laid out as `region` says ([`HtxSlice::over_received`]):
+    /// every block lies in the received head or in the reserve's payload, `reserve_start..tail_addr`.
+    pub fn check_invariants_in(&self, tail_addr: usize, region: HtxRegion) -> Result<(), String> {
         let cap = self.buf.len();
+        if region.head_start > region.head_end || region.head_end > region.reserve_start || region.reserve_start > tail_addr {
+            return Err(format!("region {region:?} out of order with tail_addr {tail_addr}"));
+        }
         let desc_table_size = self.num_blocks * HTX_DESC_SIZE;
         if desc_table_size > cap {
             return Err(format!(
@@ -1187,18 +1201,14 @@ impl<'a> HtxSliceRef<'a> {
             if desc.blk_type == HtxBlockType::Unused {
                 continue;
             }
-            let p_len = match desc.blk_type {
-                HtxBlockType::Header | HtxBlockType::Trailer => {
-                    (desc.name_len as usize) + (desc.value_len as usize)
-                }
-                _ => desc.value_len as usize,
-            };
+            let p_len = desc.span();
             let start = desc.addr as usize;
             let end = start + p_len;
-            if end > tail_addr {
+            let in_head = start >= region.head_start && end <= region.head_end;
+            if p_len > 0 && !in_head && (start < region.reserve_start || end > tail_addr) {
                 return Err(format!(
-                    "block {i} [{start}..{end}) extends past tail_addr {}",
-                    tail_addr
+                    "block {i} [{start}..{end}) is outside the head {}..{} and the payload {}..{tail_addr}",
+                    region.head_start, region.head_end, region.reserve_start
                 ));
             }
             if p_len > 0 {
@@ -1249,13 +1259,13 @@ impl<'a> HtxSliceRef<'a> {
                     }));
                 }
                 HtxBlockType::Header => {
-                    let name = utf8(&self.buf[addr..addr + desc.name_len as usize]).unwrap_or("").to_string();
-                    let value = utf8(&self.buf[addr + desc.name_len as usize..addr + desc.name_len as usize + desc.value_len as usize]).unwrap_or("").to_string();
+                    let name = utf8(&self.buf[desc.name_range()]).unwrap_or("").to_string();
+                    let value = utf8(&self.buf[desc.value_range()]).unwrap_or("").to_string();
                     blocks.push(HtxBlock::Header(HeaderField { name, value }));
                 }
                 HtxBlockType::Trailer => {
-                    let name = utf8(&self.buf[addr..addr + desc.name_len as usize]).unwrap_or("").to_string();
-                    let value = utf8(&self.buf[addr + desc.name_len as usize..addr + desc.name_len as usize + desc.value_len as usize]).unwrap_or("").to_string();
+                    let name = utf8(&self.buf[desc.name_range()]).unwrap_or("").to_string();
+                    let value = utf8(&self.buf[desc.value_range()]).unwrap_or("").to_string();
                     blocks.push(HtxBlock::Trailer(HeaderField { name, value }));
                 }
                 HtxBlockType::Eoh => blocks.push(HtxBlock::Eoh),
@@ -1294,13 +1304,11 @@ impl<'b> PartialEq<HtxSliceRef<'b>> for HtxSliceRef<'_> {
             if d1.blk_type != d2.blk_type || d1.flags != d2.flags || d1.name_len != d2.name_len || d1.value_len != d2.value_len {
                 return false;
             }
-            let s1 = d1.addr as usize;
-            let total1 = match d1.blk_type {
-                HtxBlockType::Header | HtxBlockType::Trailer => d1.name_len as usize + d1.value_len as usize,
-                _ => d1.value_len as usize,
-            };
-            let s2 = d2.addr as usize;
-            if self.buf[s1..s1 + total1] != other.buf[s2..s2 + total1] {
+            let fields = matches!(d1.blk_type, HtxBlockType::Header | HtxBlockType::Trailer);
+            if fields && self.buf[d1.name_range()] != other.buf[d2.name_range()] {
+                return false;
+            }
+            if self.buf[d1.value_range()] != other.buf[d2.value_range()] {
                 return false;
             }
         }
@@ -1321,11 +1329,8 @@ impl std::fmt::Debug for HtxSliceRef<'_> {
                     list.entry(&self.res_line());
                 }
                 HtxBlockType::Header => {
-                    let s = desc.addr as usize;
-                    let nl = desc.name_len as usize;
-                    let vl = desc.value_len as usize;
-                    let n = utf8(&self.buf[s..s + nl]).unwrap_or("");
-                    let v = utf8(&self.buf[s + nl..s + nl + vl]).unwrap_or("");
+                    let n = utf8(&self.buf[desc.name_range()]).unwrap_or("");
+                    let v = utf8(&self.buf[desc.value_range()]).unwrap_or("");
                     list.entry(&(n, v));
                 }
                 HtxBlockType::Data => {
@@ -1341,11 +1346,8 @@ impl std::fmt::Debug for HtxSliceRef<'_> {
                     list.entry(&"Eot");
                 }
                 HtxBlockType::Trailer => {
-                    let s = desc.addr as usize;
-                    let nl = desc.name_len as usize;
-                    let vl = desc.value_len as usize;
-                    let n = std::str::from_utf8(&self.buf[s..s + nl]).unwrap_or("");
-                    let v = std::str::from_utf8(&self.buf[s + nl..s + nl + vl]).unwrap_or("");
+                    let n = std::str::from_utf8(&self.buf[desc.name_range()]).unwrap_or("");
+                    let v = std::str::from_utf8(&self.buf[desc.value_range()]).unwrap_or("");
                     list.entry(&("Trailer", n, v));
                 }
                 HtxBlockType::RawData => {
@@ -1364,11 +1366,25 @@ impl std::fmt::Debug for HtxSliceRef<'_> {
 // Zero-allocation mutable slice
 // ---------------------------------------------------------------------------
 
+/// Where an HTX indexed in place lies in its transport buffer (X1,
+/// `docs/design/htx-engine-2026-11-01.md` section 2.1): the message head as it was received,
+/// `head_start..head_end`, and the reserve from `reserve_start` to the end of the memory, whose
+/// front takes the values an edit writes and whose back holds the descriptors. The bytes
+/// between the head and the reserve (the body) are never addressed nor written. The default
+/// (all 0) is an HTX of its own memory: no received head, the reserve the whole buffer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HtxRegion {
+    pub head_start: usize,
+    pub head_end: usize,
+    pub reserve_start: usize,
+}
+
 /// Zero-allocation HTX representation over a contiguous pre-allocated byte slice.
 pub struct HtxSlice<'a> {
     buf: &'a mut [u8],
     tail_addr: usize,
     num_blocks: usize,
+    region: HtxRegion,
 }
 
 impl<'a> HtxSlice<'a> {
@@ -1378,6 +1394,7 @@ impl<'a> HtxSlice<'a> {
             buf,
             tail_addr: 0,
             num_blocks: 0,
+            region: HtxRegion::default(),
         }
     }
 
@@ -1387,12 +1404,121 @@ impl<'a> HtxSlice<'a> {
             buf,
             tail_addr,
             num_blocks,
+            region: HtxRegion::default(),
         }
     }
 
+    /// An empty HTX over a transport buffer that holds a received head (X1): the descriptors
+    /// [`crate::H1Parser::index_head_in_place`] writes address the head's bytes where they
+    /// are, and only what an edit adds goes to the reserve. A head that is not edited is the
+    /// bytes that arrived.
+    ///
+    /// # Errors
+    /// [`HtxError::InvalidData`] when `region` is out of order or past `buf`, or `buf` is too
+    /// large for the descriptors' 32-bit addresses.
+    pub fn over_received(buf: &'a mut [u8], region: HtxRegion) -> Result<Self, HtxError> {
+        let ordered = region.head_start <= region.head_end && region.head_end <= region.reserve_start && region.reserve_start <= buf.len();
+        if !ordered || u32::try_from(buf.len()).is_err() {
+            return Err(HtxError::InvalidData);
+        }
+        Ok(Self { buf, tail_addr: region.reserve_start, num_blocks: 0, region })
+    }
+
+    /// [`Self::over_received`] again, with what [`Self::tail_addr`] and [`Self::num_blocks`]
+    /// were when the last one was dropped ([`Self::with_offsets`] of the in-place layout).
+    #[must_use]
+    pub fn over_received_with(buf: &'a mut [u8], region: HtxRegion, tail_addr: usize, num_blocks: usize) -> Self {
+        debug_assert!(region.head_end <= region.reserve_start && region.reserve_start <= tail_addr && tail_addr <= buf.len());
+        Self { buf, tail_addr, num_blocks, region }
+    }
+
+    /// Where the received head and the reserve are ([`HtxRegion::default`] for an HTX of its own).
+    #[must_use]
+    pub fn region(&self) -> HtxRegion {
+        self.region
+    }
+
     pub fn clear(&mut self) {
-        self.tail_addr = 0;
+        self.tail_addr = self.region.reserve_start;
         self.num_blocks = 0;
+    }
+
+    /// A request line block over a line of the received head (X1): `line` without its end of
+    /// line, the method its first `method_len` bytes, the target `uri_len` bytes. Nothing is
+    /// copied.
+    ///
+    /// # Errors
+    /// [`HtxError::InvalidData`] when `line` is not in the head, [`HtxError::OutOfMemory`]
+    /// when the reserve has no room for the descriptor.
+    pub fn push_req_line_in_place(&mut self, line: std::ops::Range<usize>, method_len: usize, uri_len: usize) -> Result<(), HtxError> {
+        if line.start < self.region.head_start || line.end > self.region.head_end || line.start > line.end {
+            return Err(HtxError::InvalidData);
+        }
+        let desc = HtxBlockDesc {
+            blk_type: HtxBlockType::ReqLine,
+            flags: HTX_BLK_FL_NONE,
+            name_len: u16::try_from(method_len).map_err(|_| HtxError::LimitExceeded)?,
+            addr: line.start as u32,
+            value_len: line.len() as u32,
+            aux: uri_len as u32,
+        };
+        self.push_desc(&desc)
+    }
+
+    /// A header block over a field of the received head (X1): the name and the value where
+    /// they are, in the case they came in (lowercasing is the encoder's, X5), the bytes
+    /// between them (`:` and blanks) skipped by the descriptor's `aux`. Nothing is copied.
+    ///
+    /// # Errors
+    /// [`HtxError::InvalidData`] when the field is not in the head or the value comes before
+    /// the name's end, [`HtxError::LimitExceeded`] as [`Self::push_header`],
+    /// [`HtxError::OutOfMemory`] when the reserve has no room for the descriptor.
+    pub fn push_header_in_place(&mut self, name: std::ops::Range<usize>, value: std::ops::Range<usize>) -> Result<(), HtxError> {
+        let r = self.region;
+        if name.start < r.head_start || name.start > name.end || name.end > value.start || value.start > value.end || value.end > r.head_end {
+            return Err(HtxError::InvalidData);
+        }
+        if name.len() > HTX_HDR_NAME_MAX_LEN || value.len() > HTX_HDR_VALUE_MAX_LEN {
+            return Err(HtxError::LimitExceeded);
+        }
+        let desc = HtxBlockDesc {
+            blk_type: HtxBlockType::Header,
+            flags: HTX_BLK_FL_NONE,
+            name_len: name.len() as u16,
+            addr: name.start as u32,
+            value_len: value.len() as u32,
+            aux: (value.start - name.end) as u32,
+        };
+        self.push_desc(&desc)
+    }
+
+    /// Appends a descriptor whose payload is already in the buffer.
+    fn push_desc(&mut self, desc: &HtxBlockDesc) -> Result<(), HtxError> {
+        if free_capacity_at(self.buf.len(), self.tail_addr, self.num_blocks) < HTX_DESC_SIZE {
+            return Err(HtxError::OutOfMemory);
+        }
+        self.num_blocks += 1;
+        write_desc_at(self.buf, self.num_blocks, self.num_blocks - 1, desc);
+        Ok(())
+    }
+
+    /// Runs `edit`, and when the reserve had no room for it, [`Self::defrag`]s once and runs it
+    /// again: the rewrite space a removed or replaced value left is taken back only then, as
+    /// `htx_defrag` is in `HAProxy`. `edit` must change nothing when it fails for want of room
+    /// (the setters here do, but [`Self::replace_header`] of several lines may have replaced
+    /// some). `OutOfMemory` after the defrag means the head does not fit the reserve: the
+    /// caller writes it out (`write_h1_wire`) and indexes it again.
+    ///
+    /// # Errors
+    /// What `edit` returns the second time.
+    pub fn retry_after_defrag<R>(&mut self, mut edit: impl FnMut(&mut Self) -> Result<R, HtxError>) -> Result<R, HtxError> {
+        match edit(self) {
+            Err(HtxError::OutOfMemory) => {
+                self.defrag();
+                edit(self)
+            }
+            r => r,
+        }
     }
 
     #[must_use]
@@ -1410,9 +1536,10 @@ impl<'a> HtxSlice<'a> {
         self.tail_addr
     }
 
+    /// The payload bytes in the reserve (all of them for an HTX of its own memory).
     #[must_use]
     pub fn payload_bytes(&self) -> usize {
-        self.tail_addr
+        self.tail_addr - self.region.reserve_start
     }
 
     #[must_use]
@@ -1563,8 +1690,7 @@ impl<'a> HtxSlice<'a> {
             .find(|&i| read_desc_at(self.buf, self.num_blocks, i).blk_type == HtxBlockType::Header)
             .ok_or(HtxError::InvalidData)?;
         let desc = read_desc_at(self.buf, self.num_blocks, idx);
-        let val_start = desc.addr as usize + desc.name_len as usize;
-        let old = &self.buf[val_start..val_start + desc.value_len as usize];
+        let old = &self.buf[desc.value_range()];
         let mut bytes: Vec<u8> = if desc.flags & HTX_BLK_FL_LATIN1 == 0 {
             old.to_vec()
         } else {
@@ -1667,7 +1793,8 @@ impl<'a> HtxSlice<'a> {
             return Err(HtxError::LimitExceeded);
         }
 
-        let is_at_tail = old_addr + name_len + old_val_len == self.tail_addr;
+        let old_value = desc.value_range();
+        let is_at_tail = old_addr >= self.region.reserve_start && old_value.end == self.tail_addr;
         if is_at_tail {
             if free_capacity_at(self.buf.len(), self.tail_addr, self.num_blocks) < added_len {
                 return Err(HtxError::OutOfMemory);
@@ -1683,10 +1810,12 @@ impl<'a> HtxSlice<'a> {
                 return Err(HtxError::OutOfMemory);
             }
             let new_addr = self.tail_addr;
-            self.buf.copy_within(old_addr..old_addr + name_len + old_val_len, new_addr);
+            self.buf.copy_within(old_addr..old_addr + name_len, new_addr);
+            self.buf.copy_within(old_value, new_addr + name_len);
             self.buf[new_addr + name_len + old_val_len..new_addr + total_new].copy_from_slice(text.as_bytes());
             self.tail_addr += total_new;
             desc.addr = new_addr as u32;
+            desc.aux = 0;
             desc.value_len = new_val_len as u32;
             write_desc_at(self.buf, self.num_blocks, idx, &desc);
             Ok(())
@@ -1712,7 +1841,8 @@ impl<'a> HtxSlice<'a> {
             return Err(HtxError::LimitExceeded);
         }
 
-        let is_at_tail = old_addr + name_len + old_val_len == self.tail_addr;
+        let old_value = desc.value_range();
+        let is_at_tail = old_addr >= self.region.reserve_start && old_value.end == self.tail_addr;
         if is_at_tail {
             if free_capacity_at(self.buf.len(), self.tail_addr, self.num_blocks) < added_len {
                 return Err(HtxError::OutOfMemory);
@@ -1728,10 +1858,12 @@ impl<'a> HtxSlice<'a> {
                 return Err(HtxError::OutOfMemory);
             }
             let new_addr = self.tail_addr;
-            self.buf.copy_within(old_addr..old_addr + name_len + old_val_len, new_addr);
+            self.buf.copy_within(old_addr..old_addr + name_len, new_addr);
+            self.buf.copy_within(old_value, new_addr + name_len);
             self.buf[new_addr + name_len + old_val_len..new_addr + total_new].copy_from_slice(text.as_bytes());
             self.tail_addr += total_new;
             desc.addr = new_addr as u32;
+            desc.aux = 0;
             desc.value_len = new_val_len as u32;
             write_desc_at(self.buf, self.num_blocks, idx, &desc);
             Ok(())
@@ -1748,7 +1880,7 @@ impl<'a> HtxSlice<'a> {
         };
 
         let mut desc = read_desc_at(self.buf, self.num_blocks, idx);
-        let val_start = desc.addr as usize + desc.name_len as usize;
+        let val_start = desc.value_range().start;
         let val_len = desc.value_len as usize;
         if val_len == 0 {
             return;
@@ -1777,7 +1909,7 @@ impl<'a> HtxSlice<'a> {
 
         let trimmed_total = val_len - new_val_len;
         if trimmed_total > 0 {
-            let is_at_tail = desc.addr as usize + desc.name_len as usize + val_len == self.tail_addr;
+            let is_at_tail = desc.addr as usize >= self.region.reserve_start && val_start + val_len == self.tail_addr;
             if is_at_tail {
                 self.tail_addr -= trimmed_total;
             }
@@ -1796,7 +1928,7 @@ impl<'a> HtxSlice<'a> {
         };
 
         let mut desc = read_desc_at(self.buf, self.num_blocks, idx);
-        let val_start = desc.addr as usize + desc.name_len as usize;
+        let val_start = desc.value_range().start;
         let val_len = desc.value_len as usize;
         if val_len == 0 {
             return;
@@ -1825,7 +1957,7 @@ impl<'a> HtxSlice<'a> {
 
         let trimmed_total = val_len - new_val_len;
         if trimmed_total > 0 {
-            let is_at_tail = desc.addr as usize + desc.name_len as usize + val_len == self.tail_addr;
+            let is_at_tail = desc.addr as usize >= self.region.reserve_start && val_start + val_len == self.tail_addr;
             if is_at_tail {
                 self.tail_addr -= trimmed_total;
             }
@@ -1861,9 +1993,7 @@ impl<'a> HtxSlice<'a> {
         for i in 0..self.num_blocks {
             let desc = read_desc_at(self.buf, self.num_blocks, i);
             if desc.blk_type == HtxBlockType::Header {
-                let s = desc.addr as usize;
-                let nl = desc.name_len as usize;
-                if let Ok(hdr_name) = utf8(&self.buf[s..s + nl]) {
+                if let Ok(hdr_name) = utf8(&self.buf[desc.name_range()]) {
                     if hdr_name.eq_ignore_ascii_case(name) {
                         if first_match.is_none() {
                             first_match = Some(i);
@@ -1893,12 +2023,9 @@ impl<'a> HtxSlice<'a> {
         for i in 0..self.num_blocks {
             let desc = read_desc_at(self.buf, self.num_blocks, i);
             if desc.blk_type == HtxBlockType::Header {
-                let s = desc.addr as usize;
-                let nl = desc.name_len as usize;
-                let vl = desc.value_len as usize;
-                if let Ok(hdr_name) = utf8(&self.buf[s..s + nl]) {
+                if let Ok(hdr_name) = utf8(&self.buf[desc.name_range()]) {
                     if hdr_name.eq_ignore_ascii_case(name) {
-                        if let Ok(hdr_val) = utf8(&self.buf[s + nl..s + nl + vl]) {
+                        if let Ok(hdr_val) = utf8(&self.buf[desc.value_range()]) {
                             let new_val = re.replace_all(hdr_val, repl).to_string();
                             if new_val != hdr_val {
                                 self.replace_block_value(i, new_val.as_bytes())?;
@@ -1982,21 +2109,18 @@ impl<'a> HtxSlice<'a> {
     }
 
     #[must_use]
+    /// The reserve's payload bytes no block holds: what [`Self::defrag`] gives back. (The
+    /// holes of a received head, its `: ` and CRLFs, are not counted: no push can use them.)
     pub fn fragmented_bytes(&self) -> usize {
+        let floor = self.region.reserve_start;
         let mut active = 0;
         for i in 0..self.num_blocks {
             let desc = read_desc_at(self.buf, self.num_blocks, i);
-            if desc.blk_type != HtxBlockType::Unused {
-                let p_len = match desc.blk_type {
-                    HtxBlockType::Header | HtxBlockType::Trailer => {
-                        desc.name_len as usize + desc.value_len as usize
-                    }
-                    _ => desc.value_len as usize,
-                };
-                active += p_len;
+            if desc.blk_type != HtxBlockType::Unused && desc.addr as usize >= floor {
+                active += desc.payload_len();
             }
         }
-        self.tail_addr.saturating_sub(active)
+        (self.tail_addr - floor).saturating_sub(active)
     }
 
     pub fn maybe_defrag_threshold(&mut self, threshold: usize) -> bool {
@@ -2031,9 +2155,17 @@ impl<'a> HtxSlice<'a> {
         count
     }
 
+    /// Packs the payload of the blocks that are not removed and drops their descriptors' holes.
+    /// Over a received head (X1, [`Self::over_received`]) the head's bytes are rewritten from
+    /// the blocks: the blocks are packed from the head's start (the head is no longer the
+    /// bytes that arrived, only an edit defragments) and what does not fit there is packed
+    /// from the reserve's start, so the reserve keeps only the values the head has no room for.
+    /// Every block moves to a lower address or into the head, so no block is overwritten before
+    /// it is moved.
     pub fn defrag(&mut self) {
+        let region = self.region;
         if self.num_blocks == 0 {
-            self.tail_addr = 0;
+            self.tail_addr = region.reserve_start;
             return;
         }
 
@@ -2060,23 +2192,36 @@ impl<'a> HtxSlice<'a> {
         // Sort active blocks by physical address so new_tail <= old_addr always holds
         active.sort_by_key(|&i| read_desc_at(self.buf, self.num_blocks, i).addr);
 
-        // 3. Compact payloads in physical order
-        let mut new_tail = 0;
+        // 3. Compact payloads in physical order: into the head while they fit (the head's
+        // own blocks always do: packed, they are smaller than the lines they were), then
+        // from the reserve's start.
+        let mut in_head = region.head_start;
+        let mut new_tail = region.reserve_start;
         for &idx in active.iter() {
             let mut desc = read_desc_at(self.buf, self.num_blocks, idx);
-            let p_len = match desc.blk_type {
-                HtxBlockType::Header | HtxBlockType::Trailer => {
-                    desc.name_len as usize + desc.value_len as usize
-                }
-                _ => desc.value_len as usize,
+            let p_len = desc.payload_len();
+            let to = if p_len > 0 && in_head + p_len <= region.head_end {
+                in_head += p_len;
+                in_head - p_len
+            } else {
+                new_tail += p_len;
+                new_tail - p_len
             };
-
-            let old_addr = desc.addr as usize;
             if p_len > 0 {
-                self.buf.copy_within(old_addr..old_addr + p_len, new_tail);
+                let value = desc.value_range();
+                let name_len = if matches!(desc.blk_type, HtxBlockType::Header | HtxBlockType::Trailer) {
+                    let name = desc.name_range();
+                    self.buf.copy_within(name.clone(), to);
+                    name.len()
+                } else {
+                    0
+                };
+                self.buf.copy_within(value, to + name_len);
             }
-            desc.addr = new_tail as u32;
-            new_tail += p_len;
+            desc.addr = to as u32;
+            if matches!(desc.blk_type, HtxBlockType::Header | HtxBlockType::Trailer) {
+                desc.aux = 0;
+            }
             write_desc_at(self.buf, self.num_blocks, idx, &desc);
         }
 
@@ -2096,7 +2241,7 @@ impl<'a> HtxSlice<'a> {
     }
 
     pub fn check_invariants(&self) -> Result<(), String> {
-        self.as_ref().check_invariants(self.tail_addr)
+        self.as_ref().check_invariants_in(self.tail_addr, self.region)
     }
 
     #[must_use]

@@ -481,10 +481,7 @@ impl H1Parser {
                 .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
         } else {
             // A byte outside ASCII: the HTX holds text, and a line that is not UTF-8 is refused.
-            fn text(b: &[u8]) -> io::Result<&str> {
-                std::str::from_utf8(b).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in start line"))
-            }
-            let (m, u, v) = (text(method)?, text(uri)?, text(version)?);
+            let (m, u, v) = (line_text(method)?, line_text(uri)?, line_text(version)?);
             check_request_target(m, u)?;
             htx.push_req_line(m, u, v)
                 .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
@@ -536,17 +533,7 @@ impl H1Parser {
                     self.prev_delim_len = delim_len;
                     return Ok(line_end + delim_len);
                 }
-                let appended = match std::str::from_utf8(folded) {
-                    Ok(folded_val) if !htx.last_header_is_latin1() && !ibex_regex::bytetext::has_escapes(folded_val) => {
-                        let mut combined = String::with_capacity(prefix.len() + folded_val.len());
-                        combined.push_str(prefix);
-                        combined.push_str(folded_val);
-                        htx.append_to_last_header(&combined)
-                    }
-                    // obs-text that is not UTF-8, here or in the line it continues (T285).
-                    _ => htx.append_latin1_to_last_header(prefix, folded),
-                };
-                appended.map_err(|_| {
+                append_fold(htx, prefix, folded).map_err(|_| {
                     self.phase = H1Phase::Error;
                     io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -600,6 +587,185 @@ impl H1Parser {
             self.prev_delim_len = delim_len;
             Ok(line_end + delim_len)
         }
+    }
+
+    /// X1 (`docs/design/htx-engine-2026-11-01.md` section 2.1): the request head that lies
+    /// in `htx`'s received head ([`HtxSlice::over_received`]) parsed as [`Self::parse`]
+    /// parses it, with the same checks, refusals and rewrites, but its blocks written over the
+    /// bytes where they are: the request line and every ASCII field are descriptors into the
+    /// head, names in the case they came in, and only what the parser changes (a folded value,
+    /// `te: trailers`, a value past ASCII, an `Upgrade` cleaned, a `Content-Length` made one)
+    /// goes to the reserve. Stops at the end of the head, as [`Self::parse`] given the head
+    /// alone does: the body stays where it is. Returns the bytes of the head read: fewer than
+    /// the head when it is not whole, and then the parser does not go on from there (the
+    /// caller gives it the whole head, as `find_eoh` finds it, to a parser just reset).
+    ///
+    /// # Errors
+    /// What [`Self::parse`] refuses the head with; `Unsupported` for a response (X3) and for a
+    /// parser that is not at a request's start.
+    pub fn index_head_in_place(&mut self, htx: &mut HtxSlice<'_>) -> io::Result<usize> {
+        if self.is_response || self.phase != H1Phase::StartLine {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "only a request head from its start is indexed in place"));
+        }
+        #[cfg(debug_assertions)]
+        REQUEST_PARSES.with(|c| c.set(c.get() + 1));
+        let start = htx.region().head_start;
+        let mut at = start + self.index_request_line(htx, start)?;
+        while at > start && self.phase == H1Phase::Headers {
+            let n = self.index_header_line(htx, at)?;
+            if n == 0 {
+                break;
+            }
+            at += n;
+        }
+        Ok(at - start)
+    }
+
+    /// [`Self::parse_request_line`] of the line at `at` in the received head, in place.
+    fn index_request_line(&mut self, htx: &mut HtxSlice<'_>, at: usize) -> io::Result<usize> {
+        let end = htx.region().head_end;
+        let (span, ascii) = {
+            let input = &htx.as_ref().buf()[at..end];
+            let span = match scan_request_line(input, self.accept_unsafe_request) {
+                ReqLineScan::Incomplete => return Ok(0),
+                ReqLineScan::Invalid => {
+                    self.phase = H1Phase::Error;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid request line"));
+                }
+                ReqLineScan::Complete(span) => span,
+            };
+            let (method, uri, version) = (&input[span.method.clone()], &input[span.uri.clone()], &input[span.version.clone()]);
+            let ascii = method.is_ascii() && uri.is_ascii() && version.is_ascii();
+            if ascii {
+                check_request_target_bytes(method, uri)?;
+            } else {
+                check_request_target(line_text(method)?, line_text(uri)?)?;
+                line_text(version)?;
+            }
+            self.line = Some(ParsedLine::of(method, uri, version));
+            (span, ascii)
+        };
+        if ascii {
+            // The words are read from the line as it is (blanks and all), so it is not copied.
+            htx.push_req_line_in_place(at..at + span.eol, span.method.len(), span.uri.len())
+        } else {
+            // A target past ASCII (`accept-unsafe-violations-in-http-request`): copied as text.
+            let line = &htx.as_ref().buf()[at..end];
+            let (m, u, v) = (line[span.method.clone()].to_vec(), line[span.uri.clone()].to_vec(), line[span.version.clone()].to_vec());
+            htx.push_req_line(line_text(&m)?, line_text(&u)?, line_text(&v)?)
+        }
+        .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+        self.prev_delim_len = span.eol_len;
+        self.head_rewritten |= span.eol_len == 1 || !span.canonical;
+        self.phase = H1Phase::Headers;
+        Ok(span.eol + span.eol_len)
+    }
+
+    /// [`Self::parse_headers`] of the line at `at` in the received head, in place.
+    fn index_header_line(&mut self, htx: &mut HtxSlice<'_>, at: usize) -> io::Result<usize> {
+        /// What a line asks of the HTX, read while the head is borrowed.
+        enum Line {
+            Eoh,
+            Fold(Vec<u8>),
+            DroppedFold,
+            Te(bool),
+            Field { name: std::ops::Range<usize>, value: std::ops::Range<usize>, ascii: bool, rewritten: bool },
+        }
+        let end = htx.region().head_end;
+        let (line, line_end, delim_len) = {
+            let input = &htx.as_ref().buf()[at..end];
+            let Some((line_end, delim_len)) = self.find_line_end(input) else {
+                return Ok(0);
+            };
+            if self.saw_bare_cr {
+                self.phase = H1Phase::Error;
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "bare CR is not a line terminator"));
+            }
+            let header_bytes = &input[..line_end];
+            let line = if line_end == 0 {
+                Line::Eoh
+            } else if header_bytes.starts_with(b" ") || header_bytes.starts_with(b"\t") {
+                if header_bytes.iter().any(|&b| b == 0 || b == b'\r') {
+                    self.phase = H1Phase::Error;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid character in header field value"));
+                }
+                if self.last_dropped { Line::DroppedFold } else { Line::Fold(header_bytes.to_vec()) }
+            } else {
+                let (name, value) = parse_header_field(header_bytes)?;
+                self.header_lines += u16::from(!uncounted(name, value));
+                if self.header_lines > MAX_REQUEST_HEADERS {
+                    self.phase = H1Phase::Error;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "too many header lines"));
+                }
+                self.seen |= seen_bit(name);
+                self.last_dropped = false;
+                if name.eq_ignore_ascii_case(b"te") {
+                    let keep = value.split(|&b| b == b',').any(|t| t.trim_ascii() == b"trailers");
+                    self.last_dropped = !keep;
+                    Line::Te(keep)
+                } else {
+                    // `value` is the line's end: `parse_header_field` takes the blanks off its front.
+                    let rewritten = delim_len == 1
+                        || header_bytes.len() != name.len() + 2 + value.len()
+                        || header_bytes[name.len() + 1] != b' '
+                        || value.last().is_some_and(|&b| b == b' ' || b == b'\t');
+                    Line::Field { name: at..at + name.len(), value: at + line_end - value.len()..at + line_end, ascii: value.is_ascii(), rewritten }
+                }
+            };
+            (line, line_end, delim_len)
+        };
+        let oom = |e| io::Error::new(io::ErrorKind::OutOfMemory, e);
+        match line {
+            Line::Eoh => {
+                htx.finalize_last_header();
+                htx.push_eoh().map_err(oom)?;
+                self.on_headers_finished(htx)?;
+                self.prev_delim_len = delim_len;
+                self.head_rewritten |= delim_len == 1;
+                return Ok(delim_len);
+            }
+            Line::Fold(folded) => {
+                let prefix = if self.prev_delim_len == 2 { "  " } else { " " };
+                append_fold(htx, prefix, &folded).map_err(|e| {
+                    if e == crate::htx::HtxError::OutOfMemory {
+                        // The reserve is full, not the head wrong: the caller parses it by copying.
+                        return oom(e);
+                    }
+                    self.phase = H1Phase::Error;
+                    io::Error::new(io::ErrorKind::InvalidData, "obs-fold continuation with no preceding header")
+                })?;
+                self.head_rewritten = true;
+            }
+            Line::DroppedFold => self.head_rewritten = true,
+            Line::Te(keep) => {
+                htx.finalize_last_header();
+                if keep {
+                    htx.push_header("te", "trailers").map_err(oom)?;
+                }
+                self.head_rewritten = true;
+            }
+            Line::Field { name, value, ascii, rewritten } => {
+                htx.finalize_last_header();
+                let host = name.len() == 4 && htx.as_ref().buf()[name.clone()].eq_ignore_ascii_case(b"host");
+                if ascii {
+                    htx.push_header_in_place(name, value).map_err(oom)?;
+                } else {
+                    // obs-text: UTF-8 or Latin-1 as the copying parse holds it (T285), copied.
+                    let b = htx.as_ref().buf();
+                    let (n, v) = (b[name].to_vec(), b[value].to_vec());
+                    htx.push_header_bytes(&n, &v).map_err(oom)?;
+                }
+                if host {
+                    if self.hosts == 0 {
+                        self.host_at = htx.num_blocks() - 1;
+                    }
+                    self.hosts = self.hosts.saturating_add(1).min(2);
+                }
+                self.head_rewritten |= rewritten;
+            }
+        }
+        self.prev_delim_len = delim_len;
+        Ok(line_end + delim_len)
     }
 
     fn parse_trailers(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<(usize, bool)> {
@@ -685,10 +851,7 @@ impl H1Parser {
                 continue;
             }
             let desc = sref.read_desc(i);
-            let s = desc.addr as usize;
-            let nl = desc.name_len as usize;
-            let vl = desc.value_len as usize;
-            let Ok(h_name) = std::str::from_utf8(&sref.buf()[s..s + nl]) else { continue };
+            let Ok(h_name) = std::str::from_utf8(&sref.buf()[desc.name_range()]) else { continue };
             if !h_name.eq_ignore_ascii_case("content-length") {
                 continue;
             }
@@ -698,7 +861,7 @@ impl H1Parser {
                 duplicate_cl = true;
             }
             
-            let Ok(h_val) = std::str::from_utf8(&sref.buf()[s + nl..s + nl + vl]) else { continue };
+            let Ok(h_val) = std::str::from_utf8(&sref.buf()[desc.value_range()]) else { continue };
             let raw = h_val.trim();
 
             let mut parts = raw.split(',').map(str::trim);
@@ -771,9 +934,7 @@ impl H1Parser {
             for i in (first_idx + 1..num_blocks).rev() {
                 if htx.as_ref().block_type(i) == Some(HtxBlockType::Header) {
                     let desc = htx.as_ref().read_desc(i);
-                    let s = desc.addr as usize;
-                    let nl = desc.name_len as usize;
-                    if let Ok(name) = std::str::from_utf8(&htx.as_ref().buf()[s..s+nl]) {
+                    if let Ok(name) = std::str::from_utf8(&htx.as_ref().buf()[desc.name_range()]) {
                         if name.eq_ignore_ascii_case("content-length") {
                             htx.remove_block(i);
                         }
@@ -1299,8 +1460,7 @@ pub fn finish_request_head(htx: &mut HtxSlice<'_>, method: &str, uri: &str) -> i
                 continue;
             }
             let d = sref.read_desc(i);
-            let (s, nl, vl) = (d.addr as usize, d.name_len as usize, d.value_len as usize);
-            let (name, value) = (&sref.buf()[s..s + nl], &sref.buf()[s + nl..s + nl + vl]);
+            let (name, value) = (&sref.buf()[d.name_range()], &sref.buf()[d.value_range()]);
             p.header_lines += u16::from(!uncounted(name, value));
             p.seen |= seen_bit(name);
             if name.len() == 4 && name.eq_ignore_ascii_case(b"host") {
@@ -1316,6 +1476,26 @@ pub fn finish_request_head(htx: &mut HtxSlice<'_>, method: &str, uri: &str) -> i
     }
     p.phase = H1Phase::Headers;
     p.on_headers_finished(htx)
+}
+
+/// A part of a request line past ASCII, as text: one that is not UTF-8 is refused.
+fn line_text(b: &[u8]) -> io::Result<&str> {
+    std::str::from_utf8(b).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in start line"))
+}
+
+/// An obs-fold continuation `folded` appended to the last header after `prefix` (the spaces
+/// the line end becomes): as text when it and the value are UTF-8 without escapes, as
+/// Latin-1 otherwise (T285).
+fn append_fold(htx: &mut HtxSlice<'_>, prefix: &str, folded: &[u8]) -> Result<(), crate::htx::HtxError> {
+    match std::str::from_utf8(folded) {
+        Ok(folded_val) if !htx.last_header_is_latin1() && !ibex_regex::bytetext::has_escapes(folded_val) => {
+            let mut combined = String::with_capacity(prefix.len() + folded_val.len());
+            combined.push_str(prefix);
+            combined.push_str(folded_val);
+            htx.append_to_last_header(&combined)
+        }
+        _ => htx.append_latin1_to_last_header(prefix, folded),
+    }
 }
 
 fn check_request_target(method_str: &str, uri: &str) -> io::Result<()> {
