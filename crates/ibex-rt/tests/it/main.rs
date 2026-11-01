@@ -55,6 +55,7 @@ mod listen_backlog;
 mod log_abort_during_connect;
 mod local_reply_connection;
 mod stats_page_framing;
+mod stats_page_headers;
 mod cold_start_timers;
 mod body_after_head_rewrite;
 mod buffer_wait;
