@@ -12852,9 +12852,22 @@ impl EngineDispatcher<'_> {
             }
         }
 
+        // 0. `;json-schema` and `;json` (`stats-json.c`): the CLI's `show stat json` rows, and
+        // the schema that describes them. Looked at before `;csv`, as `HAProxy` does.
+        if req_uri.contains(";json-schema") {
+            let page = crate::stats_stream::Page::Text(include_str!("stats_json_schema.json"), false);
+            stats_stream_page(entry, proxies, checks, pid, serving, "application/json", &refresh, page);
+            return None;
+        }
+        if req_uri.contains(";json") {
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Json, proxies[serving].stats_config.show_legends));
+            stats_stream_page(entry, proxies, checks, pid, serving, "application/json", &refresh, page);
+            return None;
+        }
+
         // 1. CSV telemetry
         if req_uri.contains(";csv") || req_uri.ends_with("/csv") {
-            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::csv());
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Csv, proxies[serving].stats_config.show_legends));
             stats_stream_page(entry, proxies, checks, pid, serving, "text/plain", &refresh, page);
             return None;
         }

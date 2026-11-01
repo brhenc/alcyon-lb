@@ -28,6 +28,8 @@ pub enum Page {
     Rows(StatCursor),
     /// The dashboard's `/api/data`.
     Json(JsonCursor),
+    /// A fixed text sent in one unit (`;json-schema`); `true` once it is out.
+    Text(&'static str, bool),
 }
 
 /// A dump in progress: the page's cursor, how it is framed, and the unit cut in two when
@@ -98,6 +100,14 @@ fn next_unit(page: &mut Page, ctx: &Ctx<'_>, out: &mut String) -> bool {
         }
         Page::Rows(cur) => cur.next_unit(ctx.proxies, ctx.checks, ctx.pid, out),
         Page::Json(cur) => cur.next_unit(ctx.proxies, ctx.checks, ctx.pid, out),
+        Page::Text(text, sent) => {
+            if *sent {
+                return false;
+            }
+            *sent = true;
+            out.push_str(text);
+            true
+        }
     }
 }
 
