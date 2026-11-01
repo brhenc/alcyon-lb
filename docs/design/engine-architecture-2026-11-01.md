@@ -436,3 +436,9 @@ lock from the path; every slice reports its ins/req before and after, user and k
 - **Soaks**: postponed until most slices are in (not after each of L2/L3/O1a/O1b).
 - **Fable after X0**: one pass rewrites §2.1 and each slice's budget from X0's figures, and adds
   a slice for any keep-alive remainder X0 locates.
+- **PGO (16:30).** Release builds ship PGO (`tools/pgo-build.sh`). Development and every slice's
+  merge criterion stay non-PGO: a saving must hold without PGO, against non-PGO HAProxy (D-8).
+  PGO is measured once at the end of a performance slice, after the non-PGO work is done, as a
+  second column (`insreq.sh` on the PGO binary, same scenarios): cost ~11 min wall (instrumented
+  + final fat-LTO builds ~5 min each, 27 s training, T435), no per-edit cost. Where a scenario
+  reaches HAProxy only with PGO, that is reported as such and is acceptable for the shipped build.
