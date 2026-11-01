@@ -756,3 +756,13 @@ row is here because the behaviour is surprising or measurable, not because it di
 | **Ibex now** | Workers start one at a time (`bin/ibex.rs`, the spawn loop waits on each worker's own ready channel). Under `-m` the first worker's cost is measured (`VmData` growth while it started, `headroom::data_bytes_under_limit`) and each later one is probed for that plus a quarter plus `THREAD_EXTRA` (`headroom::worker_need`) before it is spawned. A worker that does not fit: `[ALERT] ... Failed to create thread K (...); the memory limit (-m) is too small for N threads.`, exit 1. Test `memmax::many_threads_under_m_serve_or_refuse_cleanly` (16 and 32 threads, `-m` 8..768, 3 runs each). |
 | **Gap left** | Each worker presizes for the process's whole `maxconn` (which `-m` sizes), so a worker's cost grows with `-m` and N workers need about N times it: on this host 16 threads serve at `-m` 384 and 768 but are refused at 1024 and 2048 (and serve at 4096); 32 and 64 threads are refused from 8 to 4096. Sizing each worker for `maxconn / nbthread` would let them serve; not done here. |
 | **V&V probe** | The grid `nbthread` {16, 32, 64} x `-m` {8 .. 4096}: every cell serves or exits 1 with the alert; no exit 134, no core. |
+
+### 6.34 `tune.memory.prealloc on` does not prefill the `tls_tx` pool — **postponed by the user 2026-11-01**
+
+| | |
+|---|---|
+| **What** | `tune.memory.prealloc on` (T468, `crates/ibex-rt/src/prealloc.rs`) prefills the buffer pools and the session arena at start, sized from `maxconn` or `-m`. The `tls_tx` pool (6.32, 33,792 B per chunk, held only while ciphertext waits) is not prefilled: the first responses on each thread take a chunk from the allocator. |
+| **Why not done** | Prefilling it is a design change, not a fix: the chunks would have to be counted against `-m` (one per TLS connection that can have ciphertext in flight, up to `maxconn` x 33 KB), which changes how `-m` sizes `maxconn` (6.25) and how the prealloc refusal message is computed. |
+| **Gap** | With prealloc on, a TLS response can still reach the allocator on a cold thread, so prealloc does not yet mean "no allocation after start" for TLS. Plain-text traffic is unaffected. |
+| **Decision** | Postponed (user 2026-11-01). Revisit with the memory-budget work; until then prealloc's documentation says TLS send buffers are not prefilled. |
+

@@ -224,3 +224,10 @@ scheme.
 | **D8** | ACK frequency on by default | Measure first (Q0). It is a standard extension and a production gain, but it changes the client's load: report the A/B against HAProxy with it off, and the production figure with it on, until the user decides the default (`fair benchmark defaults`) |
 | **D9** | PGO (§4): what the board reports and what gates | Budget and A/B on non-PGO release-perf (decided); every merged slice measured on the PGO build too, reported as "shipped"; the (a)-list layout patches wait for a PGO profile; training gains h3, TLS h1 and h2 `-m 10` (M1) |
 | **D10** | Connection-ID lookups (§5): slab by handle, `ebmb`, or encoded CIDs | (i) slab by handle with a generation, now (Q1); keyed SipHash stays for the one client-chosen table; `ebmb` is the fallback; encoded CIDs with the multi-thread QUIC design, as a whole-CID PRP |
+
+**User decisions, 2026-11-01 11:20.**
+- **D1 agreed**: H4 is restated as ratios to HAProxy's own h3 at equal client datagrams (1.5x, then 1.3x, then 1.1x), plus the relative leg (Ibex h3 - Ibex h2) <= 1.5x (HAProxy h3 - HAProxy h2). Always measured against HAProxy.
+- **D5**: a Fable plan for the HTX-primary engine (rules on HTX only, HTTP/1.1 text produced at the server send) comes first; no code before it is reviewed.
+- **D8**: ACK_FREQUENCY becomes an operator setting, default off (fair A/B against HAProxy). The operator may turn it on for the production gain; note that it only asks a peer to ACK less, so a hostile client sending ACK floods can ignore it.
+- **T560** (+0.49% h3fit for the nbthread-1 burst fix, VV-31): accepted.
+- **Kernel instructions count** (Track 3 item 4, no `getsockname()` per request): a kernel-side saving is a saving and is welcome; `insreq.sh` reports kernel instructions beside user-space ones (T568).
