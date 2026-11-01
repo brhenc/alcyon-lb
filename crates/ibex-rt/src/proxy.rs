@@ -515,6 +515,46 @@ pub struct QuicAckSrc {
     pub facts: Option<ibex_sample::QuicAckFacts>,
 }
 
+ibex_alloc::declare_pool!(
+    /// `show pools` `relay_role`: the boxes of [`H2Role::Relay`], one per HTTP/3 stream of the
+    /// relay path, given back when the stream ends (`Engine::end_stream`).
+    static RELAY_ROLES: Pool<Box<H2Role>> = ibex_alloc::PoolSpec::new("relay_role").max_count(1024);
+);
+
+impl ibex_alloc::Poolable for Box<H2Role> {
+    fn footprint(&self) -> usize {
+        std::mem::size_of::<H2Role>()
+    }
+
+    fn reset(&mut self, _wipe: bool) {}
+
+    /// No spare to make: [`relay_role`] boxes the value it has.
+    fn try_new() -> Option<Self> {
+        None
+    }
+}
+
+/// The role of a relayed HTTP/3 stream: a box of the `relay_role` pool.
+#[must_use]
+pub fn relay_role(src: QuicAckSrc) -> Box<H2Role> {
+    match RELAY_ROLES.take_raw(<Box<H2Role> as ibex_alloc::Poolable>::try_new) {
+        Some(mut b) => {
+            *b = H2Role::Relay(src);
+            b
+        }
+        None => Box::new(H2Role::Relay(src)),
+    }
+}
+
+/// Gives the role box of a session that ended back, if it is a relay one.
+pub fn give_relay_role(sess: &mut TcpSession) {
+    if matches!(sess.h2_role.as_deref(), Some(H2Role::Relay(_))) {
+        if let Some(b) = sess.h2_role.take() {
+            RELAY_ROLES.give(b);
+        }
+    }
+}
+
 /// A backend connection's `conn->err_code` (`CO_ER_*`, numbered as in
 /// `include/haproxy/connection-t.h`), named and worded as `conn_err_code_name` and
 /// `conn_err_code_str` do: what `bc_err` and `bc_err_str` read.

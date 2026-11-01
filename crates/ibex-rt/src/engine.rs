@@ -8200,7 +8200,7 @@ fn register_new_session(
     sess.reset_with_request = reset_pending;
     sess.h3 = listener_idx.is_none();
     if let Some(q) = quic_ack {
-        sess.h2_role = Some(Box::new(crate::proxy::H2Role::Relay(q)));
+        sess.h2_role = Some(crate::proxy::relay_role(q));
     }
     sess.proto_h2 = listener_idx.and_then(|i| engine.listeners.get(i)).is_some_and(|l| l.proto_h2);
     sess.so_name = listener_idx.and_then(|i| engine.listeners.get(i)).and_then(|l| l.name.clone());
@@ -11489,6 +11489,7 @@ impl EngineDispatcher<'_> {
                 self.poller,
                 self.listeners,
             );
+            crate::proxy::give_relay_role(&mut entry.sess);
         }
     }
 
