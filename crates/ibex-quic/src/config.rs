@@ -183,6 +183,16 @@ impl QuicConfig {
         tc.min_mtu(self.min_mtu);
         tc.enable_segmentation_offload(self.enable_gso);
 
+        // Q0 (docs/design/quic-transport-2026-11-01.md): ask a peer that advertises
+        // `min_ack_delay` to acknowledge every third ack-eliciting packet or after 25 ms, so
+        // fewer ACK-only datagrams arrive. Reaches the data path in quinn-proto's
+        // `Connection::poll_transmit` (pending ACK_FREQUENCY); peers without the extension
+        // are unaffected.
+        let mut ack_frequency = quinn_proto::AckFrequencyConfig::default();
+        ack_frequency.max_ack_delay(Some(Duration::from_millis(25)));
+        ack_frequency.ack_eliciting_threshold(quinn_proto::VarInt::from_u32(2));
+        tc.ack_frequency_config(Some(ack_frequency));
+
         tc
     }
 

@@ -875,3 +875,70 @@ fn a_handshake_is_not_retransmitted_sooner_than_the_initial_rtt() {
          300 ms means initial_rtt is set below the standard value."
     );
 }
+
+/// Q0 (docs/design/quic-transport-2026-11-01.md §3): the server asks an established client to
+/// acknowledge less often (ACK_FREQUENCY, draft-ietf-quic-ack-frequency). The client here
+/// advertises `min_ack_delay`, as every client that implements the extension does.
+#[test]
+fn the_server_asks_the_client_for_fewer_acks() {
+    let server_config = QuicConfig::new()
+        .load_server_config_from_pem(cert_path())
+        .expect("load cert");
+    let mut server = QuicEndpoint::with_server_config(server_config).expect("server endpoint");
+
+    let crypto = ibex_quic::crypto::QuicClientConfig::without_verification(&[ALPN_H3], ibex_config::TlsCryptoProvider::Ring)
+        .expect("client crypto");
+    let mut client_config = quinn_proto::ClientConfig::new(Arc::new(crypto));
+    let mut tc = quinn_proto::TransportConfig::default();
+    tc.initial_rtt(Duration::from_millis(10));
+    tc.ack_frequency_config(Some(quinn_proto::AckFrequencyConfig::default()));
+    client_config.transport_config(Arc::new(tc));
+    let reset = Arc::new(ibex_quic::crypto::ResetKey::new().expect("reset key"));
+    let mut client_endpoint = quinn_proto::Endpoint::new(Arc::new(quinn_proto::EndpointConfig::new(reset)), None, false, None);
+
+    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+    let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 55444);
+    let mut now = Instant::now();
+    let (client_handle, mut client_conn) = client_endpoint
+        .connect(now, client_config, server_addr, "localhost")
+        .expect("connect");
+
+    let mut client_buf = Vec::new();
+    let mut server_buf = vec![0u8; 65535];
+    for _ in 0..200 {
+        now += Duration::from_millis(5);
+        client_buf.clear();
+        while let Some(tx) = client_conn.poll_transmit(now, 1, &mut client_buf) {
+            server
+                .handle_datagram(now, client_addr, None, &client_buf[..tx.size])
+                .expect("server handle datagram");
+            client_buf.clear();
+        }
+        server.handle_timeout(now);
+        while let Some(tx) = server.poll_transmit(now, &mut server_buf) {
+            let mut resp = Vec::new();
+            if let Some(quinn_proto::DatagramEvent::ConnectionEvent(_, evt)) = client_endpoint.handle(
+                now,
+                server_addr,
+                None,
+                None,
+                bytes::BytesMut::from(&server_buf[..tx.size]),
+                &mut resp,
+            ) {
+                client_conn.handle_event(evt);
+            }
+        }
+        client_conn.handle_timeout(now);
+        while let Some(ep_evt) = client_conn.poll_endpoint_events() {
+            if let Some(evt) = client_endpoint.handle_event(client_handle, ep_evt) {
+                client_conn.handle_event(evt);
+            }
+        }
+        while client_conn.poll().is_some() {}
+        while server.poll_event().is_some() {}
+        if client_conn.stats().frame_rx.ack_frequency > 0 {
+            return;
+        }
+    }
+    panic!("the server never sent ACK_FREQUENCY: {:?}", client_conn.stats().frame_rx);
+}
