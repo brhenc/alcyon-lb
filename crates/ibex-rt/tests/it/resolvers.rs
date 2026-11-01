@@ -446,8 +446,18 @@ impl Ibex {
             assert!(Instant::now() < deadline, "no log line {line:?} in {:?}", self.log());
             thread::sleep(Duration::from_millis(20));
         }
+        // stdout and stderr are read by two threads: the line seen on one may be in flight on the other.
         let warn = format!("[WARNING]  ({}) : {line}", self.child.id());
-        assert!(self.stderr().contains(&warn), "no {warn:?} in {:?}", self.stderr());
+        self.wait_stderr(&warn, secs.max(5));
+    }
+
+    /// Waits up to `secs` for the stderr line `line` (stderr is read by a thread of its own).
+    fn wait_stderr(&self, line: &str, secs: u64) {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while !self.stderr().iter().any(|l| l == line) {
+            assert!(Instant::now() < deadline, "no {line:?} in {:?}", self.stderr());
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -957,7 +967,7 @@ fn a_state_file_stopping_an_unresolved_server_is_said_on_stderr() {
             "[WARNING]  ({}) : Server l/s1 is DOWN, changed from server-state after a reload. 0 active and 0 backup servers left. 0 sessions active, 0 requeued, 0 remaining in queue.",
             ibex.child.id()
         );
-        assert!(ibex.stderr().contains(&said), "admin {admin}: no {said:?} in {:?}", ibex.stderr());
+        ibex.wait_stderr(&said, 10);
         assert!(!ibex.log().iter().any(|l| l.contains("changed from server-state")), "admin {admin}: {:?}", ibex.log());
     }
 }
@@ -1915,7 +1925,7 @@ fn an_srv_resolution_that_fails(zone: Zone, hold: &str) {
     // In the log as is, on stderr as an ALERT (`proxy 'l' ...`).
     assert!(ibex.log().iter().any(|l| l == "proxy l has no server available!"), "{:?}", ibex.log());
     let alert = format!("[ALERT]    ({}) : proxy 'l' has no server available!", ibex.child.id());
-    assert!(ibex.stderr().contains(&alert), "{:?}", ibex.stderr());
+    ibex.wait_stderr(&alert, 10);
     assert_eq!(ibex.srv_cols("srv2"), format!("- 0 32 1 1 - 0 {SRV}"));
 }
 
