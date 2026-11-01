@@ -101,8 +101,22 @@ const MAX_NAMES: usize = 1 << 16;
 
 static NAMES: LazyLock<RwLock<Names>> = LazyLock::new(|| RwLock::new(Names::default()));
 
+thread_local! {
+    static LOOKUPS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many by-name lookups of a variable (`NAMES` read + hash) this thread has made (debug
+/// builds only; always 0 in release): a test reads it around requests to show that a name the
+/// configuration gives is resolved at load (T595).
+#[must_use]
+pub fn name_lookups_on_this_thread() -> u64 {
+    LOOKUPS.with(Cell::get)
+}
+
 /// The number of `name`, if it has one.
 fn lookup(name: &str) -> Option<u32> {
+    #[cfg(debug_assertions)]
+    LOOKUPS.with(|n| n.set(n.get() + 1));
     NAMES.read().ok()?.ids.get(name).copied()
 }
 
@@ -418,8 +432,40 @@ impl VarStore {
     }
 
     fn slot(&self, name: &str) -> Option<&Slot> {
-        let s = self.slots.get(lookup(name)? as usize)?;
+        self.slot_id(lookup(name)?)
+    }
+
+    fn slot_id(&self, id: u32) -> Option<&Slot> {
+        let s = self.slots.get(id as usize)?;
         (s.val != Val::Absent).then_some(s)
+    }
+
+    /// [`Self::get`] of a variable whose number is known (T595).
+    #[must_use]
+    pub fn get_id(&self, id: u32) -> Option<Sample> {
+        self.slot_id(id)?.sample()
+    }
+
+    /// [`Self::int`] of a variable whose number is known.
+    #[must_use]
+    pub fn int_id(&self, id: u32) -> Option<i64> {
+        match self.slot_id(id)?.val {
+            Val::Sint(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// [`Self::contains_key`] of a variable whose number is known.
+    #[must_use]
+    pub fn contains_id(&self, id: u32) -> bool {
+        self.slot_id(id).is_some()
+    }
+
+    /// [`Self::remove`] of a variable whose number is known.
+    pub fn remove_id(&mut self, id: u32) {
+        if let Some(s) = self.slots.get_mut(id as usize) {
+            s.clear();
+        }
     }
 
     /// The value of `name`.
@@ -727,13 +773,124 @@ pub fn set_in(vars: &mut VarStore, name: &str, v: In<'_>) -> bool {
 /// Stores `v` in `store` if it fits the limits: `var_set`.
 fn put(store: &mut VarStore, name: &str, v: In<'_>, procs: u64) -> bool {
     let Some(id) = intern(name) else { return false };
-    let scope = Scope::of(name);
+    put_id(store, id, Scope::of(name), v, procs)
+}
+
+/// [`put`] of a variable whose number and scope are known.
+fn put_id(store: &mut VarStore, id: u32, scope: Scope, v: In<'_>, procs: u64) -> bool {
     let v = match admit(store, procs, id, scope, &v) {
         Admit::Refuse => return false,
         Admit::Bool(b) => In::Owned(Sample::Bool(b)),
         Admit::Store => v,
     };
     store.write(id, scope, v)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Names resolved at load (T595)
+
+/// A variable a rule or an expression names in the configuration, resolved once at load as
+/// `HAProxy` keeps the hash of the name in the `act_rule` / `sample_expr` (`vars_hash_name`):
+/// the data path looks up no name (no `NAMES` lock, no hash). A `proc.` name, and a name past
+/// [`MAX_NAMES`], keep the by-name path. A name built at run time never has a `VarRef`: it
+/// goes through [`intern`] and the same hasher as before.
+#[derive(Debug, Clone)]
+pub struct VarRef {
+    /// `name[,<cond>...]` as `set-var(...)` gave it.
+    spec: Box<str>,
+    /// The end of the name in `spec`.
+    name_len: usize,
+    id: Option<u32>,
+    scope: Scope,
+    conds: bool,
+}
+
+impl VarRef {
+    /// Resolves `spec` (`name[,<cond>...]`), giving the name its number now.
+    #[must_use]
+    pub fn resolve(spec: &str) -> Self {
+        let name = spec.split(',').next().unwrap_or("");
+        Self {
+            spec: spec.into(),
+            name_len: name.len(),
+            id: if is_proc(name) { None } else { intern(name) },
+            scope: Scope::of(name),
+            conds: name.len() != spec.len(),
+        }
+    }
+
+    /// The variable's full name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.spec[..self.name_len]
+    }
+
+    /// The value of the variable: the running stream's `own` first when given, else the
+    /// thread's (as `var()` reads it).
+    #[must_use]
+    pub fn get(&self, own: Option<&VarStore>) -> Option<Sample> {
+        match self.id {
+            Some(id) => own.and_then(|m| m.get_id(id)).or_else(|| with_current(|m| m.get_id(id)).flatten()),
+            None => get(self.name()),
+        }
+    }
+
+    /// `set-var(<spec>)` of `val` in the stream `vars`: the conditions, the limits, the store.
+    pub fn store(&self, vars: &mut VarStore, val: In<'_>) {
+        let Some(id) = self.id else { return store_by_name(vars, &self.spec, val) };
+        if self.conds {
+            let new = match &val {
+                In::Owned(s) => s,
+                In::Ref(s) => *s,
+            };
+            // Only an integer is compared (`ifgt`/`iflt`): the stored value is not copied to look at it.
+            let (is_set, stored) = with_stream(vars, |m| (m.contains_id(id), m.int_id(id).map(Sample::Sint))).unwrap_or((false, None));
+            if !conds_hold(&self.spec, is_set, is_set, stored.as_ref(), new) {
+                return;
+            }
+        }
+        let procs = if limits_set() { proc_size() } else { 0 };
+        with_stream(vars, |m| put_id(m, id, self.scope, val, procs));
+    }
+
+    /// `unset-var(<name>)`.
+    pub fn unset(&self, vars: &mut VarStore) {
+        match self.id {
+            Some(id) => {
+                with_stream(vars, |m| m.remove_id(id));
+            }
+            None => unset_in(vars, self.name()),
+        }
+    }
+}
+
+/// [`VarRef::unset`] by name.
+pub fn unset_in(vars: &mut VarStore, name: &str) {
+    if is_proc(name) {
+        unset(name);
+        return;
+    }
+    with_stream(vars, |m| m.remove(name));
+}
+
+/// [`VarRef::store`] by name: `spec` is `name[,<cond>...]`.
+pub fn store_by_name(vars: &mut VarStore, spec: &str, val: In<'_>) {
+    let name = spec.split(',').next().unwrap_or("");
+    let new = match &val {
+        In::Owned(s) => s,
+        In::Ref(s) => *s,
+    };
+    // Only an integer is compared (`ifgt`/`iflt`): the stored value is not copied to look at it.
+    let (is_set, stored) = if is_proc(name) {
+        (is_set(name), get_proc(name).filter(|s| matches!(s, Sample::Sint(_))))
+    } else {
+        with_stream(vars, |m| (m.contains_key(name), m.int(name).map(Sample::Sint))).unwrap_or((false, None))
+    };
+    let exists = is_proc(name) || is_set;
+    if !conds_hold(spec, exists, is_set, stored.as_ref(), new) {
+        return;
+    }
+    with_stream(vars, |m| set_in(m, name, val));
 }
 
 // Accounting: `var_accounting_add` / `var_accounting_diff` (src/vars.c).

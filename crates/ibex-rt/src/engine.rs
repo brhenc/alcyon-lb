@@ -7698,17 +7698,17 @@ fn eval_tcp_req_session_rules(
                 // A constant (`str(hello)`) is copied in, with no allocation (T364 S6).
                 let e = rc.expr.as_ref();
                 if let Some(c) = e.and_then(|e| e.constant(registry)) {
-                    store_var_in(&mut sess.vars, var_name, ibex_sample::vars::In::Ref(c));
+                    store_var_in(&mut sess.vars, &rc.var(var_name), ibex_sample::vars::In::Ref(c));
                 } else if let Some(val) = e.and_then(|e| e.eval_sample(registry, &ctx)) {
-                    store_var_smp(&mut sess.vars, var_name, val);
+                    store_var_smp(&mut sess.vars, &rc.var(var_name), val);
                 }
             }
             ibex_config::TcpReqSessionAction::SetVarFmt { var_name, fmt: _ } => {
                 let val = render_rule_fmt(rc, &ctx, registry);
-                store_var(&mut sess.vars, var_name, val);
+                store_var(&mut sess.vars, &rc.var(var_name), val);
             }
             ibex_config::TcpReqSessionAction::UnsetVar { var_name } => {
-                unset_var(&mut sess.vars, var_name);
+                unset_var(&mut sess.vars, &rc.var(var_name));
             }
             ibex_config::TcpReqSessionAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
             ibex_config::TcpReqSessionAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
@@ -7950,9 +7950,9 @@ fn eval_tcp_req_content_rules(
                 // A constant (`str(hello)`) is copied in, with no allocation (T364 S6).
                 let e = rc.expr.as_ref();
                 if let Some(c) = e.and_then(|e| e.constant(registry)) {
-                    store_var_in(&mut sess.vars, var_name, ibex_sample::vars::In::Ref(c));
+                    store_var_in(&mut sess.vars, &rc.var(var_name), ibex_sample::vars::In::Ref(c));
                 } else if let Some(val) = e.and_then(|e| e.eval_sample(registry, &ctx)) {
-                    store_var_smp(&mut sess.vars, var_name, val);
+                    store_var_smp(&mut sess.vars, &rc.var(var_name), val);
                 }
             }
             ibex_config::TcpReqContentAction::DoResolve(d) => {
@@ -7975,7 +7975,7 @@ fn eval_tcp_req_content_rules(
                         }
                         crate::resolvers::DrStep::Done(ip) => {
                             if let Some(ip) = ip {
-                                store_var_smp(&mut sess.vars, &d.var_name, ip_sample(ip));
+                                ibex_sample::vars::store_by_name(&mut sess.vars, &d.var_name, ibex_sample::vars::In::Owned(ip_sample(ip)));
                             }
                         }
                     }
@@ -7986,10 +7986,10 @@ fn eval_tcp_req_content_rules(
             }
             ibex_config::TcpReqContentAction::SetVarFmt { var_name, fmt: _ } => {
                 let val = render_rule_fmt(rc, &ctx, registry);
-                store_var(&mut sess.vars, var_name, val);
+                store_var(&mut sess.vars, &rc.var(var_name), val);
             }
             ibex_config::TcpReqContentAction::UnsetVar { var_name } => {
-                unset_var(&mut sess.vars, var_name);
+                unset_var(&mut sess.vars, &rc.var(var_name));
             }
             ibex_config::TcpReqContentAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
             ibex_config::TcpReqContentAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
@@ -8132,12 +8132,12 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
                 return ContentEvalResult::SilentDrop(0);
             }
             ibex_config::TcpResAction::SetVar { var_name, expr: _ } => {
-                set_var_from(&mut sess.vars, var_name, rc.expr.as_ref(), &ctx, registry);
+                set_var_from(&mut sess.vars, &rc.var(var_name), rc.expr.as_ref(), &ctx, registry);
             }
             ibex_config::TcpResAction::SetVarFmt { var_name, fmt: _ } => {
-                store_var(&mut sess.vars, var_name, render_rule_fmt(rc, &ctx, registry));
+                store_var(&mut sess.vars, &rc.var(var_name), render_rule_fmt(rc, &ctx, registry));
             }
-            ibex_config::TcpResAction::UnsetVar { var_name } => unset_var(&mut sess.vars, var_name),
+            ibex_config::TcpResAction::UnsetVar { var_name } => unset_var(&mut sess.vars, &rc.var(var_name)),
         }
     }
     ContentEvalResult::Done
@@ -8146,7 +8146,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
 /// `set-var(<name>) <expr>`: `action_store` (src/vars.c) -- a sample that cannot be
 /// fetched sets nothing. A constant expression (`str(hello)`, `int(5)`) is evaluated once and
 /// copied into the variable: no allocation (T364 S6).
-fn set_var_from(vars: &mut VarStore, name: &str, e: Option<&Expr>, ctx: &SampleContext, registry: &Registry) {
+fn set_var_from(vars: &mut VarStore, name: &ibex_sample::vars::VarRef, e: Option<&Expr>, ctx: &SampleContext, registry: &Registry) {
     let Some(e) = e else { return };
     if let Some(c) = e.constant(registry) {
         store_var_in(vars, name, ibex_sample::vars::In::Ref(c));
@@ -8156,12 +8156,8 @@ fn set_var_from(vars: &mut VarStore, name: &str, e: Option<&Expr>, ctx: &SampleC
 }
 
 /// `unset-var(<name>)`, from the scope it lives in.
-fn unset_var(vars: &mut VarStore, name: &str) {
-    if name.starts_with("proc.") {
-        ibex_sample::vars::unset(name);
-        return;
-    }
-    ibex_sample::vars::with_stream(vars, |m| m.remove(name));
+fn unset_var(vars: &mut VarStore, var: &ibex_sample::vars::VarRef) {
+    var.unset(vars);
 }
 
 /// Stores a variable where its scope lives, and where the rules after it read it.
@@ -8169,7 +8165,7 @@ fn unset_var(vars: &mut VarStore, name: &str) {
 /// `set-var-fmt(<name>) <fmt>`: the format is built in a trash chunk, so the value is cut
 /// at `tune.bufsize - 1` bytes (T251).
 /// The value is a `str`, as `HAProxy`'s `SMP_T_STR` (T364).
-fn store_var(vars: &mut VarStore, name: &str, mut val: String) {
+fn store_var(vars: &mut VarStore, name: &ibex_sample::vars::VarRef, mut val: String) {
     ibex_sample::registry::truncate_to_trash(&mut val);
     store_var_smp(vars, name, Sample::Str(val));
 }
@@ -8213,31 +8209,14 @@ fn ip_sample(ip: IpAddr) -> Sample {
     }
 }
 
-fn store_var_smp(vars: &mut VarStore, spec: &str, val: Sample) {
+fn store_var_smp(vars: &mut VarStore, spec: &ibex_sample::vars::VarRef, val: Sample) {
     store_var_in(vars, spec, ibex_sample::vars::In::Owned(val));
 }
 
 /// [`store_var_smp`] of a sample to keep or to copy. `vars` is the session's store; while the
 /// stream runs its variables are the thread's (`ibex_sample::vars::with_stream`).
-fn store_var_in(vars: &mut VarStore, spec: &str, val: ibex_sample::vars::In<'_>) {
-    use ibex_sample::vars::In;
-    let name = spec.split(',').next().unwrap_or("");
-    let new = match &val {
-        In::Owned(s) => s,
-        In::Ref(s) => *s,
-    };
-    // Only an integer is compared (`ifgt`/`iflt`): the stored value is not copied to look at it.
-    let check = |m: &VarStore| (m.contains_key(name), m.int(name).map(Sample::Sint));
-    let (is_set, stored) = if name.starts_with("proc.") {
-        (ibex_sample::vars::is_set(name), ibex_sample::vars::get_proc(name).filter(|s| matches!(s, Sample::Sint(_))))
-    } else {
-        ibex_sample::vars::with_stream(vars, |m| check(m)).unwrap_or((false, None))
-    };
-    let exists = name.starts_with("proc.") || is_set;
-    if !ibex_sample::var_conds_hold(spec, exists, is_set, stored.as_ref(), new) {
-        return;
-    }
-    ibex_sample::vars::with_stream(vars, |m| ibex_sample::vars::set_in(m, name, val));
+fn store_var_in(vars: &mut VarStore, var: &ibex_sample::vars::VarRef, val: ibex_sample::vars::In<'_>) {
+    var.store(vars, val);
 }
 
 /// Runs `f` with `sess`'s variables in the thread's `CURRENT_VARS`, where the fetches and
@@ -12519,14 +12498,14 @@ impl EngineDispatcher<'_> {
                         break 'rules None;
                     }
                     ibex_config::TcpResAction::SetVar { var_name, expr: _ } => {
-                        set_var_from(&mut entry.sess.vars, var_name, rc.expr.as_ref(), tcp_ctx, registry);
+                        set_var_from(&mut entry.sess.vars, &rc.var(var_name), rc.expr.as_ref(), tcp_ctx, registry);
                     }
                     ibex_config::TcpResAction::SetVarFmt { var_name, fmt: _ } => {
                         let val = render_rule_fmt(rc, tcp_ctx, registry);
-                        store_var(&mut entry.sess.vars, var_name, val);
+                        store_var(&mut entry.sess.vars, &rc.var(var_name), val);
                     }
                     ibex_config::TcpResAction::UnsetVar { var_name } => {
-                        unset_var(&mut entry.sess.vars, var_name);
+                        unset_var(&mut entry.sess.vars, &rc.var(var_name));
                     }
                 }
             }
@@ -13924,7 +13903,7 @@ impl EngineDispatcher<'_> {
                             }
                             // A wait past its bound goes on with no address, like an empty answer.
                             crate::resolvers::DrStep::Wait | crate::resolvers::DrStep::Done(None) => {}
-                            crate::resolvers::DrStep::Done(Some(ip)) => store_var_smp(&mut sess.vars, &d.var_name, ip_sample(ip)),
+                            crate::resolvers::DrStep::Done(Some(ip)) => ibex_sample::vars::store_by_name(&mut sess.vars, &d.var_name, ibex_sample::vars::In::Owned(ip_sample(ip))),
                         }
                         if held.is_some() {
                             if let Some(t) = sess.txn.as_mut() {
@@ -13940,18 +13919,18 @@ impl EngineDispatcher<'_> {
                         // A constant (`str(hello)`) is copied in, with no allocation (T364 S6).
                         let e = rc.expr.as_ref();
                         if let Some(c) = e.and_then(|e| e.constant(registry)) {
-                            store_var_in(&mut sess.vars, var_name, ibex_sample::vars::In::Ref(c));
+                            store_var_in(&mut sess.vars, &rc.var(var_name), ibex_sample::vars::In::Ref(c));
                         } else if let Some(val) = e.and_then(|e| e.eval_sample(registry, &make_ctx!(sess))) {
-                            store_var_smp(&mut sess.vars, var_name, val);
+                            store_var_smp(&mut sess.vars, &rc.var(var_name), val);
                         }
                     }
                     ibex_config::HttpReqAction::SetVarFmt { var_name, fmt } => {
                         let mut val = String::with_capacity(fmt.len());
                         rc.fmt.iter().for_each(|f| render_rule_format(f, &mut val, &make_ctx!(sess), registry, sess, proxies));
-                        store_var(&mut sess.vars, var_name, val);
+                        store_var(&mut sess.vars, &rc.var(var_name), val);
                     }
                     ibex_config::HttpReqAction::UnsetVar { var_name } => {
-                        unset_var(&mut sess.vars, var_name);
+                        unset_var(&mut sess.vars, &rc.var(var_name));
                     }
                     ibex_config::HttpReqAction::StrictMode { on } => {
                         STRICT_MODE.set(*on);
@@ -16863,7 +16842,7 @@ fn res_action(
         }
         ResOp::Del(name) => {
             if let Some(var_name) = name.strip_prefix("\0unset-var:") {
-                unset_var(vars, var_name);
+                ibex_sample::vars::unset_in(vars, var_name);
                 return Ok(true);
             }
             let freed: usize = hdrs.iter().filter(|(k, _)| header_name_matches(k, name)).map(|(k, v)| htx_hdr_size(k, v)).sum();
@@ -16909,13 +16888,13 @@ fn res_action(
     }
     if let Some(var_name) = act_name.strip_prefix("\0set-var:") {
         // A fetch that finds nothing leaves the variable as it was (`action_store`).
-        set_var_from(vars, var_name, rc.expr.as_ref(), ctx, registry);
+        set_var_from(vars, &rc.var(var_name), rc.expr.as_ref(), ctx, registry);
         return Ok(true);
     }
     if let Some(var_name) = act_name.strip_prefix("\0set-var-fmt:") {
         let mut val = String::with_capacity(act_fmt.len());
         rc.fmt.iter().for_each(|f| render_res_format(f, &mut val, ctx, registry, *status));
-        store_var(vars, var_name, val);
+        store_var(vars, &rc.var(var_name), val);
         return Ok(true);
     }
     if act_name == "\0strict-mode" {

@@ -733,6 +733,24 @@ pub struct Compiled {
     multi: Option<MultiFetchFn>,
     visit: Option<VisitFetchFn>,
     convs: Vec<(TypeSpec, ConvRef)>,
+    /// `var(<name>)`: the variable resolved at load (T595), read by number.
+    var: Option<crate::vars::VarRef>,
+}
+
+impl Compiled {
+    /// Resolves the variable `var(<name>)` names (`vars_hash_name` at parse).
+    pub(crate) fn resolve_var(&mut self, name: &str) {
+        self.var = Some(crate::vars::VarRef::resolve(name));
+    }
+
+    /// The single fetch's sample: `var()` by the number it was given at load.
+    fn fetch_single(&self, ctx: &SampleContext, args: &[String]) -> Option<Sample> {
+        if let Some(v) = &self.var {
+            // `smp_fetch_var`: the variable, else the default (a string).
+            return v.get(ctx.vars).or_else(|| args.get(1).cloned().map(Sample::Str));
+        }
+        self.single.and_then(|f| f(ctx, args))
+    }
 }
 
 impl std::fmt::Debug for Compiled {
@@ -6675,7 +6693,7 @@ impl Registry {
                 convs.push((d.in_type, ConvRef::WithCtx(d.func)));
             }
         }
-        Some(Compiled { single, multi, visit, convs })
+        Some(Compiled { single, multi, visit, convs, var: None })
     }
 
     fn apply_c<S>(c: &Compiled, ctx: &SampleContext, mut smp: Sample, converters: &[(S, Vec<String>)]) -> Option<Sample> {
@@ -6690,7 +6708,7 @@ impl Registry {
         // `compile` gives a multi or a single fetch, never neither.
         let initial: Vec<Sample> = match c.multi {
             Some(mf) => mf(ctx, fetch_args),
-            None => c.single.and_then(|f| f(ctx, fetch_args)).into_iter().collect(),
+            None => c.fetch_single(ctx, fetch_args).into_iter().collect(),
         };
         let mut out = Vec::with_capacity(initial.len());
         for smp in initial {
@@ -6729,7 +6747,7 @@ impl Registry {
                     None => break,
                 }
             }
-        } else if let Some(res) = c.single.and_then(|func| func(ctx, fetch_args)).and_then(|smp| Self::apply_c(c, ctx, smp, converters)) {
+        } else if let Some(res) = c.fetch_single(ctx, fetch_args).and_then(|smp| Self::apply_c(c, ctx, smp, converters)) {
             see(res);
         }
         any
@@ -6738,7 +6756,7 @@ impl Registry {
     /// [`Self::eval_g`] through a compiled expression: no name is looked up.
     pub(crate) fn eval_c<S>(c: &Compiled, fetch_args: &[String], converters: &[(S, Vec<String>)], ctx: &SampleContext) -> Option<Sample> {
         match c.single {
-            Some(func) => Self::apply_c(c, ctx, func(ctx, fetch_args)?, converters),
+            Some(_) => Self::apply_c(c, ctx, c.fetch_single(ctx, fetch_args)?, converters),
             None => Self::eval_all_c(c, fetch_args, converters, ctx).into_iter().next(),
         }
     }
