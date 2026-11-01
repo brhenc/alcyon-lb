@@ -15,12 +15,12 @@ needs `fixed_on`; `fixed` (time) feeds the mean time to fix. Check with
 never an open finding. Then `python3 tools/findings.py --md` and commit the CSVs and this file.
 
 ```
-== (a) open findings: 15 of 86
-severity      crash       dos    parity     flaky  total
-critical          0         0         0         0      0
-high              0         0         0         0      0
-medium            1         2         2         0      5
-low               0         3         6         1     10
+== (a) open findings: 16 of 87
+severity  smuggling     crash       dos    parity     flaky  total
+critical          0         0         0         0         0      0
+high              1         0         0         0         0      1
+medium            0         1         2         2         0      5
+low               0         0         3         6         1     10
 
 == (b) new findings per method per day
 day               vv-battery           vv-soak          vv-probe           redteam    fuzz-libfuzzer fuzz-differential            review              gate
@@ -32,13 +32,13 @@ day               vv-battery           vv-soak          vv-probe           redte
 2026-10-19                 0                 0                 2                 0                 0                 0                 1                 0
 2026-10-25                 1                 0                 4                 0                 0                 0                 0                 0
 2026-10-31                 0                 0                 1                 0                 0                 0                 0                 0
-2026-11-01                 2                 1                 1                 0                 0                 0                 0                 0
+2026-11-01                 2                 1                 2                 0                 0                 0                 0                 0
 
 == (c) clean hours since the method's last new finding (runs on the main lineage)
 method               hours  last finding     runs
 vv-battery             0.0  2026-11-01 02:27 0
 vv-soak                0.0  2026-11-01 00:18 0
-vv-probe               0.0  2026-11-01 00:10 0
+vv-probe               0.0  2026-11-01 05:16 0
 vv-recheck             1.0  never            7
 redteam                5.6  2026-10-12 12:31 37
 fuzz-libfuzzer         3.0  2026-10-10 22:18 4

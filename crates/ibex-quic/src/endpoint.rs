@@ -97,6 +97,9 @@ struct Live {
     queued: bool,
     /// In `timer_stale`: its deadline is asked again at the next `poll_timeout`.
     timer_stale: bool,
+    /// `ConnectionClosed` was queued for it. quinn raises `ConnectionLost` for an end the
+    /// peer or the network caused, not for a `close()` of ours (T561).
+    reported: bool,
 }
 
 /// A QUIC server endpoint: quinn-proto's endpoint, its connections by handle, packet dispatch.
@@ -442,7 +445,7 @@ impl QuicEndpoint {
                 }
                 let slot = &mut self.slots[idx];
                 slot.gen = slot.gen.wrapping_add(1);
-                slot.live = Some(Live { conn, cid: primary_cid, budget, queued: false, timer_stale: false });
+                slot.live = Some(Live { conn, cid: primary_cid, budget, queued: false, timer_stale: false, reported: false });
                 let c = self.handle_at(idx);
                 #[allow(clippy::cast_possible_truncation)]
                 self.active_handles.push(idx as u32);
@@ -721,6 +724,7 @@ impl QuicEndpoint {
                         }
                     };
 
+                    live.reported = true;
                     self.event_queue.push_back(TransportEvent::ConnectionClosed {
                         conn: conn_ref,
                         error_code,
@@ -805,7 +809,17 @@ impl QuicEndpoint {
     /// Forgets the connection in slot `idx`: its deadline, its half-open count, its place in
     /// `active_handles`. Its `to_poll` entry, if any, is skipped by its generation later.
     fn remove_slot(&mut self, idx: usize) {
+        let handle = self.handle_at(idx);
         let Some(live) = self.slots.get_mut(idx).and_then(|s| s.live.take()) else { return };
+        // Drained after a close of ours: quinn said nothing, so the end is reported here, the
+        // one place every connection leaves by (T561).
+        if !live.reported {
+            self.event_queue.push_back(TransportEvent::ConnectionClosed {
+                conn: handle,
+                error_code: 0,
+                reason: b"clean close".to_vec(),
+            });
+        }
         // Released before its address was validated (`quic_conn_release`).
         if !live.budget.validated {
             self.half_open_done();
