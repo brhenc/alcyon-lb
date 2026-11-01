@@ -5020,6 +5020,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         ibex_alloc::set_trim_disabled(config.global.as_ref().is_some_and(|g| g.no_memory_trimming));
         // Both off unless configured (the user, 2026-10-24: comparisons with HAProxy stay fair).
         ibex_alloc::set_zero_buffers(config.global.as_ref().and_then(|g| g.zero_buffers).unwrap_or(false));
+        ibex_alloc::set_ssl_zero_on_free(config.global.as_ref().is_some_and(|g| g.ssl_zero_on_free));
         ibex_alloc::set_ssl_zero_buffers(config.global.as_ref().and_then(|g| g.ssl_zero_buffers).unwrap_or(true));
         ibex_alloc::set_zero_spares(config.global.as_ref().and_then(|g| g.zero_spares).unwrap_or(false));
         // `tune.ibex.zero-on-free` (T459, off unless configured): read by the binary's allocator

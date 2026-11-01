@@ -276,6 +276,9 @@ struct Hot {
     wipe_spares: Cell<bool>,
     /// `tune.ibex.ssl-zero-buffers` (default on).
     wipe_ssl: Cell<bool>,
+    /// `tune.ibex.ssl-zero-buffers on-free` with the wipe on: a pooled TLS buffer is wiped when
+    /// its pool frees it, not when it is given back.
+    wipe_ssl_free: Cell<bool>,
     /// `tune.fail-alloc` under `-dMfail`: the percentage of misses refused (0: none).
     fail: Cell<u8>,
     /// The last refusal was one of `tune.fail-alloc`'s ([`take_injected`]).
@@ -299,6 +302,7 @@ thread_local! {
             wipe: Cell::new(false),
             wipe_spares: Cell::new(false),
             wipe_ssl: Cell::new(true),
+            wipe_ssl_free: Cell::new(false),
             fail: Cell::new(0),
             injected: Cell::new(false),
             rng: Cell::new(0),
@@ -443,6 +447,19 @@ pub(crate) fn wipe_ssl_on() -> bool {
     HOT.try_with(|h| h.wipe_ssl.get()).unwrap_or(true)
 }
 
+/// Whether a pooled TLS buffer is wiped when its pool frees it instead of when it is given back
+/// (`tune.ibex.ssl-zero-buffers on-free`). On when the thread is ending: whatever a dying
+/// thread's pool frees is wiped.
+#[inline]
+pub(crate) fn wipe_ssl_deferred() -> bool {
+    HOT.try_with(|h| h.wipe_ssl_free.get()).unwrap_or(true)
+}
+
+#[cfg(feature = "test-probe")]
+pub(crate) fn set_thread_wipe_ssl_free(on: bool) {
+    let _ = HOT.try_with(|h| h.wipe_ssl_free.set(on));
+}
+
 /// Sets this thread's copy of `tune.ibex.ssl-zero-buffers` only, until its next refresh: for a
 /// test that must not change the setting under the other tests of its process
 /// ([`crate::stack_probe`]).
@@ -468,6 +485,7 @@ fn refresh_local() {
             h.wipe.set(crate::zero_buffers());
             h.wipe_spares.set(crate::zero_spares());
             h.wipe_ssl.set(crate::ssl_zero_buffers());
+            h.wipe_ssl_free.set(crate::ssl_zero_buffers() && crate::ssl_zero_on_free());
             h.fail.set(FAIL_RATE.load(Ordering::Relaxed));
             h.bytes.get() > max
         })

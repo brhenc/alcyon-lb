@@ -42,12 +42,43 @@ pub use rustls24::TlsInputBuffer as InputBuffer;
 /// The output `Vec` is made with this capacity and never grows past it after the handshake.
 pub const TX_CAP: usize = 2 * (16_384 + 512);
 
+/// A `tls_tx` chunk. Under `tune.ibex.ssl-zero-buffers on-free` it is not wiped when given back;
+/// the pool's free (trim, budget, thread exit, stop) drops it, and this `Drop` wipes all of its
+/// capacity (T553). Under `on` the session wiped it at the give-back already.
+pub struct TxChunk(Vec<u8>);
+
+impl Drop for TxChunk {
+    fn drop(&mut self) {
+        if self.0.capacity() != 0 && ibex_alloc::ssl_wipe_deferred() {
+            let cap = self.0.capacity();
+            self.0.clear();
+            self.0.resize(cap, 0);
+            ibex_alloc::wipe_ssl_fast(&mut self.0);
+        }
+    }
+}
+
+impl ibex_alloc::Poolable for TxChunk {
+    fn footprint(&self) -> usize {
+        self.0.capacity()
+    }
+    fn reset(&mut self, _wipe: bool) {
+        self.0.clear();
+    }
+    fn keep(&self, max_footprint: usize) -> bool {
+        self.0.capacity() != 0 && self.0.capacity() <= max_footprint
+    }
+    fn try_new() -> Option<Self> {
+        Some(TxChunk(Vec::new()))
+    }
+}
+
 ibex_alloc::declare_pool!(
     /// `show pools` `tls_tx`: the ciphertext a TLS session has for the socket (T541). One chunk is
     /// [`TX_CAP`]: two records of 16,384 bytes of plaintext (the TLS maximum) and 512 bytes each
     /// for the header, nonce/IV, MAC or tag and padding of either protocol version; a chunk that
     /// grew (a handshake with a long certificate chain) is freed on give, not pooled.
-    static TLS_TX: Pool<Vec<u8>> = ibex_alloc::PoolSpec::new("tls_tx").size(TX_CAP).max_item(TX_CAP);
+    static TLS_TX: Pool<TxChunk> = ibex_alloc::PoolSpec::new("tls_tx").size(TX_CAP).max_item(TX_CAP);
 );
 
 /// Lists the `tls_tx` pool in `show pools` from the start.
@@ -249,9 +280,9 @@ impl TlsCtx {
     /// to an allocation of the same size, which [`Self::tx_release`] frees.
     fn tx_take(&mut self) {
         if self.tx.capacity() == 0 {
-            match TLS_TX.take_counted(|| Some(Vec::with_capacity(TX_CAP))) {
-                Some(v) => {
-                    self.tx = v;
+            match TLS_TX.take_counted(|| Some(TxChunk(Vec::with_capacity(TX_CAP)))) {
+                Some(mut c) => {
+                    self.tx = std::mem::take(&mut c.0);
                     self.tx_pooled = true;
                 }
                 None => {
@@ -270,15 +301,20 @@ impl TlsCtx {
         }
         self.tx_hw = self.tx_hw.max(self.tx.len());
         let mut v = std::mem::take(&mut self.tx);
-        // `clear` and `drain` leave the old bytes past `len`: they are still in the capacity.
-        if self.tx_hw > v.len() {
-            v.resize(self.tx_hw, 0);
+        let pooled = std::mem::take(&mut self.tx_pooled);
+        // `on-free`: a chunk going back to the pool is wiped by `TxChunk::drop` when the pool
+        // frees it (T553); one that is not pooled is freed here, so it is wiped here.
+        if !(pooled && ibex_alloc::ssl_wipe_deferred()) {
+            // `clear` and `drain` leave the old bytes past `len`: they are still in the capacity.
+            if self.tx_hw > v.len() {
+                v.resize(self.tx_hw, 0);
+            }
+            ibex_alloc::wipe_ssl_fast(&mut v);
         }
-        ibex_alloc::wipe_ssl_fast(&mut v);
         v.clear();
         self.tx_hw = 0;
-        if std::mem::take(&mut self.tx_pooled) {
-            TLS_TX.give_counted(v);
+        if pooled {
+            TLS_TX.give_counted(TxChunk(v));
         }
     }
 

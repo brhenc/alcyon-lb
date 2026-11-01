@@ -54,3 +54,8 @@ pub fn copy_below(out: &mut [u8]) {
 pub fn set_thread_ssl_zero_buffers(on: bool) {
     crate::pool::set_thread_wipe_ssl(on);
 }
+
+/// Sets this thread's copy of the `on-free` mode of `tune.ibex.ssl-zero-buffers` only.
+pub fn set_thread_ssl_zero_on_free(on: bool) {
+    crate::pool::set_thread_wipe_ssl_free(on);
+}

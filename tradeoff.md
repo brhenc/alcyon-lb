@@ -738,6 +738,14 @@ row is here because the behaviour is surprising or measurable, not because it di
 | **Decision** | Keep T541 as it is: 34 KB per idle TLS connection against ≈260 ins (0.5 %) per keep-alive TLS response, with HAProxy on the same side of the trade at a higher price. `tune.ibex.ssl-zero-buffers off` buys the wipe's share back. |
 | **V&V probe** | RSS at 10k idle TLS connections vs HAProxy (expect Ibex below); requests/s on one keep-alive TLS connection vs before T541 (expect within 0.5 %); `show pools` `tls_tx` used ≈ connections with ciphertext in flight, never ≈ connections. |
 
+**T553: `tune.ibex.ssl-zero-buffers on-free`** (user 2026-10-31, C541 option 5: "make it a setting"; default stays `on`).
+
+| | |
+|---|---|
+| **What** | A third value. `on-free` wipes a `tls_tx` chunk (all of its capacity) when the pool really frees it (trim, memory budget, thread exit, stop: `TxChunk::drop`, `ibex-tls/src/conn.rs`), not each time a drained response gives it back (`tx_release`). A chunk that is not pooled (the pool refused) is still wiped at release. The stack scrub and the plaintext buffers are unchanged. |
+| **Weaker guarantee** | Between connections of a thread an idle pooled chunk carries the previous connection's ciphertext until the next response overwrites it. Only ciphertext already on the wire; safe Rust never reads past a `Vec`'s `len`; visible in a core dump or through a memory-disclosure defect in the process. Hence opt-in. |
+| **Measured** | 2026-11-01, `tools/measure/insreq.sh` ab1/ab1s, release-perf, slot B (CPUs 12-14), min of 10 rounds (2 x 5), base 4923a1b6 -> T553 with `on` / `on-free`: `tls ab1s` 54,100 -> 54,181 (+81, +0.15 %) / 54,141 (+41, +0.08 %); 16,000-byte body, ab1s (backend a Python server on CPU 14) 99,533 -> 99,628 (+95, +0.10 %) / 98,695 (**-838, -0.84 %**); keepalive ab1 48,125 -> 48,125 / 48,125; rules ab1 77,268 -> 77,243 (-25) / 77,260 (-8). The default `on` costs the pool-chunk newtype and one more thread-local flag read per give-back (about 80 instructions); `on-free` buys back the 16 KB wipe (about 1 instruction per 18 bytes) and more. |
+
 ### 6.33 `-m` with many threads is refused at start, loudly (T557, VV-29) — **measured 2026-11-01; a deliberate divergence**
 
 | | |
