@@ -9744,3 +9744,21 @@ mod dn_sample_tests {
         assert_eq!(dn_sample(NAME, &args(&["", "", "xx"])), None);
     }
 }
+
+#[cfg(test)]
+mod compiled_multi_only {
+    use super::{Registry, Sample, SampleContext};
+
+    #[test]
+    fn a_compiled_multi_only_fetch_gives_its_first_sample() {
+        // Every shipped multi fetch also has a single one; a fetch registered with
+        // `register_multi_fetch` alone takes the list path of `eval_c`.
+        let mut r = Registry::new();
+        r.register_multi_fetch("t574_multi_only", |_, _| vec![Sample::Sint(7), Sample::Sint(8)]);
+        let none: &[(&str, Vec<String>)] = &[];
+        let c = r.compile("t574_multi_only", none).unwrap();
+        let ctx = SampleContext::default();
+        assert_eq!(Registry::eval_c(&c, &[], none, &ctx), Some(Sample::Sint(7)));
+        assert_eq!(Registry::eval_all_c(&c, &[], none, &ctx), vec![Sample::Sint(7), Sample::Sint(8)]);
+    }
+}

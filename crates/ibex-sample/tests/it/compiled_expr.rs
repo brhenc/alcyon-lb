@@ -47,7 +47,7 @@ fn the_compiled_path_gives_the_by_name_answers() {
 
 #[test]
 fn a_multi_only_fetch_gives_its_first_sample_through_the_compiled_path() {
-    // `req.ssl_alpn` has no single-sample fetch: the compiled path falls back to the list.
+    // `req.ssl_alpn` (single and multi fetch) with no payload: nothing, and no name looked up.
     let (n, m, smp) = lookups_in_one_eval("req.ssl_alpn -m found");
     assert_eq!(n, 0);
     assert!(!m);
