@@ -143,9 +143,9 @@ fn encode_prefixed_int(out: &mut Vec<u8>, prefix_bits: u8, mask: u8, mut value: 
 ///
 /// Huffman would be smaller; leaving it off keeps the encoder to one page and makes the
 /// bytes readable in a capture, which matters more while this path is being brought up.
-fn encode_string(out: &mut Vec<u8>, s: &str, prefix_bits: u8, mask: u8) {
+fn encode_string(out: &mut Vec<u8>, s: &[u8], prefix_bits: u8, mask: u8) {
     encode_prefixed_int(out, prefix_bits, mask, s.len());
-    out.extend_from_slice(s.as_bytes());
+    out.extend_from_slice(s);
 }
 
 /// Encodes a header list as a QPACK field section using only the static table and literals.
@@ -156,15 +156,15 @@ fn encode_string(out: &mut Vec<u8>, s: &str, prefix_bits: u8, mask: u8) {
 pub fn encode_field_section(headers: &[(String, String)]) -> Vec<u8> {
     let mut out = vec![0x00, 0x00];
     for (name, value) in headers {
-        put_field(&mut out, &name.to_ascii_lowercase(), value);
+        put_field(&mut out, &name.to_ascii_lowercase(), value.as_bytes());
     }
     out
 }
 
 /// Appends one field line (`name` lowercase): a static reference with one search of the
 /// table ([`crate::qpack::static_ref`]), else literals. Allocates nothing.
-fn put_field(out: &mut Vec<u8>, name: &str, value: &str) {
-    match crate::qpack::static_ref(name, value) {
+fn put_field(out: &mut Vec<u8>, name: &str, value: &[u8]) {
+    match crate::qpack::static_ref_octets(name, value) {
         // Indexed field line, static table: 1 1 index(6+)
         StaticRef::Full(idx) => encode_prefixed_int(out, 6, 0xc0, idx),
         StaticRef::Name(idx) => {
@@ -174,7 +174,7 @@ fn put_field(out: &mut Vec<u8>, name: &str, value: &str) {
         }
         StaticRef::None => {
             // Literal with literal name: 0 0 1 N=0 H=0 len(3+)
-            encode_string(out, name, 3, 0x20);
+            encode_string(out, name.as_bytes(), 3, 0x20);
             encode_string(out, value, 7, 0x00);
         }
     }
@@ -853,23 +853,33 @@ impl H3MuxContext {
     }
 
     /// The response head (`status`, `headers`) of stream `id` as a HEADERS frame.
-    fn put_head<'h>(&mut self, id: u64, status: Option<u16>, headers: impl Iterator<Item = (&'h str, &'h str)>) {
+    fn put_head<'h>(&mut self, id: u64, status: Option<u16>, headers: impl Iterator<Item = (&'h str, &'h [u8])>) {
+        self.put_head_of(id, status, headers, false);
+    }
+
+    /// [`Self::put_head`]; `lowered`: the names are in lower case already (E2).
+    fn put_head_of<'h>(&mut self, id: u64, status: Option<u16>, headers: impl Iterator<Item = (&'h str, &'h [u8])>, lowered: bool) {
         let Self { streams, scratch, lower, .. } = self;
         let Some(st) = streams.get_mut(&id) else { return };
         scratch.clear();
         scratch.extend_from_slice(&[0x00, 0x00]);
         if let Some(status) = status {
             let mut digits = [0u8; 5];
-            put_field(scratch, ":status", status_text(status, &mut digits));
+            put_field(scratch, ":status", status_text(status, &mut digits).as_bytes());
         }
         for (name, value) in headers {
-            lower.clear();
-            lower.push_str(name);
-            lower.make_ascii_lowercase();
-            if HOP_BY_HOP.contains(&lower.as_str()) || lower.starts_with(':') {
+            let name = if lowered {
+                name
+            } else {
+                lower.clear();
+                lower.push_str(name);
+                lower.make_ascii_lowercase();
+                lower.as_str()
+            };
+            if HOP_BY_HOP.contains(&name) || name.starts_with(':') {
                 continue;
             }
-            put_field(scratch, lower, value);
+            put_field(scratch, name, value);
         }
         encode_varint(&mut st.tx, FRAME_HEADERS);
         encode_varint(&mut st.tx, scratch.len() as u64);
@@ -879,13 +889,6 @@ impl H3MuxContext {
     fn live(&self, id: u64) -> bool {
         self.streams.get(&id).is_some_and(|st| st.is_live())
     }
-}
-
-/// An HTTP/1 response head: its status and its header lines. `None` if it is not one.
-fn parse_head(head: &str) -> Option<(u16, impl Iterator<Item = (&str, &str)>)> {
-    let mut lines = head.lines();
-    let status = lines.next()?.split_whitespace().nth(1)?.parse::<u16>().ok()?;
-    Some((status, lines.filter_map(|l| l.split_once(':')).map(|(n, v)| (n.trim(), v.trim()))))
 }
 
 /// What the demux of a stream borrows from its connection.
@@ -1251,9 +1254,19 @@ impl HtxMux for H3MuxContext {
         if !self.live(id) {
             return true;
         }
-        let text = String::from_utf8_lossy(head);
-        let Some((status, headers)) = parse_head(&text) else { return false };
+        let Some((status, headers)) = crate::response_head::mux_head_lines(head) else { return false };
         self.put_head(id, Some(status), headers);
+        if let Some(st) = self.streams.get_mut(&id).filter(|_| end_stream) {
+            st.tx_fin = true;
+        }
+        true
+    }
+
+    fn send_head_fields<'h>(&mut self, id: u64, status: u16, fields: impl Iterator<Item = (&'h str, &'h [u8])>, end_stream: bool) -> bool {
+        if !self.live(id) {
+            return true;
+        }
+        self.put_head_of(id, Some(status), fields, true);
         if let Some(st) = self.streams.get_mut(&id).filter(|_| end_stream) {
             st.tx_fin = true;
         }
@@ -1277,7 +1290,7 @@ impl HtxMux for H3MuxContext {
 
     fn send_trailers(&mut self, id: u64, trailers: &[(&str, &str)]) -> bool {
         if self.live(id) {
-            self.put_head(id, None, trailers.iter().copied());
+            self.put_head(id, None, trailers.iter().map(|&(n, v)| (n, v.as_bytes())));
             if let Some(st) = self.streams.get_mut(&id) {
                 st.tx_fin = true;
             }
@@ -1289,8 +1302,7 @@ impl HtxMux for H3MuxContext {
         if !self.live(id) {
             return true;
         }
-        let text = String::from_utf8_lossy(head);
-        let Some((status, headers)) = parse_head(&text).filter(|(s, _)| (100..200).contains(s)) else { return false };
+        let Some((status, headers)) = crate::response_head::mux_head_lines(head).filter(|(s, _)| (100..200).contains(s)) else { return false };
         self.put_head(id, Some(status), headers);
         if let Some(st) = self.streams.get_mut(&id) {
             st.interim_sent = true;

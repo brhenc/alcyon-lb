@@ -110,6 +110,14 @@ pub enum Verdict {
 /// without the option: `ibex_proto::response_head`.)
 #[must_use]
 pub fn check_response(head: &[u8], status: u16, req: &ReqWs, accept_unsafe: bool) -> Verdict {
+    ibex_proto::response_head::count_head_scan();
+    check_response_uncounted(head, status, req, accept_unsafe)
+}
+
+/// [`check_response`], not counted as a pass over the head (what a debug build checks the
+/// indexed reading against).
+#[must_use]
+pub fn check_response_uncounted(head: &[u8], status: u16, req: &ReqWs, accept_unsafe: bool) -> Verdict {
     // The usual response names no upgrade: nothing to read, nothing allocated.
     if status != 101 && !head.windows(7).any(|w| w.eq_ignore_ascii_case(b"upgrade")) {
         return Verdict::Keep;

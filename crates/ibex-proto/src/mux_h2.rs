@@ -969,7 +969,13 @@ impl H2MuxContext {
     /// Encodes and queues a HEADERS frame for a response, dropping the connection-specific
     /// headers HTTP/2 forbids (RFC 7540 section 8.1.2.2). Encoded straight into `tx_buf`,
     /// the names lowercased in a buffer the connection keeps (T437).
-    fn send_headers_frame<'h>(&mut self, stream_id: u32, status: u16, headers: impl Iterator<Item = (&'h str, &'h str)>, end_stream: bool) {
+    fn send_headers_frame<'h>(&mut self, stream_id: u32, status: u16, headers: impl Iterator<Item = (&'h str, &'h [u8])>, end_stream: bool) {
+        self.send_headers_frame_of(stream_id, status, headers, end_stream, false);
+    }
+
+    /// [`Self::send_headers_frame`]; `lowered`: the names are in lower case already, and
+    /// are not copied to be lowered (E2).
+    fn send_headers_frame_of<'h>(&mut self, stream_id: u32, status: u16, headers: impl Iterator<Item = (&'h str, &'h [u8])>, end_stream: bool, lowered: bool) {
         let flags = if end_stream {
             frame_flags::END_HEADERS | frame_flags::END_STREAM
         } else {
@@ -980,13 +986,18 @@ impl H2MuxContext {
         self.encoder.encode_field(":status", status_text(status, &mut digits), &mut self.tx_buf);
         let mut lower = std::mem::take(&mut self.lower_name);
         for (name, val) in headers {
-            lower.clear();
-            lower.push_str(name);
-            lower.make_ascii_lowercase();
-            if matches!(lower.as_str(), "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade") {
+            let name = if lowered {
+                name
+            } else {
+                lower.clear();
+                lower.push_str(name);
+                lower.make_ascii_lowercase();
+                lower.as_str()
+            };
+            if matches!(name, "connection" | "keep-alive" | "proxy-connection" | "transfer-encoding" | "upgrade") {
                 continue;
             }
-            self.encoder.encode_field(&lower, val, &mut self.tx_buf);
+            self.encoder.encode_field_octets(name, val, &mut self.tx_buf);
         }
         self.lower_name = lower;
         self.end_frame(at);
@@ -1002,19 +1013,26 @@ impl H2MuxContext {
         if self.streams.get(&stream_id).is_some_and(|s| matches!(s.state, H2StreamState::Reset(_))) {
             return true;
         }
-        // Borrowed unless the head is not UTF-8.
-        let head_str = String::from_utf8_lossy(head);
-        let mut lines = head_str.lines();
-        let Some(status_line) = lines.next() else { return false };
-        let Some(code) = status_line.split_whitespace().nth(1) else { return false };
-        let Ok(mut status) = code.parse::<u16>() else { return false };
+        let Some((mut status, headers)) = crate::response_head::mux_head_lines(head) else { return false };
         // An extended CONNECT is answered 200 where HTTP/1.1 switches protocols (RFC 8441
         // section 5).
         if status == 101 && self.streams.get(&stream_id).is_some_and(|s| s.ext_connect) {
             status = 200;
         }
-        let headers = lines.filter_map(|line| line.split_once(':')).map(|(name, val)| (name.trim(), val.trim()));
         self.send_headers_frame(stream_id, status, headers, end_stream);
+        true
+    }
+
+    /// [`Self::send_h1_head`] of a head already parsed (E2): its status and its fields, the
+    /// names in lower case.
+    pub fn send_head_fields<'h>(&mut self, stream_id: u32, mut status: u16, fields: impl Iterator<Item = (&'h str, &'h [u8])>, end_stream: bool) -> bool {
+        if self.streams.get(&stream_id).is_some_and(|s| matches!(s.state, H2StreamState::Reset(_))) {
+            return true;
+        }
+        if status == 101 && self.streams.get(&stream_id).is_some_and(|s| s.ext_connect) {
+            status = 200;
+        }
+        self.send_headers_frame_of(stream_id, status, fields, end_stream, true);
         true
     }
 
@@ -1086,11 +1104,7 @@ impl H2MuxContext {
         if self.streams.get(&stream_id).is_some_and(|s| matches!(s.state, H2StreamState::Reset(_))) {
             return true;
         }
-        let head_str = String::from_utf8_lossy(head);
-        let mut lines = head_str.lines();
-        let status = lines.next().and_then(|l| l.split_whitespace().nth(1)).and_then(|c| c.parse::<u16>().ok());
-        let Some(status) = status.filter(|s| (100..200).contains(s)) else { return false };
-        let headers = lines.filter_map(|line| line.split_once(':')).map(|(name, val)| (name.trim(), val.trim()));
+        let Some((status, headers)) = crate::response_head::mux_head_lines(head).filter(|(s, _)| (100..200).contains(s)) else { return false };
         self.send_headers_frame(stream_id, status, headers, false);
         true
     }
@@ -1191,6 +1205,10 @@ impl crate::htx_mux::HtxMux for H2MuxContext {
 
     fn send_head(&mut self, id: u64, head: &[u8], end_stream: bool) -> bool {
         self.send_h1_head(u32::try_from(id).unwrap_or(u32::MAX), head, end_stream)
+    }
+
+    fn send_head_fields<'h>(&mut self, id: u64, status: u16, fields: impl Iterator<Item = (&'h str, &'h [u8])>, end_stream: bool) -> bool {
+        H2MuxContext::send_head_fields(self, u32::try_from(id).unwrap_or(u32::MAX), status, fields, end_stream)
     }
 
     fn send_data(&mut self, id: u64, data: &[u8], end_stream: bool) -> usize {

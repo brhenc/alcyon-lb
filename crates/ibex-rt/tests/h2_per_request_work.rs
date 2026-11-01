@@ -46,6 +46,11 @@ fn backend(listener: TcpListener, running: Arc<AtomicBool>) -> thread::JoinHandl
 /// connection (the streams of an h2 connection are served at once, each on a server
 /// connection of its own, T280).
 fn backend_after(listener: TcpListener, running: Arc<AtomicBool>, delay: Duration) -> thread::JoinHandle<()> {
+    backend_with(listener, running, delay, RESPONSE)
+}
+
+/// [`backend_after`], answering `response`.
+fn backend_with(listener: TcpListener, running: Arc<AtomicBool>, delay: Duration, response: &'static [u8]) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         listener.set_nonblocking(true).expect("nonblocking");
         while running.load(Ordering::Relaxed) {
@@ -54,12 +59,12 @@ fn backend_after(listener: TcpListener, running: Arc<AtomicBool>, delay: Duratio
                 continue;
             };
             let running = Arc::clone(&running);
-            thread::spawn(move || serve(s, &running, delay));
+            thread::spawn(move || serve(s, &running, delay, response));
         }
     })
 }
 
-fn serve(mut s: TcpStream, running: &AtomicBool, delay: Duration) {
+fn serve(mut s: TcpStream, running: &AtomicBool, delay: Duration, response: &[u8]) {
     s.set_nonblocking(false).expect("blocking");
     s.set_read_timeout(Some(Duration::from_millis(200))).expect("timeout");
     let mut pending = Vec::new();
@@ -73,7 +78,7 @@ fn serve(mut s: TcpStream, running: &AtomicBool, delay: Duration) {
         while let Some(p) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
             pending.drain(..p + 4);
             thread::sleep(delay);
-            if s.write_all(RESPONSE).is_err() {
+            if s.write_all(response).is_err() {
                 break;
             }
         }
@@ -100,6 +105,9 @@ struct Client {
     sock: TcpStream,
     rx: Vec<u8>,
     next: u32,
+    /// The payloads of the HEADERS frames that came, in order, when kept (the memory tests
+    /// count what the process holds).
+    headers: Option<Vec<Vec<u8>>>,
 }
 
 impl Client {
@@ -110,7 +118,7 @@ impl Client {
         let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         hello.extend(frame(0x4, 0, 0, &[]));
         sock.write_all(&hello).expect("preface");
-        let mut c = Client { sock, rx: Vec::new(), next: 1 };
+        let mut c = Client { sock, rx: Vec::new(), next: 1, headers: None };
         // The server's SETTINGS, acknowledged before the first request.
         c.until(engine, |f| f.0 == 0x4 && f.1 & 1 == 0);
         c.sock.write_all(&frame(0x4, 1, 0, &[])).expect("settings ack");
@@ -131,6 +139,9 @@ impl Client {
                 let head = (self.rx[3], self.rx[4], u32::from_be_bytes([self.rx[5], self.rx[6], self.rx[7], self.rx[8]]) & 0x7fff_ffff);
                 assert_ne!(head.0, 0x3, "RST_STREAM: {:?}", &self.rx[..9 + len]);
                 assert_ne!(head.0, 0x7, "GOAWAY: {:?}", &self.rx[..9 + len]);
+                if let Some(h) = self.headers.as_mut().filter(|_| head.0 == 0x1) {
+                    h.push(self.rx[9..9 + len].to_vec());
+                }
                 self.rx.drain(..9 + len);
                 if done(head) {
                     return;
@@ -160,11 +171,15 @@ fn setup() -> (Engine, SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
 }
 
 fn setup_after(delay: Duration) -> (Engine, SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    setup_with(delay, RESPONSE)
+}
+
+fn setup_with(delay: Duration, response: &'static [u8]) -> (Engine, SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
     let srv = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let srv_addr = srv.local_addr().expect("addr");
     let fe = common::reserve_addr();
     let running = Arc::new(AtomicBool::new(true));
-    let be = backend_after(srv, Arc::clone(&running), delay);
+    let be = backend_with(srv, Arc::clone(&running), delay, response);
     let cfg = format!(
         "defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\n\
          frontend fe\n  bind {fe} proto h2\n  default_backend be\n\
@@ -431,4 +446,101 @@ fn an_h2_request_head_is_parsed_once() {
     drop(c);
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
+}
+
+/// E2 (`docs/design/quic-transport-2026-11-01.md` section 3): a response head is walked once.
+/// `check_response_head` indexes it, and what the engine reads of it after (the websocket
+/// check, the head's facts, the names it lowers, the `Connection` it writes) and the HEADERS
+/// the client gets are read from that index. Before E2 each of them walked the head again:
+/// six passes for an h2 client (`count_head_scan`, debug builds).
+#[test]
+fn a_response_head_is_scanned_once() {
+    const N: u64 = 20;
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut engine, fe, running, be) = setup();
+    let mut c = Client::connect(&mut engine, fe);
+    c.get(&mut engine);
+    let s0 = ibex_proto::response_head::head_scans();
+    for _ in 0..N {
+        c.get(&mut engine);
+    }
+    let scans = ibex_proto::response_head::head_scans() - s0;
+    println!("{N} h2 responses: {scans} passes over their heads");
+    if cfg!(debug_assertions) {
+        assert_eq!(scans, N, "{N} h2 responses walked their heads {scans} times");
+    }
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}
+
+/// The fields of the HEADERS of three responses to an h2 client, and the passes over their
+/// heads.
+type Fields = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn h2_response_fields(response: &'static [u8]) -> (Vec<Fields>, u64) {
+    let (mut engine, fe, running, be) = setup_with(Duration::ZERO, response);
+    let mut c = Client::connect(&mut engine, fe);
+    c.headers = Some(Vec::new());
+    let s0 = ibex_proto::response_head::head_scans();
+    for _ in 0..3 {
+        c.get(&mut engine);
+    }
+    let scans = ibex_proto::response_head::head_scans() - s0;
+    let mut dec = ibex_proto::hpack::HpackDecoder::new();
+    let fields = c
+        .headers
+        .iter()
+        .flatten()
+        .map(|b| {
+            let mut f = ibex_proto::hpack::DecodedFields::default();
+            dec.decode_into(b, &mut f).expect("hpack");
+            f.iter().map(|(n, v)| (n.to_vec(), v.to_vec())).collect()
+        })
+        .collect();
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+    (fields, scans)
+}
+
+/// E2: a response head the index does not hold is read the old way (more passes), and the
+/// client gets the HEADERS an indexed head gives: a head written again (`Content-Length: 02`
+/// and blanks around a value) the same as its canonical twin, which is indexed; a value that
+/// is not ASCII, and a head of more fields than the index holds, the fields as they came,
+/// names in lower case.
+#[test]
+fn a_response_head_read_again_goes_as_an_indexed_one_would() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let want = |extra: &[(&[u8], &[u8])]| {
+        let mut f: Fields = vec![(b":status".to_vec(), b"200".to_vec())];
+        f.extend(extra.iter().map(|(n, v)| (n.to_vec(), v.to_vec())));
+        f.push((b"content-length".to_vec(), b"2".to_vec()));
+        vec![f; 3]
+    };
+    let (twin, twin_scans) = h2_response_fields(b"HTTP/1.1 200 OK\r\nx-a: a\r\nContent-Length: 2\r\n\r\nok");
+    let (rewritten, rewritten_scans) = h2_response_fields(b"HTTP/1.1 200 OK\r\nX-A:  a \r\nContent-Length: 02\r\n\r\nok");
+    assert_eq!(twin, want(&[(b"x-a", b"a")]));
+    assert_eq!(rewritten, twin);
+    let (octets, octets_scans) = h2_response_fields(b"HTTP/1.1 200 OK\r\nX-A: a\xff\xfeb\r\nContent-Length: 2\r\n\r\nok");
+    assert_eq!(octets, want(&[(b"x-a", b"a\xff\xfeb")]));
+    let mut many = b"HTTP/1.1 200 OK\r\n".to_vec();
+    let names: Fields = (0..=ibex_proto::response_head::RSP_FIELDS).map(|i| (format!("x-h{i}").into_bytes(), format!("v{i}").into_bytes())).collect();
+    for (n, v) in &names {
+        many.extend_from_slice(b"X-H");
+        many.extend_from_slice(&n[3..]);
+        many.extend_from_slice(b": ");
+        many.extend_from_slice(v);
+        many.extend_from_slice(b"\r\n");
+    }
+    many.extend_from_slice(b"Content-Length: 2\r\n\r\nok");
+    let (many_fields, many_scans) = h2_response_fields(Box::leak(many.into_boxed_slice()));
+    let refs: Vec<(&[u8], &[u8])> = names.iter().map(|(n, v)| (&n[..], &v[..])).collect();
+    assert_eq!(many_fields, want(&refs));
+    if cfg!(debug_assertions) {
+        assert_eq!(twin_scans, 3, "the twin is indexed");
+        for (what, n) in [("rewritten", rewritten_scans), ("not ASCII", octets_scans), ("33 fields", many_scans)] {
+            assert!(n > 3, "{what}: {n} passes for 3 responses, the index was used");
+        }
+    }
 }
