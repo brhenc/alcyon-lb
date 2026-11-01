@@ -17,6 +17,12 @@ const REQS: u64 = 40;
 /// Runs `REQS` keep-alive requests through frontend, backend and server with no `log` line;
 /// returns what the probes counted over the last `REQS - WARM` of them.
 fn run() -> (u64, u64, u64, u64, u64) {
+    run_with(1)
+}
+
+/// [`run`] with `servers` servers in the backend (only the first is reachable); the sixth
+/// value is the server rows `account_stream` read.
+fn run_with(servers: usize) -> (u64, u64, u64, u64, u64) {
     let be = TcpListener::bind("127.0.0.1:0").unwrap();
     let be_addr = be.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -36,7 +42,8 @@ fn run() -> (u64, u64, u64, u64, u64) {
     let cfg = format!(
         "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
          frontend f\n  bind {fe_addr}\n  default_backend b\n\
-         backend b\n  server s {be_addr}\n"
+         backend b\n  server s {be_addr}\n{}",
+        (1..servers).map(|i| format!("  server x{i} 127.0.0.1:9 disabled\n")).collect::<String>()
     );
     let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
     let mut c = TcpStream::connect(fe_addr).unwrap();

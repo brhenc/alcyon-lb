@@ -20,6 +20,14 @@ pub fn add(a: &AtomicU64, v: u64) {
     a.fetch_add(v, Ordering::Relaxed);
 }
 
+/// [`add`] that does nothing for a zero: a byte count of an empty direction.
+#[inline]
+pub fn add_nz(a: &AtomicU64, v: u64) {
+    if v != 0 {
+        add(a, v);
+    }
+}
+
 /// A counted maximum.
 #[inline]
 pub fn max(a: &AtomicU32, v: u32) {

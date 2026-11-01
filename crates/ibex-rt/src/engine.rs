@@ -3500,8 +3500,8 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
             crate::statcnt::add(&fe.ereq, 1);
         }
     }
-    crate::statcnt::add(&fe.bin, bin);
-    crate::statcnt::add(&fe.bout, bout);
+    crate::statcnt::add_nz(&fe.bin, bin);
+    crate::statcnt::add_nz(&fe.bout, bout);
 
     if !routed {
         return;
@@ -3513,8 +3513,8 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     // ([`count_failed_attempt`]); this is the last attempt.
     let one = |c: &crate::statcnt::TxnCounters, server: bool| {
         crate::statcnt::add(&c.stot, 1);
-        crate::statcnt::add(&c.bin, bin);
-        crate::statcnt::add(&c.bout, bout);
+        crate::statcnt::add_nz(&c.bin, bin);
+        crate::statcnt::add_nz(&c.bout, bout);
         if http && (!server || answered) && !keepalive_lost {
             crate::statcnt::add(&c.req_tot, 1);
             c.count_status(status);
@@ -3574,8 +3574,6 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
         crate::statcnt::add(&c.lbtot, 1);
     }
     one(c, false);
-    let on_server: u32 = be.server_actconn.iter().map(|a| a.load(Ordering::Relaxed)).sum();
-    crate::statcnt::max(&c.smax, on_server);
     let srv = srv_idx.and_then(|i| Some((i, proxies[srv_be].txn_counters().srv.get(i)?)));
     for (i, c) in srv {
         if picked {
@@ -9266,7 +9264,10 @@ fn enter_backend(entry: &SessionEntry, proxies: &[Proxy], be_idx: usize) {
     }
     leave_backend(entry, proxies);
     if let Some(p) = proxies.get(be_idx) {
-        p.counters().be_streams.fetch_add(1, Ordering::Relaxed);
+        // `stream_set_backend`: `conn_max` follows `beconn`, the backend's smax, at the one
+        // place a stream joins it (O(1); no sum over the servers per request).
+        let beconn = p.counters().be_streams.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::statcnt::max(&p.txn_counters().be.smax, beconn);
         entry.be_counted.set(u32::try_from(be_idx).unwrap_or(NO_BACKEND));
     }
 }
