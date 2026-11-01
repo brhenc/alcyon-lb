@@ -285,13 +285,16 @@ fn at_least_lets_the_rules_run_on_the_bytes_that_are_here() {
 fn a_body_shorter_than_at_least_is_complete_when_it_ends() {
     // HAProxy, a 5-byte body, `at-least 100`: x-len: 5, at once.
     let srv = server();
-    let (_i, fe) = start(&cfg("http-request wait-for-body time 2s at-least 100", ""), srv.addr, None);
+    // The wait is 4 s and "at once" is anything under 2 s: load moves the arrival by tens of
+    // milliseconds, a rule waiting for `at-least` bytes that cannot come moves it by 4 s.
+    let (_i, fe) = start(&cfg("http-request wait-for-body time 4s at-least 100", ""), srv.addr, None);
     let mut c = Client::connect(fe);
     c.send(b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nabcde");
     let _ = c.read(Duration::from_millis(1200));
+    wait_seen(&srv, 1);
     let seen = srv.seen();
     assert_eq!(seen[0].header("x-len").as_deref(), Some("5"));
-    assert!(seen[0].at.duration_since(c.t0) < Duration::from_millis(250));
+    assert!(seen[0].at.duration_since(c.t0) < Duration::from_millis(2000));
 }
 
 #[test]
@@ -812,10 +815,12 @@ fn a_full_buffer_ends_the_response_wait_with_what_fits() {
     let srv = scripted(vec![
         Step::Send(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n"),
         Step::Send(&[b'a'; 50000]),
-        Step::Pause(1500),
+        Step::Pause(4500),
     ]);
+    // The wait is 4 s and "at once" is anything under 2 s: a loaded host moves the answer by
+    // tens of milliseconds, a rule that kept waiting with a full buffer moves it by 4 s.
     let cfg = format!(
-        "{DEFAULTS}frontend fe\n  bind {{fe}}\n  default_backend be\nbackend be\n  http-response wait-for-body time 300ms\n  \
+        "{DEFAULTS}frontend fe\n  bind {{fe}}\n  default_backend be\nbackend be\n  http-response wait-for-body time 4s\n  \
          http-response set-header X-Len %[res.body_len]\n  server s {{srv}}\n"
     );
     let (_i, fe) = start(&cfg, srv, None);
@@ -823,7 +828,7 @@ fn a_full_buffer_ends_the_response_wait_with_what_fits() {
     assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{}", &resp[..resp.len().min(200)]);
     let len: usize = res_header(&resp, "x-len").and_then(|v| v.parse().ok()).expect("x-len");
     assert!((13_000..=15_360).contains(&len), "x-len {len}");
-    assert!(first.expect("answer") < Duration::from_millis(250), "it waited with a full buffer");
+    assert!(first.expect("answer") < Duration::from_millis(2000), "it waited with a full buffer");
 }
 
 #[test]

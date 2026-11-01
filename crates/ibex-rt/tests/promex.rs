@@ -143,8 +143,8 @@ fn a_running_server_without_check_is_up() {
 #[test]
 fn the_query_string_is_url_decoded_and_a_bad_one_ends_the_scrape() {
     let engine = one_server_engine(false);
-    // (`uptime` moves between two scrapes and the description is another test's: compare names.)
-    let names = |b: &str| -> Vec<String> { b.lines().filter_map(|l| l.strip_prefix("# TYPE ")).map(|l| l.split(' ').next().unwrap().to_string()).filter(|n| n != "haproxy_process_description").collect() };
+    // (`uptime` moves between two scrapes and the description and the node name are another test's, set process-wide while this one runs: compare names.)
+    let names = |b: &str| -> Vec<String> { b.lines().filter_map(|l| l.strip_prefix("# TYPE ")).map(|l| l.split(' ').next().unwrap().to_string()).filter(|n| n != "haproxy_process_description" && n != "haproxy_process_node").collect() };
     let escaped = scrape(&engine, "/metrics?scope=%67lobal&x+y=1&no%2Dmaint");
     let plain = scrape(&engine, "/metrics?scope=global");
     assert!(!names(&plain).is_empty() && names(&escaped) == names(&plain), "{escaped}");

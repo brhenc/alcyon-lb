@@ -159,13 +159,22 @@ fn reset_stream_leaves_the_queue() {
     let mut a = connect(fe, &[]);
     a.write_all(&frame(1, 5, 1, &head("GET", "/a"))).expect("stream 1, holds the server");
     thread::sleep(Duration::from_millis(100));
+    let t_b = Instant::now();
     let mut b = connect(fe, &[]);
     b.write_all(&frame(1, 5, 1, &head("GET", "/b"))).expect("queued");
     thread::sleep(Duration::from_millis(100));
     b.write_all(&frame(3, 0, 1, &8u32.to_be_bytes())).expect("rst_stream cancel");
-    // HAProxy: the queued request is logged at once, `-1 0 - - CQ--`, Tw 100 ms.
+    // HAProxy: the queued request is logged at once, `-1 0 - - CQ--`, Tw 100 ms (Tq 0, Tt 100). The
+    // timers are what the loaded host made of the test's own 100 ms sleep: Tq and Tw are read, not
+    // fixed to 0 and 1xx -- Tw covers the sleep, and the whole stays within the time the test spent.
     let line = log_line(&log);
-    assert!(line.contains("be/<NOSRV> 0/1") && line.contains("/-1/-1/1") && line.contains(" -1 0 - - CQ-- "), "{line}");
+    let waited = t_b.elapsed().as_millis();
+    let timers = line.split_once(" be/<NOSRV> ").map_or("", |(_, r)| r.split(' ').next().unwrap_or(""));
+    let t: Vec<i128> = timers.split('/').filter_map(|v| v.parse().ok()).collect();
+    assert!(line.contains(" -1 0 - - CQ-- ") && t.len() == 5, "{line}");
+    let (tq, tw, tc, tr, tt) = (t[0], t[1], t[2], t[3], t[4]);
+    assert_eq!((tc, tr), (-1, -1), "{line}");
+    assert!(tw >= 99 && tt >= 100 && (tq + tw - tt).abs() <= 1 && tt <= waited as i128, "Tq {tq} Tw {tw} Tt {tt} after {waited} ms: {line}");
     // The request in front of it is answered all the same.
     let frames = frames_for(&mut a, Duration::from_millis(800));
     assert!(frames.contains(&(1, 1)) && frames.contains(&(0, 1)), "stream 1 of the first connection: {frames:?}");

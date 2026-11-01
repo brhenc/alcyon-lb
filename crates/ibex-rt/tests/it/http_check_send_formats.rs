@@ -112,43 +112,44 @@ fn http_check_send_renders_its_formats_and_reports_the_real_server_state() {
          server d1 {p3} {ck}\n  server d2 {p1} {ck} backup weight 7\n"
     );
     let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let node = hostname();
+    let (a1, a3) = (p1.port(), p3.port());
+    let want1 = format!(
+        "GET /plain%[be_name] HTTP/1.1\r\nhost: localhost\r\nx-id: U-be1-down-1\r\nx-lit: literal\r\nx-srv: s1\r\n\
+         x-haproxy-server-state: UP; address=127.0.0.1; port={a1}; name=be1/s1; node={node}; weight=1/1; scur=0/0; qcur=0\r\n\
+         content-length: 11\r\nconnection: close\r\n\r\nb%[be_name]"
+    );
+    let want2 = "POST /lfbe2/t1 HTTP/1.1\r\ncontent-length: 3\r\nconnection: close\r\n\r\nBt1";
+    let want3 = format!(
+        "GET / HTTP/1.1\r\nx-haproxy-server-state: DOWN; address=127.0.0.1; port={a3}; name=be3/d1; node={node}; \
+         weight=1/7; scur=0/0; qcur=0\r\nconnection: close\r\n\r\n"
+    );
+    let want4 = format!(
+        "GET / HTTP/1.1\r\nx-haproxy-server-state: UP; address=127.0.0.1; port={a1}; name=be3/d2; node={node}; \
+         weight=7/7; scur=0/0; qcur=0\r\nconnection: close\r\n\r\n"
+    );
+    let settled = || {
+        last_with(&seen1, "/plain").as_deref() == Some(want1.as_str())
+            && last_with(&seen2, "POST").as_deref() == Some(want2)
+            && last_with(&seen3, "name=be3/d1").as_deref() == Some(want3.as_str())
+            && last_with(&seen1, "name=be3/d2").as_deref() == Some(want4.as_str())
+    };
+    // Run for at least 1.2 s; then, on a loaded host where the checks have not all run yet, go on
+    // until the requests asserted below were seen (the assertions still compare the whole request).
     let until = Instant::now() + Duration::from_millis(1200);
-    while Instant::now() < until {
+    let hard = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < until || (!settled() && Instant::now() < hard) {
         let _ = engine.run_once();
         thread::sleep(Duration::from_millis(1));
     }
-    let node = hostname();
-    let (a1, a3) = (p1.port(), p3.port());
 
     assert_eq!(
         last_with(&seen1, "/plain").as_deref(),
-        Some(format!(
-            "GET /plain%[be_name] HTTP/1.1\r\nhost: localhost\r\nx-id: U-be1-down-1\r\nx-lit: literal\r\nx-srv: s1\r\n\
-             x-haproxy-server-state: UP; address=127.0.0.1; port={a1}; name=be1/s1; node={node}; weight=1/1; scur=0/0; qcur=0\r\n\
-             content-length: 11\r\nconnection: close\r\n\r\nb%[be_name]"
-        ).as_str()),
+        Some(want1.as_str()),
         "be1/s1's check request: the hdr values must be rendered for be1 and s1 (the unique ID from be1's \
          unique-id-format, with s2 DOWN), uri and body are literal, the empty header is dropped"
     );
-    assert_eq!(
-        last_with(&seen2, "POST").as_deref(),
-        Some("POST /lfbe2/t1 HTTP/1.1\r\ncontent-length: 3\r\nconnection: close\r\n\r\nBt1"),
-        "uri-lf and body-lf are log-formats"
-    );
-    assert_eq!(
-        last_with(&seen3, "name=be3/d1").as_deref(),
-        Some(format!(
-            "GET / HTTP/1.1\r\nx-haproxy-server-state: DOWN; address=127.0.0.1; port={a3}; name=be3/d1; node={node}; \
-             weight=1/7; scur=0/0; qcur=0\r\nconnection: close\r\n\r\n"
-        ).as_str()),
-        "send-state for a server its check found DOWN"
-    );
-    assert_eq!(
-        last_with(&seen1, "name=be3/d2").as_deref(),
-        Some(format!(
-            "GET / HTTP/1.1\r\nx-haproxy-server-state: UP; address=127.0.0.1; port={a1}; name=be3/d2; node={node}; \
-             weight=7/7; scur=0/0; qcur=0\r\nconnection: close\r\n\r\n"
-        ).as_str()),
-        "send-state for the backup that took over"
-    );
+    assert_eq!(last_with(&seen2, "POST").as_deref(), Some(want2), "uri-lf and body-lf are log-formats");
+    assert_eq!(last_with(&seen3, "name=be3/d1").as_deref(), Some(want3.as_str()), "send-state for a server its check found DOWN");
+    assert_eq!(last_with(&seen1, "name=be3/d2").as_deref(), Some(want4.as_str()), "send-state for the backup that took over");
 }
