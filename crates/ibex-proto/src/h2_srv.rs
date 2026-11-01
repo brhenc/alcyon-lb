@@ -990,12 +990,12 @@ impl H2SrvCodec {
             Rsp::Waiting | Rsp::Done => self.on_response_head(es),
             Rsp::Body { chunked, .. } => {
                 // Trailers: END_STREAM, no pseudo-header.
-                if !es || crate::h2::check_trailer_fields(self.fields.iter()).is_err() {
+                if !es || crate::h2::check_trailer_fields(self.fields.iter_text()).is_err() {
                     return Err(self.stream_fail(SrvH2Error::BadResponse, Some(0x1)));
                 }
                 if chunked {
                     self.rsp.extend_from_slice(b"0\r\n");
-                    for (n, v) in self.fields.iter() {
+                    for (n, v) in self.fields.iter_text() {
                         push_field(&mut self.rsp, n, v);
                     }
                     self.rsp.extend_from_slice(b"\r\n");
@@ -1005,7 +1005,7 @@ impl H2SrvCodec {
                 // last body byte goes out only now, so they are known before the body is.
                 if !chunked {
                     self.late.clear();
-                    for (n, v) in self.fields.iter() {
+                    for (n, v) in self.fields.iter_text() {
                         push_field(&mut self.late, n, v);
                     }
                     self.late.extend_from_slice(b"\r\n");
@@ -1021,8 +1021,8 @@ impl H2SrvCodec {
         let mut status: Option<u16> = None;
         let mut regular = false;
         let mut cl: Option<u64> = None;
-        let mut bad = crate::h2::check_response_fields(self.fields.iter()).is_err();
-        for (n, v) in self.fields.iter() {
+        let mut bad = crate::h2::check_response_fields(self.fields.iter_text()).is_err();
+        for (n, v) in self.fields.iter_text() {
             if let Some(p) = n.strip_prefix(':') {
                 bad |= p != "status" || regular || status.is_some();
                 let b = v.as_bytes();
@@ -1055,7 +1055,7 @@ impl H2SrvCodec {
         r.push(b' ');
         r.extend_from_slice(crate::actions::status_reason_phrase(status).as_bytes());
         r.extend_from_slice(b"\r\n");
-        for (n, v) in self.fields.iter().filter(|(n, _)| !n.starts_with(':')) {
+        for (n, v) in self.fields.iter_text().filter(|(n, _)| !n.starts_with(':')) {
             push_field(r, n, v);
         }
         if chunked {

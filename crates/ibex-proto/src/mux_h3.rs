@@ -391,7 +391,7 @@ pub struct H3StreamCtx {
     pub interim_sent: bool,
     /// A request `HAProxy` takes and answers 400 ([`check_request_fields`]).
     pub bad_request: bool,
-    /// The head as HTTP/1.1, as h2's (T437), until the data path takes it.
+    /// The head as its checked fields, as h2's (T437, E1), until the data path takes it.
     pub req_head: Option<Box<H2ReqHead>>,
     pub content_length: Option<u64>,
     /// The body's length when the whole request came with its head (FIN in that read):
@@ -420,7 +420,7 @@ impl H3StreamCtx {
 
 impl Poolable for H3StreamCtx {
     fn footprint(&self) -> usize {
-        std::mem::size_of::<Self>() + self.rx.capacity() + self.tx.capacity() + self.req_head.as_ref().map_or(0, |h| h.text.capacity())
+        std::mem::size_of::<Self>() + self.rx.capacity() + self.tx.capacity() + self.req_head.as_ref().map_or(0, |h| h.capacity())
     }
 
     fn reset(&mut self, wipe: bool) {
@@ -430,7 +430,7 @@ impl Poolable for H3StreamCtx {
             ibex_alloc::wipe_bytes(&mut rx);
             ibex_alloc::wipe_bytes(&mut tx);
             if let Some(h) = head.as_mut() {
-                ibex_alloc::wipe_string(&mut h.text);
+                h.wipe();
             }
         }
         rx.clear();
@@ -1021,15 +1021,15 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
     let (mut method, mut scheme, mut path, mut authority) = (None, false, false, false);
     for (n, v) in f.iter() {
         match n {
-            ":method" => method = Some(v),
-            ":scheme" => scheme = true,
-            ":path" => path = true,
-            ":authority" | "host" => authority = true,
-            _ if n.starts_with(':') => return Ok(Some(MESSAGE_ERROR)),
+            b":method" => method = Some(v),
+            b":scheme" => scheme = true,
+            b":path" => path = true,
+            b":authority" | b"host" => authority = true,
+            _ if n.starts_with(b":") => return Ok(Some(MESSAGE_ERROR)),
             _ => {}
         }
     }
-    if method == Some("CONNECT") {
+    if method == Some(b"CONNECT") {
         return Ok(Some(REQUEST_REJECTED));
     }
     // Neither `:authority` nor `host`: measured on 3.5-dev7 (T509), RESET_STREAM 0x10e and
@@ -1045,8 +1045,8 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
         return Ok(Some(MESSAGE_ERROR));
     }
     let mut cl = None;
-    for (_, v) in f.iter().filter(|(n, _)| *n == "content-length") {
-        match content_length_value(v) {
+    for (_, v) in f.iter().filter(|(n, _)| *n == b"content-length") {
+        match std::str::from_utf8(v).ok().and_then(crate::h2::content_length_value) {
             Some(x) if cl.is_none_or(|c| c == x) => cl = Some(x),
             _ => return Ok(Some(MESSAGE_ERROR)),
         }
@@ -1079,10 +1079,11 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
 /// A second HEADERS: the request's trailers (`h3_trailers_to_htx`).
 fn on_trailers(st: &mut H3StreamCtx, payload: &[u8], last: bool, sh: &mut Shared) -> Result<Option<u64>, H3Error> {
     decode_qpack_static_into(payload, sh.decoded)?;
-    if check_trailer_fields(sh.decoded.iter()).is_err() {
+    // A name or value that is not UTF-8 reads as a NUL here, and is refused (T454).
+    if check_trailer_fields(sh.decoded.iter_text()).is_err() {
         return Ok(Some(MESSAGE_ERROR));
     }
-    for (name, value) in sh.decoded.iter() {
+    for (name, value) in sh.decoded.iter_text() {
         st.rx_htx.push(HtxBlock::Trailer(HeaderField { name: name.to_string(), value: value.to_string() }));
     }
     st.rx_htx.push(HtxBlock::Eot);
@@ -1093,22 +1094,6 @@ fn on_trailers(st: &mut H3StreamCtx, payload: &[u8], last: bool, sh: &mut Shared
     Ok(None)
 }
 
-/// A `content-length` value as `HAProxy`'s `http_parse_cont_len_header` reads it: digits
-/// only, or a comma list of one repeated number.
-fn content_length_value(v: &str) -> Option<u64> {
-    let mut len = None;
-    for word in v.split(',').map(|w| w.trim_matches([' ', '\t'])) {
-        if word.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let n: u64 = word.parse().ok()?;
-        if len.is_some_and(|l| l != n) {
-            return None;
-        }
-        len = Some(n);
-    }
-    len
-}
 
 /// The DATA payload `buf` holds if it is complete frames only.
 fn complete_body_len(mut buf: &[u8]) -> Option<u64> {
@@ -1218,7 +1203,7 @@ impl HtxStream for H3StreamCtx {
     fn req_head(&self) -> Option<&H2ReqHead> {
         self.req_head.as_deref()
     }
-    fn take_req_head(&mut self) -> Option<Box<H2ReqHead>> {
+    fn take_req_fields(&mut self) -> Option<Box<H2ReqHead>> {
         self.req_head.take()
     }
     fn bad_request(&self) -> bool {
@@ -1372,7 +1357,7 @@ mod tests {
     fn a_stream_given_back_wiped_keeps_its_memory_and_nothing_else() {
         let mut st = H3StreamCtx { id: 8, rx: b"secret".to_vec(), tx: b"reply".to_vec(), dispatched: true, ..H3StreamCtx::default() };
         let mut head = Box::<H2ReqHead>::default();
-        head.text.push_str("GET /secret HTTP/1.1");
+        *head = H2ReqHead::of("GET", "/secret", &[("x-secret", "1")]);
         st.req_head = Some(head);
         st.rx_htx.push(HtxBlock::Eoh);
         let cap = st.rx.capacity();
@@ -1380,7 +1365,7 @@ mod tests {
         assert_eq!((st.id, st.dispatched, st.rx.len(), st.tx.len()), (0, false, 0, 0));
         assert_eq!(st.rx.capacity(), cap, "the buffer is kept for the next stream");
         assert_eq!(st.rx_htx.blocks(), &[] as &[HtxBlock]);
-        assert!(st.req_head.as_ref().is_some_and(|h| h.text.is_empty()));
+        assert!(st.req_head.as_ref().is_some_and(|h| h.line.is_empty() && h.bytes.is_empty()));
         Poolable::reset(&mut st, false);
         assert!(st.footprint() >= std::mem::size_of::<H3StreamCtx>());
     }

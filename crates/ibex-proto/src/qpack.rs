@@ -2,7 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 use crate::h3::H3Error;
-use crate::hpack::{decode_huffman_into, decode_integer, push_as_text, DecodedFields};
+use crate::hpack::{decode_huffman_into, decode_integer, DecodedFields};
 use crate::htx::HeaderField;
 
 pub const STATIC_TABLE: [(&str, &str); 99] = [
@@ -123,8 +123,9 @@ pub fn decode_qpack_static(block: &[u8]) -> Result<Vec<HeaderField>, H3Error> {
 /// that is not 0, any dynamic or post-base reference, a static index past the table, a
 /// truncated or bad Huffman string, or more than [`crate::hpack::MAX_DECODED_FIELDS`] fields
 /// is `QPACK_DECOMPRESSION_FAILED`, as `HAProxy`'s `qpack_decode_fs` (`qpack-dec.c:302-466`).
-/// A byte that is not UTF-8 becomes a NUL ([`push_as_text`], T454), which every field check
-/// refuses: the request is a message error on its stream, not a connection error.
+/// The strings are kept as the octets they stand for (E1): the field checks read bytes, a
+/// name that is not a token (one with a byte that is not UTF-8, T454) is a message error on
+/// its stream, not a connection error.
 ///
 /// # Errors
 /// [`H3Error::QpackDecompressionFailed`].
@@ -155,14 +156,14 @@ pub fn decode_qpack_static_into(block: &[u8], out: &mut DecodedFields) -> Result
         let mid = if (b & 0xc0) == 0xc0 {
             // Indexed Field Line, static (1 T=1 index(6+)).
             let (name, value) = static_entry(decode_integer(6, block, &mut offset).map_err(|_| FAIL)?)?;
-            text.push_str(name);
+            text.extend_from_slice(name.as_bytes());
             let mid = pos(text);
-            text.push_str(value);
+            text.extend_from_slice(value.as_bytes());
             mid
         } else if (b & 0xd0) == 0x50 {
             // Literal Field Line with Name Reference, static (0 1 N T=1 index(4+)), N either way.
             let (name, _) = static_entry(decode_integer(4, block, &mut offset).map_err(|_| FAIL)?)?;
-            text.push_str(name);
+            text.extend_from_slice(name.as_bytes());
             let mid = pos(text);
             push_string(block, &mut offset, 7, text, huff)?;
             mid
@@ -181,7 +182,7 @@ pub fn decode_qpack_static_into(block: &[u8], out: &mut DecodedFields) -> Result
     Ok(())
 }
 
-fn pos(text: &str) -> u32 {
+fn pos(text: &[u8]) -> u32 {
     u32::try_from(text.len()).unwrap_or(u32::MAX)
 }
 
@@ -191,8 +192,8 @@ fn static_entry(idx: usize) -> Result<(&'static str, &'static str), H3Error> {
 }
 
 /// Appends the string literal at `*offset` (its length an integer of `prefix` bits, the bit
-/// above them the Huffman flag, RFC 9204 section 4.1.2) to `text`, as text.
-fn push_string(block: &[u8], offset: &mut usize, prefix: u8, text: &mut String, huff: &mut Vec<u8>) -> Result<(), H3Error> {
+/// above them the Huffman flag, RFC 9204 section 4.1.2) to `text`, as octets.
+fn push_string(block: &[u8], offset: &mut usize, prefix: u8, text: &mut Vec<u8>, huff: &mut Vec<u8>) -> Result<(), H3Error> {
     const FAIL: H3Error = H3Error::QpackDecompressionFailed;
     let first = *block.get(*offset).ok_or(FAIL)?;
     let is_huffman = first & (1 << prefix) != 0;
@@ -202,9 +203,9 @@ fn push_string(block: &[u8], offset: &mut usize, prefix: u8, text: &mut String, 
     if is_huffman {
         huff.clear();
         decode_huffman_into(raw, huff).map_err(|_| FAIL)?;
-        push_as_text(text, huff);
+        text.extend_from_slice(huff);
     } else {
-        push_as_text(text, raw);
+        text.extend_from_slice(raw);
     }
     Ok(())
 }

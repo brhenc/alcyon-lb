@@ -263,19 +263,19 @@ fn test_rt_http2_hpack_dynamic_table_socket_pipeline() {
     assert_eq!(server_ctx.decoder.dynamic_table.len(), 2);
     assert_eq!(
         server_ctx.decoder.dynamic_table.get(0).unwrap().name,
-        "x-api-key"
+        b"x-api-key"
     );
     assert_eq!(
         server_ctx.decoder.dynamic_table.get(0).unwrap().value,
-        "secret-key-12345"
+        b"secret-key-12345"
     );
     assert_eq!(
         server_ctx.decoder.dynamic_table.get(1).unwrap().name,
-        ":path"
+        b":path"
     );
     assert_eq!(
         server_ctx.decoder.dynamic_table.get(1).unwrap().value,
-        "/index"
+        b"/index"
     );
 
     // Request 2: Reuses x-api-key (encoded with compact 1-byte index)

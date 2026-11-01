@@ -235,7 +235,7 @@ impl Pair {
         while let Some(id) = mux.next_dispatch() {
             let st = mux.stream_mut(id).expect("stream");
             st.set_dispatched();
-            let head = st.take_req_head().expect("head");
+            let head = st.take_req_fields().expect("head");
             self.children.insert(id, Child { path: head.uri().to_string(), ..Child::default() });
             mux.give_back_head(head);
         }
