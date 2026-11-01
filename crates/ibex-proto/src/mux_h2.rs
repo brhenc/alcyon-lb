@@ -2420,6 +2420,26 @@ mod tests {
         }
     }
 
+    /// A stream already reset stays reset when its response END_STREAM goes out after it
+    /// (T594): `local_end_stream` must not turn the reset into a half-close.
+    #[test]
+    fn a_reset_stream_stays_reset_at_its_local_end_stream() {
+        let mux = MuxH2;
+        let mut ctx = mux.init(ConnId(1), true).expect("init");
+        let mut hello = H2_CONN_PREFACE.to_vec();
+        hello.extend_from_slice(&Frame::Settings { flags: 0, settings: vec![] }.encode());
+        mux.parse(&mut ctx, &hello).expect("handshake");
+        let block = HpackEncoder::new().encode(&[
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":path".into(), value: "/".into() },
+        ]);
+        let get = Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: 1, header_block: block }.encode();
+        mux.parse(&mut ctx, &get).expect("stream 1");
+        ctx.streams.get_mut(&1).expect("1").state = H2StreamState::Reset(H2Error::Cancel);
+        ctx.local_end_stream(1);
+        assert_eq!(ctx.streams.get(&1).expect("1").state, H2StreamState::Reset(H2Error::Cancel));
+    }
+
     /// While more than [`TX_ROOM`] of output waits for the client, no frame is processed,
     /// so none is answered: a client that reads nothing cannot make replies pile up (T235).
     #[test]
