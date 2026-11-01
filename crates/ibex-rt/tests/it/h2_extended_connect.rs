@@ -303,6 +303,24 @@ fn a_websocket_over_extended_connect_is_an_upgrade_to_the_server_and_a_tunnel() 
     assert_eq!(end, vec![(0, 1, vec![])], "an empty DATA END_STREAM");
 }
 
+/// E1: a path the HTTP/1 parser refuses (UTF-8, not ASCII) leaves the head without HTX: it
+/// goes as text (`h2_bridge::text_wire`), the key the proxy made after the fields; a rule's
+/// edit (`option forwardfor`) writes it from the list the key is in (it was lost there).
+#[test]
+fn a_websocket_whose_path_is_not_ascii_goes_with_its_key_as_text() {
+    let (server, rx) = ws_server();
+    let p = proxy(server);
+    let mut s = connect(&p);
+    s.write_all(&ext_connect("websocket", Some("/caf\u{e9}"))).expect("headers");
+    let Ok(Seen::Head(head)) = rx.recv_timeout(Duration::from_secs(3)) else { panic!("the server saw no request") };
+    let lines: Vec<&str> = head.lines().collect();
+    assert_eq!(lines[0], "GET /caf\u{e9} HTTP/1.1", "{head}");
+    assert_eq!(&lines[1..6], ["host: 127.0.0.1", "sec-websocket-version: 13", "origin: http://x", "upgrade: websocket", "connection: upgrade"], "{head}");
+    let key = lines[6].strip_prefix("sec-websocket-key: ").unwrap_or_default();
+    assert_eq!(key.len(), 24, "a key made by the proxy, after the fields: {head}");
+    assert_eq!(&lines[7..], ["x-forwarded-for: 127.0.0.1"], "{head}");
+}
+
 #[test]
 fn an_extended_connect_for_h2c_or_without_a_path_is_reset() {
     let (server, rx) = ws_server();

@@ -1507,32 +1507,49 @@ impl H2Multiplexer {
 pub struct MalformedFields;
 
 /// The pseudo-headers `h2_str_to_phdr` knows: their name is checked from the second byte.
-fn known_pseudo(name: &str) -> bool {
-    matches!(name, ":method" | ":scheme" | ":authority" | ":path" | ":protocol" | ":status")
+fn known_pseudo(name: &[u8]) -> bool {
+    matches!(name, b":method" | b":scheme" | b":authority" | b":path" | b":protocol" | b":status")
 }
 
 /// The name a field may have (`h2_make_htx_request`): tokens without uppercase, the colon
 /// of a known pseudo-header excepted.
-fn name_ok(name: &str) -> bool {
+fn name_ok(name: &[u8]) -> bool {
     let skip = usize::from(known_pseudo(name));
-    !name.is_empty() && name.bytes().skip(skip).all(|b| !b.is_ascii_uppercase() && crate::h1::is_tchar(b))
+    !name.is_empty() && name.iter().skip(skip).all(|&b| !b.is_ascii_uppercase() && crate::h1::is_tchar(b))
 }
 
 /// `http_header_has_forbidden_char`: NUL, CR and LF are refused in any value, since an
 /// HTTP/1 head written from it would carry them as line ends (RFC 9113 section 8.2.1).
-fn value_ok(value: &str) -> bool {
-    !value.bytes().any(|b| matches!(b, 0 | b'\r' | b'\n'))
+fn value_ok(value: &[u8]) -> bool {
+    memchr::memchr3(0, b'\r', b'\n', value).is_none()
 }
 
 /// `http_path_has_forbidden_char`: a `:path` takes no control byte, space or `#`.
-fn path_ok(value: &str) -> bool {
-    !value.bytes().any(|b| b <= b' ' || b == b'#')
+fn path_ok(value: &[u8]) -> bool {
+    !value.iter().any(|&b| b <= b' ' || b == b'#')
 }
 
 /// `http_validate_scheme`: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) (RFC 3986 3.1).
-fn scheme_ok(s: &str) -> bool {
-    let mut b = s.bytes();
+fn scheme_ok(s: &[u8]) -> bool {
+    let mut b = s.iter().copied();
     b.next().is_some_and(|c| c.is_ascii_alphabetic()) && b.all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'))
+}
+
+/// A `content-length` value as `HAProxy`'s `http_parse_cont_len_header` reads it: digits
+/// only, or a comma list of one repeated number.
+pub(crate) fn content_length_value(v: &str) -> Option<u64> {
+    let mut len = None;
+    for word in v.split(',').map(|w| w.trim_matches([' ', '\t'])) {
+        if word.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let n: u64 = word.parse().ok()?;
+        if len.is_some_and(|l| l != n) {
+            return None;
+        }
+        len = Some(n);
+    }
+    len
 }
 
 /// The checks `HAProxy` makes of each field of a decoded HTTP/2 request
@@ -1553,27 +1570,27 @@ fn scheme_ok(s: &str) -> bool {
 /// `relaxed` is `option accept-unsafe-violations-in-http-request`: a `:path` is then
 /// checked as any value (NUL / CR / LF refused), so a `#` passes and a blank or control
 /// byte is a 400.
-pub fn check_request_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a str)>, relaxed: bool) -> Result<bool, MalformedFields> {
+pub fn check_request_fields<'a>(fields: impl IntoIterator<Item = (&'a [u8], &'a [u8])>, relaxed: bool) -> Result<bool, MalformedFields> {
     let mut bad_request = false;
-    let lws_or_ctl = |s: &str| s.bytes().any(|b| b <= b' ' || b == 0x7f);
+    let lws_or_ctl = |s: &[u8]| s.iter().any(|&b| b <= b' ' || b == 0x7f);
     for (name, value) in fields {
         if !name_ok(name) {
             return Err(MalformedFields);
         }
         let valid = match name {
-            ":path" => (if relaxed { value_ok(value) } else { path_ok(value) }) && (value.is_empty() || value.starts_with('/') || value == "*"),
-            ":authority" | "host" => value_ok(value) && !crate::authority::has_forbidden_char(value.as_bytes()),
-            "connection" | "proxy-connection" | "keep-alive" | "upgrade" | "transfer-encoding" => false,
-            "te" => value == "trailers",
+            b":path" => (if relaxed { value_ok(value) } else { path_ok(value) }) && (value.is_empty() || value.starts_with(b"/") || value == b"*"),
+            b":authority" | b"host" => value_ok(value) && !crate::authority::has_forbidden_char(value),
+            b"connection" | b"proxy-connection" | b"keep-alive" | b"upgrade" | b"transfer-encoding" => false,
+            b"te" => value == b"trailers",
             _ => value_ok(value),
         };
         if !valid {
             return Err(MalformedFields);
         }
         bad_request |= match name {
-            ":method" => value.is_empty() || !value.bytes().all(crate::h1::is_tchar),
-            ":scheme" => !scheme_ok(value),
-            ":path" => lws_or_ctl(value),
+            b":method" => value.is_empty() || !value.iter().copied().all(crate::h1::is_tchar),
+            b":scheme" => !scheme_ok(value),
+            b":path" => lws_or_ctl(value),
             _ => false,
         };
     }
@@ -1592,7 +1609,7 @@ pub fn check_trailer_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a s
             name,
             "host" | "content-length" | "connection" | "proxy-connection" | "keep-alive" | "upgrade" | "te" | "transfer-encoding"
         );
-        if name.starts_with(':') || !name_ok(name) || forbidden || !value_ok(value) {
+        if name.starts_with(':') || !name_ok(name.as_bytes()) || forbidden || !value_ok(value.as_bytes()) {
             return Err(MalformedFields);
         }
     }
@@ -1606,7 +1623,7 @@ pub fn check_trailer_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a s
 /// [`MalformedFields`] for any other.
 pub fn check_response_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<(), MalformedFields> {
     for (name, value) in fields {
-        if !name_ok(name) || !value_ok(value) {
+        if !name_ok(name.as_bytes()) || !value_ok(value.as_bytes()) {
             return Err(MalformedFields);
         }
     }
@@ -1621,7 +1638,7 @@ mod tests {
     /// on HAProxy 3.5-dev8 (`h2_field_validity` drives them through a running proxy).
     #[test]
     fn request_and_trailer_fields_are_checked_as_haproxy_checks_them() {
-        let req = |f: &[(&'static str, &'static str)]| check_request_fields(f.iter().copied(), false);
+        let req = |f: &[(&'static str, &'static str)]| check_request_fields(f.iter().map(|&(n, v)| (n.as_bytes(), v.as_bytes())), false);
         let base = [(":method", "GET"), (":scheme", "https"), (":path", "/a?b"), (":authority", "[::1]:8443")];
         assert_eq!(req(&base), Ok(false));
         assert_eq!(req(&[(":path", "*"), ("te", "trailers"), ("x-a", "a\t\x01\x7fb")]), Ok(false));
@@ -1634,6 +1651,17 @@ mod tests {
         }
         for bad_request in [(":method", "GE T"), (":method", ""), (":scheme", "1http"), (":path", "/a\x7f")] {
             assert_eq!(req(&[bad_request]), Ok(true), "{bad_request:?}");
+        }
+        // E1: bytes that are not UTF-8 are read as bytes. In a value, a cookie or `:path` they
+        // pass (HAProxy forwards them, measured on 3.5-dev8); in a name, `:authority` or
+        // `host` they are refused; in `:method` or `:scheme` they are a 400.
+        let raw = |f: &[(&'static [u8], &'static [u8])]| check_request_fields(f.iter().copied(), false);
+        assert_eq!(raw(&[(b"x-a", b"caf\xe9"), (b"cookie", b"a=\xff"), (b":path", b"/a\xe9b")]), Ok(false));
+        for bad in [(&b"x-\xe9"[..], &b"1"[..]), (b":authority", b"x\xe9"), (b"host", b"h\xe9")] {
+            assert_eq!(raw(&[bad]), Err(MalformedFields), "{bad:?}");
+        }
+        for bad_request in [(&b":method"[..], &b"G\xe9T"[..]), (b":scheme", b"h\xe9")] {
+            assert_eq!(raw(&[bad_request]), Ok(true), "{bad_request:?}");
         }
         let trl = |f: &[(&'static str, &'static str)]| check_trailer_fields(f.iter().copied());
         assert_eq!(trl(&[("x-t", "1"), ("grpc-status", "0")]), Ok(()));
