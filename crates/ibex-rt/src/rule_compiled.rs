@@ -725,3 +725,19 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod var_ref_tests {
+    use super::Rule;
+
+    /// A rule compiled from the configuration carries its variable resolved; one built
+    /// without it (as unit tests build rules) resolves it on demand, to the same variable.
+    #[test]
+    fn a_rule_without_a_resolved_variable_resolves_it_by_name() {
+        let bare = Rule::default();
+        let compiled = Rule::default().with_var("txn.p,ifnotset");
+        assert_eq!(bare.var("txn.p,ifnotset").name(), compiled.var("txn.p,ifnotset").name());
+        assert!(matches!(bare.var("txn.p"), std::borrow::Cow::Owned(_)));
+        assert!(matches!(compiled.var("txn.p,ifnotset"), std::borrow::Cow::Borrowed(_)));
+    }
+}
