@@ -904,7 +904,8 @@ backend be
 
 
 def load_previous_measurements(jsonl_path: Path) -> List[Dict[str, Any]]:
-    """Load all records from measurements.jsonl."""
+    """Load the gate's records from measurements.jsonl: rows with a "kind" (insreq.sh's
+    "insreq-h3", T555) are other tools' and are not a previous gate run."""
     if not jsonl_path.exists():
         return []
     records = []
@@ -913,9 +914,11 @@ def load_previous_measurements(jsonl_path: Path) -> List[Dict[str, Any]]:
             line = line.strip()
             if line:
                 try:
-                    records.append(json.loads(line))
+                    r = json.loads(line)
                 except Exception:
-                    pass
+                    continue
+                if isinstance(r, dict) and "kind" not in r:
+                    records.append(r)
     return records
 
 
