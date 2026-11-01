@@ -133,3 +133,7 @@ path = "fuzz_targets/h2_mux.rs"
 test = false
 doc = false
 bench = false
+
+# Vendored quinn (T542), as in the root workspace: the fuzzers build the quinn Ibex ships.
+[patch.crates-io]
+quinn-proto = { path = "../../vendor/quinn-proto" }

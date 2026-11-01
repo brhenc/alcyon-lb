@@ -114,6 +114,45 @@ impl From<ConnectionId> for quinn_proto::ConnectionId {
     }
 }
 
+/// A connection of a [`crate::QuicEndpoint`] once a datagram has been routed to it (Q1,
+/// `docs/design/quic-transport-2026-11-01.md` §5 (i)): the index of its slot, which is
+/// quinn-proto's own `ConnectionHandle`, and the generation of that slot. quinn reuses an
+/// index once a connection is gone, so a handle kept past its connection's end names a slot
+/// whose generation has moved on, and finds nothing rather than the next connection there.
+/// No key the peer chooses is involved: the connection ID is looked up once, by quinn, when
+/// the datagram is routed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnHandle {
+    idx: u32,
+    gen: u32,
+}
+
+impl ConnHandle {
+    /// The handle of slot `idx` at generation `gen`.
+    #[must_use]
+    pub const fn new(idx: u32, gen: u32) -> Self {
+        Self { idx, gen }
+    }
+
+    /// The slot index (quinn-proto's `ConnectionHandle`), dense from 0.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.idx as usize
+    }
+
+    /// The slot's generation when this handle was made.
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.gen
+    }
+}
+
+impl fmt::Display for ConnHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.idx, self.gen)
+    }
+}
+
 /// Identifies a QUIC stream within a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamId(pub u64);

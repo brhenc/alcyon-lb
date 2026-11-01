@@ -305,7 +305,7 @@ stage_diff-fuzz() {
   cargo build -q --manifest-path fuzz/Cargo.toml --bin ibex-fuzz 2>/dev/null
   local PROF
   PROF=$(mktemp -d /tmp/ibex-difffuzz-profiles.XXXXXX)
-  LLVM_PROFILE_FILE="$PROF/difffuzz-%4m.profraw" python3 fuzz/difffuzz.py gate 2>&1 | grep -vE "^$"
+  LLVM_PROFILE_FILE="$PROF/difffuzz-%4m.profraw" python3 fuzz/difffuzz.py gate --base-port $((18400 + 200 * (${IBEX_GATE_SLOT:-1} - 1))) 2>&1 | grep -vE "^$"
   check "${PIPESTATUS[0]}" "diff-fuzz"
   rm -rf "$PROF"
 }

@@ -99,10 +99,17 @@ The first vendor commit is the pristine 0.11.18; each change below is its own co
    lengths are checked before iterating them (an emptied hashbrown set scans every bucket).
    No behaviour change. Items 5 and 6 with Ibex's `ConnectionId` hash (57b26eff): h3c1
    121.8k -> 113.0k ins/req at 1.5 client datagrams per request (T543 progress, batch 4).
+7. P1, feature `ibex-pools` (off by default; `ibex-quic` turns it on; upstreamable: no, it links
+   `ibex-alloc`): `Send`, `Recv` and the `Retransmits` records of sent packets come from
+   `ibex_alloc` pools `quic_send`, `quic_recv`, `quic_retransmits` (`show pools`) instead of the
+   per-connection spare lists (`streams/{send,recv,state}.rs`, `spaces.rs`, `src/ibex_pools.rs`).
+   A `Retransmits` is taken when the first control frame needs it, no longer one per packet.
+   Unconditional, upstreamable: `SendBuffer.acks` is an `ArrayRangeSet` (`ArrayRangeSet::clear`).
+   `QP_FEATURES=ibex-pools tools/quinn-proto-tests.sh` runs the unit tests with the pools.
 
 ### Running quinn-proto's own tests
 
-`tools/quinn-proto-tests.sh [filter]` runs its unit tests (`--lib`, 181 of them) offline, on a
+`tools/quinn-proto-tests.sh [filter]` runs its unit tests (`--lib`, 182 of them) offline, on a
 copy in /tmp: `assert_matches` and `hex-literal` (not in the registry cache) are replaced by
 local shims, `fastbloom` (feature `bloom`) and the other uncached optional dependencies are
 taken out, and `src/tests/` (the end-to-end suite: needs `rcgen` 0.14, not cached) is not
