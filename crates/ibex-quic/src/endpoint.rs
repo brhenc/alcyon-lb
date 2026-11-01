@@ -394,6 +394,13 @@ impl QuicEndpoint {
         }
     }
 
+    /// The local address connection `conn`'s client reached, when the kernel told (a pinned
+    /// socket on a wildcard bind is bound to it, T558).
+    #[must_use]
+    pub fn local_ip_of(&self, conn: ConnHandle) -> Option<std::net::IpAddr> {
+        self.live(conn)?.conn.local_ip()
+    }
+
     /// Creates a `QuicEndpoint` from an already configured `quinn_proto::ServerConfig`.
     ///
     /// # Errors

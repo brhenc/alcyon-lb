@@ -190,6 +190,7 @@ mod quic_knobs;
 mod h3_many_threads;
 mod h2_stream_timings;
 mod h3_mux_drain;
+mod h3_reload;
 mod h3_mux_edges;
 mod h3_default_path;
 mod h3_wildcard_source;
