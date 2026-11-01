@@ -653,3 +653,32 @@ fn a_connection_closed_before_the_engine_counts_it_is_in_no_count() {
     assert!(rig.server.take_closed().is_empty(), "an uncounted connection was reported closed");
     assert!(!rig.server.has_waiting());
 }
+
+/// A client that stops a response written in full but not yet acknowledged (`STOP_SENDING`
+/// before its ACK) ends that stream only: the listener owes it nothing more (a soft stop
+/// would not wait for it), and the connection serves the next request.
+#[test]
+fn a_response_stopped_before_its_ack_ends_and_the_next_request_is_served() {
+    let mut rig = Rig::new();
+    let id = rig.open(&headers(&[("content-length", "0")]), true);
+    let mut eng = rig.accept();
+    engine_read(&mut eng, &mut rig, b"\r\n\r\n");
+    eng.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").expect("answer");
+    // The server alone: it reads the answer and writes it whole to the stream; the client has
+    // not read it (nor acknowledged it) when it asks the server to stop sending.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(1));
+        rig.server.pump(Instant::now()).expect("pump");
+    }
+    rig.conn.recv_stream(id).stop(VarInt::from_u32(0x10c)).expect("stop");
+    assert!(engine_sees_eof(&mut eng, &mut rig), "the relay let the stream go");
+
+    let id = rig.open(&headers(&[("content-length", "0")]), true);
+    let mut eng = rig.accept();
+    engine_read(&mut eng, &mut rig, b"\r\n\r\n");
+    eng.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").expect("answer");
+    let resp = rig.response(id);
+    assert_eq!(status(&resp), 200);
+    assert_eq!(frame_payload(&resp, 1), b"ok");
+    assert!(!rig.lost, "the connection was closed");
+}

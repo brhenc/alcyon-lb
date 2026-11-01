@@ -536,9 +536,10 @@ impl QuicEndpoint {
     fn drive_connection(&mut self, idx: usize, _now: Instant) {
         let conn_ref = self.handle_at(idx);
         let handle = ConnectionHandle(idx);
-        let Some(live) = self.slots.get_mut(idx).and_then(|s| s.live.as_mut()) else {
-            return;
-        };
+        // Every caller has just accepted, routed to or touched this connection: it is live.
+        let live = self.slots.get_mut(idx).and_then(|s| s.live.as_mut());
+        debug_assert!(live.is_some(), "drive_connection on slot {idx} without a connection");
+        let Some(live) = live else { return };
         Self::forward_endpoint_events(&mut self.endpoint, handle, &mut live.conn);
 
         // Drain connection events
