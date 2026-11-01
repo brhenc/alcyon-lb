@@ -22,9 +22,10 @@ pub struct Expr {
     pub alternates: Vec<Expr>,
     /// The value of a constant expression ([`Expr::constant`]), computed on first use.
     constant: std::sync::OnceLock<Option<Sample>>,
-    /// The fetch and converters resolved to function pointers, on first evaluation (the
-    /// registry is known there, not in [`Expr::parse`]); the data path then looks up no name.
-    compiled: std::sync::OnceLock<Compiled>,
+    /// The fetch and converters resolved to function pointers when the expression is parsed
+    /// (against [`crate::sample_registry`]); the data path then looks up no name and
+    /// initialises nothing.
+    compiled: Option<Compiled>,
 }
 
 /// The fetches whose sample is a function of their arguments only (`smp_fetch_const_*`,
@@ -309,6 +310,7 @@ impl Expr {
             }
         };
 
+        let compiled = crate::sample_registry().compile(&fetch_name, &converters);
         Ok(Expr {
             fetch_name,
             fetch_args,
@@ -316,7 +318,7 @@ impl Expr {
             matcher,
             alternates: Vec::new(),
             constant: std::sync::OnceLock::new(),
-            compiled: std::sync::OnceLock::new(),
+            compiled,
         })
     }
 
@@ -334,14 +336,15 @@ impl Expr {
             .as_ref()
     }
 
-    /// The compiled form, resolved on first use. An unknown fetch or converter is not
-    /// remembered: the by-name path answers (empty) as before.
+    /// The compiled form. A known fetch is always compiled at parse (debug assertion); an
+    /// unknown fetch or converter is not, and the by-name path answers (empty) as before.
     fn compiled(&self, registry: &Registry) -> Option<&Compiled> {
-        if let Some(c) = self.compiled.get() {
-            return Some(c);
-        }
-        let c = registry.compile(&self.fetch_name, &self.converters)?;
-        Some(self.compiled.get_or_init(|| c))
+        debug_assert!(
+            self.compiled.is_some() || !registry.has_fetch(&self.fetch_name) || self.converters.iter().any(|(n, _)| !registry.has_converter(n)),
+            "expression {:?} was not compiled at parse",
+            self.fetch_name
+        );
+        self.compiled.as_ref()
     }
 
     /// Evaluates the expression against the sample context to produce a sample value.
