@@ -204,8 +204,11 @@ run_closed() {
 }
 
 # --- run ------------------------------------------------------------------------------
-export CARGO_TARGET_DIR
+export CARGO_TARGET_DIR IBEX_GATE_SLOT
 CARGO_TARGET_DIR=$(slot_target "$SLOT")
+# Per-slot ports for stages with fixed ones (diff-fuzz): two gates side by side collided on
+# 18400 (2026-11-01, "Address already in use").
+IBEX_GATE_SLOT=$SLOT
 mkdir -p "$CARGO_TARGET_DIR"
 [ $EXCLUSIVE = 1 ] || export IBEX_GATE_SKIP_MEASURE=1
 echo "gate: CARGO_TARGET_DIR=$CARGO_TARGET_DIR IBEX_GATE_SKIP_MEASURE=${IBEX_GATE_SKIP_MEASURE:-} ${EXTRA_ENV[*]}"
