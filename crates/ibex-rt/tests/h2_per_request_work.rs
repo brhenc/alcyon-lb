@@ -475,7 +475,7 @@ fn a_response_head_is_scanned_once() {
 }
 
 /// T581 / X3: an h2 client's HEADERS are written from the response head's bytes: no field
-/// name, status or framing value is read as UTF-8 (HAProxy keeps the message as bytes).
+/// name, status or framing value is read as UTF-8 (`HAProxy` keeps the message as bytes).
 #[test]
 fn an_h2_response_head_reads_no_utf8() {
     const N: u64 = 20;

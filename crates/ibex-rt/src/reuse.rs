@@ -68,10 +68,27 @@ pub fn retain_pairs(v: &mut Vec<(String, String)>, mut keep: impl FnMut(&(String
     }
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static PAIR_LIST_COPIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The [`copy_pairs`] calls on this thread so far (debug builds; 0 in release): a test pins
+/// that the response rules copy no header list (X3).
+#[must_use]
+pub fn pair_list_copies() -> u64 {
+    #[cfg(debug_assertions)]
+    return PAIR_LIST_COPIES.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
 /// Makes `dst` a copy of `src`, reusing the strings `dst` has: what `clone_from` does, but
 /// the strings past the end of `src` are given back rather than freed, and the ones added
 /// are spares.
 pub fn copy_pairs(dst: &mut Vec<(String, String)>, src: &[(String, String)]) {
+    #[cfg(debug_assertions)]
+    PAIR_LIST_COPIES.with(|c| c.set(c.get() + 1));
     while dst.len() > src.len() {
         if let Some((k, v)) = dst.pop() {
             give(k);

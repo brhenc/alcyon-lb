@@ -228,7 +228,7 @@ fn an_http10_keep_alive_request_edited_by_a_rule_gets_the_token_last() {
 }
 
 /// T581 / X3: the server's response head is read as bytes too: its `Content-Length`, its
-/// `Connection` and its status are not read as UTF-8 (HAProxy keeps the message as bytes).
+/// `Connection` and its status are not read as UTF-8 (`HAProxy` keeps the message as bytes).
 #[test]
 fn the_parse_of_an_ascii_response_reads_no_utf8() {
     const N: usize = 20;
