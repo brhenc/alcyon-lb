@@ -19,6 +19,7 @@ mod common;
 
 mod aborted_client_waiting_for_server;
 mod abortonclose;
+mod smax_beconn;
 mod client_timeout_connect;
 mod idle_h2c_preface;
 mod post_during_connect;
