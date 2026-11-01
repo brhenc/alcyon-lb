@@ -237,6 +237,16 @@ fn normalisation_cases() -> Vec<Case> {
     let mut f = frame(1, 4, 1, &block(&id, b"POST", b"http", "/caf\u{e9}".as_bytes(), b"x", &[]));
     f.extend(frame(0, 1, 1, b"hello"));
     add(id, f, Want::Forwards(b"POST /caf\xc3\xa9 HTTP/1.1\r\nhost: x\r\nx-case: path-utf8-chunked\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
+    // The same head with a length not written in its digits (`005`, `5` twice): one
+    // `content-length: 5` in the first one's place (measured on 3.5-dev8, `%U` 76 both).
+    for (k, lens) in [("path-utf8-cl005", &[&b"005"[..]][..]), ("path-utf8-cl55", &[b"5", b"5"])] {
+        let id = k.to_string();
+        let extra: Vec<(&[u8], &[u8])> = lens.iter().map(|v| (&b"content-length"[..], *v)).collect();
+        let mut f = frame(1, 4, 1, &block(&id, b"POST", b"http", "/caf\u{e9}".as_bytes(), b"x", &extra));
+        f.extend(frame(0, 1, 1, b"hello"));
+        let want: &'static [u8] = Box::leak(format!("POST /caf\u{e9} HTTP/1.1\r\nhost: x\r\nx-case: {id}\r\ncontent-length: 5\r\n\r\nhello").into_bytes().into_boxed_slice());
+        add(id, f, Want::Forwards(want));
+    }
     // In `:path` HAProxy forwards it too (`GET /a\xe9b`); Ibex keeps the request line as
     // UTF-8 text and resets the stream (tradeoff.md 6.24).
     let id = "path-e9".to_string();

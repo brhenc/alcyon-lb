@@ -65,6 +65,7 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
     let first_body = stream.rx_htx.blocks().iter().position(|b| matches!(b, HtxBlock::Eoh)).map_or(stream.rx_htx.blocks().len(), |i| i + 1);
     // The head as the mux wrote it (T437); the stream keeps none past this.
     let head = stream.req_head.take()?;
+    let add_len = added_len(&head, stream.req_content_length.map(|n| n as u64));
     // `%U`, and the line `%r` prints, are those of the message the client sent:
     // `transfer-encoding: chunked` is added on output only, so the rules do not see it
     // either (only the forwarded head has it). The chunked end the forwarded body is
@@ -83,7 +84,7 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
         req_htx,
         request_line,
         bad_request: stream.bad_request,
-        add_len: None,
+        add_len,
     })
 }
 
@@ -107,21 +108,9 @@ pub fn dispatch_mux<M: HtxMux>(mux: &mut M, keep_request_line: bool, version: &s
     let bad_request = stream.bad_request();
     let head = stream.take_req_fields()?;
     let has_len = cl.is_some();
-    let canonical = {
-        let mut lens = head.headers().filter(|(k, _)| k.eq_ignore_ascii_case(b"content-length"));
-        match (cl, lens.next(), lens.next()) {
-            (Some(n), Some((_, v)), None) => {
-                let v = std::str::from_utf8(v).unwrap_or("");
-                (v.parse::<u64>().ok() == Some(n) && !v.starts_with('0')) || v == "0"
-            }
-            (None, None, _) => true,
-            _ => false,
-        }
-    };
     // A body without `content-length` goes chunked, also when all of it came with the head
-    // (measured on `HAProxy` 3.5-dev7 with QUIC, T511); a length written another way than
-    // its digits (`005`, `5, 5`, two lines) goes as its digits.
-    let add_len = if canonical { None } else { cl };
+    // (measured on `HAProxy` 3.5-dev7 with QUIC, T511).
+    let add_len = added_len(&head, cl);
     let chunked = !has_len && add_len.is_none() && (has_data || !eom);
     let req_htx = h2_head_size(&head).saturating_sub(u64::from(chunked));
     let request_line = (keep_request_line && head.has_line)
@@ -138,6 +127,22 @@ pub fn dispatch_mux<M: HtxMux>(mux: &mut M, keep_request_line: bool, version: &s
         bad_request,
         add_len,
     })
+}
+
+/// The length a head goes with in place of its `content-length` lines (`cl`, as the mux
+/// read them) when they are not one line of its digits (`005`, `5, 5`, two lines): `HAProxy`
+/// forwards the digits (3.5-dev7 with QUIC, T509; 3.5-dev8 over h2, E1). `None` when they are.
+fn added_len(head: &H2ReqHead, cl: Option<u64>) -> Option<u64> {
+    let mut lens = head.headers().filter(|(k, _)| k.eq_ignore_ascii_case(b"content-length"));
+    let canonical = match (cl, lens.next(), lens.next()) {
+        (Some(n), Some((_, v)), None) => {
+            let v = std::str::from_utf8(v).unwrap_or("");
+            (v.parse::<u64>().ok() == Some(n) && !v.starts_with('0')) || v == "0"
+        }
+        (None, None, _) => true,
+        _ => false,
+    };
+    if canonical { None } else { cl }
 }
 
 /// A request head with `transfer-encoding: chunked` added as its last header, `at` being
@@ -212,6 +217,11 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
             req_htx = (req_htx + kept as u64).saturating_sub(client as u64);
         }
     } else {
+        // As above: `%U` counts the digits the head goes with.
+        if let Some(n) = d.add_len {
+            let client: usize = d.head.headers().filter(|(k, _)| k.eq_ignore_ascii_case(b"content-length")).map(|(k, v)| k.len() + v.len()).sum();
+            req_htx = (req_htx + ("content-length".len() + n.to_string().len()) as u64).saturating_sub(client as u64);
+        }
         // With no HTX, a rule's edit writes the head from this list: the key is in it.
         let hdrs = sess.req_headers.get_or_insert_with(Vec::new);
         copy_headers(hdrs, d.head.text_headers().chain(key.as_deref().map(|k| ("sec-websocket-key", k))));
@@ -300,20 +310,25 @@ fn text_wire(head: &H2ReqHead, key: Option<&str>, chunked: bool, add_len: Option
         return chunked_head(&head, at);
     }
     let Some(n) = add_len else { return head };
-    // The client's own `content-length` lines are left out.
+    // The first of the client's `content-length` lines becomes the digits, the others go.
     let mut v = Vec::with_capacity(at + 40);
+    let mut first = true;
     for (i, line) in head[..at].split(|&b| b == b'\n').enumerate() {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if i > 0 && line.len() >= 15 && line[..15].eq_ignore_ascii_case(b"content-length:") {
+        let is_len = i > 0 && line.len() >= 15 && line[..15].eq_ignore_ascii_case(b"content-length:");
+        if is_len && !first {
             continue;
         }
         if i > 0 {
             v.extend_from_slice(b"\r\n");
         }
-        v.extend_from_slice(line);
+        if is_len {
+            first = false;
+            v.extend_from_slice(format!("content-length: {n}").as_bytes());
+        } else {
+            v.extend_from_slice(line);
+        }
     }
-    v.extend_from_slice(b"\r\ncontent-length: ");
-    v.extend_from_slice(n.to_string().as_bytes());
     v.extend_from_slice(&head[at..]);
     v
 }
