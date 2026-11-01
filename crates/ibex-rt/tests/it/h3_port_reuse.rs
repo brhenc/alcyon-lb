@@ -3,15 +3,10 @@
 
 //! T567: across a reload, a new QUIC client whose source address and port equal those of a peer
 //! the stopping process still holds (its connection is pinned to the old worker by a connected
-//! socket) is answered CONNECTION_REFUSED by the stopping process, at once. The kernel delivers
-//! the datagram to the old process's connected socket, so the new one never sees it.
-//!
-//! Measured on `HAProxy` 3.5-dev10 (`reference/haproxy-quic`, same scenario: `-W`, one worker,
-//! SIGUSR2, a client from a fixed source port holding a 3 s request, a second client from the
-//! same port 1.5 s after the reload): the old worker (the only process holding a socket
-//! connected to that peer, `ss -uanp`) neither refuses nor hands over: it completes the second
-//! handshake and never answers the request (no response within 8 s). So `HAProxy` is no
-//! better; Ibex's refusal lets the client fail at once and retry. See `tradeoff.md` 6.31.
+//! socket) reaches the old process, not the new one: the kernel delivers the datagram to the old
+//! process's connected socket. `HAProxy` with the private reload-loss patch (v2) then serves the
+//! new connection in the old worker; Ibex does the same (it used to answer `CONNECTION_REFUSED`).
+//! Unpatched dev10 completes the handshake there and never answers. See `tradeoff.md` 6.31.
 
 use crate::common;
 use crate::h3_mux_drain::{get, Client};
@@ -55,7 +50,7 @@ fn signal(pid: u32, sig: Signal) {
 }
 
 #[test]
-fn a_new_client_on_the_source_port_of_a_pinned_peer_is_refused_at_once_across_a_reload() {
+fn a_new_client_on_the_source_port_of_a_pinned_peer_is_served_by_the_stopping_process() {
     let be = slow_backend();
     let tcp = common::reserve_addr();
     let quic = common::reserve_addr();
@@ -110,6 +105,12 @@ fn a_new_client_on_the_source_port_of_a_pinned_peer_is_refused_at_once_across_a_
     let mut b = Client::begin_on(sock_b, quic);
     let t1 = Instant::now();
     b.run_until(Duration::from_secs(3), |c| c.lost.is_some() || !c.conn_is_handshaking());
+    let handshook = b.lost.is_none() && !b.conn_is_handshaking();
+    let mut status = None;
+    if handshook {
+        let fast = b.open(&get(b"/fast"), true);
+        status = b.outcome(fast).status;
+    }
     let verdict = b.lost.clone().map(|l| l.0);
     let took = t1.elapsed();
     let _ = slow;
@@ -117,6 +118,5 @@ fn a_new_client_on_the_source_port_of_a_pinned_peer_is_refused_at_once_across_a_
     signal(old, Signal::Usr1);
     thread::sleep(Duration::from_millis(200));
     common::stop(&mut first.0);
-    assert_eq!(verdict.as_deref(), Some("transport 0x2"), "CONNECTION_REFUSED expected");
-    assert!(took < Duration::from_secs(1), "refused after {took:?}");
+    assert_eq!(status, Some(200), "the request on the reused port got no answer (closed with {verdict:?}, after {took:?})");
 }

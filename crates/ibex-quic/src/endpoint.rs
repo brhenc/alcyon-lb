@@ -153,6 +153,9 @@ pub struct QuicEndpoint {
     tx: CopyBlock,
     /// Set by a soft stop: connections already here are served to the end, a new Initial is refused.
     refusing_new: bool,
+    /// Set while the datagrams of a pinned socket are dispatched (T567): the peer is held by
+    /// this process, so its new Initial is ours to serve even after a soft stop.
+    serving_pinned: bool,
     /// `quic-force-retry`: every new connection without a valid token gets a Retry.
     force_retry: bool,
     /// `tune.quic.fe.sec.retry-threshold`: Retry once this many connections are half open.
@@ -348,6 +351,7 @@ impl QuicEndpoint {
             tx: CopyBlock::new(TX_BLOCK),
             tx_buf: Vec::with_capacity(2048),
             refusing_new: false,
+            serving_pinned: false,
             force_retry,
             retry_threshold: QuicConfig::default().retry_threshold,
             half_open: Arc::new(AtomicU64::new(0)),
@@ -369,9 +373,18 @@ impl QuicEndpoint {
 
     /// Soft stop (HAProxy's `soft_stop()`): refuse every new connection from now on while the
     /// ones already established keep being served. The client of a refused one gets a
-    /// CONNECTION_REFUSED close and goes to whichever process is taking over.
+    /// CONNECTION_REFUSED close and goes to whichever process is taking over (one from a peer a
+    /// pinned socket holds is served here: [`Self::serve_pinned_peer`]).
     pub fn stop_accepting(&mut self) {
         self.refusing_new = true;
+    }
+
+    /// Whether the datagrams dispatched from now on came from a peer this process holds a
+    /// connected socket for (T567). The kernel sends that peer's 4-tuple here whatever it
+    /// opens, so a new Initial from it is served despite [`Self::stop_accepting`]: refused,
+    /// the client that reused its source port would fail where patched `HAProxy` serves it.
+    pub fn serve_pinned_peer(&mut self, on: bool) {
+        self.serving_pinned = on;
     }
 
     /// A new connection is accepted by [`QuicEndpoint::accept_deferred`], not by the
@@ -877,7 +890,7 @@ impl QuicTransport for QuicEndpoint {
 
         match event {
             Some(DatagramEvent::NewConnection(incoming)) => {
-                if self.refusing_new {
+                if self.refusing_new && !self.serving_pinned {
                     self.refuse_incoming(incoming);
                     return Ok(DatagramOutcome::StatelessResponse);
                 }
