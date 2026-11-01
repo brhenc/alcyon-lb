@@ -18593,7 +18593,7 @@ mod add_req_connection_tests {
     use super::*;
 
     /// A request that keeps a copy of its headers (`req_headers`) is not edited in place: the
-    /// token goes into the copy and the head is written out of it.
+    /// token goes into the copy and the head is written out of it, at the send (X2).
     #[test]
     fn the_token_of_a_request_with_a_header_copy_is_written_out_with_it() {
         let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
@@ -18602,6 +18602,8 @@ mod add_req_connection_tests {
         s.req_headers = Some(vec![("Host".to_string(), "a".to_string())]);
         add_req_connection(&mut s, "keep-alive");
         assert_eq!(s.req_headers.as_ref().map(Vec::len), Some(2));
+        assert_eq!(s.req.readable(), b"GET / HTTP/1.0\r\nHost: a\r\n\r\n", "not written before the send");
+        encode_if_modified(&mut s);
         assert_eq!(s.req.readable(), b"GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\n\r\n");
     }
 }
