@@ -380,6 +380,9 @@ pub struct H3Owner {
     /// its first one before its GOAWAY(0) and close (T558): set the first time the owner
     /// runs in the stop, [`crate::engine::H3_STOP_FIRST_REQUEST_MS`] after it.
     pub stop_grace: Option<ibex_sched::Tick>,
+    /// That grace ran out and the listener was asked to read its sockets once more before
+    /// the connection is judged to have sent nothing (T564).
+    pub stop_read: bool,
 }
 
 /// The owner's side: its children.
