@@ -80,6 +80,15 @@ pub enum Outcome {
 pub trait Dispatch {
     /// Executes `kind`. `state` carries the `state::WOKEN_*` bits that caused this run.
     fn run(&mut self, kind: WorkKind, state: u32) -> Outcome;
+
+    /// A task the last run woke for this pass (`wake_now`): the owner of a connection and
+    /// its stream hand each other work, and the one woken runs in the same pass, not after
+    /// another `epoll_wait`. Asked after every run until `None`. A task may run twice in a
+    /// pass this way; a third wake waits for the next pass.
+    #[inline]
+    fn pop_wake_now(&mut self) -> Option<TaskRef> {
+        None
+    }
 }
 
 /// Counters, kept because the adversarial-load properties are otherwise unobservable
@@ -684,9 +693,16 @@ impl Scheduler {
         budgets: &mut [u32; CLASSES],
     ) -> usize {
         let mut done = 0usize;
+        // Runs the pass's instant wakes may add, over every class (as `HAProxy`'s lists take
+        // what is woken while they run, within the pass's budget).
+        let mut instant_left = RUNQUEUE_DEPTH;
 
-        for c in Class::ALL {
+        let mut ci = 0;
+        while ci < CLASSES {
+            let c = Class::ALL[ci];
             let i = c.idx();
+            // An instant wake into a class before this one: look at it again after.
+            let mut back: Option<usize> = None;
             while budgets[i] > 0 {
                 let Some(tr) = self.pop_tasklet(c) else { break };
 
@@ -698,18 +714,28 @@ impl Scheduler {
                     continue;
                 }
 
-                // Anti-starvation: a task that already ran in this pass goes back and
-                // its whole class stops, so a self-requeueing task cannot run twice.
-                if self.tasks.get(tr).last_run == self.loops {
-                    self.push_tasklet_front(c, tr);
-                    budgets[i] = 0;
-                    break;
+                // Anti-starvation: a task that already ran in this pass goes back and its
+                // whole class stops, so a self-requeueing task cannot run twice. One woken
+                // for this pass by another task (`pop_wake_now`) runs a second time; a third
+                // waits.
+                {
+                    let t = self.tasks.get_mut(tr);
+                    if t.last_run == self.loops {
+                        if t.state & (state::WOKEN_NOW | state::RERAN) != state::WOKEN_NOW {
+                            self.push_tasklet_front(c, tr);
+                            budgets[i] = 0;
+                            break;
+                        }
+                        t.state |= state::RERAN;
+                    } else {
+                        t.state &= !state::RERAN;
+                    }
                 }
 
                 let (kind, st) = {
                     let t = self.tasks.get_mut(tr);
                     t.last_run = self.loops;
-                    t.state &= !state::QUEUED;
+                    t.state &= !(state::QUEUED | state::WOKEN_NOW);
                     t.state |= state::RUNNING;
                     (t.kind, t.state)
                 };
@@ -738,10 +764,44 @@ impl Scheduler {
                     }
                     Outcome::Keep => {}
                 }
+
+                while let Some(r) = d.pop_wake_now() {
+                    let Some(into) = self.wake_now(r) else { continue };
+                    // `Rt` and `Heavy` keep their one a pass.
+                    if instant_left > 0 && !matches!(into, Class::Rt | Class::Heavy) {
+                        instant_left -= 1;
+                        budgets[into.idx()] += 1;
+                    }
+                    if into.idx() < i {
+                        back = Some(back.map_or(into.idx(), |b| b.min(into.idx())));
+                    }
+                }
             }
+            ci = back.unwrap_or(ci + 1);
         }
 
         done
+    }
+
+    /// Queues `r` for this pass, from another task's run (`Dispatch::pop_wake_now`):
+    /// `Urgent`, or `Heavy` for a heavy task, as an I/O wakeup. Returns the class it was
+    /// put in, `None` when it was already queued (it runs in this pass anyway) or is gone.
+    fn wake_now(&mut self, r: TaskRef) -> Option<Class> {
+        if !self.tasks.is_live(r) {
+            return None;
+        }
+        let t = self.tasks.get_mut(r);
+        if t.state & state::KILLED != 0 {
+            return None;
+        }
+        t.state |= state::WOKEN_NOW;
+        if t.state & state::QUEUED != 0 {
+            t.state |= state::WOKEN_IO;
+            return None;
+        }
+        let class = if t.state & state::HEAVY != 0 { Class::Heavy } else { Class::Urgent };
+        self.tasklet_wakeup_live(r, class, state::WOKEN_IO);
+        Some(class)
     }
 }
 
@@ -761,6 +821,98 @@ mod tests {
             self.runs.push(kind.index());
             self.outcome
         }
+    }
+
+    /// Runs every task; the run of task index `from` wakes `target` for the pass, every
+    /// time (L2's owner and stream handing each other work).
+    struct Waker {
+        runs: Vec<u32>,
+        from: u32,
+        target: TaskRef,
+        pending: Option<TaskRef>,
+        outcome: Outcome,
+    }
+
+    impl Dispatch for Waker {
+        fn run(&mut self, kind: WorkKind, _state: u32) -> Outcome {
+            self.runs.push(kind.index());
+            if kind.index() == self.from {
+                self.pending = Some(self.target);
+            }
+            self.outcome
+        }
+
+        fn pop_wake_now(&mut self) -> Option<TaskRef> {
+            self.pending.take()
+        }
+    }
+
+    /// A task woken for the pass by another's run runs in that pass, and a second time if it
+    /// had run already; a third wake in the pass waits for the next one.
+    #[test]
+    fn a_task_woken_now_runs_in_the_pass_twice_at_most() {
+        let mut s = Scheduler::with_capacity(8);
+        let a = s.create(WorkKind::new(Kind::Synthetic, 1)).expect("alloc");
+        // A wakes itself on every run: it runs twice in the pass, not once and not forever.
+        let mut d = Waker { runs: Vec::new(), from: 1, target: a, pending: None, outcome: Outcome::Keep };
+        s.tasklet_wakeup(a, Class::Urgent, state::WOKEN_IO);
+        s.process_runnable_tasks(&mut d);
+        assert_eq!(d.runs, [1, 1], "woken now: a second run in the pass, the third refused");
+        // The third wake is not lost: it runs in the next pass (and twice again).
+        d.runs.clear();
+        s.process_runnable_tasks(&mut d);
+        assert_eq!(d.runs, [1, 1]);
+
+        // B, woken by A's run, runs in A's pass (it had not run in it).
+        let mut s = Scheduler::with_capacity(8);
+        let a = s.create(WorkKind::new(Kind::Synthetic, 1)).expect("alloc");
+        let b = s.create(WorkKind::new(Kind::Synthetic, 2)).expect("alloc");
+        let mut d = Waker { runs: Vec::new(), from: 1, target: b, pending: None, outcome: Outcome::Keep };
+        s.tasklet_wakeup(a, Class::Normal, state::WOKEN_IO);
+        s.process_runnable_tasks(&mut d);
+        assert_eq!(d.runs, [1, 2], "woken into Urgent from a Normal run: the pass goes back for it");
+        assert_eq!(s.run_queue_len(), 0);
+    }
+
+    /// A task woken for the pass that is gone (freed, or killed and waiting in a list to be)
+    /// is not run: the wake is dropped.
+    #[test]
+    fn a_wake_now_of_a_task_gone_is_dropped() {
+        let mut s = Scheduler::with_capacity(8);
+        let a = s.create(WorkKind::new(Kind::Synthetic, 1)).expect("alloc");
+        let b = s.create(WorkKind::new(Kind::Synthetic, 2)).expect("alloc");
+        s.destroy(b);
+        let mut d = Waker { runs: Vec::new(), from: 1, target: b, pending: None, outcome: Outcome::Keep };
+        s.tasklet_wakeup(a, Class::Urgent, state::WOKEN_IO);
+        s.process_runnable_tasks(&mut d);
+        assert_eq!(d.runs, [1], "a freed task is not woken");
+
+        // C is queued behind A, then destroyed: killed, its free deferred to its turn.
+        let c = s.create(WorkKind::new(Kind::Synthetic, 3)).expect("alloc");
+        s.tasklet_wakeup(a, Class::Urgent, state::WOKEN_IO);
+        s.tasklet_wakeup(c, Class::Normal, state::WOKEN_IO);
+        s.destroy(c);
+        d.runs.clear();
+        d.target = c;
+        s.process_runnable_tasks(&mut d);
+        assert_eq!(d.runs, [1], "a killed task is not run");
+        assert_eq!(s.live_tasks(), 1);
+    }
+
+    /// The Bulk demotion still applies to self-wakes: a task that returns `Outcome::Wake`
+    /// runs once a pass, not twice.
+    #[test]
+    fn a_self_wake_still_waits_for_the_next_pass() {
+        let mut s = Scheduler::with_capacity(8);
+        let a = s.create(WorkKind::new(Kind::Synthetic, 1)).expect("alloc");
+        let mut d = Runner { runs: Vec::new(), outcome: Outcome::Wake };
+        s.tasklet_wakeup(a, Class::Urgent, state::WOKEN_IO);
+        s.process_runnable_tasks(&mut d);
+        assert_eq!(d.runs, [1]);
+        assert_ne!(s.tasks.get(a).state & state::SELF_WAKING, 0);
+        s.process_runnable_tasks(&mut d);
+        assert_eq!(d.runs, [1, 1]);
+        assert_eq!(s.stats().runs_by_class[Class::Bulk.idx()], 1, "the second run is Bulk's");
     }
 
     fn drain(s: &mut Scheduler, d: &mut Runner) {

@@ -175,6 +175,11 @@ pub mod state {
     pub const WOKEN_MSG: u32 = 1 << 10;
     /// Woken for any reason.
     pub const WOKEN_ANY: u32 = WOKEN_TIMER | WOKEN_IO | WOKEN_MSG;
+    /// Woken by another task of the pass for this pass ([`crate::Dispatch::pop_wake_now`]):
+    /// it may run a second time in it.
+    pub const WOKEN_NOW: u32 = 1 << 11;
+    /// Ran twice in the current pass: a third run waits for the next.
+    pub const RERAN: u32 = 1 << 12;
 }
 
 /// A unit of schedulable work. Exactly 32 bytes.

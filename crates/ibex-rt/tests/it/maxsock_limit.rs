@@ -189,6 +189,20 @@ fn open_fds(pid: u32) -> usize {
     std::fs::read_dir(format!("/proc/{pid}/fd")).expect("fd dir").count()
 }
 
+/// Waits until `pid` holds as many descriptors as 50 ms before (at most 2 s).
+fn settle_fds(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last = open_fds(pid);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        let now = open_fds(pid);
+        if now == last {
+            return;
+        }
+        last = now;
+    }
+}
+
 /// The status line of a GET on a fresh h1 connection, or what went wrong.
 fn h1_get(addr: SocketAddr) -> String {
     let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else {
@@ -227,8 +241,14 @@ fn held_h2_streams_stop_at_maxsock_and_the_rest_get_a_503() {
 fn a_client_past_maxsock_is_closed_and_served_once_descriptors_free_up() {
     let (h2, h1) = (common::reserve_addr(), common::reserve_addr());
     let (be, _) = holding_backend();
-    let _ibex = spawn(h2, h1, be);
+    let ibex = spawn(h2, h1, be);
     assert!(common::wait_listening(h2) && common::wait_listening(h1), "ibex never listened");
+    // The probes' connections are closed by the client: the proxy holds their descriptors
+    // until it reads the close. Taken by the burst below, one of them was a server
+    // connection fewer, and the descriptor it freed later served the client asserted
+    // refused (35 server connections and 45 descriptors, not 36 and 46, once the streams
+    // ran in the pass their owner woke them in, L2).
+    settle_fds(ibex.child.id());
 
     let mut s = hold_streams(h2);
     let _ = answers_until(&mut s, Duration::from_secs(30), 50);

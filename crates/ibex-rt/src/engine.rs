@@ -2656,6 +2656,8 @@ pub struct Engine {
     /// from one pass to the next, as `timer_updates` (T437: a `Vec` each pass allocated as
     /// soon as anything was pushed).
     wake_scratch: Vec<TaskRef>,
+    /// The dispatcher's `wake_now` between passes (L2), empty.
+    wake_now_scratch: Vec<TaskRef>,
     h2_spawn_scratch: Vec<(u32, TaskRef)>,
     /// Every syslog target the config declared, global and per-proxy. Proxies reference
     /// these by index through `Proxy::log_target_idx`.
@@ -5412,6 +5414,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             events: Vec::with_capacity(capacity * 2),
             timer_updates: Vec::with_capacity(capacity * 2),
             wake_scratch: Vec::new(),
+            wake_now_scratch: Vec::new(),
             h2_spawn_scratch: Vec::new(),
             log_targets,
             log_tag: syslog_tag(config.global.as_ref().and_then(|g| g.log_tag.as_deref()).unwrap_or("haproxy")).to_string(),
@@ -6260,6 +6263,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // thread): this thread empties its caches, and the engine its own scratch lists.
         if crate::pool_gc::poll() {
             self.compact_arenas();
+            self.wake_now_scratch = Vec::new();
             if self.wake_scratch.is_empty() {
                 self.wake_scratch = Vec::new();
             }
@@ -6447,10 +6451,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             worker_id: self.mailbox_wid,
             quic_listeners: &mut self.quic_listeners,
             hk_due: 0,
+            wake_now: std::mem::take(&mut self.wake_now_scratch),
         };
 
         let tasks_run = self.scheduler.process_runnable_tasks(&mut dispatcher);
         let hk_due = dispatcher.hk_due;
+        self.wake_now_scratch = std::mem::take(&mut dispatcher.wake_now);
         // The server state changes the pass made (a check, the CLI, the stats page).
         if crate::srvlog::pending() {
             let proxies = dispatcher.proxies.clone();
@@ -8965,6 +8971,10 @@ struct EngineDispatcher<'a> {
     /// The housekeeping concerns whose timers fired this pass (bit per `hk::*`), run by the
     /// engine after the pass.
     hk_due: u8,
+    /// Tasks the current run woke for this pass (L2): the owner of an h2/h3 connection and
+    /// its streams, a stream that wants another run. The scheduler takes them after the run
+    /// (`Dispatch::pop_wake_now`); `wake_queue` is for what waits for the next pass.
+    wake_now: Vec<TaskRef>,
     /// Streams whose server connection is in its TLS handshake after this pass: marked
     /// heavy after it, one per pass from then on, as the client side is at admission
     /// (T283; `ssl_sock_init` sets `TASK_HEAVY` for a server connection too). T295.
@@ -10912,7 +10922,7 @@ impl EngineDispatcher<'_> {
             let window = |o: &SessionEntry| o.sess.h2_ctx.as_ref().map_or(0, |h| h.conn_send_window);
             let before = window(o);
             if h2_bridge_moves(o, c, now) {
-                self.wake_queue.push(link.task);
+                self.wake_now.push(link.task);
             }
             if window(o) < before {
                 sent_last = Some(i);
@@ -10929,7 +10939,7 @@ impl EngineDispatcher<'_> {
             let Some(link) = self.sessions.get(owner_idx).and_then(|e| e.sess.h2_owner()).and_then(|o| o.children.get(i).copied()) else { break };
             let Some((o, c)) = self.sessions.get2_mut(owner_idx, link.idx).filter(|(_, c)| c.task == link.task) else { continue };
             if h2_bridge_state(o, c, self.proxies) {
-                self.wake_queue.push(link.task);
+                self.wake_now.push(link.task);
             }
         }
         if let Some(o) = self.sessions.get(owner_idx).filter(|o| !o.sess.is_done() && matches!(o.sess.cli_state, ScState::Ready | ScState::Established) && o.sess.has_undispatched_h2_streams()) {
@@ -10961,7 +10971,7 @@ impl EngineDispatcher<'_> {
             let Some((o, c)) = self.sessions.get2_mut(owner_idx, link.idx).filter(|(_, c)| c.task == link.task) else { continue };
             if h3_bridge_moves(o, c, now) {
                 moved = true;
-                self.wake_queue.push(link.task);
+                self.wake_now.push(link.task);
             }
         }
         let Some(e) = self.sessions.get_mut(owner_idx) else { return Outcome::Done };
@@ -11004,7 +11014,7 @@ impl EngineDispatcher<'_> {
             let Some(link) = self.sessions.get(owner_idx).and_then(|e| e.sess.h2_owner()).and_then(|o| o.children.get(i).copied()) else { break };
             let Some((o, c)) = self.sessions.get2_mut(owner_idx, link.idx).filter(|(_, c)| c.task == link.task) else { continue };
             if h3_bridge_state(o, c, failed) {
-                self.wake_queue.push(link.task);
+                self.wake_now.push(link.task);
             }
         }
         let Some(e) = self.sessions.get_mut(owner_idx) else { return Outcome::Done };
@@ -11084,6 +11094,9 @@ impl EngineDispatcher<'_> {
         }
         let Some(owner) = owner else { return };
         let owner_task = owner.task;
+        // An HTTP/3 owner runs once a pass: what it frames leaves at the end of the pass, and
+        // a close in a second run would drop the GOAWAY of the first (T558).
+        let owner_h3 = owner.sess.h3_owner().is_some();
         owner.sess.h2_owner_mut().into_iter().for_each(|o| o.children.retain(|l| l.task != child.task));
         // An HTTP/3 stream whose response is all framed is let go once its FIN is out
         // (`QuicListener::owner_send`); one that ends without it is reset and let go now.
@@ -11160,7 +11173,11 @@ impl EngineDispatcher<'_> {
             owner.sess.srv_state = ScState::Closed;
             owner.sess.ending.get_or_insert(child.sess.ending.unwrap_or(crate::proxy::Ending::Complete));
         }
-        self.wake_queue.push(owner_task);
+        if owner_h3 {
+            self.wake_queue.push(owner_task);
+        } else {
+            self.wake_now.push(owner_task);
+        }
     }
 
     /// An HTTP/2 connection is freed with streams still served: each forgets it (its index
@@ -11222,6 +11239,7 @@ impl EngineDispatcher<'_> {
             return out;
         }
         let mut connect_line: Option<(usize, String)> = None;
+        let mut owner_wake: Option<TaskRef> = None;
         {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
                 return Outcome::Done;
@@ -11520,14 +11538,23 @@ impl EngineDispatcher<'_> {
             // Pending output needs no requeue: Step 4 asked the (level-triggered) poller
             // for writability, and requeueing it here spun a CPU against a client that
             // reads slowly.
+            // In this pass for an h2 owner with streams to dispatch (L2); a run that spent its
+            // budget (a scrape, a body) waits for the next one, as a self-wake does: run twice
+            // a pass, the scrape counted its own response buffers in the pool figures.
             if entry.sess.wants_rerun() && !entry.sess.is_done() {
-                self.wake_queue.push(entry.task);
+                if entry.sess.has_undispatched_h2_streams() {
+                    self.wake_now.push(entry.task);
+                } else {
+                    self.wake_queue.push(entry.task);
+                }
             }
             // A stream of an HTTP/2 connection has its owner run after it: the owner moves
             // what it produced (its response, room for more of its request) and sees how it
             // ended (T280).
+            // An HTTP/3 owner runs once a pass (see `h2_child_released`): it is woken for the
+            // next one.
             if let Some((_, owner_task)) = entry.sess.h2_child().and_then(|c| c.owner) {
-                self.wake_queue.push(owner_task);
+                owner_wake = Some(owner_task);
             }
 
             // Step 5: Update timer. Not for a stream that has ended: its task is freed when
@@ -11547,6 +11574,14 @@ impl EngineDispatcher<'_> {
             (entry.sess.is_done(), pending_admin, log_line, checkcache_alert)
         };
 
+        if let Some(owner_task) = owner_wake {
+            let owner_h3 = self.sessions.get(session_idx).and_then(|e| e.sess.h2_child()).and_then(|c| c.owner).and_then(|(i, _)| self.sessions.get(i)).is_some_and(|o| o.sess.h3_owner().is_some());
+            if owner_h3 {
+                self.wake_queue.push(owner_task);
+            } else {
+                self.wake_now.push(owner_task);
+            }
+        }
         if let Some((fe, line)) = connect_line {
             self.send_log_line(fe, line.as_bytes());
         }
@@ -11667,6 +11702,7 @@ impl EngineDispatcher<'_> {
             let task = entry.task;
             self.timer_updates.retain(|(t, _)| *t != task);
             self.wake_queue.retain(|t| *t != task);
+            self.wake_now.retain(|t| *t != task);
             self.heavy.retain(|t| *t != task);
             self.h2_spawn.retain(|(idx, _)| *idx != session_idx);
             entry.sess.ending = Some(crate::proxy::Ending::Error);
@@ -14965,6 +15001,11 @@ impl Dispatch for EngineDispatcher<'_> {
         // `sched_stuck = 0` after every task (src/task.c:681): one store, no syscall.
         crate::watchdog::progress();
         outcome
+    }
+
+    #[inline]
+    fn pop_wake_now(&mut self) -> Option<TaskRef> {
+        self.wake_now.pop()
     }
 }
 

@@ -209,19 +209,19 @@ fn counts() -> (u64, u64) {
 }
 
 /// L1: the idle purge, the buffer trim, the stick-table expiry and the pools' publish run
-/// when their timers expire (HAProxy's `srv_cleanup_idle_conns` / `process_table_expire`
+/// when their timers expire (`HAProxy`'s `srv_cleanup_idle_conns` / `process_table_expire`
 /// tasks), not on every pass: over a run of keep-alive requests, the housekeeping is bounded
 /// by the time elapsed, not by the passes made. Idle, it still runs, once a period.
 #[test]
 #[cfg(debug_assertions)]
 fn a_pass_with_nothing_due_does_no_housekeeping() {
+    const N: u64 = 200;
     let (mut engine, fe, running, be) = setup();
     let mut c = Client::connect(fe);
     for _ in 0..20 {
         c.get(&mut engine);
     }
 
-    const N: u64 = 200;
     let (p0, h0) = counts();
     let t0 = Instant::now();
     for _ in 0..N {
@@ -254,6 +254,137 @@ fn a_pass_with_nothing_due_does_no_housekeeping() {
     assert!(idle >= 1, "no housekeeping ran in {ms} idle ms: the timers are never armed");
     assert!(idle <= ms / 5 + 4, "{idle} housekeeping runs in {ms} idle ms");
 
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}
+
+fn setup_h2() -> (Engine, SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let srv = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let srv_addr = srv.local_addr().expect("addr");
+    let fe = common::reserve_addr();
+    let running = Arc::new(AtomicBool::new(true));
+    let be = backend(srv, Arc::clone(&running));
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind {fe} proto h2\n  default_backend be\n\
+         backend be\n  server s1 {srv_addr}\n"
+    );
+    let engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    (engine, fe, running, be)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(payload.len()).expect("len");
+    let mut f = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
+    f.extend_from_slice(&stream.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// One cleartext HTTP/2 connection (prior knowledge), one stream at a time (`h2load -c 1 -m 1`).
+struct H2Client {
+    sock: TcpStream,
+    rx: Vec<u8>,
+    next: u32,
+}
+
+impl H2Client {
+    fn connect(engine: &mut Engine, addr: SocketAddr) -> Self {
+        let mut sock = TcpStream::connect(addr).expect("connect");
+        sock.set_nonblocking(true).expect("nonblocking");
+        sock.set_nodelay(true).expect("nodelay");
+        let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        hello.extend(frame(0x4, 0, 0, &[]));
+        sock.write_all(&hello).expect("preface");
+        let mut c = H2Client { sock, rx: Vec::new(), next: 1 };
+        c.until(engine, |f| f.0 == 0x4 && f.1 & 1 == 0);
+        c.sock.write_all(&frame(0x4, 1, 0, &[])).expect("settings ack");
+        c
+    }
+
+    fn until(&mut self, engine: &mut Engine, mut done: impl FnMut((u8, u8, u32)) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut buf = [0u8; 4096];
+        loop {
+            while self.rx.len() >= 9 {
+                let len = (usize::from(self.rx[0]) << 16) | (usize::from(self.rx[1]) << 8) | usize::from(self.rx[2]);
+                if self.rx.len() < 9 + len {
+                    break;
+                }
+                let head = (self.rx[3], self.rx[4], u32::from_be_bytes([self.rx[5], self.rx[6], self.rx[7], self.rx[8]]) & 0x7fff_ffff);
+                assert_ne!(head.0, 0x3, "RST_STREAM");
+                assert_ne!(head.0, 0x7, "GOAWAY");
+                self.rx.drain(..9 + len);
+                if done(head) {
+                    return;
+                }
+            }
+            assert!(Instant::now() < deadline, "no frame came; have {:?}", self.rx);
+            let _ = engine.run_once();
+            match self.sock.read(&mut buf) {
+                Ok(0) => panic!("the proxy closed the connection"),
+                Ok(n) => self.rx.extend_from_slice(&buf[..n]),
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// `GET http://localhost/` (static table, the authority a literal without indexing), to
+    /// the response's `END_STREAM`.
+    fn get(&mut self, engine: &mut Engine) {
+        let id = self.next;
+        self.next += 2;
+        let mut block = vec![0x82, 0x86, 0x84, 0x01, 9];
+        block.extend_from_slice(b"localhost");
+        self.sock.write_all(&frame(0x1, 0x5, id, &block)).expect("request");
+        self.until(engine, |(kind, flags, stream)| stream == id && (kind == 0x0 || kind == 0x1) && flags & 1 != 0);
+    }
+}
+
+/// Passes a request takes, over `n` requests after a warm-up, with `get` one request.
+fn passes_per_request(n: u64, mut get: impl FnMut()) -> f64 {
+    for _ in 0..20 {
+        get();
+    }
+    let (p0, _) = counts();
+    for _ in 0..n {
+        get();
+    }
+    let (p1, _) = counts();
+    #[allow(clippy::cast_precision_loss)]
+    let per = (p1 - p0) as f64 / n as f64;
+    per
+}
+
+/// L2: the owner of an HTTP/2 connection and its stream wake each other in the pass they run
+/// in (instant wakeup, `Dispatch::wake_now`), not a pass later: a request is the client's
+/// HEADERS, the server's response and the stream spawned between them, three passes as
+/// `HAProxy`'s (X0: 3.00 `epoll_wait` a request). Eight before.
+#[test]
+#[cfg(debug_assertions)]
+fn an_h2_request_completes_in_three_passes() {
+    let (mut engine, fe, running, be) = setup_h2();
+    let mut c = H2Client::connect(&mut engine, fe);
+    let per = passes_per_request(200, || c.get(&mut engine));
+    println!("h2: {per:.2} passes a request");
+    assert!(per <= 3.2, "{per:.2} passes an HTTP/2 request: the owner and its stream wake each other a pass late");
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}
+
+/// L2 pins the h1 figure: a keep-alive request is two passes, the client's request and the
+/// server's response, under every observer on both proxies.
+#[test]
+#[cfg(debug_assertions)]
+fn an_h1_keepalive_request_completes_in_two() {
+    let (mut engine, fe, running, be) = setup();
+    let mut c = Client::connect(fe);
+    let per = passes_per_request(200, || c.get(&mut engine));
+    println!("h1: {per:.2} passes a request");
+    assert!(per <= 2.1, "{per:.2} passes an h1 keep-alive request");
     drop(c);
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
