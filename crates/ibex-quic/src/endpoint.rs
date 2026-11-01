@@ -222,16 +222,11 @@ pub struct AckTotals {
     pub excess: AtomicU64,
 }
 
+#[allow(clippy::new_without_default)]
 impl AckTotals {
     #[must_use]
     pub const fn new() -> Self {
         Self { ack_eliciting_sent: AtomicU64::new(0), ack_only_rcvd: AtomicU64::new(0), excess: AtomicU64::new(0) }
-    }
-}
-
-impl Default for AckTotals {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

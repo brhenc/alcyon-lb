@@ -362,6 +362,9 @@ impl ClientSide {
 pub enum H2Role {
     Owner(H2Owner),
     Child(H2Child),
+    /// T587: an HTTP/3 stream of the relay path (`QuicListener::start_relay`), an ordinary
+    /// client connection of the frontend that has only the QUIC connection it came on.
+    Relay(QuicAckSrc),
 }
 
 /// The owner of an HTTP/3 connection (T509, `docs/design/h3-engine-2026-10-26.md` 2.2):
@@ -475,6 +478,9 @@ pub struct H2Child {
     /// ends the connection's usefulness while the other streams finish.
     pub goaway: Option<ibex_proto::h2::H2Error>,
     pub tls: Option<Arc<ibex_tls::RustlsTlsInfo>>,
+    /// T569: the QUIC connection of an HTTP/3 stream and how its peer acknowledged (kept fresh
+    /// by the engine at the response head): what the `ibex_fc_quic_ack_*` fetches read.
+    pub quic_ack: Option<QuicAckSrc>,
     /// The connection's session variables as the stream got them: what it changed of them
     /// goes back to the connection, and only that, as other streams may have set others.
     pub sess_vars_at_start: ibex_sample::VarStore,
@@ -904,8 +910,6 @@ pub struct TcpSession {
     /// request, over TLS, logged as `HTTP/3.0` with the URI `HAProxy` builds from
     /// `:scheme` and `:authority`.
     pub h3: bool,
-    /// T587: the QUIC connection of an HTTP/3 stream, for the `ibex_fc_quic_ack_*` fetches.
-    pub quic_ack: Option<QuicAckSrc>,
 }
 
 /// The HTTP/2 stream a session is serving: its id, how much of its request body has been
@@ -1031,6 +1035,31 @@ impl TcpSession {
     #[must_use]
     pub fn h3_owner(&self) -> Option<&H3Owner> {
         self.h2_owner().and_then(|o| o.h3.as_deref())
+    }
+
+    /// T587: where an HTTP/3 stream finds its QUIC connection, `None` on any other session.
+    #[must_use]
+    pub fn quic_ack(&self) -> Option<&QuicAckSrc> {
+        match self.h2_role.as_deref() {
+            Some(H2Role::Child(c)) => c.quic_ack.as_ref(),
+            Some(H2Role::Relay(q)) => Some(q),
+            _ => None,
+        }
+    }
+
+    pub fn quic_ack_mut(&mut self) -> Option<&mut QuicAckSrc> {
+        match self.h2_role.as_deref_mut() {
+            Some(H2Role::Child(c)) => c.quic_ack.as_mut(),
+            Some(H2Role::Relay(q)) => Some(q),
+            _ => None,
+        }
+    }
+
+    /// The counts the `ibex_fc_quic_ack_*` fetches read.
+    #[must_use]
+    #[inline]
+    pub fn quic_facts(&self) -> Option<ibex_sample::QuicAckFacts> {
+        self.quic_ack().and_then(|q| q.facts)
     }
 
     pub fn h3_owner_mut(&mut self) -> Option<&mut H3Owner> {
@@ -1215,6 +1244,7 @@ impl TcpSession {
             rst: None,
             goaway: None,
             tls,
+            quic_ack: None,
             sess_vars_at_start: {
                 let mut v = ibex_sample::VarStore::new();
                 v.copy_scope_from(&owner.vars, ibex_sample::VarScope::Sess);
@@ -1465,8 +1495,7 @@ impl TcpSession {
             keep_request_line: false,
             accept_unsafe_request: false,
             h3: false,
-            quic_ack: None,
-        };
+                    };
         s.arm_client(now);
         s
     }

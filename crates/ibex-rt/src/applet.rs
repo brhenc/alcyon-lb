@@ -99,6 +99,7 @@ Dumps information about QUIC connections. Available output formats:\n\
 \x20 full       dump all known information about each connection\n\
 \x20 <levels>*  only dump certain information, defined by a comma-delimited list\n\
 \x20            of levels among 'tp', 'sock', 'pktns', 'cc', or 'mux'\n\
+\x20 ibex-acks  (Ibex) per connection ACK counts; ibex-acks-fe: the same per frontend\n\
 \x20 help       display this help\n\
 Available output filters:\n\
 \x20 all        dump all connections\n\
@@ -1522,12 +1523,8 @@ impl CliApplet {
                     let mut rows: Vec<(usize, u64, u64, u64, u64)> =
                         crate::stats::fe_ack_totals_all().into_iter().map(|(i, s, o, x)| (i, 0, s, o, x)).collect();
                     for snap in per_worker.iter().flatten().filter(|s| s.phase != ibex_quic::ConnPhase::Closing) {
-                        let Some(fe) = snap.fe else { continue };
-                        let at = rows.iter().position(|r| r.0 == fe).unwrap_or_else(|| {
-                            rows.push((fe, 0, 0, 0, 0));
-                            rows.len() - 1
-                        });
-                        let r = &mut rows[at];
+                        // Every listener with a frontend registered its row when it bound.
+                        let Some(r) = rows.iter_mut().find(|r| Some(r.0) == snap.fe) else { continue };
                         r.1 += 1;
                         r.2 += snap.acks.ack_eliciting_sent;
                         r.3 += snap.acks.ack_only_received;
