@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 use tracing::{debug, trace};
 
 use super::{
-    PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamEvent,
+    PendingStreamsQueue, Recv, RecvBox, RecvSpares, Retransmits, Send, SendBox, SendSpares, SendState, ShouldTransmit, StreamEvent,
     StreamHalf, ThinRetransmits,
 };
 use crate::{
@@ -24,9 +24,9 @@ use crate::{
 #[derive(Debug)]
 pub(super) enum StreamRecv {
     /// A `Recv` that is ready to be opened
-    Free(Box<Recv>),
+    Free(RecvBox),
     /// A `Recv` that has been opened
-    Open(Box<Recv>),
+    Open(RecvBox),
 }
 
 impl StreamRecv {
@@ -47,13 +47,14 @@ impl StreamRecv {
     }
 
     // Returns the inner `Recv`
-    pub(super) fn into_inner(self) -> Box<Recv> {
+    pub(super) fn into_inner(self) -> RecvBox {
         match self {
             Self::Free(r) | Self::Open(r) => r,
         }
     }
 
     // Reinitialize the stream so the inner `Recv` can be reused
+    #[cfg_attr(feature = "ibex-pools", allow(dead_code))]
     pub(super) fn free(self, initial_max_data: u64) -> Self {
         match self {
             Self::Free(_) => unreachable!("Self::Free on reinit()"),
@@ -69,12 +70,12 @@ impl StreamRecv {
 pub struct StreamsState {
     pub(super) side: Side,
     // Set of streams that are currently open, or could be immediately opened by the peer
-    pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
+    pub(super) send: FxHashMap<StreamId, Option<SendBox>>,
     pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
-    pub(super) free_recv: Vec<StreamRecv>,
+    pub(super) free_recv: RecvSpares,
     /// Freed `Send`s, reset, kept for the next stream of this connection (Ibex T543): a stream
     /// costs no allocation once the connection has had as many streams open at once
-    pub(super) free_send: Vec<Box<Send>>,
+    pub(super) free_send: SendSpares,
     pub(super) next: [u64; 2],
     /// Maximum number of locally-initiated streams that may be opened over the lifetime of the
     /// connection so far, per direction
@@ -160,8 +161,8 @@ impl StreamsState {
             side,
             send: FxHashMap::default(),
             recv: FxHashMap::default(),
-            free_recv: Vec::new(),
-            free_send: Vec::new(),
+            free_recv: Default::default(),
+            free_send: Default::default(),
             next: [0, 0],
             max: [0, 0],
             max_remote: [max_remote_bi.into(), max_remote_uni.into()],
@@ -1014,13 +1015,25 @@ impl StreamsState {
     }
 
     /// Keep a freed `Send` for the next stream, its data released (Ibex T543)
-    pub(super) fn send_freed(&mut self, mut send: Box<Send>) {
-        send.free();
-        self.free_send.push(send);
+    pub(super) fn send_freed(&mut self, mut send: SendBox) {
+        // With `ibex-pools` the pool resets it (`Send::free`) on the drop
+        #[cfg(not(feature = "ibex-pools"))]
+        {
+            send.free();
+            self.free_send.push(send);
+        }
+        #[cfg(feature = "ibex-pools")]
+        {
+            let _ = &mut send;
+            drop(send);
+        }
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
+        #[cfg(not(feature = "ibex-pools"))]
         self.free_recv.push(recv.free(self.stream_receive_window));
+        #[cfg(feature = "ibex-pools")]
+        drop(recv); // the pool resets it
         self.stream_freed(id, StreamHalf::Recv);
     }
 
@@ -1039,15 +1052,18 @@ impl StreamsState {
 #[inline]
 pub(super) fn get_or_insert_send(
     max_data: VarInt,
-    free: &mut Vec<Box<Send>>,
-) -> impl FnOnce(&mut Option<Box<Send>>) -> &mut Box<Send> + '_ {
+    free: &mut SendSpares,
+) -> impl FnOnce(&mut Option<SendBox>) -> &mut SendBox + '_ {
     move |opt| {
-        opt.get_or_insert_with(|| match free.pop() {
-            Some(mut s) => {
+        opt.get_or_insert_with(|| {
+            #[cfg(not(feature = "ibex-pools"))]
+            if let Some(mut s) = free.pop() {
                 s.reinit(max_data);
-                s
+                return s;
             }
-            None => Send::new(max_data),
+            #[cfg(feature = "ibex-pools")]
+            let _ = free;
+            Send::new(max_data)
         })
     }
 }
@@ -1055,7 +1071,7 @@ pub(super) fn get_or_insert_send(
 #[inline]
 pub(super) fn get_or_insert_recv(
     initial_max_data: u64,
-    free: &mut Vec<StreamRecv>,
+    free: &mut RecvSpares,
 ) -> impl FnOnce(&mut Option<StreamRecv>) -> &mut Recv + '_ {
     move |opt| {
         *opt = opt.take().map(|s| match s {
@@ -1063,9 +1079,14 @@ pub(super) fn get_or_insert_recv(
             s => s,
         });
         // A freed `Recv` (already reinitialised by `StreamRecv::free`) before a new one (Ibex T543)
-        opt.get_or_insert_with(|| match free.pop() {
-            Some(s) => StreamRecv::Open(s.into_inner()),
-            None => StreamRecv::Open(Recv::new(initial_max_data)),
+        opt.get_or_insert_with(|| {
+            #[cfg(not(feature = "ibex-pools"))]
+            if let Some(s) = free.pop() {
+                return StreamRecv::Open(s.into_inner());
+            }
+            #[cfg(feature = "ibex-pools")]
+            let _ = free;
+            StreamRecv::Open(Recv::new(initial_max_data))
         })
             .as_open_recv_mut()
             .unwrap()

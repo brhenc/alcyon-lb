@@ -15,12 +15,12 @@ use crate::{
 };
 
 mod recv;
-use recv::Recv;
+use recv::{Recv, RecvBox, RecvSpares};
 pub use recv::{Chunks, ReadError, ReadableError};
 
 mod send;
 pub(crate) use send::{ByteSlice, BytesArray};
-use send::{BytesSource, Send, SendState};
+use send::{BytesSource, Send, SendBox, SendSpares, SendState};
 pub use send::{FinishError, WriteError, Written};
 
 mod state;

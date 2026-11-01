@@ -428,8 +428,9 @@ impl ::std::ops::BitOrAssign for Retransmits {
 
 impl ::std::ops::BitOrAssign<ThinRetransmits> for Retransmits {
     fn bitor_assign(&mut self, rhs: ThinRetransmits) {
-        if let Some(retransmits) = rhs.retransmits {
-            self.bitor_assign(*retransmits)
+        if let Some(mut retransmits) = rhs.retransmits {
+            let r: &mut Retransmits = &mut retransmits;
+            self.bitor_assign(mem::take(r))
         }
     }
 }
@@ -447,10 +448,52 @@ impl ::std::iter::FromIterator<Self> for Retransmits {
     }
 }
 
+/// What a `Retransmits` record is held in: a pool object with `ibex-pools`, else a `Box`
+#[cfg(feature = "ibex-pools")]
+pub(super) type RetransmitsBox = ibex_alloc::PoolBox<Box<Retransmits>>;
+#[cfg(not(feature = "ibex-pools"))]
+pub(super) type RetransmitsBox = Box<Retransmits>;
+/// The connection's own list of spare records; with `ibex-pools` the pool is the list
+#[cfg(feature = "ibex-pools")]
+pub(super) type RetransmitsSpares = ();
+#[cfg(not(feature = "ibex-pools"))]
+pub(super) type RetransmitsSpares = Vec<RetransmitsBox>;
+
+#[cfg(feature = "ibex-pools")]
+ibex_alloc::declare_pool!(static RETRANSMITS_POOL: Pool<Box<Retransmits>> = ibex_alloc::PoolSpec::new("quic_retransmits").size(std::mem::size_of::<Retransmits>()););
+
+#[cfg(feature = "ibex-pools")]
+impl ibex_alloc::Poolable for Box<Retransmits> {
+    fn footprint(&self) -> usize {
+        std::mem::size_of::<Retransmits>()
+    }
+    fn reset(&mut self, _wipe: bool) {
+        if !self.is_vacant() {
+            **self = Retransmits::default();
+        }
+    }
+    fn try_new() -> Option<Self> {
+        Some(Box::default())
+    }
+}
+
 /// A variant of `Retransmits` which only allocates storage when required
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
+#[cfg_attr(not(feature = "ibex-pools"), derive(Clone))]
 pub(super) struct ThinRetransmits {
-    retransmits: Option<Box<Retransmits>>,
+    retransmits: Option<RetransmitsBox>,
+}
+
+#[cfg(feature = "ibex-pools")]
+impl Clone for ThinRetransmits {
+    fn clone(&self) -> Self {
+        let retransmits = self.get().map(|r| {
+            let mut b = crate::ibex_pools::take(&RETRANSMITS_POOL);
+            **b = r.clone();
+            b
+        });
+        Self { retransmits }
+    }
 }
 
 impl ThinRetransmits {
@@ -463,42 +506,62 @@ impl ThinRetransmits {
     }
 
     /// Start a packet's record with a spare box, so that the frames it carries do not allocate
-    /// one (Ibex T543)
-    pub(super) fn from_spare(spare: &mut Vec<Box<Retransmits>>) -> Self {
-        Self {
+    /// one (Ibex T543). With `ibex-pools` the record is taken from the pool when a frame needs it.
+    pub(super) fn from_spare(spare: &mut RetransmitsSpares) -> Self {
+        #[cfg(not(feature = "ibex-pools"))]
+        return Self {
             retransmits: spare.pop(),
+        };
+        #[cfg(feature = "ibex-pools")]
+        {
+            let _ = spare;
+            Self::default()
         }
     }
 
     /// Hand an unused box back to the spares (a packet that carried no retransmittable frame),
     /// leaving `self` empty (Ibex T543)
-    pub(super) fn return_if_vacant(&mut self, spare: &mut Vec<Box<Retransmits>>) {
-        if self.retransmits.as_deref().is_some_and(Retransmits::is_vacant) {
+    pub(super) fn return_if_vacant(&mut self, spare: &mut RetransmitsSpares) {
+        if self.get().is_some_and(Retransmits::is_vacant) {
+            #[cfg(not(feature = "ibex-pools"))]
             spare_push(spare, self.retransmits.take().unwrap());
+            #[cfg(feature = "ibex-pools")]
+            {
+                let _ = spare;
+                self.retransmits = None; // back to the pool
+            }
         }
     }
 
     /// Drop what the box holds and keep the box for another packet (Ibex T543)
-    pub(super) fn recycle(self, spare: &mut Vec<Box<Retransmits>>) {
+    pub(super) fn recycle(self, spare: &mut RetransmitsSpares) {
+        #[cfg(not(feature = "ibex-pools"))]
         if let Some(mut b) = self.retransmits {
             if !b.is_vacant() {
                 *b = Retransmits::default();
             }
             spare_push(spare, b);
         }
+        #[cfg(feature = "ibex-pools")]
+        let _ = (self, spare); // the pool resets it on the drop
     }
 
     /// `*pending |= self`, keeping the box for another packet (Ibex T543)
-    pub(super) fn requeue(self, pending: &mut Retransmits, spare: &mut Vec<Box<Retransmits>>) {
+    pub(super) fn requeue(self, pending: &mut Retransmits, spare: &mut RetransmitsSpares) {
         if let Some(mut b) = self.retransmits {
-            *pending |= mem::take(&mut *b);
+            let r: &mut Retransmits = &mut b;
+            *pending |= mem::take(r);
+            #[cfg(not(feature = "ibex-pools"))]
             spare_push(spare, b);
+            #[cfg(feature = "ibex-pools")]
+            let _ = spare;
         }
     }
 
     /// Returns a reference to the retransmits stored in this box
     pub(super) fn get(&self) -> Option<&Retransmits> {
-        self.retransmits.as_deref()
+        // (deref coercion: `Box` and `PoolBox<Box>` both reach `Retransmits`)
+        self.retransmits.as_ref().map(|b| -> &Retransmits { b })
     }
 
     /// Returns a mutable reference to the stored retransmits
@@ -506,17 +569,26 @@ impl ThinRetransmits {
     /// This function will allocate a backing storage if required.
     pub(super) fn get_or_create(&mut self) -> &mut Retransmits {
         if self.retransmits.is_none() {
-            self.retransmits = Some(Box::default());
+            #[cfg(feature = "ibex-pools")]
+            {
+                self.retransmits = Some(crate::ibex_pools::take(&RETRANSMITS_POOL));
+            }
+            #[cfg(not(feature = "ibex-pools"))]
+            {
+                self.retransmits = Some(Box::default());
+            }
         }
-        self.retransmits.as_deref_mut().unwrap()
+        self.retransmits.as_mut().map(|b| -> &mut Retransmits { b }).unwrap()
     }
 }
 
 /// Most `Retransmits` boxes a connection keeps for reuse (Ibex T543): about the packets with
 /// control frames that are in flight at once
+#[cfg(not(feature = "ibex-pools"))]
 const SPARE_RETRANSMITS: usize = 8;
 
-fn spare_push(spare: &mut Vec<Box<Retransmits>>, b: Box<Retransmits>) {
+#[cfg(not(feature = "ibex-pools"))]
+fn spare_push(spare: &mut Vec<RetransmitsBox>, b: RetransmitsBox) {
     if spare.len() < SPARE_RETRANSMITS {
         spare.push(b);
     }

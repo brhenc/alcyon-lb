@@ -2,7 +2,10 @@ use std::{collections::VecDeque, ops::Range};
 
 use bytes::{Buf, Bytes};
 
-use crate::{VarInt, range_set::RangeSet};
+use crate::{
+    VarInt,
+    range_set::{ArrayRangeSet, RangeSet},
+};
 
 /// Segments a `SendBuffer` keeps room for when its data is acknowledged (Ibex T543); 16 `Bytes`
 /// are 512 bytes, held while the stream (or its reuse, `Send::free`) lives
@@ -26,7 +29,7 @@ pub(super) struct SendBuffer {
     /// Acknowledged ranges which couldn't be discarded yet as they don't include the earliest
     /// offset in `unacked`
     // TODO: Recover storage from these by compacting (#700)
-    acks: RangeSet,
+    acks: ArrayRangeSet,
     /// Previously transmitted ranges deemed lost
     retransmits: RangeSet,
 }
@@ -56,6 +59,12 @@ impl SendBuffer {
         *unsent = 0;
         acks.clear();
         retransmits.clear();
+    }
+
+    /// Bytes this buffer holds for reuse: the segment queue's capacity (Ibex P1, pool footprint)
+    #[cfg(feature = "ibex-pools")]
+    pub(super) fn footprint(&self) -> usize {
+        self.unacked_segments.capacity() * std::mem::size_of::<Bytes>()
     }
 
     /// Append application data to the end of the stream
