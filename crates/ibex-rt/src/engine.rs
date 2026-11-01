@@ -13336,8 +13336,18 @@ impl EngineDispatcher<'_> {
 
         // 1. Stick table tracking from http_req_rules
 
-        let http_sample_ctx = SampleContext {
-            proxies: Some(&ProxiesView(proxies)),
+        // Only the `track-sc` rules read it: a proxy without one builds none (T584).
+        let has_track = resume.is_none()
+            && proxies[proxy_idx].http_req_rules.iter().any(|r| {
+                matches!(r.action, ibex_config::HttpReqAction::TrackSc0 { .. } | ibex_config::HttpReqAction::TrackSc1 { .. } | ibex_config::HttpReqAction::TrackSc2 { .. })
+            });
+        let track_view = ProxiesView(proxies);
+        let http_sample_ctx = if has_track {
+            if cfg!(debug_assertions) {
+                ibex_sample::work::note(ibex_sample::work::Op::TrackCtx, 1);
+            }
+            Some(SampleContext {
+            proxies: Some(&track_view),
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src(),
@@ -13367,6 +13377,9 @@ impl EngineDispatcher<'_> {
             captures_req_hdr: Some(&entry.sess.log.req_captures),
             captures_res_hdr: Some(&entry.sess.log.res_captures),
             ..Default::default()
+            })
+        } else {
+            None
         };
 
         // Only the `track-sc` rules: the condition of any other is evaluated once, in its turn
@@ -13375,7 +13388,8 @@ impl EngineDispatcher<'_> {
             resume.is_none() && matches!(r.action, ibex_config::HttpReqAction::TrackSc0 { .. } | ibex_config::HttpReqAction::TrackSc1 { .. } | ibex_config::HttpReqAction::TrackSc2 { .. })
         });
         for (rule, rc) in track_rules {
-            if !rc.cond.as_ref().is_none_or(|cond| cond.eval(&http_sample_ctx, &proxies[proxy_idx].acls, registry)) {
+            let Some(http_sample_ctx) = http_sample_ctx.as_ref() else { break };
+            if !rc.cond.as_ref().is_none_or(|cond| cond.eval(http_sample_ctx, &proxies[proxy_idx].acls, registry)) {
                 continue;
             }
             match &rule.action {
@@ -13385,7 +13399,7 @@ impl EngineDispatcher<'_> {
                     } else {
                         proxy_idx
                     };
-                    if let Some(k) = resolve_stick_key(rc.expr.as_ref(), registry, &http_sample_ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                    if let Some(k) = resolve_stick_key(rc.expr.as_ref(), registry, http_sample_ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                         track_http_slot(proxies, &mut entry.sess.tracked_sc, 0, t_idx, k);
                     }
                 }
@@ -13395,7 +13409,7 @@ impl EngineDispatcher<'_> {
                     } else {
                         proxy_idx
                     };
-                    if let Some(k) = resolve_stick_key(rc.expr.as_ref(), registry, &http_sample_ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                    if let Some(k) = resolve_stick_key(rc.expr.as_ref(), registry, http_sample_ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                         track_http_slot(proxies, &mut entry.sess.tracked_sc, 1, t_idx, k);
                     }
                 }
@@ -13405,7 +13419,7 @@ impl EngineDispatcher<'_> {
                     } else {
                         proxy_idx
                     };
-                    if let Some(k) = resolve_stick_key(rc.expr.as_ref(), registry, &http_sample_ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                    if let Some(k) = resolve_stick_key(rc.expr.as_ref(), registry, http_sample_ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                         track_http_slot(proxies, &mut entry.sess.tracked_sc, 2, t_idx, k);
                     }
                 }

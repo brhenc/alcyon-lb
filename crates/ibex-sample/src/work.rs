@@ -37,9 +37,12 @@ pub enum Op {
     /// A stream run that looked at its timers (`check_timeouts`): counted in debug builds
     /// only (L3, T586).
     TimeoutCheck = 9,
+    /// The sample context the `track-sc` rules of `http-request` read, built for a request:
+    /// counted in debug builds only (T584). A proxy without such a rule builds none.
+    TrackCtx = 10,
 }
 
-const OPS: usize = 10;
+const OPS: usize = 11;
 
 thread_local! {
     static COUNTS: [Cell<u64>; OPS] = const { [const { Cell::new(0) }; OPS] };

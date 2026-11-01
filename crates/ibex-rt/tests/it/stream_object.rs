@@ -115,6 +115,48 @@ fn taking_an_idle_connection_takes_no_lock_and_hashes_nothing() {
 }
 
 #[test]
+fn a_request_without_track_rules_builds_no_context_for_them() {
+    let srv_listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let srv_addr = srv_listener.local_addr().expect("addr");
+    let fe_addr = common::reserve_addr();
+    let running = Arc::new(AtomicBool::new(true));
+    let be = backend(srv_listener, Arc::clone(&running));
+    let config = Config {
+        frontends: vec![FrontendSection {
+            name: "fe".into(),
+            bind: Some(fe_addr),
+            mode: Mode::Http,
+            default_backend: Some("be".into()),
+            clitimeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        }],
+        backends: vec![BackendSection {
+            name: "be".into(),
+            mode: Mode::Http,
+            contimeout: Some(Duration::from_secs(5)),
+            srvtimeout: Some(Duration::from_secs(5)),
+            servers: vec![Server::new("s1", srv_addr)],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine = Engine::new(&config, 64).expect("Engine::new");
+    for _ in 0..3 {
+        one_request(&mut engine, fe_addr);
+    }
+    let before = on_this_thread()[Op::TrackCtx as usize];
+    const N: u64 = 20;
+    for _ in 0..N {
+        one_request(&mut engine, fe_addr);
+    }
+    let built = on_this_thread()[Op::TrackCtx as usize] - before;
+    println!("{N} requests: {built} track contexts built");
+    assert_eq!(built, 0, "no track-sc rule, no context built for one");
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}
+
+#[test]
 fn a_round_robin_pick_syncs_with_the_servers_only_when_one_changed() {
     let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
