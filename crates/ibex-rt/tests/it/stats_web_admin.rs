@@ -158,7 +158,7 @@ fn test_stats_http_get_dashboard_and_csv() {
     let resp = send_http_request(proxy_addr, &mut engine, get_req);
 
     assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "Got: {resp}");
-    assert!(resp.contains("Content-Type: text/html; charset=utf-8"));
+    assert!(resp.contains("content-type: text/html\r\n"));
     assert!(resp.contains("IBEX"));
     assert!(resp.contains("srv1"));
     assert!(resp.contains("badge-up"));
@@ -171,7 +171,7 @@ fn test_stats_http_get_dashboard_and_csv() {
         csv_resp.starts_with("HTTP/1.1 200 OK\r\n"),
         "Got: {csv_resp}"
     );
-    assert!(csv_resp.contains("Content-Type: text/plain; charset=utf-8"));
+    assert!(csv_resp.contains("content-type: text/plain\r\n"));
     assert!(csv_resp.contains("# pxname,svname,qcur,qmax,scur"));
     assert!(csv_resp.contains("admin_proxy,FRONTEND"));
     assert!(csv_resp.contains("admin_proxy,srv1"));
@@ -185,7 +185,7 @@ fn test_stats_http_get_dashboard_and_csv() {
         api_resp.starts_with("HTTP/1.1 200 OK\r\n"),
         "Got: {api_resp}"
     );
-    assert!(api_resp.contains("Content-Type: application/json; charset=utf-8"));
+    assert!(api_resp.contains("content-type: application/json\r\n"));
     assert!(api_resp.contains("\"totals\""));
     assert!(api_resp.contains("\"admin_proxy\""));
     assert!(api_resp.contains("\"srv1\""));

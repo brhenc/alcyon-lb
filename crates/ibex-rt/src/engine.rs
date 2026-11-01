@@ -12660,7 +12660,7 @@ impl EngineDispatcher<'_> {
         // `;norefresh` (stats-html.c, uri->refresh).
         let refresh = match proxies[serving].stats_config.refresh {
             Some(d) if !d.is_zero() && !req_uri.contains(";norefresh") => {
-                format!("Refresh: {}\r\n", d.as_millis().div_ceil(1000))
+                format!("refresh: {}\r\n", d.as_millis().div_ceil(1000))
             }
             _ => String::new(),
         };
@@ -12712,14 +12712,14 @@ impl EngineDispatcher<'_> {
         // 1. CSV telemetry
         if req_uri.contains(";csv") || req_uri.ends_with("/csv") {
             let csv = crate::stats::format_show_stat(proxies, checks, pid);
-            stats_write_page(entry, proxies, "text/plain; charset=utf-8", &refresh, csv.as_bytes());
+            stats_write_page(entry, proxies, "text/plain", &refresh, csv.as_bytes());
             return None;
         }
 
         // 2. JSON API data for live auto-refresh
         if req_uri.contains("/api/data") || req_uri.ends_with("/data") {
             let json = crate::stats_html::render_stats_json(proxies, checks, pid);
-            stats_write_page(entry, proxies, "application/json; charset=utf-8", &refresh, json.as_bytes());
+            stats_write_page(entry, proxies, "application/json", &refresh, json.as_bytes());
             return None;
         }
 
@@ -12820,18 +12820,18 @@ impl EngineDispatcher<'_> {
 
             if is_json_req {
                 let body = r#"{"status":"ok","message":"Admin action applied"}"#;
-                stats_write_page(entry, proxies, "application/json; charset=utf-8", &refresh, body.as_bytes());
+                stats_write_page(entry, proxies, "application/json", &refresh, body.as_bytes());
                 return Some(cmd);
             }
 
             let html = Self::stats_page(proxies, checks, pid, serving, req_uri);
-            stats_write_page(entry, proxies, "text/html; charset=utf-8", &refresh, html.as_bytes());
+            stats_write_page(entry, proxies, "text/html", &refresh, html.as_bytes());
             return Some(cmd);
         }
 
         // 4. Default: Render full HTML dashboard
         let html = Self::stats_page(proxies, checks, pid, serving, req_uri);
-        stats_write_page(entry, proxies, "text/html; charset=utf-8", &refresh, html.as_bytes());
+        stats_write_page(entry, proxies, "text/html", &refresh, html.as_bytes());
         None
     }
 
@@ -16712,9 +16712,9 @@ fn stick_bytes_due(sess: &TcpSession, last: bool) -> (u64, u64) {
 /// connection is closed after the body.
 fn stats_write_page(entry: &mut SessionEntry, proxies: &[Proxy], content_type: &str, refresh: &str, body: &[u8]) {
     let http11 = entry.sess.txn.as_ref().is_none_or(|t| t.req_http11);
-    let mut out = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: no-cache, no-store, must-revalidate\r\n{refresh}").into_bytes();
+    let mut out = format!("HTTP/1.1 200 OK\r\ncache-control: no-cache\r\ncontent-type: {content_type}\r\n{refresh}").into_bytes();
     if http11 {
-        out.extend_from_slice(b"Transfer-Encoding: chunked\r\n\r\n");
+        out.extend_from_slice(b"transfer-encoding: chunked\r\n\r\n");
         if !body.is_empty() {
             out.extend_from_slice(format!("{:X}\r\n", body.len()).as_bytes());
             out.extend_from_slice(body);
@@ -16722,7 +16722,7 @@ fn stats_write_page(entry: &mut SessionEntry, proxies: &[Proxy], content_type: &
         }
         out.extend_from_slice(b"0\r\n\r\n");
     } else {
-        out.extend_from_slice(b"Connection: close\r\n\r\n");
+        out.extend_from_slice(b"connection: close\r\n\r\n");
         out.extend_from_slice(body);
     }
     stats_write_reply(entry, proxies, &out);
