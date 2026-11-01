@@ -40,3 +40,4 @@ mod t364d1_bool2bin;
 mod t364d4_json_ascii;
 mod t364d5_case_ascii;
 mod t364d6_strcmp;
+mod compiled_expr;

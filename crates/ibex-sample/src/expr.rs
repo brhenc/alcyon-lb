@@ -7,7 +7,7 @@
 //! Parses expressions like `req.hdr(Host),lower -m str example.com` or `path_beg /api`.
 
 use crate::matcher::Matcher;
-use crate::registry::{Registry, SampleContext};
+use crate::registry::{Compiled, Registry, SampleContext};
 use crate::sample::Sample;
 
 /// A parsed and compiled sample expression with optional matcher.
@@ -22,6 +22,10 @@ pub struct Expr {
     pub alternates: Vec<Expr>,
     /// The value of a constant expression ([`Expr::constant`]), computed on first use.
     constant: std::sync::OnceLock<Option<Sample>>,
+    /// The fetch and converters resolved to function pointers when the expression is parsed
+    /// (against [`crate::sample_registry`]); the data path then looks up no name and
+    /// initialises nothing.
+    compiled: Option<Compiled>,
 }
 
 /// The fetches whose sample is a function of their arguments only (`smp_fetch_const_*`,
@@ -306,6 +310,7 @@ impl Expr {
             }
         };
 
+        let compiled = crate::sample_registry().compile(&fetch_name, &converters);
         Ok(Expr {
             fetch_name,
             fetch_args,
@@ -313,6 +318,7 @@ impl Expr {
             matcher,
             alternates: Vec::new(),
             constant: std::sync::OnceLock::new(),
+            compiled,
         })
     }
 
@@ -330,16 +336,33 @@ impl Expr {
             .as_ref()
     }
 
+    /// The compiled form. A known fetch is always compiled at parse (debug assertion); an
+    /// unknown fetch or converter is not, and the by-name path answers (empty) as before.
+    fn compiled(&self, registry: &Registry) -> Option<&Compiled> {
+        debug_assert!(
+            self.compiled.is_some() || !registry.has_fetch(&self.fetch_name) || self.converters.iter().any(|(n, _)| !registry.has_converter(n)),
+            "expression {:?} was not compiled at parse",
+            self.fetch_name
+        );
+        self.compiled.as_ref()
+    }
+
     /// Evaluates the expression against the sample context to produce a sample value.
     #[must_use]
     pub fn eval_sample(&self, registry: &Registry, ctx: &SampleContext) -> Option<Sample> {
-        registry.eval_g(&self.fetch_name, &self.fetch_args, &self.converters, ctx)
+        match self.compiled(registry) {
+            Some(c) => Registry::eval_c(c, &self.fetch_args, &self.converters, ctx),
+            None => registry.eval_g(&self.fetch_name, &self.fetch_args, &self.converters, ctx),
+        }
     }
 
     /// Evaluates the expression against the sample context to produce all sample values.
     #[must_use]
     pub fn eval_all_samples(&self, registry: &Registry, ctx: &SampleContext) -> Vec<Sample> {
-        registry.eval_all_g(&self.fetch_name, &self.fetch_args, &self.converters, ctx)
+        match self.compiled(registry) {
+            Some(c) => Registry::eval_all_c(c, &self.fetch_args, &self.converters, ctx),
+            None => registry.eval_all_g(&self.fetch_name, &self.fetch_args, &self.converters, ctx),
+        }
     }
 
     /// Evaluates the expression condition, returning `true` if the condition matches
@@ -352,14 +375,18 @@ impl Expr {
     fn eval_line(&self, registry: &Registry, ctx: &SampleContext) -> bool {
         // No list of the samples and no copy of the converters: each sample is matched as it
         // comes (T437).
-        registry.any_acl(&self.fetch_name, &self.fetch_args, &self.converters, ctx, |smp| match self.matcher {
+        let test = |smp: &Sample| match self.matcher {
             Some(ref matcher) => matcher.matches(smp),
             None => match smp {
                 Sample::Bool(b) => *b,
                 Sample::Sint(i) => *i != 0,
                 _ => true,
             },
-        })
+        };
+        match self.compiled(registry) {
+            Some(c) => Registry::any_acl_c(c, &self.fetch_args, &self.converters, ctx, test),
+            None => registry.any_acl(&self.fetch_name, &self.fetch_args, &self.converters, ctx, test),
+        }
     }
 }
 
