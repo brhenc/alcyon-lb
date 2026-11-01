@@ -1114,10 +1114,8 @@ fn main() {
             },
         }
     };
-    // Each worker reports once it is listening, or that it could not start. `-sf` and
-    // READY=1 wait for all of them.
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), ()>>();
-    // And then waits for `go` before it accepts anything: the process changes root, group
+    // Each worker reports once it is listening, or that it could not start, on a channel of its
+    // own (in the spawn loop). `-sf` and READY=1 wait for all of them. And then it waits for `go` before it accepts anything: the process changes root, group
     // and user in between (see identity.rs), and nothing is served before it has.
     let go = std::sync::Arc::new((std::sync::Mutex::new(Start::Wait), std::sync::Condvar::new()));
     let mut cli_pre = match cli_socket.as_ref().map(|a| bind_cli(a, stats_socket_mode)).transpose() {
@@ -1152,6 +1150,9 @@ fn main() {
     // while it starts, and a copy each held it for the life of the process.
     let config = std::sync::Arc::new(config);
     ibex_rt::watchdog::init(nbthread);
+    // What the first worker cost under `-m` (`VmData` growth while it started), the measure of
+    // what each later one needs (T557).
+    let mut worker_cost: Option<usize> = None;
     for worker_id in 0..nbthread {
         let config_clone = std::sync::Arc::clone(&config);
         let proxies_clone = shared_proxies.clone();
@@ -1159,13 +1160,22 @@ fn main() {
         let mailboxes = mailboxes.clone();
         let (cli_pre, extra_pre) = if worker_id == 0 { (cli_pre.take(), extra_pre.take()) } else { (None, None) };
         let lifecycle_clone = lifecycle.clone();
-        let ready_tx = ready_tx.clone();
+        // A channel per worker, its only sender moved into it: a worker that panics in its
+        // setup closes it, and the wait for it below ends.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), ()>>();
         let worker_go = std::sync::Arc::clone(&go);
 
         // The stack and std's alternative signal stack, probed together: a spawn that maps the
         // stack and then fails the second aborts in std (T540's gate, `-m 6`).
+        // Under `-m` a later worker is probed for what the first one cost, setup included: a
+        // Rust allocation that fails in its setup aborts the process (T557, VV-29).
         let worker_stack = std::env::var("RUST_MIN_STACK").ok().and_then(|s| s.parse().ok()).unwrap_or(2 * 1024 * 1024);
-        let spawned = ibex_alloc::headroom::thread_fits(worker_stack).and_then(|()| std::thread::Builder::new().name(format!("ibex-w{worker_id}")).spawn(move || {
+        let data_before = if worker_id == 0 { ibex_alloc::headroom::data_bytes_under_limit() } else { None };
+        let fits = match worker_cost {
+            Some(cost) => ibex_alloc::headroom::fits(ibex_alloc::headroom::worker_need(cost).max(worker_stack + ibex_alloc::headroom::THREAD_EXTRA)),
+            None => ibex_alloc::headroom::thread_fits(worker_stack),
+        };
+        let spawned = fits.and_then(|()| std::thread::Builder::new().name(format!("ibex-w{worker_id}")).spawn(move || {
             // Before the ready message, so before the chroot: it opens this thread's
             // /proc/thread-self/schedstat.
             ibex_rt::watchdog::register(worker_id);
@@ -1227,17 +1237,25 @@ fn main() {
             }
         }));
         match spawned {
-            Ok(t) => threads.push(t),
+            Ok(t) => {
+                threads.push(t);
+                // One worker at a time: the next is probed only once this one has started (or
+                // failed to), so its setup cannot race the probe (T557: the start was racy).
+                if !matches!(ready_rx.recv(), Ok(Ok(()))) {
+                    abort_start(&go, threads);
+                }
+                if let (Some(before), Some(after)) = (data_before, ibex_alloc::headroom::data_bytes_under_limit()) {
+                    worker_cost = Some(after.saturating_sub(before));
+                }
+            }
             Err(e) => {
                 // Under a tiny `-m` the stack of a thread does not fit (T508): the start fails
                 // with a message, the workers already started are told to give up.
-                ibex_rt::stderr_line!("[ALERT]    ({}) : Failed to create thread {worker_id} ({e}); the memory limit (-m) is too small for the threads.", process::id());
+                ibex_rt::stderr_line!("[ALERT]    ({}) : Failed to create thread {worker_id} ({e}); the memory limit (-m) is too small for {nbthread} threads.", process::id());
                 abort_start(&go, threads);
             }
         }
     }
-
-    drop(ready_tx);
 
     // 13. Only now, with every worker bound, tell the old process to go and tell systemd we
     //     are up. These used to run before the engine was built: a reload signalled the old
@@ -1245,7 +1263,8 @@ fn main() {
     //     with nothing accepting, and READY=1 reported a service that did not exist yet. A
     //     worker that fails to start says so (or, if it panicked, closes its end), and the
     //     start is abandoned with every worker's sockets closed first.
-    let mut started = (0..nbthread).all(|_| matches!(ready_rx.recv(), Ok(Ok(()))));
+    // Every worker has reported ready, one at a time, in the spawn loop above.
+    let mut started = true;
     // HAProxy arms its watchdog per thread at thread init (src/wdt.c:246) and does not fail
     // to start without it.
     let warn_after = config.global.as_ref().and_then(|g| g.warn_blocked_traffic_after).unwrap_or(ibex_rt::watchdog::DEFAULT_WARN_AFTER);

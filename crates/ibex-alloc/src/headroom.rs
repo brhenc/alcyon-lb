@@ -27,8 +27,16 @@ pub const THREAD_EXTRA: usize = 1024 * 1024;
 /// # Errors
 /// `ENOMEM` when the mapping does not fit.
 pub fn thread_fits(stack: usize) -> std::io::Result<()> {
+    fits(stack.saturating_add(THREAD_EXTRA))
+}
+
+/// Ok when `len` more bytes of private writable memory fit under `RLIMIT_DATA` now: they are
+/// mapped (never touched) and unmapped again.
+///
+/// # Errors
+/// `ENOMEM` when the mapping does not fit.
+pub fn fits(len: usize) -> std::io::Result<()> {
     use rustix::mm::{mmap_anonymous, munmap, MapFlags, ProtFlags};
-    let len = stack.saturating_add(THREAD_EXTRA);
     // SAFETY: a fresh anonymous mapping at an address the kernel picks; nothing else refers to
     // it, it is never read or written, and it is unmapped with the length it was mapped with.
     unsafe {
@@ -36,4 +44,33 @@ pub fn thread_fits(stack: usize) -> std::io::Result<()> {
         munmap(p, len)?;
     }
     Ok(())
+}
+
+/// What a worker started after a first one, measured, must find free under `RLIMIT_DATA` before
+/// it is spawned: the first worker's `cost` (what `VmData` grew by while it started: its stack,
+/// alternative stack, malloc arena and every allocation of its setup, all sized by `maxconn`,
+/// T557) plus a quarter for a peak above what was left mapped, plus [`THREAD_EXTRA`].
+#[must_use]
+pub fn worker_need(cost: usize) -> usize {
+    cost.saturating_add(cost / 4).saturating_add(THREAD_EXTRA)
+}
+
+/// The process's private writable memory now, as `RLIMIT_DATA` counts it (`VmData` in
+/// `/proc/self/status`), when `RLIMIT_DATA` is finite; `None` without a limit or without `/proc`.
+#[must_use]
+pub fn data_bytes_under_limit() -> Option<usize> {
+    let lim = rustix::process::getrlimit(rustix::process::Resource::Data);
+    lim.current?;
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb: usize = status.lines().find_map(|l| l.strip_prefix("VmData:"))?.trim().strip_suffix("kB")?.trim().parse().ok()?;
+    Some(kb.saturating_mul(1024))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn worker_need_is_cost_plus_a_quarter_plus_extra() {
+        assert_eq!(super::worker_need(4 << 20), (5 << 20) + super::THREAD_EXTRA);
+        assert_eq!(super::worker_need(usize::MAX), usize::MAX);
+    }
 }
