@@ -985,11 +985,9 @@ impl Buf {
     /// buffer, and the end of the head stays known. False, nothing changed, for a head with
     /// another end (a bare LF), no head, or no room.
     pub fn insert_last_header(&mut self, line: &[u8]) -> bool {
-        let Some((h, 4)) = self.eoh() else { return false };
         let n = line.len();
-        if !self.grow_to(self.len + n) {
-            return false;
-        }
+        let eoh = self.eoh();
+        let Some((h, 4)) = eoh.filter(|_| self.grow_to(self.len + n)) else { return false };
         // `grow_to` left the data at the start of the memory.
         let at = self.head + h + 2;
         self.data.copy_within(at..self.head + self.len, at + n);

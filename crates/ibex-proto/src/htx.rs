@@ -1441,11 +1441,9 @@ impl<'a> HtxSlice<'a> {
     }
 
     /// [`Self::push_req_line`] of the bytes of a line the caller found to be ASCII: they go in as
-    /// they are, with no UTF-8 check. Anything else is refused.
+    /// they are, with no UTF-8 check.
     pub fn push_req_line_ascii(&mut self, method: &[u8], uri: &[u8], version: &[u8]) -> Result<(), HtxError> {
-        if !(method.is_ascii() && uri.is_ascii() && version.is_ascii()) {
-            return Err(HtxError::InvalidData);
-        }
+        debug_assert!(method.is_ascii() && uri.is_ascii() && version.is_ascii(), "a request line past ASCII goes in as text");
         push_req_line_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, method, uri, version)
     }
 

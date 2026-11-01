@@ -199,12 +199,20 @@ fn the_parse_of_an_ascii_keep_alive_request_reads_no_utf8() {
     let mut c = rig.client();
     let req = "GET /index.html HTTP/1.0\r\nHost: localhost\r\nUser-Agent: ApacheBench/2.3\r\nAccept: */*\r\nConnection: Keep-Alive\r\n\r\n";
     let _ = rig.send(&mut c, req);
-    let before = ibex_proto::utf8_parse_calls_on_this_thread().len();
+    let before = ibex_proto::utf8_parse_calls_on_this_thread();
     for _ in 0..N {
         let _ = rig.send(&mut c, req);
     }
-    let sites = ibex_proto::utf8_parse_calls_on_this_thread();
-    if cfg!(debug_assertions) {
-        assert_eq!(sites.len() - before, 0, "UTF-8 reads in {N} requests, by site: {:?}", &sites[before..sites.len().min(before + 40)]);
-    }
+    let reads = ibex_proto::utf8_parse_calls_on_this_thread() - before;
+    assert_eq!(reads, 0, "UTF-8 reads in {N} requests");
+}
+
+/// A head with bare-LF line ends cannot take the token in place: it is written out of the HTX, as
+/// `HAProxy` writes it (CRLF, `connection: keep-alive` last; measured on 3.5-dev8).
+#[test]
+fn a_bare_lf_http10_keep_alive_head_is_written_out_with_the_token() {
+    let mut rig = Rig::new("", "");
+    let mut c = rig.client();
+    let _ = rig.send(&mut c, "GET /lf HTTP/1.0\nHost: a\nConnection: Keep-Alive\n\n");
+    assert_eq!(rig.last_head(), "GET /lf HTTP/1.0\r\nhost: a\r\nconnection: keep-alive\r\n\r\n");
 }
