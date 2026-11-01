@@ -169,3 +169,14 @@ fn balance_source_and_the_other_algorithms_pick_by_index_without_a_list() {
         assert!(e.proxies[0].select_server_idx().is_some_and(|(i, _)| i.is_some()));
     }
 }
+
+#[test]
+fn a_backend_without_servers_picks_its_dispatch_address() {
+    let d: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let config = Config {
+        backends: vec![BackendSection { name: "be".into(), mode: Mode::Http, dispatch: Some(d), ..Default::default() }],
+        ..Default::default()
+    };
+    let engine = Engine::new(&config, 8).expect("Engine::new");
+    assert_eq!(engine.proxies[0].select_server_idx(), Some((None, d)));
+}

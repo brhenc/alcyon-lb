@@ -1072,6 +1072,21 @@ mod shared_pool_tests {
         }
     }
 
+    /// Past `DENSE_MAX` servers the pool is not sized, and keeps and takes through the hashed
+    /// path as an unsized pool does.
+    #[test]
+    fn a_pool_too_large_to_size_still_keeps_and_takes() {
+        let t0 = Instant::now();
+        let pools = IdlePools::with(1, true);
+        let mut w = pools.worker(0);
+        w.size(&[IdlePool::DENSE_MAX + 1]);
+        assert!(pools.dense.get().is_none(), "not sized");
+        let (c, _p) = alive();
+        assert!(w.keep(key(), c, false, CFG, 1, t0).is_ok());
+        assert_eq!(w.total(), 1);
+        assert!(w.take(&key(), false, ibex_config::HttpReuse::Always, true).is_some());
+    }
+
     /// A connection whose server closed it while idle does not make the lists refuse the
     /// next one (T301): with it alive, a second connection that carried one request is
     /// refused (the idle list is not empty); once its peer's close was its event, the
