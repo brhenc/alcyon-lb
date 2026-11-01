@@ -157,6 +157,37 @@ impl FdUse {
     const UNLIMITED: Self = Self { used: 0, low: usize::MAX, high: usize::MAX };
 }
 
+/// Flat index of `[backend][server]`: backend `b`'s servers start at `offs[b]`.
+#[derive(Clone, Debug, Default)]
+struct DenseIdx {
+    offs: Box<[u32]>,
+}
+
+impl DenseIdx {
+    fn new(servers: &[usize]) -> Self {
+        let mut n = 0u32;
+        let offs = std::iter::once(0)
+            .chain(servers.iter().map(|&c| {
+                n = n.saturating_add(u32::try_from(c).unwrap_or(u32::MAX));
+                n
+            }))
+            .collect();
+        Self { offs }
+    }
+
+    fn total(&self) -> usize {
+        self.offs.last().map_or(0, |&n| n as usize)
+    }
+
+    /// The flat index of server `srv`, if it is covered.
+    #[inline]
+    fn at(&self, srv: (usize, usize)) -> Option<usize> {
+        let b = *self.offs.get(srv.0)? as usize;
+        let e = *self.offs.get(srv.0 + 1)? as usize;
+        (srv.1 < e - b).then_some(b + srv.1)
+    }
+}
+
 /// What a server keeps idle in one worker. `HAProxy` has two lists: a connection that has
 /// carried one request waits in `idle`, one that has carried two or more in `safe` (it
 /// proved the server reuses connections); both are also on `idle_conn_list`, oldest first,
@@ -185,6 +216,13 @@ fn server_entry(servers: &mut HashMap<(usize, usize), SrvIdle>, srv: (usize, usi
 #[derive(Debug, Default)]
 struct WorkerPool {
     servers: HashMap<(usize, usize), SrvIdle>,
+    /// Where the servers the pool was sized for are ([`IdlePool::size`]); `servers` holds any
+    /// other.
+    dense: Option<Arc<DenseIdx>>,
+    /// Per covered server, the position of its lists in `slab` (`u32::MAX`: none yet).
+    slot: Vec<u32>,
+    /// The lists of the covered servers that have had a connection, made on first use.
+    slab: Vec<((usize, usize), SrvIdle)>,
     /// Connections in all lists: a session whose server connection has the pool to itself
     /// (the usual keep-alive case) never looks the server up.
     conns: usize,
@@ -198,6 +236,40 @@ struct WorkerPool {
 }
 
 impl WorkerPool {
+    /// Server `srv`'s lists, if it has any: by index, hashed only for a server the pool was
+    /// not sized for.
+    fn srv_mut(&mut self, srv: (usize, usize)) -> Option<&mut SrvIdle> {
+        if let Some(i) = self.dense.as_ref().and_then(|d| d.at(srv)) {
+            let k = *self.slot.get(i)?;
+            return self.slab.get_mut(k as usize).map(|e| &mut e.1);
+        }
+        ibex_sample::work::note(ibex_sample::work::Op::IdleHash, 1);
+        self.servers.get_mut(&srv)
+    }
+
+    /// Server `srv`'s lists, made if it has none ([`server_entry`]).
+    fn srv_entry(&mut self, srv: (usize, usize)) -> Option<&mut SrvIdle> {
+        if let Some(i) = self.dense.as_ref().and_then(|d| d.at(srv)) {
+            let k = *self.slot.get(i)?;
+            if k != u32::MAX {
+                return self.slab.get_mut(k as usize).map(|e| &mut e.1);
+            }
+            // Bounded like `server_entry`: no list when the memory is not there.
+            self.slab.try_reserve(1).ok()?;
+            self.slot[i] = u32::try_from(self.slab.len()).ok()?;
+            self.slab.push((srv, SrvIdle::default()));
+            return self.slab.last_mut().map(|e| &mut e.1);
+        }
+        ibex_sample::work::note(ibex_sample::work::Op::IdleHash, 1);
+        server_entry(&mut self.servers, srv)
+    }
+
+    /// The server and position of the idle connection on `fd`.
+    fn find_fd(&self, fd: std::os::fd::RawFd) -> Option<((usize, usize), usize)> {
+        let at = |s: &SrvIdle| s.conns.iter().position(|p| p.conn.fd.as_raw_fd() == fd);
+        self.slab.iter().map(|(k, s)| (*k, s)).chain(self.servers.iter().map(|(&k, s)| (k, s))).find_map(|(k, s)| at(s).map(|i| (k, i)))
+    }
+
     /// When [`WorkerPool::purge`] next has work.
     fn next_purge(&self) -> Option<Instant> {
         self.next_purge
@@ -223,7 +295,7 @@ impl WorkerPool {
         if cfg.purge_delay_ms == 0 || fds.used >= fds.high {
             return Err((conn, key));
         }
-        let Some(s) = server_entry(&mut self.servers, key.srv) else { return Err((conn, key)) };
+        let Some(s) = self.srv_entry(key.srv) else { return Err((conn, key)) };
         // `srv_use_conn` raises both with every connection in use; seen from here, the
         // peak is at least the connections in use at a release.
         s.max_used = s.max_used.max(used).max(peak);
@@ -245,11 +317,15 @@ impl WorkerPool {
         }
         s.conns.push_back(Pooled { addr: key.addr, name: key.name, safe: is_safe, conn });
         s.safe += usize::from(is_safe);
-        self.conns += 1;
+        let mut armed = None;
         if s.purge_at.is_none() {
             s.purge_delay = Duration::from_millis(u64::from(cfg.purge_delay_ms));
             let at = now + s.purge_delay;
             s.purge_at = Some(at);
+            armed = Some(at);
+        }
+        self.conns += 1;
+        if let Some(at) = armed {
             self.next_purge = Some(self.next_purge.map_or(at, |n| n.min(at)));
         }
         Ok(())
@@ -264,7 +340,7 @@ impl WorkerPool {
     /// closes as the request goes out is `abort_keep_alive`'s.
     fn take(&mut self, key: &IdleKey, first_req: bool, mode: ibex_config::HttpReuse) -> Option<(IdleConn, bool)> {
         use ibex_config::HttpReuse::{Aggressive, Always, Never, Safe};
-        let s = self.servers.get_mut(&key.srv)?;
+        let s = self.srv_mut(key.srv)?;
         let order: &[bool] = match (first_req, mode) {
             (_, Never) | (true, Safe) => &[],
             (false, _) => &[false, true],
@@ -284,7 +360,7 @@ impl WorkerPool {
 
     /// Closes server `srv`'s oldest idle connection, safe or not (`idle_conn_list`'s head).
     fn close_oldest(&mut self, srv: (usize, usize)) -> bool {
-        let Some(s) = self.servers.get_mut(&srv) else { return false };
+        let Some(s) = self.srv_mut(srv) else { return false };
         let Some(p) = s.conns.pop_front() else { return false };
         s.safe -= usize::from(p.safe);
         self.conns -= 1;
@@ -317,7 +393,8 @@ impl WorkerPool {
             return;
         }
         let mut next: Option<Instant> = None;
-        for (&srv, s) in &mut self.servers {
+        let mut closed = 0;
+        for (srv, s) in self.slab.iter_mut().map(|(k, s)| (*k, s)).chain(self.servers.iter_mut().map(|(&k, s)| (k, s))) {
             let Some(at) = s.purge_at else { continue };
             if at <= now {
                 let n = to_close(srv, s).min(s.conns.len());
@@ -326,7 +403,7 @@ impl WorkerPool {
                         s.safe -= usize::from(p.safe);
                         p.conn.close();
                     }
-                    self.conns -= n;
+                    closed += n;
                 }
                 s.purge_at = (!s.conns.is_empty()).then(|| now + s.purge_delay);
             }
@@ -334,6 +411,7 @@ impl WorkerPool {
                 next = Some(next.map_or(t, |n| n.min(t)));
             }
         }
+        self.conns -= closed;
         self.next_purge = next;
     }
 }
@@ -375,6 +453,10 @@ pub struct IdlePools {
     next_takeover: AtomicUsize,
     /// Each server's idle connections in all slots (`srv->curr_idle_conns`).
     srv_idle: std::sync::RwLock<HashMap<(usize, usize), SrvIdleCount>>,
+    /// The same counts by `[backend][server]` for the servers the engine sized the pool for
+    /// ([`IdlePool::size`]): read without a lock or a hash. A server it does not cover
+    /// (the unit tests' keys) uses `srv_idle`.
+    dense: std::sync::OnceLock<(Arc<DenseIdx>, Box<[SrvIdleCount]>)>,
     /// `tune.pool_low_count`: past these fds in use, a server keeps no more idle
     /// connections than it was seen to need, and a worker takes another's even when the
     /// server has few (`tune.pool-low-fd-ratio` of `maxsock`).
@@ -420,6 +502,7 @@ impl IdlePools {
             shared,
             next_takeover: AtomicUsize::new(0),
             srv_idle: std::sync::RwLock::default(),
+            dense: std::sync::OnceLock::new(),
             pool_low,
             pool_high,
         })
@@ -433,6 +516,10 @@ impl IdlePools {
 
     /// Runs `f` on server `srv`'s counts, made on first use.
     fn with_count<R>(&self, srv: (usize, usize), f: impl Fn(&SrvIdleCount) -> R) -> R {
+        if let Some(n) = self.dense.get().and_then(|(ix, counts)| counts.get(ix.at(srv)?)) {
+            return f(n);
+        }
+        ibex_sample::work::note(ibex_sample::work::Op::IdleLock, 1);
         if let Some(n) = self.srv_idle.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&srv) {
             return f(n);
         }
@@ -511,6 +598,30 @@ impl IdlePool {
         &self.pools.slots[self.wid]
     }
 
+    /// The most servers the pool is sized for.
+    const DENSE_MAX: usize = 16384;
+
+    /// Sizes the pool for backends with `servers[b]` servers each, so that their lists and
+    /// counts are found by index (O2). Called before the engine runs; the first worker to
+    /// call fixes the counts' table, which every worker's engine builds alike.
+    pub fn size(&mut self, servers: &[usize]) {
+        // The tables cost ~24 bytes a server in all (a configuration of 60k backends is held to
+        // a memory bound the tables would break): past this many, the hashed path serves.
+        if servers.iter().sum::<usize>() > Self::DENSE_MAX {
+            return;
+        }
+        let (ix, counts) = self.pools.dense.get_or_init(|| {
+            let ix = DenseIdx::new(servers);
+            let counts = (0..ix.total()).map(|_| SrvIdleCount::default()).collect();
+            (Arc::new(ix), counts)
+        });
+        let mut pool = IdlePools::lock(self.slot());
+        if pool.dense.is_none() && pool.conns == 0 {
+            pool.slot = vec![u32::MAX; counts.len()];
+            pool.dense = Some(Arc::clone(ix));
+        }
+    }
+
     /// Whether this worker holds no idle connection.
     fn is_empty(&self) -> bool {
         self.slot().conns.load(Ordering::Relaxed) == 0
@@ -536,7 +647,7 @@ impl IdlePool {
         let (all, peak, est) = self.pools.srv_need(srv, used);
         // The server's need is server-wide and every worker's purge moves it: this worker's
         // copy starts from it, which `keep_with` raises to what it sees.
-        let Some(s) = server_entry(&mut pool.servers, srv) else { return Err(conn) };
+        let Some(s) = pool.srv_entry(srv) else { return Err(conn) };
         let own = s.conns.len();
         (s.max_used, s.est_need) = (peak, est);
         // `HAProxy` weighs a connection it may keep with its fd still counted; this one has
@@ -636,10 +747,10 @@ impl IdlePool {
     pub fn idle_event(&mut self, fd: std::os::fd::RawFd) -> bool {
         let slot = &self.pools.slots[self.wid];
         let mut pool = IdlePools::lock(slot);
-        let Some((srv, pos)) = pool.servers.iter().find_map(|(&srv, s)| s.conns.iter().position(|p| p.conn.fd.as_raw_fd() == fd).map(|i| (srv, i))) else {
+        let Some((srv, pos)) = pool.find_fd(fd) else {
             return false;
         };
-        let Some(s) = pool.servers.get_mut(&srv) else { return false };
+        let Some(s) = pool.srv_mut(srv) else { return false };
         let mut buf = [0u8; 4096];
         let quiet = s.conns.get_mut(pos).is_some_and(|p| matches!(p.conn.xprt.recv(p.conn.fd.as_fd(), &mut buf), Ok(raw::Io::WouldBlock)));
         if quiet {
@@ -2069,52 +2180,58 @@ impl Proxy {
     /// or falls back to the dispatch address if all servers are down or absent.
     #[must_use]
     pub fn select_server(&self) -> Option<SocketAddr> {
+        self.select_server_idx().map(|(_, a)| a)
+    }
+
+    /// [`Proxy::select_server`], with the index of the server picked.
+    #[must_use]
+    pub fn select_server_idx(&self) -> Option<(Option<usize>, SocketAddr)> {
         if self.servers.is_empty() {
-            return self.dispatch;
+            return self.dispatch.map(|a| (None, a));
         }
         match self.balance {
             BalanceAlgorithm::Leastconn => {
                 if let Some(idx) = crate::lb::leastconn(self) {
-                    Some(self.servers.at(idx))
+                    Some((Some(idx), self.servers.at(idx)))
                 } else {
-                    self.dispatch
+                    self.dispatch.map(|a| (None, a))
                 }
             }
             BalanceAlgorithm::StaticRr => {
                 if let Some(idx) = crate::lb::static_rr(self) {
-                    Some(self.servers.at(idx))
+                    Some((Some(idx), self.servers.at(idx)))
                 } else {
-                    self.dispatch
+                    self.dispatch.map(|a| (None, a))
                 }
             }
             BalanceAlgorithm::First => {
                 if let Some(idx) = crate::lb::first(self) {
-                    Some(self.servers.at(idx))
+                    Some((Some(idx), self.servers.at(idx)))
                 } else {
-                    self.dispatch
+                    self.dispatch.map(|a| (None, a))
                 }
             }
             BalanceAlgorithm::Random(draws) => {
                 if let Some(idx) = crate::lb::random(self, draws) {
-                    Some(self.servers.at(idx))
+                    Some((Some(idx), self.servers.at(idx)))
                 } else {
-                    self.dispatch
+                    self.dispatch.map(|a| (None, a))
                 }
             }
             BalanceAlgorithm::RoundRobin => {
                 if let Some(idx) = crate::lb::round_robin(self) {
-                    Some(self.servers.at(idx))
+                    Some((Some(idx), self.servers.at(idx)))
                 } else {
-                    self.dispatch
+                    self.dispatch.map(|a| (None, a))
                 }
             }
             _ => {
                 let eligible = self.eligible_server_indices();
                 if eligible.is_empty() {
-                    return self.dispatch;
+                    return self.dispatch.map(|a| (None, a));
                 }
                 let chosen_idx = eligible[self.next_server_idx.fetch_add(1, Ordering::Relaxed) % eligible.len()];
-                Some(self.servers.at(chosen_idx))
+                Some((Some(chosen_idx), self.servers.at(chosen_idx)))
             }
         }
     }
@@ -2123,18 +2240,25 @@ impl Proxy {
     /// respecting backup failover and connection limits.
     #[must_use]
     pub fn select_server_with_key(&self, source_ip: Option<IpAddr>, uri: Option<&str>) -> Option<SocketAddr> {
+        self.select_server_with_key_idx(source_ip, uri).map(|(_, a)| a)
+    }
+
+    /// [`Proxy::select_server_with_key`], with the index of the server picked (`None`: the
+    /// dispatch address), so that the caller does not look the address up again.
+    #[must_use]
+    pub fn select_server_with_key_idx(&self, source_ip: Option<IpAddr>, uri: Option<&str>) -> Option<(Option<usize>, SocketAddr)> {
         if self.servers.is_empty() {
-            return self.dispatch;
+            return self.dispatch.map(|a| (None, a));
         }
         match self.balance {
             BalanceAlgorithm::Source if self.hash_type == ibex_config::HashType::Consistent && source_ip.is_some() => {
                 let ip = source_ip?;
-                crate::lb::balance_source_consistent(self, ip).map(|idx| self.servers.at(idx)).or(self.dispatch)
+                crate::lb::balance_source_consistent(self, ip).map(|idx| (Some(idx), self.servers.at(idx))).or(self.dispatch.map(|a| (None, a)))
             }
             BalanceAlgorithm::Source => {
                 let eligible = self.eligible_server_indices();
                 if eligible.is_empty() {
-                    return self.dispatch;
+                    return self.dispatch.map(|a| (None, a));
                 }
                 if let Some(ip) = source_ip {
                     let hash: usize = match ip {
@@ -2145,20 +2269,20 @@ impl Proxy {
                             .fold(0usize, |acc, &b| acc.wrapping_add(b as usize)),
                     };
                     let chosen_idx = eligible[hash % eligible.len()];
-                    return Some(self.servers.at(chosen_idx));
+                    return Some((Some(chosen_idx), self.servers.at(chosen_idx)));
                 }
                 let chosen_idx = eligible[self.next_server_idx.fetch_add(1, Ordering::Relaxed) % eligible.len()];
-                Some(self.servers.at(chosen_idx))
+                Some((Some(chosen_idx), self.servers.at(chosen_idx)))
             }
             BalanceAlgorithm::Uri => {
                 let u = uri.unwrap_or("/");
                 if let Some(idx) = crate::lb::balance_uri(self, u) {
-                    Some(self.servers.at(idx))
+                    Some((Some(idx), self.servers.at(idx)))
                 } else {
-                    self.select_server()
+                    self.select_server_idx()
                 }
             }
-            _ => self.select_server(),
+            _ => self.select_server_idx(),
         }
     }
 
@@ -5220,7 +5344,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             crate::promex::prewarm();
         }
 
-        Ok(Engine {
+        let mut engine = Engine {
             quic_listeners,
             poller,
             scheduler,
@@ -5301,7 +5425,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             cli_socket_ident: None,
             mailboxes,
             mailbox_wid: 0,
-        })
+        };
+        engine.size_idle_pool();
+        Ok(engine)
     }
 
     /// Binds a Unix domain socket for CLI / `hatop` inspection.
@@ -5393,12 +5519,19 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
     }
 
+    /// Sizes the idle pool for this engine's backends' servers (O2).
+    fn size_idle_pool(&mut self) {
+        let counts: Vec<usize> = self.proxies.iter().map(|p| p.servers.len()).collect();
+        self.idle_backend_pool.size(&counts);
+    }
+
     /// Makes this engine worker `wid` of `pools`, the idle server connections all workers
     /// share (`tune.idle-pool.shared`). Called before the engine runs: a worker alone keeps
     /// a pool of its own. Its slot shares its epoll descriptor, which a worker that takes
     /// one of its idle connections takes it out of (T434).
     pub fn share_idle_pools(&mut self, pools: &Arc<IdlePools>, wid: usize) {
         self.idle_backend_pool = pools.worker(wid);
+        self.size_idle_pool();
         self.idle_backend_pool.attach_poller(self.poller.shared_epfd());
     }
 
@@ -9153,13 +9286,9 @@ fn close_http_session(
 
 /// `srv_inc_sess_ctr`: a stream was assigned to the server at `addr` of backend `be_idx`,
 /// whether it then reuses a connection to it or opens one (`srv_sess_rate`).
-fn count_server_session(proxies: &[Proxy], be_idx: usize, addr: SocketAddr) {
+fn count_server_session(proxies: &[Proxy], be_idx: usize, idx: Option<usize>) {
     let px = &proxies[be_idx];
-    px.servers
-        .iter()
-        .position(|s| s == addr)
-        .and_then(|idx| px.server_sess_rates.get(idx))
-        .inspect(|rate| rate.tick());
+    idx.and_then(|idx| px.server_sess_rates.get(idx)).inspect(|rate| rate.tick());
 }
 
 /// `SessionEntry::be_counted` of a stream no backend counts.
@@ -14062,12 +14191,12 @@ impl EngineDispatcher<'_> {
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
         entry.sess.lb_picked = cookie_server.is_none();
         let target = if let Some(idx) = cookie_server {
-            Some(proxies[be_idx].servers.at(idx))
+            Some((Some(idx), proxies[be_idx].servers.at(idx)))
         } else {
-            proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref())
+            proxies[be_idx].select_server_with_key_idx(source_ip, entry.sess.req_uri.as_deref())
         };
 
-        let Some(target_addr) = target else {
+        let Some((picked_idx, target_addr)) = target else {
             if cookie_server.is_none() && proxies[be_idx].all_servers_full() {
                 return Self::wait_in_queue(entry, proxies, now, be_idx);
             }
@@ -14079,7 +14208,7 @@ impl EngineDispatcher<'_> {
         };
         // Given a slot: out of the queue.
         entry.sess.queue.leave();
-        count_server_session(proxies, be_idx, target_addr);
+        count_server_session(proxies, be_idx, picked_idx);
 
         // The connection kept from this session's last transaction, if this request goes
         // to the same server: no new connection, no pool round trip. Otherwise it goes to
@@ -14137,7 +14266,7 @@ impl EngineDispatcher<'_> {
             release_server(entry, proxies, fdtab, poller, idle_pool, true);
         }
 
-        let s_idx = cookie_server.or_else(|| proxies[be_idx].servers.iter().position(|s| s == target_addr));
+        let s_idx = picked_idx;
         entry.target_server_idx = s_idx;
         entry.srv_backend_idx = be_idx;
         entry.sess.log.server = s_idx.and_then(crate::txnlog::server_slot);
@@ -14370,21 +14499,17 @@ impl EngineDispatcher<'_> {
         let direct = chosen.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned));
         entry.sess.lb_picked = direct.is_none();
         let target = match direct {
-            Some(i) => Some(proxies[be_idx].servers.at(i)),
-            None => proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref()),
+            Some(i) => Some((Some(i), proxies[be_idx].servers.at(i))),
+            None => proxies[be_idx].select_server_with_key_idx(source_ip, entry.sess.req_uri.as_deref()),
         };
 
-        let Some(target_addr) = target else {
+        let Some((s_idx, target_addr)) = target else {
             entry.sess.srv_state = ScState::Error;
             return;
         };
 
-        count_server_session(proxies, be_idx, target_addr);
+        count_server_session(proxies, be_idx, s_idx);
 
-        let s_idx = proxies[be_idx]
-            .servers
-            .iter()
-            .position(|s| s == target_addr);
         if let Some(idx) = s_idx {
             if idx < proxies[be_idx].server_actconn.len() {
                 proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);

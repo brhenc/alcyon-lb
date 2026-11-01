@@ -18,9 +18,14 @@ pub enum Op {
     CtxClone = 1,
     /// An expression looked up by its text ([`crate::expr::Expr::cached`]).
     ExprLookup = 2,
+    /// The server connection counts read through the `RwLock`-guarded map (a server the
+    /// pool's dense table does not cover).
+    IdleLock = 3,
+    /// A server's idle list looked up by hashing `(backend, server)`.
+    IdleHash = 4,
 }
 
-const OPS: usize = 3;
+const OPS: usize = 5;
 
 thread_local! {
     static COUNTS: [Cell<u64>; OPS] = const { [const { Cell::new(0) }; OPS] };
