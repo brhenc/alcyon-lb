@@ -29,6 +29,8 @@
 #                medians, and the fit's spread (max-min over median). min-of-rounds is retired
 #                for h3. IBEX_MEASURE_JSONL=<file> appends one row (`"kind": "insreq-h3"`) with
 #                all three; data/measurements.jsonl takes them (measure.py skips such rows).
+#                IBEX_MEASURE_BUILD=pgo marks the row as a tools/pgo-build.sh binary (the board's PGO
+#                column, `tools/measure/h3board.py`); default release-perf, haproxy by the path.
 #   The h3 scenario binds `quic4@` on the same port as its TCP `ssl` bind (h3.body).
 #
 # The scenario body is a config with @FE@ and @BE@ for the two ports (tools/measure/scenarios/),
@@ -45,7 +47,7 @@
 # built since T555, which frames a body that arrives in a read of its own), and for h3best,
 # h3worst, h3fit $HOME/ibex-targets/h3bench/release/h3bench (H3BENCH overrides; built if missing).
 set -u
-if [ $# -ne 7 ]; then sed -n '5,46p' "$0"; exit 2; fi
+if [ $# -ne 7 ]; then sed -n '5,48p' "$0"; exit 2; fi
 LABEL=$1; BIN=$2; BODY=$3; CL=$4; N=$5; ROUNDS=$6; OUT=$7
 mkdir -p "$OUT" || exit 1
 BENCH=${MEASURE_BENCH:-$HOME/ibex-targets/gate-slot1/release/measure-bench}
@@ -130,6 +132,7 @@ if jsonl:
         ["git", "-C", here, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     row = {"kind": "insreq-h3", "sha": sha, "label": label, "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
            "binary": binp, "scenario": os.path.basename(body), "method": method, "requests": int(n), "rounds": len(rows),
+           "build": os.environ.get("IBEX_MEASURE_BUILD") or ("haproxy" if "haproxy" in binp else "release-perf"),
            "fit_rate": float(rate), "h3_fit": round(med(4)), "h3_fit_spread_pct": round(spread, 3),
            "h3_best": round(med(0)), "h3_best_dgrams": med(1), "h3_worst": round(med(2)), "h3_worst_dgrams": med(3),
            "h3_fit_samples": [round(f) for f in fits]}
