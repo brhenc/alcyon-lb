@@ -140,11 +140,9 @@ pub fn fill(d: &mut Dump, ctx: &Ctx<'_>, dst: &mut [u8]) -> usize {
                 w = room;
                 d.split = Some((base, u32::try_from(skip + room).unwrap_or(u32::MAX)));
             } else {
-                // For the next buffer, from where it started.
+                // For the next buffer, from where it started. (Never the rest of a cut unit: that
+                // comes first, into an empty room.)
                 d.page = base;
-                if skip > 0 {
-                    d.split = Some((base, u32::try_from(skip).unwrap_or(u32::MAX)));
-                }
             }
             break;
         });
@@ -199,6 +197,8 @@ mod tests {
     /// A frontend and `nb` backends of `per` servers, as the engine builds them.
     fn proxies(nb: usize, per: usize) -> crate::engine::Proxies {
         let mut c = String::from("defaults\n    mode http\nfrontend fe\n    bind 127.0.0.1:8080\n    stats enable\n    stats uri /s\n");
+        // Two stick tables: one with entries enough for several units, one empty.
+        c.push_str("backend t1\n    stick-table type integer size 100 store http_req_cnt\nbackend t2\n    stick-table type ip size 10\n");
         for b in 0..nb {
             c.push_str(&format!("backend b{b}\n"));
             for s in 0..per {
@@ -206,7 +206,12 @@ mod tests {
             }
         }
         let config = ibex_config::parse_str(&c).expect("config");
-        crate::engine::Engine::build_shared_state(&config).expect("proxies")
+        let proxies = crate::engine::Engine::build_shared_state(&config).expect("proxies");
+        let t1 = proxies.iter().find_map(|p| p.stick_table.as_ref().filter(|_| p.name == "t1")).expect("t1");
+        for k in 0..40 {
+            t1.update_entry(&ibex_stick_table::entry::StickKey::Integer(k), |d| d.http_req_cnt = k as u64 * 3).expect("entry");
+        }
+        proxies
     }
 
     fn dechunk(mut b: &[u8]) -> Vec<u8> {
@@ -236,53 +241,71 @@ mod tests {
         let done = crate::stats_post::StCode::Done;
         type Make<'a> = Box<dyn Fn() -> (Page, String) + 'a>;
         let pages: [Make<'_>; 5] = [
-            Box::new(|| (Page::Html(HtmlCursor::new(&checks), None), crate::stats_html::render_stats_html_for(&proxies, &checks, 7, &cfg))),
+            Box::new(|| (Page::Html(HtmlCursor::new(), None), crate::stats_html::render_stats_html_for(&proxies, &checks, 7, &cfg))),
             Box::new(|| {
                 let html = crate::stats_html::render_stats_html_for(&proxies, &checks, 7, &cfg);
-                (Page::Html(HtmlCursor::new(&checks), Some(done)), crate::stats_post::with_banner(html, &done.banner("/s")))
+                (Page::Html(HtmlCursor::new(), Some(done)), crate::stats_post::with_banner(html, &done.banner("/s")))
             }),
-            Box::new(|| (Page::Rows(StatCursor::csv(&proxies, &checks)), crate::stats::format_show_stat(&proxies, &checks, 7))),
+            Box::new(|| (Page::Rows(StatCursor::csv()), crate::stats::format_show_stat(&proxies, &checks, 7))),
             Box::new(|| {
                 let json = crate::stats::format_show_stat_as(&proxies, &checks, 7, None, None, None, crate::stats::StatFormat::Json);
-                (Page::Rows(StatCursor::new(&proxies, &checks, crate::stats::StatFormat::Json, None, None, None)), json)
+                (Page::Rows(StatCursor::new(crate::stats::StatFormat::Json, None, None, None)), json)
             }),
-            Box::new(|| (Page::Json(JsonCursor::new(&checks)), crate::stats_html::render_stats_json(&proxies, &checks, 7))),
+            Box::new(|| (Page::Json(JsonCursor::new()), crate::stats_html::render_stats_json(&proxies, &checks, 7))),
         ];
         let (_, html) = pages[0]();
         let (_, csv) = pages[2]();
         assert!(html.len() > 100_000 && csv.len() > 20_000, "the pages need many buffers");
+        assert!(html.contains("Table has no stored entries.") && html.matches("<td class=\"mono\">117</td>").count() == 1, "both tables shown");
         for make in &pages {
             let big = make().1.len() > 1 << 20;
             // A page of MBs (the JSON rows) in 64-byte buffers would take seconds.
             for size in [MIN_ROOM, 100, 1000, 4096, 16384, 1 << 24].into_iter().filter(|&n| !big || n >= 4096) {
                 for chunked in [true, false] {
                     // `lastchg` counts seconds: a page that took one to stream is made again.
-                    let mut tries = 0;
-                    loop {
+                    let attempt = || {
                         let (page, want) = make();
                         let (got, calls) = stream_all(Dump::new(page, chunked, 0), &ctx, size);
-                        let got = if chunked { dechunk(&got) } else { got };
-                        tries += 1;
-                        if got != want.as_bytes() && tries < 3 {
-                            continue;
-                        }
-                        let at = got.iter().zip(want.as_bytes()).position(|(a, b)| a != b).unwrap_or(got.len().min(want.len()));
-                        assert!(
-                            got == want.as_bytes(),
-                            "{page:?} in buffers of {size}, chunked {chunked}: {} bytes, want {}; from {at}: {:?} want {:?}",
-                            got.len(),
-                            want.len(),
-                            String::from_utf8_lossy(&got[at.saturating_sub(80)..(at + 40).min(got.len())]),
-                            &want[at.saturating_sub(80)..(at + 40).min(want.len())]
-                        );
-                        if size <= 16384 {
-                            assert!(calls >= want.len() / size, "{calls} buffers of {size} for {} bytes", want.len());
-                        }
-                        break;
+                        (if chunked { dechunk(&got) } else { got }, want, calls, page)
+                    };
+                    let mut r = attempt();
+                    for _ in 0..2 {
+                        if r.0 != r.1.as_bytes() { r = attempt(); }
                     }
+                    let (got, want, calls, page) = r;
+                    let at = got.iter().zip(want.as_bytes()).position(|(a, b)| a != b).unwrap_or(got.len().min(want.len()));
+                    assert!(got == want.as_bytes(), "{page:?} in buffers of {size}, chunked {chunked}: {} bytes, want {}; from {at}: {:?}", got.len(), want.len(), &want[at.saturating_sub(80)..(at + 40).min(want.len())]);
+                    assert!(size > 16384 || calls >= want.len() / size, "{calls} buffers of {size} for {} bytes", want.len());
                 }
             }
         }
+    }
+
+    /// A dump that is over, or a room too small for a chunk, gets nothing written.
+    #[test]
+    fn nothing_is_written_when_over_or_without_room() {
+        let proxies = proxies(1, 2);
+        let banner = |c: crate::stats_post::StCode| c.banner("/s");
+        let cfg = ibex_config::StatsConfig::default();
+        let ctx = Ctx { proxies: &proxies, checks: &[], pid: 1, cfg: &cfg, banner: &banner };
+        let mut d = Dump::new(Page::Rows(StatCursor::csv()), true, 0);
+        assert_eq!(fill(&mut d, &ctx, &mut [0u8; MIN_ROOM - 1]), 0);
+        let mut buf = vec![0u8; 1 << 16];
+        let n = fill(&mut d, &ctx, &mut buf);
+        assert!(d.finished && buf[..n].ends_with(LAST_CHUNK), "one fill holds it all");
+        assert_eq!(fill(&mut d, &ctx, &mut buf), 0);
+    }
+
+    /// `show stat <iid> 4 <sid>`: the one server row asked for, as the one-shot answer has it.
+    #[test]
+    fn a_server_filter_keeps_one_row() {
+        let proxies = proxies(2, 5);
+        let b1 = proxies.iter().find(|p| p.name == "b1").expect("b1");
+        let iid = i32::try_from(b1.ids.iid).expect("iid");
+        let one = crate::stats::format_show_stat_as(&proxies, &[], 1, Some(iid), Some(4), Some(3), crate::stats::StatFormat::Csv);
+        let rows: Vec<&str> = one.lines().skip(1).collect();
+        assert_eq!(rows.len(), 1, "{one}");
+        assert!(rows[0].starts_with("b1,s2,"), "{one}");
     }
 
     /// The JSON rows are `[...]` with commas between them, however the buffers fall.
@@ -290,7 +313,7 @@ mod tests {
     fn json_rows_with_none_are_an_empty_array() {
         let proxies = proxies(0, 0);
         // Only server rows asked for, and there are none.
-        let mut cur = StatCursor::new(&proxies, &[], crate::stats::StatFormat::Json, None, Some(4), None);
+        let mut cur = StatCursor::new(crate::stats::StatFormat::Json, None, Some(4), None);
         let mut out = String::new();
         while cur.next_unit(&proxies, &[], 1, &mut out) {}
         assert_eq!(out, "[]\n");

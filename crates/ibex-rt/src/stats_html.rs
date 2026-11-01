@@ -55,7 +55,7 @@ pub fn render_stats_html_for(
     serving: &ibex_config::StatsConfig,
 ) -> String {
     let mut out = String::with_capacity(32768);
-    let mut cur = HtmlCursor::new(checks);
+    let mut cur = HtmlCursor::new();
     while cur.next_unit(proxies, checks, pid, serving, None, &mut out) {}
     out
 }
@@ -70,20 +70,11 @@ fn on_node(serving: &ibex_config::StatsConfig) -> String {
     node.as_deref().map_or(String::new(), |n| format!(" on {n}"))
 }
 
-/// The check of server `s` of proxy `p`: by bisection when the checks are in (proxy,
-/// server) order, as they are made, so a page of many servers is not quadratic.
-pub(crate) fn check_of(checks: &[ServerCheckState], sorted: bool, p: usize, s: usize) -> Option<&ServerCheckState> {
-    if sorted {
-        let i = checks.partition_point(|c| (c.proxy(), c.server()) < (p, s));
-        checks.get(i).filter(|c| c.proxy() == p && c.server() == s)
-    } else {
-        checks.iter().find(|c| c.proxy() == p && c.server() == s)
-    }
-}
-
-/// Whether [`check_of`] may bisect `checks`.
-pub(crate) fn checks_sorted(checks: &[ServerCheckState]) -> bool {
-    checks.windows(2).all(|w| (w[0].proxy(), w[0].server()) < (w[1].proxy(), w[1].server()))
+/// The check of server `s` of proxy `p`, by bisection: the checks are made in (proxy,
+/// server) order (`Engine::new_worker`), so a page of many servers is not quadratic.
+pub(crate) fn check_of(checks: &[ServerCheckState], p: usize, s: usize) -> Option<&ServerCheckState> {
+    let i = checks.partition_point(|c| (c.proxy(), c.server()) < (p, s));
+    checks.get(i).filter(|c| c.proxy() == p && c.server() == s)
 }
 
 const H_CSS: u8 = 0;
@@ -111,24 +102,18 @@ pub struct HtmlCursor {
     n: u32,
     any: bool,
     slot: usize,
-    checks_sorted: bool,
 }
 
 impl HtmlCursor {
     #[must_use]
-    pub fn new(checks: &[ServerCheckState]) -> HtmlCursor {
-        HtmlCursor { step: H_CSS, p: 0, s: 0, n: 0, any: false, slot: 0, checks_sorted: checks_sorted(checks) }
+    pub const fn new() -> HtmlCursor {
+        HtmlCursor { step: H_CSS, p: 0, s: 0, n: 0, any: false, slot: 0 }
     }
 
     /// The next unit is the one a `;st=` banner goes in.
     #[must_use]
     pub const fn at_banner(&self) -> bool {
         self.step == H_TOP
-    }
-
-    #[must_use]
-    pub const fn finished(&self) -> bool {
-        self.step == H_DONE
     }
 
     /// Writes the next unit of the page to `out` and returns `true`; `false` once the page
@@ -661,11 +646,9 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                     return true;
                 }
                 H_SRV => {
+                    // `p` is the proxy whose head was the last unit: the list never changes.
                     let p_idx = self.p as usize;
-                    let Some(proxy) = proxies.get(p_idx) else {
-                        self.step = H_BE;
-                        continue;
-                    };
+                    let proxy = &proxies[p_idx];
                     let s_idx = self.s as usize;
                     let Some(srv_addr) = proxy.servers.get(s_idx) else {
                         self.p += 1;
@@ -687,7 +670,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                     let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);
                     let actconn = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
 
-                    let check_state = check_of(checks, self.checks_sorted, p_idx, s_idx);
+                    let check_state = check_of(checks, p_idx, s_idx);
 
                     let (check_info, health_toggle) = if let Some(c) = check_state {
                         let info = if !c.enabled {
@@ -875,13 +858,9 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                     return true;
                 }
                 H_ST_ROWS => {
-                    let Some(tbl) = proxies.get(self.p as usize).and_then(|p| p.stick_table.as_ref()) else {
-                        self.p += 1;
-                        self.step = H_ST;
-                        continue;
-                    };
-                    // A few entries a unit, read from the slot the last unit stopped at.
-                    let (entries, next) = tbl.dump_from(self.slot, 16);
+                    // A few entries a unit, read from the slot the last unit stopped at, of the
+                    // table whose head was the first unit of this proxy.
+                    let (entries, next) = proxies[self.p as usize].stick_table.as_ref().map_or((Vec::new(), None), |t| t.dump_from(self.slot, 16));
                     self.any |= !entries.is_empty();
                     for (k, d) in entries {
                         let conn_rate = d.conn_rate.map_or(0, |r| r.rate());
@@ -1165,7 +1144,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
 #[must_use]
 pub fn render_stats_json(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) -> String {
     let mut out = String::with_capacity(8192);
-    let mut cur = JsonCursor::new(checks);
+    let mut cur = JsonCursor::new();
     while cur.next_unit(proxies, checks, pid, &mut out) {}
     out
 }
@@ -1177,7 +1156,6 @@ pub struct JsonCursor {
     step: u8,
     p: u32,
     s: u32,
-    checks_sorted: bool,
 }
 
 const J_HEAD: u8 = 0;
@@ -1188,13 +1166,8 @@ const J_DONE: u8 = 4;
 
 impl JsonCursor {
     #[must_use]
-    pub fn new(checks: &[ServerCheckState]) -> JsonCursor {
-        JsonCursor { step: J_HEAD, p: 0, s: 0, checks_sorted: checks_sorted(checks) }
-    }
-
-    #[must_use]
-    pub const fn finished(&self) -> bool {
-        self.step == J_DONE
+    pub const fn new() -> JsonCursor {
+        JsonCursor { step: J_HEAD, p: 0, s: 0 }
     }
 
     /// Writes the next unit to `out` and returns `true`; `false` once the document is over.
@@ -1264,7 +1237,7 @@ impl JsonCursor {
                 let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
                 let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);
                 let actconn = proxy.server_actconn.get(s_idx).map_or(0, |a| a.load(Relaxed));
-                let check_state = check_of(checks, self.checks_sorted, p_idx, s_idx);
+                let check_state = check_of(checks, p_idx, s_idx);
                 let check_info = if let Some(c) = check_state {
                     if !c.enabled {
                         "PAUSED".to_string()

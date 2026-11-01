@@ -1037,7 +1037,7 @@ impl CliApplet {
         }
 
         // Written a buffer at a time by `pump_table`, then ended by `end_stat_answer`.
-        let rows = crate::stats::StatCursor::new(ctx.proxies, ctx.checks, fmt, iid_filter, type_filter, sid_filter);
+        let rows = crate::stats::StatCursor::new(fmt, iid_filter, type_filter, sid_filter);
         self.stat_dump = Some(crate::stats_stream::Dump::new(crate::stats_stream::Page::Rows(rows), false, 0));
     }
 

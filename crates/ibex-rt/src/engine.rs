@@ -1543,6 +1543,19 @@ impl ProxyStats {
 
 
 
+/// Links each proxy to the one written after it ([`ProxyIdInfo::next_decl`]). The list is
+/// built listens, backends, frontends; `show stat` lists them as they were written.
+pub(crate) fn link_declaration_order(proxies: &mut [Proxy]) {
+    let mut order: Vec<usize> = (0..proxies.len()).collect();
+    order.sort_by_key(|&i| proxies[i].ids.decl);
+    for w in order.windows(2) {
+        proxies[w[0]].ids.next_decl = usize_to_u32(w[1] + 1);
+    }
+    if let Some(&last) = order.last() {
+        proxies[last].ids.next_decl = 0;
+    }
+}
+
 /// What [`Proxy::ids`] holds.
 #[derive(Debug, Clone, Default)]
 pub struct ProxyIdInfo {
@@ -1555,6 +1568,10 @@ pub struct ProxyIdInfo {
     pub iid: u32,
     /// Where the section was written among the proxies: `show stat` lists them in that order.
     pub decl: u32,
+    /// The proxy written after this one, as its index plus one; 0 for the last: `show stat`
+    /// walks the proxies in declaration order a row at a time without sorting them (T572).
+    /// Set once the list is built ([`link_declaration_order`]).
+    pub next_decl: u32,
     /// The section has an `id` of its own (`bk_f_forced_id`).
     pub forced_id: bool,
     /// Each server's numeric id in this proxy (`puid`), what `srv_id`, the `sid` column of
@@ -4286,6 +4303,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
         ids: Box::new(ProxyIdInfo {
             iid: ids.iid,
             decl: ids.decl,
+            next_decl: 0,
             forced_id: ids.forced,
             server_puids: server_puids(listen.servers.len(), &listen.server_extras),
             server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
@@ -4439,6 +4457,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
         ids: Box::new(ProxyIdInfo {
             iid: ids.iid,
             decl: ids.decl,
+            next_decl: 0,
             forced_id: ids.forced,
             server_puids: Vec::new(),
             server_forced_ids: Vec::new(),
@@ -4584,6 +4603,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
         ids: Box::new(ProxyIdInfo {
             iid: ids.iid,
             decl: ids.decl,
+            next_decl: 0,
             forced_id: ids.forced,
             server_puids: server_puids(be.servers.len(), &be.server_extras),
             server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
@@ -4982,6 +5002,7 @@ impl Engine {
         p.h1_case = Arc::clone(&h1_table);
     }
     crate::track::attach(&mut proxies, config);
+    link_declaration_order(&mut proxies);
     crate::logfwd::start(config)?;
     let _ = resolve_log_targets(config, &mut proxies);
     Ok(Proxies::new(proxies))
@@ -11151,7 +11172,10 @@ impl EngineDispatcher<'_> {
             // A Prometheus scrape or a stats page being produced: one test for both.
             match entry.sess.pending_resp.as_deref() {
                 Some(crate::proxy::PendingOut::Scrape(_)) => crate::promex::pump(&mut entry.sess, self.proxies, self.checks, self.pid),
-                Some(crate::proxy::PendingOut::Stats(_)) => stats_pump(&mut entry.sess, self.proxies, self.checks, self.pid),
+                Some(crate::proxy::PendingOut::Stats(d)) => {
+                    let d = *d;
+                    stats_pump(&mut entry.sess, d, self.proxies, self.checks, self.pid);
+                }
                 _ => {}
             }
             if entry.sess.mode == Mode::Http && !entry.sess.is_done() {
@@ -12723,14 +12747,14 @@ impl EngineDispatcher<'_> {
 
         // 1. CSV telemetry
         if req_uri.contains(";csv") || req_uri.ends_with("/csv") {
-            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::csv(proxies, checks));
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::csv());
             stats_stream_page(entry, proxies, checks, pid, serving, "text/plain", &refresh, page);
             return None;
         }
 
         // 2. JSON API data for live auto-refresh
         if req_uri.contains("/api/data") || req_uri.ends_with("/data") {
-            let page = crate::stats_stream::Page::Json(crate::stats_html::JsonCursor::new(checks));
+            let page = crate::stats_stream::Page::Json(crate::stats_html::JsonCursor::new());
             stats_stream_page(entry, proxies, checks, pid, serving, "application/json", &refresh, page);
             return None;
         }
@@ -12836,13 +12860,13 @@ impl EngineDispatcher<'_> {
                 return Some(cmd);
             }
 
-            let page = crate::stats_stream::Page::Html(crate::stats_html::HtmlCursor::new(checks), Self::stats_st_code(proxies, serving, req_uri));
+            let page = crate::stats_stream::Page::Html(crate::stats_html::HtmlCursor::new(), Self::stats_st_code(proxies, serving, req_uri));
             stats_stream_page(entry, proxies, checks, pid, serving, "text/html", &refresh, page);
             return Some(cmd);
         }
 
         // 4. Default: Render full HTML dashboard
-        let page = crate::stats_stream::Page::Html(crate::stats_html::HtmlCursor::new(checks), Self::stats_st_code(proxies, serving, req_uri));
+        let page = crate::stats_stream::Page::Html(crate::stats_html::HtmlCursor::new(), Self::stats_st_code(proxies, serving, req_uri));
         stats_stream_page(entry, proxies, checks, pid, serving, "text/html", &refresh, page);
         None
     }
@@ -16726,7 +16750,11 @@ fn stick_bytes_due(sess: &TcpSession, last: bool) -> (u64, u64) {
 fn stats_write_page(entry: &mut SessionEntry, proxies: &[Proxy], content_type: &str, refresh: &str, body: &[u8]) {
     let http11 = entry.sess.txn.as_ref().is_none_or(|t| t.req_http11);
     let mut out = format!("HTTP/1.1 200 OK\r\ncache-control: no-cache\r\ncontent-type: {content_type}\r\n{refresh}").into_bytes();
-    if http11 {
+    if entry.sess.is_h2() {
+        // HTTP/2 frames the body itself (DATA, then END_STREAM): no chunks, no `connection`.
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(body);
+    } else if http11 {
         out.extend_from_slice(b"transfer-encoding: chunked\r\n\r\n");
         if !body.is_empty() {
             out.extend_from_slice(format!("{:X}\r\n", body.len()).as_bytes());
@@ -16791,39 +16819,32 @@ fn stats_stream_page(
     if let Some(t) = sess.txn.as_mut() {
         t.rsp = crate::txn::MsgState::head(if http11 { crate::txn::Framing::Chunked } else { crate::txn::Framing::UntilClose });
     }
-    sess.set_stats_dump(Some(d));
-    stats_pump(sess, proxies, checks, pid);
+    stats_pump(sess, d, proxies, checks, pid);
 }
 
 /// Fills the session's response buffer with the next part of its stats page, if the buffer
 /// has room; called on every pass over the session while it has one. An unframed page (to
 /// an HTTP/1.0 client) ends with the bytes still in the buffer once the last is written.
-fn stats_pump(sess: &mut crate::proxy::TcpSession, proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) {
-    let Some(mut d) = sess.stats_dump() else { return };
+fn stats_pump(sess: &mut crate::proxy::TcpSession, mut d: crate::stats_stream::Dump, proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) {
+    // `serving` is the index of the proxy that took the request: the list never changes.
+    let serving = d.serving as usize;
+    let uri = sess.req_uri.as_deref().unwrap_or("");
+    let banner = |c: crate::stats_post::StCode| EngineDispatcher::stats_banner(proxies, serving, uri, c);
+    let ctx = crate::stats_stream::Ctx { proxies, checks, pid, cfg: &proxies[serving].stats_config, banner: &banner };
+    // `writable` compacts a buffer whose consumed head leaves the tail exhausted.
+    let n = crate::stats_stream::fill(&mut d, &ctx, sess.rep.writable());
+    sess.rep.commit(n);
     if !d.finished {
-        let serving = (d.serving as usize).min(proxies.len().saturating_sub(1));
-        let Some(cfg) = proxies.get(serving).map(|p| &p.stats_config) else {
-            sess.set_stats_dump(None);
-            return;
-        };
-        let uri = sess.req_uri.as_deref().unwrap_or("");
-        let banner = |c: crate::stats_post::StCode| EngineDispatcher::stats_banner(proxies, serving, uri, c);
-        let ctx = crate::stats_stream::Ctx { proxies, checks, pid, cfg, banner: &banner };
-        // `writable` compacts a buffer whose consumed head leaves the tail exhausted.
-        let n = crate::stats_stream::fill(&mut d, &ctx, sess.rep.writable());
-        sess.rep.commit(n);
+        sess.set_stats_dump(d);
+        return;
     }
-    if d.finished {
-        if !d.chunked() {
-            let left = sess.rep.readable().len() as u64;
-            if let Some(t) = sess.txn.as_mut() {
-                t.rsp = if left == 0 { crate::txn::MsgState::Done } else { crate::txn::MsgState::Body(crate::txn::Body::Length(left)) };
-            }
+    if !d.chunked() {
+        let left = sess.rep.readable().len() as u64;
+        if let Some(t) = sess.txn.as_mut() {
+            t.rsp = if left == 0 { crate::txn::MsgState::Done } else { crate::txn::MsgState::Body(crate::txn::Body::Length(left)) };
         }
-        sess.set_stats_dump(None);
-    } else {
-        sess.set_stats_dump(Some(d));
     }
+    sess.end_dump();
 }
 
 /// A stats page answer, with the `http-after-response` rules of its frontend and backend

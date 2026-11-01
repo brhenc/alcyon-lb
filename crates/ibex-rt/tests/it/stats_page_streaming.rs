@@ -48,17 +48,22 @@ impl Drop for Setup {
 }
 
 fn start(tag: &str) -> Setup {
+    start_with(tag, "", BACKENDS, PER)
+}
+
+/// [`start`] with more `global` lines and `nb` backends of `per` servers.
+fn start_with(tag: &str, global: &str, nb: usize, per: usize) -> Setup {
     let (st, ping) = (common::reserve_addr(), common::reserve_addr());
     let sock = format!("/tmp/ibex-t572-{tag}-{}.sock", std::process::id());
     let cfg = std::env::temp_dir().join(format!("ibex-t572-{tag}-{}.cfg", std::process::id()));
     let mut c = format!(
-        "global\n    nbthread 1\n    stats socket {sock} level admin\ndefaults\n    mode http\n    timeout client 30s\n    timeout server 30s\n    timeout connect 5s\n\
+        "global\n    nbthread 1\n{global}    stats socket {sock} level admin\ndefaults\n    mode http\n    timeout client 30s\n    timeout server 30s\n    timeout connect 5s\n\
          frontend st\n    bind {st}\n    stats enable\n    stats uri /s\n\
          frontend ping\n    bind {ping}\n    http-request return status 200 content-type text/plain string ok\n"
     );
-    for b in 0..BACKENDS {
+    for b in 0..nb {
         c.push_str(&format!("backend b{b}\n"));
-        for s in 0..PER {
+        for s in 0..per {
             c.push_str(&format!("    server s{s} 127.0.0.{}:{}\n", 1 + s % 250, 1000 + b));
         }
     }
@@ -232,4 +237,94 @@ fn cli_show_stat_is_streamed_with_bounded_memory() {
         bad.push(format!("prompt mode: {} bytes, show info after it: {}", out.len(), out.contains("Name: ")));
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// Past `tune.buffers.limit` the head waits for a response buffer like any reply (S6b): the
+/// page joins it, and it all goes once a buffer is free, chunked to the end.
+#[test]
+fn a_page_whose_head_waits_for_a_buffer_is_sent_whole() {
+    let s = start_with("bufwait", "    tune.buffers.limit 3\n    tune.buffers.reserve 0\n", 3, 20);
+    // Three partial heads hold the three buffers. The page's request waits for one, gets the
+    // first given back, and its answer then waits for a second.
+    let mut held: Vec<TcpStream> = (0..3)
+        .map(|_| {
+            let mut c = TcpStream::connect(s.st).expect("connect");
+            c.write_all(b"GET /held HTTP/1.1\r\nHost: x\r\n").expect("partial head");
+            c
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(300));
+    let mut a = TcpStream::connect(s.st).expect("connect");
+    // The start of a next request keeps the request buffer from being given back.
+    a.write_all(b"GET /s HTTP/1.1\r\nHost: x\r\n\r\nGET /next").expect("send");
+    std::thread::sleep(Duration::from_millis(300));
+    drop(held.remove(0));
+    std::thread::sleep(Duration::from_millis(500));
+    let mut early = [0u8; 1];
+    a.set_nonblocking(true).expect("nonblocking");
+    let waited = matches!(a.read(&mut early), Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock);
+    a.set_nonblocking(false).expect("blocking");
+    assert!(waited, "the answer did not wait for a buffer");
+    drop(held.remove(0));
+    let (body, _) = read_chunked(&mut a);
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.ends_with("</html>\n") && body.matches("<tr id=\"srv-row-").count() == 60, "{} bytes", body.len());
+}
+
+/// A HEAD gets the head of the page alone.
+#[test]
+fn a_head_request_gets_the_head_alone() {
+    let s = start_with("head", "", 2, 3);
+    let mut c = TcpStream::connect(s.st).expect("connect");
+    c.write_all(b"HEAD /s;csv HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("send");
+    c.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let mut got = Vec::new();
+    let _ = c.read_to_end(&mut got);
+    let got = String::from_utf8_lossy(&got).to_ascii_lowercase();
+    assert!(got.starts_with("http/1.1 200") && got.contains("transfer-encoding: chunked") && got.ends_with("\r\n\r\n"), "{got:?}");
+}
+
+/// HTTP/2 frame: length, type, flags, stream.
+fn h2_frame(ftype: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let mut v = u32::try_from(payload.len()).expect("short").to_be_bytes()[1..].to_vec();
+    v.extend_from_slice(&[ftype, flags]);
+    v.extend_from_slice(&stream.to_be_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+/// An HTTP/2 client gets the page as one message (DATA frames on its stream, then its end).
+#[test]
+fn an_h2_client_gets_the_whole_page() {
+    let s = start_with("h2", "", 2, 3);
+    let mut c = TcpStream::connect(s.st).expect("connect");
+    c.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").expect("preface");
+    c.write_all(&h2_frame(0x04, 0, 0, &[])).expect("settings");
+    // :method GET, :scheme http, :path /s;csv, :authority x -- no Huffman.
+    let mut h = vec![0x82, 0x86, 0x04, 6];
+    h.extend_from_slice(b"/s;csv");
+    h.extend_from_slice(&[0x01, 1, b'x']);
+    c.write_all(&h2_frame(0x01, 0x05, 1, &h)).expect("headers");
+    c.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+    let (mut raw, mut data, mut ended) = (Vec::new(), Vec::new(), false);
+    let mut tmp = [0u8; 65536];
+    while !ended {
+        let n = c.read(&mut tmp).expect("read");
+        assert!(n > 0, "closed before the end of the stream");
+        raw.extend_from_slice(&tmp[..n]);
+        while raw.len() >= 9 {
+            let len = usize::from(raw[0]) << 16 | usize::from(raw[1]) << 8 | usize::from(raw[2]);
+            if raw.len() < 9 + len {
+                break;
+            }
+            let (ty, fl, sid) = (raw[3], raw[4], u32::from_be_bytes([raw[5], raw[6], raw[7], raw[8]]) & 0x7fff_ffff);
+            if ty == 0 && sid == 1 {
+                data.extend_from_slice(&raw[9..9 + len]);
+            }
+            ended |= sid == 1 && fl & 1 != 0 && (ty == 0 || ty == 1);
+            raw.drain(..9 + len);
+        }
+    }
+    let data = String::from_utf8_lossy(&data);
+    assert!(data.starts_with("# pxname,") && data.ends_with(",\n") && data.lines().count() == 3 + 2 * 4, "{data:?}");
 }

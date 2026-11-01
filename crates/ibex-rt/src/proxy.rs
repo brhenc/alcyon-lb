@@ -2175,36 +2175,21 @@ impl TcpSession {
         }
     }
 
-    /// The stats page being produced, if any.
-    #[must_use]
-    pub fn stats_dump(&self) -> Option<crate::stats_stream::Dump> {
-        match self.pending_resp.as_deref() {
-            Some(PendingOut::Stats(d)) => Some(*d),
-            _ => None,
+    /// Sets the stats page being produced (its next state); the box is a scrape's (pool
+    /// `scrape_box`). [`Self::end_dump`] ends it.
+    pub fn set_stats_dump(&mut self, d: crate::stats_stream::Dump) {
+        if let Some(PendingOut::Stats(slot)) = self.pending_resp.as_deref_mut() {
+            *slot = d;
+            return;
         }
-    }
-
-    /// Sets (or ends) the stats page being produced; the box is a scrape's (pool `scrape_box`).
-    pub fn set_stats_dump(&mut self, d: Option<crate::stats_stream::Dump>) {
-        match (d, self.pending_resp.as_deref_mut()) {
-            (Some(d), Some(PendingOut::Stats(slot))) => *slot = d,
-            (Some(d), _) => {
-                let mut b = SCRAPE_BOXES.take_raw(<Box<PendingOut> as ibex_alloc::Poolable>::try_new).unwrap_or_else(|| Box::new(PendingOut::Stats(d)));
-                *b = PendingOut::Stats(d);
-                self.pending_resp = Some(b);
-            }
-            (None, Some(PendingOut::Stats(_))) => {
-                if let Some(b) = self.pending_resp.take() {
-                    SCRAPE_BOXES.give(b);
-                }
-            }
-            (None, _) => {}
-        }
+        let mut b = SCRAPE_BOXES.take_raw(<Box<PendingOut> as ibex_alloc::Poolable>::try_new).unwrap_or_else(|| Box::new(PendingOut::Stats(d)));
+        *b = PendingOut::Stats(d);
+        self.pending_resp = Some(b);
     }
 
     /// Ends a scrape or a stats page still being produced; the box goes back to its pool.
     /// One test of `pending_resp` for both, on every request.
-    fn end_dump(&mut self) {
+    pub fn end_dump(&mut self) {
         if matches!(self.pending_resp.as_deref(), Some(PendingOut::Scrape(_) | PendingOut::Stats(_))) {
             if let Some(b) = self.pending_resp.take() {
                 SCRAPE_BOXES.give(b);
