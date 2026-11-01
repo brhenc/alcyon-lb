@@ -843,11 +843,11 @@ fn fill_counters(r: &mut StatRow, c: &crate::statcnt::TxnCounters, http: bool, t
 }
 
 /// `algo`: the balance algorithm as `HAProxy` names it. `random` and the default
-/// (no `balance` line) print `unknown` on HAProxy; Ibex does not tell the default from an
-/// explicit `roundrobin`, and prints `roundrobin`.
+/// (no `balance` line, own or from `defaults`) print `unknown` on HAProxy, as here.
 fn balance_name(proxy: &Proxy) -> &'static str {
     use ibex_config::BalanceAlgorithm as B;
     match proxy.balance {
+        B::RoundRobin if !proxy.balance_set => "unknown",
         B::RoundRobin => "roundrobin",
         B::Source => "source",
         B::Uri => "uri",
@@ -1385,6 +1385,7 @@ mod tests {
             stats_config: ibex_config::StatsConfig::default(),
             desc: None,
             balance: ibex_config::BalanceAlgorithm::RoundRobin,
+            balance_set: true,
             default_backend: None,
             use_backends: Vec::new(),
             use_servers: Vec::new(),

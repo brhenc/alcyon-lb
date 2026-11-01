@@ -357,6 +357,8 @@ pub struct ListenSection {
     pub default_backend: Option<String>,
     /// Load balancing algorithm.
     pub balance: BalanceAlgorithm,
+    /// A `balance` line (own or from `defaults`) was given: `show stat`'s `algo` is `unknown` without one.
+    pub balance_set: bool,
     /// Stick table configuration.
     pub stick_table: Option<StickTableConfigAst>,
     /// Stick rules.
@@ -569,6 +571,7 @@ impl Default for ListenSection {
             monitor_uri: None,
             default_backend: None,
             balance: BalanceAlgorithm::RoundRobin,
+            balance_set: false,
             stick_table: None,
             stick_rules: Vec::new(),
             tcp_req_inspect_delay: None,
@@ -822,6 +825,8 @@ pub struct BackendSection {
     pub id: Option<u32>,
     /// Load balancing algorithm.
     pub balance: BalanceAlgorithm,
+    /// A `balance` line (own or from `defaults`) was given: `show stat`'s `algo` is `unknown` without one.
+    pub balance_set: bool,
     /// The `cookie` line: HTTP session persistence.
     pub cookie: Option<CookieConfig>,
     /// Connect timeout in milliseconds / Duration.
@@ -935,6 +940,7 @@ impl Default for BackendSection {
             id: None,
             description: None,
             balance: BalanceAlgorithm::RoundRobin,
+            balance_set: false,
             cookie: None,
             contimeout: None,
             srvtimeout: None,

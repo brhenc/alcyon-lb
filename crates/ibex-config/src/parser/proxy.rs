@@ -121,6 +121,7 @@ pub(crate) fn parse_listen_header(
         monitor_uri: None,
         default_backend: defaults.and_then(|d| d.default_backend.clone()),
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
+        balance_set: defaults.is_some_and(|d| d.balance.is_some()),
         stick_table: None,
         stick_rules: Vec::new(),
         tcp_req_inspect_delay: defaults.and_then(|d| d.tcp_req_inspect_delay),
@@ -298,6 +299,7 @@ pub(crate) fn parse_backend_header(
         id: None,
         description: None,
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
+        balance_set: defaults.is_some_and(|d| d.balance.is_some()),
         cookie: defaults.and_then(|d| d.cookie.clone()),
         contimeout: timeouts.connect,
         srvtimeout: timeouts.server,
@@ -412,7 +414,10 @@ pub(crate) fn parse_listen_directive(
         "log-tag" => parse_log_tag(tokens, kw).map(|t| proxy.log_tag = Some(t)),
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
-        "balance" => parse_balance(&mut proxy.balance, tokens, kw),
+        "balance" => {
+            proxy.balance_set = true;
+            parse_balance(&mut proxy.balance, tokens, kw)
+        }
         "http-reuse" => parse_http_reuse(&mut proxy.http_reuse, tokens, kw),
         "hash-type" => {
             let mut ht = proxy.hash_type.unwrap_or_default();
@@ -679,7 +684,10 @@ pub(crate) fn parse_backend_directive(
             Ok(())
         }
         "use-server" => parse_use_server(&mut be.use_servers, tokens, kw),
-        "balance" => parse_balance(&mut be.balance, tokens, kw),
+        "balance" => {
+            be.balance_set = true;
+            parse_balance(&mut be.balance, tokens, kw)
+        }
         "http-reuse" => parse_http_reuse(&mut be.http_reuse, tokens, kw),
         "hash-type" => {
             let mut ht = be.hash_type.unwrap_or_default();
