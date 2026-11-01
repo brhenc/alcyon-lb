@@ -11261,12 +11261,13 @@ impl EngineDispatcher<'_> {
     /// One run of a stream, with its variables where its rules read them
     /// ([`with_stream_vars`]): everything a stream evaluates happens inside a run, and a
     /// run never waits -- a stream that waits ends its run and is woken for another.
-    fn step_stream(&mut self, session_idx: u32) -> Outcome {
+    /// `timer`: a timer woke it (`WOKEN_TIMER`): the run looks at its timers (L3).
+    fn step_stream(&mut self, session_idx: u32, timer: bool) -> Outcome {
         if let Some(entry) = self.sessions.get_mut(session_idx) {
             stream_vars_enter(&mut entry.sess, &self.proxies[entry.proxy_idx]);
             stream_timeouts_enter(self.proxies, entry.proxy_idx, entry.backend_idx, &entry.sess);
         }
-        let out = self.step_stream_run(session_idx);
+        let out = self.step_stream_run(session_idx, timer);
         // Refused a buffer at `tune.buffers.limit` in this run: it waits for one (S6).
         if crate::buf_wait::wanted() {
             match self.sessions.get_mut(session_idx) {
@@ -11285,7 +11286,7 @@ impl EngineDispatcher<'_> {
     }
 
     #[allow(clippy::too_many_lines)] // one dispatch chain; splitting it would obscure the order
-    fn step_stream_run(&mut self, session_idx: u32) -> Outcome {
+    fn step_stream_run(&mut self, session_idx: u32, timer: bool) -> Outcome {
         // The time now, not the time the pass started: `step` takes its tick before it waits
         // in the poller, so a stream woken by a request after an idle second would arm a
         // `wait-for-body` of 300 ms from a second ago.
@@ -11349,31 +11350,38 @@ impl EngineDispatcher<'_> {
                 }
             }
 
-            // Step 2: Check timeouts
-            let cli_before = entry.sess.cli_state;
-            let timed_out = entry.sess.check_timeouts(now);
-            if timed_out && entry.sess.mode == Mode::Http && entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Client)) {
-                Self::client_timed_out(entry, self.proxies, self.fdtab, self.poller, self.idle_backend_pool, &mut self.wake_queue, now, self.pid, cli_before);
-            }
-            // `timeout connect` expired: a failed connect like any other (`back_handle_st_cer`),
-            // retried at once -- no turnaround, which only follows an asynchronous error --
-            // and counted in `econ` once the retries are spent.
-            if timed_out
-                && matches!(entry.sess.ending, Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Connect)))
-                && entry.srv_raw_fd.is_some()
-                && !entry.sess.is_done()
-            {
-                entry.sess.ending = None;
-                server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, false);
-                // The last attempt ran out of time, not out of luck: a server-side timeout
-                // (`sC--`), where a refusal is `SC--` (T496, VV-23).
-                if entry.sess.ending == Some(crate::proxy::Ending::ConnectFailed) {
-                    entry.sess.ending = Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Connect));
+            // Step 2: Check timeouts -- in a run a timer woke (L3): every deadline the stream
+            // has is its task's timer (`next_expiry`, step 5), so one that passed while the
+            // stream ran for I/O wakes it in the next pass, `WOKEN_TIMER`
+            // (`process_stream` reads `TASK_WOKEN_TIMER` the same way).
+            if timer {
+                let cli_before = entry.sess.cli_state;
+                #[cfg(debug_assertions)]
+                ibex_sample::work::note(ibex_sample::work::Op::TimeoutCheck, 1);
+                let timed_out = entry.sess.check_timeouts(now);
+                if timed_out && entry.sess.mode == Mode::Http && entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Client)) {
+                    Self::client_timed_out(entry, self.proxies, self.fdtab, self.poller, self.idle_backend_pool, &mut self.wake_queue, now, self.pid, cli_before);
                 }
-            }
-            // A retry that waited out its turnaround connects now.
-            if entry.sess.retry_after.is_set() && entry.sess.retry_after.is_expired(now) && !entry.sess.is_done() {
-                retry_now(entry, self.proxies, self.fdtab, self.poller, now);
+                // `timeout connect` expired: a failed connect like any other (`back_handle_st_cer`),
+                // retried at once -- no turnaround, which only follows an asynchronous error --
+                // and counted in `econ` once the retries are spent.
+                if timed_out
+                    && matches!(entry.sess.ending, Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Connect)))
+                    && entry.srv_raw_fd.is_some()
+                    && !entry.sess.is_done()
+                {
+                    entry.sess.ending = None;
+                    server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, false);
+                    // The last attempt ran out of time, not out of luck: a server-side timeout
+                    // (`sC--`), where a refusal is `SC--` (T496, VV-23).
+                    if entry.sess.ending == Some(crate::proxy::Ending::ConnectFailed) {
+                        entry.sess.ending = Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Connect));
+                    }
+                }
+                // A retry that waited out its turnaround connects now.
+                if entry.sess.retry_after.is_set() && entry.sess.retry_after.is_expired(now) && !entry.sess.is_done() {
+                    retry_now(entry, self.proxies, self.fdtab, self.poller, now);
+                }
             }
 
             // Step 3: Stream engine process pass
@@ -15086,8 +15094,8 @@ impl EngineDispatcher<'_> {
 }
 
 impl Dispatch for EngineDispatcher<'_> {
-    fn run(&mut self, kind: WorkKind, _state: u32) -> Outcome {
-        let outcome = self.run_task(kind);
+    fn run(&mut self, kind: WorkKind, woken: u32) -> Outcome {
+        let outcome = self.run_task(kind, woken);
         // `sched_stuck = 0` after every task (src/task.c:681): one store, no syscall.
         crate::watchdog::progress();
         outcome
@@ -15100,12 +15108,12 @@ impl Dispatch for EngineDispatcher<'_> {
 }
 
 impl EngineDispatcher<'_> {
-    fn run_task(&mut self, kind: WorkKind) -> Outcome {
+    fn run_task(&mut self, kind: WorkKind, woken: u32) -> Outcome {
         match kind.kind() {
             Some(Kind::Stream) => {
                 let session_idx = kind.index();
                 // A panic in the run closes this stream, not the process (T447).
-                crate::crash::contain(|| self.step_stream(session_idx)).unwrap_or_else(|()| self.stream_panicked(session_idx))
+                crate::crash::contain(|| self.step_stream(session_idx, woken & state::WOKEN_TIMER != 0)).unwrap_or_else(|()| self.stream_panicked(session_idx))
             }
             Some(Kind::Check) => {
                 let check_idx = kind.index() as usize;

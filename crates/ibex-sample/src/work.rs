@@ -34,9 +34,12 @@ pub enum Op {
     /// the `*_timeout` fetches read converted from the proxies' settings, the capture slots'
     /// table (`Arc`) cloned. Counted in debug builds only (L3).
     RunSetup = 8,
+    /// A stream run that looked at its timers (`check_timeouts`): counted in debug builds
+    /// only (L3, T586).
+    TimeoutCheck = 9,
 }
 
-const OPS: usize = 9;
+const OPS: usize = 10;
 
 thread_local! {
     static COUNTS: [Cell<u64>; OPS] = const { [const { Cell::new(0) }; OPS] };

@@ -414,3 +414,32 @@ fn a_keepalive_stream_run_does_only_io_and_http() {
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
 }
+
+/// What `op` counted over `n` requests after a warm-up, with `get` one request.
+fn ops_per_requests(op: Op, n: u64, mut get: impl FnMut()) -> u64 {
+    for _ in 0..20 {
+        get();
+    }
+    let c0 = on_this_thread()[op as usize];
+    for _ in 0..n {
+        get();
+    }
+    on_this_thread()[op as usize] - c0
+}
+
+/// L3 (T586): a stream run looks at its timers when a timer woke it (`WOKEN_TIMER`), not on
+/// every run: a keep-alive request is two I/O wakeups and no timer is due in either. Two
+/// `check_timeouts` a request before.
+#[test]
+#[cfg(debug_assertions)]
+fn a_keepalive_stream_run_checks_timers_only_when_one_is_due() {
+    const N: u64 = 100;
+    let (mut engine, fe, running, be) = setup();
+    let mut c = Client::connect(fe);
+    let checks = ops_per_requests(Op::TimeoutCheck, N, || c.get(&mut engine));
+    println!("{N} keep-alive requests: {checks} timeout checks");
+    assert!(checks <= 2, "{checks} timeout checks for {N} requests: every run walks every timer");
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}
