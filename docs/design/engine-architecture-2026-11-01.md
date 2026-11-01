@@ -768,3 +768,13 @@ moment." §4.6's week table is replaced by this; §4's slice rows and budgets st
   if each starts when its parent merges; the run end to end **~18-24 h**, with fix rounds after a
   red gate as the uncertainty (each ~1 h). Remaining decisions (D-12..D-18) are taken at the
   recommendation unless the user says otherwise.
+
+### 6.4 User decisions, 2026-11-01 (17:30): D-12..D-18, two passes
+
+- **D-13**: a rules miss is acceptable in this first pass if rules lands within 10 % of §5's
+  estimate (central 51.3k, i.e. <= ~56.4k user ins/req). No R5 in this pass: the leftovers of every
+  scenario go to a **second optimisation pass** after the landing re-measure.
+- **Scope of the first pass**: the multiplicative costs (per-pass, per-run, per-rule, per-header,
+  per-copy work) and the "of course we should do this" items. A slice that turns into fine-tuning
+  of a constant stops and leaves the rest to the second pass.
+- **D-12, D-14, D-15, D-16, D-17, D-18**: approved as recommended.
