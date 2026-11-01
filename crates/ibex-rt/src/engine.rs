@@ -8899,7 +8899,7 @@ fn h2_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     }
     let before = (cs.rep.len(), t.rsp);
     let srv_gone = matches!(cs.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-    if crate::h2_bridge::forward_response(h2, ch.stream.id, t, &mut cs.rep, srv_gone) {
+    if crate::h2_bridge::forward_response(h2, ch.stream.id, t, &mut cs.rep, srv_gone, &mut ch.late_trailers) {
         cs.log.term = Some(*b"SD");
         moved = true;
     }
@@ -8971,7 +8971,7 @@ fn h3_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     }
     let before = (cs.rep.len(), t.rsp);
     let srv_gone = matches!(cs.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-    if crate::h2_bridge::forward_response_mux(mux, ch.stream.id, t, &mut cs.rep, srv_gone, &mut h3.body_scratch) {
+    if crate::h2_bridge::forward_response_mux(mux, ch.stream.id, t, &mut cs.rep, srv_gone, &mut h3.body_scratch, &mut ch.late_trailers) {
         cs.log.term = Some(*b"SD");
         moved = true;
     }
