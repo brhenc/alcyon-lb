@@ -143,9 +143,159 @@ better; slice. Sources: **[I]** Ibex h2 IBS (79.6k build; E1/E2/Q2/Q3/Q8 have si
 | 14 | **Pools and malloc** | `pool_*` + malloc/free 1.4k (h2) to 4.2k (rules) [H, M] | 0 malloc; `Buf` pool 0.3k; spares 4.1k on rules [M] (row 8) | Ibex's pools are cheaper per op; the rules' spare traffic is a representation cost | nothing beyond R2/X2 | - |
 | 15 | **Safety extras on by default** (zero-on-free, wipe, `crash::contain`, `watchdog` x3/pass, `fault_point`) | none | [E] 0.3-1k; X0 item 9 lists them | Ibex-only | user decision per item (fair benchmark defaults, §6 D-11) | X0 |
 
-### 2.1 Measured (X0 appends here)
+### 2.1 Measured (X0, 2026-11-01)
 
-(unfilled: X0 has not run)
+Main e83cd302, release-perf (plain build for the totals, `-C force-frame-pointers=yes` build for
+the profiles), quiet CPUs (4-6 and 12-14 idle, governor `performance`, no `wwm.exe`; other
+sessions were compiling on other cores, load 7-21). HAProxy dev8 (dev10 for h3). Raw data,
+folded stacks, scripts: `~/ibex-worktrees/review/x0-2026-11-01/` (`insreq/`, `calls/`, `calls2/`,
+`tp/`, `strace/`, `prof/`, `clk/`, `h3/`, `scripts/`). The scenarios are `keepalive ab1` and `rules
+ab1` (the bodies in `tools/measure/scenarios/`) and `h2s1` on a copy of `h3.body` without the
+`quic4@` bind (`scripts/h2.body`).
+
+**How to read the profile columns.** Ibex: IBS (`ibs_op/cnt_ctl=1,swfilt=1/u`), frame pointers,
+inlines expanded (`fold2.py`); samples on the `syscall` instruction (24-28 % of the samples) are
+dropped and the rest scaled to the `insreq.sh` user total of the same run (T544's convention).
+HAProxy: `instructions:u -c 100003 --call-graph dwarf`, with the same two drops (`__syscall_cancel_arch_end`
+and the `clock_gettime` wrapper hold 8.0k + 4.8k a request of skid on keepalive) and the same scaling.
+Read each row as +-15 %; two tools, two skids. A "k" below is 1,000 instructions a request.
+
+**Totals** (`insreq.sh`, 5 rounds x 20,000 requests, min-total round; h3fit 5 rounds x 5,000, user
+only):
+
+| scenario | Ibex user | Ibex kernel | HAProxy user | HAProxy kernel | ratio user | Ibex passes/req | HAProxy passes/req |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| keepalive ab1 | 45,900 | 65,892 | 36,230 | 69,698 | 1.27x | 2.00 | 2.00 |
+| rules ab1 | 75,719 | 66,143 | 43,830 | 69,570 | 1.73x | 2.00 | 2.00 |
+| h2s1 | 71,593 | 69,229 | 53,171 | 76,262 | 1.35x | **6.0-8.0** | 3.00 |
+| h3fit (1.97 dg/req) | 98,882 | n/a | 64,037 (dev10) | n/a | 1.54x | 7.1 (best) / 8.1 (worst) | 3.0 / 5.1 |
+
+HAProxy dev10's h3fit is 64.0k here against 73.7k in D6 and the table of §5: dev10 was rebuilt on
+10-31 (memory: "dev10 since 18:17"); the ratio for the h3 row of §5 must be re-read from this
+table. Kernel: Ibex is **3.8k (keepalive), 3.4k (rules), 7.0k (h2s1) below HAProxy**, i.e. the
+kernel side is already past parity; every slice's "kernel <= parent" rule is the right one.
+HAProxy's keepalive user total is 36.2k here (33.3k in the htx doc's record from
+`memory-2026-10-24.md`: older build/oracle), so the keepalive gap is **9.7k**, not 12.6k.
+
+**Passes: the T544 contradiction (7.15 `Engine::step` vs 3.07 `epoll_wait`) is the observer.**
+Every `step_at` makes exactly one `epoll_wait`. Measured with the tracepoint alone
+(`perf stat -e syscalls:sys_enter_epoll_wait`, the least intrusive observer): **7.99 a request**
+on h2s1. With four uprobes and the tracepoint 7.998 (`step_at` 7.998); with 23 uprobes 6.0; under
+`strace -f` **3.03** (strace slows every syscall, the client's frames and the proxy's own wakes
+land in the same `epoll_wait`, so the pass count falls to HAProxy's). T544's 3.07 was the strace
+census, its 7.15 the uprobe run. The undisturbed figure is about **8**, and it varies with the
+timing of the client (6.0-8.0 over my runs); HAProxy is 3.00 under every observer. keepalive is 2.00
+under every observer, both proxies. Task runs a request (`Dispatch::run`, uprobes, 6-pass runs):
+Ibex 2.0 / 2.0 / 9.0 (`step_stream_run` the same; `h2_owner_mut` 10.0, `advance` 12.0, `wake_queued`
+12.0, `update_interests` 9.0 on h2s1), HAProxy `process_stream` 2 / 2 / 2, `h1_io_cb` 2 / 2 / 1,
+`h2_io_cb` 0 / 0 / 3, `sc_conn_io_cb` 3 / 3 / 3, `run_tasks_from_lists` 5.0 / - / 7.0 calls of
+`t->process` (HAProxy h2: 7 task runs, 3 passes; Ibex: 9 runs in 6-8 passes). Ibex's h2s1 pass
+costs 1.05k outside the tasks (below), so **each pass L2 removes is worth ~1k**.
+
+**Syscalls a request** (tracepoints, 5,000 requests; `strace -c` over 2,000 in `strace/` agrees
+except for `epoll_wait` on h2s1):
+
+| syscall | keepalive Ibex / HAProxy | rules Ibex / HAProxy | h2s1 Ibex / HAProxy |
+|---|---:|---:|---:|
+| `epoll_wait` | 2.00 / 2.00 | 2.00 / 2.00 | **7.99 / 3.00** |
+| `read` / `recvmsg` | 2.00 / 2.00 | 2.00 / 2.00 | 2.00 / **4.00** (1 EAGAIN each) |
+| `write` / `sendmsg` | 2.00 / 2.00 | 2.00 / 2.00 | 2.00 / 2.00 |
+| `clock_gettime` (real syscall, `CLOCK_THREAD_CPUTIME_ID`) | 0 / **4.00** | 0 / **4.00** | 0 / **6.00** |
+| all syscalls | 6.01 / 10.01 | 6.01 / 10.01 | 12.01 / 15.01 |
+
+Ibex has fewer syscalls on all three and fewer kernel instructions; the 5 extra `epoll_wait` of
+h2s1 cost less in the kernel than HAProxy's 2 `recvmsg` EAGAIN, 6 CPU-time syscalls and the rest.
+
+**Clock reads** (uprobe on libc `clock_gettime` with a call chain, `clk/`): Ibex keepalive **5.0**
+(4 `Instant::now`: two a pass, `run_loop` and `step_at`; 1 `SystemTime::now`, `StreamLog::start`
+from `reset_for_next_request`), rules **6.0** (+1 `SystemTime::now` inside a fetch, closure #214,
+`eval_g`), h2s1 **14-16.6** (2 a pass x 6-8 passes, +2 `StreamLog::start`). Q2 holds: two a pass.
+Cost, inclusive: `Instant::now` 0.55k / 0.53k / 2.58k, `SystemTime::now` 0.30k / 0.27k / 0.34k,
+the vDSO leaf alone 0.51k / 0.37k / 1.83k (**1.8 % / 1.1 % / 4.1 %** of the user total). HAProxy:
+8 / 8 / 12 `clock_gettime` calls a request, half of them real syscalls.
+
+**Rows of the §2 table, measured** (user instructions a request, keepalive / rules / h2s1; Ibex
+inclusive unless "self"; HAProxy inclusive, skid-dropped; the full tables are `prof/*.tab`,
+`ibex-rows.txt`, `hap-rows.txt`):
+
+| # | component | HAProxy | Ibex | against §2's estimate |
+|---|---|---|---|---|
+| 1 | loop pass, outside the tasks | `run_poll_loop` less `process_runnable_tasks`: 1.34k / 1.30k / 1.17k = **0.67k / 0.65k / 0.39k a pass** | `run_loop` less `run_tasks_from_lists`: 2.93k / 2.09k / ~8.4k (h2s1: `step_at` less its tasks and `spawn_h2_children`, plus `run_loop`'s own) = **1.47k / 1.05k / 1.05k a pass**; `step_at` self 0.39k / 0.31k / 1.17k; `wake_expired_tasks` 0.23 / 0.13 / 0.92, `Instant::now` 0.55 / 0.53 / 2.58 (two a pass), `trim_idle` 0.14 / 0.14 / 0.43, `publish` x3 0.04 / 0.01 / 0.32, `pool::pass` 0.01 / 0.01 / 0.09, `purge` 0.07 / 0.01 / 0.10, `watchdog` 0.04 / 0.10 / 0.11 | §2 said ~250 a pass of pure loop: measured **1.05-1.5k** including the clock, the timer queue, `epoll_wait`'s user side and event decode. Housekeeping calls alone are 0.35k / 0.2k / 1.0k a request (the 100-250 a pass of L1). |
+| 2 | passes, task runs | 2 / 2 / 3 passes; 5 / - / 7 runs | 2 / 2 / **6-8** passes; 2 / 2 / 9 runs | h2s1 is 8 passes (not 3.07, not 7.15); keepalive has no excess pass. |
+| 3 | stream run, fixed | `process_stream` self 1.98k / 2.1k / 2.7k for 2 runs = **~1.0-1.3k a run**; `process_runnable_tasks` + `run_tasks_from_lists` self 1.5k / 1.6k / 2.0k | `Dispatch::run` .. `step_stream` shell 0.48k a run + `step_stream_run` self 0.27k a run + its other children (`update_interests` 0.35k, `next_expiry`, `is_done`, `wants_rerun`, ...) = **~1.5k a run** keepalive; h2s1 (`step_stream_run` self 1.57k, `update_interests` 1.50k, `Buf::release` 0.80k, `next_expiry` 0.22k, shell 2.3k over 9 runs) = **~0.95k a run** | §2 said 500-800 a run: keepalive is above it; L3's target of 150 is right. |
+| 4 | stream set-up and tear-down | `stream_new` 3.2k / 2.6k / 1.6k + `stream_free` 4.2k / 4.4k / 4.0k = **7.4k / 7.0k / 5.6k** | keepalive: `end_txn` 1.70k (`reset_for_next_request` 0.97k, `IdlePool::note_used` 0.33k); rules 2.04k; h2s1: `h2_child_of` 2.03k (`new_with_mode` 0.80k) + `end_txn` 2.47k + `end_stream` 2.60k (`h2_child_released` 1.42k) = **7.1k** | the Ibex h1 model is **5.7k cheaper than HAProxy** per request; on h2s1 Ibex is 1.5k *dearer* (7.1k against 5.6k). `end_txn` is 1.7k on h1, not 2.7k. |
+| 5 | backend selection and reuse | `connect_server` 1.9k / 1.9k / 1.8k incl `assign_server` 1.1k, `conn_backend_get` 0.2k, `srv_add_to_idle_list` 0.5k, `stream_set_backend` 0.3k, `back_try_conn_req` 2.1k incl | `connect_http_backend` 12.9k / 33.4k / 6.4k incl; **without the request rules and the `Connection` rewrite** (below): 7.4k keepalive; `route_to_server` 1.86k / 3.89k / 2.55k (`select_server` 0.94k / 2.83k / 1.38k, `IdlePools` 0.33k / 0.59k / 0.78k) | h2s1's 6.4k (7.2k at T544) is the O2 base; the lock/hash rows (`IdlePools`) are 0.8k on h2s1 and 0.3k on keepalive: a small share. |
+| 6 | h1 parse | `h1_parse_msg_hdrs` 2.4k + `h1_headers_to_hdr_list` 0.6k + `htx_*`/`__htx_*` 1.9k = **~4.9k per head** | request: `validate_request_head` **10.06k / 9.34k** (`H1Parser::parse` 7.51k / 6.78k, of which `parse_headers` 5.86k, `parse_start_line` 1.14k; `from_utf8` 0.67k) + `req_htx_init` 0.59k / 1.45k; response: `check_response_head` 1.1k, `HeadFacts::of_response` 1.2k, `RspHead` 0.2k | **parse is 2x HAProxy** (7.5k vs 3.0k for the header parse alone): hot leaves are `memchr` 3.5k self, `eq_ignore_ascii_case` 1.1k, `to_ascii_lowercase`/`is_ascii_uppercase` 1.25k, `ascii_word_spans` 1.1k, `from_utf8` 0.55k. X2/X3's 3.5k target is right. |
+| 7 | representation through rules | see `htx-engine-2026-11-01.md` §1.3 | | |
+| 8 | rules (rules ab1) | 7.6k for the scenario: `http_req_get_intercept_rule` 7.3k incl (`acl_exec_cond` 2.1k incl, `pattern_exec_match` 1.55k, `sample_process` 0.72k, `http_add_header` 0.9k), `http_res_get_intercept_rule` 1.3k | **29.8k**: request rules (`connect_http_backend::{closure#16}`) **16.9k**, response rules `apply_http_response_rules_in` +9.7k over keepalive's; per request: **3 fetch-function bodies** (closure #19 x2, #214 x1), `apply_converters_g` 3, `render_rule_format` 2, `req_rule_header` 2, `write_req_head` **2**, `vars::with_stream` 1, `from_utf8` **39** (22 on keepalive: +17 for the rules), `spare::*` pool misses 0 (the take/give itself is 2.26k incl), `VarStore`/`vars::` 1.31k, `SampleContext` constructions 2.11k incl, `Expr::eval` 3.75k, `any_acl` 2.26k, `eval_g` 1.33k, `Matcher` (regex) 1.1k, converters 1.88k | the hash lookup is not the cost: `eval_g` is 1.33k for 3 fetches (~0.44k a fetch), `fetches.get` itself is not separable (inlined; 3 calls a request). The rules cost sits in the per-rule representation (rebuild 3.0k, spares 2.3k, contexts 2.1k, `from_utf8` 1.7k, header edits 1.75k). |
+| 9 | send/recv, I/O state machine, self | `sc_conn_recv` self 0.8k, `sc_conn_send` self 0.22k, `h1_send` self 0.23k, `h1_snd_buf` self 1.5k, `h1_rcv_buf` 0.18k, `h1_process_demux` self 1.16k = ~4.1k | `process_cli_io` self 0.88k, `process_srv*` 0.03k, `advance` self 0.05k, `MsgState::advance_counted` 0.49k, `interests` 0.05k, `update_interests` 0.07k, `Buf::nominal` 0.18k, `Buf::readable` 0.28k, `release_idle_buffers` 0.01k (0.34k incl) = **~2.1k** (h2s1: 3.0k with `advance_counted` 0.85k, `update_interests` 0.21k, `Buf::release` 0.8k incl) | the I/O state machine's *self* is not the gap (HAProxy's equivalents are larger); IO1's gain is the walk it avoids. |
+| 10 | h2 framing + HPACK | `h2_*` 24.4k incl; `h2c_dec_hdrs` 3.2k, `h2_make_htx_request` 2.6k, `h2s_snd_fhdrs` 0.6k | `MuxH2` 6.2k incl, `hpack` 3.1k incl, `start_request` 8.7k incl (incl. `put_request_head` 3.9k, `process_decoded_block` 5.3k), `forward_response` 1.3k | the bridge, not the mux, is the cost: `start_request` 8.7k. |
+| 11 | TLS (h2s1) | `SSL_read` 5.6k + `SSL_write` 7.5k = 13.1k incl (skid-shares) | `rustls` 3.6k + `ring` 3.5k + `ibex_tls` glue 3.9k incl (partly overlapping) | Ibex advantage stands. |
+| 12 | clock and timers | see "Clock reads" above | | C2 stands. |
+| 13 | counters, accounting, logs | `stream_process_counters` 0.25k + `stream_update_time_stats` 0.15-0.26k = **0.45-0.64k** | keepalive: `statcnt` 0.20k, `atomic_umax` 0.08k, `StreamLog`/`txnlog` 0.47k / 0.54k (incl. a `SystemTime::now` 0.30k), `end_txn` self 0.17k = **~0.9k**; rules ~1.0k; h2s1: `statcnt` 0.46k, `account_stream` 0.48k, `set_stream_log` 0.86k (`StreamLog` 0.78k), `end_stream` self 0.15k = **~2.0k** | §2 said ~3k: **0.9k keepalive, 2.0k h2s1**. |
+| 14 | pools and malloc | `__pool_alloc` 1.1k / 1.6k / 1.3k + `__pool_free` 0.5k / 0.75k / 0.63k + `pool_put_to_cache` 0.5k = **~2.1k / 2.9k / 2.2k** | pool take/give 0.13k / 1.84k (rules) / 0.67k; 0 malloc | Ibex advantage 2k on keepalive. |
+| 15 | safety extras on by default | none | below | below |
+
+**Safety extras (item 9), one row each, user instructions a request, keepalive / rules / h2s1:**
+
+| extra | state in release-perf | cost |
+|---|---|---:|
+| `crash::contain` (thread-local set/clear + `catch_unwind` landing pad), once per task run | on | **0.03k / 0.13k / 0.08k** (self; `catch_unwind` is zero-cost when nothing panics). Below the 0.3k at which §5 (c) would move it to a setting. |
+| `watchdog::progress` / `sleeping` / `set_streams`, 3 a pass | on | 0.04k / 0.10k / 0.11k |
+| buffer wipe (`tune.ibex.zero-buffers`) | **default off**: `ibex_alloc::wipe` is an atomic load | 0.03k / 0.05k / 0.05k |
+| TLS record wipe (`tune.ibex.ssl-zero-buffers`) | on | h2s1: a memset under `Encrypting::encrypt_records` 0.12k (probably the wipe; the call chain does not say) |
+| `fault_point` | **compiled out** (`#[cfg(debug_assertions)]`, crash.rs:101) | 0 |
+| `StreamLog`/`set_stream_log` with no `log` target (item 10) | on | **0.47k / 0.45k / 0.78k**, 1.0-1.1 % of the total; see below |
+| `Pool`/guard bookkeeping | on | not a safety extra; `Guard` 0.14k / 0.25k / 0.21k |
+| **sum of the first five** | | **0.1k - 0.35k, 0.2-0.4 % of the user total** |
+
+**Item 10: `set_stream_log`/`StreamLog` does work with no log target.** `StreamLog::start/restart`
+runs once per request (twice on h2s1) and reads `SystemTime::now()` (0.30k of its 0.47k on
+keepalive); `set_stream_log` is 0.01k on keepalive (the `StreamLog` is only restarted) but 0.27k
+on rules and 0.86k on h2s1 (it builds the log's fields and the capture state). HAProxy's
+`strm_log` costs 0 when no `log` target exists. This is the C1 slice's "fields only when a log
+target exists".
+
+**Where the keepalive remainder goes (the ~2k of the 9.6k that §5 says no slice names).** The
+measured gap is 9.7k. Its largest single item is not in any slice list: **the `Connection`-header
+path, 8.1k on Ibex against ~0.5k on HAProxy**. `ab -k` sends HTTP/1.0 with `Connection:
+Keep-Alive`, and Ibex does this per request: `strip_request_connection` 2.29k (`with_htx_mut` 0.6k,
+`and_then` 0.55k, `is_some_and` 0.66k), `rewrite_request_connection` **5.50k** (of which
+`write_req_head` 3.08k, plus a **`memset` 1.14k** attributed to
+`rewrite_request_connection` itself: the 8 KiB stack zeroing of the head rebuild, inlined
+(htx doc §1.1); `add_req_header` 0.33k, `Buf::eoh` re-scans 0.21k), `inject_connection_token_zero_alloc` 0.38k +
+a `memset` 0.31k on the response. HAProxy sets two connection-mode flags at parse
+(`h1_set_srv_conn_mode` + `h1_set_cli_conn_mode` 0.28k) and emits the token in `h1_make_headers`. Only
+`write_req_head`'s 3.1k is arguably inside X2's "descriptors in place"; the other **~5k** (the
+strip, the memset, the re-scans) is named nowhere. That is the remainder, and it is larger than 2k.
+It applies to HTTP/1.0 keep-alive clients (ab, some monitors); an HTTP/1.1 client takes the
+`scan.count == 0` fast path. **Proposed slice K1** (S, Sonnet): HTTP/1.0 `Connection: keep-alive`
+handled by flags at parse (HAProxy's `H1_MF_CONN_KAL`/`H1_MF_CLEAN_CONN_HDR`), no head rewrite,
+no memset; expected **-4 to -6k on keepalive ab1 and rules ab1**, 0 on h2s1/h3. The rest of the
+9.7k, by bucket (+-15 %, buckets overlap by <1k): request parse + facts + HTX `validate_request_head`
+etc. **+5k** (X2/X3: named); response head after the server `apply_http_response_rules_in` 5.0k with
+no rules (`HeadFacts::of_response` 1.2k, `check_response_head` 1.1k, `inject` 0.4k, memset 0.3k)
+against HAProxy's ~2.4k: **+2.6k** (E2 left it; X3 names part); loop + run fixed **+2.2k** (L1/L3:
+named); the rest nets against Ibex's **-5.7k** (no per-request stream object). So after K1 and X
+the named + K1 total covers the gap with ~1k to spare; without K1, §5's keepalive landing
+(38.7-41.9k) is optimistic by ~5k.
+
+**Does each slice's §4 range stand?**
+
+| slice | §4 range | verdict, with the measured basis |
+|---|---|---|
+| L1 | -0.3 to -0.8k all three | keepalive/rules **stands** (housekeeping 0.2-0.35k a request, `step_at` self 0.3-0.4k); **h2s1 is -1 to -2k** at the 8 passes it runs today (housekeeping 1.0k + `step_at` self 1.2k over 8 passes); the three counts shrink with L2. |
+| L2 | h2 -3 to -5k; keepalive -0.3 to -1k | h2s1 **stands at the top: -4 to -5.5k** (5 passes x 1.05k) and a kernel saving of 5 `epoll_wait`; keepalive **0** (there is no third pass: 2.00 passes, as HAProxy). Drop the keepalive saving. |
+| L3 | keepalive/rules -1.5 to -3k; h2 -3 to -5k | **stands**: measured fixed cost 1.5k a run on keepalive (2 runs) so -2.5k at the 150 target; h2s1 0.95k x 9 runs, -4 to -5k before L2 removes runs. |
+| O1a | keepalive/rules -0.5 to -1.5k | **lower**: `end_txn` is 1.70k (2.04k rules), not 2.7k; to ~1.2k is -0.5k: **-0.3 to -0.8k**. |
+| O1b | h2 -3 to -5k | **stands**: set-up + tear-down are 7.1k (`h2_child_of` 2.03k, `end_txn` 2.47k, `end_stream` 2.60k) against HAProxy's 5.6k; to ~2.5-3k is -4 to -4.5k. |
+| O2 | h2 -2 to -4k | **-2 to -3.5k**: `connect_http_backend` 6.4k (`route_to_server` 2.55k, `IdlePools` 0.78k, `select_server` 1.38k); HAProxy 1.8k. |
+| IO1 | keepalive/rules -1 to -2k; h2 -0.5 to -1k | **keepalive/rules -0.5 to -1k** (the whole I/O state machine's self is 2.1k and HAProxy's equivalent is ~4k); h2 **stands**. |
+| C1 | -0.5 to -1.2k all three | keepalive/rules **-0.3 to -0.6k** (accounting is 0.9k, HAProxy 0.5k); h2s1 **-0.8 to -1.2k** (2.0k a request). |
+| C2 | -0.3 to -0.8k all three | **stands** on keepalive (the `SystemTime::now` 0.30k and one of the two per-pass `Instant::now`: -0.3 to -0.6k); h2s1 -0.5 to -1.5k depending on L2's pass count. |
+| X2-X4, R1-R4 | (htx §1.3, §4.4) | X2: request re-serialisation 3.0k stands; parse is 2x HAProxy so the 3.5k per head target is right; R1: the hash is not the cost (0.44k a fetch, 3 fetches); R2/X3 carry the rules. |
+
+What X0 could not measure is listed in `tasks/X0-profile-post-e2.md` ("Results").
 
 ## 3. Target architecture
 

@@ -76,7 +76,38 @@ the task file. Nothing else in this plan depends on X0 for its design, only for 
 
 ### 1.3 X0 results
 
-(unfilled: X0 has not run)
+Measured on main e83cd302 (2026-11-01), release-perf, IBS with inlines expanded, shares scaled to
+`insreq.sh` user totals (45,900 keepalive / 75,719 rules / 71,593 h2s1), +-15 %, as in
+`engine-architecture-2026-11-01.md` §2.1 (method, totals, raw data in
+`~/ibex-worktrees/review/x0-2026-11-01/`). Inclusive instructions a request; the buckets overlap by
+up to ~1k.
+
+**Totals against §1.1's records:** keepalive 45.9k (HAProxy dev8 **36.2k**, not 33.3k), rules 75.7k
+(HAProxy **43.8k**, not 42.0k), h2s1 71.6k (HAProxy 53.2k), h3fit 98.9k (dev10 now 64.0k, not 73.7k).
+
+| bucket | then (§1.1) | estimate after S7/E2 | measured now (rules ab1 / keepalive / h2s1) | reading |
+|---|---:|---:|---|---|
+| request re-serialised: `write_req_head` + its 8 KiB `memset` + `replace_prefix` | ~6.5k | ~2.5k | rules: `write_req_head` **2.97k** (called **2.00 times a request**; keepalive 1.00, h2s1 0), plus `memset` 0.44k (`rewrite_request_connection`) + 0.38k (`flush_req_rebuild`) + `replace_prefix` 0.21k = **~4.0k**; keepalive 3.16k + 1.14k memset + 0.22k = **~4.5k**; h2s1 0 | S7 did not get it to one rebuild per request on rules (two); the estimate was 1.5k low. `write_h1_wire` 1.72k / 2.31k / 2.13k inside it. |
+| h2: head built into `htx_buf` then serialised | ~1.5-2k | | h2s1: `put_request_head` **3.87k**, `write_h1_wire` 2.13k (of which the h1 text), `req_htx_init` 0.83k, `start_request` 8.69k in all | two copies of the head (HTX, then h1 text) cost ~6.8k, not 1.5-2k; X4's -2 to -3k is conservative. |
+| `req_headers` re-collected as `(String, String)` | ~4.1k with the spares | ~3-4k | `req_headers`/`copy_header` **0.01k (rules) / 0 / 0.20k (h2s1)**: **the list is not built on these scenarios**; spare pool take/give `spare::*` **2.26k** (rules), `reuse::with_string`-family inside it; `VarStore`/`vars::` **1.31k** | the 4.1k bucket is now 2.3k spares + 1.3k vars; the `(String, String)` list is gone from rules ab1 (E2/S7). R4/R2 carry the 3.6k. |
+| `SampleContext` per rule | ~1.5k | 0-1.5k | **2.11k incl** (self 0.24k) on rules; `SampleContext` is built for every rule's `eval`; `Expr::eval` **3.75k**, `any_acl` 2.26k, `eval_g` 1.33k for **3 fetch bodies a request** (0.44k a fetch) | S7's "borrow" is not in: the per-rule context is 2.1k. X2/X3's single-context work is worth ~1.5-2k. |
+| `Expr::cached` | ~1.5k | ~0.5k | **0** (no `cached` frame in the profile) | compiled (T455); remaining expression cost is `Expr::eval` itself (R1). |
+| UTF-8 re-validation | ~1.6k | ~1.6k | `from_utf8` **1.68k incl, 593 self, 39 calls a request** (rules); keepalive 1.45k incl, **22 calls**; h2s1 1.07k | the rules add 17 calls (~0.25k); the other 22 a request are the parse/facts path (`validate_request_head` 0.67k, `HeadFacts`...). D-B's "validated once" saves ~1.2k on rules, ~1.0k on keepalive. |
+| response head: `check_response_head`, `HeadFacts::of_response`, `rewrite_header_names_before`, `run_res_rules`/`RspHead` | ~4-5k | ~3k | rules: 0.82k + 1.87k + **2.88k** + 1.74k = **7.3k** (overlap <1k); keepalive: 1.11k + 2.04k + 0.70k + 0.20k = 4.0k (all with no rules); h2s1: 1.87k + 2.35k + 0.34k + 0.21k = 4.8k | E2 left 4.0k standing on a rules-free keepalive; the rules scenario adds 3.3k, mostly `rewrite_header_names_before` (2.2k more than keepalive) and `run_res_rules` (1.5k more). |
+| request parse into the HTX (new, for X2/X3) | | | `validate_request_head` **10.06k** keepalive / 9.34k rules (`H1Parser::parse` 7.51k / 6.78k; `parse_headers` 5.86k / 4.89k; `parse_start_line` 1.14k; `finalize_last_header` 0.56k; `req_line`/`req_line_bytes` 2.2k / 1.9k) | HAProxy's `h1_parse_msg_hdrs` + `h1_headers_to_hdr_list` + `htx_*` ~4.9k. Leaves: `memchr` 3.5k self (7.1k on rules: regexes/ACLs), `eq_ignore_ascii_case` 1.1k, `to_ascii_lowercase`/`is_ascii_uppercase` 1.25k, `ascii_word_spans` 1.1k: byte-at-a-time scans X2 should replace. |
+
+**Sum of the representation's share standing on rules:** `write_req_head` family 4.0k + spares and vars
+3.6k + `SampleContext` 2.1k + UTF-8 1.7k + response head 7.3k = **~18.7k**, of which ~4k is the
+rules-free base (the response head scan, the facts); the rules' own representation cost is
+**~14-15k of the 29.8k gap** (§1.1 estimated 11-13k of 33.6k). On h2s1: `put_request_head` 3.87k +
+`write_h1_wire` 2.13k + `req_htx_init` 0.83k + `from_utf8` 1.07k + `copy_header` 0.20k +
+`indexed_fields` 0.30k = **~8.4k** against §1.1's 4.5-5k estimate.
+
+**Conclusions for the slices:** X1/X5/X2/X3 budgets stand or are low (rules: write 4.0k, context 2.1k,
+spares 2.3k, parse 7.5k; the engine doc §4.1 ranges are not too high). Two items of this plan are
+not covered by an X slice and are in `engine-architecture` §2.1: the **`Connection`-header path
+on HTTP/1.0 keep-alive requests** (8.1k vs ~0.5k on HAProxy, includes `write_req_head` once) and
+**`write_req_head` called twice a request on rules**.
 
 ## 2. Target design
 
