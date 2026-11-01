@@ -117,7 +117,8 @@ fn assert_best(r: &[Run; 2]) {
 /// within 1 % of each other.
 fn assert_worst(r: &[Run; 2]) {
     for run in r {
-        let answers = run.requests_phase.sent - run.requests;
+        // A datagram the wait loop sent on a quinn timer (the host stalled the client) answers nothing.
+        let answers = run.requests_phase.sent - run.requests - run.requests_phase.timer_sent;
         let rx = run.requests_phase.received;
         assert!(
             answers <= rx && answers * 100 >= rx * 98,

@@ -67,11 +67,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Counts {
     pub sent: u64,
     pub received: u64,
+    /// Of `sent`, the datagrams the wait loop sent when quinn's timer expired while nothing came
+    /// (a loss probe or a delayed ACK after the host stalled the client): not the policy's.
+    pub timer_sent: u64,
 }
 
 impl Counts {
     pub fn since(self, before: Counts) -> Counts {
-        Counts { sent: self.sent - before.sent, received: self.received - before.received }
+        Counts { sent: self.sent - before.sent, received: self.received - before.received, timer_sent: self.timer_sent - before.timer_sent }
     }
 }
 
@@ -296,7 +299,9 @@ impl Client {
                 if self.conn.poll_timeout().is_some_and(|t| t <= now) {
                     self.conn.handle_timeout(now);
                     self.events()?;
+                    let before = self.counts.sent;
                     self.flush()?;
+                    self.counts.timer_sent += self.counts.sent - before;
                 }
                 Ok(false)
             }
