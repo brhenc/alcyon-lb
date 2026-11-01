@@ -6502,6 +6502,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let tasks_run = self.scheduler.process_runnable_tasks(&mut dispatcher);
         let hk_due = dispatcher.hk_due;
         self.wake_now_scratch = std::mem::take(&mut dispatcher.wake_now);
+        // What the other workers changed on the servers whose checks run here (T593).
+        crate::track::adopt_pending(dispatcher.proxies, dispatcher.checks);
         // The server state changes the pass made (a check, the CLI, the stats page).
         if crate::srvlog::pending() {
             let proxies = dispatcher.proxies.clone();
@@ -8957,18 +8959,7 @@ pub fn set_health_check_enabled(
     else {
         return false;
     };
-    if let Some(check) = checks
-        .iter_mut()
-        .find(|c| c.proxy() == proxy_idx && c.server() == server_idx)
-    {
-        check.enabled = enabled;
-        if enabled {
-            check.next_check = now;
-        }
-        true
-    } else {
-        false
-    }
+    crate::track::set_check_enabled(proxies, checks, proxy_idx, server_idx, enabled, now)
 }
 
 /// A frontend without a `maxconn` (0 in the parsed configuration) is limited by the global
@@ -14861,6 +14852,7 @@ impl EngineDispatcher<'_> {
         if check_idx < self.checks.len() {
             let check = &mut self.checks[check_idx];
             let now = self.now;
+            crate::track::adopt_for(self.proxies, check);
             let step = check::step_check(check, self.fdtab, self.poller, now, self.proxies);
 
             let proxy_idx = check.proxy();
@@ -14868,12 +14860,7 @@ impl EngineDispatcher<'_> {
             if crate::resolvers::take_l4_timeout() {
                 trigger_resolutions(self.resolvers, &mut self.timer_updates, now, proxy_idx, server_idx);
             }
-            if check.enabled
-                && proxy_idx < self.proxies.len()
-                && server_idx < self.proxies[proxy_idx].server_statuses.len()
-            {
-                crate::track::set_raw(self.proxies, proxy_idx, server_idx, check.published(), crate::srvlog::Kind::Op, crate::srvlog::Cause::Check(check));
-            }
+            crate::track::publish_check(self.proxies, check);
 
             // The message is built while `check` is still borrowed, then the borrow ends
             // so the targets (which live behind `&self`) can be read to send it.
