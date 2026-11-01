@@ -124,3 +124,17 @@ pub fn answer(args: &[String]) -> String {
     );
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::answer;
+
+    /// A command line with no first word matches nothing: HAProxy's `cli_gen_usage_msg` then
+    /// lists every command ("Please enter one of the following commands only"), not the nearest.
+    #[test]
+    fn an_empty_command_lists_the_commands_only() {
+        let out = answer(&[String::new()]);
+        assert!(out.starts_with("Unknown command: ''. Please enter one of the following commands only:\n"), "{out}");
+        assert!(out.lines().count() > 10, "{out}");
+    }
+}
