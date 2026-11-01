@@ -395,10 +395,11 @@ fn push_req_line_raw(
     buf: &mut [u8],
     tail_addr: &mut usize,
     num_blocks: &mut usize,
-    method: &str,
-    uri: &str,
-    version: &str,
+    method: impl AsRef<[u8]>,
+    uri: impl AsRef<[u8]>,
+    version: impl AsRef<[u8]>,
 ) -> Result<(), HtxError> {
+    let (method, uri, version) = (method.as_ref(), uri.as_ref(), version.as_ref());
     let needed = method.len() + 1 + uri.len() + 1 + version.len() + HTX_DESC_SIZE;
     if free_capacity_at(buf.len(), *tail_addr, *num_blocks) < needed {
         return Err(HtxError::OutOfMemory);
@@ -407,15 +408,15 @@ fn push_req_line_raw(
     let addr = *tail_addr as u32;
     let start = *tail_addr;
 
-    buf[start..start + method.len()].copy_from_slice(method.as_bytes());
+    buf[start..start + method.len()].copy_from_slice(method);
     let cur = start + method.len();
     buf[cur] = b' ';
     let cur = cur + 1;
-    buf[cur..cur + uri.len()].copy_from_slice(uri.as_bytes());
+    buf[cur..cur + uri.len()].copy_from_slice(uri);
     let cur = cur + uri.len();
     buf[cur] = b' ';
     let cur = cur + 1;
-    buf[cur..cur + version.len()].copy_from_slice(version.as_bytes());
+    buf[cur..cur + version.len()].copy_from_slice(version);
     *tail_addr = cur + version.len();
 
     let desc = HtxBlockDesc {
@@ -480,9 +481,10 @@ fn push_header_raw(
     buf: &mut [u8],
     tail_addr: &mut usize,
     num_blocks: &mut usize,
-    name: &str,
-    value: &str,
+    name: impl AsRef<[u8]>,
+    value: impl AsRef<[u8]>,
 ) -> Result<(), HtxError> {
+    let (name, value) = (name.as_ref(), value.as_ref());
     if name.len() > HTX_HDR_NAME_MAX_LEN || value.len() > HTX_HDR_VALUE_MAX_LEN {
         return Err(HtxError::LimitExceeded);
     }
@@ -493,9 +495,9 @@ fn push_header_raw(
     }
 
     let addr = *tail_addr as u32;
-    buf[*tail_addr..*tail_addr + name.len()].copy_from_slice(name.as_bytes());
+    buf[*tail_addr..*tail_addr + name.len()].copy_from_slice(name);
     *tail_addr += name.len();
-    buf[*tail_addr..*tail_addr + value.len()].copy_from_slice(value.as_bytes());
+    buf[*tail_addr..*tail_addr + value.len()].copy_from_slice(value);
     *tail_addr += value.len();
 
     let desc = HtxBlockDesc {
@@ -1436,6 +1438,29 @@ impl<'a> HtxSlice<'a> {
             uri,
             version,
         )
+    }
+
+    /// [`Self::push_req_line`] of the bytes of a line the caller found to be ASCII: they go in as
+    /// they are, with no UTF-8 check. Anything else is refused.
+    pub fn push_req_line_ascii(&mut self, method: &[u8], uri: &[u8], version: &[u8]) -> Result<(), HtxError> {
+        if !(method.is_ascii() && uri.is_ascii() && version.is_ascii()) {
+            return Err(HtxError::InvalidData);
+        }
+        push_req_line_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, method, uri, version)
+    }
+
+    /// [`Self::push_header`] of the bytes of a field, as the HTTP/1 parser has them (`name` is
+    /// tchars): a value that is ASCII goes in as it is, with no UTF-8 check; one that is not is
+    /// UTF-8 or Latin-1 as before.
+    pub fn push_header_bytes(&mut self, name: &[u8], value: &[u8]) -> Result<(), HtxError> {
+        if value.is_ascii() {
+            return push_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, name, value);
+        }
+        let name = std::str::from_utf8(name).map_err(|_| HtxError::InvalidData)?;
+        match std::str::from_utf8(value) {
+            Ok(v) => self.push_header(name, v),
+            Err(_) => self.push_header_latin1(name, value),
+        }
     }
 
     pub fn push_res_line(

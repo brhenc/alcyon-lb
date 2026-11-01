@@ -189,3 +189,22 @@ fn the_server_reads_the_head_haproxy_sends() {
         }
     }
 }
+
+/// The parse of an ASCII request validates no UTF-8 (T575 part 2): HAProxy keeps request data as
+/// bytes. A head with non-ASCII bytes in a value still reaches the server as it came.
+#[test]
+fn the_parse_of_an_ascii_keep_alive_request_reads_no_utf8() {
+    const N: usize = 20;
+    let mut rig = Rig::new("", "");
+    let mut c = rig.client();
+    let req = "GET /index.html HTTP/1.0\r\nHost: localhost\r\nUser-Agent: ApacheBench/2.3\r\nAccept: */*\r\nConnection: Keep-Alive\r\n\r\n";
+    let _ = rig.send(&mut c, req);
+    let before = ibex_proto::utf8_parse_calls_on_this_thread().len();
+    for _ in 0..N {
+        let _ = rig.send(&mut c, req);
+    }
+    let sites = ibex_proto::utf8_parse_calls_on_this_thread();
+    if cfg!(debug_assertions) {
+        assert_eq!(sites.len() - before, 0, "UTF-8 reads in {N} requests, by site: {:?}", &sites[before..sites.len().min(before + 40)]);
+    }
+}
