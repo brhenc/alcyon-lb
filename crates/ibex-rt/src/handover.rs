@@ -20,6 +20,7 @@
 //! IBEXFD <n>\n            then n lines, one per descriptor, in the order they are attached:
 //! tcp <address>\n         a listening stream socket (a proxy's or a log-forward's `bind`)
 //! udp <address>\n         a log-forward `dgram-bind`
+//! quic <address>\n        a QUIC listener's UDP socket, one per worker thread
 //! ...
 //! END\n                   after the last batch
 //! ```
@@ -28,8 +29,14 @@
 //! after a `reload`, measured on 3.5-dev8): without them a new worker could not bind the
 //! old one's addresses, and no configuration with a `log-forward` could be reloaded (T252).
 //!
-//! QUIC listeners are not handed over. A QUIC connection lives on the listening UDP socket,
-//! so two processes sharing one would each receive datagrams for the other's connections.
+//! QUIC listeners are handed over too (T558), as 3.5-dev10 does (`sock_find_compatible_fd`
+//! matches datagram receivers as well). Bound anew, the new process's sockets joined the
+//! old one's `SO_REUSEPORT` group, and while the old process drained, the kernel hashed about
+//! half the new connections' Initials to it, which refused them. Shared, the old process
+//! stops reading them at its soft stop and serves its own connections on the connected
+//! sockets it pins then (`QuicListener::begin_soft_stop`); before the stop, both processes
+//! read them, and a datagram of one process's connection that the other reads is lost and
+//! retransmitted.
 
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
@@ -68,6 +75,8 @@ pub enum Kind {
     Tcp,
     /// A datagram socket (`log-forward` `dgram-bind`).
     Udp,
+    /// A QUIC listener's UDP socket.
+    Quic,
 }
 
 impl Kind {
@@ -75,6 +84,7 @@ impl Kind {
         match self {
             Kind::Tcp => "tcp",
             Kind::Udp => "udp",
+            Kind::Quic => "quic",
         }
     }
 }
@@ -242,7 +252,10 @@ pub fn fetch(sock: &Path) -> io::Result<Vec<(Kind, SocketAddr, OwnedFd)>> {
     let addrs: Vec<(Kind, SocketAddr)> = text
         .lines()
         .filter_map(|l| {
-            l.strip_prefix("tcp ").map(|a| (Kind::Tcp, a)).or_else(|| l.strip_prefix("udp ").map(|a| (Kind::Udp, a)))
+            l.strip_prefix("tcp ")
+                .map(|a| (Kind::Tcp, a))
+                .or_else(|| l.strip_prefix("udp ").map(|a| (Kind::Udp, a)))
+                .or_else(|| l.strip_prefix("quic ").map(|a| (Kind::Quic, a)))
         })
         .map(|(k, a)| a.parse().map(|a| (k, a)))
         .collect::<Result<_, _>>()

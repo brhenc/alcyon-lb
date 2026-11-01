@@ -356,6 +356,9 @@ impl ClientSide {
 /// that accepted the socket: the mux, the socket, the connection's timers) and its `h2s` +
 /// `struct stream` (a child: one entry per stream being served, with its own transaction,
 /// server connection and log line).
+// Boxed in the session, the box kept from one stream to the next (`H2ChildSpare`); a child
+// is the larger for its response head's index (E2).
+#[allow(clippy::large_enum_variant)]
 pub enum H2Role {
     Owner(H2Owner),
     Child(H2Child),
@@ -368,7 +371,7 @@ pub struct H3Owner {
     pub mux: ibex_alloc::PoolBox<ibex_proto::mux_h3::H3MuxContext>,
     /// The index of the QUIC listener in the engine's list.
     pub listener: u32,
-    pub conn: ibex_quic::ConnectionId,
+    pub conn: ibex_quic::ConnHandle,
     /// A response's DATA staged on its way to the mux, kept from one response to the next.
     pub body_scratch: Vec<u8>,
     /// Since when no stream is served (`qcc->idle_start`): the connection's start, then each
@@ -376,6 +379,13 @@ pub struct H3Owner {
     pub idle_start: ibex_sched::Tick,
     /// A timer expired and the GOAWAY is written: the next pass closes (`qcc_shutdown`).
     pub closing: bool,
+    /// During a soft stop, until when a connection that has sent no request yet waits for
+    /// its first one before its GOAWAY(0) and close (T558): set the first time the owner
+    /// runs in the stop, [`crate::engine::H3_STOP_FIRST_REQUEST_MS`] after it.
+    pub stop_grace: Option<ibex_sched::Tick>,
+    /// That grace ran out and the listener was asked to read its sockets once more before
+    /// the connection is judged to have sent nothing (T564).
+    pub stop_read: bool,
 }
 
 /// The owner's side: its children.
@@ -439,6 +449,15 @@ pub struct H2Child {
     /// The owner's entry and task; `None` once the owner is gone.
     pub owner: Option<(u32, ibex_sched::TaskRef)>,
     pub stream: H2ActiveStream,
+    /// Trailers an h2 server sent after a content-length body: sent to this h2 or h3 client
+    /// with the end of the stream (T559; an h1 client never has them). Here and not in the
+    /// transaction: the session entry stays small.
+    pub late_trailers: Option<ibex_alloc::PoolBox<Vec<u8>>>,
+    /// The response head as [`ibex_proto::response_head::check_response_head`] indexed it,
+    /// kept up to date through the edits the engine made since, its names in lower case:
+    /// what the client's HEADERS are written from (E2). `None`: the head is read again.
+    /// Here and not in the transaction: the session entry stays small.
+    pub rsp_head: Option<ibex_proto::response_head::RspHead>,
     /// The client (or the mux) reset the stream.
     pub reset: bool,
     /// The transaction ended through `end_txn` and the connection goes on: the entry is
@@ -1142,7 +1161,7 @@ impl TcpSession {
         c.server_addr = owner.server_addr;
         c.fc_src = owner.fc_src;
         c.fc_dst = owner.fc_dst;
-        c.created_at = Instant::now();
+        c.created_at = crate::txnlog::loop_now();
         c.bufsize = owner.bufsize;
         c.maxrewrite = owner.maxrewrite;
         // The `tcp-request content` rules the owner armed for the next request run on this
@@ -1172,6 +1191,8 @@ impl TcpSession {
         let role = H2Role::Child(H2Child {
             owner: Some(owner_ref),
             stream,
+            late_trailers: None,
+            rsp_head: None,
             reset: false,
             finished: false,
             conn_end: None,
@@ -1398,7 +1419,7 @@ impl TcpSession {
             cli_cant_recv: false,
             passes_ran_out: false,
             cli_failed: false,
-            created_at: Instant::now(),
+            created_at: crate::txnlog::loop_now(),
             bufsize: crate::buf::get_bufsize(),
             maxrewrite: 1024,
             pending_resp: None,
@@ -1729,8 +1750,15 @@ impl TcpSession {
 
     /// Attaches a server-side connection with a specific transport (`ServerXprt`).
     pub fn attach_server_with_xprt(&mut self, fd: OwnedFd, xprt: ServerXprt, now: Tick) {
+        let src = crate::raw::local_addr(std::os::fd::AsFd::as_fd(&fd));
+        self.attach_server_from(fd, xprt, src, now);
+    }
+
+    /// [`Self::attach_server_with_xprt`] for a connection whose local address `src` is known
+    /// already: one taken from the idle pool, which kept it (T550 Q8).
+    pub fn attach_server_from(&mut self, fd: OwnedFd, xprt: ServerXprt, src: Option<std::net::SocketAddr>, now: Tick) {
         self.log.queue.get_or_insert_with(crate::txnlog::loop_now);
-        self.bc_src = crate::raw::local_addr(std::os::fd::AsFd::as_fd(&fd));
+        self.bc_src = src;
         self.srv = Some(fd);
         self.srv_xprt = xprt;
         self.srv_cant_recv = false;
@@ -2056,14 +2084,24 @@ impl TcpSession {
         // an opaque run of bytes, and says nothing about `Connection`.
         // The answer to a HEAD is the head alone, on either protocol (T296).
         let raw = if txn.client_head { &raw[..head_len.min(raw.len())] } else { raw };
+        // The token is the one a server's response gets (`h1_update_res_conn_value`): `close` for
+        // a page that says HTTP/1.1, `keep-alive` on an open connection when the page or the
+        // request is not HTTP/1.1 -- the HTTP/1.0 client of `ab -k` waits for it (T563).
+        let token = if announce_close && !h2 && !raw.is_empty() && !has_header(&head, "connection") && txn.status >= 200 {
+            txn::response_connection_token(txn.close_after, head.starts_with("HTTP/1.1"), txn.req_http11, false)
+        } else {
+            None
+        };
         let mut out;
-        let raw = if announce_close && !h2 && txn.close_after && !raw.is_empty() && !has_header(&head, "connection") {
+        let raw = if let Some(token) = token {
             // The client is told, as for a server's response: last in the head, as
             // `inject_connection_close_header_zero_alloc` places it.
             let at = find_eoh(raw).map_or(0, |(h, e)| h + e / 2);
-            out = Vec::with_capacity(raw.len() + 19);
+            out = Vec::with_capacity(raw.len() + 24);
             out.extend_from_slice(&raw[..at]);
-            out.extend_from_slice(b"connection: close\r\n");
+            out.extend_from_slice(b"connection: ");
+            out.extend_from_slice(token.as_bytes());
+            out.extend_from_slice(b"\r\n");
             out.extend_from_slice(&raw[at..]);
             out.as_slice()
         } else {
@@ -3339,6 +3377,11 @@ impl TcpSession {
                     self.dechunk_rep(self.rep.len() - n);
                     self.rewrite_rep_chunk_framing();
                     self.log.bytes_from_server += n as u64;
+                    // Trailers after a content-length body (T559): the codec has them when
+                    // the body's last byte came; `h2_bridge` sends them to an h2/h3 client.
+                    if let (Some(late), Some(H2Role::Child(ch))) = (self.srv_xprt.take_late_trailers(), self.h2_role.as_deref_mut()) {
+                        ch.late_trailers = Some(late);
+                    }
                     changed = true;
                 }
                 Io::Done(_) | Io::WouldBlock => {}

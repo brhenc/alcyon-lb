@@ -10,7 +10,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
-use crate::connection::{ConnectionId, ReadStreamResult, StreamDirection, StreamId};
+use crate::connection::{ConnHandle, ConnectionId, ReadStreamResult, StreamDirection, StreamId};
 use crate::error::Result;
 
 /// Explicit Congestion Notification (ECN) codepoints (RFC 3168).
@@ -64,15 +64,17 @@ pub struct Transmit {
 pub enum TransportEvent {
     /// A new incoming QUIC connection has been accepted.
     NewConnection {
-        /// Primary Connection ID of the new connection.
-        conn_id: ConnectionId,
+        /// The connection, by handle (Q1).
+        conn: ConnHandle,
+        /// Its key in `show quic`: the destination CID of its first Initial.
+        id: ConnectionId,
         /// Remote peer address.
         remote: SocketAddr,
     },
     /// TLS handshake completed successfully and ALPN was negotiated.
     HandshakeComplete {
-        /// Connection ID.
-        conn_id: ConnectionId,
+        /// The connection.
+        conn: ConnHandle,
         /// Negotiated ALPN protocol (e.g. `b"h3"`).
         alpn: Option<Vec<u8>>,
         /// SNI server name if provided by the client.
@@ -80,8 +82,8 @@ pub enum TransportEvent {
     },
     /// A new stream was opened by the remote peer.
     StreamOpened {
-        /// Connection ID.
-        conn_id: ConnectionId,
+        /// The connection.
+        conn: ConnHandle,
         /// ID of the opened stream.
         stream_id: StreamId,
         /// Stream direction (Bidirectional or Unidirectional).
@@ -89,29 +91,29 @@ pub enum TransportEvent {
     },
     /// A stream has incoming bytes available to read.
     StreamReadable {
-        /// Connection ID.
-        conn_id: ConnectionId,
+        /// The connection.
+        conn: ConnHandle,
         /// Stream ID.
         stream_id: StreamId,
     },
     /// A stream has capacity to accept more outbound write data.
     StreamWritable {
-        /// Connection ID.
-        conn_id: ConnectionId,
+        /// The connection.
+        conn: ConnHandle,
         /// Stream ID.
         stream_id: StreamId,
     },
     /// The peer finished sending on a stream (FIN received).
     StreamFinished {
-        /// Connection ID.
-        conn_id: ConnectionId,
+        /// The connection.
+        conn: ConnHandle,
         /// Stream ID.
         stream_id: StreamId,
     },
     /// A stream was reset by the peer with an application error code.
     StreamReset {
-        /// Connection ID.
-        conn_id: ConnectionId,
+        /// The connection.
+        conn: ConnHandle,
         /// Stream ID.
         stream_id: StreamId,
         /// Application error code.
@@ -119,8 +121,8 @@ pub enum TransportEvent {
     },
     /// A stream was stopped by the peer with an error code (`STOP_SENDING`).
     StreamStopped {
-        /// Connection ID.
-        conn_id: ConnectionId,
+        /// The connection.
+        conn: ConnHandle,
         /// Stream ID.
         stream_id: StreamId,
         /// Application error code.
@@ -128,15 +130,15 @@ pub enum TransportEvent {
     },
     /// An unreliable QUIC datagram frame was received on this connection.
     DatagramReceived {
-        /// Connection ID.
-        conn_id: ConnectionId,
+        /// The connection.
+        conn: ConnHandle,
         /// Datagram payload.
         data: Vec<u8>,
     },
     /// The connection was closed.
     ConnectionClosed {
-        /// Connection ID.
-        conn_id: ConnectionId,
+        /// The connection.
+        conn: ConnHandle,
         /// Error code (0 for clean close).
         error_code: u64,
         /// Reason string / bytes.
@@ -179,9 +181,11 @@ pub trait QuicTransport {
     /// The payload is written into `out`, and on success a `Transmit` metadata struct is returned.
     fn poll_transmit(&mut self, now: Instant, out: &mut [u8]) -> Option<Transmit>;
 
-    /// Poll for the earliest timer expiry deadline across all active connections.
+    /// Poll for the earliest timer expiry deadline across all active connections. The
+    /// connections something reached since the last call are asked for theirs now, once
+    /// each, however many datagrams, packets and stream calls they had (Q1).
     #[must_use]
-    fn poll_timeout(&self) -> Option<Instant>;
+    fn poll_timeout(&mut self) -> Option<Instant>;
 
     /// Advance the transport clock and process expired timers (loss recovery, pings, idle timeout).
     fn handle_timeout(&mut self, now: Instant);
@@ -194,10 +198,8 @@ pub trait QuicTransport {
     /// # Errors
     /// Returns `QuicError::StreamLimit` if the peer's max streams limit has been reached,
     /// or `QuicError::ConnectionNotFound` if the connection does not exist.
-    fn open_stream(&mut self, conn_id: ConnectionId, dir: StreamDirection) -> Result<StreamId>;
+    fn open_stream(&mut self, conn: ConnHandle, dir: StreamDirection) -> Result<StreamId>;
 
-    /// Accept a stream opened by the peer on a connection.
-    fn accept_stream(&mut self, conn_id: ConnectionId, dir: StreamDirection) -> Option<StreamId>;
 
     /// Read data from a stream into the provided buffer.
     ///
@@ -205,7 +207,7 @@ pub trait QuicTransport {
     /// Returns an error if the stream has been reset or does not exist.
     fn read_stream(
         &mut self,
-        conn_id: ConnectionId,
+        conn: ConnHandle,
         stream_id: StreamId,
         buf: &mut [u8],
     ) -> Result<ReadStreamResult>;
@@ -217,7 +219,7 @@ pub trait QuicTransport {
     /// Returns an error if the stream is closed or has been reset.
     fn write_stream(
         &mut self,
-        conn_id: ConnectionId,
+        conn: ConnHandle,
         stream_id: StreamId,
         buf: &[u8],
         fin: bool,
@@ -227,7 +229,7 @@ pub trait QuicTransport {
     ///
     /// # Errors
     /// Returns an error if the connection or stream does not exist.
-    fn finish_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) -> Result<()>;
+    fn finish_stream(&mut self, conn: ConnHandle, stream_id: StreamId) -> Result<()>;
 
     /// Abort a stream in both directions with an application error code: `RESET_STREAM` for
     /// what we send and `STOP_SENDING` for what the peer sends (RFC 9114 section 8.1,
@@ -235,10 +237,10 @@ pub trait QuicTransport {
     ///
     /// # Errors
     /// Returns an error if the connection does not exist or the code is not a QUIC varint.
-    fn reset_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId, error_code: u64) -> Result<()>;
+    fn reset_stream(&mut self, conn: ConnHandle, stream_id: StreamId, error_code: u64) -> Result<()>;
 
     /// Close a connection with an application error code and reason phrase.
-    fn close_connection(&mut self, conn_id: ConnectionId, error_code: u64, reason: &[u8]);
+    fn close_connection(&mut self, conn: ConnHandle, error_code: u64, reason: &[u8]);
 
     /// Returns the number of currently active connections.
     #[must_use]
@@ -246,9 +248,9 @@ pub trait QuicTransport {
 
     /// Returns the negotiated ALPN protocol for a connection, if available.
     #[must_use]
-    fn alpn(&self, conn_id: ConnectionId) -> Option<Vec<u8>>;
+    fn alpn(&self, conn: ConnHandle) -> Option<Vec<u8>>;
 
     /// Returns the SNI server name for a connection, if provided.
     #[must_use]
-    fn server_name(&self, conn_id: ConnectionId) -> Option<String>;
+    fn server_name(&self, conn: ConnHandle) -> Option<String>;
 }

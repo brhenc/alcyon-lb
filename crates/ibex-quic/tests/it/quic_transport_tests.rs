@@ -44,7 +44,7 @@ fn test_endpoint_init_and_tls_config() {
         .load_server_config_from_pem(cert_path())
         .expect("load server config from pem");
 
-    let endpoint = QuicEndpoint::with_server_config(server_config).expect("endpoint init");
+    let mut endpoint = QuicEndpoint::with_server_config(server_config).expect("endpoint init");
     assert_eq!(endpoint.connection_count(), 0);
     assert!(endpoint.poll_timeout().is_none());
 }
@@ -127,14 +127,14 @@ fn test_quic_handshake_completion_alpn_h3() {
         // Process server events
         while let Some(evt) = server.poll_event() {
             if let TransportEvent::HandshakeComplete {
-                conn_id,
+                conn,
                 alpn,
                 server_name,
             } = evt
             {
                 // The transport answers the same from the connection's handshake data.
-                assert_eq!(server.alpn(conn_id).as_deref(), alpn.as_deref());
-                assert_eq!(server.server_name(conn_id), server_name);
+                assert_eq!(server.alpn(conn).as_deref(), alpn.as_deref());
+                assert_eq!(server.server_name(conn), server_name);
                 server_connected = true;
                 negotiated_alpn = alpn;
                 negotiated_server_name = server_name;

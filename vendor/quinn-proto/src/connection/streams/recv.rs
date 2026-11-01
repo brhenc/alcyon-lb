@@ -20,8 +20,44 @@ pub(super) struct Recv {
     pub(super) stopped: bool,
 }
 
+/// What a `Recv` is held in: a pool object with `ibex-pools`, else a `Box`
+#[cfg(feature = "ibex-pools")]
+pub(super) type RecvBox = ibex_alloc::PoolBox<Box<Recv>>;
+#[cfg(not(feature = "ibex-pools"))]
+pub(super) type RecvBox = Box<Recv>;
+/// The connection's own list of freed `Recv`s; with `ibex-pools` the pool is the list
+#[cfg(feature = "ibex-pools")]
+pub(super) type RecvSpares = ();
+#[cfg(not(feature = "ibex-pools"))]
+pub(super) type RecvSpares = Vec<StreamRecv>;
+
+#[cfg(feature = "ibex-pools")]
+ibex_alloc::declare_pool!(static RECV_POOL: Pool<Box<Recv>> = ibex_alloc::PoolSpec::new("quic_recv").size(std::mem::size_of::<Recv>()););
+
+#[cfg(feature = "ibex-pools")]
+impl ibex_alloc::Poolable for Box<Recv> {
+    fn footprint(&self) -> usize {
+        std::mem::size_of::<Recv>() + self.assembler.footprint()
+    }
+    fn reset(&mut self, _wipe: bool) {
+        // Chunks are `Bytes` slices of datagrams, shared: dropping them is all there is
+        self.reinit(0);
+    }
+    fn try_new() -> Option<Self> {
+        Some(Box::default())
+    }
+}
+
 impl Recv {
-    pub(super) fn new(initial_max_data: u64) -> Box<Self> {
+    #[cfg(feature = "ibex-pools")]
+    pub(super) fn new(initial_max_data: u64) -> RecvBox {
+        let mut r = crate::ibex_pools::take(&RECV_POOL);
+        r.reinit(initial_max_data);
+        r
+    }
+
+    #[cfg(not(feature = "ibex-pools"))]
+    pub(super) fn new(initial_max_data: u64) -> RecvBox {
         Box::new(Self {
             state: RecvState::default(),
             assembler: Assembler::new(),
@@ -388,7 +424,7 @@ impl Drop for Chunks<'_> {
 }
 
 enum ChunksState {
-    Readable(Box<Recv>),
+    Readable(RecvBox),
     Reset(VarInt),
     Finished,
     Finalized,

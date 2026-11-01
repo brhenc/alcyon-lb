@@ -544,6 +544,43 @@ fn response_trailers_reach_an_h2_client() {
     assert!(trailing.contains("flags=0x05"), "the trailing HEADERS frame ends the stream:\n{log}");
 }
 
+/// T559 (VV-28), measured on `HAProxy` 3.5-dev8 (`proto h2` server, nghttpd `--trailer='grpc-status: 0'`
+/// which keeps its `content-length`): an h2 client gets HEADERS (0x04, `content-length: 19`), DATA
+/// (19 bytes, no END_STREAM), HEADERS `grpc-status: 0` (0x05), as from nghttpd direct. An h1 client
+/// gets the head and the 19 bytes, the trailer dropped.
+#[test]
+fn trailers_after_a_content_length_body_reach_an_h2_client() {
+    if !have_nghttpd() || Command::new("nghttp").arg("--version").stdout(Stdio::null()).status().is_err() {
+        eprintln!("nghttpd or nghttp not found: skipped");
+        return;
+    }
+    let srv = nghttpd(false, &["--trailer=grpc-status: 0"]);
+    let p = proxy_bind(&format!("  server s {} proto h2", srv.addr), "proto h2");
+    let out = Command::new("nghttp").arg("-v").arg(format!("http://{}/index.html", p.fe)).output().expect("nghttp");
+    let log = String::from_utf8_lossy(&out.stdout).into_owned();
+    let frames: Vec<&str> = log.lines().filter(|l| l.contains("recv HEADERS frame") || l.contains("recv DATA frame")).collect();
+    assert_eq!(frames.len(), 3, "{log}");
+    assert!(frames[0].contains("flags=0x04") && frames[1].contains("DATA frame <length=19, flags=0x00") && frames[2].contains("flags=0x05"), "{log}");
+    assert!(log.contains("recv (stream_id=1) content-length: 19") && log.contains("recv (stream_id=1) grpc-status: 0"), "{log}");
+}
+
+/// T559: the same server through an h1 client: the trailer is dropped, the body whole.
+#[test]
+fn trailers_after_a_content_length_body_are_dropped_for_an_h1_client() {
+    if !have_nghttpd() {
+        return;
+    }
+    let srv = nghttpd(false, &["--trailer=grpc-status: 0"]);
+    let p = proxy_bind(&format!("  server s {} proto h2", srv.addr), "");
+    let mut c = TcpStream::connect(p.fe).expect("connect");
+    c.write_all(b"GET /index.html HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").expect("send");
+    let mut got = Vec::new();
+    let _ = c.read_to_end(&mut got);
+    let text = String::from_utf8_lossy(&got).to_ascii_lowercase();
+    assert!(text.starts_with("http/1.1 200") && text.contains("content-length: 19") && text.ends_with(BODY), "{text:?}");
+    assert!(!text.contains("grpc-status: 0"), "{text:?}");
+}
+
 /// nghttp -v against an h2 frontend over a one-shot h1 server that sends `reply`: the nghttp log and Ibex's log line.
 fn nghttp_log_h1_server(reply: &'static [u8]) -> Option<(String, String)> {
     if Command::new("nghttp").arg("--version").stdout(Stdio::null()).status().is_err() {

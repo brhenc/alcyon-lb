@@ -108,7 +108,7 @@ fn a_get_becomes_a_head_and_the_end_of_the_message() {
     let head = st.req_head().expect("head");
     assert_eq!(head.method(), "GET");
     assert_eq!(head.uri(), "/plain");
-    assert_eq!(head.get_header("host"), Some("localhost"));
+    assert_eq!(head.get_header("host"), Some(&b"localhost"[..]));
     assert_eq!(head.abs_prefix(), Some("https://localhost"));
     assert_eq!(signals(&mut m), vec![]);
     assert_eq!(m.head_partial(), None);
@@ -607,10 +607,10 @@ fn the_trait_serves_a_stream_as_the_bridge_will() {
         let id = m.next_dispatch()?;
         let st = m.stream_mut(id)?;
         st.set_dispatched();
-        let head = st.take_req_head()?;
+        let head = st.take_req_fields()?;
         assert!(st.req_head().is_none());
         assert!(!st.is_reset() && !st.bad_request() && st.rx_buffered() == 0);
-        let wire = String::from_utf8_lossy(head.wire()).into_owned();
+        let wire = String::from_utf8_lossy(&head.to_wire()).into_owned();
         assert!(wire.starts_with("GET /plain HTTP/1.1\r\n"), "{wire}");
         m.give_back_head(head);
         assert!(m.send_head(id, b"HTTP/1.1 200 OK", false));
@@ -748,4 +748,38 @@ fn data_after_a_block_the_bridge_emptied_is_a_block_of_its_own() {
     m.recv(0, &frame(0x00, b"def"), false, 0).expect("ok");
     let blocks = m.stream(0).expect("stream").rx_htx().blocks();
     assert!(matches!(&blocks[at + 1], HtxBlock::Data(d) if d == b"def"), "{blocks:?}");
+}
+
+/// A response field value that is not UTF-8 goes to an h3 client as its octets, as `HAProxy`
+/// sends it to an h2 one (3.5-dev8; its h3 mux writes the HTX value as it is too). Ibex
+/// sent U+FFFD for each (found by E2).
+#[test]
+fn a_response_value_that_is_not_utf8_goes_to_the_h3_client_as_its_octets() {
+    let mut m = mux();
+    m.recv(0, &headers(GET), true, 0).expect("request");
+    assert!(m.send_head(0, b"HTTP/1.1 200 OK\r\nX-A: a\xff\xfeb\r\ncontent-length: 2", false));
+    let f = frames(m.tx_bytes(0));
+    let fs = &f[0].1;
+    assert!(fs.windows(4).any(|w| w == b"a\xff\xfeb"), "{}", fs.escape_ascii());
+    assert!(!fs.windows(3).any(|w| w == "\u{fffd}".as_bytes()), "{}", fs.escape_ascii());
+}
+
+/// E2: a head the engine indexed goes as its fields, the same HEADERS as its text, the FIN
+/// with it when it ends the stream; a stream reset since takes it and sends nothing.
+#[test]
+fn a_head_from_its_fields_is_the_head_from_its_text() {
+    let mut text = mux();
+    text.recv(0, &headers(GET), true, 0).expect("request");
+    assert!(text.send_head(0, b"HTTP/1.1 200 OK\r\nx-a: a\r\ncontent-length: 0", true));
+    let mut fields = mux();
+    fields.recv(0, &headers(GET), true, 0).expect("request");
+    assert!(fields.send_head_fields(0, 200, [("x-a", &b"a"[..]), ("content-length", b"0")].into_iter(), true));
+    assert_eq!(fields.tx_bytes(0), text.tx_bytes(0));
+    assert!(fields.stream(0).expect("stream").tx_fin);
+    let mut m = mux();
+    m.recv(0, &headers(GET), true, 0).expect("request");
+    m.reset(0, MuxReset::Cancel);
+    let before = m.tx_bytes(0).to_vec();
+    assert!(m.send_head_fields(0, 200, [("x-a", &b"a"[..])].into_iter(), false), "taken and dropped");
+    assert_eq!(m.tx_bytes(0), &before[..]);
 }

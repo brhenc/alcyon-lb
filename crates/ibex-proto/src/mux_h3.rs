@@ -143,9 +143,9 @@ fn encode_prefixed_int(out: &mut Vec<u8>, prefix_bits: u8, mask: u8, mut value: 
 ///
 /// Huffman would be smaller; leaving it off keeps the encoder to one page and makes the
 /// bytes readable in a capture, which matters more while this path is being brought up.
-fn encode_string(out: &mut Vec<u8>, s: &str, prefix_bits: u8, mask: u8) {
+fn encode_string(out: &mut Vec<u8>, s: &[u8], prefix_bits: u8, mask: u8) {
     encode_prefixed_int(out, prefix_bits, mask, s.len());
-    out.extend_from_slice(s.as_bytes());
+    out.extend_from_slice(s);
 }
 
 /// Encodes a header list as a QPACK field section using only the static table and literals.
@@ -156,15 +156,15 @@ fn encode_string(out: &mut Vec<u8>, s: &str, prefix_bits: u8, mask: u8) {
 pub fn encode_field_section(headers: &[(String, String)]) -> Vec<u8> {
     let mut out = vec![0x00, 0x00];
     for (name, value) in headers {
-        put_field(&mut out, &name.to_ascii_lowercase(), value);
+        put_field(&mut out, &name.to_ascii_lowercase(), value.as_bytes());
     }
     out
 }
 
 /// Appends one field line (`name` lowercase): a static reference with one search of the
 /// table ([`crate::qpack::static_ref`]), else literals. Allocates nothing.
-fn put_field(out: &mut Vec<u8>, name: &str, value: &str) {
-    match crate::qpack::static_ref(name, value) {
+fn put_field(out: &mut Vec<u8>, name: &str, value: &[u8]) {
+    match crate::qpack::static_ref_octets(name, value) {
         // Indexed field line, static table: 1 1 index(6+)
         StaticRef::Full(idx) => encode_prefixed_int(out, 6, 0xc0, idx),
         StaticRef::Name(idx) => {
@@ -174,7 +174,7 @@ fn put_field(out: &mut Vec<u8>, name: &str, value: &str) {
         }
         StaticRef::None => {
             // Literal with literal name: 0 0 1 N=0 H=0 len(3+)
-            encode_string(out, name, 3, 0x20);
+            encode_string(out, name.as_bytes(), 3, 0x20);
             encode_string(out, value, 7, 0x00);
         }
     }
@@ -391,7 +391,7 @@ pub struct H3StreamCtx {
     pub interim_sent: bool,
     /// A request `HAProxy` takes and answers 400 ([`check_request_fields`]).
     pub bad_request: bool,
-    /// The head as HTTP/1.1, as h2's (T437), until the data path takes it.
+    /// The head as its checked fields, as h2's (T437, E1), until the data path takes it.
     pub req_head: Option<Box<H2ReqHead>>,
     pub content_length: Option<u64>,
     /// The body's length when the whole request came with its head (FIN in that read):
@@ -420,7 +420,7 @@ impl H3StreamCtx {
 
 impl Poolable for H3StreamCtx {
     fn footprint(&self) -> usize {
-        std::mem::size_of::<Self>() + self.rx.capacity() + self.tx.capacity() + self.req_head.as_ref().map_or(0, |h| h.text.capacity())
+        std::mem::size_of::<Self>() + self.rx.capacity() + self.tx.capacity() + self.req_head.as_ref().map_or(0, |h| h.capacity())
     }
 
     fn reset(&mut self, wipe: bool) {
@@ -430,7 +430,7 @@ impl Poolable for H3StreamCtx {
             ibex_alloc::wipe_bytes(&mut rx);
             ibex_alloc::wipe_bytes(&mut tx);
             if let Some(h) = head.as_mut() {
-                ibex_alloc::wipe_string(&mut h.text);
+                h.wipe();
             }
         }
         rx.clear();
@@ -853,23 +853,33 @@ impl H3MuxContext {
     }
 
     /// The response head (`status`, `headers`) of stream `id` as a HEADERS frame.
-    fn put_head<'h>(&mut self, id: u64, status: Option<u16>, headers: impl Iterator<Item = (&'h str, &'h str)>) {
+    fn put_head<'h>(&mut self, id: u64, status: Option<u16>, headers: impl Iterator<Item = (&'h str, &'h [u8])>) {
+        self.put_head_of(id, status, headers, false);
+    }
+
+    /// [`Self::put_head`]; `lowered`: the names are in lower case already (E2).
+    fn put_head_of<'h>(&mut self, id: u64, status: Option<u16>, headers: impl Iterator<Item = (&'h str, &'h [u8])>, lowered: bool) {
         let Self { streams, scratch, lower, .. } = self;
         let Some(st) = streams.get_mut(&id) else { return };
         scratch.clear();
         scratch.extend_from_slice(&[0x00, 0x00]);
         if let Some(status) = status {
             let mut digits = [0u8; 5];
-            put_field(scratch, ":status", status_text(status, &mut digits));
+            put_field(scratch, ":status", status_text(status, &mut digits).as_bytes());
         }
         for (name, value) in headers {
-            lower.clear();
-            lower.push_str(name);
-            lower.make_ascii_lowercase();
-            if HOP_BY_HOP.contains(&lower.as_str()) || lower.starts_with(':') {
+            let name = if lowered {
+                name
+            } else {
+                lower.clear();
+                lower.push_str(name);
+                lower.make_ascii_lowercase();
+                lower.as_str()
+            };
+            if HOP_BY_HOP.contains(&name) || name.starts_with(':') {
                 continue;
             }
-            put_field(scratch, lower, value);
+            put_field(scratch, name, value);
         }
         encode_varint(&mut st.tx, FRAME_HEADERS);
         encode_varint(&mut st.tx, scratch.len() as u64);
@@ -879,13 +889,6 @@ impl H3MuxContext {
     fn live(&self, id: u64) -> bool {
         self.streams.get(&id).is_some_and(|st| st.is_live())
     }
-}
-
-/// An HTTP/1 response head: its status and its header lines. `None` if it is not one.
-fn parse_head(head: &str) -> Option<(u16, impl Iterator<Item = (&str, &str)>)> {
-    let mut lines = head.lines();
-    let status = lines.next()?.split_whitespace().nth(1)?.parse::<u16>().ok()?;
-    Some((status, lines.filter_map(|l| l.split_once(':')).map(|(n, v)| (n.trim(), v.trim()))))
 }
 
 /// What the demux of a stream borrows from its connection.
@@ -1021,15 +1024,15 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
     let (mut method, mut scheme, mut path, mut authority) = (None, false, false, false);
     for (n, v) in f.iter() {
         match n {
-            ":method" => method = Some(v),
-            ":scheme" => scheme = true,
-            ":path" => path = true,
-            ":authority" | "host" => authority = true,
-            _ if n.starts_with(':') => return Ok(Some(MESSAGE_ERROR)),
+            b":method" => method = Some(v),
+            b":scheme" => scheme = true,
+            b":path" => path = true,
+            b":authority" | b"host" => authority = true,
+            _ if n.starts_with(b":") => return Ok(Some(MESSAGE_ERROR)),
             _ => {}
         }
     }
-    if method == Some("CONNECT") {
+    if method == Some(b"CONNECT") {
         return Ok(Some(REQUEST_REJECTED));
     }
     // Neither `:authority` nor `host`: measured on 3.5-dev7 (T509), RESET_STREAM 0x10e and
@@ -1045,8 +1048,8 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
         return Ok(Some(MESSAGE_ERROR));
     }
     let mut cl = None;
-    for (_, v) in f.iter().filter(|(n, _)| *n == "content-length") {
-        match content_length_value(v) {
+    for (_, v) in f.iter().filter(|(n, _)| *n == b"content-length") {
+        match std::str::from_utf8(v).ok().and_then(crate::h2::content_length_value) {
             Some(x) if cl.is_none_or(|c| c == x) => cl = Some(x),
             _ => return Ok(Some(MESSAGE_ERROR)),
         }
@@ -1079,10 +1082,11 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
 /// A second HEADERS: the request's trailers (`h3_trailers_to_htx`).
 fn on_trailers(st: &mut H3StreamCtx, payload: &[u8], last: bool, sh: &mut Shared) -> Result<Option<u64>, H3Error> {
     decode_qpack_static_into(payload, sh.decoded)?;
-    if check_trailer_fields(sh.decoded.iter()).is_err() {
+    // A name or value that is not UTF-8 reads as a NUL here, and is refused (T454).
+    if check_trailer_fields(sh.decoded.iter_text()).is_err() {
         return Ok(Some(MESSAGE_ERROR));
     }
-    for (name, value) in sh.decoded.iter() {
+    for (name, value) in sh.decoded.iter_text() {
         st.rx_htx.push(HtxBlock::Trailer(HeaderField { name: name.to_string(), value: value.to_string() }));
     }
     st.rx_htx.push(HtxBlock::Eot);
@@ -1093,22 +1097,6 @@ fn on_trailers(st: &mut H3StreamCtx, payload: &[u8], last: bool, sh: &mut Shared
     Ok(None)
 }
 
-/// A `content-length` value as `HAProxy`'s `http_parse_cont_len_header` reads it: digits
-/// only, or a comma list of one repeated number.
-fn content_length_value(v: &str) -> Option<u64> {
-    let mut len = None;
-    for word in v.split(',').map(|w| w.trim_matches([' ', '\t'])) {
-        if word.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let n: u64 = word.parse().ok()?;
-        if len.is_some_and(|l| l != n) {
-            return None;
-        }
-        len = Some(n);
-    }
-    len
-}
 
 /// The DATA payload `buf` holds if it is complete frames only.
 fn complete_body_len(mut buf: &[u8]) -> Option<u64> {
@@ -1218,7 +1206,7 @@ impl HtxStream for H3StreamCtx {
     fn req_head(&self) -> Option<&H2ReqHead> {
         self.req_head.as_deref()
     }
-    fn take_req_head(&mut self) -> Option<Box<H2ReqHead>> {
+    fn take_req_fields(&mut self) -> Option<Box<H2ReqHead>> {
         self.req_head.take()
     }
     fn bad_request(&self) -> bool {
@@ -1266,9 +1254,19 @@ impl HtxMux for H3MuxContext {
         if !self.live(id) {
             return true;
         }
-        let text = String::from_utf8_lossy(head);
-        let Some((status, headers)) = parse_head(&text) else { return false };
+        let Some((status, headers)) = crate::response_head::mux_head_lines(head) else { return false };
         self.put_head(id, Some(status), headers);
+        if let Some(st) = self.streams.get_mut(&id).filter(|_| end_stream) {
+            st.tx_fin = true;
+        }
+        true
+    }
+
+    fn send_head_fields<'h>(&mut self, id: u64, status: u16, fields: impl Iterator<Item = (&'h str, &'h [u8])>, end_stream: bool) -> bool {
+        if !self.live(id) {
+            return true;
+        }
+        self.put_head_of(id, Some(status), fields, true);
         if let Some(st) = self.streams.get_mut(&id).filter(|_| end_stream) {
             st.tx_fin = true;
         }
@@ -1292,7 +1290,7 @@ impl HtxMux for H3MuxContext {
 
     fn send_trailers(&mut self, id: u64, trailers: &[(&str, &str)]) -> bool {
         if self.live(id) {
-            self.put_head(id, None, trailers.iter().copied());
+            self.put_head(id, None, trailers.iter().map(|&(n, v)| (n, v.as_bytes())));
             if let Some(st) = self.streams.get_mut(&id) {
                 st.tx_fin = true;
             }
@@ -1304,8 +1302,7 @@ impl HtxMux for H3MuxContext {
         if !self.live(id) {
             return true;
         }
-        let text = String::from_utf8_lossy(head);
-        let Some((status, headers)) = parse_head(&text).filter(|(s, _)| (100..200).contains(s)) else { return false };
+        let Some((status, headers)) = crate::response_head::mux_head_lines(head).filter(|(s, _)| (100..200).contains(s)) else { return false };
         self.put_head(id, Some(status), headers);
         if let Some(st) = self.streams.get_mut(&id) {
             st.interim_sent = true;
@@ -1372,7 +1369,7 @@ mod tests {
     fn a_stream_given_back_wiped_keeps_its_memory_and_nothing_else() {
         let mut st = H3StreamCtx { id: 8, rx: b"secret".to_vec(), tx: b"reply".to_vec(), dispatched: true, ..H3StreamCtx::default() };
         let mut head = Box::<H2ReqHead>::default();
-        head.text.push_str("GET /secret HTTP/1.1");
+        *head = H2ReqHead::of("GET", "/secret", &[("x-secret", "1")]);
         st.req_head = Some(head);
         st.rx_htx.push(HtxBlock::Eoh);
         let cap = st.rx.capacity();
@@ -1380,7 +1377,7 @@ mod tests {
         assert_eq!((st.id, st.dispatched, st.rx.len(), st.tx.len()), (0, false, 0, 0));
         assert_eq!(st.rx.capacity(), cap, "the buffer is kept for the next stream");
         assert_eq!(st.rx_htx.blocks(), &[] as &[HtxBlock]);
-        assert!(st.req_head.as_ref().is_some_and(|h| h.text.is_empty()));
+        assert!(st.req_head.as_ref().is_some_and(|h| h.line.is_empty() && h.bytes.is_empty()));
         Poolable::reset(&mut st, false);
         assert!(st.footprint() >= std::mem::size_of::<H3StreamCtx>());
     }

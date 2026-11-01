@@ -1454,6 +1454,45 @@ impl<'a> HtxSlice<'a> {
         )
     }
 
+    /// Writes the request head `head` (an HTTP/2 or HTTP/3 request's checked fields, E1) as
+    /// its blocks: the start line `METHOD PATH HTTP/1.1`, a header block per field (a value
+    /// that is not UTF-8 as Latin-1, as the HTTP/1 parser keeps it), `extra` last, the end of
+    /// the headers; then the end-of-head checks and edits of the HTTP/1 parser
+    /// ([`crate::h1::finish_request_head`]). `each` is given each field of `head` as the
+    /// text the HTX holds (a Latin-1 value as its text), read once for both. The blocks are those
+    /// [`crate::h1::H1Parser::parse`] made of the same head written as HTTP/1.1 text, with
+    /// no text in between, and a cookie's outer blanks kept (`http_cookie_merge`).
+    ///
+    /// # Errors
+    /// Where the parser refuses that head (`InvalidData`), or the blocks do not fit
+    /// (`OutOfMemory`); what was written is then partial.
+    pub fn put_request_head(&mut self, head: &crate::mux_h2::H2ReqHead, extra: Option<(&str, &str)>, mut each: impl FnMut(&str, &str)) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+        let oom = |e: HtxError| Error::new(ErrorKind::OutOfMemory, e);
+        // A head without a line has an empty method, which the line check refuses.
+        let (method, uri) = (head.method(), head.uri());
+        crate::h1::check_request_line(method, uri)?;
+        self.push_req_line(method, uri, "HTTP/1.1").map_err(oom)?;
+        for (n, v) in head.headers() {
+            // A name is a token (checked by the mux): ASCII.
+            let name = std::str::from_utf8(n).map_err(|_| Error::new(ErrorKind::InvalidData, "header name"))?;
+            if let Ok(v) = std::str::from_utf8(v) {
+                self.push_header(name, v).map_err(oom)?;
+                each(name, v);
+            } else {
+                let text = latin1_to_text(v);
+                push_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, name, &text).map_err(oom)?;
+                self.set_last_flag(HTX_BLK_FL_LATIN1);
+                each(name, &text);
+            }
+        }
+        if let Some((n, v)) = extra {
+            self.push_header(n, v).map_err(oom)?;
+        }
+        self.push_eoh().map_err(oom)?;
+        crate::h1::finish_request_head(self, method, uri)
+    }
+
     /// Pushes a header whose value is text a peer sent. A character the byte mapping uses
     /// (U+F780-U+F7FF, [`ibex_regex::bytetext`]) in it is held as its own UTF-8 bytes, so
     /// the flag is never inferred from what a peer sent: only [`Self::push_header_latin1`]

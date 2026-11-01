@@ -11,7 +11,8 @@ import subprocess
 import tempfile
 import unittest
 from measure import (check_regressions, MetricDelta, Verdict, reference_sha, split_modes,
-                     parse_insreq, min_ins_per_req, host_problems)
+                     parse_insreq, min_ins_per_req, host_problems, load_previous_measurements)
+from h3board import board, render
 
 
 def _git(repo, *args):
@@ -191,6 +192,15 @@ class TestRegressionDetector(unittest.TestCase):
         self.assertEqual(verdict, Verdict.FAIL)
         self.assertTrue(any(d.name == "binary_bytes" and d.is_regression for d in deltas))
 
+    def test_insreq_h3_rows_are_not_the_previous_gate_record(self):
+        # T555: insreq.sh's h3 rows (`"kind": "insreq-h3"`) share data/measurements.jsonl;
+        # the gate's history is its own rows only.
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "m.jsonl"
+            p.write_text('{"rps_1conn": 1}\n{"kind": "insreq-h3", "h3_fit": 2}\n')
+            self.assertEqual(load_previous_measurements(p), [{"rps_1conn": 1}])
+
     def test_no_previous_run_is_baseline_pass(self):
         current = {"allocs_per_request": 5, "rps_1conn": 10000}
         previous = None
@@ -278,3 +288,32 @@ class TestHostProblems(unittest.TestCase):
         why = self.check({})
         self.assertEqual(len(why), 1)
         self.assertIn("schedutil", why[0])
+
+
+class TestH3Board(unittest.TestCase):
+    """M1: the h3 board has a non-PGO column, a PGO ("shipped") column and HAProxy's."""
+
+    def row(self, label, fit, build=None, binary="/t/release-perf/ibex", sha="aaa", method="get"):
+        r = {"kind": "insreq-h3", "sha": sha, "label": label, "binary": binary, "scenario": "h3.body",
+             "method": method, "h3_fit": fit, "fit_rate": 1.97, "at": "2026-11-01T00:00:00Z"}
+        if build:
+            r["build"] = build
+        return r
+
+    def test_pgo_is_its_own_column_and_haproxy_the_ratio_base(self):
+        rows = [self.row("i", 109000), self.row("p", 95000, "pgo"),
+                self.row("h", 64000, binary="/ref/haproxy-quic/haproxy"), {"kind": "other"}]
+        (b,) = board(rows)
+        self.assertEqual((b["release-perf"], b["pgo"], b["haproxy"]), (109000, 95000, 64000))
+        self.assertAlmostEqual(b["ratio"], 109000 / 64000)
+        self.assertAlmostEqual(b["pgo_ratio"], 95000 / 64000)
+        out = render([b])
+        self.assertIn("pgo", out.splitlines()[0])
+        self.assertIn("1.48x", out)
+
+    def test_the_last_row_of_a_column_wins_and_shas_are_separate_lines(self):
+        rows = [self.row("a", 100, sha="s1"), self.row("b", 90, sha="s1"), self.row("c", 80, sha="s2")]
+        got = board(rows)
+        self.assertEqual([(g["sha"], g["release-perf"]) for g in got], [("s1", 90), ("s2", 80)])
+        self.assertIsNone(got[0]["pgo"])
+        self.assertIn("-", render(got))

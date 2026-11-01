@@ -16,6 +16,7 @@
 #   --out FILE        also copy the final binary to FILE
 #   --bolt            add llvm-bolt reordering (needs llvm-bolt; off by default)
 #   --keep            keep the work directory under /tmp
+# The training covers h1 (plain, TLS), h2 (TLS, h2c), h3 (h3bench and h2load -m 10), rules, errors.
 # Needs: rustc and llvm-profdata with the same LLVM major version, h2load, socat, openssl, curl, nc.
 # Environment: CARGO_BUILD_PREFIX (e.g. "nice -n 19 taskset -c 0-47") is put in front of cargo.
 set -u
@@ -28,7 +29,7 @@ while [ $# -gt 0 ]; do
     --out) OUT=$2; shift 2;;
     --bolt) BOLT=1; shift;;
     --keep) KEEP=1; shift;;
-    -h|--help) sed -n 2,22p "$0"; exit 0;;
+    -h|--help) sed -n 2,20p "$0"; exit 0;;
     *) echo "pgo-build: unknown option $1" >&2; exit 2;;
   esac
 done
@@ -72,19 +73,25 @@ log "building measure-bench"
   || { tail -20 "$W/build-bench.log" >&2; die "measure-bench build failed"; }
 BENCH=$BENCH_TD/release/measure-bench
 [ -x "$BENCH" ] || die "measure-bench not found at $BENCH"
+# h3bench: the deterministic HTTP/3 client (T555), for the QUIC part of the training.
+log "building h3bench"
+(cd "$ROOT/tools/measure/h3bench" || exit 1; CARGO_TARGET_DIR="$BENCH_TD" $PFX cargo build --release --offline >"$W/build-h3bench.log" 2>&1) \
+  || { tail -20 "$W/build-h3bench.log" >&2; die "h3bench build failed"; }
+H3BENCH=$BENCH_TD/release/h3bench
+[ -x "$H3BENCH" ] || die "h3bench not found at $H3BENCH"
 
 # 2. Training load.
 # train <ibex-binary> <label>: start backend + log sink + proxy, drive the load, stop the proxy
 # with SIGUSR1 (graceful, so the profile is written at exit) and wait for it.
 train() {
   local BIN=$1 LABEL=$2
-  local P_LOG P_H1 P_TLS P_H2C P_BE P_DEAD
-  P_LOG=$(port); P_H1=$(port); P_TLS=$(port); P_H2C=$(port); P_BE=$(port); P_DEAD=$(port)
+  local P_LOG P_H1 P_TLS P_H2C P_H3 P_BE P_DEAD
+  P_LOG=$(port); P_H1=$(port); P_TLS=$(port); P_H2C=$(port); P_H3=$(port); P_BE=$(port); P_DEAD=$(port)
   if [ ! -f "$W/cert.pem" ]; then
     openssl req -x509 -newkey rsa:2048 -nodes -keyout "$W/cert.pem" -out "$W/crt.pem" -subj /CN=localhost -days 1 2>/dev/null \
       && cat "$W/crt.pem" >> "$W/cert.pem" || die "openssl cert generation failed"
   fi
-  sed -e "s/@P_LOG@/$P_LOG/;s/@P_H1@/$P_H1/;s/@P_TLS@/$P_TLS/;s/@P_H2C@/$P_H2C/;s/@P_BE@/$P_BE/;s/@P_DEAD@/$P_DEAD/" \
+  sed -e "s/@P_LOG@/$P_LOG/;s/@P_H1@/$P_H1/;s/@P_TLS@/$P_TLS/;s/@P_H2C@/$P_H2C/;s/@P_H3@/$P_H3/;s/@P_BE@/$P_BE/;s/@P_DEAD@/$P_DEAD/" \
       -e "s#@CERT@#$W/cert.pem#" "$ROOT/tools/pgo/train.cfg" > "$W/train.cfg"
 
   "$BENCH" backend "$P_BE" >/dev/null 2>&1 & local BEP=$!; PIDS+=("$BEP")
@@ -112,14 +119,31 @@ train() {
     printf 'GARBAGE\r\n\r\n' | nc -w 1 127.0.0.1 "$P_H1" >/dev/null 2>&1
     printf 'GET / HTTP/1.1\r\nBad Header\r\n\r\n' | nc -w 1 127.0.0.1 "$P_H1" >/dev/null 2>&1
   done
-  log "[$LABEL] TLS HTTP/1.1"
+  log "[$LABEL] TLS HTTP/1.1 (one connection, then ten)"
+  h2load --h1 -n 5000 -c 1 "https://$TLS/" >/dev/null 2>&1
   h2load --h1 -n 20000 -c 10 "https://$TLS/" >/dev/null 2>&1
   curl -sk --http1.1 -o /dev/null -w '' "https://$TLS/old" 2>/dev/null
-  log "[$LABEL] TLS + h2 (ALPN)"
+  log "[$LABEL] TLS + h2 (ALPN): one stream at a time, then -m 10"
+  h2load -n 10000 -c 1 -m 1 "https://$TLS/" >/dev/null 2>&1
   h2load -n 100000 -c 10 -m 10 "https://$TLS/" >/dev/null 2>&1
   h2load -n 5000 -c 5 -m 5 "https://$TLS/old" >/dev/null 2>&1
   log "[$LABEL] h2c"
   h2load -n 50000 -c 10 -m 10 "http://$H2C/" >/dev/null 2>&1
+  # HTTP/3: h3bench keeps the ACK path in both policies (the h3fit shape), h2load adds
+  # concurrent connections and streams (-m 10) and a POST with a 4 KB body (QPACK, DATA framing).
+  local H3=127.0.0.1:$P_H3
+  head -c 4096 /dev/zero | tr '\0' 'x' > "$W/body4k"
+  log "[$LABEL] HTTP/3 h3bench best/worst, GET and POST"
+  "$H3BENCH" "$H3" 20000 best get >/dev/null 2>&1
+  "$H3BENCH" "$H3" 20000 worst get >/dev/null 2>&1
+  "$H3BENCH" "$H3" 5000 best post >/dev/null 2>&1
+  "$H3BENCH" "$H3" 5000 worst post >/dev/null 2>&1
+  log "[$LABEL] HTTP/3 h2load: -c 10 -m 1, -c 50, -m 10, POST 4 KB, /old redirect"
+  h2load --alpn-list=h3 -n 20000 -c 10 -m 1 "https://$H3/" >/dev/null 2>&1
+  h2load --alpn-list=h3 -n 10000 -c 50 -m 1 "https://$H3/" >/dev/null 2>&1
+  h2load --alpn-list=h3 -n 30000 -c 10 -m 10 "https://$H3/" >/dev/null 2>&1
+  h2load --alpn-list=h3 -n 5000 -c 10 -m 1 -d "$W/body4k" "https://$H3/" >/dev/null 2>&1
+  h2load --alpn-list=h3 -n 3000 -c 5 -m 1 "https://$H3/old" >/dev/null 2>&1
   kill -USR1 "$IP" 2>/dev/null
   for i in $(seq 1 100); do kill -0 "$IP" 2>/dev/null || break; sleep 0.1; done
   kill -0 "$IP" 2>/dev/null && { log "[$LABEL] ibex ignored SIGUSR1, killing"; kill "$IP" 2>/dev/null; }

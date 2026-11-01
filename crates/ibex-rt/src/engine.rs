@@ -93,6 +93,9 @@ pub struct IdleKey {
 pub struct IdleConn {
     pub fd: OwnedFd,
     pub xprt: crate::xprt::ServerXprt,
+    /// Its local address (`%bi`/`%bp`), read when it was opened: the stream that takes it
+    /// again has it without a `getsockname` (T550 Q8).
+    pub src: Option<SocketAddr>,
 }
 
 impl IdleConn {
@@ -754,7 +757,7 @@ mod shared_pool_tests {
         let (a, b) = std::os::unix::net::UnixStream::pair().expect("pair");
         // Non-blocking, as every server socket is: an event's read must not wait.
         a.set_nonblocking(true).expect("nonblocking");
-        (IdleConn { fd: OwnedFd::from(a), xprt: crate::xprt::ServerXprt::Plain }, b)
+        (IdleConn { fd: OwnedFd::from(a), xprt: crate::xprt::ServerXprt::Plain, src: None }, b)
     }
 
     fn key() -> IdleKey {
@@ -1054,7 +1057,7 @@ mod pool_tests {
     use super::*;
 
     fn conn() -> IdleConn {
-        IdleConn { fd: OwnedFd::from(std::fs::File::open("/dev/null").expect("open")), xprt: crate::xprt::ServerXprt::Plain }
+        IdleConn { fd: OwnedFd::from(std::fs::File::open("/dev/null").expect("open")), xprt: crate::xprt::ServerXprt::Plain, src: None }
     }
 
     fn key() -> IdleKey {
@@ -1107,7 +1110,7 @@ mod pool_tests {
         let mut pool = WorkerPool::default();
         // A socket pair: the idle connection must look alive to be taken.
         let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
-        let c = IdleConn { fd: OwnedFd::from(a), xprt: crate::xprt::ServerXprt::Plain };
+        let c = IdleConn { fd: OwnedFd::from(a), xprt: crate::xprt::ServerXprt::Plain, src: None };
         assert!(pool.keep(key(), c, false, CFG, 3, t0).is_ok());
         assert!(pool.take(&key(), false, ibex_config::HttpReuse::Safe).is_some());
         pool.purge(t0 + Duration::from_millis(500), |_| 0);
@@ -5020,6 +5023,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         ibex_alloc::set_trim_disabled(config.global.as_ref().is_some_and(|g| g.no_memory_trimming));
         // Both off unless configured (the user, 2026-10-24: comparisons with HAProxy stay fair).
         ibex_alloc::set_zero_buffers(config.global.as_ref().and_then(|g| g.zero_buffers).unwrap_or(false));
+        ibex_alloc::set_ssl_zero_on_free(config.global.as_ref().is_some_and(|g| g.ssl_zero_on_free));
         ibex_alloc::set_ssl_zero_buffers(config.global.as_ref().and_then(|g| g.ssl_zero_buffers).unwrap_or(true));
         ibex_alloc::set_zero_spares(config.global.as_ref().and_then(|g| g.zero_spares).unwrap_or(false));
         // `tune.ibex.zero-on-free` (T459, off unless configured): read by the binary's allocator
@@ -5637,8 +5641,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// # Errors
     /// Returns an error if polling epoll fails.
     pub fn run_once(&mut self) -> io::Result<usize> {
-        let now = self.current_tick();
-        self.step(now)
+        let at = Instant::now();
+        self.step_at(self.tick_at(at), at)
     }
 
     /// Registers any backend socket a QUIC listener has opened since the last pass.
@@ -5776,13 +5780,20 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     continue;
                 };
                 sess.h3 = true;
+                // Admitted during a soft stop (its handshake ended after it began, T558): its
+                // streams are served as those of the sessions the stop found (`begin_soft_stop`),
+                // their server connections not kept for a request that will not come.
+                if self.stopping {
+                    sess.stopping = true;
+                    sess.close_client = true;
+                }
                 sess.cli_state = ScState::Established;
                 sess.cli_exp = Tick::ETERNITY;
                 sess.req_exp = Tick::ETERNITY;
                 // Its role, which keeps its children and its mux, is made now (two `Box`es a
                 // connection).
                 sess.h2_role = Some(Box::new(crate::proxy::H2Role::Owner(crate::proxy::H2Owner {
-                    h3: Some(Box::new(crate::proxy::H3Owner { mux, listener: usize_to_u32(q_idx), conn, body_scratch: Vec::new(), idle_start: self.now, closing: false })),
+                    h3: Some(Box::new(crate::proxy::H3Owner { mux, listener: usize_to_u32(q_idx), conn, body_scratch: Vec::new(), idle_start: self.now, closing: false, stop_grace: None, stop_read: false })),
                     ..Default::default()
                 })));
                 let entry = SessionEntry {
@@ -5904,6 +5915,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     }
 
     pub fn step(&mut self, now: Tick) -> io::Result<usize> {
+        self.step_at(now, Instant::now())
+    }
+
+    /// [`Self::step`] with the clock already read: `now_inst` is the instant `now` was taken
+    /// from, what the deadlines before the poller are measured against.
+    fn step_at(&mut self, now: Tick, now_inst: Instant) -> io::Result<usize> {
         self.now = now;
         crate::watchdog::progress();
         crate::watchdog::set_streams(self.sessions.live());
@@ -5940,14 +5957,20 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
         // A QUIC transport's next deadline can be sooner than the scheduler's. Waiting past
         // it would delay loss recovery; the shortest of the two wins.
-        let now_inst = Instant::now();
         let poll_timeout = self
             .quic_listeners
-            .iter()
+            .iter_mut()
             .filter_map(crate::quic_listener::QuicListener::poll_timeout)
             .fold(poll_timeout, |acc, deadline| {
                 acc.min(deadline.saturating_duration_since(now_inst))
             });
+        // Datagrams read and not served yet (a pass serves `RX_PER_PASS`, T560): the socket
+        // may be empty and wake nothing, so look again at once. The listener is marked ready.
+        let poll_timeout = if self.quic_listeners.iter().any(crate::quic_listener::QuicListener::has_backlog) {
+            Duration::ZERO
+        } else {
+            poll_timeout
+        };
 
         // The idle server connections beyond what their servers need are purged every
         // `pool-purge-delay` (`srv_cleanup_idle_conns`): this is where that keyword acts.
@@ -6093,14 +6116,16 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // has expired. `poll_timeout` is asked rather than calling `handle_timeout` on each
         // wakeup, because a transport told the time has advanced when it has not will arm and
         // fire loss-recovery timers that are not due.
-        let inst = Instant::now();
+        // The pass's clock: read once after the poller, as everything since.
+        let inst = pass_start;
         for ql in &mut self.quic_listeners {
             let timer_due = ql.poll_timeout().is_some_and(|d| d <= inst);
             if timer_due {
                 ql.handle_timeout(inst);
             }
+            // Sent at the end of the pass, with what the owner sessions write (Q1).
             if ql.take_ready() || timer_due {
-                let _ = ql.pump(inst);
+                let _ = ql.serve(inst);
             }
         }
         self.admit_quic_connections();
@@ -6182,8 +6207,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         for (owner_idx, owner_task) in h2_spawn.drain(..) {
             self.spawn_h2_children(owner_idx, owner_task, &mut wake_queue);
         }
-        // What the owners of HTTP/3 connections wrote goes out now (T509). The clock is read
-        // only when one did: once per pass is a fifth of an h1 request's added cost otherwise.
+        // What the owners of HTTP/3 connections wrote goes out now (T509), with what the
+        // listener's own pass (`serve`) left to send: one send a pass (Q1). The clock is read
+        // only when there is one: once per pass is a fifth of an h1 request's added cost otherwise.
         for ql in &mut self.quic_listeners {
             if ql.take_dirty() {
                 let _ = ql.send_batch(Instant::now());
@@ -6768,8 +6794,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     break;
                 }
             }
-            let now = self.current_tick();
-            let ran = self.step(now)?;
+            // One clock read before the poller (`now` and the deadlines it waits for) and
+            // one after it (`pass_start`), as HAProxy's two `clock_update_date` (T550 Q2).
+            let at = Instant::now();
+            let ran = self.step_at(self.tick_at(at), at)?;
             quiet = ran == 0 && self.scheduler.run_queue_len() == 0;
         }
         Ok(())
@@ -6814,6 +6842,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         crate::logfwd::soft_stop();
         for ql in &mut self.quic_listeners {
             ql.begin_soft_stop();
+            // Handed over: the socket stays open (this process still sends on it) but is the
+            // next process's to read (T558).
+            if ql.is_deaf() {
+                let _ = self.poller.delete(ql.borrowed_fd());
+            }
         }
         if let Some(cli) = self.cli_listener.take() {
             self.fdtab.remove(cli.as_raw_fd());
@@ -7961,6 +7994,13 @@ fn arm_res_inspect(proxy: &Proxy, sess: &mut TcpSession) {
 /// Unset, the environment variable `IBEX_H3_PATH` (`mux` or `relay`) decides, so that the h3
 /// tests run on both paths without a configuration of their own; else the mux (the default
 /// since T536).
+/// How long a soft stop waits for the first request of an HTTP/3 connection that has sent
+/// none (T558): long enough for a client's request lost on its way (sent while the reuseport
+/// group was changing, before the connection was pinned) to be retransmitted -- quinn's and
+/// ngtcp2's probe timeouts are tens of milliseconds on a short path, doubling -- and short
+/// enough that a connection opened and left idle does not keep the old process long.
+pub const H3_STOP_FIRST_REQUEST_MS: u32 = 1000;
+
 fn h3_mux(keyword: Option<bool>) -> bool {
     keyword.unwrap_or_else(|| std::env::var("IBEX_H3_PATH").map_or(true, |v| v != "relay"))
 }
@@ -8783,7 +8823,7 @@ fn release_server(
             // first response on: `HAProxy` keeps it in the server's available list (A.3 row 7,
             // 1 connection for 5 clients one after the other; T540).
             let safe = entry.srv_served >= 2 || xprt.is_h2();
-            if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt }, safe, cfg, used, Instant::now()) {
+            if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt, src: entry.sess.bc_src }, safe, cfg, used, crate::txnlog::loop_now()) {
                 // Closing its only descriptor takes it out of the epoll set.
                 fdtab.remove(sfd);
                 conn.close();
@@ -8888,7 +8928,7 @@ fn h2_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     }
     let before = (cs.rep.len(), t.rsp);
     let srv_gone = matches!(cs.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-    if crate::h2_bridge::forward_response(h2, ch.stream.id, t, &mut cs.rep, srv_gone) {
+    if crate::h2_bridge::forward_response(h2, ch.stream.id, t, &mut cs.rep, srv_gone, &mut ch.late_trailers, &mut ch.rsp_head) {
         cs.log.term = Some(*b"SD");
         moved = true;
     }
@@ -8960,7 +9000,7 @@ fn h3_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     }
     let before = (cs.rep.len(), t.rsp);
     let srv_gone = matches!(cs.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-    if crate::h2_bridge::forward_response_mux(mux, ch.stream.id, t, &mut cs.rep, srv_gone, &mut h3.body_scratch) {
+    if crate::h2_bridge::forward_response_mux(mux, ch.stream.id, t, &mut cs.rep, srv_gone, &mut h3.body_scratch, &mut ch.late_trailers, &mut ch.rsp_head) {
         cs.log.term = Some(*b"SD");
         moved = true;
     }
@@ -8999,7 +9039,15 @@ fn h3_owner_deadline(s: &crate::proxy::TcpSession, now: Tick) -> Tick {
         (None, Some(_)) => (h3.idle_start, if s.keep_alive_ms != 0 { s.keep_alive_ms } else { s.http_request_ms }),
     };
     if ms == 0 {
-        client
+        // `timeout client` as the fallback (T562): HAProxy computes it from `now` only when the
+        // mux is woken by a stream event, so on a quiet connection (PINGs wake no mux) it runs
+        // out. Recomputed from `now` at every owner step it would slide for ever; anchor it at
+        // `idle_start` unless a stream's head is in progress.
+        if mux.head_partial().is_none() && s.timeouts.client != 0 {
+            h3.idle_start.add(s.timeouts.client)
+        } else {
+            client
+        }
     } else {
         base.add(ms)
     }
@@ -9544,13 +9592,20 @@ cache-control: no-cache\r\ncontent-type: text/html\r\n\r\n\
 
 /// Adds `Connection: <token>` as the last header of the head at the front of `buf`, with the
 /// line ends the head has. The head is copied through the stack (no allocation) when it fits.
-fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str) {
-    let Some((eoh_pos, eoh_len)) = buf.eoh() else { return };
-    let crlf = buf.readable()[..eoh_pos + eoh_len].windows(2).any(|w| w == b"\r\n");
+/// `canonical`: the head is one [`ibex_proto::response_head::RspHead`] indexes (CRLF line
+/// ends, names in lower case), and the line goes in as `connection: <token>\r\n`. The length
+/// of the line put in, `None` when it went in another way.
+fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str, canonical: bool) -> Option<usize> {
+    let (eoh_pos, eoh_len) = buf.eoh()?;
+    let crlf = canonical || {
+        ibex_proto::response_head::count_head_scan();
+        buf.readable()[..eoh_pos + eoh_len].windows(2).any(|w| w == b"\r\n")
+    };
     // `token` is `close` or `keep-alive`: the line is 24 bytes at most.
     let mut line = [0u8; 40];
     let mut n = 0;
-    for part in [b"Connection: ".as_slice(), token.as_bytes(), if crlf { b"\r\n" } else { b"\n" }] {
+    let name: &[u8] = if canonical { b"connection: " } else { b"Connection: " };
+    for part in [name, token.as_bytes(), if crlf { b"\r\n" } else { b"\n" }] {
         line[n..n + part.len()].copy_from_slice(part);
         n += part.len();
     }
@@ -9567,8 +9622,10 @@ fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str) {
         stack_hdr[at..at + inject.len()].copy_from_slice(inject);
         stack_hdr[at + inject.len()..total_new].copy_from_slice(&readable[at..total_old]);
         buf.replace_prefix(total_old, &stack_hdr[..total_new]);
+        Some(inject.len())
     } else {
-        buf.inject_http_header("Connection", token);
+        buf.inject_http_header(if canonical { "connection" } else { "Connection" }, token);
+        None
     }
 }
 
@@ -9924,8 +9981,9 @@ impl EngineDispatcher<'_> {
                 if Self::l7_retry(entry, proxies, fdtab, poller, now) {
                     continue;
                 }
-                Self::apply_http_response_rules(entry, proxies, now);
-                Self::write_response_head_names(entry, proxies);
+                if !Self::apply_http_response_rules(entry, proxies, now) {
+                    Self::write_response_head_names(entry, proxies);
+                }
             }
             if Self::l7_retry_failure(entry, proxies, fdtab, poller, now) {
                 continue;
@@ -10612,13 +10670,37 @@ impl EngineDispatcher<'_> {
         let Some(crate::proxy::H2Role::Owner(crate::proxy::H2Owner { children: served_by, h3: Some(h3), .. })) = e.sess.h2_role.as_deref_mut() else { return Outcome::Done };
         let served = |id: u64| served_by.iter().any(|l| u64::from(l.stream_id) == id);
         let ql = &mut self.quic_listeners[q_idx];
+        // A connection that has sent no request yet when the soft stop reaches it -- one the
+        // client opened to send one, whose request may be on the wire, or one whose handshake
+        // ends during the stop -- waits for that first request, at most
+        // `H3_STOP_FIRST_REQUEST_MS`; it is then served and drained as any other (T558,
+        // VV-30). `HAProxy` sends GOAWAY(0) and closes it at once, and the request is lost.
+        let stopping = ql.is_stopping();
+        let grace = if stopping { *h3.stop_grace.get_or_insert(now.add(H3_STOP_FIRST_REQUEST_MS)) } else { Tick::ETERNITY };
+        // Its grace over, the connection is judged on what its sockets hold, not on what was
+        // read when its timer fired: a pass whose poller was interrupted (a signal, a stopped
+        // or starved process) runs the expired timers with nothing read, and the request its
+        // client sent meanwhile waits in the socket. The listener reads them all in the next
+        // pass, and the owner looks again after it (T564: GOAWAY(0) and a close with the
+        // request unread, curl `ERR_DRAINING`).
+        if stopping && h3.mux.last_client_stream_id.is_none() && grace.is_expired(now) && !h3.stop_read {
+            h3.stop_read = true;
+            ql.mark_ready();
+            self.wake_queue.push(task);
+            return Outcome::Keep;
+        }
+        let fresh = stopping && h3.mux.last_client_stream_id.is_none() && !grace.is_expired(now);
         // The GOAWAY of a soft stop goes out in this pass: framed after the write, it was
         // what kept an idle owner from closing, nothing waking it to write it (T511).
-        if ql.is_stopping() {
+        let goaway_before = h3.mux.goaway_sent.is_some();
+        if stopping && !fresh {
             h3.mux.send_goaway();
         }
         ql.owner_send(conn, &mut h3.mux, |id| !served(id));
         let idle = children == 0 && !ibex_proto::htx_mux::HtxMux::tx_pending(&*h3.mux);
+        // A request whose head is still arriving is in flight too: the drain waits for it.
+        // Read only in a stop: `head_partial` walks the streams, every pass of every request.
+        let in_flight = stopping && (ibex_proto::htx_mux::HtxMux::next_dispatch(&*h3.mux).is_some() || h3.mux.head_partial().is_some());
         let failed = h3.mux.error.is_some();
         for i in 0..children {
             let Some(link) = self.sessions.get(owner_idx).and_then(|e| e.sess.h2_owner()).and_then(|o| o.children.get(i).copied()) else { break };
@@ -10635,7 +10717,17 @@ impl EngineDispatcher<'_> {
         // the client had not received yet (T521): it closes.
         let ended = !matches!(e.sess.cli_state, ScState::Ready | ScState::Established);
         let ql = &self.quic_listeners[q_idx];
-        let drained = idle && ql.is_stopping() && !ql.owner_unacked(conn);
+        let drained = stopping && idle && !fresh && !in_flight && !ql.owner_unacked(conn);
+        // Its GOAWAY was framed in this pass: the close waits for the next one, as a timer's
+        // does, or quinn drops the GOAWAY with the close (T558: the client of a connection
+        // idle at the stop saw only CONNECTION_CLOSE).
+        if drained && !goaway_before && !ended && !failed {
+            if let Some(h3) = e.sess.h3_owner_mut() {
+                h3.closing = true;
+            }
+            self.wake_queue.push(task);
+            return Outcome::Keep;
+        }
         if ended || failed || drained || e.sess.h3_owner().is_some_and(|h| h.closing) {
             if !failed {
                 self.quic_listeners[q_idx].owner_close(conn);
@@ -10654,6 +10746,7 @@ impl EngineDispatcher<'_> {
             self.wake_queue.push(task);
         }
         let exp = h3_owner_deadline(&e.sess, now);
+        let exp = if fresh { exp.earliest(grace) } else { exp };
         if exp.is_expired(now) {
             // `qcc_timeout_task` -> `qcc_shutdown`: a GOAWAY now, the close in the next
             // pass, once the GOAWAY is out (quinn sends no stream data after a close).
@@ -11387,11 +11480,24 @@ impl EngineDispatcher<'_> {
             return;
         }
         let table = client_case_table(&proxies[entry.proxy_idx]);
+        ibex_proto::response_head::count_head_scan();
         entry.sess.rep.edit_keeping_lines(|head, eoh| rewrite_header_names_before(head, eoh, table));
     }
 
+    /// The response head's rules, framing and `Connection`. True when the head's names are
+    /// in lower case already, from its index (E2), and [`Self::write_response_head_names`]
+    /// has nothing to do.
+    fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &[Proxy], now: Tick) -> bool {
+        if let Some(c) = entry.sess.h2_child_mut() {
+            c.rsp_head = None;
+        }
+        let mut lowered = false;
+        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered);
+        lowered
+    }
+
     #[allow(clippy::too_many_lines)]
-    fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &[Proxy], now: Tick) {
+    fn apply_http_response_rules_in(entry: &mut SessionEntry, proxies: &[Proxy], now: Tick, lowered: &mut bool) {
         let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
         // Empty lines ahead of a status line are skipped (`H1_MSG_RPBEFORE`), so that the
         // end of the head is not looked for in them (T275).
@@ -11423,6 +11529,8 @@ impl EngineDispatcher<'_> {
         let mut close_server = false;
         // What `%B` counts of the head: what HTX holds of it.
         let mut held: Option<Vec<u8>> = None;
+        // The head as parsed, while nothing has edited it (E2).
+        let mut index: Option<ibex_proto::response_head::RspHead> = None;
         if entry.sess.txn.as_ref().is_some_and(|t| t.rsp_wait.is_none()) {
             let accept = proxies[be_idx].stats_config.accept_unsafe_response;
             match ibex_proto::response_head::check_response_head(&entry.sess.rep.readable()[..total_hdr_len], accept) {
@@ -11433,16 +11541,29 @@ impl EngineDispatcher<'_> {
                     reply_error(entry, proxies, 502);
                     return;
                 }
-                ibex_proto::response_head::ResponseHead::Valid { status, rewrite, close_server: close } => {
+                ibex_proto::response_head::ResponseHead::Valid { status, rewrite, close_server: close, index: ix } => {
                     close_server = close;
+                    index = ix;
                     if let Some(r) = rewrite {
                         entry.sess.rep.replace_prefix(total_hdr_len, &r.head);
                         total_hdr_len = r.head.len();
                         held = Some(r.held);
                     }
-                    // The websocket handshake against what the request asked for (T281).
+                    // The websocket handshake against what the request asked for (T281):
+                    // nothing to read in a head with no `Upgrade` field but a `101`.
                     let req_ws = entry.sess.req_ws.as_deref().copied().unwrap_or_default();
-                    match crate::websocket::check_response(&entry.sess.rep.readable()[..total_hdr_len], status, &req_ws, accept) {
+                    let verdict = match &index {
+                        Some(ix) if status != 101 && !ix.upgrade => crate::websocket::Verdict::Keep,
+                        _ => crate::websocket::check_response(&entry.sess.rep.readable()[..total_hdr_len], status, &req_ws, accept),
+                    };
+                    #[cfg(debug_assertions)]
+                    if index.is_some() {
+                        debug_assert_eq!(verdict, crate::websocket::check_response_uncounted(&entry.sess.rep.readable()[..total_hdr_len], status, &req_ws, accept));
+                    }
+                    if !matches!(verdict, crate::websocket::Verdict::Keep) {
+                        index = None;
+                    }
+                    match verdict {
                         crate::websocket::Verdict::Keep => {}
                         crate::websocket::Verdict::Refuse => {
                             entry.sess.rep.clear();
@@ -11463,14 +11584,22 @@ impl EngineDispatcher<'_> {
         // every head on the fast path) and the borrow ends before `rep` is edited.
         // One pass over the head for what follows reads of it (T436); a head the facts are not
         // read from is read the old way, a pass for each.
-        let rsp_facts = crate::txn::HeadFacts::scan(&entry.sess.rep.readable()[..total_hdr_len], false);
+        let rsp_facts = match &index {
+            Some(ix) => crate::txn::HeadFacts::of_response(&entry.sess.rep.readable()[..total_hdr_len], ix),
+            None => crate::txn::HeadFacts::scan(&entry.sess.rep.readable()[..total_hdr_len], false),
+        };
         let (status, framing, srv_has_close, srv_http11) = {
             let raw = &entry.sess.rep.readable()[..total_hdr_len];
             let method = entry.sess.req_method.as_deref();
             if let Some(f) = rsp_facts {
-                let status = crate::txn::status_of_line(&raw[..memchr::memchr(b'\n', raw).unwrap_or(raw.len())]);
+                let (status, http11) = match &index {
+                    Some(ix) => (ix.status, ix.http11),
+                    None => (crate::txn::status_of_line(&raw[..memchr::memchr(b'\n', raw).unwrap_or(raw.len())]), ibex_proto::response_head::is_http11(raw)),
+                };
+                #[cfg(debug_assertions)]
+                debug_assert_eq!((status, http11), (crate::txn::status_of_line(&raw[..memchr::memchr(b'\n', raw).unwrap_or(raw.len())]), ibex_proto::response_head::is_http11(raw)));
                 let framing = f.response_framing(method, status).unwrap_or_else(|| crate::txn::response_framing(&String::from_utf8_lossy(raw), method, status));
-                (status, framing, f.wants_close(), ibex_proto::response_head::is_http11(raw))
+                (status, framing, f.wants_close(), http11)
             } else {
                 let head = String::from_utf8_lossy(raw);
                 let status = crate::txn::status_of(&head);
@@ -11661,6 +11790,18 @@ impl EngineDispatcher<'_> {
             || !proxies[be_idx].srvexp.is_empty();
 
         if !has_rules {
+            // The names in lower case, as `HAProxy` writes what went through HTX, from the
+            // index: nothing has edited the head since it was made (E2). With an
+            // `h1-case-adjust` table for the client, `write_response_head_names` does it.
+            let mut index = index.filter(|ix| ix.len as usize == total_hdr_len && client_case_table(&proxies[fe_idx]).is_none());
+            if let Some(ix) = &index {
+                entry.sess.rep.edit_keeping_lines(|head, _| {
+                    for f in ix.fields() {
+                        head[f.at as usize..f.colon as usize].make_ascii_lowercase();
+                    }
+                });
+                *lowered = true;
+            }
             // `keep-alive` and `close` out of the server's `Connection`, the one this
             // connection's state calls for in (`h1_update_res_conn_value`).
             let (h, e) = entry.sess.rep.eoh().unwrap_or_default();
@@ -11682,15 +11823,30 @@ impl EngineDispatcher<'_> {
                 // `close`; the head is edited where it is, with no copy.
                 if scan.count == 1 {
                     entry.sess.rep.cut(scan.first.0, scan.first.1);
+                    if let Some(ix) = index.as_mut() {
+                        ix.cut_line(scan.first.0, scan.first.1);
+                    }
                 }
                 if let Some(tok) = token {
-                    inject_connection_token_zero_alloc(&mut entry.sess.rep, tok);
+                    // A head the index holds ends with CRLF, and its names are lower case. A
+                    // line put in another way (a head past 4096 bytes) leaves the index of the
+                    // head before it, which the client side then reads again (its length).
+                    let line = inject_connection_token_zero_alloc(&mut entry.sess.rep, tok, index.is_some());
+                    if let (Some(ix), Some(l)) = (index.as_mut(), line) {
+                        ix.add_line("connection".len(), l);
+                    }
                 }
             } else {
                 let head = ibex_regex::bytetext::bytes_to_text(&entry.sess.rep.readable()[..h + e]);
                 if let Some(new) = crate::txn::rewrite_response_connection(&head, client_close, req_http11, tunnel) {
                     entry.sess.rep.replace_prefix(h + e, &ibex_regex::bytetext::text_to_bytes(&new));
+                    index = None;
+                    *lowered = false;
                 }
+            }
+            // What an HTTP/2 or HTTP/3 client's HEADERS are written from.
+            if let Some(c) = entry.sess.h2_child_mut() {
+                c.rsp_head = index;
             }
             set_rsp(entry);
             return;
@@ -14050,10 +14206,10 @@ impl EngineDispatcher<'_> {
         }
 
         count_connect(proxies, be_idx, s_idx, reused.is_some());
-        if let Some((IdleConn { fd: srv_fd, xprt }, registered)) = reused {
+        if let Some((IdleConn { fd: srv_fd, xprt, src }, registered)) = reused {
             let sfd = srv_fd.as_raw_fd();
             entry.srv_raw_fd = Some(sfd);
-            entry.sess.attach_server_with_xprt(srv_fd, xprt, now);
+            entry.sess.attach_server_from(srv_fd, xprt, src, now);
             entry.sess.server_connected(now);
             if let Some(txn) = entry.sess.txn.as_mut() {
                 txn.srv_reused = true;
@@ -17153,7 +17309,7 @@ mod registry_tests {
             let mut b = crate::buf::Buf::standard();
             b.writable()[..raw.len()].copy_from_slice(raw);
             b.commit(raw.len());
-            super::inject_connection_token_zero_alloc(&mut b, tok);
+            super::inject_connection_token_zero_alloc(&mut b, tok, false);
             String::from_utf8(b.readable().to_vec()).unwrap()
         };
         assert_eq!(

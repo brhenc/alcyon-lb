@@ -150,6 +150,24 @@ fn the_configured_ssl_zero_buffers_reaches_the_tls_buffer_wipe() {
     ibex_alloc::set_zero_buffers(false);
 }
 
+/// AGENTS.md 5 (T553): `tune.ibex.ssl-zero-buffers on-free` reaches the TLS send buffer's pool
+/// (`ibex_alloc::ssl_wipe_deferred`, read by `ibex-tls` `tx_release` and `TxChunk::drop`):
+/// `Engine::new` applies it; `on`, `off` and unset do not defer.
+#[test]
+fn the_configured_on_free_reaches_the_tls_tx_pool_wipe() {
+    let _turn = TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (text, deferred) in [("on-free", true), ("on", false), ("off", false), ("", false)] {
+        let mut global = String::from("global\n");
+        if !text.is_empty() {
+            global.push_str(&format!("    tune.ibex.ssl-zero-buffers {text}\n"));
+        }
+        let _engine = Engine::new(&ibex_config::parse_str(&global).expect("parse"), 64).expect("Engine::new");
+        assert_eq!(ibex_alloc::ssl_wipe_deferred(), deferred, "ssl-zero-buffers {text:?}");
+    }
+    ibex_alloc::set_ssl_zero_on_free(false);
+    ibex_alloc::set_ssl_zero_buffers(true);
+}
+
 /// A server that answers no request before it has `n` of them (or 90 s went by), so that the
 /// `n` requests are in the proxy at once.
 fn held_backend(l: TcpListener, n: usize, run: Arc<AtomicBool>) -> thread::JoinHandle<()> {

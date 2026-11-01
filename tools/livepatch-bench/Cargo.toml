@@ -13,3 +13,7 @@ ibex-rt = { path = "../../crates/ibex-rt" }
 inherits = "release"
 codegen-units = 1
 lto = "fat"
+
+# Vendored quinn (T542), as in the root workspace.
+[patch.crates-io]
+quinn-proto = { path = "../../vendor/quinn-proto" }

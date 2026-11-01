@@ -178,6 +178,22 @@ impl ParsedLine {
     }
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static REQUEST_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Request heads [`H1Parser::parse`] has started on this thread (debug builds; 0 in release):
+/// a test pins that an HTTP/2 or HTTP/3 request head, written as HTX from its decoded fields,
+/// is never parsed as HTTP/1 text (E1).
+#[must_use]
+pub fn request_parses() -> u64 {
+    #[cfg(debug_assertions)]
+    return REQUEST_PARSES.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
 /// A `Content-Length` header was parsed ([`H1Parser`]'s `seen`).
 const SEEN_CL: u8 = 1;
 /// A `Transfer-Encoding` header.
@@ -326,6 +342,10 @@ impl H1Parser {
     /// # Errors
     /// Returns an error if the HTTP stream contains framing syntax violations.
     pub fn parse(&mut self, input: &[u8], htx: &mut HtxSlice<'_>) -> io::Result<usize> {
+        #[cfg(debug_assertions)]
+        if !self.is_response && self.phase == H1Phase::StartLine {
+            REQUEST_PARSES.with(|c| c.set(c.get() + 1));
+        }
         let mut cursor = 0;
 
         while cursor < input.len() && self.phase != H1Phase::Done && self.phase != H1Phase::Error {
@@ -1239,6 +1259,58 @@ fn parse_request_line_borrowed(line: &str) -> io::Result<(&str, &str, &str)> {
     // (A fourth token is refused above: the version is the last token of the line.)
     check_request_target(method_str, uri)?;
     Ok((method_str, uri, version_str))
+}
+
+/// The request line of a head written as HTX blocks from decoded fields (an HTTP/2 or
+/// HTTP/3 request, E1), checked as [`H1Parser::parse`] checks the line it reads
+/// ([`scan_request_line`] without `accept_unsafe`, then the target's form): a method of
+/// tokens, a target of `!`..`~` without `#`.
+///
+/// # Errors
+/// `InvalidData` where the parser refuses the line.
+pub fn check_request_line(method: &str, uri: &str) -> io::Result<()> {
+    let target_ok = |b: &u8| (0x21..=0x7e).contains(b) && *b != b'#';
+    if method.is_empty() || !method.bytes().all(is_tchar) || uri.is_empty() || !uri.as_bytes().iter().all(target_ok) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid request line"));
+    }
+    check_request_target(method, uri)
+}
+
+/// The end of a request head written as HTX blocks from decoded fields (E1), its line
+/// `method uri HTTP/1.1` checked by [`check_request_line`]: what [`H1Parser::parse`] does
+/// once it has read the blank line (the header count, `Host` against the authority, the
+/// `Content-Length` lines as one canonical value, `Upgrade`), so that the HTX is the one the
+/// parser made of the same head as HTTP/1.1 text.
+///
+/// # Errors
+/// As the parser refuses the head.
+pub fn finish_request_head(htx: &mut HtxSlice<'_>, method: &str, uri: &str) -> io::Result<()> {
+    let mut p = H1Parser::new(false);
+    p.line = Some(ParsedLine::of(method.as_bytes(), uri.as_bytes(), b"HTTP/1.1"));
+    {
+        let sref = htx.as_ref();
+        for i in 0..sref.num_blocks() {
+            if sref.block_type(i) != Some(HtxBlockType::Header) {
+                continue;
+            }
+            let d = sref.read_desc(i);
+            let (s, nl, vl) = (d.addr as usize, d.name_len as usize, d.value_len as usize);
+            let (name, value) = (&sref.buf()[s..s + nl], &sref.buf()[s + nl..s + nl + vl]);
+            p.header_lines += u16::from(!uncounted(name, value));
+            p.seen |= seen_bit(name);
+            if name.len() == 4 && name.eq_ignore_ascii_case(b"host") {
+                if p.hosts == 0 {
+                    p.host_at = i;
+                }
+                p.hosts = p.hosts.saturating_add(1).min(2);
+            }
+        }
+    }
+    if p.header_lines > MAX_REQUEST_HEADERS {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "too many header lines"));
+    }
+    p.phase = H1Phase::Headers;
+    p.on_headers_finished(htx)
 }
 
 fn check_request_target(method_str: &str, uri: &str) -> io::Result<()> {

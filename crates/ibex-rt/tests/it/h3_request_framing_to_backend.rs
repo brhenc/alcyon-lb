@@ -398,6 +398,16 @@ fn connection_specific_fields_never_reach_the_server() {
 }
 }
 
+/// E1, the mux path: a path the HTTP/1 parser refuses (UTF-8, not ASCII) goes as text, the
+/// length written as its digits there too (`h2_bridge::text_wire`). (The relay path refuses
+/// such a path.)
+#[test]
+fn a_head_without_htx_gets_its_length_in_digits() {
+    crate::common::on_h3_path("mux", || {
+        assert_all(&[case("cl-leading-zero-caf\u{e9}", "POST", &[("content-length", "005")], &[b"hello"], Forwarded { framing: "content-length: 5", body: b"hello" })]);
+    });
+}
+
 crate::h3_both_paths! {
 /// RFC 9114 4.1.2: a `content-length` other than the sum of the DATA frames is malformed.
 /// HAProxy (`http_parse_cont_len_header`) takes a comma list of one repeated value, and

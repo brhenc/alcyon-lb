@@ -129,3 +129,69 @@ fn a_release_after_a_partial_send_wipes_to_the_high_water_mark() {
     assert_eq!(ibex_alloc::wiped_ssl_fast_bytes() - wiped, hw, "wiped up to the high-water mark, not to len");
     assert_eq!(tx_pool_cached(), cached + 1, "and given back to the pool");
 }
+
+/// T553: under `tune.ibex.ssl-zero-buffers on-free` a give-back does not wipe the chunk; the
+/// pool's free does (its whole capacity: the chunk carries the last connection's ciphertext
+/// until then). Under `on` the give-back wipes, as before.
+#[test]
+fn on_free_wipes_when_the_pool_frees_not_on_give_back() {
+    use ibex_alloc::stack_probe::set_thread_ssl_zero_on_free;
+    use ibex_tls::conn::tx_pool_cached;
+    let mut p = pair();
+    p.complete();
+    ibex_alloc::drain_local_pools();
+    set_thread_ssl_zero_on_free(true);
+    assert_eq!(p.srv.write_plain(b"ciphertext-to-keep").expect("write"), 18);
+    let hw = p.srv.pending_tx().len();
+    let wiped = ibex_alloc::wiped_ssl_fast_bytes();
+    p.srv.tx_done(hw);
+    assert_eq!(p.srv.tx_capacity(), 0, "released once drained");
+    assert_eq!(ibex_alloc::wiped_ssl_fast_bytes(), wiped, "on-free: the give-back does not wipe");
+    assert_eq!(tx_pool_cached(), 1, "and the chunk is in the pool");
+    ibex_alloc::drain_local_pools();
+    assert_eq!(tx_pool_cached(), 0);
+    assert!(ibex_alloc::wiped_ssl_fast_bytes() - wiped >= hw, "the pool's free wipes the chunk");
+    // `on`: the give-back wipes to the high-water mark, the later free again (cheap, rare).
+    set_thread_ssl_zero_on_free(false);
+    assert_eq!(p.srv.write_plain(b"ciphertext-to-keep").expect("write"), 18);
+    let hw = p.srv.pending_tx().len();
+    let wiped = ibex_alloc::wiped_ssl_fast_bytes();
+    p.srv.tx_done(hw);
+    assert_eq!(ibex_alloc::wiped_ssl_fast_bytes() - wiped, hw, "on: wiped at the give-back");
+}
+
+/// `show pools` for `tls_tx`: (allocated, used).
+fn tls_tx_line() -> (usize, usize) {
+    let dump = ibex_alloc::global_pool_registry().show_pools(&[]);
+    let line = dump.lines().find(|l| l.starts_with("  - Pool tls_tx (")).expect("tls_tx listed");
+    let num = |after: &str, before: &str| -> usize {
+        let s = &line[line.find(after).expect(after) + after.len()..];
+        s[..s.find(before).expect(before)].trim().parse().expect("number")
+    };
+    (num(") : ", " allocated"), num("bytes), ", " used"))
+}
+
+/// With this thread's cache empty, the session's first take is a miss that builds a chunk, it works, and it goes back to the pool on release.
+#[test]
+fn a_take_from_an_empty_pool_builds_a_chunk_that_works_and_returns() {
+    use ibex_tls::conn::{tx_pool_cached, TX_CAP};
+    ibex_tls::conn::register_pools();
+    ibex_alloc::drain_local_pools();
+    assert_eq!(tx_pool_cached(), 0, "the pool is empty: the take is a miss");
+    let mut p = pair(); // the client's ClientHello takes a chunk
+    assert!(p.cli.tx_capacity() >= TX_CAP, "a chunk of the pool's size");
+    assert_eq!(tx_pool_cached(), 0, "taken, not cached");
+    // The counts are the process's (tests of this binary run on other threads): at least ours.
+    let (alloc1, used1) = tls_tx_line();
+    assert!(alloc1 >= 1 && used1 >= 1, "show pools: allocated {alloc1}, used {used1}");
+    let hello = p.cli.pending_tx().to_vec();
+    assert!(!hello.is_empty(), "the chunk holds the ClientHello");
+    p.sin.extend(&hello, &p.srv);
+    p.cli.tx_done(hello.len());
+    p.complete();
+    assert_eq!(p.send_to_server(b"GET / HTTP/1.1\r\n\r\n"), b"GET / HTTP/1.1\r\n\r\n");
+    drop(p);
+    assert!(tx_pool_cached() >= 1, "back in the pool");
+    let (alloc2, _) = tls_tx_line();
+    assert!(alloc2 >= 1, "show pools: kept, not freed");
+}

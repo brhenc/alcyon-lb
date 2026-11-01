@@ -8,7 +8,7 @@
 # them `src/tests/` (the end-to-end suite, which needs rcgen); `bloom` (fastbloom, not cached)
 # is off. Works on a copy in /tmp; the vendored tree is not touched.
 #
-# Usage: tools/quinn-proto-tests.sh [test filter...]
+# Usage: [QP_FEATURES=ibex-pools] tools/quinn-proto-tests.sh [test filter...]
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 work=${QP_WORK:-/tmp/ibex-quinn-proto-tests}
@@ -16,6 +16,8 @@ rm -rf "$work"
 mkdir -p "$work/shims/assert_matches/src" "$work/shims/hex-literal/src"
 cp -a "$here/vendor/quinn-proto" "$work/quinn-proto"
 cp "$here/Cargo.lock" "$work/quinn-proto/Cargo.lock"
+# P1: the optional ibex-alloc dependency (feature ibex-pools) is a path outside the copy
+sed -i "s|path = \"../../crates/ibex-alloc\"|path = \"$here/crates/ibex-alloc\"|" "$work/quinn-proto/Cargo.toml"
 
 cat > "$work/shims/assert_matches/Cargo.toml" <<'EOF'
 [package]
@@ -99,4 +101,4 @@ assert l2 != l, "mod tests; not found"
 open("src/lib.rs", "w").write(l2)
 EOF
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$work/target}
-cargo test --offline --lib --no-default-features --features rustls-ring,log -- "$@"
+cargo test --offline --lib --no-default-features --features "rustls-ring,log${QP_FEATURES:+,$QP_FEATURES}" -- "$@"

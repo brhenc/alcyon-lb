@@ -359,11 +359,11 @@ fn test_hpack_compression_decompression_and_dynamic_table_mutations() {
     assert_eq!(dec.dynamic_table.size(), 62 + 60);
 
     // Index 62 is the most recently added entry ("x-custom-trace")
-    assert_eq!(dec.dynamic_table.get(0).unwrap().name, "x-custom-trace");
-    assert_eq!(dec.dynamic_table.get(0).unwrap().value, "trace-abc-1234");
+    assert_eq!(dec.dynamic_table.get(0).unwrap().name, b"x-custom-trace");
+    assert_eq!(dec.dynamic_table.get(0).unwrap().value, b"trace-abc-1234");
     // Index 63 is the second entry ("x-custom-tenant")
-    assert_eq!(dec.dynamic_table.get(1).unwrap().name, "x-custom-tenant");
-    assert_eq!(dec.dynamic_table.get(1).unwrap().value, "tenant-omega-99");
+    assert_eq!(dec.dynamic_table.get(1).unwrap().name, b"x-custom-tenant");
+    assert_eq!(dec.dynamic_table.get(1).unwrap().value, b"tenant-omega-99");
 
     // Request 2: Re-sends the same custom headers. Encoder should use 1-byte indexed entries!
     let req2 = vec![
@@ -420,13 +420,13 @@ fn test_hpack_compression_decompression_and_dynamic_table_mutations() {
     // 2: x-custom-trace
     assert_eq!(
         dec.dynamic_table.get(0).unwrap().name,
-        "x-another-large-header"
+        b"x-another-large-header"
     );
     assert_eq!(
         dec.dynamic_table.get(1).unwrap().name,
-        "x-large-payload-header"
+        b"x-large-payload-header"
     );
-    assert_eq!(dec.dynamic_table.get(2).unwrap().name, "x-custom-trace");
+    assert_eq!(dec.dynamic_table.get(2).unwrap().name, b"x-custom-trace");
 
     // Shrinking dynamic table capacity via set_max_size
     dec.dynamic_table.set_max_size(100);
@@ -434,7 +434,7 @@ fn test_hpack_compression_decompression_and_dynamic_table_mutations() {
     assert_eq!(dec.dynamic_table.len(), 1);
     assert_eq!(
         dec.dynamic_table.get(0).unwrap().name,
-        "x-another-large-header"
+        b"x-another-large-header"
     );
 }
 
