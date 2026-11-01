@@ -230,6 +230,13 @@ fn normalisation_cases() -> Vec<Case> {
         f.extend(frame(0, 1, 1, b"hello"));
         add(id, f, Want::Rst);
     }
+    // A `:path` that is UTF-8 but not ASCII: the HTTP/1 parser refuses it, so the head
+    // has no HTX and goes as text (`h2_bridge::text_wire`); without a length, chunked.
+    // Measured on 3.5-dev8: `POST /caf\xc3\xa9` forwarded with `transfer-encoding: chunked`.
+    let id = "path-utf8-chunked".to_string();
+    let mut f = frame(1, 4, 1, &block(&id, b"POST", b"http", "/caf\u{e9}".as_bytes(), b"x", &[]));
+    f.extend(frame(0, 1, 1, b"hello"));
+    add(id, f, Want::Forwards(b"POST /caf\xc3\xa9 HTTP/1.1\r\nhost: x\r\nx-case: path-utf8-chunked\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
     // In `:path` HAProxy forwards it too (`GET /a\xe9b`); Ibex keeps the request line as
     // UTF-8 text and resets the stream (tradeoff.md 6.24).
     let id = "path-e9".to_string();

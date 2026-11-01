@@ -212,7 +212,9 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
             req_htx = (req_htx + kept as u64).saturating_sub(client as u64);
         }
     } else {
-        copy_headers(sess.req_headers.get_or_insert_with(Vec::new), d.head.text_headers());
+        // With no HTX, a rule's edit writes the head from this list: the key is in it.
+        let hdrs = sess.req_headers.get_or_insert_with(Vec::new);
+        copy_headers(hdrs, d.head.text_headers().chain(key.as_deref().map(|k| ("sec-websocket-key", k))));
     }
     sess.req.clear();
     // The head waits here for a server connection (a stream held in the queue, or whose body
@@ -225,13 +227,15 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     if parsed {
         // The head written once, from the HTX, as a rule's edit writes it (`write_req_head`).
         let w = sess.req.writable();
-        let n = match slice.as_ref().write_h1_wire(w) {
-            Ok(n) => n,
-            Err(_) => copy_into(w, &slice.as_ref().write_h1_wire_vec()),
-        };
+        // The buffer is sized for the head (`out_len`); one it does not fit fails the stream
+        // as a buffer that cannot be had does, rather than going out cut short.
+        let n = slice.as_ref().write_h1_wire(w).unwrap_or(0);
+        no_mem |= n == 0;
         // A request without a length goes chunked, the header after the others, which no
-        // rule sees.
-        let n = if chunked && n >= 2 && w.len() >= n - 2 + TE.len() {
+        // rule sees; without room for it the stream fails, not the framing.
+        let te = chunked && n >= 2 && w.len() >= n - 2 + TE.len();
+        no_mem |= chunked && !te;
+        let n = if te {
             w[n - 2..n - 2 + TE.len()].copy_from_slice(TE);
             n - 2 + TE.len()
         } else {

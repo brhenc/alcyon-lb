@@ -1469,9 +1469,7 @@ impl<'a> HtxSlice<'a> {
     pub fn put_request_head(&mut self, head: &crate::mux_h2::H2ReqHead, extra: Option<(&str, &str)>, mut each: impl FnMut(&str, &str)) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind};
         let oom = |e: HtxError| Error::new(ErrorKind::OutOfMemory, e);
-        if !head.has_line {
-            return Err(Error::new(ErrorKind::InvalidData, "no request line"));
-        }
+        // A head without a line has an empty method, which the line check refuses.
         let (method, uri) = (head.method(), head.uri());
         crate::h1::check_request_line(method, uri)?;
         self.push_req_line(method, uri, "HTTP/1.1").map_err(oom)?;
