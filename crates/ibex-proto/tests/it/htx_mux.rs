@@ -60,7 +60,7 @@ fn the_h2_mux_serves_a_stream_through_the_trait() {
     assert!(st.rx_htx_mut().is_eoh());
     st.set_dispatched();
     assert!(st.dispatched());
-    let head = st.take_req_head().expect("head");
+    let head = st.take_req_fields().expect("head");
     assert!(st.req_head().is_none());
     m.give_back_head(head);
     assert_eq!(m.next_dispatch(), Some(3), "the next stream with a head");
@@ -123,7 +123,7 @@ impl RxTaken for H2MuxContext {
 
 /// What the bridge will do, generic over the mux: every call goes through the trait.
 fn respond<M: HtxMux>(m: &mut M, id: u64) {
-    let head = m.stream_mut(id).and_then(HtxStream::take_req_head).expect("head");
+    let head = m.stream_mut(id).and_then(HtxStream::take_req_fields).expect("head");
     m.give_back_head(head);
     assert!(m.send_interim(id, b"HTTP/1.1 100 Continue"));
     assert!(m.send_head(id, b"HTTP/1.1 200 OK", false));

@@ -17,9 +17,10 @@
 //! | `:path` `/a\xe9b` | forwarded byte for byte |
 //! | a second request on the same connection after the first | answered 200 |
 //!
-//! Ibex refuses the value and the path (stream reset 0x10e), as it does on HTTP/2
-//! (`tradeoff.md` 6.24). What is tested for those rows is that the stream, not the
-//! connection, is refused, and that the next request on the connection is served.
+//! Ibex refuses the path (stream reset 0x10e), as it does on HTTP/2 (`tradeoff.md` 6.24);
+//! the value is forwarded on the mux path since E1 and refused on the relay path. What is
+//! tested for a refused row is that the stream, not the connection, is refused, and that the
+//! next request on the connection is served.
 
 use crate::common;
 
@@ -359,9 +360,21 @@ fn a_huffman_name_with_a_byte_that_is_not_utf8_resets_the_stream() {
 }
 
 crate::h3_both_paths! {
-/// Row 3: `HAProxy` forwards it; Ibex refuses the stream (`tradeoff.md` 6.24).
-fn a_value_with_a_byte_that_is_not_utf8_resets_the_stream_only() {
-    refused_then_served(&request(b"/r3", Some((b"x-a", &[b'a', E9, b'b'], false))), b"/r3");
+/// Row 3: `HAProxy` forwards it, and so does the mux since E1 (the fields go into the HTX as
+/// bytes); the relay path refuses the stream (`tradeoff.md` 6.24).
+fn a_value_with_a_byte_that_is_not_utf8_is_forwarded_byte_for_byte() {
+    let req = request(b"/r3", Some((b"x-a", &[b'a', E9, b'b'], false)));
+    if !crate::common::h3_mux() {
+        refused_then_served(&req, b"/r3");
+        return;
+    }
+    let (be, heads) = backend();
+    let ibex = ibex(be);
+    let mut cl = Client::connect(ibex.quic);
+    let id = cl.open(&req);
+    assert_eq!(cl.outcome(id).status, Some(200));
+    let h = heads.lock().unwrap();
+    assert!(h[0].windows(9).any(|w| w == b"x-a: a\xe9b\r"), "{:?}", String::from_utf8_lossy(&h[0]));
 }
 }
 

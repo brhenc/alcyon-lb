@@ -20,16 +20,17 @@ pub const STATIC_TABLE_LEN: usize = 61;
 /// Default maximum dynamic table size (4096 octets).
 pub const DEFAULT_DYNAMIC_TABLE_MAX_SIZE: usize = 4096;
 
-/// Entry in the Static or Dynamic Header Table.
+/// Entry in the Static or Dynamic Header Table. HPACK strings are octets (E1: a value that is
+/// not UTF-8 is held as it came, and comes out of the table as it went in).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableEntry {
-    pub name: String,
-    pub value: String,
+    pub name: Vec<u8>,
+    pub value: Vec<u8>,
 }
 
 impl TableEntry {
     #[must_use]
-    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
         Self {
             name: name.into(),
             value: value.into(),
@@ -565,7 +566,7 @@ impl DynamicTable {
 
     /// [`Self::insert`] of a copy of `name` and `value`, in the memory of an entry it evicts
     /// when there is one (T437): a table that turns over costs no allocation per entry.
-    pub fn insert_copy(&mut self, name: &str, value: &str) {
+    pub fn insert_copy(&mut self, name: &[u8], value: &[u8]) {
         let entry_size = name.len() + value.len() + 32;
         if entry_size > self.max_size {
             self.clear();
@@ -582,9 +583,9 @@ impl DynamicTable {
         let entry = match spare {
             Some(mut e) => {
                 e.name.clear();
-                e.name.push_str(name);
+                e.name.extend_from_slice(name);
                 e.value.clear();
-                e.value.push_str(value);
+                e.value.extend_from_slice(value);
                 e
             }
             None => TableEntry::new(name, value),
@@ -635,18 +636,18 @@ impl DynamicTable {
 
 /// Look up in the combined static and dynamic table using 1-based HPACK index (RFC 7541 §2.3.3).
 #[must_use]
-pub fn lookup_table(idx: usize, dynamic: &DynamicTable) -> Option<(&str, &str)> {
+pub fn lookup_table(idx: usize, dynamic: &DynamicTable) -> Option<(&[u8], &[u8])> {
     if idx == 0 {
         return None;
     }
     if idx <= STATIC_TABLE_LEN {
         let (n, v) = STATIC_TABLE[idx - 1];
-        Some((n, v))
+        Some((n.as_bytes(), v.as_bytes()))
     } else {
         let dyn_idx = idx - STATIC_TABLE_LEN - 1;
         dynamic
             .get(dyn_idx)
-            .map(|e| (e.name.as_str(), e.value.as_str()))
+            .map(|e| (e.name.as_slice(), e.value.as_slice()))
     }
 }
 
@@ -725,8 +726,8 @@ pub fn find_table_entry(name: &str, value: &str, dynamic: &DynamicTable) -> Opti
     // Search dynamic table next
     for (i, entry) in dynamic.entries.iter().enumerate() {
         let full_idx = STATIC_TABLE_LEN + 1 + i;
-        if entry.name.eq_ignore_ascii_case(name) {
-            if entry.value == value {
+        if entry.name.eq_ignore_ascii_case(name.as_bytes()) {
+            if entry.value == value.as_bytes() {
                 return Some((full_idx, true));
             }
             if name_match.is_none() {
@@ -846,13 +847,12 @@ fn huffman_len(input: &[u8]) -> usize {
 }
 
 /// Appends a string literal (RFC 7541 section 5.2) at `*offset` of `src` to `out`
-/// (T437: into memory the caller keeps). `huff` is where a Huffman string is decoded before
-/// it is checked as UTF-8.
+/// (T437: into memory the caller keeps), as the octets it stands for (E1: none is checked as
+/// UTF-8 here; the field checks read bytes). `huff` is where a Huffman string is decoded.
 ///
 /// # Errors
-/// Returns `H2Error::CompressionError` if incomplete or invalid Huffman. A byte that is not
-/// UTF-8 is decoded as a NUL ([`push_as_text`]).
-pub fn decode_string_literal_into(src: &[u8], offset: &mut usize, out: &mut String, huff: &mut Vec<u8>) -> Result<(), H2Error> {
+/// Returns `H2Error::CompressionError` if incomplete or invalid Huffman.
+pub fn decode_string_literal_into(src: &[u8], offset: &mut usize, out: &mut Vec<u8>, huff: &mut Vec<u8>) -> Result<(), H2Error> {
     if *offset >= src.len() {
         return Err(H2Error::CompressionError);
     }
@@ -866,15 +866,16 @@ pub fn decode_string_literal_into(src: &[u8], offset: &mut usize, out: &mut Stri
     if is_huffman {
         huff.clear();
         decode_huffman_into(raw, huff)?;
-        push_as_text(out, huff);
+        out.extend_from_slice(huff);
     } else {
-        push_as_text(out, raw);
+        out.extend_from_slice(raw);
     }
     Ok(())
 }
 
 /// Appends `bytes` to `out`, each byte that is not part of a UTF-8 character as a NUL
-/// (T451). HPACK strings are octets: one that is not UTF-8 is no compression error, and the
+/// (T451): how the fields of a block reach a reader of text ([`DecodedFields::to_fields`],
+/// [`DecodedFields::iter_text`]). HPACK strings are octets: one that is not UTF-8 is no compression error, and the
 /// block it is in must be decoded on, or the dynamic table is no longer the peer's. A NUL is
 /// what every field check refuses (a name is no token, a value or a pseudo-header carries a
 /// byte `http_header_has_forbidden_char` refuses), so the stream is reset, as `HAProxy`
@@ -887,14 +888,15 @@ pub fn push_as_text(out: &mut String, bytes: &[u8]) {
 }
 
 /// A decoded header block, in memory kept from one block to the next (T437): the names and
-/// values one after the other in one `String`, and where each field is in it.
+/// values one after the other in one buffer, as the octets the peer sent (E1), and where each
+/// field is in it.
 #[derive(Debug, Default, Clone)]
 pub struct DecodedFields {
-    text: String,
+    text: Vec<u8>,
     /// Per field: the start of its name, the end of its name (the start of its value), the
     /// end of its value.
     spans: Vec<(u32, u32, u32)>,
-    /// A Huffman string before it is checked as UTF-8.
+    /// A Huffman string as it is decoded.
     huff: Vec<u8>,
 }
 
@@ -910,21 +912,34 @@ impl DecodedFields {
         self.spans.len()
     }
 
-    /// The fields in order, as name and value.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> + Clone + '_ {
+    /// The fields in order, as name and value, in bytes.
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> + Clone + '_ {
         self.spans.iter().map(|&(n, v, e)| (&self.text[n as usize..v as usize], &self.text[v as usize..e as usize]))
+    }
+
+    /// The fields in order as text, for a reader that keeps text (trailers, a response): a
+    /// name or value that is not UTF-8 reads as one NUL, which every field check refuses, as
+    /// [`push_as_text`] makes it (T451).
+    pub fn iter_text(&self) -> impl Iterator<Item = (&str, &str)> + Clone + '_ {
+        self.iter().map(|(n, v)| (std::str::from_utf8(n).unwrap_or("\0"), std::str::from_utf8(v).unwrap_or("\0")))
     }
 
     /// The first value of the field `name`.
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&str> {
+    pub fn get(&self, name: &[u8]) -> Option<&[u8]> {
         self.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
     }
 
-    /// The fields as [`HeaderField`]s (what [`HpackDecoder::decode`] returns).
+    /// The fields as [`HeaderField`]s (what [`HpackDecoder::decode`] returns), a byte that
+    /// is not UTF-8 as a NUL ([`push_as_text`]).
     #[must_use]
     pub fn to_fields(&self) -> Vec<HeaderField> {
-        self.iter().map(|(n, v)| HeaderField { name: n.to_string(), value: v.to_string() }).collect()
+        let text = |b: &[u8]| {
+            let mut s = String::with_capacity(b.len());
+            push_as_text(&mut s, b);
+            s
+        };
+        self.iter().map(|(n, v)| HeaderField { name: text(n), value: text(v) }).collect()
     }
 
     fn pos(&self) -> u32 {
@@ -934,7 +949,7 @@ impl DecodedFields {
     /// The memory a decoder writes the next field into (the text, and the Huffman
     /// scratch), and where the field starts: the QPACK decoder's way in
     /// (`qpack::decode_qpack_static_into`).
-    pub(crate) fn begin_field(&mut self) -> (u32, &mut String, &mut Vec<u8>) {
+    pub(crate) fn begin_field(&mut self) -> (u32, &mut Vec<u8>, &mut Vec<u8>) {
         (self.pos(), &mut self.text, &mut self.huff)
     }
 
@@ -1017,9 +1032,9 @@ impl HpackDecoder {
                     return Err(H2Error::CompressionError);
                 };
                 let start = out.pos();
-                out.text.push_str(n);
+                out.text.extend_from_slice(n);
                 let mid = out.pos();
-                out.text.push_str(v);
+                out.text.extend_from_slice(v);
                 out.spans.push((start, mid, out.pos()));
             } else if (b & 0x40) != 0 {
                 // 2. Literal Header Field with Incremental Indexing: 01xxxxxx (RFC 7541 §6.2.1)
@@ -1029,7 +1044,7 @@ impl HpackDecoder {
                 if idx == 0 {
                     decode_string_literal_into(block, &mut offset, &mut out.text, &mut out.huff)?;
                 } else if let Some((n, _)) = lookup_table(idx, &self.dynamic_table) {
-                    out.text.push_str(n);
+                    out.text.extend_from_slice(n);
                 } else {
                     return Err(H2Error::CompressionError);
                 }
@@ -1057,7 +1072,7 @@ impl HpackDecoder {
                 if idx == 0 {
                     decode_string_literal_into(block, &mut offset, &mut out.text, &mut out.huff)?;
                 } else if let Some((n, _)) = lookup_table(idx, &self.dynamic_table) {
-                    out.text.push_str(n);
+                    out.text.extend_from_slice(n);
                 } else {
                     return Err(H2Error::CompressionError);
                 }
@@ -1127,14 +1142,14 @@ impl HpackEncoder {
                 // Literal with Incremental Indexing - Indexed Name: 01xxxxxx (6-bit prefix)
                 encode_integer(idx, 6, 0x40, out);
                 encode_string_literal(value, self.use_huffman, out);
-                self.dynamic_table.insert_copy(name, value);
+                self.dynamic_table.insert_copy(name.as_bytes(), value.as_bytes());
             }
         } else {
             // Literal with Incremental Indexing - New Name: 01000000
             out.push(0x40);
             encode_string_literal(name, self.use_huffman, out);
             encode_string_literal(value, self.use_huffman, out);
-            self.dynamic_table.insert_copy(name, value);
+            self.dynamic_table.insert_copy(name.as_bytes(), value.as_bytes());
         }
     }
 
@@ -1236,10 +1251,10 @@ mod tests {
     #[test]
     fn test_static_table_lookup() {
         let dt = DynamicTable::new(4096);
-        assert_eq!(lookup_table(1, &dt), Some((":authority", "")));
-        assert_eq!(lookup_table(2, &dt), Some((":method", "GET")));
-        assert_eq!(lookup_table(8, &dt), Some((":status", "200")));
-        assert_eq!(lookup_table(61, &dt), Some(("www-authenticate", "")));
+        assert_eq!(lookup_table(1, &dt), Some((&b":authority"[..], &b""[..])));
+        assert_eq!(lookup_table(2, &dt), Some((&b":method"[..], &b"GET"[..])));
+        assert_eq!(lookup_table(8, &dt), Some((&b":status"[..], &b"200"[..])));
+        assert_eq!(lookup_table(61, &dt), Some((&b"www-authenticate"[..], &b""[..])));
         assert_eq!(lookup_table(62, &dt), None);
     }
 
@@ -1255,10 +1270,10 @@ mod tests {
         dt.insert("custom-new".into(), "value-5678".into());
         assert_eq!(dt.len(), 1);
         assert_eq!(dt.size(), 52);
-        assert_eq!(dt.get(0).unwrap().name, "custom-new");
+        assert_eq!(dt.get(0).unwrap().name, b"custom-new");
 
         // Lookup combined index 62
-        assert_eq!(lookup_table(62, &dt), Some(("custom-new", "value-5678")));
+        assert_eq!(lookup_table(62, &dt), Some((&b"custom-new"[..], &b"value-5678"[..])));
     }
 
     #[test]

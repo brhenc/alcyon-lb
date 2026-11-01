@@ -407,3 +407,28 @@ fn an_h2_request_over_tls_reads_each_socket_once() {
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
 }
+
+/// E1 (`docs/design/quic-transport-2026-11-01.md` section 3): an h2 request head is decoded
+/// once. The mux keeps the decoded fields and the bridge writes the HTX blocks from them;
+/// no HTTP/1.1 text is written and parsed again in between (`H1Parser::parse` on the
+/// request side, counted in debug builds).
+#[test]
+fn an_h2_request_head_is_parsed_once() {
+    const N: u64 = 20;
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut engine, fe, running, be) = setup();
+    let mut c = Client::connect(&mut engine, fe);
+    c.get(&mut engine);
+    let p0 = ibex_proto::h1::request_parses();
+    for _ in 0..N {
+        c.get(&mut engine);
+    }
+    let parses = ibex_proto::h1::request_parses() - p0;
+    println!("{N} h2 requests: {parses} HTTP/1 request-head parses");
+    if cfg!(debug_assertions) {
+        assert_eq!(parses, 0, "{N} h2 requests parsed {parses} request heads as HTTP/1 text");
+    }
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}

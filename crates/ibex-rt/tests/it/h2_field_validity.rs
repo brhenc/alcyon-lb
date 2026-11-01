@@ -211,10 +211,27 @@ fn normalisation_cases() -> Vec<Case> {
     b.extend(&h);
     b.extend([0x01, b'1']);
     add(id.clone(), frame(1, 5, 1, &b), Want::Rst);
-    // The same byte in a value or `:path`: HAProxy forwards it; Ibex keeps fields as UTF-8
-    // text and resets the stream (tradeoff.md 6.24).
+    // The same byte in a value: HAProxy forwards it as it came, in a cookie too, the
+    // crumbs joined (measured on 3.5-dev8, E1: `x-a: caf\xe9`, `x-a: \xff\xfe`,
+    // `cookie: a=\xe9;  b=2 `). Ibex carries the fields as bytes into the HTX since E1.
     let id = "val-e9".to_string();
-    add(id.clone(), one(&id, b"GET", b"http", b"/", b"x", &[(b"x-a", b"\xe9")]), Want::Rst);
+    add(id.clone(), one(&id, b"GET", b"http", b"/", b"x", &[(b"x-a", b"caf\xe9")]), Want::Forwards(b"\r\nx-a: caf\xe9\r\n"));
+    let id = "val-ff".to_string();
+    add(id.clone(), one(&id, b"GET", b"http", b"/", b"x", &[(b"x-a", b"\xff\xfe")]), Want::Forwards(b"\r\nx-a: \xff\xfe\r\n"));
+    let id = "cookie-e9".to_string();
+    add(id.clone(), one(&id, b"GET", b"http", b"/", b"x", &[(b"cookie", b"a=\xe9"), (b"cookie", b" b=2 ")]), Want::Forwards(b"\r\ncookie: a=\xe9;  b=2 \r\n"));
+    // E1: a `content-length` that is no length, or two that differ, is RST_STREAM
+    // PROTOCOL_ERROR (`h2_parse_cont_len_header`; measured on 3.5-dev8: `abc`, `5\xe9`, `5`
+    // then `6`), with the body that follows; Ibex forwarded `abc` and the two lengths.
+    for (k, lens) in [("cl-abc", &[&b"abc"[..]][..]), ("cl-e9", &[b"5\xe9"]), ("cl-56", &[b"5", b"6"])] {
+        let id = k.to_string();
+        let extra: Vec<(&[u8], &[u8])> = lens.iter().map(|v| (&b"content-length"[..], *v)).collect();
+        let mut f = frame(1, 4, 1, &block(&id, b"POST", b"http", b"/", b"x", &extra));
+        f.extend(frame(0, 1, 1, b"hello"));
+        add(id, f, Want::Rst);
+    }
+    // In `:path` HAProxy forwards it too (`GET /a\xe9b`); Ibex keeps the request line as
+    // UTF-8 text and resets the stream (tradeoff.md 6.24).
     let id = "path-e9".to_string();
     add(id.clone(), one(&id, b"GET", b"http", b"/a\xe9b", b"x", &[]), Want::Rst);
     out
