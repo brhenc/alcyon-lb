@@ -1146,7 +1146,7 @@ impl TcpSession {
         c.server_addr = owner.server_addr;
         c.fc_src = owner.fc_src;
         c.fc_dst = owner.fc_dst;
-        c.created_at = Instant::now();
+        c.created_at = crate::txnlog::loop_now();
         c.bufsize = owner.bufsize;
         c.maxrewrite = owner.maxrewrite;
         // The `tcp-request content` rules the owner armed for the next request run on this
@@ -1403,7 +1403,7 @@ impl TcpSession {
             cli_cant_recv: false,
             passes_ran_out: false,
             cli_failed: false,
-            created_at: Instant::now(),
+            created_at: crate::txnlog::loop_now(),
             bufsize: crate::buf::get_bufsize(),
             maxrewrite: 1024,
             pending_resp: None,
@@ -1734,8 +1734,15 @@ impl TcpSession {
 
     /// Attaches a server-side connection with a specific transport (`ServerXprt`).
     pub fn attach_server_with_xprt(&mut self, fd: OwnedFd, xprt: ServerXprt, now: Tick) {
+        let src = crate::raw::local_addr(std::os::fd::AsFd::as_fd(&fd));
+        self.attach_server_from(fd, xprt, src, now);
+    }
+
+    /// [`Self::attach_server_with_xprt`] for a connection whose local address `src` is known
+    /// already: one taken from the idle pool, which kept it (T550 Q8).
+    pub fn attach_server_from(&mut self, fd: OwnedFd, xprt: ServerXprt, src: Option<std::net::SocketAddr>, now: Tick) {
         self.log.queue.get_or_insert_with(crate::txnlog::loop_now);
-        self.bc_src = crate::raw::local_addr(std::os::fd::AsFd::as_fd(&fd));
+        self.bc_src = src;
         self.srv = Some(fd);
         self.srv_xprt = xprt;
         self.srv_cant_recv = false;

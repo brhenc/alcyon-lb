@@ -218,3 +218,37 @@ fn deny_on_a_reused_connection_has_no_server_address() {
     let h = get(&mut c, "/");
     assert_eq!(header(&h, "x-aft"), format!("127.0.0.1|{ip}|{}", header(&h, "x-peer").split_once('|').unwrap().1));
 }
+
+/// T550 Q8: a server connection taken from the idle pool by another client connection
+/// (`http-reuse always`) prints the address the server sees on it, in the rules and in the log,
+/// as the connection that opened it did. Oracle (same configuration, two client connections one
+/// after the other): both lines `LOG 127.0.0.1|<port>` with the same port, the server's peer.
+#[test]
+fn a_connection_from_the_idle_pool_prints_its_address() {
+    let collector = UdpSocket::bind("127.0.0.1:0").unwrap();
+    collector.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let log = collector.local_addr().unwrap();
+    let (be, a) = (backend("127.0.0.1:0"), common::reserve_addr());
+    let cfg = format!(
+        "frontend fe\n  bind {a}\n  log {log} local0\n  option dontlognull\n  log-format \"LOG %bi|%bp\"\n  \
+         http-after-response set-header x-aft \"%bi|%bp\"\n  default_backend b\nbackend b\n  http-reuse always\n  server s {be}\n"
+    );
+    let _ibex = start("idle-pool", &cfg, &[a]);
+    let mut peers = Vec::new();
+    for _ in 0..3 {
+        let mut c = connect(a);
+        let h = get(&mut c, "/");
+        let peer = header(&h, "x-peer");
+        assert_eq!(header(&h, "x-aft"), peer);
+        let mut buf = [0u8; 2048];
+        let n = collector.recv(&mut buf).expect("a log line");
+        let l = String::from_utf8_lossy(&buf[..n]).into_owned();
+        assert_eq!(l[l.find("LOG ").unwrap()..].trim_end(), format!("LOG {peer}"));
+        peers.push(peer);
+        drop(c);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The path under test: the later client connections were served on the first one's server
+    // connection, from the pool.
+    assert!(peers.iter().all(|p| *p == peers[0]), "not reused: {peers:?}");
+}

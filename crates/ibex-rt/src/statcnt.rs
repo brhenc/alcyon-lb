@@ -172,11 +172,13 @@ impl TxnCounters {
     }
 }
 
-/// Milliseconds since the first call, never 0.
+/// Milliseconds since the first call, never 0, on the loop's clock for the pass
+/// ([`crate::txnlog::loop_now`]: `HAProxy`'s `now_ms`, read once per pass; a clock read
+/// where no loop runs). The rate counters of a request read it five times (T550 Q2).
 #[must_use]
 pub fn now_ms() -> u64 {
     static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
-    EPOCH.elapsed().as_millis() as u64 + 1
+    crate::txnlog::loop_now().saturating_duration_since(*EPOCH).as_millis() as u64 + 1
 }
 
 /// A proxy's counters: as a frontend, as a backend, and one set per server.
