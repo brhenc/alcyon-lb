@@ -783,3 +783,23 @@ moment." §4.6's week table is replaced by this; §4's slice rows and budgets st
   **PGO** ones (the shipped build). A scenario is done when its PGO figure is at or below HAProxy
   and what remains can't reasonably be optimised further. Whatever ends up out of scope is
   recorded in `challenges/` (one file each, `C<task>-challenge-<slug>.md`, as C541).
+
+### 6.5 Wave-1 landing, measured (2026-11-01 23:05, main 85edb342)
+
+After T574 (R1), T575 (K1 + parse bytes), T577 (L1-L3), T578 (O2), T579 (C1+C2), T583 (smax O(1)),
+plus correctness merges. `tools/measure/perfbase.sh` (release-perf) and the same scenarios on a
+`tools/pgo-build.sh` binary, counts slot, min of 5 (h3fit: median of 3 fits). User ins/req;
+HAProxy = §2.1's dev8 (dev10 for h3fit), non-PGO. Board: `~/ibex-worktrees/boards/pgo-wave1-85edb342/`.
+
+| scenario | start (rc4) | release-perf | ratio | **PGO** | **PGO ratio** | HAProxy | kernel (rp) |
+|---|---|---|---|---|---|---|---|
+| keepalive ab1 | 45.9k | 39.7k | 1.10x | **34.7k** | **0.96x** | 36.2k | 65.8k (HAProxy 69.7k) |
+| rules ab1 | 75.7k | 68.6k | 1.57x | **59.6k** | **1.36x** | 43.8k | 65.9k |
+| h2s1 | 71.6k | 60.9k | 1.14x | **54.1k** | **1.02x** | 53.2k | 66.7k (HAProxy 76.3k) |
+| h3fit (1.97 dg/req) | 98.9k | 87.9k | 1.37x | **75.7k** | **1.18x** | 64.0k | n/a |
+
+- **keepalive passes with PGO** (0.96x); h2s1 is at 1.02x with PGO, inside D-13's 10 %.
+- **rules is the gap** (1.36x with PGO): the X2/X3/R2/R4 slices carry it (X5, not in this build,
+  measured -2.7k rules on its own branch; T584 -0.3k; T595 targets the var lookup ~0.4k).
+- **h3fit 1.18x with PGO**: O1c and T586 item 3 (h3 same-pass wake) are the h3 slices.
+- PGO gains here: keepalive -12 %, rules -13 %, h2s1 -11 %, h3fit -14 % over release-perf.
