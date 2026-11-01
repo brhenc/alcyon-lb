@@ -216,3 +216,13 @@ fn a_bare_lf_http10_keep_alive_head_is_written_out_with_the_token() {
     let _ = rig.send(&mut c, "GET /lf HTTP/1.0\nHost: a\nConnection: Keep-Alive\n\n");
     assert_eq!(rig.last_head(), "GET /lf HTTP/1.0\r\nhost: a\r\nconnection: keep-alive\r\n\r\n");
 }
+
+/// A request a rule edited goes out with the token too, `HAProxy`'s wire: the HTX is written out
+/// (the rule's copy of the headers, `req_headers`, is why the token is not put in place).
+#[test]
+fn an_http10_keep_alive_request_edited_by_a_rule_gets_the_token_last() {
+    let mut rig = Rig::new("  http-request set-header X-A 1\n", "");
+    let mut c = rig.client();
+    let _ = rig.send(&mut c, "GET /r HTTP/1.0\r\nHost: a\r\nConnection: Keep-Alive\r\n\r\n");
+    assert_eq!(rig.last_head(), "GET /r HTTP/1.0\r\nhost: a\r\nx-a: 1\r\nconnection: keep-alive\r\n\r\n");
+}
