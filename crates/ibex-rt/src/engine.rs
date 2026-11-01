@@ -9733,8 +9733,16 @@ fn retry_server_connect(
         stats.retries_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    let Some(target_addr) = target else {
+    // The stream leaves the server it held a slot on only for another one (or none); the
+    // other one's slot is taken as a pick's (T590). One that another worker filled since the
+    // balancer offered it is no server for this attempt, as if none had been offered.
+    let s_idx = target.and_then(|a| proxies[be_idx].servers.iter().position(|s| s == a));
+    let moves = target.is_none() || s_idx.is_none() || s_idx != old_idx || be_idx != old_be;
+    if moves {
         give_back_old();
+    }
+    let target = target.filter(|_| !moves || s_idx.is_none_or(|i| proxies[be_idx].take_server_slot(i, true).is_some()));
+    let Some(target_addr) = target else {
         entry.sess.srv_state = ScState::Error;
         return false;
     };
@@ -9745,25 +9753,11 @@ fn retry_server_connect(
     if wait && !resuming && entry.sess.target_addr == Some(target_addr) {
         entry.sess.retry_after = now.add(entry.sess.retry_delay_ms());
         // Waiting, the stream keeps its server and the slot on it.
-        entry.target_server_idx = old_idx;
+        entry.target_server_idx = s_idx;
+        entry.srv_backend_idx = be_idx;
         return false;
     }
 
-    let s_idx = proxies[be_idx]
-        .servers
-        .iter()
-        .position(|s| s == target_addr);
-    if s_idx.is_none() || s_idx != old_idx || be_idx != old_be {
-        give_back_old();
-        // Another server: its slot is taken as a pick's (T590). One that another worker
-        // filled since the balancer offered it is this attempt failing at once, and the
-        // next retry asks again.
-        if let Some(idx) = s_idx {
-            if proxies[be_idx].take_server_slot(idx, true).is_none() {
-                return true;
-            }
-        }
-    }
     entry.target_server_idx = s_idx;
     entry.srv_backend_idx = be_idx;
     entry.sess.log.server = s_idx.and_then(crate::txnlog::server_slot);
