@@ -759,12 +759,12 @@ moment." §4.6's week table is replaced by this; §4's slice rows and budgets st
 | wave | in flight (disjoint files) |
 |---|---|
 | 1 | K1 + parse-bytes (T575), L1 → L2 → L3 (one worktree), O2, C1 + C2, (T572 stats, T576 tools) |
-| 2 | X1 (after T575: same parser files), then X2 ∥ X3 |
+| 2 | X1 (after T575: same parser files), then X5 (h1 encoder: X2 and X3 both depend on it, htx-engine §3), then X2 ∥ X3 |
 | 3 | X4, R2 (after X2), O1a (after X2) |
 | 4 | O1b (after O1a, X4), R4 (after O1a), IO1 only if keepalive > 1.0x here (D-16) |
 | 5 | O1c, X6/X7/X8 fillers, landing re-measure + PGO column |
 
-- **Critical path:** X1 → X2 → X4 → O1b → O1c, five slices at ~2.5-4 h = **~15-20 h** wall time
+- **Critical path:** X1 → X5 → X2 → X4 → O1b → O1c (X5 added 11-01 20:20: the table had left it out), six slices at ~2.5-4 h = **~15-20 h** wall time
   if each starts when its parent merges; the run end to end **~18-24 h**, with fix rounds after a
   red gate as the uncertainty (each ~1 h). Remaining decisions (D-12..D-18) are taken at the
   recommendation unless the user says otherwise.
