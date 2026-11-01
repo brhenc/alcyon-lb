@@ -420,3 +420,19 @@ trade: no slice trades security; L3's timer gating fires timers through the wait
 HAProxy. Memory-safety-only dependencies: none added. `unsafe`: none added. AGENTS §8 (pools,
 no cross-thread writes on the fast path): O1's `Stream` is an `ibex_alloc::Pool`; O2 removes a
 lock from the path; every slice reports its ins/req before and after, user and kernel.
+
+### 6.1 User decisions, 2026-11-01 (16:05)
+
+- **D-1, D-2, D-3, D-5, D-6, D-7, D-8, D-11**: approved as recommended.
+- **D-4: both.** Shared `Relaxed` atomics stay the default. Per-thread (or per-thread-group)
+  counter rows become an operator setting (`tune.ibex.*`) for CPU-bound deployments that can pay
+  the memory. This is the programme's first explicit memory-versus-CPU trade: C1 gets a short
+  design first (the setting, memory cost per server x thread, how `show stat`/`show info` sum the
+  rows). The shared default is a recorded exception to AGENTS §8 ("the fast path writes nothing
+  another thread reads") until that setting exists.
+- **D-9**: decided after X0, per safety extra.
+- **D-10: accepted.** keepalive <= 1.0x, h2s1 <= 1.0x (aim 0.9x), rules <= 1.1x for the first
+  landing; 1.0x on rules is the stretch after R2/X2 measure.
+- **Soaks**: postponed until most slices are in (not after each of L2/L3/O1a/O1b).
+- **Fable after X0**: one pass rewrites §2.1 and each slice's budget from X0's figures, and adds
+  a slice for any keep-alive remainder X0 locates.
