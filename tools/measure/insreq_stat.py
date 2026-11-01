@@ -27,7 +27,21 @@ def parse_stat(text):
     return got["u"], got.get("k")
 
 
+def summary(label, rounds, n):
+    """The summary line of rounds [(user, kernel-or-None)] of n requests: the round with the
+    least total, with that round's own user and kernel, so user + kernel = total."""
+    if any(k is None for _, k in rounds):
+        return f"{label} summary (min of {len(rounds)}): user {min(u for u, _ in rounds) // n}, kernel n/a, total n/a ins/req"
+    u, k = min(rounds, key=lambda r: r[0] + r[1])
+    return (f"{label} summary (min total of {len(rounds)}): user {u // n}, kernel {k // n}, "
+            f"total {(u + k) // n} ins/req")
+
+
 def main(argv):
+    if len(argv) == 5 and argv[1] == "summary":  # summary <label> <n> <file of "U K" lines>
+        rows = [l.split() for l in open(argv[4]) if l.strip()]
+        print(summary(argv[2], [(int(u), None if k == "-" else int(k)) for u, k in rows], int(argv[3])))
+        return 0
     if len(argv) != 2:
         print(__doc__, file=sys.stderr)
         return 2
