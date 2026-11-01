@@ -419,6 +419,9 @@ impl QuicEndpoint {
 
     /// Accepts a new connection: its first datagram of `len` bytes; `counted` if it is half
     /// open already ([`QuicEndpoint::defer_accepts`]).
+    // Out of `handle_datagram`'s body: its request path is the routed datagram (T560).
+    #[cold]
+    #[inline(never)]
     fn accept_incoming(&mut self, incoming: quinn_proto::Incoming, now: Instant, len: u64, counted: bool) -> DatagramOutcome {
         let remote_addr = incoming.remote_address();
         let local_ip = incoming.local_ip();
