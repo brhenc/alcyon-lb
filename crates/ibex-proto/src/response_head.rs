@@ -94,11 +94,15 @@ impl RspHead {
         &self.fields[..usize::from(self.n)]
     }
 
-    /// The line at `at..next` was cut from the head: false if it is no field line of it.
-    pub fn cut_line(&mut self, at: usize, next: usize) -> bool {
+    /// The line at `at..next` was cut from the head. One that is no field line of it leaves
+    /// an index of no head: its length is no head's ([`Self::len`] `u32::MAX`), which a
+    /// reader checks against the head before it reads the index.
+    pub fn cut_line(&mut self, at: usize, next: usize) {
         let n = usize::from(self.n);
-        let Some(i) = self.fields[..n].iter().position(|f| f.at as usize == at && f.end as usize == next) else {
-            return false;
+        let found = (self.len != u32::MAX).then(|| self.fields[..n].iter().position(|f| f.at as usize == at && f.end as usize == next)).flatten();
+        let Some(i) = found else {
+            self.len = u32::MAX;
+            return;
         };
         let gone = u32::try_from(next - at).unwrap_or(u32::MAX);
         self.fields.copy_within(i + 1..n, i);
@@ -109,22 +113,20 @@ impl RspHead {
             f.end -= gone;
         }
         self.len -= gone;
-        true
     }
 
     /// A line `name: value\r\n` of `len` bytes, its colon `colon` bytes in, was put after
-    /// the last field line: false if the index has no room for it (it is then stale).
-    pub fn add_line(&mut self, colon: usize, len: usize) -> bool {
+    /// the last field line. With no room for it, the index is of no head ([`Self::cut_line`]).
+    pub fn add_line(&mut self, colon: usize, len: usize) {
         let n = usize::from(self.n);
-        let (Ok(colon), Ok(len)) = (u32::try_from(colon), u32::try_from(len)) else { return false };
-        if n == RSP_FIELDS {
-            return false;
-        }
+        let (Ok(colon), Ok(len), true) = (u32::try_from(colon), u32::try_from(len), n < RSP_FIELDS && u32::try_from(len).ok().and_then(|l| self.len.checked_add(l)).is_some_and(|l| l != u32::MAX)) else {
+            self.len = u32::MAX;
+            return;
+        };
         let at = self.len - 2;
         self.fields[n] = RspField { at, colon: at + colon, end: at + len };
         self.n += 1;
         self.len += len;
-        true
     }
 }
 
@@ -764,13 +766,15 @@ mod tests {
         let c = ix.fields()[1];
         let mut cut = head[..c.at as usize].to_vec();
         cut.extend_from_slice(&head[c.end as usize..]);
-        assert!(ix.cut_line(c.at as usize, c.end as usize));
-        assert!(!ix.cut_line(c.at as usize, c.end as usize + 1));
+        let mut missed = ix;
+        missed.cut_line(c.at as usize, c.end as usize + 1);
+        assert_eq!(missed.len, u32::MAX, "a line the index does not hold leaves it of no head");
+        ix.cut_line(c.at as usize, c.end as usize);
         let line = b"connection: close\r\n";
         let mut added = cut[..cut.len() - 2].to_vec();
         added.extend_from_slice(line);
         added.extend_from_slice(b"\r\n");
-        assert!(ix.add_line(10, line.len()));
+        ix.add_line(10, line.len());
         assert_eq!(ix.len as usize, added.len());
         assert_eq!(fields(&ix, &added), fields(&index(&added).expect("indexed"), &added));
         assert!(index(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: upgrade\r\nSec-WebSocket-Accept: x\r\n\r\n").expect("indexed").upgrade);
@@ -791,7 +795,9 @@ mod tests {
         let mut full = RspHead::new();
         full.n = u8::try_from(RSP_FIELDS).unwrap();
         full.len = 4;
-        assert!(!full.add_line(10, 19));
+        full.add_line(10, 19);
+        assert_eq!(full.len, u32::MAX, "no room: of no head");
+        assert_eq!(index(b"garbage\r\n\r\n"), None);
     }
 
     fn valid(head: &[u8], accept: bool) -> Option<Option<Vec<u8>>> {

@@ -156,3 +156,22 @@ fn a_response_value_that_is_not_utf8_goes_to_the_h2_client_as_its_octets() {
     assert_eq!(f.get(b"x-a"), Some(&b"a\xff\xfeb"[..]));
     assert_eq!(f.get(b"content-length"), Some(&b"2"[..]));
 }
+
+/// E2: a head the engine indexed goes through the trait as its fields, the same HEADERS
+/// as its text; a stream reset since takes it and sends nothing.
+#[test]
+fn a_head_from_its_fields_is_the_head_from_its_text() {
+    let mut text = h2_with_get();
+    assert!(text.send_head(1, b"HTTP/1.1 200 OK\r\nx-a: a\r\ncontent-length: 0", true));
+    let mut fields = h2_with_get();
+    assert!(HtxMux::send_head_fields(&mut fields, 1, 200, [("x-a", &b"a"[..]), ("content-length", b"0")].into_iter(), true));
+    assert_eq!(sent_headers(&fields), sent_headers(&text));
+    assert_ne!(sent_headers(&fields)[0].0 & frame_flags::END_STREAM, 0);
+    let mut m = h2_with_get();
+    m.stream_mut(1).expect("stream").set_dispatched();
+    m.reset(1, MuxReset::Cancel);
+    let before = m.tx_buf.len();
+    assert!(HtxMux::send_head_fields(&mut m, 1, 200, [("x-a", &b"a"[..])].into_iter(), false), "taken and dropped");
+    assert!(sent_headers(&m).is_empty() || m.tx_buf.len() == before);
+    assert!(!m.tx_buf[before..].windows(3).any(|w| w == b"x-a"));
+}

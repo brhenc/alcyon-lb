@@ -763,3 +763,23 @@ fn a_response_value_that_is_not_utf8_goes_to_the_h3_client_as_its_octets() {
     assert!(fs.windows(4).any(|w| w == b"a\xff\xfeb"), "{}", fs.escape_ascii());
     assert!(!fs.windows(3).any(|w| w == "\u{fffd}".as_bytes()), "{}", fs.escape_ascii());
 }
+
+/// E2: a head the engine indexed goes as its fields, the same HEADERS as its text, the FIN
+/// with it when it ends the stream; a stream reset since takes it and sends nothing.
+#[test]
+fn a_head_from_its_fields_is_the_head_from_its_text() {
+    let mut text = mux();
+    text.recv(0, &headers(GET), true, 0).expect("request");
+    assert!(text.send_head(0, b"HTTP/1.1 200 OK\r\nx-a: a\r\ncontent-length: 0", true));
+    let mut fields = mux();
+    fields.recv(0, &headers(GET), true, 0).expect("request");
+    assert!(fields.send_head_fields(0, 200, [("x-a", &b"a"[..]), ("content-length", b"0")].into_iter(), true));
+    assert_eq!(fields.tx_bytes(0), text.tx_bytes(0));
+    assert!(fields.stream(0).expect("stream").tx_fin);
+    let mut m = mux();
+    m.recv(0, &headers(GET), true, 0).expect("request");
+    m.reset(0, MuxReset::Cancel);
+    let before = m.tx_bytes(0).to_vec();
+    assert!(m.send_head_fields(0, 200, [("x-a", &b"a"[..])].into_iter(), false), "taken and dropped");
+    assert_eq!(m.tx_bytes(0), &before[..]);
+}

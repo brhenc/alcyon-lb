@@ -11823,15 +11823,17 @@ impl EngineDispatcher<'_> {
                 // `close`; the head is edited where it is, with no copy.
                 if scan.count == 1 {
                     entry.sess.rep.cut(scan.first.0, scan.first.1);
-                    if index.as_mut().is_some_and(|ix| !ix.cut_line(scan.first.0, scan.first.1)) {
-                        index = None;
+                    if let Some(ix) = index.as_mut() {
+                        ix.cut_line(scan.first.0, scan.first.1);
                     }
                 }
                 if let Some(tok) = token {
-                    // A head the index holds ends with CRLF, and its names are lower case.
+                    // A head the index holds ends with CRLF, and its names are lower case. A
+                    // line put in another way (a head past 4096 bytes) leaves the index of the
+                    // head before it, which the client side then reads again (its length).
                     let line = inject_connection_token_zero_alloc(&mut entry.sess.rep, tok, index.is_some());
-                    if index.as_mut().is_some_and(|ix| !line.is_some_and(|l| ix.add_line("connection".len(), l))) {
-                        index = None;
+                    if let (Some(ix), Some(l)) = (index.as_mut(), line) {
+                        ix.add_line("connection".len(), l);
                     }
                 }
             } else {

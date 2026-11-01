@@ -1799,13 +1799,11 @@ impl HeadFacts {
     }
 
     /// The facts of a response head [`ibex_proto::response_head::check_response_head`] has
-    /// indexed (E2): its field lines are read from the index, not looked for again. `None`
-    /// for a head the index is not of (its length differs).
+    /// indexed (E2): its field lines are read from the index, not looked for again. The
+    /// index is of `head`, made from it with nothing edited since.
     #[must_use]
     pub fn of_response(head: &[u8], index: &ibex_proto::response_head::RspHead) -> Option<Self> {
-        if index.len as usize != head.len() {
-            return None;
-        }
+        debug_assert_eq!(index.len as usize, head.len(), "an index of another head");
         let mut scan = FactsScan::start(head, index.start as usize - 1, false)?;
         for f in index.fields() {
             scan.field(f.at as usize, f.end as usize, f.name(head), ascii_trim(f.value(head)));
