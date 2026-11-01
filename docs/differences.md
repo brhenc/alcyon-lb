@@ -398,15 +398,23 @@ rustls itself are not Ibex's to overwrite. The TLS record buffers (plaintext and
 `rx_raw`/`tx_raw` included) are not covered by this setting: they have their own
 `tune.ibex.ssl-zero-buffers` (default on, below).
 
-## `tune.ibex.ssl-zero-buffers on|off`: an Ibex-only global keyword (S2)
+## `tune.ibex.ssl-zero-buffers on|on-free|off`: an Ibex-only global keyword (S2)
 
 When a TLS connection ends, Ibex overwrites the whole capacity of its TLS record buffers (the
 ciphertext read from and written to the socket, and the plaintext decrypted from it) with zeros,
 so session data does not stay in freed memory. Default **on** (user decision 2026-10-24: TLS keys
 and plaintext are a real target); `off` leaves them as HAProxy does. The plain I/O buffers
 follow `tune.ibex.zero-buffers` (default off) instead. HAProxy 3.5-dev8 refuses the keyword as
-unknown. It takes exactly `on` or `off`; anything else, or a missing argument, is a
+unknown. It takes exactly `on`, `on-free` or `off`; anything else, or a missing argument, is a
 configuration error. Limits: key material inside rustls/ring is not covered (`tradeoff.md` 6.27).
+
+`on-free` (T553) keeps everything above except one wipe: the pooled TLS send buffer (`tls_tx`,
+ciphertext already on the wire) is no longer zeroed each time a response has been written and the
+buffer goes back to its pool, but when the pool really frees it (trim, memory budget, thread exit,
+stop). In between, a thread's idle chunk carries the previous connection's ciphertext until the
+next one overwrites it. Only ciphertext, never read past its length by safe Rust; visible in a core
+dump or through a memory-disclosure defect. It saves about 1 instruction per 18 bytes of response
+(`tradeoff.md` 6.32). The default stays `on`.
 
 ## `tune.ibex.h3-path relay|mux`: an Ibex-only global keyword (T509, temporary)
 

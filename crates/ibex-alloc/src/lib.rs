@@ -774,6 +774,31 @@ pub fn zero_spares() -> bool {
 /// when released. Read through the thread's copy (`pool::HOT`), refreshed once per loop pass.
 static SSL_ZERO_BUFFERS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
+/// `tune.ibex.ssl-zero-buffers on-free` (default off, i.e. `on`): a pooled TLS send buffer is
+/// wiped when its pool frees it, not on each give-back (T553). Only meaningful with the wipe on.
+static SSL_ZERO_ON_FREE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Sets the `on-free` mode of `tune.ibex.ssl-zero-buffers`.
+pub fn set_ssl_zero_on_free(on: bool) {
+    SSL_ZERO_ON_FREE.store(on, core::sync::atomic::Ordering::Relaxed);
+    pool::settings_changed();
+}
+
+/// Whether the `on-free` mode is set.
+#[must_use]
+pub fn ssl_zero_on_free() -> bool {
+    SSL_ZERO_ON_FREE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a pooled TLS buffer's wipe waits for the pool's free (`on-free` with the wipe on; the
+/// thread's copy). `ibex-tls` skips the give-back wipe when it is true and wipes in the chunk's
+/// `Drop` instead.
+#[inline]
+#[must_use]
+pub fn ssl_wipe_deferred() -> bool {
+    pool::wipe_ssl_deferred()
+}
+
 /// Sets `tune.ibex.ssl-zero-buffers`.
 pub fn set_ssl_zero_buffers(on: bool) {
     SSL_ZERO_BUFFERS.store(on, core::sync::atomic::Ordering::Relaxed);
