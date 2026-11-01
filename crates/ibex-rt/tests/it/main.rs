@@ -187,6 +187,7 @@ mod h3_end_to_end;
 mod h3_field_validity;
 mod quic_retry;
 mod quic_knobs;
+mod quic_handshake_burst;
 mod h3_many_threads;
 mod h2_stream_timings;
 mod h3_mux_drain;
