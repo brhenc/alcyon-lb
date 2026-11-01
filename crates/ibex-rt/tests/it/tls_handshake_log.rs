@@ -207,8 +207,14 @@ fn session_with(mode: &str, extra: &str, inputs: &[(&[u8], bool)], cmds: &[&str]
 
 /// `session_with`, with `bind_opts` on the `bind` line.
 fn session_full(mode: &str, bind_opts: &str, extra: &str, inputs: &[(&[u8], bool)], cmds: &[&str]) -> Session {
+    session_quiet(mode, bind_opts, extra, inputs, cmds, 400)
+}
+
+/// `session_full`, a probe's log read until `quiet_ms` pass without a line. Longer waits make the
+/// session slower, which the rate counters (`conn_rate`, per second) the other tests read do not take.
+fn session_quiet(mode: &str, bind_opts: &str, extra: &str, inputs: &[(&[u8], bool)], cmds: &[&str], quiet_ms: u64) -> Session {
     let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
-    collector.set_read_timeout(Some(Duration::from_millis(1500))).expect("timeout");
+    collector.set_read_timeout(Some(Duration::from_millis(quiet_ms))).expect("timeout");
     let fe = common::reserve_addr();
     let cert = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem");
     let sock = format!("/tmp/t268-{}-{}.sock", std::process::id(), fe.port());
@@ -411,10 +417,14 @@ fn a_client_that_leaves_after_a_whole_record_is_a_bare_failure() {
     let full = client_hello(b"\x13\x01", 0x0301);
     let cut = |n: usize| record(0x16, 0x0301, &full[5..5 + n]);
     let (r3, r20, r40) = (cut(3), cut(20), cut(40));
-    let s = session(
+    // A line the loaded host delivers late must still be read: 1.5 s of quiet ends a probe's log.
+    let s = session_quiet(
         "http",
         "",
+        "",
         &[(&r20, false), (&r40, false), (&full, false), (&r20, true), (&full, true), (&r3, false), (&full[..30], false), (&full[..30], true), (&r3, true)],
+        &[],
+        1500,
     );
     assert_eq!(s.probes.len(), 9, "{}", s.stderr);
     let msgs: Vec<String> = s.probes.iter().map(message).collect();
