@@ -1729,8 +1729,15 @@ impl TcpSession {
 
     /// Attaches a server-side connection with a specific transport (`ServerXprt`).
     pub fn attach_server_with_xprt(&mut self, fd: OwnedFd, xprt: ServerXprt, now: Tick) {
+        let src = crate::raw::local_addr(std::os::fd::AsFd::as_fd(&fd));
+        self.attach_server_from(fd, xprt, src, now);
+    }
+
+    /// [`Self::attach_server_with_xprt`] for a connection whose local address `src` is known
+    /// already: one taken from the idle pool, which kept it (T550 Q8).
+    pub fn attach_server_from(&mut self, fd: OwnedFd, xprt: ServerXprt, src: Option<std::net::SocketAddr>, now: Tick) {
         self.log.queue.get_or_insert_with(crate::txnlog::loop_now);
-        self.bc_src = crate::raw::local_addr(std::os::fd::AsFd::as_fd(&fd));
+        self.bc_src = src;
         self.srv = Some(fd);
         self.srv_xprt = xprt;
         self.srv_cant_recv = false;
