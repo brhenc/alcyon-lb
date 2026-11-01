@@ -69,7 +69,15 @@ impl ibex_alloc::Poolable for TxChunk {
         self.0.capacity() != 0 && self.0.capacity() <= max_footprint
     }
     fn try_new() -> Option<Self> {
-        Some(TxChunk(Vec::new()))
+        TxChunk::made()
+    }
+}
+
+impl TxChunk {
+    /// A new chunk of [`TX_CAP`]: what a miss in `TlsCtx::tx_take` and the pool's own
+    /// construction ([`ibex_alloc::Poolable::try_new`]) both make.
+    fn made() -> Option<Self> {
+        Some(TxChunk(Vec::with_capacity(TX_CAP)))
     }
 }
 
@@ -280,7 +288,7 @@ impl TlsCtx {
     /// to an allocation of the same size, which [`Self::tx_release`] frees.
     fn tx_take(&mut self) {
         if self.tx.capacity() == 0 {
-            match TLS_TX.take_counted(|| Some(TxChunk(Vec::with_capacity(TX_CAP)))) {
+            match TLS_TX.take_counted(TxChunk::made) {
                 Some(mut c) => {
                     self.tx = std::mem::take(&mut c.0);
                     self.tx_pooled = true;
@@ -803,5 +811,26 @@ mod wipe_tests {
         }
         ibex_alloc::set_zero_buffers(false);
         ibex_alloc::set_ssl_zero_buffers(true);
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::{tx_pool_cached, TLS_TX, TX_CAP};
+
+    /// `Pool::take` and the prefill make a chunk with `Poolable::try_new`: it has the size of
+    /// every other `tls_tx` chunk (not capacity 0, which `keep` refuses on the way back), and
+    /// goes to the pool on drop.
+    #[test]
+    fn a_chunk_the_pool_makes_has_the_chunk_size_and_is_kept_when_given_back() {
+        ibex_alloc::drain_local_pools();
+        assert_eq!(tx_pool_cached(), 0);
+        let c = TLS_TX.take().expect("a miss makes a chunk");
+        assert!(c.0.capacity() >= TX_CAP, "capacity {}", c.0.capacity());
+        drop(c);
+        assert_eq!(tx_pool_cached(), 1, "kept: the chunk is of the pool's size");
+        TLS_TX.prefill(2);
+        assert_eq!(tx_pool_cached(), 3, "a prefill adds chunks");
+        ibex_alloc::drain_local_pools();
     }
 }

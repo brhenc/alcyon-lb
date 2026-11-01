@@ -171,8 +171,7 @@ fn tls_tx_line() -> (usize, usize) {
     (num(") : ", " allocated"), num("bytes), ", " used"))
 }
 
-/// The pool's constructor (`TxChunk::try_new`) runs on a miss: with this thread's cache empty,
-/// the session's first take builds a chunk, it works, and it goes back to the pool on release.
+/// With this thread's cache empty, the session's first take is a miss that builds a chunk, it works, and it goes back to the pool on release.
 #[test]
 fn a_take_from_an_empty_pool_builds_a_chunk_that_works_and_returns() {
     use ibex_tls::conn::{tx_pool_cached, TX_CAP};
