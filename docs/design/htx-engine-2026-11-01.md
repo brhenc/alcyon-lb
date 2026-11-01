@@ -333,3 +333,18 @@ without that row). Do not weaken a `tools/checkin.sha256` test to pass; report i
 | **D-F** | Order against the transport programme: X-slices before E3/Track 3, parallel to Q1/P1/Q2 | **Yes**; E3 after X4 |
 | **D-G** | Spend: four Opus L/M slices (X1, X5, X2, X3) plus X4 Opus M and three Sonnet M; ~2-3 weeks | approve X0, X1, X5 now; X2/X3 after X0's numbers confirm the §1 estimates (if the representation's share measures < 8k on rules, stop after X5 and go to S2/S3 instead) |
 | **D-H** | `early-hint` (`http-request early-hint`, missing from the parser): add after X3's interim messages, or leave refused | leave refused until X3 ships; then one Sonnet S slice |
+
+## 5. User decisions (2026-11-01 11:45)
+
+- **D-A, D-B, D-C, D-D, D-F, D-H: as recommended** (layout A; values and `:path` as bytes; strict
+  keepalive budget; body on demand; X slices before E3; `early-hint` refused until X3).
+- **D-E: a setting, not a fixed rule.** "HAProxy lowercasing everything has been a headache."
+  `tune.ibex.h1-lowercase-headers on|off` (name to be settled in X5): `off` = an unmodified head
+  keeps the case it arrived with and the encoder writes names as stored; `on` = every h1 output
+  lowercased, as HAProxy (with `h1-case-adjust` still applying on top, as HAProxy). Default
+  `off` (today's Ibex behaviour, and the cheaper path); differential rows against HAProxy run
+  with `on`. Built in X5 (encoder) and X2 (passthrough).
+- **D-G: both.** The representation work (X0 -> X1, X5 -> X2, X3 ...) and the engine/scheduler
+  work (T550 S2 = slice E3, a stream object per h2/h3 child; S3, the loop row: 17.4k on h2 against
+  HAProxy's 2.3k, 7.15 loop passes per request) run in parallel. X0's profile covers S3 too, so the
+  S3 slices are written from its numbers; X2/X3 go ahead whatever X0's representation share is.
