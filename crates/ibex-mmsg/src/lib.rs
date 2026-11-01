@@ -40,6 +40,10 @@ impl<'a> RecvMsg<'a> {
 pub struct SendMsg<'a> {
     pub buf: &'a [u8],
     pub dst_addr: Option<SocketAddr>,
+    /// The source address the datagram leaves from, sent as an `IP_PKTINFO` (`ipi_spec_dst`) or
+    /// `IPV6_PKTINFO` control message, as `HAProxy`'s `cmsg_set_saddr` (`quic_sock.c`). Set it
+    /// only on a socket bound to the wildcard address (T552): a socket bound to one address
+    /// needs none, and `None` sends no control message at all.
     pub src_addr: Option<IpAddr>,
 }
 
@@ -55,6 +59,61 @@ impl<'a> SendMsg<'a> {
 }
 
 const BATCH_MAX: usize = 64;
+
+/// One message's source-address control message: `CMSG_SPACE` of the larger of the two
+/// payloads, in `u64`s so the buffer has `cmsghdr`'s alignment.
+const SRC_CMSG_WORDS: usize = 6;
+// SAFETY: `CMSG_SPACE` is arithmetic on its argument; it reads no memory.
+const SRC_CMSG_SPACE_V6: usize = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as libc::c_uint) } as usize;
+// SAFETY: as above.
+const SRC_CMSG_SPACE_V4: usize = unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as libc::c_uint) } as usize;
+const _: () = assert!(SRC_CMSG_SPACE_V6 <= SRC_CMSG_WORDS * 8 && SRC_CMSG_SPACE_V4 <= SRC_CMSG_SPACE_V6);
+
+/// Writes the control message that makes the kernel send from `src` into `space` (zeroed by
+/// the caller), and points
+/// `hdr` at it. The family follows the destination's, so an IPv4 source on an IPv6 socket
+/// goes as its IPv4-mapped form and a mapped source on an IPv4 socket as plain IPv4.
+fn set_src_cmsg(hdr: &mut libc::msghdr, space: &mut [u64; SRC_CMSG_WORDS], src: IpAddr, dst_v6: bool) {
+    let src = match (src, dst_v6) {
+        (IpAddr::V4(v4), true) => IpAddr::V6(v4.to_ipv6_mapped()),
+        (IpAddr::V6(v6), false) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => return,
+        },
+        (src, _) => src,
+    };
+    hdr.msg_control = space.as_mut_ptr().cast::<libc::c_void>();
+    // SAFETY: `space` is a zeroed, 8-byte aligned buffer of at least `CMSG_SPACE` of either
+    // payload (the const assertion above), and `hdr.msg_control`/`msg_controllen` describe it,
+    // so `CMSG_FIRSTHDR` returns its start and the header and payload written fit inside it.
+    // The payload is written unaligned, as `CMSG_DATA` promises no alignment for it.
+    unsafe {
+        match src {
+            IpAddr::V4(v4) => {
+                hdr.msg_controllen = SRC_CMSG_SPACE_V4 as _;
+                let cmsg = libc::CMSG_FIRSTHDR(hdr);
+                (*cmsg).cmsg_level = libc::IPPROTO_IP;
+                (*cmsg).cmsg_type = libc::IP_PKTINFO;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as libc::c_uint) as _;
+                let info = libc::in_pktinfo {
+                    ipi_ifindex: 0,
+                    ipi_spec_dst: libc::in_addr { s_addr: u32::to_be(u32::from(v4)) },
+                    ipi_addr: libc::in_addr { s_addr: 0 },
+                };
+                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::in_pktinfo>(), info);
+            }
+            IpAddr::V6(v6) => {
+                hdr.msg_controllen = SRC_CMSG_SPACE_V6 as _;
+                let cmsg = libc::CMSG_FIRSTHDR(hdr);
+                (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
+                (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as libc::c_uint) as _;
+                let info = libc::in6_pktinfo { ipi6_addr: libc::in6_addr { s6_addr: v6.octets() }, ipi6_ifindex: 0 };
+                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::in6_pktinfo>(), info);
+            }
+        }
+    }
+}
 
 fn parse_sockaddr(storage: &libc::sockaddr_storage, len: usize) -> Option<SocketAddr> {
     if i32::from(storage.ss_family) == libc::AF_INET && len >= std::mem::size_of::<libc::sockaddr_in>() {
@@ -160,7 +219,7 @@ pub fn recvmmsg(fd: BorrowedFd<'_>, msgs: &mut [RecvMsg]) -> io::Result<usize> {
     }
 
     loop {
-        // SAFETY: the `mmsghdr`/`iovec`/`sockaddr_storage` arrays are stack locals that outlive the syscall;
+        // SAFETY: the `mmsghdr`/`iovec`/`sockaddr_storage`arrays are stack locals that outlive the syscall;
         // each `iov_base` points into a buffer the caller lent us for the duration of the call;
         // the kernel fills at most `count` entries, so the fill-back loop cannot run off.
         let ret = unsafe {
@@ -223,6 +282,11 @@ pub fn sendmmsg(fd: BorrowedFd<'_>, msgs: &[SendMsg]) -> io::Result<usize> {
     let mut addrs: [std::mem::MaybeUninit<libc::sockaddr_storage>; BATCH_MAX] =
         // SAFETY: std::mem::MaybeUninit array doesn't require initialization.
         unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+    // Written only for a message with a `src_addr` (`set_src_cmsg`), so a socket bound to one
+    // address pays nothing for it.
+    let mut src_cmsgs: [std::mem::MaybeUninit<[u64; SRC_CMSG_WORDS]>; BATCH_MAX] =
+        // SAFETY: std::mem::MaybeUninit array doesn't require initialization.
+        unsafe { std::mem::MaybeUninit::uninit().assume_init() };
     
     for i in 0..count {
         // SAFETY: mem::zeroed() is sound for these types because an all-zero bit pattern is valid for every field.
@@ -281,10 +345,14 @@ pub fn sendmmsg(fd: BorrowedFd<'_>, msgs: &[SendMsg]) -> io::Result<usize> {
         
         msg.msg_hdr.msg_control = std::ptr::null_mut();
         msg.msg_hdr.msg_controllen = 0;
+        if let Some(src) = msgs[i].src_addr {
+            let dst_v6 = matches!(msgs[i].dst_addr, Some(SocketAddr::V6(_)));
+            set_src_cmsg(&mut msg.msg_hdr, src_cmsgs[i].write([0; SRC_CMSG_WORDS]), src, dst_v6);
+        }
     }
 
     loop {
-        // SAFETY: the `mmsghdr`/`iovec`/`sockaddr_storage` arrays are stack locals that outlive the syscall;
+        // SAFETY: the `mmsghdr`/`iovec`/`sockaddr_storage`/control-message arrays are stack locals that outlive the syscall;
         // each `iov_base` points into a buffer the caller lent us for the duration of the call;
         // the kernel fills at most `count` entries, so the fill-back loop cannot run off.
         let ret = unsafe {

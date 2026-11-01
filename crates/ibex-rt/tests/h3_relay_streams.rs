@@ -70,6 +70,10 @@ impl Rig {
     }
 
     fn build(setup: impl FnOnce(&mut QuicListener), guard: Option<std::sync::RwLockReadGuard<'static, ()>>) -> Self {
+        Self::build_stop(setup, guard, false)
+    }
+
+    fn build_stop(setup: impl FnOnce(&mut QuicListener), guard: Option<std::sync::RwLockReadGuard<'static, ()>>, stop_after_initial: bool) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let crt = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem"));
         let (certs, key) = ibex_tls::config::load_cert_file(crt).expect("cert");
@@ -85,6 +89,19 @@ impl Rig {
         let mut ep = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
         let (handle, conn) = ep.connect(Instant::now(), client_cfg, server.addr(), "localhost").expect("connect");
         let mut rig = Self { server, sock, ep, handle, conn, buf: vec![0u8; 65536], lost: false, lost_reason: None, _guard: guard };
+        if stop_after_initial {
+            // The client's Initial is read and its connection made, but the event saying so
+            // is not polled before the soft stop begins: HAProxy's lost-accept race (T558).
+            let mut out = Vec::new();
+            while let Some(t) = rig.conn.poll_transmit(Instant::now(), 1, &mut out) {
+                let _ = rig.sock.send_to(&out[..t.size], t.destination);
+                out.clear();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            rig.server.recv_batch(Instant::now()).expect("recv");
+            rig.server.begin_soft_stop();
+            assert!(rig.server.pinned_borrowed_fds().is_empty(), "the stop knew of the connection already");
+        }
         assert!(rig.run_until(|r| r.connected()), "no handshake");
         rig
     }
@@ -681,4 +698,81 @@ fn a_response_stopped_before_its_ack_ends_and_the_next_request_is_served() {
     assert_eq!(status(&resp), 200);
     assert_eq!(frame_payload(&resp, 1), b"ok");
     assert!(!rig.lost, "the connection was closed");
+}
+
+/// T558: a connection whose Initial was read just before the soft stop, and whose
+/// `NewConnection` surfaces only after it, is pinned when it surfaces (the stop's own pinning
+/// did not know it), and its first request is served: the old process of a reload keeps it.
+#[test]
+fn a_connection_surfacing_after_the_stop_is_pinned_and_served() {
+    let guard = FDS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut rig = Rig::build_stop(|s| s.set_frontend(0), Some(guard), true);
+    assert_eq!(rig.server.pinned_borrowed_fds().len(), 1, "the connection that surfaced after the stop was not pinned");
+    let id = rig.open(&headers(&[("content-length", "0")]), true);
+    let mut eng = rig.accept();
+    eng.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").expect("write");
+    let got = rig.response(id);
+    assert_eq!(status(&got), 200);
+}
+
+/// T558: between its bind and its connect, a pinned socket is an unconnected member of the
+/// port's group, and another client's datagram can be queued on it. That datagram is
+/// dropped, not answered: answered, the stopping listener would refuse the other client's
+/// Initial, a lost request. Bound to a more specific address than the wildcard listener
+/// (127.0.0.3, as a wildcard pin is), the pinned socket gets the datagram deterministically.
+/// The control: the same Initial sent to the listener itself is refused.
+#[test]
+fn a_datagram_queued_on_a_pinned_socket_before_its_connect_is_dropped() {
+    let _guard = FDS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let crt = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem"));
+    let (certs, key) = ibex_tls::config::load_cert_file(crt).expect("cert");
+    let tls = ibex_tls::tcp::BindTls::single_tls13(certs, key, vec![b"h3".to_vec()]).expect("tls");
+    let mut server = QuicListener::bind("0.0.0.0:0".parse().expect("addr"), &tls, None).expect("bind");
+    server.set_frontend(0);
+    let port = server.addr().port();
+    server.begin_soft_stop();
+
+    // An Initial from a client that is not the pinned peer, sent to `to`; what comes back.
+    let initial_to = |to: std::net::SocketAddr| -> UdpSocket {
+        let mut ctls = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(Any)).with_no_client_auth();
+        ctls.alpn_protocols = vec![b"h3".to_vec()];
+        let cfg = ClientConfig::new(Arc::new(QuicClientConfig::try_from(ctls).expect("client config")));
+        let sock = UdpSocket::bind("127.0.0.1:0").expect("other client");
+        sock.set_nonblocking(true).expect("nonblocking");
+        let mut ep = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+        let (_, mut conn) = ep.connect(Instant::now(), cfg, to, "localhost").expect("connect");
+        let mut out = Vec::new();
+        while let Some(t) = conn.poll_transmit(Instant::now(), 1, &mut out) {
+            sock.send_to(&out[..t.size], to).expect("send");
+            out.clear();
+        }
+        sock
+    };
+    let peer: std::net::SocketAddr = "127.0.0.1:9".parse().expect("peer");
+    let mut queued = None;
+    server.pin_with(peer, Some("127.0.0.3".parse().expect("ip")), |at| {
+        assert_eq!(at, std::net::SocketAddr::from(([127, 0, 0, 3], port)), "a wildcard pin binds the address reached");
+        queued = Some(initial_to(at));
+        std::thread::sleep(Duration::from_millis(20));
+    });
+    let queued = queued.expect("sent");
+    assert_eq!(server.pinned_borrowed_fds().len(), 1);
+    let control = initial_to(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    std::thread::sleep(Duration::from_millis(20));
+
+    let answered = |s: &UdpSocket| {
+        let mut b = [0u8; 2048];
+        s.recv_from(&mut b).is_ok()
+    };
+    let (mut to_queued, mut to_control) = (false, false);
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_millis(500) {
+        server.pump(Instant::now()).expect("pump");
+        to_queued |= answered(&queued);
+        to_control |= answered(&control);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(to_control, "control: an Initial to the stopping listener is refused (else this test shows nothing)");
+    assert!(!to_queued, "the datagram queued on the pinned socket before its connect was answered");
 }

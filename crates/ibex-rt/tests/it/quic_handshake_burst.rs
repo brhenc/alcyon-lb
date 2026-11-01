@@ -151,3 +151,58 @@ fn new_connections_past_one_pass_are_accepted_without_waiting() {
     let gap = at.windows(2).map(|w| w[1] - w[0]).max().unwrap_or_default();
     assert!(gap < Duration::from_millis(40), "the longest wait between two answers was {gap:?}");
 }
+
+/// A new connection whose Initial was read before a soft stop, and that was not accepted yet
+/// (a pass accepts 32, these are 40), is accepted after it, pinned and served, as T558 serves
+/// one whose `NewConnection` surfaces after the stop. Refused, its client would have to start
+/// again, and `HAProxy`'s lost accept (`listener_accept` on an unbound receiver,
+/// review/haproxy-quic-reload-report.md) is a connection read before the stop and never
+/// served.
+#[test]
+fn a_connection_deferred_across_a_soft_stop_is_accepted_and_pinned() {
+    const N: usize = 40;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let crt = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem"));
+    let (certs, key) = ibex_tls::config::load_cert_file(crt).expect("cert");
+    let tls = ibex_tls::tcp::BindTls::single_tls13(certs, key, vec![b"h3".to_vec()]).expect("tls");
+    let mut server = ibex_rt::quic_listener::QuicListener::bind("127.0.0.1:0".parse().expect("addr"), &tls, None).expect("bind");
+    server.set_frontend(0);
+    let mut clients = clients(N, server.addr());
+    for (sock, initial, _, _) in &clients {
+        let _ = sock.send_to(initial, server.addr());
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    server.recv_batch(Instant::now()).expect("recv");
+    assert!(server.has_backlog(), "some connections wait to be accepted");
+    server.begin_soft_stop();
+
+    let mut buf = vec![0u8; 65536];
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && clients.iter().any(|(_, _, _, c)| c.is_handshaking() && !c.is_closed()) {
+        let _ = server.pump(Instant::now());
+        std::thread::sleep(Duration::from_millis(2));
+        let now = Instant::now();
+        for (sock, _, ep, conn) in &mut clients {
+            while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                let mut resp = Vec::new();
+                if let Some(ibex_quic::quinn_proto::DatagramEvent::ConnectionEvent(_, e)) = ep.handle(now, from, None, None, buf[..n].into(), &mut resp) {
+                    conn.handle_event(e);
+                }
+            }
+            if conn.poll_timeout().is_some_and(|t| t <= now) {
+                conn.handle_timeout(now);
+            }
+            while conn.poll_endpoint_events().is_some() {}
+            while conn.poll().is_some() {}
+            let mut out = Vec::new();
+            while let Some(t) = conn.poll_transmit(now, 1, &mut out) {
+                let _ = sock.send_to(&out[..t.size], t.destination);
+                out.clear();
+            }
+        }
+    }
+    let refused = clients.iter().filter(|(_, _, _, c)| c.is_closed()).count();
+    let connected = clients.iter().filter(|(_, _, _, c)| !c.is_handshaking() && !c.is_closed()).count();
+    assert_eq!((connected, refused), (N, 0), "connected, refused of {N} read before the stop");
+    assert_eq!(server.pinned_borrowed_fds().len(), N, "each is pinned");
+}

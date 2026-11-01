@@ -160,12 +160,23 @@ struct Client {
     uni: HashMap<StreamId, Vec<u8>>,
     /// Until then, datagrams from the server are dropped unread.
     deaf_until: Option<Instant>,
+    /// Until then, what the client sends is dropped (lost on the way, or gone to the other
+    /// process of a reload): quinn retransmits it.
+    mute_until: Option<Instant>,
     /// Our control stream.
     control: Option<StreamId>,
 }
 
 impl Client {
     fn connect(server: SocketAddr) -> Self {
+        let mut c = Self::begin(server);
+        c.finish_handshake();
+        c
+    }
+
+    /// Sends the client's first Initial and nothing more: the server's answer waits in the
+    /// socket until [`Client::finish_handshake`].
+    fn begin(server: SocketAddr) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut ctls = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(std::sync::Arc::new(Any)).with_no_client_auth();
         ctls.alpn_protocols = vec![b"h3".to_vec()];
@@ -174,7 +185,14 @@ impl Client {
         sock.set_nonblocking(true).expect("nonblocking");
         let mut ep = Endpoint::new(std::sync::Arc::new(EndpointConfig::default()), None, true, None);
         let (handle, conn) = ep.connect(Instant::now(), client_cfg, server, "localhost").expect("connect");
-        let mut c = Self { sock, ep, handle, conn, buf: vec![0u8; 65536], lost: None, uni: HashMap::new(), deaf_until: None, control: None };
+        let mut c = Self { sock, ep, handle, conn, buf: vec![0u8; 65536], lost: None, uni: HashMap::new(), deaf_until: None, mute_until: None, control: None };
+        c.transmit();
+        c
+    }
+
+    /// Completes the handshake and opens the control stream.
+    fn finish_handshake(&mut self) {
+        let c = self;
         c.run_until(Duration::from_secs(4), |c| !c.conn.is_handshaking() || c.lost.is_some());
         assert!(!c.conn.is_handshaking(), "no handshake: {:?}", c.lost);
         // A control stream with an empty SETTINGS, as every client sends.
@@ -183,16 +201,22 @@ impl Client {
         ibex_proto::mux_h3::encode_frame(&mut b, 0x04, b"");
         c.conn.send_stream(ctl).write(&b).expect("write control");
         c.control = Some(ctl);
-        c
+    }
+
+    fn transmit(&mut self) {
+        let now = Instant::now();
+        let mute = self.mute_until.is_some_and(|t| now < t);
+        let mut out = Vec::new();
+        while let Some(t) = self.conn.poll_transmit(now, 1, &mut out) {
+            if !mute {
+                let _ = self.sock.send_to(&out[..t.size], t.destination);
+            }
+            out.clear();
+        }
     }
 
     fn step(&mut self) {
-        let now = Instant::now();
-        let mut out = Vec::new();
-        while let Some(t) = self.conn.poll_transmit(now, 1, &mut out) {
-            let _ = self.sock.send_to(&out[..t.size], t.destination);
-            out.clear();
-        }
+        self.transmit();
         thread::sleep(Duration::from_millis(2));
         let now = Instant::now();
         let deaf = self.deaf_until.is_some_and(|t| now < t);
@@ -513,6 +537,77 @@ fn a_soft_stop_waits_for_the_response_to_be_acknowledged() {
         let lost = cl.closed(Duration::from_secs(5));
         assert_eq!(lost.map(|l| l.0).as_deref(), Some("app 0x100"));
         assert!(ibex.exited_within(Duration::from_secs(5)), "ibex did not exit after the drain");
+    });
+}
+
+/// T558 (VV-30): a connection whose handshake the old process of a reload completes after
+/// its soft stop began -- the client's Finished and request went first to the new process,
+/// whose socket joined the reuseport group, and came back on the pinned socket -- is served.
+/// Before T558 the old process found it idle the moment it was accepted, sent GOAWAY(0) and
+/// closed it `H3_NO_ERROR`: curl's request on stream 0, already sent, was lost (ngtcp2
+/// `ERR_DRAINING`), 1.8 % of short requests across 100 reloads. Here the stop lands between
+/// the client's Initial and its Finished, and the request's first transmission is lost.
+#[test]
+fn a_connection_whose_handshake_ends_during_a_soft_stop_is_served() {
+    for path in ["mux", "relay"] {
+        common::on_h3_path(path, || {
+            let mut ibex = ibex(backend(), "timeout client 5s");
+            let mut cl = Client::begin(ibex.quic);
+            thread::sleep(Duration::from_millis(100));
+            ibex.usr1();
+            thread::sleep(Duration::from_millis(150));
+            cl.finish_handshake();
+            cl.mute_until = Some(Instant::now() + Duration::from_millis(150));
+            let id = cl.open(&get(b"/a"), true);
+            let o = cl.outcome(id);
+            assert_eq!((o.status, o.fin), (Some(200), true), "{path}: {o:?} {:?} GOAWAYs {:?}", cl.lost, cl.goaways());
+            let lost = cl.closed(Duration::from_secs(3));
+            assert_eq!(lost.map(|l| l.0).as_deref(), Some("app 0x100"), "{path}");
+            if path == "mux" {
+                assert_eq!(cl.goaways(), vec![4], "{path}: the GOAWAY names the stream served");
+            }
+            // The closed connection drains for three PTOs (RFC 9000 10.2) before the process
+            // can leave, and this client's held handshake and lost request left the server an
+            // RTT estimate of about a second: ~10 s here, ~0 on a real reload.
+            assert!(ibex.exited_within(Duration::from_secs(15)), "{path}: ibex did not exit after the drain");
+        });
+    }
+}
+
+/// T558: a connection that is established but has sent no request yet when the soft stop
+/// begins was opened to send one, which may be on the wire: it gets its first request
+/// served (GOAWAY after it), not GOAWAY(0) and a close at once.
+#[test]
+fn a_fresh_connection_at_a_soft_stop_gets_its_first_request_served() {
+    for path in ["mux", "relay"] {
+        common::on_h3_path(path, || {
+            let mut ibex = ibex(backend(), "timeout client 5s");
+            let mut cl = Client::connect(ibex.quic);
+            cl.run_until(Duration::from_millis(100), |_| false);
+            ibex.usr1();
+            cl.run_until(Duration::from_millis(150), |c| c.lost.is_some());
+            let id = cl.open(&get(b"/a"), true);
+            let o = cl.outcome(id);
+            assert_eq!((o.status, o.fin), (Some(200), true), "{path}: {o:?} {:?} GOAWAYs {:?}", cl.lost, cl.goaways());
+            let lost = cl.closed(Duration::from_secs(3));
+            assert_eq!(lost.map(|l| l.0).as_deref(), Some("app 0x100"), "{path}");
+            assert!(ibex.exited_within(Duration::from_secs(5)), "{path}: ibex did not exit after the drain");
+        });
+    }
+}
+
+/// T558: the wait for that first request is bounded: a fresh connection that sends nothing
+/// is closed (GOAWAY(0), `H3_NO_ERROR`) about a second into the stop, and the process exits.
+#[test]
+fn a_fresh_connection_that_sends_nothing_is_closed_after_the_stop_grace() {
+    common::on_h3_path("mux", || {
+        let mut ibex = ibex(backend(), "timeout client 10s");
+        let mut cl = Client::connect(ibex.quic);
+        cl.run_until(Duration::from_millis(100), |_| false);
+        let t0 = Instant::now();
+        ibex.usr1();
+        assert_graceful_close(&mut cl, t0, Duration::from_millis(800), Duration::from_millis(2500), 0);
+        assert!(ibex.exited_within(Duration::from_secs(3)), "ibex did not exit after the drain");
     });
 }
 

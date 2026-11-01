@@ -388,16 +388,13 @@ impl QuicEndpoint {
     }
 
     /// Accepts the oldest new connection [`QuicEndpoint::defer_accepts`] held; false if none
-    /// waits. One a soft stop came after is refused.
+    /// waits. One a soft stop came after is accepted too: its Initial was read before the
+    /// stop, as a connection whose `NewConnection` surfaces after it, which the listener pins
+    /// and serves (T558). Refused, it would be the request `HAProxy` loses at a reload, a
+    /// connection read before the stop and never served (its `listener_accept` on an unbound
+    /// receiver); only an Initial read after the stop is refused (`handle_datagram`).
     pub fn accept_deferred(&mut self, now: Instant) -> bool {
         let Some(d) = self.deferred.pop_front() else { return false };
-        if self.refusing_new {
-            if d.counted {
-                self.half_open_done();
-            }
-            self.refuse_incoming(d.incoming);
-            return true;
-        }
         let _ = self.accept_incoming(d.incoming, now, d.len, d.counted);
         true
     }
@@ -517,6 +514,13 @@ impl QuicEndpoint {
         if let Some(live) = self.touch(conn) {
             let _ = live.conn.recv_stream(stream_id.into()).stop(code);
         }
+    }
+
+    /// The local address connection `conn`'s client reached, when the kernel told (a pinned
+    /// socket on a wildcard bind is bound to it, T558).
+    #[must_use]
+    pub fn local_ip_of(&self, conn: ConnHandle) -> Option<std::net::IpAddr> {
+        self.live(conn)?.conn.local_ip()
     }
 
     /// Creates a `QuicEndpoint` from an already configured `quinn_proto::ServerConfig`.
