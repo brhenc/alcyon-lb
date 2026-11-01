@@ -5956,6 +5956,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             .fold(poll_timeout, |acc, deadline| {
                 acc.min(deadline.saturating_duration_since(now_inst))
             });
+        // Datagrams read and not served yet (a pass serves `RX_PER_PASS`, T560): the socket
+        // may be empty and wake nothing, so look again at once. The listener is marked ready.
+        let poll_timeout = if self.quic_listeners.iter().any(crate::quic_listener::QuicListener::has_backlog) {
+            Duration::ZERO
+        } else {
+            poll_timeout
+        };
 
         // The idle server connections beyond what their servers need are purged every
         // `pool-purge-delay` (`srv_cleanup_idle_conns`): this is where that keyword acts.

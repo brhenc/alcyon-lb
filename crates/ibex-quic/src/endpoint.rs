@@ -161,6 +161,18 @@ pub struct QuicEndpoint {
     /// This endpoint's own part of `half_open`: those of its connections with an
     /// [`AmplificationBudget`] not `validated`. Given back when the endpoint is dropped.
     own_half_open: u64,
+    /// [`QuicEndpoint::defer_accepts`]: a new connection waits here, half open from its
+    /// first Initial on, until [`QuicEndpoint::accept_deferred`] runs its first flight (T560).
+    deferring: bool,
+    deferred: VecDeque<Deferred>,
+}
+
+/// A new connection [`QuicEndpoint::accept_deferred`] has not accepted yet: its first
+/// datagram's size (its amplification budget) and whether it counts as half open.
+struct Deferred {
+    incoming: quinn_proto::Incoming,
+    len: u64,
+    counted: bool,
 }
 
 impl Drop for QuicEndpoint {
@@ -337,6 +349,8 @@ impl QuicEndpoint {
             retry_threshold: QuicConfig::default().retry_threshold,
             half_open: Arc::new(AtomicU64::new(0)),
             own_half_open: 0,
+            deferring: false,
+            deferred: VecDeque::new(),
         }
     }
 
@@ -355,6 +369,117 @@ impl QuicEndpoint {
     /// CONNECTION_REFUSED close and goes to whichever process is taking over.
     pub fn stop_accepting(&mut self) {
         self.refusing_new = true;
+    }
+
+    /// A new connection is accepted by [`QuicEndpoint::accept_deferred`], not by the
+    /// datagram that opens it (T560). Its first flight (the key exchange and the signature,
+    /// ~2M instructions) no longer runs before the next datagram is read, and it is half open
+    /// from its first Initial on, so the Initials of a burst past the Retry threshold get a
+    /// Retry at once: `HAProxy` counts `half_open_conn` in `qc_new_conn`, when it parses the
+    /// datagram, and runs the handshake later in the connection's tasklet.
+    pub fn defer_accepts(&mut self) {
+        self.deferring = true;
+    }
+
+    /// Whether a new connection waits for [`QuicEndpoint::accept_deferred`].
+    #[must_use]
+    pub fn has_deferred(&self) -> bool {
+        !self.deferred.is_empty()
+    }
+
+    /// Accepts the oldest new connection [`QuicEndpoint::defer_accepts`] held; false if none
+    /// waits. One a soft stop came after is refused.
+    pub fn accept_deferred(&mut self, now: Instant) -> bool {
+        let Some(d) = self.deferred.pop_front() else { return false };
+        if self.refusing_new {
+            if d.counted {
+                self.half_open_done();
+            }
+            self.refuse_incoming(d.incoming);
+            return true;
+        }
+        let _ = self.accept_incoming(d.incoming, now, d.len, d.counted);
+        true
+    }
+
+    fn refuse_incoming(&mut self, incoming: quinn_proto::Incoming) {
+        self.response_buf.clear();
+        let tx = self.endpoint.refuse(incoming, &mut self.response_buf);
+        self.pending_transmits.push_back(TransmitEntry {
+            transmit: Transmit {
+                destination: tx.destination,
+                src_ip: tx.src_ip,
+                size: tx.size,
+                segment_size: tx.segment_size,
+                ecn: tx.ecn.map(EcnCodepoint::from),
+            },
+            data: self.response_buf.clone(),
+        });
+    }
+
+    /// Accepts a new connection: its first datagram of `len` bytes; `counted` if it is half
+    /// open already ([`QuicEndpoint::defer_accepts`]).
+    fn accept_incoming(&mut self, incoming: quinn_proto::Incoming, now: Instant, len: u64, counted: bool) -> DatagramOutcome {
+        let remote_addr = incoming.remote_address();
+        let local_ip = incoming.local_ip();
+        let validated = incoming.remote_address_validated();
+        let primary_cid = ConnectionId::from(*incoming.orig_dst_cid());
+        self.response_buf.clear();
+        match self.endpoint.accept(incoming, now, &mut self.response_buf, Some(self.server_config.clone())) {
+            Ok((handle, conn)) => {
+                let idx = handle.0;
+                if self.slots.len() <= idx {
+                    self.slots.resize_with(idx + 1, Slot::default);
+                    self.deadlines.resize(idx + 1, None);
+                }
+                // quinn hands out an index again only once its connection is gone;
+                // one this endpoint did not see drained is forgotten now.
+                self.remove_slot(idx);
+                let mut budget = AmplificationBudget::new(len, self.anti_amplification_factor);
+                // A Retry token validates the address (RFC 9000 §8.1.2): no
+                // amplification limit, and not half open (`qc_new_conn`).
+                budget.validated = validated;
+                if !validated && !counted {
+                    self.own_half_open += 1;
+                    self.half_open.fetch_add(1, Ordering::Relaxed);
+                }
+                let slot = &mut self.slots[idx];
+                slot.gen = slot.gen.wrapping_add(1);
+                slot.live = Some(Live { conn, cid: primary_cid, budget, queued: false, timer_stale: false });
+                let c = self.handle_at(idx);
+                #[allow(clippy::cast_possible_truncation)]
+                self.active_handles.push(idx as u32);
+                let _ = self.touch(c);
+
+                self.event_queue.push_back(TransportEvent::NewConnection {
+                    conn: c,
+                    id: primary_cid,
+                    remote: remote_addr,
+                });
+
+                self.drive_connection(idx, now);
+                DatagramOutcome::Accepted
+            }
+            Err(_) => {
+                if counted {
+                    self.half_open_done();
+                }
+                if !self.response_buf.is_empty() {
+                    let tx = Transmit {
+                        destination: remote_addr,
+                        src_ip: local_ip,
+                        size: self.response_buf.len(),
+                        segment_size: None,
+                        ecn: None,
+                    };
+                    self.pending_transmits.push_back(TransmitEntry {
+                        transmit: tx,
+                        data: self.response_buf.clone(),
+                    });
+                }
+                DatagramOutcome::Ignored
+            }
+        }
     }
 
     /// What `show quic` lists of each connection (T524): read-only, one entry per live
@@ -729,20 +854,8 @@ impl QuicTransport for QuicEndpoint {
 
         match event {
             Some(DatagramEvent::NewConnection(incoming)) => {
-                let remote_addr = incoming.remote_address();
                 if self.refusing_new {
-                    self.response_buf.clear();
-                    let tx = self.endpoint.refuse(incoming, &mut self.response_buf);
-                    self.pending_transmits.push_back(TransmitEntry {
-                        transmit: Transmit {
-                            destination: tx.destination,
-                            src_ip: tx.src_ip,
-                            size: tx.size,
-                            segment_size: tx.segment_size,
-                            ecn: tx.ecn.map(EcnCodepoint::from),
-                        },
-                        data: self.response_buf.clone(),
-                    });
+                    self.refuse_incoming(incoming);
                     return Ok(DatagramOutcome::StatelessResponse);
                 }
                 let validated = incoming.remote_address_validated();
@@ -757,67 +870,17 @@ impl QuicTransport for QuicEndpoint {
                 if !validated && (self.force_retry || self.half_open.load(Ordering::Relaxed) >= self.retry_threshold) {
                     return Ok(self.send_retry(incoming));
                 }
-                let primary_cid = ConnectionId::from(*incoming.orig_dst_cid());
-                let outcome = match self.endpoint.accept(
-                    incoming,
-                    now,
-                    &mut self.response_buf,
-                    Some(self.server_config.clone()),
-                ) {
-                    Ok((handle, conn)) => {
-                        let idx = handle.0;
-                        if self.slots.len() <= idx {
-                            self.slots.resize_with(idx + 1, Slot::default);
-                            self.deadlines.resize(idx + 1, None);
-                        }
-                        // quinn hands out an index again only once its connection is gone;
-                        // one this endpoint did not see drained is forgotten now.
-                        self.remove_slot(idx);
-                        let mut budget = AmplificationBudget::new(buf.len() as u64, self.anti_amplification_factor);
-                        // A Retry token validates the address (RFC 9000 §8.1.2): no
-                        // amplification limit, and not half open (`qc_new_conn`).
-                        budget.validated = validated;
-                        if !validated {
-                            self.own_half_open += 1;
-                            self.half_open.fetch_add(1, Ordering::Relaxed);
-                        }
-                        let slot = &mut self.slots[idx];
-                        slot.gen = slot.gen.wrapping_add(1);
-                        slot.live = Some(Live { conn, cid: primary_cid, budget, queued: false, timer_stale: false });
-                        let c = self.handle_at(idx);
-                        #[allow(clippy::cast_possible_truncation)]
-                        self.active_handles.push(idx as u32);
-                        let _ = self.touch(c);
-
-                        self.event_queue.push_back(TransportEvent::NewConnection {
-                            conn: c,
-                            id: primary_cid,
-                            remote: remote_addr,
-                        });
-
-                        self.drive_connection(idx, now);
-                        DatagramOutcome::Accepted
+                if self.deferring {
+                    // Half open from now on (`qc_new_conn`): the next Initial is weighed
+                    // against the threshold with this one in.
+                    if !validated {
+                        self.own_half_open += 1;
+                        self.half_open.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(e) => {
-                        if !self.response_buf.is_empty() {
-                            let tx = Transmit {
-                                destination: from,
-                                src_ip: local_ip,
-                                size: self.response_buf.len(),
-                                segment_size: None,
-                                ecn: None,
-                            };
-                            self.pending_transmits.push_back(TransmitEntry {
-                                transmit: tx,
-                                data: self.response_buf.clone(),
-                            });
-                        }
-                        let _ = e;
-                        DatagramOutcome::Ignored
-                    }
-                };
-
-                Ok(outcome)
+                    self.deferred.push_back(Deferred { incoming, len: buf.len() as u64, counted: !validated });
+                    return Ok(DatagramOutcome::Accepted);
+                }
+                Ok(self.accept_incoming(incoming, now, buf.len() as u64, false))
             }
 
             Some(DatagramEvent::ConnectionEvent(handle, conn_evt)) => {

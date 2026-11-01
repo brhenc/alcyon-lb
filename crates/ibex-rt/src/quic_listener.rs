@@ -23,6 +23,12 @@ use ibex_quic::{
 
 /// Batch size for datagram I/O.
 const BATCH_SIZE: usize = 32;
+/// Datagrams the receive ring holds (T560): about what `HAProxy`'s 256 KiB datagram ring per
+/// thread (`QUIC_RX_BUFSZ`) holds of 1200-byte Initials.
+const RX_RING: usize = 6 * BATCH_SIZE;
+/// Datagrams served a pass at most: `HAProxy`'s `quic_lstnr_dghdlr` serves
+/// `tune.maxpollevents` (200) a call and comes back for the rest.
+const RX_PER_PASS: usize = 200;
 /// Buffer capacity per datagram (covers maximum standard Ethernet MTU and QUIC padding).
 const DGRAM_BUF_SIZE: usize = 2048;
 /// Control message buffer capacity per datagram for `IP_PKTINFO`.
@@ -81,6 +87,15 @@ fn take_prebound(addr: SocketAddr, worker: usize) -> Option<DgramSocket> {
     Some(all.swap_remove(i).2)
 }
 
+/// What `recvmmsg` said of a datagram in the receive ring.
+#[derive(Clone, Copy, Default)]
+struct RxMeta {
+    len: usize,
+    src: Option<SocketAddr>,
+    dst: Option<std::net::IpAddr>,
+    truncated: bool,
+}
+
 /// A QUIC listener managing datagram I/O on a nonblocking UDP socket and driving the QUIC transport.
 pub struct QuicListener {
     /// The poller saw the socket readable this pass ([`QuicListener::mark_ready`]).
@@ -88,8 +103,13 @@ pub struct QuicListener {
     socket: DgramSocket,
     endpoint: QuicEndpoint,
     addr: SocketAddr,
+    /// The receive ring (T560): `RX_RING` datagram buffers, `rx_len` of them read and not
+    /// yet served, from `rx_head` on.
     recv_raw_bufs: Vec<Vec<u8>>,
     recv_cmsg_bufs: Vec<Vec<u8>>,
+    rx_meta: Vec<RxMeta>,
+    rx_head: usize,
+    rx_len: usize,
     send_raw_bufs: Vec<Vec<u8>>,
     /// Each connection's state, in the slot of its handle's index (Q1, design
     /// `quic-transport-2026-11-01.md` §5 (i)): no hashing on the request path. A slot whose
@@ -315,11 +335,13 @@ impl QuicListener {
     }
 
     /// Wraps a bound UDP socket and an already-configured endpoint.
-    fn from_socket(addr: SocketAddr, socket: DgramSocket, endpoint: QuicEndpoint) -> Self {
+    fn from_socket(addr: SocketAddr, socket: DgramSocket, mut endpoint: QuicEndpoint) -> Self {
+        // New connections are accepted between reads of the socket (`recv_batch`, T560).
+        endpoint.defer_accepts();
         let bound_addr = socket.local_addr().unwrap_or(addr);
 
-        let recv_raw_bufs = vec![vec![0u8; DGRAM_BUF_SIZE]; BATCH_SIZE];
-        let recv_cmsg_bufs = vec![vec![0u8; CMSG_BUF_SIZE]; BATCH_SIZE];
+        let recv_raw_bufs = vec![vec![0u8; DGRAM_BUF_SIZE]; RX_RING];
+        let recv_cmsg_bufs = vec![vec![0u8; CMSG_BUF_SIZE]; RX_RING];
         let send_raw_bufs = vec![vec![0u8; DGRAM_BUF_SIZE]; BATCH_SIZE];
 
         Self {
@@ -329,6 +351,9 @@ impl QuicListener {
             addr: bound_addr,
             recv_raw_bufs,
             recv_cmsg_bufs,
+            rx_meta: vec![RxMeta::default(); RX_RING],
+            rx_head: 0,
+            rx_len: 0,
             send_raw_bufs,
             conns: Vec::new(),
             frontend: None,
@@ -701,23 +726,97 @@ impl QuicListener {
         self.socket.borrowed_fd()
     }
 
-    /// Receives a batch of incoming datagrams and passes them to the QUIC transport.
+    /// Reads the socket into the receive ring until the ring is full or the socket has
+    /// nothing more (`recvmmsg` gave fewer than it was offered).
+    fn fill_ring(&mut self) -> io::Result<usize> {
+        if self.rx_len == 0 {
+            self.rx_head = 0;
+        }
+        let mut got = 0;
+        while self.rx_len < RX_RING {
+            let tail = (self.rx_head + self.rx_len) % RX_RING;
+            let room = (RX_RING - self.rx_len).min(RX_RING - tail).min(BATCH_SIZE);
+            // On the stack, not a `Vec` per call (T512: one allocation a pass).
+            let mut lent = self.recv_raw_bufs[tail..tail + room].iter_mut().zip(self.recv_cmsg_bufs[tail..tail + room].iter_mut());
+            let mut dgram_bufs: [DgramBuf; BATCH_SIZE] = std::array::from_fn(|_| {
+                lent.next().map_or_else(|| DgramBuf::new(&mut [], &mut []), |(buf, cmsg_buf)| DgramBuf::new(buf.as_mut_slice(), cmsg_buf.as_mut_slice()))
+            });
+            let n = self.socket.recv_batch(&mut dgram_bufs[..room])?;
+            for (meta, d) in self.rx_meta[tail..tail + n].iter_mut().zip(&dgram_bufs) {
+                *meta = RxMeta { len: d.len, src: d.src_addr, dst: d.dst_addr, truncated: d.truncated };
+            }
+            self.rx_len += n;
+            got += n;
+            if n < room {
+                break;
+            }
+        }
+        Ok(got)
+    }
+
+    /// Whether datagrams read from the socket wait in the receive ring: the loop must not
+    /// sleep, the socket may have nothing left to wake it (T560).
+    #[must_use]
+    pub fn has_backlog(&self) -> bool {
+        self.rx_len > 0 || self.endpoint.has_deferred()
+    }
+
+    /// Receives incoming datagrams and passes them to the QUIC transport, `RX_PER_PASS` at
+    /// most, and accepts `BATCH_SIZE` new connections at most; the rest wait in the receive
+    /// ring and the endpoint for the next pass, which comes at once ([`Self::has_backlog`]).
+    ///
+    /// The socket is read again after each new connection accepted and after each
+    /// `BATCH_SIZE` datagrams served. A new connection's first flight (its key exchange and
+    /// signature, ~2M instructions) ran as its Initial was read, 32 of them before the next
+    /// read: a burst of Initials overflowed the socket's buffer meanwhile, and the same
+    /// clients lost every retransmission (T560, VV-31). `HAProxy` reads into its ring
+    /// between handshakes the same way, and counts a connection half open as it reads it.
     ///
     /// # Errors
     /// Returns an error if a non-transient socket error occurs.
     pub fn recv_batch(&mut self, now: Instant) -> io::Result<usize> {
-        // On the stack, not a `Vec` per call (T512: one allocation a pass). Both lists hold
-        // `BATCH_SIZE` buffers, so the empty fallback is never used.
-        let mut lent = self.recv_raw_bufs.iter_mut().zip(self.recv_cmsg_bufs.iter_mut());
+        self.fill_ring()?;
+        let mut n = 0;
+        let mut accepted = 0;
+        loop {
+            let mut since_read = 0;
+            while self.rx_len > 0 && n < RX_PER_PASS {
+                let i = self.rx_head;
+                let meta = self.rx_meta[i];
+                self.rx_head = (i + 1) % RX_RING;
+                self.rx_len -= 1;
+                n += 1;
+                let Some(src) = meta.src.filter(|_| !meta.truncated) else { continue };
+                let _ = self.endpoint.handle_datagram(now, src, meta.dst, &self.recv_raw_bufs[i][..meta.len]);
+                since_read += 1;
+                if since_read >= BATCH_SIZE {
+                    since_read = 0;
+                    // An error here is the next pass's first read's to report.
+                    let _ = self.fill_ring();
+                }
+            }
+            // One new connection's first flight, then the socket again.
+            if accepted >= BATCH_SIZE || !self.endpoint.accept_deferred(now) {
+                break;
+            }
+            accepted += 1;
+            let _ = self.fill_ring();
+        }
+        if self.has_backlog() {
+            self.ready = true;
+        }
+        let mut total = n;
+        if self.pinned.is_empty() {
+            return Ok(total);
+        }
+        // Read into the send buffers, free until `send_batch`: the ring's may hold datagrams
+        // not served yet. The control buffers are only the kernel's while it reads.
+        let mut lent = self.send_raw_bufs.iter_mut().zip(self.recv_cmsg_bufs.iter_mut());
         let mut dgram_bufs: [DgramBuf; BATCH_SIZE] = std::array::from_fn(|_| {
             lent.next().map_or_else(|| DgramBuf::new(&mut [], &mut []), |(buf, cmsg_buf)| DgramBuf::new(buf.as_mut_slice(), cmsg_buf.as_mut_slice()))
         });
-
-        let n = self.socket.recv_batch(&mut dgram_bufs)?;
-        Self::dispatch(&mut self.endpoint, now, &dgram_bufs, n);
         // Datagrams of the connections a soft stop pinned. A pinned socket is drained empty
         // each time, like the listening one, so level-triggered readiness cannot spin.
-        let mut total = n;
         for (_, sock) in &self.pinned {
             loop {
                 // WouldBlock is "drained"; any other error on a socket we may drop is too.
