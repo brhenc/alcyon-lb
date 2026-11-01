@@ -13,3 +13,7 @@ ibex-config = { path = "../../crates/ibex-config" }
 ibex-alloc = { path = "../../crates/ibex-alloc" }
 
 [workspace]
+
+# Vendored quinn (T542), as in the root workspace.
+[patch.crates-io]
+quinn-proto = { path = "../../vendor/quinn-proto" }
