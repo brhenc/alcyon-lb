@@ -67,7 +67,7 @@ pub trait HtxMux {
     fn send_head(&mut self, id: u64, head: &[u8], end_stream: bool) -> bool;
     /// [`Self::send_head`] of a head already parsed (E2): its status and its fields, the
     /// names in lower case, in order.
-    fn send_head_fields<'h>(&mut self, id: u64, status: u16, fields: impl Iterator<Item = (&'h str, &'h [u8])>, end_stream: bool) -> bool;
+    fn send_head_fields<'h, N: AsRef<[u8]>>(&mut self, id: u64, status: u16, fields: impl Iterator<Item = (N, &'h [u8])>, end_stream: bool) -> bool;
     /// Sends as much of `data` as [`Self::data_budget`] allows: the bytes taken.
     fn send_data(&mut self, id: u64, data: &[u8], end_stream: bool) -> usize;
     /// Sends the response's trailers, which end the stream.

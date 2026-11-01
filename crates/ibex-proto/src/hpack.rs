@@ -717,11 +717,17 @@ pub fn find_table_entry(name: &str, value: &str, dynamic: &DynamicTable) -> Opti
 /// [`find_table_entry`] of a value that is octets.
 #[must_use]
 pub fn find_table_entry_octets(name: &str, value: &[u8], dynamic: &DynamicTable) -> Option<(usize, bool)> {
+    find_table_entry_bytes(name.as_bytes(), value, dynamic)
+}
+
+/// [`find_table_entry_octets`] of a name that is bytes (T581).
+#[must_use]
+pub fn find_table_entry_bytes(name: &[u8], value: &[u8], dynamic: &DynamicTable) -> Option<(usize, bool)> {
     let mut name_match = None;
 
     // The static table first: the run of entries of this name (they are adjacent), the
     // first of them with the value, else the first of them.
-    if let Some((first, count)) = static_name_run(name.as_bytes()) {
+    if let Some((first, count)) = static_name_run(name) {
         let (first, count) = (usize::from(first), usize::from(count));
         if let Some(k) = STATIC_TABLE[first - 1..first - 1 + count].iter().position(|&(_, v)| v.as_bytes() == value) {
             return Some((first + k, true));
@@ -732,7 +738,7 @@ pub fn find_table_entry_octets(name: &str, value: &[u8], dynamic: &DynamicTable)
     // Search dynamic table next
     for (i, entry) in dynamic.entries.iter().enumerate() {
         let full_idx = STATIC_TABLE_LEN + 1 + i;
-        if entry.name.eq_ignore_ascii_case(name.as_bytes()) {
+        if entry.name.eq_ignore_ascii_case(name) {
             if entry.value == value {
                 return Some((full_idx, true));
             }
@@ -1150,7 +1156,13 @@ impl HpackEncoder {
     /// [`Self::encode_field`] of a value that is octets, not necessarily UTF-8 text: a
     /// response field goes to the client as the server sent it (E2).
     pub fn encode_field_octets(&mut self, name: &str, value: &[u8], out: &mut Vec<u8>) {
-        if let Some((idx, exact)) = find_table_entry_octets(name, value, &self.dynamic_table) {
+        self.encode_field_bytes(name.as_bytes(), value, out);
+    }
+
+    /// [`Self::encode_field_octets`] of a name that is bytes: a response head's field, a token,
+    /// not read as UTF-8 (T581).
+    pub fn encode_field_bytes(&mut self, name: &[u8], value: &[u8], out: &mut Vec<u8>) {
+        if let Some((idx, exact)) = find_table_entry_bytes(name, value, &self.dynamic_table) {
             if exact {
                 // Indexed Header Field: 1xxxxxxx (7-bit prefix)
                 encode_integer(idx, 7, 0x80, out);
@@ -1158,14 +1170,14 @@ impl HpackEncoder {
                 // Literal with Incremental Indexing - Indexed Name: 01xxxxxx (6-bit prefix)
                 encode_integer(idx, 6, 0x40, out);
                 encode_octets_literal(value, self.use_huffman, out);
-                self.dynamic_table.insert_copy(name.as_bytes(), value);
+                self.dynamic_table.insert_copy(name, value);
             }
         } else {
             // Literal with Incremental Indexing - New Name: 01000000
             out.push(0x40);
-            encode_string_literal(name, self.use_huffman, out);
+            encode_octets_literal(name, self.use_huffman, out);
             encode_octets_literal(value, self.use_huffman, out);
-            self.dynamic_table.insert_copy(name.as_bytes(), value);
+            self.dynamic_table.insert_copy(name, value);
         }
     }
 

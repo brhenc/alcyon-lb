@@ -475,11 +475,12 @@ fn push_res_line_raw(
     buf: &mut [u8],
     tail_addr: &mut usize,
     num_blocks: &mut usize,
-    version: &str,
+    version: &[u8],
     status: u16,
-    reason: &str,
+    reason: &[u8],
 ) -> Result<(), HtxError> {
-    let status_str = status.to_string();
+    let mut digits = [0u8; 10];
+    let status_str = format_u16_into(status, &mut digits);
     let needed = version.len() + 1 + status_str.len() + 1 + reason.len() + HTX_DESC_SIZE;
     if free_capacity_at(buf.len(), *tail_addr, *num_blocks) < needed {
         return Err(HtxError::OutOfMemory);
@@ -488,15 +489,15 @@ fn push_res_line_raw(
     let addr = *tail_addr as u32;
     let start = *tail_addr;
 
-    buf[start..start + version.len()].copy_from_slice(version.as_bytes());
+    buf[start..start + version.len()].copy_from_slice(version);
     let cur = start + version.len();
     buf[cur] = b' ';
     let cur = cur + 1;
-    buf[cur..cur + status_str.len()].copy_from_slice(status_str.as_bytes());
+    buf[cur..cur + status_str.len()].copy_from_slice(status_str);
     let cur = cur + status_str.len();
     buf[cur] = b' ';
     let cur = cur + 1;
-    buf[cur..cur + reason.len()].copy_from_slice(reason.as_bytes());
+    buf[cur..cur + reason.len()].copy_from_slice(reason);
     *tail_addr = cur + reason.len();
 
     let desc = HtxBlockDesc {
@@ -1594,14 +1595,12 @@ impl<'a> HtxSlice<'a> {
         status: u16,
         reason: &str,
     ) -> Result<(), HtxError> {
-        push_res_line_raw(
-            self.buf,
-            &mut self.tail_addr,
-            &mut self.num_blocks,
-            version,
-            status,
-            reason,
-        )
+        self.push_res_line_bytes(version.as_bytes(), status, reason.as_bytes())
+    }
+
+    /// [`Self::push_res_line`] of a line read as bytes (T581).
+    pub fn push_res_line_bytes(&mut self, version: &[u8], status: u16, reason: &[u8]) -> Result<(), HtxError> {
+        push_res_line_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, version, status, reason)
     }
 
     /// Writes the request head `head` (an HTTP/2 or HTTP/3 request's checked fields, E1) as

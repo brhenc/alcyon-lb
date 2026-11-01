@@ -87,22 +87,76 @@ pub struct TransferCodings {
     pub invalid: bool,
 }
 
+/// A header name or value as the framing readings take it: its bytes, whatever holds them
+/// (T581: the framing of a message is read as bytes, as `HAProxy` reads it, not as UTF-8).
+pub trait FieldBytes {
+    fn field_bytes(&self) -> &[u8];
+}
+
+impl FieldBytes for [u8] {
+    fn field_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl FieldBytes for str {
+    fn field_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl FieldBytes for String {
+    fn field_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl FieldBytes for Vec<u8> {
+    fn field_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl FieldBytes for std::borrow::Cow<'_, str> {
+    fn field_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl FieldBytes for std::borrow::Cow<'_, [u8]> {
+    fn field_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl<T: FieldBytes + ?Sized> FieldBytes for &T {
+    fn field_bytes(&self) -> &[u8] {
+        (**self).field_bytes()
+    }
+}
+
+/// `s` without the blanks (`SP`, `HTAB`) at either end.
+fn trim_lws(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|&c| c != b' ' && c != b'\t').unwrap_or(s.len());
+    let end = s.iter().rposition(|&c| c != b' ' && c != b'\t').map_or(start, |e| e + 1);
+    &s[start..end.max(start)]
+}
+
 impl TransferCodings {
-    pub fn of<N: AsRef<str>, V: AsRef<str>>(headers: impl Iterator<Item = (N, V)>, is_response: bool) -> Self {
-        let lws = |c: char| c == ' ' || c == '\t';
+    pub fn of<N: FieldBytes, V: FieldBytes>(headers: impl Iterator<Item = (N, V)>, is_response: bool) -> Self {
         let mut t = TransferCodings::default();
         let mut chunked_seen = false;
-        for (_, value) in headers.filter(|(n, _)| n.as_ref().eq_ignore_ascii_case("transfer-encoding")) {
+        for (_, value) in headers.filter(|(n, _)| n.field_bytes().eq_ignore_ascii_case(b"transfer-encoding")) {
             t.present = true;
-            let v = value.as_ref().trim_matches(lws);
-            if v.is_empty() || v.ends_with(',') {
+            let v = trim_lws(value.field_bytes());
+            if v.is_empty() || v.ends_with(b",") {
                 t.invalid = true;
             }
-            for word in v.split(',').map(|w| w.trim_matches(lws)) {
+            for word in v.split(|&c| c == b',').map(trim_lws) {
                 t.chunked_last = false;
                 if word.is_empty() {
                     t.invalid = true;
-                } else if word.eq_ignore_ascii_case("chunked") {
+                } else if word.eq_ignore_ascii_case(b"chunked") {
                     t.invalid |= chunked_seen;
                     chunked_seen = true;
                     t.chunked_last = true;
@@ -442,13 +496,9 @@ impl H1Parser {
         let Some((line_end, delim_len)) = self.find_line_end(input) else {
             return Ok(0);
         };
-        let line_bytes = &input[..line_end];
-        let line_str = crate::utf8_parse(line_bytes).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in start line")
-        })?;
-
-        let (version, status, reason) = parse_response_line_borrowed(line_str)?;
-        htx.push_res_line(version, status, reason)
+        // Read as bytes (T581): the status line of a response is not text to HAProxy.
+        let (version, status, reason) = parse_response_line_bytes(&input[..line_end])?;
+        htx.push_res_line_bytes(version, status, reason)
             .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
 
         self.prev_delim_len = delim_len;
@@ -1529,21 +1579,19 @@ fn check_request_target_bytes(method: &[u8], uri: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn parse_response_line_borrowed(line: &str) -> io::Result<(&str, u16, &str)> {
-    let mut parts = line.splitn(3, ' ');
-    let version_str = parts
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP version"))?;
-    let status_str = parts
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP status"))?;
-    let reason = parts.next().unwrap_or("").trim();
-
-    let status = status_str
-        .parse::<u16>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP status code"))?;
-
-    Ok((version_str, status, reason))
+/// The version, status and reason of a status line, on its bytes: the words split at the first
+/// two spaces, the reason trimmed (ASCII blanks), the status `u16`'s decimal reading.
+fn parse_response_line_bytes(line: &[u8]) -> io::Result<(&[u8], u16, &[u8])> {
+    let mut parts = line.splitn(3, |&b| b == b' ');
+    let version = parts.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP version"))?;
+    let code = parts.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP status"))?;
+    let reason = parts.next().unwrap_or_default().trim_ascii();
+    let digits = code.strip_prefix(b"+").unwrap_or(code);
+    let status = (!digits.is_empty() && digits.iter().all(u8::is_ascii_digit))
+        .then(|| digits.iter().try_fold(0u16, |n, &d| n.checked_mul(10)?.checked_add(u16::from(d - b'0'))))
+        .flatten()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP status code"))?;
+    Ok((version, status, reason))
 }
 
 /// True for RFC 9110 `tchar`, the only octets allowed in a header field name.

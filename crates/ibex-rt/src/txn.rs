@@ -11,6 +11,7 @@
 //! the engine has processed its head. "Where is this transaction" is answered here, by
 //! state, instead of being inferred from buffer occupancy and socket states.
 
+use ibex_proto::h1::FieldBytes;
 use crate::proxy::find_eoh;
 
 /// How a message body is delimited (RFC 9112 section 6.3).
@@ -1002,18 +1003,18 @@ impl<'a> Iterator for Fields<'a> {
 /// `http_parse_cont_len_header` reads it: each line a comma-separated list of decimal
 /// values, all equal. `None` without one, or when they do not agree on one value (a head
 /// the parser refuses).
-fn content_length<K: AsRef<str>, V: AsRef<str>>(fields: impl Iterator<Item = (K, V)>) -> Option<u64> {
+fn content_length<K: FieldBytes, V: FieldBytes>(fields: impl Iterator<Item = (K, V)>) -> Option<u64> {
     let mut len = None;
-    for (_, v) in fields.filter(|(k, _)| k.as_ref().eq_ignore_ascii_case("content-length")) {
-        let v = v.as_ref();
-        if v.ends_with(',') {
+    for (_, v) in fields.filter(|(k, _)| k.field_bytes().eq_ignore_ascii_case(b"content-length")) {
+        let v = v.field_bytes();
+        if v.ends_with(b",") {
             return None;
         }
-        for word in v.split(',').map(|w| w.trim_matches([' ', '\t'])) {
-            if word.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) {
+        for word in v.split(|&b| b == b',').map(trim_sp_ht) {
+            if word.is_empty() || !word.iter().all(u8::is_ascii_digit) {
                 return None;
             }
-            let n = word.parse::<u64>().ok()?;
+            let n = word.iter().try_fold(0u64, |n, &d| n.checked_mul(10)?.checked_add(u64::from(d - b'0')))?;
             if len.is_some_and(|l| l != n) {
                 return None;
             }
@@ -1024,7 +1025,7 @@ fn content_length<K: AsRef<str>, V: AsRef<str>>(fields: impl Iterator<Item = (K,
 }
 
 /// The `Transfer-Encoding` lines of a head, all of them, as one list.
-fn codings<K: AsRef<str>, V: AsRef<str>>(fields: impl Iterator<Item = (K, V)>, is_response: bool) -> ibex_proto::h1::TransferCodings {
+fn codings<K: FieldBytes, V: FieldBytes>(fields: impl Iterator<Item = (K, V)>, is_response: bool) -> ibex_proto::h1::TransferCodings {
     ibex_proto::h1::TransferCodings::of(fields, is_response)
 }
 
@@ -1045,7 +1046,7 @@ pub fn request_framing(head: &[u8]) -> Framing {
 }
 
 /// [`request_framing`] from the `Transfer-Encoding` and `Content-Length` fields of a head.
-fn request_framing_of<K: AsRef<str>, V: AsRef<str>>(te: impl Iterator<Item = (K, V)>, cl: impl Iterator<Item = (K, V)>) -> Framing {
+fn request_framing_of<K: FieldBytes, V: FieldBytes>(te: impl Iterator<Item = (K, V)>, cl: impl Iterator<Item = (K, V)>) -> Framing {
     if codings(te, false).present {
         // Without a final `chunked` the request has no length and is refused (400);
         // were it to get here, chunked is the reading that forwards nothing unframed.
@@ -1099,7 +1100,7 @@ fn response_framing_general(head: &str) -> Framing {
 
 /// How a response with a body is framed, from its `Transfer-Encoding` and `Content-Length`
 /// fields.
-fn response_body_framing<K: AsRef<str>, V: AsRef<str>>(te: impl Iterator<Item = (K, V)>, cl: impl Iterator<Item = (K, V)>) -> Framing {
+fn response_body_framing<K: FieldBytes, V: FieldBytes>(te: impl Iterator<Item = (K, V)>, cl: impl Iterator<Item = (K, V)>) -> Framing {
     let te = codings(te, true);
     if te.present {
         return if te.chunked_last { Framing::Chunked } else { Framing::UntilClose };
@@ -1141,6 +1142,13 @@ fn split_lf(s: &[u8]) -> impl Iterator<Item = &[u8]> {
     })
 }
 
+/// `s` without the spaces and tabs at either end (`trim_matches([' ', '\t'])`).
+fn trim_sp_ht(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|&c| c != b' ' && c != b'\t').unwrap_or(s.len());
+    let end = s.iter().rposition(|&c| c != b' ' && c != b'\t').map_or(start, |e| e + 1);
+    &s[start..end]
+}
+
 /// `str::trim` of ASCII bytes.
 fn ascii_trim(s: &[u8]) -> &[u8] {
     ascii_trim_end(ascii_trim_start(s))
@@ -1148,19 +1156,21 @@ fn ascii_trim(s: &[u8]) -> &[u8] {
 
 /// The `Transfer-Encoding` and `Content-Length` fields of a head, as [`fields`] reads them.
 struct FramingFields<'a> {
-    te: [&'a str; 4],
+    te: [&'a [u8]; 4],
     n_te: usize,
-    cl: [&'a str; 4],
+    cl: [&'a [u8]; 4],
     n_cl: usize,
 }
 
 impl<'a> FramingFields<'a> {
-    fn te(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
-        self.te[..self.n_te].iter().map(|v| ("transfer-encoding", *v))
+    const EMPTY: Self = Self { te: [b""; 4], n_te: 0, cl: [b""; 4], n_cl: 0 };
+
+    fn te(&self) -> impl Iterator<Item = (&'static [u8], &'a [u8])> + '_ {
+        self.te[..self.n_te].iter().map(|v| (&b"transfer-encoding"[..], *v))
     }
 
-    fn cl(&self) -> impl Iterator<Item = (&'a str, &'a str)> + '_ {
-        self.cl[..self.n_cl].iter().map(|v| ("content-length", *v))
+    fn cl(&self) -> impl Iterator<Item = (&'static [u8], &'a [u8])> + '_ {
+        self.cl[..self.n_cl].iter().map(|v| (&b"content-length"[..], *v))
     }
 }
 
@@ -1173,10 +1183,8 @@ impl<'a> FramingFields<'a> {
 /// `str::trim` might trim, and which the lossy reading of a request head replaces), or more
 /// than four lines of one kind.
 fn framing_fields(head: &[u8]) -> Option<FramingFields<'_>> {
-    fn trim(s: &[u8]) -> &str {
-        std::str::from_utf8(ascii_trim(s)).unwrap_or_default()
-    }
-    let mut out = FramingFields { te: [""; 4], n_te: 0, cl: [""; 4], n_cl: 0 };
+    let trim = ascii_trim;
+    let mut out = FramingFields::EMPTY;
     let mut at = memchr::memchr(b'\n', head)? + 1;
     while at <= head.len() {
         let end = memchr::memchr(b'\n', &head[at..]).map_or(head.len(), |n| at + n);
@@ -1198,9 +1206,9 @@ fn framing_fields(head: &[u8]) -> Option<FramingFields<'_>> {
         }
         let Some(colon) = line.iter().position(|&b| b == b':') else { continue };
         let (name, value) = (trim(&line[..colon]), &line[colon + 1..]);
-        let (slot, n) = if name.eq_ignore_ascii_case("transfer-encoding") {
+        let (slot, n) = if name.eq_ignore_ascii_case(b"transfer-encoding") {
             (&mut out.te, &mut out.n_te)
-        } else if name.eq_ignore_ascii_case("content-length") {
+        } else if name.eq_ignore_ascii_case(b"content-length") {
             (&mut out.cl, &mut out.n_cl)
         } else {
             continue;
@@ -1332,6 +1340,20 @@ pub fn response_connection_token(close: bool, rsp_http11: bool, req_http11: bool
 /// all go: the header is removed whole.
 #[must_use]
 pub fn connection_is_plain(value: &str) -> bool {
+    connection_is_plain_bytes(value.as_bytes())
+}
+
+/// [`connection_is_plain`] of a value's bytes: an ASCII one read as bytes (T581), any other as
+/// the text it is (its blanks are `str::trim`'s).
+#[must_use]
+pub fn connection_is_plain_bytes(value: &[u8]) -> bool {
+    if !value.is_ascii() {
+        return std::str::from_utf8(value).is_ok_and(connection_is_plain_text);
+    }
+    value.split(|&b| b == b',').map(ascii_trim).all(|t| t.is_empty() || t.eq_ignore_ascii_case(b"keep-alive") || t.eq_ignore_ascii_case(b"close"))
+}
+
+fn connection_is_plain_text(value: &str) -> bool {
     if value.is_ascii() {
         return value.as_bytes().split(|&b| b == b',').map(ascii_trim).all(|t| t.is_empty() || t.eq_ignore_ascii_case(b"keep-alive") || t.eq_ignore_ascii_case(b"close"));
     }
@@ -1369,7 +1391,7 @@ pub fn scan_connection(head: &[u8]) -> ConnScan {
                     out.first = (at, end);
                 }
                 out.count += 1;
-                out.plain &= std::str::from_utf8(&rest[1..]).is_ok_and(connection_is_plain);
+                out.plain &= connection_is_plain_bytes(&rest[1..]);
                 out.commas |= rest.contains(&b',');
             }
         }
@@ -1550,7 +1572,17 @@ pub fn rewrite_response_connection(head: &str, close: bool, req_http11: bool, tu
 #[must_use]
 pub fn status_of_line(line: &[u8]) -> u16 {
     let mut words = line.split(|&b| b == b' ');
-    words.nth(1).and_then(|c| std::str::from_utf8(c).ok()).and_then(|c| c.trim().parse().ok()).unwrap_or(0)
+    let Some(c) = words.nth(1) else { return 0 };
+    if !c.is_ascii() {
+        return std::str::from_utf8(c).ok().and_then(|c| c.trim().parse().ok()).unwrap_or(0);
+    }
+    // `str::parse::<u16>` of the word trimmed, on its bytes (T581).
+    let c = ascii_trim(c);
+    let digits = c.strip_prefix(b"+").unwrap_or(c);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return 0;
+    }
+    digits.iter().try_fold(0u16, |n, &d| n.checked_mul(10)?.checked_add(u16::from(d - b'0'))).unwrap_or(0)
 }
 
 /// The status of a response head, 0 if the status line does not parse.
@@ -1655,6 +1687,35 @@ struct FactsScan<'h> {
 impl<'h> FactsScan<'h> {
     /// From the start line, `head[..nl]` (`nl` its line feed).
     fn start(head: &'h [u8], nl: usize, request: bool) -> Option<Self> {
+        let mut scan = Self::empty(request);
+        scan.start_line(head, nl)?;
+        Some(scan)
+    }
+
+    /// Before any line is read: the fields may come first and the start line last
+    /// ([`ResponseFacts`]).
+    fn empty(request: bool) -> Self {
+        Self {
+            f: HeadFacts {
+                size: 0,
+                headers: 0,
+                conn_close: false,
+                conn_keep_alive: false,
+                http10: false,
+                conn: ConnScan { plain: true, ..ConnScan::default() },
+                framing: None,
+            },
+            ff: FramingFields::EMPTY,
+            many: false,
+            request,
+            upg_hdr: false,
+            upg_fix: (0, 0),
+        }
+    }
+
+    /// What the start line, `head[..nl]` (`nl` its line feed), adds to the facts.
+    fn start_line(&mut self, head: &[u8], nl: usize) -> Option<()> {
+        let request = self.request;
         let first_raw = &head[..nl];
         let first = first_raw.strip_suffix(b"\r").unwrap_or(first_raw);
         let strings = if request {
@@ -1668,22 +1729,9 @@ impl<'h> FactsScan<'h> {
             let (status, reason) = rest.split_at(rest.len().min(3));
             version.len() + status.len() + ascii_trim(reason).len()
         };
-        Some(Self {
-            f: HeadFacts {
-                size: 20 + strings as u64 + 1,
-                headers: 0,
-                conn_close: false,
-                conn_keep_alive: false,
-                http10: first_raw.windows(8).any(|w| w == b"HTTP/1.0"),
-                conn: ConnScan { plain: true, ..ConnScan::default() },
-                framing: None,
-            },
-            ff: FramingFields { te: [""; 4], n_te: 0, cl: [""; 4], n_cl: 0 },
-            many: false,
-            request,
-            upg_hdr: false,
-            upg_fix: (0, 0),
-        })
+        self.f.size += 20 + strings as u64 + 1;
+        self.f.http10 = first_raw.windows(8).any(|w| w == b"HTTP/1.0");
+        Some(())
     }
 
     /// The field line `at..next`: `name`, and `value` trimmed.
@@ -1728,16 +1776,14 @@ impl<'h> FactsScan<'h> {
         } else if request && name.len() == 7 && name.eq_ignore_ascii_case(b"upgrade") {
             self.upg_hdr |= upgrade_value_kept(value);
         } else if name.len() == 14 && name.eq_ignore_ascii_case(b"content-length") {
-            let v = std::str::from_utf8(value).unwrap_or_default();
             match ff.cl.get_mut(ff.n_cl) {
-                Some(slot) => *slot = v,
+                Some(slot) => *slot = value,
                 None => self.many = true,
             }
             ff.n_cl += 1;
         } else if name.len() == 17 && name.eq_ignore_ascii_case(b"transfer-encoding") {
-            let v = std::str::from_utf8(value).unwrap_or_default();
             match ff.te.get_mut(ff.n_te) {
-                Some(slot) => *slot = v,
+                Some(slot) => *slot = value,
                 None => self.many = true,
             }
             ff.n_te += 1;
@@ -1805,7 +1851,8 @@ impl HeadFacts {
 
     /// The facts of a response head [`ibex_proto::response_head::check_response_head`] has
     /// indexed (E2): its field lines are read from the index, not looked for again. The
-    /// index is of `head`, made from it with nothing edited since.
+    /// index is of `head`, made from it with nothing edited since. (The engine reads them in
+    /// the check's own pass, [`ResponseFacts`]; this is the reading it is held to.)
     #[must_use]
     pub fn of_response(head: &[u8], index: &ibex_proto::response_head::RspHead) -> Option<Self> {
         debug_assert_eq!(index.len as usize, head.len(), "an index of another head");
@@ -1853,6 +1900,43 @@ impl HeadFacts {
     #[must_use]
     pub fn response_framing(&self, req_method: Option<&str>, status: u16) -> Option<Framing> {
         response_framing_before_fields(req_method, status).or(self.framing)
+    }
+}
+
+/// A response head's [`HeadFacts`] read in the pass of
+/// [`ibex_proto::response_head::check_response_head_with`] over it (X3: no second walk over
+/// its fields): [`Self::field`] for each field line the check indexes, [`Self::finish`]
+/// once the check has said the head is indexed.
+pub struct ResponseFacts<'h> {
+    scan: FactsScan<'h>,
+}
+
+impl Default for ResponseFacts<'_> {
+    fn default() -> Self {
+        Self { scan: FactsScan::empty(false) }
+    }
+}
+
+impl<'h> ResponseFacts<'h> {
+    /// The field line `head[at..end]`, its colon at `colon`, as the check indexes it
+    /// (`name: value CRLF`).
+    #[inline]
+    pub fn field(&mut self, head: &'h [u8], at: usize, colon: usize, end: usize) {
+        self.scan.field(at, end, &head[at..colon], ascii_trim(&head[colon + 2..end - 2]));
+    }
+
+    /// The facts of `head`, whose start line (its CRLF included) is `start` bytes, once every
+    /// field line went to [`Self::field`].
+    #[must_use]
+    pub fn finish(mut self, head: &'h [u8], start: usize) -> Option<HeadFacts> {
+        self.scan.start_line(head, start.checked_sub(1)?)?;
+        let facts = self.scan.finish();
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(Some(facts), HeadFacts::scan_plain(head, false), "facts of {:?}", String::from_utf8_lossy(head));
+            facts.check(head, false);
+        }
+        Some(facts)
     }
 }
 

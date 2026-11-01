@@ -11950,9 +11950,17 @@ impl EngineDispatcher<'_> {
         let mut held: Option<Vec<u8>> = None;
         // The head as parsed, while nothing has edited it (E2).
         let mut index: Option<ibex_proto::response_head::RspHead> = None;
+        // The facts of an indexed head, read in the check's pass over it (X3).
+        let mut checked_facts = None;
         if entry.sess.txn.as_ref().is_some_and(|t| t.rsp_wait.is_none()) {
             let accept = proxies[be_idx].stats_config.accept_unsafe_response;
-            match ibex_proto::response_head::check_response_head(&entry.sess.rep.readable()[..total_hdr_len], accept) {
+            let head = &entry.sess.rep.readable()[..total_hdr_len];
+            let mut facts = crate::txn::ResponseFacts::default();
+            let checked = ibex_proto::response_head::check_response_head_with(head, accept, |at, colon, end| facts.field(head, at, colon, end));
+            if let ibex_proto::response_head::ResponseHead::Valid { rewrite: None, index: Some(ix), .. } = &checked {
+                checked_facts = facts.finish(head, ix.start as usize);
+            }
+            match checked {
                 ibex_proto::response_head::ResponseHead::Invalid => {
                     entry.sess.rep.clear();
                     entry.sess.log.term.get_or_insert(*b"PH");
@@ -12003,9 +12011,10 @@ impl EngineDispatcher<'_> {
         // every head on the fast path) and the borrow ends before `rep` is edited.
         // One pass over the head for what follows reads of it (T436); a head the facts are not
         // read from is read the old way, a pass for each.
-        let rsp_facts = match &index {
-            Some(ix) => crate::txn::HeadFacts::of_response(&entry.sess.rep.readable()[..total_hdr_len], ix),
-            None => crate::txn::HeadFacts::scan(&entry.sess.rep.readable()[..total_hdr_len], false),
+        let rsp_facts = match (&index, checked_facts) {
+            (Some(_), Some(f)) => Some(f),
+            (Some(ix), None) => crate::txn::HeadFacts::of_response(&entry.sess.rep.readable()[..total_hdr_len], ix),
+            (None, _) => crate::txn::HeadFacts::scan(&entry.sess.rep.readable()[..total_hdr_len], false),
         };
         let (status, framing, srv_has_close, srv_http11) = {
             let raw = &entry.sess.rep.readable()[..total_hdr_len];
