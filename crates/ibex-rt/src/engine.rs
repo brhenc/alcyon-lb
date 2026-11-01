@@ -6821,6 +6821,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         crate::logfwd::soft_stop();
         for ql in &mut self.quic_listeners {
             ql.begin_soft_stop();
+            // Handed over: the socket stays open (this process still sends on it) but is the
+            // next process's to read (T558).
+            if ql.is_deaf() {
+                let _ = self.poller.delete(ql.borrowed_fd());
+            }
         }
         if let Some(cli) = self.cli_listener.take() {
             self.fdtab.remove(cli.as_raw_fd());

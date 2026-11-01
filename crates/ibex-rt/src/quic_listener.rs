@@ -54,9 +54,19 @@ static PREBOUND: std::sync::Mutex<Vec<(SocketAddr, usize, DgramSocket)>> = std::
 /// # Errors
 /// The first socket that cannot be bound; none of this address's sockets are kept then.
 pub fn prebind(addr: SocketAddr, workers: usize) -> io::Result<()> {
+    // The old process's sockets first (`-x`, T558): the reuseport group stays as it was, and
+    // the old process stops reading them at its soft stop. More of them than workers (fewer
+    // threads now): the rest are closed here, and the old process's copies leave the group
+    // when it exits.
+    let mut inherited = crate::handover::take_inherited_all(crate::handover::Kind::Quic, addr).into_iter();
     let mut socks = Vec::with_capacity(workers);
     for worker in 0..workers {
-        socks.push((addr, worker, DgramSocket::bind(addr)?));
+        let sock = match inherited.next() {
+            Some(fd) => DgramSocket::from_inherited(fd),
+            None => DgramSocket::bind(addr)?,
+        };
+        crate::handover::expose_kind(crate::handover::Kind::Quic, addr, sock.borrowed_fd())?;
+        socks.push((addr, worker, sock));
     }
     PREBOUND.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(socks);
     Ok(())
@@ -109,6 +119,8 @@ pub struct QuicListener {
     scratch: Vec<u8>,
     /// Set by a soft stop: no new connection, and a connection is closed once it is idle.
     stopping: bool,
+    /// The listening socket is the next process's now (handed over, T558): not read.
+    deaf: bool,
     /// Where each live connection's peer is, so a soft stop can pin its datagrams here.
     peers: HashMap<ConnectionId, SocketAddr>,
     /// Soft stop only: one connected UDP socket per peer still being served. See
@@ -311,6 +323,7 @@ impl QuicListener {
             outq: HashMap::new(),
             scratch: Vec::new(),
             stopping: false,
+            deaf: false,
             peers: HashMap::new(),
             pinned: Vec::new(),
             released: Vec::new(),
@@ -678,17 +691,26 @@ impl QuicListener {
             lent.next().map_or_else(|| DgramBuf::new(&mut [], &mut []), |(buf, cmsg_buf)| DgramBuf::new(buf.as_mut_slice(), cmsg_buf.as_mut_slice()))
         });
 
-        let n = self.socket.recv_batch(&mut dgram_bufs)?;
+        let n = if self.deaf { 0 } else { self.socket.recv_batch(&mut dgram_bufs)? };
         Self::dispatch(&mut self.endpoint, now, &dgram_bufs, n);
         // Datagrams of the connections a soft stop pinned. A pinned socket is drained empty
         // each time, like the listening one, so level-triggered readiness cannot spin.
         let mut total = n;
-        for (_, sock) in &self.pinned {
+        for (peer, sock) in &self.pinned {
             loop {
                 // WouldBlock is "drained"; any other error on a socket we may drop is too.
                 let got = sock.recv_batch(&mut dgram_bufs).unwrap_or(0);
                 if got == 0 {
                     break;
+                }
+                // Between its bind and its connect, a pinned socket was an unconnected member
+                // of the reuseport group: a datagram of another client queued on it then is
+                // not ours to answer (refused, it would be a lost request). Its client
+                // retransmits to the socket it belongs to.
+                for d in dgram_bufs.iter_mut().take(got) {
+                    if d.src_addr != Some(*peer) {
+                        d.truncated = true;
+                    }
                 }
                 Self::dispatch(&mut self.endpoint, now, &dgram_bufs, got);
                 total += got;
@@ -835,9 +857,8 @@ impl QuicListener {
                     // read before it may surface here): pinned too, or its datagrams may be
                     // hashed to the next process.
                     if self.stopping && !self.pinned.iter().any(|(p, _)| *p == remote) {
-                        if let Ok(sock) = DgramSocket::bind(self.addr).and_then(|s| s.connect(remote).map(|()| s)) {
-                            self.pinned.push((remote, sock));
-                        }
+                        let local = self.endpoint.connection_infos().into_iter().find(|i| i.id == conn_id).and_then(|i| i.local_ip);
+                        self.pin(remote, local);
                     }
                 }
                 TransportEvent::StreamOpened { conn_id, stream_id, dir } => {
@@ -930,6 +951,10 @@ impl QuicListener {
     pub fn begin_soft_stop(&mut self) {
         // Called once, by the engine, when the soft stop begins.
         self.stopping = true;
+        // Handed over, the listening socket is the next process's from now on: its datagrams,
+        // new connections' Initials included, are for that process to read (T558). The engine
+        // takes it out of its poller. This process's own connections are pinned below.
+        self.deaf = crate::handover::handed_over();
         self.endpoint.stop_accepting();
         self.pin_peers();
         // A connection with no request yet gets its GOAWAY after its first one, or at the end
@@ -963,13 +988,27 @@ impl QuicListener {
     /// tuple before the reuseport group is consulted, which is what keeps those datagrams
     /// here. HAProxy does the same in `quic-socket connection` mode (`quic_sock.c`).
     fn pin_peers(&mut self) {
-        let mut want: Vec<SocketAddr> = self.peers.values().copied().collect();
+        let infos = self.endpoint.connection_infos();
+        let mut want: Vec<(SocketAddr, Option<std::net::IpAddr>)> =
+            infos.iter().filter(|i| self.peers.contains_key(&i.id)).map(|i| (i.remote, i.local_ip)).collect();
         want.sort();
-        want.dedup();
-        for peer in want {
-            if let Ok(sock) = DgramSocket::bind(self.addr).and_then(|s| s.connect(peer).map(|()| s)) {
-                self.pinned.push((peer, sock));
-            }
+        want.dedup_by_key(|w| w.0);
+        for (peer, local) in want {
+            self.pin(peer, local);
+        }
+    }
+
+    /// One connected socket for `peer`, bound to the address the client reached (`local`) on a
+    /// wildcard bind, as `HAProxy`'s `qc_alloc_fd` binds the connection's local address: bound
+    /// to the wildcard, the kernel gives it the route's source address, and a client of
+    /// another local address does not match it (T552 note, VV-27).
+    fn pin(&mut self, peer: SocketAddr, local: Option<std::net::IpAddr>) {
+        let at = match local {
+            Some(ip) if self.addr.ip().is_unspecified() => SocketAddr::new(ip, self.addr.port()),
+            _ => self.addr,
+        };
+        if let Ok(sock) = DgramSocket::bind(at).and_then(|s| s.connect(peer).map(|()| s)) {
+            self.pinned.push((peer, sock));
         }
     }
 
@@ -984,6 +1023,12 @@ impl QuicListener {
             }
             keep
         });
+    }
+
+    /// Whether the listening socket is no longer read (handed over, soft stop; T558).
+    #[must_use]
+    pub const fn is_deaf(&self) -> bool {
+        self.deaf
     }
 
     /// The pinned sockets (see `begin_soft_stop`), for the engine's poller. Read-only
