@@ -778,3 +778,8 @@ moment." §4.6's week table is replaced by this; §4's slice rows and budgets st
   per-copy work) and the "of course we should do this" items. A slice that turns into fine-tuning
   of a constant stops and leaves the rest to the second pass.
 - **D-12, D-14, D-15, D-16, D-17, D-18**: approved as recommended.
+- **Finishing early / stopping point (user, 17:40):** if the queue runs dry before the run ends,
+  use the time on what this pass skipped, to hit the numbers. The numbers that matter most are the
+  **PGO** ones (the shipped build). A scenario is done when its PGO figure is at or below HAProxy
+  and what remains can't reasonably be optimised further. Whatever ends up out of scope is
+  recorded in `challenges/` (one file each, `C<task>-challenge-<slug>.md`, as C541).
