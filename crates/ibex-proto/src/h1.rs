@@ -596,30 +596,22 @@ impl H1Parser {
     /// head, names in the case they came in, and only what the parser changes (a folded value,
     /// `te: trailers`, a value past ASCII, an `Upgrade` cleaned, a `Content-Length` made one)
     /// goes to the reserve. Stops at the end of the head, as [`Self::parse`] given the head
-    /// alone does: the body stays where it is. Returns the bytes of the head read (fewer than
-    /// the head when it is not whole).
+    /// alone does: the body stays where it is. Returns the bytes of the head read: fewer than
+    /// the head when it is not whole, and then the parser does not go on from there (the
+    /// caller gives it the whole head, as `find_eoh` finds it, to a parser just reset).
     ///
     /// # Errors
     /// What [`Self::parse`] refuses the head with; `Unsupported` for a response (X3) and for a
-    /// parser past the head.
+    /// parser that is not at a request's start.
     pub fn index_head_in_place(&mut self, htx: &mut HtxSlice<'_>) -> io::Result<usize> {
-        if self.is_response || !matches!(self.phase, H1Phase::StartLine | H1Phase::Headers) {
-            return Err(io::Error::new(io::ErrorKind::Unsupported, "only a request head is indexed in place"));
+        if self.is_response || self.phase != H1Phase::StartLine {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "only a request head from its start is indexed in place"));
         }
         #[cfg(debug_assertions)]
-        if self.phase == H1Phase::StartLine {
-            REQUEST_PARSES.with(|c| c.set(c.get() + 1));
-        }
+        REQUEST_PARSES.with(|c| c.set(c.get() + 1));
         let start = htx.region().head_start;
-        let mut at = start;
-        if self.phase == H1Phase::StartLine {
-            let n = self.index_request_line(htx, at)?;
-            if n == 0 {
-                return Ok(0);
-            }
-            at += n;
-        }
-        while self.phase == H1Phase::Headers {
+        let mut at = start + self.index_request_line(htx, start)?;
+        while at > start && self.phase == H1Phase::Headers {
             let n = self.index_header_line(htx, at)?;
             if n == 0 {
                 break;

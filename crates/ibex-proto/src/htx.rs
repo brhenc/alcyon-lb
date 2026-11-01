@@ -1414,14 +1414,12 @@ impl<'a> HtxSlice<'a> {
     /// bytes that arrived.
     ///
     /// # Errors
-    /// [`HtxError::InvalidData`] when `region` is out of order or past `buf`,
-    /// [`HtxError::LimitExceeded`] when `buf` is too large for the descriptors' addresses.
+    /// [`HtxError::InvalidData`] when `region` is out of order or past `buf`, or `buf` is too
+    /// large for the descriptors' 32-bit addresses.
     pub fn over_received(buf: &'a mut [u8], region: HtxRegion) -> Result<Self, HtxError> {
-        if region.head_start > region.head_end || region.head_end > region.reserve_start || region.reserve_start > buf.len() {
+        let ordered = region.head_start <= region.head_end && region.head_end <= region.reserve_start && region.reserve_start <= buf.len();
+        if !ordered || u32::try_from(buf.len()).is_err() {
             return Err(HtxError::InvalidData);
-        }
-        if u32::try_from(buf.len()).is_err() {
-            return Err(HtxError::LimitExceeded);
         }
         Ok(Self { buf, tail_addr: region.reserve_start, num_blocks: 0, region })
     }

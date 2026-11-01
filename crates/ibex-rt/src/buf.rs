@@ -1076,6 +1076,7 @@ mod tests {
         b.consume(1);
         assert!(b.htx_over_head(head.len() + 61, 64).is_none(), "the head is longer than the readable bytes");
         assert!(b.htx_over_head(head.len(), 256).is_none(), "the reserve leaves no room for the bytes");
+        assert_eq!(b.htx_over_head(head.len(), 16).map(|(_, r)| r.head_start), Some(100), "room enough: not moved");
         let (mem, region) = b.htx_over_head(head.len(), 128).expect("fits once compacted");
         assert_eq!((region.head_start, region.head_end, region.reserve_start), (0, head.len(), 128));
         let mut htx = ibex_proto::htx::HtxSlice::over_received(mem, region).unwrap();

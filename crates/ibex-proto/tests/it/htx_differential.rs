@@ -558,6 +558,13 @@ mod in_place {
         b"GET / HTTP/1.1\r\nHost: h\r\nCookie: a=1; b=2\r\nCookie: c=3\r\n\r\n",
         b"G@T / HTTP/1.1\r\nHost: h\r\n\r\n",
         b"GET / HTTP/1.1\r\nhost: lower\r\nCONTENT-LENGTH: 0\r\n\r\n",
+        // Heads that are not whole, and refusals before the end of the head.
+        b"GET / HTT",
+        b"GET / HTTP/1.1\r",
+        b"GET / HTTP/1.1\r\nHost",
+        b"GET / HTTP/1.1\r\nHost: h\r\n",
+        b"GET / HTTP/1.1\r\nHost: h\r\nX-Fold: a\r\n b\x00c\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: h\rX-A: 1\r\n\r\n",
     ];
 
     #[test]
@@ -566,6 +573,96 @@ mod in_place {
             same(head, false).unwrap();
             same(head, true).unwrap();
         }
+    }
+
+    /// More header lines than `MAX_REQUEST_HEADERS` are refused in place as by copying.
+    #[test]
+    fn too_many_header_lines_are_refused_the_same_in_place() {
+        let mut head = b"GET / HTTP/1.1\r\nHost: h\r\n".to_vec();
+        for i in 0..120 {
+            head.extend_from_slice(format!("X-{i}: v\r\n").as_bytes());
+        }
+        head.extend_from_slice(b"\r\n");
+        let c = copied(&head, false);
+        assert!(c.facts.res.is_err());
+        let mut buf = vec![0u8; 8192];
+        buf[..head.len()].copy_from_slice(&head);
+        let region = HtxRegion { head_start: 0, head_end: head.len(), reserve_start: head.len() };
+        let mut s = HtxSlice::over_received(&mut buf, region).unwrap();
+        let mut p = H1Parser::new(false);
+        let r = p.index_head_in_place(&mut s);
+        assert_eq!(facts(&p, r), c.facts);
+    }
+
+    /// What the in-place index and the layout refuse.
+    #[test]
+    fn the_in_place_layout_refuses_what_it_cannot_hold() {
+        let head = b"GET / HTTP/1.1\r\nHost: h\r\n\r\n";
+        let mut buf = vec![0u8; 256];
+        buf[..head.len()].copy_from_slice(head);
+        let ok = HtxRegion { head_start: 0, head_end: head.len(), reserve_start: 128 };
+        for bad in [
+            HtxRegion { head_start: 5, head_end: 4, reserve_start: 128 },
+            HtxRegion { head_start: 0, head_end: 200, reserve_start: 128 },
+            HtxRegion { head_start: 0, head_end: 4, reserve_start: 300 },
+        ] {
+            assert_eq!(HtxSlice::over_received(&mut buf, bad).err(), Some(HtxError::InvalidData));
+        }
+        let mut s = HtxSlice::over_received(&mut buf, ok).unwrap();
+        assert_eq!(s.region(), ok);
+        // Ranges outside the head, a value before its name's end, a name too long.
+        assert_eq!(s.push_req_line_in_place(100..110, 3, 1), Err(HtxError::InvalidData));
+        assert_eq!(s.push_header_in_place(0..4, 2..3), Err(HtxError::InvalidData));
+        assert_eq!(s.push_header_in_place(0..4, 6..120), Err(HtxError::InvalidData));
+        // A response is not indexed in place, nor a parser past a request's start.
+        assert_eq!(H1Parser::new(true).index_head_in_place(&mut s).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+        let mut p = H1Parser::new(false);
+        assert_eq!(p.index_head_in_place(&mut s).unwrap(), head.len());
+        assert_eq!(p.index_head_in_place(&mut s).unwrap_err().kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(s.payload_bytes(), 0);
+        assert_eq!(s.fragmented_bytes(), 0);
+        // An edit that fails for another reason than room is not retried.
+        assert_eq!(s.retry_after_defrag(|s| s.replace_block_value(0, b"x").and(Err::<(), _>(HtxError::InvalidData))), Err(HtxError::InvalidData));
+        s.clear();
+        assert_eq!((s.num_blocks(), s.tail_addr()), (0, 128));
+        s.defrag();
+        assert_eq!(s.tail_addr(), 128);
+        // A reserve with no room for a descriptor.
+        let full = HtxRegion { head_start: 0, head_end: head.len(), reserve_start: 256 };
+        let mut s = HtxSlice::over_received(&mut buf, full).unwrap();
+        assert_eq!(s.push_header_in_place(16..20, 22..23), Err(HtxError::OutOfMemory));
+        let mut long = vec![b'n'; 300];
+        long.extend_from_slice(b": v\r\n");
+        let mut big = vec![0u8; 1024];
+        big[..long.len()].copy_from_slice(&long);
+        let region = HtxRegion { head_start: 0, head_end: long.len(), reserve_start: 512 };
+        let mut s = HtxSlice::over_received(&mut big, region).unwrap();
+        assert_eq!(s.push_header_in_place(0..300, 302..303), Err(HtxError::LimitExceeded));
+    }
+
+    /// The invariants check names a region out of order and a block outside it; slices that
+    /// differ by a header name are not equal; the debug form shows in-place fields.
+    #[test]
+    fn invariants_equality_and_debug_know_the_gap() {
+        let head = b"GET / HTTP/1.1\r\nHost: h\r\nX-A: 1\r\n\r\n";
+        let p = placed(head, b"", 256, false);
+        let v = HtxSliceRef::new(&p.buf, p.blocks);
+        assert!(v.check_invariants_in(p.tail, p.region).is_ok());
+        let late = HtxRegion { reserve_start: p.tail + 1, ..p.region };
+        assert!(v.check_invariants_in(p.tail, late).unwrap_err().contains("out of order"));
+        // A head shorter than the one indexed leaves its blocks outside.
+        let short = HtxRegion { head_end: p.region.head_start + 5, ..p.region };
+        assert!(v.check_invariants_in(p.tail, short).unwrap_err().contains("outside"));
+        let other = placed(b"GET / HTTP/1.1\r\nHost: h\r\nX-B: 1\r\n\r\n", b"", 256, false);
+        assert!(v != HtxSliceRef::new(&other.buf, other.blocks));
+        assert!(v == HtxSliceRef::new(&p.buf, p.blocks));
+        let c = copied(head, false);
+        assert!(v == HtxSliceRef::new(&c.buf, c.blocks), "in place and copied hold the same blocks");
+        assert!(format!("{v:?}").contains("(\"X-A\", \"1\")"));
+        let mut t = vec![0u8; 512];
+        let mut s = HtxSlice::new(&mut t);
+        s.push_trailer("x-t", "tv").unwrap();
+        assert!(format!("{:?}", s.as_ref()).contains("(\"Trailer\", \"x-t\", \"tv\")"));
     }
 
     #[test]
