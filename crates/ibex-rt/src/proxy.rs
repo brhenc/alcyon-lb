@@ -1142,7 +1142,7 @@ impl TcpSession {
         c.server_addr = owner.server_addr;
         c.fc_src = owner.fc_src;
         c.fc_dst = owner.fc_dst;
-        c.created_at = Instant::now();
+        c.created_at = crate::txnlog::loop_now();
         c.bufsize = owner.bufsize;
         c.maxrewrite = owner.maxrewrite;
         // The `tcp-request content` rules the owner armed for the next request run on this
@@ -1398,7 +1398,7 @@ impl TcpSession {
             cli_cant_recv: false,
             passes_ran_out: false,
             cli_failed: false,
-            created_at: Instant::now(),
+            created_at: crate::txnlog::loop_now(),
             bufsize: crate::buf::get_bufsize(),
             maxrewrite: 1024,
             pending_resp: None,

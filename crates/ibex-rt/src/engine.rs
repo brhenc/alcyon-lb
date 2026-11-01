@@ -5637,8 +5637,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// # Errors
     /// Returns an error if polling epoll fails.
     pub fn run_once(&mut self) -> io::Result<usize> {
-        let now = self.current_tick();
-        self.step(now)
+        let at = Instant::now();
+        self.step_at(self.tick_at(at), at)
     }
 
     /// Registers any backend socket a QUIC listener has opened since the last pass.
@@ -5904,6 +5904,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     }
 
     pub fn step(&mut self, now: Tick) -> io::Result<usize> {
+        self.step_at(now, Instant::now())
+    }
+
+    /// [`Self::step`] with the clock already read: `now_inst` is the instant `now` was taken
+    /// from, what the deadlines before the poller are measured against.
+    fn step_at(&mut self, now: Tick, now_inst: Instant) -> io::Result<usize> {
         self.now = now;
         crate::watchdog::progress();
         crate::watchdog::set_streams(self.sessions.live());
@@ -5940,7 +5946,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
         // A QUIC transport's next deadline can be sooner than the scheduler's. Waiting past
         // it would delay loss recovery; the shortest of the two wins.
-        let now_inst = Instant::now();
         let poll_timeout = self
             .quic_listeners
             .iter()
@@ -6093,7 +6098,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // has expired. `poll_timeout` is asked rather than calling `handle_timeout` on each
         // wakeup, because a transport told the time has advanced when it has not will arm and
         // fire loss-recovery timers that are not due.
-        let inst = Instant::now();
+        // The pass's clock: read once after the poller, as everything since.
+        let inst = pass_start;
         for ql in &mut self.quic_listeners {
             let timer_due = ql.poll_timeout().is_some_and(|d| d <= inst);
             if timer_due {
@@ -6768,8 +6774,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     break;
                 }
             }
-            let now = self.current_tick();
-            let ran = self.step(now)?;
+            // One clock read before the poller (`now` and the deadlines it waits for) and
+            // one after it (`pass_start`), as HAProxy's two `clock_update_date` (T550 Q2).
+            let at = Instant::now();
+            let ran = self.step_at(self.tick_at(at), at)?;
             quiet = ran == 0 && self.scheduler.run_queue_len() == 0;
         }
         Ok(())
@@ -8783,7 +8791,7 @@ fn release_server(
             // first response on: `HAProxy` keeps it in the server's available list (A.3 row 7,
             // 1 connection for 5 clients one after the other; T540).
             let safe = entry.srv_served >= 2 || xprt.is_h2();
-            if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt }, safe, cfg, used, Instant::now()) {
+            if let Err(conn) = idle_pool.keep(key, IdleConn { fd: srv_fd, xprt }, safe, cfg, used, crate::txnlog::loop_now()) {
                 // Closing its only descriptor takes it out of the epoll set.
                 fdtab.remove(sfd);
                 conn.close();
