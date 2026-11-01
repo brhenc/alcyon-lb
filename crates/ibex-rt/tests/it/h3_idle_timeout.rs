@@ -8,18 +8,43 @@
 
 use crate::common;
 
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+fn cli(sock: &str, cmd: &str) -> String {
+    let mut s = UnixStream::connect(sock).expect("cli");
+    s.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+    s.write_all(format!("{cmd}\n").as_bytes()).expect("write");
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+fn counts(sock: &str) -> (u64, u64) {
+    let info = cli(sock, "show info");
+    let c = info.lines().find_map(|l| l.strip_prefix("CurrConns: ")).and_then(|v| v.trim().parse().ok()).unwrap_or(99);
+    let stat = cli(sock, "show stat");
+    let s = stat.lines().find(|l| l.starts_with("fe,FRONTEND,")).and_then(|l| l.split(',').nth(4)).and_then(|v| v.parse().ok()).unwrap_or(99);
+    (c, s)
+}
+
 fn run(tag: &str, req: u32, ping: &str) {
+    run_max(tag, req, ping, 100);
+}
+
+/// `maxconn` of the frontend: two idle closes, then a third client is still served.
+fn run_max(tag: &str, req: u32, ping: &str, maxconn: u32) {
     let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
     let quic = common::reserve_addr();
     let dir = std::env::temp_dir().join(format!("t562-{tag}-{}-{}", common::h3_path_name(), std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("dir");
+    let sock = dir.join("cli.sock").display().to_string();
     let cfg = format!(
-        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 2s\n  timeout client 500ms\n  timeout server 30s\n\
-         frontend fe\n  bind quic4@{quic} ssl crt {crt} alpn h3\n  http-request return status 200 content-type text/plain string ok\n"
+        "global\n  stats socket {sock} level admin\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 2s\n  timeout client 500ms\n  timeout server 30s\n\
+         frontend fe\n  maxconn {maxconn}\n  bind quic4@{quic} ssl crt {crt} alpn h3\n  http-request return status 200 content-type text/plain string ok\n"
     );
     let path = dir.join("c.cfg");
     std::fs::write(&path, cfg).expect("cfg");
@@ -27,14 +52,28 @@ fn run(tag: &str, req: u32, ping: &str) {
     let _ibex = common::Ibex(child);
     std::thread::sleep(Duration::from_millis(700));
     let script = format!("{}/tests/data/h3_idle.py", env!("CARGO_MANIFEST_DIR"));
-    let t = Instant::now();
-    let out = Command::new("python3")
-        .args([&script, &quic.port().to_string(), &req.to_string(), ping, "6", "30"])
-        .output()
-        .expect("python3 with aioquic");
-    let out = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    assert!(out.contains("CLOSED"), "the proxy kept an idle connection past `timeout client 500ms` ({tag}): {out}");
-    assert!(t.elapsed() < Duration::from_secs(4), "closed too late: {:?} {out}", t.elapsed());
+    let port = quic.port().to_string();
+    let client = || {
+        let t = Instant::now();
+        let out = Command::new("python3").args([&script, &port, &req.to_string(), ping, "6", "30"]).output().expect("python3 with aioquic");
+        let out = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.contains("CLOSED"), "the proxy kept an idle connection past `timeout client 500ms` ({tag}): {out}");
+        assert!(t.elapsed() < Duration::from_secs(4), "closed too late: {:?} {out}", t.elapsed());
+        // Its slot comes back with the close (T561's release reaches this path too).
+        let end = Instant::now() + Duration::from_secs(1);
+        loop {
+            let (c, s) = counts(&sock);
+            if c == 0 && s == 0 {
+                break;
+            }
+            assert!(Instant::now() < end, "closed by `timeout client`, but CurrConns={c} scur={s} ({tag})");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let rounds = if maxconn < 100 { maxconn + 1 } else { 1 };
+    for _ in 0..rounds {
+        client();
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -51,4 +90,9 @@ fn silent_after_request() {
 #[test]
 fn pinging_client() {
     common::on_h3_path("mux", || run("ping", 1, "0.2"));
+}
+
+#[test]
+fn maxconn_slots_come_back() {
+    common::on_h3_path("mux", || run_max("max", 1, "0", 2));
 }
