@@ -7,7 +7,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -27,6 +27,10 @@ const BATCH_SIZE: usize = 32;
 const DGRAM_BUF_SIZE: usize = 2048;
 /// Control message buffer capacity per datagram for `IP_PKTINFO`.
 const CMSG_BUF_SIZE: usize = 128;
+/// How long a soft stop waits for the first request of a connection that has sent none
+/// (T558); the mux path's is `engine::H3_STOP_FIRST_REQUEST_MS`.
+const STOP_FIRST_REQUEST: Duration = Duration::from_millis(crate::engine::H3_STOP_FIRST_REQUEST_MS as u64);
+
 /// H3_NO_ERROR (RFC 9114 section 8.1), the application error code of a graceful close.
 const H3_NO_ERROR: u64 = 0x100;
 /// Two eight-byte varints: the largest frame header, which a buffer may hold on top of a
@@ -233,6 +237,8 @@ struct H3State {
     next_request: u64,
     /// A GOAWAY went out, or the connection was closed.
     draining: bool,
+    /// Soft stop: until when a connection with no request yet waits for its first (T558).
+    fresh_until: Option<Instant>,
 }
 
 impl QuicListener {
@@ -753,7 +759,16 @@ impl QuicListener {
     /// Returns the next earliest timer expiry instant.
     #[must_use]
     pub fn poll_timeout(&self) -> Option<Instant> {
-        self.endpoint.poll_timeout()
+        let t = self.endpoint.poll_timeout();
+        if !self.stopping {
+            return t;
+        }
+        // The end of a fresh connection's wait for its first request (T558).
+        let fresh = self.h3.values().filter(|st| st.next_request == 0).filter_map(|st| st.fresh_until).min();
+        match (t, fresh) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Polls for the next queued transport event.
@@ -816,6 +831,14 @@ impl QuicListener {
                 }
                 TransportEvent::NewConnection { conn_id, remote } => {
                     self.peers.insert(conn_id, remote);
+                    // One the stop did not know of (none is accepted after it, but an Initial
+                    // read before it may surface here): pinned too, or its datagrams may be
+                    // hashed to the next process.
+                    if self.stopping && !self.pinned.iter().any(|(p, _)| *p == remote) {
+                        if let Ok(sock) = DgramSocket::bind(self.addr).and_then(|s| s.connect(remote).map(|()| s)) {
+                            self.pinned.push((remote, sock));
+                        }
+                    }
                 }
                 TransportEvent::StreamOpened { conn_id, stream_id, dir } => {
                     self.stream_event(conn_id, stream_id, dir == StreamDirection::Bidirectional, &mut scratch);
@@ -909,8 +932,15 @@ impl QuicListener {
         self.stopping = true;
         self.endpoint.stop_accepting();
         self.pin_peers();
+        // A connection with no request yet gets its GOAWAY after its first one, or at the end
+        // of its grace (`drain_idle_connections`, T558).
+        let fresh_until = Instant::now() + STOP_FIRST_REQUEST;
         for (conn_id, st) in &mut self.h3 {
-            Self::send_goaway(&mut self.endpoint, *conn_id, st);
+            if st.next_request == 0 {
+                st.fresh_until = Some(fresh_until);
+            } else {
+                Self::send_goaway(&mut self.endpoint, *conn_id, st);
+            }
         }
         // Each owner (the mux path) sends its own GOAWAY and closes when idle: woken now, or
         // one whose client went quiet sleeps through the stop until quinn's idle timeout (T511).
@@ -983,10 +1013,23 @@ impl QuicListener {
         }
     }
 
-    /// Closes, with H3_NO_ERROR, every connection that owes no response.
+    /// Closes, with `H3_NO_ERROR`, every connection that owes no response, after its GOAWAY.
+    /// One that has sent no request yet waits for its first, until its `fresh_until` (T558).
     fn drain_idle_connections(&mut self) {
         let mut idle = Vec::new();
+        let now = Instant::now();
+        for (conn_id, st) in &mut self.h3 {
+            if st.next_request == 0 && st.fresh_until.is_some_and(|t| now < t) {
+                continue;
+            }
+            // Its wait is over (a request came, or the time is up): no timer for it any more.
+            st.fresh_until = None;
+            Self::send_goaway(&mut self.endpoint, *conn_id, st);
+        }
         for (conn_id, st) in &self.h3 {
+            if st.fresh_until.is_some() {
+                continue;
+            }
             let owes = !st.unacked.is_empty()
                 || st.req.values().any(|b| !b.is_empty())
                 || self.relays.iter().any(|r| r.conn_id == *conn_id)
@@ -1048,7 +1091,12 @@ impl QuicListener {
         let Ok(sid) = self.endpoint.open_stream(conn_id, StreamDirection::Unidirectional) else {
             return;
         };
-        self.h3.entry(conn_id).or_default().control = Some(sid);
+        let st = self.h3.entry(conn_id).or_default();
+        st.control = Some(sid);
+        // Its handshake ended during a soft stop: it waits for its first request (T558).
+        if self.stopping {
+            st.fresh_until = Some(Instant::now() + STOP_FIRST_REQUEST);
+        }
         let bytes = mux_h3::encode_control_stream_open();
         let _ = self.endpoint.write_stream(conn_id, sid, &bytes, false);
     }

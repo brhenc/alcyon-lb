@@ -5776,13 +5776,20 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     continue;
                 };
                 sess.h3 = true;
+                // Admitted during a soft stop (its handshake ended after it began, T558): its
+                // streams are served as those of the sessions the stop found (`begin_soft_stop`),
+                // their server connections not kept for a request that will not come.
+                if self.stopping {
+                    sess.stopping = true;
+                    sess.close_client = true;
+                }
                 sess.cli_state = ScState::Established;
                 sess.cli_exp = Tick::ETERNITY;
                 sess.req_exp = Tick::ETERNITY;
                 // Its role, which keeps its children and its mux, is made now (two `Box`es a
                 // connection).
                 sess.h2_role = Some(Box::new(crate::proxy::H2Role::Owner(crate::proxy::H2Owner {
-                    h3: Some(Box::new(crate::proxy::H3Owner { mux, listener: usize_to_u32(q_idx), conn, body_scratch: Vec::new(), idle_start: self.now, closing: false })),
+                    h3: Some(Box::new(crate::proxy::H3Owner { mux, listener: usize_to_u32(q_idx), conn, body_scratch: Vec::new(), idle_start: self.now, closing: false, stop_grace: None })),
                     ..Default::default()
                 })));
                 let entry = SessionEntry {
@@ -7961,6 +7968,13 @@ fn arm_res_inspect(proxy: &Proxy, sess: &mut TcpSession) {
 /// Unset, the environment variable `IBEX_H3_PATH` (`mux` or `relay`) decides, so that the h3
 /// tests run on both paths without a configuration of their own; else the mux (the default
 /// since T536).
+/// How long a soft stop waits for the first request of an HTTP/3 connection that has sent
+/// none (T558): long enough for a client's request lost on its way (sent while the reuseport
+/// group was changing, before the connection was pinned) to be retransmitted -- quinn's and
+/// ngtcp2's probe timeouts are tens of milliseconds on a short path, doubling -- and short
+/// enough that a connection opened and left idle does not keep the old process long.
+pub const H3_STOP_FIRST_REQUEST_MS: u32 = 1000;
+
 fn h3_mux(keyword: Option<bool>) -> bool {
     keyword.unwrap_or_else(|| std::env::var("IBEX_H3_PATH").map_or(true, |v| v != "relay"))
 }
@@ -10612,13 +10626,24 @@ impl EngineDispatcher<'_> {
         let Some(crate::proxy::H2Role::Owner(crate::proxy::H2Owner { children: served_by, h3: Some(h3), .. })) = e.sess.h2_role.as_deref_mut() else { return Outcome::Done };
         let served = |id: u64| served_by.iter().any(|l| u64::from(l.stream_id) == id);
         let ql = &mut self.quic_listeners[q_idx];
+        // A connection that has sent no request yet when the soft stop reaches it -- one the
+        // client opened to send one, whose request may be on the wire, or one whose handshake
+        // ends during the stop -- waits for that first request, at most
+        // `H3_STOP_FIRST_REQUEST_MS`; it is then served and drained as any other (T558,
+        // VV-30). `HAProxy` sends GOAWAY(0) and closes it at once, and the request is lost.
+        let stopping = ql.is_stopping();
+        let grace = if stopping { *h3.stop_grace.get_or_insert(now.add(H3_STOP_FIRST_REQUEST_MS)) } else { Tick::ETERNITY };
+        let fresh = stopping && h3.mux.last_client_stream_id.is_none() && !grace.is_expired(now);
         // The GOAWAY of a soft stop goes out in this pass: framed after the write, it was
         // what kept an idle owner from closing, nothing waking it to write it (T511).
-        if ql.is_stopping() {
+        let goaway_before = h3.mux.goaway_sent.is_some();
+        if stopping && !fresh {
             h3.mux.send_goaway();
         }
         ql.owner_send(conn, &mut h3.mux, |id| !served(id));
         let idle = children == 0 && !ibex_proto::htx_mux::HtxMux::tx_pending(&*h3.mux);
+        // A request whose head is still arriving is in flight too: the drain waits for it.
+        let in_flight = ibex_proto::htx_mux::HtxMux::next_dispatch(&*h3.mux).is_some() || h3.mux.head_partial().is_some();
         let failed = h3.mux.error.is_some();
         for i in 0..children {
             let Some(link) = self.sessions.get(owner_idx).and_then(|e| e.sess.h2_owner()).and_then(|o| o.children.get(i).copied()) else { break };
@@ -10635,7 +10660,17 @@ impl EngineDispatcher<'_> {
         // the client had not received yet (T521): it closes.
         let ended = !matches!(e.sess.cli_state, ScState::Ready | ScState::Established);
         let ql = &self.quic_listeners[q_idx];
-        let drained = idle && ql.is_stopping() && !ql.owner_unacked(conn);
+        let drained = idle && stopping && !fresh && !in_flight && !ql.owner_unacked(conn);
+        // Its GOAWAY was framed in this pass: the close waits for the next one, as a timer's
+        // does, or quinn drops the GOAWAY with the close (T558: the client of a connection
+        // idle at the stop saw only CONNECTION_CLOSE).
+        if drained && !goaway_before && !ended && !failed {
+            if let Some(h3) = e.sess.h3_owner_mut() {
+                h3.closing = true;
+            }
+            self.wake_queue.push(task);
+            return Outcome::Keep;
+        }
         if ended || failed || drained || e.sess.h3_owner().is_some_and(|h| h.closing) {
             if !failed {
                 self.quic_listeners[q_idx].owner_close(conn);
@@ -10654,6 +10689,7 @@ impl EngineDispatcher<'_> {
             self.wake_queue.push(task);
         }
         let exp = h3_owner_deadline(&e.sess, now);
+        let exp = if fresh { exp.earliest(grace) } else { exp };
         if exp.is_expired(now) {
             // `qcc_timeout_task` -> `qcc_shutdown`: a GOAWAY now, the close in the next
             // pass, once the GOAWAY is out (quinn sends no stream data after a close).
