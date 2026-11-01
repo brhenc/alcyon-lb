@@ -53,6 +53,7 @@ mod bind_name;
 mod bind_options_per_bind;
 mod listen_backlog;
 mod log_abort_during_connect;
+mod local_reply_connection;
 mod cold_start_timers;
 mod body_after_head_rewrite;
 mod buffer_wait;

@@ -2072,14 +2072,24 @@ impl TcpSession {
         // an opaque run of bytes, and says nothing about `Connection`.
         // The answer to a HEAD is the head alone, on either protocol (T296).
         let raw = if txn.client_head { &raw[..head_len.min(raw.len())] } else { raw };
+        // The token is the one a server's response gets (`h1_update_res_conn_value`): `close` for
+        // a page that says HTTP/1.1, `keep-alive` on an open connection when the page or the
+        // request is not HTTP/1.1 -- the HTTP/1.0 client of `ab -k` waits for it (T563).
+        let token = if announce_close && !h2 && !raw.is_empty() && !has_header(&head, "connection") && txn.status >= 200 {
+            txn::response_connection_token(txn.close_after, head.starts_with("HTTP/1.1"), txn.req_http11, false)
+        } else {
+            None
+        };
         let mut out;
-        let raw = if announce_close && !h2 && txn.close_after && !raw.is_empty() && !has_header(&head, "connection") {
+        let raw = if let Some(token) = token {
             // The client is told, as for a server's response: last in the head, as
             // `inject_connection_close_header_zero_alloc` places it.
             let at = find_eoh(raw).map_or(0, |(h, e)| h + e / 2);
-            out = Vec::with_capacity(raw.len() + 19);
+            out = Vec::with_capacity(raw.len() + 24);
             out.extend_from_slice(&raw[..at]);
-            out.extend_from_slice(b"connection: close\r\n");
+            out.extend_from_slice(b"connection: ");
+            out.extend_from_slice(token.as_bytes());
+            out.extend_from_slice(b"\r\n");
             out.extend_from_slice(&raw[at..]);
             out.as_slice()
         } else {
