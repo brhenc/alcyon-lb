@@ -366,6 +366,7 @@ mod sc_src_fetches;
 mod scheduler_task_reuse;
 mod server_and_option_keywords;
 mod server_disabled_use_server;
+mod server_maxconn_workers;
 mod server_hostnames;
 mod server_request_header_case;
 mod server_reuse_chunked;

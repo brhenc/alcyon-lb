@@ -2188,6 +2188,44 @@ impl Proxy {
         })
     }
 
+    /// Takes one of server `idx`'s connection slots: in one step with the check against its
+    /// `maxconn`, so that two workers never both take its last one (T590). `HAProxy` checks
+    /// `srv->served < srv_dynamic_maxconn(srv)` and counts the stream under the server's
+    /// lock (`assign_server_and_queue`, `pendconn_dequeue`). `None`: the server is full.
+    /// Without a `maxconn` the slot is always there, and counted only with `count_unlimited`
+    /// (`Some(false)`: the caller counts it when the connection is in use, T224).
+    #[must_use]
+    pub fn take_server_slot(&self, idx: usize, count_unlimited: bool) -> Option<bool> {
+        let Some(cur) = self.server_actconn.get(idx) else { return Some(false) };
+        match self.server_maxconn.get(idx).filter(|&mc| mc > 0) {
+            None => {
+                if count_unlimited {
+                    cur.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(count_unlimited)
+            }
+            Some(mc) => cur.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| (c < mc).then_some(c + 1)).ok().map(|_| true),
+        }
+    }
+
+    /// A server `pick` gives, with its slot taken ([`Proxy::take_server_slot`]; the `bool`:
+    /// counted). A server another worker filled since `pick` saw room in it is passed over
+    /// and `pick` asked again: it no longer offers that one while it is full. `None` when
+    /// every pick was full (the request queues then: [`Proxy::all_servers_full`]) or there
+    /// is no server; the dispatch address takes no slot.
+    pub fn pick_and_take(
+        &self,
+        count_unlimited: bool,
+        mut pick: impl FnMut() -> Option<(Option<usize>, SocketAddr)>,
+    ) -> Option<((Option<usize>, SocketAddr), bool)> {
+        (0..=self.servers.len())
+            .find_map(|_| match pick() {
+                Some((Some(i), addr)) => self.take_server_slot(i, count_unlimited).map(|counted| Some(((Some(i), addr), counted))),
+                other => Some(other.map(|t| (t, false))),
+            })
+            .flatten()
+    }
+
     /// Selects the target backend server using the configured load balancing algorithm,
     /// preferring primary servers over backup servers,
     /// or falls back to the dispatch address if all servers are down or absent.
@@ -8212,7 +8250,8 @@ fn register_new_session(
     if target_addr.is_some() {
         count_connect(&engine.proxies, proxy_idx, target_server_idx, false);
     }
-    if let Some(idx) = target_server_idx {
+    // A balanced pick counted its server when it took the slot (`init_client_session`).
+    if let Some(idx) = target_server_idx.filter(|_| !sess.lb_picked) {
         if idx < proxy.server_actconn.len() {
             proxy.server_actconn[idx].fetch_add(1, Ordering::Relaxed);
         }
@@ -8586,9 +8625,16 @@ fn init_client_session(
         && proxy.default_backend.is_none()
     {
         sess.lb_picked = use_server.is_none();
+        // A balanced pick takes its server's slot with it (T590), on the index the session
+        // is counted on (`register_new_session`); `use-server` is counted there.
         target_addr = match use_server {
             Some(i) => Some(proxy.servers.at(i)),
-            None => proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref()),
+            None => proxy
+                .pick_and_take(true, || {
+                    let a = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref())?;
+                    Some((proxy.servers.iter().position(|s| s == a), a))
+                })
+                .map(|((_, a), _)| a),
         };
         if let Some(target) = target_addr {
             let proxies: &[Proxy] = proxies;
@@ -14223,14 +14269,32 @@ impl EngineDispatcher<'_> {
     ) -> Option<crate::stats_html::AdminAction> {
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
         entry.sess.lb_picked = cookie_server.is_none();
+        // The server's slot is taken with the pick (T590): checked apart, two workers both
+        // took a `maxconn 1` server's last one. A server persistence names takes it whether
+        // or not it is full, as before.
+        // Only a server with a `maxconn` is counted here; the others are counted once their
+        // connection is in use, below (T224). `counted`: the slot is counted already.
+        let be = &proxies[be_idx];
+        let pick = || be.pick_and_take(false, || be.select_server_with_key_idx(source_ip, entry.sess.req_uri.as_deref()));
+        let mut full = false;
         let target = if let Some(idx) = cookie_server {
-            Some((Some(idx), proxies[be_idx].servers.at(idx)))
+            Some(((Some(idx), be.servers.at(idx)), false))
         } else {
-            proxies[be_idx].select_server_with_key_idx(source_ip, entry.sess.req_uri.as_deref())
+            // No pick while a server looked full, and no longer full when asked, is a slot
+            // another worker freed in between: asked again rather than refused (`SRV_STATUS_FULL`
+            // is decided under the lock in `HAProxy`). The verdict that queues is the one seen
+            // here, not one read again later.
+            let limited = || (0..be.servers.len()).any(|i| be.server_maxconn.get(i).is_some_and(|m| m > 0));
+            let mut tries = 0..3;
+            loop {
+                let t = pick();
+                full = t.is_none() && be.all_servers_full();
+                if t.is_some() || full || tries.next().is_none() || !limited() { break t; }
+            }
         };
 
-        let Some((picked_idx, target_addr)) = target else {
-            if cookie_server.is_none() && proxies[be_idx].all_servers_full() {
+        let Some(((picked_idx, target_addr), counted)) = target else {
+            if full {
                 return Self::wait_in_queue(entry, proxies, now, be_idx);
             }
             proxies[be_idx].counters().failed_conn.fetch_add(1, Ordering::Relaxed);
@@ -14284,9 +14348,17 @@ impl EngineDispatcher<'_> {
                 // The connection is already there, so `%Tw` and `%Tc` are both 0, not
                 // -1 and the time from the request to now.
                 entry.sess.log.queue.get_or_insert_with(crate::txnlog::loop_now);
+                // A parked connection is in use again: the slot taken with the pick, or one
+                // counted now. One that was not parked holds its own, and the pick's goes back.
                 if entry.sess.srv_park_exp.is_set() {
                     entry.sess.srv_park_exp = Tick::ETERNITY;
-                    server_actconn_add(entry, proxies, true);
+                    if !counted {
+                        server_actconn_add(entry, proxies, true);
+                    }
+                } else if counted {
+                    if let Some(a) = picked_idx.and_then(|i| proxies[be_idx].server_actconn.get(i)) {
+                        a.fetch_sub(1, Ordering::Relaxed);
+                    }
                 }
                 entry.sess.server_connected(now);
                 entry.sess.bc_idle = false;
@@ -14338,7 +14410,8 @@ impl EngineDispatcher<'_> {
         // connection taken from the pool was in use and idle at once, and another worker
         // weighing a release (`srv_add_to_idle_list`) saw one more than there were and closed
         // a connection the next burst needed (T224: 9 server connections where 8 serve).
-        if let Some(idx) = s_idx {
+        // A server with a `maxconn` was counted with the pick (T590).
+        if let Some(idx) = s_idx.filter(|_| !counted) {
             if idx < proxies[be_idx].server_actconn.len() {
                 proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);
             }
@@ -14532,19 +14605,22 @@ impl EngineDispatcher<'_> {
         let assigned = chosen.is_some();
         let direct = chosen.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned));
         entry.sess.lb_picked = direct.is_none();
+        // The slot is taken with the pick (T590); a server persistence names is counted
+        // whether or not it is full, as before.
+        let be = &proxies[be_idx];
         let target = match direct {
-            Some(i) => Some((Some(i), proxies[be_idx].servers.at(i))),
-            None => proxies[be_idx].select_server_with_key_idx(source_ip, entry.sess.req_uri.as_deref()),
+            Some(i) => Some(((Some(i), be.servers.at(i)), false)),
+            None => be.pick_and_take(true, || be.select_server_with_key_idx(source_ip, entry.sess.req_uri.as_deref())),
         };
 
-        let Some((s_idx, target_addr)) = target else {
+        let Some(((s_idx, target_addr), counted)) = target else {
             entry.sess.srv_state = ScState::Error;
             return;
         };
 
         count_server_session(proxies, be_idx, s_idx);
 
-        if let Some(idx) = s_idx {
+        if let Some(idx) = s_idx.filter(|_| !counted) {
             if idx < proxies[be_idx].server_actconn.len() {
                 proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);
             }
