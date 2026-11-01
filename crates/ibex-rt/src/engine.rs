@@ -2218,17 +2218,12 @@ impl Proxy {
         count_unlimited: bool,
         mut pick: impl FnMut() -> Option<(Option<usize>, SocketAddr)>,
     ) -> Option<((Option<usize>, SocketAddr), bool)> {
-        for _ in 0..=self.servers.len() {
-            match pick() {
-                Some((Some(i), addr)) => {
-                    if let Some(counted) = self.take_server_slot(i, count_unlimited) {
-                        return Some(((Some(i), addr), counted));
-                    }
-                }
-                other => return other.map(|t| (t, false)),
-            }
-        }
-        None
+        (0..=self.servers.len())
+            .find_map(|_| match pick() {
+                Some((Some(i), addr)) => self.take_server_slot(i, count_unlimited).map(|counted| Some(((Some(i), addr), counted))),
+                other => Some(other.map(|t| (t, false))),
+            })
+            .flatten()
     }
 
     /// Selects the target backend server using the configured load balancing algorithm,
@@ -14289,15 +14284,13 @@ impl EngineDispatcher<'_> {
             // another worker freed in between: asked again rather than refused (`SRV_STATUS_FULL`
             // is decided under the lock in `HAProxy`). The verdict that queues is the one seen
             // here, not one read again later.
-            let mut t = None;
-            for _ in 0..4 {
-                t = pick();
+            let limited = || (0..be.servers.len()).any(|i| be.server_maxconn.get(i).is_some_and(|m| m > 0));
+            let mut tries = 0..3;
+            loop {
+                let t = pick();
                 full = t.is_none() && be.all_servers_full();
-                if t.is_some() || full || !(0..be.servers.len()).any(|i| be.server_maxconn.get(i).is_some_and(|m| m > 0)) {
-                    break;
-                }
+                if t.is_some() || full || tries.next().is_none() || !limited() { break t; }
             }
-            t
         };
 
         let Some(((picked_idx, target_addr), counted)) = target else {

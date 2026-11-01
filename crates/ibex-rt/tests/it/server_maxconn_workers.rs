@@ -78,6 +78,34 @@ impl Drop for Ibex {
     }
 }
 
+/// A keep-alive server: every request on a connection answered at once.
+fn keepalive_backend() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        buf.drain(..end + 4);
+                        if conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").is_err() {
+                            return;
+                        }
+                    }
+                    match conn.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
 fn start(servers: &str) -> Ibex {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
@@ -118,13 +146,17 @@ fn cli(ibex: &Ibex, cmd: &str) -> String {
     out
 }
 
-/// `smax` of `be,<sv>` in `show stat`.
-fn smax(ibex: &Ibex, sv: &str) -> String {
+/// Field `n` of `be,<sv>` in `show stat` (4: `scur`, 5: `smax`).
+fn stat(ibex: &Ibex, sv: &str, n: usize) -> String {
     let text = cli(ibex, "show stat");
     text.lines()
         .find(|l| l.starts_with(&format!("be,{sv},")))
-        .and_then(|l| l.split(',').nth(5))
+        .and_then(|l| l.split(',').nth(n))
         .map_or_else(|| format!("<no be,{sv} in {text:?}>"), str::to_string)
+}
+
+fn smax(ibex: &Ibex, sv: &str) -> String {
+    stat(ibex, sv, 5)
 }
 
 /// `CLIENTS` requests at once; every one is answered.
@@ -165,4 +197,34 @@ fn set_maxconn_server_holds_across_workers() {
     assert_eq!(cli(&ibex, "set maxconn server be/b 1"), "\n");
     burst(ibex.fe);
     assert_eq!((a.peak.load(Ordering::SeqCst), b.peak.load(Ordering::SeqCst)), (1, 1), "a server held more than its maxconn 1");
+}
+
+/// Under `http-reuse never` the server connection stays on its session between requests and
+/// is counted as in use there; the slot a later request on it takes with the pick goes back,
+/// since that connection holds one already: `scur` stays 1 and is 0 once the client left.
+#[test]
+fn kept_connection_gives_back_the_slot_of_its_next_request() {
+    let be = keepalive_backend();
+    let ibex = start(&format!("  http-reuse never\n  server a {be} maxconn 2\n"));
+    let mut c = TcpStream::connect(ibex.fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    for _ in 0..3 {
+        c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+            match c.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got.extend_from_slice(&chunk[..n]),
+            }
+        }
+        assert!(got.starts_with(b"HTTP/1.1 200"), "{:?}", String::from_utf8_lossy(&got));
+        assert_eq!(stat(&ibex, "a", 4), "1", "scur with one connection kept");
+    }
+    drop(c);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while stat(&ibex, "a", 4) != "0" && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(stat(&ibex, "a", 4), "0", "scur once the client left");
 }
