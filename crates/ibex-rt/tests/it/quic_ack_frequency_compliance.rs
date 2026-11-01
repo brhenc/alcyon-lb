@@ -364,6 +364,11 @@ fn without_ack_frequency_the_excess_has_no_sample_and_the_ratio_is_still_counted
         eprintln!("off: {r:?}");
         assert_eq!(r.hdr("x-excess"), None, "{r:?}");
         assert!(num(&r, "x-only") > 10 && num(&r, "x-sent") > 10 && num(&r, "x-ratio") > 0, "{r:?}");
+        // The connection is not judged: no threshold, no excess.
+        let out = cli(&rig.sock, "show quic ibex-acks");
+        let line = out.lines().nth(1).unwrap_or_else(|| panic!("no connection: {out}"));
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(cols[cols.len() - 2..], ["-", "-"], "{out}");
         let info = cli(&rig.sock, "show info");
         assert!(!info.contains("QuicAck"), "{info}");
     });
