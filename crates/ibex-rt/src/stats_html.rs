@@ -54,49 +54,89 @@ pub fn render_stats_html_for(
     pid: u32,
     serving: &ibex_config::StatsConfig,
 ) -> String {
+    let mut out = String::with_capacity(32768);
+    let mut cur = HtmlCursor::new();
+    while cur.next_unit(proxies, checks, pid, serving, None, &mut out) {}
+    out
+}
+
+/// " on <node>" for `stats show-node`, empty without it.
+fn on_node(serving: &ibex_config::StatsConfig) -> String {
     let node = serving
         .show_node
         .as_deref()
         .map(|n| if n.is_empty() { crate::stats::node_name() } else { n.to_string() })
         .filter(|n| !n.is_empty());
-    let on_node = node.as_deref().map_or(String::new(), |n| format!(" on {n}"));
-    // `stats show-desc` without text shows `global description` (`uri->desc ? uri->desc : global.desc`).
-    let desc = serving
-        .show_desc
-        .as_deref()
-        .map(|d| if d.is_empty() { crate::stats::description().unwrap_or_default() } else { d.to_string() })
-        .map_or(String::new(), |d| format!(": {d}"));
-    // `stats show-version` names the build next to the title; the default hides it.
-    let version = if serving.show_version() { format!(" version {}", crate::version::VERSION) } else { String::new() };
-    let heading = format!("Statistics Report for pid {pid}{on_node}{desc}");
-    let mut out = String::with_capacity(32768);
+    node.as_deref().map_or(String::new(), |n| format!(" on {n}"))
+}
 
-    // Calculate aggregated metrics
-    let total_act_conn: u32 = proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
-    let total_cum_conn: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
-    let total_bytes_in: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
-    let total_bytes_out: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
+/// The check of server `s` of proxy `p`, by bisection: the checks are made in (proxy,
+/// server) order (`Engine::new_worker`), so a page of many servers is not quadratic.
+pub(crate) fn check_of(checks: &[ServerCheckState], p: usize, s: usize) -> Option<&ServerCheckState> {
+    let i = checks.partition_point(|c| (c.proxy(), c.server()) < (p, s));
+    checks.get(i).filter(|c| c.proxy() == p && c.server() == s)
+}
 
-    let mut total_servers = 0;
-    let mut total_up = 0;
-    let mut total_down = 0;
-    let mut total_drain = 0;
-    let mut total_maint = 0;
+const H_CSS: u8 = 0;
+const H_TOP: u8 = 1;
+const H_FE: u8 = 2;
+const H_FE_END: u8 = 3;
+const H_BE: u8 = 4;
+const H_SRV: u8 = 5;
+const H_BE_END: u8 = 6;
+const H_ST: u8 = 7;
+const H_ST_ROWS: u8 = 8;
+const H_TAIL: u8 = 9;
+const H_DONE: u8 = 10;
 
-    for proxy in proxies {
-        for status_atomic in proxy.server_statuses.iter() { let status = ServerStatus::from(status_atomic.load(std::sync::atomic::Ordering::Relaxed));
-            total_servers += 1;
-            match status {
-                ServerStatus::Up => total_up += 1,
-                ServerStatus::Down => total_down += 1,
-                ServerStatus::Drain => total_drain += 1,
-                ServerStatus::Maint => total_maint += 1,
-            }
-        }
+/// Where the HTML page stands between two buffers of it (T572): the section, the proxy and
+/// server (or stick-table slot) next, and what the section has shown so far. The page is a
+/// series of units -- the style sheet, the summary, one row, one table head, the script --
+/// each a few kB, produced one after the other into the buffer the client reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HtmlCursor {
+    step: u8,
+    p: u32,
+    s: u32,
+    /// Rows (frontends, backends, tables) the section has shown; entries of the table.
+    n: u32,
+    any: bool,
+    slot: usize,
+}
+
+impl HtmlCursor {
+    #[must_use]
+    pub const fn new() -> HtmlCursor {
+        HtmlCursor { step: H_CSS, p: 0, s: 0, n: 0, any: false, slot: 0 }
     }
 
-    let _ = write!(
-        out,
+    /// The next unit is the one a `;st=` banner goes in.
+    #[must_use]
+    pub const fn at_banner(&self) -> bool {
+        self.step == H_TOP
+    }
+
+    /// Writes the next unit of the page to `out` and returns `true`; `false` once the page
+    /// is over. `banner` is put after the opening of the container, in the unit
+    /// [`Self::at_banner`] names.
+    #[allow(clippy::too_many_arguments)]
+    pub fn next_unit(
+        &mut self,
+        proxies: &[Proxy],
+        checks: &[ServerCheckState],
+        pid: u32,
+        serving: &ibex_config::StatsConfig,
+        banner: Option<&str>,
+        out: &mut String,
+    ) -> bool {
+        loop {
+            match self.step {
+                H_CSS => {
+                    self.step = H_TOP;
+                    let on_node = on_node(serving);
+                    let _ = write!(
+                        out,
+
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -327,7 +367,53 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
 }}
 </style>
 </head>
-<body>
+"#
+                    );
+                    return true;
+                }
+                H_TOP => {
+                    self.step = H_FE;
+                    self.p = 0;
+                    self.n = 0;
+                    let on_node = on_node(serving);
+                    // `stats show-desc` without text shows `global description` (`uri->desc ? uri->desc : global.desc`).
+                    let desc = serving
+                        .show_desc
+                        .as_deref()
+                        .map(|d| if d.is_empty() { crate::stats::description().unwrap_or_default() } else { d.to_string() })
+                        .map_or(String::new(), |d| format!(": {d}"));
+                    // `stats show-version` names the build next to the title; the default hides it.
+                    let version = if serving.show_version() { format!(" version {}", crate::version::VERSION) } else { String::new() };
+                    let heading = format!("Statistics Report for pid {pid}{on_node}{desc}");
+
+                    // Calculate aggregated metrics
+                    let total_act_conn: u32 = proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
+                    let total_cum_conn: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
+                    let total_bytes_in: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
+                    let total_bytes_out: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
+
+                    let mut total_servers = 0;
+                    let mut total_up = 0;
+                    let mut total_down = 0;
+                    let mut total_drain = 0;
+                    let mut total_maint = 0;
+
+                    for proxy in proxies {
+                        for status_atomic in proxy.server_statuses.iter() { let status = ServerStatus::from(status_atomic.load(std::sync::atomic::Ordering::Relaxed));
+                            total_servers += 1;
+                            match status {
+                                ServerStatus::Up => total_up += 1,
+                                ServerStatus::Down => total_down += 1,
+                                ServerStatus::Drain => total_drain += 1,
+                                ServerStatus::Maint => total_maint += 1,
+                            }
+                        }
+                    }
+
+                    let at = out.len();
+                    let _ = write!(
+                        out,
+                        r#"<body>
 <div class="container">
   <header>
     <div class="brand">
@@ -389,13 +475,13 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
     </div>
   </div>
 "#,
-        format_bytes(total_bytes_in),
-        format_bytes(total_bytes_out)
-    );
+                        format_bytes(total_bytes_in),
+                        format_bytes(total_bytes_out)
+                    );
 
-    // 1. Group: Frontends
-    out.push_str(
-        r#"  <!-- Frontend Section -->
+                    // 1. Group: Frontends
+                    out.push_str(
+                        r#"  <!-- Frontend Section -->
   <div class="section">
     <div class="section-header">
       <h2 class="section-title">Frontends</h2>
@@ -417,18 +503,29 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
         </thead>
         <tbody id="frontend-tbody">
 "#,
-    );
-
-    let mut frontend_count = 0;
-    for proxy in proxies {
-        if proxy.addr.port() > 0
-            || proxy.default_backend.is_some()
-            || !proxy.use_backends.is_empty()
-        {
-            frontend_count += 1;
-            let _ = write!(
-                out,
-                r#"          <tr id="fe-row-{name}">
+                    );
+                    if let Some(b) = banner {
+                        const MARK: &str = "<div class=\"container\">\n";
+                        if let Some(i) = out[at..].find(MARK) {
+                            out.insert_str(at + i + MARK.len(), b);
+                        }
+                    }
+                    return true;
+                }
+                H_FE => {
+                    let Some(proxy) = proxies.get(self.p as usize) else {
+                        self.step = H_FE_END;
+                        continue;
+                    };
+                    self.p += 1;
+                    if proxy.addr.port() > 0
+                        || proxy.default_backend.is_some()
+                        || !proxy.use_backends.is_empty()
+                    {
+                        self.n += 1;
+                        let _ = write!(
+                            out,
+                            r#"          <tr id="fe-row-{name}">
             <td><strong>{name}</strong>{desc}</td>
             <td><span class="tag">{mode:?}</span></td>
             <td class="mono">{addr}</td>
@@ -447,50 +544,62 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
             <td class="mono fe-bytes-out">{bytes_out}</td>
           </tr>
 "#,
-                name = proxy.name,
-                desc = proxy_desc(proxy),
-                mode = proxy.mode,
-                addr = proxy.addr,
-                act_conn = proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>(),
-                maxconn = proxy.maxconn,
-                cum_conn = proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
-                bytes_in = format_bytes(proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()),
-                bytes_out = format_bytes(proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()),
-            );
-        }
-    }
+                            name = proxy.name,
+                            desc = proxy_desc(proxy),
+                            mode = proxy.mode,
+                            addr = proxy.addr,
+                            act_conn = proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>(),
+                            maxconn = proxy.maxconn,
+                            cum_conn = proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
+                            bytes_in = format_bytes(proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()),
+                            bytes_out = format_bytes(proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()),
+                        );
+                        return true;
+                    }
+                }
+                H_FE_END => {
+                    self.step = H_BE;
+                    self.p = 0;
+                    let frontend_count = std::mem::take(&mut self.n);
 
-    if frontend_count == 0 {
-        out.push_str(r#"          <tr><td colspan="9" class="empty-card">No frontends configured.</td></tr>"#);
-    }
+                    if frontend_count == 0 {
+                        out.push_str(r#"          <tr><td colspan="9" class="empty-card">No frontends configured.</td></tr>"#);
+                    }
 
-    out.push_str(
-        r"        </tbody>
+                    out.push_str(
+                        r"        </tbody>
       </table>
     </div>
   </div>
 ",
-    );
+                    );
 
-    // 2. Group: Backends
-    out.push_str(
-        r#"  <!-- Backend Section -->
+                    // 2. Group: Backends
+                    out.push_str(
+                        r#"  <!-- Backend Section -->
   <div class="section">
     <div class="section-header">
       <h2 class="section-title">Backends &amp; Servers</h2>
     </div>
 "#,
-    );
-
-    let mut backend_count = 0;
-    for (p_idx, proxy) in proxies.iter().enumerate() {
-        if proxy.servers.is_empty() {
-            continue;
-        }
-        backend_count += 1;
-        let _ = write!(
-            out,
-            r#"    <div class="table-wrapper" style="margin-bottom: 20px;">
+                    );
+                    return true;
+                }
+                H_BE => {
+                    let Some(proxy) = proxies.get(self.p as usize) else {
+                        self.step = H_BE_END;
+                        continue;
+                    };
+                    if proxy.servers.is_empty() {
+                        self.p += 1;
+                        continue;
+                    }
+                    self.n += 1;
+                    self.s = 0;
+                    self.step = H_SRV;
+                    let _ = write!(
+                        out,
+                        r#"    <div class="table-wrapper" style="margin-bottom: 20px;">
       <div style="padding: 12px 16px; background: var(--bg-table-header); border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
         <div style="display: flex; align-items: center; gap: 8px;">
           <span style="font-weight: 700; font-size: 15px;">Backend: {name}</span>
@@ -525,75 +634,90 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
         </thead>
         <tbody>
 "#,
-            name = proxy.name,
-            desc = proxy_desc(proxy),
-            mode = proxy.mode,
-            algo = proxy.balance,
-            act_conn = proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>(),
-            cum_conn = proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
-            bytes_in = format_bytes(proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()),
-            bytes_out = format_bytes(proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()),
-        );
+                        name = proxy.name,
+                        desc = proxy_desc(proxy),
+                        mode = proxy.mode,
+                        algo = proxy.balance,
+                        act_conn = proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>(),
+                        cum_conn = proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
+                        bytes_in = format_bytes(proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()),
+                        bytes_out = format_bytes(proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()),
+                    );
+                    return true;
+                }
+                H_SRV => {
+                    // `p` is the proxy whose head was the last unit: the list never changes.
+                    let p_idx = self.p as usize;
+                    let proxy = &proxies[p_idx];
+                    let s_idx = self.s as usize;
+                    let Some(srv_addr) = proxy.servers.get(s_idx) else {
+                        self.p += 1;
+                        self.step = H_BE;
+                        out.push_str(
+                            r"        </tbody>
+      </table>
+    </div>
+",
+                        );
+                        return true;
+                    };
+                    self.s += 1;
+                    let srv_id = proxy.server_ids.get(s_idx).map_or("srv", String::as_str);
+                    let srv_status = proxy
+                        .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
+                    let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
+                    let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
+                    let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);
+                    let actconn = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
 
-        for (s_idx, srv_addr) in proxy.servers.iter().enumerate() {
-            let srv_id = proxy.server_ids.get(s_idx).map_or("srv", String::as_str);
-            let srv_status = proxy
-                .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
-            let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
-            let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
-            let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);
-            let actconn = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
+                    let check_state = check_of(checks, p_idx, s_idx);
 
-            let check_state = checks
-                .iter()
-                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-
-            let (check_info, health_toggle) = if let Some(c) = check_state {
-                let info = if !c.enabled {
-                    "PAUSED".to_string()
-                } else if c.status == ServerStatus::Up {
-                    format!("{}ms (pass {})", c.check_duration_ms, c.rise_count)
-                } else {
-                    format!("FAIL (fails {})", c.fall_count)
-                };
-                let toggle = if c.enabled {
-                    format!(
-                        r#"<form class="admin-form" method="POST" action="" style="display:inline; margin-left: 6px;">
+                    let (check_info, health_toggle) = if let Some(c) = check_state {
+                        let info = if !c.enabled {
+                            "PAUSED".to_string()
+                        } else if c.status == ServerStatus::Up {
+                            format!("{}ms (pass {})", c.check_duration_ms, c.rise_count)
+                        } else {
+                            format!("FAIL (fails {})", c.fall_count)
+                        };
+                        let toggle = if c.enabled {
+                            format!(
+                                r#"<form class="admin-form" method="POST" action="" style="display:inline; margin-left: 6px;">
                           <input type="hidden" name="action" value="disable_health">
                           <input type="hidden" name="backend" value="{px}">
                           <input type="hidden" name="server" value="{sv}">
                           <button type="submit" class="btn btn-xs btn-pause" title="Pause active health check">Pause</button>
                         </form>"#,
-                        px = proxy.name,
-                        sv = srv_id,
-                    )
-                } else {
-                    format!(
-                        r#"<form class="admin-form" method="POST" action="" style="display:inline; margin-left: 6px;">
+                                px = proxy.name,
+                                sv = srv_id,
+                            )
+                        } else {
+                            format!(
+                                r#"<form class="admin-form" method="POST" action="" style="display:inline; margin-left: 6px;">
                           <input type="hidden" name="action" value="enable_health">
                           <input type="hidden" name="backend" value="{px}">
                           <input type="hidden" name="server" value="{sv}">
                           <button type="submit" class="btn btn-xs btn-resume" title="Resume active health check">Resume</button>
                         </form>"#,
-                        px = proxy.name,
-                        sv = srv_id,
-                    )
-                };
-                (info, toggle)
-            } else {
-                ("no check".to_string(), String::new())
-            };
+                                px = proxy.name,
+                                sv = srv_id,
+                            )
+                        };
+                        (info, toggle)
+                    } else {
+                        ("no check".to_string(), String::new())
+                    };
 
-            let badge_class = match srv_status {
-                ServerStatus::Up => "badge-up",
-                ServerStatus::Down => "badge-down",
-                ServerStatus::Drain => "badge-drain",
-                ServerStatus::Maint => "badge-maint",
-            };
+                    let badge_class = match srv_status {
+                        ServerStatus::Up => "badge-up",
+                        ServerStatus::Down => "badge-down",
+                        ServerStatus::Drain => "badge-drain",
+                        ServerStatus::Maint => "badge-maint",
+                    };
 
-            let _ = write!(
-                out,
-                r#"          <tr id="srv-row-{px}-{sv}">
+                    let _ = write!(
+                        out,
+                        r#"          <tr id="srv-row-{px}-{sv}">
             <td><strong>{sv}</strong></td>
             <td class="mono">{addr}</td>
             <td>{role}</td>
@@ -651,59 +775,66 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
             </td>
           </tr>
 "#,
-                px = proxy.name,
-                sv = srv_id,
-                addr = srv_addr,
-                role = if is_backup {
-                    r#"<span class="badge badge-backup">BACKUP</span>"#
-                } else {
-                    "Active"
-                },
-                badge_class = badge_class,
-                status_str = srv_status.as_str(),
-                weight = weight,
-                srv_maxconn = srv_maxconn,
-                actconn = actconn,
-                check_info = check_info,
-                health_toggle = health_toggle,
-            );
-        }
+                        px = proxy.name,
+                        sv = srv_id,
+                        addr = srv_addr,
+                        role = if is_backup {
+                            r#"<span class="badge badge-backup">BACKUP</span>"#
+                        } else {
+                            "Active"
+                        },
+                        badge_class = badge_class,
+                        status_str = srv_status.as_str(),
+                        weight = weight,
+                        srv_maxconn = srv_maxconn,
+                        actconn = actconn,
+                        check_info = check_info,
+                        health_toggle = health_toggle,
+                    );
+                    return true;
+                }
+                H_BE_END => {
+                    self.step = H_ST;
+                    self.p = 0;
+                    let backend_count = std::mem::take(&mut self.n);
 
-        out.push_str(
-            r"        </tbody>
-      </table>
-    </div>
-",
-        );
-    }
+                    if backend_count == 0 {
+                        out.push_str(
+                            r#"    <div class="table-wrapper empty-card">No backends or servers configured.</div>"#,
+                        );
+                    }
+                    out.push_str("  </div>\n");
 
-    if backend_count == 0 {
-        out.push_str(
-            r#"    <div class="table-wrapper empty-card">No backends or servers configured.</div>"#,
-        );
-    }
-    out.push_str("  </div>\n");
-
-    // 3. Group: Stick Tables
-    out.push_str(
-        r#"  <!-- Stick Tables Section -->
+                    // 3. Group: Stick Tables
+                    out.push_str(
+                        r#"  <!-- Stick Tables Section -->
   <div class="section">
     <div class="section-header">
       <h2 class="section-title">Stick Tables</h2>
     </div>
 "#,
-    );
+                    );
+                    return true;
+                }
+                H_ST => {
+                    let Some(proxy) = proxies.get(self.p as usize) else {
+                        self.step = H_TAIL;
+                        continue;
+                    };
+                    let Some(ref tbl) = proxy.stick_table else {
+                        self.p += 1;
+                        continue;
+                    };
+                    self.n += 1;
+                    self.slot = 0;
+                    self.any = false;
+                    self.step = H_ST_ROWS;
+                    let cfg = tbl.config();
+                    let entries_count = tbl.len();
 
-    let mut stick_table_count = 0;
-    for proxy in proxies {
-        if let Some(ref tbl) = proxy.stick_table {
-            stick_table_count += 1;
-            let cfg = tbl.config();
-            let entries_count = tbl.len();
-
-            let _ = write!(
-                out,
-                r#"    <div class="table-wrapper" style="margin-bottom: 20px;">
+                    let _ = write!(
+                        out,
+                        r#"    <div class="table-wrapper" style="margin-bottom: 20px;">
       <div style="padding: 12px 16px; background: var(--bg-table-header); border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between;">
         <span style="font-weight: 700; font-size: 15px;">Table: {name}</span>
         <span class="mono" style="font-size: 12px; color: var(--text-secondary);">Type: {key_type:?} &bull; Size: {size} &bull; Current Entries: {entries}</span>
@@ -719,16 +850,18 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
         </thead>
         <tbody>
 "#,
-                name = cfg.name,
-                key_type = cfg.key_type,
-                size = cfg.max_size,
-                entries = entries_count,
-            );
-
-            if let Ok(entries) = tbl.dump_entries() {
-                if entries.is_empty() {
-                    out.push_str(r#"          <tr><td colspan="4" class="empty-card">Table has no stored entries.</td></tr>"#);
-                } else {
+                        name = cfg.name,
+                        key_type = cfg.key_type,
+                        size = cfg.max_size,
+                        entries = entries_count,
+                    );
+                    return true;
+                }
+                H_ST_ROWS => {
+                    // A few entries a unit, read from the slot the last unit stopped at, of the
+                    // table whose head was the first unit of this proxy.
+                    let (entries, next) = proxies[self.p as usize].stick_table.as_ref().map_or((Vec::new(), None), |t| t.dump_from(self.slot, 16));
+                    self.any |= !entries.is_empty();
                     for (k, d) in entries {
                         let conn_rate = d.conn_rate.map_or(0, |r| r.rate());
                         let http_rate = d.http_req_rate.map_or(0, |r| r.rate());
@@ -744,33 +877,41 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                             req_cnt = d.http_req_cnt,
                         );
                     }
-                }
-            } else {
-                out.push_str(r#"          <tr><td colspan="4" class="empty-card">Unable to dump table entries.</td></tr>"#);
-            }
-
-            out.push_str(
-                r"        </tbody>
+                    match next {
+                        Some(n) => self.slot = n,
+                        None => {
+                            if !self.any {
+                                out.push_str(r#"          <tr><td colspan="4" class="empty-card">Table has no stored entries.</td></tr>"#);
+                            }
+                            out.push_str(
+                                r"        </tbody>
       </table>
     </div>
 ",
-            );
-        }
-    }
+                            );
+                            self.p += 1;
+                            self.step = H_ST;
+                        }
+                    }
+                    return true;
+                }
+                H_TAIL => {
+                    self.step = H_DONE;
+                    let stick_table_count = std::mem::take(&mut self.n);
 
-    if stick_table_count == 0 {
-        out.push_str(
-            r#"    <div class="table-wrapper empty-card">No stick tables configured in runtime.</div>"#,
-        );
-    }
-    out.push_str("  </div>\n");
+                    if stick_table_count == 0 {
+                        out.push_str(
+                            r#"    <div class="table-wrapper empty-card">No stick tables configured in runtime.</div>"#,
+                        );
+                    }
+                    out.push_str("  </div>\n");
 
-    // Toast notification element
-    out.push_str(r#"  <div id="toast" class="toast">Action applied successfully</div>"#);
+                    // Toast notification element
+                    out.push_str(r#"  <div id="toast" class="toast">Action applied successfully</div>"#);
 
-    // Inlined, zero-CDN JavaScript
-    out.push_str(
-        r"
+                    // Inlined, zero-CDN JavaScript
+                    out.push_str(
+                        r"
 </div>
 <script>
 (function() {
@@ -990,104 +1131,146 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
 </body>
 </html>
 ",
-    );
-
-    out
+                    );
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+    }
 }
 
 /// Renders JSON telemetry data matching the dashboard layout for live `fetch` auto-refresh.
 #[must_use]
 pub fn render_stats_json(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) -> String {
     let mut out = String::with_capacity(8192);
-
-    let total_act_conn: u32 = proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>()).sum();
-    let total_cum_conn: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
-    let total_bytes_in: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
-    let total_bytes_out: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
-
-    let mut count_up = 0;
-    let mut count_down = 0;
-    let mut count_drain = 0;
-    let mut count_maint = 0;
-
-    for proxy in proxies {
-        for status_atomic in proxy.server_statuses.iter() { let status = ServerStatus::from(status_atomic.load(std::sync::atomic::Ordering::Relaxed));
-            match status {
-                ServerStatus::Up => count_up += 1,
-                ServerStatus::Down => count_down += 1,
-                ServerStatus::Drain => count_drain += 1,
-                ServerStatus::Maint => count_maint += 1,
-            }
-        }
-    }
-
-    let _ = write!(
-        out,
-        r#"{{"pid":{pid},"totals":{{"act_conn":{total_act_conn},"cum_conn":{total_cum_conn},"bytes_in":{total_bytes_in},"bytes_out":{total_bytes_out}}},"counts":{{"up":{count_up},"down":{count_down},"drain":{count_drain},"maint":{count_maint}}},"proxies":["#
-    );
-
-    for (p_idx, proxy) in proxies.iter().enumerate() {
-        if p_idx > 0 {
-            out.push(',');
-        }
-        let _ = write!(
-            out,
-            r#"{{"name":"{}","maxconn":{},"act_conn":{},"cum_conn":{},"bytes_in":{},"bytes_out":{},"servers":["#,
-            proxy.name,
-            proxy.maxconn,
-            proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>(),
-            proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
-            proxy.stats.iter().map(|s| s.bytes_in.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
-            proxy.stats.iter().map(|s| s.bytes_out.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
-        );
-
-        for (s_idx, _) in proxy.servers.iter().enumerate() {
-            if s_idx > 0 {
-                out.push(',');
-            }
-            let srv_id = proxy.server_ids.get(s_idx).map_or("srv", String::as_str);
-            let srv_status = proxy
-                .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
-            let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
-            let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);
-            let actconn = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
-
-            let check_state = checks
-                .iter()
-                .find(|c| c.proxy() == p_idx && c.server() == s_idx);
-
-            let check_info = if let Some(c) = check_state {
-                if !c.enabled {
-                    "PAUSED".to_string()
-                } else if c.status == ServerStatus::Up {
-                    format!("{}ms (pass {})", c.check_duration_ms, c.rise_count)
-                } else {
-                    format!("FAIL (fails {})", c.fall_count)
-                }
-            } else {
-                "no check".to_string()
-            };
-
-            let check_enabled = check_state.is_some_and(|c| c.enabled);
-
-            let _ = write!(
-                out,
-                r#"{{"name":"{}","status":"{}","weight":{},"maxconn":{},"act_conn":{},"check_info":"{}","check_enabled":{}}}"#,
-                srv_id,
-                srv_status.as_str(),
-                weight,
-                srv_maxconn,
-                actconn,
-                check_info,
-                check_enabled,
-            );
-        }
-
-        out.push_str("]}");
-    }
-
-    out.push_str("]}");
+    let mut cur = JsonCursor::new();
+    while cur.next_unit(proxies, checks, pid, &mut out) {}
     out
+}
+
+/// Where the dashboard's JSON (`/api/data`) stands between two buffers of it (T572): the
+/// proxy and server next. Units are the totals, one proxy's opening, one server, a closing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JsonCursor {
+    step: u8,
+    p: u32,
+    s: u32,
+}
+
+const J_HEAD: u8 = 0;
+const J_PX: u8 = 1;
+const J_SRV: u8 = 2;
+const J_END: u8 = 3;
+const J_DONE: u8 = 4;
+
+impl JsonCursor {
+    #[must_use]
+    pub const fn new() -> JsonCursor {
+        JsonCursor { step: J_HEAD, p: 0, s: 0 }
+    }
+
+    /// Writes the next unit to `out` and returns `true`; `false` once the document is over.
+    pub fn next_unit(&mut self, proxies: &[Proxy], checks: &[ServerCheckState], pid: u32, out: &mut String) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.step {
+            J_HEAD => {
+                self.step = J_PX;
+                let total_act_conn: u32 = proxies.iter().map(|p| p.stats.iter().map(|s| s.act_conn.load(Relaxed)).sum::<u32>()).sum();
+                let total_cum_conn: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(Relaxed)).sum::<u64>()).sum();
+                let total_bytes_in: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_in.load(Relaxed)).sum::<u64>()).sum();
+                let total_bytes_out: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_out.load(Relaxed)).sum::<u64>()).sum();
+                let (mut count_up, mut count_down, mut count_drain, mut count_maint) = (0, 0, 0, 0);
+                for proxy in proxies {
+                    for status_atomic in proxy.server_statuses.iter() {
+                        match ServerStatus::from(status_atomic.load(Relaxed)) {
+                            ServerStatus::Up => count_up += 1,
+                            ServerStatus::Down => count_down += 1,
+                            ServerStatus::Drain => count_drain += 1,
+                            ServerStatus::Maint => count_maint += 1,
+                        }
+                    }
+                }
+                let _ = write!(
+                    out,
+                    r#"{{"pid":{pid},"totals":{{"act_conn":{total_act_conn},"cum_conn":{total_cum_conn},"bytes_in":{total_bytes_in},"bytes_out":{total_bytes_out}}},"counts":{{"up":{count_up},"down":{count_down},"drain":{count_drain},"maint":{count_maint}}},"proxies":["#
+                );
+                true
+            }
+            J_PX => {
+                let Some(proxy) = proxies.get(self.p as usize) else {
+                    self.step = J_END;
+                    return self.next_unit(proxies, checks, pid, out);
+                };
+                if self.p > 0 {
+                    out.push(',');
+                }
+                let _ = write!(
+                    out,
+                    r#"{{"name":"{}","maxconn":{},"act_conn":{},"cum_conn":{},"bytes_in":{},"bytes_out":{},"servers":["#,
+                    proxy.name,
+                    proxy.maxconn,
+                    proxy.stats.iter().map(|s| s.act_conn.load(Relaxed)).sum::<u32>(),
+                    proxy.stats.iter().map(|s| s.cum_conn.load(Relaxed)).sum::<u64>(),
+                    proxy.stats.iter().map(|s| s.bytes_in.load(Relaxed)).sum::<u64>(),
+                    proxy.stats.iter().map(|s| s.bytes_out.load(Relaxed)).sum::<u64>(),
+                );
+                self.s = 0;
+                self.step = J_SRV;
+                true
+            }
+            J_SRV => {
+                let p_idx = self.p as usize;
+                let s_idx = self.s as usize;
+                let Some(proxy) = proxies.get(p_idx).filter(|p| s_idx < p.servers.len()) else {
+                    out.push_str("]}");
+                    self.p += 1;
+                    self.step = J_PX;
+                    return true;
+                };
+                self.s += 1;
+                if s_idx > 0 {
+                    out.push(',');
+                }
+                let srv_id = proxy.server_ids.get(s_idx).map_or("srv", String::as_str);
+                let srv_status = proxy.server_statuses.get(s_idx).map_or(ServerStatus::Up, |s| ServerStatus::from(s.load(Relaxed)));
+                let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
+                let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);
+                let actconn = proxy.server_actconn.get(s_idx).map_or(0, |a| a.load(Relaxed));
+                let check_state = check_of(checks, p_idx, s_idx);
+                let check_info = if let Some(c) = check_state {
+                    if !c.enabled {
+                        "PAUSED".to_string()
+                    } else if c.status == ServerStatus::Up {
+                        format!("{}ms (pass {})", c.check_duration_ms, c.rise_count)
+                    } else {
+                        format!("FAIL (fails {})", c.fall_count)
+                    }
+                } else {
+                    "no check".to_string()
+                };
+                let check_enabled = check_state.is_some_and(|c| c.enabled);
+                let _ = write!(
+                    out,
+                    r#"{{"name":"{}","status":"{}","weight":{},"maxconn":{},"act_conn":{},"check_info":"{}","check_enabled":{}}}"#,
+                    srv_id,
+                    srv_status.as_str(),
+                    weight,
+                    srv_maxconn,
+                    actconn,
+                    check_info,
+                    check_enabled,
+                );
+                true
+            }
+            J_END => {
+                self.step = J_DONE;
+                out.push_str("]}");
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Parsed command for admin server state/weight/maxconn mutations and session/health actions.

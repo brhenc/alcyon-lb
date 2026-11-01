@@ -80,6 +80,7 @@ pub mod statcnt;
 pub mod xprt;
 pub mod stats_html;
 pub mod stats_post;
+pub mod stats_stream;
 pub mod stats_typed;
 pub mod systemd;
 pub mod lifecycle;

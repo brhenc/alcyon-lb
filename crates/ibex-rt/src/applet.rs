@@ -21,7 +21,6 @@ use crate::check::{ServerCheckState, ServerStatus};
 use crate::engine::{Proxy, SessionArena};
 use crate::fdtab::Interest;
 use crate::mailbox::{Gather, Mailboxes, Msg, QuicSnap, SessFilter, SessSnap};
-use crate::stats::format_show_stat_as;
 use ibex_sched::task::TaskRef;
 use ibex_sched::Tick;
 use std::fmt::Write as FmtWrite;
@@ -262,6 +261,8 @@ pub struct CliApplet {
     pending_rest: Option<String>,
     /// A `show table` being written, a chunk at a time (`pump_table`).
     table_dump: Option<TableDump>,
+    /// A `show stat` being written, a buffer at a time (`pump_table`, T572).
+    stat_dump: Option<crate::stats_stream::Dump>,
 }
 
 /// Where a `show table` is: the filters, the proxy and the slot of its table to read next.
@@ -278,6 +279,9 @@ struct TableDump {
 const TABLE_CHUNK: usize = 64 * 1024;
 /// How much of a `show table` one turn of the connection writes before it yields.
 const PUMP_BUDGET: usize = 1024 * 1024;
+/// The output buffer of a `show stat`: one `tune.bufsize`'s worth, as HAProxy's CLI applet
+/// fills its channel. One a turn: the other streams of the worker run between two.
+const STAT_CHUNK: usize = 16384;
 
 impl CliApplet {
     /// Creates a new `CliApplet` for an accepted CLI connection.
@@ -308,6 +312,7 @@ impl CliApplet {
             pending: None,
             pending_rest: None,
             table_dump: None,
+            stat_dump: None,
         }
     }
 
@@ -392,8 +397,8 @@ impl CliApplet {
 
     /// Executes complete command lines available in `in_buf`.
     pub fn process_commands(&mut self, ctx: &mut AppletContext) {
-        // Nothing new runs while a `show table` is still being written.
-        if self.table_dump.is_some() {
+        // Nothing new runs while a `show table` or `show stat` is still being written.
+        if self.table_pending() {
             return;
         }
         if let Some(p) = self.pending.take() {
@@ -440,7 +445,7 @@ impl CliApplet {
                     // Answered once every worker has; what follows waits until then.
                     return;
                 }
-                if self.table_dump.is_some() {
+                if self.table_pending() {
                     // A `show table` is written first; in `prompt` mode what follows runs
                     // once it is out (`pump_table`), otherwise nothing more runs.
                     if !self.interactive {
@@ -1031,9 +1036,26 @@ impl CliApplet {
             sid_filter = parts[4].parse::<i32>().ok();
         }
 
-        let stat_csv = format_show_stat_as(ctx.proxies, ctx.checks, ctx.pid, iid_filter, type_filter, sid_filter, fmt);
-        self.out_buf.extend_from_slice(stat_csv.as_bytes());
-        self.end_stat_answer();
+        // Written a buffer at a time by `pump_table`, then ended by `end_stat_answer`.
+        let rows = crate::stats::StatCursor::new(fmt, iid_filter, type_filter, sid_filter);
+        self.stat_dump = Some(crate::stats_stream::Dump::new(crate::stats_stream::Page::Rows(rows), false, 0));
+    }
+
+    /// Puts the next buffer of a running `show stat` in the (empty) output buffer; the
+    /// answer's end once the rows are out.
+    fn stat_chunk(&mut self, ctx: &AppletContext) {
+        let Some(mut d) = self.stat_dump.take() else { return };
+        let none = |_| String::new();
+        let cfg = ibex_config::StatsConfig::default();
+        let sctx = crate::stats_stream::Ctx { proxies: ctx.proxies, checks: ctx.checks, pid: ctx.pid, cfg: &cfg, banner: &none };
+        self.out_buf.resize(STAT_CHUNK, 0);
+        let n = crate::stats_stream::fill(&mut d, &sctx, &mut self.out_buf);
+        self.out_buf.truncate(n);
+        if d.finished {
+            self.end_stat_answer();
+        } else {
+            self.stat_dump = Some(d);
+        }
     }
 
     fn handle_show_table(&mut self, cmd: &str, ctx: &AppletContext) {
@@ -1205,11 +1227,16 @@ impl CliApplet {
     /// is then due again at once, so that one dump does not hold the worker).
     pub fn pump_table(&mut self, ctx: &AppletContext) {
         let mut sent = 0usize;
-        while self.table_dump.is_some() && sent < PUMP_BUDGET && !self.is_done {
+        let budget = if self.stat_dump.is_some() { STAT_CHUNK } else { PUMP_BUDGET };
+        while self.table_pending() && sent < budget && !self.is_done {
             if self.out_buf.is_empty() {
                 self.out_offset = 0;
                 // The last chunk ends the answer, so it is never empty.
-                self.table_chunk(ctx, TABLE_CHUNK);
+                if self.stat_dump.is_some() {
+                    self.stat_chunk(ctx);
+                } else {
+                    self.table_chunk(ctx, TABLE_CHUNK);
+                }
             }
             let before = self.out_buf.len() - self.out_offset;
             self.write_output();
@@ -1223,13 +1250,14 @@ impl CliApplet {
         // dump has nowhere to go.
         if self.is_done {
             self.table_dump = None;
+            self.stat_dump = None;
         }
     }
 
-    /// Whether a `show table` has more to send once what is queued is written.
+    /// Whether a `show table` or `show stat` has more to send once what is queued is written.
     #[must_use]
     pub fn table_pending(&self) -> bool {
-        self.table_dump.is_some()
+        self.table_dump.is_some() || self.stat_dump.is_some()
     }
 
     /// `shutdown sessions server <be>/<srv>` (`cli_parse_shutdown_sessions_server`): every
@@ -2058,7 +2086,7 @@ impl CliApplet {
     /// side and nothing it sent is left to answer.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.out_buf.is_empty() && self.table_dump.is_none() && (self.is_done || (self.read_shut && self.pending.is_none()))
+        self.out_buf.is_empty() && !self.table_pending() && (self.is_done || (self.read_shut && self.pending.is_none()))
     }
 }
 
