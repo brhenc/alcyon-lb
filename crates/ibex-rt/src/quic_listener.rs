@@ -1087,11 +1087,21 @@ impl QuicListener {
     /// to the wildcard, the kernel gives it the route's source address, and a client of
     /// another local address does not match it (T552 note, VV-27).
     fn pin(&mut self, peer: SocketAddr, local: Option<std::net::IpAddr>) {
+        self.pin_with(peer, local, |_| {});
+    }
+
+    /// [`QuicListener::pin`] with `between` run after the bind and before the connect, given
+    /// the address bound: tests use it to queue another client's datagram on the socket
+    /// while it is an unconnected member of the group, the race `recv_batch` filters (T558).
+    #[doc(hidden)]
+    pub fn pin_with(&mut self, peer: SocketAddr, local: Option<std::net::IpAddr>, between: impl FnOnce(SocketAddr)) {
         let at = match local {
             Some(ip) if self.addr.ip().is_unspecified() => SocketAddr::new(ip, self.addr.port()),
             _ => self.addr,
         };
-        if let Ok(sock) = DgramSocket::bind(at).and_then(|s| s.connect(peer).map(|()| s)) {
+        let Ok(sock) = DgramSocket::bind(at) else { return };
+        between(at);
+        if sock.connect(peer).is_ok() {
             self.pinned.push((peer, sock));
         }
     }
