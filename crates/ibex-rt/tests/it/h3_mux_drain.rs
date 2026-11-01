@@ -596,6 +596,32 @@ fn a_fresh_connection_at_a_soft_stop_gets_its_first_request_served() {
     }
 }
 
+/// T564: the first request's wait is counted in the process's time awake, not the wall's: a
+/// stopping process starved past the grace (the reload test under the gate's load, `SIGSTOP`
+/// here) finds the request its client sent meanwhile waiting in its socket. It must read it
+/// before it judges the connection idle, not close it (`H3_NO_ERROR`; curl `ERR_DRAINING`).
+#[test]
+fn a_first_request_sent_while_the_stopping_process_is_starved_is_served() {
+    common::on_h3_path("mux", || {
+        let mut ibex = ibex(backend(), "timeout client 10s");
+        let mut cl = Client::connect(ibex.quic);
+        cl.run_until(Duration::from_millis(100), |_| false);
+        ibex.usr1();
+        cl.run_until(Duration::from_millis(150), |c| c.lost.is_some());
+        assert!(cl.lost.is_none(), "closed before the request: {:?}", cl.lost);
+        let pid = rustix::process::Pid::from_raw(i32::try_from(ibex.child.id()).expect("pid")).expect("pid");
+        rustix::process::kill_process(pid, rustix::process::Signal::Stop).expect("SIGSTOP");
+        let id = cl.open(&get(b"/a"), true);
+        cl.run_until(Duration::from_millis(1300), |_| false);
+        rustix::process::kill_process(pid, rustix::process::Signal::Cont).expect("SIGCONT");
+        let o = cl.outcome(id);
+        assert_eq!((o.status, o.fin), (Some(200), true), "{o:?} {:?} GOAWAYs {:?}", cl.lost, cl.goaways());
+        let lost = cl.closed(Duration::from_secs(3));
+        assert_eq!(lost.map(|l| l.0).as_deref(), Some("app 0x100"));
+        assert!(ibex.exited_within(Duration::from_secs(5)), "ibex did not exit after the drain");
+    });
+}
+
 /// T558: the wait for that first request is bounded: a fresh connection that sends nothing
 /// is closed (GOAWAY(0), `H3_NO_ERROR`) about a second into the stop, and the process exits.
 #[test]

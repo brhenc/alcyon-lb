@@ -5793,7 +5793,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 // Its role, which keeps its children and its mux, is made now (two `Box`es a
                 // connection).
                 sess.h2_role = Some(Box::new(crate::proxy::H2Role::Owner(crate::proxy::H2Owner {
-                    h3: Some(Box::new(crate::proxy::H3Owner { mux, listener: usize_to_u32(q_idx), conn, body_scratch: Vec::new(), idle_start: self.now, closing: false, stop_grace: None })),
+                    h3: Some(Box::new(crate::proxy::H3Owner { mux, listener: usize_to_u32(q_idx), conn, body_scratch: Vec::new(), idle_start: self.now, closing: false, stop_grace: None, stop_read: false })),
                     ..Default::default()
                 })));
                 let entry = SessionEntry {
@@ -10677,6 +10677,18 @@ impl EngineDispatcher<'_> {
         // VV-30). `HAProxy` sends GOAWAY(0) and closes it at once, and the request is lost.
         let stopping = ql.is_stopping();
         let grace = if stopping { *h3.stop_grace.get_or_insert(now.add(H3_STOP_FIRST_REQUEST_MS)) } else { Tick::ETERNITY };
+        // Its grace over, the connection is judged on what its sockets hold, not on what was
+        // read when its timer fired: a pass whose poller was interrupted (a signal, a stopped
+        // or starved process) runs the expired timers with nothing read, and the request its
+        // client sent meanwhile waits in the socket. The listener reads them all in the next
+        // pass, and the owner looks again after it (T564: GOAWAY(0) and a close with the
+        // request unread, curl `ERR_DRAINING`).
+        if stopping && h3.mux.last_client_stream_id.is_none() && grace.is_expired(now) && !h3.stop_read {
+            h3.stop_read = true;
+            ql.mark_ready();
+            self.wake_queue.push(task);
+            return Outcome::Keep;
+        }
         let fresh = stopping && h3.mux.last_client_stream_id.is_none() && !grace.is_expired(now);
         // The GOAWAY of a soft stop goes out in this pass: framed after the write, it was
         // what kept an idle owner from closing, nothing waking it to write it (T511).
