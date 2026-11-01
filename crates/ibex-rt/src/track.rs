@@ -10,7 +10,7 @@
 //! apart in [`Track::own`], because it must survive the target changing and be given up when
 //! the operator says `ready`.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::check::ServerStatus;
 use crate::srvlog::{Cause, Kind};
@@ -225,14 +225,140 @@ pub fn apply_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckSta
 /// [`apply_admin`] without the `SRV_ADMF_RMAINT` guard: the resolver taking a server into
 /// maintenance, or giving it back the admin state it had (`crate::resolvers`).
 pub fn set_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus, cause: Cause<'_>) {
-    let check = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s);
     if track_of(proxies, p, s).is_some() {
         set_status(proxies, p, s, to, Kind::Admin, cause);
-    } else if let Some(c) = check {
+        return;
+    }
+    let Some(px) = proxies.get(p) else { return };
+    let mut ops = lock_ops(px);
+    adopt(&mut ops, p, checks);
+    if let Some(c) = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s) {
         c.set_admin_status(to);
         set_raw(proxies, p, s, c.published(), Kind::Admin, cause);
-    } else if let Some(cur) = proxies.get(p).and_then(|px| px.server_statuses.get(s)) {
+    } else if let Some(cur) = px.server_statuses.get(s) {
+        queue(&mut ops, px, s, CheckOp::Admin(to));
         set_raw(proxies, p, s, crate::check::admin_transition(cur.load(Ordering::Relaxed), to), Kind::Admin, cause);
+    }
+}
+
+/// An operator's change to a checked server made on a worker that does not hold its check
+/// (the checks run on worker 0; the stats page answers on every worker, T593). The change is
+/// applied to `Proxy::server_statuses` and logged where it is made, as `HAProxy` does under
+/// the server lock whichever thread runs the applet (`srv_set_stopped`, `srv_adm_set_ready`,
+/// `src/server.c`), and queued here for the owner of the check, which takes it into its
+/// state before it publishes anything ([`publish_check`]), so its next step does not put
+/// its stale state back.
+#[derive(Debug, Clone, Copy)]
+pub enum CheckOp {
+    Admin(ServerStatus),
+    Health(bool),
+    Enabled(bool),
+}
+
+/// The [`CheckOp`]s of one proxy waiting for the owner of the checks, a field of the proxy's
+/// counters that every worker shares. Its lock is the server lock of the checked servers of
+/// the proxy: whoever changes their state, the owner included, holds it.
+#[derive(Debug, Default)]
+pub struct CheckOps(std::sync::Mutex<Vec<(u32, CheckOp)>>);
+
+/// How many [`CheckOp`]s wait in all proxies.
+static OPS_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+fn lock_ops(px: &Proxy) -> std::sync::MutexGuard<'_, Vec<(u32, CheckOp)>> {
+    px.txn_counters().check_ops.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Queues `op` for server `s` when it has a check (held by another worker); a server with
+/// no check has nothing but `Proxy::server_statuses`.
+fn queue(ops: &mut Vec<(u32, CheckOp)>, px: &Proxy, s: usize, op: CheckOp) {
+    if px.server_check_configs.get(s).is_some_and(Option::is_some) {
+        ops.push((crate::engine::usize_to_u32(s), op));
+        OPS_PENDING.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Applies to `checks` the queued ops of proxy `p` whose check is there, in order; the
+/// others stay queued.
+fn adopt(ops: &mut Vec<(u32, CheckOp)>, p: usize, checks: &mut [crate::check::ServerCheckState]) {
+    if ops.is_empty() || checks.is_empty() {
+        return;
+    }
+    let before = ops.len();
+    ops.retain(|&(s, op)| {
+        let Some(c) = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s as usize) else {
+            return true;
+        };
+        match op {
+            CheckOp::Admin(to) => c.set_admin_status(to),
+            CheckOp::Health(up) => c.set_health(up),
+            CheckOp::Enabled(on) => c.enabled = on,
+        }
+        false
+    });
+    OPS_PENDING.fetch_sub(before - ops.len(), Ordering::Release);
+}
+
+/// The owner of `check` takes the changes made elsewhere before the check runs a step, so
+/// that its verdict lands on top of them, as `HAProxy`'s does (measured: a check passing
+/// after `hdown` brings a `rise 1` server back up).
+pub fn adopt_for(proxies: &[Proxy], check: &mut crate::check::ServerCheckState) {
+    if OPS_PENDING.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if let Some(px) = proxies.get(check.proxy()) {
+        adopt(&mut lock_ops(px), check.proxy(), std::slice::from_mut(check));
+    }
+}
+
+/// The owner of the checks takes the changes the other workers made (once per loop pass,
+/// only when some wait), so `show stat` on its CLI reads them before the next check step.
+pub fn adopt_pending(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState]) {
+    if checks.is_empty() || OPS_PENDING.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    for (p, px) in proxies.iter().enumerate() {
+        if px.ids.tc.get().is_some() {
+            let mut ops = lock_ops(px);
+            adopt(&mut ops, p, checks);
+            // Every check is here: what is left has none (a server added since), nothing
+            // will take it, and it must not make every loop pass take the locks.
+            OPS_PENDING.fetch_sub(ops.len(), Ordering::Release);
+            ops.clear();
+        }
+    }
+}
+
+/// `enable health`/`disable health` (CLI) and the stats page's `ehlth`/`dhlth` on server
+/// `s` of proxy `p`; false when it has no check.
+pub fn set_check_enabled(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, enabled: bool, now: ibex_sched::Tick) -> bool {
+    let Some(px) = proxies.get(p) else { return false };
+    let mut ops = lock_ops(px);
+    adopt(&mut ops, p, checks);
+    if let Some(c) = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s) {
+        c.enabled = enabled;
+        if enabled {
+            c.next_check = now;
+        }
+        true
+    } else if px.server_check_configs.get(s).is_some_and(Option::is_some) {
+        queue(&mut ops, px, s, CheckOp::Enabled(enabled));
+        true
+    } else {
+        false
+    }
+}
+
+/// A check's verdict reaches `Proxy::server_statuses`: the owner of the check (worker 0)
+/// after each step of it.
+pub fn publish_check(proxies: &[Proxy], check: &mut crate::check::ServerCheckState) {
+    let (p, s) = (check.proxy(), check.server());
+    let Some(px) = proxies.get(p) else { return };
+    // Under the lock: a change another worker makes is either taken in first, or made
+    // after this publication, on top of it (T593).
+    let mut ops = lock_ops(px);
+    adopt(&mut ops, p, std::slice::from_mut(check));
+    if check.enabled && s < px.server_statuses.len() {
+        set_raw(proxies, p, s, check.published(), Kind::Op, Cause::Check(check));
     }
 }
 
@@ -244,10 +370,114 @@ pub fn is_tracking(proxies: &[Proxy], p: usize, s: usize) -> bool {
 /// `set server health up|down` on server `s` of proxy `p` (not a tracker: refused before):
 /// the operational state moves, the admin state stays.
 pub fn apply_health(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, up: bool, cause: Cause<'_>) {
+    let Some(px) = proxies.get(p) else { return };
+    let mut ops = lock_ops(px);
+    adopt(&mut ops, p, checks);
     if let Some(c) = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s) {
         c.set_health(up);
         set_raw(proxies, p, s, c.published(), Kind::Op, cause);
-    } else if let Some(cur) = proxies.get(p).and_then(|px| px.server_statuses.get(s)) {
+    } else if let Some(cur) = px.server_statuses.get(s) {
+        queue(&mut ops, px, s, CheckOp::Health(up));
         set_raw(proxies, p, s, crate::check::health_transition(cur.load(Ordering::Relaxed), up), Kind::Op, cause);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::check::ServerCheckState;
+
+    /// Backend `b`: `s1` checked, `s2` a backup; the check of `s1` as worker 0 holds it.
+    fn setup() -> (crate::engine::Proxies, ServerCheckState) {
+        let c = "defaults\n    mode http\nbackend b\n    server s1 127.0.0.1:1 check inter 200ms fall 1 rise 1\n    server s2 127.0.0.1:1 backup\n";
+        let config = ibex_config::parse_str(c).expect("config");
+        let proxies = crate::engine::Engine::build_shared_state(&config).expect("proxies");
+        let p = proxies.iter().position(|x| x.name == "b").expect("b");
+        let cfg = proxies[p].server_check_configs[0].clone().expect("check");
+        let addr = proxies[p].servers.get(0).expect("s1");
+        let check = ServerCheckState::new(p, 0, addr, cfg, ibex_sched::Tick(1));
+        (proxies, check)
+    }
+
+    fn lines(proxies: &[Proxy]) -> Vec<String> {
+        let mut out = Vec::new();
+        crate::srvlog::drain(proxies, |_, _, l| out.push(l.to_owned()));
+        out
+    }
+
+    fn status(proxies: &[Proxy], p: usize) -> u8 {
+        proxies[p].server_statuses[0].load(Ordering::Relaxed)
+    }
+
+    /// T593: the stats page runs on any worker, the check of the server on worker 0 only. A
+    /// change made where the check is not (an empty `checks`) is applied and logged once, and
+    /// the owner's next check step keeps it instead of putting its own stale state back.
+    #[test]
+    fn admin_change_from_a_worker_without_the_check() {
+        let (proxies, mut check) = setup();
+        let p = check.proxy();
+        publish_check(&proxies, &mut check);
+        drop(lines(&proxies));
+
+        apply_admin(&proxies, &mut [], p, 0, ServerStatus::Maint, Cause::WebDisable);
+        publish_check(&proxies, &mut check);
+        assert_eq!(status(&proxies, p), ServerStatus::Maint as u8);
+        let l = lines(&proxies);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert!(l[0].starts_with("Server b/s1 is going DOWN for maintenance ('disable' on stats page)."), "{l:?}");
+
+        apply_admin(&proxies, &mut [], p, 0, ServerStatus::Up, Cause::Web);
+        publish_check(&proxies, &mut check);
+        assert_eq!(status(&proxies, p), ServerStatus::Up as u8);
+        assert_eq!(lines(&proxies), ["Server b/s1 is UP/READY (leaving forced maintenance)."]);
+    }
+
+    /// T593, the test's sequence: `hdown` and `hrunn` on the stats page of another worker,
+    /// then `set server b/s1 health down` on the CLI (worker 0, the owner).
+    #[test]
+    fn health_change_from_a_worker_without_the_check() {
+        let (proxies, mut check) = setup();
+        let p = check.proxy();
+        publish_check(&proxies, &mut check);
+        drop(lines(&proxies));
+
+        apply_health(&proxies, &mut [], p, 0, false, Cause::Web);
+        publish_check(&proxies, &mut check);
+        assert_eq!(status(&proxies, p), ServerStatus::Down as u8);
+        let l = lines(&proxies);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert!(l[0].starts_with("Server b/s1 is DOWN, changed from Web interface."), "{l:?}");
+
+        apply_health(&proxies, &mut [], p, 0, true, Cause::Web);
+        publish_check(&proxies, &mut check);
+        assert_eq!(status(&proxies, p), ServerStatus::Up as u8);
+        let l = lines(&proxies);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert!(l[0].starts_with("Server b/s1 is UP, changed from Web interface."), "{l:?}");
+
+        apply_health(&proxies, std::slice::from_mut(&mut check), p, 0, false, Cause::Cli);
+        assert_eq!(status(&proxies, p), ServerStatus::Down as u8);
+        let l = lines(&proxies);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert!(l[0].starts_with("Server b/s1 is DOWN, changed from CLI."), "{l:?}");
+    }
+
+    /// A check that passes after an `hdown` made on another worker brings a `rise 1` server
+    /// back up (measured on `HAProxy` 3.5-dev8, `nbthread 4`): the owner takes the change in
+    /// before the step, and the verdict lands on top of it.
+    #[test]
+    fn a_check_after_a_change_from_another_worker_lands_on_top() {
+        let (proxies, mut check) = setup();
+        let p = check.proxy();
+        publish_check(&proxies, &mut check);
+        apply_health(&proxies, &mut [], p, 0, false, Cause::Web);
+        drop(lines(&proxies));
+        adopt_for(&proxies, &mut check);
+        check.on_success(0);
+        publish_check(&proxies, &mut check);
+        assert_eq!(status(&proxies, p), ServerStatus::Up as u8);
+        let l = lines(&proxies);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert!(l[0].starts_with("Server b/s1 is UP, reason: Layer4 check passed"), "{l:?}");
     }
 }
