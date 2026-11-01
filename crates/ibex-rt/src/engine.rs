@@ -2118,43 +2118,31 @@ impl Proxy {
     /// If no servers are available, returns an empty vector.
     #[must_use]
     pub fn eligible_server_indices(&self) -> Vec<usize> {
-        let is_server_available = |idx: usize| -> bool {
-            if idx >= self.servers.len() || crate::lb::avoided(self, idx) {
-                return false;
-            }
-            if let Some(status) = self.server_statuses.get(idx) {
-                if status.load(Ordering::Relaxed) != ServerStatus::Up as u8 {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-            if let Some(mc) = self.server_maxconn.get(idx) {
-                if mc > 0 {
-                    let act = self.server_actconn.get(idx).map(|a| a.load(Ordering::Relaxed)).unwrap_or(0);
-                    if act >= mc {
-                        return false;
-                    }
-                }
-            }
-            true
-        };
+        let n = self.eligible_count();
+        (0..n).filter_map(|k| self.eligible_nth(k)).collect()
+    }
 
-        // 1. Check active (non-backup) servers first
-        let active_up: Vec<usize> = (0..self.servers.len())
-            .filter(|&idx| {
-                let is_backup = self.server_backups.get(idx).copied().unwrap_or(false);
-                // A weight of 0 (`set server ... weight 0`) takes no balanced traffic.
-                !is_backup && is_server_available(idx) && self.server_weights.get(idx).unwrap_or(1) > 0
-            })
-            .collect();
+    /// Whether server `idx` is an active server that takes balanced traffic.
+    fn is_eligible_active(&self, idx: usize) -> bool {
+        let is_backup = self.server_backups.get(idx).copied().unwrap_or(false);
+        // A weight of 0 (`set server ... weight 0`) takes no balanced traffic.
+        !is_backup && crate::lb::is_server_available(self, idx) && self.server_weights.get(idx).unwrap_or(1) > 0
+    }
 
-        if !active_up.is_empty() {
-            return active_up;
+    /// How many servers [`Proxy::eligible_server_indices`] lists, without listing them.
+    fn eligible_count(&self) -> usize {
+        let active = (0..self.servers.len()).filter(|&i| self.is_eligible_active(i)).count();
+        if active > 0 { active } else { usize::from(crate::lb::first_backup(self).is_some()) }
+    }
+
+    /// The `k`th of [`Proxy::eligible_server_indices`], without listing them.
+    fn eligible_nth(&self, k: usize) -> Option<usize> {
+        let mut it = (0..self.servers.len()).filter(|&i| self.is_eligible_active(i));
+        match it.nth(k) {
+            Some(i) => Some(i),
+            None if k == 0 => crate::lb::first_backup(self),
+            None => None,
         }
-
-        // 2. No active server: the first usable backup alone (`lbprm.fbck`).
-        crate::lb::first_backup(self).into_iter().collect()
     }
 
     /// Whether no server can take a connection only because each one that is UP is at its
@@ -2226,11 +2214,11 @@ impl Proxy {
                 }
             }
             _ => {
-                let eligible = self.eligible_server_indices();
-                if eligible.is_empty() {
+                let n = self.eligible_count();
+                if n == 0 {
                     return self.dispatch.map(|a| (None, a));
                 }
-                let chosen_idx = eligible[self.next_server_idx.fetch_add(1, Ordering::Relaxed) % eligible.len()];
+                let Some(chosen_idx) = self.eligible_nth(self.next_server_idx.fetch_add(1, Ordering::Relaxed) % n) else { return self.dispatch.map(|a| (None, a)) };
                 Some((Some(chosen_idx), self.servers.at(chosen_idx)))
             }
         }
@@ -2256,8 +2244,8 @@ impl Proxy {
                 crate::lb::balance_source_consistent(self, ip).map(|idx| (Some(idx), self.servers.at(idx))).or(self.dispatch.map(|a| (None, a)))
             }
             BalanceAlgorithm::Source => {
-                let eligible = self.eligible_server_indices();
-                if eligible.is_empty() {
+                let n = self.eligible_count();
+                if n == 0 {
                     return self.dispatch.map(|a| (None, a));
                 }
                 if let Some(ip) = source_ip {
@@ -2268,10 +2256,10 @@ impl Proxy {
                             .iter()
                             .fold(0usize, |acc, &b| acc.wrapping_add(b as usize)),
                     };
-                    let chosen_idx = eligible[hash % eligible.len()];
+                    let chosen_idx = self.eligible_nth(hash % n)?;
                     return Some((Some(chosen_idx), self.servers.at(chosen_idx)));
                 }
-                let chosen_idx = eligible[self.next_server_idx.fetch_add(1, Ordering::Relaxed) % eligible.len()];
+                let chosen_idx = self.eligible_nth(self.next_server_idx.fetch_add(1, Ordering::Relaxed) % n)?;
                 Some((Some(chosen_idx), self.servers.at(chosen_idx)))
             }
             BalanceAlgorithm::Uri => {

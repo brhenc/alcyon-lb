@@ -113,3 +113,28 @@ fn taking_an_idle_connection_takes_no_lock_and_hashes_nothing() {
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
 }
+
+#[test]
+fn a_round_robin_pick_syncs_with_the_servers_only_when_one_changed() {
+    let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+    let config = Config {
+        backends: vec![BackendSection {
+            name: "be".into(),
+            mode: Mode::Http,
+            servers: vec![Server::new("s1", a), Server::new("s2", b)],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let engine = Engine::new(&config, 8).expect("Engine::new");
+    let px = &engine.proxies[0];
+    assert!(px.select_server().is_some());
+    let before = on_this_thread()[Op::LbSync as usize];
+    let picks: Vec<_> = (0..100).map(|_| px.select_server()).collect();
+    assert_eq!(on_this_thread()[Op::LbSync as usize] - before, 0, "100 picks, nothing changed");
+    assert_eq!(picks.iter().filter(|p| **p == Some(a)).count(), 50);
+    px.set_weight(1, 0);
+    assert!(px.select_server_idx().is_some_and(|(i, _)| i == Some(0)), "a weight change is seen by the next pick");
+    assert_eq!(on_this_thread()[Op::LbSync as usize] - before, 1);
+}

@@ -23,9 +23,11 @@ pub enum Op {
     IdleLock = 3,
     /// A server's idle list looked up by hashing `(backend, server)`.
     IdleHash = 4,
+    /// The round-robin trees compared with every server's weight and state (`Fwrr::sync`).
+    LbSync = 5,
 }
 
-const OPS: usize = 5;
+const OPS: usize = 6;
 
 thread_local! {
     static COUNTS: [Cell<u64>; OPS] = const { [const { Cell::new(0) }; OPS] };
