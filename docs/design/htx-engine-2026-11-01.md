@@ -185,14 +185,17 @@ reserve model fails X2's tests on large heads (§4).
   comma-split by `http_find_header(full=0)`'s rule (http_htx.c:130-245: next element in the same
   block first, then the next block of the same name; `full=1` one whole line). Ibex's
   `header_blocks_where`/`get_header` (htx.rs:874-1126) already walk this way for the request.
-- **`str` samples stay UTF-8** (tradeoff 6.12, decided 2026-10-10): a fetch that yields a `str`
-  validates the block's bytes once at the fetch (`from_utf8` on 20-60 B). That is the ~1.6k
-  "UTF-8 re-validation" row; X2 reduces it to one validation per fetched block rather than per
-  fetch and per materialised `String`, not to zero. Bytes that are not UTF-8 are forwarded
-  byte for byte (HAProxy treats values as opaque: h1.c:899-909 stops only at NUL, CR, LF;
-  tradeoff 6.24, E1) and a `str` fetch on such a block yields what today's Latin-1 holding does.
-  Closes 6.24's open item (`:path` with such bytes is a `ReqLine` block of bytes, forwarded; `%r`
-  logs it as HAProxy's `#E9` escape), D-B.
+- **Samples are bytes** (user decision 2026-11-01, superseding the 2026-10-10 half of tradeoff
+  6.12 that kept `str` samples UTF-8): Ibex keeps data as bytes like HAProxy and neither
+  validates nor re-encodes it. A `str`-typed sample is `Cow<'a, [u8]>` (engine doc §4.4 R2);
+  matchers and converters work on bytes (HAProxy's `pat_match_*` on `smp->data.u.str`); the
+  linear regex is `regex::bytes`, the backtracking one (fancy-regex, `str`) validates at the
+  match only and a non-match is the answer on bytes it cannot decode. The ~1.6k "UTF-8
+  re-validation" row goes to zero: the parse-path 22 calls with T575 Part 2, the rules-path 17
+  with R2, the format/var `String` sites with R4. Bytes that are not UTF-8 are forwarded byte
+  for byte (HAProxy treats values as opaque: h1.c:899-909 stops only at NUL, CR, LF; tradeoff
+  6.24, E1). Closes 6.24's open item (`:path` with such bytes is a `ReqLine` block of bytes,
+  forwarded; `%r` logs it as HAProxy's `#E9` escape), D-B.
 - **Rules** (`rule_compiled::http_req`, rule_compiled.rs:354; `req_rule_header` engine.rs:15720;
   `run_res_rules` engine.rs:16567): every action edits blocks through `HtxSlice`
   (`set_header` 1834, `add_header` 1819, `remove_header` 1992, `replace_header` 1866, `set_uri`
@@ -292,7 +295,7 @@ One function per direction, the port of `h1_make_reqline`/`h1_make_stline`/`h1_m
 | tunnel / upgrade | `H1_MSG_TUNNEL`, RAW_DATA | raw | same |
 | 1xx | own message, forwarded, loop | forwarded on h1; dropped on h2/h3 (h3-engine §4) | X3 interim messages; h2/h3 `send_interim` |
 | `maxrewrite` | 400/502 when a rewrite does not fit (`tune.maxrewrite`) | `res_htx_resize` models it (engine.rs:15688) | the reserve **is** `maxrewrite`: same limit, now enforced by the layout; large-head rows (16 KiB head, 1 KiB reserve, five `set-header`) in the test plan |
-| non-UTF-8 bytes | opaque | values forwarded (E1/E2), `:path`/`:method` refused on h2/h3 | all forwarded as bytes (D-B); `str` fetch validates at the fetch |
+| non-UTF-8 bytes | opaque | values forwarded (E1/E2), `:path`/`:method` refused on h2/h3 | all forwarded as bytes (D-B); samples, matchers and converters on bytes, no validation (user, 2026-11-01; R2) |
 
 ## 3. Slices
 
@@ -357,7 +360,7 @@ without that row). Do not weaken a `tools/checkin.sha256` test to pass; report i
 | | question | recommendation |
 |---|---|---|
 | **D-A** | Layout: (A) descriptors in the transport buffer's reserve over the received bytes, passthrough for unmodified heads; or (B) HAProxy's separate HTX buffer, copy at the parse | **A.** B costs keepalive +2-3k for simplicity Ibex does not need; A keeps today's zero-work keep-alive path and is HAProxy's layout in every other respect |
-| **D-B** | Header values, `:path`, `:method` as bytes in the HTX; `str` samples validated at the fetch (tradeoff 6.12 kept, 6.24's open item closed) | **Yes.** It is what HAProxy does (opaque bytes) and removes the h2/h3 `:path` reset where HAProxy forwards |
+| **D-B** | Header values, `:path`, `:method` as bytes in the HTX; `str` samples validated at the fetch (tradeoff 6.12 kept, 6.24's open item closed) | **Yes.** It is what HAProxy does (opaque bytes) and removes the h2/h3 `:path` reset where HAProxy forwards. **Amended 2026-11-01 (user, §5)**: no validation at the fetch either; samples are bytes (R2) |
 | **D-C** | Keepalive budget for X2: strict ±0.5 %, or allow up to +1 % if rules gains ≥ 6k | **Strict.** Keep-alive is the production path for a blog; the design claims it is flat, so measure it flat |
 | **D-D** | Body in HTX as DATA blocks always (HAProxy's non-fast-forward path) or on demand only (X6) | **On demand.** HAProxy itself bypasses HTX for the body whenever it can; always-DATA is a copy per body for nothing |
 | **D-E** | Lowercase header names on every h1 output (HAProxy's behaviour, costs the unmodified passthrough ~0.2-0.4k on keepalive) or keep the client's case when nothing was modified (today) | **Lowercase everywhere**, inside the keepalive budget, because the oracle does and the differential corpus (R1 item 2) otherwise carries a permanent documented difference; if it does not fit the budget, keep passthrough and document in `tradeoff.md` |
@@ -379,3 +382,17 @@ without that row). Do not weaken a `tools/checkin.sha256` test to pass; report i
   work (T550 S2 = slice E3, a stream object per h2/h3 child; S3, the loop row: 17.4k on h2 against
   HAProxy's 2.3k, 7.15 loop passes per request) run in parallel. X0's profile covers S3 too, so the
   S3 slices are written from its numbers; X2/X3 go ahead whatever X0's representation share is.
+
+**2026-11-01 (evening), after X0.**
+
+- **D-B amended: bytes like HAProxy.** Ibex keeps request and response data as bytes and does
+  not validate or re-encode it; the "`str` samples stay UTF-8, validated once at the fetch" half
+  of tradeoff 6.12 is retired (`tradeoff.md` 6.12 and 6.24 updated at R2's merge). `Sample` Str
+  becomes borrowed bytes, matchers and converters on bytes, the linear regex `regex::bytes`,
+  fancy-regex (`str`) only where a pattern needs lookaround or backreferences and then
+  validating at the match (engine doc §4.4 R2, §2.2 above). The parse path goes to bytes first
+  (T575 Part 2, in flight).
+- **The "expected" cells of §3 are superseded** by the engine doc §4.1 (X1 is now L and owns
+  the parse scan; X2 keepalive -3 to -5k, not flat; X3 keepalive -1.5 to -2.5k and rules -3.5
+  to -5k; X4 -3 to -5k) and the landing by its §5; the goals, files and tests of §3 stand.
+  The §3 "Expected total" paragraph is pre-X0 and is not the landing.

@@ -6,6 +6,10 @@ we are still leaving performance on the table"). No measurement was run for this
 host was in use); every number names its record. Oracle: `~/reference/haproxy` (3.5-dev8,
 88576119c), line numbers as of 2026-11-01.
 
+**Re-budgeted after X0 (2026-11-01 evening, §6.2).** §0 and §2 keep the pre-X0 reasoning and the
+figures they were written with; §2.1 holds the measurements; **§4, §4.6, §5 and §6 are the
+re-budget** and supersede the ranges quoted in §0 (landing, cost, critical path).
+
 This document is the whole programme. `htx-engine-2026-11-01.md` (D5, the representation) is
 one of its four tracks and keeps its slices except where §4 says otherwise; the T550 survey's
 S2/S3 become the O and L tracks here; the h3 track (`quic-transport-2026-11-01.md`) keeps its
@@ -428,98 +432,189 @@ Sizes: S <= 1 day, M 2-3 days, L 4-6 days of agent time. Models: Opus where the 
 scheduler semantics, lifetimes across crates, or `engine.rs`'s dispatch chain; Sonnet where the
 brief is mechanical and the test pins it.
 
-### 4.1 Track X, representation (D5, revised)
+**Budgets after X0 (2026-11-01).** Every "expected" cell below is rewritten from §2.1's measured
+rows and names its base; the pre-X0 reasoning in the same cell is gone. Base figures (user
+instructions a request): Ibex keepalive 45.9k, rules 75.7k, h2s1 71.6k, h3fit 98.9k; HAProxy
+36.2k, 43.8k, 53.2k, 64.0k (dev10). Delivery so far against a design range: R1 (T574) measured
+-1.06k on a -1.5 to -3k range (X0: the name lookup was not the cost); S7/E2 left 4.0k where
+~2.5k was estimated (htx §1.3 row 1). §5 therefore reads the sums at a **delivery factor of
+0.7** (range 0.5-1.0). A slice that measures under the low end of its range on its target
+scenario stops and reports (§6 stop rules); the budget on every other scenario stays +0.5 %.
 
-X0 (extended, §1.2, Sonnet S), X1, X5, X2, X3, X4, X7, X6, X8 as `htx-engine-2026-11-01.md` §3,
-with these changes:
+In flight at the time of the re-budget: **R1** (T574, closing at -1.06k rules), **K1 + the
+parse path in bytes** (T575, Sonnet: K1 -4k or better on keepalive and rules; UTF-8 off the
+parse path -0.8k or better on keepalive).
 
-- **X2** also: the request-phase `SampleContext` built once per rule run (not per rule) and
-  the `tune.ibex.h1-lowercase-headers` passthrough leg (D-E, default off).
-- **X3** also: the per-rule `SampleContext` clone retired (S7's "borrow"); the HPACK static
-  `match` is **already done (Q3)**, so X3's h2 expectation drops to -1 to -2k.
-- **X4** expectation unchanged (-2 to -3k on h2/h3); it is the prerequisite of O1b.
-- **X0** produces §1.2's ten items, not only the representation rows.
+### 4.1 Track X, representation (D5, revised after X0)
+
+X0 is done (§2.1, htx §1.3). X1, X5, X2, X3, X4, X7, X6, X8 as `htx-engine-2026-11-01.md` §3,
+with these changes (the "expected" cells there are superseded by the ranges here):
+
+- **X1** (now **L**, was M): `index_h1_head` is also the fast scan. §2.1 row 6: the request
+  parse is **10.1k against HAProxy's 4.9k per head**, and its leaves are byte-at-a-time
+  (`memchr` 3.5k self, `eq_ignore_ascii_case` 1.1k, `to_ascii_lowercase`/`is_ascii_uppercase`
+  1.25k, `ascii_word_spans` 1.1k htx.rs:359, `finalize_last_header` 0.56k, h1.rs:490
+  `parse_headers` 5.9k). The in-place parser finds delimiters one line at a time with
+  `memchr2`/`memchr3` (already a dependency), checks tchar and lowercases names with one
+  256-entry table, writes descriptors as it goes, and works on bytes throughout (T575 Part 2's
+  rule). Target **<= 3.5k per head** on the scenarios' heads; the number is measured by X2 (the
+  path), X1 itself is off the path (0). The differential test of htx §3 is unchanged.
+- **X5**: unchanged, neutral. Its `ConnMode` flags are K1's (T575) flags: K1 lands first, X5
+  consumes them (`h1_make_eoh`'s mode rule emits the token; K1's interim token write goes).
+- **X2**: also the request-phase `SampleContext` built once per rule run (not per rule) and the
+  `tune.ibex.h1-lowercase-headers` passthrough leg (D-E, default off). Expected: **keepalive
+  -3 to -5k** (the parse 10.1k -> 5-7k with X1's parser, `req_htx_init` 0.6k and the `htx_buf`
+  take/give gone, +0.2k descriptor writes; T575's UTF-8 -0.8k and K1's Connection path are
+  **excluded** because they land first; K1's remaining token write folds into
+  `encode_if_modified`: -0.5 to -1k more). **rules -9 to -13k** (the keepalive share, plus:
+  `write_req_head` **x2** + its memsets + `flush_req_rebuild`/`replace_prefix` 4.0k -> one
+  encode at the send <= 1k; `req_rule_header` 2.0k / `add_req_header` 1.6k / `set_header`
+  family 1.75k (overlapping) -> block edits ~0.5k; `SampleContext` 2.1k -> once per phase <=
+  0.4k; §2.1 row 8). **h2s1 0** (`copy_header` is 0.2k, not 1k). The "keepalive flat" of htx §3
+  was written before X0 showed the parse at 2x; it is replaced by the range above, and D-C's
+  strict budget applies to what X2 does not name (kernel, h2s1).
+- **X3**: also the per-rule `SampleContext` clone retired (S7's "borrow"); the HPACK static
+  `match` is done (Q3). Expected: **keepalive -1.5 to -2.5k** (the response head with no rules
+  is 5.0k: `HeadFacts::of_response` 2.0k, `check_response_head` 1.1k,
+  `rewrite_header_names_before` 0.7k, `inject` 0.4k + memset 0.3k; target ~2.5k, HAProxy ~2.4k);
+  **rules -3.5 to -5k** (7.3k: `rewrite_header_names_before` 2.9k engine.rs:16773,
+  `run_res_rules` 1.7k engine.rs:16514, `HeadFacts` 1.9k, `check_response_head` 0.8k; target
+  <= 3k, HAProxy's response rules 1.3k + head 2.4k); **h2s1/h3fit -2 to -3k** (4.8k:
+  `indexed_fields`, the HPACK scan, the `(String, String)` head).
+- **X4**: **h2s1/h3fit -3 to -5k** (was -2 to -3k: two copies of the head cost 6.8k measured,
+  `put_request_head` 3.9k + `write_h1_wire` 2.1k + `req_htx_init` 0.8k, htx §1.3). Still the
+  prerequisite of O1b.
+- **X7**: unchanged (rules -1k, h2s1 -0.5k, keepalive -0.3k).
+- **X6, X8**: neutral on the four scenarios; last, after the week-6 re-measure, Sonnet fillers.
 
 ### 4.2 Track L, loop and scheduler (survey S3)
 
 | slice | goal | files | test that fails first | expected ins/req (reasoning) | size | depends | model |
 |---|---|---|---|---|---|---|---|
-| **L1** | housekeeping out of the pass: idle purge, buffer trim, stick-table expiry, `pool::pass`, the three `publish`es, accept-limit and CLI-retry checks become `Kind::Housekeeping` tasks on the wait queue (one per concern, HAProxy's `srv_cleanup_idle_conns`/`process_table_expire` model) run when their timer expires; QUIC admit/adopt/serve behind `!quic_listeners.is_empty()`; `EngineDispatcher` built once per `Engine` | `engine.rs` `step_at` 5923-6230, `sched.rs` (a task kind), `pool.rs` (`pass` from a task) | `crates/ibex-rt/tests/it/engine_pass.rs` (new module): `a_pass_with_nothing_due_does_no_housekeeping` — `#[cfg(debug_assertions)]` `work::Op::Housekeeping` counter 0 over 100 idle passes and 1 per timer period; red today (every pass). `show pools`/`show info` rows stay identical under the stats battery | **-0.3 to -0.8k on all three** (3-7 passes x 100-250); kernel 0 | M | - | Sonnet |
-| **L2** | instant wakeup: `Dispatch` gets `wake_now(TaskRef)` which pushes to the current pass's tasklet list; `run_tasks_from_lists` drains what arrives while it runs (budget-bounded, as HAProxy's lists); the `last_run == loops` guard (sched.rs:703) allows a second run per pass and refuses a third; the owner<->child wakes (engine.rs:11212, `h2_owner_pass`'s `wake_queue`) and `wants_rerun` use it; `wake_queue` keeps only cross-pass uses (buffer waiters, mailbox) | `sched.rs` 637-740, `engine.rs` dispatcher (`wake_queue` sites), `h2_owner_pass` | `engine_pass.rs`: `an_h2_request_completes_in_three_passes` and `an_h1_keepalive_request_completes_in_two` — debug counter of `step_at` per request through a local h2load/ab run in the test harness (as `h2_per_request_work.rs` counts); red today (7 / to be measured by X0). `ibex-sched` unit tests: a task woken twice in a pass runs twice, a third wake waits; the Bulk demotion still applies to self-wakes | **h2 -3 to -5k** (4 fewer passes x ~0.9k: `step_at` + poll glue + `epoll_wait` user side); **keepalive -0.3 to -1k** if a third pass exists; **kernel: -4 `epoll_wait` per h2 request (a kernel saving)**; rules as keepalive | M | X0 (counts) | Opus |
-| **L3** | the stream run gated by state: `step_stream_run` reads the wake reason (`WOKEN_TIMER` -> `check_timeouts`; `WOKEN_IO` -> clear the fired side's `cant_recv`), a `pending: u16` on `TcpSession` for the rare conditions (set where each arises: deferred session rules, tcp inspect x2, scrape, stick stores, glitches, park expiry, retry, connect-log, rate-max, srv handshake failure, checkcache), `stream_vars_enter/leave` and `stream_timeouts_enter` replaced by `&Proxy`/timeouts passed down (Q6: no `Arc` clone), `update_interests` only on a changed `(Want, Want)`, `req/rep.release()` at txn end | `engine.rs` 10889-11270, 7927-8000, 9485; `proxy.rs` (`pending`) | `engine_pass.rs`: `a_keepalive_stream_run_does_only_io_and_http` — `work::Op` counters for each rare check are 0 on a plain GET and 1 when the condition is set (deferred rule, inspect, scrape); red today. The timeout battery (T140-era `timeouts_*` modules) and `h2_per_request_work.rs` green; `Arc` strong count of the capture table constant across a request | **keepalive/rules -1.5 to -3k** (2-3 runs x 500-1000), **h2 -3 to -5k** (5-7 runs) | L | L2 (run counts), X0 | Opus |
+| **L1** | housekeeping out of the pass: idle purge, buffer trim, stick-table expiry, `pool::pass`, the three `publish`es, accept-limit and CLI-retry checks become `Kind::Housekeeping` tasks on the wait queue (one per concern, HAProxy's `srv_cleanup_idle_conns`/`process_table_expire` model) run when their timer expires; QUIC admit/adopt/serve behind `!quic_listeners.is_empty()`; `EngineDispatcher` built once per `Engine` | `engine.rs` `step_at` 5923-6230, `sched.rs` (a task kind), `pool.rs` (`pass` from a task) | `crates/ibex-rt/tests/it/engine_pass.rs` (new module): `a_pass_with_nothing_due_does_no_housekeeping` — `#[cfg(debug_assertions)]` `work::Op::Housekeeping` counter 0 over 100 idle passes and 1 per timer period; red today (every pass). `show pools`/`show info` rows stay identical under the stats battery | **keepalive/rules -0.3 to -0.8k** (§2.1 row 1: housekeeping calls 0.2-0.35k a request + `step_at` self 0.3-0.4k); **h2s1/h3fit -1 to -2k at today's 8 passes** (housekeeping 1.0k + `step_at` self 1.2k), **-0.5 to -1k once L2 holds 3 passes**; kernel 0 | M | - | Sonnet |
+| **L2** | instant wakeup: `Dispatch` gets `wake_now(TaskRef)` which pushes to the current pass's tasklet list; `run_tasks_from_lists` drains what arrives while it runs (budget-bounded, as HAProxy's lists); the `last_run == loops` guard (sched.rs:703) allows a second run per pass and refuses a third; the owner<->child wakes (engine.rs:11212, `h2_owner_pass`'s `wake_queue`) and `wants_rerun` use it; `wake_queue` keeps only cross-pass uses (buffer waiters, mailbox) | `sched.rs` 637-740, `engine.rs` dispatcher (`wake_queue` sites), `h2_owner_pass` | `engine_pass.rs`: `an_h2_request_completes_in_three_passes` and `an_h1_keepalive_request_completes_in_two` — debug counter of `step_at` per request through a local h2load/ab run in the test harness (as `h2_per_request_work.rs` counts); red today on h2 (8 passes undisturbed, X0; the h1 row is already 2.00 and only pins). `ibex-sched` unit tests: a task woken twice in a pass runs twice, a third wake waits; the Bulk demotion still applies to self-wakes | **h2s1 -4 to -5.5k** (§2.1: 7.99 passes against HAProxy's 3.00, 1.05k a pass outside the tasks; 5 passes removed) and **kernel -5 `epoll_wait` a request**; **h3fit -4 to -6k** (7-8 passes to <= 3-4); **keepalive/rules 0**: 2.00 passes under every observer on both proxies, no third pass exists; the slice names no h1 saving | M | - | Opus |
+| **L3** | the stream run gated by state: `step_stream_run` reads the wake reason (`WOKEN_TIMER` -> `check_timeouts`; `WOKEN_IO` -> clear the fired side's `cant_recv`), a `pending: u16` on `TcpSession` for the rare conditions (set where each arises: deferred session rules, tcp inspect x2, scrape, stick stores, glitches, park expiry, retry, connect-log, rate-max, srv handshake failure, checkcache), `stream_vars_enter/leave` and `stream_timeouts_enter` replaced by `&Proxy`/timeouts passed down (Q6: no `Arc` clone), `update_interests` only on a changed `(Want, Want)`, `req/rep.release()` at txn end | `engine.rs` 10889-11270, 7927-8000, 9485; `proxy.rs` (`pending`) | `engine_pass.rs`: `a_keepalive_stream_run_does_only_io_and_http` — `work::Op` counters for each rare check are 0 on a plain GET and 1 when the condition is set (deferred rule, inspect, scrape); red today. The timeout battery (T140-era `timeouts_*` modules) and `h2_per_request_work.rs` green; `Arc` strong count of the capture table constant across a request | **keepalive/rules -1.5 to -2.5k** (§2.1 row 3: fixed cost 1.5k a run x 2 runs; the 150 target leaves 0.3k), **h2s1/h3fit -3 to -4k after L2** (0.95k a run; 9 runs today, 5-7 after L2; -4 to -5k if L3 lands first, then L2's figure shrinks by the same) | L | L2 (run counts) | Opus |
 
 ### 4.3 Track O, stream objects and the backend side (survey S2 = E3)
 
 | slice | goal | files | test that fails first | expected | size | depends | model |
 |---|---|---|---|---|---|---|---|
-| **O1a** | the `Stream` object: `txn`, `log`, txn/reqres vars, captures, backend side, task, timers out of `TcpSession` into a pooled `Stream` (`ibex_alloc::Pool`, 1 KiB class, counted in `show pools`); the h1 session holds one and **resets** it at txn end (`Stream::reset`: the fields that change, no `Default`); `end_txn` becomes reset + the connection-level decisions | `proxy.rs` 653-894 (`TcpSession` split), `txn.rs`, `txnlog.rs`, `engine.rs` `end_txn` 10476, `account_stream` | `crates/ibex-rt/tests/it/stream_object.rs` (new module): `a_keepalive_request_resets_its_stream_in_place` (debug counter: 0 `Stream` allocations and 0 `StreamLog` constructions per keep-alive request after the first; red today: `end_txn` rebuilds), `stream_is_at_most_1_kib` (`size_of` pin), the log-format battery (`%Tr`, `%Tw`, `%ST`, captures, vars) identical | **keepalive/rules -0.5 to -1.5k** (`end_txn` 2.7k -> ~1.2k); h2 0 (O1b) | L | X2 (the stream's buffers are the layout) | Opus |
-| **O1b** | h2 children as `Stream`s: the owner holds `Vec<Stream>` by stream id with a task each; `h2_child_of`/`h2_child_done`/`spawn_h2_children` become `Stream::start`/`finish`; `h2_owner_pass` iterates its streams (no `sessions.get2_mut` per child per pass); `end_stream` for a child is `finish` + pool give | `engine.rs` 6237, 10607-10660, 11272; `h2_bridge.rs`; `proxy.rs` (`h2_owner`) | `stream_object.rs`: `an_h2_stream_is_not_a_session` (debug counter: 0 `TcpSession` constructions per h2 request; red today 1), `h2_per_request_work.rs` rows green, the h2 battery (T280, T409, GOAWAY/RST rows) green | **h2 -3 to -5k** (set-up 3.4k -> ~1k, tear-down 4.4k -> ~1.5k) | L | O1a, X4 (D-F) | Opus |
-| **O1c** | h3 streams as `Stream`s: `step_h3_owner`'s children, `read_stream`/`write_stream` into the stream's layout (Q1's handle) | `engine.rs` `step_h3_owner`, `quic_listener.rs`, `mux_h3.rs` | `stream_object.rs`: the h3 row of the counter test; `h3_request_framing_to_backend.rs` green; h3fit measured | **h3fit -3 to -5k** | M | O1b, Q1 | Opus |
-| **O2** | backend side without hashes or locks: servers by dense index (Q5: `engine.rs:170,179,369,427`), idle connections as per-thread per-server `Vec<IdleConn>` (own thread first, cross-thread take only on a miss, as `conn_backend_get`), `IdlePools::with_count` and the `RwLock` read gone from the take, `route_to_server`/`select_server` on the compiled backend (precomputed server list, no name compares) | `engine.rs` `connect_http_backend` 12840-13100, `route_to_server` 14016, `select_server` 2054, `IdlePool` 265-600 | `stream_object.rs`: `taking_an_idle_connection_takes_no_lock_and_hashes_nothing` (debug counters on the lock and on `IdleKey` hashing; red today), `http_reuse_*` rows (safe/aggressive/always, the 64-thread `vtc` port at `engine.rs:1036`) green | **h2 -2 to -4k** (`connect_http_backend` 7.2k -> ~3k); keepalive/rules ~0 (parked); kernel 0 | M | - | Sonnet |
+| **O1a** | the `Stream` object: `txn`, `log`, txn/reqres vars, captures, backend side, task, timers out of `TcpSession` into a pooled `Stream` (`ibex_alloc::Pool`, 1 KiB class, counted in `show pools`); the h1 session holds one and **resets** it at txn end (`Stream::reset`: the fields that change, no `Default`); `end_txn` becomes reset + the connection-level decisions | `proxy.rs` 653-894 (`TcpSession` split), `txn.rs`, `txnlog.rs`, `engine.rs` `end_txn` 10476, `account_stream` | `crates/ibex-rt/tests/it/stream_object.rs` (new module): `a_keepalive_request_resets_its_stream_in_place` (debug counter: 0 `Stream` allocations and 0 `StreamLog` constructions per keep-alive request after the first; red today: `end_txn` rebuilds), `stream_is_at_most_1_kib` (`size_of` pin), the log-format battery (`%Tr`, `%Tw`, `%ST`, captures, vars) identical | **keepalive/rules -0.3 to -0.8k** (§2.1 row 4: `end_txn` is 1.70k / 2.04k measured, not 2.7k: `reset_for_next_request` 0.97k proxy.rs:2190, `IdlePool::note_used` 0.33k; to ~1.2k); h2 0. The slice's worth is structural: O1b (-4 to -4.5k) and R4 (-1 to -2k) stand on the object, not its own saving | L | X2 (the stream's buffers are the layout) | Opus |
+| **O1b** | h2 children as `Stream`s: the owner holds `Vec<Stream>` by stream id with a task each; `h2_child_of`/`h2_child_done`/`spawn_h2_children` become `Stream::start`/`finish`; `h2_owner_pass` iterates its streams (no `sessions.get2_mut` per child per pass); `end_stream` for a child is `finish` + pool give | `engine.rs` 6237, 10607-10660, 11272; `h2_bridge.rs`; `proxy.rs` (`h2_owner`) | `stream_object.rs`: `an_h2_stream_is_not_a_session` (debug counter: 0 `TcpSession` constructions per h2 request; red today 1), `h2_per_request_work.rs` rows green, the h2 battery (T280, T409, GOAWAY/RST rows) green | **h2s1 -4 to -4.5k** (§2.1 row 4: set-up + tear-down 7.1k measured, `h2_child_of` 2.03k, `end_txn` 2.47k, `end_stream` 2.60k with `h2_child_released` 1.42k; HAProxy 5.6k; target 2.5-3k) | L | O1a, X4 (D-F) | Opus |
+| **O1c** | h3 streams as `Stream`s: `step_h3_owner`'s children, `read_stream`/`write_stream` into the stream's layout (Q1's handle) | `engine.rs` `step_h3_owner`, `quic_listener.rs`, `mux_h3.rs` | `stream_object.rs`: the h3 row of the counter test; `h3_request_framing_to_backend.rs` green; h3fit measured | **h3fit -3 to -5k** (the h2s1 object figures carried over; X0 took no post-E2 h3 per-function table, T544's stands) | M | O1b, Q1 | Opus |
+| **O2** | backend side without hashes or locks: servers by dense index (Q5: `engine.rs:170,179,369,427`), idle connections as per-thread per-server `Vec<IdleConn>` (own thread first, cross-thread take only on a miss, as `conn_backend_get`), `IdlePools::with_count` and the `RwLock` read gone from the take, `route_to_server`/`select_server` on the compiled backend (precomputed server list, no name compares) | `engine.rs` `connect_http_backend` 12840-13100, `route_to_server` 14016, `select_server` 2054, `IdlePool` 265-600 | `stream_object.rs`: `taking_an_idle_connection_takes_no_lock_and_hashes_nothing` (debug counters on the lock and on `IdleKey` hashing; red today), `http_reuse_*` rows (safe/aggressive/always, the 64-thread `vtc` port at `engine.rs:1036`) green | **h2s1/h3fit -2 to -3.5k** (§2.1 row 5: `connect_http_backend` 6.4k on h2s1 without rules: `route_to_server` 2.55k, `select_server` 1.38k, `IdlePools` 0.78k; HAProxy 1.8k; target <= 3k); keepalive/rules ~0 (parked; the lock/hash rows are 0.3k there); kernel 0 | M | - | Sonnet |
 
 ### 4.4 Track R, rules
 
 | slice | goal | files | test that fails first | expected | size | depends | model |
 |---|---|---|---|---|---|---|---|
-| **R1** | compiled dispatch: `Expr::parse` resolves `fetch_name` to `FetchFn` (+ `MultiFetchFn`/`VisitFetchFn`), parses args into `Arg` (lowercase header name bytes, int, regex, var name, table ref), resolves converters to `ConvFn`; `Registry::eval_g`/`any_acl`/`eval_all_g` take the compiled form; the by-name entry points stay for the CLI and tests only. Covers `tcp-request`/`tcp-response`, `use_backend`, `stick`, `log-format %[...]`, `track-sc` (the "Expr::cached" remainder) | `crates/ibex-sample/src/expr.rs`, `registry.rs` 1290-1330, `rule_compiled.rs`, `logfmt.rs` | `crates/ibex-sample/tests/it/compiled_expr.rs` (new module): `evaluating_a_compiled_expression_looks_up_no_name` (debug counter on `fetches.get`/`converters.get`: 0 per eval; red today 1 per fetch), the fetch/converter batteries (T80, T81) green through the compiled path | **rules -1.5 to -3k** (8 lookups x 200-350: SipHash on the name + `&[String]` arg handling); keepalive/h2 0 | M | - | Sonnet |
-| **R2** | borrowed samples: `Sample<'a>` with `Str(Cow<'a, [u8]>)`/`Bin(Cow<'a, [u8]>)` views into the HTX block for header, path, method, query, cookie fetches (HAProxy's `SMP_F_CONST`); owned bytes only after a converter produces new ones; `str` validated once at the fetch (D-B, tradeoff 6.12 kept); `spare::string_from` off the fetch path | `ibex-sample` (`sample.rs`, the ~1,200 lines of fetches, `matcher.rs`), `rule_compiled.rs`, the 290 test sites tradeoff 6.12 counted | `compiled_expr.rs`: `a_header_acl_takes_no_spare_string` (spare counter 0 for `hdr(host) -m sub` and `path_reg`; red today), `request_allocations*.rs` pins | **rules -2.5 to -4k** (spares 3-4k [M]); 0 elsewhere | L | X2 (the HTX views), R1 | Opus |
-| **R4** | vars and format scratch in the `Stream`: `set-var(txn.*)` into the stream's var slots (no 4 KiB `VarStore` spare take/give per txn), `%[rand]`/log-format fragments rendered into a stream scratch `[u8; 256]` with overflow to a pool buffer | `vars.rs`, `logfmt.rs`, `txn.rs` | `stream_object.rs`: `set_var_takes_no_spare` (counter; red today) | **rules -0.5 to -1k** | S | O1a | Sonnet |
+| **R1** | compiled dispatch: `Expr::parse` resolves `fetch_name` to `FetchFn` (+ `MultiFetchFn`/`VisitFetchFn`), parses args into `Arg` (lowercase header name bytes, int, regex, var name, table ref), resolves converters to `ConvFn`; `Registry::eval_g`/`any_acl`/`eval_all_g` take the compiled form; the by-name entry points stay for the CLI and tests only. Covers `tcp-request`/`tcp-response`, `use_backend`, `stick`, `log-format %[...]`, `track-sc` (the "Expr::cached" remainder) | `crates/ibex-sample/src/expr.rs`, `registry.rs` 1290-1330, `rule_compiled.rs`, `logfmt.rs` | `crates/ibex-sample/tests/it/compiled_expr.rs` (new module): `evaluating_a_compiled_expression_looks_up_no_name` (debug counter on `fetches.get`/`converters.get`: 0 per eval; red today 1 per fetch), the fetch/converter batteries (T80, T81) green through the compiled path | **closed: T574 measured rules -1.06k, keepalive flat** (design range was -1.5 to -3k; §2.1 row 8: the lookup was ~0.44k a fetch x 3 fetches, not 8 x 200-350; the rest of `Expr::eval`'s 3.75k is the materialised sample and the per-rule context, R2's and X2's) | M | - | Sonnet |
+| **R2** | samples as bytes, borrowed (user decision 2026-11-01: Ibex keeps data as bytes like HAProxy, no UTF-8 validation or re-encoding; replaces the "`str` samples stay UTF-8, validated once at the fetch" half of tradeoff 6.12 / D-B): `Sample<'a>` with `Str(Cow<'a, [u8]>)`/`Bin(Cow<'a, [u8]>)` views into the HTX block for header, path, method, query, cookie fetches (HAProxy's `SMP_F_CONST`, `smp->data.u.str` is bytes); owned bytes only after a converter produces new ones; **matchers and converters on bytes** (`-m str/sub/beg/end/dir/dom`, `lower`/`upper`/`word`/`field` as ASCII byte ops, HAProxy's `pat_match_*`); **regex**: `UserRegex::Linear` becomes `regex::bytes::Regex` (ibex-regex/src/lib.rs:596-601; no lookaround/backrefs), `Backtracking` stays `fancy_regex` on `str` and validates at the match only (one `from_utf8` per such match, a non-match on invalid bytes, as HAProxy's `regex_exec` on bytes it cannot decode); no `from_utf8` anywhere else on the fetch/ACL/action path; `spare::string_from` off the fetch path; `%[...]` in a `str` position (log, var, format) takes the bytes and escapes as `%r` does | `ibex-sample` (`sample.rs`, the ~1,200 lines of fetches, `matcher.rs`, converters), `rule_compiled.rs`, `ibex-regex/src/lib.rs`, the 290 test sites tradeoff 6.12 counted | `compiled_expr.rs`: `a_header_acl_takes_no_spare_string` (spare counter 0 for `hdr(host) -m sub` and `path_reg`; red today), `a_rule_run_validates_no_utf8` (debug counter on `from_utf8` from the rules path: 0 for the rules scenario's 2 ACLs + 7 rules; red today: 17), `a_non_utf8_header_matches_as_bytes` (`hdr(x) -m sub \xff` and `-m reg` on a Latin-1 value: same verdict as HAProxy, recorded from the oracle), `request_allocations*.rs` pins | **rules -3 to -4.5k** (§2.1 row 8: spares 2.26k, the rules' 17 `from_utf8` ~0.3-0.5k, the `String` materialisation inside `Expr::eval`/`any_acl` ~1k); 0 elsewhere | L | X2 (the HTX views), R1 | Opus |
+| **R4** | vars and format scratch in the `Stream`, as bytes: `set-var(txn.*)` into the stream's var slots (no 4 KiB `VarStore` spare take/give per txn; var values are bytes, R2's rule), `%[rand]`/log-format fragments rendered into a stream scratch `[u8; 256]` with overflow to a pool buffer (no `String`: the last rules-side `from_utf8`/`String` sites go here) | `vars.rs`, `logfmt.rs`, `txn.rs`, `engine.rs` `render_rule_format` 3262 | `stream_object.rs`: `set_var_takes_no_spare` (counter; red today), `a_format_render_takes_no_string` (counter on `String` construction in `render_rule_format`: 0; red today 2) | **rules -1 to -2k** (§2.1 row 8: `VarStore`/`vars::` 1.31k, `render_rule_format` 1.71k incl.) | S | O1a, R2 | Sonnet |
 
-### 4.5 Track IO and C, send/recv and accounting
+### 4.5 Tracks K, IO and C: connection mode, send/recv, accounting
 
 | slice | goal | files | test that fails first | expected | size | depends | model |
 |---|---|---|---|---|---|---|---|
-| **IO1** | the h1 I/O state machine: `advance` driven by the poller's readiness bits (no `interests` recompute unless changed), `MsgState` advanced by what the parser returned (no re-derivation per run), the buffer kept while the txn is open (`release` at txn end), `Buf` accessors without the `nominal` indirection; written from X0 item 4 | `proxy.rs` 2489-2700, 3471-3800, `buf.rs`, `txn.rs` (`MsgState`) | `engine_pass.rs`: `a_keepalive_request_takes_its_buffers_once` (buffer take/give counter: 2 per request, red today: per run), the I/O batteries (half-close T88, pipelining, `timeout http-keep-alive`) green | **keepalive/rules -1 to -2k**, h2 -0.5 to -1k | M | X0 | Opus |
-| **C1** | accounting once: Q6 (`TimeStat::add` load + store-if-greater, `Arc` borrows), `account_stream` from the pass clock (no `now_ms` read), one `count_status`, `StreamLog` fields only when a log target exists (X0 item 10), `RateCtr` ticks from the pass | `statcnt.rs`, `engine.rs` 3349-3480, `txnlog.rs` | `engine_pass.rs`: `accounting_a_request_does_at_most_n_atomic_rmws` (pin n from X0 item 5; red at today's count), `show stat`/`show info` rows identical under the stats battery | **-0.5 to -1.2k on all three** | S | X0 | Sonnet |
-| **C2** | clock residue: `%t`/`%Tl` from the pass clock (HAProxy's `date`), ticks as the pass's `u32` ms, `Duration::as_millis`/`Timespec` conversions off the path | `txnlog.rs`, `tick.rs`, `engine.rs` `tick_at` | `engine_pass.rs`: `a_request_reads_the_clock_at_most_twice_per_pass` (counter; X0 item 8 sets red) | **-0.3 to -0.8k on all three** | S | X0 | Sonnet |
+| **K1** (new after X0; **in flight as T575**, with "parse path in bytes" as its Part 2) | HTTP/1.0 keep-alive by flags: the request parse records the `Connection` tokens and the version as connection-mode flags on the txn (HAProxy's `H1_MF_CONN_KAL`/`H1_MF_CONN_CLO`/`H1_MF_CLEAN_CONN_HDR`, `h1_set_cli_conn_mode`/`h1_set_srv_conn_mode`, mux_h1.c); `strip_request_connection` (proxy.rs:2344, 2.29k), `rewrite_request_connection` (engine.rs:15273, 5.50k: `write_req_head` 3.08k, the 8 KiB stack `memset` 1.14k, `add_req_header` 0.33k, `Buf::eoh` re-scans 0.21k) and the response `inject_connection_token_zero_alloc` (engine.rs:9605, 0.38k + memset 0.31k) go; the token the server and the client see is decided from the flags when the head is written (pre-X5: one bounded in-place token edit; after X5: the encoder's `h1_make_eoh` mode rule); HTTP/1.1 clients keep the `scan.count == 0` fast path; no 8 KiB scratch zeroing anywhere (`MaybeUninit` or a pool buffer if a scratch is needed). Part 2: `H1Parser`, `HeadFacts` and the facts on `&[u8]`, no `from_utf8` on the parse path (22 calls a request today), no `unsafe` | `proxy.rs` (`strip_request_connection` 2344, `validate_request_head` 2398, `reset_for_next_request` 2190), `engine.rs` (15273, 9605, the send site), `txn.rs` (flags, `HeadFacts`), `crates/ibex-proto/src/h1.rs` | `tasks/T575-k1-connection-flags-bytes-parse.md`: a debug `work::Op` counter on head rebuilds, 0 per HTTP/1.0 keep-alive request (red today: 1); wire equality with HAProxy for 1.0 keep-alive, 1.0 close, 1.1 `Connection: close`, `Connection: keep-alive, foo` (other tokens kept), `option http-server-close`, `option httpclose`, both directions (oracle bytes recorded); Part 2: a counter on `from_utf8` from the parse path, 0 per keepalive request (red today: 22); the connection-mode batteries and E1/E2's non-UTF-8 forwarding rows green | **keepalive -4 to -6k, rules -4 to -6k** (§2.1: the `Connection` path is 8.1k / 6.5k against HAProxy's ~0.5k; <= 1-2k before X5, <= 0.5k after); **Part 2 keepalive -0.8 to -1.2k** (`from_utf8` 1.45k incl. on the parse/facts path), rules the same; h2s1/h3fit 0; kernel 0 | S + S | - (X5 takes the last ~1k) | Sonnet |
+| **IO1** | the h1 I/O state machine: `advance` driven by the poller's readiness bits (no `interests` recompute unless changed), `MsgState` advanced by what the parser returned (no re-derivation per run), the buffer kept while the txn is open (`release` at txn end), `Buf` accessors without the `nominal` indirection; written from X0 item 4 | `proxy.rs` 2489-2700, 3471-3800, `buf.rs`, `txn.rs` (`MsgState`) | `engine_pass.rs`: `a_keepalive_request_takes_its_buffers_once` (buffer take/give counter: 2 per request, red today: per run), the I/O batteries (half-close T88, pipelining, `timeout http-keep-alive`) green | **keepalive/rules -0.5 to -1k** (§2.1 row 9: the I/O state machine's self is 2.1k measured against HAProxy's ~4k; the gain is the re-walk and the buffer take/give per run, not the self), **h2s1 -0.5 to -1k** (3.0k). **Conditional**: scheduled only if the week-5 re-measure leaves keepalive above 1.0x | M | X2 (the parse owns `MsgState`'s advance) | Opus |
+| **C1** | accounting once: Q6 (`TimeStat::add` load + store-if-greater, `Arc` borrows), `account_stream` from the pass clock (no `now_ms` read), one `count_status`, `StreamLog`/`set_stream_log` (engine.rs:3581) fields and `SystemTime::now` only when a log target exists (X0 item 10: 0.47k / 0.45k / 0.78k with none), `RateCtr` ticks from the pass. **First a short design for D-4 "both"**: per-thread (or per-tgroup) counter rows as a `tune.ibex.*` setting, memory per server x thread, how `show stat`/`show info` sum the rows; the user approves it before the code | `statcnt.rs`, `engine.rs` 3349-3480, 3581, `txnlog.rs` | `engine_pass.rs`: `accounting_a_request_does_at_most_n_atomic_rmws` (X0 could not count them: pin n from a `#[cfg(debug_assertions)]` counter at the `statcnt` sites in the slice; red at today's count), `a_request_with_no_log_target_builds_no_log_line` (counter 0; red today: `StreamLog::start` once per request, twice on h2), `show stat`/`show info` rows identical under the stats battery | **keepalive/rules -0.3 to -0.6k** (§2.1 row 13: accounting 0.9-1.0k, HAProxy 0.5-0.6k; the no-target `StreamLog` 0.47k is most of it), **h2s1/h3fit -0.8 to -1.2k** (2.0k: `set_stream_log` 0.86k, `statcnt` 0.46k, `account_stream` 0.48k) | S | - | Sonnet |
+| **C2** | clock residue: `%t`/`%Tl` from the pass clock (HAProxy's `date`), one `Instant::now` a pass (today two: `run_loop` and `step_at`), ticks as the pass's `u32` ms, `Duration::as_millis`/`Timespec` conversions off the path; the `rand` fetch (registry.rs:3637) seeded from a per-thread RNG, not `SystemTime::now` per call | `txnlog.rs`, `tick.rs`, `engine.rs` `tick_at`/`run_loop`, `ibex-sample/src/registry.rs` | `engine_pass.rs`: `a_request_reads_the_clock_once_per_pass_and_never_for_a_log_it_does_not_write` (counter: X0 item 8 measured 5.0 / 6.0 / 14-16.6; pin 1 a pass + 0; red today) | **keepalive/rules -0.3 to -0.6k** (§2.1 "Clock reads": `StreamLog::start`'s `SystemTime::now` 0.30k, one of the two per-pass `Instant::now` 0.27k, the `rand` fetch's read on rules), **h2s1/h3fit -0.5 to -1.5k before L2, -0.3 to -0.8k after** (two reads a pass x the pass count) | S | - | Sonnet |
 
-### 4.6 Order, critical path, parallelism
+### 4.6 Order, critical path, parallelism (after X0)
 
-Two gate slots and two measure slots (A: claims; B: counts). Every slice merges alone and is
-measured on the four scenarios against its parent.
+Four gate slots (disk, T570) and two measure slots (A, CPUs 4-6: claims; B, CPUs 12-14: counts;
+C/D may be added for counts). Every slice merges alone and is measured on the four scenarios
+against its parent. **At most two large `engine.rs` slices in flight, three only in weeks 3-4**
+(D-15): every merge of one forces the others to rebase (risk 5), about half a day of agent time
+each. The remaining slots take slices outside `engine.rs` (`ibex-proto`, `ibex-sample`,
+`ibex-regex`, `h2_bridge.rs`, h3) or Sonnet S slices with small `engine.rs` touches.
 
-```
-week 1   X0 (B)         | R1 (Sonnet)   | O2 (Sonnet)   | L1 (Sonnet)      | Q1 (h3, Opus)
-week 2   X1 || X5 (Opus)| L2 (Opus)     | C1, C2 (S)    | Q2a, Q4 (h3)
-week 3   X2 || X3 (Opus)| L3 (Opus)     | IO1 (Opus)    |
-week 4   X4 (Opus)      | R2 (Opus)     | O1a (Opus)    | X7 (Sonnet)
-week 5   O1b (Opus)     | R4 (Sonnet)   | X6, X8 (S)    | Q2 b1 (h3)
-week 6   O1c (Opus)     | re-measure (the landing table)
-```
+- Large `engine.rs` slices: L2 (with `sched.rs`), L3, X2, X3, O1a (with `proxy.rs`), O1b, O2,
+  IO1.
+- Small `engine.rs` touches (S, cheap to rebase): K1 (T575), L1, C1, C2, X5's call sites.
+- Outside `engine.rs`: X1, X4, R2, R4, X7, X6, X8, Q1/Q2a/Q4.
 
-Critical path: **X0 -> X1/X5 -> X2 -> X4 -> O1a -> O1b -> O1c** (~4-5 weeks). Parallel: L1, L2,
-L3 (engine.rs `step_at`/`step_stream_run` regions, disjoint from X2's rules region and O2's
-backend region; the later merge rebases), R1 (ibex-sample), O2, C1, C2. At most two Opus L
-slices in flight at once (the gate slots), Sonnet S/M beside them. The h3 track's Q1/Q2a/Q4 run
-in the h3 slot of the week and do not touch these files.
+**Dependencies, hard**: X1 -> X5 -> X2, X3; X2 -> X4, O1a, R2, IO1; X4 + O1a -> O1b -> O1c;
+O1a + R2 -> R4; X2 + X3 + X4 -> X7; L2 -> Q2 b1. **Soft (order, for the budgets' sake)**: K1
+before X5 and X2 (holds: T575 is in flight); L2 before L3 (L3's h2 figure is quoted after L2).
 
-## 5. Expected landing
+**Sequential** (the critical path): **X1 -> X2 -> X4 -> O1b -> O1c**, ~19-22 agent-days of Opus
+work in series plus a gate and a rebase at each merge: **weeks 1-6, the landing re-measure in
+week 7**. The previous plan said 4-5 weeks for X0 -> O1c: X1's growth to L (the parse scan),
+X2/X3 at their measured sizes and K1 ahead of X5 add about a week. **Parallel** beside it: K1,
+L1, O2, C1, C2 at any time; L2 then L3; X3 beside X2; R2 and O1a after X2; R4 after O1a; the h3
+track's Q1/Q2a/Q4 in any free slot (no shared files); X7/X6/X8 last.
 
-Per scenario, user-space instructions per request, non-PGO release-perf. Ranges are each
-slice's §4 range; **the sums overlap and are read at +-30 %**, as in D5. Kernel: every slice
-must hold kernel at or below its parent; L2 lowers it on h2.
+| week (from 11-02) | slot 1 (`engine.rs`) | slot 2 (`engine.rs`) | slot 3 | slot 4 | large `engine.rs` in flight |
+|---|---|---|---|---|---|
+| 1 | R1 close (T574), then **L1** (M, Sonnet) | **K1 + Part 2** (T575, Sonnet) | **X1** (L, Opus: `htx.rs`, `buf.rs`, `h1.rs`) | **X5** (M, Opus: the encoder), then **C2** (S, Sonnet) | 0 |
+| 2 | **L2** (M, Opus) | **O2** (M, Sonnet) | X1 (cont.) | X5 -> **C1** (D-4 design, then code; S, Sonnet); **Q1** (h3) when free | 2 |
+| 3 | **X2** (L, Opus) | **X3** (L, Opus; the second to merge rebases) | **L3** (L, Opus) | Q2a / Q4 (h3) | 3 (the limit) |
+| 4 | X2 (cont.) | X3 -> **O1a** (L, Opus) | L3 (cont.) | **X4** (M, Opus) after X2; then **R2** (L, Opus, `ibex-sample`/`ibex-regex`) | 3 |
+| 5 | **O1b** (L, Opus) after X4 + O1a | O1a -> **R4** (S, Sonnet) after R2 | **re-measure 1**: keepalive and rules verdicts (D-13, D-16); **IO1** only if keepalive > 1.0x | R2 (cont.); **X7** (M, Sonnet) | 2 |
+| 6 | O1b (cont.) | **O1c** (M, Opus) after O1b | Q2 b1 (h3, after L2) | X6, X8 (Sonnet fillers) | 2 |
+| 7 | **re-measure 2**: the landing table, non-PGO and the PGO column (§5) | slack: rebases, a stopped slice's re-plan | | | |
 
-| scenario | today | after X (D5) | after L | after O | after R | after IO/C | **landing** | HAProxy | ratio |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| keepalive ab1 | 45.8k | 44.3-45.8 | 42.2-44.4 | 41.0-43.8 | 41.0-43.8 | **38.7-41.9** (opt. 35) | **35-42k** | 36.2k | **0.96-1.16x**, central ~1.05x |
-| rules ab1 | 75.7k | 62.7-65.7 | 58.4-63.8 | 56.5-62.9 | 51.5-58.9 | **49.2-56.5** (opt. 45) | **45-57k** | 43.8k | **1.03-1.30x**, central ~1.15x |
-| h2s1 | ~70k | 64-67 | 54-61 | 46-54 | 46-54 | **44-52** (opt. 41) | **41-54k** | ~54k | **0.75-1.0x**, central ~0.9x |
-| h3fit (for D1) | 98.4k | 91-94 | 83-89 | 75-83 | 75-83 | 73-81 | **70-81k** + Q1/Q2/Q4 (-10 to -17k) | 73.7k (dev10) | ~1.0x after both programmes |
+**ETA, honestly.** Seven weeks if no slice stops and no rebase goes wrong; nothing is budgeted
+for a stop. A stopped X2 or O1b (the two L slices on the path) costs its re-plan plus the gate
+runs behind it, about a week each; a stopped L3 or X3 costs nothing on the path. The verdict
+per scenario arrives before the end: keepalive after K1, X2, X3, L3, C1, C2 (week 5); rules
+after R2 and R4 (week 6); h2s1 after L2, O2, X4, O1b (week 6-7). The latency board
+(`m1_latency.py`) runs with L2 and L3 (risk 1); the soaks wait until most slices are in (§6.1).
 
-Reading: **h2s1 meets the target** (the pass count, the child object, the backend take, and the
-TLS advantage). **keepalive meets it only at the optimistic end**: the slices name ~7.5k central
-of the 9.6k gap; the remainder is what X0 must find (the candidates: the I/O state machine
-beyond IO1's estimate, the response scan family after E2, the safety extras, death by a thousand
-cuts). **rules lands at ~1.15x**: its 1.0x needs the keepalive base at parity *and* a per-rule
-cost at HAProxy's ~1k (X2's block edits at ~200 instr an action, R2's views at the top of the
-range); the honest first target for rules is **<= 1.1x** (§6 D-10).
+## 5. Expected landing (after X0)
 
-What would make 1.0x unreachable on keepalive: (a) X0 shows the remaining gap spread over 50+
-sites of 100-200 instructions each (bounds checks, `Option` re-matching, enum state
-re-derivation): no slice collects that, only PGO (-13 %, T435) does, and PGO is outside the A/B
-(D9); (b) the safety extras the user keeps on by default cost more than the margin (X0 item 9);
-(c) `crash::contain` per run turns out to cost more than ~0.3k (then it is a `tune.ibex.*`
-setting, default on, and the A/B is reported both ways under "fair benchmark defaults").
+Per scenario, user-space instructions a request, non-PGO release-perf against non-PGO HAProxy
+(D-8). **Method**: base = X0's totals (§2.1); each slice's §4 range on the scenarios it names,
+in-flight slices at their budgets (R1 at its measured -1.06k, K1 -4 to -6k, T575 Part 2 -0.8 to
+-1.2k); IO1 excluded (conditional, D-16); **Σ = the sum of the midpoints**; **central = base -
+0.7 x Σ** (the delivery factor of §4: R1 delivered 47 % of its midpoint, S7/E2 about 60 %);
+**range = base - 1.0 x Σ (every slice at its midpoint) to base - 0.5 x Σ**. The PGO column is
+x 0.87 (T435's -13 %) and is the shipped figure, not the merge criterion (§6.1). Kernel: Ibex
+is already 3.4-7.0k a request below HAProxy on every scenario (§2.1); every slice holds kernel
+at or below its parent, L2 removes 5 `epoll_wait` a request on h2s1.
+
+What Σ is made of (midpoints, k):
+- keepalive: K1 5.0, Part 2 1.0, X2 4.75 (incl. K1's remainder), X3 2.0, L3 2.0, L1 0.55,
+  O1a 0.55, C1 0.45, C2 0.45, X7 0.3 = **17.05** (low 12.8, high 21.3).
+- rules: the keepalive items at their rules figures (K1 5.0, Part 2 1.0, X2 11.75, X3 4.25,
+  L3 2.0, L1 0.55, O1a 0.55, C1 0.45, C2 0.45, X7 1.0) + R1 1.06 + R2 3.75 + R4 1.5 + O2 1.5
+  (`route_to_server`/`select_server` are 2.0k dearer on rules than on keepalive, §2.1 row 5;
+  cause not located by X0; O2's compiled backend names it as a secondary target) = **34.8**
+  (27.6-42.1).
+- h2s1: L2 4.75, O1b 4.25, X4 4.0, L3 3.5, O2 2.75, X3 2.5, C1 1.0, L1 0.75, C2 0.55, X7 0.5 =
+  **24.55** (20.1-29.0).
+- h3fit: the h2s1 items with O1c 4.0 for O1b and L2 5.0, no X7 = **24.05**; plus the quinn
+  track Q1/Q2/Q4 -10 to -17k (mid 13.5) = **37.55**.
+
+| scenario | base (X0) | Σ mid (low-high) | **central** (0.7 Σ) | range (1.0 Σ .. 0.5 Σ) | HAProxy | ratio, central (range) | D-10 target | reached non-PGO? | PGO, shipped |
+|---|---:|---:|---:|---:|---:|---|---|---|---:|
+| keepalive ab1 | 45.9k | 17.1 (12.8-21.3) | **34.0k** | 28.9-37.4k | 36.2k | **0.94x** (0.80-1.03x) | <= 1.0x | **yes at central**; misses by ~1.2k at delivery 0.5 (IO1's -0.5 to -1k is the reserve, D-16) | 29.6k, 0.82x |
+| rules ab1 | 75.7k | 34.8 (27.6-42.1) | **51.3k** | 40.9-58.3k | 43.8k | **1.17x** (0.93-1.33x) | <= 1.1x first, 1.0x stretch | **no at central**: 1.1x (48.2k) needs delivery >= 0.79, 1.0x >= 0.92 (D-13) | 44.6k, 1.02x |
+| h2s1 | 71.6k | 24.6 (20.1-29.0) | **54.4k** | 47.1-59.3k | 53.2k | **1.02x** (0.89-1.11x) | <= 1.0x, aim 0.9x | **borderline**: 1.0x needs delivery >= 0.75; 0.9x (47.9k) >= 0.97 (D-17) | 47.3k, 0.89x |
+| h3fit (1.97 dg/req) | 98.9k | 37.6 (engine 24.1 + quinn 13.5) | **72.6k** | 61.4-80.1k | 64.0k (dev10) | **1.13x** (0.96-1.25x) | none (D1: ~1.0x after both programmes) | 1.0x only at full delivery | 63.2k, 0.99x |
+
+Reading. **keepalive reaches D-10 at the central estimate** because X0 located the remainder:
+K1 and the parse (X1/X2) are 9.75k of Σ's 17.05k and both are single functions with a measured
+HAProxy figure to beat, not a spread of small sites; the bet is X1's parser at <= 3.5k a head.
+**rules does not reach <= 1.1x at the central estimate.** After every named slice the rules'
+own cost is 12-17k (full to central delivery: 40.9 - 28.9, 51.3 - 34.0) against HAProxy's 7.6k: what remains unowned is
+`Expr::eval`/`any_acl`'s remainder after R1/R2 (~1.5k), the converters 1.9k, the regex 1.1k
+(parity with `pattern_exec_match` 1.55k), and whatever makes `route_to_server` 2k dearer on
+rules. A rules remainder pass (R5) is not funded until X2, X3 and R2 have measured (D-13); with
+PGO the shipped build is at ~1.0x. **h2s1 is borderline at 1.02x** (the earlier ~0.9x central
+was read before X0 put the base at 71.6k and before the delivery factor): L2's pass count is
+timing-dependent (6.0-8.0 passes, §2.1), so L2 must be measured on the same day as its parent
+and report the pass count beside the instructions; the 0.9x aim is the PGO figure (D-17).
+**h3fit** lands at ~1.13x with both programmes at central, 1.0x only at full delivery; D1's
+ratios move with the engine slices as before.
+
+What would still make keepalive miss 1.0x: (a) X1's parser lands at 5-7k a head instead of
+<= 3.5k (then X2's keepalive figure halves and the central is ~1.0x); (b) a slice measured
+outside its range is merged anyway (the stop rule exists for this); (c) delivery under 0.6
+across the board, which the week-5 re-measure shows in time to schedule IO1 and to re-read the
+PGO column as the shipped answer.
 
 ## 6. Risks, stop rules, decisions
 
@@ -562,6 +657,35 @@ converted and reports the rest); do not weaken a `tools/checkin.sha256` test to 
 | **D-10** | Restate the target per scenario: keepalive <= 1.0x, h2s1 <= 1.0x (aim 0.9x), rules <= 1.1x first landing with 1.0x the stretch after R2/X2 measure | **Yes**: rules carries HAProxy's own ~1k-a-rule floor plus the base |
 | **D-11** | X0's extended scope (§1.2, ten items, both proxies, three scenarios + h3fit): ~1 day Sonnet on a quiet host, before any L/O/C slice sets its budget | **Approve now**; it is the only measurement the programme waits for |
 
+**D-9, per safety extra (X0 item 9, §2.1; user instructions a request, keepalive / rules / h2s1).**
+
+| extra | measured cost | recommendation |
+|---|---:|---|
+| `crash::contain` per task run (T447) | 0.03k / 0.13k / 0.08k | **keep on, no setting**: under the 0.3k threshold of §5 (c) in the pre-X0 text; `catch_unwind` costs nothing when nothing panics |
+| `watchdog::progress`/`sleeping`/`set_streams`, 3 a pass | 0.04k / 0.10k / 0.11k | **keep on, no setting**; L1 folds the three stores into one per pass as a side effect |
+| buffer wipe, `tune.ibex.zero-buffers` | 0.03k / 0.05k / 0.05k with the default **off** (an atomic load) | **nothing to decide**: already a setting, default off |
+| TLS record wipe, `tune.ibex.ssl-zero-buffers` | h2s1 ~0.12k (0.17 %; a memset under `encrypt_records`, attribution uncertain) | **keep on by default**: a security trade that is already a setting (memory: "Security trade = setting"); the cost is under the +-0.5 % budget noise |
+| `fault_point` | 0: compiled out in release (`#[cfg(debug_assertions)]`, crash.rs:101) | nothing |
+| `StreamLog`/`set_stream_log` with no `log` target | 0.47k / 0.45k / 0.78k | not a safety extra: **C1 removes it** (item 10); no decision |
+| pool `Guard` bookkeeping | 0.14k / 0.25k / 0.21k | not a safety extra (AGENTS §8's accounting, `show pools`); keep |
+
+Sum of the five extras: 0.1-0.35k, 0.2-0.4 % of the user total, below the +-0.5 % slice budget.
+**Recommendation: no extra becomes a new setting, nothing is turned off, and the A/B against
+HAProxy runs with every default as shipped; no second "fair benchmark defaults" column is
+needed.** D-9 is thereby closed unless the user rules otherwise.
+
+**New decisions after X0 (2026-11-01 evening), one line each.**
+
+| | question | recommendation |
+|---|---|---|
+| **D-12** | K1 + "parse path in bytes" (T575, Sonnet, launched by the user): merge criterion keepalive -4k and -0.8k or better (§4.5) | **Confirm** as launched; X5 takes K1's last ~1k |
+| **D-13** | rules: <= 1.1x is not reached at the central estimate (1.17x non-PGO, 1.02x PGO). Keep <= 1.1x and decide at the week-5 re-measure whether to fund a rules remainder pass (R5: `Expr::eval`/converter remainder, `route_to_server` on rules; 12-17k own against 7.6k), or accept 1.1-1.2x non-PGO | **Keep <= 1.1x; decide R5 at week 5**, not before X2, X3 and R2 have measured |
+| **D-14** | X1 grows from M to L to own the parse scan (<= 3.5k a head) instead of a separate parser slice | **Yes, inside X1**: a separate slice would write the same function twice |
+| **D-15** | four gate slots: three large `engine.rs` slices at once in weeks 3-4 (X2, X3, L3) at the cost of two rebases, or two and a week longer | **Three in weeks 3-4 only**, two otherwise (§4.6) |
+| **D-16** | IO1 becomes conditional: scheduled only if the week-5 re-measure leaves keepalive above 1.0x | **Yes**; its range fell to -0.5 to -1k |
+| **D-17** | h2s1's 0.9x aim: the central lands at 1.02x non-PGO and 0.89x with PGO | **Restate**: <= 1.0x non-PGO is the merge target, 0.9x is the shipped (PGO) figure; no extra slice for it now |
+| **D-18** | bytes everywhere (user, 2026-11-01): tradeoff 6.12's "`str` samples stay UTF-8" half retired; the one `from_utf8` left on the rules path is fancy-regex's at a backtracking match | **Record in `tradeoff.md` at R2's merge** (6.12 and 6.24 rows); no further decision |
+
 **Earlier decisions touched.** D1 (h3 ratios): unchanged, h3 gains from every engine slice.
 D5 (HTX-primary plan first): this document is the superset; D5's slices stand. D-A..D-H:
 unchanged (D-E's setting is built in X5/X2 as decided; D-F refined by D-6 above). D9 (PGO outside
@@ -592,3 +716,25 @@ lock from the path; every slice reports its ins/req before and after, user and k
   second column (`insreq.sh` on the PGO binary, same scenarios): cost ~11 min wall (instrumented
   + final fat-LTO builds ~5 min each, 27 s training, T435), no per-edit cost. Where a scenario
   reaches HAProxy only with PGO, that is reported as such and is acceptable for the shipped build.
+
+### 6.2 Re-budget after X0 (2026-11-01)
+
+- **Refs**: HAProxy keepalive 36.2k, rules 43.8k, h2s1 53.2k, h3fit 64.0k (dev10; not 73.7k).
+  Kernel: Ibex 3.4-7.0k below HAProxy on every scenario; no slice needs a kernel saving.
+- **New**: K1 + parse path in bytes (T575, in flight): the largest single keepalive item (8.1k,
+  the HTTP/1.0 `Connection` rewrite) was in no slice. R1 closed at -1.06k (T574).
+- **Grown**: X1 M -> L (the parse scan: 10.1k -> <= 3.5k a head); X2 keepalive -3 to -5k (was
+  flat), rules -9 to -13k; X3 keepalive -1.5 to -2.5k, rules -3.5 to -5k; X4 -3 to -5k; R2 as
+  bytes -3 to -4.5k; R4 -1 to -2k; L2 on h2s1 -4 to -5.5k plus 5 `epoll_wait`; O2 also on rules.
+- **Shrunk**: L2 on h1 (0: 2.00 passes on both proxies); O1a -0.3 to -0.8k (kept: O1b and R4
+  stand on it); IO1 -0.5 to -1k and conditional; C1 on h1 -0.3 to -0.6k; X2 on h2 0.
+- **User decision, bytes like HAProxy**: no UTF-8 validation or re-encoding (R2, T575 Part 2).
+  The rules-side UTF-8 cost reaches zero after **R2 + R4** (R2: the 17 fetch/ACL/action calls;
+  R4: the format/var `String` sites), the parse side after T575 Part 2 (22 calls); the single
+  `from_utf8` left is fancy-regex's at a backtracking match (D-18).
+- **D-9**: no safety extra becomes a setting; sum 0.1-0.35k, under the budget noise.
+- **Landing** (§5, delivery 0.7): keepalive 34.0k **0.94x** (reached), rules 51.3k **1.17x**
+  (<= 1.1x not at central, D-13), h2s1 54.4k **1.02x** (borderline, D-17), h3fit 72.6k 1.13x;
+  with PGO 0.82x / 1.02x / 0.89x / 0.99x.
+- **Order**: 4 gate slots, <= 2 large `engine.rs` slices (3 in weeks 3-4); critical path
+  X1 -> X2 -> X4 -> O1b -> O1c, weeks 1-6, landing re-measure week 7 (was 4-5 + 6).
