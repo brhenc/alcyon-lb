@@ -1001,6 +1001,9 @@ impl H2MuxContext {
         }
         self.lower_name = lower;
         self.end_frame(at);
+        if end_stream {
+            self.local_end_stream(stream_id);
+        }
     }
 
     /// Parses an HTTP/1 response head (status line and headers, with or without the
@@ -1133,7 +1136,8 @@ impl H2MuxContext {
     fn local_end_stream(&mut self, stream_id: u32) {
         self.streams.entry(stream_id).and_modify(|stream| {
             stream.state = match stream.state {
-                H2StreamState::HalfClosedRemote => H2StreamState::Closed,
+                H2StreamState::HalfClosedRemote | H2StreamState::Closed => H2StreamState::Closed,
+                H2StreamState::Reset(e) => H2StreamState::Reset(e),
                 _ => H2StreamState::HalfClosedLocal,
             };
         });
@@ -1617,7 +1621,13 @@ impl MuxH2 {
         header_block: &[u8],
         decoded: &mut DecodedFields,
     ) -> io::Result<()> {
-        if !ctx.streams.contains_key(&stream_id) && stream_id <= ctx.highest_opened {
+        // A stream both sides are done with is closed even while the data path still holds
+        // it (T594; `h2s_close`): HEADERS on it are the same connection error.
+        let closed = match ctx.streams.get(&stream_id) {
+            None => stream_id <= ctx.highest_opened,
+            Some(s) => s.state == H2StreamState::Closed,
+        };
+        if closed {
             // HEADERS on a stream that is closed, or that was skipped and so can no longer
             // be opened: a connection error STREAM_CLOSED (RFC 9113 section 5.1.1; HAProxy
             // measured: GOAWAY with the highest stream id seen, then close). It was a stream
@@ -2374,6 +2384,60 @@ mod tests {
         let g = &ctx.tx_buf[sent..];
         assert_eq!((g[3], &g[9..13], &g[13..17]), (0x7, &[0, 0, 0, 1][..], &[0, 0, 0, 5][..]), "{g:?}");
         assert_eq!(ctx.conn_state, H2ConnState::GoAwaySent);
+    }
+
+    /// HEADERS on a stream whose response END_STREAM was sent after the request ended: the
+    /// stream is closed, so it is a connection error STREAM_CLOSED, not a stream reset
+    /// (T594; HAProxy measured: GOAWAY with the last stream id, code 5).
+    #[test]
+    fn headers_on_a_stream_closed_by_the_response_are_a_connection_error() {
+        for via_headers in [false, true] {
+            let mux = MuxH2;
+            let mut ctx = mux.init(ConnId(1), true).expect("init");
+            let mut hello = H2_CONN_PREFACE.to_vec();
+            hello.extend_from_slice(&Frame::Settings { flags: 0, settings: vec![] }.encode());
+            mux.parse(&mut ctx, &hello).expect("handshake");
+            let mut enc = HpackEncoder::new();
+            let mut get = || {
+                let block = enc.encode(&[
+                    HeaderField { name: ":method".into(), value: "GET".into() },
+                    HeaderField { name: ":path".into(), value: "/".into() },
+                ]);
+                Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: 1, header_block: block }.encode()
+            };
+            mux.parse(&mut ctx, &get()).expect("stream 1");
+            ctx.streams.get_mut(&1).expect("1").dispatched = true;
+            if via_headers {
+                assert!(ctx.send_h1_head(1, b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", true));
+            } else {
+                ctx.send_h1_head(1, b"HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n", false);
+                ctx.send_data(1, b"x", true);
+            }
+            let sent = ctx.tx_buf.len();
+            assert!(mux.parse(&mut ctx, &get()).is_err(), "via_headers {via_headers}");
+            let g = &ctx.tx_buf[sent..];
+            assert_eq!((g[3], &g[13..17]), (0x7, &[0, 0, 0, 5][..]), "via_headers {via_headers}: {g:?}");
+        }
+    }
+
+    /// A stream already reset stays reset when its response END_STREAM goes out after it
+    /// (T594): `local_end_stream` must not turn the reset into a half-close.
+    #[test]
+    fn a_reset_stream_stays_reset_at_its_local_end_stream() {
+        let mux = MuxH2;
+        let mut ctx = mux.init(ConnId(1), true).expect("init");
+        let mut hello = H2_CONN_PREFACE.to_vec();
+        hello.extend_from_slice(&Frame::Settings { flags: 0, settings: vec![] }.encode());
+        mux.parse(&mut ctx, &hello).expect("handshake");
+        let block = HpackEncoder::new().encode(&[
+            HeaderField { name: ":method".into(), value: "GET".into() },
+            HeaderField { name: ":path".into(), value: "/".into() },
+        ]);
+        let get = Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: 1, header_block: block }.encode();
+        mux.parse(&mut ctx, &get).expect("stream 1");
+        ctx.streams.get_mut(&1).expect("1").state = H2StreamState::Reset(H2Error::Cancel);
+        ctx.local_end_stream(1);
+        assert_eq!(ctx.streams.get(&1).expect("1").state, H2StreamState::Reset(H2Error::Cancel));
     }
 
     /// While more than [`TX_ROOM`] of output waits for the client, no frame is processed,
