@@ -271,6 +271,10 @@ pub struct AcceptedStream {
     pub peer: SocketAddr,
     /// The listener's address, the stream's destination.
     pub local: SocketAddr,
+    /// The QUIC connection the stream is on and how its peer acknowledged when the request
+    /// head was read (T587: `ibex_fc_quic_ack_*` on the relay path).
+    pub conn: ConnHandle,
+    pub acks: Option<ibex_sample::QuicAckFacts>,
 }
 
 #[derive(Default)]
@@ -606,6 +610,7 @@ impl QuicListener {
     /// connection of the frontend, collected with [`QuicListener::take_accepted`].
     pub fn set_frontend(&mut self, proxy_idx: usize) {
         self.frontend = Some(proxy_idx);
+        self.endpoint.set_ack_sink(crate::stats::fe_ack_totals(proxy_idx));
     }
 
     /// The frontend (proxy index) the requests are handed to, if any.
@@ -1538,7 +1543,8 @@ impl QuicListener {
             return;
         }
         let peer = self.peer_of(conn_id);
-        self.accepted.push(AcceptedStream { fd: theirs, peer, local: self.addr });
+        let acks = self.ack_facts(conn_id);
+        self.accepted.push(AcceptedStream { fd: theirs, peer, local: self.addr, conn: conn_id, acks });
         self.relays.push(relay);
     }
 

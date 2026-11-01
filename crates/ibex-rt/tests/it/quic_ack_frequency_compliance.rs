@@ -65,6 +65,14 @@ impl Drop for Rig {
 /// request with a 12 kB body and the connection's counters in headers, or 429 once the
 /// unexplained ACKs pass 20.
 fn start(tag: &str, ack: &str) -> Rig {
+    let rules = "  http-request return status 429 if { ibex_fc_quic_ack_excess gt 20 }\n\
+         \x20 http-request return status 200 content-type text/plain file %BODY% hdr x-excess \"%[ibex_fc_quic_ack_excess]\" hdr x-ratio \"%[ibex_fc_quic_ack_ratio]\" hdr x-only \"%[ibex_fc_quic_ack_only_rcvd]\" hdr x-sent \"%[ibex_fc_quic_ack_eliciting_sent]\"\n";
+    start_cfg(tag, ack, rules, "")
+}
+
+/// [`start`] with the frontend's rules (`%BODY%` stands for the 12 kB file) and any lines after
+/// the frontend (a backend).
+fn start_cfg(tag: &str, ack: &str, rules: &str, tail: &str) -> Rig {
     let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
     let quic = common::reserve_addr();
     let dir = std::env::temp_dir().join(format!("t569-{tag}-{}", std::process::id()));
@@ -73,13 +81,12 @@ fn start(tag: &str, ack: &str) -> Rig {
     let sock = dir.join("cli.sock").display().to_string();
     let body = dir.join("body.txt");
     std::fs::write(&body, vec![b'x'; 12_000]).expect("body");
+    let rules = rules.replace("%BODY%", &body.display().to_string());
     let cfg = format!(
-        "global\n  stats socket {sock} level admin\n  nbthread 1\n  tune.ibex.h3-path mux\n{ack}\
+        "global\n  stats socket {sock} level admin\n  nbthread 1\n  tune.ibex.h3-path {}\n{ack}\
          defaults\n  mode http\n  timeout connect 2s\n  timeout client 30s\n  timeout server 30s\n\
-         frontend fe\n  bind quic4@{quic} ssl crt {crt} alpn h3\n\
-         \x20 http-request return status 429 if {{ ibex_fc_quic_ack_excess gt 20 }}\n\
-         \x20 http-request return status 200 content-type text/plain file {} hdr x-excess \"%[ibex_fc_quic_ack_excess]\" hdr x-ratio \"%[ibex_fc_quic_ack_ratio]\" hdr x-only \"%[ibex_fc_quic_ack_only_rcvd]\" hdr x-sent \"%[ibex_fc_quic_ack_eliciting_sent]\"\n",
-        body.display()
+         frontend fe\n  bind quic4@{quic} ssl crt {crt} alpn h3\n{rules}{tail}",
+        common::h3_path_name()
     );
     let path = dir.join("c.cfg");
     std::fs::write(&path, cfg).expect("cfg");
@@ -214,11 +221,22 @@ impl Client {
     }
 
     fn get(&mut self) -> Resp {
+        let id = self.send("/");
+        self.read(id)
+    }
+
+    /// Sends a GET for `path` on a new stream.
+    fn send(&mut self, path: &str) -> StreamId {
         let id: StreamId = self.conn.streams().open(Dir::Bi).expect("stream credit");
         let mut s = self.conn.send_stream(id);
-        let req = get_frame();
+        let req = get_frame(path);
         assert_eq!(s.write(&req).expect("write"), req.len());
         s.finish().expect("finish");
+        id
+    }
+
+    /// The whole response on stream `id`.
+    fn read(&mut self, id: StreamId) -> Resp {
         let mut all = Vec::new();
         let ended = self.run_until(Duration::from_secs(5), |c| {
             let mut rs = c.conn.recv_stream(id);
@@ -248,9 +266,9 @@ fn lit(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
     out.extend_from_slice(value);
 }
 
-fn get_frame() -> Vec<u8> {
+fn get_frame(path: &str) -> Vec<u8> {
     let mut b = vec![0x00, 0x00];
-    for (n, v) in [(&b":method"[..], &b"GET"[..]), (b":scheme", b"https"), (b":path", b"/"), (b":authority", b"localhost")] {
+    for (n, v) in [(&b":method"[..], &b"GET"[..]), (b":scheme", b"https"), (b":path", path.as_bytes()), (b":authority", b"localhost")] {
         lit(&mut b, n, v);
     }
     let mut out = Vec::new();
@@ -371,5 +389,96 @@ fn without_ack_frequency_the_excess_has_no_sample_and_the_ratio_is_still_counted
         assert_eq!(cols[cols.len() - 2..], ["-", "-"], "{out}");
         let info = cli(&rig.sock, "show info");
         assert!(!info.contains("QuicAck"), "{info}");
+    });
+}
+
+/// T587 item 2: the h3 relay path (one socket pair per stream, no mux) has the fetches too.
+#[test]
+fn the_relay_path_gives_the_ack_fetches() {
+    common::on_h3_path("relay", || {
+        let rig = start("rel", "  tune.ibex.quic-ack-frequency on\n  tune.ibex.quic-ack-frequency-threshold 2\n  tune.ibex.quic-ack-frequency-max-delay 25ms\n");
+        let mut bad = Client::connect(rig.quic, true);
+        let mut r = Resp::default();
+        for _ in 0..8 {
+            let n = bad.get();
+            // The rule denies the flooder once its excess passes 20: that is the fetch working.
+            if n.status == 200 {
+                r = n;
+            }
+        }
+        eprintln!("relay: {r:?}");
+        assert_eq!(r.status, 200, "no request was answered with the counts");
+        assert!(num(&r, "x-only") > 10 && num(&r, "x-sent") > 10 && num(&r, "x-ratio") > 0, "{r:?}");
+        assert!(num(&r, "x-excess") > 5, "{r:?}");
+    });
+}
+
+/// T587 item 3: a stream that waits for its server sees the packets sent meanwhile in a
+/// response rule, not the count of its request head.
+#[test]
+fn a_waiting_stream_sees_live_counts_in_the_response_rules() {
+    for path in ["mux", "relay"] {
+        common::on_h3_path(path, || {
+            let srv = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = srv.local_addr().expect("addr");
+            let t = thread::spawn(move || {
+                let (mut c, _) = srv.accept().expect("accept");
+                let mut b = [0u8; 4096];
+                let _ = c.read(&mut b);
+                thread::sleep(Duration::from_millis(500));
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+            });
+            let rules = format!(
+                "  http-request set-var(txn.sent) ibex_fc_quic_ack_eliciting_sent\n\
+                 \x20 http-response set-header x-req \"%[var(txn.sent)]\"\n\
+                 \x20 http-response set-header x-late \"%[ibex_fc_quic_ack_eliciting_sent]\"\n\
+                 \x20 http-request return status 200 content-type text/plain file %BODY% if {{ path / }}\n\
+                 \x20 default_backend be\n");
+            let rig = start_cfg("live", "", &rules, &format!("backend be\n  server s {addr}\n"));
+            let mut c = Client::connect(rig.quic, false);
+            let slow = c.send("/slow");
+            let fast = c.send("/");
+            let f = c.read(fast);
+            assert_eq!(f.status, 200, "{f:?}");
+            let r = c.read(slow);
+            let _ = t.join();
+            eprintln!("{path}: {r:?}");
+            assert_eq!(r.status, 200, "{r:?}");
+            assert!(num(&r, "x-late") > num(&r, "x-req") + 5, "{path}: the response rule saw the request's counts: {r:?}");
+        });
+    }
+}
+
+/// T587 item 1: the counts per frontend, live connections and ended ones.
+#[test]
+fn the_counts_per_frontend_cover_live_and_ended_connections() {
+    common::on_h3_path("mux", || {
+        let rig = start("fe", "  tune.ibex.quic-ack-frequency on\n");
+        let mut bad = Client::connect(rig.quic, true);
+        for _ in 0..3 {
+            assert_eq!(bad.get().status, 200);
+        }
+        let cols = |out: &str| -> Vec<String> {
+            let l = out.lines().nth(1).unwrap_or_else(|| panic!("no frontend line: {out}"));
+            l.split_whitespace().map(str::to_string).collect()
+        };
+        let live = cli(&rig.sock, "show quic ibex-acks-fe");
+        eprintln!("{live}");
+        assert!(live.starts_with("# frontend"), "{live}");
+        let l = cols(&live);
+        assert_eq!(l[0], "fe", "{live}");
+        let (sent_live, only_live): (u64, u64) = (l[2].parse().expect("sent"), l[3].parse().expect("only"));
+        assert!(sent_live > 10 && only_live > 10, "{live}");
+        bad.conn.close(bad.now(), 0u32.into(), b"".to_vec().into());
+        bad.step();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cli(&rig.sock, "show quic all").lines().filter(|l| !l.is_empty()).count() > 1 {
+            assert!(Instant::now() < deadline, "the connection never ended");
+            thread::sleep(Duration::from_millis(50));
+        }
+        let ended = cli(&rig.sock, "show quic ibex-acks-fe");
+        let e = cols(&ended);
+        assert_eq!(e[1], "0", "no live connection left: {ended}");
+        assert!(e[2].parse::<u64>().expect("sent") >= sent_live && e[3].parse::<u64>().expect("only") >= only_live, "ended counts lost: {ended}");
     });
 }

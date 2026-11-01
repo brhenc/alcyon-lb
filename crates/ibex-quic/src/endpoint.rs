@@ -167,6 +167,8 @@ pub struct QuicEndpoint {
     /// This endpoint's own part of `half_open`: those of its connections with an
     /// [`AmplificationBudget`] not `validated`. Given back when the endpoint is dropped.
     own_half_open: u64,
+    /// T587: where the counts of an ended connection are also added, per frontend.
+    ack_sink: Option<Arc<AckTotals>>,
     /// [`QuicEndpoint::defer_accepts`]: a new connection waits here, half open from its
     /// first Initial on, until [`QuicEndpoint::accept_deferred`] runs its first flight (T560).
     deferring: bool,
@@ -218,6 +220,14 @@ pub struct AckTotals {
     pub ack_only_rcvd: AtomicU64,
     /// Only the connections whose peer acknowledged an ACK_FREQUENCY frame add to it.
     pub excess: AtomicU64,
+}
+
+#[allow(clippy::new_without_default)]
+impl AckTotals {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { ack_eliciting_sent: AtomicU64::new(0), ack_only_rcvd: AtomicU64::new(0), excess: AtomicU64::new(0) }
+    }
 }
 
 pub static ACK_TOTALS: AckTotals =
@@ -371,6 +381,7 @@ impl QuicEndpoint {
             retry_threshold: QuicConfig::default().retry_threshold,
             half_open: Arc::new(AtomicU64::new(0)),
             own_half_open: 0,
+            ack_sink: None,
             deferring: false,
             deferred: VecDeque::new(),
         }
@@ -599,6 +610,12 @@ impl QuicEndpoint {
     #[must_use]
     pub const fn cid_lookups(&self) -> u64 {
         self.cid_lookups
+    }
+
+    /// T587: the counts of every connection of this endpoint that ends are also added to `sink`
+    /// (the frontend's).
+    pub fn set_ack_sink(&mut self, sink: Arc<AckTotals>) {
+        self.ack_sink = Some(sink);
     }
 
     /// How the peer of `conn` acknowledges (T569): what the `ibex_fc_quic_ack_*` fetches of
@@ -856,6 +873,11 @@ impl QuicEndpoint {
         ACK_TOTALS.ack_eliciting_sent.fetch_add(acks.ack_eliciting_sent, Ordering::Relaxed);
         ACK_TOTALS.ack_only_rcvd.fetch_add(acks.ack_only_received, Ordering::Relaxed);
         ACK_TOTALS.excess.fetch_add(acks.ack_frequency_excess, Ordering::Relaxed);
+        if let Some(sink) = &self.ack_sink {
+            sink.ack_eliciting_sent.fetch_add(acks.ack_eliciting_sent, Ordering::Relaxed);
+            sink.ack_only_rcvd.fetch_add(acks.ack_only_received, Ordering::Relaxed);
+            sink.excess.fetch_add(acks.ack_frequency_excess, Ordering::Relaxed);
+        }
         // Drained after a close of ours: quinn said nothing, so the end is reported here, the
         // one place every connection leaves by (T561).
         if !live.reported {

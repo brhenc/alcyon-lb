@@ -69,6 +69,8 @@ enum Pending {
 struct QuicShow {
     filter: QuicFilter,
     acks: bool,
+    /// T587, `ibex-acks-fe`: one line per frontend instead of one per connection.
+    per_fe: bool,
 }
 
 /// Which connections `show quic` lists (`QC_CLI_FL_SHOW_*`).
@@ -86,6 +88,10 @@ const SHOW_QUIC_HEADER: &str = "# conn/frontend                     state   in_f
 const SHOW_QUIC_ACKS_HEADER: &str = "# conn/frontend                     state   ack_elic_sent ack_only_rcvd ratio_pm ackf_thr ackf_excess\n";
 
 /// `show quic help`, as HAProxy answers it.
+/// `show quic ibex-acks-fe` (T587, an Ibex extension): per frontend, the live connections and the
+/// ack-eliciting packets sent, ACK-only received and unexplained ones of those and of the ended.
+const SHOW_QUIC_ACKS_FE_HEADER: &str = "# frontend                conns ack_elic_sent ack_only_rcvd ratio_pm ackf_excess\n";
+
 const SHOW_QUIC_HELP: &str = "Usage: show quic [help|<format>] [<filter>]\n\
 Dumps information about QUIC connections. Available output formats:\n\
 \x20 oneline    dump a single, netstat-like line per connection (default)\n\
@@ -93,6 +99,7 @@ Dumps information about QUIC connections. Available output formats:\n\
 \x20 full       dump all known information about each connection\n\
 \x20 <levels>*  only dump certain information, defined by a comma-delimited list\n\
 \x20            of levels among 'tp', 'sock', 'pktns', 'cc', or 'mux'\n\
+\x20 ibex-acks  (Ibex) per connection ACK counts; ibex-acks-fe: the same per frontend\n\
 \x20 help       display this help\n\
 Available output filters:\n\
 \x20 all        dump all connections\n\
@@ -1390,7 +1397,13 @@ impl CliApplet {
             ));
         };
         let mut acks = false;
+        let mut per_fe = false;
         match args.first().copied() {
+            // T587, an Ibex extension: the same counts per frontend, live and ended connections.
+            Some("ibex-acks-fe") => {
+                per_fe = true;
+                i += 1;
+            }
             Some("oneline") => i += 1,
             // T569, an Ibex extension: how each connection's peer acknowledges.
             Some("ibex-acks") => {
@@ -1438,7 +1451,7 @@ impl CliApplet {
         }
         let g = Gather::new(ctx.mailboxes, ctx.worker_id, ctx.task);
         ctx.mailboxes.broadcast(|| Msg::ShowQuic(Arc::clone(&g)));
-        self.pending = Some(Pending::Quic(g, QuicShow { filter, acks }));
+        self.pending = Some(Pending::Quic(g, QuicShow { filter, acks, per_fe }));
     }
 
     /// One connection as `dump_quic_oneline` prints it: `%p[%02u]/%-.12s ` padded to 36
@@ -1503,7 +1516,29 @@ impl CliApplet {
                     self.pending = Some(Pending::Quic(g, filter));
                     return false;
                 };
-                let QuicShow { filter, acks } = filter;
+                let QuicShow { filter, acks, per_fe } = filter;
+                if per_fe {
+                    self.out_buf.extend_from_slice(SHOW_QUIC_ACKS_FE_HEADER.as_bytes());
+                    // Per frontend: the live connections' counts, then the ended ones'.
+                    let mut rows: Vec<(usize, u64, u64, u64, u64)> =
+                        crate::stats::fe_ack_totals_all().into_iter().map(|(i, s, o, x)| (i, 0, s, o, x)).collect();
+                    for snap in per_worker.iter().flatten().filter(|s| s.phase != ibex_quic::ConnPhase::Closing) {
+                        // Every listener with a frontend registered its row when it bound.
+                        let Some(r) = rows.iter_mut().find(|r| Some(r.0) == snap.fe) else { continue };
+                        r.1 += 1;
+                        r.2 += snap.acks.ack_eliciting_sent;
+                        r.3 += snap.acks.ack_only_received;
+                        r.4 += snap.acks.ack_frequency_excess;
+                    }
+                    rows.sort_by_key(|r| r.0);
+                    for (fe, conns, sent, only, excess) in rows {
+                        let name = ctx.proxies.get(fe).map_or("UNKNOWN", |p| p.name.as_str());
+                        let ratio = if sent == 0 { "-".to_string() } else { (only.saturating_mul(1000) / sent).to_string() };
+                        self.out_buf.extend_from_slice(format!("{name:<24} {conns:>5} {sent:>13} {only:>13} {ratio:>8} {excess:>11}\n").as_bytes());
+                    }
+                    self.finish_msg("");
+                    return true;
+                }
                 self.out_buf.extend_from_slice(if acks { SHOW_QUIC_ACKS_HEADER } else { SHOW_QUIC_HEADER }.as_bytes());
                 // Backend connections do not exist (no `quic4@` server), and closing ones are
                 // only those quinn-proto still holds.

@@ -3256,7 +3256,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         is_first_req: s.is_first_req,
         proxy_tlvs: s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&s.cli_xprt, s.h2_role.as_deref()),
-        quic_acks: crate::proxy::quic_acks(s.h2_role.as_deref()),
+        quic_acks: s.quic_facts(),
         fc_http_major: s.fc_http_major(),
         bc_http_major: s.bc_http_major(),
         req_version: s.client_version(),
@@ -5974,7 +5974,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         for q_idx in 0..self.quic_listeners.len() {
             let Some(proxy_idx) = self.quic_listeners[q_idx].frontend() else { continue };
             for st in self.quic_listeners[q_idx].take_accepted() {
-                self.admit_connection(proxy_idx, None, st.fd, st.peer, st.local);
+                let src = crate::proxy::QuicAckSrc { listener: usize_to_u32(q_idx), conn: st.conn, facts: st.acks };
+                self.admit_connection(proxy_idx, None, st.fd, st.peer, st.local, Some(src));
             }
         }
     }
@@ -6384,8 +6385,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let mut sess = TcpSession::h2_child_of(&mut owner.sess, (owner_idx, owner_task), d.stream);
             sess.h3 = owner.sess.h3;
             // T569: the connection's acknowledgement counts as this request found them.
-            if let (Some(h3), Some(c)) = (owner.sess.h3_owner(), sess.h2_child_mut()) {
-                c.quic_acks = self.quic_listeners.get(h3.listener as usize).and_then(|ql| ql.ack_facts(h3.conn));
+            if let Some(h3) = owner.sess.h3_owner() {
+                let facts = self.quic_listeners.get(h3.listener as usize).and_then(|ql| ql.ack_facts(h3.conn));
+                if let Some(c) = sess.h2_child_mut() {
+                    c.quic_ack = Some(crate::proxy::QuicAckSrc { listener: h3.listener, conn: h3.conn, facts });
+                }
             }
             // An HTTP/2 owner stamps the first byte of each stream as it reads it; an HTTP/3
             // one reads no bytes of its own. The stream's request head is in, which is where
@@ -6584,7 +6588,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             };
             crate::globalconn::note_accept();
             let local_addr = self.listeners[l_idx].addr();
-            self.admit_connection(proxy_idx, Some(l_idx), cli_fd, peer_addr, local_addr);
+            self.admit_connection(proxy_idx, Some(l_idx), cli_fd, peer_addr, local_addr, None);
         }
     }
 
@@ -6672,6 +6676,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         cli_fd: std::os::fd::OwnedFd,
         peer_addr: SocketAddr,
         local_addr: SocketAddr,
+        quic_ack: Option<crate::proxy::QuicAckSrc>,
     ) {
         if l_idx.is_some() {
             count_global_conn();
@@ -6860,6 +6865,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 fc_dst,
                 tracked_sc,
                 expect_proxy,
+                quic_ack,
             );
         }
     }
@@ -7374,7 +7380,7 @@ fn eval_tcp_req_session_rules(
         fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
-        quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
+        quic_acks: sess.quic_facts(),
         req_version: sess.client_version(),
         ssl_bc: sess.srv_xprt.ssl_facts(),
         act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
@@ -7586,7 +7592,7 @@ fn eval_tcp_req_content_rules(
         fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
-        quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
+        quic_acks: sess.quic_facts(),
         fc_http_major: sess.fc_http_major(),
         bc_http_major: sess.bc_http_major(),
         req_version: sess.client_version(),
@@ -7878,7 +7884,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
-        quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
+        quic_acks: sess.quic_facts(),
         fc_http_major: sess.fc_http_major(),
         bc_http_major: sess.bc_http_major(),
         req_version: sess.client_version(),
@@ -8154,6 +8160,7 @@ fn register_new_session(
     fc_dst: SocketAddr,
     tracked_sc: [Option<(usize, StickKey)>; 3],
     expect_proxy: bool,
+    quic_ack: Option<crate::proxy::QuicAckSrc>,
 ) {
     // Cloned out before `proxies` is borrowed mutably. TLS belongs to the bind that
     // accepted, not to the proxy, so it is read from the listener.
@@ -8192,6 +8199,9 @@ fn register_new_session(
     // Without a listener, the client is an HTTP/3 request stream (`adopt_quic_streams`).
     sess.reset_with_request = reset_pending;
     sess.h3 = listener_idx.is_none();
+    if let Some(q) = quic_ack {
+        sess.h2_role = Some(crate::proxy::relay_role(q));
+    }
     sess.proto_h2 = listener_idx.and_then(|i| engine.listeners.get(i)).is_some_and(|l| l.proto_h2);
     sess.so_name = listener_idx.and_then(|i| engine.listeners.get(i)).and_then(|l| l.name.clone());
     sess.so_id = listener_idx.and_then(|i| engine.listeners.get(i)).map(|l| l.luid).filter(|&id| id != 0);
@@ -9786,7 +9796,7 @@ impl EngineDispatcher<'_> {
             is_first_req: sess.is_first_req,
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
-            quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
+            quic_acks: sess.quic_facts(),
             fc_http_major: sess.fc_http_major(),
             bc_http_major: sess.bc_http_major(),
             req_version: sess.client_version(),
@@ -11291,6 +11301,15 @@ impl EngineDispatcher<'_> {
                 }
                 _ => {}
             }
+            // T587: an HTTP/3 stream's response head is in: the response rules and the log see the
+            // packets sent and received since its request head, not the counts it found then.
+            if !entry.sess.rep.is_empty() && entry.sess.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting) {
+                if let Some(q) = entry.sess.quic_ack_mut() {
+                    if let Some(f) = self.quic_listeners.get(q.listener as usize).and_then(|ql| ql.ack_facts(q.conn)) {
+                        q.facts = Some(f);
+                    }
+                }
+            }
             if entry.sess.mode == Mode::Http && !entry.sess.is_done() {
                 pending_admin = Self::http_step(
                     entry,
@@ -11470,6 +11489,7 @@ impl EngineDispatcher<'_> {
                 self.poller,
                 self.listeners,
             );
+            crate::proxy::give_relay_role(&mut entry.sess);
         }
     }
 
@@ -12129,7 +12149,7 @@ impl EngineDispatcher<'_> {
             is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             ssl_fc: crate::proxy::ssl_fc(&entry.sess.cli_xprt, entry.sess.h2_role.as_deref()),
-            quic_acks: crate::proxy::quic_acks(entry.sess.h2_role.as_deref()),
+            quic_acks: entry.sess.quic_facts(),
             fc_http_major: entry.sess.fc_http_major(),
             bc_http_major: entry.sess.bc_http_major(),
             req_version: entry.sess.client_version(),
@@ -12603,7 +12623,7 @@ impl EngineDispatcher<'_> {
             fc_dst: sess.fc_dst(),
             is_first_req: sess.is_first_req,
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
-            quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
+            quic_acks: sess.quic_facts(),
             fc_http_major: sess.fc_http_major(),
             req_version: sess.client_version(),
             req_uri: sess.req_uri.as_deref(),
@@ -13094,7 +13114,7 @@ impl EngineDispatcher<'_> {
             is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             ssl_fc: crate::proxy::ssl_fc(&entry.sess.cli_xprt, entry.sess.h2_role.as_deref()),
-            quic_acks: crate::proxy::quic_acks(entry.sess.h2_role.as_deref()),
+            quic_acks: entry.sess.quic_facts(),
             fc_http_major: entry.sess.fc_http_major(),
             bc_http_major: entry.sess.bc_http_major(),
             req_version: entry.sess.client_version(),
@@ -13191,7 +13211,7 @@ impl EngineDispatcher<'_> {
                         is_first_req: $s.is_first_req,
                         proxy_tlvs: $s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
                         ssl_fc: crate::proxy::ssl_fc(&$s.cli_xprt, $s.h2_role.as_deref()),
-                        quic_acks: crate::proxy::quic_acks($s.h2_role.as_deref()),
+                        quic_acks: $s.quic_facts(),
                         fc_http_major: $s.fc_http_major(),
                         bc_http_major: $s.bc_http_major(),
                         req_version: $s.client_version(),
@@ -17187,7 +17207,7 @@ fn after_res_on_reply<'r>(
             is_first_req: sess.is_first_req,
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
-            quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
+            quic_acks: sess.quic_facts(),
             fc_http_major: sess.fc_http_major(),
             bc_http_major: sess.bc_http_major(),
             req_version: sess.client_version(),
@@ -17262,7 +17282,7 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Pr
                     fc_dst: sess.fc_dst(),
                     is_first_req: sess.is_first_req,
                     ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
-                    quic_acks: crate::proxy::quic_acks(sess.h2_role.as_deref()),
+                    quic_acks: sess.quic_facts(),
                     fc_http_major: sess.fc_http_major(),
                     bc_http_major: sess.bc_http_major(),
                     req_version: sess.client_version(),
@@ -17910,7 +17930,7 @@ mod idle_poll_tests {
         let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         ours.set_nonblocking(true).expect("nonblocking");
         let local: SocketAddr = "127.0.0.1:443".parse().expect("addr");
-        e.admit_connection(0, None, theirs.into(), "127.0.0.1:50000".parse().expect("addr"), local);
+        e.admit_connection(0, None, theirs.into(), "127.0.0.1:50000".parse().expect("addr"), local, None);
         ours.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("send");
         let mut got = Vec::new();
         let mut buf = [0u8; 512];
