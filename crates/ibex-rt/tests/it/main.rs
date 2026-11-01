@@ -194,6 +194,7 @@ mod quic_handshake_burst;
 mod h3_many_threads;
 mod h2_stream_timings;
 mod h3_mux_drain;
+mod h3_port_reuse;
 mod h3_reload;
 mod h3_mux_edges;
 mod h3_default_path;

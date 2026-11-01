@@ -148,14 +148,14 @@ fn ibex(be: SocketAddr, timeouts: &str) -> Ibex {
 }
 
 /// One QUIC connection to `ibex`, driven by hand.
-struct Client {
-    sock: UdpSocket,
+pub(crate) struct Client {
+    pub(crate) sock: UdpSocket,
     ep: Endpoint,
     handle: ConnectionHandle,
     conn: Connection,
     buf: Vec<u8>,
     /// The application or transport code the connection was closed with, and when.
-    lost: Option<(String, Instant)>,
+    pub(crate) lost: Option<(String, Instant)>,
     /// What each of the server's unidirectional streams carried.
     uni: HashMap<StreamId, Vec<u8>>,
     /// Until then, datagrams from the server are dropped unread.
@@ -168,7 +168,7 @@ struct Client {
 }
 
 impl Client {
-    fn connect(server: SocketAddr) -> Self {
+    pub(crate) fn connect(server: SocketAddr) -> Self {
         let mut c = Self::begin(server);
         c.finish_handshake();
         c
@@ -177,11 +177,16 @@ impl Client {
     /// Sends the client's first Initial and nothing more: the server's answer waits in the
     /// socket until [`Client::finish_handshake`].
     fn begin(server: SocketAddr) -> Self {
+        Self::begin_on(UdpSocket::bind("127.0.0.1:0").expect("client socket"), server)
+    }
+
+    /// As [`Client::begin`], from an existing socket (T567: a second client on a source port
+    /// a first one still holds).
+    pub(crate) fn begin_on(sock: UdpSocket, server: SocketAddr) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut ctls = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(std::sync::Arc::new(Any)).with_no_client_auth();
         ctls.alpn_protocols = vec![b"h3".to_vec()];
         let client_cfg = ClientConfig::new(std::sync::Arc::new(QuicClientConfig::try_from(ctls).expect("client config")));
-        let sock = UdpSocket::bind("127.0.0.1:0").expect("client socket");
         sock.set_nonblocking(true).expect("nonblocking");
         let mut ep = Endpoint::new(std::sync::Arc::new(EndpointConfig::default()), None, true, None);
         let (handle, conn) = ep.connect(Instant::now(), client_cfg, server, "localhost").expect("connect");
@@ -191,7 +196,11 @@ impl Client {
     }
 
     /// Completes the handshake and opens the control stream.
-    fn finish_handshake(&mut self) {
+    pub(crate) fn conn_is_handshaking(&self) -> bool {
+        self.conn.is_handshaking()
+    }
+
+    pub(crate) fn finish_handshake(&mut self) {
         let c = self;
         c.run_until(Duration::from_secs(4), |c| !c.conn.is_handshaking() || c.lost.is_some());
         assert!(!c.conn.is_handshaking(), "no handshake: {:?}", c.lost);
@@ -265,7 +274,7 @@ impl Client {
         }
     }
 
-    fn run_until(&mut self, within: Duration, mut done: impl FnMut(&mut Self) -> bool) -> bool {
+    pub(crate) fn run_until(&mut self, within: Duration, mut done: impl FnMut(&mut Self) -> bool) -> bool {
         let deadline = Instant::now() + within;
         while Instant::now() < deadline {
             self.step();
@@ -277,12 +286,12 @@ impl Client {
     }
 
     /// Runs until the connection is closed (at most `within`): the code and when.
-    fn closed(&mut self, within: Duration) -> Option<(String, Instant)> {
+    pub(crate) fn closed(&mut self, within: Duration) -> Option<(String, Instant)> {
         self.run_until(within, |c| c.lost.is_some());
         self.lost.clone()
     }
 
-    fn open(&mut self, bytes: &[u8], fin: bool) -> StreamId {
+    pub(crate) fn open(&mut self, bytes: &[u8], fin: bool) -> StreamId {
         let id = self.conn.streams().open(Dir::Bi).expect("open");
         let mut s = self.conn.send_stream(id);
         assert_eq!(s.write(bytes).expect("write"), bytes.len());
@@ -299,7 +308,7 @@ impl Client {
     }
 
     /// How stream `id` ended: its status, FIN or reset code.
-    fn outcome(&mut self, id: StreamId) -> Outcome {
+    pub(crate) fn outcome(&mut self, id: StreamId) -> Outcome {
         let mut all = Vec::new();
         let (mut fin, mut reset) = (false, None);
         self.run_until(Duration::from_secs(8), |c| {
@@ -335,11 +344,11 @@ impl Client {
 }
 
 #[derive(Debug)]
-struct Outcome {
-    status: Option<u16>,
-    fin: bool,
-    reset: Option<u64>,
-    at: Instant,
+pub(crate) struct Outcome {
+    pub(crate) status: Option<u16>,
+    pub(crate) fin: bool,
+    pub(crate) reset: Option<u64>,
+    pub(crate) at: Instant,
 }
 
 fn frames(mut b: &[u8]) -> Vec<(u64, Vec<u8>)> {
@@ -370,7 +379,7 @@ fn lit(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
 }
 
 /// A HEADERS frame for `GET path`.
-fn get(path: &[u8]) -> Vec<u8> {
+pub(crate) fn get(path: &[u8]) -> Vec<u8> {
     let mut b = vec![0x00, 0x00];
     for (n, v) in [(&b":method"[..], &b"GET"[..]), (b":scheme", b"https"), (b":path", path), (b":authority", b"localhost")] {
         lit(&mut b, n, v);
