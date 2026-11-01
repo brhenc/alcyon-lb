@@ -459,7 +459,7 @@ fn gen_row(c: &Ctx<'_>, kind: Kind, p_idx: usize, s_idx: usize, buf: &mut String
         Kind::Front => crate::stats::write_frontend_row(buf, Csv, proxy, c.pid, iid),
         Kind::Back => crate::stats::write_backend_row(buf, Csv, proxy, c.pid, iid, true),
         Kind::Server => {
-            let check = c.checks.iter().find(|k| k.proxy() == p_idx && k.server() == s_idx);
+            let check = crate::track::check_view(proxy, c.checks, p_idx, s_idx);
             crate::stats::write_server_row(buf, Csv, proxy, s_idx, check, c.pid, iid, proxy.server_puid(s_idx), true);
         }
     }

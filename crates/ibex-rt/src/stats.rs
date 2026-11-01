@@ -939,7 +939,7 @@ pub(crate) fn write_server_row(
     fmt: StatFormat,
     proxy: &Proxy,
     s_idx: usize,
-    check_state: Option<&ServerCheckState>,
+    check_state: Option<crate::check::CheckView<'_>>,
     _pid: u32,
     iid: u32,
     sid: u32,
@@ -953,7 +953,7 @@ pub(crate) fn write_server_row(
     let srv_addr = proxy.servers.at(s_idx);
     // Everything below is written into the row's strings as it is read: a `show stat` row of
     // a scrape allocates nothing (T369).
-    struct Word<'a>(Option<&'a ServerCheckState>, &'static str, &'a str);
+    struct Word<'a>(Option<&'a crate::check::CheckView<'a>>, &'static str, &'a str);
     impl std::fmt::Display for Word<'_> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self.0 {
@@ -981,7 +981,7 @@ pub(crate) fn write_server_row(
     let rmaint = proxy.server_rmaint(s_idx);
     let status_str = if rmaint {
         Word(None, "MAINT (resolution)", "")
-    } else if let Some(c) = check_state {
+    } else if let Some(c) = &check_state {
         Word(Some(c), "", "")
     } else {
         let s = proxy.server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
@@ -996,16 +996,16 @@ pub(crate) fn write_server_row(
             ServerStatus::Maint => Word(None, "MAINT", ""),
         }
     };
-    let (chkfail, chkdown) = check_state.map_or((0, 0), |c| (c.failed_checks, c.down_transitions));
+    let (chkfail, chkdown) = check_state.as_ref().map_or((0, 0), |c| (c.failed_checks, c.down_transitions));
     // A star while a check is running; the code only for the statuses that carry data
     // (L57DATA and above); the info text as `last_chk`.
-    let check_status = Opt(check_state.map(|c| Star(c.in_progress, c.last_status_code)));
-    let check_code = Opt(check_state.filter(|c| c.carries_code()).map(|c| c.http_code.unwrap_or(0)));
-    let last_chk = check_state.and_then(|c| c.last_status_info.as_deref()).unwrap_or("");
+    let check_status = Opt(check_state.as_ref().map(|c| Star(c.in_progress, c.last_status_code)));
+    let check_code = Opt(check_state.as_ref().filter(|c| c.carries_code()).map(|c| c.http_code.unwrap_or(0)));
+    let last_chk = check_state.as_ref().and_then(|c| c.last_status_info.as_deref()).unwrap_or("");
     // From the first completed check on (`HCHK_STATUS_CHECKED`), not while `INI`.
-    let check_duration = Opt(check_state.filter(|c| c.last_status_code != "INI").map(|c| c.check_duration_ms));
+    let check_duration = Opt(check_state.as_ref().filter(|c| c.last_status_code != "INI").map(|c| c.check_duration_ms));
     // `get_check_status_description`: the fixed text of the status.
-    let check_desc = check_state.map_or("", |c| c.last_status_desc);
+    let check_desc = check_state.as_ref().map_or("", |c| c.last_status_desc);
     let has_check = check_state.is_some();
 
     let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
@@ -1060,7 +1060,7 @@ pub(crate) fn write_server_row(
     r.set("sid", sid);
     r.set("type", 2);
     // A server in maintenance has its checks paused: no check column (`CHK_ST_PAUSED`).
-    if has_check && !check_state.is_some_and(|c| c.status == ServerStatus::Maint) {
+    if has_check && !check_state.as_ref().is_some_and(|c| c.status == ServerStatus::Maint) {
         r.set("check_status", check_status);
         r.set("check_code", check_code);
         r.set("check_duration", check_duration);
@@ -1279,7 +1279,7 @@ impl StatCursor {
                     if self.sid.is_some_and(|f| f != -1 && u32::try_from(f).ok() != Some(sid)) {
                         continue;
                     }
-                    write_server_row(out, self.fmt, p, s, crate::stats_html::check_of(checks, i, s), pid, p.ids.iid, sid, self.legends);
+                    write_server_row(out, self.fmt, p, s, crate::stats_html::check_of(p, checks, i, s), pid, p.ids.iid, sid, self.legends);
                     break;
                 }
                 ST_BACKEND => {

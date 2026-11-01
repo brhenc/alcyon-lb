@@ -227,12 +227,14 @@ pub struct ProxyCounters {
     /// Operator changes to checked servers waiting for the owner of the checks
     /// ([`crate::track::CheckOps`], T593).
     pub check_ops: crate::track::CheckOps,
+    /// What the stats pages of the other workers read of the checks ([`crate::track::CheckViews`], T597).
+    pub check_views: crate::track::CheckViews,
 }
 
 impl ProxyCounters {
     #[must_use]
     pub fn new(servers: usize) -> Self {
-        ProxyCounters { fe: TxnCounters::default(), be: TxnCounters::default(), srv: (0..servers).map(|_| TxnCounters::default()).collect(), srv_events: crate::srvlog::Queue::default(), check_ops: crate::track::CheckOps::default() }
+        ProxyCounters { fe: TxnCounters::default(), be: TxnCounters::default(), srv: (0..servers).map(|_| TxnCounters::default()).collect(), srv_events: crate::srvlog::Queue::default(), check_ops: crate::track::CheckOps::default(), check_views: crate::track::CheckViews::default() }
     }
 }
 

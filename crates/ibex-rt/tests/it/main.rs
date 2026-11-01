@@ -77,6 +77,7 @@ mod server_state_log;
 mod check_reply_buffer_bound;
 mod check_rules;
 mod check_port;
+mod check_columns_workers;
 mod check_stats_columns;
 mod check_status_word;
 mod check_verdicts;
