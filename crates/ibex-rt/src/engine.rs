@@ -1754,6 +1754,10 @@ pub(crate) fn link_declaration_order(proxies: &mut [Proxy]) {
 /// What [`Proxy::ids`] holds.
 #[derive(Debug, Clone, Default)]
 pub struct ProxyIdInfo {
+    /// The proxy's `timeout client`, `server`, `connect`, `queue`, `tunnel`, `tarpit` in ms
+    /// (0 unset), as the `*_timeout` fetches report them: converted once, not a stream run
+    /// (L3, [`stream_timeouts`]). Here, in the box, because `Proxy` is held to its size.
+    pub timeout_ms: [u32; 6],
     /// The transaction counters `show stat` prints (T165), made on first use. Here, in the
     /// box, because `Proxy` is held to its size.
     pub tc: std::sync::OnceLock<Arc<crate::statcnt::ProxyCounters>>,
@@ -3229,7 +3233,7 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &[Proxy], fe_idx: usize,
     crate::txnlog::reset_captures(&mut entry.sess.log.res_captures, fe.res_capture_slots.len());
     // T331: what the `capture-req` and `capture-res` converters cut at.
     // The run that parsed the request has started already, with no slots to give.
-    ibex_sample::capture_write::enter(fe.req_capture_slots.clone(), fe.res_capture_slots.clone());
+    let _ = ibex_sample::capture_write::enter_shared(&fe.req_capture_slots, &fe.res_capture_slots);
     // `HAProxy` builds the ID on first use (`stream_generate_unique_id`); built here, once,
     // it is the same value for every reader, from the request as received.
     if let Some(fmt) = fe.unique_id_format.as_ref() {
@@ -4456,6 +4460,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: ibex_config::ast::ProxyId, list
     Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
+            timeout_ms: timeouts_ms(&listen.timeouts),
             iid: ids.iid,
             decl: ids.decl,
             next_decl: 0,
@@ -4611,6 +4616,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, fe
     Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
+            timeout_ms: timeouts_ms(&fe.timeouts),
             iid: ids.iid,
             decl: ids.decl,
             next_decl: 0,
@@ -4758,6 +4764,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: ibex_config::ast::ProxyId, be:
     Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
+            timeout_ms: timeouts_ms(&be.timeouts),
             iid: ids.iid,
             decl: ids.decl,
             next_decl: 0,
@@ -8217,8 +8224,12 @@ fn with_stream_vars<R>(sess: &mut TcpSession, fe: &Proxy, f: impl FnOnce(&mut Tc
 /// The start of [`with_stream_vars`].
 fn stream_vars_enter(sess: &mut TcpSession, fe: &Proxy) {
     ibex_sample::vars::enter(&mut sess.vars);
-    // T331: the slots' lengths, for the converters that write them.
-    ibex_sample::capture_write::enter(fe.req_capture_slots.clone(), fe.res_capture_slots.clone());
+    // T331: the slots' lengths, for the converters that write them. The thread keeps the
+    // last frontend's tables: no `Arc` clone a run (L3, Q6).
+    let taken = ibex_sample::capture_write::enter_shared(&fe.req_capture_slots, &fe.res_capture_slots);
+    if cfg!(debug_assertions) && taken {
+        ibex_sample::work::note(ibex_sample::work::Op::RunSetup, 1);
+    }
 }
 
 /// The end of [`with_stream_vars`]: the thread's store goes back to `sess`, or is emptied
@@ -8226,7 +8237,7 @@ fn stream_vars_enter(sess: &mut TcpSession, fe: &Proxy) {
 fn stream_vars_leave(sess: Option<&mut TcpSession>) {
     // T331: what `capture-req` and `capture-res` wrote goes into the slots; a stream that is
     // gone has none to take it.
-    let writes = ibex_sample::capture_write::leave();
+    let writes = ibex_sample::capture_write::leave_kept();
     let Some(sess) = sess else {
         ibex_sample::vars::leave(None);
         return;
@@ -8246,12 +8257,8 @@ fn stream_vars_leave(sess: Option<&mut TcpSession>) {
 /// `cur_*` is the backend's timeout, the client's the frontend's, unless a rule set it,
 /// as `smp_fetch_cur_*_timeout` (src/stream.c) read the stream's own timers.
 fn stream_timeouts(fe: &Proxy, be: &Proxy, set: Option<&crate::proxy::TimeoutsSet>) -> ibex_sample::StreamTimeouts {
-    let ms = |p: &Proxy| {
-        let t = &p.stats_config.raw_timeouts;
-        [t.client, t.server, t.connect, t.queue, t.tunnel, t.tarpit].map(|v| v.map_or(0, millis_to_u32))
-    };
-    let fe_ms = ms(fe);
-    let mut be_ms = ms(be);
+    let fe_ms = fe.ids.timeout_ms;
+    let mut be_ms = be.ids.timeout_ms;
     be_ms[TimeoutKind::Client as usize] = fe_ms[TimeoutKind::Client as usize];
     let mut cur = be_ms;
     if let Some(set) = set {
@@ -8262,6 +8269,13 @@ fn stream_timeouts(fe: &Proxy, be: &Proxy, set: Option<&crate::proxy::TimeoutsSe
         }
     }
     ibex_sample::StreamTimeouts { fe: fe_ms, be: be_ms, cur }
+}
+
+/// [`Proxy::timeout_ms`] of a proxy's `timeouts`.
+fn timeouts_ms(t: &ibex_config::TimeoutConfig) -> [u32; 6] {
+    #[cfg(debug_assertions)]
+    ibex_sample::work::note(ibex_sample::work::Op::RunSetup, 1);
+    [t.client, t.server, t.connect, t.queue, t.tunnel, t.tarpit].map(|v| v.map_or(0, millis_to_u32))
 }
 
 /// Puts the timeouts of the stream that runs now where its fetches read them

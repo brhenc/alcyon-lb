@@ -30,9 +30,13 @@ pub enum Op {
     Housekeeping = 6,
     /// A pass of the engine loop (`step_at`): counted in debug builds only (L1, L2).
     Pass = 7,
+    /// A stream run's context built from the configuration instead of kept: the timeouts
+    /// the `*_timeout` fetches read converted from the proxies' settings, the capture slots'
+    /// table (`Arc`) cloned. Counted in debug builds only (L3).
+    RunSetup = 8,
 }
 
-const OPS: usize = 8;
+const OPS: usize = 9;
 
 thread_local! {
     static COUNTS: [Cell<u64>; OPS] = const { [const { Cell::new(0) }; OPS] };

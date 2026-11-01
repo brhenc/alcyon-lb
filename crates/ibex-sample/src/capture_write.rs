@@ -43,6 +43,37 @@ pub fn enter(req: SlotLens, res: SlotLens) {
     });
 }
 
+/// [`enter`] without a clone a run (L3, Q6): the thread keeps the tables of the frontend
+/// that ran last, and takes another's only when it changes. [`leave_kept`] ends the run.
+/// Returns whether the tables were taken (cloned).
+#[must_use]
+pub fn enter_shared(req: &SlotLens, res: &SlotLens) -> bool {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.writes.clear();
+        let same = s.req.as_ref().is_some_and(|r| Arc::ptr_eq(r, req)) && s.res.as_ref().is_some_and(|r| Arc::ptr_eq(r, res));
+        if !same {
+            s.req = Some(Arc::clone(req));
+            s.res = Some(Arc::clone(res));
+        }
+        !same
+    })
+}
+
+/// The end of a run [`enter_shared`] began: what its converters wrote, if anything (no
+/// allocation when nothing was). The tables stay for the next run.
+#[must_use]
+pub fn leave_kept() -> Vec<CaptureWrite> {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.writes.is_empty() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut s.writes)
+        }
+    })
+}
+
 /// The run ends: what its converters wrote, to be put in the stream's slots.
 #[must_use]
 pub fn leave() -> Vec<CaptureWrite> {

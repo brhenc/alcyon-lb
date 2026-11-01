@@ -389,3 +389,28 @@ fn an_h1_keepalive_request_completes_in_two() {
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
 }
+
+/// L3: a keep-alive stream's run builds nothing from the configuration: the timeouts its
+/// fetches read are the proxies' own, converted once, and the capture slots' table is not
+/// cloned (Q6: no `Arc` clone a run). Two of each a run before (`stream_timeouts`,
+/// `stream_vars_enter`).
+#[test]
+#[cfg(debug_assertions)]
+fn a_keepalive_stream_run_does_only_io_and_http() {
+    const N: u64 = 100;
+    let (mut engine, fe, running, be) = setup();
+    let mut c = Client::connect(fe);
+    for _ in 0..20 {
+        c.get(&mut engine);
+    }
+    let s0 = on_this_thread()[Op::RunSetup as usize];
+    for _ in 0..N {
+        c.get(&mut engine);
+    }
+    let setups = on_this_thread()[Op::RunSetup as usize] - s0;
+    println!("{N} keep-alive requests: {setups} run set-ups");
+    assert!(setups <= 2, "{setups} run set-ups for {N} requests: each stream run rebuilds its context");
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}
