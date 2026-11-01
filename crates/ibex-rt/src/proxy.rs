@@ -2405,15 +2405,14 @@ impl TcpSession {
     /// takes a buffer back if the empty one was released (a stream with none gets no room
     /// and tries again on the next pass, as a stats page does) and compacts a used-up tail.
     pub fn drain_pending_raw_h2(&mut self) {
-        if let Some(PendingOut::Raw(ref data, ref mut offset)) = self.pending_resp.as_deref_mut() {
-            let room = self.rep.writable();
-            let n = room.len().min(data.len() - *offset);
-            room[..n].copy_from_slice(&data[*offset..*offset + n]);
-            self.rep.commit(n);
-            *offset += n;
-            if *offset >= data.len() {
-                self.pending_resp = None;
-            }
+        let Some(PendingOut::Raw(data, offset)) = self.pending_resp.as_deref_mut() else { return };
+        let room = self.rep.writable();
+        let n = room.len().min(data.len() - *offset);
+        room[..n].copy_from_slice(&data[*offset..*offset + n]);
+        self.rep.commit(n);
+        *offset += n;
+        if *offset >= data.len() {
+            self.pending_resp = None;
         }
     }
 
