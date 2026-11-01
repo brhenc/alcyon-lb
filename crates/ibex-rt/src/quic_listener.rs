@@ -1247,10 +1247,10 @@ impl QuicListener {
     /// The client reset the request or asked us to stop sending the response: the engine's
     /// stream is cut, which it sees as the client going away.
     fn abandon_stream(&mut self, conn_id: ConnHandle, stream_id: StreamId) {
-        if let Some(st) = slot_of(&mut self.conns, conn_id).and_then(|s| s.h3.as_mut()) {
-            st.req.remove(&stream_id);
-            st.unacked.retain(|s| *s != stream_id);
-        }
+        // Its request and its wait for an acknowledgement go (a connection the relay never
+        // gave HTTP/3 state has neither). One expression: there is no other branch to take.
+        let st = slot_of(&mut self.conns, conn_id).and_then(|s| s.h3.as_mut());
+        st.map(|st| (st.req.remove(&stream_id), st.unacked.retain(|s| *s != stream_id)));
         for r in &mut self.relays {
             if r.conn == conn_id && r.stream_id == stream_id {
                 r.done = true;
