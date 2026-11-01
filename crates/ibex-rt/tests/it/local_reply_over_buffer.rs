@@ -136,7 +136,9 @@ fn an_errorfile_that_does_not_fit_the_buffer_is_refused() {
 
 // ---- what is accepted and still larger than a buffer: it must arrive whole ----------------
 
-const BODY: usize = 49_152; // three buffers
+// The longest `string` is the one that fits the HTX buffer with its head (T597: HAProxy answers 500
+// for a longer one, which `local_reply_string_fit` checks); the reply is then nearly a whole buffer.
+const BODY: usize = 16_000;
 
 struct Run {
     child: common::Ibex,
@@ -160,8 +162,8 @@ fn start_with(tag: &str, global: &str, body_len: usize) -> Run {
     let d = dir(tag);
     let (plain, tls) = (common::reserve_addr(), common::reserve_addr());
     let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
-    // `string` is the one body HAProxy accepts at any length at parse; Ibex answers it whole
-    // over HTTP/1.1, and so must it over HTTP/2.
+    // `string` is the one body HAProxy accepts at any length at parse (and answers 500 for at
+    // run time when it does not fit, T597); a reply that fits goes whole over HTTP/1.1 and HTTP/2.
     let body = "b".repeat(body_len);
     let c = format!(
         "global\n  nbthread 1\n{global}defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
@@ -187,14 +189,14 @@ fn curl(args: &[&str], url: &str) -> (String, Option<i32>, Duration) {
 }
 
 #[test]
-fn a_three_buffer_local_reply_arrives_whole_over_h2c() {
+fn a_buffer_sized_local_reply_arrives_whole_over_h2c() {
     let r = start("h2c");
     let (got, code, took) = curl(&["--http2-prior-knowledge"], &format!("http://{}/", r.plain));
     assert_eq!((got.as_str(), code), (&*format!("200 {BODY} 2"), Some(0)), "after {took:?}");
 }
 
 #[test]
-fn a_three_buffer_local_reply_arrives_whole_over_tls_h2() {
+fn a_buffer_sized_local_reply_arrives_whole_over_tls_h2() {
     let r = start("tls");
     let (got, code, took) = curl(&["--http2"], &format!("https://{}/", r.tls));
     assert_eq!((got.as_str(), code), (&*format!("200 {BODY} 2"), Some(0)), "after {took:?}");
@@ -212,7 +214,7 @@ fn the_same_reply_over_http11_stays_whole() {
 /// is moved into the room that appears.
 #[test]
 fn a_slow_h2_reader_gets_a_long_local_reply_whole() {
-    const LONG: usize = 300_000;
+    const LONG: usize = 16_000;
     let r = start_with("slow", "", LONG);
     let (got, code, took) = curl(&["--http2-prior-knowledge", "--limit-rate", "400k"], &format!("http://{}/", r.plain));
     assert_eq!((got.as_str(), code), (&*format!("200 {LONG} 2"), Some(0)), "after {took:?}");
