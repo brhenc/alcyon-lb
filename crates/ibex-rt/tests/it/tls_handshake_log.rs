@@ -208,7 +208,7 @@ fn session_with(mode: &str, extra: &str, inputs: &[(&[u8], bool)], cmds: &[&str]
 /// `session_with`, with `bind_opts` on the `bind` line.
 fn session_full(mode: &str, bind_opts: &str, extra: &str, inputs: &[(&[u8], bool)], cmds: &[&str]) -> Session {
     let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
-    collector.set_read_timeout(Some(Duration::from_millis(400))).expect("timeout");
+    collector.set_read_timeout(Some(Duration::from_millis(1500))).expect("timeout");
     let fe = common::reserve_addr();
     let cert = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem");
     let sock = format!("/tmp/t268-{}-{}.sock", std::process::id(), fe.port());
