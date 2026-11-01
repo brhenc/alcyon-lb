@@ -10648,7 +10648,8 @@ impl EngineDispatcher<'_> {
         ql.owner_send(conn, &mut h3.mux, |id| !served(id));
         let idle = children == 0 && !ibex_proto::htx_mux::HtxMux::tx_pending(&*h3.mux);
         // A request whose head is still arriving is in flight too: the drain waits for it.
-        let in_flight = ibex_proto::htx_mux::HtxMux::next_dispatch(&*h3.mux).is_some() || h3.mux.head_partial().is_some();
+        // Read only in a stop: `head_partial` walks the streams, every pass of every request.
+        let in_flight = stopping && (ibex_proto::htx_mux::HtxMux::next_dispatch(&*h3.mux).is_some() || h3.mux.head_partial().is_some());
         let failed = h3.mux.error.is_some();
         for i in 0..children {
             let Some(link) = self.sessions.get(owner_idx).and_then(|e| e.sess.h2_owner()).and_then(|o| o.children.get(i).copied()) else { break };
@@ -10665,7 +10666,7 @@ impl EngineDispatcher<'_> {
         // the client had not received yet (T521): it closes.
         let ended = !matches!(e.sess.cli_state, ScState::Ready | ScState::Established);
         let ql = &self.quic_listeners[q_idx];
-        let drained = idle && stopping && !fresh && !in_flight && !ql.owner_unacked(conn);
+        let drained = stopping && idle && !fresh && !in_flight && !ql.owner_unacked(conn);
         // Its GOAWAY was framed in this pass: the close waits for the next one, as a timer's
         // does, or quinn drops the GOAWAY with the close (T558: the client of a connection
         // idle at the stop saw only CONNECTION_CLOSE).
