@@ -1006,6 +1006,13 @@ impl ServerXprt {
         matches!(self, ServerXprt::H2(h) if h.bad_response())
     }
 
+    /// The trailers an h2 server sent after a content-length body, as a trailer section;
+    /// `None` for none and for any other transport (T559).
+    pub fn take_late_trailers(&mut self) -> Option<ibex_alloc::PoolBox<Vec<u8>>> {
+        let ServerXprt::H2(h) = self else { return None };
+        h.take_late_trailers()
+    }
+
     /// What the `ssl_bc*` fetches read of the session; `None` for a plaintext connection.
     #[must_use]
     pub fn ssl_facts(&self) -> Option<ibex_sample::SslFacts<'_>> {
