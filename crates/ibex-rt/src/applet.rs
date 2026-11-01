@@ -213,6 +213,7 @@ impl Proxy {
     /// decision sees it.
     pub fn set_weight(&self, idx: usize, weight: u32) {
         self.server_weights.set(idx, weight);
+        self.fwrr.changed();
     }
 }
 

@@ -158,6 +158,7 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &ibex_config::Server, f: &[&str; M
         admin = ServerStatus::Maint;
     }
     let before = p.server_statuses.get(i).map_or(cur, |slot| slot.swap(cur, Ordering::Relaxed));
+    p.fwrr.changed();
     // `srv_set_stopped` from the file: written on stderr only, the log is not up yet.
     // (The administrative changes are not: `_srv_update_status_adm` keeps quiet while
     // `MODE_STARTING`.)
@@ -184,6 +185,7 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &ibex_config::Server, f: &[&str; M
     // The CLI's weight is kept unless the configuration's changed.
     if v.iweight == cfg_iweight {
         p.server_weights.set(i, v.uweight);
+        p.fwrr.changed();
     }
     // `i` is a server of the configuration, so of `p.servers`.
     let addr = p.servers.at(i);

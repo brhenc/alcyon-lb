@@ -123,12 +123,21 @@ pub fn first_backup(proxy: &Proxy) -> Option<usize> {
 /// moved, as `HAProxy` does (`fwrr_update_server_weight`, `fwrr_set_server_status_up` and
 /// `_down`), and the window goes on.
 ///
-/// Per request it costs one uncontended mutex, one compare of the weights with the ones
-/// the state was built from (`O(servers)`, no allocation) and, in `HAProxy`'s own terms,
+/// Per request it costs one uncontended mutex, one compare of a generation (bumped by
+/// [`Fwrr::changed`] where a weight or status is written; the trees are synced only then,
+/// `O(servers)` once per change) and, in `HAProxy`'s own terms,
 /// a handful of `eb32` operations, here pops and inserts on small sorted vectors whose
 /// capacity is reserved at the rebuild: no allocation either.
 #[derive(Debug, Default)]
-pub struct Fwrr(std::sync::Mutex<Option<Box<FwrrState>>>);
+pub struct Fwrr(std::sync::Mutex<Option<Box<FwrrState>>>, std::sync::atomic::AtomicU32);
+
+impl Fwrr {
+    /// A server's weight or state changed: the next pick moves it in the trees
+    /// ([`round_robin`] compares this generation, not every server, per pick).
+    pub fn changed(&self) {
+        self.1.fetch_add(1, Ordering::Release);
+    }
+}
 
 /// One server's place in the window (`struct srv_per_tgroup`).
 #[derive(Debug, Clone, Copy, Default)]
@@ -167,6 +176,8 @@ struct FwrrState {
     curr_pos: u32,
     curr_weight: u32,
     next_weight: u32,
+    /// The [`Fwrr::changed`] generation the trees were synced at.
+    generation: u32,
 }
 
 /// `BE_WEIGHT_SCALE`, and `SRV_EWGHT_MAX` (`SRV_UWGHT_MAX` * `BE_WEIGHT_SCALE`).
@@ -189,6 +200,7 @@ impl FwrrState {
     /// Rebuild when a server's effective weight is not the one the trees were built with
     /// (`fwrr_init_server_groups`: every usable server in `init`, in declaration order).
     fn sync(&mut self, proxy: &Proxy) {
+        ibex_sample::work::note(ibex_sample::work::Op::LbSync, 1);
         let n = proxy.servers.len();
         if self.built_from.len() != n {
             self.rebuild((0..n).map(|i| Self::eweight(proxy, i)));
@@ -395,7 +407,11 @@ pub fn round_robin(proxy: &Proxy) -> Option<usize> {
     // Built on first use: a configuration of tens of thousands of backends pays for the
     // ones that balance only.
     let st = guard.get_or_insert_with(Box::default);
-    st.sync(proxy);
+    let generation = proxy.fwrr.1.load(Ordering::Acquire);
+    if st.generation != generation || st.built_from.len() != proxy.servers.len() {
+        st.generation = generation;
+        st.sync(proxy);
+    }
     st.pick(|i| is_server_available(proxy, i)).or_else(|| first_backup(proxy))
 }
 

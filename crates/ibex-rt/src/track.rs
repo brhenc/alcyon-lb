@@ -67,6 +67,7 @@ fn propagate(proxies: &[Proxy], p: usize, s: usize) {
             }
             let own = ServerStatus::from(tr.own.load(Ordering::Relaxed));
             px.server_statuses[t].store(combine(own, state) as u8, Ordering::Relaxed);
+            px.fwrr.changed();
             propagate(proxies, q, t);
         }
     }
@@ -116,8 +117,10 @@ fn set_status_inner(proxies: &[Proxy], p: usize, s: usize, raw: u8) {
         let (tp, ts) = tr.target;
         let eff = combine(st, load(proxies, tp, ts));
         proxies[p].server_statuses[s].store(eff as u8, Ordering::Relaxed);
+        proxies[p].fwrr.changed();
     } else if let Some(a) = proxies.get(p).and_then(|px| px.server_statuses.get(s)) {
         a.store(raw, Ordering::Relaxed);
+        proxies[p].fwrr.changed();
     }
     propagate(proxies, p, s);
 }
