@@ -980,6 +980,25 @@ impl Buf {
         }
     }
 
+    /// Puts `line` (a header line with its CRLF) after the last header of a head that ends in
+    /// CRLF CRLF, in place: the tail of the data moves up, nothing is copied through a scratch
+    /// buffer, and the end of the head stays known. False, nothing changed, for a head with
+    /// another end (a bare LF), no head, or no room.
+    pub fn insert_last_header(&mut self, line: &[u8]) -> bool {
+        let n = line.len();
+        let eoh = self.eoh();
+        let Some((h, 4)) = eoh.filter(|_| self.grow_to(self.len + n)) else { return false };
+        // `grow_to` left the data at the start of the memory.
+        let at = self.head + h + 2;
+        self.data.copy_within(at..self.head + self.len, at + n);
+        self.data[at..at + n].copy_from_slice(line);
+        self.len += n;
+        self.mark();
+        // The old last header ended at `h`; the new one at `h + n`.
+        self.eoh.set(eoh_pack(Some((h + n, 4))));
+        true
+    }
+
     /// Cuts `start..end` (offsets in the readable data) out of the buffer.
     pub fn cut(&mut self, start: usize, end: usize) {
         self.eoh.set(EOH_UNKNOWN);

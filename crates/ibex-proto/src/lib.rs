@@ -132,3 +132,26 @@ pub use proxy_protocol::{
 pub use session::{Session, SessionId};
 pub use stream::{Stream, StreamId};
 pub use transport::{TlsInfo, Transport, TransportKind};
+
+/// `str::from_utf8` as the HTTP/1 parse path calls it, counted in debug builds (T575): a test holds
+/// the parse of an ASCII request to none.
+#[inline]
+pub fn utf8_parse(b: &[u8]) -> Result<&str, std::str::Utf8Error> {
+    #[cfg(debug_assertions)]
+    PARSE_UTF8.with(|c| c.set(c.get() + 1));
+    std::str::from_utf8(b)
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static PARSE_UTF8: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The [`utf8_parse`] calls on this thread so far (always 0 in a release build).
+#[must_use]
+pub fn utf8_parse_calls_on_this_thread() -> u64 {
+    #[cfg(debug_assertions)]
+    return PARSE_UTF8.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
+}

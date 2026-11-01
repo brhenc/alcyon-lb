@@ -443,7 +443,7 @@ impl H1Parser {
             return Ok(0);
         };
         let line_bytes = &input[..line_end];
-        let line_str = std::str::from_utf8(line_bytes).map_err(|_| {
+        let line_str = crate::utf8_parse(line_bytes).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in start line")
         })?;
 
@@ -473,14 +473,23 @@ impl H1Parser {
             }
             ReqLineScan::Complete(span) => span,
         };
-        let text = |r: std::ops::Range<usize>| {
-            std::str::from_utf8(&input[r]).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in start line"))
-        };
-        let (method, uri, version) = (text(span.method)?, text(span.uri)?, text(span.version)?);
-        check_request_target(method, uri)?;
-        htx.push_req_line(method, uri, version)
-            .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
-        self.line = Some(ParsedLine::of(method.as_bytes(), uri.as_bytes(), version.as_bytes()));
+        let (method, uri, version) = (&input[span.method], &input[span.uri], &input[span.version]);
+        if method.is_ascii() && uri.is_ascii() && version.is_ascii() {
+            // The usual line: kept as bytes, nothing read as text.
+            check_request_target_bytes(method, uri)?;
+            htx.push_req_line_ascii(method, uri, version)
+                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+        } else {
+            // A byte outside ASCII: the HTX holds text, and a line that is not UTF-8 is refused.
+            fn text(b: &[u8]) -> io::Result<&str> {
+                std::str::from_utf8(b).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in start line"))
+            }
+            let (m, u, v) = (text(method)?, text(uri)?, text(version)?);
+            check_request_target(m, u)?;
+            htx.push_req_line(m, u, v)
+                .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+        }
+        self.line = Some(ParsedLine::of(method, uri, version));
         self.prev_delim_len = span.eol_len;
         self.head_rewritten |= span.eol_len == 1 || !span.canonical;
         self.phase = H1Phase::Headers;
@@ -551,18 +560,18 @@ impl H1Parser {
             }
 
             let (name, value) = parse_header_field(header_bytes)?;
-            self.header_lines += u16::from(!uncounted(name.as_bytes(), value));
+            self.header_lines += u16::from(!uncounted(name, value));
             if !self.is_response && self.header_lines > MAX_REQUEST_HEADERS {
                 self.phase = H1Phase::Error;
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "too many header lines"));
             }
             htx.finalize_last_header();
-            self.seen |= seen_bit(name.as_bytes());
+            self.seen |= seen_bit(name);
             // `TE` is hop-by-hop: `HAProxy` sends on `te: trailers` when a token of it is
             // exactly `trailers`, and nothing otherwise, so that a server that honours `TE`
             // does not compress or chunk for a client that never asked (T286).
             self.last_dropped = false;
-            if !self.is_response && name.eq_ignore_ascii_case("te") {
+            if !self.is_response && name.eq_ignore_ascii_case(b"te") {
                 if value.split(|&b| b == b',').any(|t| t.trim_ascii() == b"trailers") {
                     htx.push_header("te", "trailers").map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
                 } else {
@@ -572,14 +581,10 @@ impl H1Parser {
                 self.prev_delim_len = delim_len;
                 return Ok(line_end + delim_len);
             }
-            match std::str::from_utf8(value) {
-                Ok(value) => htx.push_header(name, value),
-                // obs-text (RFC 9110 section 5.5) that is not UTF-8: Latin-1 from an old
-                // client, which HAProxy forwards as received (T285, V&V VV-8).
-                Err(_) => htx.push_header_latin1(name, value),
-            }
-            .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
-            if name.len() == 4 && name.eq_ignore_ascii_case("host") {
+            // ASCII goes in as it is; obs-text (RFC 9110 section 5.5) that is not UTF-8 is Latin-1
+            // from an old client, which HAProxy forwards as received (T285, V&V VV-8).
+            htx.push_header_bytes(name, value).map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+            if name.len() == 4 && name.eq_ignore_ascii_case(b"host") {
                 if self.hosts == 0 {
                     self.host_at = htx.num_blocks() - 1;
                 }
@@ -1314,24 +1319,28 @@ pub fn finish_request_head(htx: &mut HtxSlice<'_>, method: &str, uri: &str) -> i
 }
 
 fn check_request_target(method_str: &str, uri: &str) -> io::Result<()> {
+    check_request_target_bytes(method_str.as_bytes(), uri.as_bytes())
+}
 
+/// [`check_request_target`] on the bytes of the line.
+fn check_request_target_bytes(method: &[u8], uri: &[u8]) -> io::Result<()> {
     // Request-target forms (RFC 9112 section 3.2), as HAProxy's H1 parser enforces them
     // (`reg-tests/http-messaging/h1_request_target_validation.vtc`): origin-form `/...`,
     // absolute-form `scheme://authority...` with any scheme, asterisk-form only for
     // OPTIONS, authority-form `host:port` only for CONNECT.
-    let absolute_form = |u: &str| {
-        u.split_once("://").is_some_and(|(scheme, rest)| {
-            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    let find = |u: &[u8]| u.windows(3).position(|w| w == b"://");
+    let absolute_form = |u: &[u8]| {
+        find(u).is_some_and(|p| {
+            let (scheme, rest) = (&u[..p], &u[p + 3..]);
+            scheme.first().is_some_and(u8::is_ascii_alphabetic)
+                && scheme.iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'))
                 && !rest.is_empty()
         })
     };
-    let is_valid = match method_str {
-        "CONNECT" => !uri.starts_with('/') && !uri.contains("://") && uri.contains(':'),
-        "OPTIONS" => uri == "*" || uri.starts_with('/') || absolute_form(uri),
-        _ => uri.starts_with('/') || absolute_form(uri),
+    let is_valid = match method {
+        b"CONNECT" => !uri.starts_with(b"/") && find(uri).is_none() && uri.contains(&b':'),
+        b"OPTIONS" => uri == b"*" || uri.starts_with(b"/") || absolute_form(uri),
+        _ => uri.starts_with(b"/") || absolute_form(uri),
     };
 
     if !is_valid {
@@ -1368,13 +1377,14 @@ pub(crate) const fn is_tchar(b: u8) -> bool {
 /// [`parse_header_field`] of a line that is text.
 fn parse_header_field_borrowed(line: &str) -> io::Result<(&str, &str)> {
     let (name, value) = parse_header_field(line.as_bytes())?;
+    let name = std::str::from_utf8(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid header field name"))?;
     // The value starts after an ASCII byte of `line`, so on a character boundary.
     Ok((name, &line[line.len() - value.len()..]))
 }
 
 /// The name and the value of a header line, the value without its leading blanks. The name
-/// is a token, so text; the value is bytes, any but NUL, CR and LF.
-fn parse_header_field(line: &[u8]) -> io::Result<(&str, &[u8])> {
+/// is a token (ASCII); the value is bytes, any but NUL, CR and LF.
+fn parse_header_field(line: &[u8]) -> io::Result<(&[u8], &[u8])> {
     let colon = memchr::memchr(b':', line)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Header missing colon"))?;
     let (name, val) = (&line[..colon], &line[colon + 1..]);
@@ -1394,7 +1404,6 @@ fn parse_header_field(line: &[u8]) -> io::Result<(&str, &[u8])> {
         ));
     }
     // Tokens are ASCII.
-    let name = std::str::from_utf8(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid header field name"))?;
 
     // Field values may not carry NUL, CR or LF.
     if memchr::memchr3(0, b'\r', b'\n', val).is_some() {

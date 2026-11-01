@@ -9729,6 +9729,10 @@ fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str, ca
         n += part.len();
     }
     let inject = &line[..n];
+    // The usual head ends in CRLF CRLF: the line goes in where it is (no scratch copy).
+    if crlf && eoh_len == 4 && buf.insert_last_header(inject) {
+        return Some(inject.len());
+    }
     let total_old = eoh_pos + eoh_len;
     let total_new = total_old + inject.len();
     // `find_eoh` points at the start of the blank-line pair; the last header's own
@@ -15424,7 +15428,7 @@ fn rewrite_request_connection(sess: &mut TcpSession, opt_close: bool) {
         }
         let close = kept(sess, false, false);
         if let Some(tok) = crate::txn::request_connection_token(close, http11, false) {
-            add_req_header(sess, "Connection", tok);
+            add_req_connection(sess, tok);
         }
         return;
     }
@@ -15554,6 +15558,31 @@ fn add_req_header_fit(sess: &mut TcpSession, name: &str, val: &str) -> bool {
     sess.htx_reserve(name.len() + val.len());
     add_req_header(sess, name, val);
     true
+}
+
+/// `Connection: <tok>` as the last header of the request, for the token the server connection's
+/// state calls for (`h1_make_headers` writes it from the connection-mode flags, `HAProxy`'s
+/// `H1_MF_CONN_KAL`/`H1_MF_CONN_CLO`). The head the client sent is in the request buffer as it
+/// is (the client's own tokens went at the parse, [`crate::proxy`]'s `strip_request_connection`),
+/// so the line goes in where it belongs, with the HTX block; nothing is written out again. A
+/// request that edits go through [`add_req_header`].
+fn add_req_connection(sess: &mut TcpSession, tok: &str) {
+    let plain_h1 = !REQ_REBUILD.get().0 && sess.has_htx && sess.req_headers.is_none() && sess.h2_active().is_none() && !sess.h3;
+    let mut line = [0u8; 40];
+    let parts: [&[u8]; 3] = [b"connection: ", tok.as_bytes(), b"\r\n"];
+    let mut n = 0;
+    for p in parts {
+        line[n..n + p.len()].copy_from_slice(p);
+        n += p.len();
+    }
+    // In place when the head is the HTX alone, ends in CRLF and has room; otherwise (an HTTP/2
+    // request, a copy of the headers, a head held for edits) the HTX and the head are written out.
+    let in_place = plain_h1 && sess.req.insert_last_header(&line[..n]);
+    if in_place {
+        let _ = sess.with_htx_mut(|htx| htx.add_header("Connection", tok));
+    } else {
+        add_req_header(sess, "Connection", tok);
+    }
 }
 
 fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {
@@ -18043,6 +18072,24 @@ mod accept_pause_tests {
         engine.listeners[0].maxconn.dec();
         engine.resume_paused_listeners();
         assert!(!engine.fdtab.interest(lfd).is_none(), "the listener must be polled again");
+    }
+}
+
+#[cfg(test)]
+mod add_req_connection_tests {
+    use super::*;
+
+    /// A request that keeps a copy of its headers (`req_headers`) is not edited in place: the
+    /// token goes into the copy and the head is written out of it.
+    #[test]
+    fn the_token_of_a_request_with_a_header_copy_is_written_out_with_it() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut s = TcpSession::new(OwnedFd::from(a), Default::default(), 0, Tick::ETERNITY);
+        s.req.replace_prefix(0, b"GET / HTTP/1.0\r\nHost: a\r\n\r\n");
+        s.req_headers = Some(vec![("Host".to_string(), "a".to_string())]);
+        add_req_connection(&mut s, "keep-alive");
+        assert_eq!(s.req_headers.as_ref().map(Vec::len), Some(2));
+        assert_eq!(s.req.readable(), b"GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\n\r\n");
     }
 }
 
