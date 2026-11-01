@@ -749,6 +749,11 @@ impl QuicListener {
     /// Returns an error if a non-transient socket write error occurs.
     pub fn send_batch(&mut self, now: Instant) -> io::Result<usize> {
         let mut total_sent = 0;
+        // HAProxy's `quic_lstnr_may_set_src`: the source address goes with each datagram only
+        // on a wildcard bind, where the kernel would otherwise pick the route's source and a
+        // client that reached another local address drops the reply (T552, VV-27). A bind to
+        // one address sends no control message.
+        let wildcard = self.addr.ip().is_unspecified();
 
         loop {
             // What each datagram needs once its bytes are in `send_raw_bufs[i]`: on the stack,
@@ -770,7 +775,7 @@ impl QuicListener {
                 (Some((size, dst, src)), Some(buf)) => {
                     let mut msg = DgramOut::new(&buf[..size]);
                     msg.dst_addr = Some(dst);
-                    msg.src_addr = src;
+                    msg.src_addr = if wildcard { src } else { None };
                     msg
                 }
                 _ => DgramOut::new(&[]),
