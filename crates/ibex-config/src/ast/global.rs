@@ -261,6 +261,15 @@ pub struct GlobalSection {
     /// `tune.quic.fe.stream.max-total`: request streams one QUIC connection may carry; it
     /// is closed once the last of them is done (unset: no limit). T525.
     pub quic_stream_max_total: Option<u32>,
+    /// `tune.ibex.quic-ack-frequency on|off` (Ibex-only, Q0): ask a QUIC peer that supports the
+    /// ACK_FREQUENCY extension to acknowledge less often; `None` is off.
+    pub quic_ack_frequency: Option<bool>,
+    /// `tune.ibex.quic-ack-frequency-threshold`: ack-eliciting packets the peer may receive
+    /// before it acknowledges at once (0 to 255); `None` is 2.
+    pub quic_ack_frequency_threshold: Option<u32>,
+    /// `tune.ibex.quic-ack-frequency-max-delay`: milliseconds (1 to 16383) the peer may delay
+    /// an acknowledgement; `None` is 25.
+    pub quic_ack_frequency_max_delay_ms: Option<u32>,
     /// `tune.quic.listen off`: `quic4@`/`quic6@` binds get no UDP socket. T525.
     pub quic_listen: Option<bool>,
     /// `ibex.debug.panic <request|response> <path-prefix>`: a test-only fault (T447), accepted

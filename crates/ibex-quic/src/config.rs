@@ -59,6 +59,10 @@ pub struct QuicConfig {
     /// Initial without a token is answered by a Retry. The count is per endpoint, that is
     /// per worker, as `HAProxy`'s is per thread.
     pub retry_threshold: u64,
+    /// `tune.ibex.quic-ack-frequency on` (Q0): ask a peer that advertises `min_ack_delay` to
+    /// acknowledge only every `threshold + 1` ack-eliciting packets, or after `max_delay`
+    /// (default off: HAProxy sends no ACK_FREQUENCY, so the A/B stays fair).
+    pub ack_frequency: Option<(u32, Duration)>,
     /// Anti-amplification factor limit for unvalidated peer paths (default: 3, per RFC 9000 §8.1).
     pub anti_amplification_factor: u64,
 }
@@ -85,6 +89,7 @@ impl Default for QuicConfig {
             alpn_protocols: vec![ALPN_H3.to_vec()],
             require_retry: false,
             retry_threshold: 100,
+            ack_frequency: None,
             anti_amplification_factor: 3,
         }
     }
@@ -182,6 +187,18 @@ impl QuicConfig {
         tc.initial_mtu(self.initial_mtu);
         tc.min_mtu(self.min_mtu);
         tc.enable_segmentation_offload(self.enable_gso);
+
+        // Q0 (`tune.ibex.quic-ack-frequency`, off by default): ask a peer that advertises
+        // `min_ack_delay` to acknowledge less often. Reaches the data path here, in
+        // `TransportConfig::ack_frequency_config`, and then in quinn-proto's
+        // `Connection::poll_transmit` (pending ACK_FREQUENCY); peers without the extension are
+        // unaffected. It only asks: a hostile client can ignore it.
+        if let Some((threshold, max_delay)) = self.ack_frequency {
+            let mut ack_frequency = quinn_proto::AckFrequencyConfig::default();
+            ack_frequency.max_ack_delay(Some(max_delay));
+            ack_frequency.ack_eliciting_threshold(quinn_proto::VarInt::from_u32(threshold));
+            tc.ack_frequency_config(Some(ack_frequency));
+        }
 
         tc
     }

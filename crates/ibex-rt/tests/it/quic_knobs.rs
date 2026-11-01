@@ -109,7 +109,11 @@ impl Client {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut ctls = rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(std::sync::Arc::new(Any)).with_no_client_auth();
         ctls.alpn_protocols = vec![b"h3".to_vec()];
-        let client_cfg = ClientConfig::new(std::sync::Arc::new(QuicClientConfig::try_from(ctls).expect("client config")));
+        let mut client_cfg = ClientConfig::new(std::sync::Arc::new(QuicClientConfig::try_from(ctls).expect("client config")));
+        // Advertise `min_ack_delay`, as every client with the ACK_FREQUENCY extension does (Q0).
+        let mut tc = ibex_quic::quinn_proto::TransportConfig::default();
+        tc.ack_frequency_config(Some(ibex_quic::quinn_proto::AckFrequencyConfig::default()));
+        client_cfg.transport_config(std::sync::Arc::new(tc));
         let sock = UdpSocket::bind("127.0.0.1:0").expect("client socket");
         sock.set_nonblocking(true).expect("nonblocking");
         let mut ep = Endpoint::new(std::sync::Arc::new(EndpointConfig::default()), None, true, None);
@@ -393,4 +397,34 @@ fn listen_on_is_the_default_and_binds_the_udp_socket() {
         let ibex = ibex(line, "timeout client 10s");
         assert!(!udp_free(ibex.quic), "{line:?}: no UDP socket on {}", ibex.quic);
     }
+}
+
+/// Q0: `tune.ibex.quic-ack-frequency on` (with its threshold and max delay) reaches the listener's
+/// transport configuration: the client, which advertises `min_ack_delay`, receives ACK_FREQUENCY.
+/// (quinn-proto exposes only the frame count, not the values the frame carried; the values'
+/// parsing is in `ibex-config`'s `quic_ack_frequency` tests and their use in `engine.rs` is the
+/// same branch.)
+#[test]
+fn quic_ack_frequency_on_is_sent_to_the_client() {
+    let ibex = ibex("tune.ibex.quic-ack-frequency on\n    tune.ibex.quic-ack-frequency-threshold 7\n    tune.ibex.quic-ack-frequency-max-delay 40ms", "timeout client 5s");
+    let mut c = Client::connect(ibex.quic);
+    assert!(
+        c.run_until(Duration::from_secs(3), |c| c.conn.stats().frame_rx.ack_frequency > 0),
+        "no ACK_FREQUENCY received: {:?}",
+        c.conn.stats().frame_rx
+    );
+}
+
+/// Q0: unset, the default is off and the server sends no ACK_FREQUENCY.
+#[test]
+fn quic_ack_frequency_unset_sends_nothing() {
+    let ibex = ibex("", "timeout client 5s");
+    let mut c = Client::connect(ibex.quic);
+    c.run_until(Duration::from_millis(1500), |_| false);
+    assert_eq!(c.conn.stats().frame_rx.ack_frequency, 0);
+    assert!(c.lost.is_none(), "{:?}", c.lost);
+    let ibex = self::ibex("tune.ibex.quic-ack-frequency off", "timeout client 5s");
+    let mut c = Client::connect(ibex.quic);
+    c.run_until(Duration::from_millis(1500), |_| false);
+    assert_eq!(c.conn.stats().frame_rx.ack_frequency, 0);
 }

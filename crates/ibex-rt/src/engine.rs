@@ -3966,6 +3966,13 @@ fn open_quic_bind(
         // 0 sends no parameter: no transport idle timeout.
         qc.max_idle_timeout = (ms != 0).then(|| Duration::from_millis(u64::from(ms)));
     }
+    // Q0: `tune.ibex.quic-ack-frequency` and its two parameters (default off, 2, 25 ms) reach
+    // `QuicConfig::ack_frequency`, then `TransportConfig::ack_frequency_config`.
+    if g.and_then(|g| g.quic_ack_frequency) == Some(true) {
+        let threshold = g.and_then(|g| g.quic_ack_frequency_threshold).unwrap_or(2);
+        let delay = g.and_then(|g| g.quic_ack_frequency_max_delay_ms).unwrap_or(25);
+        qc.ack_frequency = Some((threshold, Duration::from_millis(u64::from(delay))));
+    }
     let total = g.and_then(|g| g.quic_stream_max_total).unwrap_or(0);
     let mut streams = g.and_then(|g| g.quic_stream_max_concurrent).unwrap_or(100);
     if total != 0 {
