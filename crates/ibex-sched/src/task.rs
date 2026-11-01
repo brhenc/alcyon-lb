@@ -81,6 +81,10 @@ pub enum Kind {
     Synthetic = 5,
     /// A `resolvers` section's DNS I/O and timers (`process_resolvers`).
     Resolver = 6,
+    /// The engine's periodic upkeep, one task per concern (idle-connection purge, buffer
+    /// trim, stick-table expiry, the pools' publish), run when its timer expires as
+    /// `HAProxy`'s `srv_cleanup_idle_conns` and `process_table_expire` tasks are.
+    Housekeeping = 7,
 }
 
 impl Kind {
@@ -95,6 +99,7 @@ impl Kind {
             4 => Some(Kind::Listener),
             5 => Some(Kind::Synthetic),
             6 => Some(Kind::Resolver),
+            7 => Some(Kind::Housekeeping),
             _ => None,
         }
     }

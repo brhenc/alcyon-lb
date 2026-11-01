@@ -3,14 +3,22 @@
 
 //! What a request costs the shared counters and the clock, pinned per request (T579, C1/C2).
 //! The counters are the debug-build ones of `ibex_rt::probe`, per thread.
+//!
+//! What one pass of the engine loop does (engine track L,
+//! `docs/design/engine-architecture-2026-11-01.md` §4.2): the housekeeping runs when its
+//! timer is due, not on every pass (L1). Counted with the debug-only `work::Op` counters of
+//! this thread; the engine runs on the test's thread.
 
 use crate::common;
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::time::{Duration, Instant};
-
 use ibex_rt::engine::Engine;
+use ibex_sample::work::{on_this_thread, Op};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const REQS: u64 = 40;
 
@@ -103,4 +111,150 @@ fn a_request_reads_the_clock_once_per_pass_and_never_for_a_log_it_does_not_write
     eprintln!("monotonic reads {clock} over {n} passes, wall {wall}");
     assert_eq!(wall, 0);
     assert_eq!(clock, n, "{clock} Instant reads over {n} passes");
+}
+
+const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+/// A keep-alive backend answering every request head, a thread per connection.
+fn backend(listener: TcpListener, running: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking");
+        while running.load(Ordering::Relaxed) {
+            let Ok((mut s, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            let running = Arc::clone(&running);
+            thread::spawn(move || {
+                s.set_nonblocking(false).expect("blocking");
+                s.set_nodelay(true).expect("nodelay");
+                s.set_read_timeout(Some(Duration::from_millis(200))).expect("timeout");
+                let mut pending = Vec::new();
+                let mut buf = [0u8; 4096];
+                while running.load(Ordering::Relaxed) {
+                    match s.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => pending.extend_from_slice(&buf[..n]),
+                        Err(_) => continue,
+                    }
+                    while let Some(p) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                        pending.drain(..p + 4);
+                        if s.write_all(RESPONSE).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    })
+}
+
+fn setup() -> (Engine, SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let srv = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let srv_addr = srv.local_addr().expect("addr");
+    let fe = common::reserve_addr();
+    let running = Arc::new(AtomicBool::new(true));
+    let be = backend(srv, Arc::clone(&running));
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind {fe}\n  default_backend be\n\
+         backend be\n  server s1 {srv_addr}\n"
+    );
+    let engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    (engine, fe, running, be)
+}
+
+/// One keep-alive client, its requests sent one at a time (`ab -k -c 1`).
+struct Client {
+    sock: TcpStream,
+    rx: Vec<u8>,
+}
+
+impl Client {
+    fn connect(addr: SocketAddr) -> Self {
+        let sock = TcpStream::connect(addr).expect("connect");
+        sock.set_nonblocking(true).expect("nonblocking");
+        sock.set_nodelay(true).expect("nodelay");
+        Client { sock, rx: Vec::new() }
+    }
+
+    /// One request, the engine run until its whole response has come.
+    fn get(&mut self, engine: &mut Engine) {
+        self.sock.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("request");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut buf = [0u8; 4096];
+        loop {
+            if let Some(p) = self.rx.windows(4).position(|w| w == b"\r\n\r\n") {
+                if self.rx.len() >= p + 4 + 2 {
+                    assert!(self.rx.starts_with(b"HTTP/1.1 200"), "{:?}", String::from_utf8_lossy(&self.rx));
+                    self.rx.drain(..p + 6);
+                    return;
+                }
+            }
+            assert!(Instant::now() < deadline, "no response; have {:?}", String::from_utf8_lossy(&self.rx));
+            let _ = engine.run_once();
+            match self.sock.read(&mut buf) {
+                Ok(0) => panic!("the proxy closed the connection"),
+                Ok(n) => self.rx.extend_from_slice(&buf[..n]),
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+/// (passes, housekeeping runs) on this thread so far.
+fn counts() -> (u64, u64) {
+    let c = on_this_thread();
+    (c[Op::Pass as usize], c[Op::Housekeeping as usize])
+}
+
+/// L1: the idle purge, the buffer trim, the stick-table expiry and the pools' publish run
+/// when their timers expire (HAProxy's `srv_cleanup_idle_conns` / `process_table_expire`
+/// tasks), not on every pass: over a run of keep-alive requests, the housekeeping is bounded
+/// by the time elapsed, not by the passes made. Idle, it still runs, once a period.
+#[test]
+#[cfg(debug_assertions)]
+fn a_pass_with_nothing_due_does_no_housekeeping() {
+    let (mut engine, fe, running, be) = setup();
+    let mut c = Client::connect(fe);
+    for _ in 0..20 {
+        c.get(&mut engine);
+    }
+
+    const N: u64 = 200;
+    let (p0, h0) = counts();
+    let t0 = Instant::now();
+    for _ in 0..N {
+        c.get(&mut engine);
+    }
+    let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let (p1, h1) = counts();
+    let (passes, hk) = (p1 - p0, h1 - h0);
+    println!("{N} keep-alive requests in {ms} ms: {passes} passes, {hk} housekeeping runs");
+    assert!(passes >= N, "{passes} passes for {N} requests: the counter is not counting");
+    // The shortest period is 250 ms (the stick tables'; this config has none, the trim's is 500).
+    // The bound is loose: a run every 5 ms would still be far below one a pass.
+    let bound = ms / 5 + 4;
+    assert!(
+        hk <= bound,
+        "{hk} housekeeping runs in {passes} passes over {ms} ms (at most {bound} are due): \
+         the housekeeping runs on every pass"
+    );
+
+    // Idle: the buffer trim watches the allocations for 600 ms after the work, then the worker sleeps.
+    let (_, h2) = counts();
+    let t1 = Instant::now();
+    while t1.elapsed() < Duration::from_millis(700) {
+        let _ = engine.run_once();
+    }
+    let ms = u64::try_from(t1.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let (_, h3) = counts();
+    let idle = h3 - h2;
+    println!("idle {ms} ms: {idle} housekeeping runs");
+    assert!(idle >= 1, "no housekeeping ran in {ms} idle ms: the timers are never armed");
+    assert!(idle <= ms / 5 + 4, "{idle} housekeeping runs in {ms} idle ms");
+
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
 }

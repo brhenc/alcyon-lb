@@ -25,9 +25,14 @@ pub enum Op {
     IdleHash = 4,
     /// The round-robin trees compared with every server's weight and state (`Fwrr::sync`).
     LbSync = 5,
+    /// A housekeeping concern of the engine run (idle purge, buffer trim, stick-table
+    /// expiry): counted in debug builds only (L1).
+    Housekeeping = 6,
+    /// A pass of the engine loop (`step_at`): counted in debug builds only (L1, L2).
+    Pass = 7,
 }
 
-const OPS: usize = 6;
+const OPS: usize = 8;
 
 thread_local! {
     static COUNTS: [Cell<u64>; OPS] = const { [const { Cell::new(0) }; OPS] };

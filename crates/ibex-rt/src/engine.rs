@@ -565,8 +565,65 @@ impl IdlePools {
     }
 }
 
-/// How often a worker drops the expired entries of the stick tables.
-const STICK_PURGE: Duration = Duration::from_millis(250);
+
+/// The engine's upkeep, one `Kind::Housekeeping` task per concern (L1): each runs when its
+/// timer expires, as `HAProxy`'s `srv_cleanup_idle_conns` and `process_table_expire` tasks,
+/// not on every loop pass. A periodic concern stays armed while the thread is busy (a task ran
+/// since its last run) and for [`hk::TAIL`] runs after, then sleeps until work comes back.
+mod hk {
+    /// The heap trim after a burst of fresh buffers (`buf::trim_idle`): it notes when the
+    /// allocations last moved, every 100 ms (the poll's own bound) while the thread works and
+    /// for 600 ms after, and trims once they have been still for 500 ms.
+    pub const BUF_TRIM: usize = 0;
+    /// The expired entries of the stick tables, while there is a table (none, no timer).
+    pub const STICK: usize = 1;
+    /// The idle server connections beyond need (`pool-purge-delay`): at the pool's own time.
+    pub const IDLE_PURGE: usize = 2;
+    pub const N: usize = 3;
+    /// The period of each periodic concern, in ms (`IDLE_PURGE` has none: the pool says).
+    pub const PERIOD_MS: [u32; N] = [100, 250, 0];
+    /// Runs a periodic concern makes with no work since its last before its timer stops (an
+    /// idle worker sleeps until something is due): the trim's 600 ms; the stick tables' expiry is
+    /// armed as long as a table exists.
+    pub const TAIL: [u8; N] = [6, u8::MAX, 0];
+}
+
+/// The housekeeping tasks and what decides their timers.
+#[derive(Debug)]
+struct Housekeeping {
+    tasks: [TaskRef; hk::N],
+    /// Concerns whose task has a timer queued.
+    armed: u8,
+    /// The scheduler's `tasks_run` at each concern's last run: activity since is "busy".
+    seen_runs: [u64; hk::N],
+    /// Idle runs since each concern last saw activity.
+    idle_runs: [u8; hk::N],
+    /// The idle pool's purge instant the `IDLE_PURGE` timer is queued for.
+    purge_at: Option<Instant>,
+    /// Concern runs so far: the scheduler counts them among its tasks run, which are not the
+    /// thread's work.
+    own_runs: u64,
+}
+
+impl Housekeeping {
+    /// The tasks, none armed but the stick tables' expiry when `stick` (a table exists):
+    /// the others arm with the thread's first work.
+    fn new(scheduler: &mut Scheduler, now: Tick, stick: bool) -> Self {
+        let mut tasks = [TaskRef::NONE; hk::N];
+        let mut armed = 0u8;
+        for (i, t) in tasks.iter_mut().enumerate() {
+            let Some(task) = scheduler.create(WorkKind::new(Kind::Housekeeping, u32::try_from(i).unwrap_or(0))) else { continue };
+            *t = task;
+            if i == hk::STICK && stick {
+                scheduler.queue_timer(task, now.add(hk::PERIOD_MS[i]));
+                armed |= 1 << i;
+            }
+        }
+        // Without a table the expiry counts as armed: nothing ever arms it.
+        let armed = if stick { armed } else { armed | (1 << hk::STICK) };
+        Housekeeping { tasks, armed, seen_runs: [0; hk::N], idle_runs: [0; hk::N], purge_at: None, own_runs: 0 }
+    }
+}
 
 /// A worker's handle on [`IdlePools`]: what the engine keeps, takes and purges through.
 #[derive(Debug)]
@@ -2624,8 +2681,8 @@ pub struct Engine {
     pub global_h2_flood_config: ibex_proto::H2FloodConfig,
     /// Shared idle backend connection pool across sessions (`http-reuse`).
     pub idle_backend_pool: IdlePool,
-    /// When this worker next drops the expired entries of the stick tables.
-    next_stick_purge: Option<Instant>,
+    /// The upkeep tasks (L1).
+    housekeeping: Housekeeping,
     /// Stop requests from signals, shared by every worker. `None` in tests and embeddings
     /// that drive the engine directly and stop it with [`Engine::stop`].
     lifecycle: Option<crate::lifecycle::Lifecycle>,
@@ -5293,6 +5350,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let start_time = Instant::now();
         crate::stats::note_process_start(start_time);
         let now = Tick(1);
+        let housekeeping = Housekeeping::new(&mut scheduler, now, proxies.iter().any(|p| p.stick_table.is_some()));
         
         let checks = if worker_id == 0 {
             init_checks(&proxies, &mut scheduler, now)
@@ -5392,7 +5450,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 rxbuf: config.global.as_ref().and_then(|g| g.h2_fe_rxbuf).unwrap_or(0),
             },
             idle_backend_pool: IdlePool::default(),
-            next_stick_purge: None,
+            housekeeping,
             lifecycle: None,
             stopping: false,
             hard_stop_after: config.global.as_ref().and_then(|g| g.hard_stop_after),
@@ -6006,14 +6064,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
     }
 
-    /// Drops the expired entries of every stick table, at most every [`STICK_PURGE`] (the
-    /// expire task of `HAProxy`'s tables): without it an entry stays, and counts as used,
+    /// Drops the expired entries of every stick table, every 250 ms from the
+    /// `hk::STICK` housekeeping task (the expire task of `HAProxy`'s tables): without it an entry stays, and counts as used,
     /// until the table is full.
-    fn purge_stick_tables(&mut self, now: Instant) {
-        if self.next_stick_purge.is_some_and(|t| t > now) {
-            return;
-        }
-        self.next_stick_purge = Some(now + STICK_PURGE);
+    fn purge_stick_tables(&mut self) {
         let mut purged = 0;
         for p in self.proxies.iter() {
             if let Some(t) = p.stick_table.as_ref() {
@@ -6044,6 +6098,100 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
     }
 
+    /// The accept limits' per-pass part, while one is in force: `global maxconn`'s pause
+    /// expiring, the listeners it or a frontend's `maxconn` stopped resuming, the CLI's
+    /// accept retry. Returns the poll timeout, shortened to the retry's instant.
+    #[cold]
+    #[inline(never)]
+    fn limits_pass(&mut self, now_inst: Instant, poll_timeout: Duration) -> Duration {
+        if let Some((until, actconn)) = self.accept_limited {
+            if now_inst >= until || crate::globalconn::current() < actconn {
+                self.accept_limited = None;
+            }
+        }
+        self.resume_paused_listeners();
+        match self.cli_accept_retry {
+            Some(t) if t <= now_inst => {
+                self.cli_accept_retry = None;
+                self.resume_cli_after_close();
+                poll_timeout
+            }
+            Some(t) => poll_timeout.min(t.saturating_duration_since(now_inst)),
+            None => poll_timeout,
+        }
+    }
+
+    /// Whether a housekeeping timer is to be queued after a pass that ran tasks: a periodic
+    /// concern asleep, or the idle pool's purge instant moved.
+    #[inline]
+    fn housekeeping_rearm_wanted(&self) -> bool {
+        const PERIODIC: u8 = (1 << hk::BUF_TRIM) | (1 << hk::STICK);
+        self.housekeeping.armed & PERIODIC != PERIODIC || self.idle_backend_pool.next_purge() != self.housekeeping.purge_at
+    }
+
+    /// Runs the housekeeping concerns whose timers fired this pass (`due`), and queues the
+    /// timers again: a periodic one while the thread is busy and [`hk::TAIL`] runs after, the
+    /// purge at the idle pool's next purge.
+    #[cold]
+    #[inline(never)]
+    fn run_housekeeping(&mut self, due: u8, inst: Instant) {
+        let now = self.now;
+        let activity = self.scheduler.stats().tasks_run.wrapping_sub(self.housekeeping.own_runs);
+        for i in 0..hk::N {
+            if due & (1 << i) == 0 {
+                continue;
+            }
+            self.housekeeping.armed &= !(1 << i);
+            self.housekeeping.own_runs += 1;
+            #[cfg(debug_assertions)]
+            ibex_sample::work::note(ibex_sample::work::Op::Housekeeping, 1);
+            match i {
+                hk::BUF_TRIM => crate::buf::trim_idle(inst),
+                hk::STICK => self.purge_stick_tables(),
+                _ => {
+                    // The idle server connections beyond what their servers need are purged
+                    // every `pool-purge-delay` (`srv_cleanup_idle_conns`): this is where that
+                    // keyword acts.
+                    let proxies = &self.proxies;
+                    self.idle_backend_pool.purge(inst, |(be, s)| {
+                        proxies.get(be).and_then(|p| p.server_actconn.get(s)).map_or(0, |a| a.load(Ordering::Relaxed))
+                    });
+                    self.housekeeping.purge_at = None;
+                    continue;
+                }
+            }
+            let h = &mut self.housekeeping;
+            if activity == h.seen_runs[i] {
+                h.idle_runs[i] = h.idle_runs[i].saturating_add(1);
+            } else {
+                h.seen_runs[i] = activity;
+                h.idle_runs[i] = 0;
+            }
+            if h.idle_runs[i] < hk::TAIL[i] {
+                self.scheduler.queue_timer(h.tasks[i], now.add(hk::PERIOD_MS[i]));
+                h.armed |= 1 << i;
+            }
+        }
+        // A periodic concern asleep wakes with the thread's work.
+        for i in 0..hk::N {
+            let h = &mut self.housekeeping;
+            if hk::PERIOD_MS[i] != 0 && h.armed & (1 << i) == 0 && activity != h.seen_runs[i] && self.scheduler.is_live(h.tasks[i]) {
+                h.idle_runs[i] = 0;
+                self.scheduler.queue_timer(h.tasks[i], now.add(hk::PERIOD_MS[i]));
+                h.armed |= 1 << i;
+            }
+        }
+        let next = self.idle_backend_pool.next_purge();
+        if next != self.housekeeping.purge_at {
+            let task = self.housekeeping.tasks[hk::IDLE_PURGE];
+            if let Some(t) = next.filter(|_| self.scheduler.is_live(task)) {
+                // A millisecond late rather than early: a tick is the instant rounded down.
+                self.scheduler.queue_timer(task, self.tick_at(t).add(1));
+            }
+            self.housekeeping.purge_at = next;
+        }
+    }
+
     pub fn step(&mut self, now: Tick) -> io::Result<usize> {
         self.step_at(now, Instant::now())
     }
@@ -6051,6 +6199,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// [`Self::step`] with the clock already read: `now_inst` is the instant `now` was taken
     /// from, what the deadlines before the poller are measured against.
     fn step_at(&mut self, now: Tick, now_inst: Instant) -> io::Result<usize> {
+        #[cfg(debug_assertions)]
+        ibex_sample::work::note(ibex_sample::work::Op::Pass, 1);
         self.now = now;
         crate::watchdog::progress();
         crate::watchdog::set_streams(self.sessions.live());
@@ -6087,29 +6237,25 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
         // A QUIC transport's next deadline can be sooner than the scheduler's. Waiting past
         // it would delay loss recovery; the shortest of the two wins.
-        let poll_timeout = self
-            .quic_listeners
-            .iter_mut()
-            .filter_map(crate::quic_listener::QuicListener::poll_timeout)
-            .fold(poll_timeout, |acc, deadline| {
-                acc.min(deadline.saturating_duration_since(now_inst))
-            });
-        // Datagrams read and not served yet (a pass serves `RX_PER_PASS`, T560): the socket
-        // may be empty and wake nothing, so look again at once. The listener is marked ready.
-        let poll_timeout = if self.quic_listeners.iter().any(crate::quic_listener::QuicListener::has_backlog) {
-            Duration::ZERO
-        } else {
+        let poll_timeout = if self.quic_listeners.is_empty() {
             poll_timeout
+        } else {
+            let poll_timeout = self
+                .quic_listeners
+                .iter_mut()
+                .filter_map(crate::quic_listener::QuicListener::poll_timeout)
+                .fold(poll_timeout, |acc, deadline| acc.min(deadline.saturating_duration_since(now_inst)));
+            // Datagrams read and not served yet (a pass serves `RX_PER_PASS`, T560): the socket
+            // may be empty and wake nothing, so look again at once. The listener is marked ready.
+            if self.quic_listeners.iter().any(crate::quic_listener::QuicListener::has_backlog) {
+                Duration::ZERO
+            } else {
+                poll_timeout
+            }
         };
 
         // The idle server connections beyond what their servers need are purged every
         // `pool-purge-delay` (`srv_cleanup_idle_conns`): this is where that keyword acts.
-        let proxies = &self.proxies;
-        self.idle_backend_pool.purge(now_inst, |(be, s)| {
-            proxies.get(be).and_then(|p| p.server_actconn.get(s)).map_or(0, |a| a.load(Ordering::Relaxed))
-        });
-        crate::buf::trim_idle(now_inst);
-        self.purge_stick_tables(now_inst);
         // A `pool_gc` was asked for (a signal, the stop path, a failed allocation on any
         // thread): this thread empties its caches, and the engine its own scratch lists.
         if crate::pool_gc::poll() {
@@ -6121,30 +6267,21 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 self.h2_spawn_scratch = Vec::new();
             }
         }
-        // The pools' per-pass work: this thread's settings copy and its `show pools` counts.
+        // The pools' per-pass work stays (a load and two compares: the settings copy, and the
+        // `show pools` counts at most every 10 ms, as every pass of a busy thread saw them);
+        // the idle purge, the buffer trim and the stick-table expiry are the housekeeping
+        // tasks (L1). Published from a timer, a burst's counts lagged the scrape that followed.
         ibex_alloc::pool::pass(now_inst);
+        // The arenas' counts stay per pass: a compare each, and `show pools` and the scrape read
+        // a stream's slot as soon as its pass made it.
         self.sessions.publish();
         self.applets.publish();
         self.scheduler.tasks.publish();
-        let poll_timeout = self
-            .idle_backend_pool
-            .next_purge()
-            .map_or(poll_timeout, |t| poll_timeout.min(t.saturating_duration_since(now_inst)));
-
-        if let Some((until, actconn)) = self.accept_limited {
-            if now_inst >= until || crate::globalconn::current() < actconn {
-                self.accept_limited = None;
-            }
-        }
-        self.resume_paused_listeners();
-        let poll_timeout = match self.cli_accept_retry {
-            Some(t) if t <= now_inst => {
-                self.cli_accept_retry = None;
-                self.resume_cli_after_close();
-                poll_timeout
-            }
-            Some(t) => poll_timeout.min(t.saturating_duration_since(now_inst)),
-            None => poll_timeout,
+        // The accept limits: one test when none is in force.
+        let poll_timeout = if self.accept_limited.is_some() || self.global_paused || self.fe_paused || self.cli_accept_retry.is_some() {
+            self.limits_pass(now_inst, poll_timeout)
+        } else {
+            poll_timeout
         };
 
         // 3. Poll readiness events
@@ -6249,21 +6386,21 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // fire loss-recovery timers that are not due.
         // The pass's clock: read once after the poller, as everything since.
         let inst = pass_start;
-        for ql in &mut self.quic_listeners {
-            let timer_due = ql.poll_timeout().is_some_and(|d| d <= inst);
-            if timer_due {
-                ql.handle_timeout(inst);
-            }
-            // Sent at the end of the pass, with what the owner sessions write (Q1).
-            if ql.take_ready() || timer_due {
-                let _ = ql.serve(inst);
-            }
-        }
-        self.admit_quic_connections();
-        self.adopt_quic_owners();
-        self.adopt_quic_streams();
-        self.sync_quic_backend_fds();
         if !self.quic_listeners.is_empty() {
+            for ql in &mut self.quic_listeners {
+                let timer_due = ql.poll_timeout().is_some_and(|d| d <= inst);
+                if timer_due {
+                    ql.handle_timeout(inst);
+                }
+                // Sent at the end of the pass, with what the owner sessions write (Q1).
+                if ql.take_ready() || timer_due {
+                    let _ = ql.serve(inst);
+                }
+            }
+            self.admit_quic_connections();
+            self.adopt_quic_owners();
+            self.adopt_quic_streams();
+            self.sync_quic_backend_fds();
             let mut quic_wake = std::mem::take(&mut self.wake_scratch);
             for ql in &mut self.quic_listeners {
                 ql.take_wake(&mut quic_wake);
@@ -6309,9 +6446,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             mailboxes: &self.mailboxes,
             worker_id: self.mailbox_wid,
             quic_listeners: &mut self.quic_listeners,
+            hk_due: 0,
         };
 
         let tasks_run = self.scheduler.process_runnable_tasks(&mut dispatcher);
+        let hk_due = dispatcher.hk_due;
         // The server state changes the pass made (a check, the CLI, the stats page).
         if crate::srvlog::pending() {
             let proxies = dispatcher.proxies.clone();
@@ -6355,6 +6494,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
         self.h2_spawn_scratch = h2_spawn;
         self.wake_scratch = wake_queue;
+        if hk_due != 0 || (tasks_run > 0 && self.housekeeping_rearm_wanted()) {
+            self.run_housekeeping(hk_due, inst);
+        }
         // Slots this pass freed go to the queue now, not on the next poll's timeout.
         self.wake_queued();
         self.resume_cli_after_close();
@@ -8820,6 +8962,9 @@ struct EngineDispatcher<'a> {
     now: Tick,
     timer_updates: Vec<(TaskRef, Tick)>,
     wake_queue: Vec<TaskRef>,
+    /// The housekeeping concerns whose timers fired this pass (bit per `hk::*`), run by the
+    /// engine after the pass.
+    hk_due: u8,
     /// Streams whose server connection is in its TLS handshake after this pass: marked
     /// heavy after it, one per pass from then on, as the client side is at admission
     /// (T283; `ssl_sock_init` sets `TASK_HEAVY` for a server connection too). T295.
@@ -14836,6 +14981,11 @@ impl EngineDispatcher<'_> {
                 self.step_check(check_idx)
             }
             Some(Kind::Resolver) => self.step_resolver(kind.index() as usize),
+            // Its timer fired: the engine runs the concern after the pass (L1).
+            Some(Kind::Housekeeping) => {
+                self.hk_due |= 1u8 << (kind.index() & 7);
+                Outcome::Keep
+            }
             Some(Kind::Applet) => {
                 let applet_idx = kind.index() as usize;
                 self.step_applet(applet_idx)
