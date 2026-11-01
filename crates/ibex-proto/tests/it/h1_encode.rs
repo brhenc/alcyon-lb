@@ -525,3 +525,175 @@ fn an_h2_head_encodes_as_write_h1_wire_wrote_it() {
         assert_eq!(r.chunked, chunked);
     }
 }
+
+/// The head of `line` + `fields` encoded with the options `f` makes of the defaults.
+fn enc(dir: H1Dir, line: &str, fields: &[(&str, &str)], f: impl FnOnce(&mut H1EncodeOpts<'static>)) -> Result<(String, ibex_proto::h1_encode::H1Encoded), ibex_proto::htx::HtxError> {
+    let mut buf = vec![0u8; 4096];
+    let mut s = HtxSlice::new(&mut buf);
+    let w: Vec<&str> = line.splitn(3, ' ').collect();
+    match dir {
+        H1Dir::Request => s.push_req_line_ascii(w[0].as_bytes(), w[1].as_bytes(), w[2].as_bytes()).unwrap(),
+        H1Dir::Response => s.push_res_line(w[0], w[1].parse().unwrap(), w.get(2).copied().unwrap_or("")).unwrap(),
+    }
+    for (n, v) in fields {
+        s.push_header(n, v).unwrap();
+    }
+    s.push_eoh().unwrap();
+    let blocks = s.num_blocks();
+    let mut o = H1EncodeOpts::new(dir, SlFlags::XFER_LEN | SlFlags::BODYLESS, true);
+    f(&mut o);
+    let htx = ibex_proto::htx::HtxSliceRef::new(&buf, blocks);
+    let mut out = vec![0u8; 4096];
+    let r = h1_encode_head(htx, &o, &mut out)?;
+    Ok((String::from_utf8_lossy(&out[..r.len]).into_owned(), r))
+}
+
+const GET11: &str = "GET / HTTP/1.1";
+const REQ: H1Dir = H1Dir::Request;
+const RSP: H1Dir = H1Dir::Response;
+
+/// `h1_parse_connection_header`/`h1_parse_upgrade_header` with `H1_MF_CLEAN_CONN_HDR`: a list
+/// as it came while nothing is dropped, then joined by `,`; a quoted comma is not a separator.
+#[test]
+fn connection_and_upgrade_lists_are_cleaned_as_haproxy_cleans_them() {
+    let (h, r) = enc(REQ, GET11, &[("Connection", "foo, \"a,b\\\"c\", close, bar")], |_| {}).unwrap();
+    assert_eq!(h, "GET / HTTP/1.1\r\nconnection: foo, \"a,b\\\"c\",bar\r\nconnection: close\r\n\r\n");
+    assert_eq!(r.want, ConnMode::Close, "the client's close asks the server to close");
+    let (h, _) = enc(REQ, GET11, &[("connection", "keep-alive")], |_| {}).unwrap();
+    assert_eq!(h, "GET / HTTP/1.1\r\n\r\n", "a list of the encoder's tokens only goes");
+    let (h, _) = enc(REQ, GET11, &[("upgrade", "h2c")], |_| {}).unwrap();
+    assert_eq!(h, "GET / HTTP/1.1\r\n\r\n");
+    let (h, _) = enc(REQ, GET11, &[("upgrade", "h2c, websocket, h2")], |_| {}).unwrap();
+    assert_eq!(h, "GET / HTTP/1.1\r\nupgrade: websocket\r\n\r\n");
+    // A handshake without a key gets the caller's.
+    let (h, _) = enc(REQ, GET11, &[("connection", "upgrade"), ("upgrade", "websocket")], |o| o.ws_key = Some(b"k==")).unwrap();
+    assert_eq!(h, "GET / HTTP/1.1\r\nconnection: upgrade\r\nupgrade: websocket\r\nsec-websocket-key: k==\r\n\r\n");
+    let (h, _) = enc(RSP, "HTTP/1.1 101 Switching", &[("connection", "upgrade"), ("upgrade", "websocket")], |o| o.ws_key = Some(b"acc")).unwrap();
+    assert_eq!(h, "HTTP/1.1 101 Switching\r\nconnection: upgrade\r\nupgrade: websocket\r\nsec-websocket-accept: acc\r\n\r\n");
+}
+
+/// `http_parse_cont_len_header`: leading zeros trimmed, a list of one number kept as one,
+/// anything else a processing error; a second header with the same number skipped.
+#[test]
+fn content_length_is_parsed_as_haproxy_parses_it() {
+    let cl = |v: &str| enc(REQ, "POST / HTTP/1.1", &[("content-length", v)], |o| o.sl = SlFlags::XFER_LEN | SlFlags::CLEN);
+    let (h, r) = cl("005").unwrap();
+    assert_eq!(h, "POST / HTTP/1.1\r\ncontent-length: 5\r\n\r\n");
+    assert_eq!(r.body_len, Some(5));
+    assert_eq!(cl(" 7 , 7").unwrap().0, "POST / HTTP/1.1\r\ncontent-length: 7\r\n\r\n");
+    for bad in ["", "  ", "5x", "5, 6", "x", "99999999999999999999999"] {
+        assert!(cl(bad).is_err(), "{bad:?}");
+    }
+    let two = |b: &str| enc(REQ, "POST / HTTP/1.1", &[("content-length", "5"), ("Content-Length", b)], |o| o.sl = SlFlags::XFER_LEN | SlFlags::CLEN);
+    assert_eq!(two("5").unwrap().0, "POST / HTTP/1.1\r\ncontent-length: 5\r\n\r\n");
+    assert!(two("6").is_err());
+    // A request whose head is its whole message, with a length: the server side closes
+    // (`C-L but no data`).
+    let (_, r) = enc(REQ, "POST / HTTP/1.1", &[("content-length", "5")], |o| {
+        o.sl = SlFlags::XFER_LEN | SlFlags::CLEN;
+        o.eom = true;
+    })
+    .unwrap();
+    assert_eq!(r.want, ConnMode::Close);
+}
+
+/// The `h1_make_eoh` branches: chunked to the end, a removed `transfer-encoding`, T-E on a
+/// 1.0 message, both headers, CONNECT, 1xx, the stopping proxy, `http-pretend-keepalive`.
+#[test]
+fn the_end_of_head_rules() {
+    let chnk = SlFlags::XFER_LEN | SlFlags::XFER_ENC | SlFlags::CHNK;
+    let (h, r) = enc(REQ, "POST / HTTP/1.1", &[("transfer-encoding", "chunked")], |o| {
+        o.sl = chnk;
+        o.eom = true;
+    })
+    .unwrap();
+    assert_eq!(h, "POST / HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n");
+    assert!(r.chunked);
+    // Chunked by its flags, the header not written (a 204's), a length of 0 kept: the length
+    // frames it (`h1_make_eoh`, one of the two headers present).
+    let (h, r) = enc(RSP, "HTTP/1.1 204 No Content", &[("content-length", "0"), ("transfer-encoding", "chunked")], |o| o.sl = chnk).unwrap();
+    assert_eq!(h, "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n");
+    assert!(!r.chunked);
+    // `transfer-encoding` received and a length kept (flags HAProxy's parse does not make,
+    // which never keeps both): `h1_make_eoh` taken literally, the length dropped from the
+    // framing, the server side closed, the body chunked.
+    let (h, r) = enc(REQ, "POST / HTTP/1.1", &[("content-length", "3"), ("transfer-encoding", "chunked")], |o| o.sl = SlFlags::XFER_LEN | SlFlags::XFER_ENC | SlFlags::CLEN).unwrap();
+    assert_eq!(h, "POST / HTTP/1.1\r\ncontent-length: 3\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n");
+    assert_eq!(r.want, ConnMode::Close);
+    // T-E on HTTP/1.0: close, no token.
+    let (h, r) = enc(REQ, "POST / HTTP/1.0", &[("transfer-encoding", "chunked")], |o| o.sl = chnk).unwrap();
+    assert_eq!(h, "POST / HTTP/1.0\r\ntransfer-encoding: chunked\r\n\r\n");
+    assert_eq!(r.want, ConnMode::Close);
+    // A response whose framing headers a rule removed: no length known, the client closes.
+    let (h, r) = enc(RSP, "HTTP/1.1 200 OK", &[], |o| o.sl = chnk).unwrap();
+    assert_eq!(h, "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n");
+    assert_eq!(r.want, ConnMode::Close);
+    // CONNECT: no chunking, and its 2xx is a tunnel.
+    let (h, _) = enc(REQ, "CONNECT a:443 HTTP/1.1", &[("host", "a:443")], |o| o.sl = SlFlags::XFER_LEN).unwrap();
+    assert_eq!(h, "CONNECT a:443 HTTP/1.1\r\nhost: a:443\r\n\r\n");
+    let (h, r) = enc(RSP, "HTTP/1.1 200 OK", &[], |o| {
+        o.sl = SlFlags::NONE;
+        o.req_meth = H1Method::of(b"CONNECT");
+    })
+    .unwrap();
+    assert_eq!((h.as_str(), r.want), ("HTTP/1.1 200 OK\r\n\r\n", ConnMode::Tunnel));
+    // 1xx: no `connection`, no framing.
+    let (h, _) = enc(RSP, "HTTP/1.1 100 Continue", &[("transfer-encoding", "chunked")], |o| o.sl = SlFlags::XFER_LEN).unwrap();
+    assert_eq!(h, "HTTP/1.1 100 Continue\r\n\r\n");
+    // A response to HEAD with a chunked header, its head the whole message: no last chunk.
+    let (h, _) = enc(RSP, "HTTP/1.1 200 OK", &[("transfer-encoding", "chunked")], |o| {
+        o.sl = chnk;
+        o.req_meth = H1Method::of(b"HEAD");
+        o.eom = true;
+    })
+    .unwrap();
+    assert_eq!(h, "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n");
+    // A stopping proxy closes; `http-pretend-keepalive` keeps the token of a 1.0 request.
+    let (h, _) = enc(REQ, GET11, &[], |o| o.stopping = true).unwrap();
+    assert_eq!(h, "GET / HTTP/1.1\r\nconnection: close\r\n\r\n");
+    let (h, _) = enc(REQ, "GET / HTTP/1.0", &[], |o| {
+        o.http_close = true;
+        o.pretend_keepalive = true;
+    })
+    .unwrap();
+    assert_eq!(h, "GET / HTTP/1.0\r\nconnection: keep-alive\r\n\r\n");
+    let (h, _) = enc(RSP, "HTTP/1.1 200 OK", &[("content-length", "0")], |o| {
+        o.sl = SlFlags::XFER_LEN | SlFlags::CLEN;
+        o.stopping = true;
+    })
+    .unwrap();
+    assert_eq!(h, "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+}
+
+/// `te`: kept as `trailers` only when `trailers` ends the value or a `,` follows it; a
+/// pseudo-header is never written; a Latin-1 value goes as its bytes; a removed block is
+/// skipped; an HTX that is not a head of the direction is refused.
+#[test]
+fn the_other_fields_and_what_is_refused() {
+    let te = |v: &str| enc(REQ, GET11, &[("te", v)], |_| {}).unwrap().0;
+    assert_eq!(te("trailers,gzip"), "GET / HTTP/1.1\r\nte: trailers\r\n\r\n");
+    assert_eq!(te("trailersx"), "GET / HTTP/1.1\r\n\r\n");
+    let (h, _) = enc(REQ, GET11, &[(":authority", "x"), ("x-a", "b")], |_| {}).unwrap();
+    assert_eq!(h, "GET / HTTP/1.1\r\nx-a: b\r\n\r\n");
+    assert!(enc(REQ, GET11, &[], |o| o.dir = RSP).is_err(), "a request line is not a response's");
+    assert!(enc(RSP, "HTTP/1.1 200 OK", &[], |o| o.dir = REQ).is_err(), "nor a status line a request's");
+
+    let mut buf = vec![0u8; 4096];
+    let mut s = HtxSlice::new(&mut buf);
+    s.push_req_line_ascii(b"GET", b"/", b"HTTP/1.1").unwrap();
+    s.push_header_latin1("x-l", b"caf\xe9").unwrap();
+    s.push_header("x-gone", "1").unwrap();
+    s.push_header("x-kept", "2").unwrap();
+    let blocks_without_eoh = s.num_blocks();
+    s.push_eoh().unwrap();
+    s.push_header("x-after", "eoh").unwrap();
+    s.remove_block(2);
+    let blocks = s.num_blocks();
+    let o = H1EncodeOpts::new(REQ, SlFlags::XFER_LEN | SlFlags::BODYLESS, false);
+    let mut out = vec![0u8; 512];
+    let r = h1_encode_head(ibex_proto::htx::HtxSliceRef::new(&buf, blocks), &o, &mut out).unwrap();
+    assert_eq!(&out[..r.len], b"GET / HTTP/1.1\r\nx-l: caf\xe9\r\nx-kept: 2\r\n\r\n");
+    // Without its EOH (the blocks before it) the head is not whole.
+    assert!(h1_encode_head(ibex_proto::htx::HtxSliceRef::new(&buf, blocks_without_eoh), &o, &mut out).is_err(), "no EOH");
+    assert!(h1_encode_head(ibex_proto::htx::HtxSliceRef::new(&buf, 0), &o, &mut out).is_err(), "an empty HTX");
+}
