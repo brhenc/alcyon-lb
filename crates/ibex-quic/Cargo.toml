@@ -11,7 +11,7 @@ autotests = false
 [dependencies]
 # T461: no `rustls-ring`: QUIC's TLS is rustls 0.24 (`src/crypto.rs`), and neither quinn's rustls
 # 0.23 nor its *ring* is linked into the binary.
-quinn-proto = { version = "0.11", default-features = false }
+quinn-proto = { version = "0.11", default-features = false, features = ["ibex-pools"] }
 rustls24 = { workspace = true }
 rustls-pemfile = "2.2.0"
 ibex-tls = { workspace = true }
