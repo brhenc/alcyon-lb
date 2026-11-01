@@ -64,3 +64,29 @@ fn wildcard_v6_accepts_a_source() {
     let got = source_seen(&sender, &to, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
     assert_eq!(got.ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
 }
+
+/// A dual-stack IPv6 socket reaching an IPv4 client through its mapped address: an IPv4 source
+/// goes as its mapped form, which the kernel takes as the IPv4 source.
+#[test]
+fn mapped_destination_takes_an_ipv4_source() {
+    let Ok(sender) = UdpSocket::bind("[::]:0") else { return };
+    let to = UdpSocket::bind("127.0.0.1:0").unwrap();
+    to.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    let mut msg = SendMsg::new(b"m");
+    msg.dst_addr = Some(std::net::SocketAddr::new(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()), to.local_addr().unwrap().port()));
+    msg.src_addr = Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
+    assert_eq!(sendmmsg(sender.as_fd(), &[msg]).unwrap(), 1);
+    let mut buf = [0u8; 8];
+    assert_eq!(to.recv_from(&mut buf).unwrap().1.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
+}
+
+/// An IPv4 destination with a mapped IPv6 source sends it as IPv4; a source that has no IPv4
+/// form is left to the kernel rather than sent as a control message the kernel refuses.
+#[test]
+fn ipv4_destination_with_an_ipv6_source() {
+    let sender = UdpSocket::bind("0.0.0.0:0").unwrap();
+    let to = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mapped = IpAddr::V6(Ipv4Addr::new(127, 0, 0, 2).to_ipv6_mapped());
+    assert_eq!(source_seen(&sender, &to, Some(mapped)).ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
+    assert_eq!(source_seen(&sender, &to, Some(IpAddr::V6(Ipv6Addr::LOCALHOST))).ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+}
