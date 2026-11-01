@@ -898,6 +898,7 @@ pub(crate) fn write_server_row(
     _pid: u32,
     iid: u32,
     sid: u32,
+    legends: bool,
 ) {
     let srv_name = if s_idx < proxy.server_ids.len() {
         &proxy.server_ids[s_idx]
@@ -1022,14 +1023,16 @@ pub(crate) fn write_server_row(
         r.set("check_desc", check_desc);
     }
     // No address: the column is empty, as `HAProxy`'s for `AF_UNSPEC`.
-    if !rmaint {
+    // The stats page gives the address only under `stats show-legends` (`STAT_F_SHLGNDS`);
+    // the CLI and the exporter always do.
+    if !rmaint && legends {
         r.set("addr", srv_addr);
     }
     r.default_untracked('S', proxy.mode == ibex_config::Mode::Http, "");
     r.emit(out, fmt);
 }
 
-pub(crate) fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u32, iid: u32) {
+pub(crate) fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u32, iid: u32, legends: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     let c = proxy.ids.tc.get().map_or(&*EMPTY, |p| &p.be);
     let http = proxy.mode == ibex_config::Mode::Http;
@@ -1086,7 +1089,7 @@ pub(crate) fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy
         r.set("cache_hits", 0);
     }
     fill_counters(&mut r, c, http, true);
-    r.default_untracked('B', http, balance_name(proxy));
+    r.default_untracked('B', http, if legends { balance_name(proxy) } else { "" });
     r.emit(out, fmt);
 }
 
@@ -1138,6 +1141,8 @@ pub struct StatCursor {
     s: u32,
     /// Rows written (JSON separates them).
     rows: u32,
+    /// Server rows carry their address: always for the CLI, for the page under `stats show-legends`.
+    legends: bool,
 }
 
 const ST_HEADER: u8 = 0;
@@ -1151,7 +1156,14 @@ const ST_DONE: u8 = 6;
 impl StatCursor {
     #[must_use]
     pub fn new(fmt: StatFormat, iid: Option<i32>, typ: Option<i32>, sid: Option<i32>) -> StatCursor {
-        StatCursor { fmt, iid, typ, sid, step: ST_HEADER, px: u32::MAX, s: 0, rows: 0 }
+        StatCursor { fmt, iid, typ, sid, step: ST_HEADER, px: u32::MAX, s: 0, rows: 0, legends: true }
+    }
+
+    /// The cursor of a stats page's `;csv` or `;json`: the server address only if the section
+    /// has `stats show-legends`.
+    #[must_use]
+    pub fn page(fmt: StatFormat, show_legends: bool) -> StatCursor {
+        StatCursor { legends: show_legends, ..StatCursor::new(fmt, None, None, None) }
     }
 
     /// The whole of `show stat`, as [`format_show_stat`] gives it.
@@ -1222,14 +1234,14 @@ impl StatCursor {
                     if self.sid.is_some_and(|f| f != -1 && u32::try_from(f).ok() != Some(sid)) {
                         continue;
                     }
-                    write_server_row(out, self.fmt, p, s, crate::stats_html::check_of(checks, i, s), pid, p.ids.iid, sid);
+                    write_server_row(out, self.fmt, p, s, crate::stats_html::check_of(checks, i, s), pid, p.ids.iid, sid, self.legends);
                     break;
                 }
                 ST_BACKEND => {
                     self.step = ST_PROXY;
                     let p = &proxies[i];
                     if p.has_backend && self.type_wanted(1) && self.proxy_rows_wanted() {
-                        write_backend_row(out, self.fmt, p, pid, p.ids.iid);
+                        write_backend_row(out, self.fmt, p, pid, p.ids.iid, self.legends);
                         break;
                     }
                 }
