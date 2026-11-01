@@ -665,6 +665,22 @@ mod in_place {
         assert!(format!("{:?}", s.as_ref()).contains("(\"Trailer\", \"x-t\", \"tv\")"));
     }
 
+    /// A trailer continued after another block moves to the tail whole (name, then value),
+    /// and a trailer at the tail gives its trimmed blanks back.
+    #[test]
+    fn trailers_move_and_trim_as_fields() {
+        let mut t = vec![0u8; 512];
+        let mut s = HtxSlice::new(&mut t);
+        s.push_trailer("x-t", " a ").unwrap();
+        s.finalize_last_trailer();
+        let tail = s.tail_addr();
+        assert_eq!(tail, 4, "the blanks at the tail are given back");
+        s.push_data(b"zz").unwrap();
+        s.append_to_last_trailer("bc").unwrap();
+        assert_eq!(s.trailers().collect::<Vec<_>>(), [("x-t", "abc")]);
+        s.check_invariants().unwrap();
+    }
+
     #[test]
     fn a_head_with_a_non_ascii_target_reads_the_same_in_place() {
         same(b"GET /caf\xc3\xa9 HTTP/1.1\r\nHost: h\r\n\r\n", true).unwrap();
