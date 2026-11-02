@@ -24,6 +24,7 @@ fn every_start_address_gets_an_aligned_buffer_inside_the_original() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn a_datagram_is_received_with_an_unaligned_cmsg_buffer() {
     let server = UdpSocket::bind("127.0.0.1:0").expect("bind");
     set_ip_pktinfo(server.as_fd(), true).expect("IP_PKTINFO");

@@ -443,6 +443,7 @@ mod tests {
     use std::os::fd::AsFd;
 
     #[test]
+    #[cfg_attr(miri, ignore = "socket/recvmmsg syscalls")]
     fn test_recvmmsg_bounds() {
         let server = UdpSocket::bind("127.0.0.1:0").unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -475,5 +476,40 @@ mod tests {
             assert_eq!(item.len, 0);
             assert_eq!(item.buf, &[0u8; 10]);
         }
+    }
+
+    /// The control message `set_src_cmsg` builds, read back by `extract_dst_addr` and by hand,
+    /// with no socket (so Miri can run it).
+    #[test]
+    fn a_built_source_cmsg_reads_back_inside_its_buffer() {
+        for (src, dst_v6) in [
+            (IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), false),
+            (IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), true),
+            (IpAddr::V6("2001:db8::7".parse().unwrap()), true),
+            (IpAddr::V6(Ipv4Addr::new(192, 0, 2, 7).to_ipv6_mapped()), false),
+        ] {
+            let mut space = [0u64; SRC_CMSG_WORDS];
+            // SAFETY: an all-zero msghdr is valid (null pointers, zero lengths).
+            let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+            set_src_cmsg(&mut hdr, &mut space, src, dst_v6);
+            assert!(!hdr.msg_control.is_null());
+            let got = extract_dst_addr(&hdr);
+            if dst_v6 && src.is_ipv6() {
+                assert_eq!(got, Some(src));
+            } else if dst_v6 {
+                assert_eq!(got, Some(IpAddr::V6(Ipv4Addr::new(192, 0, 2, 7).to_ipv6_mapped())));
+            } else {
+                // IPv4: `ipi_spec_dst` carries the source, `ipi_addr` (what is extracted) is 0.
+                assert_eq!(got, Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+            }
+        }
+        // A cut-short message (cmsg_len below its data) is skipped, not read past.
+        let mut space = [0u64; SRC_CMSG_WORDS];
+        // SAFETY: as above.
+        let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+        set_src_cmsg(&mut hdr, &mut space, IpAddr::V6("2001:db8::7".parse().unwrap()), true);
+        // SAFETY: set_src_cmsg wrote a header at the start of `space`.
+        unsafe { (*libc::CMSG_FIRSTHDR(&hdr)).cmsg_len = 8 };
+        assert_eq!(extract_dst_addr(&hdr), None);
     }
 }
