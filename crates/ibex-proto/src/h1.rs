@@ -218,12 +218,85 @@ impl ParsedLine {
             connect: method.eq_ignore_ascii_case(b"CONNECT"),
         }
     }
+
+    /// The line `method <target> HTTP/1.1` of an HTTP/2 or HTTP/3 request, whose target the
+    /// writer of the head already read.
+    fn of_h11(method: &[u8], target: crate::authority::Target) -> Self {
+        ParsedLine { target, http11: true, http10: false, bodiless: [&b"GET"[..], b"HEAD", b"DELETE"].contains(&method), connect: method.eq_ignore_ascii_case(b"CONNECT") }
+    }
+}
+
+/// What the writer of a request head from decoded fields (`h2::write_request_htx`) learned of
+/// the headers it wrote, one by one ([`Self::add`]), so that [`finish_request_head`] does not
+/// read the blocks again: the lines the limit counts, which of `Content-Length`, `Upgrade` and
+/// `Connection` there are, where the one `Host` is, and the one canonical length when there is
+/// exactly one such field (CP2a-b).
+#[derive(Debug, Clone, Copy)]
+pub struct HeadScan {
+    header_lines: u16,
+    seen: u8,
+    hosts: u8,
+    host_at: usize,
+    cl_fields: u8,
+    cl: Option<usize>,
+    target: crate::authority::Target,
+}
+
+impl HeadScan {
+    /// A head whose request target is `target`.
+    #[must_use]
+    pub fn new(target: crate::authority::Target) -> Self {
+        HeadScan { header_lines: 0, seen: 0, hosts: 0, host_at: 0, cl_fields: 0, cl: None, target }
+    }
+
+    /// The header written as block `at`.
+    pub fn add(&mut self, at: usize, name: &[u8], value: &[u8]) {
+        self.header_lines += u16::from(!uncounted(name, value));
+        let bit = seen_bit(name);
+        self.seen |= bit;
+        if bit == SEEN_CL {
+            self.cl_fields = self.cl_fields.saturating_add(1);
+            self.cl = canonical_length(value);
+        } else if name.len() == 4 && name.eq_ignore_ascii_case(b"host") {
+            if self.hosts == 0 {
+                self.host_at = at;
+            }
+            self.hosts = self.hosts.saturating_add(1).min(2);
+        }
+    }
+}
+
+/// A `Content-Length` value that is one length in canonical digits: no sign, no blank, no list,
+/// no leading zero, and in range. Any other is read (and refused or rewritten) from the head.
+fn canonical_length(v: &[u8]) -> Option<usize> {
+    if v.is_empty() || !v.iter().all(u8::is_ascii_digit) || (v.len() > 1 && v[0] == b'0') {
+        return None;
+    }
+    std::str::from_utf8(v).ok()?.parse().ok()
 }
 
 #[cfg(debug_assertions)]
 thread_local! {
     static REQUEST_PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static REQUEST_COPIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static HEAD_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Walks over the blocks of a request head that [`finish_request_head`] made, or the end of the
+/// head ([`H1Parser`]) made of a `Content-Length` (debug builds; 0 in release): a pin that an
+/// HTTP/2 or HTTP/3 request head written by `write_request_htx` is not read again when its
+/// fields prove the head has one host, at most one canonical length and no `Upgrade` (CP2a-b).
+#[must_use]
+pub fn head_walks() -> u64 {
+    #[cfg(debug_assertions)]
+    return HEAD_WALKS.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
+#[cfg(debug_assertions)]
+fn count_head_walk() {
+    HEAD_WALKS.with(|c| c.set(c.get() + 1));
 }
 
 /// Of [`request_parses`], those [`H1Parser::parse`] made, copying the head's fields into the
@@ -889,13 +962,18 @@ impl H1Parser {
                 .map_or(0, |i| i + 1)
         };
 
-        let mut seen_cl: Option<usize> = None;
+        // (Set by `finish_request_head` when the writer saw the one canonical length.)
+        let mut seen_cl: Option<usize> = self.content_length;
         let mut first_cl_idx: Option<usize> = None;
         let mut duplicate_cl = false;
         let mut comma_cl = false;
         // `0005`: forwarded as `5` (T285).
         let mut padded_cl = false;
 
+        #[cfg(debug_assertions)]
+        if last_start_line < htx.num_blocks() {
+            count_head_walk();
+        }
         let sref = htx.as_ref();
         for i in last_start_line..sref.num_blocks() {
             if sref.block_type(i) != Some(HtxBlockType::Header) {
@@ -1072,6 +1150,8 @@ impl H1Parser {
 
         // Without an `Upgrade` line there is nothing to check or clean.
         if !self.is_response && self.seen & SEEN_UPGRADE != 0 {
+            #[cfg(debug_assertions)]
+            count_head_walk();
             self.check_upgrade(htx)?;
         }
 
@@ -1506,10 +1586,24 @@ pub fn check_request_line(method: &str, uri: &str) -> io::Result<()> {
 ///
 /// # Errors
 /// As the parser refuses the head.
-pub fn finish_request_head(htx: &mut HtxSlice<'_>, method: &str, uri: &str) -> io::Result<()> {
+pub fn finish_request_head(htx: &mut HtxSlice<'_>, method: &str, uri: &str, scan: Option<&HeadScan>) -> io::Result<()> {
     let mut p = H1Parser::new(false);
-    p.line = Some(ParsedLine::of(method.as_bytes(), uri.as_bytes(), b"HTTP/1.1"));
-    {
+    if let Some(s) = scan {
+        // The writer saw each header as it wrote it: no second pass over the blocks.
+        p.line = Some(ParsedLine::of_h11(method.as_bytes(), s.target));
+        p.header_lines = s.header_lines;
+        p.seen = s.seen;
+        p.hosts = s.hosts;
+        p.host_at = s.host_at;
+        if s.cl_fields == 1 && s.cl.is_some() {
+            // One field and one canonical value: the length the end of the head would read.
+            p.content_length = s.cl;
+            p.seen &= !SEEN_CL;
+        }
+    } else {
+        p.line = Some(ParsedLine::of(method.as_bytes(), uri.as_bytes(), b"HTTP/1.1"));
+        #[cfg(debug_assertions)]
+        count_head_walk();
         let sref = htx.as_ref();
         for i in 0..sref.num_blocks() {
             if sref.block_type(i) != Some(HtxBlockType::Header) {
@@ -1653,6 +1747,16 @@ fn parse_header_field(line: &[u8]) -> io::Result<(&[u8], &[u8])> {
 
 #[cfg(test)]
 mod tests {
+    /// CP2a-b: the writer's scan keeps a length only when it is one field in canonical digits.
+    #[test]
+    fn a_scan_keeps_only_a_canonical_length() {
+        let mut s = super::HeadScan::new(crate::authority::Target { fragment: false, origin: true });
+        for (v, want) in [(&b"5"[..], Some(5)), (b"0", Some(0)), (b"", None), (b"05", None), (b"5, 5", None), (b"+5", None), (b"99999999999999999999999", None), (b"\xff", None)] {
+            s.add(1, b"content-length", v);
+            assert_eq!(s.cl, want, "{v:?}");
+        }
+    }
+
     /// T433: `find_line_end` with `memchr2` ends a line where the byte-at-a-time loop did,
     /// with the same bare-CR state, on short strings of `a`, CR and LF and on long lines.
     #[test]

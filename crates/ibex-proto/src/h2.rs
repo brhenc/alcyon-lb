@@ -1828,7 +1828,11 @@ pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<
     crate::h1::check_request_line(method, &uri).map_err(|_| HeadError::Invalid)?;
     out.push_req_line(method, &uri, "HTTP/1.1").map_err(oom)?;
     let (mut count, mut field_bytes, mut cl_bytes) = (0usize, 0usize, 0usize);
+    // The target is origin-form (`/...` or `*`, as `check_request_fields` demands), and holds a
+    // `#` only where `relaxed` lets a path carry one.
+    let mut scan = crate::h1::HeadScan::new(crate::authority::Target { fragment: relaxed && memchr::memchr(b'#', uri.as_bytes()).is_some(), origin: true });
     if let Some(a) = made_host {
+        scan.add(out.num_blocks(), b"host", a.as_bytes());
         out.push_header_bytes(b"host", a.as_bytes()).map_err(oom)?;
         count += 1;
         field_bytes += "host".len() + a.len();
@@ -1846,6 +1850,7 @@ pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<
         }
         // A value's leading and trailing blanks go (RFC 9113 section 8.2.1).
         let v = trim_blanks(v);
+        scan.add(out.num_blocks(), n, v);
         out.push_header_bytes(n, v).map_err(oom)?;
         count += 1;
         field_bytes += n.len() + v.len();
@@ -1854,6 +1859,8 @@ pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<
         }
     }
     if let Some(p) = protocol {
+        scan.add(out.num_blocks(), b"upgrade", p.as_bytes());
+        scan.add(out.num_blocks() + 1, b"connection", b"upgrade");
         out.push_header_bytes(b"upgrade", p.as_bytes()).map_err(oom)?;
         out.push_header_bytes(b"connection", b"upgrade").map_err(oom)?;
         count += 2;
@@ -1863,13 +1870,14 @@ pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<
     // and their blanks kept (`h2_make_htx_request`; measured, T506).
     let mut cookies = fields.iter().filter(|(n, _)| *n == b"cookie").map(|(_, v)| v);
     if let Some(first) = cookies.next() {
+        scan.add(out.num_blocks(), b"cookie", first);
         out.push_header_joined("cookie", first, cookies.clone()).map_err(oom)?;
         count += 1;
         field_bytes += "cookie".len() + cookies.fold(first.len(), |t, v| t + 2 + v.len());
     }
     out.push_eoh().map_err(oom)?;
     crate::htx::count_head_bytes(method.len() + uri.len() + field_bytes);
-    crate::h1::finish_request_head(out, method, &uri).map_err(|e| if e.kind() == io::ErrorKind::OutOfMemory { HeadError::NoRoom } else { HeadError::Invalid })?;
+    crate::h1::finish_request_head(out, method, &uri, Some(&scan)).map_err(|e| if e.kind() == io::ErrorKind::OutOfMemory { HeadError::NoRoom } else { HeadError::Invalid })?;
     Ok(HeadFacts {
         tail: out.tail_addr(),
         blocks: out.num_blocks(),
