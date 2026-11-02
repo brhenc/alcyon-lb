@@ -318,14 +318,17 @@ impl StickTable {
             }
         }
 
-        // Capacity check and O(1) eviction
+        // Capacity check: the oldest entry no session tracks makes room. An entry a session
+        // tracks stays, as in `HAProxy`'s `stktable_trash_oldest` (a tracked entry dropped
+        // here loses its `conn_cur` and its rates, which is how a limit is bypassed); when
+        // all are tracked the new key gets no entry.
         if inner.len >= self.config.max_size {
-            let now = Instant::now();
-            if let Some(head) = inner.head_lru {
-                let is_expired = inner.slots[head as usize].as_ref().is_none_or(|s| self.config.is_expired(now, s.data.last_updated));
-                if is_expired || inner.len >= self.config.max_size {
-                    inner.evict_slot(head);
-                }
+            let slots = &inner.slots;
+            let next = |&i: &u32| slots[i as usize].as_ref().and_then(|s| s.next_lru);
+            let victim = std::iter::successors(inner.head_lru, next)
+                .find(|&i| slots[i as usize].as_ref().is_some_and(|s| s.data.trackers == 0));
+            if let Some(idx) = victim {
+                inner.evict_slot(idx);
             }
         }
 
