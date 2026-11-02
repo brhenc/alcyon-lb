@@ -35,6 +35,8 @@ pub struct H2Dispatch {
     /// A request `HAProxy` answers 400 without contacting a server
     /// ([`ibex_proto::H2StreamCtx::bad_request`]).
     pub bad_request: bool,
+    /// The mux could get no memory for the head's blocks: the stream is answered 500 (S5).
+    pub no_memory: bool,
     /// The `content-length` the forwarded head gets in place of the client's: one whose
     /// length was not written once in its canonical form (`5, 5`, `005`, twice: `HAProxy` 3.5-dev7 forwards
     /// `content-length: 5`, T509).
@@ -109,6 +111,7 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
         req_htx,
         request_line,
         bad_request: stream.bad_request,
+        no_memory: stream.no_memory,
         add_len,
     })
 }
@@ -150,6 +153,7 @@ pub fn dispatch_mux<M: HtxMux>(mux: &mut M, keep_request_line: bool, version: &s
         req_htx,
         request_line,
         bad_request,
+        no_memory: false,
         add_len,
     })
 }
@@ -199,7 +203,7 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Option<Box<H2ReqHe
             start_txn(sess, adopted_framing(facts, chunked), adopted_req_htx(d.req_htx, facts), d.bad_request, no_mem);
             None
         }
-        DispatchHead::Fields(head) => Some(start_fields(sess, head, d.request_line.as_deref(), chunked, d.req_htx, d.add_len, d.bad_request)),
+        DispatchHead::Fields(head) => Some(start_fields(sess, head, d.request_line.as_deref(), chunked, d.req_htx, d.add_len, d.bad_request, d.no_memory)),
     }
 }
 
@@ -273,7 +277,7 @@ fn start_adopted(sess: &mut TcpSession, rx: RxHead, facts: HeadFacts, abs_len: u
 }
 
 /// [`start_request`] of a head the mux kept as its fields.
-fn start_fields(sess: &mut TcpSession, head: Box<H2ReqHead>, request_line: Option<&str>, chunked: bool, d_req_htx: u64, add_len: Option<u64>, bad_request: bool) -> Box<H2ReqHead> {
+fn start_fields(sess: &mut TcpSession, head: Box<H2ReqHead>, request_line: Option<&str>, chunked: bool, d_req_htx: u64, add_len: Option<u64>, bad_request: bool, head_no_mem: bool) -> Box<H2ReqHead> {
     if sess.keep_request_line {
         sess.strm.log.request_line.set_opt(request_line);
     }
@@ -301,7 +305,7 @@ fn start_fields(sess: &mut TcpSession, head: Box<H2ReqHead>, request_line: Optio
     }
     let raw = sess.htx_buf.htx_slice_mut();
     // A buffer that cannot be had fails this stream (S5), once its transaction is set up.
-    let mut no_mem = raw.is_empty();
+    let mut no_mem = raw.is_empty() || head_no_mem;
     let mut slice = ibex_proto::htx::HtxSlice::new(raw);
     let extra = key.as_deref().map(|k| ("sec-websocket-key", k));
     // The blocks are the request's only copy (X4): no field list beside them (the samples and
@@ -1080,6 +1084,7 @@ mod tests {
             req_htx: 7,
             request_line: None,
             bad_request: false,
+            no_memory: false,
             add_len: None,
         }
     }

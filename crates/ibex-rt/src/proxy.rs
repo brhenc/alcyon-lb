@@ -688,15 +688,7 @@ impl ReqText {
     /// session gave back when it ended, rather than allocating. `false`, and no text, when the
     /// memory cannot be had (S5: T446's run under `RLIMIT_DATA` aborted here, `reserve_exact`).
     pub fn set(&mut self, s: &str) -> bool {
-        if self.buf.capacity() == 0 {
-            self.buf = crate::reuse::string();
-        }
-        self.buf.clear();
-        self.set = self.buf.try_reserve_exact(s.len()).is_ok();
-        if self.set {
-            self.buf.push_str(s);
-        }
-        self.set
+        self.set_parts(&[s])
     }
 
     /// [`Self::set`] of the `parts` one after the other, with no joined copy (CP2: the line

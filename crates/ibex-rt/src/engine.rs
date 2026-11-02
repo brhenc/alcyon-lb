@@ -19293,6 +19293,7 @@ mod pending_req_head_tests {
             req_htx: 0,
             request_line: None,
             bad_request: false,
+            no_memory: false,
             add_len: None,
         };
         crate::h2_bridge::start_request(&mut s, d);

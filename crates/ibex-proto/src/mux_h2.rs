@@ -98,6 +98,9 @@ pub struct H2StreamCtx {
     /// The bytes of `scheme://authority` (the start of the line `HAProxy` logs) after the
     /// head's payload in [`Self::rx_head`], 0 for a request without both.
     pub abs_len: usize,
+    /// No memory could be had for the head's blocks ([`H2MuxContext::take_rx_head`]): kept as
+    /// its fields, and the stream answered 500 by the data path (S5).
+    pub no_memory: bool,
 }
 
 /// A request head as the fields of its HEADERS, checked and in the order the HTTP/1.1 head
@@ -446,13 +449,17 @@ impl H2ReqHead {
 /// stream's transaction adopts, `H2StreamCtx::rx_head`), then `scheme://authority` after
 /// them for the log line. The checks, the limits (`tune.http.maxhdr`, the head's room: T242)
 /// and the refusals are the writer's, those of `h2_make_htx_request` (T437, T449, E1). The
-/// error is the stream's reset: `PROTOCOL_ERROR` for a refused head, `REFUSED_STREAM` when
-/// no memory can be had. A head the HTTP/1 checks refuse, and an extended CONNECT (its
+/// error is the stream's reset (`PROTOCOL_ERROR`, a refused head). A head the HTTP/1 checks refuse, no memory for the blocks, and an extended CONNECT (its
 /// websocket key is the bridge's), are kept as their fields ([`H2ReqHead`], [`keep_fields`]).
 fn request_head(stream: &mut H2StreamCtx, fields: &DecodedFields, take_rx: fn(usize) -> Option<RxHead>, relaxed: bool, spare_heads: &mut Vec<Box<H2ReqHead>>) -> Result<(), H2Error> {
     let mut need = rx_head_need(fields);
     for _ in 0..2 {
-        let mut rx = take_rx(need).ok_or(H2Error::RefusedStream)?;
+        // No memory to be had: kept as its fields, and the data path answers 500 when the
+        // stream's buffer cannot be had either (S5), the connection going on.
+        let Some(mut rx) = take_rx(need) else {
+            stream.no_memory = true;
+            break;
+        };
         match crate::h2::write_request_htx(fields, &mut crate::htx::HtxSlice::over(&mut rx), relaxed) {
             Err(crate::h2::HeadError::Refused(_)) => return Err(H2Error::ProtocolError),
             Ok(facts) if !facts.ext_connect => {
@@ -735,6 +742,7 @@ impl H2StreamCtx {
             rx_head: None,
             head_facts: crate::h2::HeadFacts::default(),
             abs_len: 0,
+            no_memory: false,
         }
     }
 }
@@ -819,7 +827,7 @@ pub struct H2MuxContext {
     pub spare_htx: Vec<Htx>,
     /// Where a server connection's request heads are written (CP2, [`H2StreamCtx::rx_head`]):
     /// memory for a head of an estimated `need` bytes of HTX, `None` when there is none (the
-    /// stream is refused, `REFUSED_STREAM`). The data path's pool (`Buf::take_rx_head`);
+    /// head is kept as its fields). The data path's pool (`Buf::take_rx_head`);
     /// without one, the heap.
     pub take_rx_head: fn(usize) -> Option<RxHead>,
 }
@@ -3228,8 +3236,8 @@ mod tests {
     }
 
     /// CP2: a request head is written as HTX blocks into the memory the data path hands the
-    /// mux (`take_rx_head`), with `scheme://authority` after them; none to be had refuses the
-    /// stream (`REFUSED_STREAM`), memory too small is asked for again, larger, and a head
+    /// mux (`take_rx_head`), with `scheme://authority` after them; none to be had keeps the
+    /// head as its fields (the data path answers 500, S5), memory too small is asked for again, larger, and a head
     /// that fits neither is kept as its fields.
     #[test]
     fn a_request_head_is_written_into_the_memory_the_data_path_gives() {
@@ -3243,8 +3251,8 @@ mod tests {
             (ctx, s)
         };
         let (ctx, s) = run(no_memory);
-        assert!(s.contains(&(3, 1, 7)), "REFUSED_STREAM: {s:?}");
-        assert!(ctx.streams.get(&1).is_none_or(|st| st.rx_head.is_none() && st.req_head.is_none()));
+        assert_eq!(s, vec![], "no reset: the head is kept as its fields");
+        assert!(ctx.streams.get(&1).is_some_and(|st| st.rx_head.is_none() && st.req_head.is_some() && st.no_memory));
 
         let (ctx, s) = run(heap_rx_head);
         assert_eq!(s, vec![]);
