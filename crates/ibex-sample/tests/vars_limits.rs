@@ -75,4 +75,26 @@ fn limits_refuse_what_does_not_fit_and_leave_the_old_value_as_a_bool() {
     assert_eq!(vars::var_arg_int("proc.nothing"), None);
     assert_eq!(vars::var_arg_str("proc.nothing"), None);
     assert_eq!(vars::var_arg_bin("proc.nothing"), None);
+
+    a_text_stored_from_bytes_obeys_the_limits();
+}
+
+/// R4: a text stored from its bytes (`VarRef::store_smp`) is counted as the text stored from a
+/// `Sample` is: refused when the variable's struct does not fit, a `bool` when its bytes do not.
+/// Run by the test above, which owns the process-wide limits while it runs.
+fn a_text_stored_from_bytes_obeys_the_limits() {
+    use ibex_sample::Smp;
+    let long = "z".repeat(100);
+
+    vars::set_limits(0, 0, 0, 0, 0, 200);
+    let mut map = VarStore::new();
+    for name in ["check.r4a", "check.r4b", "check.r4c"] {
+        vars::VarRef::resolve(name).store_smp(&mut map, Smp::str(b"ab"));
+    }
+    assert_eq!(map.get("check.r4a"), Some(Sample::Str("ab".into())));
+    assert!(map.get("check.r4c").is_none(), "a third check variable does not fit check-max-size 200");
+
+    vars::VarRef::resolve("check.r4a").store_smp(&mut map, Smp::str(long.as_bytes()));
+    assert_eq!(map.get("check.r4a"), Some(Sample::Bool(false)), "a text too long for the limit leaves a bool, as `set` does");
+    vars::set_limits(0, 0, 0, 0, 0, 0);
 }

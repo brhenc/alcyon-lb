@@ -372,3 +372,29 @@ fn stream_is_at_most_1_kib() {
     println!("Stream: {n} bytes");
     assert!(n <= 1024, "Stream grew to {n} bytes (bound 1024)");
 }
+
+/// R4: `set-var(txn.p) path` keeps the path as bytes in the variable's slot: no spare string
+/// is taken for the sample (on ibex-rc5 and until R4 the sample was made a text `String`, the
+/// slot copied it and gave it back).
+#[test]
+fn set_var_takes_no_spare() {
+    const REQ: &[u8] = b"GET /api/x HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const N: u64 = 20;
+    let (mut engine, fe, running, be) = keepalive_engine("  http-request set-var(txn.p) path\n", "", "");
+    let mut client = TcpStream::connect(fe).expect("connect");
+    client.set_nonblocking(true).expect("nonblocking");
+    client.set_nodelay(true).expect("nodelay");
+    for _ in 0..4 {
+        keepalive_request(&mut engine, &mut client, REQ);
+    }
+    let t0 = ibex_sample::spare::strings_taken_on_this_thread();
+    for _ in 0..N {
+        keepalive_request(&mut engine, &mut client, REQ);
+    }
+    let takes = ibex_sample::spare::strings_taken_on_this_thread() - t0;
+    println!("{N} keep-alive requests with set-var(txn.p) path: {takes} spare strings taken");
+    assert_eq!(takes, 0, "set-var of a path takes a spare string");
+    running.store(false, Ordering::Relaxed);
+    drop(client);
+    let _ = be.join();
+}

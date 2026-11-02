@@ -224,6 +224,7 @@ mod h2_field_validity;
 mod hdr_cnt_values;
 mod latin1_header_rules;
 mod bytes_samples_oracle;
+mod vars_bytes_oracle;
 mod hard_stop_websocket_fin;
 mod hatop_compat;
 mod health_check;

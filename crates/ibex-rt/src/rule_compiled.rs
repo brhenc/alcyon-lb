@@ -148,9 +148,8 @@ impl Format {
                 match part {
                     Part::Text(t) => out.push_str(t),
                     Part::Sample(e) => {
-                        if let Some(smp) = e.eval_sample(registry, ctx) {
-                            crate::engine::push_sample(out, &smp, &push);
-                            ibex_sample::spare::give_sample(smp);
+                        if let Some(smp) = e.eval_smp(registry, ctx) {
+                            crate::engine::push_smp(out, &smp, &push);
                         }
                     }
                 }

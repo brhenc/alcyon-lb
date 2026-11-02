@@ -361,6 +361,16 @@ impl Expr {
         }
     }
 
+    /// [`Self::eval_sample`] in the bytes form: a text borrowed from the request stays borrowed
+    /// (R4), where `eval_sample` makes it a text `String`.
+    #[must_use]
+    pub fn eval_smp<'c>(&self, registry: &Registry, ctx: &'c SampleContext<'_>) -> Option<Smp<'c>> {
+        match self.compiled(registry) {
+            Some(c) => Registry::eval_smp_c(c, &self.fetch_args, &self.converters, ctx),
+            None => registry.eval_g(&self.fetch_name, &self.fetch_args, &self.converters, ctx).map(Smp::from_sample),
+        }
+    }
+
     /// Evaluates the expression against the sample context to produce all sample values.
     #[must_use]
     pub fn eval_all_samples(&self, registry: &Registry, ctx: &SampleContext) -> Vec<Sample> {

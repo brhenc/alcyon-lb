@@ -772,6 +772,28 @@ fn set_var_on_a_keep_alive_request_allocates_nothing() {
     }
 }
 
+/// R4: a rule's format renders with no `String` built for it: `%r` in a `set-header` value is
+/// the request line the rule reads from the stream (`request_line_of` built it with `format!`,
+/// one allocation a request), and `set-var-fmt` renders its value in a scratch, not a
+/// `String::with_capacity`.
+#[test]
+fn a_format_render_takes_no_string() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let none = keepalive_request_allocations("");
+    let cases = [
+        ("%r", "  http-request set-header X-L \"%r\"\n"),
+        ("%[path]", "  http-request set-header X-L \"%[path]\"\n"),
+        ("%HM", "  http-request set-header X-L \"%HM\"\n"),
+        ("%[path] %HM", "  http-request set-header X-L \"%[path] %HM\"\n"),
+        ("set-var-fmt", "  http-request set-var-fmt(txn.f) \"%[path]-%HM\"\n"),
+    ];
+    let got: Vec<_> = cases.iter().map(|(n, r)| (*n, keepalive_request_allocations(r))).collect();
+    println!("[MEASUREMENT R4] keep-alive request allocations: none {none}, {got:?}");
+    for (name, n) in got {
+        assert_eq!(n, none, "a rule rendering `{name}` allocated {n} times on a keep-alive request, {none} without it");
+    }
+}
+
 /// A keep-alive HTTP/1.1 server for `keepalive_proxied_allocations`: answers every head on every
 /// connection with a 2-byte body, from a fixed buffer, so the backend thread allocates nothing
 /// per request (the counter is process-wide).

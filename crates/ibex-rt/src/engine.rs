@@ -3496,13 +3496,46 @@ fn stream_data<'a>(sess: &'a TcpSession, proxies: &'a [Proxy], ctx: &SampleConte
 /// (`session_log_data`); one that reads names, addresses and samples reads them from `ctx`.
 fn render_rule_format(f: &crate::rule_compiled::Format, out: &mut String, ctx: &SampleContext, registry: &Registry, sess: &TcpSession, proxies: &[Proxy]) {
     if f.needs_stream() {
-        let line = f.uses_request_line().then(|| request_line_of(ctx));
-        if let Some(data) = stream_data(sess, proxies, ctx, line.as_deref()) {
-            f.render_into(out, ctx, registry, Some(&data));
+        let rendered = if f.uses_request_line() {
+            with_request_line(ctx, |line| stream_data(sess, proxies, ctx, Some(line)).map(|data| f.render_into(out, ctx, registry, Some(&data))))
+        } else {
+            stream_data(sess, proxies, ctx, None).map(|data| f.render_into(out, ctx, registry, Some(&data)))
+        };
+        if rendered.is_some() {
             return;
         }
     }
     f.render_into(out, ctx, registry, None);
+}
+
+/// Bytes of a request line kept inline by [`with_request_line`]; a longer one spills into a
+/// pooled string.
+const REQUEST_LINE_INLINE: usize = 256;
+
+/// Runs `f` with the request line as the access log keeps it (`%r`, `%HM`, ... in a rule's
+/// format), written from what the context holds of the request into a scratch on the stack:
+/// no `String` is built for a line that fits (R4; `request_line_of` made one with `format!`).
+fn with_request_line<R>(ctx: &SampleContext, f: impl FnOnce(&str) -> R) -> R {
+    let parts = [ctx.req_method.unwrap_or_default(), " ", ctx.req_uri.unwrap_or_default(), " ", ctx.req_version.unwrap_or("HTTP/1.1")];
+    let total: usize = parts.iter().map(|p| p.len()).sum();
+    if total > REQUEST_LINE_INLINE {
+        let mut line = crate::reuse::string();
+        parts.iter().for_each(|p| line.push_str(p));
+        let r = f(&line);
+        crate::reuse::give(line);
+        return r;
+    }
+    let mut buf = [0u8; REQUEST_LINE_INLINE];
+    let mut at = 0;
+    for p in parts {
+        buf[at..at + p.len()].copy_from_slice(p.as_bytes());
+        at += p.len();
+    }
+    // The parts are `&str`s, so the line is UTF-8: the check cannot fail (and does not read more
+    // than the line).
+    let line = std::str::from_utf8(&buf[..at]);
+    debug_assert!(line.is_ok());
+    f(line.unwrap_or_default())
 }
 
 /// `%ST`: -1 for a transaction that has no status (`txn->status` starts at -1), as one the
@@ -7791,8 +7824,8 @@ fn eval_tcp_req_session_rules(
                 let e = rc.expr.as_ref();
                 if let Some(c) = e.and_then(|e| e.constant(registry)) {
                     store_var_in(&mut sess.strm.vars, &rc.var(var_name), ibex_sample::vars::In::Ref(c));
-                } else if let Some(val) = e.and_then(|e| e.eval_sample(registry, &ctx)) {
-                    store_var_smp(&mut sess.strm.vars, &rc.var(var_name), val);
+                } else if let Some(val) = e.and_then(|e| e.eval_smp(registry, &ctx)) {
+                    rc.var(var_name).store_smp(&mut sess.strm.vars, val);
                 }
             }
             ibex_config::TcpReqSessionAction::SetVarFmt { var_name, fmt: _ } => {
@@ -8044,8 +8077,8 @@ fn eval_tcp_req_content_rules(
                 let e = rc.expr.as_ref();
                 if let Some(c) = e.and_then(|e| e.constant(registry)) {
                     store_var_in(&mut sess.strm.vars, &rc.var(var_name), ibex_sample::vars::In::Ref(c));
-                } else if let Some(val) = e.and_then(|e| e.eval_sample(registry, &ctx)) {
-                    store_var_smp(&mut sess.strm.vars, &rc.var(var_name), val);
+                } else if let Some(val) = e.and_then(|e| e.eval_smp(registry, &ctx)) {
+                    rc.var(var_name).store_smp(&mut sess.strm.vars, val);
                 }
             }
             ibex_config::TcpReqContentAction::DoResolve(d) => {
@@ -8243,8 +8276,8 @@ fn set_var_from(vars: &mut VarStore, name: &ibex_sample::vars::VarRef, e: Option
     let Some(e) = e else { return };
     if let Some(c) = e.constant(registry) {
         store_var_in(vars, name, ibex_sample::vars::In::Ref(c));
-    } else if let Some(val) = e.eval_sample(registry, ctx) {
-        store_var_smp(vars, name, val);
+    } else if let Some(val) = e.eval_smp(registry, ctx) {
+        name.store_smp(vars, val);
     }
 }
 
@@ -8261,6 +8294,12 @@ fn unset_var(vars: &mut VarStore, var: &ibex_sample::vars::VarRef) {
 fn store_var(vars: &mut VarStore, name: &ibex_sample::vars::VarRef, mut val: String) {
     ibex_sample::registry::truncate_to_trash(&mut val);
     store_var_smp(vars, name, Sample::Str(val));
+}
+
+/// [`store_var`] of a text rendered in a string the caller keeps: copied into the variable.
+fn store_var_text(vars: &mut VarStore, name: &ibex_sample::vars::VarRef, val: &mut String) {
+    ibex_sample::registry::truncate_to_trash(val);
+    name.store_smp(vars, ibex_sample::Smp::Str(ibex_regex::bytetext::text_to_bytes(val)));
 }
 
 /// `name[,<cond>...]` of `set-var(...)`: the variable is set only when every condition holds
@@ -14150,14 +14189,24 @@ impl EngineDispatcher<'_> {
                         let e = rc.expr.as_ref();
                         if let Some(c) = e.and_then(|e| e.constant(registry)) {
                             store_var_in(&mut sess.strm.vars, &rc.var(var_name), ibex_sample::vars::In::Ref(c));
-                        } else if let Some(val) = e.and_then(|e| e.eval_sample(registry, &make_ctx!(sess))) {
-                            store_var_smp(&mut sess.strm.vars, &rc.var(var_name), val);
+                        } else {
+                            // The value borrows the request through `ctx`, which borrows the whole
+                            // session: the stream's variables are taken out for the store (a
+                            // swap of an empty `Vec`, no allocation) and put back.
+                            let mut vars = std::mem::take(&mut sess.strm.vars);
+                            let ctx = make_ctx!(sess);
+                            if let Some(val) = e.and_then(|e| e.eval_smp(registry, &ctx)) {
+                                rc.var(var_name).store_smp(&mut vars, val);
+                            }
+                            sess.strm.vars = vars;
                         }
                     }
                     ibex_config::HttpReqAction::SetVarFmt { var_name, fmt } => {
-                        let mut val = String::with_capacity(fmt.len());
-                        rc.fmt.iter().for_each(|f| render_rule_format(f, &mut val, &make_ctx!(sess), registry, sess, proxies));
-                        store_var(&mut sess.strm.vars, &rc.var(var_name), val);
+                        // Rendered into a per-thread string and stored from it: none built for the value (R4).
+                        crate::reuse::with_string(|val| {
+                            rc.fmt.iter().for_each(|f| render_rule_format(f, val, &make_ctx!(sess), registry, sess, proxies));
+                            store_var_text(&mut sess.strm.vars, &rc.var(var_name), val);
+                        });
                     }
                     ibex_config::HttpReqAction::UnsetVar { var_name } => {
                         unset_var(&mut sess.strm.vars, &rc.var(var_name));
@@ -15544,6 +15593,39 @@ pub(crate) fn format_sample_into(out: &mut String, fmt: &str, ctx: &SampleContex
 
 /// `smp` as a format writes it, appended to `out` through `push`, with no string of its own
 /// for a number, an address or a method.
+/// [`push_sample`] of a sample in its bytes form: a text borrowed from the request is pushed
+/// from the request's bytes, no `String` made for it (R4).
+pub(crate) fn push_smp(out: &mut String, smp: &ibex_sample::Smp<'_>, push: &dyn Fn(&mut String, &str)) {
+    use ibex_sample::Smp;
+    match smp {
+        Smp::Str(b) => match std::str::from_utf8(b) {
+            Ok(t) if !ibex_regex::bytetext::has_escapes(t) => push(out, t),
+            _ => push(out, &ibex_regex::bytetext::bytes_to_text(b)),
+        },
+        Smp::Bin(b) => {
+            let b = &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())];
+            match std::str::from_utf8(b) {
+                Ok(t) if !ibex_regex::bytetext::has_escapes(t) => push(out, t),
+                _ => push(out, &ibex_regex::bytetext::bytes_to_text(b)),
+            }
+        }
+        Smp::Bool(v) => out.push(if *v { '1' } else { '0' }),
+        Smp::Sint(n) => {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{n}");
+        }
+        Smp::Ipv4(ip) => {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{ip}");
+        }
+        Smp::Ipv6(ip) => {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{ip}");
+        }
+        Smp::Meth(m) => out.push_str(m.as_str()),
+    }
+}
+
 pub(crate) fn push_sample(out: &mut String, smp: &Sample, push: &dyn Fn(&mut String, &str)) {
     use std::fmt::Write as _;
     match smp {

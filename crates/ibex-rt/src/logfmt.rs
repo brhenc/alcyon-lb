@@ -930,29 +930,36 @@ impl LogFormat {
             }
             let value_beg = out.0.len();
             match value {
-                Value::Expr(e) => match e.eval_sample(registry, ctx) {
-                    // Outside a log line an empty value writes nothing, not `-`.
-                    Some(Sample::Str(v)) if !log && (!self.dash_m || !o.mandatory) && v.is_empty() && !o.quote && !o.encoded() => {}
-                    Some(Sample::Bin(v)) if !log && (!self.dash_m || !o.mandatory) && v.is_empty() && !o.quote && !o.encoded() => {}
-                    Some(s) if self.http && !o.encoded() => {
-                        // Written in place, then escaped: a copy only when a byte needs it.
-                        let start = out.0.len();
-                        sample(out, &s, o, Cast::Same, !e.converters.is_empty());
-                        if out.0[start..].iter().any(|&c| crate::engine::http_encoded(c)) {
-                            let plain = out.0.split_off(start);
-                            for &c in &plain {
-                                if crate::engine::http_encoded(c) {
-                                    let _ = write!(out, "%{c:02X}");
-                                } else {
-                                    out.0.push(c);
+                Value::Expr(e) => {
+                    let smp = e.eval_sample(registry, ctx);
+                    match &smp {
+                        // Outside a log line an empty value writes nothing, not `-`.
+                        Some(Sample::Str(v)) if !log && (!self.dash_m || !o.mandatory) && v.is_empty() && !o.quote && !o.encoded() => {}
+                        Some(Sample::Bin(v)) if !log && (!self.dash_m || !o.mandatory) && v.is_empty() && !o.quote && !o.encoded() => {}
+                        Some(s) if self.http && !o.encoded() => {
+                            // Written in place, then escaped: a copy only when a byte needs it.
+                            let start = out.0.len();
+                            sample(out, s, o, Cast::Same, !e.converters.is_empty());
+                            if out.0[start..].iter().any(|&c| crate::engine::http_encoded(c)) {
+                                let plain = out.0.split_off(start);
+                                for &c in &plain {
+                                    if crate::engine::http_encoded(c) {
+                                        let _ = write!(out, "%{c:02X}");
+                                    } else {
+                                        out.0.push(c);
+                                    }
                                 }
                             }
                         }
+                        Some(s) => sample(out, s, o, named.as_ref().map_or(Cast::Same, |n| n.cast), !e.converters.is_empty()),
+                        // `+M` prints `-` in a log line and in a rule's non-HTTP format.
+                        None => missing(out, o, log || self.dash_m),
                     }
-                    Some(s) => sample(out, &s, o, named.as_ref().map_or(Cast::Same, |n| n.cast), !e.converters.is_empty()),
-                    // `+M` prints `-` in a log line and in a rule's non-HTTP format.
-                    None => missing(out, o, log || self.dash_m),
-                },
+                    // A text sample is a spare string: given back for the next fetch (R4).
+                    if let Some(s) = smp {
+                        ibex_sample::spare::give_sample(s);
+                    }
+                }
                 Value::Alias(a) => {
                     if o.encoded() {
                         // The value as the plain format writes it, then as the encoding carries it:

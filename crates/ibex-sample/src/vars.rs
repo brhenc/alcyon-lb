@@ -41,7 +41,8 @@
 //! this module: a nested borrow reads as "no variable" or writes nothing, never a panic.
 
 use crate::cast::cast;
-use crate::sample::{Sample, SampleType};
+use crate::sample::{Sample, SampleType, Smp};
+use std::borrow::Cow;
 use ibex_proto::htx::HttpMethod;
 
 use std::cell::{Cell, RefCell};
@@ -258,6 +259,15 @@ impl Slot {
             Val::Ipv4(a) => !a.is_unspecified(),
             _ => false,
         }
+    }
+
+    /// Sets a `str` value from the ASCII bytes `b`, copied into the buffer (no `String`, no
+    /// UTF-8 check: an ASCII text is its own bytetext).
+    fn set_ascii(&mut self, b: &[u8]) {
+        self.buf.clear();
+        let Some(()) = reserve_more(&mut self.buf, b.len()) else { return self.val = Val::Bool(self.as_bool()) };
+        self.buf.extend_from_slice(b);
+        self.val = Val::Str;
     }
 
     /// Sets the value from `v`. Bytes go into the buffer when it has the room; else an owned
@@ -511,6 +521,17 @@ impl VarStore {
         let slot = &mut self.slots[i];
         slot.scope = scope;
         slot.set(v);
+        true
+    }
+
+    /// [`Self::write`] of the text `b`, all ASCII.
+    fn write_ascii(&mut self, id: u32, scope: Scope, b: &[u8]) -> bool {
+        debug_assert!(b.is_ascii());
+        let i = id as usize;
+        let Some(()) = grow_to(&mut self.slots, i + 1) else { return false };
+        let slot = &mut self.slots[i];
+        slot.scope = scope;
+        slot.set_ascii(b);
         true
     }
 
@@ -778,12 +799,22 @@ fn put(store: &mut VarStore, name: &str, v: In<'_>, procs: u64) -> bool {
 
 /// [`put`] of a variable whose number and scope are known.
 fn put_id(store: &mut VarStore, id: u32, scope: Scope, v: In<'_>, procs: u64) -> bool {
-    let v = match admit(store, procs, id, scope, &v) {
+    let v = match admit(store, procs, id, scope, v.is_bytes().then(|| v.extra_bytes())) {
         Admit::Refuse => return false,
         Admit::Bool(b) => In::Owned(Sample::Bool(b)),
         Admit::Store => v,
     };
     store.write(id, scope, v)
+}
+
+/// [`put_id`] of the text `b`, every byte of it ASCII (so its text form is itself): copied
+/// into the slot's buffer as it is (R4).
+fn put_ascii(store: &mut VarStore, id: u32, scope: Scope, b: &[u8], procs: u64) -> bool {
+    match admit(store, procs, id, scope, Some(b.len() as u64)) {
+        Admit::Refuse => false,
+        Admit::Bool(v) => store.write(id, scope, In::Owned(Sample::Bool(v))),
+        Admit::Store => store.write_ascii(id, scope, b),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -851,6 +882,26 @@ impl VarRef {
         }
         let procs = if limits_set() { proc_size() } else { 0 };
         with_stream(vars, |m| put_id(m, id, self.scope, val, procs));
+    }
+
+    /// [`Self::store`] of a sample in its bytes form. An ASCII text with no condition goes
+    /// from the bytes it borrows into the slot's buffer as they are: no spare string taken,
+    /// no UTF-8 check (R4). Any other sample is stored in its text form.
+    pub fn store_smp(&self, vars: &mut VarStore, smp: Smp<'_>) {
+        if let (Some(id), false, Smp::Str(b)) = (self.id, self.conds, &smp) {
+            if b.is_ascii() {
+                let procs = if limits_set() { proc_size() } else { 0 };
+                with_stream(vars, |m| put_ascii(m, id, self.scope, b, procs));
+                // An owned text is a spare string's buffer, usually: given back for the next fetch.
+                if let Smp::Str(Cow::Owned(v)) = smp {
+                    if let Ok(t) = String::from_utf8(v) {
+                        crate::spare::give(t);
+                    }
+                }
+                return;
+            }
+        }
+        self.store(vars, In::Owned(smp.into_sample()));
     }
 
     /// `unset-var(<name>)`.
@@ -956,7 +1007,7 @@ enum Admit {
 /// this one (a process total is this process's `proc.` variables and the running stream's; S7
 /// brings the rest) and the 88 bytes `HAProxy` charges for each `proc.` name the configuration only
 /// mentions (it creates them at load).
-fn admit(store: &VarStore, procs: u64, id: u32, scope: Scope, new: &In<'_>) -> Admit {
+fn admit(store: &VarStore, procs: u64, id: u32, scope: Scope, new_bytes: Option<u64>) -> Admit {
     if !limits_set() {
         return Admit::Store;
     }
@@ -983,7 +1034,7 @@ fn admit(store: &VarStore, procs: u64, id: u32, scope: Scope, new: &In<'_>) -> A
         return Admit::Refuse;
     }
     let held = old.map_or(0, Slot::extra_bytes);
-    if new.is_bytes() && !fits(if created { VAR_STRUCT_COST } else { 0 } + new.extra_bytes(), held) {
+    if new_bytes.is_some_and(|extra| !fits(if created { VAR_STRUCT_COST } else { 0 } + extra, held)) {
         return Admit::Bool(old.is_some_and(Slot::as_bool));
     }
     Admit::Store
@@ -1136,6 +1187,33 @@ mod tests {
         assert_eq!(var_arg_int("txn.t364b"), None);
         unset("txn.t364b");
         assert!(!is_set("txn.t364b"));
+    }
+
+    #[test]
+    fn a_text_stored_from_bytes_is_the_text_stored_from_a_sample() {
+        let mut s = VarStore::new();
+        let v = VarRef::resolve("txn.r4a");
+        v.store_smp(&mut s, Smp::str(b"/api/x"));
+        assert_eq!(s.get("txn.r4a"), Some(Sample::Str("/api/x".into())));
+        // An owned ASCII text: copied, its string given back.
+        v.store_smp(&mut s, Smp::Str(Cow::Owned(b"owned".to_vec())));
+        assert_eq!(s.get("txn.r4a"), Some(Sample::Str("owned".into())));
+        // A byte 0x80-0xFF is held as the text of that byte, the form `req.hdr` gives it.
+        v.store_smp(&mut s, Smp::str(b"caf\xe9"));
+        assert_eq!(s.get("txn.r4a"), Some(Sample::Str(ibex_regex::bytetext::bytes_to_text(b"caf\xe9"))));
+        // A scalar, and a name with a condition (`ifnotempty`): the text form's rules.
+        v.store_smp(&mut s, Smp::Sint(7));
+        assert_eq!(s.get("txn.r4a"), Some(Sample::Sint(7)));
+        let cond = VarRef::resolve("txn.r4a,ifempty");
+        cond.store_smp(&mut s, Smp::str(b"no"));
+        assert_eq!(s.get("txn.r4a"), Some(Sample::Sint(7)), "ifempty: the new value is not empty");
+        cond.store_smp(&mut s, Smp::str(b""));
+        assert_eq!(s.get("txn.r4a"), Some(Sample::Str(String::new())));
+        // The buffer a value was copied into is the next value's.
+        v.store_smp(&mut s, Smp::str(b"0123456789"));
+        let cap = s.slot("txn.r4a").map(|x| x.buf.capacity());
+        v.store_smp(&mut s, Smp::str(b"abc"));
+        assert_eq!(s.slot("txn.r4a").map(|x| x.buf.capacity()), cap);
     }
 
     #[test]
