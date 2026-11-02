@@ -198,6 +198,15 @@ pub struct Context {
     num_pending: usize,
 }
 
+// ring-ibex: the partial block holds what the context was fed, which under HMAC, HKDF and the
+// ECDSA nonce key is key material.
+#[cfg(feature = "zeroize")]
+impl Drop for Context {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.pending[..]);
+    }
+}
+
 impl Context {
     #[cfg(all(test, feature = "zeroize"))]
     pub(crate) fn state_bytes_for_test(&self) -> alloc::vec::Vec<u8> {
@@ -278,7 +287,13 @@ impl Context {
         mut self,
         cpu_features: cpu::Features,
     ) -> Result<Digest, InputTooLongError> {
-        self.block
+        // ring-ibex: `Context` has a `Drop` under `zeroize`, so `block` cannot be moved out; the
+        // copy is consumed here and `self` (the original) is wiped when it drops.
+        #[cfg(feature = "zeroize")]
+        let block = self.block.clone();
+        #[cfg(not(feature = "zeroize"))]
+        let block = self.block;
+        block
             .try_finish(&mut self.pending, self.num_pending, cpu_features)
             .map_err(|err| match err {
                 FinishError::InputTooLong(i) => i,
@@ -314,6 +329,12 @@ pub struct Digest {
 }
 
 impl Digest {
+    /// ring-ibex: overwrite a digest that is key material (an HKDF block, a nonce key).
+    #[cfg(feature = "zeroize")]
+    pub(crate) fn wipe(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.value.0[..]);
+    }
+
     pub(crate) fn compute_from(
         algorithm: &'static Algorithm,
         data: &[u8],
@@ -686,5 +707,20 @@ mod tests {
         max_input_tests!(SHA256);
         max_input_tests!(SHA384);
         max_input_tests!(SHA512);
+    }
+}
+
+// ring-ibex (zrev): a `Context` buffers a partial block of whatever it is fed; under HKDF and
+// HMAC that is key material (the extract input, the previous expand block, the nonce key).
+#[cfg(all(test, feature = "zeroize"))]
+mod zeroize_tests {
+    use super::*;
+
+    #[test]
+    fn context_wipes_its_pending_block() {
+        let secret = [0xA7u8, 0x13, 0x5c, 0xe9, 0x21, 0x84, 0x3b, 0x6d, 0xf0, 0x57, 0x0e, 0xc2, 0x99, 0x4a, 0xd1, 0x38];
+        let mut ctx = Context::new(&SHA256);
+        ctx.update(&secret);
+        crate::zeroize_testutil::assert_needle_wiped(ctx, &secret, "digest::Context pending");
     }
 }

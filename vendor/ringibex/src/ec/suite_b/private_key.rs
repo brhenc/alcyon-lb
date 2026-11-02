@@ -138,8 +138,12 @@ pub(super) fn public_from_private(
     let elem_and_scalar_bytes = ops.common.len();
     debug_assert_eq!(public_out.len(), 1 + (2 * elem_and_scalar_bytes));
     let n = &ops.common.scalar_modulus(cpu);
-    let my_private_key = private_key_as_scalar(n, my_private_key);
+    #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
+    let mut my_private_key = private_key_as_scalar(n, my_private_key);
     let my_public_key = ops.point_mul_base(&my_private_key, cpu);
+    // ring-ibex (zrev): as `ecdh` does for its copy of the scalar.
+    #[cfg(feature = "zeroize")]
+    my_private_key.wipe();
     public_out[0] = 4; // Uncompressed encoding.
     let (x_out, y_out) = public_out[1..].split_at_mut(elem_and_scalar_bytes);
 

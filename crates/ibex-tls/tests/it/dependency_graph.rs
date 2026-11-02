@@ -19,3 +19,38 @@ fn no_workspace_crate_has_rustls_023_as_a_normal_dependency() {
     let dependents = String::from_utf8_lossy(&out.stdout);
     assert!(dependents.trim().is_empty(), "rustls 0.23 is a normal dependency of:\n{dependents}");
 }
+
+fn tree(args: &[&str]) -> (bool, String, String) {
+    let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml");
+    let out = Command::new(env!("CARGO"))
+        .args(["tree", "--offline", "-e", "normal", "--prefix", "none", "--manifest-path", manifest])
+        .args(args)
+        .output()
+        .expect("cargo tree");
+    (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// Zeroize review (zrev): QUIC reaches vanilla `ring` only through the provider selection
+/// (`tune.ibex.crypto-provider ring`). The vendored quinn-proto is built without its `ring`
+/// feature (its own HMAC/HKDF/AEAD would bypass `ring-ibex`): `ring` is not in its normal graph,
+/// and in the whole workspace's normal graph the only crate that depends on `ring` is
+/// `rustls-ring`, the provider `ibex_tls::provider` picks it by.
+#[test]
+fn quic_reaches_vanilla_ring_only_through_the_rustls_ring_provider() {
+    let (ok, out, err) = tree(&["-p", "quinn-proto"]);
+    assert!(ok, "cargo tree: {err}");
+    assert!(!out.lines().any(|l| l.starts_with("ring ") || l.starts_with("rustls ")), "quinn-proto's normal graph contains ring or rustls 0.23:\n{out}");
+    let (ok, out, err) = tree(&["--workspace", "-i", "ring@0.17.14", "--depth", "1"]);
+    assert!(ok, "cargo tree: {err}");
+    let dependents: Vec<&str> = out.lines().skip(1).filter(|l| !l.trim().is_empty()).collect();
+    assert!(dependents.len() == 1 && dependents[0].starts_with("rustls-ring "), "vanilla ring has other normal dependents:\n{out}");
+}
+
+/// The same for the fork: only its rustls provider depends on `ringibex`.
+#[test]
+fn ringibex_is_reached_only_through_its_rustls_provider() {
+    let (ok, out, err) = tree(&["--workspace", "-i", "ringibex", "--depth", "1"]);
+    assert!(ok, "cargo tree: {err}");
+    let dependents: Vec<&str> = out.lines().skip(1).filter(|l| !l.trim().is_empty()).collect();
+    assert!(dependents.len() == 1 && dependents[0].starts_with("rustls-ringibex "), "ringibex has other normal dependents:\n{out}");
+}

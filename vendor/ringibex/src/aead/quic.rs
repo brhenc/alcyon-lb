@@ -39,7 +39,11 @@ impl From<hkdf::Okm<'_, &'static Algorithm>> for HeaderProtectionKey {
         let algorithm = *okm.len();
         let key_bytes = &mut key_bytes[..algorithm.key_len()];
         okm.fill(key_bytes).unwrap();
-        Self::new(algorithm, key_bytes).unwrap()
+        let key = Self::new(algorithm, key_bytes).unwrap();
+        // ring-ibex: the raw header protection key (as `UnboundKey::from(Okm)` does).
+        #[cfg(feature = "zeroize")]
+        zeroize::Zeroize::zeroize(key_bytes);
+        key
     }
 }
 
@@ -51,10 +55,11 @@ impl HeaderProtectionKey {
         algorithm: &'static Algorithm,
         key_bytes: &[u8],
     ) -> Result<Self, error::Unspecified> {
-        Ok(Self {
-            inner: (algorithm.init)(key_bytes, cpu::features())?,
-            algorithm,
-        })
+        let cpu = cpu::features();
+        let inner = (algorithm.init)(key_bytes, cpu)?;
+        // ring-ibex (zrev): the key schedule's registers, as `aead::Algorithm::new_key` does.
+        crate::vregs::clear_if_zeroize(cpu);
+        Ok(Self { inner, algorithm })
     }
 
     /// Generate a new QUIC Header Protection mask.

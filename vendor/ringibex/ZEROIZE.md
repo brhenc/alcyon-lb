@@ -29,15 +29,15 @@ File:line are in the unmodified 0.17.14 tree (line shifts a few after the patch)
 | 12 | `aes_gcm::Key(DynKey)` and `Combo` | src/aead/aes_gcm.rs:41,502 | R | contains 9+11; wiping those suffices | DONE (via 9, 11) |
 | 13 | `chacha::Key` (32 bytes, `[u32;8]`) | src/aead/chacha.rs:41 | R | Drop zeroize | DONE |
 | 14 | `aead::UnboundKey` / `LessSafeKey` / `SealingKey` / `OpeningKey` | src/aead/unbound_key.rs:28, less_safe_key.rs:24 | R wrappers | via 9-13 | DONE (via 9-13) |
-| 15 | `poly1305::Key` (one-time key r,s, derived per record from ChaCha block 0) | src/aead/poly1305.rs:26 | R stack | Drop zeroize | DONE |
+| 15 | `poly1305::Key` (one-time key r,s, derived per record from ChaCha block 0) and `poly1305::State` (clamped r, s and the raw `s` half in `poly1305_state_st`) | src/aead/poly1305.rs:26, poly1305/ffi_fallback.rs | R stack | Drop zeroize on both (zrev: `State` had none, and `new_context` copied the key out of `Key`) | DONE |
 | 16 | `HeaderProtectionKey` (QUIC) | src/aead/quic.rs:25 | R | via 9/13 | DONE (via 9/13) |
-| 17 | `hmac::Key` (inner/outer digest contexts holding the keyed block state) | src/hmac.rs:155 | R, two `digest::BlockContext` | Drop zeroize both contexts | DONE |
+| 17 | `hmac::Key` (inner/outer digest contexts holding the keyed block state) | src/hmac.rs:155 | R, two `digest::BlockContext` | Drop zeroize both contexts; key setup also clears the vector registers and wipes the hash of an over-long key (zrev) | DONE |
 | 18 | `hmac::Context` (running keyed state) | src/hmac.rs:304 | R | Drop | DONE (via 21) |
 | 19 | `hkdf::Salt` / `Prk` (wrap hmac::Key) | src/hkdf.rs:56,109 | R | via 17 | DONE (via 17) |
 | 20 | `hkdf::Okm` + `fill` output (caller-owned; rustls zeroizes its own) | src/hkdf.rs:161 | R | caller | n/a |
-| 21 | `digest::Context` / `BlockContext` / `Output` (used under HMAC with key-derived blocks) | src/digest.rs:39,187,510 | R | Drop on Context; hmac pad blocks on stack too | DONE (DynState; see notes) |
-| 22 | `Ed25519KeyPair` (seed + expanded scalar) | src/ec/curve25519/ed25519/signing.rs:26 | R | Drop zeroize (`Scalar`, `[u8;32]`) | DONE (scalar + prefix; the SHA-512 `Digest` of the seed on the stack is not wiped) |
-| 23 | `EcdsaKeyPair` (holds `ec::KeyPair`, i.e. Seed #1) | src/ec/suite_b/ecdsa/signing.rs:61 | R | via #1 once Seed drop covers KeyPair (done); per-signature nonce `NonceRandomKey` signing.rs:346 and ECDSA nonce scalar are TODO | partial: seed wiped; ECDSA nonce and per-signature temporaries TODO |
+| 21 | `digest::Context` / `BlockContext` / `Output` (used under HMAC with key-derived blocks) | src/digest.rs:39,187,510 | R | Drop on `DynState` and, since zrev, on `Context` (the `pending` partial block); hmac pad blocks on stack too | DONE (DynState + pending; see notes) |
+| 22 | `Ed25519KeyPair` (seed + expanded scalar), per-signature nonce | src/ec/curve25519/ed25519/signing.rs:26 | R | Drop zeroize (`Scalar` has its own `Drop` since zrev, so the nonce `Scalar` is wiped; the SHA-512 digests of the seed and of the nonce, the `unreduced` array and `generate_pkcs8`'s seed are wiped explicitly) | DONE |
+| 23 | `EcdsaKeyPair`: the private scalar `d` (Montgomery form) and `nonce_key` (`Copy` values inside the struct; the `Seed` is only borrowed and dropped in `new`) | src/ec/suite_b/ecdsa/signing.rs:61 | R | `Drop for EcdsaKeyPair` wipes `d` and `nonce_key` (zrev; the earlier "via #1" was wrong, the Seed does not outlive `new`); per signature `k`, `k_inv`, `e+dr` and the nonce digest are wiped | DONE (zrev) |
 | 24 | `rsa::KeyPair` (n,e public; p,q,dP,dQ,qInv and `d`-free CRT) as `PrivatePrime`/`PrivateCrtPrime` | src/rsa/keypair.rs:35,410,450 | R heap `BoxedLimbs` | Drop on `BoxedLimbs` (src/arithmetic/bigint/boxed_limbs.rs:27, shared with public values; cheap) | DONE (primes, dP/dQ via BoxedLimbs/PrivateExponent Drop; qInv, `One`, Elem temporaries too) |
 | 25 | RSA signing temporaries (bigint `Elem`, `Storage`, blinding) | src/arithmetic/bigint.rs:68,83 | R heap | via 24 | DONE (Elem/Storage own BoxedLimbs; temporaries are wiped when freed) |
 | 26 | pkcs8 parse buffers (`Document`) | src/pkcs8.rs | R | caller-owned PKCS#8 bytes; rustls/Ibex owns | n/a |
@@ -131,6 +131,71 @@ below its TLS layer after each handshake step (`ibex_alloc::scrub_stack`, Ibex `
 covers every frame ring and rustls used during the handshake. Per-record operations are not followed by
 a scrub; their keys live in the structs wiped on drop.
 
+### Review pass "zrev" (Ibex, 2026-11-02): 38 scanner candidates, verified against the code
+
+Fixed (each with a red test unless marked "no test"; tests are in the module they test):
+
+- `EcdsaKeyPair` had no `Drop`: the long-term `d` and `nonce_key` were never wiped (the previous text of
+  row 23 claimed the Seed covered it; the Seed is dropped at the end of `new`). Now `Drop` wipes both, `new`
+  wipes its unmontgomeried copy of `d`, `NonceRandomKey::new` its random input, `sign_digest` the nonce `k`,
+  `k_inv` and `e+dr` (no test for those stack values), `NonceRandom::fill` the nonce digest. Tests
+  `ecdsa_p256/p384_private_scalar_is_wiped`, `ecdsa_nonce_key_is_wiped`.
+- `digest::Context` now wipes its `pending` block on drop. Under HKDF-Extract the message is the secret, under
+  HKDF-Expand it contains T(n-1), and `NonceRandomKey` feeds the ECDSA seed; the old note "pending holds
+  message bytes, not key bytes" was wrong for those. `try_finish` clones the `BlockContext` out of the
+  context (a type with `Drop` cannot be destructured); the original is wiped when it drops. Test
+  `digest::zeroize_tests::context_wipes_its_pending_block`.
+- `curve25519::Scalar` has a `Drop` (the per-signature Ed25519 nonce was a `Scalar` that went out of scope
+  unwiped); `from_sha512_digest_reduced` wipes its `unreduced` array; `Ed25519KeyPair::sign` wipes the nonce
+  digest; `from_seed_` the SHA-512 digest of the seed; `generate_pkcs8` the seed. Test `scalar_is_wiped_on_drop`.
+- `poly1305::ffi_fallback::State` has a `Drop` and `new_context` no longer copies the key out of `Key`. Test
+  `poly1305_state_is_wiped`.
+- `HeaderProtectionKey::from(Okm)` wipes its key buffer (as `UnboundKey::from(Okm)` does) and
+  `HeaderProtectionKey::new` clears the vector registers after key setup (no test for either).
+- HKDF-Expand: each block `T(i)` (`hmac::Tag`, `Copy`) is wiped after it is copied out (no test).
+- HMAC key setup (`Key::try_new`: every `Key::new`, `Salt`, `Prk`, `From<Okm>`) clears the vector registers and
+  wipes `key_hash` (no test).
+- ChaCha20-Poly1305 integrated seal/open (x86_64 SSE4.1/AVX2, AArch64 NEON): the stack `InOut` holding a copy of
+  the 256-bit key is wiped after the tag is copied out (no test: a stack value).
+- `AlignedStorage` (the window table of `elem_exp_consttime`) has a `Drop`: the table holds powers of
+  (c mod p) for the secret prime p, which reveals p (gcd of c - (c mod p) with n). Test
+  `exponentiation_window_table_is_wiped`. `bigint::elem_reduced` wipes its `tmp` copy of the other prime (the
+  RSA key load; no test).
+- `public_from_private` wipes the P-256/P-384 scalar as `ecdh` does (no test).
+- `chacha20_poly1305_openssh` (not used by Ibex) clears the vector registers at the end of `seal_in_place`,
+  `open_in_place`, `decrypt_packet_length` (no test).
+
+Known limits, not fixed (a practical fix would be a rewrite, or the copy is of a derived value):
+
+- By-value moves: `hmac::Key` / `Context` returned or consumed by value, `AES_KEY` returned by `new` and moved
+  into `hw::Key`, `DynKey`, `UnboundKey`, `Seed` and `[u8; 32]` keys into `chacha::Key::new`. A move can leave
+  the old bytes in a dead stack slot. Ibex scrubs the stack below its TLS layer after each handshake step.
+- GHASH `H = E_K(0)` as a `Block` / `[u64; 2]` by value (`KeyValue::new`, `into_inner`) and, in the portable
+  fallback (CPUs without PCLMULQDQ), `U128` copies in `init`/`gmult`/`ghash`. H is derived from the key, not
+  the key.
+- `rand::generate` / `Random::expose` move the random secret by value. `pbkdf2` (`derived_buf`, the `U_i`
+  tags) is not wiped; Ibex does not use PBKDF2.
+- Other stack temporaries of the signing code (RSA CRT intermediates in registers and spills, `Elem` copies in
+  the ECDSA ladder) are as in inventory 7 and 8.
+
+Vector registers and the ABI. `vregs::clear` declares every register it writes as a clobber (`out("ymm0..15")`,
+`out("xmm0..15")`, `out("v0..31")`), so the compiler saves and restores whatever of the caller's it keeps in
+the callee-saved ones: Win64 `xmm6-15` and AArch64 `v8-v15` (low 64 bits). The assembly itself restores
+those on return, so no key material stays there; the clear is correct on those targets by construction, but
+this was only built and run on x86_64 Linux (the ABI argument has not been run on Win64 or AArch64, where
+nothing here was built). `vzeroall` and the `pxor` fallback are both exercised only when the CPU has AVX or
+not respectively (the test machine has AVX).
+
+Wipe not optimised out: `zeroize` writes with `ptr::write_volatile` and ends with a `compiler_fence`
+(zeroize 1.x, `volatile_set` + `atomic_fence`). All drop-based tests pass in `--release` too (`cargo test
+--release --features zeroize zeroize`: 33 pass). Three stack-probe tests in `agreement/zeroize_tests.rs` FAIL in
+release, at 741d7a8 as well as after zrev (not caused by it): `x25519_shared_secret_not_on_stack`,
+`p256_private_scalar_not_on_stack`, `x25519_masked_private_scalar_not_on_stack` (the P-256/P-384 shared-secret
+tests pass). The first and last were already described above as not evidence in debug; in release the
+probe finds the needle, i.e. a copy of the X25519 shared secret / the P-256 or X25519 scalar is left below the
+frame by compiler copies or assembly temporaries. It was not investigated further (a copy in the test's own
+`to_vec()` is not excluded); it is stack residue of the kind Ibex's `scrub_stack` covers, not a missing Drop.
+
 ## Renaming for side-by-side linking (DONE): package and lib `ringibex`
 `Cargo.toml`: `name = "ringibex"`, `links = "ringibex_core_0_17_14_"`, `[lib] name = "ringibex"` (chosen so
 the crate name cannot clash with vanilla `ring` even without `package =` renames; tests and doc comments use
@@ -178,7 +243,7 @@ Also done (session 2, after the rename): Ed25519KeyPair Drop (22), RSA BoxedLimb
 (24, 25). RSA tests observe heap memory with a test-only global allocator (`zeroize_testutil::spy`, active
 under `cfg(test, feature = "zeroize")`) that scans each block just before it is freed; control test
 `spy_sees_an_unwiped_block`. Red before (3 tests: p, q, dP), green after. Counts now: `cargo test` 183, with
-`--features zeroize` 211.
+`--features zeroize` 211 (219 passed after zrev; 7 new tests).
 Next: (c) 7 elem temporaries in big_endian_affine_from_jacobian; (d') ECDSA nonce (23) and the RSA signing
 stack temporaries; the by-value copies listed in the notes under the inventory.
 Open questions: whether to wipe moved-from stack (needs a stack-sweep call at the end of
@@ -193,7 +258,8 @@ Step 4 (wiring) was changed by the coordinator: no `[patch]`; Ibex worktree unto
     export CARGO_TARGET_DIR=/home/bhenc/ibex-targets/ring-ibex CARGO_INCREMENTAL=0
     cargo test                              # baseline, 183 passed
     cargo test --features zeroize           # 211 passed
-    cargo test --lib --features zeroize zeroize_tests
+    cargo test --lib --features zeroize zeroize
+    cargo test --release --features zeroize zeroize   # the wipes survive the optimiser
     cd rustls-ringibex && cargo test        # 30 passed
     # side by side: /tmp/ring-both (scratch, recreate: deps ring =0.17.14, ringibex path+zeroize,
     # rustls =0.24.0-dev.2, rustls-ring =0.24.0-dev.2, rustls-ringibex path, rcgen 0.13); cargo run; nm target/debug/ring-both

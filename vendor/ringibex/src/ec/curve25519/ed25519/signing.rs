@@ -60,13 +60,17 @@ impl Ed25519KeyPair {
         rng: &dyn rand::SecureRandom,
     ) -> Result<pkcs8::Document, error::Unspecified> {
         let cpu_features = cpu::features();
-        let seed: [u8; SEED_LEN] = rand::generate(rng)?.expose();
+        #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
+        let mut seed: [u8; SEED_LEN] = rand::generate(rng)?.expose();
         let key_pair = Self::from_seed_(&seed, cpu_features);
-        Ok(pkcs8::wrap_key(
+        let document = pkcs8::wrap_key(
             &PKCS8_TEMPLATE,
             &seed[..],
             key_pair.public_key().as_ref(),
-        ))
+        );
+        #[cfg(feature = "zeroize")]
+        zeroize::Zeroize::zeroize(&mut seed);
+        Ok(document)
     }
 
     /// Constructs an Ed25519 key pair by parsing an unencrypted PKCS#8 v2
@@ -181,7 +185,8 @@ impl Ed25519KeyPair {
     }
 
     fn from_seed_(seed: &Seed, cpu_features: cpu::Features) -> Self {
-        let h = digest::digest(&digest::SHA512, seed);
+        #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
+        let mut h = digest::digest(&digest::SHA512, seed);
         let (private_scalar, private_prefix) = h.as_ref().split_at(SCALAR_LEN);
 
         let private_scalar =
@@ -189,11 +194,15 @@ impl Ed25519KeyPair {
 
         let a = ExtPoint::from_scalarmult_base(&private_scalar, cpu_features);
 
-        Self {
+        let r = Self {
             private_scalar,
             private_prefix: private_prefix.try_into().unwrap(),
             public_key: PublicKey(a.into_encoded_point(cpu_features)),
-        }
+        };
+        // ring-ibex: the digest of the seed holds the scalar and the prefix.
+        #[cfg(feature = "zeroize")]
+        h.wipe();
+        r
     }
 
     /// Returns the signature of the message `msg`.
@@ -213,13 +222,18 @@ impl Ed25519KeyPair {
 
             let (signature_bytes, _unused) = signature_bytes.split_at_mut(ELEM_LEN + SCALAR_LEN);
             let (signature_r, signature_s) = signature_bytes.split_at_mut(ELEM_LEN);
-            let nonce = {
+            #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
+            let mut nonce = {
                 let mut ctx = digest::Context::new(&digest::SHA512);
                 ctx.update(&self.private_prefix);
                 ctx.update(msg);
                 ctx.finish()
             };
-            let nonce = Scalar::from_sha512_digest_reduced(nonce);
+            let nonce_scalar = Scalar::from_sha512_digest_reduced(nonce);
+            // ring-ibex: the digest is the unreduced secret nonce; the `Scalar` wipes itself.
+            #[cfg(feature = "zeroize")]
+            nonce.wipe();
+            let nonce = nonce_scalar;
 
             let r = ExtPoint::from_scalarmult_base(&nonce, cpu_features);
             signature_r.copy_from_slice(&r.into_encoded_point(cpu_features));

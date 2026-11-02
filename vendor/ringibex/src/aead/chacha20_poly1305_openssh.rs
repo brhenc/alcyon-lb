@@ -78,6 +78,8 @@ impl SealingKey {
             slice::split_first_chunk_mut(plaintext_in_ciphertext_out).unwrap();
 
         let cpu = cpu::features();
+        // ring-ibex (zrev): K_1/K_2 and the Poly1305 key were in vector registers.
+        let _clear = crate::vregs::ClearOnDrop(cpu);
         // XXX/TODO(SemVer): Refactor API to return an error.
         let (counter, poly_key) = chacha20_poly1305::begin(
             &self.key.k_2,
@@ -126,6 +128,8 @@ impl OpeningKey {
         encrypted_packet_length: [u8; PACKET_LENGTH_LEN],
     ) -> [u8; PACKET_LENGTH_LEN] {
         let cpu = cpu::features();
+        // ring-ibex (zrev): K_1/K_2 and the Poly1305 key were in vector registers.
+        let _clear = crate::vregs::ClearOnDrop(cpu);
         let mut packet_length = encrypted_packet_length;
         let _: Counter = self.key.k_1.encrypt_single_block_with_ctr_0(
             make_nonce(sequence_number),
@@ -154,6 +158,8 @@ impl OpeningKey {
             slice::split_first_chunk_mut(ciphertext_in_plaintext_out).ok_or(error::Unspecified)?;
 
         let cpu = cpu::features();
+        // ring-ibex (zrev): K_1/K_2 and the Poly1305 key were in vector registers.
+        let _clear = crate::vregs::ClearOnDrop(cpu);
         let (counter, poly_key) = chacha20_poly1305::begin(
             &self.key.k_2,
             make_nonce(sequence_number),
