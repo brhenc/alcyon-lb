@@ -13,11 +13,18 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn cfg(dir: &std::path::Path, addr: std::net::SocketAddr, fe_maxconn: &str) -> std::path::PathBuf {
+    let listen = fe_maxconn.starts_with("listen");
+    let fe_maxconn = fe_maxconn.trim_start_matches("listen");
     let path = dir.join("c.cfg");
+    let proxies = if listen {
+        format!("listen f\n    bind {addr}\n{fe_maxconn}    server s 127.0.0.1:1\n")
+    } else {
+        format!("frontend f\n    bind {addr}\n{fe_maxconn}    default_backend b\nbackend b\n    server s 127.0.0.1:1\n")
+    };
     std::fs::write(
         &path,
         format!(
-            "global\n    stats socket {}/cli.sock level admin\ndefaults\n    mode http\n    timeout client 5s\n    timeout server 5s\n    timeout connect 5s\nfrontend f\n    bind {addr}\n{fe_maxconn}    default_backend b\nbackend b\n    server s 127.0.0.1:1\n",
+            "global\n    stats socket {}/cli.sock level admin\ndefaults\n    mode http\n    timeout client 5s\n    timeout server 5s\n    timeout connect 5s\n{proxies}",
             dir.display()
         ),
     )
@@ -71,6 +78,9 @@ fn minus_n_is_the_default_proxy_maxconn() {
     assert_eq!(run_slim("n-default", &["-N", "7"], ""), "7");
     assert_eq!(run_slim("n-attached", &["-N7"], ""), "7");
     assert_eq!(run_slim("n-own", &["-N", "7"], "    maxconn 3\n"), "3");
+    // A `listen` section is a proxy like the others.
+    assert_eq!(run_slim("n-listen", &["-N", "7"], "listen"), "7");
+    assert_eq!(run_slim("n-listen-own", &["-N", "7"], "listen    maxconn 3\n"), "3");
 }
 
 #[test]

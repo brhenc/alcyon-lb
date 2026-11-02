@@ -51,3 +51,23 @@ fn a_real_head_still_decides_the_framing() {
     mux.snd_buf(&mut c, &mut sd, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
     assert_eq!(c.streams_total, 1);
 }
+
+#[test]
+fn a_head_split_over_two_writes_is_sniffed_whole_and_the_body_after_it_is_chunked() {
+    let (mux, mut c, mut sd) = ctx();
+    // The head ends in the second slice, which also carries the first body bytes.
+    mux.snd_buf(&mut c, &mut sd, b"HTTP/1.1 200 OK\r\nTransfer-Enc").unwrap();
+    assert!(!c.tx_chunked);
+    mux.snd_buf(&mut c, &mut sd, b"oding: chunked\r\n\r\nhello").unwrap();
+    assert!(c.tx_chunked);
+    assert_eq!(mux.pending_output(&c), &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"[..]);
+}
+
+#[test]
+fn a_head_that_never_ends_is_refused_at_a_bound() {
+    let (mux, mut c, mut sd) = ctx();
+    let junk = vec![b'a'; 40 * 1024];
+    mux.snd_buf(&mut c, &mut sd, &junk).unwrap();
+    let e = mux.snd_buf(&mut c, &mut sd, &junk).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+}

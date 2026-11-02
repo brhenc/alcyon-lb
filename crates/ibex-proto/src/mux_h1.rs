@@ -74,6 +74,9 @@ pub enum H1StreamState {
     Error,
 }
 
+/// The most of a message head `snd_buf` holds while waiting for its end.
+const MAX_TX_HEAD: usize = 64 * 1024;
+
 /// Connection context for the H1 multiplexer.
 pub struct H1MuxContext {
     pub conn: ConnId,
@@ -88,6 +91,8 @@ pub struct H1MuxContext {
     pub tx_chunked: bool,
     /// The head of the message being written has been seen: the rest is body.
     pub tx_head_done: bool,
+    /// The start of a message head whose end has not been written yet.
+    pub tx_head_pending: Vec<u8>,
     pub streams_used: u32,
     pub streams_total: u64,
     pub is_shut: bool,
@@ -117,6 +122,7 @@ impl H1MuxContext {
             tx_consumed: 0,
             tx_chunked: false,
             tx_head_done: false,
+            tx_head_pending: Vec::new(),
             streams_used: 0,
             streams_total: 0,
             is_shut: false,
@@ -144,6 +150,7 @@ impl H1MuxContext {
         self.rx_wire_consumed = 0;
         self.tx_chunked = false;
         self.tx_head_done = false;
+        self.tx_head_pending.clear();
         self.is_upgrade = false;
         self.stream_state = H1StreamState::Idle;
     }
@@ -439,14 +446,25 @@ impl Mux for MuxH1 {
         }
 
         // Inspect start line and headers (only those) for protocol upgrade or connection
-        // directives; a slice that ends inside the head is inspected again with the next one.
-        let (head, body) = match input.windows(4).position(|w| w == b"\r\n\r\n") {
-            Some(end) => {
-                ctx.tx_head_done = true;
-                input.split_at(end + 4)
-            }
-            None => (input, &input[input.len()..]),
+        // directives. A head that is not complete yet is held until it is, so that a header
+        // line split over two writes is seen whole.
+        let joined;
+        let whole: &[u8] = if ctx.tx_head_pending.is_empty() {
+            input
+        } else {
+            joined = [ctx.tx_head_pending.as_slice(), input].concat();
+            &joined
         };
+        let Some(end) = whole.windows(4).position(|w| w == b"\r\n\r\n") else {
+            if ctx.tx_head_pending.len() + input.len() > MAX_TX_HEAD {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "message head too large"));
+            }
+            ctx.tx_head_pending.extend_from_slice(input);
+            return Ok(input.len());
+        };
+        ctx.tx_head_done = true;
+        let (head, body) = whole.split_at(end + 4);
+        ctx.tx_head_pending.clear();
         let head_str = std::str::from_utf8(head).unwrap_or("");
         let head_lower = head_str.to_ascii_lowercase();
         // A header line is what starts a line: the same words inside a value are not it.
