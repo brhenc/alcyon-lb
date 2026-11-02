@@ -6231,7 +6231,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let (peer, local) = (ql.peer_of(conn), ql.addr());
                 let tracked: [Option<(usize, StickKey)>; 3] = [None, None, None];
                 let (client_addr, server_addr, fc_src, fc_dst) =
-                    match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, &tracked) {
+                    match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, None) {
                         ConnEvalOutcome::Accept(c, s, fs, fd, _) => (c, s, fs, fd),
                         ConnEvalOutcome::Reject | ConnEvalOutcome::SilentDrop(_) => {
                             self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
@@ -7151,69 +7151,14 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 }
             }
 
-            // 2. Process tcp_req_conn_rules (e.g. `tcp-request connection track-sc0 ...`)
-            for (rule, rc) in self.proxies[proxy_idx].tcp_req_conn_rules.iter().zip(&self.proxies[proxy_idx].rules.tcp_req_conn) {
-                let matches = rc.cond.as_ref().is_none_or(|c| c.eval(&sample_ctx, &self.proxies[proxy_idx].acls, sample_registry()));
-                if !matches {
-                    continue;
-                }
-                match &rule.action {
-                    ibex_config::TcpReqConnAction::TrackSc0 { table, expr: _ } => {
-                        let t_idx = if let Some(ref tname) = table {
-                            self.proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy_idx)
-                        } else {
-                            proxy_idx
-                        };
-                        if let Some(key) = resolve_stick_key(rc.expr.as_ref(), sample_registry(), &sample_ctx, self.proxies[t_idx].stick_table.as_ref()) {
-                            if let Some(ref tbl) = self.proxies[t_idx].stick_table {
-                                if tracked_sc[0].is_none() {
-                                    let _ = tbl.update_entry(&key, |data| data.track(true));
-                                    tracked_sc[0] = Some((t_idx, key));
-                                }
-                            }
-                        }
-                    }
-                    ibex_config::TcpReqConnAction::TrackSc1 { table, expr: _ } => {
-                        let t_idx = if let Some(ref tname) = table {
-                            self.proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy_idx)
-                        } else {
-                            proxy_idx
-                        };
-                        if let Some(key) = resolve_stick_key(rc.expr.as_ref(), sample_registry(), &sample_ctx, self.proxies[t_idx].stick_table.as_ref()) {
-                            if let Some(ref tbl) = self.proxies[t_idx].stick_table {
-                                if tracked_sc[1].is_none() {
-                                    let _ = tbl.update_entry(&key, |data| data.track(true));
-                                    tracked_sc[1] = Some((t_idx, key));
-                                }
-                            }
-                        }
-                    }
-                    ibex_config::TcpReqConnAction::TrackSc2 { table, expr: _ } => {
-                        let t_idx = if let Some(ref tname) = table {
-                            self.proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy_idx)
-                        } else {
-                            proxy_idx
-                        };
-                        if let Some(key) = resolve_stick_key(rc.expr.as_ref(), sample_registry(), &sample_ctx, self.proxies[t_idx].stick_table.as_ref()) {
-                            if let Some(ref tbl) = self.proxies[t_idx].stick_table {
-                                if tracked_sc[2].is_none() {
-                                    let _ = tbl.update_entry(&key, |data| data.track(true));
-                                    tracked_sc[2] = Some((t_idx, key));
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
+            // 2. `tcp-request connection` rules, `track-sc*` among them, in rule order.
             let (client_addr, server_addr, fc_src, fc_dst, expect_proxy) = match eval_tcp_req_conn_rules(
                 &self.proxies[proxy_idx],
                 &self.proxies,
                 sample_registry(),
                 peer_addr,
                 local_addr,
-                &tracked_sc,
+                Some(&mut tracked_sc),
             ) {
                 ConnEvalOutcome::Accept(c, s, fs, fd, ep) => (c, s, fs, fd, ep),
                 ConnEvalOutcome::Reject => {
@@ -7706,7 +7651,7 @@ fn eval_tcp_req_conn_rules(
     registry: &Registry,
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
-    tracked: &[Option<(usize, StickKey)>; 3],
+    mut tracked: Option<&mut [Option<(usize, StickKey)>; 3]>,
 ) -> ConnEvalOutcome {
     let mut client_addr = peer_addr;
     let mut server_addr = local_addr;
@@ -7714,7 +7659,7 @@ fn eval_tcp_req_conn_rules(
     let mut fc_dst = local_addr;
     let mut expect_proxy = false;
 
-    let stick = StickView::new(proxies, tracked);
+    let stick = StickView::new(proxies, tracked.as_deref().unwrap_or(&[None, None, None]));
     let mut ctx = ibex_sample::PhaseCtx {
         proxies: Some(&ProxiesView(proxies)),
         stick: Some(&stick),
@@ -7746,6 +7691,25 @@ fn eval_tcp_req_conn_rules(
             }
             ibex_config::TcpReqConnAction::ExpectProxy => {
                 expect_proxy = true;
+            }
+            // In rule order: an earlier `accept` or `reject` ends the list before it, and the
+            // key is read from the address as the rules before it left it. A slot that tracks an
+            // entry already keeps it. The caller that passes no slots (a QUIC owner) tracks none.
+            ibex_config::TcpReqConnAction::TrackSc0 { table, .. } | ibex_config::TcpReqConnAction::TrackSc1 { table, .. } | ibex_config::TcpReqConnAction::TrackSc2 { table, .. } => {
+                let slot = match &rule.action {
+                    ibex_config::TcpReqConnAction::TrackSc0 { .. } => 0,
+                    ibex_config::TcpReqConnAction::TrackSc1 { .. } => 1,
+                    _ => 2,
+                };
+                let own = proxy.id as usize;
+                let t_idx = table.as_ref().map_or(own, |tname| proxies.iter().position(|p| p.name == *tname).unwrap_or(own));
+                if let Some(slots) = tracked.as_deref_mut().filter(|s| s[slot].is_none()) {
+                    if let (Some(key), Some(tbl)) = (resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                        let _ = tbl.update_entry(&key, |data| data.track(true));
+                        stick.track(slot, t_idx, &key);
+                        slots[slot] = Some((t_idx, key));
+                    }
+                }
             }
             ibex_config::TcpReqConnAction::SetSrcPort { expr: _ } => {
                 if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
@@ -13948,111 +13912,45 @@ impl EngineDispatcher<'_> {
 
         let registry = sample_registry();
 
-        // 1. Stick table tracking from http_req_rules
-
-        // Only the `track-sc` rules read it: a proxy without one builds none (T584).
-        let has_track = resume.is_none()
-            && proxies[proxy_idx].http_req_rules.iter().any(|r| {
-                matches!(r.action, ibex_config::HttpReqAction::TrackSc0 { .. } | ibex_config::HttpReqAction::TrackSc1 { .. } | ibex_config::HttpReqAction::TrackSc2 { .. })
-            });
-        let track_view = ProxiesView(proxies);
-        let http_sample_ctx = if has_track {
-            if cfg!(debug_assertions) {
-                ibex_sample::work::note(ibex_sample::work::Op::TrackCtx, 1);
-            }
-            Some(SampleContext { phase: &ibex_sample::PhaseCtx {
-            proxies: Some(&track_view),
-            client_addr: entry.sess.client_addr,
-            server_addr: entry.sess.server_addr,
-            fc_src: entry.sess.fc_src(),
-            so_name: entry.sess.so_name.as_deref(),
-            so_id: entry.sess.so_id,
-            fc_dst: entry.sess.fc_dst(),
-            is_first_req: entry.sess.is_first_req,
-            proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
-            ssl_fc: crate::proxy::ssl_fc(&entry.sess.cli_xprt, entry.sess.h2_role.as_deref()),
-            quic_acks: entry.sess.quic_facts(),
-            fc_http_major: entry.sess.fc_http_major(),
-            bc_http_major: entry.sess.bc_http_major(),
-            req_version: entry.sess.client_version(),
-            ssl_bc: entry.sess.srv_xprt.ssl_facts(),
-            req_uri: entry.sess.req_uri.as_deref(),
-            req_method: entry.sess.req_method.as_deref(),
-            req_headers: entry.sess.req_headers.as_deref(),
-            // `track-sc0 req.hdr(x-key)` reads the request's HTX. Built from the fields
-            // rather than by `htx_slice()`, which would borrow the whole session while the
-            // rules below set its `tracked_sc`.
-            htx_slice: entry.sess.has_htx.then(|| ibex_proto::htx::HtxSliceRef::new(entry.sess.htx_buf.raw_slice(), entry.sess.htx_blocks)),
-            fe_name: Some(&proxies[proxy_idx].name),
-            fe_id: Some(proxies[proxy_idx].ids.iid),
-            act_conn: proxies[proxy_idx].counters().act_conn.load(Ordering::Relaxed),
-            unique_id: entry.sess.strm.log.unique_id.as_deref(),
-            accept_date: Some(entry.sess.strm.log.date()),
-            captures_req_hdr: Some(&entry.sess.strm.log.req_captures),
-            captures_res_hdr: Some(&entry.sess.strm.log.res_captures),
-            ..Default::default()
-            }, live: None })
-        } else {
-            None
-        };
-
-        // Only the `track-sc` rules: the condition of any other is evaluated once, in its turn
-        // below (S7: each was evaluated twice per request, its ACLs looked up by name).
-        let track_rules = proxies[proxy_idx].http_req_rules.iter().zip(&proxies[proxy_idx].rules.http_req).filter(|(r, _)| {
-            resume.is_none() && matches!(r.action, ibex_config::HttpReqAction::TrackSc0 { .. } | ibex_config::HttpReqAction::TrackSc1 { .. } | ibex_config::HttpReqAction::TrackSc2 { .. })
-        });
-        for (rule, rc) in track_rules {
-            let Some(http_sample_ctx) = http_sample_ctx.as_ref() else { break };
-            if !rc.cond.as_ref().is_none_or(|cond| cond.eval(http_sample_ctx, &proxies[proxy_idx].acls, registry)) {
-                continue;
-            }
-            match &rule.action {
-                ibex_config::HttpReqAction::TrackSc0 { table, expr: _ } => {
-                    let t_idx = if let Some(ref tname) = table {
-                        proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy_idx)
-                    } else {
-                        proxy_idx
-                    };
-                    if let Some(k) = resolve_stick_key(rc.expr.as_ref(), registry, http_sample_ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
-                        track_http_slot(proxies, &mut entry.sess.tracked_sc, 0, t_idx, k);
-                    }
-                }
-                ibex_config::HttpReqAction::TrackSc1 { table, expr: _ } => {
-                    let t_idx = if let Some(ref tname) = table {
-                        proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy_idx)
-                    } else {
-                        proxy_idx
-                    };
-                    if let Some(k) = resolve_stick_key(rc.expr.as_ref(), registry, http_sample_ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
-                        track_http_slot(proxies, &mut entry.sess.tracked_sc, 1, t_idx, k);
-                    }
-                }
-                ibex_config::HttpReqAction::TrackSc2 { table, expr: _ } => {
-                    let t_idx = if let Some(ref tname) = table {
-                        proxies.iter().position(|p| p.name == *tname).unwrap_or(proxy_idx)
-                    } else {
-                        proxy_idx
-                    };
-                    if let Some(k) = resolve_stick_key(rc.expr.as_ref(), registry, http_sample_ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
-                        track_http_slot(proxies, &mut entry.sess.tracked_sc, 2, t_idx, k);
-                    }
-                }
-                _ => {}
-            }
-        }
+        // The `track-sc` rules run in rule order with the others, in `eval_http_rules` below
+        // (`http-request track-sc*` is an ordinary action: an earlier `allow` or `deny` stops it, and
+        // an earlier rewrite is seen by its key and condition). A proxy without one pays nothing.
 
         // Count HTTP request into all active tracked slots, and credit them the bytes of the
-        // requests that are over.
+        // requests that are over. A slot that a `track-sc` rule of the frontend decides is
+        // counted where the rule runs (or, none having run, after the list): it still holds the
+        // entry of the previous request of the connection until then, which is not this one's.
+        let mut due = (0, 0);
+        let deferred: [bool; 3] = if resume.is_none() {
+            proxies[proxy_idx].http_req_rules.iter().fold([false; 3], |mut d, r| {
+                match r.action {
+                    ibex_config::HttpReqAction::TrackSc0 { .. } => d[0] = true,
+                    ibex_config::HttpReqAction::TrackSc1 { .. } => d[1] = true,
+                    ibex_config::HttpReqAction::TrackSc2 { .. } => d[2] = true,
+                    _ => {}
+                }
+                d
+            })
+        } else {
+            [false; 3]
+        };
         if resume.is_none() {
             // One update per slot: the request, and the bytes of the ones that are over.
             let (din, dout) = stick_bytes_due(&entry.sess, false);
+            due = (din, dout);
             entry.sess.stick_acct_in += din;
             entry.sess.stick_out_pending = 0;
-            for_tracked(proxies, &entry.sess, |data| {
-                data.count_request();
-                data.add_bytes(din, dout);
-            });
+            for (slot, tracked) in entry.sess.tracked_sc.iter().enumerate() {
+                let Some((t_idx, key)) = tracked.as_ref().filter(|_| !deferred[slot]) else { continue };
+                if let Some(table) = proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()) {
+                    let _ = table.update_entry(key, |data| {
+                        data.count_request();
+                        data.add_bytes(din, dout);
+                    });
+                }
+            }
         }
+        let counted = std::cell::Cell::new([false; 3]);
 
         let stick = StickView::new(proxies, &entry.sess.tracked_sc);
         let act_conn = proxies[proxy_idx].counters().act_conn.load(Ordering::Relaxed);
@@ -14738,7 +14636,46 @@ impl EngineDispatcher<'_> {
                             }
                         }
                     }
+                    ibex_config::HttpReqAction::TrackSc0 { table, .. } | ibex_config::HttpReqAction::TrackSc1 { table, .. } | ibex_config::HttpReqAction::TrackSc2 { table, .. } => {
+                        let slot = match &rule.action {
+                            ibex_config::HttpReqAction::TrackSc0 { .. } => 0,
+                            ibex_config::HttpReqAction::TrackSc1 { .. } => 1,
+                            _ => 2,
+                        };
+                        let t_idx = table.as_ref().map_or(pages_idx, |tname| proxies.iter().position(|p| p.name == *tname).unwrap_or(pages_idx));
+                        let key = resolve_stick_key(rc.expr.as_ref(), registry, &make_ctx!(sess), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()));
+                        if let Some(k) = key {
+                            let before = sess.tracked_sc[slot].clone();
+                            track_http_slot(proxies, &mut sess.tracked_sc, slot, t_idx, k.clone());
+                            // The request is counted in the entry the slot ends on, once.
+                            let mut c = counted.get();
+                            if before != sess.tracked_sc[slot] || (deferred[slot] && !c[slot]) {
+                                stick.track(slot, t_idx, &k);
+                                if let Some(table) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
+                                    let _ = table.update_entry(&k, |data| {
+                                        data.count_request();
+                                        data.add_bytes(due.0, due.1);
+                                    });
+                                }
+                                c[slot] = true;
+                                counted.set(c);
+                            }
+                        }
+                    }
                     _ => {}
+                }
+            }
+            // No `track-sc` rule of a slot ran (its condition did not hold): it keeps its entry, which counts the request.
+            if !be_stage {
+                let c = counted.get();
+                for (slot, tracked) in sess.tracked_sc.iter().enumerate() {
+                    let Some((t_idx, key)) = tracked.as_ref().filter(|_| deferred[slot] && !c[slot]) else { continue };
+                    if let Some(table) = proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()) {
+                        let _ = table.update_entry(key, |data| {
+                            data.count_request();
+                            data.add_bytes(due.0, due.1);
+                        });
+                    }
                 }
             }
             Ok(RuleFlow::Next)
