@@ -2538,6 +2538,17 @@ pub fn version_digits(ver: &[u8]) -> Option<u8> {
 mod tests {
     use super::*;
 
+    /// X4: a request state read over a buffer without its head skips the head; any other
+    /// state is as it is.
+    #[test]
+    fn past_head_skips_only_a_head() {
+        assert_eq!(MsgState::head(Framing::Length(3)).past_head(), MsgState::Body(Body::Length(3)));
+        assert_eq!(MsgState::head(Framing::None).past_head(), MsgState::Done);
+        let body = MsgState::Body(Body::Length(7));
+        assert_eq!(body.past_head(), body);
+        assert_eq!(MsgState::Tunnel.past_head(), MsgState::Tunnel);
+    }
+
     #[test]
     fn a_chunked_body_stops_at_its_trailer_section_to_hand_it_over() {
         let body = b"3\r\nabc\r\n0\r\nx-sum: 42\r\n\r\n";

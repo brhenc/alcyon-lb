@@ -18681,6 +18681,77 @@ mod add_req_connection_tests {
 }
 
 #[cfg(test)]
+mod pending_req_head_tests {
+    use super::*;
+    use crate::proxy::{H2ActiveStream, H2ReqBody};
+    use ibex_proto::mux_h2::{H2MuxContext, H2ReqHead};
+
+    /// A stream's session with `head` started on it (`h2_bridge::start_request`), its head in
+    /// its HTX alone (X4).
+    fn started(head: H2ReqHead, chunked: bool) -> (TcpSession, TcpSession, std::os::unix::net::UnixStream) {
+        let (a, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut owner = TcpSession::new(OwnedFd::from(a), Default::default(), 0, Tick(1000));
+        owner.h2_ctx = Some(Box::new(H2MuxContext::new(ibex_proto::ConnId(0), true)));
+        let stream = H2ActiveStream { id: 1, body: H2ReqBody { chunked, ..H2ReqBody::default() }, chunk_out: chunked };
+        let mut s = TcpSession::h2_child_of(&mut owner, (0, TaskRef::NONE), stream);
+        let d = crate::h2_bridge::H2Dispatch {
+            stream: H2ActiveStream { id: 1, body: H2ReqBody { chunked, ..H2ReqBody::default() }, chunk_out: chunked },
+            head: Box::new(head),
+            req_htx: 0,
+            request_line: None,
+            bad_request: false,
+            add_len: None,
+        };
+        crate::h2_bridge::start_request(&mut s, d);
+        assert!(s.req_head_pending && s.req.readable().is_empty());
+        (s, owner, peer)
+    }
+
+    /// A head larger than the free memory behind the body already in `req` is written through
+    /// a `Vec` grown until it fits, the body kept behind it.
+    #[test]
+    fn a_head_larger_than_the_room_behind_the_body_goes_in_front_of_it() {
+        let big = "v".repeat(6000);
+        let (mut s, _o, _p) = started(H2ReqHead::of("POST", "/", &[("host", "x"), ("x-big", &big), ("content-length", "3")]), false);
+        let free = s.req.writable().len();
+        s.req.writable()[..free].fill(b'b');
+        s.req.commit(free);
+        assert!(encode_if_modified(&mut s, false, None), "written by the encoder");
+        let want = format!("POST / HTTP/1.1\r\nhost: x\r\nx-big: {big}\r\ncontent-length: 3\r\n\r\n");
+        let data = s.req.readable();
+        assert_eq!(&data[..want.len()], want.as_bytes());
+        assert_eq!(data.len(), want.len() + free, "the body is kept behind the head");
+        assert!(!s.req_head_pending);
+    }
+
+    /// The engine never sends a head the encoder refuses (a rule's non-numeric
+    /// `content-length` is refused or dropped by `reread_request_framing` first); one that
+    /// gets here anyway goes as its blocks are, as an edited head did before X4, chunked when
+    /// the stream is. In free memory and through the grown `Vec` alike.
+    #[test]
+    fn a_head_the_encoder_refuses_goes_as_its_blocks_are() {
+        let big = "v".repeat(6000);
+        for (chunked, extra, fill) in [(false, None, false), (true, None, false), (false, Some(big.as_str()), true)] {
+            let mut fields = vec![("host", "x")];
+            fields.extend(extra.map(|v| ("x-big", v)));
+            let (mut s, _o, _p) = started(H2ReqHead::of("POST", "/", &fields), chunked);
+            s.with_htx_mut(|h| {
+                let _ = h.add_header("content-length", "x");
+            });
+            if fill {
+                let free = s.req.writable().len();
+                s.req.commit(free);
+            }
+            assert!(!encode_if_modified(&mut s, false, None), "{chunked} {fill}: refused by the encoder");
+            let head = String::from_utf8_lossy(s.req.readable()).into_owned();
+            assert!(head.starts_with("POST / HTTP/1.1\r\nhost: x\r\n"), "{head:.80}");
+            assert!(head.contains("content-length: x\r\n"), "{chunked} {fill}");
+            assert_eq!(head.contains("transfer-encoding: chunked\r\n"), chunked, "{chunked} {fill}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod stats_req_headers_tests {
     use super::*;
 
