@@ -40,6 +40,15 @@ const FRAME_W: i64 = 16384;
 const BIG_FRAMES: usize = 88;
 const SMALL_STREAMS: u32 = 99;
 const CONNS: usize = 3;
+/// The release test's `maxconn`. `global.maxsock` (`10 + listeners + 2 * maxconn + 3` = 135 at
+/// 60) is a ceiling on the descriptor *number* of a server socket, and once the backend accepts,
+/// the 300 streams open their connects as fast as the demux frees buffers: a backend that
+/// answers slowly (a loaded host) leaves ~130 open at once, so the next connects fail as
+/// `503 SC` (T614: HAProxy 3.5-dev8 does the same under load, 1 run in 40 at 4 hogs on 4 CPUs,
+/// 227 of 300 answered, peak 136 fds). That is the ceiling, not a held stream. 200 puts it at
+/// 435, above the 300 streams; the held-phase assertion (`held <= CONNS * 16`) is what tells
+/// a pending connect per stream, and it does not depend on `maxconn`.
+const RELEASE_MAXCONN: u32 = 200;
 
 fn frame(ftype: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     let len = u32::try_from(payload.len()).expect("frame payload fits in 24 bits");
@@ -140,6 +149,8 @@ struct Client {
     next: usize,
     stalled_since: Option<Instant>,
     answered: HashMap<u32, u8>,
+    /// The first bytes of each stream's response HEADERS block (to read a non-200 status).
+    heads: HashMap<u32, Vec<u8>>,
     reset: HashMap<u32, u32>,
     closed: bool,
 }
@@ -163,6 +174,7 @@ impl Client {
             next: 0,
             stalled_since: None,
             answered: HashMap::new(),
+            heads: HashMap::new(),
             reset: HashMap::new(),
             closed: false,
         }
@@ -216,6 +228,7 @@ impl Client {
                 1 => {
                     // The first byte of the block: 0x88 is `:status 200` from the static table.
                     self.answered.entry(sid).or_insert(p.first().copied().unwrap_or(0));
+                    self.heads.entry(sid).or_insert_with(|| p.iter().take(8).copied().collect());
                 }
                 3 if p.len() >= 4 => {
                     self.reset.insert(sid, u32::from_be_bytes([p[0], p[1], p[2], p[3]]));
@@ -315,7 +328,7 @@ impl Drop for Proxy {
 
 /// The proxy, with the h2 bind, the h1 bind, `/slow` to `hung` and the rest to a backend
 /// that answers.
-fn start(hung: SocketAddr, defaults_extra: &str) -> (Proxy, u32, u16, u16) {
+fn start(hung: SocketAddr, defaults_extra: &str, maxconn: u32) -> (Proxy, u32, u16, u16) {
     let ok = ok_backend();
     let (h2, h1) = (common::reserve_port(), common::reserve_port());
     let dir = tempfile::TempDir::new().expect("dir");
@@ -323,7 +336,7 @@ fn start(hung: SocketAddr, defaults_extra: &str) -> (Proxy, u32, u16, u16) {
     std::fs::write(
         &cfg,
         format!(
-            "global\n\tnbthread 1\n\tmaxconn 60\n\n\
+            "global\n\tnbthread 1\n\tmaxconn {maxconn}\n\n\
              defaults\n\tmode http\n\ttimeout client 60s\n\ttimeout server 60s\n\t{defaults_extra}\n\n\
              frontend fe\n\tbind 127.0.0.1:{h2} proto h2\n\tbind 127.0.0.1:{h1}\n\
              \tuse_backend slow if {{ path_beg /slow }}\n\tdefault_backend ok\n\n\
@@ -344,7 +357,7 @@ fn start(hung: SocketAddr, defaults_extra: &str) -> (Proxy, u32, u16, u16) {
 #[test]
 fn streams_waiting_for_a_connect_hold_the_demux_not_an_fd_each() {
     let (hung, hung_addr, filler) = full_listener();
-    let (proxy, pid, h2, h1) = start(hung_addr, "timeout connect 30s");
+    let (proxy, pid, h2, h1) = start(hung_addr, "timeout connect 30s", RELEASE_MAXCONN);
     let _proxy = proxy;
     let idle = fds(pid);
 
@@ -390,6 +403,13 @@ fn streams_waiting_for_a_connect_hold_the_demux_not_an_fd_each() {
     for b in clients.iter().flat_map(|c| c.answered.values()) {
         *statuses.entry(*b).or_insert(0usize) += 1;
     }
+    for (n, c) in clients.iter().enumerate() {
+        for (sid, h) in &c.heads {
+            if h[0] != 0x88 {
+                eprintln!("released: conn {n} stream {sid} head {h:02x?}");
+            }
+        }
+    }
     let unfinished = clients.iter().filter(|c| !c.done()).count();
     eprintln!("released: first header bytes {statuses:x?}; connections not done {unfinished}");
 
@@ -408,7 +428,7 @@ fn streams_waiting_for_a_connect_hold_the_demux_not_an_fd_each() {
 #[test]
 fn streams_whose_connect_fails_give_their_buffers_back() {
     let (_hung, hung_addr, _filler) = full_listener();
-    let (proxy, _pid, h2, _) = start(hung_addr, "timeout connect 300ms\n\tretries 0");
+    let (proxy, _pid, h2, _) = start(hung_addr, "timeout connect 300ms\n\tretries 0", 60);
     let _proxy = proxy;
     let mut c = Client::new(h2);
     let end = Instant::now() + Duration::from_secs(30);
@@ -431,7 +451,7 @@ fn streams_whose_connect_fails_give_their_buffers_back() {
 /// connections closed).
 fn hold(extra: &str, secs: u64) -> (usize, usize, usize) {
     let (_hung, hung_addr, _filler) = full_listener();
-    let (proxy, pid, h2, _) = start(hung_addr, extra);
+    let (proxy, pid, h2, _) = start(hung_addr, extra, 60);
     let _proxy = proxy;
     let idle = fds(pid);
     let mut clients: Vec<Client> = (0..CONNS).map(|_| Client::new(h2)).collect();

@@ -752,11 +752,16 @@ fn a_response_body_that_does_not_come_in_time_is_a_504() {
     let line = log_line_of(&logs, "GET /x");
     assert!(line.contains(" 504 ") && line.contains(" sH-- "), "{line}");
 
-    let (_j, fe) = start(&res_cfg("http-response wait-for-body time 300ms at-least 5"), part, Some(log));
+    // `time 3s`, not 300 ms: "answers at once" is "does not wait for the timer", and a bound of
+    // 250 ms on a 300 ms timer failed on a loaded host (T614, gate runs: the answer took >250 ms
+    // to come back through a busy machine). With 3 s the server's own 1.5 s pause also sits
+    // between "at once" and a wait, and 1 s stays well under both. HAProxy releases a response
+    // as soon as `at-least` bytes are here, whatever `time` is.
+    let (_j, fe) = start(&res_cfg("http-response wait-for-body time 3s at-least 5"), part, Some(log));
     let (resp, first) = get(fe, Duration::from_millis(1200));
     assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
     assert_eq!(res_header(&resp, "x-len").as_deref(), Some("5"), "{resp}");
-    assert!(first.expect("answer") < Duration::from_millis(250));
+    assert!(first.expect("answer") < Duration::from_millis(1000));
     let (_k, fe) = start(&res_cfg("http-response wait-for-body time 300ms at-least 6"), part, Some(log));
     let (resp, _) = get(fe, Duration::from_millis(1200));
     assert!(resp.starts_with("HTTP/1.1 504"), "{resp}");
