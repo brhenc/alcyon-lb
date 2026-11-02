@@ -342,7 +342,7 @@ fn queued_request_is_served_when_the_slot_frees() {
     // a 5 s `timeout queue`.
     let be = backend(Be::Slow);
     let t = "  timeout connect 1500ms\n  timeout client 10s\n  timeout server 10s\n  timeout queue 5s\n";
-    let (gap, status) = with_ibex(t, "http", "", be, |fe, _| {
+    let (gap, status, a_status) = with_ibex(t, "http", "", be, |fe, _| {
         let mut a = TcpStream::connect(fe).expect("a");
         a.write_all(b"GET /a HTTP/1.1\r\nHost: t\r\n\r\n").expect("a");
         // When the first answer reaches us: the slot frees then. Both instants are taken in
@@ -358,7 +358,7 @@ fn queued_request_is_served_when_the_slot_frees() {
                         _ => break,
                     }
                 }
-                Instant::now()
+                (Instant::now(), String::from_utf8_lossy(&r).lines().next().unwrap_or("").to_string())
             })
         };
         thread::sleep(Duration::from_millis(200));
@@ -374,14 +374,16 @@ fn queued_request_is_served_when_the_slot_frees() {
             }
         }
         let b_done = Instant::now();
-        let a_done = a_done.join().expect("a reader");
+        let (a_done, a_status) = a_done.join().expect("a reader");
         let _ = a.shutdown(std::net::Shutdown::Both);
-        (
-            b_done.saturating_duration_since(a_done),
-            String::from_utf8_lossy(&r).lines().next().unwrap_or("").to_string(),
-        )
+        // Which of the two took the slot is the proxy's order of work, not the test's: the
+        // requests are 200 ms apart, and a loaded host can hand ibex both in one pass, `/b` first
+        // (T614: a gap of 0 ns, B answered before A). Whichever came second waited behind the
+        // other, so the distance between the two answers is what is measured.
+        let gap = if b_done > a_done { b_done - a_done } else { a_done - b_done };
+        (gap, String::from_utf8_lossy(&r).lines().next().unwrap_or("").to_string(), a_status)
     });
-    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert_eq!((status.as_str(), a_status.as_str()), ("HTTP/1.1 200 OK", "HTTP/1.1 200 OK"));
     // The second request only goes to the server once the first one's answer has left, and
     // then the backend takes its own 2 s: it cannot be answered sooner than that after the
     // first, and a request that waited out the 5 s `timeout queue` would have been a 503.
