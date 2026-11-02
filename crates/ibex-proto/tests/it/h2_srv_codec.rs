@@ -908,7 +908,9 @@ fn the_response_head_index_is_the_checks_of_the_bytes_written() {
         ("299", vec![], true),
         ("200", many, false),
     ];
+    // 31 fields and the codec's own `transfer-encoding` fill the index; 32 and it overflow it.
     cases.push(("200", (0..31).map(|i| (format!("x-f{i}"), "v".to_string())).collect(), true));
+    cases.push(("200", (0..32).map(|i| (format!("x-f{i}"), "v".to_string())).collect(), false));
     for (status, fields, indexed) in cases {
         let mut c = ready();
         let _ = request(&mut c, b"GET / HTTP/1.1\r\nhost: x\r\n\r\n");

@@ -3776,11 +3776,9 @@ impl TcpSession {
         self.htx_modified = false;
         // Nothing of the head went (the text is written before it goes): its length is read
         // again from the head written, not the one it replaces.
-        if let Some(t) = self.strm.txn.as_mut() {
-            if let txn::MsgState::Head { body, .. } = t.req {
-                t.req = txn::MsgState::head(body);
-            }
-        }
+        // (A deferred head is one of a transaction whose head is still to send.)
+        debug_assert!(self.strm.txn.as_ref().is_some_and(|t| matches!(t.req, txn::MsgState::Head { .. })));
+        if let Some(t) = self.strm.txn.as_mut() { if let txn::MsgState::Head { body, .. } = t.req { t.req = txn::MsgState::head(body); } }
         if lower {
             self.req.edit_keeping_lines(|head, eoh| crate::engine::rewrite_header_names_before(head, eoh, None, true));
         }
