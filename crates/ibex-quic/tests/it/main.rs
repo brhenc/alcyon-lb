@@ -11,6 +11,7 @@
 //! a test file no target compiles.
 
 mod quic_transport_tests;
+mod config_windows;
 mod dependency_graph;
 mod quic_resumption;
 mod stack_scrub;

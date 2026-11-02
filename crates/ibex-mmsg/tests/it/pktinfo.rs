@@ -67,3 +67,24 @@ fn ipv6_reports_the_destination_the_client_aimed_at() {
          checking the wrong constant leaves dst_addr None forever"
     );
 }
+
+/// A control buffer too small for the whole pktinfo (T611 / #1): the kernel cuts the message
+/// short (`MSG_CTRUNC`, `cmsg_len` below `CMSG_LEN(size_of::<in_pktinfo>())`), and the
+/// reader must not take the missing bytes as an address. The 8 bytes past the slice are 0xAA
+/// so that reading them shows.
+#[test]
+fn a_truncated_pktinfo_control_message_gives_no_destination() {
+    #[repr(align(8))]
+    struct Aligned([u8; 40]);
+    let server = UdpSocket::bind("127.0.0.1:0").expect("bind v4");
+    set_ip_pktinfo(server.as_fd(), true).expect("IP_PKTINFO");
+    let addr = server.local_addr().expect("addr");
+    UdpSocket::bind("127.0.0.1:0").expect("client").send_to(b"probe", addr).expect("send");
+
+    let mut buf = [0u8; 64];
+    let mut ctl = Aligned([0xAA; 40]);
+    let mut msgs = vec![RecvMsg::new(&mut buf, &mut ctl.0[..24])];
+    let n = recvmmsg(server.as_fd(), &mut msgs).expect("recvmmsg");
+    assert_eq!(n, 1);
+    assert_eq!(msgs[0].dst_addr, None);
+}

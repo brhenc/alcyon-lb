@@ -275,6 +275,16 @@ impl Resolver {
         }
     }
 
+    /// Names the `do-resolve` cache keeps at most.
+    pub const CACHE_MAX: usize = 4096;
+
+    /// Names in the `do-resolve` cache (tests).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cached_names(&self) -> usize {
+        self.cache.len()
+    }
+
     /// Starts a resolution of `name`. A `DoResolve` query inside `hold valid` of a valid
     /// answer is answered from the cache. The query is sent by the next [`Self::poll_transmit`].
     ///
@@ -444,8 +454,19 @@ impl Resolver {
             Verdict::Valid(answers) => {
                 let f = self.in_flight.remove(idx);
                 if !self.cfg.hold_valid.is_zero() {
-                    let slot = self.cache.entry(f.name).or_default();
-                    *slot.get(f.question == Question::Srv) = Some((answers.clone(), now + self.cfg.hold_valid));
+                    // The names come from a sample expression: a full cache first drops what
+                    // has expired, and keeps nothing new when none has.
+                    if self.cache.len() >= Self::CACHE_MAX && !self.cache.contains_key(&f.name) {
+                        self.cache.retain(|_, s| {
+                            s.addr.take_if(|c| c.1 <= now);
+                            s.srv.take_if(|c| c.1 <= now);
+                            s.addr.is_some() || s.srv.is_some()
+                        });
+                    }
+                    if self.cache.len() < Self::CACHE_MAX || self.cache.contains_key(&f.name) {
+                        let slot = self.cache.entry(f.name).or_default();
+                        *slot.get(f.question == Question::Srv) = Some((answers.clone(), now + self.cfg.hold_valid));
+                    }
                 }
                 self.results.push_back((f.id, Ok(answers)));
                 return Received::Valid;

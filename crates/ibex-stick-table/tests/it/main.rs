@@ -10,5 +10,7 @@
 //! own `[[test]]` in Cargo.toml and says why in its header. `harness/test_layout.py` fails on
 //! a test file no target compiles.
 
+mod evict_tracked;
 mod proptest_sliding_rate;
 mod proptest_stick_table;
+
