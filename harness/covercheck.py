@@ -14,6 +14,12 @@ All four are the same question -- did a test run the lines you changed? -- and t
 is mechanical. This answers it.
 
 Usage:  python3 harness/covercheck.py [base]
+        python3 harness/covercheck.py --tests <crate>:<target>[:<filter>] ... [base]
+
+The second form (T609) is for an agent before it reports: it builds only the named crates
+(and the changed ones) into the caller's own $CARGO_TARGET_DIR, runs only the selected tests
+(and the changed crates' lib unit tests), and lists the changed lines none of them ran, as
+candidates. Advisory: exit 0. It takes no gate or load lock; run it under `nice -n 19`.
 
 The base is what a change is judged against (`default_base`): `[base]`, else
 `IBEX_COVERCHECK_BASE` (or the older `COVERCHECK_BASE`), else the same rule as
@@ -130,12 +136,65 @@ def _llvm_env() -> dict:
     return env
 
 
-def covered(paths: set[str]) -> tuple[dict[str, set[int]], dict[str, set[int]]] | None:
+def parse_specs(args: list[str]) -> list[tuple[str, str, str]]:
+    """`<crate>:<test target>[:<filter>]` -> (crate, target, filter). The filter is a
+    substring of the test's name, as `cargo test <filter>` takes it, and may hold colons."""
+    specs = []
+    for a in args:
+        crate, _, rest = a.partition(":")
+        target, _, filt = rest.partition(":")
+        if not crate or not target:
+            raise SystemExit(f"covercheck: --tests {a!r}: want <crate>:<test target>[:<filter>]")
+        specs.append((crate, target, filt))
+    return specs
+
+
+def selector(specs: list[tuple[str, str, str]], changed_crates: set[str]):
+    """The tests the scoped run keeps: those the specs name, and the lib unit tests of the
+    crates the change touched."""
+    def select(pkg: str, target: str, test: str) -> bool:
+        if target == "lib" and pkg in changed_crates:
+            return True
+        return any(pkg == c and target == t and f in test for c, t, f in specs)
+    return select
+
+
+def scoped_packages(specs, changed: dict[str, set[int]], repo: str = REPO
+                    ) -> tuple[list[str], set[str]]:
+    """(packages to build, changed crates' package names): the crates the specs name, then
+    the changed ones (the name in `crates/<dir>/Cargo.toml`)."""
+    changed_crates = set()
+    for path in changed:
+        m = re.match(r"crates/([^/]+)/", path)
+        if not m:
+            continue
+        try:
+            toml = open(os.path.join(repo, "crates", m.group(1), "Cargo.toml")).read()
+        except OSError:
+            continue
+        n = re.search(r'^name\s*=\s*"([^"]+)"', toml, re.M)
+        if n:
+            changed_crates.add(n.group(1))
+    build = []
+    for name in [c for c, _, _ in specs] + sorted(changed_crates):
+        if name not in build:
+            build.append(name)
+    return build, changed_crates
+
+
+# Set by scoped runs (`--tests`) for `run_pooled`: (select, packages), or None for the full run.
+_scope = None
+
+
+def covered(paths: set[str], scope=None) -> tuple[dict[str, set[int]], dict[str, set[int]]] | None:
+    """`scope`: (select, packages) of a scoped run, else the whole suite runs."""
+    global _scope
+    _scope = scope
     if os.path.exists(LCOV):
         os.unlink(LCOV)
     _wanted.clear()
     _wanted.update(paths)
-    ok = run_serial() if os.environ.get("COVERCHECK_SERIAL") == "1" else run_pooled()
+    ok = run_serial() if os.environ.get("COVERCHECK_SERIAL") == "1" and scope is None else run_pooled()
     if not ok:
         return None
     if not os.path.exists(LCOV):
@@ -229,8 +288,16 @@ def run_pooled() -> bool:
     os.environ.update(env)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import suite  # noqa: E402 -- reads os.environ when it runs, not when imported
-    rec = suite_run_reusable(tdir, suite)
-    if rec is not None:
+    scope = _scope
+    # A scoped run never reuses the suite section's profiles: they are of another selection.
+    rec = None if scope else suite_run_reusable(tdir, suite)
+    if scope:
+        clear_profiles(tdir)
+        select, packages = scope
+        print(f"covercheck: scoped: building {', '.join(packages)} and running the selected "
+              f"tests instrumented, {suite.JOBS} at a time", flush=True)
+        r = suite.run_parallel(doc=False, select=select, packages=packages)
+    elif rec is not None:
         print("covercheck: using the profiles of the suite section's run (no second build or run)",
               flush=True)
         failed_tests = rec.get("failed", {})
@@ -255,7 +322,8 @@ def run_pooled() -> bool:
         print(f"covercheck: removed {stale} test binaries an earlier build left in deps/")
     profraws = sum(f.endswith(".profraw") for f in os.listdir(tdir))
     binaries = _test_binaries(os.path.join(tdir, "debug", "deps"))
-    if not enough_profiles(profraws, binaries):
+    # A scoped run executes few of the binaries deps/ holds, so the ratio says nothing there.
+    if not scope and not enough_profiles(profraws, binaries):
         print(f"covercheck: only {profraws} profiles written by {binaries} test binaries: the "
               "build was not instrumented, so this report cannot judge anything")
         return False
@@ -538,11 +606,33 @@ def print_env() -> int:
     return 0
 
 
+def misses(changed: dict[str, set[int]], execd: dict[str, set[int]],
+           hitmap: dict[str, set[int]]) -> dict[str, list[int]]:
+    """The changed lines the compiler instrumented that no test executed, by file."""
+    m = {f: sorted((ls & execd.get(f, set())) - hitmap.get(f, set())) for f, ls in changed.items()}
+    return {f: ls for f, ls in m.items() if ls}
+
+
 def main() -> int:
-    if sys.argv[1:] == ["--print-env"]:
+    argv = sys.argv[1:]
+    if argv == ["--print-env"]:
         return print_env()
-    if len(sys.argv) > 1:
-        base = default_base(REPO, {"IBEX_COVERCHECK_BASE": sys.argv[1]})
+    tests: list[str] = []
+    rest: list[str] = []
+    it = iter(argv)
+    for a in it:
+        if a == "--tests":
+            tests.append(next(it, ""))
+        elif a.startswith("--tests="):
+            tests.append(a[len("--tests="):])
+        else:
+            rest.append(a)
+    specs = parse_specs(tests)
+    scoped = bool(tests)
+    if len(rest) > 1 or any(a.startswith("-") for a in rest):
+        raise SystemExit("usage: covercheck.py [--tests <crate>:<target>[:<filter>] ...] [base]")
+    if rest:
+        base = default_base(REPO, {"IBEX_COVERCHECK_BASE": rest[0]})
     else:
         base = default_base()
     desc = _git(REPO, "log", "-1", "--format=%h %s", base).stdout.strip()
@@ -556,26 +646,44 @@ def main() -> int:
     print(f"covercheck: {total} source lines changed in {len(changed)} files"
           f" since {base[:12]}")
 
-    result = covered(set(changed))
+    if scoped:
+        packages, changed_crates = scoped_packages(specs, changed)
+        result = covered(set(changed), (selector(specs, changed_crates), packages))
+    else:
+        result = covered(set(changed))
     if result is None:
-        return 1  # hung: a gate that cannot finish has not passed
+        # Full: a gate that cannot finish has not passed. Scoped: advisory, but say so.
+        if scoped:
+            print("covercheck: scoped run produced no verdict (see above)")
+            return 0
+        return 1
     execd, hitmap = result
     if not execd:
         return 0  # reported above; an unavailable tool is not a gate failure
 
     # Only judge lines the compiler actually instrumented.
-    misses = {f: sorted((ls & execd.get(f, set())) - hitmap.get(f, set()))
-              for f, ls in changed.items()}
-    misses = {f: ls for f, ls in misses.items() if ls}
+    missed = misses(changed, execd, hitmap)
     executable = sum(len(ls & execd.get(f, set())) for f, ls in changed.items())
-    hit = executable - sum(len(v) for v in misses.values())
+    hit = executable - sum(len(v) for v in missed.values())
+    if scoped:
+        print(f"covercheck: {hit}/{executable} executable changed lines are executed by the "
+              f"selected tests  ({total} changed, {total - executable} not executable)")
+        if missed:
+            print("covercheck: changed lines NO selected test executes")
+        for f, ls in sorted(missed.items()):
+            shown = ", ".join(str(x) for x in ls[:12]) + (" ..." if len(ls) > 12 else "")
+            print(f"   {f}: {shown}")
+        n = sum(len(v) for v in missed.values())
+        print(f"covercheck: candidates: {n} lines; a line run only by a test outside the "
+              "selection shows here too, the gate decides")
+        return 0
     print(f"covercheck: {hit}/{executable} executable changed lines are executed by a test"
           f"  ({total} changed, {total - executable} not executable)")
-    if not misses:
+    if not missed:
         print("covercheck: clean")
         return 0
     print("covercheck: changed lines NO test executes")
-    for f, ls in sorted(misses.items()):
+    for f, ls in sorted(missed.items()):
         shown = ", ".join(str(x) for x in ls[:12]) + (" ..." if len(ls) > 12 else "")
         print(f"   {f}: {shown}")
     return 1

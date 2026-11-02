@@ -544,5 +544,103 @@ class ReportObjects(unittest.TestCase):
                          [built])
 
 
+class ScopedMode(unittest.TestCase):
+    """T609: `covercheck.py --tests <crate>:<target>[:<filter>]` judges the changed lines by
+    the selected tests only, prints the candidates and always exits 0 (advisory)."""
+
+    def test_a_spec_is_crate_target_and_filter(self):
+        self.assertEqual(covercheck.parse_specs(["ibex-rt:it:htx_primary::", "ibex-proto:it"]),
+                         [("ibex-rt", "it", "htx_primary::"), ("ibex-proto", "it", "")])
+
+    def test_a_filter_may_hold_colons(self):
+        self.assertEqual(covercheck.parse_specs(["a:it:m::t"]), [("a", "it", "m::t")])
+
+    def test_a_malformed_spec_is_refused(self):
+        for bad in ("ibex-rt", ":it", "ibex-rt:", ""):
+            with self.assertRaises(SystemExit, msg=bad):
+                covercheck.parse_specs([bad])
+
+    def test_the_selector_takes_the_named_target_and_filter_only(self):
+        sel = covercheck.selector(covercheck.parse_specs(["c:it:m::"]), {"d"})
+        self.assertTrue(sel("c", "it", "m::t1"))
+        self.assertFalse(sel("c", "it", "other::t1"))
+        self.assertFalse(sel("c", "wire", "m::t1"))
+        self.assertFalse(sel("x", "it", "m::t1"))
+
+    def test_the_changed_crates_lib_unit_tests_are_selected_too(self):
+        sel = covercheck.selector(covercheck.parse_specs(["c:it:m::"]), {"d"})
+        self.assertTrue(sel("d", "lib", "anything"))
+        self.assertFalse(sel("d", "it", "anything"))
+
+    def test_the_packages_built_are_the_selected_and_the_changed_ones(self):
+        r = Repo()
+        try:
+            r.write("crates/x/Cargo.toml", '[package]\nname = "ibex-x"\nversion = "0.1.0"\n')
+            self.assertEqual(
+                covercheck.scoped_packages(covercheck.parse_specs(["c:it:"]),
+                                           {"crates/x/src/lib.rs": {1}}, r.path),
+                (["c", "ibex-x"], {"ibex-x"}))
+        finally:
+            r.close()
+
+    def test_candidates_are_changed_executable_lines_no_selected_test_ran(self):
+        changed = {"crates/x/src/lib.rs": {1, 2, 3, 4}}
+        execd = {"crates/x/src/lib.rs": {1, 2, 3}}   # line 4 is not executable code
+        hit = {"crates/x/src/lib.rs": {1}}
+        self.assertEqual(covercheck.misses(changed, execd, hit), {"crates/x/src/lib.rs": [2, 3]})
+
+    def run_main(self, argv, report):
+        import io
+        from contextlib import redirect_stdout
+        saved = (sys.argv, covercheck.changed_lines, covercheck.covered, covercheck.default_base)
+        covercheck.changed_lines = lambda base, repo=covercheck.REPO: {"crates/x/src/lib.rs": {2, 3}}
+        covercheck.covered = lambda paths, scope=None: report
+        covercheck.default_base = lambda *a, **k: "0" * 40
+        sys.argv = ["covercheck.py", *argv]
+        out = io.StringIO()
+        try:
+            with redirect_stdout(out):
+                rc = covercheck.main()
+        finally:
+            sys.argv, covercheck.changed_lines, covercheck.covered, covercheck.default_base = saved
+        return rc, out.getvalue()
+
+    def test_a_selection_that_misses_a_line_lists_it_and_exits_0(self):
+        rc, out = self.run_main(["--tests", "c:it:m::"],
+                                ({"crates/x/src/lib.rs": {2, 3}}, {"crates/x/src/lib.rs": {2}}))
+        self.assertEqual(rc, 0)
+        self.assertIn("crates/x/src/lib.rs: 3", out)
+        self.assertIn("candidates: 1 lines; a line run only by a test outside the selection "
+                      "shows here too, the gate decides", out)
+
+    def test_a_selection_that_runs_every_line_has_no_candidate(self):
+        rc, out = self.run_main(["--tests", "c:it:m::"],
+                                ({"crates/x/src/lib.rs": {2, 3}}, {"crates/x/src/lib.rs": {2, 3}}))
+        self.assertEqual(rc, 0)
+        self.assertIn("candidates: 0 lines", out)
+        self.assertNotIn("crates/x/src/lib.rs: ", out)
+
+    def test_the_full_mode_still_exits_1_on_a_miss(self):
+        rc, out = self.run_main([], ({"crates/x/src/lib.rs": {2, 3}}, {"crates/x/src/lib.rs": {2}}))
+        self.assertEqual(rc, 1)
+        self.assertIn("covercheck: changed lines NO test executes", out)
+        self.assertNotIn("candidates:", out)
+
+    def test_the_full_mode_is_clean_when_every_line_ran(self):
+        rc, out = self.run_main([], ({"crates/x/src/lib.rs": {2, 3}}, {"crates/x/src/lib.rs": {2, 3}}))
+        self.assertEqual(rc, 0)
+        self.assertIn("covercheck: clean", out)
+
+    def test_a_base_may_still_be_given_beside_tests(self):
+        rc, out = self.run_main(["--tests", "c:it", "HEAD"],
+                                ({"crates/x/src/lib.rs": {2, 3}}, {"crates/x/src/lib.rs": {2, 3}}))
+        self.assertEqual(rc, 0)
+
+    def test_scoped_mode_takes_no_gate_lock(self):
+        src = open(covercheck.__file__).read()
+        self.assertNotIn("ibex-gate", src)
+        self.assertNotIn("ibex-load.lock", src)
+
+
 if __name__ == "__main__":
     unittest.main()

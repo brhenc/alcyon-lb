@@ -241,9 +241,10 @@ built_executables: set[str] = set()
 build_fresh = False
 
 
-def test_targets() -> list[tuple[str, str, list[str], str, dict]] | None:
+def test_targets(packages: list[str] | None = None) -> list[tuple[str, str, list[str], str, dict]] | None:
     """Builds every test target and lists them: (package, target, selector args for `cargo
-    test`, executable, the package's metadata).
+    test`, executable, the package's metadata). `packages` (T609, scoped covercheck) builds
+    only those packages' tests, not the workspace's.
 
     `None` when the build fails (the caller reports it, as the serial run would)."""
     meta = json.loads(subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1"],
@@ -251,7 +252,8 @@ def test_targets() -> list[tuple[str, str, list[str], str, dict]] | None:
     pkgs = {p["manifest_path"]: p for p in meta["packages"]}
     say("suite: building the tests")
     t0 = time.monotonic()
-    p = subprocess.run(["cargo", "test", "--workspace", "--no-run", "--message-format=json"],
+    scope = [a for n in packages for a in ("-p", n)] if packages else ["--workspace"]
+    p = subprocess.run(["cargo", "test", *scope, "--no-run", "--message-format=json"],
                        cwd=REPO, capture_output=True, text=True)
     say(f"suite: built in {time.monotonic() - t0:.0f}s")
     if p.returncode != 0:
@@ -327,16 +329,23 @@ def list_jobs(targets) -> list[tuple]:
         return [j for js in pool.map(one, targets) for j in js]
 
 
-def run_parallel(doc: bool = True) -> tuple[list[tuple], dict[str, set[str]], int, int] | None:
+def run_parallel(doc: bool = True, select=None, packages: list[str] | None = None
+                 ) -> tuple[list[tuple], dict[str, set[str]], int, int] | None:
     """Runs every test, each in its own process, `JOBS` at once. Returns the failing jobs
     (package, target, test, command, cwd, env), the failing tests of each target (keyed by
     target), and the totals of tests passed and failed. `doc=False` leaves the doc tests out
-    (covercheck: `cargo llvm-cov` does not instrument them)."""
-    targets = test_targets()
+    (covercheck: `cargo llvm-cov` does not instrument them). `select(package, target, test)`
+    keeps only the tests it accepts and `packages` builds only those packages (T609: the
+    scoped covercheck an agent runs on its own target directory)."""
+    targets = test_targets(packages)
     if targets is None:
         print("suite: the workspace's tests do not build")
         return None
     jobs = list_jobs(targets)
+    if select is not None:
+        jobs = [j for j in jobs if select(j[0], j[1], j[2])]
+        if not jobs:
+            say("suite: the selection matches no test (check the <crate>:<target>:<filter> spelling)")
     if doc:
         jobs.append(("workspace", "doc", "<doc>", ["cargo", "test", "--workspace", "--doc", "--no-fail-fast"],
                      REPO, doc_env()))
