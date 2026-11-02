@@ -9,7 +9,7 @@
 
 use crate::h2::HeadFacts;
 use crate::htx::{Htx, RxHead};
-use crate::mux_h2::H2ReqHead;
+use crate::h2::TextHead;
 
 /// Why the data path resets a stream, in each protocol's code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,12 +36,12 @@ pub trait HtxStream {
     fn rx_buffered(&self) -> usize;
     /// Reset by the client or by the mux.
     fn is_reset(&self) -> bool;
-    /// The request head as its checked fields (T437, E1), until the data path takes it.
-    fn req_head(&self) -> Option<&H2ReqHead>;
-    fn take_req_fields(&mut self) -> Option<Box<H2ReqHead>>;
+    /// The request head the HTTP/1 checks refuse, as the text it goes out as, until the data
+    /// path takes it.
+    fn take_text_head(&mut self) -> Option<Box<TextHead>>;
     /// CP2b: the request head as the HTX blocks the mux wrote into the memory the stream's
     /// buffer adopts, what the writer said of them and the length of the `scheme://authority`
-    /// after them; `None` for a head kept as its fields.
+    /// after them; `None` for a head kept as text ([`Self::take_text_head`]).
     fn take_rx_head(&mut self) -> Option<(RxHead, HeadFacts, usize)>;
     /// No memory could be had for the head's blocks: the stream is answered 500 (S5).
     fn no_memory(&self) -> bool;
@@ -63,8 +63,6 @@ pub trait HtxMux {
     /// The lowest stream with its whole head that no child serves yet, if one may be
     /// served now.
     fn next_dispatch(&self) -> Option<u64>;
-    /// A head the data path took ([`HtxStream::take_req_fields`]), for the next streams.
-    fn give_back_head(&mut self, head: Box<H2ReqHead>);
     /// A DATA block's bytes the data path wrote out whole, for the next DATA frame (h3: a
     /// pool, T512); an
     /// implementation without a pool drops it.

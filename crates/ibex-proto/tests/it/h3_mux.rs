@@ -106,7 +106,7 @@ fn a_get_becomes_a_head_and_the_end_of_the_message() {
     assert_eq!(st.state, H3StreamState::HalfClosedRemote);
     assert_eq!(st.known_body, Some(0), "FIN with the head: bodyless");
     // CP2b: the head is the blocks the mux wrote, no fields.
-    assert!(st.req_head().is_none() && !st.no_memory);
+    assert!(st.text_head.is_none() && !st.no_memory);
     let head = st.request_htx().expect("head");
     let line = head.req_line().expect("start line");
     assert_eq!((line.method, line.uri), ("GET", "/plain"));
@@ -625,7 +625,7 @@ fn the_trait_serves_a_stream_as_the_bridge_will() {
         let id = m.next_dispatch()?;
         let st = m.stream_mut(id)?;
         st.set_dispatched();
-        assert!(st.take_req_fields().is_none() && !st.no_memory());
+        assert!(st.take_text_head().is_none() && !st.no_memory());
         let (rx, facts, abs_len) = st.take_rx_head()?;
         assert!(st.take_rx_head().is_none());
         assert!(!st.is_reset() && !st.bad_request() && st.rx_buffered() == 0);
@@ -802,11 +802,11 @@ fn a_head_from_its_fields_is_the_head_from_its_text() {
     assert_eq!(m.tx_bytes(0), &before[..]);
 }
 
-/// CP2b: no memory for the head's blocks keeps it as its fields and flags the stream, which
+/// CP2b: no memory for the head's blocks flags the stream, which
 /// the data path answers 500 (S5); the connection goes on and the next stream is written as
 /// blocks.
 #[test]
-fn no_memory_for_a_head_keeps_its_fields_and_flags_the_stream() {
+fn no_memory_for_a_head_flags_the_stream() {
     fn none(_: usize) -> Option<ibex_proto::htx::RxHead> {
         None
     }
@@ -815,27 +815,26 @@ fn no_memory_for_a_head_keeps_its_fields_and_flags_the_stream() {
     m.recv(0, &headers(GET), true, 0).expect("request");
     let st = m.stream_mut(0).expect("stream");
     assert!(st.no_memory() && st.request_htx().is_none() && st.take_rx_head().is_none());
-    let head = st.take_req_fields().expect("the fields");
-    assert_eq!((head.method(), head.uri()), ("GET", "/plain"));
+    assert!(st.take_text_head().is_none(), "no head is kept: the data path answers 500");
     assert_eq!(signals(&mut m), vec![], "no stream error: the data path answers");
     m.take_rx_head = |n| Some(ibex_proto::htx::RxHead::from_box(vec![0; n * 2].into_boxed_slice()));
     m.recv(4, &headers(GET), true, 0).expect("request");
     let st = m.stream(4).expect("stream");
-    assert!(!st.no_memory() && st.request_htx().is_some() && st.req_head().is_none());
+    assert!(!st.no_memory() && st.request_htx().is_some() && st.text_head.is_none());
 }
 
 /// CP2b: a head the HTTP/1 checks refuse but `accept-unsafe-violations-in-http-request` lets
-/// through (a blank in the path) is kept as its fields, flagged bad (h2's 400); without the
+/// through (a blank in the path) is kept as text, flagged bad (h2's 400); without the
 /// option it is a message error over h3, and its memory is given back.
 #[test]
-fn a_head_the_http1_checks_refuse_is_kept_as_its_fields_under_the_relaxed_option() {
+fn a_head_the_http1_checks_refuse_is_kept_as_text_under_the_relaxed_option() {
     let bad: &[(&str, &str)] = &[(":method", "GET"), (":scheme", "https"), (":authority", "localhost"), (":path", "/a b")];
     let mut m = mux();
     m.relaxed_path = true;
     m.recv(0, &headers(bad), true, 0).expect("request");
     let st = m.stream(0).expect("stream");
     assert!(st.bad_request && st.request_htx().is_none() && !st.no_memory);
-    assert_eq!(st.req_head().expect("the fields").uri(), "/a b");
+    assert_eq!(st.text_head.as_ref().expect("the text").uri(), "/a b");
     let mut m = mux();
     m.recv(0, &headers(bad), true, 0).expect("request");
     assert_eq!(stream_error(&signals(&mut m), 0), Some(0x10e), "H3_MESSAGE_ERROR");

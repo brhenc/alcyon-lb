@@ -1499,7 +1499,7 @@ pub(crate) fn count_head_bytes(n: usize) {
 /// Bytes of HTTP/2 and HTTP/3 request heads written into memory on this thread, a head's
 /// method, path, names and values each time one of its writers copies them (debug builds; 0
 /// in release): CP2 pins that an h2 head is written once, where it was three times (the
-/// mux's `H2ReqHead`, the bridge's blocks).
+/// mux's fields, the bridge's blocks).
 #[must_use]
 pub fn head_bytes_written() -> u64 {
     #[cfg(debug_assertions)]
@@ -1783,46 +1783,6 @@ impl<'a> HtxSlice<'a> {
     /// [`Self::push_res_line`] of a line read as bytes (T581).
     pub fn push_res_line_bytes(&mut self, version: &[u8], status: u16, reason: &[u8]) -> Result<(), HtxError> {
         push_res_line_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, version, status, reason)
-    }
-
-    /// Writes the request head `head` (an HTTP/2 or HTTP/3 request's checked fields, E1) as
-    /// its blocks: the start line `METHOD PATH HTTP/1.1`, a header block per field (a value
-    /// that is not UTF-8 as Latin-1, as the HTTP/1 parser keeps it), `extra` last, the end of
-    /// the headers; then the end-of-head checks and edits of the HTTP/1 parser
-    /// ([`crate::h1::finish_request_head`]). `each` is given each field of `head` as the
-    /// text the HTX holds (a Latin-1 value as its text), read once for both. The blocks are those
-    /// [`crate::h1::H1Parser::parse`] made of the same head written as HTTP/1.1 text, with
-    /// no text in between, and a cookie's outer blanks kept (`http_cookie_merge`).
-    ///
-    /// # Errors
-    /// Where the parser refuses that head (`InvalidData`), or the blocks do not fit
-    /// (`OutOfMemory`); what was written is then partial.
-    pub fn put_request_head(&mut self, head: &crate::mux_h2::H2ReqHead, extra: Option<(&str, &str)>, mut each: impl FnMut(&str, &str)) -> std::io::Result<()> {
-        use std::io::{Error, ErrorKind};
-        let oom = |e: HtxError| Error::new(ErrorKind::OutOfMemory, e);
-        // A head without a line has an empty method, which the line check refuses.
-        let (method, uri) = (head.method(), head.uri());
-        crate::h1::check_request_line(method, uri)?;
-        self.push_req_line(method, uri, "HTTP/1.1").map_err(oom)?;
-        for (n, v) in head.headers() {
-            // A name is a token (checked by the mux): ASCII.
-            let name = std::str::from_utf8(n).map_err(|_| Error::new(ErrorKind::InvalidData, "header name"))?;
-            if let Ok(v) = std::str::from_utf8(v) {
-                self.push_header(name, v).map_err(oom)?;
-                each(name, v);
-            } else {
-                let text = latin1_to_text(v);
-                push_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, name, &text).map_err(oom)?;
-                self.set_last_flag(HTX_BLK_FL_LATIN1);
-                each(name, &text);
-            }
-        }
-        if let Some((n, v)) = extra {
-            self.push_header(n, v).map_err(oom)?;
-        }
-        self.push_eoh().map_err(oom)?;
-        count_head_bytes(method.len() + uri.len() + head.field_bytes + extra.map_or(0, |(n, v)| n.len() + v.len()));
-        crate::h1::finish_request_head(self, method, uri, None)
     }
 
     /// Pushes a header whose value is text a peer sent. A character the byte mapping uses

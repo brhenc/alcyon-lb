@@ -883,20 +883,15 @@ mod in_place {
 }
 
 /// CP1 (`docs/design/copies-2026-11-02.md` section 6, row S1): `write_request_htx` over the
-/// decoded fields writes the blocks, and refuses the heads, that the h2 mux's `H2ReqHead::write`
-/// followed by `HtxSlice::put_request_head` do today. The reference here is today's code: a
-/// server `H2MuxContext` fed the same HEADERS frame says whether the stream is taken (its
-/// checks, limits and `bad_request` included), then `H2ReqHead::write` + `put_request_head`
-/// write the blocks (CP2: the mux itself writes with `write_request_htx` now); the expected values behind it are pinned by T437/T449/T451/E1
-/// (`h2_field_validity.rs`) and were measured on ``HAProxy`` 3.5-dev8 then, so no row here
-/// doubts them.
+/// decoded fields writes the blocks, and refuses the heads, that the h2 mux's former
+/// `H2ReqHead::write` followed by `HtxSlice::put_request_head` did. The reference is the golden
+/// files (CP2b-2: the live code is gone), dumped from it; the expected values behind it are
+/// pinned by T437/T449/T451/E1 (`h2_field_validity.rs`) and were measured on ``HAProxy``
+/// 3.5-dev8 then, so no row here doubts them.
 mod request_head_writer {
-    use ibex_proto::conn::ConnId;
-    use ibex_proto::h2::{frame_flags, write_request_htx, Frame, HeadError, H2_CONN_PREFACE};
+    use ibex_proto::h2::{write_request_htx, HeadError};
     use ibex_proto::hpack::{DecodedFields, HpackDecoder, HpackEncoder};
     use ibex_proto::htx::{HtxSlice, RxHead};
-    use ibex_proto::mux::Mux;
-    use ibex_proto::mux_h2::MuxH2;
     use proptest::prelude::*;
 
     type Fields = Vec<(Vec<u8>, Vec<u8>)>;
@@ -921,117 +916,16 @@ mod request_head_writer {
         b
     }
 
-    /// What today's path made of a head: `Err(true)` the mux refused it, `Err(false)` the
-    /// parser's `InvalidData`, `Ok` the blocks.
-    struct Today {
-        verdict: Result<(), HeadError>,
-        buf: Vec<u8>,
-        tail: usize,
-        blocks: usize,
-        bad_request: bool,
-        length: Option<usize>,
-        ext_connect: bool,
-        method_len: usize,
-        uri_len: usize,
-        path_raw: bool,
-        has_abs: bool,
-        fields: usize,
-        field_bytes: usize,
-        wire_len: usize,
-    }
-
-    fn today(fields: &Fields, relaxed: bool, cap: usize) -> Today {
-        let mut ctx = MuxH2.init(ConnId(1), true).expect("init");
-        ctx.relaxed_path = relaxed;
-        let mut b = H2_CONN_PREFACE.to_vec();
-        b.extend(Frame::Settings { flags: 0, settings: vec![] }.encode());
-        b.extend(Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: 1, header_block: block(fields) }.encode());
-        MuxH2.parse(&mut ctx, &b).expect("the connection survives the head");
-        // A head the mux refuses before it keeps the stream (an empty list) has none.
-        let (bad_request, length, ext_connect) = ctx.streams.get(&1).map_or((false, None, false), |st| (st.bad_request, st.req_content_length, st.ext_connect));
-        let mut buf = vec![0u8; cap];
-        let mut out = Today {
-            verdict: Err(HeadError::Refused("mux")),
-            buf: Vec::new(),
-            tail: 0,
-            blocks: 0,
-            bad_request,
-            length,
-            ext_connect,
-            method_len: 0,
-            uri_len: 0,
-            path_raw: false,
-            has_abs: false,
-            fields: 0,
-            field_bytes: 0,
-            wire_len: 0,
-        };
-        // CP2a: the mux writes the head it takes with `write_request_htx` (or keeps it as its
-        // fields); the reference blocks are `H2ReqHead::write`'s, of a head the mux took.
-        let taken = ctx.streams.get(&1).is_some_and(|s| s.rx_head.is_some() || s.req_head.is_some());
-        let reference = taken.then(|| {
-            let mut head = ibex_proto::mux_h2::H2ReqHead::default();
-            head.write(&decoded(fields)).expect("a head the mux took is one `H2ReqHead::write` takes");
-            head
-        });
-        if let Some(head) = reference {
-            let mut slice = HtxSlice::new(&mut buf);
-            out.verdict = match slice.put_request_head(&head, None, |_, _| {}) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::OutOfMemory => Err(HeadError::NoRoom),
-                Err(_) => Err(HeadError::Invalid),
-            };
-            (out.tail, out.blocks) = (slice.tail_addr(), slice.num_blocks());
-            out.method_len = head.method().len();
-            out.uri_len = head.uri_len();
-            out.path_raw = head.path_raw;
-            out.has_abs = head.abs_prefix().is_some();
-            out.fields = head.headers().count();
-            out.field_bytes = head.field_bytes;
-            out.wire_len = head.wire_len();
-        }
-        out.buf = buf;
-        out
-    }
-
     fn decoded(fields: &Fields) -> DecodedFields {
         let mut d = DecodedFields::default();
         HpackDecoder::new().decode_into(&block(fields), &mut d).expect("decodes");
         d
     }
 
-    /// The new writer against today's path, on a memory of `cap` bytes. Returns the verdict
-    /// both gave.
-    fn same(name: &str, fields: &Fields, relaxed: bool, cap: usize) -> Result<(), HeadError> {
-        let old = today(fields, relaxed, cap);
-        let mut mem = vec![0u8; cap];
-        let mut slice = HtxSlice::new(&mut mem);
-        let new = write_request_htx(&decoded(fields), &mut slice, relaxed);
-        let ctx = format!("{name} (cap {cap}, relaxed {relaxed}): {fields:?}");
-        match (&old.verdict, &new) {
-            (Err(HeadError::Refused(_)), Err(HeadError::Refused(_))) => {}
-            (Err(a), Err(b)) => assert_eq!(a, b, "{ctx}"),
-            (Ok(()), Ok(f)) => {
-                assert_eq!((f.tail, f.blocks), (old.tail, old.blocks), "{ctx}");
-                let mut old_buf = old.buf.clone();
-                let reference = HtxSlice::with_offsets(&mut old_buf, old.tail, old.blocks);
-                assert!(reference.as_ref() == slice.as_ref(), "{ctx}\nold: {:?}\nnew: {:?}", reference.as_ref(), slice.as_ref());
-                assert_eq!(f.bad_request, old.bad_request, "{ctx}");
-                assert_eq!(f.content_length, old.length, "{ctx}");
-                assert_eq!(f.ext_connect, old.ext_connect, "{ctx}");
-                assert_eq!((f.method_len, f.uri_len, f.has_abs, f.fields, f.field_bytes), (old.method_len, old.uri_len, old.has_abs, old.fields, old.field_bytes), "{ctx}");
-                assert_eq!(f.path_raw, old.path_raw, "{ctx}");
-                assert_eq!(f.wire_len(), old.wire_len, "{ctx}");
-            }
-            (a, b) => panic!("{ctx}: today {a:?}, new {b:?}"),
-        }
-        old.verdict
-    }
-
     /// The golden file: for every row of the corpus, on every memory, under both settings of
     /// `accept-unsafe-violations-in-http-request`, what `H2ReqHead::write` + `put_request_head`
-    /// made of the head (CP2b-1, the reference the writer was built against, dumped before the
-    /// live reference goes): the verdict, and for a written head its facts and its blocks.
+    /// made of the head (CP2b-1, the reference the writer was built against, dumped before it
+    /// went): the verdict, and for a written head its facts and its blocks.
     const GOLDEN: &str = include_str!("../data/htx_request_head_golden.txt");
 
     /// One line of the golden file: tab-separated `name`, `relaxed`, `cap`, the verdict
@@ -1044,19 +938,6 @@ mod request_head_writer {
             Err(HeadError::NoRoom) => "NoRoom",
         };
         if verdict.is_ok() { format!("{name}\t{relaxed}\t{cap}\t{v}\t{facts}\t{blocks}") } else { format!("{name}\t{relaxed}\t{cap}\t{v}") }
-    }
-
-    /// The golden line of what `H2ReqHead::write` + `put_request_head` make today (used to dump
-    /// the file; the live reference goes with `H2ReqHead`, CP2b-2).
-    fn old_line(name: &str, fields: &Fields, relaxed: bool, cap: usize) -> String {
-        let old = today(fields, relaxed, cap);
-        let facts = format!(
-            "{} {} {} {:?} {} {} {} {} {} {} {} {}",
-            old.tail, old.blocks, old.bad_request, old.length, old.ext_connect, old.method_len, old.uri_len, old.path_raw, old.has_abs, old.fields, old.field_bytes, old.wire_len
-        );
-        let mut buf = old.buf.clone();
-        let blocks = format!("{:?}", HtxSlice::with_offsets(&mut buf, old.tail, old.blocks).as_ref());
-        golden_line(name, relaxed, cap, &old.verdict, &facts, &blocks)
     }
 
     /// The golden line of what the writer makes.
@@ -1212,23 +1093,9 @@ mod request_head_writer {
     }
 
     /// The writer's blocks, facts and verdicts for the whole corpus are those in the golden
-    /// file (CP2b-1: dumped from `H2ReqHead::write` + `put_request_head`, which this no longer
-    /// runs). `IBEX_BLESS_GOLDEN=<path>` writes the file from the live reference instead.
+    /// file (CP2b-1: dumped from `H2ReqHead::write` + `put_request_head`, which are gone).
     #[test]
     fn the_written_head_is_the_one_in_the_golden_file() {
-        if let Ok(path) = std::env::var("IBEX_BLESS_GOLDEN") {
-            let mut out = String::new();
-            for (name, fields) in corpus() {
-                for relaxed in [false, true] {
-                    for cap in CAPS {
-                        out.push_str(&old_line(name, &fields, relaxed, cap));
-                        out.push('\n');
-                    }
-                }
-            }
-            std::fs::write(path, out).expect("write the golden file");
-            return;
-        }
         let mut want = GOLDEN.lines();
         let (mut written, mut refused, mut parser_refused, mut no_room, mut bad) = (0, 0, 0, 0, 0);
         for (name, fields) in corpus() {
@@ -1251,16 +1118,97 @@ mod request_head_writer {
         assert!(written > 300 && refused > 400 && parser_refused > 20 && no_room > 100 && bad >= 5, "{written} {refused} {parser_refused} {no_room} {bad}");
     }
 
-    /// The live reference still agrees on the same corpus (until `H2ReqHead` goes, CP2b-2).
+    /// The text golden file: for every row the HTTP/1 checks refuse (`Invalid` on the large
+    /// memory), the head as the HTTP/1.1 text `H2ReqHead::to_wire` made of it, which is what
+    /// the data path forwards (CP2b-2, dumped before the live reference went).
+    const TEXT_GOLDEN: &str = include_str!("../data/htx_request_text_golden.txt");
+
+    fn text_line(name: &str, fields: &Fields, relaxed: bool) -> Option<String> {
+        let t = ibex_proto::h2::write_request_text(&decoded(fields), relaxed, None).ok()?;
+        Some(format!("{name}\t{relaxed}\t{}\t{}\t{}\t{}", t.wire.escape_ascii(), t.facts.method_len, t.facts.uri_len, t.facts.field_bytes))
+    }
+
+    /// The text of a head the HTTP/1 checks refuse is the one in the golden file; every other
+    /// row has no text (the writer makes its blocks).
     #[test]
-    fn the_live_reference_agrees_with_the_golden_file_rows() {
+    fn the_text_of_a_refused_head_is_the_one_in_the_text_golden_file() {
+        let mut want = TEXT_GOLDEN.lines();
+        let mut n = 0;
+        for (name, fields) in corpus() {
+            for relaxed in [false, true] {
+                let mut mem = vec![0u8; 16384];
+                let invalid = matches!(write_request_htx(&decoded(&fields), &mut HtxSlice::new(&mut mem), relaxed), Err(HeadError::Invalid));
+                if !invalid {
+                    continue;
+                }
+                let line = text_line(name, &fields, relaxed).expect("a head the checks refuse has its text");
+                assert_eq!(Some(line.as_str()), want.next(), "{name} (relaxed {relaxed})");
+                n += 1;
+            }
+        }
+        assert_eq!(want.next(), None, "the golden file has rows the corpus lost");
+        assert!(n >= 20, "{n}");
+    }
+
+    /// The blocks writer and the text writer scan the same fields: one refuses what the other
+    /// refuses, and where the blocks are written they agree on what the head is made of.
+    fn the_two_writers_agree(name: &str, fields: &Fields, relaxed: bool, cap: usize) {
+        let d = decoded(fields);
+        let mut mem = vec![0u8; cap];
+        let blocks = write_request_htx(&d, &mut HtxSlice::new(&mut mem), relaxed);
+        let text = ibex_proto::h2::write_request_text(&d, relaxed, None);
+        let ctx = format!("{name} (cap {cap}, relaxed {relaxed}): {fields:?}");
+        match (&blocks, &text) {
+            (Err(HeadError::Refused(_)), Err(HeadError::Refused(_))) => {}
+            (Ok(f), Ok(t)) => {
+                let g = &t.facts;
+                assert_eq!((f.method_len, f.uri_len, f.path_raw, f.has_abs, f.fields, f.field_bytes, f.cl_bytes), (g.method_len, g.uri_len, g.path_raw, g.has_abs, g.fields, g.field_bytes, g.cl_bytes), "{ctx}");
+                assert_eq!((f.bad_request, f.content_length, f.ext_connect), (g.bad_request, g.content_length, g.ext_connect), "{ctx}");
+                assert_eq!(f.wire_len(), t.wire.len(), "{ctx}");
+            }
+            (Err(HeadError::Invalid | HeadError::NoRoom), Ok(_)) => {}
+            (a, b) => panic!("{ctx}: blocks {a:?}, text {:?}", b.as_ref().map(|t| t.facts)),
+        }
+    }
+
+    #[test]
+    fn the_writers_agree_on_the_corpus() {
         for (name, fields) in corpus() {
             for relaxed in [false, true] {
                 for cap in CAPS {
-                    let _ = same(name, &fields, relaxed, cap);
+                    the_two_writers_agree(name, &fields, relaxed, cap);
                 }
             }
         }
+    }
+
+    /// E1, kept from the bridge's test: the blocks the writer makes of a head are the ones the
+    /// HTTP/1 parser makes of the same head as text ([`ibex_proto::h2::TextHead`]), and so is the
+    /// head written from them; a head the parser refuses, the writer finds `Invalid`.
+    #[test]
+    fn the_blocks_written_are_the_parsers_of_the_text() {
+        let mut compared = 0;
+        for (name, fields) in corpus() {
+            let d = decoded(&fields);
+            let (mut a, mut b) = (vec![0u8; 16384], vec![0u8; 16384]);
+            let mut put = HtxSlice::new(&mut a);
+            let written = write_request_htx(&d, &mut put, false);
+            let Ok(text) = ibex_proto::h2::write_request_text(&d, false, None) else { continue };
+            let mut parsed = HtxSlice::new(&mut b);
+            let parse_ok = ibex_proto::H1Parser::new(false).parse(&text.wire, &mut parsed).is_ok();
+            let shown = String::from_utf8_lossy(&text.wire);
+            assert_eq!(written.is_ok(), parse_ok, "{name}: {shown}");
+            if written.is_ok() {
+                // `Invalid` is where the parser refuses; a head the parser takes has the same
+                // blocks. (The cookie's blanks are kept by the writer, the parser trims them.)
+                if !shown.contains("cookie") {
+                    assert_eq!(put.to_blocks(), parsed.to_blocks(), "{name}: {shown}");
+                    assert_eq!(put.to_h1_wire(), parsed.to_h1_wire(), "{name}: {shown}");
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 30, "{compared}");
     }
 
     #[test]
@@ -1344,10 +1292,10 @@ mod request_head_writer {
         #![proptest_config(ProptestConfig::with_cases(400))]
 
         /// Random field lists over the names and values the rules look at: whatever the
-        /// pseudo-headers' order, duplicates and values, the two paths agree.
+        /// pseudo-headers' order, duplicates and values, the two writers agree.
         #[test]
-        fn random_heads_are_written_as_they_are_today(fields in prop::collection::vec((token(), value()), 0..9), relaxed in any::<bool>(), cap in prop::sample::select(CAPS.to_vec())) {
-            let _ = same("random", &fields, relaxed, cap);
+        fn random_heads_have_one_scan(fields in prop::collection::vec((token(), value()), 0..9), relaxed in any::<bool>(), cap in prop::sample::select(CAPS.to_vec())) {
+            the_two_writers_agree("random", &fields, relaxed, cap);
         }
     }
 }

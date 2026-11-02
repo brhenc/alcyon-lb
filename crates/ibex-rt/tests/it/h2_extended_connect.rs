@@ -304,7 +304,7 @@ fn a_websocket_over_extended_connect_is_an_upgrade_to_the_server_and_a_tunnel() 
 }
 
 /// E1: a path the HTTP/1 parser refuses (UTF-8, not ASCII) leaves the head without HTX: it
-/// goes as text (`h2_bridge::text_wire`), the key the proxy made after the fields; a rule's
+/// goes as text (`h2_bridge::framed_text`), the key the proxy made after the fields; a rule's
 /// edit (`option forwardfor`) writes it from the list the key is in (it was lost there).
 #[test]
 fn a_websocket_whose_path_is_not_ascii_goes_with_its_key_as_text() {

@@ -231,7 +231,7 @@ fn normalisation_cases() -> Vec<Case> {
         add(id, f, Want::Rst);
     }
     // A `:path` that is UTF-8 but not ASCII: the HTTP/1 parser refuses it, so the head
-    // has no HTX and goes as text (`h2_bridge::text_wire`); without a length, chunked.
+    // has no HTX and goes as text (`h2_bridge::framed_text`); without a length, chunked.
     // Measured on 3.5-dev8: `POST /caf\xc3\xa9` forwarded with `transfer-encoding: chunked`.
     let id = "path-utf8-chunked".to_string();
     let mut f = frame(1, 4, 1, &block(&id, b"POST", b"http", "/caf\u{e9}".as_bytes(), b"x", &[]));

@@ -26,6 +26,7 @@ use crate::h2::{
     MAX_MAX_FRAME_SIZE, MAX_WINDOW_SIZE, MIN_MAX_FRAME_SIZE,
 };
 use crate::hpack::{DecodedFields, HpackDecoder, HpackEncoder};
+use crate::h2::TextHead;
 use crate::htx::{HeaderField, HttpVersion, Htx, HtxBlock, RxHead};
 use crate::mux::{mux_flags, Mux, MuxFlags, MuxOps, ShutMode};
 use std::io;
@@ -79,12 +80,12 @@ pub struct H2StreamCtx {
     /// The request head of a stream of a server connection, as its checked fields (T437,
     /// E1): what the data path writes the HTX of the head from. `rx_htx` then holds no
     /// start line nor headers, only the end of the head and what follows. `None` for a
-    /// head kept as HTX blocks ([`H2ReqHead`]).
-    pub req_head: Option<Box<H2ReqHead>>,
+    /// head written as HTX blocks ([`Self::rx_head`]).
+    pub text_head: Option<Box<TextHead>>,
     /// The request's `content-length`, as a number, kept for the stream's window (the
     /// head is taken by the data path).
     pub req_content_length: Option<usize>,
-    /// The request is an extended CONNECT (RFC 8441, [`H2ReqHead::ext_connect`]): the
+    /// The request is an extended CONNECT (RFC 8441, [`crate::h2::HeadFacts::ext_connect`]): the
     /// server's `101` is a `200` to the client, and what follows a tunnel.
     pub ext_connect: bool,
     /// CP2: the request head of a stream of a server connection as the HTX blocks
@@ -103,372 +104,50 @@ pub struct H2StreamCtx {
     pub no_memory: bool,
 }
 
-/// A request head as the fields of its HEADERS, checked and in the order the HTTP/1.1 head
-/// is written in (T437, E1): `METHOD PATH HTTP/1.1`, the host the authority makes when there
-/// is no `host` header, the other headers, `upgrade` and `connection` for an extended
-/// CONNECT, the cookies joined last, as `h2_make_htx_request` makes them; then the
-/// `scheme://authority` prefix of the start line `HAProxy` logs, if the request had both.
-/// The data path writes the HTX blocks of the head from it once
-/// ([`crate::htx::HtxSlice::put_request_head`]); no HTTP/1 text is written in between. Kept
-/// from one stream of the connection to the next ([`H2MuxContext::spare_heads`]).
-#[derive(Debug, Clone, Default)]
-pub struct H2ReqHead {
-    /// The method, the path, then the prefix: the pseudo-headers, which are text (a stream
-    /// whose pseudo-header is not UTF-8 is refused, `tradeoff.md` 6.24).
-    pub line: String,
-    /// The fields' names and values, one after the other, as the octets the client sent.
-    pub bytes: Vec<u8>,
-    /// The method: `line[..method_len]`.
-    pub method_len: usize,
-    /// The path in `line`.
-    pub uri: (usize, usize),
-    /// The prefix in `line` (empty without one).
-    pub abs: (usize, usize),
-    /// The headers: name start, name end (value start), value end in `bytes`.
-    pub fields: Vec<(u32, u32, u32)>,
-    /// The fields' names and values, in bytes (`%U` counts them).
-    pub field_bytes: usize,
-    /// The head has a start line (`method` and `uri` are its).
-    pub has_line: bool,
-    /// The request is an extended CONNECT (RFC 8441), written as the `GET` with
-    /// `upgrade: <protocol>` and `connection: upgrade` of an HTTP/1.1 upgrade.
-    pub ext_connect: bool,
-    /// The path was not UTF-8: `uri()` is the text standing for its bytes
-    /// ([`ibex_regex::bytetext`]), [`Self::uri_len`] their number (X7).
-    pub path_raw: bool,
-}
-
-/// A pseudo-header's value as text: one that is not UTF-8 is refused (`tradeoff.md` 6.24).
-fn text(v: &[u8]) -> Result<&str, &'static str> {
-    std::str::from_utf8(v).map_err(|_| "pseudo-header not UTF-8")
-}
-
-/// A value without its leading and trailing blanks (space, tab).
-fn trim_blanks(mut v: &[u8]) -> &[u8] {
-    while let [b' ' | b'\t', rest @ ..] = v {
-        v = rest;
-    }
-    while let [rest @ .., b' ' | b'\t'] = v {
-        v = rest;
-    }
-    v
-}
-
-impl H2ReqHead {
-    /// No head; the memory is kept.
-    pub fn clear(&mut self) {
-        self.line.clear();
-        self.bytes.clear();
-        self.fields.clear();
-        (self.method_len, self.uri, self.abs, self.field_bytes, self.has_line, self.ext_connect, self.path_raw) = (0, (0, 0), (0, 0), 0, false, false, false);
-    }
-
-    /// The memory the head holds, for a pool's accounting.
-    #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.line.capacity() + self.bytes.capacity() + self.fields.capacity() * std::mem::size_of::<(u32, u32, u32)>()
-    }
-
-    /// Zeroes what the head held (`tune.ibex.zero-buffers`).
-    pub fn wipe(&mut self) {
-        ibex_alloc::wipe_string(&mut self.line);
-        ibex_alloc::wipe_bytes(&mut self.bytes);
-    }
-
-    /// A head of the request line `method uri` and the fields `fields` (a head made
-    /// elsewhere: tests, and the bridge's own).
-    #[must_use]
-    pub fn of(method: &str, uri: &str, fields: &[(&str, &str)]) -> Self {
-        let mut h = Self { has_line: true, ..Self::default() };
-        h.line.push_str(method);
-        h.method_len = method.len();
-        h.line.push_str(uri);
-        h.uri = (method.len(), h.line.len());
-        for (n, v) in fields {
-            h.push_field(n.as_bytes(), v.as_bytes());
-        }
-        h
-    }
-
-    /// The head as HTTP/1.1 text, up to and with its blank line: what the head was before E1,
-    /// for a head the HTX cannot be written from (the bridge's fallback) and for tests.
-    #[must_use]
-    pub fn to_wire(&self) -> Vec<u8> {
-        let mut w = Vec::with_capacity(self.wire_len());
-        if self.has_line {
-            w.extend_from_slice(self.method().as_bytes());
-            w.push(b' ');
-            if self.path_raw {
-                w.extend_from_slice(&ibex_regex::bytetext::text_to_bytes(self.uri()));
-            } else {
-                w.extend_from_slice(self.uri().as_bytes());
-            }
-            w.extend_from_slice(b" HTTP/1.1\r\n");
-        }
-        for (n, v) in self.headers() {
-            w.extend_from_slice(n);
-            w.extend_from_slice(b": ");
-            w.extend_from_slice(v);
-            w.extend_from_slice(b"\r\n");
-        }
-        w.extend_from_slice(b"\r\n");
-        w
-    }
-
-    /// The length of [`Self::to_wire`].
-    #[must_use]
-    pub fn wire_len(&self) -> usize {
-        let line = if self.has_line { self.method_len + 1 + self.uri_len() + 11 } else { 0 };
-        line + self.field_bytes + 4 * self.fields.len() + 2
-    }
-
-    #[must_use]
-    pub fn method(&self) -> &str {
-        &self.line[..self.method_len]
-    }
-
-    #[must_use]
-    pub fn uri(&self) -> &str {
-        &self.line[self.uri.0..self.uri.1]
-    }
-
-    /// The number of bytes of the path as the client sent it.
-    #[must_use]
-    pub fn uri_len(&self) -> usize {
-        if self.path_raw {
-            ibex_regex::bytetext::text_len(self.uri())
-        } else {
-            self.uri.1 - self.uri.0
-        }
-    }
-
-    /// `scheme://authority`, when the request had both.
-    #[must_use]
-    pub fn abs_prefix(&self) -> Option<&str> {
-        (self.abs.1 > self.abs.0).then(|| &self.line[self.abs.0..self.abs.1])
-    }
-
-    /// The headers in order, as name and value, in bytes.
-    pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
-        self.fields.iter().map(|&(a, b, c)| (&self.bytes[a as usize..b as usize], &self.bytes[b as usize..c as usize]))
-    }
-
-    /// The headers whose name and value are text, as text (a value that is not UTF-8 is left
-    /// out: no reader of these looks for one).
-    pub fn text_headers(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
-        self.headers().filter_map(|(n, v)| Some((std::str::from_utf8(n).ok()?, std::str::from_utf8(v).ok()?)))
-    }
-
-    /// The first value of header `name` (ASCII case-insensitive), as `Htx::get_header`.
-    #[must_use]
-    pub fn get_header(&self, name: &str) -> Option<&[u8]> {
-        self.headers().find(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes())).map(|(_, v)| v)
-    }
-
-    fn push_field(&mut self, name: &[u8], value: &[u8]) {
-        let pos = |t: &Vec<u8>| u32::try_from(t.len()).unwrap_or(u32::MAX);
-        let a = pos(&self.bytes);
-        self.bytes.extend_from_slice(name);
-        let b = pos(&self.bytes);
-        self.bytes.extend_from_slice(value);
-        let c = pos(&self.bytes);
-        self.fields.push((a, b, c));
-        self.field_bytes += name.len() + value.len();
-    }
-
-    /// The `cookie` field of the values `values`, joined with "; "; none, no field.
-    fn push_cookies<'a>(&mut self, values: impl Iterator<Item = &'a [u8]>) {
-        let pos = |t: &Vec<u8>| u32::try_from(t.len()).unwrap_or(u32::MAX);
-        let mut first = true;
-        let (mut a, mut b) = (0, 0);
-        for v in values {
-            if first {
-                first = false;
-                a = pos(&self.bytes);
-                self.bytes.extend_from_slice(b"cookie");
-                b = pos(&self.bytes);
-            } else {
-                self.bytes.extend_from_slice(b"; ");
-            }
-            self.bytes.extend_from_slice(v);
-        }
-        if !first {
-            let c = pos(&self.bytes);
-            self.fields.push((a, b, c));
-            self.field_bytes += "cookie".len() + (c - b) as usize;
-        }
-    }
-
-    /// Keeps the request of `fields`, checked as
-    /// `pseudo_headers_to_htx` checks it, and refused as `HAProxy` 3.5-dev8 refuses it
-    /// (measured, T437): without `:method`, with a `:status`, or with a `:protocol` outside
-    /// an extended CONNECT. A `host` after the first is dropped, as `HAProxy` drops it. A
-    /// pseudo-header that is not UTF-8 is refused (`tradeoff.md` 6.24); a regular value is
-    /// kept as the bytes it is. Every request of a server connection is kept this way.
-    ///
-    /// # Errors
-    /// The refusal, as text. (Public as the reference of `htx_differential.rs` until CP2b.)
-    pub fn write(&mut self, fields: &DecodedFields) -> Result<(), &'static str> {
-        self.clear();
-        let (mut method, mut path, mut authority, mut host, mut scheme, mut protocol) = (None, None, None, None, false, None);
-        let mut seen_regular = false;
-        for (n, v) in fields.iter() {
-            if n.starts_with(b":") {
-                if seen_regular {
-                    return Err("pseudo-header after regular header");
-                }
-                let slot = match n {
-                    b":method" => &mut method,
-                    b":path" => {
-                        if path.is_some() {
-                            return Err("duplicate pseudo-header");
-                        }
-                        if v.is_empty() {
-                            return Err("empty :path");
-                        }
-                        // The octets the client sent: forwarded as `HAProxy` forwards them
-                        // (X7), not refused when they are not UTF-8.
-                        path = Some(v);
-                        continue;
-                    }
-                    b":authority" => &mut authority,
-                    b":protocol" => &mut protocol,
-                    b":scheme" => {
-                        if scheme {
-                            return Err("duplicate pseudo-header");
-                        }
-                        scheme = true;
-                        continue;
-                    }
-                    _ => return Err("unknown pseudo-header"),
-                };
-                if slot.is_some() {
-                    return Err("duplicate pseudo-header");
-                }
-                *slot = Some(text(v)?);
-            } else {
-                seen_regular = true;
-                if n.eq_ignore_ascii_case(b"host") && host.is_none() {
-                    host = Some(v);
-                }
-            }
-        }
-        if let (Some(a), Some(h)) = (authority, host) {
-            if !a.as_bytes().eq_ignore_ascii_case(h) {
-                return Err("authority and host mismatch");
-            }
-        }
-        let method = method.ok_or("no :method")?;
-        // The path as text; one that is not UTF-8 is held as `ibex_regex::bytetext` stands for
-        // its bytes, and `path_raw` says so (the text of `uri()`, `%r`, the fetches; the octets
-        // go out in `to_wire`).
-        let path_text: Option<std::borrow::Cow<'_, str>> = path.map(|p| {
-            std::str::from_utf8(p).map_or_else(
-                |_| {
-                    self.path_raw = true;
-                    std::borrow::Cow::Owned(ibex_regex::bytetext::bytes_to_text(p))
-                },
-                std::borrow::Cow::Borrowed,
-            )
-        });
-        let path = path_text.as_deref();
-        // `:protocol` is an extended CONNECT's (RFC 8441), which goes to the server as the
-        // `GET` of an HTTP/1.1 upgrade to that protocol (`h2_prepare_htx_reqline`,
-        // `h2_make_htx_request`): with `:scheme`, `:path` and `:authority`, and not to h2.
-        if protocol.is_some() && method != "CONNECT" {
-            return Err(":protocol outside CONNECT");
-        }
-        if let Some(p) = protocol {
-            if !scheme || path.is_none() || authority.is_none() {
-                return Err("extended CONNECT without :scheme, :path or :authority");
-            }
-            if p.eq_ignore_ascii_case("h2c") || p.eq_ignore_ascii_case("h2") {
-                return Err("extended CONNECT to h2");
-            }
-        }
-        // `HAProxy`'s start line: the first `:scheme` and `:authority`.
-        let abs = match (fields.get(b":scheme"), authority) {
-            (Some(sc), Some(a)) => Some((text(sc)?, a)),
-            _ => None,
-        };
-        self.ext_connect = protocol.is_some();
-        let method = if self.ext_connect { "GET" } else { method };
-        self.has_line = true;
-        self.line.push_str(method);
-        self.method_len = self.line.len();
-        // `:path *` with an `:authority` is the absolute form without a path, which
-        // `HAProxy` writes as `/`, as `*` for OPTIONS (`h2_prepare_htx_reqline`; measured,
-        // T451).
-        let path = match path {
-            Some("*") if authority.is_some() && method != "OPTIONS" => "/",
-            p => p.unwrap_or("/"),
-        };
-        self.line.push_str(path);
-        self.uri = (self.method_len, self.line.len());
-        if let Some((sc, a)) = abs {
-            let start = self.line.len();
-            self.line.push_str(sc);
-            self.line.push_str("://");
-            self.line.push_str(a);
-            self.abs = (start, self.line.len());
-        }
-        if let (Some(a), None) = (authority, host) {
-            self.push_field(b"host", a.as_bytes());
-        }
-        let mut host_seen = false;
-        for (n, v) in fields.iter().filter(|(n, _)| !n.starts_with(b":")) {
-            if n.eq_ignore_ascii_case(b"host") {
-                if host_seen {
-                    continue;
-                }
-                host_seen = true;
-            }
-            // The cookie fields are merged after the others (below).
-            if n == b"cookie" {
-                continue;
-            }
-            // A value's leading and trailing blanks go, as `h2_make_htx_request` trims them
-            // (RFC 9113 section 8.2.1).
-            self.push_field(n, trim_blanks(v));
-        }
-        if let Some(p) = protocol {
-            self.push_field(b"upgrade", p.as_bytes());
-            self.push_field(b"connection", b"upgrade");
-        }
-        // RFC 9113 section 8.2.3: the cookie fields are one line, their values joined with
-        // "; " and their blanks kept, after the other fields (`h2_make_htx_request`;
-        // measured, T506).
-        self.push_cookies(fields.iter().filter(|(n, _)| *n == b"cookie").map(|(_, v)| v));
-        crate::htx::count_head_bytes(self.method_len + (self.uri.1 - self.uri.0) + self.field_bytes);
-        Ok(())
-    }
-}
-
 /// The request head of a server connection's stream from its decoded `fields` (CP2): the HTX
-/// blocks [`crate::h2::write_request_htx`] writes into memory from `take_rx` (the buffer the
+/// blocks [`crate::h2::write_request_htx_with`] writes into memory from `take_rx` (the buffer the
 /// stream's transaction adopts, `H2StreamCtx::rx_head`), then `scheme://authority` after
 /// them for the log line. The checks, the limits (`tune.http.maxhdr`, the head's room: T242)
 /// and the refusals are the writer's, those of `h2_make_htx_request` (T437, T449, E1). The
-/// error is the stream's reset (`PROTOCOL_ERROR`, a refused head). A head the HTTP/1 checks refuse, no memory for the blocks, and an extended CONNECT (its
-/// websocket key is the bridge's), are kept as their fields ([`H2ReqHead`], [`keep_fields`]).
-fn request_head(stream: &mut H2StreamCtx, fields: &DecodedFields, take_rx: fn(usize) -> Option<RxHead>, relaxed: bool, spare_heads: &mut Vec<Box<H2ReqHead>>) -> Result<(), H2Error> {
-    match write_head(fields, take_rx, relaxed) {
+/// error is the stream's reset (`PROTOCOL_ERROR`, a refused head). A head the HTTP/1 checks
+/// refuse is kept as the text it goes out as ([`TextHead`]); one with no memory to be had
+/// flags the stream (`no_memory`), which the data path answers 500.
+fn request_head(stream: &mut H2StreamCtx, fields: &DecodedFields, hooks: HeadHooks, relaxed: bool) -> Result<(), H2Error> {
+    match write_head(fields, hooks, relaxed) {
         HeadOut::Refused => Err(H2Error::ProtocolError),
         HeadOut::Blocks { rx, facts, abs_len } => {
             stream.bad_request = facts.bad_request;
             stream.req_content_length = facts.content_length;
-            stream.ext_connect = false;
+            stream.ext_connect = facts.ext_connect;
             stream.head_facts = facts;
             stream.abs_len = abs_len;
             stream.rx_head = Some(rx);
             stream.rx_htx.push(HtxBlock::Eoh);
             Ok(())
         }
-        HeadOut::Fields { no_memory } => {
-            stream.no_memory = no_memory;
-            keep_fields(stream, fields, relaxed, spare_heads)
+        HeadOut::Text(t) => {
+            stream.bad_request = t.facts.bad_request;
+            stream.req_content_length = t.facts.content_length;
+            stream.ext_connect = t.facts.ext_connect;
+            stream.text_head = Some(t);
+            stream.rx_htx.push(HtxBlock::Eoh);
+            Ok(())
+        }
+        HeadOut::NoMemory => {
+            stream.no_memory = true;
+            stream.bad_request = crate::h2::check_request_fields(fields.iter(), relaxed) == Ok(true);
+            stream.rx_htx.push(HtxBlock::Eoh);
+            Ok(())
         }
     }
+}
+
+/// What the data path gives the mux to write a request head with: memory (`Buf::take_rx_head`)
+/// and the key of a websocket handshake (`websocket::fresh_key`).
+#[derive(Clone, Copy)]
+pub(crate) struct HeadHooks {
+    pub take_rx: fn(usize) -> Option<RxHead>,
+    pub ws_key: fn() -> String,
 }
 
 /// What [`write_head`] made of a request head.
@@ -477,36 +156,50 @@ pub(crate) enum HeadOut {
     Blocks { rx: RxHead, facts: crate::h2::HeadFacts, abs_len: usize },
     /// A head the writer refused: the stream's error.
     Refused,
-    /// Not written as blocks (a head the HTTP/1 checks refuse, an extended CONNECT, no memory
-    /// to be had: `no_memory`): the caller keeps the fields.
-    Fields { no_memory: bool },
+    /// A head the HTTP/1 checks refuse: its text.
+    Text(Box<TextHead>),
+    /// No memory to be had for the blocks, or a head that does not fit the largest memory
+    /// with its `scheme://authority`: the stream is answered 500 (S5).
+    NoMemory,
 }
 
-/// The head of `fields` written as blocks into memory from `take_rx` (CP2, CP2b: h2 and h3
-/// both), then `scheme://authority` after them. Larger than its estimate, once more in more
-/// memory.
-pub(crate) fn write_head(fields: &DecodedFields, take_rx: fn(usize) -> Option<RxHead>, relaxed: bool) -> HeadOut {
+/// The head of `fields` written as blocks into memory from `hooks.take_rx` (CP2, CP2b: h2 and h3
+/// both), then `scheme://authority` after them; an extended CONNECT to a websocket with the
+/// `sec-websocket-key` an HTTP/2 client does not send. Larger than its estimate, once more in
+/// more memory.
+pub(crate) fn write_head(fields: &DecodedFields, hooks: HeadHooks, relaxed: bool) -> HeadOut {
     let mut need = rx_head_need(fields);
+    // Only an extended CONNECT to a websocket without a key of its own gets one (`ReqWs::of`).
+    let ws = fields.iter().any(|(n, v)| n == b":protocol" && v.split(|&b| b == b',').any(|t| t.trim_ascii().eq_ignore_ascii_case(b"websocket")));
+    let key = (ws && !fields.iter().any(|(n, _)| n.eq_ignore_ascii_case(b"sec-websocket-key"))).then(hooks.ws_key);
+    let extra = key.as_deref().map(|k| ("sec-websocket-key", k));
     for _ in 0..2 {
-        // No memory to be had: kept as its fields, and the data path answers 500 when the
-        // stream's buffer cannot be had either (S5), the connection going on.
-        let Some(mut rx) = take_rx(need) else {
-            return HeadOut::Fields { no_memory: true };
+        let Some(mut rx) = (hooks.take_rx)(need) else {
+            return HeadOut::NoMemory;
         };
-        match crate::h2::write_request_htx(fields, &mut crate::htx::HtxSlice::over(&mut rx), relaxed) {
+        match crate::h2::write_request_htx_with(fields, &mut crate::htx::HtxSlice::over(&mut rx), relaxed, extra) {
             Err(crate::h2::HeadError::Refused(_)) => return HeadOut::Refused,
-            Ok(facts) if !facts.ext_connect => {
+            Ok(facts) => {
                 if let Some(abs_len) = put_abs(&mut rx, &facts, fields) {
                     return HeadOut::Blocks { rx, facts, abs_len };
                 }
             }
             Err(crate::h2::HeadError::NoRoom) => {}
-            // `Invalid`, an extended CONNECT.
-            _ => break,
+            Err(crate::h2::HeadError::Invalid) => return text_head(fields, relaxed, key.as_deref()),
         }
         need = rx.len() + 1;
     }
-    HeadOut::Fields { no_memory: false }
+    HeadOut::NoMemory
+}
+
+/// The head the HTTP/1 checks refuse as text ([`TextHead`]), with the websocket `key` if any.
+#[cold]
+#[inline(never)]
+fn text_head(fields: &DecodedFields, relaxed: bool, key: Option<&str>) -> HeadOut {
+    match crate::h2::write_request_text(fields, relaxed, key) {
+        Ok(t) => HeadOut::Text(Box::new(t)),
+        Err(_) => HeadOut::Refused,
+    }
 }
 
 /// `scheme://authority` of a request that had both, written after the head's payload in
@@ -538,28 +231,6 @@ pub(crate) fn put_abs(rx: &mut RxHead, facts: &crate::h2::HeadFacts, fields: &De
     Some(len)
 }
 
-/// The request head of a server connection's stream as its fields ([`H2ReqHead`], T437), for
-/// the heads [`request_head`] does not write as blocks, which the writer has checked and
-/// not refused: the bridge writes them as HTTP/1.1 text (one the HTTP/1 parser refuses) or
-/// as blocks with the websocket key (an extended CONNECT).
-#[cold]
-#[inline(never)]
-fn keep_fields(stream: &mut H2StreamCtx, fields: &DecodedFields, relaxed: bool, spare_heads: &mut Vec<Box<H2ReqHead>>) -> Result<(), H2Error> {
-    stream.bad_request = crate::h2::check_request_fields(fields.iter(), relaxed) == Ok(true);
-    let mut head = stream.req_head.take().or_else(|| spare_heads.pop()).unwrap_or_default();
-    // Every `content-length` one length, as `h2_parse_cont_len_header` reads them
-    // (measured on 3.5-dev8, E1): the writer refused any other.
-    let cl = fields.iter().filter(|(n, _)| *n == b"content-length").find_map(|(_, v)| std::str::from_utf8(v).ok().and_then(crate::h2::content_length_value));
-    // The writer took these fields, so `write` does (the differential row): this error is
-    // never seen, and would refuse the stream.
-    head.write(fields).map_err(|_| H2Error::ProtocolError)?;
-    stream.req_content_length = cl.and_then(|c| usize::try_from(c).ok());
-    stream.ext_connect = head.ext_connect;
-    stream.req_head = Some(head);
-    stream.rx_htx.push(HtxBlock::Eoh);
-    Ok(())
-}
-
 impl H2StreamCtx {
     /// The request head as the HTX blocks the mux wrote ([`Self::rx_head`]), until the data
     /// path takes it.
@@ -573,7 +244,7 @@ impl H2StreamCtx {
     pub fn request_method(&self) -> Option<&str> {
         match self.request_htx() {
             Some(h) => h.req_line().map(|l| l.method),
-            None => self.req_head.as_ref().map(|h| h.method()),
+            None => self.text_head.as_ref().map(|h| h.method()),
         }
     }
 
@@ -582,7 +253,7 @@ impl H2StreamCtx {
     pub fn request_uri(&self) -> Option<&str> {
         match self.request_htx() {
             Some(h) => h.req_line().map(|l| l.uri),
-            None => self.req_head.as_ref().map(|h| h.uri()),
+            None => self.text_head.as_ref().map(|h| h.uri()),
         }
     }
 
@@ -592,7 +263,7 @@ impl H2StreamCtx {
     pub fn request_header(&self, name: &str) -> Option<&str> {
         match self.request_htx() {
             Some(h) => h.get_header_bytes(name.as_bytes()).and_then(|v| std::str::from_utf8(v).ok()),
-            None => self.req_head.as_ref().and_then(|h| h.get_header(name)).and_then(|v| std::str::from_utf8(v).ok()),
+            None => self.text_head.as_ref().and_then(|h| h.text_headers().find(|(n, _)| n.eq_ignore_ascii_case(name))).map(|(_, v)| v),
         }
     }
 
@@ -761,7 +432,7 @@ impl H2StreamCtx {
             rx_fill: 0,
             rx_limit: 0,
             bad_request: false,
-            req_head: None,
+            text_head: None,
             req_content_length: None,
             ext_connect: false,
             rx_head: None,
@@ -845,8 +516,6 @@ pub struct H2MuxContext {
     decoded: DecodedFields,
     /// A HEADERS frame's block, copied out of `rx_buf` to be decoded.
     block_scratch: Vec<u8>,
-    /// The memory of request heads the data path has taken ([`H2ReqHead`]), for the next.
-    pub spare_heads: Vec<Box<H2ReqHead>>,
     /// The memory of the HTX of streams that are over, for the next (at most
     /// [`SPARE_STREAMS`]).
     pub spare_htx: Vec<Htx>,
@@ -855,12 +524,20 @@ pub struct H2MuxContext {
     /// head is kept as its fields). The data path's pool (`Buf::take_rx_head`);
     /// without one, the heap.
     pub take_rx_head: fn(usize) -> Option<RxHead>,
+    /// A fresh `sec-websocket-key` for an extended CONNECT to a websocket (the data path's
+    /// `websocket::fresh_key`; without one, [`heap_ws_key`]'s fixed key).
+    pub ws_key: fn() -> String,
 }
 
 /// [`H2MuxContext::take_rx_head`] of a context the data path gave none: twice the need, at
 /// least 1 KB, from the heap.
 pub(crate) fn heap_rx_head(need: usize) -> Option<RxHead> {
     Some(RxHead::from_box(vec![0u8; need.saturating_mul(2).max(1024)].into_boxed_slice()))
+}
+
+/// [`H2MuxContext::ws_key`] of a context the data path gave none: a fixed key.
+pub(crate) fn heap_ws_key() -> String {
+    "AAAAAAAAAAAAAAAAAAAAAA==".to_string()
 }
 
 /// The estimate of a request head's HTX that [`H2MuxContext::take_rx_head`] is asked for:
@@ -944,9 +621,9 @@ impl H2MuxContext {
             body_scratch: Vec::new(),
             decoded: DecodedFields::default(),
             block_scratch: Vec::new(),
-            spare_heads: Vec::new(),
             spare_htx: Vec::new(),
             take_rx_head: heap_rx_head,
+            ws_key: heap_ws_key,
         }
     }
 
@@ -971,18 +648,9 @@ impl H2MuxContext {
     /// after the other needs, not what the busiest moment needed ([`IDLE_SPARES`], a small
     /// body stage).
     pub fn trim_idle(&mut self) {
-        self.spare_heads.truncate(IDLE_SPARES);
         self.spare_htx.truncate(IDLE_SPARES);
         if self.body_scratch.capacity() > 4096 {
             self.body_scratch = Vec::new();
-        }
-    }
-
-    /// A request head the data path took ([`H2StreamCtx::req_head`]) is given back.
-    pub fn give_back_head(&mut self, mut h: Box<H2ReqHead>) {
-        if self.spare_heads.len() < SPARE_STREAMS {
-            h.clear();
-            self.spare_heads.push(h);
         }
     }
 
@@ -1373,11 +1041,8 @@ impl crate::htx_mux::HtxStream for H2StreamCtx {
     fn is_reset(&self) -> bool {
         matches!(self.state, H2StreamState::Reset(_))
     }
-    fn req_head(&self) -> Option<&H2ReqHead> {
-        self.req_head.as_deref()
-    }
-    fn take_req_fields(&mut self) -> Option<Box<H2ReqHead>> {
-        self.req_head.take()
+    fn take_text_head(&mut self) -> Option<Box<TextHead>> {
+        self.text_head.take()
     }
     fn take_rx_head(&mut self) -> Option<(RxHead, crate::h2::HeadFacts, usize)> {
         self.rx_head.take().map(|rx| (rx, self.head_facts, self.abs_len))
@@ -1417,10 +1082,6 @@ impl crate::htx_mux::HtxMux for H2MuxContext {
                     && st.rx_htx.blocks().iter().any(|b| matches!(b, HtxBlock::Eoh))
             })
             .map(|st| u64::from(st.id))
-    }
-
-    fn give_back_head(&mut self, head: Box<H2ReqHead>) {
-        H2MuxContext::give_back_head(self, head);
     }
 
     fn send_head(&mut self, id: u64, head: &[u8], end_stream: bool) -> bool {
@@ -1663,9 +1324,8 @@ impl Mux for MuxH2 {
         // Export parsed HTX data to output buffer; a head kept as text goes before the
         // blocks, which then start with its blank line.
         let mut wire = stream.rx_htx.to_h1_wire();
-        if let Some(h) = &stream.req_head {
-            let head = h.to_wire();
-            wire.splice(..0, head[..head.len() - 2].iter().copied());
+        if let Some(h) = &stream.text_head {
+            wire.splice(..0, h.wire[..h.wire.len() - 2].iter().copied());
         } else if let Some(h) = stream.request_htx() {
             // A head written as blocks (CP2a): its line and fields as text.
             let mut head = Vec::new();
@@ -1909,7 +1569,7 @@ impl MuxH2 {
         // `h2_make_htx_response` (no runtime path speaks h2 to a server yet: `proto h2` on
         // a server is refused by the parser).
         let checked = if ctx.is_server { Ok(()) } else { crate::h2::check_response_fields(decoded.iter_text()) };
-        let (take_rx, relaxed) = (ctx.take_rx_head, ctx.relaxed_path);
+        let (take_rx, ws_key, relaxed) = (ctx.take_rx_head, ctx.ws_key, ctx.relaxed_path);
         let spare_htx = ctx.spare_htx.pop();
         let stream = ctx.streams.entry(stream_id).or_insert_with(|| {
             let mut s = H2StreamCtx::new(
@@ -1929,7 +1589,7 @@ impl MuxH2 {
         let converted = if ctx.is_server {
             // A server connection's request head: written once, as the HTX blocks of the
             // memory the stream's buffer adopts (CP2a), checked and limited as it is written.
-            request_head(stream, decoded, take_rx, relaxed, &mut ctx.spare_heads)
+            request_head(stream, decoded, HeadHooks { take_rx, ws_key }, relaxed)
         } else if checked.is_err() {
             Err(H2Error::ProtocolError)
         } else {
@@ -3091,7 +2751,7 @@ mod tests {
             .sum::<usize>()
             // A head kept as text (T437) holds its fields there, one written as blocks (CP2a)
             // in its `rx_head`.
-            + ctx.streams.values().map(|s| s.req_head.as_ref().map_or(0, |h| h.field_bytes)).sum::<usize>()
+            + ctx.streams.values().map(|s| s.text_head.as_ref().map_or(0, |h| h.facts.field_bytes)).sum::<usize>()
             + ctx.streams.values().filter(|s| s.rx_head.is_some()).map(|s| s.head_facts.field_bytes).sum::<usize>();
         assert!(held >= 8000, "the control request is held: {held}");
         assert!(held <= 2 << 20, "{} streams hold {held} bytes of headers from {} bytes", ctx.streams.len(), wire.len());
@@ -3243,7 +2903,7 @@ mod tests {
         for (what, block) in cases {
             let (ctx, s) = answer(&headers(frame_flags::END_HEADERS | frame_flags::END_STREAM, 1, block));
             assert_eq!(s, vec![(3, 1, 1)], "{what}: not RST_STREAM PROTOCOL_ERROR");
-            assert!(ctx.streams.get(&1).is_none_or(|st| st.req_head.is_none()), "{what}: a head was kept");
+            assert!(ctx.streams.get(&1).is_none_or(|st| st.text_head.is_none() && st.rx_head.is_none()), "{what}: a head was kept");
         }
     }
 
@@ -3267,9 +2927,9 @@ mod tests {
     }
 
     /// CP2: a request head is written as HTX blocks into the memory the data path hands the
-    /// mux (`take_rx_head`), with `scheme://authority` after them; none to be had keeps the
-    /// head as its fields (the data path answers 500, S5), memory too small is asked for again, larger, and a head
-    /// that fits neither is kept as its fields.
+    /// mux (`take_rx_head`), with `scheme://authority` after them; none to be had flags the
+    /// stream (the data path answers 500, S5), memory too small is asked for again, larger, and
+    /// a head that fits neither flags it too (CP2b-2: no head is kept as fields any more).
     #[test]
     fn a_request_head_is_written_into_the_memory_the_data_path_gives() {
         let block = [&[0x82u8, 0x86, 0x84][..], &lit(b":authority", b"a")].concat();
@@ -3282,8 +2942,8 @@ mod tests {
             (ctx, s)
         };
         let (ctx, s) = run(no_memory);
-        assert_eq!(s, vec![], "no reset: the head is kept as its fields");
-        assert!(ctx.streams.get(&1).is_some_and(|st| st.rx_head.is_none() && st.req_head.is_some() && st.no_memory));
+        assert_eq!(s, vec![], "no reset: the data path answers");
+        assert!(ctx.streams.get(&1).is_some_and(|st| st.rx_head.is_none() && st.text_head.is_none() && st.no_memory));
 
         let (ctx, s) = run(heap_rx_head);
         assert_eq!(s, vec![]);
@@ -3298,15 +2958,75 @@ mod tests {
         let st = ctx.streams.get(&1).expect("the stream");
         assert_eq!(st.rx_head.as_ref().map(RxHead::len), Some(4096), "asked again, for more");
 
-        // Room for the head and not the prefix, then too little for the head: kept as fields.
+        // Room for the head and not the prefix, then too little for the head: no memory.
         for size in [exact + "http://a".len() - 1, 40] {
             GIVE.with(|g| g.set(size));
             let (ctx, s) = run(given);
             assert_eq!(s, vec![], "{size}");
             let st = ctx.streams.get(&1).expect("the stream");
-            assert!(st.rx_head.is_none() && st.req_head.is_some(), "{size}: kept as fields");
-            assert_eq!((st.request_method(), st.request_uri()), (Some("GET"), Some("/")));
+            assert!(st.rx_head.is_none() && st.text_head.is_none() && st.no_memory, "{size}: no memory");
+            assert_eq!(st.request_method(), None);
         }
+    }
+
+    /// CP2b-2: an extended CONNECT to a websocket is written as blocks with the
+    /// `sec-websocket-key` the data path's hook makes, after the other headers; the client's own
+    /// key is kept and none made.
+    #[test]
+    fn an_extended_connect_to_a_websocket_is_written_with_a_key() {
+        fn key() -> String {
+            "a".repeat(24)
+        }
+        let ext = |extra: &[u8]| [lit(b":method", b"CONNECT"), vec![0x86, 0x84], lit(b":authority", b"a"), lit(b":protocol", b"websocket"), extra.to_vec()].concat();
+        let run = |hook: fn() -> String, extra: &[u8]| {
+            let (mux, mut ctx) = open_conn();
+            ctx.ws_key = hook;
+            let _ = mux.parse(&mut ctx, &headers(frame_flags::END_HEADERS, 1, ext(extra)));
+            ctx
+        };
+        let ctx = run(key, &[]);
+        let st = ctx.streams.get(&1).expect("the stream");
+        assert!(st.text_head.is_none() && st.rx_head.is_some() && st.ext_connect, "written as blocks");
+        assert!(st.head_facts.key_written);
+        assert_eq!(st.request_header("sec-websocket-key"), Some(key().as_str()));
+        assert_eq!((st.head_facts.fields, st.head_facts.field_bytes), (3, 5 + 16 + 17), "the key is not counted");
+        let ctx = run(key, &lit(b"sec-websocket-key", b"dGhlIHNhbXBsZSBub25jZQ=="));
+        let st = ctx.streams.get(&1).expect("the stream");
+        assert!(!st.head_facts.key_written);
+        assert_eq!(st.request_header("sec-websocket-key"), Some("dGhlIHNhbXBsZSBub25jZQ=="));
+        let ctx = run(heap_ws_key, &[]);
+        let st = ctx.streams.get(&1).expect("the stream");
+        assert!(st.rx_head.is_some() && st.head_facts.key_written, "a context without the hook has the fixed key");
+        // A head the HTTP/1 checks refuse (a path past ASCII) is text, with the key after the fields.
+        let (mux, mut ctx) = open_conn();
+        ctx.ws_key = key;
+        let block = [lit(b":method", b"CONNECT"), vec![0x86], lit(b":path", "/caf\u{e9}".as_bytes()), lit(b":authority", b"a"), lit(b":protocol", b"websocket")].concat();
+        let _ = mux.parse(&mut ctx, &headers(frame_flags::END_HEADERS, 1, block));
+        let st = ctx.streams.get(&1).expect("the stream");
+        let t = st.text_head.as_ref().expect("text");
+        assert!(st.rx_head.is_none() && st.ext_connect && t.facts.key_written);
+        assert!(t.wire.ends_with(format!("connection: upgrade\r\nsec-websocket-key: {}\r\n\r\n", key()).as_bytes()), "{}", t.wire.escape_ascii());
+        // Another protocol gets none.
+        let (mux, mut ctx) = open_conn();
+        ctx.ws_key = key;
+        let block = [lit(b":method", b"CONNECT"), vec![0x86, 0x84], lit(b":authority", b"a"), lit(b":protocol", b"connect-udp")].concat();
+        let _ = mux.parse(&mut ctx, &headers(frame_flags::END_HEADERS, 1, block));
+        assert!(!ctx.streams.get(&1).expect("the stream").head_facts.key_written);
+    }
+
+    /// CP2b-2: a head the HTTP/1 checks refuse (a `:path` that is not UTF-8) is kept as the text
+    /// it goes out as, the raw bytes in it, and no blocks; the stream is not reset.
+    #[test]
+    fn a_path_that_is_not_utf8_is_kept_as_text_with_its_bytes() {
+        let block = [&[0x82u8, 0x86][..], &lit(b":path", b"/caf\xe9"), &lit(b":authority", b"a")].concat();
+        let (ctx, s) = answer(&headers(frame_flags::END_HEADERS | frame_flags::END_STREAM, 1, block));
+        assert_eq!(s, vec![]);
+        let st = ctx.streams.get(&1).expect("the stream");
+        assert!(st.rx_head.is_none() && !st.no_memory);
+        let t = st.text_head.as_ref().expect("the text");
+        assert_eq!(&t.wire[..], b"GET /caf\xe9 HTTP/1.1\r\nhost: a\r\n\r\n");
+        assert_eq!((t.facts.path_raw, t.facts.uri_len, t.abs.as_str()), (true, 5, "http://a"));
+        assert_eq!(st.request_uri(), Some(t.uri()), "readers see the text that stands for the bytes");
     }
 
     /// T437: a request with two `host` headers is taken, with the first (HAProxy 3.5-dev8,

@@ -399,7 +399,7 @@ fn connection_specific_fields_never_reach_the_server() {
 }
 
 /// E1, the mux path: a path the HTTP/1 parser refuses (UTF-8, not ASCII) goes as text, the
-/// length written as its digits there too (`h2_bridge::text_wire`). (The relay path refuses
+/// length written as its digits there too (`h2_bridge::framed_text`). (The relay path refuses
 /// such a path.)
 #[test]
 fn a_head_without_htx_gets_its_length_in_digits() {
