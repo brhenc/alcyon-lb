@@ -905,7 +905,7 @@ Ratios, Ibex / HAProxy, user instructions (above 1 = Ibex does more work):
 
 What each build is worth on HAProxy (user ins, from o2): lto -1.5 % keepalive, -1.3 % rules, -1.2 %
 h2s1, -2.0 % h3fit; pgo -7.7 / -7.8 / -5.7 / -7.3 %; pgo-lto -11.4 / -11.2 / -8.3 / -10.9 %. Ibex PGO
-over release-perf: -14.9 / -15.4 / -12.7 / -13.7 %. So the PGO gain flattered Ibex by about 3-5 points,
+over release-perf: -14.9 / -15.4 / -12.7 / -13.7 %. So the PGO gain flattered Ibex by about 3-4 points,
 not by 10-15: HAProxy gains 8-11 % from the same treatment. Kernel instructions do not move with the
 build (Ibex 66k, HAProxy 69.6k / 76.1k): Ibex is 3.7k (keepalive, rules) and 9.6k (h2s1) below.
 
@@ -946,11 +946,11 @@ Reading it:
   The gap on rules is instructions, not memory.
 - **IPC.** Ibex PGO runs user code at IPC 1.43-1.48 against HAProxy pgo-lto 1.00-1.38; on h2s1 that is
   why 9 % fewer instructions become 38 % fewer user cycles (30.2k vs 48.7k). Without PGO Ibex's IPC is
-  1.0-1.2, HAProxy's 0.7-0.97. On rules Ibex's higher IPC (1.34 vs 1.43) is not enough to cover +15 % instructions:
+  1.0-1.2, HAProxy's 0.7-0.97. On rules Ibex's higher IPC (1.43 vs 1.34) is not enough to cover +15 % instructions:
   user cycles are 31.3k vs 29.1k (+8 %).
-- **Kernel.** 70-80 % of cycles of a request are kernel on both proxies (IPC about 0.6). Ibex's kernel
-  cycles are 7-10 % lower at the same syscalls count order (Ibex does fewer kernel instructions and
-  its cycles per kernel instruction are equal): the kernel part is not where the user-space PGO gap is.
+- **Kernel.** 72-83 % of the cycles of a request are kernel on both proxies (IPC about 0.6). Ibex's
+  kernel cycles are 7 % (keepalive), 3 % (rules) and 17 % (h2s1) below HAProxy pgo-lto, with fewer
+  kernel instructions at the same IPC: the kernel part is not where the user-space gap is.
 - h2s1 note: Ibex is not at parity in the pass count (§2.1); the cycle figure above says the extra
   passes are cheap in cycles (hot caches) on this host, not that they are free.
 
