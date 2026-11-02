@@ -132,7 +132,9 @@ pub fn parse_h1<'a>(
         err_state: 0,
     };
 
-    let mut slp = std::mem::MaybeUninit::<h1_sl>::uninit();
+    // Zeroed, not uninit: `h1.c` writes `*slp` only once the start line is parsed (ret <= 0
+    // before that), and an all-zero `h1_sl` (null `ist`s, 0 ints) is a valid empty view.
+    let mut slp = std::mem::MaybeUninit::<h1_sl>::zeroed();
     let mut hdrs = vec![
         http_hdr {
             n: ist { ptr: std::ptr::null_mut(), len: 0 },
@@ -174,7 +176,15 @@ pub fn parse_h1<'a>(
         }
     };
 
-    let safe_sl = if is_response {
+    // `h1.c` copies its local, partly filled `sl` to `*slp` on every return, so before the start
+    // line is complete (ret <= 0) some of its fields are stack leftovers: no view of them.
+    let safe_sl = if ret <= 0 {
+        if is_response {
+            SafeSl::Response(SafeSlSt { v: &[], c: &[], r: &[], status: 0 })
+        } else {
+            SafeSl::Request(SafeSlRq { m: &[], u: &[], v: &[], meth: 0 })
+        }
+    } else if is_response {
         let st = unsafe { slp.assume_init().st };
         SafeSl::Response(SafeSlSt {
             v: safe_ist(st.v),
