@@ -3,10 +3,9 @@
 
 //! Per-thread storage the request path reuses instead of allocating (T437).
 //!
-//! The rules work on header lists of owned `String`s (the response head, the copy the
-//! sample fetches read in `CURRENT_RES_HEADERS`). A `String` that leaves such a list comes
-//! back here, cleared, and the next list takes it with the capacity it grew to, so a
-//! steady stream of requests through the same rules allocates nothing. The strings are the
+//! A `String` the rules are done with comes back here, cleared, and the next one taken has the
+//! capacity it grew to, so a steady stream of requests through the same rules allocates
+//! nothing (the response head's header list this served is HTX blocks since X3b-1). The strings are the
 //! sample engine's spares ([`ibex_sample::spare`], bounded), shared with the fetches.
 //!
 //! The scratch buffers ([`with_string`], [`with_bytes`]) are taken from their pool for the
@@ -44,88 +43,6 @@ pub fn register_pools() {
     crate::stats::register_pools();
     crate::proxy::register_pools();
     crate::txn::L7Retry::register_pools();
-}
-
-/// Empties `v`, its strings given back; `v` keeps its capacity.
-pub fn clear_pairs(v: &mut Vec<(String, String)>) {
-    for (k, val) in v.drain(..) {
-        give(k);
-        give(val);
-    }
-}
-
-/// [`Vec::retain`] on a header list, the strings of what goes given back.
-pub fn retain_pairs(v: &mut Vec<(String, String)>, mut keep: impl FnMut(&(String, String)) -> bool) {
-    let mut i = 0;
-    while i < v.len() {
-        if keep(&v[i]) {
-            i += 1;
-        } else {
-            let (k, val) = v.remove(i);
-            give(k);
-            give(val);
-        }
-    }
-}
-
-#[cfg(debug_assertions)]
-thread_local! {
-    static PAIR_LIST_COPIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// The [`copy_pairs`] calls on this thread so far (debug builds; 0 in release): a test pins
-/// that the response rules copy no header list (X3).
-#[must_use]
-pub fn pair_list_copies() -> u64 {
-    #[cfg(debug_assertions)]
-    return PAIR_LIST_COPIES.with(std::cell::Cell::get);
-    #[cfg(not(debug_assertions))]
-    0
-}
-
-/// Makes `dst` a copy of `src`, reusing the strings `dst` has: what `clone_from` does, but
-/// the strings past the end of `src` are given back rather than freed, and the ones added
-/// are spares.
-pub fn copy_pairs(dst: &mut Vec<(String, String)>, src: &[(String, String)]) {
-    #[cfg(debug_assertions)]
-    PAIR_LIST_COPIES.with(|c| c.set(c.get() + 1));
-    while dst.len() > src.len() {
-        if let Some((k, v)) = dst.pop() {
-            give(k);
-            give(v);
-        }
-    }
-    for (d, s) in dst.iter_mut().zip(src) {
-        d.0.clone_from(&s.0);
-        d.1.clone_from(&s.1);
-    }
-    let have = dst.len();
-    for (k, v) in &src[have..] {
-        dst.push((string_from(k), string_from(v)));
-    }
-}
-
-/// `hdrs[at]` is `(name, value)`, written over the strings it has; a pair more than the list
-/// has is one with spare strings (`at` is at most `hdrs.len()`).
-pub fn set_pair(hdrs: &mut Vec<(String, String)>, at: usize, name: &str, value: &str) {
-    if let Some((k, v)) = hdrs.get_mut(at) {
-        k.clear();
-        k.push_str(name);
-        v.clear();
-        v.push_str(value);
-    } else {
-        hdrs.push((string_from(name), string_from(value)));
-    }
-}
-
-/// `hdrs` cut to its first `len` pairs, the strings of the others given back.
-pub fn truncate_pairs(hdrs: &mut Vec<(String, String)>, len: usize) {
-    while hdrs.len() > len {
-        if let Some((k, v)) = hdrs.pop() {
-            give(k);
-            give(v);
-        }
-    }
 }
 
 /// A [`string`] that is given back when it is dropped.
@@ -332,22 +249,6 @@ mod tests {
         let t = string();
         assert_eq!(t.len(), 0);
         assert_eq!(t.capacity(), cap);
-    }
-
-    /// `copy_pairs` gives `dst` the contents of `src` whatever their lengths.
-    #[test]
-    fn copy_pairs_copies_longer_and_shorter_lists() {
-        let a = vec![("a".to_string(), "1".to_string()), ("b".to_string(), "2".to_string())];
-        let mut d = vec![("z".to_string(), "9".to_string())];
-        copy_pairs(&mut d, &a);
-        assert_eq!(d, a);
-        copy_pairs(&mut d, &a[..1]);
-        assert_eq!(d, a[..1]);
-        let mut v = a.clone();
-        retain_pairs(&mut v, |(k, _)| k == "b");
-        assert_eq!(v, a[1..]);
-        clear_pairs(&mut v);
-        assert_eq!(v.len(), 0);
     }
 
     /// A dropped `PString` and `PPairs` give their storage back.

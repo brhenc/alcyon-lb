@@ -563,6 +563,36 @@ impl Buf {
         Some((&mut self.data, region))
     }
 
+    /// X3b: the memory for an HTX over the first `head_len` readable bytes (the received
+    /// head), with all the memory after the readable bytes as its reserve:
+    /// [`Self::htx_over_head`] with the largest reserve there is (none for a buffer with no
+    /// memory), for a pass that ends with
+    /// the head written out of the HTX ([`Self::finish_head_from`]) and nothing read into the
+    /// buffer meanwhile.
+    pub fn htx_after_data(&mut self, head_len: usize) -> (&mut [u8], ibex_proto::htx::HtxRegion) {
+        self.compact();
+        self.eoh.set(EOH_UNKNOWN);
+        let region = ibex_proto::htx::HtxRegion { head_start: 0, head_end: head_len.min(self.len), reserve_start: self.len };
+        (&mut self.data, region)
+    }
+
+    /// X3b: the first `old` readable bytes (the head) replaced by the `n` bytes an HTX wrote at
+    /// `at` in this buffer's free memory ([`ibex_proto::htx::HtxSlice::write_h1_head_in_free`]
+    /// over [`Self::htx_after_data`]): no copy of the head outside the buffer.
+    pub fn finish_head_from(&mut self, old: usize, at: usize, n: usize) {
+        self.eoh.set(EOH_UNKNOWN);
+        let old = old.min(self.len);
+        let (start, end) = (self.head, self.head + self.len);
+        debug_assert!(at >= end && at + n <= self.data.len(), "the new head is past the data");
+        self.hwm = self.hwm.max(to_mark(at + n));
+        // [old | rest | ... new] -> [old | rest | new] -> [new | rest] at the front.
+        self.data.copy_within(at..at + n, end);
+        self.data[start + old..end + n].rotate_right(n);
+        self.data.copy_within(start + old..end + n, 0);
+        self.head = 0;
+        self.len = self.len - old + n;
+    }
+
     /// Records that an HTX of `tail` data bytes and `desc_bytes` of descriptors is in the
     /// memory ([`Self::htx_slice_mut`]).
     pub fn note_htx(&mut self, tail: usize, desc_bytes: usize) {

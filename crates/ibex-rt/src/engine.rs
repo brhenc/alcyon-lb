@@ -8,7 +8,7 @@
 //! Connects [`Listener`], [`Poller`], [`FdTab`], [`Scheduler`], and [`TcpSession`]
 //! into the single-threaded soft-realtime execution loop described in `design/008-tcp-first.md`.
 
-// `assigning_clones` fires on the CURRENT_RES_HEADERS thread-local writes below.
+// `assigning_clones` fires on some owned-or-borrowed header writes below.
 // Those sites mix owned and borrowed `hdrs`, so a uniform `clone_from()` does not
 // typecheck, and varying it per-site is churn for no measurable gain.
 #![allow(clippy::assigning_clones)]
@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 // yet" and renders `-`, where the old engine-local default reported a 200 that had
 // never been sent.
 use ibex_sample::registry::{
-    TimeoutKind, CURRENT_RES_HEADERS, CURRENT_RES_STATUS, CURRENT_RES_TR, CURRENT_SRV_STATUS, CURRENT_TIMEOUTS,
+    TimeoutKind, CURRENT_RES_STATUS, CURRENT_RES_TR, CURRENT_SRV_STATUS, CURRENT_TIMEOUTS,
 };
 use ibex_sample::vars::VarStore;
 
@@ -12717,7 +12717,7 @@ impl EngineDispatcher<'_> {
 
         // Bare-LF line ends are a head too (`find_eoh` accepts them, as HAProxy's parser
         // does); split only on CRLF, such a head skipped every rule.
-        let Some((first_line, rest_headers)) = hdr_str.split_once("\r\n").or_else(|| hdr_str.split_once('\n')) else {
+        let Some((first_line, _)) = hdr_str.split_once("\r\n").or_else(|| hdr_str.split_once('\n')) else {
             set_rsp(entry);
             return;
         };
@@ -12746,36 +12746,41 @@ impl EngineDispatcher<'_> {
             }
         }
 
-        // The headers the rules edit are the list the response fetches read (X3): built once
-        // where they read it, edited there, and written out from it, with no copy of it per
-        // rule or per list.
-        // The previous response's strings are written over in place (X7): a spare string is
-        // taken only for a header more than that response had.
-        with_res_hdrs(|hdrs| {
-            let mut n = 0;
-            for line in rest_headers.lines() {
-                if line.is_empty() {
-                    break;
-                }
-                if let Some((k, v)) = line.split_once(':') {
-                    crate::reuse::set_pair(hdrs, n, k.trim(), v.trim());
-                    n += 1;
-                }
-            }
-            crate::reuse::truncate_pairs(hdrs, n);
-        });
-        // T439: the rules do not see the server's `close` and `keep-alive` (`HAProxy` takes
-        // them out as it parses the head), and what framed the response is kept for after
-        // them. A head back from a `wait-for-body` is the one the rules left: done then.
-        if resume.is_none() {
-            let len_hdrs = with_res_hdrs(|hdrs| {
-                crate::txn::strip_connection_tokens(hdrs);
-                crate::txn::LenHdrs::of_response(hdrs)
-            });
-            if let Some(t) = entry.sess.strm.txn.as_mut() {
-                t.rsp_len_hdrs = len_hdrs;
-            }
+        // X3b: the headers the rules edit, and that the response fetches read, are HTX blocks
+        // over the head's bytes in the response buffer, the descriptors and what the rules
+        // write in the memory after the data: no string of them, no copy of them per rule.
+        // The reserve: a descriptor a line at most (two bytes a line or more), and the room
+        // `HAProxy` leaves the rules when the body fills its buffer (`tune.maxrewrite`, which
+        // it caps at half the buffer, `src/haproxy.c`); a buffer the body filled grows for it.
+        let body_in_buf = entry.sess.rep.readable().len().saturating_sub(total_hdr_len);
+        let reserve = entry.sess.maxrewrite.min(entry.sess.bufsize / 2);
+        let room = entry.sess.rep.len() + 8 * total_hdr_len + 64 + reserve;
+        if entry.sess.rep.capacity() < room && !entry.sess.rep.grow_capacity(room) {
+            // No memory for it: this stream fails (S5).
+            entry.sess.rep.clear();
+            entry.sess.strm.log.bytes_from_server = 0;
+            reply_error(entry, proxies, 500);
+            return;
         }
+        let (htx_region, htx_tail, htx_blocks, hdrs_size) = {
+            let (mem, region) = entry.sess.rep.htx_after_data(total_hdr_len);
+            let mut h = ibex_proto::htx::HtxSlice::over_received_with(mem, region, region.reserve_start, 0);
+            let indexed = index_res_headers(&mut h);
+            debug_assert!(indexed.is_ok(), "the reserve holds a descriptor a line: {indexed:?}");
+            // T439: the rules do not see the server's `close` and `keep-alive` (`HAProxy` takes
+            // them out as it parses the head), and what framed the response is kept for after
+            // them. A head back from a `wait-for-body` is the one the rules left: done then.
+            if resume.is_none() {
+                crate::txn::strip_connection_tokens(&mut h);
+                let len_hdrs = crate::txn::LenHdrs::of_response(h.as_ref());
+                if let Some(t) = entry.sess.strm.txn.as_mut() {
+                    t.rsp_len_hdrs = len_hdrs;
+                }
+            }
+            let size: usize = h.as_ref().header_bytes().map(|(k, v, _)| 8 + k.len() + v.len()).sum();
+            (region, h.tail_addr(), h.num_blocks(), size)
+        };
+        entry.sess.rep.note_htx(htx_tail, htx_blocks * ibex_proto::htx::HTX_DESC_SIZE);
 
         CURRENT_RES_STATUS.set(status);
         CURRENT_SRV_STATUS.set(status);
@@ -12783,10 +12788,7 @@ impl EngineDispatcher<'_> {
         // `t_data - t_connect` (`smp_fetch_reX_timers`).
         let tr = entry.sess.strm.log.data.zip(entry.sess.strm.log.connect).map(|(d, c)| d.saturating_duration_since(c).as_millis());
         CURRENT_RES_TR.set(tr.map_or(-1, |ms| i64::try_from(ms).unwrap_or(i64::MAX)));
-        // `HAProxy` caps `tune.maxrewrite` at half the buffer (`src/haproxy.c`).
-        let reserve = entry.sess.maxrewrite.min(entry.sess.bufsize / 2);
-        let body_in_buf = entry.sess.rep.readable().len().saturating_sub(total_hdr_len);
-        with_res_hdrs(|hdrs| res_htx_init(entry.sess.bufsize, Some(reserve), &proto_version, &status_msg, hdrs, body_in_buf));
+        res_htx_init(entry.sess.bufsize, Some(reserve), &proto_version, &status_msg, hdrs_size, body_in_buf);
 
         let registry = sample_registry();
 
@@ -12878,6 +12880,10 @@ impl EngineDispatcher<'_> {
                 .map(String::as_str),
             ..Default::default()
         };
+        let rh = RepHead {
+            htx: std::cell::RefCell::new(ibex_proto::htx::HtxSlice::over_received_with(entry.sess.rep.htx_slice_mut(), htx_region, htx_tail, htx_blocks)),
+        };
+        ctx.res_htx = Some(&rh);
 
         // `process_store_rules`: `stick store-response` takes a key from the response (the
         // first per table, none where the request already stored one), and every key queued
@@ -12918,12 +12924,10 @@ impl EngineDispatcher<'_> {
             // as HTTP (`AN_RES_INSPECT` ahead of `AN_RES_WAIT_HTTP`), so its status and
             // headers are not there to fetch until they are done.
             CURRENT_RES_STATUS.set(0);
-            // The headers, out of the fetches' sight while the `tcp-response` rules run, and
-            // back whatever ends them.
-            let hidden = with_res_hdrs(std::mem::take);
             let tcp_stop = 'tcp: {
             // Copied only for a backend that has the rules (S7: a copy per response).
-            let tcp_ctx = (resume.is_none() && !proxies[be_idx].tcp_res_content_rules.is_empty()).then(|| SampleContext { res_version: None, ..ctx.clone() });
+            // The headers are out of their fetches' sight while the `tcp-response` rules run.
+            let tcp_ctx = (resume.is_none() && !proxies[be_idx].tcp_res_content_rules.is_empty()).then(|| SampleContext { res_version: None, res_htx: None, ..ctx.clone() });
             // `tcp-response inspect-delay` runs from the first pass over the head; with none,
             // the rules cannot wait (`tcp_inspect_response`).
             let inspect_exp = inspect_wait.map(|w| w.deadline).or_else(|| {
@@ -12980,7 +12984,6 @@ impl EngineDispatcher<'_> {
             }
             false
             };
-            with_res_hdrs(|hdrs| *hdrs = hidden);
             if tcp_stop {
                 break 'rules None;
             }
@@ -13043,6 +13046,7 @@ impl EngineDispatcher<'_> {
                     &proxies[px].acls,
                     (&mut status, &mut status_msg),
                     &mut ctx,
+                    &rh,
                     caps,
                     registry,
                     &mut entry.sess.strm.vars,
@@ -13080,7 +13084,8 @@ impl EngineDispatcher<'_> {
                     safe_method: matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE"),
                     post: method == "POST",
                 };
-                let sck = with_res_hdrs(|hdrs| crate::cookie::process_response(cfg, target, &cookie_txn, req, status, unix_now(), hdrs));
+                // A cold path (a `cookie` line): on the headers as a list of pairs.
+                let (sck, _) = with_res_pairs(&mut rh.htx.borrow_mut(), |hdrs| crate::cookie::process_response(cfg, target, &cookie_txn, req, status, unix_now(), hdrs));
                 if let Some(txn) = entry.sess.strm.txn.as_mut() {
                     txn.ck.sck = sck;
                 }
@@ -13090,13 +13095,13 @@ impl EngineDispatcher<'_> {
             // blocked (`http_process_res_common`). The fetches in the rules above may have
             // changed the headers, so this reads them as they now are.
             if proxies[be_idx].ids.checkcache
-                && with_res_hdrs(|hdrs| hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("set-cookie")))
+                && rh.htx.borrow().as_ref().header_bytes().any(|(k, _, _)| k.eq_ignore_ascii_case(b"set-cookie"))
                 && {
                     let req = crate::cookie::ReqKind {
                         safe_method: matches!(entry.sess.req_method.as_deref().unwrap_or(""), "GET" | "HEAD" | "OPTIONS" | "TRACE"),
                         post: entry.sess.req_method.as_deref() == Some("POST"),
                     };
-                    let (cacheable, cook) = with_res_hdrs(|hdrs| crate::cookie::response_cache_flags(req, status, hdrs));
+                    let ((cacheable, cook), _) = with_res_pairs(&mut rh.htx.borrow_mut(), |hdrs| crate::cookie::response_cache_flags(req, status, hdrs));
                     cacheable && cook
                 }
             {
@@ -13113,6 +13118,7 @@ impl EngineDispatcher<'_> {
                 be_idx,
                 (&mut status, &mut status_msg),
                 &mut ctx,
+                &rh,
                 Some(&mut res_caps),
                 registry,
                 &mut entry.sess.strm.vars,
@@ -13122,6 +13128,22 @@ impl EngineDispatcher<'_> {
                 break 'rules Some(stop);
             }
             None
+        };
+        // A `return` is made while the context is there to render it: its reply reads the
+        // response as truncated (`http_reply_message`), its status and headers fetching as
+        // nothing.
+        let return_raw = match &failed {
+            Some(ResStop::Return { status, content_type, reply, page, error_page }) => {
+                CURRENT_RES_STATUS.set(0);
+                let res_ctx = SampleContext { res_version: None, res_htx: None, ..ctx.clone() };
+                let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
+                // A body made from a template is held to the buffer (`fit_or_500`) once it is made.
+                match resolve_error_body(&proxies[be_idx], &proxies[entry.proxy_idx], *status, error_page.as_ref(), content_type.as_ref(), reply.as_deref(), page.as_deref()) {
+                    ResolvedErrorBody::Raw(bytes) => (bytes.to_vec(), false),
+                    ResolvedErrorBody::Custom { content_type, reply } => (build_templated_error_response(*status, content_type, reply, None, &res_ctx, registry), true),
+                }
+            }
+            _ => (Vec::new(), false),
         };
         if rejected {
             entry.sess.rep.clear();
@@ -13134,11 +13156,9 @@ impl EngineDispatcher<'_> {
         if let Some(wait) = held {
             // Held for the body: the head as the rules so far left it goes back into the
             // buffer, and the rules go on from the wait when the body is here.
-            let mut new_hdr = format!("{proto_version} {status} {status_msg}\r\n");
-            with_res_hdrs(|hdrs| push_header_lines(&mut new_hdr, hdrs));
-            new_hdr.push_str("\r\n");
             note_response_head_write();
-            entry.sess.rep.replace_prefix(total_hdr_len, &ibex_regex::bytetext::text_to_bytes(&new_hdr));
+            let (out, end) = write_res_head(rh.htx.into_inner(), &proto_version, status, &status_msg);
+            out.put(&mut entry.sess.rep, total_hdr_len, end);
             entry.sess.strm.log.res_captures.clone_from(&res_caps);
             if let Some(txn) = entry.sess.strm.txn.as_mut() {
                 txn.rsp_wait = Some(wait);
@@ -13160,8 +13180,10 @@ impl EngineDispatcher<'_> {
             let mut pay = 0;
             // Whether the server's response was all here and its connection fit for another
             // request: a reply that replaces it leaves the connection to the pool then (the
-            // rest of a larger response is not read, and the connection is closed).
+            // rest of a larger response is not read, and the connection is closed). The head
+            // is its length: the rules' blocks may have written over its bytes.
             let mut srv_msg = MsgState::head(framing);
+            srv_msg.measure_head_by(|| Some((total_hdr_len, 0)));
             let used = srv_msg.advance_counted(entry.sess.rep.readable(), &mut pay);
             let srv_complete = srv_msg.is_done() && used == entry.sess.rep.readable().len() && entry.sess.strm.txn.as_ref().is_some_and(|t| t.srv_reusable);
             if let Some(t) = entry.sess.strm.txn.as_mut().and_then(|t| t.rsp_htx.as_mut()) {
@@ -13177,21 +13199,12 @@ impl EngineDispatcher<'_> {
                     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
                     send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &raw);
                 }
-                ResStop::Return { status, content_type, reply, page, error_page } => {
-                    // The server's response is already truncated when the reply is built
-                    // (`http_reply_message`): its status and headers fetch as nothing.
-                    CURRENT_RES_STATUS.set(0);
-                    CURRENT_RES_HEADERS.with(|h| crate::reuse::clear_pairs(&mut h.borrow_mut()));
-                    let res_ctx = SampleContext { res_version: None, ..ctx.clone() };
+                ResStop::Return { .. } => {
                     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
-                    let raw: Vec<u8> = match resolve_error_body(&proxies[be_idx], &proxies[entry.proxy_idx], status, error_page.as_ref(), content_type.as_ref(), reply.as_deref(), page.as_deref()) {
-                        ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
-                        ResolvedErrorBody::Custom { content_type, reply } => {
-                            let mut r = build_templated_error_response(status, content_type, reply, None, &res_ctx, registry);
-                            fit_or_500(&entry.sess, proxies, entry.proxy_idx, be_idx, &mut r);
-                            r
-                        }
-                    };
+                    let (mut raw, custom) = return_raw;
+                    if custom {
+                        fit_or_500(&entry.sess, proxies, entry.proxy_idx, be_idx, &mut raw);
+                    }
                     // The proxy's own answer, not a refusal: `LH`.
                     entry.sess.strm.log.term = Some(*b"LH");
                     send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &raw);
@@ -13218,13 +13231,14 @@ impl EngineDispatcher<'_> {
             return;
         }
 
+        let mut h = rh.htx.into_inner();
         // What the rules did to the framing and to `Connection`, read again as `HAProxy` reads
         // it when it writes the head out (`h1_make_eoh`, `src/mux_h1.c`; T439): a response
         // left with no length, or a `close` a rule wrote, closes the client connection.
         let was = entry.sess.strm.txn.as_ref().map_or_else(Default::default, |t| t.rsp_len_hdrs);
         // A `keep-alive` a rule wrote keeps the connection `option httpclose` alone would close
         // (`h1_set_cli_conn_mode`, T442).
-        let (rule_close, rule_kal) = with_res_hdrs(|hdrs| crate::txn::reread_response_after_rules(hdrs, was, status));
+        let (rule_close, rule_kal) = crate::txn::reread_response_after_rules(&mut h, was, status);
         let client_close = if rule_close && !tunnel {
             if let Some(t) = entry.sess.strm.txn.as_mut() {
                 t.close_after = true;
@@ -13240,31 +13254,21 @@ impl EngineDispatcher<'_> {
         };
         // A chunked body whose `Transfer-Encoding` the rules removed goes without its chunk
         // framing, until the end of the message (`h1_process_emit_headers`, T442).
-        if framing == crate::txn::Framing::Chunked && was.chnk && !with_res_hdrs(|hdrs| hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"))) {
+        if framing == crate::txn::Framing::Chunked && was.chnk && !h.as_ref().header_bytes().any(|(k, _, _)| k.eq_ignore_ascii_case(b"transfer-encoding")) {
             if let Some(t) = entry.sess.strm.txn.as_mut() {
                 t.rsp_dechunk = Some(Box::new(crate::txn::Chunk::START));
             }
         }
-        // The same `Connection` handling as without rules, on the headers the rules left.
-        // The head written again, from the list the fetches read (left there for the ones
-        // after, the log's), straight into the buffer (X7: no string of it).
-        with_res_hdrs(|hdrs| crate::txn::apply_response_connection(hdrs, srv_http11, client_close, req_http11, tunnel || status < 100));
+        // The same `Connection` handling as without rules, on the headers the rules left
+        // (a `Connection` header that has no room is not written: the blocks have the
+        // memory the buffer has, and the connection's state is the transaction's).
+        let conn = crate::txn::apply_response_connection(&mut h, srv_http11, client_close, req_http11, tunnel || status < 100);
+        debug_assert!(conn.is_ok(), "a `Connection` header fits what the rules left: {conn:?}");
+        // The head written once, from the blocks, into the buffer's free memory and moved to
+        // the front (X3b: no string of it, no copy of it outside the buffer).
         note_response_head_write();
-        let old = total_hdr_len;
-        let written = with_res_hdrs(|hdrs| entry.sess.rep.replace_head_with(old, |out| write_response_head(out, &proto_version, status, &status_msg, hdrs)));
-        if !written {
-            // Larger than the buffer's free memory: through a `Vec`, which the buffer grows for.
-            // Sized once: no piece is shorter as bytes than as the text that stands for them.
-            let mut v = Vec::new();
-            with_res_hdrs(|hdrs| {
-                let size = proto_version.len() + status_msg.len() + 16 + hdrs.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>();
-                v.resize(size, 0);
-                let n = write_response_head(&mut v, &proto_version, status, &status_msg, hdrs);
-                debug_assert!(n.is_some(), "the head fits the room it was sized for");
-                v.truncate(n.unwrap_or(0));
-            });
-            entry.sess.rep.replace_prefix(old, &v);
-        }
+        let (out, end) = write_res_head(h, &proto_version, status, &status_msg);
+        out.put(&mut entry.sess.rep, total_hdr_len, end);
         set_rsp(entry);
     }
 
@@ -17197,26 +17201,98 @@ pub fn response_head_writes() -> u64 {
     0
 }
 
-/// `f` on the response headers the rules edit, which are the ones the response fetches read
-/// (`CURRENT_RES_HEADERS`, X3): no copy of them per rule. Nothing `f` does may evaluate a
-/// fetch (the list is borrowed for it): a rule's format and condition are evaluated before.
-fn with_res_hdrs<R>(f: impl FnOnce(&mut Vec<(String, String)>) -> R) -> R {
-    CURRENT_RES_HEADERS.with(|h| f(&mut h.borrow_mut()))
+/// X3b: the response head the rules edit, as HTX header blocks over the response buffer (or,
+/// for a reply the proxy made, over memory of its own): what the `res.*` fetches read through
+/// [`SampleContext::res_htx`] and the actions edit, with no copy of it per rule. Nothing may
+/// evaluate a fetch while an action holds it borrowed: a rule's format and condition are
+/// evaluated before.
+struct RepHead<'b> {
+    htx: std::cell::RefCell<ibex_proto::htx::HtxSlice<'b>>,
 }
 
-/// The head `proto status reason`, the headers and the blank line, as bytes into `out`
-/// (the text of the strings standing for their bytes, [`ibex_regex::bytetext`]); `None` when
-/// `out` is too small.
-fn write_response_head(out: &mut [u8], proto: &str, status: u16, reason: &str, hdrs: &[(String, String)]) -> Option<usize> {
-    let mut at = 0;
-    let mut put = |piece: &str| -> Option<()> {
-        // ASCII is itself; only a piece with bytes beyond it is looked at for the characters
-        // that stand for a byte.
-        let bytes = if piece.is_ascii() { std::borrow::Cow::Borrowed(piece.as_bytes()) } else { ibex_regex::bytetext::text_to_bytes(piece) };
-        out.get_mut(at..at + bytes.len())?.copy_from_slice(&bytes);
-        at += bytes.len();
-        Some(())
-    };
+impl std::fmt::Debug for RepHead<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RepHead")
+    }
+}
+
+impl ibex_sample::registry::ResHead for RepHead<'_> {
+    fn read(&self, f: &mut dyn FnMut(ibex_proto::htx::HtxSliceRef<'_>)) {
+        f(self.htx.borrow().as_ref());
+    }
+}
+
+/// X3b: the header lines of the head the HTX `h` holds in place (its region's head, the
+/// status line first) as header blocks over their bytes: each line's name and value trimmed,
+/// a line with no colon left out, up to the blank line.
+fn index_res_headers(h: &mut ibex_proto::htx::HtxSlice<'_>) -> Result<(), ibex_proto::htx::HtxError> {
+    let r = h.region();
+    let mut at = r.head_start;
+    let mut first = true;
+    loop {
+        let line = {
+            let buf = &h.as_ref().buf()[at..r.head_end];
+            let Some(nl) = memchr::memchr(b'\n', buf) else { return Ok(()) };
+            let text = &buf[..nl];
+            let text = text.strip_suffix(b"\r").unwrap_or(text);
+            let field = text.iter().position(|&b| b == b':').filter(|_| !first).map(|colon| {
+                let name = trim_range(text, 0, colon);
+                let value = trim_range(text, colon + 1, text.len());
+                (at + name.start..at + name.end, at + value.start..at + value.end)
+            });
+            (text.is_empty() && !first, field, at + nl + 1)
+        };
+        let (blank, field, next) = line;
+        if blank {
+            return Ok(());
+        }
+        if let Some((name, value)) = field {
+            h.push_header_in_place(name, value)?;
+        }
+        first = false;
+        at = next;
+    }
+}
+
+/// `text[from..to]` without the ASCII white space around it, as a range of `text`.
+fn trim_range(text: &[u8], from: usize, to: usize) -> std::ops::Range<usize> {
+    let part = &text[from..to];
+    let lead = part.len() - part.trim_ascii_start().len();
+    let trail = part.len() - part.trim_ascii_end().len();
+    if lead == part.len() {
+        return from..from;
+    }
+    from + lead..to - trail
+}
+
+/// X3b: the header blocks of `h` as `(name, value)` text pairs, `f` on them, and the blocks made
+/// again from what `f` left when it changed them: for the cold paths that edit a list (`cookie`,
+/// `*-headers-bin`). False when the headers `f` left do not fit (the blocks are then what fit).
+fn with_res_pairs<R>(h: &mut ibex_proto::htx::HtxSlice<'_>, f: impl FnOnce(&mut Vec<(String, String)>) -> R) -> (R, bool) {
+    let before: Vec<(String, String)> = h
+        .as_ref()
+        .header_bytes()
+        .map(|(k, v, latin1)| (ibex_sample::registry::htx_value_text(k, false).into_owned(), ibex_sample::registry::htx_value_text(v, latin1).into_owned()))
+        .collect();
+    let mut pairs = before.clone();
+    let r = f(&mut pairs);
+    if pairs == before {
+        return (r, true);
+    }
+    for i in 0..h.num_blocks() {
+        if crate::txn::htx_header_at(h, i).is_some() {
+            h.remove_block(i);
+        }
+    }
+    let fits = pairs.iter().all(|(k, v)| h.retry_after_defrag(|h| h.add_header(k, v)).is_ok());
+    (r, fits)
+}
+
+/// X3b: the head `proto status reason`, the header blocks of `h` and the blank line, written
+/// in the free memory of `h` ([`ibex_proto::htx::HtxSlice::write_h1_head_in_free`]) or, when
+/// it has too little, into a `Vec`; and the HTX's end (`tail_addr`, descriptor bytes), for
+/// [`crate::buf::Buf::note_htx`].
+fn write_res_head(mut h: ibex_proto::htx::HtxSlice<'_>, proto: &str, status: u16, reason: &str) -> (ResHeadOut, (usize, usize)) {
     let mut digits = [0u8; 5];
     let mut i = digits.len();
     let mut n = status;
@@ -17228,30 +17304,56 @@ fn write_response_head(out: &mut [u8], proto: &str, status: u16, reason: &str, h
             break;
         }
     }
-    put(proto)?;
-    put(" ")?;
-    // ASCII digits.
-    put(std::str::from_utf8(&digits[i..]).unwrap_or_default())?;
-    put(" ")?;
-    put(reason)?;
-    put("\r\n")?;
-    for (k, v) in hdrs {
-        put(k)?;
-        put(": ")?;
-        put(v)?;
-        put("\r\n")?;
-    }
-    put("\r\n")?;
-    Some(at)
+    // The text of the words standing for their bytes (`ibex_regex::bytetext`).
+    let proto_b = ibex_regex::bytetext::text_to_bytes(proto);
+    let reason_b = ibex_regex::bytetext::text_to_bytes(reason);
+    let line: [&[u8]; 6] = [&proto_b, b" ", &digits[i..], b" ", &reason_b, b"\r\n"];
+    let out = match h.write_h1_head_in_free(&line) {
+        Some((at, n)) => ResHeadOut::InPlace(at, n),
+        None => {
+            let mut v: Vec<u8> = line.concat();
+            for (k, val, latin1) in h.as_ref().header_bytes() {
+                v.extend_from_slice(k);
+                v.extend_from_slice(b": ");
+                if latin1 {
+                    v.extend_from_slice(&ibex_regex::bytetext::text_to_bytes(std::str::from_utf8(val).unwrap_or_default()));
+                } else {
+                    v.extend_from_slice(val);
+                }
+                v.extend_from_slice(b"\r\n");
+            }
+            v.extend_from_slice(b"\r\n");
+            ResHeadOut::Copied(v)
+        }
+    };
+    let end = (h.tail_addr(), h.num_blocks() * ibex_proto::htx::HTX_DESC_SIZE);
+    (out, end)
 }
 
-/// `name: value\r\n` for each header, without the formatting machinery.
-fn push_header_lines(out: &mut String, hdrs: &[(String, String)]) {
-    for (k, v) in hdrs {
-        out.push_str(k);
-        out.push_str(": ");
-        out.push_str(v);
-        out.push_str("\r\n");
+/// Where [`write_res_head`] wrote the head.
+enum ResHeadOut {
+    /// In the buffer's free memory: where, and its length ([`crate::buf::Buf::finish_head_from`]).
+    InPlace(usize, usize),
+    /// Too large for it.
+    Copied(Vec<u8>),
+}
+
+impl ResHeadOut {
+    /// The head's bytes, `mem` the memory of the HTX that wrote it.
+    fn bytes<'m>(&'m self, mem: &'m [u8]) -> &'m [u8] {
+        match self {
+            ResHeadOut::InPlace(at, n) => &mem[*at..*at + *n],
+            ResHeadOut::Copied(v) => v,
+        }
+    }
+
+    /// The response buffer's head (its first `old` bytes) replaced by this one.
+    fn put(self, rep: &mut crate::buf::Buf, old: usize, end: (usize, usize)) {
+        rep.note_htx(end.0, end.1);
+        match self {
+            ResHeadOut::InPlace(at, n) => rep.finish_head_from(old, at, n),
+            ResHeadOut::Copied(v) => rep.replace_prefix(old, &v),
+        }
     }
 }
 
@@ -17305,7 +17407,7 @@ fn htx_hdr_size(name: &str, value: &str) -> usize {
 /// Sizes the HTX message the rules rewrite (`RES_HTX`), as `HAProxy` holds the response: a
 /// buffer of `tune.bufsize` less the 40-byte `struct htx`, holding the status line (an
 /// 8-byte block, 20 bytes of `htx_sl` and the three strings), each header
-/// ([`htx_hdr_size`]), the 9-byte end-of-headers, and the body bytes already in the buffer
+/// ([`htx_hdr_size`], their sum `hdrs_size`), the 9-byte end-of-headers, and the body bytes already in the buffer
 /// (an 8-byte block and the data).
 ///
 /// A rewrite fails when what it adds does not fit (`htx_reserve_nxblk`): `tune.maxrewrite`
@@ -17317,9 +17419,9 @@ fn htx_hdr_size(name: &str, value: &str) -> usize {
 /// default buffer, a server's `HTTP/1.1 200 OK` and `Content-Length: 0` alone, two
 /// `set-header` of `n`-byte values on two-letter names fit up to `n` = 8125 and fail at
 /// 8126; each further header, or body byte, takes the bytes above from that room.
-fn res_htx_init(bufsize: usize, reserve: Option<usize>, version: &str, reason: &str, hdrs: &[(String, String)], body: usize) {
+fn res_htx_init(bufsize: usize, reserve: Option<usize>, version: &str, reason: &str, hdrs_size: usize, body: usize) {
     let size = bufsize.saturating_sub(40);
-    let head = 8 + 20 + version.len() + 3 + reason.len() + hdrs.iter().map(|(k, v)| htx_hdr_size(k, v)).sum::<usize>() + 9;
+    let head = 8 + 20 + version.len() + 3 + reason.len() + hdrs_size + 9;
     let mut body = if body == 0 { 0 } else { 8 + body };
     if let Some(reserve) = reserve {
         body = body.min(size.saturating_sub(reserve).saturating_sub(head));
@@ -17454,6 +17556,7 @@ fn res_action(
     status: &mut u16,
     status_msg: &mut crate::reuse::Word,
     ctx: &SampleContext,
+    rh: &RepHead<'_>,
     registry: &Registry,
     vars: &mut VarStore,
 ) -> Result<bool, ResStop> {
@@ -17508,22 +17611,19 @@ fn res_action(
                 ibex_sample::vars::unset_in(vars, var_name);
                 return Ok(true);
             }
-            with_res_hdrs(|hdrs| {
-                let freed: usize = hdrs.iter().filter(|(k, _)| header_name_matches(k, name)).map(|(k, v)| htx_hdr_size(k, v)).sum();
-                crate::reuse::retain_pairs(hdrs, |(k, _)| !header_name_matches(k, name));
-                res_htx_resize(freed, 0);
-            });
+            let freed = res_remove(&mut rh.htx.borrow_mut(), |k| header_name_matches(k, name));
+            res_htx_resize(freed, 0);
             return Ok(true);
         }
         ResOp::Add(name, rc) => {
-            let mut val = crate::reuse::string();
-            rc.fmt.iter().for_each(|f| render_res_format(f, &mut val, ctx, registry, *status));
-            if !htx_hdr_add(name, &val) {
-                crate::reuse::give(val);
-                return failed();
-            }
-            with_res_hdrs(|hdrs| hdrs.push((crate::reuse::string_from(name), val)));
-            return Ok(true);
+            return crate::reuse::with_string(|val| {
+                rc.fmt.iter().for_each(|f| render_res_format(f, val, ctx, registry, *status));
+                if htx_hdr_add(name, val) && res_add(&mut rh.htx.borrow_mut(), name, val) {
+                    Ok(true)
+                } else {
+                    failed()
+                }
+            });
         }
         ResOp::Set(name, fmt, rc) => (name, fmt, rc),
     };
@@ -17547,7 +17647,7 @@ fn res_action(
             Some((c, r)) => (c, Some(r)),
             None => (act_fmt, None),
         };
-        return res_action(ResOp::Status(code.parse().unwrap_or(*status), reason), status, status_msg, ctx, registry, vars);
+        return res_action(ResOp::Status(code.parse().unwrap_or(*status), reason), status, status_msg, ctx, rh, registry, vars);
     }
     if let Some(var_name) = act_name.strip_prefix("\0set-var:") {
         // A fetch that finds nothing leaves the variable as it was (`action_store`).
@@ -17569,7 +17669,8 @@ fn res_action(
         // be fetched changes nothing.
         let Some(smp) = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, ctx)) else { return Ok(true) };
         let bin = sample_to_bin(smp);
-        let walk = with_res_hdrs(|hdrs| res_headers_bin(op, prefix, &bin, hdrs));
+        let (walk, fits) = with_res_pairs(&mut rh.htx.borrow_mut(), |hdrs| res_headers_bin(op, prefix, &bin, hdrs));
+        let walk = if fits { walk } else { crate::hdrs_bin::Walk::Rewrite };
         return match walk {
             crate::hdrs_bin::Walk::Done => Ok(true),
             crate::hdrs_bin::Walk::Rewrite => failed(),
@@ -17585,53 +17686,67 @@ fn res_action(
         // action with the ones before it rewritten.
         let Some((re_str, _)) = act_fmt.split_once('\t') else { return Ok(true) };
         let Ok(re) = ibex_regex::UserRegex::cached(re_str) else { return Ok(true) };
-        let mut repl_text = crate::reuse::string();
-        rc.fmt.iter().for_each(|f| render_res_format(f, &mut repl_text, ctx, registry, *status));
-        let repl = repl_text.as_str();
-        let mut result = Ok(true);
-        with_res_hdrs(|hdrs| {
-            for (k, v) in hdrs.iter_mut().filter(|(k, _)| k.eq_ignore_ascii_case(hdr_name)) {
-                let new_v = if full {
-                    match re.captures(v) {
-                        Some(caps) => exp_replace(repl, &caps),
-                        None => continue,
+        return crate::reuse::with_string(|repl| {
+            rc.fmt.iter().for_each(|f| render_res_format(f, repl, ctx, registry, *status));
+            let mut h = rh.htx.borrow_mut();
+            for i in 0..h.num_blocks() {
+                let new_v = match crate::txn::htx_header_at(&h, i) {
+                    Some((k, v, latin1)) if k.eq_ignore_ascii_case(hdr_name.as_bytes()) => {
+                        let v = ibex_sample::registry::htx_value_text(v, latin1);
+                        let new_v = if full {
+                            match re.captures(&v) {
+                                Some(caps) => exp_replace(repl, &caps),
+                                None => continue,
+                            }
+                        } else {
+                            replace_each_value(&v, &re, repl)
+                        };
+                        new_v.filter(|n| n.len() <= HTX_HDR_VALUE_MAX_LEN && res_htx_resize(8 + k.len() + v.len(), 8 + k.len() + n.len()))
                     }
-                } else {
-                    replace_each_value(v, &re, repl)
+                    _ => continue,
                 };
-                match new_v {
-                    Some(n) if n.len() <= HTX_HDR_VALUE_MAX_LEN && res_htx_resize(htx_hdr_size(k, v), htx_hdr_size(k, &n)) => *v = n,
-                    _ => {
-                        result = failed();
-                        break;
-                    }
+                if !new_v.is_some_and(|n| h.retry_after_defrag(|h| h.replace_block_value(i, n.as_bytes())).is_ok()) {
+                    return failed();
                 }
             }
+            Ok(true)
         });
-        crate::reuse::give(repl_text);
-        return result;
     }
 
     // `set-header`: every occurrence goes, then one is added at the end
     // (`http_action_set_header`) -- the removal stays when the addition does not fit.
-    let mut val = crate::reuse::string();
-    rc.fmt.iter().for_each(|f| render_res_format(f, &mut val, ctx, registry, *status));
-    let fits = with_res_hdrs(|hdrs| {
-        let freed: usize = hdrs.iter().filter(|(k, _)| k.eq_ignore_ascii_case(act_name)).map(|(k, v)| htx_hdr_size(k, v)).sum();
-        crate::reuse::retain_pairs(hdrs, |(k, _)| !k.eq_ignore_ascii_case(act_name));
+    crate::reuse::with_string(|val| {
+        rc.fmt.iter().for_each(|f| render_res_format(f, val, ctx, registry, *status));
+        let mut h = rh.htx.borrow_mut();
+        let freed = res_remove(&mut h, |k| k.eq_ignore_ascii_case(act_name));
         res_htx_resize(freed, 0);
-        htx_hdr_add(act_name, &val)
-    });
-    if fits {
-        with_res_hdrs(|hdrs| hdrs.push((crate::reuse::string_from(act_name), val)));
-    } else {
-        crate::reuse::give(val);
+        if htx_hdr_add(act_name, val) && res_add(&mut h, act_name, val) {
+            Ok(true)
+        } else {
+            failed()
+        }
+    })
+}
+
+/// X3b: every header block of `h` whose name `hit` matches removed; the HTX size they took
+/// ([`htx_hdr_size`]).
+fn res_remove(h: &mut ibex_proto::htx::HtxSlice<'_>, hit: impl Fn(&str) -> bool) -> usize {
+    let mut freed = 0;
+    for i in 0..h.num_blocks() {
+        let size = match crate::txn::htx_header_at(h, i) {
+            Some((k, v, _)) if hit(&ibex_sample::registry::htx_value_text(k, false)) => 8 + k.len() + v.len(),
+            _ => continue,
+        };
+        freed += size;
+        h.remove_block(i);
     }
-    if fits {
-        Ok(true)
-    } else {
-        failed()
-    }
+    freed
+}
+
+/// X3b: a header block `name: value` added after the others; false when the HTX has no room
+/// for it, even defragmented.
+fn res_add(h: &mut ibex_proto::htx::HtxSlice<'_>, name: &str, value: &str) -> bool {
+    h.retry_after_defrag(|h| h.add_header(name, value)).is_ok()
 }
 
 /// The response capture slots a rule list writes, with their lengths ([`run_res_rules`]).
@@ -17653,6 +17768,7 @@ fn run_res_rules<'a, 'c>(
     acls: &'c ibex_sample::Acls,
     head: (&mut u16, &mut crate::reuse::Word),
     ctx: &mut SampleContext<'c>,
+    rh: &RepHead<'_>,
     caps: ResCaps<'_>,
     registry: &Registry,
     vars: &mut VarStore,
@@ -17660,7 +17776,7 @@ fn run_res_rules<'a, 'c>(
 ) -> Result<Option<usize>, ResStop> {
     // In place, not a copy of the context per rule (S7).
     let prev = ctx.acls.replace(acls);
-    let flow = run_res_rules_in(rules, acls, head, ctx, caps, registry, vars, wait);
+    let flow = run_res_rules_in(rules, acls, head, ctx, rh, caps, registry, vars, wait);
     ctx.acls = prev;
     flow
 }
@@ -17671,6 +17787,7 @@ fn run_res_rules_in<'a>(
     acls: &ibex_sample::Acls,
     head: (&mut u16, &mut crate::reuse::Word),
     ctx: &SampleContext,
+    rh: &RepHead<'_>,
     mut caps: ResCaps<'_>,
     registry: &Registry,
     vars: &mut VarStore,
@@ -17740,7 +17857,7 @@ fn run_res_rules_in<'a>(
         if line != 0 && matches!(op, ResOp::Redirect(..) | ResOp::Return(..) | ResOp::Set("\0allow" | "\0deny" | "\0silent-drop", ..)) {
             LAST_RULE.set(Some(line));
         }
-        match res_action(op, status, status_msg, ctx, registry, vars) {
+        match res_action(op, status, status_msg, ctx, rh, registry, vars) {
             Ok(true) => {}
             Ok(false) => break,
             Err(stop) => {
@@ -17765,6 +17882,7 @@ fn eval_after_res_rules<'c>(
     be_idx: usize,
     head: (&mut u16, &mut crate::reuse::Word),
     ctx: &mut SampleContext<'c>,
+    rh: &RepHead<'_>,
     mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
     vars: &mut VarStore,
@@ -17777,7 +17895,7 @@ fn eval_after_res_rules<'c>(
         // `http-after-response capture` writes the frontend's slots, whichever proxy the rule is in.
         let fe_slots = &proxies[fe_idx].res_capture_slots;
         let caps = res_caps.as_deref_mut().filter(|_| !fe_slots.is_empty()).map(|c| (c, &fe_slots[..]));
-        run_res_rules(rules, &proxies[px].acls, (&mut *status, &mut *status_msg), ctx, caps, registry, vars, None)?;
+        run_res_rules(rules, &proxies[px].acls, (&mut *status, &mut *status_msg), ctx, rh, caps, registry, vars, None)?;
     }
     Ok(())
 }
@@ -18107,31 +18225,37 @@ fn after_res_on_reply<'r>(
     // refused at load when they are not an HTTP response (`load_errorfile_bytes`).
     let parsed = crate::proxy::find_eoh(raw).and_then(|(hdr_end, eoh_len)| {
         let head = String::from_utf8_lossy(&raw[..hdr_end]);
-        let (first, rest) = head.split_once('\n').unwrap_or((&head, ""));
+        let first = head.split_once('\n').map_or(&*head, |(f, _)| f);
         let mut parts = first.trim_end_matches('\r').splitn(3, ' ');
         let version = parts.next().unwrap_or("HTTP/1.1").to_string();
         let status = parts.next()?.parse::<u16>().ok()?;
         let reason = parts.next().unwrap_or_default().to_string();
-        let hdrs: Vec<(String, String)> = rest
-            .split('\n')
-            .filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
-            .collect();
-        Some((hdr_end, eoh_len, version, status, reason, hdrs))
+        Some((hdr_end, eoh_len, version, status, reason))
     });
-    let Some((hdr_end, eoh_len, version, mut status, reason_text, hdrs)) = parsed else {
+    let Some((hdr_end, eoh_len, version, mut status, reason_text)) = parsed else {
         return Ok(Cow::Borrowed(raw));
     };
     let mut reason = crate::reuse::Word::usual("");
     reason.set_words(std::iter::once(reason_text.as_str()));
+    // X3b: the reply's head as HTX blocks the rules edit and the fetches read, as a server's
+    // is, in memory of its own (a cold path): the head, a descriptor a line, and the room
+    // `HAProxy`'s buffer would leave the rules.
+    let head_len = hdr_end + eoh_len;
+    let mut mem = vec![0u8; head_len + 8 * head_len + sess.bufsize];
+    mem[..head_len].copy_from_slice(&raw[..head_len]);
+    let region = ibex_proto::htx::HtxRegion { head_start: 0, head_end: head_len, reserve_start: head_len };
+    let mut h = ibex_proto::htx::HtxSlice::over_received_with(&mut mem, region, head_len, 0);
+    let indexed = index_res_headers(&mut h);
+    debug_assert!(indexed.is_ok(), "the reply's memory holds a descriptor a line: {indexed:?}");
+    let hdrs_size: usize = h.as_ref().header_bytes().map(|(k, v, _)| 8 + k.len() + v.len()).sum();
 
     CURRENT_RES_STATUS.set(status);
     // A reply Ibex built has no server status and no Tr (HAProxy: 0 and -1), whatever response
     // this thread handled before.
     CURRENT_SRV_STATUS.set(0);
     CURRENT_RES_TR.set(-1);
-    res_htx_init(sess.bufsize, None, &version, &reason_text, &hdrs, raw.len() - hdr_end - eoh_len);
-    // The rules edit the list the fetches read (X3).
-    with_res_hdrs(|h| *h = hdrs);
+    res_htx_init(sess.bufsize, None, &version, &reason_text, hdrs_size, raw.len() - hdr_end - eoh_len);
+    let rh = RepHead { htx: std::cell::RefCell::new(h) };
     // The variables are the session's own, in `CURRENT_VARS` for the run that makes the
     // reply (`step_stream`).
     let mut vars = std::mem::take(&mut sess.strm.vars);
@@ -18170,6 +18294,7 @@ fn after_res_on_reply<'r>(
             be_max_retries: Some(proxies[be_idx].retries),
             cur_max_retries: Some(sess.max_retries),
             res_version: Some(&version),
+            res_htx: Some(&rh),
             unique_id: sess.strm.log.unique_id.as_deref(),
             accept_date: Some(sess.strm.log.date()),
             stream: Some(stream_facts(sess, Some(status), true)),
@@ -18188,6 +18313,7 @@ fn after_res_on_reply<'r>(
             be_idx,
             (&mut status, &mut reason),
             &mut ctx,
+            &rh,
             Some(&mut res_caps),
             sample_registry(),
             &mut vars,
@@ -18198,13 +18324,10 @@ fn after_res_on_reply<'r>(
     CURRENT_RES_STATUS.set(0);
     CURRENT_SRV_STATUS.set(0);
     CURRENT_RES_TR.set(-1);
-    let hdrs = with_res_hdrs(std::mem::take);
     result.map_err(|_| ())?;
 
-    let mut out = format!("{version} {status} {reason}\r\n");
-    push_header_lines(&mut out, &hdrs);
-    out.push_str("\r\n");
-    let mut bytes = out.into_bytes();
+    let (out, _) = write_res_head(rh.htx.into_inner(), &version, status, &reason);
+    let mut bytes = out.bytes(&mem).to_vec();
     bytes.extend_from_slice(&raw[hdr_end + eoh_len..]);
     Ok(Cow::Owned(bytes))
 }

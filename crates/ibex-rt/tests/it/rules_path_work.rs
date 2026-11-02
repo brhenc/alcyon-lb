@@ -177,17 +177,17 @@ fn rule_expressions_are_not_looked_up_per_request() {
 
 /// X7: the response rules hold the head's strings in place. R2 counted 12 spare-string takes per
 /// request on this scenario (debug build): 1 for the request's `set-var` and 2 more on the
-/// request side, 11 for the response head held as `(String, String)` pairs. What is left of
-/// those is the pair `set-header` adds and the one a header more than the last response had
-/// makes: 4.
+/// request side, 11 for the response head held as `(String, String)` pairs. X7 left 4: the pair
+/// `set-header` adds and the one a header more than the last response had makes. X3b-1: the
+/// response head is HTX blocks the rules edit in the response buffer, and takes none.
 #[test]
-fn the_response_rules_take_few_spare_strings() {
+fn the_response_rules_take_no_spare_strings() {
     const N: u64 = 50;
     let (_, rsp, _) = work(1, 50);
-    assert!(rsp.contains("x-served: ibex"), "response: {rsp:?}");
+    assert!(rsp.contains("x-served: ibex") && !rsp.to_ascii_lowercase().contains("server: be"), "response: {rsp:?}");
     let per = TAKES.get() / N;
-    println!("[MEASUREMENT X7] spare strings taken per request: {per}");
-    assert!(per <= 7, "spare strings taken per request: {per} (3 on the request side, 4 on the response's)");
+    println!("[MEASUREMENT X3b-1] spare strings taken per request: {per}");
+    assert_eq!(per, 0, "spare strings taken per request");
 }
 
 /// A server that answers the request heads with `responses`, whole, in turn.

@@ -25,7 +25,6 @@ thread_local! {
     /// The timeouts of the stream running on the thread, for the `*_timeout` fetches; set
     /// by the engine for the length of one run of a stream, `None` outside one.
     pub static CURRENT_TIMEOUTS: Cell<Option<StreamTimeouts>> = const { Cell::new(None) };
-    pub static CURRENT_RES_HEADERS: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     pub static CURRENT_RES_STATUS: Cell<u16> = const { Cell::new(0) };
     /// T385: the status as the server sent it (`txn->server_status`), which `set-status` leaves
     /// alone; 0 before a server response.
@@ -108,8 +107,39 @@ pub fn take_debug_destinations() -> Vec<String> {
 
 
 
-pub fn set_current_res_headers(headers: Vec<(String, String)>) {
-    CURRENT_RES_HEADERS.with(|h| *h.borrow_mut() = headers);
+/// X3b: the response head the rules edit, as HTX blocks, read by the `res.*` header fetches
+/// ([`SampleContext::res_htx`]). The engine's is a `RefCell` over the response buffer's HTX:
+/// a fetch reads the blocks as they are when it runs, and an action edits them between fetches.
+pub trait ResHead: std::fmt::Debug {
+    /// `f` over the blocks as they are now.
+    fn read(&self, f: &mut dyn FnMut(HtxSliceRef<'_>));
+}
+
+/// A header value as the text the fetches read: a Latin-1 block's text as it is, the bytes of
+/// another with [`ibex_regex::bytetext::bytes_to_text`] when they are not plain UTF-8.
+#[must_use]
+pub fn htx_value_text(v: &[u8], latin1: bool) -> Cow<'_, str> {
+    match std::str::from_utf8(v) {
+        Ok(t) if latin1 || !ibex_regex::bytetext::has_escapes(t) => Cow::Borrowed(t),
+        _ => Cow::Owned(ibex_regex::bytetext::bytes_to_text(v)),
+    }
+}
+
+/// The response headers as `(name, value)` text pairs: `ctx.res_headers`, else the blocks of
+/// [`SampleContext::res_htx`] (a copy, for the fetches that read the whole list).
+fn res_pairs(ctx: &SampleContext) -> Vec<(String, String)> {
+    if let Some(h) = ctx.res_headers {
+        return h.to_vec();
+    }
+    let mut out = Vec::new();
+    if let Some(head) = ctx.res_htx {
+        head.read(&mut |htx| {
+            for (k, v, latin1) in htx.header_bytes() {
+                out.push((htx_value_text(k, false).into_owned(), htx_value_text(v, latin1).into_owned()));
+            }
+        });
+    }
+    out
 }
 
 pub fn set_current_res_status(status: u16) {
@@ -247,6 +277,9 @@ pub struct SampleContext<'a> {
     pub raw_res: Option<&'a [u8]>,
     pub res_version: Option<&'a str>,
     pub res_headers: Option<&'a [(String, String)]>,
+    /// X3b: the response head the response rules edit, as HTX blocks ([`ResHead`]); read when
+    /// `res_headers` is `None`.
+    pub res_htx: Option<&'a dyn ResHead>,
     pub res_status: Option<u16>,
     pub res_body: Option<&'a [u8]>,
     pub fe_id: Option<u32>,
@@ -2272,11 +2305,8 @@ impl Registry {
             // T329: `smp_fetch_hdrs_bin` on the response, through the same H1 cleanup and
             // varint as req.hdrs_bin.
             func: |ctx, _args| {
-                let pairs = |h: &[(String, String)]| hdrs_bin(h.iter().map(|(k, v)| (k.as_str(), v.as_str())), false);
-                if let Some(headers) = ctx.res_headers {
-                    return Some(pairs(headers));
-                }
-                Some(CURRENT_RES_HEADERS.with(|h| pairs(&h.borrow())))
+                let h = res_pairs(ctx);
+                Some(hdrs_bin(h.iter().map(|(k, v)| (k.as_str(), v.as_str())), false))
             },
         });
 
@@ -7212,13 +7242,16 @@ fn visit_header_lines_b<'c>(ctx: &'c SampleContext<'_>, name: &str, res: bool, f
             }
         }
         if !any {
-            CURRENT_RES_HEADERS.with(|hdrs| {
-                for (k, v) in hdrs.borrow().iter() {
-                    if k.eq_ignore_ascii_case(name) {
-                        f(Cow::Owned(ibex_regex::bytetext::text_to_bytes(v).into_owned()));
+            if let Some(head) = ctx.res_htx {
+                head.read(&mut |htx| {
+                    for (k, v, latin1) in htx.header_bytes() {
+                        if k.eq_ignore_ascii_case(name.as_bytes()) {
+                            let bytes = if latin1 { ibex_regex::bytetext::text_to_bytes(std::str::from_utf8(v).unwrap_or_default()).into_owned() } else { v.to_vec() };
+                            f(Cow::Owned(bytes));
+                        }
                     }
-                }
-            });
+                });
+            }
         }
         return;
     }
@@ -7522,10 +7555,8 @@ fn get_res_header(ctx: &SampleContext, name: &str) -> Option<String> {
 /// Read from `ctx.res_headers`, else from the response being processed.
 fn res_header_block(ctx: &SampleContext) -> String {
     use crate::h1_clean::{h1_clean_headers, header_block};
-    let hdrs = match ctx.res_headers {
-        Some(h) => h1_clean_headers(h.iter().map(|(k, v)| (k.as_str(), v.as_str())), false),
-        None => CURRENT_RES_HEADERS.with(|h| h1_clean_headers(h.borrow().iter().map(|(k, v)| (k.as_str(), v.as_str())), false)),
-    };
+    let pairs = res_pairs(ctx);
+    let hdrs = h1_clean_headers(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())), false);
     header_block(&hdrs)
 }
 
@@ -7538,11 +7569,11 @@ fn get_all_res_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
             }
         }
     }
-    if matches.is_empty() {
-        CURRENT_RES_HEADERS.with(|hdrs| {
-            for (k, v) in hdrs.borrow().iter() {
-                if k.eq_ignore_ascii_case(name) {
-                    matches.push(v.clone());
+    if let (true, Some(head)) = (matches.is_empty(), ctx.res_htx) {
+        head.read(&mut |htx| {
+            for (k, v, latin1) in htx.header_bytes() {
+                if k.eq_ignore_ascii_case(name.as_bytes()) {
+                    matches.push(htx_value_text(v, latin1).into_owned());
                 }
             }
         });
@@ -7558,10 +7589,11 @@ fn get_all_res_header_names(ctx: &SampleContext) -> Vec<String> {
         let kept = crate::h1_clean::kept_headers(hdrs, false);
         hdrs.iter().zip(kept).filter(|(_, k)| *k).map(|((n, _), _)| n.to_ascii_lowercase()).collect()
     };
-    if let Some(headers) = ctx.res_headers.filter(|h| !h.is_empty()) {
-        return names(&headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>());
-    }
-    CURRENT_RES_HEADERS.with(|hdrs| names(&hdrs.borrow().iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>()))
+    let pairs = match ctx.res_headers.filter(|h| !h.is_empty()) {
+        Some(h) => h.to_vec(),
+        None => res_pairs(&SampleContext { res_headers: None, ..ctx.clone() }),
+    };
+    names(&pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>())
 }
 
 
@@ -7570,7 +7602,7 @@ fn get_all_res_header_names(ctx: &SampleContext) -> Vec<String> {
 fn get_all_res_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
     let mut all: Vec<(String, String)> = ctx.res_headers.map(<[_]>::to_vec).unwrap_or_default();
     if all.is_empty() {
-        CURRENT_RES_HEADERS.with(|hdrs| all.extend(hdrs.borrow().iter().cloned()));
+        all = res_pairs(&SampleContext { res_headers: None, ..ctx.clone() });
     }
     cleaned_for(&all, false)
 }

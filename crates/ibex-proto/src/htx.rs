@@ -1129,6 +1129,16 @@ impl<'a> HtxSliceRef<'a> {
         })
     }
 
+    /// [`Self::header_bytes`] with each block's index (what `replace_block_value` and
+    /// `remove_block` take): no name or value read as UTF-8 (X3b).
+    pub fn header_blocks_bytes(self) -> impl Iterator<Item = (usize, &'a [u8], &'a [u8], bool)> + 'a {
+        (0..self.num_blocks).filter_map(move |i| {
+            let desc = self.read_desc(i);
+            (desc.blk_type == HtxBlockType::Header)
+                .then(|| (i, &self.buf[desc.name_range()], &self.buf[desc.value_range()], desc.flags & HTX_BLK_FL_LATIN1 != 0))
+        })
+    }
+
     /// [`Self::header_blocks`] of the headers whose name `keep` keeps, the name read as bytes:
     /// what `header_blocks().filter(..)` on the name gives, without reading as UTF-8 the
     /// names and values of the headers it does not keep.
@@ -1579,6 +1589,53 @@ impl<'a> HtxSlice<'a> {
     #[must_use]
     pub fn as_ref(&self) -> HtxSliceRef<'_> {
         HtxSliceRef::new(self.buf, self.num_blocks)
+    }
+
+    /// An HTTP/1 head written from the blocks into this HTX's own free memory (between the
+    /// values' tail and the descriptors, which no block addresses): `line` (the start line and
+    /// its end of line, in pieces), then each header block as `name: value\r\n`, a Latin-1 value as its
+    /// bytes, then the blank line (X3b: the response rules' head, written once from the blocks
+    /// they edited). Where it starts and its length; `None` when the free memory is too small,
+    /// nothing a block addresses written.
+    pub fn write_h1_head_in_free(&mut self, line: &[&[u8]]) -> Option<(usize, usize)> {
+        let at = self.tail_addr;
+        let end = self.buf.len().saturating_sub(self.num_blocks * HTX_DESC_SIZE);
+        let room = |pos: usize, n: usize| (pos + n <= end).then_some(());
+        let mut pos = at;
+        for piece in line {
+            room(pos, piece.len())?;
+            self.buf[pos..pos + piece.len()].copy_from_slice(piece);
+            pos += piece.len();
+        }
+        for i in 0..self.num_blocks {
+            let desc = read_desc_at(self.buf, self.num_blocks, i);
+            if desc.blk_type != HtxBlockType::Header {
+                continue;
+            }
+            let name = desc.name_range();
+            room(pos, name.len() + 2)?;
+            self.buf.copy_within(name.clone(), pos);
+            pos += name.len();
+            self.buf[pos..pos + 2].copy_from_slice(b": ");
+            pos += 2;
+            let value = desc.value_range();
+            if desc.flags & HTX_BLK_FL_LATIN1 == 0 {
+                room(pos, value.len())?;
+                self.buf.copy_within(value.clone(), pos);
+                pos += value.len();
+            } else {
+                let bytes = ibex_regex::bytetext::text_to_bytes(utf8(&self.buf[value]).unwrap_or_default()).into_owned();
+                room(pos, bytes.len())?;
+                self.buf[pos..pos + bytes.len()].copy_from_slice(&bytes);
+                pos += bytes.len();
+            }
+            room(pos, 2)?;
+            self.buf[pos..pos + 2].copy_from_slice(b"\r\n");
+            pos += 2;
+        }
+        room(pos, 2)?;
+        self.buf[pos..pos + 2].copy_from_slice(b"\r\n");
+        Some((at, pos + 2 - at))
     }
 
     #[must_use]
