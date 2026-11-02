@@ -110,9 +110,17 @@ pub fn take_debug_destinations() -> Vec<String> {
 /// X3b: the response head the rules edit, as HTX blocks, read by the `res.*` header fetches
 /// ([`SampleContext::res_htx`]). The engine's is a `RefCell` over the response buffer's HTX:
 /// a fetch reads the blocks as they are when it runs, and an action edits them between fetches.
-pub trait ResHead: std::fmt::Debug {
+pub trait ResHead {
     /// `f` over the blocks as they are now.
     fn read(&self, f: &mut dyn FnMut(HtxSliceRef<'_>));
+}
+
+impl std::fmt::Debug for dyn ResHead + '_ {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut n = 0;
+        self.read(&mut |htx| n = htx.header_bytes().count());
+        write!(f, "ResHead({n} headers)")
+    }
 }
 
 /// A header value as the text the fetches read: a Latin-1 block's text as it is, the bytes of

@@ -1445,6 +1445,12 @@ fn clean_connection_blocks(h: &mut ibex_proto::htx::HtxSlice<'_>) -> ConnTokens 
     for i in 0..h.num_blocks() {
         // `None`: left as it is; `Some(None)`: removed; `Some(Some(c))`: `c` in its place.
         let cleaned = match htx_header_at(h, i) {
+            // The usual value, one token taken out whole: the header goes, no text of it made.
+            Some((k, v, _)) if k.eq_ignore_ascii_case(b"connection") && (v.eq_ignore_ascii_case(b"keep-alive") || v.eq_ignore_ascii_case(b"close")) => {
+                tokens.keep_alive |= v.len() == 10;
+                tokens.close |= v.len() == 5;
+                Some(None)
+            }
             Some((k, v, latin1)) if k.eq_ignore_ascii_case(b"connection") => match clean_connection_value(&ibex_sample::registry::htx_value_text(v, latin1), false, &mut tokens) {
                 Some(c) if c.as_bytes() == v => None,
                 c => Some(c),

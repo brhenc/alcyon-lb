@@ -1129,16 +1129,6 @@ impl<'a> HtxSliceRef<'a> {
         })
     }
 
-    /// [`Self::header_bytes`] with each block's index (what `replace_block_value` and
-    /// `remove_block` take): no name or value read as UTF-8 (X3b).
-    pub fn header_blocks_bytes(self) -> impl Iterator<Item = (usize, &'a [u8], &'a [u8], bool)> + 'a {
-        (0..self.num_blocks).filter_map(move |i| {
-            let desc = self.read_desc(i);
-            (desc.blk_type == HtxBlockType::Header)
-                .then(|| (i, &self.buf[desc.name_range()], &self.buf[desc.value_range()], desc.flags & HTX_BLK_FL_LATIN1 != 0))
-        })
-    }
-
     /// [`Self::header_blocks`] of the headers whose name `keep` keeps, the name read as bytes:
     /// what `header_blocks().filter(..)` on the name gives, without reading as UTF-8 the
     /// names and values of the headers it does not keep.

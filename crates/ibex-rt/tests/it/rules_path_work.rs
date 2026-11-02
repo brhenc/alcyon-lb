@@ -312,3 +312,17 @@ fn bytes_beyond_ascii_in_a_response_head_survive_the_rules() {
     assert!(l.contains("X-L: caf\u{fffd}\r\n") || l.contains("x-l: caf\u{fffd}\r\n"), "response: {l:?}");
     assert!(l.contains("caf\u{e9}\r\n"), "response: {l:?}");
 }
+
+/// X3b-1: the response fetches read the head's blocks as the rules leave them: a header with an
+/// empty value is one (and is written back), `res.hdr_names` lists the names, and a value that
+/// is not UTF-8 is read as its bytes (`res.cook` over a Latin-1 `Set-Cookie`).
+#[test]
+fn the_response_fetches_read_the_head_blocks() {
+    let rules = "  http-response set-header X-Names %[res.hdr_names]\n  \
+        http-response set-header X-Cook %[res.cook(a)]\n";
+    let rsp = answers(rules, &[b"HTTP/1.1 200 OK\r\nX-Empty:\r\nSet-Cookie: a=\xe9t\xe9\r\nContent-Length: 2\r\n\r\nok"], 1);
+    let rsp = rsp[0].to_ascii_lowercase();
+    assert!(rsp.contains("\r\nx-empty: \r\n"), "the empty header: {rsp:?}");
+    assert!(rsp.contains("\r\nx-names: x-empty,set-cookie,content-length\r\n"), "res.hdr_names: {rsp:?}");
+    assert!(rsp.contains("\r\nx-cook: \u{fffd}t\u{fffd}\r\n"), "res.cook of a Latin-1 value: {rsp:?}");
+}

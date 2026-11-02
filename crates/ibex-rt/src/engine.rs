@@ -12707,19 +12707,19 @@ impl EngineDispatcher<'_> {
             None => return,
         };
         let hdr_bytes = &entry.sess.rep.readable()[..total_hdr_len];
-        // The head as text, read where it is when it is plain UTF-8 (every head on the fast path);
-        // the status line's words are constants when they are the usual ones (X7): no spare
-        // string for the head or its words.
-        let hdr_str: std::borrow::Cow<'_, str> = match std::str::from_utf8(hdr_bytes) {
-            Ok(t) if !ibex_regex::bytetext::has_escapes(t) => std::borrow::Cow::Borrowed(t),
-            _ => std::borrow::Cow::Owned(ibex_regex::bytetext::bytes_to_text(hdr_bytes)),
-        };
-
-        // Bare-LF line ends are a head too (`find_eoh` accepts them, as HAProxy's parser
-        // does); split only on CRLF, such a head skipped every rule.
-        let Some((first_line, _)) = hdr_str.split_once("\r\n").or_else(|| hdr_str.split_once('\n')) else {
+        // The status line as text (X3b: only it, the headers are blocks), read where it is
+        // when it is plain UTF-8 (every head on the fast path); its words are constants when
+        // they are the usual ones (X7): no spare string for it or its words. Bare-LF line ends
+        // are a head too (`find_eoh` accepts them, as HAProxy's parser does); the `\r` of a
+        // CRLF is white space to the split below.
+        let Some(line_end) = memchr::memchr(b'\n', hdr_bytes) else {
             set_rsp(entry);
             return;
+        };
+        let line = &hdr_bytes[..line_end];
+        let first_line: std::borrow::Cow<'_, str> = match std::str::from_utf8(line) {
+            Ok(t) if !ibex_regex::bytetext::has_escapes(t) => std::borrow::Cow::Borrowed(t),
+            _ => std::borrow::Cow::Owned(ibex_regex::bytetext::bytes_to_text(line)),
         };
 
         let mut status: u16 = 200;
@@ -17210,12 +17210,6 @@ struct RepHead<'b> {
     htx: std::cell::RefCell<ibex_proto::htx::HtxSlice<'b>>,
 }
 
-impl std::fmt::Debug for RepHead<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RepHead")
-    }
-}
-
 impl ibex_sample::registry::ResHead for RepHead<'_> {
     fn read(&self, f: &mut dyn FnMut(ibex_proto::htx::HtxSliceRef<'_>)) {
         f(self.htx.borrow().as_ref());
@@ -17233,14 +17227,14 @@ fn index_res_headers(h: &mut ibex_proto::htx::HtxSlice<'_>) -> Result<(), ibex_p
         let line = {
             let buf = &h.as_ref().buf()[at..r.head_end];
             let Some(nl) = memchr::memchr(b'\n', buf) else { return Ok(()) };
+            // The `\r` of a CRLF is trimmed with the value's white space.
             let text = &buf[..nl];
-            let text = text.strip_suffix(b"\r").unwrap_or(text);
-            let field = text.iter().position(|&b| b == b':').filter(|_| !first).map(|colon| {
+            let field = memchr::memchr(b':', text).filter(|_| !first).map(|colon| {
                 let name = trim_range(text, 0, colon);
                 let value = trim_range(text, colon + 1, text.len());
                 (at + name.start..at + name.end, at + value.start..at + value.end)
             });
-            (text.is_empty() && !first, field, at + nl + 1)
+            (matches!(text, b"" | b"\r") && !first, field, at + nl + 1)
         };
         let (blank, field, next) = line;
         if blank {
@@ -17611,7 +17605,12 @@ fn res_action(
                 ibex_sample::vars::unset_in(vars, var_name);
                 return Ok(true);
             }
-            let freed = res_remove(&mut rh.htx.borrow_mut(), |k| header_name_matches(k, name));
+            // A plain name is compared as bytes; a pattern (`-m beg` ...) reads the name as text.
+            let freed = if name.starts_with('\0') {
+                res_remove(&mut rh.htx.borrow_mut(), |k| header_name_matches(&ibex_sample::registry::htx_value_text(k, false), name))
+            } else {
+                res_remove(&mut rh.htx.borrow_mut(), |k| k.eq_ignore_ascii_case(name.as_bytes()))
+            };
             res_htx_resize(freed, 0);
             return Ok(true);
         }
@@ -17718,7 +17717,7 @@ fn res_action(
     crate::reuse::with_string(|val| {
         rc.fmt.iter().for_each(|f| render_res_format(f, val, ctx, registry, *status));
         let mut h = rh.htx.borrow_mut();
-        let freed = res_remove(&mut h, |k| k.eq_ignore_ascii_case(act_name));
+        let freed = res_remove(&mut h, |k| k.eq_ignore_ascii_case(act_name.as_bytes()));
         res_htx_resize(freed, 0);
         if htx_hdr_add(act_name, val) && res_add(&mut h, act_name, val) {
             Ok(true)
@@ -17730,11 +17729,11 @@ fn res_action(
 
 /// X3b: every header block of `h` whose name `hit` matches removed; the HTX size they took
 /// ([`htx_hdr_size`]).
-fn res_remove(h: &mut ibex_proto::htx::HtxSlice<'_>, hit: impl Fn(&str) -> bool) -> usize {
+fn res_remove(h: &mut ibex_proto::htx::HtxSlice<'_>, hit: impl Fn(&[u8]) -> bool) -> usize {
     let mut freed = 0;
     for i in 0..h.num_blocks() {
         let size = match crate::txn::htx_header_at(h, i) {
-            Some((k, v, _)) if hit(&ibex_sample::registry::htx_value_text(k, false)) => 8 + k.len() + v.len(),
+            Some((k, v, _)) if hit(k) => 8 + k.len() + v.len(),
             _ => continue,
         };
         freed += size;
