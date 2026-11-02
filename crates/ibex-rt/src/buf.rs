@@ -150,6 +150,7 @@ fn register_arena_pools(reg: &ibex_alloc::PoolRegistry) {
     reg.register_provider("session", crate::engine::session_pool_stats);
     reg.register_provider("appctx", crate::applet::appctx_pool_stats);
     reg.register_provider("task", ibex_sched::task_pool_stats);
+    reg.register_provider("counters", crate::statcnt::counters_pool_stats);
     // The `ibex_alloc::Pool`s list themselves when first used; these are listed from the start.
     crate::reuse::register_pools();
 }

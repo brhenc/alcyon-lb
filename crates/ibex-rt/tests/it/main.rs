@@ -125,6 +125,7 @@ mod converter_edge_cases;
 mod converter_load_refusals;
 mod checkcache;
 mod cookie_persistence;
+mod counters_per_thread;
 mod curl_parity;
 mod debug_converter;
 mod default_nbthread;

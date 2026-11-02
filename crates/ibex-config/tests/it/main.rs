@@ -27,6 +27,7 @@ mod cond_enabled;
 mod cond_expected_message;
 mod connection_limits;
 mod cookie_config;
+mod counters_mode;
 mod crypto_provider;
 mod differential;
 mod env_expansion;

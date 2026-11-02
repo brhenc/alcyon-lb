@@ -191,6 +191,17 @@ pub enum ZeroOnFree {
     Hard,
 }
 
+/// `tune.ibex.counters shared|per-thread` (Ibex-only, T582): who writes the per-request counter
+/// rows of the frontends, backends and servers (`docs/design/per-thread-counters-2026-11-02.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountersMode {
+    /// One set of relaxed atomics per object, written by every thread (`HAProxy` with one thread
+    /// group). The default.
+    Shared,
+    /// One row per object per thread, written by its thread alone; the readers sum the rows.
+    PerThread,
+}
+
 /// `dns-accept-family <family>[,...]` (`cfg_parse_dns_accept_family`, `resolvers.c:4227`).
 /// `auto` anywhere in the list wins: IPv4, and IPv6 while the host has a route to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +329,8 @@ pub struct GlobalSection {
     /// `tune.ibex.zero-on-free off|soft|hard` (Ibex-only, T459): wipe every freed heap block. Off
     /// when unset.
     pub zero_on_free: Option<ZeroOnFree>,
+    /// `tune.ibex.counters shared|per-thread` (Ibex-only, T582): `shared` when unset.
+    pub counters: Option<CountersMode>,
     /// `tune.memory.hot-size <bytes>`: the most each thread keeps in its pools together
     /// (`global.tune.pool_cache_size`, 524288 when unset).
     pub hot_size: Option<usize>,

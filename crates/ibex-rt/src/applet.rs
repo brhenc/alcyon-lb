@@ -984,7 +984,7 @@ impl CliApplet {
         let active_conns = crate::globalconn::current();
         let max_conns: u32 = ctx.proxies.iter().map(|p| p.maxconn.get()).sum();
         let cum_conns: u64 = ctx.proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>()).sum();
-        let cum_reqs: u64 = ctx.proxies.iter().filter_map(|p| p.ids.tc.get()).map(|c| c.fe.req_tot.load(std::sync::atomic::Ordering::Relaxed)).sum();
+        let cum_reqs: u64 = ctx.proxies.iter().map(|p| crate::statcnt::snapshot(p, crate::statcnt::FE).req_tot).sum();
         let info = crate::stats::format_show_info_as(
             fmt,
             ctx.start_time,

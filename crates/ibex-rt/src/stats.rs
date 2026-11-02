@@ -431,9 +431,6 @@ pub fn description() -> Option<String> {
 
 pub static NBTHREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-// T320: process-wide count of streams (HTTP transactions, TCP sessions, CLI connections).
-pub static CUM_STREAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// T320: TLS connections open now, client and server side (`CurrSslConns`).
 pub static SSL_CURR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// T320: TLS connections set up since start, client and server side (`CumSslConns`).
@@ -568,7 +565,7 @@ pub fn process_info_pairs(p: &mut InfoPairs, proxies: &[Proxy]) {
     for px in proxies {
         max_conns += px.maxconn.get();
         cum_conns += px.stats.iter().map(|s| s.cum_conn.load(Relaxed)).sum::<u64>();
-        cum_reqs += px.ids.tc.get().map_or(0, |c| c.fe.req_tot.load(Relaxed));
+        cum_reqs += crate::statcnt::snapshot(px, crate::statcnt::FE).req_tot;
     }
     let active_conns = crate::globalconn::current();
     p.n = 0;
@@ -808,7 +805,7 @@ fn fill_info_pairs(
     p.put("BootTime_ms", format_args!("{}", "0"));
     p.put("Niced_tasks", format_args!("{}", "0"));
     p.put("CurrStreams", format_args!("{}", "0"));
-    p.put("CumStreams", format_args!("{}", crate::stats::CUM_STREAMS.load(std::sync::atomic::Ordering::Relaxed)));
+    p.put("CumStreams", format_args!("{}", crate::engine::cum_streams()));
     p.put("BlockedTrafficWarnings", format_args!("{}", crate::watchdog::blocked_traffic_warnings()));
     p.put("PatternsAdded", format_args!("{}", "0"));
     p.put("PatternsFreed", format_args!("{}", "0"));
@@ -834,37 +831,39 @@ fn ld(a: &std::sync::atomic::AtomicU64) -> u64 {
 }
 
 /// The columns every kind of row counts the same way: response classes and requests (HTTP
-/// only: `HAProxy` leaves them empty in TCP mode), bytes, aborts and the timings.
-fn fill_counters(r: &mut StatRow, c: &crate::statcnt::TxnCounters, http: bool, timed: bool) {
+/// only: `HAProxy` leaves them empty in TCP mode), bytes, aborts and the timings. `n` is the
+/// object's rows summed ([`crate::statcnt::snapshot`]), `c` its shared maxima.
+fn fill_counters(r: &mut StatRow, n: &crate::statcnt::Snapshot, c: &crate::statcnt::TxnCounters, http: bool, timed: bool) {
+    use crate::statcnt::{CTIME, QTIME, RTIME, TTIME};
     if http {
-        for (name, h) in ["hrsp_1xx", "hrsp_2xx", "hrsp_3xx", "hrsp_4xx", "hrsp_5xx", "hrsp_other"].iter().zip(&c.hrsp) {
-            r.set(name, ld(h));
+        for (name, h) in ["hrsp_1xx", "hrsp_2xx", "hrsp_3xx", "hrsp_4xx", "hrsp_5xx", "hrsp_other"].iter().zip(n.hrsp) {
+            r.set(name, h);
         }
-        r.set("req_tot", ld(&c.req_tot));
+        r.set("req_tot", n.req_tot);
         r.set("mode", "http");
     } else {
         r.set("mode", "tcp");
     }
-    r.set("bin", ld(&c.bin));
-    r.set("bout", ld(&c.bout));
+    r.set("bin", n.bin);
+    r.set("bout", n.bout);
     if timed {
-        r.set("cli_abrt", ld(&c.cli_abrt));
-        r.set("srv_abrt", ld(&c.srv_abrt));
-        if let Some(secs) = crate::statcnt::TxnCounters::since_secs(c.last_sess.load(std::sync::atomic::Ordering::Relaxed)) {
+        r.set("cli_abrt", n.cli_abrt);
+        r.set("srv_abrt", n.srv_abrt);
+        if let Some(secs) = crate::statcnt::TxnCounters::since_secs(n.last_sess) {
             r.set("lastsess", secs);
         }
-        let counted = if http { ld(&c.req_tot) } else { ld(&c.lbtot) };
-        r.set("qtime", c.qtime.avg(counted));
-        r.set("ctime", c.ctime.avg(counted));
-        r.set("rtime", c.rtime.avg(counted));
-        r.set("ttime", c.ttime.avg(counted));
-        r.set("qtime_max", c.qtime.max());
-        r.set("ctime_max", c.ctime.max());
-        r.set("rtime_max", c.rtime.max());
-        r.set("ttime_max", c.ttime.max());
+        let tmax = |k: usize| c.tmax[k].load(std::sync::atomic::Ordering::Relaxed);
+        r.set("qtime", n.tavg[QTIME]);
+        r.set("ctime", n.tavg[CTIME]);
+        r.set("rtime", n.tavg[RTIME]);
+        r.set("ttime", n.tavg[TTIME]);
+        r.set("qtime_max", tmax(QTIME));
+        r.set("ctime_max", tmax(CTIME));
+        r.set("rtime_max", tmax(RTIME));
+        r.set("ttime_max", tmax(TTIME));
         r.set("wrew", 0);
     }
-    r.set("eint", ld(&c.eint));
+    r.set("eint", n.eint);
 }
 
 /// `algo`: the balance algorithm as `HAProxy` names it. `random` and the default
@@ -885,6 +884,7 @@ fn balance_name(proxy: &Proxy) -> &'static str {
 
 pub(crate) fn write_frontend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u32, iid: u32) {
     let c = proxy.ids.tc.get().map_or(&*EMPTY, |p| &p.fe);
+    let n = crate::statcnt::snapshot(proxy, crate::statcnt::FE);
     let http = proxy.mode == ibex_config::Mode::Http;
     let mut r = StatRow::new();
     r.set("pxname", &proxy.name);
@@ -899,14 +899,14 @@ pub(crate) fn write_frontend_row(out: &mut String, fmt: StatFormat, proxy: &Prox
     r.set("dreq", proxy.stats.iter().map(|s| s.denied_req.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("dresp", proxy.stats.iter().map(|s| s.denied_resp.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
     r.set("dcon", proxy.stats.iter().map(|s| s.denied_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>());
-    r.set("ereq", ld(&c.ereq));
+    r.set("ereq", n.ereq);
     r.set("status", "OPEN");
     r.set("pid", PROCESS_NUM);
     r.set("iid", iid);
     r.set("sid", 0);
     r.set("type", 0);
     let rate: u64 = proxy.stats.iter().map(|s| s.fe_sess_rate.rate()).sum();
-    let rate_max = u64::from(c.rate_max.load(std::sync::atomic::Ordering::Relaxed));
+    let rate_max = n.rate_max;
     r.set("rate", rate);
     r.set("rate_lim", 0);
     r.set("rate_max", rate_max);
@@ -927,7 +927,7 @@ pub(crate) fn write_frontend_row(out: &mut String, fmt: StatFormat, proxy: &Prox
         r.set("cache_lookups", 0);
         r.set("cache_hits", 0);
     }
-    fill_counters(&mut r, c, http, false);
+    fill_counters(&mut r, &n, c, http, false);
     r.set("dses", 0);
     r.set("wrew", 0);
     r.default_untracked('F', http, "");
@@ -1019,21 +1019,22 @@ pub(crate) fn write_server_row(
     r.set("svname", srv_name);
     let pc = proxy.ids.tc.get();
     let c = pc.and_then(|p| p.srv.get(s_idx)).unwrap_or(&EMPTY);
+    let n = crate::statcnt::snapshot(proxy, crate::statcnt::SRV + s_idx);
     r.set("qcur", 0);
     r.set("qmax", 0);
     r.set("scur", scur);
     r.set("smax", c.smax.load(std::sync::atomic::Ordering::Relaxed).max(scur));
     r.set("slim", slim);
-    r.set("stot", ld(&c.stot));
+    r.set("stot", n.stot);
     r.set("dresp", 0);
-    r.set("eresp", ld(&c.eresp));
-    r.set("lbtot", ld(&c.lbtot));
-    r.set("connect", ld(&c.connect));
-    r.set("reuse", ld(&c.reuse));
-    r.set("rate", c.sess_rate.rate());
-    r.set("rate_max", c.rate_max.load(std::sync::atomic::Ordering::Relaxed));
+    r.set("eresp", n.eresp);
+    r.set("lbtot", n.lbtot);
+    r.set("connect", n.connect);
+    r.set("reuse", n.reuse);
+    r.set("rate", n.rate);
+    r.set("rate_max", n.rate_max);
     r.set("lastchg", proxy.ids.server_lastchg(s_idx, c.last_chg.load(std::sync::atomic::Ordering::Relaxed)));
-    fill_counters(&mut r, c, proxy.mode == ibex_config::Mode::Http, true);
+    fill_counters(&mut r, &n, c, proxy.mode == ibex_config::Mode::Http, true);
     r.set("uweight", weight);
     let (wretr, wredis, econ) = proxy
         .server_retr
@@ -1080,6 +1081,7 @@ pub(crate) fn write_server_row(
 pub(crate) fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy, _pid: u32, iid: u32, legends: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     let c = proxy.ids.tc.get().map_or(&*EMPTY, |p| &p.be);
+    let n = crate::statcnt::snapshot(proxy, crate::statcnt::BE);
     let http = proxy.mode == ibex_config::Mode::Http;
     let up = |i: usize| {
         proxy
@@ -1101,11 +1103,11 @@ pub(crate) fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy
     r.set("scur", scur);
     r.set("smax", c.smax.load(Relaxed).max(scur));
     r.set("slim", proxy.maxconn.get());
-    r.set("stot", ld(&c.stot));
+    r.set("stot", n.stot);
     r.set("dreq", proxy.counters().denied_req.load(Relaxed));
     r.set("dresp", proxy.counters().denied_resp.load(Relaxed));
     r.set("econ", proxy.counters().failed_conn.load(Relaxed));
-    r.set("eresp", ld(&c.eresp));
+    r.set("eresp", n.eresp);
     r.set("wretr", proxy.counters().retries_count.load(Relaxed));
     r.set("wredis", proxy.counters().redispatches.load(Relaxed));
     r.set("status", if be_down { "DOWN" } else { "UP" });
@@ -1116,11 +1118,11 @@ pub(crate) fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy
     r.set("chkdown", ld(&c.chkdown));
     r.set("lastchg", crate::statcnt::TxnCounters::since_secs(c.last_chg.load(Relaxed)).unwrap_or_else(|| crate::statcnt::now_ms() / 1000));
     r.set("downtime", c.downtime_secs());
-    r.set("lbtot", ld(&c.lbtot));
-    r.set("connect", ld(&c.connect));
-    r.set("reuse", ld(&c.reuse));
-    r.set("rate", c.sess_rate.rate());
-    r.set("rate_max", c.rate_max.load(Relaxed));
+    r.set("lbtot", n.lbtot);
+    r.set("connect", n.connect);
+    r.set("reuse", n.reuse);
+    r.set("rate", n.rate);
+    r.set("rate_max", n.rate_max);
     r.set("pid", PROCESS_NUM);
     r.set("iid", iid);
     r.set("sid", 0);
@@ -1133,7 +1135,7 @@ pub(crate) fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy
         r.set("cache_lookups", 0);
         r.set("cache_hits", 0);
     }
-    fill_counters(&mut r, c, http, true);
+    fill_counters(&mut r, &n, c, http, true);
     r.default_untracked('B', http, if legends { balance_name(proxy) } else { "" });
     r.emit(out, fmt);
 }

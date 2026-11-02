@@ -1570,6 +1570,8 @@ struct ThreadRates {
     sess: RateCtr,
     max_conn: AtomicU32,
     max_sess: AtomicU32,
+    /// Streams made on this thread (`CumStreams`), written with a load and a store (T582 Q5).
+    streams: AtomicU64,
     /// The `CLEAR_EPOCH` the maxima belong to; a share from before the last `clear counters` reads as 0.
     epoch: AtomicU32,
 }
@@ -1585,6 +1587,7 @@ thread_local! {
             sess: RateCtr::new(),
             max_conn: AtomicU32::new(0),
             max_sess: AtomicU32::new(0),
+            streams: AtomicU64::new(0),
             epoch: AtomicU32::new(CLEAR_EPOCH.load(Ordering::Relaxed)),
         }));
         THREAD_RATES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(r);
@@ -1628,6 +1631,17 @@ pub fn global_conn_rate() -> u64 {
 #[must_use]
 pub fn global_sess_rate() -> u64 {
     sum_rates(|r| r.sess.rate())
+}
+
+/// `CumStreams`: the streams made since the start, all threads.
+#[must_use]
+pub fn cum_streams() -> u64 {
+    sum_rates(|r| r.streams.load(Ordering::Relaxed))
+}
+
+/// One stream made (`CumStreams`), on this thread's share: no shared write (T582 Q5).
+pub(crate) fn count_global_stream() {
+    LOCAL_RATES.with(|r| crate::statcnt::Write::add(crate::statcnt::Owned, &r.streams, 1));
 }
 
 /// `MaxConnRate` since start or the last `clear counters`.
@@ -1755,6 +1769,9 @@ pub struct ProxyIdInfo {
     /// The transaction counters `show stat` prints (T165), made on first use. Here, in the
     /// box, because `Proxy` is held to its size.
     pub tc: std::sync::OnceLock<Arc<crate::statcnt::ProxyCounters>>,
+    /// `tune.ibex.counters per-thread` (T582): the per-thread counter rows of every proxy,
+    /// one table shared by all of them; `None` under `shared`.
+    pub rows: Option<Arc<crate::statcnt::CounterTable>>,
     /// The proxy's numeric id (`uuid`): `iid` in `show stat`, `be_id` in `show servers
     /// state`, what `fe_id` and `be_id` read. Numbered in the order the sections were
     /// written, from 2, around the ones that asked for an `id` (`Config::proxy_ids`).
@@ -3564,17 +3581,33 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
 /// stream's log line is made, whether or not it logs: the frontend counts every request it
 /// took (the one it could not parse included), the backend the ones routed to it, and the
 /// server the ones it was given.
+///
+/// Under `tune.ibex.counters per-thread` the rows are this thread's own and are written with
+/// a plain load and store ([`crate::statcnt::Owned`]); otherwise the shared sets, with locked
+/// adds. One copy of the accounting per mode, chosen here once.
 fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     if entry.stats_done {
         return;
     }
     entry.stats_done = true;
+    match crate::statcnt::own_rows(&proxies[entry.proxy_idx]) {
+        Some(rows) => account_rows(entry, proxies, rows),
+        None => account_rows(entry, proxies, crate::statcnt::SharedRows),
+    }
+}
+
+// The one accounting of a stream's end, per mode: split, its closure would take the
+// stream's figures as a dozen arguments.
+#[allow(clippy::too_many_lines)]
+fn account_rows<'a, R: crate::statcnt::Rows<'a>>(entry: &SessionEntry, proxies: &'a [Proxy], rows: R) {
+    use crate::statcnt::Write as _;
+    let w = rows.w();
     let http = entry.sess.mode == Mode::Http;
     // `show info` `CumStreams`: `HAProxy` makes a stream for a TCP session at once, and for
     // HTTP only once a request was parsed (`stream_new`); a probe, an unparsable request,
-    // a 408 or garbage to an h2 bind never had one.
+    // a 408 or garbage to an h2 bind never had one. Per thread in every mode (T582 Q5).
     if !http || entry.sess.log.request.is_some() {
-        crate::statcnt::add(&crate::stats::CUM_STREAMS, 1);
+        count_global_stream();
     }
     // Only what the counters need of the log line's data: the whole `LogData` costs a
     // measurable share of a request (T172).
@@ -3599,18 +3632,24 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     let be_idx = entry.backend_idx;
     let srv_be = entry.srv_backend_idx;
 
-    let fe = &proxies[entry.proxy_idx].txn_counters().fe;
-    if http {
-        crate::statcnt::add(&fe.req_tot, 1);
-        if !keepalive_lost {
-            fe.count_status(status);
+    if let Some(fe) = rows.row(&proxies[entry.proxy_idx], crate::statcnt::FE) {
+        if http {
+            w.add(&fe.req_tot, 1);
+            if !keepalive_lost {
+                fe.count_status(w, status);
+            }
+            if entry.sess.log.request.is_none() {
+                w.add(&fe.ereq, 1);
+            }
         }
-        if entry.sess.log.request.is_none() {
-            crate::statcnt::add(&fe.ereq, 1);
+        // Skip the add of an empty direction.
+        if bin != 0 {
+            w.add(&fe.bin, bin);
+        }
+        if bout != 0 {
+            w.add(&fe.bout, bout);
         }
     }
-    crate::statcnt::add_nz(&fe.bin, bin);
-    crate::statcnt::add_nz(&fe.bout, bout);
 
     if !routed {
         return;
@@ -3620,13 +3659,18 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     // A server counts each attempt made on it where it is made (`srv_inc_sess_ctr`): the
     // retries that failed on other servers, or on this one, were counted there already
     // ([`count_failed_attempt`]); this is the last attempt.
-    let one = |c: &crate::statcnt::TxnCounters, server: bool| {
-        crate::statcnt::add(&c.stot, 1);
-        crate::statcnt::add_nz(&c.bin, bin);
-        crate::statcnt::add_nz(&c.bout, bout);
+    // `c` is the row the stream writes, `cold` the object's shared maxima.
+    let one = |c: &crate::statcnt::HotRow, cold: &crate::statcnt::TxnCounters, server: bool| {
+        w.add(&c.stot, 1);
+        if bin != 0 {
+            w.add(&c.bin, bin);
+        }
+        if bout != 0 {
+            w.add(&c.bout, bout);
+        }
         if http && (!server || answered) && !keepalive_lost {
-            crate::statcnt::add(&c.req_tot, 1);
-            c.count_status(status);
+            w.add(&c.req_tot, 1);
+            c.count_status(w, status);
         }
         // Which side's fault, as `HAProxy`'s termination code counts it (measured on
         // 3.5-dev8-885761-29: `SH` adds two to `eresp`, `sH` one, `SD` one to `eresp` and
@@ -3649,13 +3693,13 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
         };
         // Most streams end cleanly: skip the locked add of a zero.
         if abrt_cli != 0 {
-            crate::statcnt::add(&c.cli_abrt, abrt_cli);
+            w.add(&c.cli_abrt, abrt_cli);
         }
         if abrt_srv != 0 {
-            crate::statcnt::add(&c.srv_abrt, abrt_srv);
+            w.add(&c.srv_abrt, abrt_srv);
         }
         if eresp != 0 {
-            crate::statcnt::add(&c.eresp, eresp);
+            w.add(&c.eresp, eresp);
         }
         // `econ` is counted where the last connect fails (`server_connect_failed`), as
         // `HAProxy` counts it in `back_handle_st_cer`, whatever the termination code.
@@ -3663,34 +3707,36 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
         // (`stream_update_time_stats`).
         if tc >= 0 && (tr >= 0 || !http) {
             let ms = |v: i64| u64::try_from(v).unwrap_or(0);
+            // The window is the row's own count (`HAProxy`'s per-tgroup rule, design Q2).
             let counted = if http { c.req_tot.load(Ordering::Relaxed) } else { c.lbtot.load(Ordering::Relaxed) };
-            c.qtime.add(ms(tw), counted);
-            c.ctime.add(ms(tc), counted);
-            c.rtime.add(if http { ms(tr) } else { 0 }, counted);
-            c.ttime.add(ms(ta), counted);
+            let samples = [ms(tw), ms(tc), if http { ms(tr) } else { 0 }, ms(ta)];
+            for ((sum, max), v) in c.tsum.iter().zip(&cold.tmax).zip(samples) {
+                crate::statcnt::swrate_add(sum, v, counted);
+                crate::statcnt::max(max, u32::try_from(v).unwrap_or(u32::MAX));
+            }
         }
         c.last_sess.store(now_ms, Ordering::Relaxed);
         c.sess_rate.tick_at(now);
         let rate = u32::try_from(c.sess_rate.rate_at(now)).unwrap_or(u32::MAX);
-        if rate > c.rate_max.load(Ordering::Relaxed) {
-            crate::statcnt::max(&c.rate_max, rate);
-        }
+        w.max(&c.rate_max, rate);
     };
     let be = &proxies[be_idx];
-    let c = &be.txn_counters().be;
     let picked = srv_idx.is_some() && entry.sess.lb_picked;
-    if picked {
-        crate::statcnt::add(&c.lbtot, 1);
-    }
-    one(c, false);
-    let srv = srv_idx.and_then(|i| Some((i, proxies[srv_be].txn_counters().srv.get(i)?)));
-    for (i, c) in srv {
+    if let Some(c) = rows.row(be, crate::statcnt::BE) {
         if picked {
-            crate::statcnt::add(&c.lbtot, 1);
+            w.add(&c.lbtot, 1);
         }
-        one(c, true);
-        let now_on = proxies[srv_be].server_actconn.get(i).map_or(0, |a| a.load(Ordering::Relaxed));
-        crate::statcnt::max(&c.smax, now_on);
+        one(c, &be.txn_counters().be, false);
+    }
+    let sbe = &proxies[srv_be];
+    let srv = srv_idx.and_then(|i| Some((i, rows.row(sbe, crate::statcnt::SRV + i)?, sbe.txn_counters().srv.get(i)?)));
+    if let Some((i, c, cold)) = srv {
+        if picked {
+            w.add(&c.lbtot, 1);
+        }
+        one(c, cold, true);
+        let now_on = sbe.server_actconn.get(i).map_or(0, |a| a.load(Ordering::Relaxed));
+        crate::statcnt::max(&cold.smax, now_on);
     }
 }
 
@@ -5209,6 +5255,23 @@ impl Engine {
     for p in &mut proxies {
         p.h1_lower = h1_lower;
     }
+    // `tune.ibex.counters per-thread` (T582): the rows' places are fixed here; each worker
+    // makes its own slab when it starts (`new_worker`), and the accounting writes there.
+    if config.global.as_ref().and_then(|g| g.counters) == Some(ibex_config::ast::CountersMode::PerThread) {
+        debug_assert!(proxies.iter().enumerate().all(|(i, p)| p.id as usize == i), "a proxy's id is its index");
+        let threads = (crate::stats::NBTHREAD.load(Ordering::Relaxed) as usize).max(1);
+        let table = Arc::new(crate::statcnt::CounterTable::new(&proxies, threads));
+        crate::stderr_line!(
+            "[NOTICE] tune.ibex.counters per-thread: {} counter rows of {} bytes per thread, {} threads: {} bytes",
+            table.slab_rows(),
+            std::mem::size_of::<crate::statcnt::HotRow>(),
+            table.threads(),
+            table.bytes()
+        );
+        for p in &mut proxies {
+            p.ids.rows = Some(Arc::clone(&table));
+        }
+    }
     crate::track::attach(&mut proxies, config);
     link_declaration_order(&mut proxies);
     crate::logfwd::start(config)?;
@@ -5234,6 +5297,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // on use instead.
         let _ = crate::buf_wait::presize(capacity);
         let applets = AppletArena::with_capacity(capacity);
+        // `tune.ibex.counters per-thread` (T582 Q4): this worker's counter rows, now, not on the
+        // request path; short of memory the start fails, naming the size.
+        if let Some(t) = proxies.first().and_then(|p| p.ids.rows.as_deref()) {
+            t.start_worker(worker_id)?;
+        }
 
         ibex_sample::set_userlists(
             config
@@ -5850,7 +5918,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let active_conns = crate::globalconn::current();
         let max_conns: u32 = self.proxies.iter().map(|p| p.maxconn.get()).sum();
         let cum_conns: u64 = self.proxies.iter().map(|p| p.stats.iter().map(|s| s.cum_conn.load(Ordering::Relaxed)).sum::<u64>()).sum();
-        let cum_reqs: u64 = self.proxies.iter().filter_map(|p| p.ids.tc.get()).map(|c| c.fe.req_tot.load(Ordering::Relaxed)).sum();
+        let cum_reqs: u64 = self.proxies.iter().map(|p| crate::statcnt::snapshot(p, crate::statcnt::FE).req_tot).sum();
         crate::stats::format_show_info_counts(
             self.start_time,
             pid,
@@ -6681,7 +6749,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     crate::globalconn::note_accept();
                     let mut applet = CliApplet::new(stream, self.now);
                     // T320: count each CLI connection.
-                    crate::stats::CUM_STREAMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    count_global_stream();
                     applet.timeout_ms = self.cli_timeout_ms;
                     applet.level = level;
                     applet.socket_name = name.cloned();
@@ -8904,6 +8972,10 @@ fn clear_one(p: &Proxy) {
         c.be.clear();
         c.srv.iter().for_each(crate::statcnt::TxnCounters::clear);
     }
+    // The per-thread rows: each owner zeroes its own (T582).
+    if let Some(t) = p.ids.rows.as_deref() {
+        t.clear(p.id as usize, true);
+    }
     p.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
 }
 
@@ -8920,6 +8992,9 @@ pub fn clear_proxy_maxima(proxies: &[Proxy]) {
             c.fe.clear_max();
             c.be.clear_max();
             c.srv.iter().for_each(crate::statcnt::TxnCounters::clear_max);
+        }
+        if let Some(t) = p.ids.rows.as_deref() {
+            t.clear(p.id as usize, false);
         }
     }
 }
@@ -9515,20 +9590,21 @@ fn leave_backend(entry: &SessionEntry, proxies: &[Proxy]) {
 /// backend when the stream uses a connection that exists already, in `connect` when it makes
 /// one (failed attempts included).
 fn count_connect(proxies: &[Proxy], be_idx: usize, srv_idx: Option<usize>, reused: bool) {
+    use crate::statcnt::{Rows as _, Write as _};
     let Some(px) = proxies.get(be_idx) else { return };
-    let tc = px.txn_counters();
-    let pick = |c: &crate::statcnt::TxnCounters| if reused { c.reuse.fetch_add(1, Ordering::Relaxed) } else { c.connect.fetch_add(1, Ordering::Relaxed) };
-    pick(&tc.be);
-    if let Some(c) = srv_idx.and_then(|i| tc.srv.get(i)) {
-        pick(c);
-    }
+    let rows = crate::statcnt::rows_here(px);
+    let pick = |c: &crate::statcnt::HotRow| rows.w().add(if reused { &c.reuse } else { &c.connect }, 1);
+    rows.row(px, crate::statcnt::BE).into_iter().chain(srv_idx.and_then(|i| rows.row(px, crate::statcnt::SRV + i))).for_each(pick);
 }
 
 /// `srv_inc_sess_ctr` for a connect attempt that failed: the server's `stot` and session
 /// rate count it, as they count the attempt that ends the stream ([`account_stream`]).
 fn count_failed_attempt(proxies: &[Proxy], be_idx: usize, srv_idx: usize) {
-    if let Some(c) = proxies.get(be_idx).and_then(|p| p.txn_counters().srv.get(srv_idx)) {
-        c.stot.fetch_add(1, Ordering::Relaxed);
+    use crate::statcnt::{Rows as _, Write as _};
+    let Some(px) = proxies.get(be_idx) else { return };
+    let rows = crate::statcnt::rows_here(px);
+    if let Some(c) = rows.row(px, crate::statcnt::SRV + srv_idx) {
+        rows.w().add(&c.stot, 1);
         c.sess_rate.tick_at(RateCtr::at(crate::statcnt::now_ms()));
     }
 }
@@ -9696,9 +9772,11 @@ fn retry_server_connect(
         // The server left was a pick too, if the balancer made it (`cum_lbconn` counts each
         // pick of a server other than the last); the next one is the balancer's.
         if entry.sess.lb_picked {
-            proxies[be_idx].txn_counters().be.lbtot.fetch_add(1, Ordering::Relaxed);
-            if let Some(c) = old_idx.and_then(|i| proxies[entry.srv_backend_idx].txn_counters().srv.get(i)) {
-                c.lbtot.fetch_add(1, Ordering::Relaxed);
+            use crate::statcnt::{Rows as _, Write as _};
+            let rows = crate::statcnt::rows_here(&proxies[be_idx]);
+            let old = old_idx.and_then(|i| rows.row(&proxies[entry.srv_backend_idx], crate::statcnt::SRV + i));
+            for c in rows.row(&proxies[be_idx], crate::statcnt::BE).into_iter().chain(old) {
+                rows.w().add(&c.lbtot, 1);
             }
         }
         entry.sess.lb_picked = true;
@@ -11359,7 +11437,7 @@ impl EngineDispatcher<'_> {
             if entry.sess.rare_armed && entry.rate_max_due && entry.sess.cli_xprt.is_ready() {
                 entry.rate_max_due = false;
                 let rate = self.proxies[entry.proxy_idx].counters().fe_sess_rate.rate();
-                self.proxies[entry.proxy_idx].txn_counters().fe.rate_max.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), Ordering::Relaxed);
+                self.proxies[entry.proxy_idx].txn_counters().fe.hot.rate_max.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), Ordering::Relaxed);
             }
 
             // Step 1: Server connect check if connecting
@@ -11812,13 +11890,13 @@ impl EngineDispatcher<'_> {
             let in_request = entry.sess.mode == Mode::Http && entry.target_server_idx.is_none() && entry.srv_raw_fd.is_none();
             entry.sess.log.term = in_request.then_some(*b"IR");
             let fe = &self.proxies[entry.proxy_idx];
-            fe.txn_counters().fe.eint.fetch_add(1, Ordering::Relaxed);
+            fe.txn_counters().fe.hot.eint.fetch_add(1, Ordering::Relaxed);
             // The backend once the stream has one (`SF_BE_ASSIGNED`), as `HAProxy` counts.
             if let Some(be) = counted_backend(entry).and_then(|i| self.proxies.get(i)) {
-                be.txn_counters().be.eint.fetch_add(1, Ordering::Relaxed);
+                be.txn_counters().be.hot.eint.fetch_add(1, Ordering::Relaxed);
             }
             if let Some(srv) = entry.target_server_idx.and_then(|i| self.proxies.get(entry.srv_backend_idx)?.txn_counters().srv.get(i)) {
-                srv.eint.fetch_add(1, Ordering::Relaxed);
+                srv.hot.eint.fetch_add(1, Ordering::Relaxed);
             }
             let client = entry.sess.client_addr.map_or_else(String::new, |a| format!(", client {a}"));
             crate::stderr_line!("[ALERT] ibex: a stream of frontend '{}'{client} panicked; it was closed, the process serves on", fe.name);

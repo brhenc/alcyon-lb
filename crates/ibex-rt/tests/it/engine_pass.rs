@@ -31,6 +31,11 @@ fn run() -> (u64, u64, u64, u64, u64) {
 /// [`run`] with `servers` servers in the backend (only the first is reachable); the sixth
 /// value is the server rows `account_stream` read.
 fn run_with(servers: usize) -> (u64, u64, u64, u64, u64) {
+    run_global(servers, "")
+}
+
+/// [`run_with`] under the `global` section `global` (empty: none).
+fn run_global(servers: usize, global: &str) -> (u64, u64, u64, u64, u64) {
     let be = TcpListener::bind("127.0.0.1:0").unwrap();
     let be_addr = be.local_addr().unwrap();
     std::thread::spawn(move || {
@@ -48,7 +53,7 @@ fn run_with(servers: usize) -> (u64, u64, u64, u64, u64) {
     });
     let fe_addr = common::reserve_addr();
     let cfg = format!(
-        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
+        "{global}defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
          frontend f\n  bind {fe_addr}\n  default_backend b\n\
          backend b\n  server s {be_addr}\n{}",
         (1..servers).map(|i| format!("  server x{i} 127.0.0.1:9 disabled\n")).collect::<String>()
@@ -92,9 +97,23 @@ fn accounting_a_request_does_at_most_n_atomic_rmws() {
     let (rmws, ..) = run();
     let per = rmws as f64 / REQS as f64;
     eprintln!("rmws per request: {per}");
-    // frontend: req_tot, hrsp, bin, bout; backend and server: stot, bin, bout, req_tot, hrsp,
-    // lbtot, smax = 7 each; timings add no maximum RMW when the sample does not beat it.
+    // frontend: req_tot, hrsp, bin, bout; backend: stot, bin, bout, req_tot, hrsp, lbtot,
+    // reuse; server: the same and smax; timings add no maximum RMW when the sample does not
+    // beat it (the backend's smax is counted where a stream joins it, T583). `CumStreams` is
+    // counted per thread in every mode (T582 Q5); `reuse` (or `connect`) was an uncounted
+    // `fetch_add` before T582.
     assert!(per <= 20.0, "{per} atomic RMWs per request");
+}
+
+#[test]
+fn per_thread_counters_take_the_locked_rmws_off_a_request() {
+    // `tune.ibex.counters per-thread` (T582): the frontend, backend and server rows of a
+    // stream are its thread's own, written with a plain load and store. What is left is a
+    // maximum beaten now and then (`smax`, a timing's `*_max`): near 0 a request.
+    let (rmws, ..) = run_global(1, "global\n  tune.ibex.counters per-thread\n");
+    let per = rmws as f64 / REQS as f64;
+    eprintln!("rmws per request, per-thread rows: {per}");
+    assert!(per <= 0.25, "{per} atomic RMWs per request with per-thread rows");
 }
 
 #[test]

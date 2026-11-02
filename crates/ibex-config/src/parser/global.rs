@@ -486,6 +486,30 @@ pub(crate) fn parse_global_directive(
             });
             Ok(())
         }
+        "tune.ibex.counters" => {
+            let expected = "'tune.ibex.counters' expects 'shared' or 'per-thread'";
+            let Some(arg) = tokens.get(1) else {
+                return Err(ConfigError::new(kw.line, kw.col, format!("{expected}.")));
+            };
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(extra.line, extra.col, format!("'tune.ibex.counters' cannot handle unexpected argument '{}'.", extra.text)));
+            }
+            global.counters = Some(match arg.text.as_str() {
+                "shared" => crate::ast::CountersMode::Shared,
+                "per-thread" => crate::ast::CountersMode::PerThread,
+                // Ibex runs one thread group (`thread-groups` > 1 is refused): per thread group
+                // would be `shared` under another name (AGENTS.md section 5).
+                "per-tgroup" => {
+                    return Err(ConfigError::new(
+                        arg.line,
+                        arg.col,
+                        "'tune.ibex.counters': 'per-tgroup' is not implemented (one thread group); expected 'shared' or 'per-thread'",
+                    ))
+                }
+                other => return Err(ConfigError::new(arg.line, arg.col, format!("{expected}, got '{other}'."))),
+            });
+            Ok(())
+        }
         "tune.ibex.zero-spares" => {
             let Some(arg) = tokens.get(1) else {
                 return Err(ConfigError::new(kw.line, kw.col, "'tune.ibex.zero-spares' expects 'on' or 'off'."));
