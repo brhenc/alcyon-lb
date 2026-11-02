@@ -530,10 +530,11 @@ impl CounterTable {
     fn each(&self, p: usize, k: usize, mut f: impl FnMut(&HotRow, bool, bool)) {
         // `p` is in range as in [`Self::clear`].
         debug_assert!(p < self.spans.len(), "proxy {p} of a table of {}", self.spans.len());
+        // Every proxy has a frontend and a backend row whatever its sections, and the readers
+        // ask for servers below `servers.len()` (`show stat`, the stats page, Prometheus), the
+        // count the span was made with (Ibex has no `add server`).
         let ((base, n), epoch) = (self.spans[p], &self.epochs[p]);
-        if k >= n as usize {
-            return;
-        }
+        debug_assert!(k < n as usize, "row {k} of a proxy of {n}");
         let at = base as usize + k;
         let want = epoch.load(Ordering::Relaxed);
         for slab in self.slabs.iter().filter_map(std::sync::OnceLock::get) {
