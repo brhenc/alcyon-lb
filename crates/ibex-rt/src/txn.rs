@@ -893,6 +893,15 @@ impl BodyCheck {
     }
 }
 
+/// The request body a `wait-for-body` saw.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReqBody {
+    /// This many bytes of a `Content-Length` body, read in the request buffer behind the head.
+    InPlace(usize),
+    /// A body that had to be un-framed (chunked): the decoded bytes.
+    Owned(Vec<u8>),
+}
+
 /// Where `http-request` rules are held for a body: the rule list (the frontend's or the
 /// backend's), the rule to run next, and when the wait ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2190,7 +2199,7 @@ pub struct HttpTxn {
     pub body_wait: Option<BodyWait>,
     /// The request body as it was when the wait ended (decoded: chunk framing removed),
     /// what `req.body` reads in the rules after the wait.
-    pub req_body: Option<Vec<u8>>,
+    pub req_body: Option<ReqBody>,
     /// A `wait-for-body` the response rules are held at.
     pub rsp_wait: Option<RspWait>,
     /// The proxy is answering this request itself; nothing is read from a server.

@@ -10013,7 +10013,7 @@ impl EngineDispatcher<'_> {
             req_version: sess.client_version(),
             ssl_bc: sess.srv_xprt.ssl_facts(),
             // The body a `wait-for-body` saw; otherwise the bytes in the buffer.
-            req_body: match sess.txn.as_ref().and_then(|t| t.req_body.as_deref()) {
+            req_body: match txn_req_body(sess) {
                 Some(body) => Some(body),
                 None if sess.req.readable().is_empty() => None,
                 None => Some(sess.req.readable()),
@@ -13525,7 +13525,7 @@ impl EngineDispatcher<'_> {
                         req_uri: $s.req_uri.as_deref(),
                         req_method: $s.req_method.as_deref(),
                         req_headers: $s.req_headers.as_deref(),
-                        req_body: $s.txn.as_ref().and_then(|t| t.req_body.as_deref()),
+                        req_body: txn_req_body(&$s),
                         fe_name,
                         be_name,
                         fe_id: fe_name.and_then(|n| proxies.iter().find(|p| p.has_frontend && p.name == n)).map(|p| p.ids.iid),
@@ -16095,14 +16095,26 @@ fn wait_for_request_body(
     };
     let data = sess.req.readable();
     let head = crate::proxy::find_eoh(data).map_or(data.len(), |(h, e)| h + e);
+    // A `Content-Length` body is read where it is: its length so far, no copy (the pass runs
+    // again at every read while it is incomplete). Other framings are un-framed into `body`.
+    let limit = sess.bufsize.saturating_sub(sess.maxrewrite);
     let mut body = Vec::new();
-    let progress = crate::txn::read_body(framing, &data[head..], &mut body);
+    let mut in_place = None;
+    let progress = if let crate::txn::Framing::Length(n) = framing {
+        let avail = data.len() - head;
+        let have = usize::try_from(n).unwrap_or(usize::MAX).min(avail);
+        in_place = Some(have);
+        if n as usize <= avail || n == 0 { crate::txn::BodyProgress::Complete } else { crate::txn::BodyProgress::Partial }
+    } else {
+        note_request_body_copy();
+        crate::txn::read_body(framing, &data[head..], &mut body)
+    };
     // The buffer is full when `tune.maxrewrite` is all that is left of it, and what a rule
     // sees of the body is what fits before that.
-    let limit = sess.bufsize.saturating_sub(sess.maxrewrite);
     let full = sess.req.len() >= limit;
     body.truncate(limit.saturating_sub(head));
-    let enough = at_least > 0 && body.len() >= at_least as usize;
+    let body_len = in_place.map_or(body.len(), |n| n.min(limit.saturating_sub(head)));
+    let enough = at_least > 0 && body_len >= at_least as usize;
     let outcome = if progress == crate::txn::BodyProgress::Error {
         BodyWait::Malformed
     } else if progress == crate::txn::BodyProgress::Complete || enough || full {
@@ -16126,10 +16138,26 @@ fn wait_for_request_body(
     for txn in sess.txn.as_mut() {
         txn.body_wait = pending.then_some(crate::txn::BodyWait { backend, rule, deadline, tarpit: false, inspect: false, resolve: false });
         if ready {
-            txn.req_body = Some(std::mem::take(&mut body));
+            txn.req_body = Some(match in_place {
+                Some(_) => crate::txn::ReqBody::InPlace(body_len),
+                None => crate::txn::ReqBody::Owned(std::mem::take(&mut body)),
+            });
         }
     }
     outcome
+}
+
+/// The body a `wait-for-body` saw (X6): a view into the request buffer, behind the head as it is
+/// now (the rules after the wait may have rewritten the head), or the un-framed copy.
+fn txn_req_body(sess: &TcpSession) -> Option<&[u8]> {
+    match sess.txn.as_ref()?.req_body.as_ref()? {
+        crate::txn::ReqBody::Owned(b) => Some(b),
+        crate::txn::ReqBody::InPlace(len) => {
+            let data = sess.req.readable();
+            let head = crate::proxy::find_eoh(data).map_or(data.len(), |(h, e)| h + e);
+            Some(&data[head..(head + len).min(data.len())])
+        }
+    }
 }
 
 fn del_req_header(sess: &mut TcpSession, name: &str) {
@@ -16698,6 +16726,29 @@ impl<'a> ResOp<'a> {
             ibex_config::HttpAfterResAction::DelHeader { name } => Self::Del(name),
         })
     }
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static REQ_BODY_COPIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The request body was copied out of the request buffer (debug builds): a `wait-for-body`
+/// on a framing that cannot be read in place (chunked).
+#[inline]
+fn note_request_body_copy() {
+    #[cfg(debug_assertions)]
+    REQ_BODY_COPIES.with(|c| c.set(c.get() + 1));
+}
+
+/// The copies [`note_request_body_copy`] counted on this thread (0 in release builds): a test
+/// pins none for a `Content-Length` body (X6).
+#[must_use]
+pub fn request_body_copies() -> u64 {
+    #[cfg(debug_assertions)]
+    return REQ_BODY_COPIES.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
 }
 
 #[cfg(debug_assertions)]
