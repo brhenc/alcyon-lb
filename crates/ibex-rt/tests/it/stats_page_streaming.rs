@@ -650,8 +650,14 @@ fn an_h2_stream_reset_mid_dump_ends_the_dump() {
     }
     // CANCEL.
     h.s.write_all(&h2_frame(0x03, 0, 1, &8u32.to_be_bytes())).expect("rst");
-    std::thread::sleep(Duration::from_millis(300));
-    let (alloc, cached) = scrape_boxes(&s.sock);
+    // The box is back in its pool once the proxy has handled the reset: wait for that (up to
+    // 10 s), not a fixed 300 ms a loaded host can overrun.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut alloc, mut cached) = scrape_boxes(&s.sock);
+    while !(alloc >= 1 && cached == alloc) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        (alloc, cached) = scrape_boxes(&s.sock);
+    }
     h.s.write_all(&h2_request(3, false, "/s;csv")).expect("send csv");
     let r = h.read_stream(3);
     let csv = String::from_utf8_lossy(&r.body);

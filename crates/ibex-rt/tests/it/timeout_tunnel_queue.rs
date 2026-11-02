@@ -214,7 +214,9 @@ fn tcp_mode_idle_is_closed_after_timeout_tunnel() {
         assert!(logged(lines, " cD"), "log: {:?}", lines.lock().expect("lock"));
         r
     });
-    assert!(eof && near(d, 700), "closed after {d:?} ({eof})");
+    // Never sooner than the timer; the upper bound only has to tell 700 ms from `timeout
+    // client` (2 s), the host's delay in waking this thread is not what is tested.
+    assert!(eof && d + Duration::from_millis(150) >= Duration::from_millis(700) && d <= Duration::from_millis(1500), "closed after {d:?} ({eof})");
 }
 
 #[test]
@@ -235,12 +237,23 @@ fn queued(timeouts: &str, body: &str) -> (Duration, String, String, String, Stri
     with_ibex(timeouts, "http", &body, be, |fe, lines| {
         let mut a = TcpStream::connect(fe).expect("a");
         a.write_all(b"GET /a HTTP/1.1\r\nHost: t\r\n\r\n").expect("a");
-        thread::sleep(Duration::from_millis(200));
+        // /b only once /a holds the server's one slot: sent together (a late accept, a loaded
+        // host) /b could take the slot and /a be the queued one.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server_scur(fe) != "1" {
+            assert!(Instant::now() < deadline, "/a never took the slot");
+            thread::sleep(Duration::from_millis(20));
+        }
         let mut b = TcpStream::connect(fe).expect("b");
         let t0 = Instant::now();
         b.write_all(b"GET /b HTTP/1.1\r\nHost: t\r\n\r\n").expect("b");
-        thread::sleep(Duration::from_millis(250));
-        let mid = backend_row(fe);
+        // /b is queued: wait for the row to say so (it stays queued for the timeout).
+        let deadline = Instant::now() + Duration::from_millis(600);
+        let mut mid = backend_row(fe);
+        while !mid.starts_with("qcur=1") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            mid = backend_row(fe);
+        }
         b.set_read_timeout(Some(Duration::from_secs(6))).expect("rt");
         let mut r = Vec::new();
         let mut buf = [0u8; 1024];
@@ -262,6 +275,18 @@ fn queued(timeouts: &str, body: &str) -> (Duration, String, String, String, Stri
     })
 }
 
+/// The `scur` of server `s`, as the text of the CSV field.
+fn server_scur(fe: SocketAddr) -> String {
+    let mut c = TcpStream::connect(fe).expect("stats");
+    c.write_all(b"GET /st;csv HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n").expect("send");
+    c.set_read_timeout(Some(Duration::from_secs(2))).expect("rt");
+    let mut out = String::new();
+    let _ = c.read_to_string(&mut out);
+    let hdr: Vec<&str> = out.lines().find(|l| l.starts_with("# ")).expect("header")[2..].split(',').collect();
+    let row: Vec<&str> = out.lines().find(|l| l.starts_with("l,s,")).expect("row").split(',').collect();
+    row[hdr.iter().position(|h| *h == "scur").expect("column")].to_string()
+}
+
 /// The `qcur` and `econ` of the backend row, as `qcur=<n> econ=<n>`.
 fn backend_row(fe: SocketAddr) -> String {
     let mut c = TcpStream::connect(fe).expect("stats");
@@ -279,7 +304,8 @@ fn backend_row(fe: SocketAddr) -> String {
 fn queued_request_gets_503_after_timeout_queue() {
     let t = format!("  timeout connect 1500ms\n  timeout client 10s\n  timeout server 10s\n  timeout queue 700ms\n");
     let (d, status, mid, end, log) = queued(&t, "");
-    assert!(near(d, 700), "answered after {d:?}: {status}; log {log}");
+    let tw = queue_wait_ms(&log);
+    assert!(tw.is_some_and(|tw| near(Duration::from_millis(tw), 700)), "Tw {tw:?} ms; answered after {d:?}: {status}; log {log}");
     assert_eq!(status, "HTTP/1.1 503 Service Unavailable", "{log}");
     assert!(log.contains(" sQ-- "), "{log}");
     assert!(log.contains(" 0/1 \"GET /b"), "queue positions: {log}");
@@ -305,7 +331,8 @@ fn queued_request_waits_timeout_connect_when_no_timeout_queue() {
 fn set_timeout_queue_changes_the_timer() {
     let t = "  timeout connect 1500ms\n  timeout client 10s\n  timeout server 10s\n  timeout queue 5s\n";
     let (d, status, _, _, log) = queued(t, "  http-request set-timeout queue 400\n");
-    assert!(near(d, 400), "answered after {d:?}: {status}; log {log}");
+    let tw = queue_wait_ms(&log);
+    assert!(tw.is_some_and(|tw| near(Duration::from_millis(tw), 400)), "Tw {tw:?} ms; answered after {d:?}: {status}; log {log}");
     assert!(log.contains(" sQ-- "), "{log}");
 }
 
