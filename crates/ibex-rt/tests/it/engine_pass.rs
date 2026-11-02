@@ -566,3 +566,21 @@ fn a_stream_run_looks_at_no_rare_check_when_none_is_armed() {
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
 }
+
+/// T599: an HTTP/2 GET is three runs of its stream (its request, the server's response, its
+/// end) and four of the owner (the client's HEADERS, then after each of its stream's runs):
+/// the owner is not run again in a pass for a stream its run already queued for spawning,
+/// nor woken by the spawn before the stream has run. Nine before.
+#[test]
+#[cfg(debug_assertions)]
+fn an_h2_request_runs_its_owner_only_when_there_is_something_to_move() {
+    const N: u64 = 100;
+    let (mut engine, fe, running, be) = setup_h2();
+    let mut c = H2Client::connect(&mut engine, fe);
+    let (runs, _) = runs_and_ops(Op::Pass, N, || c.get(&mut engine));
+    println!("{N} h2 requests: {runs} stream runs");
+    assert!(runs <= 7 * N, "{runs} stream runs for {N} HTTP/2 requests");
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}

@@ -6642,8 +6642,16 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             if let Some(o) = owner.sess.h2_owner_mut() {
                 o.children.push(crate::proxy::H2ChildLink { idx: child_idx, task, stream_id });
             }
+            // What the owner's next run would move first (the request's body so far, its end)
+            // moves now, so the stream's first run has it (T599). That run wakes the owner in
+            // the next pass (`owner_wake`), which moves the rest: woken here too, the owner
+            // ran before its stream had, to do just this.
+            if owner.sess.h2_ctx.is_some() {
+                let _ = h2_bridge_moves(owner, child, now);
+            } else {
+                wake_queue.push(owner_task);
+            }
             wake_queue.push(task);
-            wake_queue.push(owner_task);
         }
     }
 
@@ -11637,7 +11645,11 @@ impl EngineDispatcher<'_> {
             // a pass, the scrape counted its own response buffers in the pool figures.
             if entry.sess.wants_rerun() && !entry.sess.is_done() {
                 if entry.sess.has_undispatched_h2_streams() {
-                    self.wake_now.push(entry.task);
+                    // Its streams are spawned after the pass, which `h2_owner_pass` queued in
+                    // this run: a second run now would only queue it again (T599).
+                    if self.h2_spawn.last() != Some(&(session_idx, entry.task)) {
+                        self.wake_now.push(entry.task);
+                    }
                 } else {
                     self.wake_queue.push(entry.task);
                 }
