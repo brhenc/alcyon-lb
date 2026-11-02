@@ -1384,10 +1384,39 @@ fn attach_server_to(
 /// field in). An h2 server cannot send that field (the codec refuses it), so one in the text
 /// is the codec's.
 fn h2_htx_overcount(head: &[u8]) -> u64 {
+    #[cfg(debug_assertions)]
+    H2_OVERCOUNT_SCANS.with(|c| c.set(c.get() + 1));
+    h2_htx_overcount_uncounted(head)
+}
+
+/// [`h2_htx_overcount`] from the codec's index of `head` (T618): the start line is
+/// `HTTP/1.1 NNN ` and the reason, and the added field is one line of the index.
+fn h2_htx_overcount_indexed(head: &[u8], ix: &ibex_proto::response_head::RspHead) -> u64 {
+    let reason = u64::from(ix.start).saturating_sub(15);
+    let te = if ix.fields().iter().any(|f| head.get(f.at as usize..f.end as usize) == Some(&b"transfer-encoding: chunked\r\n"[..])) { 25 } else { 0 };
+    reason + te
+}
+
+/// The scan of the head's text, for a head the codec did not index.
+fn h2_htx_overcount_uncounted(head: &[u8]) -> u64 {
     let first = head.split(|&b| b == b'\n').next().unwrap_or_default();
     let reason = first.splitn(3, |&b| b == b' ').nth(2).map_or(0, |r| r.strip_suffix(b"\r").unwrap_or(r).len());
     let te = if head.windows(28).any(|w| w == b"\ntransfer-encoding: chunked\r") { 25 } else { 0 };
     reason as u64 + te
+}
+
+thread_local! {
+    static H2_OVERCOUNT_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The scans of a response head's text [`h2_htx_overcount`] made on this thread (0 in release
+/// builds): a head the codec indexed is not scanned (T618).
+#[must_use]
+pub fn h2_overcount_scans() -> u64 {
+    #[cfg(debug_assertions)]
+    return H2_OVERCOUNT_SCANS.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
 }
 
 /// Attaches a `proto h2` connection: `xprt` under the h2 layer. Without memory for its codec
@@ -12416,6 +12445,8 @@ impl EngineDispatcher<'_> {
         let mut index: Option<ibex_proto::response_head::RspHead> = None;
         // The facts of an indexed head, read in the check's pass over it (X3).
         let mut checked_facts = None;
+        // `index` is the h2 codec's (a canonical start line), not one the check parsed (T618).
+        let mut codec_indexed = false;
         if entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp_wait.is_none()) {
             let accept = proxies[be_idx].stats_config.accept_unsafe_response;
             // An h2 server's head was indexed by the codec that wrote it (X3b-2): read, not
@@ -12425,6 +12456,7 @@ impl EngineDispatcher<'_> {
             let head = &entry.sess.rep.readable()[..total_hdr_len];
             let given = given.filter(|ix| ix.len as usize == total_hdr_len && head.get(9..12) == Some(&ibex_proto::actions::status_digits(ix.status)[..]));
             let mut facts = crate::txn::ResponseFacts::default();
+            codec_indexed = given.is_some();
             let checked = match given {
                 Some(ix) => {
                     for f in ix.fields() {
@@ -12565,7 +12597,17 @@ impl EngineDispatcher<'_> {
                 return;
             }
         }
-        let h2_less = if entry.sess.srv_xprt.is_h2() { h2_htx_overcount(&entry.sess.rep.readable()[..total_hdr_len]) } else { 0 };
+        let h2_less = if !entry.sess.srv_xprt.is_h2() {
+            0
+        } else if let Some(ix) = index.as_ref().filter(|_| codec_indexed) {
+            let head = &entry.sess.rep.readable()[..total_hdr_len];
+            let n = h2_htx_overcount_indexed(head, ix);
+            #[cfg(debug_assertions)]
+            debug_assert_eq!(n, h2_htx_overcount_uncounted(head), "{:?}", String::from_utf8_lossy(head));
+            n
+        } else {
+            h2_htx_overcount(&entry.sess.rep.readable()[..total_hdr_len])
+        };
         let Some(txn) = entry.sess.strm.txn.as_mut() else {
             return;
         };
