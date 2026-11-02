@@ -854,8 +854,9 @@ impl CliApplet {
 
     /// `show|add|set|del|clear` of `map` or `acl`.
     fn is_patref_command(cmd: &str) -> bool {
-        let mut it = cmd.split_whitespace();
-        matches!(it.next(), Some("show" | "add" | "set" | "del" | "clear")) && matches!(it.next(), Some("map" | "acl"))
+        // The words `run_patref` sees: `show\ map` is one word there, not two.
+        let w = cli_words(cmd);
+        w.len() >= 2 && matches!(w[0].as_str(), "show" | "add" | "set" | "del" | "clear") && matches!(w[1].as_str(), "map" | "acl")
     }
 
     /// Runs a map or ACL command on the process-wide pattern references
@@ -863,6 +864,11 @@ impl CliApplet {
     fn run_patref(&mut self, cmd: &str, payload: Option<&str>) {
         let owned = cli_words(cmd);
         let words: Vec<&str> = owned.iter().map(String::as_str).collect();
+        if words.len() < 2 {
+            self.out_buf.extend_from_slice(crate::cli_unknown::answer(&owned).as_bytes());
+            self.finish_msg("");
+            return;
+        }
         let kind = if words[1] == "map" { ibex_sample::patref::RefKind::Map } else { ibex_sample::patref::RefKind::Acl };
         let out = ibex_sample::patref::command(words[0], kind, &words[2..], payload);
         self.out_buf.extend_from_slice(out.as_bytes());
@@ -2355,4 +2361,24 @@ pub fn cli_words(line: &str) -> Vec<String> {
         words.push(cur);
     }
     words
+}
+
+#[cfg(test)]
+mod rv_d_tests {
+    use super::*;
+
+    /// IBEX-CLI-PATREF-IDX-001: `is_patref_command` split on Unicode whitespace but
+    /// `run_patref` on `cli_words` (space, tab, CR, LF, backslash escapes); `show\ map` is one
+    /// word for the latter and `words[1]` panicked, aborting the process (the CLI applet is
+    /// not under `crash::contain`).
+    #[test]
+    fn an_escaped_space_is_not_a_map_command_and_does_not_panic() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        for cmd in ["show\\ map", "show\u{a0}map", "clear\\ acl", "add\\ map"] {
+            assert!(!CliApplet::is_patref_command(cmd), "{cmd:?}");
+        }
+        let mut applet = CliApplet::new(a, Tick::ETERNITY);
+        applet.run_patref("show\\ map", None);
+        assert!(CliApplet::is_patref_command("show map"));
+    }
 }

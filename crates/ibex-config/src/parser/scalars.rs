@@ -108,6 +108,10 @@ pub(crate) fn parse_hex_binary(hex: &str) -> Result<Vec<u8>, String> {
     if !clean.len().is_multiple_of(2) {
         return Err(format!("odd hex string length: {}", clean.len()));
     }
+    // `str` slicing below needs ASCII; `from_str_radix` would take a leading `+`.
+    if let Some(c) = clean.chars().find(|c| !c.is_ascii_hexdigit()) {
+        return Err(format!("an hex digit is expected (found '{c}')"));
+    }
     let mut bytes = Vec::with_capacity(clean.len() / 2);
     for i in (0..clean.len()).step_by(2) {
         let byte = u8::from_str_radix(&clean[i..i + 2], 16)

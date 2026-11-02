@@ -86,7 +86,7 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &ibex_config::Server, f: &[&str; M
             true
         }
         1 if rise == 1 => {
-            health = rise + fall - 1;
+            health = rise.saturating_add(fall) - 1;
             false
         }
         1 => {
@@ -100,14 +100,14 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &ibex_config::Server, f: &[&str; M
             true
         }
         3 => {
-            if health < rise || health > rise + fall - 2 {
+            if health < rise || health > rise.saturating_add(fall) - 2 {
                 health = rise;
             }
             partial.push_str(", srv_op_state 3 (stopping, NOLB) is not implemented in Ibex: the server runs");
             false
         }
         _ => {
-            health = rise + fall - 1;
+            health = rise.saturating_add(fall) - 1;
             false
         }
     };
