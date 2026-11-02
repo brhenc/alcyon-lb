@@ -994,10 +994,9 @@ impl Buf {
     /// and no `memset`. False when it does not fit; the bytes are then the caller's to write
     /// another way ([`Self::replace_prefix`]), the first `old` possibly overwritten.
     pub fn replace_head_with(&mut self, old: usize, write: impl FnOnce(&mut [u8]) -> Option<usize>) -> bool {
+        // A buffer without memory has nothing to keep and no room: `write` gets an empty
+        // slice and says the head does not fit.
         self.eoh.set(EOH_UNKNOWN);
-        if !self.alloc_if_needed() {
-            return false;
-        }
         let old = old.min(self.len);
         let rest = self.len - old;
         if rest == 0 {

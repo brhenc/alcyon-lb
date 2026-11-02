@@ -2610,7 +2610,11 @@ impl TcpSession {
             // What a refused head wrote is zeroed on release like any other.
             self.htx_buf.note_htx(tail, blocks * HTX_DESC_SIZE);
             match r {
-                Ok(n) if n == head_len => break (tail, blocks),
+                // `head_len` is where `find_eoh` found the end: the head is whole.
+                Ok(n) => {
+                    debug_assert_eq!(n, head_len, "a whole head is read whole");
+                    break (tail, blocks);
+                }
                 // Once: an `OutOfMemory` with the head's own lines counted is the parser's (a
                 // name longer than a block holds), refused as the copying parse refuses it.
                 Err(e) if e.kind() == io::ErrorKind::OutOfMemory && !sized => {
@@ -2618,7 +2622,6 @@ impl TcpSession {
                     lines = self.req.readable()[..head_len].iter().filter(|&&b| b == b'\n').count() + 3;
                     h1_parser = new_parser(self.accept_unsafe_request);
                 }
-                Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "request head not whole")),
                 Err(e) => return Err(e),
             }
         };

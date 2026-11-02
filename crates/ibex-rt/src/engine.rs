@@ -15794,34 +15794,11 @@ fn rewrite_request_connection(sess: &mut TcpSession, opt_close: bool) {
         }
         forced || rule_close || (opt_close && !kal)
     };
-    // One look at the head, no copy. The usual request has no `Connection`, or one that is
-    // all `keep-alive` and `close` and goes whole, cut out of the head where it is. The text is
-    // read only while it is the HTX (nothing edited it); an edited head is read from its HTX
-    // and written at the send (X2).
-    let synced = req_text_is_htx(sess);
-    let scan = if synced {
-        sess.req.eoh().map(|(h, e)| crate::txn::scan_connection(&sess.req.readable()[..h + e])).unwrap_or_default()
-    } else {
-        let n = sess.htx_slice().map_or(0, |h| h.header_blocks_where(|n| n.eq_ignore_ascii_case(b"connection")).count());
-        crate::txn::ConnScan { count: n, ..Default::default() }
-    };
-    if scan.count == 0 || (synced && scan.count == 1 && scan.plain) {
-        if scan.count == 1 {
-            // The client's `close` went before the rules (`strip_request_connection`): one
-            // here is a rule's, and the server is asked to close (`h1_set_srv_conn_mode`, T439).
-            let v = sess.htx_slice().and_then(|h| h.get_header("connection"));
-            let (rule_close, rule_kal) = (v.is_some_and(|v| crate::txn::connection_has(v, "close")), v.is_some_and(|v| crate::txn::connection_has(v, "keep-alive")));
-            let close = kept(sess, rule_close, rule_kal);
-            // The line and its block go together: the text stays the HTX.
-            sess.with_htx_synced(|htx| {
-                let _ = htx.remove_header("connection");
-            });
-            sess.req.cut(scan.first.0, scan.first.1);
-            if let Some(tok) = crate::txn::request_connection_token(close, http11, false) {
-                add_req_header(sess, "Connection", tok);
-            }
-            return;
-        }
+    // The usual request has no `Connection` by now: a lone plain one the client sent went at
+    // the parse (`strip_request_connection`), so what is left is a rule's, read from the HTX
+    // (an edited head's text is stale until the send writes it, X2).
+    let count = sess.htx_slice().map_or(0, |h| h.header_blocks_where(|n| n.eq_ignore_ascii_case(b"connection")).count());
+    if count == 0 {
         let close = kept(sess, false, false);
         if let Some(tok) = crate::txn::request_connection_token(close, http11, false) {
             add_req_connection(sess, tok);
@@ -18605,6 +18582,20 @@ mod add_req_connection_tests {
         assert_eq!(s.req.readable(), b"GET / HTTP/1.0\r\nHost: a\r\n\r\n", "not written before the send");
         encode_if_modified(&mut s);
         assert_eq!(s.req.readable(), b"GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\n\r\n");
+    }
+
+    /// Without an HTX (an HTTP/2 head the HTX could not hold) `set-header` and `del-header`
+    /// edit the copy, and the send writes the head out of it.
+    #[test]
+    fn a_request_without_an_htx_is_edited_in_its_copy() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut s = TcpSession::new(OwnedFd::from(a), Default::default(), 0, Tick::ETERNITY);
+        s.req.replace_prefix(0, b"GET / HTTP/1.1\r\nHost: a\r\nX-A: 1\r\n\r\n");
+        s.req_headers = Some(vec![("Host".to_string(), "a".to_string()), ("X-A".to_string(), "1".to_string())]);
+        set_req_header(&mut s, "x-a", "2");
+        del_req_header(&mut s, "host");
+        encode_if_modified(&mut s);
+        assert_eq!(s.req.readable(), b"GET / HTTP/1.1\r\nx-a: 2\r\n\r\n");
     }
 }
 
