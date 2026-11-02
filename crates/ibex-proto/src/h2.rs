@@ -6,7 +6,7 @@
 //!
 //! Complies strictly with RFC 7540 / RFC 9113 under `#![forbid(unsafe_code)]`.
 
-use crate::hpack::{HpackDecoder, HpackEncoder};
+use crate::hpack::{DecodedFields, HpackDecoder, HpackEncoder};
 use crate::htx::HeaderField;
 use std::collections::BTreeMap;
 use std::io;
@@ -1628,6 +1628,254 @@ pub fn check_response_fields<'a>(fields: impl IntoIterator<Item = (&'a str, &'a 
         }
     }
     Ok(())
+}
+
+/// Bytes of decoded names and values a request head may carry: `tune.bufsize` (16384) less
+/// `tune.maxrewrite` (1024), the room `HAProxy`'s request buffer gives a head (T242).
+const MAX_HEAD_BYTES: usize = 16384 - 1024;
+
+/// Header fields a request may carry once converted, the `host` made from `:authority`
+/// counted: `tune.http.maxhdr` (101) less one (measured: `host` + 99 pass, + 100 are refused).
+const MAX_HEAD_FIELDS: usize = 100;
+
+/// Why [`write_request_htx`] wrote no head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadError {
+    /// A request the mux refuses with a stream error (`RST_STREAM` PROTOCOL_ERROR): malformed
+    /// fields, a pseudo-header out of order, duplicated or unknown, the limits, a
+    /// `content-length` that is not one length. Nothing was written.
+    Refused(&'static str),
+    /// The head the fields make is one the HTTP/1 parser refuses (an invalid request line, too
+    /// many header lines, a `Host` against the authority, a length the parser reads otherwise):
+    /// what `put_request_head` returned `InvalidData` for. What was written is partial.
+    Invalid,
+    /// The blocks do not fit the memory (`OutOfMemory` in `put_request_head`). What was
+    /// written is partial.
+    NoRoom,
+}
+
+/// What the mux and the data path need to know of a request head written by
+/// [`write_request_htx`], without reading its blocks again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeadFacts {
+    /// `HtxSlice::tail_addr` after the head: the bytes of payload written.
+    pub tail: usize,
+    /// `HtxSlice::num_blocks` after the head.
+    pub blocks: usize,
+    /// A request `HAProxy` takes and answers 400 (a method that is not a token, a scheme that
+    /// is not one, a blank or DEL in the path): the data path fails the request once set up.
+    pub bad_request: bool,
+    /// An extended CONNECT (RFC 8441), written as the `GET` with `upgrade: <protocol>` and
+    /// `connection: upgrade` of an HTTP/1.1 upgrade.
+    pub ext_connect: bool,
+    /// The length the `content-length` fields agree on, as the client wrote it.
+    pub content_length: Option<usize>,
+    /// The method's bytes in the request line block.
+    pub method_len: usize,
+    /// The path's bytes as the client sent them (the block holds a non-UTF-8 path as text).
+    pub uri_len: usize,
+    /// The path was not UTF-8 and the block holds it as [`ibex_regex::bytetext`] text.
+    pub path_raw: bool,
+    /// The request had `:scheme` and `:authority`: the line `HAProxy` logs starts with
+    /// `scheme://authority` (read from the fields that were written).
+    pub has_abs: bool,
+    /// The fields written (the made `host`, `cookie` and `upgrade`/`connection` included).
+    pub fields: usize,
+    /// Their names and values, in bytes (`%U` counts them).
+    pub field_bytes: usize,
+}
+
+impl HeadFacts {
+    /// The length of the head as HTTP/1.1 text: the line, each field, the blank line.
+    #[must_use]
+    pub fn wire_len(&self) -> usize {
+        self.method_len + 1 + self.uri_len + 11 + self.field_bytes + 4 * self.fields + 2
+    }
+}
+
+/// A pseudo-header's value as text: one that is not UTF-8 is refused (`tradeoff.md` 6.24).
+fn pseudo_text(v: &[u8]) -> Result<&str, HeadError> {
+    std::str::from_utf8(v).map_err(|_| HeadError::Refused("pseudo-header not UTF-8"))
+}
+
+/// A value without its leading and trailing blanks (space, tab).
+fn trim_blanks(v: &[u8]) -> &[u8] {
+    let start = v.iter().position(|b| !matches!(b, b' ' | b'\t')).unwrap_or(v.len());
+    let end = v.iter().rposition(|b| !matches!(b, b' ' | b'\t')).map_or(start, |e| e + 1);
+    &v[start..end]
+}
+
+/// Writes the request head of the decoded `fields` as the HTX blocks the data path starts a
+/// stream with: `ReqLine`, a `Header` per field, `Eoh`, then the end-of-head checks and edits
+/// of the HTTP/1 parser, so that the blocks (and which heads are refused) are those of
+/// `H2ReqHead::write` followed by `HtxSlice::put_request_head` (the differential row in
+/// `tests/it/htx_differential.rs`). One scan of the fields checks them and counts what the
+/// limits count, then the blocks are written from the fields where they lie: no text of the
+/// head and no list of its fields in between.
+///
+/// `relaxed` is `option accept-unsafe-violations-in-http-request`.
+///
+/// # Errors
+/// [`HeadError`]; `out` is then to be discarded.
+pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<'_>, relaxed: bool) -> Result<HeadFacts, HeadError> {
+    // Every field is checked before any block is written from it (T449).
+    let bad_request = check_request_fields(fields.iter(), relaxed).map_err(|_| HeadError::Refused("malformed field"))?;
+    let (mut method, mut path, mut authority, mut host, mut scheme, mut protocol) = (None, None, None, None, None, None);
+    let (mut seen_regular, mut regular, mut bytes, mut exact_host) = (false, 0usize, 0usize, false);
+    // Every `content-length` one length, as `h2_parse_cont_len_header` reads them (E1).
+    let mut length: Option<u64> = None;
+    let mut length_ok = true;
+    for (n, v) in fields.iter() {
+        bytes += n.len() + v.len();
+        if n.starts_with(b":") {
+            if seen_regular {
+                return Err(HeadError::Refused("pseudo-header after regular header"));
+            }
+            let slot = match n {
+                b":method" => &mut method,
+                b":path" => {
+                    if path.is_some() {
+                        return Err(HeadError::Refused("duplicate pseudo-header"));
+                    }
+                    if v.is_empty() {
+                        return Err(HeadError::Refused("empty :path"));
+                    }
+                    path = Some(v);
+                    continue;
+                }
+                b":authority" => &mut authority,
+                b":protocol" => &mut protocol,
+                b":scheme" => &mut scheme,
+                _ => return Err(HeadError::Refused("unknown pseudo-header")),
+            };
+            if slot.is_some() {
+                return Err(HeadError::Refused("duplicate pseudo-header"));
+            }
+            *slot = Some(v);
+            continue;
+        }
+        seen_regular = true;
+        regular += 1;
+        if n.eq_ignore_ascii_case(b"host") {
+            exact_host |= n == b"host";
+            host = host.or(Some(v));
+        } else if n == b"content-length" {
+            let one = std::str::from_utf8(v).ok().and_then(content_length_value);
+            length_ok &= one.is_some() && length.is_none_or(|l| Some(l) == one);
+            length = length.or(one);
+        }
+    }
+    // The pseudo-header values that are text.
+    let method = method.map(pseudo_text).transpose()?;
+    let authority = authority.map(pseudo_text).transpose()?;
+    let protocol = protocol.map(pseudo_text).transpose()?;
+    // A `host` made from `:authority` when the request has no `host` field.
+    let made_host = authority.filter(|_| !exact_host);
+    if regular + usize::from(made_host.is_some()) > MAX_HEAD_FIELDS {
+        return Err(HeadError::Refused("too many header fields"));
+    }
+    if bytes > MAX_HEAD_BYTES {
+        return Err(HeadError::Refused("head too large"));
+    }
+    if !length_ok {
+        return Err(HeadError::Refused("content-length"));
+    }
+    if let (Some(a), Some(h)) = (authority, host) {
+        if !a.as_bytes().eq_ignore_ascii_case(h) {
+            return Err(HeadError::Refused("authority and host mismatch"));
+        }
+    }
+    let method = method.ok_or(HeadError::Refused("no :method"))?;
+    // `:protocol` is an extended CONNECT's (RFC 8441), which goes to the server as the `GET`
+    // of an HTTP/1.1 upgrade to that protocol, with `:scheme`, `:path` and `:authority`.
+    if let Some(p) = protocol {
+        if method != "CONNECT" {
+            return Err(HeadError::Refused(":protocol outside CONNECT"));
+        }
+        if scheme.is_none() || path.is_none() || authority.is_none() {
+            return Err(HeadError::Refused("extended CONNECT without :scheme, :path or :authority"));
+        }
+        if p.eq_ignore_ascii_case("h2c") || p.eq_ignore_ascii_case("h2") {
+            return Err(HeadError::Refused("extended CONNECT to h2"));
+        }
+    }
+    // `HAProxy`'s start line is `scheme://authority` and the path: the log field is read from
+    // the fields, and a scheme that is not text is refused with it.
+    let has_abs = match (scheme, authority) {
+        (Some(sc), Some(_)) => {
+            pseudo_text(sc)?;
+            true
+        }
+        _ => false,
+    };
+    let ext_connect = protocol.is_some();
+    let method = if ext_connect { "GET" } else { method };
+    // The path as text; one that is not UTF-8 is held as `bytetext` stands for its bytes.
+    // `:path *` with an `:authority` is the absolute form without a path, written as `/`, as
+    // `*` for OPTIONS (`h2_prepare_htx_reqline`; measured, T451).
+    let (uri, path_raw, uri_len): (std::borrow::Cow<'_, str>, bool, usize) = match path {
+        Some(b"*") if authority.is_some() && method != "OPTIONS" => ("/".into(), false, 1),
+        Some(p) => match std::str::from_utf8(p) {
+            Ok(t) => (t.into(), false, p.len()),
+            Err(_) => (ibex_regex::bytetext::bytes_to_text(p).into(), true, p.len()),
+        },
+        None => ("/".into(), false, 1),
+    };
+    let oom = |_| HeadError::NoRoom;
+    crate::h1::check_request_line(method, &uri).map_err(|_| HeadError::Invalid)?;
+    out.push_req_line(method, &uri, "HTTP/1.1").map_err(oom)?;
+    let (mut count, mut field_bytes) = (0usize, 0usize);
+    if let Some(a) = made_host {
+        out.push_header_bytes(b"host", a.as_bytes()).map_err(oom)?;
+        count += 1;
+        field_bytes += "host".len() + a.len();
+    }
+    let mut host_seen = false;
+    for (n, v) in fields.iter().filter(|(n, _)| !n.starts_with(b":")) {
+        // A second `host` is dropped, the cookies are merged after the others.
+        if n.eq_ignore_ascii_case(b"host") {
+            if host_seen {
+                continue;
+            }
+            host_seen = true;
+        } else if n == b"cookie" {
+            continue;
+        }
+        // A value's leading and trailing blanks go (RFC 9113 section 8.2.1).
+        let v = trim_blanks(v);
+        out.push_header_bytes(n, v).map_err(oom)?;
+        count += 1;
+        field_bytes += n.len() + v.len();
+    }
+    if let Some(p) = protocol {
+        out.push_header_bytes(b"upgrade", p.as_bytes()).map_err(oom)?;
+        out.push_header_bytes(b"connection", b"upgrade").map_err(oom)?;
+        count += 2;
+        field_bytes += "upgrade".len() + p.len() + "connection".len() + "upgrade".len();
+    }
+    // RFC 9113 section 8.2.3: the cookie fields are one line, their values joined with "; "
+    // and their blanks kept (`h2_make_htx_request`; measured, T506).
+    let mut cookies = fields.iter().filter(|(n, _)| *n == b"cookie").map(|(_, v)| v);
+    if let Some(first) = cookies.next() {
+        out.push_header_joined("cookie", first, cookies.clone()).map_err(oom)?;
+        count += 1;
+        field_bytes += "cookie".len() + cookies.fold(first.len(), |t, v| t + 2 + v.len());
+    }
+    out.push_eoh().map_err(oom)?;
+    crate::h1::finish_request_head(out, method, &uri).map_err(|e| if e.kind() == io::ErrorKind::OutOfMemory { HeadError::NoRoom } else { HeadError::Invalid })?;
+    Ok(HeadFacts {
+        tail: out.tail_addr(),
+        blocks: out.num_blocks(),
+        bad_request,
+        ext_connect,
+        content_length: length.and_then(|l| usize::try_from(l).ok()),
+        method_len: method.len(),
+        uri_len,
+        path_raw,
+        has_abs,
+        fields: count,
+        field_bytes,
+    })
 }
 
 #[cfg(test)]

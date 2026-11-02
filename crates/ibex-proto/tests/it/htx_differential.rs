@@ -881,3 +881,383 @@ mod in_place {
         }
     }
 }
+
+/// CP1 (`docs/design/copies-2026-11-02.md` section 6, row S1): `write_request_htx` over the
+/// decoded fields writes the blocks, and refuses the heads, that the h2 mux's `H2ReqHead::write`
+/// followed by `HtxSlice::put_request_head` do today. The reference here is today's code, run
+/// live through a server `H2MuxContext` fed the same HEADERS frame (its checks, limits and
+/// `bad_request` included); the expected values behind it are pinned by T437/T449/T451/E1
+/// (`h2_field_validity.rs`) and were measured on ``HAProxy`` 3.5-dev8 then, so no row here
+/// doubts them.
+mod request_head_writer {
+    use ibex_proto::conn::ConnId;
+    use ibex_proto::h2::{frame_flags, write_request_htx, Frame, HeadError, H2_CONN_PREFACE};
+    use ibex_proto::hpack::{DecodedFields, HpackDecoder, HpackEncoder};
+    use ibex_proto::htx::{HtxSlice, RxHead};
+    use ibex_proto::mux::Mux;
+    use ibex_proto::mux_h2::MuxH2;
+    use proptest::prelude::*;
+
+    type Fields = Vec<(Vec<u8>, Vec<u8>)>;
+
+    fn row(f: &[(&[u8], &[u8])]) -> Fields {
+        f.iter().map(|(n, v)| (n.to_vec(), v.to_vec())).collect()
+    }
+
+    /// The pseudo-headers of a plain GET, then `more`.
+    fn get(more: &[(&[u8], &[u8])]) -> Fields {
+        let mut f = row(&[(b":method", b"GET"), (b":scheme", b"https"), (b":path", b"/p?q=1"), (b":authority", b"example.com")]);
+        f.extend(row(more));
+        f
+    }
+
+    fn block(fields: &Fields) -> Vec<u8> {
+        let mut enc = HpackEncoder::new();
+        let mut b = Vec::new();
+        for (n, v) in fields {
+            enc.encode_field_bytes(n, v, &mut b);
+        }
+        b
+    }
+
+    /// What today's path made of a head: `Err(true)` the mux refused it, `Err(false)` the
+    /// parser's `InvalidData`, `Ok` the blocks.
+    struct Today {
+        verdict: Result<(), HeadError>,
+        buf: Vec<u8>,
+        tail: usize,
+        blocks: usize,
+        bad_request: bool,
+        length: Option<usize>,
+        ext_connect: bool,
+        method_len: usize,
+        uri_len: usize,
+        path_raw: bool,
+        has_abs: bool,
+        fields: usize,
+        field_bytes: usize,
+        wire_len: usize,
+    }
+
+    fn today(fields: &Fields, relaxed: bool, cap: usize) -> Today {
+        let mut ctx = MuxH2.init(ConnId(1), true).expect("init");
+        ctx.relaxed_path = relaxed;
+        let mut b = H2_CONN_PREFACE.to_vec();
+        b.extend(Frame::Settings { flags: 0, settings: vec![] }.encode());
+        b.extend(Frame::Headers { flags: frame_flags::END_HEADERS | frame_flags::END_STREAM, stream_id: 1, header_block: block(fields) }.encode());
+        MuxH2.parse(&mut ctx, &b).expect("the connection survives the head");
+        // A head the mux refuses before it keeps the stream (an empty list) has none.
+        let (bad_request, length, ext_connect) = ctx.streams.get(&1).map_or((false, None, false), |st| (st.bad_request, st.req_content_length, st.ext_connect));
+        let mut buf = vec![0u8; cap];
+        let mut out = Today {
+            verdict: Err(HeadError::Refused("mux")),
+            buf: Vec::new(),
+            tail: 0,
+            blocks: 0,
+            bad_request,
+            length,
+            ext_connect,
+            method_len: 0,
+            uri_len: 0,
+            path_raw: false,
+            has_abs: false,
+            fields: 0,
+            field_bytes: 0,
+            wire_len: 0,
+        };
+        if let Some(head) = ctx.streams.get_mut(&1).and_then(|s| s.req_head.take()) {
+            let mut slice = HtxSlice::new(&mut buf);
+            out.verdict = match slice.put_request_head(&head, None, |_, _| {}) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::OutOfMemory => Err(HeadError::NoRoom),
+                Err(_) => Err(HeadError::Invalid),
+            };
+            (out.tail, out.blocks) = (slice.tail_addr(), slice.num_blocks());
+            out.method_len = head.method().len();
+            out.uri_len = head.uri_len();
+            out.path_raw = head.path_raw;
+            out.has_abs = head.abs_prefix().is_some();
+            out.fields = head.headers().count();
+            out.field_bytes = head.field_bytes;
+            out.wire_len = head.wire_len();
+        }
+        out.buf = buf;
+        out
+    }
+
+    fn decoded(fields: &Fields) -> DecodedFields {
+        let mut d = DecodedFields::default();
+        HpackDecoder::new().decode_into(&block(fields), &mut d).expect("decodes");
+        d
+    }
+
+    /// The new writer against today's path, on a memory of `cap` bytes. Returns the verdict
+    /// both gave.
+    fn same(name: &str, fields: &Fields, relaxed: bool, cap: usize) -> Result<(), HeadError> {
+        let old = today(fields, relaxed, cap);
+        let mut mem = vec![0u8; cap];
+        let mut slice = HtxSlice::new(&mut mem);
+        let new = write_request_htx(&decoded(fields), &mut slice, relaxed);
+        let ctx = format!("{name} (cap {cap}, relaxed {relaxed}): {fields:?}");
+        match (&old.verdict, &new) {
+            (Err(HeadError::Refused(_)), Err(HeadError::Refused(_))) => {}
+            (Err(a), Err(b)) => assert_eq!(a, b, "{ctx}"),
+            (Ok(()), Ok(f)) => {
+                assert_eq!((f.tail, f.blocks), (old.tail, old.blocks), "{ctx}");
+                let mut old_buf = old.buf.clone();
+                let reference = HtxSlice::with_offsets(&mut old_buf, old.tail, old.blocks);
+                assert!(reference.as_ref() == slice.as_ref(), "{ctx}\nold: {:?}\nnew: {:?}", reference.as_ref(), slice.as_ref());
+                assert_eq!(f.bad_request, old.bad_request, "{ctx}");
+                assert_eq!(f.content_length, old.length, "{ctx}");
+                assert_eq!(f.ext_connect, old.ext_connect, "{ctx}");
+                assert_eq!((f.method_len, f.uri_len, f.has_abs, f.fields, f.field_bytes), (old.method_len, old.uri_len, old.has_abs, old.fields, old.field_bytes), "{ctx}");
+                assert_eq!(f.path_raw, old.path_raw, "{ctx}");
+                assert_eq!(f.wire_len(), old.wire_len, "{ctx}");
+            }
+            (a, b) => panic!("{ctx}: today {a:?}, new {b:?}"),
+        }
+        old.verdict
+    }
+
+    /// The memories a row runs on: a normal buffer and several too small ones, so that every
+    /// write of the head is the one that finds no room in some run.
+    const CAPS: [usize; 9] = [64, 96, 128, 160, 200, 256, 400, 1024, 16384];
+
+    fn corpus() -> Vec<(&'static str, Fields)> {
+        let long = |c: u8, n: usize| vec![c; n];
+        let mut rows: Vec<(&'static str, Fields)> = vec![
+            ("plain", get(&[])),
+            ("authority first", row(&[(b":authority", b"a.test"), (b":path", b"/"), (b":scheme", b"http"), (b":method", b"POST")])),
+            ("no scheme", row(&[(b":method", b"GET"), (b":path", b"/x"), (b":authority", b"a.test")])),
+            ("no authority", row(&[(b":method", b"GET"), (b":path", b"/x"), (b":scheme", b"https"), (b"host", b"h.test")])),
+            ("no path", row(&[(b":method", b"CONNECT"), (b":authority", b"a.test:443")])),
+            ("empty path", row(&[(b":method", b"GET"), (b":path", b""), (b":authority", b"a")])),
+            ("no method", row(&[(b":path", b"/"), (b":authority", b"a")])),
+            ("dup method", row(&[(b":method", b"GET"), (b":method", b"GET"), (b":path", b"/")])),
+            ("dup path", row(&[(b":method", b"GET"), (b":path", b"/"), (b":path", b"/")])),
+            ("dup authority", row(&[(b":method", b"GET"), (b":path", b"/"), (b":authority", b"a"), (b":authority", b"a")])),
+            ("dup scheme", row(&[(b":method", b"GET"), (b":path", b"/"), (b":scheme", b"http"), (b":scheme", b"http")])),
+            ("dup protocol", row(&[(b":method", b"CONNECT"), (b":scheme", b"https"), (b":path", b"/"), (b":authority", b"a"), (b":protocol", b"websocket"), (b":protocol", b"websocket")])),
+            ("pseudo after regular", get(&[(b"x-a", b"1"), (b":method", b"GET")])),
+            ("unknown pseudo", get(&[]).into_iter().chain(row(&[(b":foo", b"1")])).collect()),
+            ("status pseudo", row(&[(b":method", b"GET"), (b":path", b"/"), (b":status", b"200")])),
+            ("authority and equal host", get(&[(b"host", b"example.com")])),
+            ("authority and host in another case", get(&[(b"host", b"EXAMPLE.com")])),
+            ("authority and other host", get(&[(b"host", b"other.test")])),
+            ("two hosts", get(&[(b"host", b"example.com"), (b"x", b"1"), (b"host", b"example.com")])),
+            ("two different hosts", row(&[(b":method", b"GET"), (b":path", b"/"), (b"host", b"a"), (b"host", b"b")])),
+            ("host in blanks", row(&[(b":method", b"GET"), (b":path", b"/"), (b"host", b"  a.test \t")])),
+            ("empty host", row(&[(b":method", b"GET"), (b":path", b"/"), (b"host", b"")])),
+            ("empty authority", row(&[(b":method", b"GET"), (b":path", b"/"), (b":authority", b""), (b":scheme", b"https")])),
+            ("default port", row(&[(b":method", b"GET"), (b":path", b"/"), (b":authority", b"example.com:443"), (b":scheme", b"https")])),
+            ("extended connect", row(&[(b":method", b"CONNECT"), (b":scheme", b"https"), (b":path", b"/chat"), (b":authority", b"a.test"), (b":protocol", b"websocket"), (b"sec-websocket-version", b"13")])),
+            ("extended connect no scheme", row(&[(b":method", b"CONNECT"), (b":path", b"/chat"), (b":authority", b"a.test"), (b":protocol", b"websocket")])),
+            ("extended connect no path", row(&[(b":method", b"CONNECT"), (b":scheme", b"https"), (b":authority", b"a.test"), (b":protocol", b"websocket")])),
+            ("extended connect no authority", row(&[(b":method", b"CONNECT"), (b":scheme", b"https"), (b":path", b"/"), (b":protocol", b"websocket")])),
+            ("extended connect to h2c", row(&[(b":method", b"CONNECT"), (b":scheme", b"https"), (b":path", b"/"), (b":authority", b"a"), (b":protocol", b"h2c")])),
+            ("extended connect to H2", row(&[(b":method", b"CONNECT"), (b":scheme", b"https"), (b":path", b"/"), (b":authority", b"a"), (b":protocol", b"H2")])),
+            ("protocol not text", row(&[(b":method", b"CONNECT"), (b":scheme", b"https"), (b":path", b"/"), (b":authority", b"a"), (b":protocol", b"\xff")])),
+            ("connect", row(&[(b":method", b"CONNECT"), (b":authority", b"a.test:443")])),
+            ("lower case method", row(&[(b":method", b"get"), (b":path", b"/")])),
+            ("method with a blank", row(&[(b":method", b"GE T"), (b":path", b"/")])),
+            ("empty method", row(&[(b":method", b""), (b":path", b"/")])),
+            ("method not text", row(&[(b":method", b"G\xe9T"), (b":path", b"/")])),
+            ("scheme not a scheme", row(&[(b":method", b"GET"), (b":path", b"/"), (b":scheme", b"1http"), (b":authority", b"a")])),
+            ("scheme not text, no authority", row(&[(b":method", b"GET"), (b":path", b"/"), (b":scheme", b"ht\xfftp")])),
+            ("scheme not text", row(&[(b":method", b"GET"), (b":path", b"/"), (b":scheme", b"ht\xfftp"), (b":authority", b"a")])),
+            ("authority not text", row(&[(b":method", b"GET"), (b":path", b"/"), (b":authority", b"a\xe9")])),
+            ("star with authority", row(&[(b":method", b"GET"), (b":path", b"*"), (b":authority", b"a"), (b":scheme", b"http")])),
+            ("options star with authority", row(&[(b":method", b"OPTIONS"), (b":path", b"*"), (b":authority", b"a"), (b":scheme", b"http")])),
+            ("star without authority", row(&[(b":method", b"OPTIONS"), (b":path", b"*"), (b"host", b"a")])),
+            ("path with a blank", row(&[(b":method", b"GET"), (b":path", b"/a b")])),
+            ("path with a hash", row(&[(b":method", b"GET"), (b":path", b"/a#b")])),
+            ("path with DEL", row(&[(b":method", b"GET"), (b":path", b"/a\x7fb")])),
+            ("path not absolute", row(&[(b":method", b"GET"), (b":path", b"a")])),
+            ("latin-1 path", row(&[(b":method", b"GET"), (b":path", b"/caf\xe9"), (b":authority", b"a"), (b":scheme", b"http")])),
+            ("escape character in a path", row(&[(b":method", b"GET"), (b":path", "/\u{f780}".as_bytes())])),
+            ("two content-length", get(&[(b"content-length", b"5"), (b"content-length", b"5")])),
+            ("conflicting content-length", get(&[(b"content-length", b"5"), (b"content-length", b"6")])),
+            ("content-length list", get(&[(b"content-length", b"5, 5")])),
+            ("content-length list conflict", get(&[(b"content-length", b"5, 6")])),
+            ("content-length letters", get(&[(b"content-length", b"abc")])),
+            ("content-length not text", get(&[(b"content-length", b"5\xe9")])),
+            ("content-length padded", get(&[(b"content-length", b"005")])),
+            ("content-length zero", get(&[(b"content-length", b"0")])),
+            ("content-length empty", get(&[(b"content-length", b"")])),
+            ("content-length u64 max", get(&[(b"content-length", b"18446744073709551615")])),
+            ("content-length past u64", get(&[(b"content-length", b"18446744073709551616")])),
+            ("content-length in blanks", get(&[(b"content-length", b" 7 ")])),
+            ("value not text", get(&[(b"x-a", b"caf\xe9")])),
+            ("value with an escape character", get(&[(b"x-a", "a\u{f781}b".as_bytes())])),
+            ("value in blanks", get(&[(b"x-a", b" \t v \t ")])),
+            ("value all blanks", get(&[(b"x-a", b" \t ")])),
+            ("empty value", get(&[(b"x-a", b"")])),
+            ("one cookie", get(&[(b"cookie", b"a=1")])),
+            ("cookies", get(&[(b"cookie", b"a=1"), (b"x-a", b"1"), (b"cookie", b" b=2 "), (b"cookie", b"")])),
+            ("cookie not text", get(&[(b"cookie", b"a=1"), (b"cookie", b"b=\xff")])),
+            ("cookie with an escape character", get(&[(b"cookie", "a=\u{f782}".as_bytes()), (b"cookie", b"b=2")])),
+            ("cookie before host", row(&[(b":method", b"GET"), (b":path", b"/"), (b"cookie", b"a=1"), (b"host", b"h"), (b"cookie", b"b=2")])),
+            ("upper case name", get(&[(b"X-A", b"1")])),
+            ("empty name", get(&[(b"", b"1")])),
+            ("name not text", get(&[(b"x-\xe9", b"1")])),
+            ("CR in a value", get(&[(b"x-a", b"1\r\nx: 2")])),
+            ("NUL in a value", get(&[(b"x-a", b"1\0")])),
+            ("tab and controls in a value", get(&[(b"x-a", b"a\t\x01\x7fb")])),
+            ("connection", get(&[(b"connection", b"close")])),
+            ("keep-alive", get(&[(b"keep-alive", b"1")])),
+            ("transfer-encoding", get(&[(b"transfer-encoding", b"chunked")])),
+            ("upgrade", get(&[(b"upgrade", b"websocket")])),
+            ("te trailers", get(&[(b"te", b"trailers")])),
+            ("te gzip", get(&[(b"te", b"gzip")])),
+            ("authority with a forbidden character", row(&[(b":method", b"GET"), (b":path", b"/"), (b":authority", b"u@x")])),
+            ("many fields", get(&[(b"x-a", b"1"), (b"user-agent", b"ua"), (b"accept", b"*/*"), (b"accept-encoding", b"gzip"), (b"accept-language", b"en"), (b"referer", b"https://r/"), (b"x-b", b"2"), (b"x-c", b"3")])),
+        ];
+        // The protocol pseudo-header outside an extended CONNECT.
+        let mut with_protocol = get(&[]);
+        with_protocol.insert(1, (b":protocol".to_vec(), b"websocket".to_vec()));
+        rows.push(("protocol on a GET", with_protocol));
+        // The limits: 100 fields pass (the host the authority makes counted), 101 do not.
+        let many = |n: usize, extra: &[(&[u8], &[u8])]| -> Fields {
+            let mut f = row(&[(b":method", b"GET"), (b":path", b"/")]);
+            f.extend(extra.iter().map(|(a, b)| (a.to_vec(), b.to_vec())));
+            f.extend((0..n).map(|i| (format!("x-{i}").into_bytes(), b"v".to_vec())));
+            f
+        };
+        rows.push(("99 fields", many(99, &[])));
+        rows.push(("100 fields", many(100, &[])));
+        rows.push(("101 fields", many(101, &[])));
+        rows.push(("100 fields and a made host", many(99, &[(b":authority", b"a")])));
+        rows.push(("101 with a made host", many(100, &[(b":authority", b"a")])));
+        rows.push(("100 fields and a host", many(99, &[(b":authority", b"a"), (b"host", b"a")])));
+        rows.push(("100 fields, extended connect", {
+            let mut f = many(98, &[(b":authority", b"a"), (b":scheme", b"https"), (b":protocol", b"websocket")]);
+            f[0].1 = b"CONNECT".to_vec();
+            f
+        }));
+        rows.push(("100 fields, extended connect, 2 more lines", {
+            let mut f = many(100, &[(b":authority", b"a"), (b":scheme", b"https"), (b":protocol", b"websocket")]);
+            f[0].1 = b"CONNECT".to_vec();
+            f
+        }));
+        // The size: 15,360 bytes of names and values pass, one more does not.
+        let sized = |total: usize| -> Fields {
+            let mut f = row(&[(b":method", b"GET"), (b":path", b"/")]);
+            let used: usize = f.iter().map(|(n, v)| n.len() + v.len()).sum();
+            f.push((b"x-big".to_vec(), long(b'a', total - used - 5)));
+            f
+        };
+        rows.push(("15360 bytes", sized(15_360)));
+        rows.push(("15361 bytes", sized(15_361)));
+        rows.push(("15400 bytes", sized(15_400)));
+        rows.push(("a long cookie", get(&[(b"cookie", &long(b'c', 3000)), (b"cookie", &long(b'd', 3000))])));
+        rows
+    }
+
+    #[test]
+    fn the_written_head_is_the_one_put_request_head_makes_of_the_mux_s() {
+        let (mut written, mut refused, mut parser_refused, mut no_room, mut bad) = (0, 0, 0, 0, 0);
+        for (name, fields) in corpus() {
+            for relaxed in [false, true] {
+                for cap in CAPS {
+                    match same(name, &fields, relaxed, cap) {
+                        Ok(()) => written += 1,
+                        Err(HeadError::Refused(_)) => refused += 1,
+                        Err(HeadError::Invalid) => parser_refused += 1,
+                        Err(HeadError::NoRoom) => no_room += 1,
+                    }
+                }
+            }
+            bad += usize::from(today(&fields, false, 16384).bad_request);
+        }
+        // The corpus reaches every verdict, so the comparison above is not vacuous.
+        assert!(written > 300 && refused > 400 && parser_refused > 20 && no_room > 100 && bad >= 5, "{written} {refused} {parser_refused} {no_room} {bad}");
+    }
+
+    #[test]
+    fn rows_whose_head_is_known() {
+        let d = |f: &Fields| {
+            let mut mem = vec![0u8; 16384];
+            let mut s = HtxSlice::new(&mut mem);
+            let facts = write_request_htx(&decoded(f), &mut s, false).expect("written");
+            (facts, format!("{:?}", s.as_ref()))
+        };
+        // The made host leads, the cookies are one line at the end, the ASCII fast path of the joined value.
+        let (facts, blocks) = d(&get(&[(b"cookie", b"a=1"), (b"x-a", b" v "), (b"cookie", b"b=2")]));
+        assert!(facts.has_abs && !facts.ext_connect && !facts.bad_request && facts.content_length.is_none());
+        let at = |s: &str| blocks.find(s).unwrap_or_else(|| panic!("{s} in {blocks}"));
+        assert!(at("example.com") < at("x-a") && at("x-a") < at("a=1; b=2"), "{blocks}");
+        let (facts, _) = d(&get(&[(b"content-length", b"5, 5")]));
+        assert_eq!((facts.content_length, facts.wire_len() > 40), (Some(5), true));
+    }
+
+    /// `HeadError` of the heads the mux refuses is `Refused`, and of the ones the parser does
+    /// `Invalid`; the messages name the rule.
+    #[test]
+    fn a_refusal_names_the_rule() {
+        let why = |f: &Fields| {
+            let mut mem = vec![0u8; 16384];
+            write_request_htx(&decoded(f), &mut HtxSlice::new(&mut mem), false).expect_err("refused")
+        };
+        assert_eq!(why(&get(&[(b"x-a", b"1\0")])), HeadError::Refused("malformed field"));
+        assert_eq!(why(&row(&[(b":path", b"/")])), HeadError::Refused("no :method"));
+        assert_eq!(why(&row(&[(b":method", b"GE T"), (b":path", b"/")])), HeadError::Invalid);
+        let mut mem = vec![0u8; 64];
+        assert_eq!(write_request_htx(&decoded(&get(&[])), &mut HtxSlice::new(&mut mem), false), Err(HeadError::NoRoom));
+    }
+
+    /// The memory the head is written into is the memory of a buffer: `HtxSlice::over` an
+    /// `RxHead` is the HTX of a boxed slice, and the box comes back out as it went in.
+    #[test]
+    fn a_head_is_written_into_an_rx_head_and_the_box_comes_back() {
+        let mut rx = RxHead::from_box(vec![0u8; 2048].into_boxed_slice());
+        assert!(!rx.is_empty());
+        let facts = {
+            let mut s = HtxSlice::over(&mut rx);
+            write_request_htx(&decoded(&get(&[(b"x-a", b"1")])), &mut s, false).expect("written")
+        };
+        assert!(facts.tail > 0 && facts.blocks == 5, "{facts:?}");
+        assert_eq!(rx.len(), 2048);
+        let mem = rx.into_box();
+        assert_eq!(mem.len(), 2048);
+        assert!(RxHead::from_box(Box::new([])).is_empty());
+    }
+
+    /// The joined header refuses what `push_header_bytes` refuses: a name past 255 bytes (the
+    /// writer's own name is `cookie`, so only a direct call reaches it).
+    #[test]
+    fn a_joined_header_has_the_limits_of_a_header() {
+        use ibex_proto::htx::HtxError;
+        let mut mem = vec![0u8; 512];
+        let mut s = HtxSlice::new(&mut mem);
+        let name = "n".repeat(256);
+        assert_eq!(s.push_header_joined(&name, b"a", [&b"b"[..]].into_iter()), Err(HtxError::LimitExceeded));
+        assert_eq!(s.num_blocks(), 0);
+    }
+
+    fn token() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            Just(b"x-a".to_vec()), Just(b"host".to_vec()), Just(b"cookie".to_vec()), Just(b"content-length".to_vec()),
+            Just(b"te".to_vec()), Just(b"X-Up".to_vec()), Just(b":path".to_vec()), Just(b":authority".to_vec()),
+            Just(b":scheme".to_vec()), Just(b":method".to_vec()), Just(b":protocol".to_vec()), Just(b":status".to_vec()),
+        ]
+    }
+
+    fn value() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            Just(b"GET".to_vec()), Just(b"CONNECT".to_vec()), Just(b"/".to_vec()), Just(b"*".to_vec()), Just(b"/a?b".to_vec()),
+            Just(b"a.test".to_vec()), Just(b"https".to_vec()), Just(b"websocket".to_vec()), Just(b"5".to_vec()), Just(b"6".to_vec()),
+            Just(b" v ".to_vec()), Just(b"a=1".to_vec()), Just(b"\xe9".to_vec()), Just(b"".to_vec()), Just(b"trailers".to_vec()),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(400))]
+
+        /// Random field lists over the names and values the rules look at: whatever the
+        /// pseudo-headers' order, duplicates and values, the two paths agree.
+        #[test]
+        fn random_heads_are_written_as_they_are_today(fields in prop::collection::vec((token(), value()), 0..9), relaxed in any::<bool>(), cap in prop::sample::select(CAPS.to_vec())) {
+            let _ = same("random", &fields, relaxed, cap);
+        }
+    }
+}

@@ -1392,6 +1392,41 @@ pub struct HtxRegion {
     pub reserve_start: usize,
 }
 
+/// The memory a request head is written into before the stream that will own it exists (CP1,
+/// `docs/design/copies-2026-11-02.md` section 3.1): a small buffer's box, whose HTX is written
+/// by [`HtxSlice::over`] and which `ibex_rt::buf::Buf::adopt` moves into the stream as its
+/// `htx_buf`, no copy. It is not a pool of its own: the box comes from, and goes back to, the
+/// small-buffer pool (`Buf::take_rx_head`, `Buf`'s drop), so it is counted there and the box
+/// never changes pool on the way.
+#[derive(Debug)]
+pub struct RxHead(Box<[u8]>);
+
+impl RxHead {
+    /// Takes the memory of a buffer.
+    #[must_use]
+    pub fn from_box(mem: Box<[u8]>) -> Self {
+        Self(mem)
+    }
+
+    /// The memory, to become a buffer's.
+    #[must_use]
+    pub fn into_box(self) -> Box<[u8]> {
+        self.0
+    }
+
+    /// The size of the memory.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// No memory.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Zero-allocation HTX representation over a contiguous pre-allocated byte slice.
 pub struct HtxSlice<'a> {
     buf: &'a mut [u8],
@@ -1409,6 +1444,13 @@ impl<'a> HtxSlice<'a> {
             num_blocks: 0,
             region: HtxRegion::default(),
         }
+    }
+
+    /// An empty HTX over the memory of `head` (CP1): the descriptors from its end, the payload
+    /// from its front. [`Self::tail_addr`] and [`Self::num_blocks`] say what was written.
+    #[must_use]
+    pub fn over(head: &'a mut RxHead) -> Self {
+        Self::new(&mut head.0)
     }
 
     #[must_use]
@@ -1663,6 +1705,46 @@ impl<'a> HtxSlice<'a> {
             return push_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, name, value);
         }
         self.push_header_latin1(name, value.as_bytes())
+    }
+
+    /// A header of `name` whose value is `first` and the `rest`, one after the other with
+    /// `"; "` between them (RFC 9113 section 8.2.3: the cookie fields of an HTTP/2 request, which
+    /// the HTTP/1 form carries as one line), written in place: what [`Self::push_header_bytes`]
+    /// makes of the joined value, with no joined copy when the parts are ASCII.
+    pub fn push_header_joined<'p>(&mut self, name: &str, first: &'p [u8], rest: impl Iterator<Item = &'p [u8]> + Clone) -> Result<(), HtxError> {
+        let total = rest.clone().fold(first.len(), |t, p| t + 2 + p.len());
+        if first.is_ascii() && rest.clone().all(<[u8]>::is_ascii) {
+            if name.len() > HTX_HDR_NAME_MAX_LEN || total > HTX_HDR_VALUE_MAX_LEN {
+                return Err(HtxError::LimitExceeded);
+            }
+            if free_capacity_at(self.buf.len(), self.tail_addr, self.num_blocks) < name.len() + total + HTX_DESC_SIZE {
+                return Err(HtxError::OutOfMemory);
+            }
+            let addr = self.tail_addr;
+            let mut at = addr;
+            self.buf[at..at + name.len()].copy_from_slice(name.as_bytes());
+            at += name.len();
+            self.buf[at..at + first.len()].copy_from_slice(first);
+            at += first.len();
+            for p in rest {
+                self.buf[at..at + 2].copy_from_slice(b"; ");
+                self.buf[at + 2..at + 2 + p.len()].copy_from_slice(p);
+                at += 2 + p.len();
+            }
+            let desc = HtxBlockDesc { blk_type: HtxBlockType::Header, flags: HTX_BLK_FL_NONE, name_len: name.len() as u16, addr: addr as u32, value_len: total as u32, aux: 0 };
+            self.tail_addr = at;
+            self.num_blocks += 1;
+            write_desc_at(self.buf, self.num_blocks, self.num_blocks - 1, &desc);
+            return Ok(());
+        }
+        // Past ASCII the value is read as UTF-8 or Latin-1 whole, so it is joined first.
+        let mut value = Vec::with_capacity(total);
+        value.extend_from_slice(first);
+        for p in rest {
+            value.extend_from_slice(b"; ");
+            value.extend_from_slice(p);
+        }
+        self.push_header_bytes(name.as_bytes(), &value)
     }
 
     /// [`Self::push_header`] of a value that is not UTF-8, read as Latin-1 and flagged
