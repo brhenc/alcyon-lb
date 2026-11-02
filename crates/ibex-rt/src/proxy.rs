@@ -782,9 +782,6 @@ pub struct TcpSession {
     /// Server to client.
     pub rep: Buf,
     pub timeouts: Timeouts,
-    /// What `http-request set-timeout` set for the stream in progress; `None` until a rule
-    /// sets one, so a stream that sets none allocates nothing.
-    pub timeouts_set: Option<Box<TimeoutsSet>>,
     /// The chosen backend's `timeout tunnel` and `timeout queue`, in ms (0: none). The queue
     /// one is `timeout connect` where the backend has no `timeout queue` of its own (the
     /// value `HAProxy` is configured with). What `set-timeout` set for the stream is in
@@ -892,9 +889,6 @@ pub struct TcpSession {
     /// The PROXY header the server connection opened with, if any: a later request reuses
     /// that connection only if it would send the same one.
     pub send_proxy_header: Vec<u8>,
-    /// The HTTP transaction in progress: `None` between requests, and always in `mode
-    /// tcp`. What may be forwarded in each direction is decided by its message states.
-    pub txn: Option<HttpTxn>,
     /// The server socket is drained, so it is not read again until the poller reports it
     /// readable (`HAProxy`'s `fd_cant_recv`): set by a read that returned `EAGAIN` or
     /// fewer bytes than asked for (`src/raw_sock.c`). HTTP over plain sockets only: those
@@ -937,15 +931,11 @@ pub struct TcpSession {
     /// The backend has `tcp-response content` rules for this stream: they start, with
     /// this inspect-delay, once the server connection is up (`server_connected`).
     pub res_inspect_armed: Option<Option<u32>>,
-    /// The stream's variables, every scope (`sess.`, `txn.`, `req.`, `res.`); in the thread's
-    /// `CURRENT_VARS` while the stream runs, swapped (T364 S6).
-    pub vars: ibex_sample::VarStore,
-    /// What this stream measured for its log line, and its captures and unique ID.
-    pub log: crate::txnlog::StreamLog,
+    /// The per-request state (O1a): the transaction, the log's measures and captures, the
+    /// variables, the stick keys taken, the timeouts set. Made with the session, reset in
+    /// place between the requests of a connection ([`crate::stream::Stream::reset`]).
+    pub strm: crate::stream::Stream,
     pub tracked_sc: [Option<(usize, StickKey)>; 3],
-    /// The keys `stick on` and `stick store-request` took from the request, each with the
-    /// proxy whose table keeps it: stored with the server that answers.
-    pub stick_stores: Vec<(usize, StickKey)>,
     pub bufsize: usize,
     pub maxrewrite: usize,
     pub h2_ctx: Option<Box<H2MuxContext>>,
@@ -1273,7 +1263,7 @@ impl TcpSession {
         // credit them again.
         c.stick_acct_in = owner.stick_acct_in;
         c.stick_out_pending = std::mem::take(&mut owner.stick_out_pending);
-        owner.stick_acct_in = owner.stick_acct_in.max(owner.log.bytes_in_at_start);
+        owner.stick_acct_in = owner.stick_acct_in.max(owner.strm.log.bytes_in_at_start);
         c.accept_proxy = owner.accept_proxy;
         c.accept_proxy_v2 = owner.accept_proxy_v2;
         c.proxy_handshake_done = owner.proxy_handshake_done;
@@ -1291,15 +1281,15 @@ impl TcpSession {
         // rules: the content inspection it takes over is its only rare check (T599).
         c.rare_armed = !c.tcp_inspect_done;
         c.inspect_exp = owner.inspect_exp.take();
-        c.vars.copy_scope_from(&owner.vars, ibex_sample::VarScope::Sess);
-        c.log = owner.log.clone();
+        c.strm.vars.copy_scope_from(&owner.strm.vars, ibex_sample::VarScope::Sess);
+        c.strm.log = owner.strm.log.clone();
         // The memory the connection's last stream held for its request (T437).
         let mut spare_role = None;
         if let Some(o) = owner.h2_owner_mut() {
             let sp = &mut o.spare;
             c.req_uri = std::mem::take(&mut sp.req_uri);
             c.req_method = std::mem::take(&mut sp.req_method);
-            c.log.request_line = std::mem::take(&mut sp.request_line);
+            c.strm.log.request_line = std::mem::take(&mut sp.request_line);
             // Its strings are reused in place: `start_request`, which runs next, writes the
             // stream's own headers over them before anything reads the list.
             c.req_headers = sp.req_headers.take();
@@ -1326,7 +1316,7 @@ impl TcpSession {
             quic_ack: None,
             sess_vars_at_start: {
                 let mut v = ibex_sample::VarStore::new();
-                v.copy_scope_from(&owner.vars, ibex_sample::VarScope::Sess);
+                v.copy_scope_from(&owner.strm.vars, ibex_sample::VarScope::Sess);
                 v
             },
         });
@@ -1348,16 +1338,16 @@ impl TcpSession {
         // Other streams may be served beside this one: what it changed is merged in, the
         // rest of the connection's state is left as they made it.
         let at_start = child.h2_child_mut().map(|c| std::mem::take(&mut c.sess_vars_at_start)).unwrap_or_default();
-        self.vars.merge_sess_from(&child.vars, &at_start);
-        child.vars.clear_scope(ibex_sample::VarScope::Sess);
+        self.strm.vars.merge_sess_from(&child.strm.vars, &at_start);
+        child.strm.vars.clear_scope(ibex_sample::VarScope::Sess);
         for (mine, theirs) in self.tracked_sc.iter_mut().zip(&mut child.tracked_sc) {
             if mine.is_none() {
                 *mine = theirs.take();
             }
         }
         self.stick_acct_in = self.stick_acct_in.max(child.stick_acct_in);
-        self.stick_out_pending += child.stick_out_pending + child.log.bytes_from_server;
-        self.log.restart(self.bytes_in, self.bytes_out);
+        self.stick_out_pending += child.stick_out_pending + child.strm.log.bytes_from_server;
+        self.strm.log.reset(self.bytes_in, self.bytes_out);
         // The memory the stream held for its request is the next stream's (T437).
         if let Some(o) = self.h2_owner_mut() {
             let sp = &mut o.spare;
@@ -1365,7 +1355,7 @@ impl TcpSession {
             sp.req_uri.reset();
             sp.req_method = std::mem::take(&mut child.req_method);
             sp.req_method.reset();
-            sp.request_line = std::mem::take(&mut child.log.request_line);
+            sp.request_line = std::mem::take(&mut child.strm.log.request_line);
             sp.request_line.reset();
             sp.req_headers = child.req_headers.take();
             // Nothing reads the stream's role once it is over: its entry is being freed.
@@ -1501,7 +1491,6 @@ impl TcpSession {
             req: Buf::unallocated(crate::buf::BufClass::Standard),
             rep: Buf::unallocated(crate::buf::BufClass::Standard),
             timeouts,
-            timeouts_set: None,
             be_tunnel_ms: 0,
             be_queue_ms: 0,
             queue: QueueSlot::default(),
@@ -1543,7 +1532,6 @@ impl TcpSession {
             server_addr: None,
             send_proxy_prepended: false,
             send_proxy_header: Vec::new(),
-            txn: None,
             srv_cant_recv: false,
             cli_cant_recv: false,
             passes_ran_out: false,
@@ -1561,10 +1549,8 @@ impl TcpSession {
             res_inspect_pending: false,
             res_inspect_exp: None,
             res_inspect_armed: None,
-            vars: ibex_sample::VarStore::new(),
-            log: crate::txnlog::StreamLog::start(0, 0),
+            strm: crate::stream::Stream::start(),
             tracked_sc: [None, None, None],
-            stick_stores: Vec::new(),
             h2_ctx: None,
             h2_idle_goaway: false,
             cli_linger: false,
@@ -1597,7 +1583,7 @@ impl TcpSession {
             None
         } else {
             // The head's HTX is gone once it is forwarded: the version is kept apart.
-            self.txn.as_ref().and_then(|t| txn::version_text(t.req_version))
+            self.strm.txn.as_ref().and_then(|t| txn::version_text(t.req_version))
         }
     }
 
@@ -1736,7 +1722,7 @@ impl TcpSession {
     /// loop as long as the server took (T186).
     #[must_use]
     pub fn has_undispatched_h2_streams(&self) -> bool {
-        if self.h2_owner().is_some_and(|o| o.children.len() >= self.h2_max_children()) || self.txn.is_some() {
+        if self.h2_owner().is_some_and(|o| o.children.len() >= self.h2_max_children()) || self.strm.txn.is_some() {
             return false;
         }
         if let Some(ref h2) = self.h2_ctx {
@@ -1819,11 +1805,11 @@ impl TcpSession {
     /// sides; without it those two go on.
     #[must_use]
     pub fn tunnel_ms(&self) -> Option<u32> {
-        let set = self.timeouts_set.as_ref().map_or(0, |s| s.ms[ibex_sample::TimeoutKind::Tunnel as usize]);
+        let set = self.strm.timeouts_set.as_ref().map_or(0, |s| s.ms[ibex_sample::TimeoutKind::Tunnel as usize]);
         let ms = if set != 0 { set } else { self.be_tunnel_ms };
         let on = match self.mode {
             Mode::Tcp => self.srv_state == ScState::Established,
-            _ => self.mode == Mode::Http && self.txn.as_ref().is_some_and(|t| t.rsp == txn::MsgState::Tunnel && t.req == txn::MsgState::Tunnel),
+            _ => self.mode == Mode::Http && self.strm.txn.as_ref().is_some_and(|t| t.rsp == txn::MsgState::Tunnel && t.req == txn::MsgState::Tunnel),
         };
         (ms != 0 && on).then_some(ms)
     }
@@ -1839,7 +1825,7 @@ impl TcpSession {
     /// `timeout queue` for this stream, in ms (0: none).
     #[must_use]
     pub fn queue_ms(&self) -> u32 {
-        let set = self.timeouts_set.as_ref().map_or(0, |s| s.ms[ibex_sample::TimeoutKind::Queue as usize]);
+        let set = self.strm.timeouts_set.as_ref().map_or(0, |s| s.ms[ibex_sample::TimeoutKind::Queue as usize]);
         if set != 0 { set } else { self.be_queue_ms }
     }
 
@@ -1847,7 +1833,7 @@ impl TcpSession {
     /// the connection is new or part of a request is here.
     fn head_pending(&self) -> bool {
         self.mode == Mode::Http
-            && self.txn.is_none()
+            && self.strm.txn.is_none()
             && (self.is_first_req || !self.req.is_empty())
             // An HTTP/2 connection serving a stream has its request head (T280).
             && self.h2_owner().is_none_or(|o| o.children.is_empty())
@@ -1856,7 +1842,7 @@ impl TcpSession {
     /// Whether the connection waits for the first byte of its next request: a response has
     /// gone, nothing has come.
     fn idle_wait(&self) -> bool {
-        self.mode == Mode::Http && !self.is_h2() && self.txn.is_none() && !self.is_first_req && self.req.is_empty()
+        self.mode == Mode::Http && !self.is_h2() && self.strm.txn.is_none() && !self.is_first_req && self.req.is_empty()
     }
 
     /// Starts `timeout http-request` when a request head starts, and ends it when the head
@@ -1906,7 +1892,7 @@ impl TcpSession {
     /// [`Self::attach_server_with_xprt`] for a connection whose local address `src` is known
     /// already: one taken from the idle pool, which kept it (T550 Q8).
     pub fn attach_server_from(&mut self, fd: OwnedFd, xprt: ServerXprt, src: Option<std::net::SocketAddr>, now: Tick) {
-        self.log.queue.get_or_insert_with(crate::txnlog::loop_now);
+        self.strm.log.queue.get_or_insert_with(crate::txnlog::loop_now);
         self.bc_src = src;
         self.srv = Some(fd);
         self.srv_xprt = xprt;
@@ -1937,7 +1923,7 @@ impl TcpSession {
         if self.mode == Mode::Tcp && self.tunnel_ms().is_some() {
             self.arm_client(now);
         }
-        self.log.connect = Some(crate::txnlog::loop_now());
+        self.strm.log.connect = Some(crate::txnlog::loop_now());
         // `AN_RES_INSPECT` runs from here, before any of the response has arrived.
         if let Some(delay) = self.res_inspect_armed.take() {
             self.res_inspect_pending = true;
@@ -2052,7 +2038,7 @@ impl TcpSession {
     #[must_use]
     pub fn rep_window(&self) -> usize {
         let data = self.rep.readable();
-        match &self.txn {
+        match &self.strm.txn {
             Some(t) if self.mode == Mode::Http && t.rsp.holds_trailer(data, self.bufsize) => 0,
             Some(t) if self.mode == Mode::Http => t.client_window(data),
             _ => data.len(),
@@ -2068,7 +2054,7 @@ impl TcpSession {
         if self.mode != Mode::Http {
             return;
         }
-        let Some(t) = &self.txn else { return };
+        let Some(t) = &self.strm.txn else { return };
         let n = self.req_msg(t).canonical_chunk_lines(self.req.readable_mut(), self.drop_req_trailers);
         self.req.cut(n, self.req.len());
     }
@@ -2079,7 +2065,7 @@ impl TcpSession {
         if self.mode != Mode::Http {
             return;
         }
-        let Some(t) = &self.txn else { return };
+        let Some(t) = &self.strm.txn else { return };
         let n = t.rsp.canonical_chunk_lines(self.rep.readable_mut(), self.drop_rsp_trailers);
         self.rep.cut(n, self.rep.len());
     }
@@ -2091,7 +2077,7 @@ impl TcpSession {
     /// nothing of this read goes and the server connection is aborted, as when the framing
     /// breaks in a body forwarded as it came.
     pub fn dechunk_rep(&mut self, from: usize) {
-        let Some(t) = self.txn.as_mut() else { return };
+        let Some(t) = self.strm.txn.as_mut() else { return };
         let Some(c) = t.rsp_dechunk.as_deref_mut() else { return };
         // A head that came alone leaves nothing after it (`from == len`): `dechunk` reads
         // nothing, and the parser stays where it is.
@@ -2120,7 +2106,7 @@ impl TcpSession {
                 t.aborted = true;
                 self.srv_state = ScState::Error;
                 self.ending.get_or_insert(Ending::ServerAbort);
-                self.log.term = Some(*b"PH");
+                self.strm.log.term = Some(*b"PH");
             }
         }
     }
@@ -2140,7 +2126,7 @@ impl TcpSession {
         if self.mode != Mode::Http {
             return;
         }
-        let Some(t) = &self.txn else { return };
+        let Some(t) = &self.strm.txn else { return };
         while let Some(at) = self.req_msg(t).trailer_bare_lf(self.req.readable()) {
             let mut fixed = Vec::with_capacity(at + 2);
             fixed.extend_from_slice(&self.req.readable()[..at]);
@@ -2158,7 +2144,7 @@ impl TcpSession {
         if self.mode != Mode::Http {
             return data.len();
         }
-        match &self.txn {
+        match &self.strm.txn {
             // Not before its rules have run: a server connection kept from the last
             // transaction is ready to take bytes the moment a head is parsed, and the
             // request would reach it unfiltered and unrewritten.
@@ -2186,7 +2172,7 @@ impl TcpSession {
     /// from flipping off and on with every transaction. Bytes outside a response are the
     /// engine's to judge (`end_txn`, `http_step`).
     fn reads_server(&self) -> bool {
-        self.mode != Mode::Http || self.txn.as_ref().is_none_or(|t| !t.local && t.error.is_none())
+        self.mode != Mode::Http || self.strm.txn.as_ref().is_none_or(|t| !t.local && t.error.is_none())
     }
 
     /// Whether the client side keeps `cli_cant_recv` (see `srv_cant_recv` for the rule).
@@ -2235,7 +2221,7 @@ impl TcpSession {
             crate::h2_bridge::write_pending_head(self, false, None);
         }
         let h2 = self.is_h2();
-        let txn = self.txn.get_or_insert_with(|| HttpTxn::new(txn::Framing::None, false));
+        let txn = self.strm.txn.get_or_insert_with(|| HttpTxn::new(txn::Framing::None, false));
         let data = self.req.readable();
         let n = txn.req.window(data);
         txn.request_consumed(data, n);
@@ -2369,9 +2355,9 @@ impl TcpSession {
     /// `rep` (chunked, like a server's response relayed). A `HEAD` gets the head alone.
     pub fn start_scrape(&mut self) {
         self.write_reply_with(crate::promex::REPLY_HEAD, true);
-        let head_only = self.txn.as_ref().is_some_and(|t| t.client_head);
+        let head_only = self.strm.txn.as_ref().is_some_and(|t| t.client_head);
         if !head_only {
-            if let Some(t) = self.txn.as_mut() {
+            if let Some(t) = self.strm.txn.as_mut() {
                 t.rsp = txn::MsgState::head(txn::Framing::Chunked);
             }
             self.set_scrape(Some(crate::promex::Cursor::start()));
@@ -2381,23 +2367,19 @@ impl TcpSession {
     /// Clears what belonged to the transaction that just ended, so the next request on
     /// this connection starts from nothing. The one place that list lives.
     pub fn reset_for_next_request(&mut self) {
-        self.stick_out_pending += self.log.bytes_from_server;
-        self.log.restart(self.bytes_in, self.bytes_out);
-        self.txn = None;
+        self.stick_out_pending += self.strm.log.bytes_from_server;
+        // The stream becomes the next request's in place (O1a): its transaction, log,
+        // captures, `txn.`/`req.`/`res.` variables, stick keys and set timeouts go.
+        self.strm.reset(self.bytes_in, self.bytes_out, &mut self.timeouts);
         self.req_method.reset();
         self.req_body_htx.set(None);
         self.req_uri.reset();
         self.end_dump();
         self.req_headers = None;
         self.clear_htx();
-        self.vars.clear_txn();
-        if let Some(set) = self.timeouts_set.take() {
-            self.timeouts = set.before;
-        }
         // The stream is running, so its variables are in the thread's map
         // (`engine::with_stream_vars`): the transaction's go from there too.
         ibex_sample::vars::with_current_mut(ibex_sample::VarStore::clear_txn);
-        self.stick_stores.clear();
         self.is_first_req = false;
         // How the last transaction ended is not how the next one will: a 503 after refused
         // connects left `ConnectFailed`, and the next request's client leaving was then
@@ -2443,7 +2425,7 @@ impl TcpSession {
     /// went to the server without it (`HttpTxn::req_body_dropped`), once the head has gone.
     pub(crate) fn drain_request(&mut self) {
         let dropped = |t: &HttpTxn| t.req_body_dropped && !matches!(t.req, txn::MsgState::Head { .. });
-        if let Some(t) = self.txn.as_mut().filter(|t| ((t.local && !t.close_after) || dropped(t)) && !t.req.is_done()) {
+        if let Some(t) = self.strm.txn.as_mut().filter(|t| ((t.local && !t.close_after) || dropped(t)) && !t.req.is_done()) {
             let data = self.req.readable();
             let n = t.req.window(data);
             t.request_consumed(data, n);
@@ -2454,10 +2436,10 @@ impl TcpSession {
     /// The request cannot be parsed. It is answered with `status` -- by the engine, which
     /// has the error pages -- and the connection closes; nothing more is read from it.
     pub(crate) fn fail_request(&mut self, status: u16) {
-        self.log.term = Some(*b"PR");
+        self.strm.log.term = Some(*b"PR");
         self.req.clear();
         self.req_head_pending = false;
-        self.txn = Some(HttpTxn::failed(status));
+        self.strm.txn = Some(HttpTxn::failed(status));
         // A stream of an HTTP/2 connection fails alone: its answer goes out as HEADERS and the
         // connection and its other streams go on (T464), so its state is not the connection's.
         if self.h2_child_mut().is_none() {
@@ -2527,12 +2509,12 @@ impl TcpSession {
         // A stream's `bytes_out` is its connection's, which has written before it (SETTINGS,
         // the other streams' frames): its own response has started when its transaction says so.
         let nothing_sent = match self.h2_child_mut() {
-            Some(_) => self.txn.as_ref().is_none_or(|t| t.rsp == txn::MsgState::Waiting),
-            None => self.bytes_out == self.log.bytes_out_at_start,
+            Some(_) => self.strm.txn.as_ref().is_none_or(|t| t.rsp == txn::MsgState::Waiting),
+            None => self.bytes_out == self.strm.log.bytes_out_at_start,
         };
         if self.mode == Mode::Http && nothing_sent && self.rep.is_empty() {
             self.req.clear();
-            self.txn = Some(HttpTxn::failed(500));
+            self.strm.txn = Some(HttpTxn::failed(500));
             // On HTTP/2 the failure stays on the stream (T464): see `fail_request`.
             if self.h2_child_mut().is_none() && !matches!(self.cli_state, ScState::Closed | ScState::Error) {
                 self.cli_state = ScState::ShutR;
@@ -2908,7 +2890,7 @@ impl TcpSession {
                         // connection closed below, as HAProxy does, not dropped unsent.
                         let _ = MuxH2.parse(h2, &raw_buf[..n]).map_err(|_| h2.ensure_goaway());
                         self.bytes_in += n as u64;
-                        self.log.first_byte_now();
+                        self.strm.log.first_byte_now();
                         changed = true;
                     }
                     Io::Done(_) | Io::WouldBlock => {}
@@ -2948,7 +2930,7 @@ impl TcpSession {
                         self.req.commit(n);
                         self.rewrite_req_chunk_framing();
                         self.bytes_in += n as u64;
-                        self.log.first_byte_now();
+                        self.strm.log.first_byte_now();
                         changed = true;
                     }
                     // Nothing came: the buffer taken for the read goes back
@@ -3132,7 +3114,7 @@ impl TcpSession {
                         // 400, or the 413 / 422 HAProxy answers to some heads (T276).
                         self.fail_request(ibex_proto::h1::Refusal::status_of(&e));
                         if ibex_proto::h1::Refusal::is_quiet(&e) {
-                            if let Some(t) = self.txn.as_mut() {
+                            if let Some(t) = self.strm.txn.as_mut() {
                                 t.quiet = true;
                             }
                         }
@@ -3195,7 +3177,7 @@ impl TcpSession {
                 // (`HAProxy` takes it from the HTX start line), before any rule rewrites it
                 // (and keeps its first `tune.http.logurilen`, 1024, bytes). The head forwarded
                 // may have been regenerated just above, so its length is read again.
-                self.log.request = Some(crate::txnlog::loop_now());
+                self.strm.log.request = Some(crate::txnlog::loop_now());
                 if self.keep_request_line {
                     let head = self.req.readable();
                     let line_end = head.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(head.len());
@@ -3206,9 +3188,9 @@ impl TcpSession {
                         let host = self.htx_slice().and_then(|h| {
                             h.headers().find(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.to_string())
                         });
-                        self.log.request_line.set(&h3_log_line(&line, host.as_deref()));
+                        self.strm.log.request_line.set(&h3_log_line(&line, host.as_deref()));
                     } else {
-                        self.log.request_line.set(&line);
+                        self.strm.log.request_line.set(&line);
                     }
                 }
 
@@ -3248,7 +3230,7 @@ impl TcpSession {
                         }
                         txn::BodyCheck::TooLarge { trailer: true } => {
                             self.fail_request(400);
-                            if let Some(t) = self.txn.as_mut() {
+                            if let Some(t) = self.strm.txn.as_mut() {
                                 t.quiet = true;
                             }
                             return Ok(true);
@@ -3283,7 +3265,7 @@ impl TcpSession {
                 txn.req_version = txn::version_digits(ver).unwrap_or(txn.req_version);
                 // The client's own method: rules that rewrite it have not run yet.
                 txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
-                self.txn = Some(txn);
+                self.strm.txn = Some(txn);
                 self.drop_req_trailers = false;
                 self.rewrite_req_chunk_framing();
                 self.cli_state = ScState::Established;
@@ -3305,7 +3287,7 @@ impl TcpSession {
                 // earlier line's a close with nothing written (T315).
                 self.fail_request(400);
                 if early == ibex_proto::h1::ClEarly::Conflict {
-                    if let Some(t) = self.txn.as_mut() {
+                    if let Some(t) = self.strm.txn.as_mut() {
                         t.quiet = true;
                     }
                 }
@@ -3344,7 +3326,7 @@ impl TcpSession {
         // A response to a HEAD that carries a body anyway (the server answered a GET):
         // the body is read to its end and dropped.
         if self.mode == Mode::Http && !self.is_h2() {
-            if let Some(t) = self.txn.as_mut() {
+            if let Some(t) = self.strm.txn.as_mut() {
                 let n = t.skip_head_body(self.rep.readable());
                 if n > 0 {
                     self.rep.consume(n);
@@ -3360,7 +3342,7 @@ impl TcpSession {
             match self.cli.send(&mut self.cli_xprt, &self.rep.readable()[..window])? {
                 Io::Done(n) if n > 0 => {
                     if self.mode == Mode::Http {
-                        if let Some(t) = self.txn.as_mut() {
+                        if let Some(t) = self.strm.txn.as_mut() {
                             t.response_sent(self.rep.readable(), n);
                         }
                     }
@@ -3489,7 +3471,7 @@ impl TcpSession {
     #[cold]
     #[inline(never)]
     fn l7_keep(&mut self, window: usize) {
-        let Some(t) = self.txn.as_mut() else { return };
+        let Some(t) = self.strm.txn.as_mut() else { return };
         let data = &self.req.readable()[..window];
         let mut after = t.req;
         after.advance(data);
@@ -3533,7 +3515,7 @@ impl TcpSession {
         // `retry-on <status>`: the request is copied the first time it is sent, whole, so
         // that it can be sent again when the answer is one to retry on.
         if window > 0 && self.srv_state.can_write() && self.mode == Mode::Http {
-            if self.txn.as_ref().is_some_and(|t| matches!(t.l7, txn::L7Retry::Armed)) {
+            if self.strm.txn.as_ref().is_some_and(|t| matches!(t.l7, txn::L7Retry::Armed)) {
                 self.l7_keep(window);
             }
         }
@@ -3553,7 +3535,7 @@ impl TcpSession {
             match r {
                 Io::Done(n) if n > 0 => {
                     if self.mode == Mode::Http {
-                        if let Some(t) = self.txn.as_mut() {
+                        if let Some(t) = self.strm.txn.as_mut() {
                             t.request_consumed(self.req.readable(), n);
                             head_gone = !matches!(t.req, txn::MsgState::Head { .. });
                         }
@@ -3620,7 +3602,7 @@ impl TcpSession {
                     self.rep.commit(n);
                     self.dechunk_rep(self.rep.len() - n);
                     self.rewrite_rep_chunk_framing();
-                    self.log.bytes_from_server += n as u64;
+                    self.strm.log.bytes_from_server += n as u64;
                     // Trailers after a content-length body (T559): the codec has them when
                     // the body's last byte came; `h2_bridge` sends them to an h2/h3 client.
                     if let (Some(late), Some(H2Role::Child(ch))) = (self.srv_xprt.take_late_trailers(), self.h2_role.as_deref_mut()) {
@@ -3857,7 +3839,7 @@ impl TcpSession {
 
     fn cli_timer_live(&self) -> bool {
         // A tarpitted request is held for `timeout tarpit` alone.
-        if self.txn.as_ref().is_some_and(|t| t.body_wait.is_some_and(|w| w.tarpit)) {
+        if self.strm.txn.as_ref().is_some_and(|t| t.body_wait.is_some_and(|w| w.tarpit)) {
             return false;
         }
         // An HTTP/2 connection has no timer of its own while streams are attached: each
@@ -3871,7 +3853,7 @@ impl TcpSession {
         // this the held streams of an HTTP/2 connection timed out, freed their receive buffers
         // and let the demux open a connect for each stream behind them (T379, VV-16).
         if self.mode == Mode::Http
-            && self.txn.as_ref().is_some_and(|t| !t.req.is_done() && !t.local)
+            && self.strm.txn.as_ref().is_some_and(|t| !t.req.is_done() && !t.local)
             && self.req.readable().len() >= self.bufsize.saturating_sub(self.maxrewrite)
         {
             return false;
@@ -3879,19 +3861,19 @@ impl TcpSession {
         // Once an HTTP request is complete the client owes nothing until its response
         // starts: the wait belongs to `timeout server`, as in HAProxy.
         let awaiting_server = self.mode == Mode::Http
-            && self.txn.as_ref().is_some_and(|t| t.req.is_done() && !t.local && t.error.is_none())
+            && self.strm.txn.as_ref().is_some_and(|t| t.req.is_done() && !t.local && t.error.is_none())
             && !self.has_pending_output();
         // A request with no body is complete once its head is in: the client owes nothing
         // while the stream connects or waits for a connection (`sC--`, not `cH--`, T496).
         let head_only = self.mode == Mode::Http
-            && self.txn.as_ref().is_some_and(|t| matches!(t.req, txn::MsgState::Head { body: txn::Framing::None, .. }) && !t.local && t.error.is_none())
+            && self.strm.txn.as_ref().is_some_and(|t| matches!(t.req, txn::MsgState::Head { body: txn::Framing::None, .. }) && !t.local && t.error.is_none())
             && !self.has_pending_output();
         // So is one whose `Content-Length` body is all in the buffer, only waiting for the
         // server connection to forward it (T501; HAProxy: a complete POST to an unreachable
         // server is `sC--` at the connect timeout, not `cC--` at the client's).
         let body_buffered = self.mode == Mode::Http
             && !self.has_pending_output()
-            && self.txn.as_ref().is_some_and(|t| match t.req {
+            && self.strm.txn.as_ref().is_some_and(|t| match t.req {
                 txn::MsgState::Head { body: txn::Framing::Length(n), .. } if !t.local && t.error.is_none() => {
                     let data = self.req.readable();
                     find_eoh(data).is_some_and(|(h, e)| (data.len() - (h + e)) as u64 >= n)
@@ -3910,14 +3892,14 @@ impl TcpSession {
 
     fn srv_timer_live(&self) -> bool {
         // A server connection kept idle between HTTP transactions owes nothing.
-        let srv_idle = self.mode == Mode::Http && self.txn.is_none();
+        let srv_idle = self.mode == Mode::Http && self.strm.txn.is_none();
         // Nor one whose request is still coming, with nothing of it waiting for the server
         // to take: the wait is the client's (`SE_FL_EXP_NO_DATA` until the request's end,
         // `sc_rcv_may_expire`). A stalled upload ends at `timeout client`, not at a shorter
         // `timeout server` (T305 item 2). A send the server does not take still times out.
         let awaiting_client = self.mode == Mode::Http
             && self.req.readable().is_empty()
-            && self.txn.as_ref().is_some_and(|t| !matches!(t.req, txn::MsgState::Done | txn::MsgState::Tunnel));
+            && self.strm.txn.as_ref().is_some_and(|t| !matches!(t.req, txn::MsgState::Done | txn::MsgState::Tunnel));
         !srv_idle
             && !awaiting_client
             && matches!(
@@ -3942,11 +3924,11 @@ impl TcpSession {
             exp = exp.earliest(r_exp);
         }
         // A request held for its body (`wait-for-body`) answers 408 when the time is up.
-        if let Some(wait) = self.txn.as_ref().and_then(|t| t.body_wait) {
+        if let Some(wait) = self.strm.txn.as_ref().and_then(|t| t.body_wait) {
             exp = exp.earliest(wait.deadline);
         }
         // So is a response, held for its body: `504`.
-        if let Some(wait) = self.txn.as_ref().and_then(|t| t.rsp_wait) {
+        if let Some(wait) = self.strm.txn.as_ref().and_then(|t| t.rsp_wait) {
             exp = exp.earliest(wait.deadline);
         }
         exp
@@ -4585,7 +4567,7 @@ mod tests {
         // The send writes the head (X4); this test goes there without the engine.
         assert!(crate::h2_bridge::write_pending_head(&mut s, false, None));
         assert_eq!(s.h2_active().map(|a| a.id), Some(1), "the stream is the child's");
-        s.txn.as_mut().expect("txn").req_rules_done = true;
+        s.strm.txn.as_mut().expect("txn").req_rules_done = true;
 
         // The body, as the mux would have stored it from DATA frames: more than 16 passes
         // move on (one buffer each), so the passes run out before it is all gone.

@@ -166,9 +166,9 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
         c.stream = d.stream;
     }
     if sess.keep_request_line {
-        sess.log.request_line.set_opt(d.request_line.as_deref());
+        sess.strm.log.request_line.set_opt(d.request_line.as_deref());
     }
-    sess.log.request = Some(crate::txnlog::loop_now());
+    sess.strm.log.request = Some(crate::txnlog::loop_now());
     // An extended CONNECT to a websocket goes to the server with the `Sec-WebSocket-Key`
     // an HTTP/2 client does not send, which the server's accept must then answer
     // (`h1_process_mux` adds it to a handshake that has none, T505). It is in the head the
@@ -273,7 +273,7 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     // goes as `content-length: 0` with no body. A body sent chunked has its
     // `transfer-encoding` on output only, which no rule sees.
     txn.req_len_hdrs = Some(txn::LenHdrs { clen: matches!(framing, txn::Framing::Length(_)), chnk: false });
-    sess.txn = Some(txn);
+    sess.strm.txn = Some(txn);
     sess.cli_state = ScState::Established;
     if d.bad_request {
         sess.fail_request(400);
@@ -743,7 +743,7 @@ pub fn stream_is_reset(h2: &H2MuxContext, id: u32) -> bool {
 /// What is left in either buffer is dropped, as it would be taken for the next stream's.
 /// The caller ends the transaction. `false` when there is none.
 pub fn abort_reset_stream(sess: &mut TcpSession) -> bool {
-    let Some(txn) = sess.txn.as_mut() else {
+    let Some(txn) = sess.strm.txn.as_mut() else {
         return false;
     };
     let response_done = txn.rsp.is_done();
@@ -760,15 +760,15 @@ pub fn abort_reset_stream(sess: &mut TcpSession) -> bool {
             raw::abort_with_rst(srv.as_fd());
         }
         if sess.queue.leave() {
-            sess.log.queue.get_or_insert_with(crate::txnlog::loop_now);
-            sess.log.term = Some(*b"CQ");
+            sess.strm.log.queue.get_or_insert_with(crate::txnlog::loop_now);
+            sess.strm.log.term = Some(*b"CQ");
         } else if txn.local {
             // A reply of the proxy's own keeps the status and ending it was given.
         } else if waiting {
-            sess.log.status = Some(400);
-            sess.log.term = Some(if request_done { *b"CD" } else { *b"CH" });
+            sess.strm.log.status = Some(400);
+            sess.strm.log.term = Some(if request_done { *b"CD" } else { *b"CH" });
         } else {
-            sess.log.term = Some(*b"CD");
+            sess.strm.log.term = Some(*b"CD");
         }
     }
     sess.rep.clear();
@@ -785,6 +785,7 @@ pub fn abort_on_client_left(sess: &mut TcpSession) -> bool {
     // A request still coming is cut short by the caller; a reply of the proxy's own, a
     // response all in, or one already ending have nothing to abort.
     let Some(txn) = sess
+        .strm
         .txn
         .as_ref()
         .filter(|t| t.req.is_done() && !(t.local || t.aborted || t.req == MsgState::Tunnel || t.rsp.is_done()))
@@ -796,10 +797,10 @@ pub fn abort_on_client_left(sess: &mut TcpSession) -> bool {
         raw::abort_with_rst(srv.as_fd());
     }
     if waiting {
-        sess.log.status = Some(400);
-        sess.log.term = Some(*b"CH");
+        sess.strm.log.status = Some(400);
+        sess.strm.log.term = Some(*b"CH");
     } else {
-        sess.log.term = Some(*b"CD");
+        sess.strm.log.term = Some(*b"CD");
     }
     sess.rep.clear();
     true
@@ -983,7 +984,7 @@ mod tests {
         start_request(&mut s, dispatch(H2ReqHead::of("\x01\x02", "not", &[])));
         assert!(!s.has_htx, "the parser refused the head: no HTX for the rules");
         assert_eq!(s.req.readable(), b"\x01\x02 not HTTP/1.1\r\n\r\n", "the head is in `req` as it came");
-        assert_eq!(s.txn.as_ref().and_then(|t| t.req_htx), Some(7));
+        assert_eq!(s.strm.txn.as_ref().and_then(|t| t.req_htx), Some(7));
         assert_eq!(s.h2_active().map(|a| a.id), Some(1));
         assert_eq!(s.cli_state, ScState::Established);
         // The same with a head it takes: parsed for the rules.
@@ -1110,7 +1111,7 @@ mod tests {
         let (mut s, _peer) = session();
         let state = s.srv_state;
         assert!(!abort_reset_stream(&mut s));
-        assert!(s.log.term.is_none());
+        assert!(s.strm.log.term.is_none());
         assert_eq!(s.srv_state, state);
     }
 }

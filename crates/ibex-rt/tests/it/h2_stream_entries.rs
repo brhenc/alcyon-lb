@@ -122,7 +122,7 @@ fn be_streams(e: &Engine) -> u32 {
 
 /// The entries with a transaction, and those without.
 fn entries(e: &Engine) -> (usize, usize) {
-    let with = e.sessions.iter().filter(|(_, s)| s.sess.txn.is_some()).count();
+    let with = e.sessions.iter().filter(|(_, s)| s.sess.strm.txn.is_some()).count();
     (with, e.sessions.live() - with)
 }
 

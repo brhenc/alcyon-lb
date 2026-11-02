@@ -12,6 +12,24 @@ mod on {
         static RMWS: Cell<u64> = const { Cell::new(0) };
         static WALL_READS: Cell<u64> = const { Cell::new(0) };
         static CLOCK_READS: Cell<u64> = const { Cell::new(0) };
+        static STREAM_TAKES: Cell<u64> = const { Cell::new(0) };
+        static STREAM_LOG_STARTS: Cell<u64> = const { Cell::new(0) };
+    }
+    /// A `Stream` was made, for a session (O1a).
+    pub fn stream_take() {
+        STREAM_TAKES.with(|c| c.set(c.get() + 1));
+    }
+    /// A `StreamLog` was built whole (`StreamLog::start`), not reset in place (O1a).
+    pub fn stream_log_start() {
+        STREAM_LOG_STARTS.with(|c| c.set(c.get() + 1));
+    }
+    #[must_use]
+    pub fn stream_takes() -> u64 {
+        STREAM_TAKES.with(Cell::get)
+    }
+    #[must_use]
+    pub fn stream_log_starts() -> u64 {
+        STREAM_LOG_STARTS.with(Cell::get)
     }
     pub fn rmw() {
         RMWS.with(|c| c.set(c.get() + 1));
@@ -46,6 +64,10 @@ mod off {
     pub fn wall_read() {}
     #[inline(always)]
     pub fn clock_read() {}
+    #[inline(always)]
+    pub fn stream_take() {}
+    #[inline(always)]
+    pub fn stream_log_start() {}
 }
 #[cfg(not(debug_assertions))]
 pub use off::*;
