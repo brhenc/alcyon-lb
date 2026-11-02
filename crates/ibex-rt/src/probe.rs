@@ -15,6 +15,7 @@ mod on {
         static STREAM_TAKES: Cell<u64> = const { Cell::new(0) };
         static STREAM_LOG_STARTS: Cell<u64> = const { Cell::new(0) };
         static SESSION_NEWS: Cell<u64> = const { Cell::new(0) };
+        static ENTRY_MOVES: Cell<u64> = const { Cell::new(0) };
     }
     /// A `TcpSession` was built (`new_with_mode`), for a connection or an HTTP/2 stream (O1b).
     pub fn session_new() {
@@ -23,6 +24,15 @@ mod on {
     #[must_use]
     pub fn session_news() -> u64 {
         SESSION_NEWS.with(Cell::get)
+    }
+    /// A session entry was moved out of its arena slot (`SessionArena::free`) or back
+    /// (`SessionArena::park`): 1.6 KB each way (CP3).
+    pub fn entry_move() {
+        ENTRY_MOVES.with(|c| c.set(c.get() + 1));
+    }
+    #[must_use]
+    pub fn entry_moves() -> u64 {
+        ENTRY_MOVES.with(Cell::get)
     }
     /// A `Stream` was made, for a session (O1a).
     pub fn stream_take() {
@@ -79,6 +89,8 @@ mod off {
     pub fn stream_log_start() {}
     #[inline(always)]
     pub fn session_new() {}
+    #[inline(always)]
+    pub fn entry_move() {}
 }
 #[cfg(not(debug_assertions))]
 pub use off::*;

@@ -18,7 +18,7 @@ use crate::proxy::{Ending, Which};
 /// The process-wide stream counter, `%rt` (`global.req_count`).
 static STREAM_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct StreamLog {
     /// `accept_ts`: the stream's start.
     pub start: Instant,
@@ -122,6 +122,16 @@ pub fn release_captures(caps: &mut Vec<Option<Vec<u8>>>) {
         clear_capture(c);
     }
     caps.clear();
+}
+
+/// `to` as a copy of `from`, from the memory it and its values hold.
+fn copy_captures(to: &mut Vec<Option<Vec<u8>>>, from: &[Option<Vec<u8>>]) {
+    reset_captures(to, from.len());
+    for (t, f) in to.iter_mut().zip(from) {
+        if let Some(v) = f {
+            set_capture(t, v);
+        }
+    }
 }
 
 /// `caps` as `n` empty slots, from the memory it and its values hold.
@@ -302,6 +312,55 @@ impl StreamLog {
         *be_queue = 0;
         *asap_done = false;
         *srv_status = 0;
+    }
+
+    /// Makes this log a copy of `src`, in the memory it has: the capture lists, their values, the
+    /// request line and the unique id keep their buffers (CP3). `Clone::clone_from` of a derived
+    /// `Clone` is `*self = src.clone()`, which allocates the lists anew for every stream an HTTP/2
+    /// connection starts. No `Clone`: this is the one copy a log has, and every field is named
+    /// (no `..`), so one added to the struct does not compile here until its copy is written.
+    pub fn clone_from(&mut self, src: &StreamLog) {
+        let StreamLog {
+            start,
+            first_byte,
+            request,
+            date_cache,
+            queue,
+            server,
+            connect,
+            data,
+            bytes_in_at_start,
+            bytes_out_at_start,
+            bytes_from_server,
+            checkcache_blocked,
+            request_line,
+            req_captures,
+            res_captures,
+            unique_id,
+            last_rule,
+            prio_class,
+            prio_offset,
+            uniq_id,
+            term,
+            status,
+            redispatched,
+            applet,
+            be_queue,
+            asap_done,
+            srv_status,
+        } = self;
+        (*start, *first_byte, *request) = (src.start, src.first_byte, src.request);
+        date_cache.set(src.date_cache.get());
+        (*queue, *server, *connect, *data) = (src.queue, src.server, src.connect, src.data);
+        (*bytes_in_at_start, *bytes_out_at_start, *bytes_from_server) = (src.bytes_in_at_start, src.bytes_out_at_start, src.bytes_from_server);
+        *checkcache_blocked = src.checkcache_blocked;
+        request_line.set_opt(src.request_line.as_deref());
+        copy_captures(req_captures, &src.req_captures);
+        copy_captures(res_captures, &src.res_captures);
+        unique_id.clone_from(&src.unique_id);
+        (*last_rule, *prio_class, *prio_offset, *uniq_id) = (src.last_rule, src.prio_class, src.prio_offset, src.uniq_id);
+        (*term, *status) = (src.term, src.status);
+        (*redispatched, *applet, *be_queue, *asap_done, *srv_status) = (src.redispatched, src.applet, src.be_queue, src.asap_done, src.srv_status);
     }
 
     /// Milliseconds from the stream's start to `t`, -1 if it never happened.

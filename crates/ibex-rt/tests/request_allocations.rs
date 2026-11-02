@@ -1178,13 +1178,18 @@ impl H2cClient {
 /// The allocations of `n` requests on one h2c connection, each proxied to a keep-alive
 /// HTTP/1.1 server, after three warm-up requests.
 fn h2c_proxied_allocations(n: usize) -> usize {
+    h2c_allocations_with("", n)
+}
+
+/// [`h2c_proxied_allocations`], the frontend with the lines `fe_lines` (each ending in a newline).
+fn h2c_allocations_with(fe_lines: &str, n: usize) -> usize {
     let (srv, srv_addr) = loopback0();
     let addr = common::reserve_addr();
     let running = Arc::new(AtomicBool::new(true));
     let be = start_keepalive_backend(srv, Arc::clone(&running), b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     let cfg = format!(
         "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
-         frontend f\n  bind {addr} proto h2\n  default_backend b\nbackend b\n  server s1 {srv_addr}\n"
+         frontend f\n  bind {addr} proto h2\n{fe_lines}  default_backend b\nbackend b\n  server s1 {srv_addr}\n"
     );
     let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
     let mut client = H2cClient::connect(addr);
@@ -1221,6 +1226,20 @@ fn an_h2c_request_allocates_nothing() {
     // Measured after (2026-10-19): 0 and 0 or 1, and 1 for 2100, 4100 and 8100 requests: a
     // buffer of the connection grows once, at a moment the timing decides, not per request.
     assert!(many <= few + 1, "1000 more h2c requests made {} more allocations", many.abs_diff(few));
+}
+
+/// CP3: starting a stream of an h2 connection allocates nothing with header captures configured:
+/// the stream's log takes the connection's by `clone_from`, into the capture lists and strings it
+/// kept, not by a clone that builds them anew. Measured before (2026-11-02, main 6b86eb3a, debug):
+/// see the commit message.
+#[test]
+fn a_stream_start_allocates_nothing() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fe = "  capture request header User-Agent len 32\n  capture request header X-Trace len 32\n";
+    let few = h2c_allocations_with(fe, 100);
+    let many = h2c_allocations_with(fe, 1100);
+    println!("[MEASUREMENT CP3] h2c allocations with two captures: 100 requests {few}, 1100 requests {many}");
+    assert!(many <= few + 1, "1000 more h2c requests with captures made {} more allocations", many.abs_diff(few));
 }
 
 /// The allocations of `n` keep-alive requests (`Host: localhost`) on one client connection,
