@@ -582,6 +582,27 @@ impl Buf {
         self.data = new;
     }
 
+    /// The memory of a small buffer for a request head to be written into before the stream
+    /// that owns it exists (CP1, [`ibex_proto::htx::RxHead`]); `None` when the pool refuses
+    /// (memory short, `tune.fail-alloc`): the caller refuses the stream, never mallocs.
+    #[must_use]
+    pub fn take_rx_head() -> Option<ibex_proto::htx::RxHead> {
+        alloc_small().map(ibex_proto::htx::RxHead::from_box)
+    }
+
+    /// The buffer that owns `head`'s memory, the HTX of `blocks` blocks and `tail` bytes of
+    /// payload that [`ibex_proto::h2::write_request_htx`] wrote there being its `htx_buf`
+    /// (`HtxSlice::with_offsets`): moved, not copied. Released, the memory goes back to the
+    /// small-buffer pool (zeroed first under `tune.ibex.zero-buffers`) when it is of its size.
+    #[must_use]
+    pub fn adopt(head: ibex_proto::htx::RxHead, tail: usize, blocks: usize) -> Self {
+        let data = head.into_box();
+        let class = if data.len() == get_bufsize_small() { BufClass::Small } else { BufClass::Custom };
+        let mut b = Buf { data, head: 0, len: 0, hwm: 0, lo: NO_LO, class, eoh: Cell::new(EOH_UNKNOWN) };
+        b.note_htx(tail, blocks * ibex_proto::htx::HTX_DESC_SIZE);
+        b
+    }
+
     /// Allocates a standard-size buffer from the thread-local pool.
     #[must_use]
     pub fn standard() -> Self {
@@ -1089,6 +1110,39 @@ impl Buf {
 #[cfg(test)]
 mod tests {
     use super::Buf;
+
+    /// CP1: a request head written into an `RxHead` is the `htx_buf` of the buffer that adopts
+    /// it, bytes unmoved; released, its memory is the small pool's again, and what the head
+    /// wrote is zeroed on the way (`note_htx`'s marks).
+    #[test]
+    fn an_adopted_head_is_the_buffers_htx_and_its_memory_goes_back_to_the_small_pool() {
+        use ibex_proto::htx::HtxSlice;
+        let mut rx = Buf::take_rx_head().expect("the pool has memory");
+        let at = rx.len();
+        assert_eq!(at, super::get_bufsize_small());
+        let (tail, blocks) = {
+            let mut s = HtxSlice::over(&mut rx);
+            s.push_req_line("GET", "/p", "HTTP/1.1").unwrap();
+            s.push_header("host", "h").unwrap();
+            s.push_eoh().unwrap();
+            (s.tail_addr(), s.num_blocks())
+        };
+        let mut b = Buf::adopt(rx, tail, blocks);
+        let ptr = b.raw_slice().as_ptr();
+        assert_eq!(b.class(), super::BufClass::Small);
+        {
+            let s = HtxSlice::with_offsets(b.htx_slice_mut(), tail, blocks);
+            assert_eq!(s.as_ref().get_header_bytes(b"host"), Some(&b"h"[..]));
+        }
+        drop(b);
+        let again = Buf::take_rx_head().expect("the pool has it back");
+        assert_eq!(again.len(), at);
+        let b = Buf::adopt(again, 0, 0);
+        assert_eq!(b.raw_slice().as_ptr(), ptr, "the box the head went in is the one that came back");
+        // A memory of another size than the class's is of no pool.
+        let odd = Buf::adopt(ibex_proto::htx::RxHead::from_box(vec![0u8; 100].into_boxed_slice()), 0, 0);
+        assert_eq!(odd.class(), super::BufClass::Custom);
+    }
 
     /// X1: the head of the readable bytes indexed in place, its descriptors in the reserve at
     /// the end of the memory; the body between them is not touched, and readable bytes that
