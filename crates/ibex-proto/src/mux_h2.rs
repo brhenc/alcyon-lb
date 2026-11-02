@@ -3027,6 +3027,23 @@ mod tests {
         assert_eq!(&t.wire[..], b"GET /caf\xe9 HTTP/1.1\r\nhost: a\r\n\r\n");
         assert_eq!((t.facts.path_raw, t.facts.uri_len, t.abs.as_str()), (true, 5, "http://a"));
         assert_eq!(st.request_uri(), Some(t.uri()), "readers see the text that stands for the bytes");
+        assert_eq!(st.request_header("Host"), Some("a"));
+        // The stream's reader gets the text, then what follows its blank line.
+        let mut ctx = ctx;
+        let mut sd = SeDesc { endpoint: Endpoint::MuxStream { conn: ConnId(1), stream: 1 }, ..SeDesc::default() };
+        let mut out = [0u8; 256];
+        let n = MuxH2.rcv_buf(&mut ctx, &mut sd, &mut out).expect("read");
+        assert!(out[..n].starts_with(b"GET /caf\xe9 HTTP/1.1\r\nhost: a\r\n"), "{}", out[..n].escape_ascii());
+    }
+
+    /// CP2b-2: the text of a head the scan refuses cannot be made (the writer found it
+    /// `Invalid` only after the same scan took it), so the mux refuses the stream.
+    #[test]
+    fn a_text_head_the_scan_refuses_refuses_the_stream() {
+        let mut d = DecodedFields::default();
+        let block = [lit(b":method", b"GET"), lit(b":path", b""), vec![0x86]].concat();
+        HpackDecoder::new().decode_into(&block, &mut d).expect("decodes");
+        assert!(matches!(text_head(&d, false, None), HeadOut::Refused));
     }
 
     /// T437: a request with two `host` headers is taken, with the first (HAProxy 3.5-dev8,

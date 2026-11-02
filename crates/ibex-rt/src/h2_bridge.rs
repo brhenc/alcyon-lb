@@ -100,10 +100,10 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
         let size = t.facts.log_size(t.abs.len(), "HTTP/2.0");
         let add_len = t.add_len;
         (DispatchHead::Text(t), add_len, size, request_line)
-    } else if stream.no_memory {
-        (DispatchHead::None, None, 0, None)
     } else {
-        return None;
+        // Every head the mux takes is blocks, text, or the stream's `no_memory`.
+        debug_assert!(stream.no_memory);
+        (DispatchHead::None, None, 0, None)
     };
     let req_htx = req_htx.saturating_sub(u64::from(chunked));
     Some(H2Dispatch {
@@ -162,10 +162,9 @@ pub fn dispatch_mux<M: HtxMux>(mux: &mut M, keep_request_line: bool, version: &'
         let request_line = keep_request_line.then(|| format!("{} {}{} {version}", t.method(), t.abs, t.uri()));
         let (add_len, size) = (t.add_len, t.facts.log_size(t.abs.len(), version));
         (DispatchHead::Text(t), add_len, size, request_line)
-    } else if no_memory {
-        (DispatchHead::None, None, 0, None)
     } else {
-        return None;
+        debug_assert!(no_memory);
+        (DispatchHead::None, None, 0, None)
     };
     // A body without `content-length` goes chunked, also when all of it came with the head
     // (measured on `HAProxy` 3.5-dev7 with QUIC, T511).
