@@ -168,18 +168,13 @@ impl QuicConfig {
             tc.max_idle_timeout(None);
         }
 
-        if let Ok(val) = u32::try_from(self.max_concurrent_bidi_streams) {
-            tc.max_concurrent_bidi_streams(val.into());
-        }
-        if let Ok(val) = u32::try_from(self.max_concurrent_uni_streams) {
-            tc.max_concurrent_uni_streams(val.into());
-        }
-        if let Ok(val) = u32::try_from(self.stream_receive_window) {
-            tc.stream_receive_window(val.into());
-        }
-        if let Ok(val) = u32::try_from(self.receive_window) {
-            tc.receive_window(val.into());
-        }
+        // A value past the varint range becomes the largest varint; skipping the setter would
+        // leave quinn's default, which for the two windows is unbounded.
+        let varint = |v: u64| quinn_proto::VarInt::from_u64(v).unwrap_or(quinn_proto::VarInt::MAX);
+        tc.max_concurrent_bidi_streams(varint(self.max_concurrent_bidi_streams));
+        tc.max_concurrent_uni_streams(varint(self.max_concurrent_uni_streams));
+        tc.stream_receive_window(varint(self.stream_receive_window));
+        tc.receive_window(varint(self.receive_window));
 
         tc.send_window(self.send_window);
         tc.packet_threshold(self.packet_threshold);
