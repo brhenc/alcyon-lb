@@ -193,6 +193,10 @@ pub struct QueueWait {
     /// The backend's stats while the request waits; `None` in a spare (left already).
     stats: Option<Arc<Vec<crate::engine::ProxyStats>>>,
     be_idx: usize,
+    /// The server persistence or `use-server` assigned the request to (`SF_ASSIGNED`), which
+    /// it waits for, in `HAProxy` in that server's queue (`pendconn_add` with `srv` set, T592);
+    /// `None`: whichever server the balancing picks.
+    srv: Option<usize>,
 }
 
 ibex_alloc::declare_pool!(
@@ -212,7 +216,7 @@ impl ibex_alloc::Poolable for Box<QueueWait> {
         if let Some(stats) = self.stats.take() {
             stats[0].queue_cur.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             let (task, be) = (self.task, self.be_idx);
-            let _ = QUEUED.try_with(|q| q.borrow_mut().retain(|&(t, b)| !(t == task && b == be)));
+            let _ = QUEUED.try_with(|q| q.borrow_mut().retain(|&(t, b, _)| !(t == task && b == be)));
         }
     }
 
@@ -240,21 +244,28 @@ impl QueueSlot {
         self.0.as_ref().map(|q| q.deadline)
     }
 
+    /// The server the waiting request is assigned to, if any (`QueueWait::srv`).
+    #[must_use]
+    pub fn server(&self) -> Option<usize> {
+        self.0.as_ref().and_then(|q| q.srv)
+    }
+
     /// Leaves the queue; whether the request waited.
     pub fn leave(&mut self) -> bool {
         self.0.take().map(|q| PENDCONN.give(q)).is_some()
     }
 
     /// Puts the request of `task` in the queue of backend `be_idx` (`stats` are the
-    /// backend's, where `qcur` and `qmax` are kept); returns its place in it, for `%bq`.
-    pub fn enter(&mut self, task: ibex_sched::TaskRef, be_idx: usize, stats: Arc<Vec<crate::engine::ProxyStats>>, deadline: Tick) -> u32 {
+    /// backend's, where `qcur` and `qmax` are kept), waiting for server `srv` if it is
+    /// assigned one; returns its place in it, for `%bq`.
+    pub fn enter(&mut self, task: ibex_sched::TaskRef, be_idx: usize, srv: Option<usize>, stats: Arc<Vec<crate::engine::ProxyStats>>, deadline: Tick) -> u32 {
         self.leave();
         let mut q = PENDCONN.take_raw(<Box<QueueWait> as ibex_alloc::Poolable>::try_new).unwrap_or_else(QueueWait::blank);
         let st = &stats[0];
         let pos = st.queue_cur.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         st.queue_max.fetch_max(pos, std::sync::atomic::Ordering::Relaxed);
-        QUEUED.with(|l| l.borrow_mut().push((task, be_idx)));
-        *q = QueueWait { deadline, pos, task, stats: Some(stats), be_idx };
+        QUEUED.with(|l| l.borrow_mut().push((task, be_idx, srv)));
+        *q = QueueWait { deadline, pos, task, stats: Some(stats), be_idx, srv };
         self.0 = Some(q);
         pos
     }
@@ -270,13 +281,13 @@ thread_local! {
     /// The requests queued on this thread, oldest first, with the backend each waits for:
     /// what `Engine::wake_queued` hands slots to. (A session never leaves its thread.) Live
     /// state, not a cache: the boxes behind it are the `pendconn` pool.
-    static QUEUED: std::cell::RefCell<Vec<(ibex_sched::TaskRef, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static QUEUED: std::cell::RefCell<Vec<(ibex_sched::TaskRef, usize, Option<usize>)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl QueueWait {
     /// A box in no queue.
     fn blank() -> Box<QueueWait> {
-        Box::new(QueueWait { deadline: Tick::ETERNITY, pos: 0, task: ibex_sched::TaskRef::NONE, stats: None, be_idx: 0 })
+        Box::new(QueueWait { deadline: Tick::ETERNITY, pos: 0, task: ibex_sched::TaskRef::NONE, stats: None, be_idx: 0, srv: None })
     }
 
     /// Whether anything is queued on this thread.
@@ -285,17 +296,19 @@ impl QueueWait {
         QUEUED.with(|q| !q.borrow().is_empty())
     }
 
-    /// The tasks to wake: for each backend, the oldest `free(be)` of those waiting on it.
-    pub fn take_due(mut free: impl FnMut(usize) -> usize) -> Vec<ibex_sched::TaskRef> {
+    /// The tasks to wake: for each backend, the oldest `free(be, None)` of those waiting on
+    /// it for any server, and for each server assigned, the oldest `free(be, Some(srv))` of
+    /// those waiting for that one.
+    pub fn take_due(mut free: impl FnMut(usize, Option<usize>) -> usize) -> Vec<ibex_sched::TaskRef> {
         QUEUED.with(|q| {
             let q = q.borrow();
-            let mut left: Vec<(usize, usize)> = Vec::new();
+            let mut left: Vec<((usize, Option<usize>), usize)> = Vec::new();
             let mut due = Vec::new();
-            for &(task, be) in q.iter() {
-                let slot = if let Some(i) = left.iter().position(|(b, _)| *b == be) {
+            for &(task, be, srv) in q.iter() {
+                let slot = if let Some(i) = left.iter().position(|(b, _)| *b == (be, srv)) {
                     i
                 } else {
-                    left.push((be, free(be)));
+                    left.push(((be, srv), free(be, srv)));
                     left.len() - 1
                 };
                 if left[slot].1 > 0 {
@@ -810,6 +823,11 @@ pub struct TcpSession {
     /// When the server connection kept after a response goes back to the server's lists
     /// if no next request has taken it (T187; unset while none is kept).
     pub srv_park_exp: Tick,
+    /// The server connection stays on the session between its transactions (`http-reuse
+    /// never`, a PROXY header, an h2 connection under `safe`, a next request already read)
+    /// and holds no slot of the server's: `HAProxy` counts streams (`served`), not
+    /// connections, so the next request takes one with its pick as any other (T592).
+    pub srv_kept: bool,
     /// The backend retries a failed connection (`retry-on conn-failure`, the default).
     pub retry_conn: bool,
     /// The stream was redispatched (`SF_REDISP`): what `txn.redispatched` reads.
@@ -1467,6 +1485,7 @@ impl TcpSession {
             max_retries: retries,
             retry_after: Tick::ETERNITY,
             srv_park_exp: Tick::ETERNITY,
+            srv_kept: false,
             retry_conn: true,
             redispatched: false,
             target_addr: None,
@@ -1923,6 +1942,13 @@ impl TcpSession {
             self.ending.get_or_insert(Ending::ConnectFailed);
             false
         }
+    }
+
+    /// Whether the server connection on the session holds no slot of its server: parked
+    /// after a response, or kept between transactions ([`Self::srv_kept`]).
+    #[must_use]
+    pub fn srv_uncounted(&self) -> bool {
+        self.srv_kept || self.srv_park_exp.is_set()
     }
 
     /// Turn-around delay: `MIN(1s, timeout connect)`, matching `src/backend.c:2898`.
@@ -4253,13 +4279,13 @@ fn h3_log_line(line: &str, host: Option<&str>) -> String {
         let stats = Arc::new(vec![crate::engine::ProxyStats::default()]);
         let mut slot = QueueSlot::default();
         assert!(!slot.leave() && slot.deadline().is_none() && !QueueWait::any());
-        assert_eq!(slot.enter(ibex_sched::TaskRef(1), 0, stats.clone(), Tick::ETERNITY), 1);
+        assert_eq!(slot.enter(ibex_sched::TaskRef(1), 0, None, stats.clone(), Tick::ETERNITY), 1);
         assert!(slot.is_some() && QueueWait::any());
         assert_eq!(PENDCONN.local_count(), 0);
         assert!(slot.leave());
         assert!(!QueueWait::any());
         assert_eq!(PENDCONN.local_count(), 1, "the box went back to the pool");
-        assert_eq!(slot.enter(ibex_sched::TaskRef(2), 0, stats.clone(), Tick::ETERNITY), 1, "the queue length went down with the first");
+        assert_eq!(slot.enter(ibex_sched::TaskRef(2), 0, None, stats.clone(), Tick::ETERNITY), 1, "the queue length went down with the first");
         assert_eq!(PENDCONN.local_count(), 0, "the box came from the pool");
         drop(slot);
         assert!(!QueueWait::any());

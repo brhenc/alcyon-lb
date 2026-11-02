@@ -33,7 +33,10 @@ struct Backend {
 }
 
 fn backend(delay: Duration) -> Backend {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    backend_on(TcpListener::bind("127.0.0.1:0").expect("bind backend"), delay)
+}
+
+fn backend_on(listener: TcpListener, delay: Duration) -> Backend {
     let addr = listener.local_addr().expect("addr");
     let cur = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
@@ -161,12 +164,17 @@ fn smax(ibex: &Ibex, sv: &str) -> String {
 
 /// `CLIENTS` requests at once; every one is answered.
 fn burst(fe: SocketAddr) {
+    burst_of(fe, b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+}
+
+/// `CLIENTS` requests `req` at once; every one is answered.
+fn burst_of(fe: SocketAddr, req: &'static [u8]) {
     let threads: Vec<_> = (0..CLIENTS)
         .map(|_| {
             std::thread::spawn(move || {
                 let mut c = TcpStream::connect(fe).expect("connect");
                 c.set_read_timeout(Some(Duration::from_secs(30))).expect("timeout");
-                c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("send");
+                c.write_all(req).expect("send");
                 let mut got = Vec::new();
                 let _ = c.read_to_end(&mut got);
                 String::from_utf8_lossy(&got).into_owned()
@@ -219,7 +227,7 @@ fn kept_connection_gives_back_the_slot_of_its_next_request() {
             }
         }
         assert!(got.starts_with(b"HTTP/1.1 200"), "{:?}", String::from_utf8_lossy(&got));
-        assert_eq!(stat(&ibex, "a", 4), "1", "scur with one connection kept");
+        assert_eq!(stat(&ibex, "a", 4), "0", "scur with one connection kept, as HAProxy (T592)");
     }
     drop(c);
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -227,4 +235,103 @@ fn kept_connection_gives_back_the_slot_of_its_next_request() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(stat(&ibex, "a", 4), "0", "scur once the client left");
+}
+
+/// One request on `c`, read up to the end of its head (the keep-alive server sends no body).
+fn ask(c: &mut TcpStream, req: &[u8]) -> String {
+    c.write_all(req).expect("send");
+    let mut got = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+        match c.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&chunk[..n]),
+        }
+    }
+    String::from_utf8_lossy(&got).into_owned()
+}
+
+/// `HAProxy` counts a server's streams (`served`), not its connections: the connection a
+/// session keeps between requests (`http-reuse never`) holds no slot of the server's
+/// `maxconn`, so that session's next request is not queued behind its own idle connection
+/// (T592). Ibex counted it in use until the session ended: with `maxconn 1` the next
+/// request waited in the queue (`qcur` 1) while it went out on the kept connection, and once
+/// `timeout queue` was over the request after it got the 503. HAProxy 3.5-dev8, same
+/// config, `nbthread` 1 and 4: three 200s, `scur` 0 and `qcur` 0 between requests, one
+/// server connection.
+#[test]
+fn kept_connection_holds_no_slot_between_requests() {
+    let be = keepalive_backend();
+    let ibex = start(&format!("  http-reuse never\n  timeout queue 200ms\n  server a {be} maxconn 1\n"));
+    let mut c = TcpStream::connect(ibex.fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    for i in 0..3 {
+        let got = ask(&mut c, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(got.starts_with("HTTP/1.1 200"), "request {i}: {got:?}");
+        assert_eq!(stat(&ibex, "a", 4), "0", "request {i}: scur between requests");
+        assert_eq!(stat(&ibex, "BACKEND", 2), "0", "request {i}: qcur between requests");
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
+
+/// A request a client sends and reads to the end, in a thread: the status line.
+fn request_in_thread(fe: SocketAddr) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut c = TcpStream::connect(fe).expect("connect");
+        c.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+        c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("send");
+        let mut got = Vec::new();
+        let _ = c.read_to_end(&mut got);
+        String::from_utf8_lossy(&got).lines().next().unwrap_or_default().to_string()
+    })
+}
+
+/// A retry keeps the slot of the attempt that failed (T592): `HAProxy` keeps `s->srv_conn`
+/// over the turnaround after a connect error and connects the same server again without
+/// asking its queue (`assign_server_and_queue`). Ibex gave the slot back when the attempt
+/// failed and took one again, unchecked, when the retry connected: a request that came
+/// during the turnaround took the slot, and the `maxconn 1` server held two connections.
+/// HAProxy 3.5-dev8 (`nbthread` 1 and 4): the second request waits in the queue (`qmax` 1),
+/// both 200, server peak 1, `smax` 1; Ibex before: peak 2, `smax` 2.
+#[test]
+fn retry_keeps_its_slot_over_the_turnaround() {
+    // Nothing listens there yet: the first connect fails (asynchronously, on loopback) and
+    // the retry waits `MIN(1s, timeout connect)` to connect the same server again.
+    let addr = common::reserve_addr();
+    let ibex = start(&format!("  retries 3\n  timeout connect 500ms\n  server a {addr} maxconn 1\n"));
+    let first = request_in_thread(ibex.fe);
+    std::thread::sleep(Duration::from_millis(100));
+    let a = backend_on(TcpListener::bind(addr).expect("bind the server"), Duration::from_millis(800));
+    let second = request_in_thread(ibex.fe);
+    let (first, second) = (first.join().expect("first"), second.join().expect("second"));
+    assert!(first.starts_with("HTTP/1.1 200") && second.starts_with("HTTP/1.1 200"), "{first:?} {second:?}");
+    assert_eq!(a.peak.load(Ordering::SeqCst), 1, "server a held more than its maxconn 1");
+    assert_eq!(smax(&ibex, "a"), "1");
+}
+
+/// A server `use-server` or a persistence cookie names (`SF_ASSIGNED`) takes a slot as a
+/// pick does, or the request waits for that server (`pendconn_add` with the server set,
+/// `assign_server_and_queue`, T592). Ibex connected to it whether it was full or not.
+/// HAProxy 3.5-dev8 (`nbthread` 1 and 8), 48 requests at once to a `maxconn 1` server:
+/// 48x200, server peak 1, `smax` 1; Ibex before: peak 22 to 43, `smax` up to 48.
+#[test]
+fn use_server_waits_for_a_full_server() {
+    let a = backend(Duration::from_millis(20));
+    let b = backend(Duration::from_millis(20));
+    let ibex = start(&format!("  use-server a if {{ path_beg /a }}\n  server a {} maxconn 1\n  server b {}\n", a.addr, b.addr));
+    burst_of(ibex.fe, b"GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    assert_eq!(a.peak.load(Ordering::SeqCst), 1, "server a held more than its maxconn 1");
+    assert_eq!(smax(&ibex, "a"), "1");
+    assert_eq!(b.peak.load(Ordering::SeqCst), 0, "the requests for a went to b");
+}
+
+#[test]
+fn cookie_persistence_waits_for_a_full_server() {
+    let a = backend(Duration::from_millis(20));
+    let b = backend(Duration::from_millis(20));
+    let ibex = start(&format!("  cookie SRV insert indirect\n  server a {} maxconn 1 cookie a\n  server b {} cookie b\n", a.addr, b.addr));
+    burst_of(ibex.fe, b"GET / HTTP/1.1\r\nHost: x\r\nCookie: SRV=a\r\nConnection: close\r\n\r\n");
+    assert_eq!(a.peak.load(Ordering::SeqCst), 1, "server a held more than its maxconn 1");
+    assert_eq!(smax(&ibex, "a"), "1");
+    assert_eq!(b.peak.load(Ordering::SeqCst), 0, "the requests for a went to b");
 }
