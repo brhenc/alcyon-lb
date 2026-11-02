@@ -49,6 +49,14 @@ GATE_WRITES = {"data/measurements.jsonl"}
 # when PROFILES_MARK says the suite wrote them for this key and suite-run.json is still the
 # one it wrote; otherwise the suite runs with it.
 DEPS = {"covercheck": "suite"}
+# T608: stages carried from the parent's full gate when the diff is only crates/*/tests/**.
+# Each one runs no file under crates/*/tests/ (checked by reading it): smoke runs the built
+# ibex on reg-test configs, diff-fuzz the built ibex against HAProxy, surface prints counts.
+# Not carried, whatever the diff: tripwire (hashes protected tests), suite, covercheck, oracles,
+# findings, haproxy (these run cargo test), lint (--all-targets compiles tests), harness-tests,
+# measure, stray.
+CARRY = ["smoke", "diff-fuzz", "surface"]
+TESTS_ONLY = re.compile(r"^crates/[^/]+/tests/.+")
 PROFILES_MARK = "gate-tree.json"
 SUITE_RUN = "suite-run.json"
 
@@ -65,7 +73,8 @@ def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
 
 
-def tree_key(repo: str = REPO, env: dict | None = None) -> tuple[str | None, str]:
+def tree_key(repo: str = REPO, env: dict | None = None,
+             rev: str = "HEAD") -> tuple[str | None, str]:
     """(key, description), or (None, why) for a tree whose results must not be kept."""
     env = os.environ if env is None else env
     st = _git(repo, "status", "--porcelain")
@@ -76,11 +85,11 @@ def tree_key(repo: str = REPO, env: dict | None = None) -> tuple[str | None, str
     if dirty:
         shown = ", ".join(dirty[:5]) + (" ..." if len(dirty) > 5 else "")
         return None, f"dirty tree ({shown})"
-    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    head = _git(repo, "rev-parse", rev).stdout.strip()
     sys.path.insert(0, HERE)
     import covercheck  # noqa: E402
     try:
-        base = covercheck.default_base(repo, dict(env))
+        base = covercheck.default_base(repo, dict(env), rev)
     except SystemExit as e:
         return None, str(e)
     ident = {
@@ -134,7 +143,7 @@ def _detail(log: str) -> str:
 
 
 def record(sdir: str, key: str, stage: str, status: str, secs: int, log: str,
-           fails: list[str]) -> dict:
+           fails: list[str], carried_from: str = "") -> dict:
     """Appends one attempt of `stage` on tree `key`; keeps the end of its log."""
     with _locked(sdir, key):
         st = load(sdir, key)
@@ -151,6 +160,8 @@ def record(sdir: str, key: str, stage: str, status: str, secs: int, log: str,
             f.writelines(lines[-EXCERPT_LINES:])
         a = {"n": n, "status": status, "secs": int(secs), "at": time.strftime("%F %T"),
              "fails": fails, "detail": _detail(log) if status == "fail" else "", "log": kept}
+        if carried_from:
+            a["carried_from"] = carried_from
         attempts.append(a)
         tmp = os.path.join(sdir, f"{key}.json.tmp")
         with open(tmp, "w") as f:
@@ -210,8 +221,41 @@ def with_deps(selected: list[str], stages: list[str], key: str | None,
     return [s for s in stages if s in sel], notes
 
 
+def carry(repo: str, sdir: str, key: str, stages: list[str],
+          env: dict | None = None) -> tuple[list[str], str]:
+    """T608: records and returns the CARRY stages that need no run on tree `key`, and why not
+    when there are none ("" when the diff simply is not tests-only). Only HEAD^ is looked at, never further back."""
+    pkey, why = tree_key(repo, env, "HEAD^")
+    if pkey is None:
+        return [], f"no parent tree key: {why}"
+    diff = _git(repo, "diff", "--name-only", "--no-renames", "HEAD^", "HEAD")
+    if diff.returncode != 0:
+        return [], "git diff HEAD^ HEAD failed"
+    outside = [p for p in diff.stdout.splitlines() if not TESTS_ONLY.match(p)]
+    if outside:
+        return [], ""  # the ordinary case: say nothing
+    pst = load(sdir, pkey)
+    missing = plan_rerun(pst, stages)
+    if missing:
+        return [], f"the parent {pkey} was not gated in full (not passed: {', '.join(missing)})"
+    carried = []
+    with _locked(sdir, key):
+        st = load(sdir, key)
+        for s in (c for c in CARRY if c in stages):
+            mine = _last(st, s)
+            if mine is not None and not mine.get("carried_from"):
+                continue  # this tree has a result of its own
+            carried.append(s)
+    for s in carried:
+        if _last(load(sdir, key), s) is None:
+            src = _last(pst, s)
+            record(sdir, key, s, src["status"], 0, "", [], carried_from=pkey)
+    return carried, ""
+
+
 def _fmt(a: dict) -> str:
-    s = f"{a['status'].upper()} ({a['secs']}s)"
+    s = (f"{a['status'].upper()} (carried from {a['carried_from']})" if a.get("carried_from")
+         else f"{a['status'].upper()} ({a['secs']}s)")
     if a["status"] == "fail":
         what = a.get("detail") or ", ".join(a.get("fails") or [])
         s += (f": {what}" if what else "") + f"  [{a['log']}]"
@@ -264,7 +308,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("key", help="print the tree key (exit 1 and why, when there is none)")
-    for name in ("plan", "deps", "verdict", "record", "mark-profiles"):
+    for name in ("plan", "deps", "verdict", "record", "mark-profiles", "carry"):
         p = sub.add_parser(name)
         p.add_argument("--key", required=True)
         p.add_argument("--stages", default="")
@@ -291,6 +335,11 @@ def main() -> int:
         for n in notes:
             print(f"checkin: {n}", file=sys.stderr)
         print(" ".join(sel))
+    elif a.cmd == "carry":
+        done, why = carry(REPO, sdir, a.key, split(a.stages))
+        if why:
+            print(f"checkin: nothing taken from the parent's gate: {why}", file=sys.stderr)
+        print(" ".join(done))
     elif a.cmd == "record":
         record(sdir, a.key, a.stage, a.status, a.secs, a.log, a.fail)
     elif a.cmd == "mark-profiles":

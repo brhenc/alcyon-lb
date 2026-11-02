@@ -143,8 +143,16 @@ else
   export IBEX_GATE_STATE=$RUN_DIR/state
 fi
 STAGE_LIST=$(IFS=,; echo "${STAGES[*]}")
+# T608: a child whose diff from its parent is only crates/*/tests/** carries the stages that
+# read no test file from the parent's full gate (harness/gatestate.py CARRY). --only asks for
+# a stage by name and gets it run.
+CARRIED=""
+if [ "$KEY" != dirty ] && [ "$MODE" != only ]; then
+  CARRIED=$(gs carry --key "$KEY" --stages "$STAGE_LIST")
+  [ -z "$CARRIED" ] || echo "checkin: carried from the parent's full gate (diff is crates/*/tests/** only): $CARRIED"
+fi
 case "$MODE" in
-  all) SELECTED=("${STAGES[@]}") ;;
+  all) SELECTED=(); for id in "${STAGES[@]}"; do case " $CARRIED " in *" $id "*) ;; *) SELECTED+=("$id") ;; esac; done ;;
   only) read -ra SELECTED <<<"${ONLY//,/ }" ;;
   rerun)
     if [ "$KEY" = dirty ]; then
