@@ -36,6 +36,8 @@ pub struct BitQueue<'a> {
     pub out_pos: usize,
     pub queue: u64,
     pub qbits: u32,
+    /// Set when a write did not fit; the caller turns it into an error.
+    pub overflow: bool,
 }
 
 impl<'a> BitQueue<'a> {
@@ -52,7 +54,11 @@ impl<'a> BitQueue<'a> {
         }
         
         if qbits >= 32 {
-            while qbits >= 8 && self.out_pos < self.outbuf.len() {
+            while qbits >= 8 {
+                if self.out_pos >= self.outbuf.len() {
+                    self.overflow = true;
+                    break;
+                }
                 self.outbuf[self.out_pos] = queue as u8;
                 queue >>= 8;
                 qbits -= 8;
@@ -64,6 +70,17 @@ impl<'a> BitQueue<'a> {
         self.qbits = qbits;
     }
     
+    /// Stores the queue back in <strm> and returns the bytes written, or the error of a write
+    /// that did not fit (the last line of defence, see the crate docs).
+    pub fn commit(self, strm: &mut Encoder) -> Result<usize, std::io::Error> {
+        strm.queue = self.queue;
+        strm.qbits = self.qbits;
+        if self.overflow {
+            return Err(crate::short_buffer());
+        }
+        Ok(self.out_pos)
+    }
+
     #[inline(always)]
     pub fn enqueue8(&mut self, x: u64, xbits: u32) {
         self.enqueue24(x, xbits);
@@ -76,21 +93,17 @@ impl<'a> BitQueue<'a> {
 
     #[inline(always)]
     pub fn flush_bits(&mut self) {
-        if self.qbits > 0 && self.out_pos < self.outbuf.len() {
-            self.outbuf[self.out_pos] = self.queue as u8;
+        let mut q = self.queue;
+        let mut left = self.qbits;
+        while left > 0 {
+            if self.out_pos >= self.outbuf.len() {
+                self.overflow = true;
+                break;
+            }
+            self.outbuf[self.out_pos] = q as u8;
             self.out_pos += 1;
-        }
-        if self.qbits > 8 && self.out_pos < self.outbuf.len() {
-            self.outbuf[self.out_pos] = (self.queue >> 8) as u8;
-            self.out_pos += 1;
-        }
-        if self.qbits > 16 && self.out_pos < self.outbuf.len() {
-            self.outbuf[self.out_pos] = (self.queue >> 16) as u8;
-            self.out_pos += 1;
-        }
-        if self.qbits > 24 && self.out_pos < self.outbuf.len() {
-            self.outbuf[self.out_pos] = (self.queue >> 24) as u8;
-            self.out_pos += 1;
+            q >>= 8;
+            left = left.saturating_sub(8);
         }
         self.queue = 0;
         self.qbits = 0;
@@ -98,10 +111,7 @@ impl<'a> BitQueue<'a> {
 
     #[inline(always)]
     pub fn copy_16b(&mut self, word: u16) {
-        if self.out_pos + 2 <= self.outbuf.len() {
-            self.outbuf[self.out_pos..self.out_pos+2].copy_from_slice(&word.to_le_bytes());
-            self.out_pos += 2;
-        }
+        self.copy_data(&word.to_le_bytes());
     }
 
     #[inline(always)]
@@ -110,6 +120,8 @@ impl<'a> BitQueue<'a> {
         if self.out_pos + len <= self.outbuf.len() {
             self.outbuf[self.out_pos..self.out_pos+len].copy_from_slice(data);
             self.out_pos += len;
+        } else {
+            self.overflow = true;
         }
     }
 }
@@ -158,13 +170,17 @@ pub fn copy_lit_huff(strm: &mut Encoder, bq: &mut BitQueue, buf: &[u8], more: bo
     }
 }
 
-pub fn rfc1951_encode(strm: &mut Encoder, out: &mut [u8], input: &[u8], more: bool) -> usize {
+/// Encodes <input> as raw deflate into <out> and returns the bytes written. Fails with
+/// `WriteZero` if a write did not fit; the encoder is then inconsistent and must be dropped.
+/// [`crate::Encoder::encode`] checks the room first and never gets here with a short buffer.
+pub fn rfc1951_encode(strm: &mut Encoder, out: &mut [u8], input: &[u8], more: bool) -> Result<usize, std::io::Error> {
     let mut refs = [(-32769_i64) as u64; 1 << HASH_BITS];
     let mut bq = BitQueue {
         outbuf: out,
         out_pos: 0,
         queue: strm.queue,
         qbits: strm.qbits,
+        overflow: false,
     };
     
     let ilen = input.len();
@@ -274,7 +290,62 @@ pub fn rfc1951_encode(strm: &mut Encoder, out: &mut [u8], input: &[u8], more: bo
         }
     }
 
-    strm.queue = bq.queue;
-    strm.qbits = bq.qbits;
-    bq.out_pos
+    bq.commit(strm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bq(buf: &mut [u8]) -> BitQueue<'_> {
+        BitQueue { outbuf: buf, out_pos: 0, queue: 0, qbits: 0, overflow: false }
+    }
+
+    #[test]
+    fn every_short_write_sets_overflow() {
+        let mut b = [0u8; 2];
+        let mut q = bq(&mut b);
+        q.copy_data(&[1, 2, 3]);
+        assert!(q.overflow);
+
+        let mut q = bq(&mut b[..0]);
+        q.queue = 0xffff_ffff;
+        q.qbits = 31;
+        q.enqueue24(0xffffff, 24); // 55 bits queued, nowhere to put them
+        assert!(q.overflow);
+
+        // room for two of the bytes only: they are written, then the overflow is noted
+        let mut q = bq(&mut b);
+        q.queue = 0xffff_ffff;
+        q.qbits = 31;
+        q.enqueue24(0xffffff, 24);
+        assert!(q.overflow);
+        assert_eq!(q.out_pos, 2);
+
+        let mut q = bq(&mut b[..0]);
+        q.queue = 1;
+        q.qbits = 5;
+        q.flush_bits();
+        assert!(q.overflow);
+        assert_eq!((q.queue, q.qbits), (0, 0));
+    }
+
+    #[test]
+    fn exact_fit_is_not_overflow() {
+        let mut b = [0u8; 4];
+        let mut q = bq(&mut b);
+        q.queue = 0x0102_0304;
+        q.qbits = 25;
+        q.flush_bits();
+        assert!(!q.overflow);
+        assert_eq!(q.out_pos, 4);
+    }
+
+    #[test]
+    fn rfc1951_encode_reports_a_short_buffer() {
+        let mut e = Encoder::new(crate::Format::Deflate, crate::Level::NoCompression);
+        let mut out = [0u8; 8];
+        let r = rfc1951_encode(&mut e, &mut out, &[7u8; 100], false);
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::WriteZero);
+    }
 }

@@ -48,7 +48,7 @@ fn test_vectors() {
         };
 
         let mut encoder = Encoder::new(format, level);
-        let mut out = vec![0; vec.out_len + 1024];
+        let mut out = vec![0; slz::max_compressed_len(input.len(), format) + vec.out_len];
         let mut pos = 0;
         
         pos += encoder.encode(&input, &mut out[pos..], false).unwrap();
