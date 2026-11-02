@@ -208,6 +208,7 @@ impl StreamLog {
     /// A stream starting now, on a session whose counters read `bytes_in`/`bytes_out`.
     #[must_use]
     pub fn start(bytes_in: u64, bytes_out: u64) -> StreamLog {
+        crate::probe::stream_log_start();
         StreamLog {
             start: loop_now(),
             date_cache: std::cell::Cell::new((0, 0)),
@@ -239,20 +240,68 @@ impl StreamLog {
         }
     }
 
-    /// The next stream of the connection starts now: as [`StreamLog::start`], but the
-    /// buffers of the one that ended (the request line, the capture slots) are kept for it,
-    /// emptied, so that a kept-alive request does not allocate them again (T437).
-    pub fn restart(&mut self, bytes_in: u64, bytes_out: u64) {
-        let mut request_line = std::mem::take(&mut self.request_line);
+    /// The next stream of the connection starts now: as [`StreamLog::start`], in place (O1a):
+    /// the buffers of the one that ended (the request line, the capture slots) are kept for
+    /// it, emptied, so that a kept-alive request does not allocate them again (T437), and no
+    /// `StreamLog` is built. Every field is named (no `..`): one added to the struct does not
+    /// compile here until its reset is written.
+    pub fn reset(&mut self, bytes_in: u64, bytes_out: u64) {
+        let StreamLog {
+            start,
+            first_byte,
+            request,
+            date_cache,
+            queue,
+            server,
+            connect,
+            data,
+            bytes_in_at_start,
+            bytes_out_at_start,
+            bytes_from_server,
+            checkcache_blocked,
+            request_line,
+            req_captures,
+            res_captures,
+            unique_id,
+            last_rule,
+            prio_class,
+            prio_offset,
+            uniq_id,
+            term,
+            status,
+            redispatched,
+            applet,
+            be_queue,
+            asap_done,
+            srv_status,
+        } = self;
+        *start = loop_now();
+        *first_byte = None;
+        *request = None;
+        date_cache.set((0, 0));
+        *queue = None;
+        *server = None;
+        *connect = None;
+        *data = None;
+        *bytes_in_at_start = bytes_in;
+        *bytes_out_at_start = bytes_out;
+        *bytes_from_server = 0;
+        *checkcache_blocked = false;
         request_line.reset();
-        let mut request_slots = std::mem::take(&mut self.req_captures);
-        release_captures(&mut request_slots);
-        let mut response_slots = std::mem::take(&mut self.res_captures);
-        release_captures(&mut response_slots);
-        *self = StreamLog::start(bytes_in, bytes_out);
-        self.request_line = request_line;
-        self.req_captures = request_slots;
-        self.res_captures = response_slots;
+        release_captures(req_captures);
+        release_captures(res_captures);
+        *unique_id = None;
+        *last_rule = None;
+        *prio_class = 0;
+        *prio_offset = 0;
+        *uniq_id = STREAM_COUNTER.fetch_add(1, Ordering::Relaxed);
+        *term = None;
+        *status = None;
+        *redispatched = false;
+        *applet = false;
+        *be_queue = 0;
+        *asap_done = false;
+        *srv_status = 0;
     }
 
     /// Milliseconds from the stream's start to `t`, -1 if it never happened.
@@ -321,5 +370,32 @@ mod tests {
         assert_eq!(l.term_state(Some(Ending::Timeout(Which::Client)), true, false), *b"cD");
         l.term = Some(*b"PR");
         assert_eq!(l.term_state(Some(Ending::Complete), true, false), *b"PR");
+    }
+
+    /// `reset` leaves the log as `start` builds it (O1a): every field a stream wrote is gone,
+    /// the stream's start and its `%rt` are new.
+    #[test]
+    fn reset_is_a_new_start_in_place() {
+        let mut l = StreamLog::start(1, 2);
+        let t = Instant::now();
+        (l.first_byte, l.request, l.queue, l.connect, l.data) = (Some(t), Some(t), Some(t), Some(t), Some(t));
+        l.server = server_slot(3);
+        l.bytes_from_server = 9;
+        l.checkcache_blocked = true;
+        l.request_line.set("GET / HTTP/1.1");
+        l.req_captures = vec![None, None];
+        set_capture(&mut l.req_captures[1], b"x");
+        l.res_captures = vec![None];
+        set_capture(&mut l.res_captures[0], b"y");
+        l.unique_id = Some("id".into());
+        (l.last_rule, l.prio_class, l.prio_offset) = (Some(4), 5, 6);
+        (l.term, l.status, l.redispatched, l.applet, l.be_queue, l.asap_done, l.srv_status) = (Some(*b"PR"), Some(400), true, true, 7, true, 200);
+        let _ = l.date();
+        let id = l.uniq_id;
+        l.reset(10, 20);
+        let mut fresh = StreamLog::start(10, 20);
+        assert!(l.uniq_id > id);
+        (fresh.start, fresh.uniq_id) = (l.start, l.uniq_id);
+        assert_eq!(format!("{l:?}"), format!("{fresh:?}"));
     }
 }

@@ -4,11 +4,16 @@
 //! O2: the backend side finds a server and its idle connections by index. A request that
 //! takes an idle server connection reads no `RwLock` and hashes no `(backend, server)`
 //! (`work::Op::IdleLock`, `work::Op::IdleHash`).
+//!
+//! O1a: the per-request state is a `Stream` the HTTP/1 session keeps and resets in
+//! place between its requests (`docs/design/engine-architecture-2026-11-01.md` §4.3): no
+//! `Stream` taken and no `StreamLog` built per keep-alive request, and nothing a request set
+//! (a variable, a capture, a priority, a timeout) left for the next one to log.
 
 use crate::common;
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -221,4 +226,149 @@ fn a_backend_without_servers_picks_its_dispatch_address() {
     };
     let engine = Engine::new(&config, 8).expect("Engine::new");
     assert_eq!(engine.proxies[0].select_server_idx(), Some((None, d)));
+}
+
+/// A keep-alive server answering each request head; `X-R: r1` on a request for `/one`.
+fn keepalive_backend(listener: TcpListener, running: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking");
+        let mut conns: Vec<(TcpStream, Vec<u8>)> = Vec::new();
+        while running.load(Ordering::Relaxed) {
+            if let Ok((s, _)) = listener.accept() {
+                s.set_nonblocking(true).expect("nonblocking");
+                conns.push((s, Vec::new()));
+            }
+            let mut buf = [0u8; 4096];
+            conns.retain_mut(|(s, pending)| {
+                match s.read(&mut buf) {
+                    Ok(0) => return false,
+                    Ok(n) => pending.extend_from_slice(&buf[..n]),
+                    Err(_) => {}
+                }
+                while let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let one = pending.starts_with(b"GET /one ");
+                    pending.drain(..end + 4);
+                    let extra: &[u8] = if one { b"X-R: r1\r\n" } else { b"" };
+                    let _ = s.write_all(&[&b"HTTP/1.1 200 OK\r\n"[..], extra, b"Content-Length: 2\r\n\r\nok"].concat());
+                }
+                true
+            });
+            thread::sleep(Duration::from_micros(100));
+        }
+    })
+}
+
+/// One request on the kept-alive `client`, the engine run until its response is in.
+fn keepalive_request(engine: &mut Engine, client: &mut TcpStream, req: &[u8]) {
+    client.write_all(req).expect("write");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut got = Vec::new();
+    let mut buf = [0u8; 512];
+    while !got.ends_with(b"ok") {
+        assert!(Instant::now() < deadline, "no response: {:?}", String::from_utf8_lossy(&got));
+        let _ = engine.run_once();
+        match client.read(&mut buf) {
+            Ok(0) => panic!("the proxy closed the connection"),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(_) => {}
+        }
+    }
+    assert!(got.starts_with(b"HTTP/1.1 200"), "{:?}", String::from_utf8_lossy(&got));
+}
+
+fn keepalive_engine(extra_fe: &str, extra_be: &str, defaults: &str) -> (Engine, SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let srv = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let srv_addr = srv.local_addr().expect("addr");
+    let running = Arc::new(AtomicBool::new(true));
+    let be = keepalive_backend(srv, Arc::clone(&running));
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n{defaults}\
+         frontend fe\n  bind {fe}\n{extra_fe}  default_backend be\n\
+         backend be\n{extra_be}  server s {srv_addr}\n"
+    );
+    let engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    (engine, fe, running, be)
+}
+
+/// A keep-alive request after the first makes no `Stream` and builds no `StreamLog`: the
+/// session's stream is reset in place at the transaction's end (O1a; on
+/// ibex-rc5 `end_txn` rebuilt the log, `StreamLog::start` once a request).
+#[test]
+fn a_keepalive_request_resets_its_stream_in_place() {
+    const REQ: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const N: u64 = 20;
+    let (mut engine, fe, running, be) = keepalive_engine(
+        "  capture request header Host len 16\n  http-request set-var(txn.x) str(a)\n",
+        "",
+        "",
+    );
+    let mut client = TcpStream::connect(fe).expect("connect");
+    client.set_nonblocking(true).expect("nonblocking");
+    client.set_nodelay(true).expect("nodelay");
+    for _ in 0..4 {
+        keepalive_request(&mut engine, &mut client, REQ);
+    }
+    let (t0, l0) = (ibex_rt::probe::stream_takes(), ibex_rt::probe::stream_log_starts());
+    for _ in 0..N {
+        keepalive_request(&mut engine, &mut client, REQ);
+    }
+    let (takes, logs) = (ibex_rt::probe::stream_takes() - t0, ibex_rt::probe::stream_log_starts() - l0);
+    println!("{N} keep-alive requests: {takes} Streams made, {logs} StreamLog constructions");
+    assert_eq!((takes, logs), (0, 0), "the session's Stream is reset in place, not rebuilt");
+    running.store(false, Ordering::Relaxed);
+    drop(client);
+    let _ = be.join();
+}
+
+/// What the first request of a connection set (a `txn.` variable, header captures of both
+/// kinds, the priority class, a stream timeout) is gone for the second: each line as
+/// `HAProxy` 3.5-dev8-885761-29 logged it for the same two requests, measured 2026-11-02:
+///   "GET /one HTTP/1.1" 200 one - s1 {c1|d1} {r1} 5 1000 56
+///   "GET /two HTTP/1.1" 200 - - - {|} {} 0 5000 51
+#[test]
+fn a_field_set_in_request_one_is_absent_in_request_two() {
+    let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
+    collector.set_nonblocking(true).expect("nonblocking");
+    let defaults = format!(
+        "  log {} local0\n  log-format \"%{{+Q}}r %ST %[var(txn.x)] %[var(req.r)] %[var(res.s)] %hr %hs %[prio_class] %[cur_server_timeout] %B\"\n",
+        collector.local_addr().expect("addr")
+    );
+    let (mut engine, fe, running, be) = keepalive_engine(
+        "  capture request header X-Cap len 10\n  capture response header X-R len 10\n  http-request capture req.hdr(x-c2) len 10\n\
+           http-request set-var(txn.x) str(one) if { path /one }\n  http-request set-var(req.r) str(r1) if { path /one }\n\
+           http-request set-priority-class int(5) if { path /one }\n  http-response set-var(res.s) str(s1) if { var(txn.x) -m found }\n",
+        "  http-request set-timeout server 1s if { path /one }\n",
+        &defaults,
+    );
+    let mut client = TcpStream::connect(fe).expect("connect");
+    client.set_nonblocking(true).expect("nonblocking");
+    keepalive_request(&mut engine, &mut client, b"GET /one HTTP/1.1\r\nHost: h\r\nX-Cap: c1\r\nX-C2: d1\r\n\r\n");
+    keepalive_request(&mut engine, &mut client, b"GET /two HTTP/1.1\r\nHost: h\r\n\r\n");
+    let mut lines = Vec::new();
+    let mut buf = [0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while lines.len() < 2 && Instant::now() < deadline {
+        let _ = engine.run_once();
+        if let Ok(n) = collector.recv(&mut buf) {
+            let l = String::from_utf8_lossy(&buf[..n]).into_owned();
+            lines.push(l.split_once("]: ").map_or(l.clone(), |(_, b)| b.trim_end().to_string()));
+        }
+    }
+    assert_eq!(
+        lines,
+        ["\"GET /one HTTP/1.1\" 200 one - s1 {c1|d1} {r1} 5 1000 56", "\"GET /two HTTP/1.1\" 200 - - - {|} {} 0 5000 51"]
+    );
+    running.store(false, Ordering::Relaxed);
+    drop(client);
+    let _ = be.join();
+}
+
+/// The stream is at most 1 KiB (O1a; plan §4.3): what grows it past that is boxed, or belongs
+/// to the connection.
+#[test]
+fn stream_is_at_most_1_kib() {
+    let n = std::mem::size_of::<ibex_rt::stream::Stream>();
+    println!("Stream: {n} bytes");
+    assert!(n <= 1024, "Stream grew to {n} bytes (bound 1024)");
 }

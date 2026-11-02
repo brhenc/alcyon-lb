@@ -809,6 +809,28 @@ fn a_malformed_response_body_is_a_502_flagged_ph() {
 }
 
 #[test]
+fn a_response_body_that_turns_malformed_during_the_wait_is_a_502_flagged_ph() {
+    // HAProxy 3.5-dev8-885761-29, measured 2026-11-02: a first chunk, then 300 ms later a chunk
+    // size `zz` while `wait-for-body` waits: `502 Bad Gateway` when the bad chunk comes, `PH--`,
+    // `%Ta` 300.
+    let logs = UdpSocket::bind("127.0.0.1:0").expect("log socket");
+    logs.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    let log = logs.local_addr().expect("addr");
+    let srv = scripted(vec![
+        Step::Send(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"),
+        Step::Pause(300),
+        Step::Send(b"zz\r\nhello\r\n"),
+    ]);
+    let (_i, fe) = start(&res_cfg("http-response wait-for-body time 5s"), srv, Some(log));
+    let (resp, first) = get(fe, Duration::from_millis(1500));
+    assert!(resp.starts_with("HTTP/1.1 502 Bad Gateway\r\n"), "{resp}");
+    let first = first.expect("answer");
+    assert!(first >= Duration::from_millis(250) && first < Duration::from_millis(1000), "{first:?}");
+    let line = log_line_of(&logs, "GET /x");
+    assert!(line.contains(" 502 ") && line.contains(" PH-- "), "{line}");
+}
+
+#[test]
 fn a_full_buffer_ends_the_response_wait_with_what_fits() {
     // HAProxy, a 100000-byte body of which 50000 are sent, `time 300ms`: the rules run at
     // once on 15234 body bytes. As for a request, the test bounds the figure by the buffer.
