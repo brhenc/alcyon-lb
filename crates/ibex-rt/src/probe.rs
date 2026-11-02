@@ -14,6 +14,15 @@ mod on {
         static CLOCK_READS: Cell<u64> = const { Cell::new(0) };
         static STREAM_TAKES: Cell<u64> = const { Cell::new(0) };
         static STREAM_LOG_STARTS: Cell<u64> = const { Cell::new(0) };
+        static SESSION_NEWS: Cell<u64> = const { Cell::new(0) };
+    }
+    /// A `TcpSession` was built (`new_with_mode`), for a connection or an HTTP/2 stream (O1b).
+    pub fn session_new() {
+        SESSION_NEWS.with(|c| c.set(c.get() + 1));
+    }
+    #[must_use]
+    pub fn session_news() -> u64 {
+        SESSION_NEWS.with(Cell::get)
     }
     /// A `Stream` was made, for a session (O1a).
     pub fn stream_take() {
@@ -68,6 +77,8 @@ mod off {
     pub fn stream_take() {}
     #[inline(always)]
     pub fn stream_log_start() {}
+    #[inline(always)]
+    pub fn session_new() {}
 }
 #[cfg(not(debug_assertions))]
 pub use off::*;
