@@ -808,3 +808,20 @@ fn ibex_c_refuses_a_bad_rule_expression_beside_a_valid_tls_server() {
     assert_ne!(code, Some(0), "{text}");
     assert!(text.contains("nosuchfetch"), "{text}");
 }
+
+/// T612a (IBEX-SRVTLS-SNI-FALLBACK-001), measured on HAProxy 3.5-dev8-885761-29: with `ssl
+/// verify required ca-file <ca>` and the automatic SNI, a Host that is not a DNS name the
+/// certificate carries -- an address, a name with an underscore, a bracketed address -- is 503,
+/// like any other mismatching Host. It must not turn the name check off.
+#[test]
+fn a_host_that_is_not_a_dns_name_does_not_turn_the_name_check_off() {
+    let p = pki();
+    let srv = serve(Some(server_config(&p.cert, &p.key, None, &[])));
+    let front = common::reserve_addr();
+    let ca = &p.ca_pem;
+    let _ibex = start(&p.dir, &config(&[(front, &format!("  server s {} ssl verify required ca-file {ca}", srv.addr))]), &[front]);
+    assert_eq!(get(front, "backend.example.com").0, 200);
+    for host in ["10.9.9.9", "a_b", "[::1]"] {
+        assert_eq!(get(front, host).0, 503, "Host: {host}");
+    }
+}
