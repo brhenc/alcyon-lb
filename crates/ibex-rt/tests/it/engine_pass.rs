@@ -487,13 +487,15 @@ fn an_h3_owner_and_its_stream_wake_each_other_in_the_same_pass() {
          backend be\n  server s1 {srv_addr}\n"
     );
     let passes = Arc::new(AtomicU64::new(0));
+    let wakes = Arc::new(AtomicU64::new(0));
     let eng = {
-        let (running, passes) = (Arc::clone(&running), Arc::clone(&passes));
+        let (running, passes, wakes) = (Arc::clone(&running), Arc::clone(&passes), Arc::clone(&wakes));
         thread::spawn(move || {
             let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
             while running.load(Ordering::Relaxed) {
                 let _ = engine.run_once();
                 passes.store(on_this_thread()[Op::Pass as usize], Ordering::Relaxed);
+                wakes.store(on_this_thread()[Op::H3OwnerWakeNow as usize], Ordering::Relaxed);
             }
         })
     };
@@ -510,6 +512,7 @@ fn an_h3_owner_and_its_stream_wake_each_other_in_the_same_pass() {
     // The ACKs and timers of the warm-up settle.
     thread::sleep(Duration::from_millis(50));
     let p0 = passes.load(Ordering::Relaxed);
+    let w0 = wakes.load(Ordering::Relaxed);
     let mut runs = 0u64;
     let started = Instant::now();
     for _ in 0..N {
@@ -517,13 +520,18 @@ fn an_h3_owner_and_its_stream_wake_each_other_in_the_same_pass() {
         runs += 1;
     }
     let p1 = passes.load(Ordering::Relaxed);
+    let w1 = wakes.load(Ordering::Relaxed);
     #[allow(clippy::cast_precision_loss)]
     let per = (p1 - p0) as f64 / runs as f64;
-    println!("h3: {per:.2} passes a request ({:?} for {N})", started.elapsed());
+    println!("h3: {per:.2} passes a request ({:?} for {N}), {} in-pass owner wakes", started.elapsed(), w1 - w0);
     running.store(false, Ordering::Relaxed);
     let _ = eng.join();
     let _ = be.join();
-    assert!(per <= 4.6, "{per:.2} passes an HTTP/3 request: the owner and its stream wake each other a pass late");
+    // The pass count of a request is bimodal with the phase of the client and engine threads
+    // (4.0 or 5.0 on a quiet host, T614), so it is printed and not asserted: what L2 changed is
+    // counted. Every request's stream wakes its owner (its release at least) for the pass it
+    // is in; before L2 each of these wakes went to the next pass (counted 0).
+    assert!(w1 - w0 >= runs, "{} in-pass owner wakes for {runs} requests: the owner and its stream wake each other a pass late", w1 - w0);
 }
 
 /// (stream runs, `op`) counted over `n` requests after a warm-up, with `get` one request.

@@ -51,9 +51,12 @@ pub enum Op {
     RareCheck = 13,
     /// The engine's dispatcher built: counted in debug builds only (T599). Once an engine.
     DispatcherBuild = 14,
+    /// An HTTP/3 owner woken for the pass it is in by its stream (run or release): counted in
+    /// debug builds only (T614b). One of the two wakes was a pass late before L2.
+    H3OwnerWakeNow = 15,
 }
 
-const OPS: usize = 15;
+const OPS: usize = 16;
 
 thread_local! {
     static COUNTS: [Cell<u64>; OPS] = const { [const { Cell::new(0) }; OPS] };

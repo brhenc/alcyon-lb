@@ -170,13 +170,17 @@ fn error_and_embryonic_lines_carry_it_and_connect_lines_do_not() {
 
 #[test]
 fn tcp_and_plain_error_lines_carry_it_spaces_merge_and_nothing_is_a_dash() {
+    // `retries 0`: the server is a closed port, and with the default 3 retries a second apart
+    // the `tc` line is logged at 3001 ms, as the probe's own 3 s read gives up; a host that
+    // stalls it 400 ms lands the line in the next probe's window (T614b, gate log
+    // fe46f0ea3b476101). The line (`SC`) is the same, at once.
     let cfg = format!(
         "defaults\n{TIMEOUTS}  log @LOG@ format rfc5424 local0\n\
          frontend tc\n  mode tcp\n  bind @B0@\n  option tcplog\n  log-format-sd \"[t@1   a=\\\"%ci\\\"]   x\"\n  default_backend b\n\
          frontend e\n  mode http\n  bind @B1@\n  log-format \"E\"\n  log-format-sd %{{-M}}[var(txn.nope)]\n  http-request return status 200\n\
          frontend n\n  mode http\n  bind @B2@\n  log-format \"N\"\n  http-request return status 200\n\
          frontend p\n  mode http\n  bind @B3@ accept-proxy\n  option httplog\n  log-format-sd \"[p@1 f=\\\"%f\\\"]\"\n  http-request return status 200\n\
-         backend b\n  mode tcp\n  log-format-sd \"[b@1]\"\n  server s 127.0.0.1:1\n"
+         backend b\n  mode tcp\n  retries 0\n  log-format-sd \"[b@1]\"\n  server s 127.0.0.1:1\n"
     );
     let r = logs(session(&cfg, &[(0, b"hi", true), (1, PLAIN, false), (2, PLAIN, false), (3, b"PROXY FOO\r\n", false)], None));
     assert_eq!(r[0].len(), 1, "{r:#?}");
