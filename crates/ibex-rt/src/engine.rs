@@ -11611,6 +11611,10 @@ impl EngineDispatcher<'_> {
             owner.sess.srv_state = ScState::Closed;
             owner.sess.ending.get_or_insert(child.sess.ending.unwrap_or(crate::proxy::Ending::Complete));
         }
+        #[cfg(debug_assertions)]
+        if owner.sess.h3_owner().is_some() {
+            ibex_sample::work::note(ibex_sample::work::Op::H3OwnerWakeNow, 1);
+        }
         env.wake_now.push(owner_task);
     }
 
@@ -12034,6 +12038,10 @@ impl EngineDispatcher<'_> {
         };
 
         if let Some(owner_task) = owner_wake {
+            #[cfg(debug_assertions)]
+            if self.sessions.get(session_idx).and_then(|e| e.sess.h2_child()).and_then(|c| c.owner).and_then(|(i, _)| self.sessions.get(i)).is_some_and(|o| o.sess.h3_owner().is_some()) {
+                ibex_sample::work::note(ibex_sample::work::Op::H3OwnerWakeNow, 1);
+            }
             self.wake_now.push(owner_task);
         }
         if let Some((fe, line)) = connect_line {

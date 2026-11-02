@@ -103,7 +103,14 @@ fn a_command_line_longer_than_the_buffer_is_refused_and_not_stored() {
     }
     let got = read_some(&mut c).unwrap_or_default();
     assert!(String::from_utf8_lossy(&got).starts_with(TOO_BIG), "answer: {:?}", String::from_utf8_lossy(&got));
-    assert_eq!(read_some(&mut c), Some(Vec::new()), "the connection stays open");
+    // Closed: end of file, or a reset when the proxy closed with part of the 8 MiB still unread
+    // (a unix socket reports that to the peer once, `ECONNRESET`, after the answer). A read
+    // that times out is the connection staying open (T614b: gate log b59550643b8602b9 failed
+    // here at its second read; the kind of error was not shown).
+    let mut b = [0u8; 256];
+    let end = c.read(&mut b);
+    let closed = matches!(&end, Ok(0)) || matches!(&end, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset);
+    assert!(closed, "the connection stays open: {end:?}");
     let grew = rss_kb(pid).saturating_sub(before);
     assert!(grew < 4096, "RSS grew by {grew} kB");
 }
