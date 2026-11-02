@@ -8,7 +8,10 @@
 //! Measured on `HAProxy` 3.5-dev8 (`RVC_ORACLE=<haproxy>` runs this file against it), one
 //! request with `x-k: orig` to each frontend of [`CFG`]; the table of each afterwards:
 //! `hset` foo, `allow` none, `deny` none, `caccept` none, `hlate` orig, `hvar` v1,
-//! `ginc` (sc-inc-gpc0 before the track) `http_req_cnt=1 gpc0=0`.
+//! `ginc` (sc-inc-gpc0 before the track) `http_req_cnt=1 gpc0=0`; a second track of a slot
+//! (`cdup`, `htwice`) leaves it on the first entry, counted once; a missing key (`cnokey`,
+//! `hnokey`) tracks nothing; a slot the connection rules tracked whose `http-request track-sc`
+//! does not run (`hdefer`) still counts the request.
 
 use crate::common;
 
@@ -48,6 +51,18 @@ backend ts_caccept
   stick-table type ip size 10 expire 1m store conn_cnt
 backend ts_ginc
   stick-table type ip size 10 expire 1m store http_req_cnt,gpc0
+backend ts_cdup
+  stick-table type ip size 10 expire 1m store http_req_cnt
+backend ts_cdup2
+  stick-table type ip size 10 expire 1m store http_req_cnt
+backend ts_cnokey
+  stick-table type string len 16 size 10 expire 1m store conn_cnt
+backend ts_htwice
+  stick-table type ip size 10 expire 1m store http_req_cnt
+backend ts_hnokey
+  stick-table type string len 16 size 10 expire 1m store http_req_cnt
+backend ts_hdefer
+  stick-table type ip size 10 expire 1m store http_req_cnt
 frontend hset
   bind {hset}
   http-request set-header x-k foo
@@ -82,6 +97,29 @@ frontend ginc
   http-request sc-inc-gpc0(0)
   http-request track-sc0 src table ts_ginc
   http-request return status 200
+frontend cdup
+  bind {cdup}
+  tcp-request connection track-sc0 src table ts_cdup
+  tcp-request connection track-sc0 src table ts_cdup2
+  http-request return status 200
+frontend cnokey
+  bind {cnokey}
+  tcp-request connection track-sc1 var(sess.none) table ts_cnokey
+  http-request return status 200
+frontend htwice
+  bind {htwice}
+  http-request track-sc0 src table ts_htwice
+  http-request track-sc0 src table ts_htwice
+  http-request return status 200
+frontend hnokey
+  bind {hnokey}
+  http-request track-sc1 req.hdr(x-none) table ts_hnokey
+  http-request return status 200
+frontend hdefer
+  bind {hdefer}
+  tcp-request connection track-sc0 src table ts_hdefer
+  http-request track-sc0 src table ts_hdefer if FALSE
+  http-request return status 200
 "####;
 
 fn cli(sock: &str, cmd: &str) -> String {
@@ -114,7 +152,7 @@ fn entries(sock: &str, table: &str) -> Vec<String> {
 
 #[test]
 fn track_rules_run_in_rule_order() {
-    let names = ["hset", "hlate", "hvar", "allow", "deny", "caccept", "ginc"];
+    let names = ["hset", "hlate", "hvar", "allow", "deny", "caccept", "ginc", "cdup", "cnokey", "htwice", "hnokey", "hdefer"];
     let addrs: Vec<SocketAddr> = names.iter().map(|_| common::reserve_addr()).collect();
     let dir = std::env::temp_dir().join(format!("rvc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -137,8 +175,9 @@ fn track_rules_run_in_rule_order() {
         assert!(Instant::now() < deadline, "no stats socket");
         std::thread::sleep(Duration::from_millis(20));
     }
-    // `wait_listening` itself connects: start from empty tables.
-    for n in names {
+    // `wait_listening` itself connects: start from empty tables. (Ibex has no `clear table`
+    // yet, T625: the tables count requests, which the probe connection does not make.)
+    for n in names.iter().chain(&["cdup2"]) {
         cli(&sock, &format!("clear table ts_{n}"));
     }
     for a in &addrs {
@@ -153,6 +192,12 @@ fn track_rules_run_in_rule_order() {
         ("deny", vec![]),
         ("caccept", vec![]),
         ("ginc", vec!["gpc0=0 http_req_cnt=1 key=127.0.0.1"]),
+        ("cdup", vec!["http_req_cnt=1 key=127.0.0.1"]),
+        ("cdup2", vec![]),
+        ("cnokey", vec![]),
+        ("htwice", vec!["http_req_cnt=1 key=127.0.0.1"]),
+        ("hnokey", vec![]),
+        ("hdefer", vec!["http_req_cnt=1 key=127.0.0.1"]),
     ] {
         let got = entries(&sock, &format!("ts_{n}"));
         if got != want {

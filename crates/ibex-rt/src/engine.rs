@@ -14643,20 +14643,18 @@ impl EngineDispatcher<'_> {
                             _ => 2,
                         };
                         let t_idx = table.as_ref().map_or(pages_idx, |tname| proxies.iter().position(|p| p.name == *tname).unwrap_or(pages_idx));
-                        let key = resolve_stick_key(rc.expr.as_ref(), registry, &make_ctx!(sess), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()));
-                        if let Some(k) = key {
+                        let tbl = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref());
+                        if let (Some(k), Some(table)) = (resolve_stick_key(rc.expr.as_ref(), registry, &make_ctx!(sess), tbl), tbl) {
                             let before = sess.tracked_sc[slot].clone();
                             track_http_slot(proxies, &mut sess.tracked_sc, slot, t_idx, k.clone());
                             // The request is counted in the entry the slot ends on, once.
                             let mut c = counted.get();
                             if before != sess.tracked_sc[slot] || (deferred[slot] && !c[slot]) {
                                 stick.track(slot, t_idx, &k);
-                                if let Some(table) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
-                                    let _ = table.update_entry(&k, |data| {
-                                        data.count_request();
-                                        data.add_bytes(due.0, due.1);
-                                    });
-                                }
+                                let _ = table.update_entry(&k, |data| {
+                                    data.count_request();
+                                    data.add_bytes(due.0, due.1);
+                                });
                                 c[slot] = true;
                                 counted.set(c);
                             }
@@ -14665,20 +14663,20 @@ impl EngineDispatcher<'_> {
                     _ => {}
                 }
             }
-            // No `track-sc` rule of a slot ran (its condition did not hold): it keeps its entry, which counts the request.
-            if !be_stage && deferred != [false; 3] {
-                let c = counted.get();
-                for (slot, tracked) in sess.tracked_sc.iter().enumerate() {
-                    let Some((t_idx, key)) = tracked.as_ref().filter(|_| deferred[slot] && !c[slot]) else { continue };
-                    if let Some(table) = proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()) {
-                        let _ = table.update_entry(key, |data| {
-                            data.count_request();
-                            data.add_bytes(due.0, due.1);
-                        });
-                    }
-                }
-            }
             Ok(RuleFlow::Next)
+        };
+        // No `track-sc` rule of a slot ran (its condition did not hold, or an earlier `return`,
+        // `deny` or `allow` ended the list): it keeps its entry, which counts the request.
+        let count_deferred = |sess: &TcpSession| {
+            let c = counted.get();
+            for (slot, tracked) in sess.tracked_sc.iter().enumerate() {
+                let Some((t_idx, key)) = tracked.as_ref().filter(|_| deferred[slot] && !c[slot]) else { continue };
+                let Some(table) = proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()) else { continue };
+                let _ = table.update_entry(key, |data| {
+                    data.count_request();
+                    data.add_bytes(due.0, due.1);
+                });
+            }
         };
         // The rules edit the HTX alone: the head is written out of it once, at the server send
         // (`encode_if_modified`, X2).
@@ -14689,7 +14687,11 @@ impl EngineDispatcher<'_> {
             let fe_rules = &proxies[proxy_idx].http_req_rules;
             let fe_acls = &proxies[proxy_idx].acls;
             let start = resume.map_or(0, |w| w.rule);
-            match eval_http_rules(fe_rules, &proxies[proxy_idx].rules.http_req, fe_acls, &mut entry.sess, proxies[proxy_idx].retries, Some(&proxies[proxy_idx].name), None, proxy_idx, false, start) {
+            let flow = eval_http_rules(fe_rules, &proxies[proxy_idx].rules.http_req, fe_acls, &mut entry.sess, proxies[proxy_idx].retries, Some(&proxies[proxy_idx].name), None, proxy_idx, false, start);
+            if deferred != [false; 3] && !matches!(flow, Ok(RuleFlow::Suspend)) {
+                count_deferred(&entry.sess);
+            }
+            match flow {
                 Ok(RuleFlow::Replied) => {
                     entry.sess.strm.log.term.get_or_insert(*b"LR");
                     return None;
