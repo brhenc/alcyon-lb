@@ -275,62 +275,6 @@ impl<'a> Rows<'a> for OwnRows<'a> {
     }
 }
 
-/// Either, for the sites that count once per connection or less (`connect`, `reuse`, a
-/// failed attempt, a redispatch): one branch there instead of a second copy of the site.
-#[derive(Clone, Copy, Debug)]
-pub enum AnyRows<'a> {
-    Shared,
-    Own(OwnRows<'a>),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum AnyWrite {
-    Shared,
-    Owned,
-}
-
-impl Write for AnyWrite {
-    #[inline]
-    fn add(self, a: &AtomicU64, v: u64) {
-        match self {
-            AnyWrite::Shared => Shared.add(a, v),
-            AnyWrite::Owned => Owned.add(a, v),
-        }
-    }
-    #[inline]
-    fn max(self, a: &AtomicU32, v: u32) {
-        match self {
-            AnyWrite::Shared => Shared.max(a, v),
-            AnyWrite::Owned => Owned.max(a, v),
-        }
-    }
-}
-
-impl<'a> Rows<'a> for AnyRows<'a> {
-    type W = AnyWrite;
-    #[inline]
-    fn w(self) -> AnyWrite {
-        match self {
-            AnyRows::Shared => AnyWrite::Shared,
-            AnyRows::Own(_) => AnyWrite::Owned,
-        }
-    }
-    #[inline]
-    fn row(self, p: &'a crate::engine::Proxy, k: usize) -> Option<&'a HotRow> {
-        match self {
-            AnyRows::Shared => SharedRows.row(p, k),
-            AnyRows::Own(o) => o.row(p, k),
-        }
-    }
-    #[inline]
-    fn obj(self, p: &'a crate::engine::Proxy, k: usize) -> Option<(&'a HotRow, &'a TxnCounters)> {
-        match self {
-            AnyRows::Shared => SharedRows.obj(p, k),
-            AnyRows::Own(o) => o.obj(p, k),
-        }
-    }
-}
-
 /// The rows this thread writes for the proxies of `any` (any proxy of the list: they share
 /// one table): its slab under `per-thread`, else the shared sets. Its rows of a proxy that
 /// `clear counters` cleared since are zeroed first (one shared load when none was).
@@ -344,13 +288,6 @@ pub fn own_rows(any: &crate::engine::Proxy) -> Option<OwnRows<'_>> {
         slab.catch_up(table, cleared);
     }
     Some(OwnRows { spans: &table.spans, rows: &slab.rows })
-}
-
-/// [`own_rows`] or the shared sets, as an [`AnyRows`].
-#[inline]
-#[must_use]
-pub fn rows_here(any: &crate::engine::Proxy) -> AnyRows<'_> {
-    own_rows(any).map_or(AnyRows::Shared, AnyRows::Own)
 }
 
 /// The counters of one frontend, one backend or one server: the per-stream ones
@@ -781,4 +718,17 @@ mod tests {
         let got: Vec<u64> = c.hot.hrsp.iter().map(|h| h.load(Ordering::Relaxed)).collect();
         assert_eq!(got, [1, 2, 1, 1, 1, 2]);
     }
+
+    #[test]
+    fn a_slab_is_made_once_per_worker_and_never_compacted() {
+        let mut t = CounterTable::new(&[], 2);
+        assert_eq!(t.slab_rows(), 2, "the guard rows");
+        assert!(t.start_worker(5).is_ok(), "a worker past the table has no slab");
+        assert!(t.start_worker(0).is_ok());
+        assert!(t.start_worker(0).is_ok(), "a second start keeps the slab");
+        let slab = t.slabs[0].get_mut().expect("worker 0's slab");
+        assert_eq!(ibex_alloc::Arena::<HotRow>::compact(slab), 0);
+        assert!(t.slabs[1].get().is_none() && t.slabs.get(5).is_none());
+    }
+
 }

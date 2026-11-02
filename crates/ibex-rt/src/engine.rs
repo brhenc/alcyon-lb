@@ -9617,12 +9617,36 @@ fn count_connect_on<'a, R: crate::statcnt::Rows<'a>>(rows: R, px: &'a Proxy, srv
 /// `srv_inc_sess_ctr` for a connect attempt that failed: the server's `stot` and session
 /// rate count it, as they count the attempt that ends the stream ([`account_stream`]).
 fn count_failed_attempt(proxies: &[Proxy], be_idx: usize, srv_idx: usize) {
-    use crate::statcnt::{Rows as _, Write as _};
     let Some(px) = proxies.get(be_idx) else { return };
-    let rows = crate::statcnt::rows_here(px);
+    match crate::statcnt::own_rows(px) {
+        Some(rows) => count_failed_attempt_on(rows, px, srv_idx),
+        None => count_failed_attempt_on(crate::statcnt::SharedRows, px, srv_idx),
+    }
+}
+
+fn count_failed_attempt_on<'a, R: crate::statcnt::Rows<'a>>(rows: R, px: &'a Proxy, srv_idx: usize) {
+    use crate::statcnt::Write as _;
     if let Some(c) = rows.row(px, crate::statcnt::SRV + srv_idx) {
         rows.w().add(&c.stot, 1);
         c.sess_rate.tick_at(RateCtr::at(crate::statcnt::now_ms()));
+    }
+}
+
+/// A redispatch away from a server the balancer picked: one more `lbtot` on the backend and
+/// on the server left (`old` of `sbe`).
+fn count_redispatch_pick(proxies: &[Proxy], be_idx: usize, sbe_idx: usize, old: Option<usize>) {
+    let (Some(be), Some(sbe)) = (proxies.get(be_idx), proxies.get(sbe_idx)) else { return };
+    match crate::statcnt::own_rows(be) {
+        Some(rows) => count_redispatch_pick_on(rows, be, sbe, old),
+        None => count_redispatch_pick_on(crate::statcnt::SharedRows, be, sbe, old),
+    }
+}
+
+fn count_redispatch_pick_on<'a, R: crate::statcnt::Rows<'a>>(rows: R, be: &'a Proxy, sbe: &'a Proxy, old: Option<usize>) {
+    use crate::statcnt::Write as _;
+    let old = old.and_then(|i| rows.row(sbe, crate::statcnt::SRV + i));
+    for c in rows.row(be, crate::statcnt::BE).into_iter().chain(old) {
+        rows.w().add(&c.lbtot, 1);
     }
 }
 
@@ -9789,12 +9813,7 @@ fn retry_server_connect(
         // The server left was a pick too, if the balancer made it (`cum_lbconn` counts each
         // pick of a server other than the last); the next one is the balancer's.
         if entry.sess.lb_picked {
-            use crate::statcnt::{Rows as _, Write as _};
-            let rows = crate::statcnt::rows_here(&proxies[be_idx]);
-            let old = old_idx.and_then(|i| rows.row(&proxies[entry.srv_backend_idx], crate::statcnt::SRV + i));
-            for c in rows.row(&proxies[be_idx], crate::statcnt::BE).into_iter().chain(old) {
-                rows.w().add(&c.lbtot, 1);
-            }
+            count_redispatch_pick(proxies, be_idx, entry.srv_backend_idx, old_idx);
         }
         entry.sess.lb_picked = true;
         entry.sess.txn.iter_mut().for_each(|txn| {

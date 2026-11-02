@@ -128,9 +128,10 @@ fn start(tag: &str, nbthread: usize, mode: Option<&str>, live: u16, dead: u16, s
              defaults\n  mode http\n  timeout connect 1s\n  timeout client 10s\n  timeout server 10s\n\
              frontend f\n  bind 127.0.0.1:{http}\n  http-request deny if {{ path /deny }}\n\
                http-request return status 404 if {{ path /return }}\n\
-               use_backend bd if {{ path /dead }}\n  default_backend b\n\
+               use_backend bd if {{ path /dead }}\n  use_backend br if {{ path /retry }}\n  default_backend b\n\
              backend b\n  balance roundrobin\n  server s1 127.0.0.1:{live}\n  server s2 127.0.0.1:{live}\n\
              backend bd\n  retries 0\n  server d 127.0.0.1:{dead}\n\
+             backend br\n  balance roundrobin\n  retries 1\n  option redispatch\n  server x 127.0.0.1:{dead}\n  server y 127.0.0.1:{live}\n\
              listen t\n  mode tcp\n  bind 127.0.0.1:{tcp}\n  server s 127.0.0.1:{live}\n\
              frontend p\n  bind 127.0.0.1:{prom}\n  http-request use-service prometheus-exporter\n",
             sock.display()
@@ -182,14 +183,21 @@ fn traffic(d: &Daemon) {
         // One connection at a time, so `smax` does not depend on when the last one closed.
         idle(d);
     }
-    for path in ["/deny", "/deny", "/dead", "/dead", "/dead"] {
+    // `/retry`: the balancer's picks alternate between a dead server, which fails and
+    // redispatches to the live one (a failed attempt, a second `lbtot`), and the live one.
+    for path in ["/deny", "/deny", "/dead", "/dead", "/dead", "/retry", "/retry", "/retry", "/retry"] {
         let mut c = TcpStream::connect(("127.0.0.1", d.http)).expect("connect");
         c.set_read_timeout(Some(Duration::from_secs(10))).ok();
         write!(c, "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("write");
         let mut out = Vec::new();
         let _ = c.read_to_end(&mut out);
         let status = String::from_utf8_lossy(&out).split(' ').nth(1).unwrap_or("").to_string();
-        assert_eq!(status, if path == "/deny" { "403" } else { "503" }, "{path}");
+        let want = match path {
+            "/deny" => "403",
+            "/retry" => "200",
+            _ => "503",
+        };
+        assert_eq!(status, want, "{path}");
         drop(c);
         idle(d);
     }
@@ -349,12 +357,12 @@ fn per_thread_rows_are_a_pool_and_the_start_says_their_size() {
     let line = |out: &str| out.lines().find(|l| l.trim_start().starts_with("- Pool counters (")).map(str::to_string);
     let pools = cli(&per, "show pools");
     let pool = line(&pools).unwrap_or_else(|| panic!("no counters pool in {pools}"));
-    // 5 proxies (f, b, bd, t, p) x 2 rows, and 4 servers: 14 rows a thread, and a guard row
-    // at each end of the thread's slab so that no other object shares its first and last
-    // cache lines: 16 rows a thread, 2 threads.
+    // 6 proxies (f, b, bd, br, t, p) x 2 rows, and 6 servers: 18 rows a thread, and a guard
+    // row at each end of the thread's slab so that no other object shares its first and last
+    // cache lines: 20 rows a thread, 2 threads.
     let size: usize = pool.split(" (").nth(1).and_then(|s| s.split(' ').next()).and_then(|s| s.parse().ok()).expect("size");
     let allocated: usize = pool.split(" : ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse().ok()).expect("allocated");
-    assert_eq!(allocated, 32, "{pool}");
+    assert_eq!(allocated, 40, "{pool}");
     assert!(size >= 200, "{pool}");
 
     let shared = start("pools_shared", 2, Some("shared"), live, dead, Stdio::null());
@@ -367,5 +375,33 @@ fn per_thread_rows_are_a_pool_and_the_start_says_their_size() {
     per.ibex.stderr.take().expect("stderr").read_to_string(&mut err).expect("stderr");
     let notice = err.lines().find(|l| l.contains("tune.ibex.counters per-thread")).unwrap_or_else(|| panic!("no notice in {err:?}"));
     assert!(notice.starts_with("[NOTICE]"), "{notice}");
-    assert!(notice.contains(&format!("{} bytes", 32 * size)), "{notice}");
+    assert!(notice.contains(&format!("{} bytes", 40 * size)), "{notice}");
+}
+
+/// `clear counters` (the maxima only) under `per-thread`: every thread's `rate_max` reads 0 at
+/// once (no thread writes another's row: a reader counts a row of an older clear as no
+/// maximum), the totals stay, and a thread that counts again starts its peak from 0.
+#[test]
+fn clear_counters_zeroes_the_per_thread_rate_maxima_and_keeps_the_totals() {
+    let (live, dead) = (backend(), common::reserve_port());
+    let per = start("maxima", 2, Some("per-thread"), live, dead, Stdio::null());
+    traffic(&per);
+    idle(&per);
+    let col = |d: &Daemon, px: &str, sv: &str, name: &str| -> String {
+        let out = cli(d, "show stat");
+        let mut lines = out.lines();
+        let header: Vec<&str> = lines.next().expect("header").trim_start_matches("# ").split(',').collect();
+        let i = header.iter().position(|h| *h == name).expect("column");
+        lines.map(|l| l.split(',').collect::<Vec<_>>()).find(|f| f[0] == px && f[1] == sv).map(|f| f[i].to_string()).expect("row")
+    };
+    assert_ne!(col(&per, "b", "BACKEND", "rate_max"), "0", "the traffic made a peak");
+    let stot = col(&per, "b", "BACKEND", "stot");
+    assert_eq!(cli(&per, "clear counters"), "\n");
+    for sv in ["BACKEND", "s1", "s2"] {
+        assert_eq!(col(&per, "b", sv, "rate_max"), "0", "b/{sv} rate_max after clear counters");
+    }
+    assert_eq!(col(&per, "b", "BACKEND", "stot"), stot, "clear counters keeps the totals");
+    traffic(&per);
+    idle(&per);
+    assert_ne!(col(&per, "b", "BACKEND", "rate_max"), "0", "a peak after the clear");
 }

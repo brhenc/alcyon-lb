@@ -771,3 +771,21 @@ fn idle_server_connections_are_purged_without_memory() {
     let after = keepalive_get(&mut engine, addr);
     assert!(after.starts_with("HTTP/1.1 200") && after.ends_with("ok"), "after: {after:?}");
 }
+
+/// `tune.ibex.counters per-thread` (T582 Q4): a worker whose counter rows cannot be had does not
+/// start, and says how many bytes it asked for; it never aborts. One frontend and a backend of
+/// seven servers: 2 + 2 + 7 rows and a guard row at each end, 13 rows of 208 bytes.
+#[test]
+fn a_worker_whose_counter_rows_cannot_be_had_does_not_start_and_names_the_size() {
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let addr = common::reserve_addr();
+    let servers: String = (1..=7).map(|i| format!("  server s{i} 127.0.0.1:9 disabled\n")).collect();
+    let cfg = format!("global\n  tune.ibex.counters per-thread\n{DEFAULTS}frontend f\n  bind {addr}\n  default_backend b\nbackend b\n{servers}");
+    let config = ibex_config::parse_str(&cfg).expect("parse");
+    let bytes = 13 * 208;
+    refuse_allocs_here(bytes, 0, 1);
+    let started = Engine::new(&config, 64);
+    refuse_allocs_here(bytes, 0, 0);
+    let err = started.err().expect("the start fails");
+    assert_eq!(err.to_string(), format!("tune.ibex.counters per-thread: cannot allocate the {bytes} bytes of thread 1's counter rows"));
+}
