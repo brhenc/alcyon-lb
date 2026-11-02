@@ -302,6 +302,25 @@ fn a_rewrite_whose_larger_htx_cannot_be_had_is_refused_as_one_without_room() {
     assert!(after.starts_with("HTTP/1.1 200"), "after: {after:?}");
 }
 
+/// A response whose body filled the buffer, with a `http-response` rule: the rules need room
+/// beside it, the buffer must grow, and the larger memory cannot be had: the client gets a `500`
+/// (nothing of the response had gone to it), not the response, and the next stream is served
+/// (X3b-1, `apply_http_response_rules_in`).
+#[test]
+fn a_response_rule_whose_room_cannot_be_had_answers_500() {
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut rsp = b"HTTP/1.1 200 OK\r\nContent-Length: 30000\r\n\r\n".to_vec();
+    rsp.extend_from_slice(&[b'a'; 30000]);
+    let srv = backend(Vec::leak(rsp));
+    let (mut engine, addr) = engine_with("", &format!("  http-response set-header x-a 1\n  default_backend b\nbackend b\n  server s1 {srv}\n"));
+    fail_thread_allocs_from(BUFSIZE + 1);
+    let got = send(&mut engine, addr, GET);
+    fail_thread_allocs_from(usize::MAX);
+    assert!(got.starts_with("HTTP/1.1 500"), "{}", &got[..got.len().min(200)]);
+    let after = send(&mut engine, addr, GET);
+    assert!(after.starts_with("HTTP/1.1 200"), "after: {}", &after[..after.len().min(200)]);
+}
+
 /// `Buf` itself: a buffer whose memory cannot be had is one without memory, a small buffer that
 /// cannot be promoted stays small and full, and a growth that cannot be had leaves it as it was.
 #[test]

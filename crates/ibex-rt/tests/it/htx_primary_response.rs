@@ -7,10 +7,10 @@
 //! to a keep-alive server.
 //!
 //! What is pinned, per response, on the thread that runs the engine (debug builds):
-//! - the response's header list is never copied for the fetches to read
-//!   ([`ibex_rt::reuse::pair_list_copies`]): the rules edit the list the fetches read. Before X3
-//!   it was copied twice before the rules and once after each rule that edited it (4 a response
-//!   with the scenario's two rules);
+//! - (X3, retired by X3b-1) the response's header list was never copied for the fetches to
+//!   read. Before X3 it was copied twice before the rules and once after each rule that edited
+//!   it; since X3b-1 there is no list: the rules edit HTX blocks over the head in the response
+//!   buffer, which the fetches read (`rules_path_work::the_response_rules_take_no_spare_strings`);
 //! - the head is written once with rules and not at all without
 //!   ([`ibex_rt::engine::response_head_writes`]).
 //! (Module of the `it` binary: shares the process, counts its own thread only.)
@@ -69,9 +69,9 @@ fn request(client: &mut TcpStream, engine: &mut Engine) -> String {
     String::from_utf8_lossy(&rsp[..len]).into_owned()
 }
 
-/// `n` responses through a frontend with `rules`: the header-list copies and head writes they
+/// `n` responses through a frontend with `rules`: the head writes they
 /// cost, and the last response.
-fn responses(rules: &str, n: u64) -> (u64, u64, String) {
+fn responses(rules: &str, n: u64) -> (u64, String) {
     let srv = TcpListener::bind("127.0.0.1:0").expect("bind");
     let srv_addr = srv.local_addr().expect("addr");
     let fe = common::reserve_addr();
@@ -85,29 +85,28 @@ fn responses(rules: &str, n: u64) -> (u64, u64, String) {
     let mut c = TcpStream::connect(fe).expect("connect");
     c.set_nonblocking(true).expect("nonblocking");
     let mut last = request(&mut c, &mut engine);
-    let (c0, w0) = (ibex_rt::reuse::pair_list_copies(), ibex_rt::engine::response_head_writes());
+    let w0 = ibex_rt::engine::response_head_writes();
     for _ in 0..n {
         last = request(&mut c, &mut engine);
     }
-    let (copies, writes) = (ibex_rt::reuse::pair_list_copies() - c0, ibex_rt::engine::response_head_writes() - w0);
+    let writes = ibex_rt::engine::response_head_writes() - w0;
     drop(c);
     for _ in 0..5 {
         let _ = engine.run_once();
     }
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
-    (copies, writes, last)
+    (writes, last)
 }
 
-/// With the scenario's two response rules: no copy of the header list, one write of the head.
+/// With the scenario's two response rules: one write of the head.
 #[test]
 fn a_response_head_is_walked_once_and_written_at_most_once() {
     const N: u64 = 20;
-    let (copies, writes, last) = responses(RULES, N);
+    let (writes, last) = responses(RULES, N);
     assert!(last.starts_with("HTTP/1.1 200 OK\r\n") && last.contains("X-Served: ibex\r\n") && !last.contains("Server: be"), "{last:?}");
-    println!("[X3] {N} responses with two rules: {copies} header-list copies, {writes} head writes");
+    println!("[X3] {N} responses with two rules: {writes} head writes");
     if cfg!(debug_assertions) {
-        assert_eq!(copies, 0, "header-list copies in {N} responses");
         assert_eq!(writes, N, "head writes in {N} responses");
     }
 }
@@ -116,9 +115,9 @@ fn a_response_head_is_walked_once_and_written_at_most_once() {
 #[test]
 fn a_response_head_without_rules_is_not_written_again() {
     const N: u64 = 20;
-    let (copies, writes, last) = responses("", N);
+    let (writes, last) = responses("", N);
     assert!(last.starts_with("HTTP/1.1 200 OK\r\nServer: be\r\n"), "{last:?}");
     if cfg!(debug_assertions) {
-        assert_eq!((copies, writes), (0, 0), "header-list copies and head writes in {N} responses");
+        assert_eq!(writes, 0, "head writes in {N} responses");
     }
 }

@@ -1428,35 +1428,61 @@ pub fn scan_connection(head: &[u8]) -> ConnScan {
     out
 }
 
-/// [`rewrite_response_connection`] on a list of headers.
-pub fn apply_response_connection(hdrs: &mut Vec<(String, String)>, rsp_http11: bool, close: bool, req_http11: bool, tunnel: bool) {
+/// X3b: the header block `i` of `h`: its name, its value, and whether the value is Latin-1
+/// text; `None` for a block that is not a header.
+#[must_use]
+pub fn htx_header_at<'h>(h: &'h ibex_proto::htx::HtxSlice<'_>, i: usize) -> Option<(&'h [u8], &'h [u8], bool)> {
+    let r = h.as_ref();
+    let d = r.read_desc(i);
+    let buf = r.buf();
+    (d.blk_type == ibex_proto::htx::HtxBlockType::Header).then(|| (&buf[d.name_range()], &buf[d.value_range()], d.flags & ibex_proto::htx::HTX_BLK_FL_LATIN1 != 0))
+}
+
+/// The `Connection` blocks of `h` as `HAProxy` leaves them ([`clean_connection_value`]):
+/// each edited in place (what is left is shorter) or removed. The tokens seen.
+fn clean_connection_blocks(h: &mut ibex_proto::htx::HtxSlice<'_>) -> ConnTokens {
     let mut tokens = ConnTokens::default();
-    // A header that goes gives its strings back for reuse (T437).
-    let mut i = 0;
-    while i < hdrs.len() {
-        let (k, v) = &mut hdrs[i];
-        if !k.eq_ignore_ascii_case("connection") {
-            i += 1;
-            continue;
-        }
-        match clean_connection_value(v, false, &mut tokens) {
-            Some(c) => {
-                v.clear();
-                v.push_str(&c);
-                i += 1;
+    for i in 0..h.num_blocks() {
+        // `None`: left as it is; `Some(None)`: removed; `Some(Some(c))`: `c` in its place.
+        let cleaned = match htx_header_at(h, i) {
+            // The usual value, one token taken out whole: the header goes, no text of it made.
+            Some((k, v, _)) if k.eq_ignore_ascii_case(b"connection") && (v.eq_ignore_ascii_case(b"keep-alive") || v.eq_ignore_ascii_case(b"close")) => {
+                tokens.keep_alive |= v.len() == 10;
+                tokens.close |= v.len() == 5;
+                Some(None)
             }
-            None => {
-                let (k, v) = hdrs.remove(i);
-                crate::reuse::give(k);
-                crate::reuse::give(v);
+            Some((k, v, latin1)) if k.eq_ignore_ascii_case(b"connection") => match clean_connection_value(&ibex_sample::registry::htx_value_text(v, latin1), false, &mut tokens) {
+                Some(c) if c.as_bytes() == v => None,
+                c => Some(c),
+            },
+            _ => None,
+        };
+        match cleaned {
+            None => {}
+            Some(Some(c)) => {
+                // Shorter than the value it replaces: written in place, no room needed.
+                let r = h.replace_block_value(i, c.as_bytes());
+                debug_assert!(r.is_ok(), "a shorter value fits");
             }
+            Some(None) => h.remove_block(i),
         }
     }
+    tokens
+}
+
+/// [`rewrite_response_connection`] on the header blocks of a response head (X3b): each
+/// `Connection` cleaned, and the token the connection's state calls for added last.
+///
+/// # Errors
+/// [`ibex_proto::htx::HtxError::OutOfMemory`] when the added header has no room.
+pub fn apply_response_connection(h: &mut ibex_proto::htx::HtxSlice<'_>, rsp_http11: bool, close: bool, req_http11: bool, tunnel: bool) -> Result<(), ibex_proto::htx::HtxError> {
+    let tokens = clean_connection_blocks(h);
     if !tunnel {
         if let Some(tok) = response_connection_token(close, rsp_http11, req_http11, tokens.upgrade) {
-            hdrs.push((crate::reuse::string_from("Connection"), crate::reuse::string_from(tok)));
+            return h.retry_after_defrag(|h| h.add_header("Connection", tok));
         }
     }
+    Ok(())
 }
 
 /// What framed a message when `HAProxy` parsed it (T439): `H1_MF_CLEN`, a `Content-Length`
@@ -1471,10 +1497,11 @@ pub struct LenHdrs {
 }
 
 impl LenHdrs {
-    /// What framed a response with headers `hdrs`, before its rules.
+    /// What framed a response with header blocks `h`, before its rules.
     #[must_use]
-    pub fn of_response(hdrs: &[(String, String)]) -> Self {
-        match response_body_framing(hdrs.iter().map(|(k, v)| (k, v)), hdrs.iter().map(|(k, v)| (k, v))) {
+    pub fn of_response(h: ibex_proto::htx::HtxSliceRef<'_>) -> Self {
+        let fields = || h.header_bytes().map(|(k, v, _)| (k, v));
+        match response_body_framing(fields(), fields()) {
             Framing::Length(_) => LenHdrs { clen: true, chnk: false },
             Framing::Chunked => LenHdrs { clen: false, chnk: true },
             _ => LenHdrs::default(),
@@ -1485,32 +1512,9 @@ impl LenHdrs {
 /// The `Connection` headers of a parsed message as `HAProxy` holds them for its rules: the
 /// `close` and `keep-alive` tokens taken out (`h1_parse_connection_header`), and a header
 /// left with nothing gone. A `close` in a `Connection` header after the rules is then one a
-/// rule wrote.
-pub fn strip_connection_tokens(hdrs: &mut Vec<(String, String)>) {
-    if !hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("connection")) {
-        return;
-    }
-    let mut tokens = ConnTokens::default();
-    // The strings of what goes are given back (T437), so a steady stream of responses with a
-    // `Connection` header allocates nothing here.
-    let mut i = 0;
-    while i < hdrs.len() {
-        if !hdrs[i].0.eq_ignore_ascii_case("connection") {
-            i += 1;
-            continue;
-        }
-        match clean_connection_value(&hdrs[i].1, false, &mut tokens) {
-            Some(c) => {
-                crate::reuse::give(std::mem::replace(&mut hdrs[i].1, c));
-                i += 1;
-            }
-            None => {
-                let (k, v) = hdrs.remove(i);
-                crate::reuse::give(k);
-                crate::reuse::give(v);
-            }
-        }
-    }
+/// rule wrote. On the head's blocks, in place (X3b).
+pub fn strip_connection_tokens(h: &mut ibex_proto::htx::HtxSlice<'_>) {
+    clean_connection_blocks(h);
 }
 
 /// The response headers the rules left, read again as `HAProxy` writes them out
@@ -1520,26 +1524,31 @@ pub fn strip_connection_tokens(hdrs: &mut Vec<(String, String)>) {
 /// is to close after it: the rules left it no length it had (`H1_MF_XFER_LEN` gone), or wrote
 /// a `close` (`H1_MF_CONN_CLO`).
 /// The second: a `keep-alive` a rule wrote (`H1_MF_CONN_KAL`).
-pub fn reread_response_after_rules(hdrs: &mut Vec<(String, String)>, was: LenHdrs, status: u16) -> (bool, bool) {
+pub fn reread_response_after_rules(h: &mut ibex_proto::htx::HtxSlice<'_>, was: LenHdrs, status: u16) -> (bool, bool) {
     let bodyless = status < 200 || status == 204;
     let (mut cl, mut te, mut close, mut kal) = (false, false, false, false);
-    hdrs.retain(|(k, v)| {
-        if k.eq_ignore_ascii_case("transfer-encoding") {
+    for i in 0..h.num_blocks() {
+        let Some((k, v, latin1)) = htx_header_at(h, i) else { continue };
+        let keep = if k.eq_ignore_ascii_case(b"transfer-encoding") {
             te |= was.chnk && !bodyless;
-            return was.chnk && !bodyless;
-        }
-        if k.eq_ignore_ascii_case("content-length") {
+            was.chnk && !bodyless
+        } else if k.eq_ignore_ascii_case(b"content-length") {
             // The first only: a second one a rule added is not written (T442).
-            let keep = (was.clen || (bodyless && v.trim() == "0")) && !cl;
+            let keep = (was.clen || (bodyless && v.trim_ascii() == b"0")) && !cl;
             cl |= keep;
-            return keep;
+            keep
+        } else {
+            if k.eq_ignore_ascii_case(b"connection") {
+                let v = ibex_sample::registry::htx_value_text(v, latin1);
+                close |= connection_has(&v, "close");
+                kal |= connection_has(&v, "keep-alive");
+            }
+            true
+        };
+        if !keep {
+            h.remove_block(i);
         }
-        if k.eq_ignore_ascii_case("connection") {
-            close |= connection_has(v, "close");
-            kal |= connection_has(v, "keep-alive");
-        }
-        true
-    });
+    }
     let lost = (was.clen && !cl) || (was.chnk && !te && !cl);
     (close || lost, kal)
 }
@@ -3250,18 +3259,24 @@ mod tests {
         assert_eq!(scan_connection(b"HTTP/1.1 200 OK\r\n\r\nConnection: close\r\n").count, 0);
     }
 
+    /// X3b: the header blocks of `hdrs`, `apply_response_connection` on them, and what is left.
+    fn applied(hdrs: &[(&str, &str)], close: bool, tunnel: bool) -> Vec<(String, String)> {
+        let mut mem = vec![0u8; 1024];
+        let mut h = ibex_proto::htx::HtxSlice::new(&mut mem);
+        for (k, v) in hdrs {
+            h.push_header(k, v).unwrap();
+        }
+        apply_response_connection(&mut h, true, close, true, tunnel).unwrap();
+        h.as_ref().headers().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
     #[test]
     fn a_list_of_headers_is_cleaned_like_a_head() {
-        let mut h = vec![("Connection".to_string(), "x-foo, keep-alive".to_string()), ("Connection".to_string(), "close".to_string())];
-        apply_response_connection(&mut h, true, false, true, false);
-        assert_eq!(h, vec![("Connection".to_string(), "x-foo".to_string())]);
-        let mut h = vec![("Connection".to_string(), "upgrade".to_string())];
-        apply_response_connection(&mut h, true, false, true, false);
-        assert_eq!(h, vec![("Connection".to_string(), "upgrade".to_string())], "an upgrade is left alone");
-        let mut h = Vec::new();
-        apply_response_connection(&mut h, true, true, true, false);
-        assert_eq!(h, vec![("Connection".to_string(), "close".to_string())]);
-        apply_response_connection(&mut Vec::new(), true, false, true, true);
+        let s = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(applied(&[("Connection", "x-foo, keep-alive"), ("Connection", "close")], false, false), vec![s("Connection", "x-foo")]);
+        assert_eq!(applied(&[("Connection", "upgrade")], false, false), vec![s("Connection", "upgrade")], "an upgrade is left alone");
+        assert_eq!(applied(&[], true, false), vec![s("Connection", "close")]);
+        assert_eq!(applied(&[], false, true), vec![]);
     }
 
     #[test]

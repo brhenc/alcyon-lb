@@ -370,6 +370,7 @@ mod response_fetch_in_request;
 mod response_head_validation;
 mod response_te;
 mod response_rule_actions;
+mod response_rule_byte_paths;
 mod retry_on;
 mod retry_on_reused_close;
 mod rfc7239_field;

@@ -291,9 +291,17 @@ fn header_occurrences_from_every_source_of_the_context() {
     check(&SampleContext { htx_slice: Some(slice.as_ref()), ..Default::default() }, "req.", "htx_slice");
 
     check(&SampleContext { res_headers: Some(&hdrs), ..Default::default() }, "res.", "res_headers");
-    ibex_sample::registry::set_current_res_headers(hdrs.clone());
-    check(&SampleContext::default(), "res.", "the response being processed");
-    ibex_sample::registry::set_current_res_headers(Vec::new());
+    // X3b: the response being processed is the HTX blocks its rules edit.
+    struct Head<'h>(ibex_proto::htx::HtxSliceRef<'h>);
+    impl ibex_sample::registry::ResHead for Head<'_> {
+        fn read(&self, f: &mut dyn FnMut(ibex_proto::htx::HtxSliceRef<'_>)) {
+            f(self.0);
+        }
+    }
+    let head = Head(slice.as_ref());
+    let ctx = SampleContext { res_htx: Some(&head), ..Default::default() };
+    check(&ctx, "res.", "the response being processed");
+    assert!(format!("{ctx:?}").contains(&format!("ResHead({} headers)", hdrs.len())), "a context shows its response head");
 }
 
 /// A converter that gives no sample for one occurrence of a multi-value fetch: outside an ACL

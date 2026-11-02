@@ -1581,6 +1581,53 @@ impl<'a> HtxSlice<'a> {
         HtxSliceRef::new(self.buf, self.num_blocks)
     }
 
+    /// An HTTP/1 head written from the blocks into this HTX's own free memory (between the
+    /// values' tail and the descriptors, which no block addresses): `line` (the start line and
+    /// its end of line, in pieces), then each header block as `name: value\r\n`, a Latin-1 value as its
+    /// bytes, then the blank line (X3b: the response rules' head, written once from the blocks
+    /// they edited). Where it starts and its length; `None` when the free memory is too small,
+    /// nothing a block addresses written.
+    pub fn write_h1_head_in_free(&mut self, line: &[&[u8]]) -> Option<(usize, usize)> {
+        let at = self.tail_addr;
+        let end = self.buf.len().saturating_sub(self.num_blocks * HTX_DESC_SIZE);
+        let room = |pos: usize, n: usize| (pos + n <= end).then_some(());
+        let mut pos = at;
+        for piece in line {
+            room(pos, piece.len())?;
+            self.buf[pos..pos + piece.len()].copy_from_slice(piece);
+            pos += piece.len();
+        }
+        for i in 0..self.num_blocks {
+            let desc = read_desc_at(self.buf, self.num_blocks, i);
+            if desc.blk_type != HtxBlockType::Header {
+                continue;
+            }
+            let name = desc.name_range();
+            room(pos, name.len() + 2)?;
+            self.buf.copy_within(name.clone(), pos);
+            pos += name.len();
+            self.buf[pos..pos + 2].copy_from_slice(b": ");
+            pos += 2;
+            let value = desc.value_range();
+            if desc.flags & HTX_BLK_FL_LATIN1 == 0 {
+                room(pos, value.len())?;
+                self.buf.copy_within(value.clone(), pos);
+                pos += value.len();
+            } else {
+                let bytes = ibex_regex::bytetext::text_to_bytes(utf8(&self.buf[value]).unwrap_or_default()).into_owned();
+                room(pos, bytes.len())?;
+                self.buf[pos..pos + bytes.len()].copy_from_slice(&bytes);
+                pos += bytes.len();
+            }
+            room(pos, 2)?;
+            self.buf[pos..pos + 2].copy_from_slice(b"\r\n");
+            pos += 2;
+        }
+        room(pos, 2)?;
+        self.buf[pos..pos + 2].copy_from_slice(b"\r\n");
+        Some((at, pos + 2 - at))
+    }
+
     #[must_use]
     pub fn num_blocks(&self) -> usize {
         self.num_blocks
