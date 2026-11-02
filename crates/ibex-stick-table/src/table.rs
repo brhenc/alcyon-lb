@@ -286,7 +286,18 @@ impl StickTable {
                 }
                 std::borrow::Cow::Owned(StickKey::String(s[..end].to_string()))
             }
-            StickKey::Binary(b) if b.len() > n => std::borrow::Cow::Owned(StickKey::Binary(b[..n].to_vec())),
+            // A binary key is its bytes padded with zeros (`HAProxy` keeps `len` bytes, zero-filled),
+            // so trailing zeros are not part of it: `a` and `a\0` are one key. The tree, which
+            // reads a key as ending in zeros too, could not find such keys again otherwise.
+            StickKey::Binary(b) => {
+                let kept = &b[..b.len().min(n)];
+                let end = kept.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1);
+                if end == b.len() {
+                    std::borrow::Cow::Borrowed(key)
+                } else {
+                    std::borrow::Cow::Owned(StickKey::Binary(b[..end].to_vec()))
+                }
+            }
             _ => std::borrow::Cow::Borrowed(key),
         }
     }
