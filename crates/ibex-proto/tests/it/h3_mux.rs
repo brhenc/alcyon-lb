@@ -119,6 +119,20 @@ fn a_get_becomes_a_head_and_the_end_of_the_message() {
     assert_eq!(m.next_request, 4, "GOAWAY id: the stream after the last one opened");
 }
 
+/// CP2b-1: an h3 head with one host and one content-length reaches the data path through the
+/// facts the writer built: the blocks are not walked again (debug builds count the passes).
+#[test]
+fn a_head_with_one_host_and_one_length_is_not_walked_again() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let mut m = mux();
+    let w0 = ibex_proto::h1::head_walks();
+    m.recv(0, &headers_owned(&post(&[("content-length", "5")])), false, 7).expect("request");
+    assert_eq!(ibex_proto::h1::head_walks() - w0, 0);
+    assert_eq!(m.stream(0).expect("stream").head_facts.content_length, Some(5));
+}
+
 #[test]
 fn a_head_in_pieces_waits_and_arms_the_http_request_timer() {
     let mut m = mux();

@@ -78,3 +78,29 @@ fn a_fragment_let_through_by_relaxed_is_refused_by_the_end_of_the_head() {
     let relaxed = write_request_htx(&decoded(&f), &mut HtxSlice::new(&mut mem), true);
     assert_eq!(relaxed, Err(ibex_proto::h2::HeadError::Invalid));
 }
+
+/// CP2b-1: the request line is read back with the lengths the writer reports, without
+/// splitting it, and agrees with the split; lengths that do not fit the line are refused.
+#[test]
+fn the_request_line_is_read_with_the_writers_lengths() {
+    let f: Vec<(&[u8], &[u8])> = vec![(b":method", b"GET"), (b":scheme", b"https"), (b":path", b"/p?q=1"), (b":authority", b"a.test")];
+    let mut mem = vec![0u8; 16384];
+    let mut s = HtxSlice::new(&mut mem);
+    let facts = write_request_htx(&decoded(&f), &mut s, false).expect("written");
+    let (m, u) = (facts.method_len, facts.uri_len);
+    let view = s.as_ref();
+    let sized = view.req_line_sized(m, u).expect("sized");
+    let split = view.req_line().expect("split");
+    assert_eq!((sized.method, sized.uri, sized.version), (split.method, split.uri, split.version));
+    assert_eq!((sized.method, sized.uri, sized.version), ("GET", "/p?q=1", "HTTP/1.1"));
+    assert!(view.req_line_sized(m + 1, u).is_none(), "a method length off by one");
+    assert!(view.req_line_sized(m, u + 1).is_none(), "a URI length off by one");
+    assert!(view.req_line_sized(m, u + 20).is_none(), "a URI longer than the line");
+    let mut empty = vec![0u8; 64];
+    let e = HtxSlice::new(&mut empty);
+    assert!(e.as_ref().req_line_sized(3, 1).is_none(), "no blocks");
+    let mut hdr = vec![0u8; 256];
+    let mut h = HtxSlice::new(&mut hdr);
+    h.push_header("a", "b").unwrap();
+    assert!(h.as_ref().req_line_sized(3, 1).is_none(), "first block is not a request line");
+}

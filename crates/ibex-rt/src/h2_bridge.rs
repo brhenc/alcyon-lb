@@ -260,7 +260,11 @@ fn start_adopted(sess: &mut TcpSession, rx: RxHead, facts: HeadFacts, abs_len: u
         let htx = ibex_proto::htx::HtxSliceRef::new(rx.bytes(), facts.blocks);
         // The writer wrote a start line of ASCII words (the HTTP/1 line check), and the
         // prefix of text: neither is missing.
-        let line = htx.req_line().unwrap_or(ibex_proto::htx::RequestLineView { method: "", uri: "", version: "" });
+        let line = (!facts.path_raw)
+            .then(|| htx.req_line_sized(facts.method_len, facts.uri_len))
+            .flatten()
+            .or_else(|| htx.req_line())
+            .unwrap_or(ibex_proto::htx::RequestLineView { method: "", uri: "", version: "" });
         if sess.keep_request_line {
             // Text: the writer checked the scheme and the authority.
             let abs = String::from_utf8_lossy(&rx.bytes()[facts.tail..facts.tail + abs_len]);

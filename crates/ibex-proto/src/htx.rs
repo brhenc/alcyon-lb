@@ -870,6 +870,30 @@ impl<'a> HtxSliceRef<'a> {
         None
     }
 
+    /// [`Self::req_line`] of a head the writer made (`write_request_htx`): the request line is the
+    /// first block, `METHOD URI HTTP/1.1`, and the writer knows the lengths of the method and of
+    /// the URI, so nothing is split (CP2b-1). `None` when the block does not read that way
+    /// (callers fall back to [`Self::req_line`]).
+    #[must_use]
+    pub fn req_line_sized(&self, method_len: usize, uri_len: usize) -> Option<RequestLineView<'a>> {
+        if self.num_blocks == 0 {
+            return None;
+        }
+        let desc = self.read_desc(0);
+        if desc.blk_type != HtxBlockType::ReqLine {
+            return None;
+        }
+        let start = desc.addr as usize;
+        let raw = &self.buf[start..start + desc.value_len as usize];
+        let uri_at = method_len + 1;
+        let ver_at = uri_at + uri_len + 1;
+        if ver_at > raw.len() || raw[method_len] != b' ' || raw[ver_at - 1] != b' ' {
+            return None;
+        }
+        let line = utf8(raw).ok()?;
+        Some(RequestLineView { method: &line[..method_len], uri: &line[uri_at..ver_at - 1], version: &line[ver_at..] })
+    }
+
     /// [`Self::req_line`] as bytes: the same words, not read as UTF-8 when the line is
     /// ASCII (every line the parser takes without `accept-unsafe-violations-in-http-request`).
     #[must_use]
