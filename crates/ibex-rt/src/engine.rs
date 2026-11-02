@@ -12000,56 +12000,55 @@ impl EngineDispatcher<'_> {
             self.send_stream_log(fe, err, &line, sd);
             crate::logfmt::recycle_line(line);
         }
-        if let Some(mut entry) = self.sessions.free(session_idx) {
-            if entry.buf_wait.queued() {
-                crate::buf_wait::leave(session_idx);
+        let Some(mut entry) = self.sessions.free(session_idx) else { return };
+        if entry.buf_wait.queued() {
+            crate::buf_wait::leave(session_idx);
+        }
+        let mut park_in = None;
+        if entry.sess.is_h2_child() {
+            // A stream over as its transaction ended (not reset, not ending its
+            // connection, not a panic's) leaves its session to its connection's next
+            // stream (O1b), while the connection serves and keeps fewer than it may
+            // serve at once (this one is among its children still).
+            park_in = entry
+                .sess
+                .h2_child()
+                .filter(|c| close_notify && c.finished && c.conn_end.is_none())
+                .and_then(|c| c.owner)
+                .filter(|&(idx, task)| {
+                    self.sessions.get(idx).filter(|o| o.task == task).is_some_and(|o| {
+                        let max = o.sess.h2_max_children();
+                        let serving = !o.sess.is_done() && matches!(o.sess.cli_state, ScState::Ready | ScState::Established);
+                        serving && o.sess.h2_owner().is_some_and(|h| h.parked.len() + h.children.len() <= max)
+                    })
+                });
+            // The stream is freed in its own run: its variables are in the run's map
+            // until they go back to it here, for its connection's.
+            stream_vars_leave(Some(&mut entry.sess));
+            self.h2_child_released(&mut entry, now, park_in.is_some());
+        } else {
+            if entry.sess.h2_owner().is_some_and(|o| !o.children.is_empty()) {
+                self.h2_owner_released(&mut entry);
             }
-            let mut park_in = None;
-            if entry.sess.is_h2_child() {
-                // A stream over as its transaction ended (not reset, not ending its
-                // connection, not a panic's) leaves its session to its connection's next
-                // stream (O1b), while the connection serves and keeps fewer than it may
-                // serve at once (this one is among its children still).
-                park_in = entry
-                    .sess
-                    .h2_child()
-                    .filter(|c| close_notify && c.finished && c.conn_end.is_none())
-                    .and_then(|c| c.owner)
-                    .filter(|&(idx, task)| {
-                        self.sessions.get(idx).filter(|o| o.task == task).is_some_and(|o| {
-                            let max = o.sess.h2_max_children();
-                            let serving = !o.sess.is_done() && matches!(o.sess.cli_state, ScState::Ready | ScState::Established);
-                            serving && o.sess.h2_owner().is_some_and(|h| h.parked.len() + h.children.len() <= max)
-                        })
-                    });
-                // The stream is freed in its own run: its variables are in the run's map
-                // until they go back to it here, for its connection's.
-                stream_vars_leave(Some(&mut entry.sess));
-                self.h2_child_released(&mut entry, now, park_in.is_some());
-            } else {
-                if entry.sess.h2_owner().is_some_and(|o| !o.children.is_empty()) {
-                    self.h2_owner_released(&mut entry);
-                }
-                // The sessions it kept for its next streams go with it.
-                for idx in entry.sess.h2_owner_mut().map(|o| std::mem::take(&mut o.parked)).unwrap_or_default() {
-                    self.sessions.free_parked(idx);
-                }
-            }
-            if close_notify {
-                entry.sess.close_notify_both();
-            }
-            cleanup_done(
-                &entry,
-                self.proxies,
-                self.fdtab,
-                self.poller,
-                self.listeners,
-            );
-            crate::proxy::give_relay_role(&mut entry.sess);
-            if let Some((owner_idx, owner_task)) = park_in {
-                self.park_h2_child(owner_idx, owner_task, session_idx, entry);
+            // The sessions it kept for its next streams go with it.
+            for idx in entry.sess.h2_owner_mut().map(|o| std::mem::take(&mut o.parked)).unwrap_or_default() {
+                self.sessions.free_parked(idx);
             }
         }
+        if close_notify {
+            entry.sess.close_notify_both();
+        }
+        cleanup_done(
+            &entry,
+            self.proxies,
+            self.fdtab,
+            self.poller,
+            self.listeners,
+        );
+        crate::proxy::give_relay_role(&mut entry.sess);
+        // (Nothing follows: a stream not kept for its connection is done here.)
+        let Some((owner_idx, owner_task)) = park_in else { return };
+        self.park_h2_child(owner_idx, owner_task, session_idx, entry);
     }
 
     /// The session `entry` of a stream of `owner_idx` that is over, slot `idx` (just freed),
