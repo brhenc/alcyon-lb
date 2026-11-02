@@ -946,3 +946,23 @@ fn an_interim_head_is_not_indexed_the_final_one_is() {
     c.receive(&hdrs(1, &[lit(":status", "200"), lit("content-length", "0")], true)).unwrap();
     assert_eq!(c.take_head_index().map(|i| (i.status, i.fields().len())), Some((200, 1)));
 }
+
+/// IBEX-H2SRV-CONT-UNBOUNDED-001: a server's header block is bounded. HAProxy folds the
+/// CONTINUATION frames into one buffer and fails the connection when they do not fit; here
+/// HEADERS without END_HEADERS and endless full CONTINUATION frames are a connection error
+/// (FRAME_SIZE_ERROR, as for HAProxy's "too large CONTINUATION frame") once past 64 KiB,
+/// not 16 MB of `hblock`.
+#[test]
+fn an_endless_continuation_run_is_a_connection_error() {
+    let mut c = ready();
+    let _ = request(&mut c, b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+    let block = vec![0u8; 16384];
+    c.receive(&fr(1, 0, 1, &block)).expect("HEADERS");
+    let mut r = Ok(());
+    let mut sent = 0;
+    while sent < 1000 && r.is_ok() {
+        r = c.receive(&fr(9, 0, 1, &block));
+        sent += 1;
+    }
+    assert_eq!(r, Err(SrvH2Error::Connection(6)), "{sent} CONTINUATION frames of 16384 bytes accepted");
+}

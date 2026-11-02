@@ -494,8 +494,6 @@ pub struct H2MuxContext {
     pub encoder: HpackEncoder,
     pub is_shut: bool,
     pub reset_count: u32,
-    pub ping_count: u32,
-    pub settings_count: u32,
     pub continuation_stream: Option<u32>,
     pub continuation_flags: u8,
     pub continuation_buf: Vec<u8>,
@@ -615,8 +613,6 @@ impl H2MuxContext {
             encoder: HpackEncoder::new(),
             is_shut: false,
             reset_count: 0,
-            ping_count: 0,
-            settings_count: 0,
             continuation_stream: None,
             continuation_flags: 0,
             continuation_buf: Vec::new(),
@@ -1766,11 +1762,6 @@ impl MuxH2 {
                     // Settings ACK received from peer
                     ctx.settings_ack_received = true;
                 } else {
-                    ctx.settings_count = ctx.settings_count.saturating_add(1);
-                    if ctx.settings_count > 100 {
-                        ctx.send_goaway(0, H2Error::EnhanceYourCalm, b"SETTINGS flood detected");
-                        return Ok(());
-                    }
                     // Peer sent settings: validate them all before applying any (RFC 9113
                     // section 6.5.2). HAProxy answers GOAWAY with the last stream processed and
                     // does not acknowledge.
@@ -2022,11 +2013,8 @@ impl MuxH2 {
 
             Frame::Ping { flags, opaque_data } => {
                 if (flags & frame_flags::ACK) == 0 {
-                    ctx.ping_count = ctx.ping_count.saturating_add(1);
-                    if ctx.ping_count > 100 {
-                        ctx.send_goaway(0, H2Error::EnhanceYourCalm, b"PING flood detected");
-                        return Ok(());
-                    }
+                    // No count: HAProxy's `h2c_handle_ping` keeps none. A client that reads
+                    // nothing is held off by the full-output rule in `parse`.
                     // Send PING ACK reply with exact same opaque_data
                     let ping_ack = Frame::Ping {
                         flags: frame_flags::ACK,
@@ -2452,6 +2440,23 @@ mod tests {
         hello.extend_from_slice(&Frame::Settings { flags: 0, settings: vec![] }.encode());
         mux.parse(&mut ctx, &hello).expect("handshake");
         (mux, ctx)
+    }
+
+    /// IBEX-H2-PING-LIFETIME-001: HAProxy 3.5 (`h2c_handle_ping`, `h2c_handle_settings`) keeps no
+    /// count of PING or SETTINGS frames, so a long-lived connection that keeps sending
+    /// keepalive PINGs (or the odd SETTINGS) is never cut. A reader that stops reading is held
+    /// off by the full-output rule, not by a lifetime quota.
+    #[test]
+    fn pings_and_settings_over_a_connection_lifetime_are_never_a_flood() {
+        let (mux, mut ctx) = open_conn();
+        for i in 0..250u64 {
+            mux.parse(&mut ctx, &Frame::Ping { flags: 0, opaque_data: i.to_be_bytes() }.encode()).expect("ping");
+            mux.parse(&mut ctx, &Frame::Settings { flags: 0, settings: vec![] }.encode()).expect("settings");
+            let n = ctx.tx_buf.len();
+            mux.consume_output(&mut ctx, n);
+            ctx.resume();
+        }
+        assert_eq!(ctx.goaway_sent, None, "a connection was cut for pinging");
     }
 
     fn post_headers(id: u32) -> Vec<u8> {

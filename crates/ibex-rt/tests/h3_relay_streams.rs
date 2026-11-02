@@ -776,3 +776,22 @@ fn a_datagram_queued_on_a_pinned_socket_before_its_connect_is_dropped() {
     assert!(to_control, "control: an Initial to the stopping listener is refused (else this test shows nothing)");
     assert!(!to_queued, "the datagram queued on the pinned socket before its connect was answered");
 }
+
+/// IBEX-H3-ANSWERED-GROWTH-001: the set of answered request streams of a connection holds the
+/// streams still open, not every request the connection ever carried.
+#[test]
+fn the_answered_set_does_not_grow_with_the_requests_of_a_connection() {
+    let mut rig = Rig::new();
+    for _ in 0..30 {
+        let id = rig.open(&headers(&[("content-length", "0")]), true);
+        let mut eng = rig.accept();
+        engine_read(&mut eng, &mut rig, b"\r\n\r\n");
+        eng.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").expect("answer");
+        let resp = rig.response(id);
+        assert_eq!(status(&resp), 200);
+    }
+    for _ in 0..50 {
+        rig.step();
+    }
+    assert!(rig.server.answered_streams() <= 4, "answered set holds {} streams after 30 finished requests", rig.server.answered_streams());
+}

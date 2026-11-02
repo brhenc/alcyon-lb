@@ -330,9 +330,10 @@ fn rapid_reset_flood_triggers_goaway_enhance_your_calm() {
     );
 }
 
-/// PING flood triggers GOAWAY with `ENHANCE_YOUR_CALM` (0xb).
+/// HAProxy 3.5 keeps no PING count (`h2c_handle_ping`): 150 PINGs draw no GOAWAY
+/// (IBEX-H2-PING-LIFETIME-001).
 #[test]
-fn ping_flood_triggers_goaway_enhance_your_calm() {
+fn a_ping_burst_is_acked_and_never_a_goaway() {
     let (backend_port, _) = spawn_backend();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2pingflood_{}.cfg", std::process::id()));
@@ -381,16 +382,19 @@ fn ping_flood_triggers_goaway_enhance_your_calm() {
     }
     let _ = std::fs::remove_file(&cfg);
 
-    let has_goaway = resp.windows(9).any(|hdr| hdr[3] == 0x07);
-    assert!(
-        has_goaway,
-        "PING flood must trigger a GOAWAY frame from the daemon"
-    );
+    // Walk the frames: a byte of PING payload can equal 0x07 anywhere.
+    let (mut at, mut has_goaway) = (0, false);
+    while at + 9 <= resp.len() {
+        has_goaway |= resp[at + 3] == 0x07;
+        at += 9 + ((usize::from(resp[at]) << 16) | (usize::from(resp[at + 1]) << 8) | usize::from(resp[at + 2]));
+    }
+    assert!(!has_goaway, "a PING burst must not draw a GOAWAY");
 }
 
-/// SETTINGS flood triggers GOAWAY with `ENHANCE_YOUR_CALM` (0xb).
+/// HAProxy 3.5 keeps no SETTINGS count (`h2c_handle_settings`): 150 SETTINGS are answered, no
+/// GOAWAY (IBEX-H2-PING-LIFETIME-001).
 #[test]
-fn settings_flood_triggers_goaway_enhance_your_calm() {
+fn a_settings_burst_is_acked_and_never_a_goaway() {
     let (backend_port, _) = spawn_backend();
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("ibex_h2setflood_{}.cfg", std::process::id()));
@@ -440,10 +444,7 @@ fn settings_flood_triggers_goaway_enhance_your_calm() {
     let _ = std::fs::remove_file(&cfg);
 
     let has_goaway = resp.windows(9).any(|hdr| hdr[3] == 0x07);
-    assert!(
-        has_goaway,
-        "SETTINGS flood must trigger a GOAWAY frame from the daemon"
-    );
+    assert!(!has_goaway, "a SETTINGS burst must not draw a GOAWAY");
 }
 
 /// An HTTP/1 backend that records every complete request header block it receives.

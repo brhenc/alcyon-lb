@@ -296,7 +296,8 @@ struct H3State {
     /// Bytes accumulated per request stream. A HEADERS frame can arrive split across
     /// datagrams, so a readable event is not a complete frame.
     req: HashMap<StreamId, Vec<u8>>,
-    /// Request streams already answered, so a second readable event does not answer twice.
+    /// Request streams already answered, so a second readable event does not answer twice;
+    /// dropped when the stream finishes or is reset, so it holds the streams in flight.
     answered: Vec<StreamId>,
     /// Responses written in full whose last byte the peer has not yet acknowledged. Closing
     /// the connection before then abandons them.
@@ -624,6 +625,13 @@ impl QuicListener {
     #[must_use]
     pub fn pending_request_bytes(&self) -> usize {
         self.conns.iter().flatten().filter_map(|c| c.h3.as_ref()).flat_map(|st| st.req.values()).map(Vec::len).sum()
+    }
+
+    /// Request streams remembered as answered, over every connection (for tests).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn answered_streams(&self) -> usize {
+        self.conns.iter().flatten().filter_map(|c| c.h3.as_ref()).map(|st| st.answered.len()).sum()
     }
 
     /// How the peer of `conn` acknowledges (T569), for the `ibex_fc_quic_ack_*` fetches of
@@ -1080,6 +1088,8 @@ impl QuicListener {
                     if let Some(st) = slot.h3.as_mut() {
                         st.req.remove(&stream_id);
                         st.unacked.retain(|s| *s != stream_id);
+                        // Done with: no event for it comes again, so it is no longer remembered.
+                        st.answered.retain(|s| *s != stream_id);
                     }
                     if close {
                         self.endpoint.close_connection(conn, H3_NO_ERROR, b"");
@@ -1488,7 +1498,7 @@ impl QuicListener {
         // Its request and its wait for an acknowledgement go (a connection the relay never
         // gave HTTP/3 state has neither). One expression: there is no other branch to take.
         let st = slot_of(&mut self.conns, conn_id).and_then(|s| s.h3.as_mut());
-        st.map(|st| (st.req.remove(&stream_id), st.unacked.retain(|s| *s != stream_id)));
+        st.map(|st| (st.req.remove(&stream_id), st.unacked.retain(|s| *s != stream_id), st.answered.retain(|s| *s != stream_id)));
         for r in &mut self.relays {
             if r.conn == conn_id && r.stream_id == stream_id {
                 r.done = true;
