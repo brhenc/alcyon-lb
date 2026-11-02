@@ -62,6 +62,7 @@ fn an_expression_with_an_unknown_fetch_is_not_compiled_and_still_evaluates() {
     assert!(!format!("{e:?}").contains("Compiled"));
     assert!(e.eval_all_samples(&reg, &ctx).is_empty());
     assert_eq!(e.eval_sample(&reg, &ctx), None);
+    assert!(e.eval_smp(&reg, &ctx).is_none(), "the bytes form takes the by-name path too (R4)");
     assert!(!e.eval(&reg, &ctx));
     let known = Expr::parse("str(abc),upper -m str ABC").unwrap();
     assert!(format!("{known:?}").contains("Compiled"), "{known:?}");
