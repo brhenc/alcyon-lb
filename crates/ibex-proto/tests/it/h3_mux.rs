@@ -105,11 +105,15 @@ fn a_get_becomes_a_head_and_the_end_of_the_message() {
     assert_eq!(st.rx_htx().blocks(), &[HtxBlock::Eoh, HtxBlock::Eom]);
     assert_eq!(st.state, H3StreamState::HalfClosedRemote);
     assert_eq!(st.known_body, Some(0), "FIN with the head: bodyless");
-    let head = st.req_head().expect("head");
-    assert_eq!(head.method(), "GET");
-    assert_eq!(head.uri(), "/plain");
-    assert_eq!(head.get_header("host"), Some(&b"localhost"[..]));
-    assert_eq!(head.abs_prefix(), Some("https://localhost"));
+    // CP2b: the head is the blocks the mux wrote, no fields.
+    assert!(st.req_head().is_none() && !st.no_memory);
+    let head = st.request_htx().expect("head");
+    let line = head.req_line().expect("start line");
+    assert_eq!((line.method, line.uri), ("GET", "/plain"));
+    let host: Vec<_> = head.header_blocks_where(|n| n == b"host").map(|(_, _, v)| v).collect();
+    assert_eq!(host, ["localhost"]);
+    let rx = st.rx_head.as_ref().expect("memory");
+    assert_eq!(&rx.bytes()[st.head_facts.tail..][..st.abs_len], b"https://localhost");
     assert_eq!(signals(&mut m), vec![]);
     assert_eq!(m.head_partial(), None);
     assert_eq!(m.next_request, 4, "GOAWAY id: the stream after the last one opened");
@@ -607,12 +611,12 @@ fn the_trait_serves_a_stream_as_the_bridge_will() {
         let id = m.next_dispatch()?;
         let st = m.stream_mut(id)?;
         st.set_dispatched();
-        let head = st.take_req_fields()?;
-        assert!(st.req_head().is_none());
+        assert!(st.take_req_fields().is_none() && !st.no_memory());
+        let (rx, facts, abs_len) = st.take_rx_head()?;
+        assert!(st.take_rx_head().is_none());
         assert!(!st.is_reset() && !st.bad_request() && st.rx_buffered() == 0);
-        let wire = String::from_utf8_lossy(&head.to_wire()).into_owned();
-        assert!(wire.starts_with("GET /plain HTTP/1.1\r\n"), "{wire}");
-        m.give_back_head(head);
+        assert_eq!((facts.method_len, facts.uri_len, abs_len), (3, "/plain".len(), "https://localhost".len()));
+        assert!(rx.len() >= facts.tail);
         assert!(m.send_head(id, b"HTTP/1.1 200 OK", false));
         let n = m.data_budget(id).min(2);
         assert_eq!(m.send_data(id, &b"ok"[..n], true), 2);
@@ -782,4 +786,43 @@ fn a_head_from_its_fields_is_the_head_from_its_text() {
     let before = m.tx_bytes(0).to_vec();
     assert!(m.send_head_fields(0, 200, [("x-a", &b"a"[..])].into_iter(), false), "taken and dropped");
     assert_eq!(m.tx_bytes(0), &before[..]);
+}
+
+/// CP2b: no memory for the head's blocks keeps it as its fields and flags the stream, which
+/// the data path answers 500 (S5); the connection goes on and the next stream is written as
+/// blocks.
+#[test]
+fn no_memory_for_a_head_keeps_its_fields_and_flags_the_stream() {
+    fn none(_: usize) -> Option<ibex_proto::htx::RxHead> {
+        None
+    }
+    let mut m = mux();
+    m.take_rx_head = none;
+    m.recv(0, &headers(GET), true, 0).expect("request");
+    let st = m.stream_mut(0).expect("stream");
+    assert!(st.no_memory() && st.request_htx().is_none() && st.take_rx_head().is_none());
+    let head = st.take_req_fields().expect("the fields");
+    assert_eq!((head.method(), head.uri()), ("GET", "/plain"));
+    assert_eq!(signals(&mut m), vec![], "no stream error: the data path answers");
+    m.take_rx_head = |n| Some(ibex_proto::htx::RxHead::from_box(vec![0; n * 2].into_boxed_slice()));
+    m.recv(4, &headers(GET), true, 0).expect("request");
+    let st = m.stream(4).expect("stream");
+    assert!(!st.no_memory() && st.request_htx().is_some() && st.req_head().is_none());
+}
+
+/// CP2b: a head the HTTP/1 checks refuse but `accept-unsafe-violations-in-http-request` lets
+/// through (a blank in the path) is kept as its fields, flagged bad (h2's 400); without the
+/// option it is a message error over h3, and its memory is given back.
+#[test]
+fn a_head_the_http1_checks_refuse_is_kept_as_its_fields_under_the_relaxed_option() {
+    let bad: &[(&str, &str)] = &[(":method", "GET"), (":scheme", "https"), (":authority", "localhost"), (":path", "/a b")];
+    let mut m = mux();
+    m.relaxed_path = true;
+    m.recv(0, &headers(bad), true, 0).expect("request");
+    let st = m.stream(0).expect("stream");
+    assert!(st.bad_request && st.request_htx().is_none() && !st.no_memory);
+    assert_eq!(st.req_head().expect("the fields").uri(), "/a b");
+    let mut m = mux();
+    m.recv(0, &headers(bad), true, 0).expect("request");
+    assert_eq!(stream_error(&signals(&mut m), 0), Some(0x10e), "H3_MESSAGE_ERROR");
 }

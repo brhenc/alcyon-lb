@@ -241,3 +241,36 @@ fn an_h3_request_through_the_mux_allocates_at_most_the_pinned_count() {
 fn an_h3_post_through_the_mux_allocates_at_most_the_pinned_count() {
     assert_pinned("POST", b"hello");
 }
+
+/// CP2b (`docs/design/copies-2026-11-02.md` section 3.1, row S2): an h3 request head is written
+/// into memory once, by the mux, as the HTX blocks of the buffer the stream then owns. Before
+/// CP2b the mux wrote it into an `H2ReqHead` and the bridge wrote it again as blocks: twice the
+/// head's bytes per request (`ibex_proto::htx::head_bytes_written`, debug builds). The head
+/// here: `GET`, `/`, `host: localhost`, 17 bytes.
+#[test]
+fn an_h3_request_head_is_copied_once() {
+    const N: u64 = 20;
+    const HEAD: u64 = 3 + 1 + 4 + 9;
+    let running = Arc::new(AtomicBool::new(true));
+    let (be, h) = backend(Arc::clone(&running));
+    let mut rig = Rig::new(be);
+    let f: Vec<(String, String)> = [(":method", "GET"), (":scheme", "https"), (":authority", "localhost"), (":path", "/")]
+        .iter()
+        .map(|(a, b)| ((*a).to_string(), (*b).to_string()))
+        .collect();
+    let mut req = Vec::new();
+    ibex_proto::mux_h3::encode_frame(&mut req, 0x01, &ibex_proto::mux_h3::encode_field_section(&f));
+    rig.request(&req);
+    let b0 = ibex_proto::htx::head_bytes_written();
+    for _ in 0..N {
+        rig.request(&req);
+    }
+    let bytes = ibex_proto::htx::head_bytes_written() - b0;
+    println!("{N} h3 requests: {bytes} head bytes written ({HEAD} a head)");
+    if cfg!(debug_assertions) {
+        assert_eq!(bytes, N * HEAD, "{N} h3 requests of a {HEAD}-byte head wrote {bytes} head bytes");
+    }
+    drop(rig);
+    running.store(false, Ordering::Relaxed);
+    let _ = h.join();
+}

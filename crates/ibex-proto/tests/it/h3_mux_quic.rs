@@ -235,9 +235,9 @@ impl Pair {
         while let Some(id) = mux.next_dispatch() {
             let st = mux.stream_mut(id).expect("stream");
             st.set_dispatched();
-            let head = st.take_req_fields().expect("head");
-            self.children.insert(id, Child { path: head.uri().to_string(), ..Child::default() });
-            mux.give_back_head(head);
+            let (rx, facts, _) = st.take_rx_head().expect("head");
+            let line = ibex_proto::htx::HtxSliceRef::new(rx.bytes(), facts.blocks).req_line().expect("start line").uri.to_string();
+            self.children.insert(id, Child { path: line, ..Child::default() });
         }
         for (&id, child) in &mut self.children {
             let Some(st) = mux.stream_mut(id) else { continue };

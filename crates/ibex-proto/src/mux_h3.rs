@@ -278,9 +278,9 @@ pub fn take_request_headers(buf: &[u8], max_frame: usize) -> Result<Option<Vec<u
 // A connection error is `Err` from `recv` and stays in [`H3MuxContext::error`]: the owner
 // closes the connection with that code. Design: `docs/design/h3-engine-2026-10-26.md` §2-§6.
 
-use crate::h2::{check_request_fields, check_trailer_fields};
+use crate::h2::{check_request_fields, check_trailer_fields, HeadFacts};
 use crate::hpack::DecodedFields;
-use crate::htx::{HeaderField, Htx, HtxBlock};
+use crate::htx::{HeaderField, Htx, HtxBlock, RxHead};
 use crate::htx_mux::{HtxMux, HtxStream, MuxReset};
 use crate::mux_h2::{status_text, H2ReqHead, StreamMap};
 use crate::qpack::{decode_decoder_stream, decode_encoder_stream, decode_qpack_static_into};
@@ -391,8 +391,21 @@ pub struct H3StreamCtx {
     pub interim_sent: bool,
     /// A request `HAProxy` takes and answers 400 ([`check_request_fields`]).
     pub bad_request: bool,
-    /// The head as its checked fields, as h2's (T437, E1), until the data path takes it.
+    /// The head as its checked fields, as h2's (T437, E1), until the data path takes it: only
+    /// for a head [`Self::rx_head`] does not hold (one the HTTP/1 checks refuse, no memory).
     pub req_head: Option<Box<H2ReqHead>>,
+    /// CP2b: the request head as the HTX blocks the mux wrote ([`crate::h2::write_request_htx`])
+    /// into the memory the stream's buffer adopts, once from the decoded fields; `None` until
+    /// the head comes, once the data path has taken it, and for a head kept in
+    /// [`Self::req_head`].
+    pub rx_head: Option<RxHead>,
+    /// What [`Self::rx_head`]'s writer said of the head.
+    pub head_facts: HeadFacts,
+    /// The bytes of `scheme://authority` after the head's payload in [`Self::rx_head`].
+    pub abs_len: usize,
+    /// No memory could be had for the head's blocks ([`H3MuxContext::take_rx_head`]): kept as
+    /// its fields, and the stream answered 500 by the data path (S5).
+    pub no_memory: bool,
     pub content_length: Option<u64>,
     /// The body's length when the whole request came with its head (FIN in that read):
     /// HAProxy's h1 side then writes a `content-length`, not chunks.
@@ -413,6 +426,13 @@ impl H3StreamCtx {
         &self.tx[self.tx_head..]
     }
 
+    /// The request head as the HTX blocks the mux wrote ([`Self::rx_head`]), until the data
+    /// path takes it.
+    #[must_use]
+    pub fn request_htx(&self) -> Option<crate::htx::HtxSliceRef<'_>> {
+        self.rx_head.as_ref().map(|rx| crate::htx::HtxSliceRef::new(rx.bytes(), self.head_facts.blocks))
+    }
+
     fn is_live(&self) -> bool {
         !matches!(self.state, H3StreamState::Reset(_))
     }
@@ -420,7 +440,7 @@ impl H3StreamCtx {
 
 impl Poolable for H3StreamCtx {
     fn footprint(&self) -> usize {
-        std::mem::size_of::<Self>() + self.rx.capacity() + self.tx.capacity() + self.req_head.as_ref().map_or(0, |h| h.capacity())
+        std::mem::size_of::<Self>() + self.rx.capacity() + self.tx.capacity() + self.req_head.as_ref().map_or(0, |h| h.capacity()) + self.rx_head.as_ref().map_or(0, RxHead::len)
     }
 
     fn reset(&mut self, wipe: bool) {
@@ -486,6 +506,10 @@ pub struct H3MuxContext {
     // Boxed: the bridge takes a head as the `Box` h2's `H2Dispatch` carries, and gives it back.
     #[allow(clippy::vec_box)]
     spare_heads: Vec<Box<H2ReqHead>>,
+    /// Where a request head is written (CP2b, [`H3StreamCtx::rx_head`]): memory for a head of
+    /// an estimated `need` bytes of HTX, `None` when there is none. The data path's pool
+    /// (`Buf::take_rx_head`); without one, the heap.
+    pub take_rx_head: fn(usize) -> Option<RxHead>,
     /// A field section being encoded, kept for the next.
     scratch: Vec<u8>,
     /// A header name lowercased, kept for the next.
@@ -545,6 +569,7 @@ impl H3MuxContext {
             signals: VecDeque::new(),
             decoded: DecodedFields::default(),
             spare_heads: Vec::new(),
+            take_rx_head: crate::mux_h2::heap_rx_head,
             scratch: Vec::new(),
             lower: Vec::new(),
             tx_last: None,
@@ -638,9 +663,9 @@ impl H3MuxContext {
 
     /// Frames what stream `id` holds.
     fn demux_req(&mut self, id: u64) -> Result<(), H3Error> {
-        let Self { streams, decoded, spare_heads, relaxed_path, .. } = self;
+        let Self { streams, decoded, spare_heads, relaxed_path, take_rx_head, .. } = self;
         let Some(st) = streams.get_mut(&id) else { return Ok(()) };
-        let mut shared = Shared { decoded, spare_heads, relaxed: *relaxed_path };
+        let mut shared = Shared { decoded, spare_heads, take_rx: *take_rx_head, relaxed: *relaxed_path };
         if let Some(code) = demux(st, &mut shared)? {
             if code != REQUEST_REJECTED {
                 self.glitch_count += 1;
@@ -897,6 +922,7 @@ struct Shared<'a> {
     decoded: &'a mut DecodedFields,
     #[allow(clippy::vec_box)]
     spare_heads: &'a mut Vec<Box<H2ReqHead>>,
+    take_rx: fn(usize) -> Option<RxHead>,
     relaxed: bool,
 }
 
@@ -1041,13 +1067,6 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
     if method.is_none() || !scheme || !path || !authority {
         return Ok(Some(MESSAGE_ERROR));
     }
-    let Ok(bad) = check_request_fields(f.iter(), sh.relaxed) else { return Ok(Some(MESSAGE_ERROR)) };
-    // What h2 takes and answers 400 (a method or scheme that is not a token) is a message
-    // error over h3: measured on 3.5-dev7 (T509). A `:path` with a blank under
-    // `option accept-unsafe-violations-in-http-request` keeps h2's 400 (not measured).
-    if bad && !sh.relaxed {
-        return Ok(Some(MESSAGE_ERROR));
-    }
     let mut cl = None;
     for (_, v) in f.iter().filter(|(n, _)| *n == b"content-length") {
         match std::str::from_utf8(v).ok().and_then(crate::h2::content_length_value) {
@@ -1059,14 +1078,37 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
     if last && cl.is_some_and(|c| c != 0) {
         return Ok(Some(MESSAGE_ERROR));
     }
-    let mut head = st.req_head.take().or_else(|| sh.spare_heads.pop()).unwrap_or_default();
-    if head.write(f).is_err() {
-        if sh.spare_heads.len() < SPARE_HEADS {
-            sh.spare_heads.push(head);
+    // Written once, as the blocks of the memory the stream's buffer adopts (CP2b). A head the
+    // HTTP/1 checks refuse (a `:path` that is not UTF-8), and no memory for the blocks, are kept
+    // as their fields; there is no extended CONNECT over h3 (`:protocol` is refused above).
+    // What h2 takes and answers 400 (a method or scheme that is not a token) is a message
+    // error over h3: measured on 3.5-dev7 (T509). A `:path` with a blank under
+    // `option accept-unsafe-violations-in-http-request` keeps h2's 400 (not measured).
+    let bad;
+    match crate::mux_h2::write_head(f, sh.take_rx, sh.relaxed) {
+        crate::mux_h2::HeadOut::Refused => return Ok(Some(MESSAGE_ERROR)),
+        crate::mux_h2::HeadOut::Blocks { rx, facts, abs_len } => {
+            debug_assert!(!facts.ext_connect);
+            bad = facts.bad_request;
+            st.head_facts = facts;
+            st.abs_len = abs_len;
+            st.rx_head = Some(rx);
         }
+        crate::mux_h2::HeadOut::Fields { no_memory } => {
+            st.no_memory = no_memory;
+            // The writer took the fields (`Refused` is the other verdict on a malformed one).
+            bad = check_request_fields(f.iter(), sh.relaxed) == Ok(true);
+            let mut head = st.req_head.take().or_else(|| sh.spare_heads.pop()).unwrap_or_default();
+            // The writer took these fields, so `write` does (the differential's rows).
+            let written = head.write(f);
+            debug_assert!(written.is_ok(), "the writer took the fields: {written:?}");
+            st.req_head = Some(head);
+        }
+    }
+    if bad && !sh.relaxed {
+        // The head's memory goes back with `st.rx_head`/`st.req_head` when the stream does.
         return Ok(Some(MESSAGE_ERROR));
     }
-    st.req_head = Some(head);
     st.bad_request = bad;
     st.content_length = cl;
     st.rx_htx.push(HtxBlock::Eoh);
@@ -1209,6 +1251,12 @@ impl HtxStream for H3StreamCtx {
     }
     fn take_req_fields(&mut self) -> Option<Box<H2ReqHead>> {
         self.req_head.take()
+    }
+    fn take_rx_head(&mut self) -> Option<(RxHead, HeadFacts, usize)> {
+        self.rx_head.take().map(|rx| (rx, self.head_facts, self.abs_len))
+    }
+    fn no_memory(&self) -> bool {
+        self.no_memory
     }
     fn bad_request(&self) -> bool {
         self.bad_request

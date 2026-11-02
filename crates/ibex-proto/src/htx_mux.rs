@@ -7,7 +7,8 @@
 //! bytes, so one bridge (`h2_bridge`, generic over this in slice H3a) serves both, as
 //! `HAProxy`'s `h2s` and `qcs` both feed a `struct stream`.
 
-use crate::htx::Htx;
+use crate::h2::HeadFacts;
+use crate::htx::{Htx, RxHead};
 use crate::mux_h2::H2ReqHead;
 
 /// Why the data path resets a stream, in each protocol's code.
@@ -38,6 +39,12 @@ pub trait HtxStream {
     /// The request head as its checked fields (T437, E1), until the data path takes it.
     fn req_head(&self) -> Option<&H2ReqHead>;
     fn take_req_fields(&mut self) -> Option<Box<H2ReqHead>>;
+    /// CP2b: the request head as the HTX blocks the mux wrote into the memory the stream's
+    /// buffer adopts, what the writer said of them and the length of the `scheme://authority`
+    /// after them; `None` for a head kept as its fields.
+    fn take_rx_head(&mut self) -> Option<(RxHead, HeadFacts, usize)>;
+    /// No memory could be had for the head's blocks: the stream is answered 500 (S5).
+    fn no_memory(&self) -> bool;
     /// A request `HAProxy` takes and answers 400.
     fn bad_request(&self) -> bool;
     /// The request's `content-length`, as the mux read it (one value, however the client

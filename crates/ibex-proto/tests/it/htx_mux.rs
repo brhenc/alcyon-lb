@@ -124,11 +124,13 @@ impl RxTaken for H2MuxContext {
 
 /// What the bridge will do, generic over the mux: every call goes through the trait.
 fn respond<M: HtxMux>(m: &mut M, id: u64) {
-    // An h3 head is its fields; an h2 one the blocks the mux wrote (CP2a), which the stream
-    // drops with it.
+    // Both muxes write the head as blocks (CP2a, CP2b), which the stream drops with it; the
+    // fields are the cold fallback.
     if let Some(head) = m.stream_mut(id).and_then(HtxStream::take_req_fields) {
         m.give_back_head(head);
     }
+    assert!(m.stream(id).is_some_and(|st| !st.no_memory()));
+    drop(m.stream_mut(id).and_then(HtxStream::take_rx_head));
     assert!(m.send_interim(id, b"HTTP/1.1 100 Continue"));
     assert!(m.send_head(id, b"HTTP/1.1 200 OK", false));
     let n = m.data_budget(id).min(2);

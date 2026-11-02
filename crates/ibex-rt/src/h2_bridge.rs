@@ -48,8 +48,9 @@ pub enum DispatchHead {
     /// CP2: the HTX blocks the h2 mux wrote from the decoded fields
     /// ([`ibex_proto::h2::write_request_htx`]), in the memory that becomes the stream's
     /// `htx_buf` ([`Buf::adopt`]), what the writer said of them, and the length of the
-    /// `scheme://authority` written after them (the log line's).
-    Htx { rx: RxHead, facts: HeadFacts, abs_len: usize },
+    /// `scheme://authority` written after them (the log line's), and the protocol version the
+    /// log line ends with.
+    Htx { rx: RxHead, facts: HeadFacts, abs_len: usize, version: &'static str },
     /// The head as its checked fields, as the client sent them (without the
     /// `transfer-encoding: chunked` a request with no length goes out with), with its start
     /// line: memory of the connection's, given back once the transaction has started
@@ -90,7 +91,7 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
         let facts = stream.head_facts;
         let abs_len = stream.abs_len;
         let size = 20 + facts.method_len + abs_len + facts.uri_len + "HTTP/2.0".len() + 1 + facts.field_bytes;
-        (DispatchHead::Htx { rx, facts, abs_len }, None, size as u64, None)
+        (DispatchHead::Htx { rx, facts, abs_len, version: "HTTP/2.0" }, None, size as u64, None)
     } else {
         // The head as the mux kept it (T437); the stream keeps none past this.
         let head = stream.req_head.take()?;
@@ -120,7 +121,7 @@ pub fn dispatch_next(h2: &mut H2MuxContext, keep_request_line: bool) -> Option<H
 /// served next, marked served. `version` is what `%r` prints after the target. A stream id
 /// past `u32` (2^30 requests on one connection) is refused, as the stream entries count
 /// in `u32`.
-pub fn dispatch_mux<M: HtxMux>(mux: &mut M, keep_request_line: bool, version: &str) -> Option<H2Dispatch> {
+pub fn dispatch_mux<M: HtxMux>(mux: &mut M, keep_request_line: bool, version: &'static str) -> Option<H2Dispatch> {
     let id = mux.next_dispatch()?;
     let Ok(id32) = u32::try_from(id) else {
         mux.reset(id, MuxReset::Refused);
@@ -134,6 +135,25 @@ pub fn dispatch_mux<M: HtxMux>(mux: &mut M, keep_request_line: bool, version: &s
     let eom = stream.rx_htx().is_eom();
     let cl = stream.content_length();
     let bad_request = stream.bad_request();
+    if let Some((rx, facts, abs_len)) = stream.take_rx_head() {
+        // The head as the mux wrote it (CP2b): framed as an h2 one is.
+        let chunked = cl.is_none() && (has_data || !eom);
+        let size = 20 + facts.method_len + abs_len + facts.uri_len + version.len() + 1 + facts.field_bytes;
+        return Some(H2Dispatch {
+            stream: H2ActiveStream {
+                id: id32,
+                body: H2ReqBody { cursor: first_body, off: 0, chunked, ..H2ReqBody::default() },
+                chunk_out: chunked,
+            },
+            head: DispatchHead::Htx { rx, facts, abs_len, version },
+            req_htx: (size as u64).saturating_sub(u64::from(chunked)),
+            request_line: None,
+            bad_request,
+            no_memory: false,
+            add_len: None,
+        });
+    }
+    let no_memory = stream.no_memory();
     let head = stream.take_req_fields()?;
     let has_len = cl.is_some();
     // A body without `content-length` goes chunked, also when all of it came with the head
@@ -153,7 +173,7 @@ pub fn dispatch_mux<M: HtxMux>(mux: &mut M, keep_request_line: bool, version: &s
         req_htx,
         request_line,
         bad_request,
-        no_memory: false,
+        no_memory,
         add_len,
     })
 }
@@ -197,8 +217,8 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Option<Box<H2ReqHe
     }
     sess.strm.log.request = Some(crate::txnlog::loop_now());
     match d.head {
-        DispatchHead::Htx { rx, facts, abs_len } => {
-            start_adopted(sess, rx, facts, abs_len, chunked);
+        DispatchHead::Htx { rx, facts, abs_len, version } => {
+            start_adopted(sess, rx, facts, abs_len, version, chunked);
             let no_mem = !sess.req.alloc_if_needed();
             start_txn(sess, adopted_framing(facts, chunked), adopted_req_htx(d.req_htx, facts), d.bad_request, no_mem);
             None
@@ -235,7 +255,7 @@ fn digits(n: u64) -> usize {
 /// [`start_request`] of a head the h2 mux wrote as HTX blocks into `rx` (CP2): the memory
 /// becomes the stream's `htx_buf` as it is, and the log fields are read from its start line
 /// (and the `scheme://authority` after its payload, `abs_len` bytes) before it does.
-fn start_adopted(sess: &mut TcpSession, rx: RxHead, facts: HeadFacts, abs_len: usize, chunked: bool) {
+fn start_adopted(sess: &mut TcpSession, rx: RxHead, facts: HeadFacts, abs_len: usize, version: &str, chunked: bool) {
     {
         let htx = ibex_proto::htx::HtxSliceRef::new(rx.bytes(), facts.blocks);
         // The writer wrote a start line of ASCII words (the HTTP/1 line check), and the
@@ -244,7 +264,7 @@ fn start_adopted(sess: &mut TcpSession, rx: RxHead, facts: HeadFacts, abs_len: u
         if sess.keep_request_line {
             // Text: the writer checked the scheme and the authority.
             let abs = String::from_utf8_lossy(&rx.bytes()[facts.tail..facts.tail + abs_len]);
-            sess.strm.log.request_line.set_parts(&[line.method, " ", &abs, line.uri, " HTTP/2.0"]);
+            sess.strm.log.request_line.set_parts(&[line.method, " ", &abs, line.uri, " ", version]);
         }
         sess.req_method.set(line.method);
         sess.req_uri.set(line.uri);
@@ -1134,6 +1154,49 @@ mod tests {
         (rx, facts, 9)
     }
 
+    /// An h3 request's HEADERS frame (and, when `body` is not empty, one DATA frame).
+    fn h3_request(method: &str, body: &[u8]) -> Vec<u8> {
+        let f: Vec<(String, String)> = [(":method", method), (":scheme", "https"), (":authority", "x"), (":path", "/a")]
+            .iter()
+            .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+            .collect();
+        let mut req = Vec::new();
+        ibex_proto::mux_h3::encode_frame(&mut req, 0x01, &ibex_proto::mux_h3::encode_field_section(&f));
+        if !body.is_empty() {
+            ibex_proto::mux_h3::encode_frame(&mut req, 0x00, body);
+        }
+        req
+    }
+
+    /// CP2b: an h3 head the mux wrote as blocks is dispatched as the same `DispatchHead::Htx`
+    /// as h2's, with the h3 version on the log line and chunked framing for a body with no
+    /// length; no memory for the blocks dispatches the fields and says so (S5).
+    #[test]
+    fn an_h3_head_the_mux_wrote_is_dispatched_as_blocks() {
+        let mut m = ibex_proto::mux_h3::H3MuxContext::new();
+        m.open_control(3);
+        m.recv(0, &h3_request("GET", b""), true, 0).expect("request");
+        m.recv(4, &h3_request("POST", b"hello"), false, 0).expect("request");
+        let d = dispatch_mux(&mut m, true, "HTTP/3.0").expect("a stream");
+        assert!(!d.no_memory && d.request_line.is_none() && d.add_len.is_none() && !d.stream.chunk_out);
+        // `%U`: 20 + "GET" + "https://x" + "/a" + "HTTP/3.0" + 1 + "host" + "x".
+        assert_eq!(d.req_htx, 20 + 3 + 9 + 2 + 8 + 1 + 5);
+        let DispatchHead::Htx { version, abs_len, .. } = d.head else { panic!("blocks") };
+        assert_eq!((version, abs_len), ("HTTP/3.0", 9));
+        let d = dispatch_mux(&mut m, true, "HTTP/3.0").expect("a stream");
+        assert!(d.stream.chunk_out, "a body with no length goes out chunked");
+        assert_eq!(d.req_htx, 20 + 4 + 9 + 2 + 8 + 1 + 5 - 1);
+        assert!(matches!(d.head, DispatchHead::Htx { .. }));
+
+        fn none(_: usize) -> Option<RxHead> {
+            None
+        }
+        m.take_rx_head = none;
+        m.recv(8, &h3_request("GET", b""), true, 0).expect("request");
+        let d = dispatch_mux(&mut m, true, "HTTP/3.0").expect("a stream");
+        assert!(d.no_memory && matches!(d.head, DispatchHead::Fields(_)));
+    }
+
     /// CP2: a head the h2 mux wrote as blocks is the stream's `htx_buf`, the memory moved,
     /// not copied: its log line and method from its start line, framed and counted (`%U`) by
     /// the one canonical `content-length` the blocks hold in place of the client's `005`.
@@ -1144,7 +1207,7 @@ mod tests {
         let (mut s, _owner, _peer) = child();
         s.keep_request_line = true;
         let mut d = dispatch(H2ReqHead::default());
-        d.head = DispatchHead::Htx { rx, facts, abs_len };
+        d.head = DispatchHead::Htx { rx, facts, abs_len, version: "HTTP/2.0" };
         assert!(start_request(&mut s, d).is_none(), "no fields to give back");
         assert_eq!(s.htx_buf.raw_slice().as_ptr(), ptr, "adopted, not copied");
         assert!(s.has_htx && s.req_head_pending && s.req.readable().is_empty());
@@ -1161,7 +1224,7 @@ mod tests {
         let (rx, facts, abs_len) = written(&[(b":method", b"POST"), (b":scheme", b"https"), (b":path", b"/"), (b":authority", b"x"), (b"content-length", b"0")]);
         let (mut s, _owner, _peer) = child();
         let mut d = dispatch(H2ReqHead::default());
-        d.head = DispatchHead::Htx { rx, facts, abs_len };
+        d.head = DispatchHead::Htx { rx, facts, abs_len, version: "HTTP/2.0" };
         assert!(start_request(&mut s, d).is_none());
         assert_eq!(s.strm.log.request_line.as_deref(), None);
         let txn = s.strm.txn.as_ref().expect("a transaction");
@@ -1174,7 +1237,7 @@ mod tests {
         let (mut s, _owner, _peer) = child();
         s.keep_request_line = true;
         let mut d = dispatch(H2ReqHead::default());
-        d.head = DispatchHead::Htx { rx, facts, abs_len: 0 };
+        d.head = DispatchHead::Htx { rx, facts, abs_len: 0, version: "HTTP/2.0" };
         assert!(start_request(&mut s, d).is_none());
         assert_eq!((s.req_method.as_deref(), s.strm.log.request_line.as_deref()), (Some(""), Some("  HTTP/2.0")));
     }

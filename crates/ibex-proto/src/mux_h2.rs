@@ -452,43 +452,68 @@ impl H2ReqHead {
 /// error is the stream's reset (`PROTOCOL_ERROR`, a refused head). A head the HTTP/1 checks refuse, no memory for the blocks, and an extended CONNECT (its
 /// websocket key is the bridge's), are kept as their fields ([`H2ReqHead`], [`keep_fields`]).
 fn request_head(stream: &mut H2StreamCtx, fields: &DecodedFields, take_rx: fn(usize) -> Option<RxHead>, relaxed: bool, spare_heads: &mut Vec<Box<H2ReqHead>>) -> Result<(), H2Error> {
+    match write_head(fields, take_rx, relaxed) {
+        HeadOut::Refused => Err(H2Error::ProtocolError),
+        HeadOut::Blocks { rx, facts, abs_len } => {
+            stream.bad_request = facts.bad_request;
+            stream.req_content_length = facts.content_length;
+            stream.ext_connect = false;
+            stream.head_facts = facts;
+            stream.abs_len = abs_len;
+            stream.rx_head = Some(rx);
+            stream.rx_htx.push(HtxBlock::Eoh);
+            Ok(())
+        }
+        HeadOut::Fields { no_memory } => {
+            stream.no_memory = no_memory;
+            keep_fields(stream, fields, relaxed, spare_heads)
+        }
+    }
+}
+
+/// What [`write_head`] made of a request head.
+pub(crate) enum HeadOut {
+    /// The blocks, in `rx`; `abs_len` bytes of `scheme://authority` follow their payload.
+    Blocks { rx: RxHead, facts: crate::h2::HeadFacts, abs_len: usize },
+    /// A head the writer refused: the stream's error.
+    Refused,
+    /// Not written as blocks (a head the HTTP/1 checks refuse, an extended CONNECT, no memory
+    /// to be had: `no_memory`): the caller keeps the fields.
+    Fields { no_memory: bool },
+}
+
+/// The head of `fields` written as blocks into memory from `take_rx` (CP2, CP2b: h2 and h3
+/// both), then `scheme://authority` after them. Larger than its estimate, once more in more
+/// memory.
+pub(crate) fn write_head(fields: &DecodedFields, take_rx: fn(usize) -> Option<RxHead>, relaxed: bool) -> HeadOut {
     let mut need = rx_head_need(fields);
     for _ in 0..2 {
         // No memory to be had: kept as its fields, and the data path answers 500 when the
         // stream's buffer cannot be had either (S5), the connection going on.
         let Some(mut rx) = take_rx(need) else {
-            stream.no_memory = true;
-            break;
+            return HeadOut::Fields { no_memory: true };
         };
         match crate::h2::write_request_htx(fields, &mut crate::htx::HtxSlice::over(&mut rx), relaxed) {
-            Err(crate::h2::HeadError::Refused(_)) => return Err(H2Error::ProtocolError),
+            Err(crate::h2::HeadError::Refused(_)) => return HeadOut::Refused,
             Ok(facts) if !facts.ext_connect => {
                 if let Some(abs_len) = put_abs(&mut rx, &facts, fields) {
-                    stream.bad_request = facts.bad_request;
-                    stream.req_content_length = facts.content_length;
-                    stream.ext_connect = false;
-                    stream.head_facts = facts;
-                    stream.abs_len = abs_len;
-                    stream.rx_head = Some(rx);
-                    stream.rx_htx.push(HtxBlock::Eoh);
-                    return Ok(());
+                    return HeadOut::Blocks { rx, facts, abs_len };
                 }
             }
             Err(crate::h2::HeadError::NoRoom) => {}
             // `Invalid`, an extended CONNECT.
             _ => break,
         }
-        // Larger than its estimate: once more in more memory.
         need = rx.len() + 1;
     }
-    keep_fields(stream, fields, relaxed, spare_heads)
+    HeadOut::Fields { no_memory: false }
 }
 
 /// `scheme://authority` of a request that had both, written after the head's payload in
 /// `rx` (where its free memory starts; what the head's buffer writes next goes over it once
 /// the log line has it): its length, 0 for a request without both, `None` when it does not
 /// fit.
-fn put_abs(rx: &mut RxHead, facts: &crate::h2::HeadFacts, fields: &DecodedFields) -> Option<usize> {
+pub(crate) fn put_abs(rx: &mut RxHead, facts: &crate::h2::HeadFacts, fields: &DecodedFields) -> Option<usize> {
     if !facts.has_abs {
         return Some(0);
     }
@@ -834,7 +859,7 @@ pub struct H2MuxContext {
 
 /// [`H2MuxContext::take_rx_head`] of a context the data path gave none: twice the need, at
 /// least 1 KB, from the heap.
-fn heap_rx_head(need: usize) -> Option<RxHead> {
+pub(crate) fn heap_rx_head(need: usize) -> Option<RxHead> {
     Some(RxHead::from_box(vec![0u8; need.saturating_mul(2).max(1024)].into_boxed_slice()))
 }
 
@@ -1353,6 +1378,12 @@ impl crate::htx_mux::HtxStream for H2StreamCtx {
     }
     fn take_req_fields(&mut self) -> Option<Box<H2ReqHead>> {
         self.req_head.take()
+    }
+    fn take_rx_head(&mut self) -> Option<(RxHead, crate::h2::HeadFacts, usize)> {
+        self.rx_head.take().map(|rx| (rx, self.head_facts, self.abs_len))
+    }
+    fn no_memory(&self) -> bool {
+        self.no_memory
     }
     fn bad_request(&self) -> bool {
         self.bad_request

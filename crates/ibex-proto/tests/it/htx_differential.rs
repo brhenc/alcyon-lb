@@ -1028,6 +1028,55 @@ mod request_head_writer {
         old.verdict
     }
 
+    /// The golden file: for every row of the corpus, on every memory, under both settings of
+    /// `accept-unsafe-violations-in-http-request`, what `H2ReqHead::write` + `put_request_head`
+    /// made of the head (CP2b-1, the reference the writer was built against, dumped before the
+    /// live reference goes): the verdict, and for a written head its facts and its blocks.
+    const GOLDEN: &str = include_str!("../data/htx_request_head_golden.txt");
+
+    /// One line of the golden file: tab-separated `name`, `relaxed`, `cap`, the verdict
+    /// (`Ok`, `Refused`, `Invalid`, `NoRoom`) and, for `Ok`, the facts and the blocks.
+    fn golden_line(name: &str, relaxed: bool, cap: usize, verdict: &Result<(), HeadError>, facts: &str, blocks: &str) -> String {
+        let v = match verdict {
+            Ok(()) => "Ok",
+            Err(HeadError::Refused(_)) => "Refused",
+            Err(HeadError::Invalid) => "Invalid",
+            Err(HeadError::NoRoom) => "NoRoom",
+        };
+        if verdict.is_ok() { format!("{name}\t{relaxed}\t{cap}\t{v}\t{facts}\t{blocks}") } else { format!("{name}\t{relaxed}\t{cap}\t{v}") }
+    }
+
+    /// The golden line of what `H2ReqHead::write` + `put_request_head` make today (used to dump
+    /// the file; the live reference goes with `H2ReqHead`, CP2b-2).
+    fn old_line(name: &str, fields: &Fields, relaxed: bool, cap: usize) -> String {
+        let old = today(fields, relaxed, cap);
+        let facts = format!(
+            "{} {} {} {:?} {} {} {} {} {} {} {} {}",
+            old.tail, old.blocks, old.bad_request, old.length, old.ext_connect, old.method_len, old.uri_len, old.path_raw, old.has_abs, old.fields, old.field_bytes, old.wire_len
+        );
+        let mut buf = old.buf.clone();
+        let blocks = format!("{:?}", HtxSlice::with_offsets(&mut buf, old.tail, old.blocks).as_ref());
+        golden_line(name, relaxed, cap, &old.verdict, &facts, &blocks)
+    }
+
+    /// The golden line of what the writer makes.
+    fn new_line(name: &str, fields: &Fields, relaxed: bool, cap: usize) -> String {
+        let mut mem = vec![0u8; cap];
+        let mut slice = HtxSlice::new(&mut mem);
+        let r = write_request_htx(&decoded(fields), &mut slice, relaxed);
+        match r {
+            Ok(f) => {
+                let facts = format!(
+                    "{} {} {} {:?} {} {} {} {} {} {} {} {}",
+                    f.tail, f.blocks, f.bad_request, f.content_length, f.ext_connect, f.method_len, f.uri_len, f.path_raw, f.has_abs, f.fields, f.field_bytes, f.wire_len()
+                );
+                golden_line(name, relaxed, cap, &Ok(()), &facts, &format!("{:?}", slice.as_ref()))
+            }
+            Err(e) => golden_line(name, relaxed, cap, &Err(e), "", ""),
+        }
+    }
+
+    /// The memories a row runs on:
     /// The memories a row runs on: a normal buffer and several too small ones, so that every
     /// write of the head is the one that finds no room in some run.
     const CAPS: [usize; 9] = [64, 96, 128, 160, 200, 256, 400, 1024, 16384];
@@ -1162,24 +1211,56 @@ mod request_head_writer {
         rows
     }
 
+    /// The writer's blocks, facts and verdicts for the whole corpus are those in the golden
+    /// file (CP2b-1: dumped from `H2ReqHead::write` + `put_request_head`, which this no longer
+    /// runs). `IBEX_BLESS_GOLDEN=<path>` writes the file from the live reference instead.
     #[test]
-    fn the_written_head_is_the_one_put_request_head_makes_of_the_mux_s() {
+    fn the_written_head_is_the_one_in_the_golden_file() {
+        if let Ok(path) = std::env::var("IBEX_BLESS_GOLDEN") {
+            let mut out = String::new();
+            for (name, fields) in corpus() {
+                for relaxed in [false, true] {
+                    for cap in CAPS {
+                        out.push_str(&old_line(name, &fields, relaxed, cap));
+                        out.push('\n');
+                    }
+                }
+            }
+            std::fs::write(path, out).expect("write the golden file");
+            return;
+        }
+        let mut want = GOLDEN.lines();
         let (mut written, mut refused, mut parser_refused, mut no_room, mut bad) = (0, 0, 0, 0, 0);
         for (name, fields) in corpus() {
             for relaxed in [false, true] {
                 for cap in CAPS {
-                    match same(name, &fields, relaxed, cap) {
-                        Ok(()) => written += 1,
-                        Err(HeadError::Refused(_)) => refused += 1,
-                        Err(HeadError::Invalid) => parser_refused += 1,
-                        Err(HeadError::NoRoom) => no_room += 1,
+                    let line = new_line(name, &fields, relaxed, cap);
+                    assert_eq!(Some(line.as_str()), want.next(), "{name} (cap {cap}, relaxed {relaxed})");
+                    match line.split('\t').nth(3) {
+                        Some("Ok") => written += 1,
+                        Some("Refused") => refused += 1,
+                        Some("Invalid") => parser_refused += 1,
+                        _ => no_room += 1,
                     }
+                    bad += usize::from(line.split('\t').nth(4).is_some_and(|f| f.split(' ').nth(2) == Some("true")));
                 }
             }
-            bad += usize::from(today(&fields, false, 16384).bad_request);
         }
+        assert_eq!(want.next(), None, "the golden file has rows the corpus lost");
         // The corpus reaches every verdict, so the comparison above is not vacuous.
         assert!(written > 300 && refused > 400 && parser_refused > 20 && no_room > 100 && bad >= 5, "{written} {refused} {parser_refused} {no_room} {bad}");
+    }
+
+    /// The live reference still agrees on the same corpus (until `H2ReqHead` goes, CP2b-2).
+    #[test]
+    fn the_live_reference_agrees_with_the_golden_file_rows() {
+        for (name, fields) in corpus() {
+            for relaxed in [false, true] {
+                for cap in CAPS {
+                    let _ = same(name, &fields, relaxed, cap);
+                }
+            }
+        }
     }
 
     #[test]

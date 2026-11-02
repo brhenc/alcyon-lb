@@ -6162,6 +6162,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     continue;
                 };
                 mux.relaxed_path = self.proxies[proxy_idx].stats_config.accept_unsafe_request;
+                // The request heads go into the buffers their streams adopt (CP2b).
+                mux.take_rx_head = crate::buf::Buf::take_rx_head;
                 let raw_fd = ql.raw_fd();
                 let Some((mut sess, _, _)) = init_client_session(
                     &self.proxies,
