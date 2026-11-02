@@ -12062,8 +12062,8 @@ impl EngineDispatcher<'_> {
         let Some(h) = h else { return };
         // A connection left with no stream keeps one session for its next, not one per
         // stream of a burst it served (a cache, AGENTS §8): the others go now.
-        let idle = h.children.is_empty();
-        let extra = if idle { std::mem::take(&mut h.parked) } else { Vec::new() };
+        // (Freed one by one, the list keeping its memory: no allocation a request.)
+        let extra = if h.children.is_empty() { h.parked.len() } else { 0 };
         h.parked.push(idx);
         entry.sess.park_h2_child();
         let SessionEntry {
@@ -12104,8 +12104,11 @@ impl EngineDispatcher<'_> {
         (*log_err, *log_sd) = (false, 0);
         *buf_wait = crate::buf_wait::WaitState::default();
         self.sessions.park(idx, entry);
-        for i in extra {
-            self.sessions.free_parked(i);
+        for _ in 0..extra {
+            // The oldest first: this one, last, stays.
+            let i = self.sessions.get_mut(owner_idx).and_then(|o| o.sess.h2_owner_mut()).map(|h| h.parked.remove(0));
+            debug_assert!(i.is_some(), "the owner was found above");
+            i.into_iter().for_each(|i| self.sessions.free_parked(i));
         }
     }
 
