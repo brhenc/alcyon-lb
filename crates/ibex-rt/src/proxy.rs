@@ -768,6 +768,10 @@ pub struct TcpSession {
     /// The HTX was edited since the head in `req` was written from it (or parsed): `req`'s
     /// head is then stale, and the server send writes it out of the HTX once (X2).
     pub htx_modified: bool,
+    /// An HTTP/2 or HTTP/3 request head is in the HTX alone: `req` holds none of it (only the
+    /// body the bridge moved), and the server send writes it at the front, once (X4,
+    /// [`crate::h2_bridge::write_pending_head`]). Whatever reads `req` as text first writes it.
+    pub req_head_pending: bool,
     /// What the request in flight asked for of a websocket upgrade, for its response
     /// (`crate::websocket`); `None` for one that asked for no upgrade.
     pub req_ws: Option<Box<crate::websocket::ReqWs>>,
@@ -1011,6 +1015,9 @@ pub struct H2ReqBody {
     /// been given stream window for (T195: the window is granted as the body is consumed).
     pub consumed: u64,
     pub credited: u64,
+    /// The room the request head takes in `req` once written, kept free while it is in its
+    /// HTX alone (X4, `TcpSession::req_head_pending`).
+    pub head_room: usize,
 }
 
 impl TcpSession {
@@ -1487,6 +1494,7 @@ impl TcpSession {
             htx_head: 0,
             has_htx: false,
             htx_modified: false,
+            req_head_pending: false,
             req_ws: None,
             cli_state,
             srv_state: ScState::Init,
@@ -1681,6 +1689,7 @@ impl TcpSession {
         self.htx_tail = 0;
         self.htx_blocks = 0;
         self.htx_modified = false;
+        self.req_head_pending = false;
     }
 
     /// Whether there is output the client may be sent now: response bytes inside the
@@ -2060,7 +2069,7 @@ impl TcpSession {
             return;
         }
         let Some(t) = &self.txn else { return };
-        let n = t.req.canonical_chunk_lines(self.req.readable_mut(), self.drop_req_trailers);
+        let n = self.req_msg(t).canonical_chunk_lines(self.req.readable_mut(), self.drop_req_trailers);
         self.req.cut(n, self.req.len());
     }
 
@@ -2132,7 +2141,7 @@ impl TcpSession {
             return;
         }
         let Some(t) = &self.txn else { return };
-        while let Some(at) = t.req.trailer_bare_lf(self.req.readable()) {
+        while let Some(at) = self.req_msg(t).trailer_bare_lf(self.req.readable()) {
             let mut fixed = Vec::with_capacity(at + 2);
             fixed.extend_from_slice(&self.req.readable()[..at]);
             fixed.extend_from_slice(b"\r\n");
@@ -2153,11 +2162,21 @@ impl TcpSession {
             // Not before its rules have run: a server connection kept from the last
             // transaction is ready to take bytes the moment a head is parsed, and the
             // request would reach it unfiltered and unrewritten.
-            Some(t) if t.req.holds_trailer(data, self.bufsize) => 0,
+            Some(t) if self.req_msg(t).holds_trailer(data, self.bufsize) => 0,
             // A body the rules left without framing goes nowhere: the head alone (T442).
             Some(t) if t.req_rules_done && !t.local && t.error.is_none() && t.req_body_dropped => t.req.head_window(data),
             Some(t) if t.req_rules_done && !t.local && t.error.is_none() => t.req.window(data),
             _ => 0,
+        }
+    }
+
+    /// The request's message state as `req`'s bytes read: past its head while an HTTP/2 or
+    /// HTTP/3 head is in its HTX alone (X4, [`Self::req_head_pending`]).
+    fn req_msg(&self, t: &HttpTxn) -> txn::MsgState {
+        if self.req_head_pending {
+            t.req.past_head()
+        } else {
+            t.req
         }
     }
 
@@ -2211,6 +2230,10 @@ impl TcpSession {
     /// connection says so (`Connection: close`) when the page does not. HAProxy's 431 for
     /// an oversized request head does not (measured on 3.5-dev8, `tasks/T87`).
     pub fn write_reply_with(&mut self, raw: &[u8], announce_close: bool) {
+        // The request is read past its head below: an HTTP/2 one still in its HTX goes in first.
+        if self.req_head_pending {
+            crate::h2_bridge::write_pending_head(self, false, None);
+        }
         let h2 = self.is_h2();
         let txn = self.txn.get_or_insert_with(|| HttpTxn::new(txn::Framing::None, false));
         let data = self.req.readable();
@@ -2433,6 +2456,7 @@ impl TcpSession {
     pub(crate) fn fail_request(&mut self, status: u16) {
         self.log.term = Some(*b"PR");
         self.req.clear();
+        self.req_head_pending = false;
         self.txn = Some(HttpTxn::failed(status));
         // A stream of an HTTP/2 connection fails alone: its answer goes out as HEADERS and the
         // connection and its other streams go on (T464), so its state is not the connection's.
@@ -4558,6 +4582,8 @@ mod tests {
         let d = crate::h2_bridge::dispatch_next(o.h2_ctx.as_deref_mut().expect("h2"), false).expect("the request is dispatched");
         let mut s = super::TcpSession::h2_child_of(&mut o, (0, ibex_sched::TaskRef::NONE), d.stream);
         crate::h2_bridge::start_request(&mut s, d);
+        // The send writes the head (X4); this test goes there without the engine.
+        assert!(crate::h2_bridge::write_pending_head(&mut s, false, None));
         assert_eq!(s.h2_active().map(|a| a.id), Some(1), "the stream is the child's");
         s.txn.as_mut().expect("txn").req_rules_done = true;
 

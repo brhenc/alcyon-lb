@@ -349,6 +349,28 @@ impl MsgState {
         MsgState::Head { left: 0, body }
     }
 
+    /// The state a message framed by `body` is in once its head is consumed.
+    fn after_head(body: Framing) -> Self {
+        match body {
+            Framing::None | Framing::Length(0) => MsgState::Done,
+            Framing::Length(n) => MsgState::Body(Body::Length(n)),
+            Framing::Chunked => MsgState::Body(Body::Chunked(CHUNK_START)),
+            Framing::UntilClose => MsgState::Body(Body::UntilClose),
+            Framing::Tunnel => MsgState::Tunnel,
+        }
+    }
+
+    /// This state as read over a buffer that holds none of the head (an HTTP/2 or HTTP/3
+    /// request head still in its HTX, X4): a head not yet consumed is skipped, its body read
+    /// from the first byte.
+    #[must_use]
+    pub fn past_head(self) -> Self {
+        match self {
+            MsgState::Head { body, .. } => Self::after_head(body),
+            s => s,
+        }
+    }
+
     /// Consumes the bytes of `data` that belong to this message, from its current
     /// position, and returns how many there were. The rest of `data` is not this
     /// message's.
@@ -383,13 +405,7 @@ impl MsgState {
                         *self = MsgState::Head { left: left - n, body };
                         return used;
                     }
-                    *self = match body {
-                        Framing::None | Framing::Length(0) => MsgState::Done,
-                        Framing::Length(n) => MsgState::Body(Body::Length(n)),
-                        Framing::Chunked => MsgState::Body(Body::Chunked(CHUNK_START)),
-                        Framing::UntilClose => MsgState::Body(Body::UntilClose),
-                        Framing::Tunnel => MsgState::Tunnel,
-                    };
+                    *self = Self::after_head(body);
                 }
                 MsgState::Body(Body::Length(n)) => {
                     let avail = (data.len() - used) as u64;
