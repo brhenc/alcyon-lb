@@ -1349,7 +1349,7 @@ fn attach_server_to(
     let (fe, be) = (&proxies[fe_idx], &proxies[be_idx]);
     let stick = StickView::new(proxies, &sess.tracked_sc);
     let ip = s_idx.and_then(|i| be.servers.get(i)).map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |a| a.ip());
-    let mut xprt = tls.with_sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies), &stick), |sni| {
+    let mut xprt = tls.with_sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies), &stick).as_ctx(), |sni| {
         tls.connect(&srv_fd, sni, ip)
     });
     // A PROXY header (`send-proxy*`) was put at the head of the request; to a TLS
@@ -1422,7 +1422,7 @@ fn with_server_sni<R>(
         return f(None);
     };
     let stick = StickView::new(proxies, &sess.tracked_sc);
-    tls.with_sni(sample_registry(), &stream_sample_ctx(sess, &proxies[fe_idx], &proxies[be_idx], &ProxiesView(proxies), &stick), f)
+    tls.with_sni(sample_registry(), &stream_sample_ctx(sess, &proxies[fe_idx], &proxies[be_idx], &ProxiesView(proxies), &stick).as_ctx(), f)
 }
 
 /// The pool key of a connection to `addr` for server `s_idx` of backend `be_idx`, opened
@@ -3355,7 +3355,7 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &[Proxy], fe_idx: usize,
             let view = ProxiesView(proxies);
             let stick = StickView::new(proxies, &entry.sess.tracked_sc);
             let ctx = stream_sample_ctx(&entry.sess, fe, fe, &view, &stick);
-            fmt.render(&data, sample_registry(), &ctx)
+            fmt.render(&data, sample_registry(), &ctx.as_ctx())
         };
         if let Some(h) = fe.unique_id_header.as_deref() {
             // Into the HTX too: the head is written again from it whenever a later step edits a header.
@@ -3421,8 +3421,8 @@ fn request_date(log: &crate::txnlog::StreamLog) -> (i64, u32) {
 }
 
 /// The sample context a log line's `%[...]` reads.
-fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>) -> SampleContext<'a> {
-    SampleContext {
+fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>) -> ibex_sample::PhaseCtx<'a> {
+    ibex_sample::PhaseCtx {
         proxies: Some(view),
         stick: Some(stick),
         client_addr: s.client_addr,
@@ -3460,6 +3460,59 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         bc_dst: s.bc_dst(),
         bc_src: s.bc_src(),
         ..Default::default()
+    }
+}
+
+/// CP4a-2: what a request rule's sample reads of the session at the fetch, rather than copied
+/// into a context per rule: the same expressions the rule's context was assembled from.
+impl ibex_sample::LiveReq for TcpSession {
+    fn client_addr(&self) -> Option<SocketAddr> {
+        self.client_addr
+    }
+    fn server_addr(&self) -> Option<SocketAddr> {
+        self.server_addr
+    }
+    fn so_name(&self) -> Option<&str> {
+        self.so_name.as_deref()
+    }
+    fn proxy_tlvs(&self) -> Option<&[u8]> {
+        self.proxy_info.as_ref().map(|p| p.tlv_data.as_slice())
+    }
+    fn ssl_fc(&self) -> ibex_sample::SslFacts<'_> {
+        crate::proxy::ssl_fc(&self.cli_xprt, self.h2_role.as_deref())
+    }
+    fn htx_slice(&self) -> Option<ibex_proto::htx::HtxSliceRef<'_>> {
+        TcpSession::htx_slice(self)
+    }
+    fn req_uri(&self) -> Option<&str> {
+        self.req_uri.as_deref()
+    }
+    fn req_method(&self) -> Option<&str> {
+        self.req_method.as_deref()
+    }
+    fn req_headers(&self) -> Option<&[(String, String)]> {
+        self.req_headers.as_deref()
+    }
+    fn req_body(&self) -> Option<&[u8]> {
+        txn_req_body(self)
+    }
+    fn captures_req_hdr(&self) -> Option<&[Option<Vec<u8>>]> {
+        Some(&self.strm.log.req_captures)
+    }
+    fn unique_id(&self) -> Option<&str> {
+        self.strm.log.unique_id.as_deref()
+    }
+    fn last_rule(&self) -> Option<(&str, u32)> {
+        last_rule_at(self.strm.log.last_rule)
+    }
+    fn prio(&self) -> (i32, i32) {
+        (self.strm.log.prio_class, self.strm.log.prio_offset)
+    }
+    fn term_state(&self) -> Option<[u8; 2]> {
+        Some(sess_term_state(self))
+    }
+    fn cur_max_retries(&self) -> Option<u16> {
+        Some(self.max_retries)
     }
 }
 
@@ -3528,7 +3581,7 @@ fn render_res_format(f: &crate::rule_compiled::Format, out: &mut String, ctx: &S
 /// The request line as the access log keeps it, from what a context holds of the request
 /// (`%r`, `%HM`, ... in a rule's format).
 fn request_line_of(ctx: &SampleContext) -> String {
-    format!("{} {} {}", ctx.req_method.unwrap_or_default(), ctx.req_uri.unwrap_or_default(), ctx.req_version.unwrap_or("HTTP/1.1"))
+    format!("{} {} {}", ctx.req_method().unwrap_or_default(), ctx.req_uri().unwrap_or_default(), ctx.req_version.unwrap_or("HTTP/1.1"))
 }
 
 /// What the session measured, for a rule's format that reads it ([`session_log_data`]); `None`
@@ -3572,7 +3625,7 @@ const REQUEST_LINE_INLINE: usize = 256;
 /// format), written from what the context holds of the request into a scratch on the stack:
 /// no `String` is built for a line that fits (R4; `request_line_of` made one with `format!`).
 fn with_request_line<R>(ctx: &SampleContext, f: impl FnOnce(&str) -> R) -> R {
-    let parts = [ctx.req_method.unwrap_or_default(), " ", ctx.req_uri.unwrap_or_default(), " ", ctx.req_version.unwrap_or("HTTP/1.1")];
+    let parts = [ctx.req_method().unwrap_or_default(), " ", ctx.req_uri().unwrap_or_default(), " ", ctx.req_version.unwrap_or("HTTP/1.1")];
     let total: usize = parts.iter().map(|p| p.len()).sum();
     if total > REQUEST_LINE_INLINE {
         let mut line = crate::reuse::string();
@@ -3919,7 +3972,7 @@ fn stream_log_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) -> Option<
     CURRENT_SRV_STATUS.set(entry.sess.strm.log.srv_status);
     let tr = entry.sess.strm.log.data.zip(entry.sess.strm.log.connect).map(|(d, c)| d.saturating_duration_since(c).as_millis());
     CURRENT_RES_TR.set(tr.map_or(-1, |ms| i64::try_from(ms).unwrap_or(i64::MAX)));
-    let ctx = SampleContext { at_log: true, res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick) };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { at_log: true, res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick) }, live: None };
     let (line, sd) = with_sd(fe.log_format_sd(), fmt, &data, &ctx);
     fe.log_count.fetch_add(1, Ordering::Relaxed);
     Some((line, sd, err))
@@ -4084,7 +4137,7 @@ fn proxy_header_error_line(entry: &SessionEntry, proxies: &[Proxy], pid: u32) ->
     };
     let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &s.tracked_sc));
     // No stream, so no backend either: `be_name` has no value in `HAProxy`'s line.
-    let ctx = SampleContext { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, ..stream_sample_ctx(s, fe, fe, &view, &stick) };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, ..stream_sample_ctx(s, fe, fe, &view, &stick) }, live: None };
     let line = match fe.error_log_format() {
         Some(elf) => with_sd(fe.log_format_sd(), elf, &data, &ctx),
         None => {
@@ -7039,7 +7092,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         {
             let mut tracked_sc: [Option<(usize, StickKey)>; 3] = [None, None, None];
 
-            let sample_ctx = SampleContext {
+            let sample_ctx = SampleContext { phase: &ibex_sample::PhaseCtx {
                 proxies: Some(&ProxiesView(&self.proxies)),
                 client_addr: Some(peer_addr),
                 server_addr: Some(local_addr),
@@ -7047,7 +7100,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 fc_dst: Some(local_addr),
                 act_conn: self.proxies[proxy_idx].counters().act_conn.load(Ordering::Relaxed),
                 ..Default::default()
-            };
+            }, live: None };
 
             // 1. Process stick_rules (e.g. `track-sc0 src` from frontend/listen)
             for (srule, rc) in self.proxies[proxy_idx].stick_rules.iter().zip(&self.proxies[proxy_idx].rules.stick) {
@@ -7633,7 +7686,7 @@ fn eval_tcp_req_conn_rules(
     let mut expect_proxy = false;
 
     let stick = StickView::new(proxies, tracked);
-    let mut ctx = SampleContext {
+    let mut ctx = ibex_sample::PhaseCtx {
         proxies: Some(&ProxiesView(proxies)),
         stick: Some(&stick),
         client_addr: Some(client_addr),
@@ -7645,7 +7698,7 @@ fn eval_tcp_req_conn_rules(
     };
 
     for (rule, rc) in proxy.tcp_req_conn_rules.iter().zip(&proxy.rules.tcp_req_conn) {
-        let matches = rc.cond.as_ref().is_none_or(|c| c.eval(&ctx, &proxy.acls, registry));
+        let matches = rc.cond.as_ref().is_none_or(|c| c.eval(&ctx.as_ctx(), &proxy.acls, registry));
         if !matches {
             continue;
         }
@@ -7666,7 +7719,7 @@ fn eval_tcp_req_conn_rules(
                 expect_proxy = true;
             }
             ibex_config::TcpReqConnAction::SetSrcPort { expr: _ } => {
-                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx) {
+                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
                     client_addr = with_port(Some(client_addr), port);
                     fc_src = client_addr;
                     ctx.client_addr = Some(client_addr);
@@ -7674,7 +7727,7 @@ fn eval_tcp_req_conn_rules(
                 }
             }
             ibex_config::TcpReqConnAction::SetDstPort { expr: _ } => {
-                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx) {
+                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
                     server_addr = with_port(Some(server_addr), port);
                     fc_dst = server_addr;
                     ctx.server_addr = Some(server_addr);
@@ -7682,7 +7735,7 @@ fn eval_tcp_req_conn_rules(
                 }
             }
             ibex_config::TcpReqConnAction::SetSrc { expr: _ } => {
-                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| sample_to_string(&smp)).unwrap_or_default();
+                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
                 if let Ok(ip) = val.parse::<IpAddr>() {
                     client_addr = SocketAddr::new(ip, client_addr.port());
                     ctx.client_addr = Some(client_addr);
@@ -7696,7 +7749,7 @@ fn eval_tcp_req_conn_rules(
                 }
             }
             ibex_config::TcpReqConnAction::SetDst { expr: _ } => {
-                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| sample_to_string(&smp)).unwrap_or_default();
+                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
                 if let Ok(ip) = val.parse::<IpAddr>() {
                     server_addr = SocketAddr::new(ip, server_addr.port());
                     ctx.server_addr = Some(server_addr);
@@ -7723,7 +7776,7 @@ fn eval_tcp_req_session_rules(
     sess: &mut TcpSession,
 ) -> SessionEvalOutcome {
     let stick = StickView::new(proxies, &sess.tracked_sc);
-    let mut ctx = SampleContext {
+    let mut ctx = ibex_sample::PhaseCtx {
         proxies: Some(&ProxiesView(proxies)),
         stick: Some(&stick),
         client_addr: sess.client_addr,
@@ -7747,7 +7800,7 @@ fn eval_tcp_req_session_rules(
     };
 
     for (rule, rc) in proxy.tcp_req_session_rules.iter().zip(&proxy.rules.tcp_req_session) {
-        let matches = rc.cond.as_ref().is_none_or(|c| c.eval(&ctx, &proxy.acls, registry));
+        let matches = rc.cond.as_ref().is_none_or(|c| c.eval(&ctx.as_ctx(), &proxy.acls, registry));
         if !matches {
             continue;
         }
@@ -7770,7 +7823,7 @@ fn eval_tcp_req_session_rules(
                 } else {
                     proxy.id as usize
                 };
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
                         // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
                         if sess.tracked_sc[0].is_none() {
@@ -7787,7 +7840,7 @@ fn eval_tcp_req_session_rules(
                 } else {
                     proxy.id as usize
                 };
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
                         // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
                         if sess.tracked_sc[1].is_none() {
@@ -7804,7 +7857,7 @@ fn eval_tcp_req_session_rules(
                 } else {
                     proxy.id as usize
                 };
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
                         // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
                         if sess.tracked_sc[2].is_none() {
@@ -7816,7 +7869,7 @@ fn eval_tcp_req_session_rules(
                 }
             }
             ibex_config::TcpReqSessionAction::SetSrc { expr: _ } => {
-                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| sample_to_string(&smp)).unwrap_or_default();
+                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
                 if let Ok(ip) = val.parse::<IpAddr>() {
                     let port = sess.client_addr.map_or(0, |a| a.port());
                     let new_addr = SocketAddr::new(ip, port);
@@ -7828,7 +7881,7 @@ fn eval_tcp_req_session_rules(
                 }
             }
             ibex_config::TcpReqSessionAction::SetDst { expr: _ } => {
-                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| sample_to_string(&smp)).unwrap_or_default();
+                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
                 if let Ok(ip) = val.parse::<IpAddr>() {
                     let port = sess.server_addr.map_or(0, |a| a.port());
                     let new_addr = SocketAddr::new(ip, port);
@@ -7840,14 +7893,14 @@ fn eval_tcp_req_session_rules(
                 }
             }
             ibex_config::TcpReqSessionAction::SetSrcPort { expr: _ } => {
-                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx) {
+                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
                     let new_addr = with_port(sess.client_addr, port);
                     sess.client_addr = Some(new_addr);
                     ctx.client_addr = Some(new_addr);
                 }
             }
             ibex_config::TcpReqSessionAction::SetDstPort { expr: _ } => {
-                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx) {
+                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
                     let new_addr = with_port(sess.server_addr, port);
                     sess.server_addr = Some(new_addr);
                     ctx.server_addr = Some(new_addr);
@@ -7859,14 +7912,15 @@ fn eval_tcp_req_session_rules(
                 // fetched sets nothing.
                 // A constant (`str(hello)`) is copied in, with no allocation (T364 S6).
                 let e = rc.expr.as_ref();
+                let sc = ctx.as_ctx();
                 if let Some(c) = e.and_then(|e| e.constant(registry)) {
                     store_var_in(&mut sess.strm.vars, &rc.var(var_name), ibex_sample::vars::In::Ref(c));
-                } else if let Some(val) = e.and_then(|e| e.eval_smp(registry, &ctx)) {
+                } else if let Some(val) = e.and_then(|e| e.eval_smp(registry, &sc)) {
                     rc.var(var_name).store_smp(&mut sess.strm.vars, val);
                 }
             }
             ibex_config::TcpReqSessionAction::SetVarFmt { var_name, fmt: _ } => {
-                let val = render_rule_fmt(rc, &ctx, registry);
+                let val = render_rule_fmt(rc, &ctx.as_ctx(), registry);
                 store_var(&mut sess.strm.vars, &rc.var(var_name), val);
             }
             ibex_config::TcpReqSessionAction::UnsetVar { var_name } => {
@@ -7875,16 +7929,16 @@ fn eval_tcp_req_session_rules(
             ibex_config::TcpReqSessionAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
             ibex_config::TcpReqSessionAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
             ibex_config::TcpReqSessionAction::ScSetGpt0 { sc, expr } => {
-                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx);
+                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx.as_ctx());
                 sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::SetTag(val));
             }
             ibex_config::TcpReqSessionAction::ScIncGpc { idx, sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Inc),
             ibex_config::TcpReqSessionAction::ScAddGpc { idx, sc, expr } => {
-                let n = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx);
+                let n = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx.as_ctx());
                 sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Add(u64::from(n)));
             }
             ibex_config::TcpReqSessionAction::ScSetGpt { idx, sc, expr } => {
-                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx);
+                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx.as_ctx());
                 sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
             }
             _ => {}
@@ -7937,7 +7991,7 @@ fn eval_tcp_req_content_rules(
     }
 
     let stick = StickView::new(proxies, &sess.tracked_sc);
-    let mut ctx = SampleContext {
+    let mut ctx = ibex_sample::PhaseCtx {
         proxies: Some(&ProxiesView(proxies)),
         stick: Some(&stick),
         client_addr: sess.client_addr,
@@ -7974,7 +8028,7 @@ fn eval_tcp_req_content_rules(
 
     let mut has_missing_data = false;
     for (rule_idx, (rule, rc)) in proxy.tcp_req_content_rules.iter().zip(&proxy.rules.tcp_req_content).enumerate().skip(start) {
-        let cond_res = rc.cond.as_ref().map_or(crate::proxy::AclEvalResult::Matched, |c| c.eval_extended(&ctx, &proxy.acls, registry, req_bytes, can_wait));
+        let cond_res = rc.cond.as_ref().map_or(crate::proxy::AclEvalResult::Matched, |c| c.eval_extended(&ctx.as_ctx(), &proxy.acls, registry, req_bytes, can_wait));
         match cond_res {
             crate::proxy::AclEvalResult::MissingData => {
                 has_missing_data = true;
@@ -8008,7 +8062,7 @@ fn eval_tcp_req_content_rules(
                 } else {
                     proxy.id as usize
                 };
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
                         // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
                         if sess.tracked_sc[0].is_none() {
@@ -8025,7 +8079,7 @@ fn eval_tcp_req_content_rules(
                 } else {
                     proxy.id as usize
                 };
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
                         // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
                         if sess.tracked_sc[1].is_none() {
@@ -8042,7 +8096,7 @@ fn eval_tcp_req_content_rules(
                 } else {
                     proxy.id as usize
                 };
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx, proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
                         // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
                         if sess.tracked_sc[2].is_none() {
@@ -8054,7 +8108,7 @@ fn eval_tcp_req_content_rules(
                 }
             }
             ibex_config::TcpReqContentAction::SetSrc { expr: _ } => {
-                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| sample_to_string(&smp)).unwrap_or_default();
+                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
                 if let Ok(ip) = val.parse::<IpAddr>() {
                     let port = sess.client_addr.map_or(0, |a| a.port());
                     let new_addr = SocketAddr::new(ip, port);
@@ -8069,7 +8123,7 @@ fn eval_tcp_req_content_rules(
                 // The slot is the holding proxy's own; a stream from another frontend has
                 // none and the rule is ignored (`tcp_action_capture`: `px != strm_fe(s)`).
                 if std::ptr::eq(proxy, &proxies[fe_idx]) {
-                    let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| sample_to_string(&smp));
+                    let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp));
                     if let (Some(id), Some(val)) = (id, val) {
                         // The context borrows the slots: the rules after this one run on a new
                         // pass, over the written slots, in place of this one.
@@ -8081,7 +8135,7 @@ fn eval_tcp_req_content_rules(
                 }
             }
             ibex_config::TcpReqContentAction::SetDst { expr: _ } => {
-                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx)).map(|smp| sample_to_string(&smp)).unwrap_or_default();
+                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
                 if let Ok(ip) = val.parse::<IpAddr>() {
                     let port = sess.server_addr.map_or(0, |a| a.port());
                     let new_addr = SocketAddr::new(ip, port);
@@ -8093,14 +8147,14 @@ fn eval_tcp_req_content_rules(
                 }
             }
             ibex_config::TcpReqContentAction::SetSrcPort { expr: _ } => {
-                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx) {
+                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
                     let new_addr = with_port(sess.client_addr, port);
                     sess.client_addr = Some(new_addr);
                     ctx.client_addr = Some(new_addr);
                 }
             }
             ibex_config::TcpReqContentAction::SetDstPort { expr: _ } => {
-                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx) {
+                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
                     let new_addr = with_port(sess.server_addr, port);
                     sess.server_addr = Some(new_addr);
                     ctx.server_addr = Some(new_addr);
@@ -8112,9 +8166,10 @@ fn eval_tcp_req_content_rules(
                 // fetched sets nothing.
                 // A constant (`str(hello)`) is copied in, with no allocation (T364 S6).
                 let e = rc.expr.as_ref();
+                let sc = ctx.as_ctx();
                 if let Some(c) = e.and_then(|e| e.constant(registry)) {
                     store_var_in(&mut sess.strm.vars, &rc.var(var_name), ibex_sample::vars::In::Ref(c));
-                } else if let Some(val) = e.and_then(|e| e.eval_smp(registry, &ctx)) {
+                } else if let Some(val) = e.and_then(|e| e.eval_smp(registry, &sc)) {
                     rc.var(var_name).store_smp(&mut sess.strm.vars, val);
                 }
             }
@@ -8125,7 +8180,7 @@ fn eval_tcp_req_content_rules(
                 let held = crate::resolvers::dr_wait_unpack(sess.dr_wait).filter(|w| w.0 == rule_idx);
                 if can_wait {
                     let task = crate::resolvers::dr_task();
-                    let step = with_rule_name(rc.expr.as_ref(), registry, &ctx, |name| match held {
+                    let step = with_rule_name(rc.expr.as_ref(), registry, &ctx.as_ctx(), |name| match held {
                         Some((_, asked)) => crate::resolvers::dr_poll(d.section_idx, d.prefer_ipv4, name, asked).map_or(crate::resolvers::DrStep::Wait, crate::resolvers::DrStep::Done),
                         None => crate::resolvers::dr_start(d.section_idx, d.prefer_ipv4, name, task, std::time::Instant::now()),
                     });
@@ -8148,7 +8203,7 @@ fn eval_tcp_req_content_rules(
                 }
             }
             ibex_config::TcpReqContentAction::SetVarFmt { var_name, fmt: _ } => {
-                let val = render_rule_fmt(rc, &ctx, registry);
+                let val = render_rule_fmt(rc, &ctx.as_ctx(), registry);
                 store_var(&mut sess.strm.vars, &rc.var(var_name), val);
             }
             ibex_config::TcpReqContentAction::UnsetVar { var_name } => {
@@ -8157,16 +8212,16 @@ fn eval_tcp_req_content_rules(
             ibex_config::TcpReqContentAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
             ibex_config::TcpReqContentAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
             ibex_config::TcpReqContentAction::ScSetGpt0 { sc, expr } => {
-                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx);
+                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx.as_ctx());
                 sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::SetTag(val));
             }
             ibex_config::TcpReqContentAction::ScIncGpc { idx, sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Inc),
             ibex_config::TcpReqContentAction::ScAddGpc { idx, sc, expr } => {
-                let n = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx);
+                let n = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx.as_ctx());
                 sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Add(u64::from(n)));
             }
             ibex_config::TcpReqContentAction::ScSetGpt { idx, sc, expr } => {
-                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx);
+                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx.as_ctx());
                 sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
             }
             ibex_config::TcpReqContentAction::SwitchModeHttp { .. } => {
@@ -8229,7 +8284,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
     let final_ = server_closed || sess.rep.is_full() || expired;
     let rep_bytes = sess.rep.readable();
     let stick = StickView::new(proxies, &sess.tracked_sc);
-    let ctx = SampleContext {
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx {
         proxies: Some(&ProxiesView(proxies)),
         stick: Some(&stick),
         client_addr: sess.client_addr,
@@ -8258,7 +8313,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &[Proxy], registry: &Regis
         bc_dst: sess.bc_dst(),
         bc_src: sess.bc_src(),
         ..Default::default()
-    };
+    }, live: None };
     for (rule, rc) in proxy.tcp_res_content_rules.iter().zip(&proxy.rules.tcp_res_content) {
         if let Some(cond) = &rc.cond {
             // `acl_exec_cond`: a sample that may change and does not match is a miss.
@@ -8763,7 +8818,7 @@ fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &[Proxy], sess: &mut TcpSess
             // (`stream_generate_unique_id`, `make_proxy_line_v2`).
             if sess.strm.log.unique_id.is_none() {
                 if let Some(fmt) = fe.unique_id_format.as_ref() {
-                    let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy, &ProxiesView(proxies), &StickView::new(proxies, &sess.tracked_sc)));
+                    let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy, &ProxiesView(proxies), &StickView::new(proxies, &sess.tracked_sc)).as_ctx());
                     sess.strm.log.unique_id = Some(id);
                 }
             }
@@ -10270,8 +10325,8 @@ fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str, ca
 impl EngineDispatcher<'_> {
     /// What the sample fetches of a request rule see: the session, the proxy whose rules
     /// run (for its counters), and the proxies' state.
-    fn request_ctx<'a>(sess: &'a TcpSession, proxy: &Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>) -> SampleContext<'a> {
-        SampleContext {
+    fn request_ctx<'a>(sess: &'a TcpSession, proxy: &Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>) -> ibex_sample::PhaseCtx<'a> {
+        ibex_sample::PhaseCtx {
             proxies: Some(view),
             stick: Some(stick),
             client_addr: sess.client_addr,
@@ -10329,11 +10384,11 @@ impl EngineDispatcher<'_> {
         let registry = sample_registry();
         // `lookup_fe_persist_rules`: the frontend's `force-be-switch` conditions.
         let forced = || {
-            proxy.rules.force_be.iter().any(|c| c.eval(&ctx, &proxy.acls, registry))
+            proxy.rules.force_be.iter().any(|c| c.eval(&ctx.as_ctx(), &proxy.acls, registry))
         };
 
         for (rule, rc) in proxy.use_backends.iter().zip(&proxy.rules.use_backend) {
-            let matches = rc.cond.as_ref().is_none_or(|cond| cond.eval(&ctx, &proxy.acls, registry));
+            let matches = rc.cond.as_ref().is_none_or(|cond| cond.eval(&ctx.as_ctx(), &proxy.acls, registry));
             if matches {
                 if let Some(idx) = proxies.iter().position(|p| p.name == rule.backend) {
                     return Some(idx);
@@ -10370,7 +10425,7 @@ impl EngineDispatcher<'_> {
         let ctx = Self::request_ctx(sess, be, &view, &stick);
         let registry = sample_registry();
         for (rule, rc) in be.use_servers.iter().zip(&be.rules.use_server) {
-            if !rc.cond.as_ref().is_some_and(|cond| cond.eval(&ctx, &be.acls, registry)) {
+            if !rc.cond.as_ref().is_some_and(|cond| cond.eval(&ctx.as_ctx(), &be.acls, registry)) {
                 continue;
             }
             let Some(i) = be.server_ids.iter().position(|s| *s == rule.server) else { continue };
@@ -10416,10 +10471,10 @@ impl EngineDispatcher<'_> {
             if is_store && sess.strm.stick_stores.iter().chain(stores.iter()).any(|(t, _)| *t == t_idx) {
                 continue;
             }
-            if rc.cond.as_ref().is_some_and(|c| !c.eval(&ctx, &be.acls, registry)) {
+            if rc.cond.as_ref().is_some_and(|c| !c.eval(&ctx.as_ctx(), &be.acls, registry)) {
                 continue;
             }
-            let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx, Some(tbl)) else {
+            let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), Some(tbl)) else {
                 continue;
             };
             if is_match {
@@ -12843,7 +12898,7 @@ impl EngineDispatcher<'_> {
         // The keys of the request, and the response's own, wait for the server's id.
         let mut stick_stores = std::mem::take(&mut entry.sess.strm.stick_stores);
         let stick = StickView::new(proxies, &entry.sess.tracked_sc);
-        let mut ctx = SampleContext {
+        let mut ctx = ibex_sample::PhaseCtx {
             proxies: Some(&ProxiesView(proxies)),
             stick: Some(&stick),
             client_addr: entry.sess.client_addr,
@@ -12915,10 +12970,10 @@ impl EngineDispatcher<'_> {
                 if stick_stores[from_request..].iter().any(|(t, _)| *t == t_idx) || stick_stores.len() >= 8 {
                     continue;
                 }
-                if rc.cond.as_ref().is_some_and(|c| !c.eval(&ctx, &be.acls, registry)) {
+                if rc.cond.as_ref().is_some_and(|c| !c.eval(&ctx.as_ctx(), &be.acls, registry)) {
                     continue;
                 }
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx, Some(tbl)) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), Some(tbl)) {
                     stick_stores.push((t_idx, key));
                 }
             }
@@ -12940,7 +12995,7 @@ impl EngineDispatcher<'_> {
             let tcp_stop = 'tcp: {
             // Copied only for a backend that has the rules (S7: a copy per response).
             // The headers are out of their fetches' sight while the `tcp-response` rules run.
-            let tcp_ctx = (resume.is_none() && !proxies[be_idx].tcp_res_content_rules.is_empty()).then(|| SampleContext { res_version: None, res_htx: None, ..ctx.clone() });
+            let tcp_ctx = (resume.is_none() && !proxies[be_idx].tcp_res_content_rules.is_empty()).then(|| ibex_sample::PhaseCtx { res_version: None, res_htx: None, ..ctx.clone() });
             // `tcp-response inspect-delay` runs from the first pass over the head; with none,
             // the rules cannot wait (`tcp_inspect_response`).
             let inspect_exp = inspect_wait.map(|w| w.deadline).or_else(|| {
@@ -12950,6 +13005,7 @@ impl EngineDispatcher<'_> {
             // response still waits for the whole delay.
             let inspect_final = rep_full || srv_timed_out || inspect_exp.is_none_or(|exp| exp.is_expired(now));
             for (rule, rc, tcp_ctx) in tcp_ctx.iter().flat_map(|c| proxies[be_idx].tcp_res_content_rules.iter().zip(&proxies[be_idx].rules.tcp_res_content).map(move |(r, rc)| (r, rc, c))) {
+                let tcp_ctx = &tcp_ctx.as_ctx();
                 let matches = match &rc.cond {
                     None => true,
                     Some(cond) => {
@@ -13148,12 +13204,12 @@ impl EngineDispatcher<'_> {
         let return_raw = match &failed {
             Some(ResStop::Return { status, content_type, reply, page, error_page }) => {
                 CURRENT_RES_STATUS.set(0);
-                let res_ctx = SampleContext { res_version: None, res_htx: None, ..ctx.clone() };
+                let res_ctx = ibex_sample::PhaseCtx { res_version: None, res_htx: None, ..ctx.clone() };
                 let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
                 // A body made from a template is held to the buffer (`fit_or_500`) once it is made.
                 match resolve_error_body(&proxies[be_idx], &proxies[entry.proxy_idx], *status, error_page.as_ref(), content_type.as_ref(), reply.as_deref(), page.as_deref()) {
                     ResolvedErrorBody::Raw(bytes) => (bytes.to_vec(), false),
-                    ResolvedErrorBody::Custom { content_type, reply } => (build_templated_error_response(*status, content_type, reply, None, &res_ctx, registry), true),
+                    ResolvedErrorBody::Custom { content_type, reply } => (build_templated_error_response(*status, content_type, reply, None, &res_ctx.as_ctx(), registry), true),
                 }
             }
             _ => (Vec::new(), false),
@@ -13334,10 +13390,10 @@ impl EngineDispatcher<'_> {
 
     /// What a `stats` rule's condition and its `http-error` template see of the stream: the
     /// request line, headers, addresses, and the proxy as frontend and backend.
-    fn stats_ctx<'a>(sess: &'a crate::proxy::TcpSession, view: &'a ProxiesView<'a>, serving: usize) -> SampleContext<'a> {
+    fn stats_ctx<'a>(sess: &'a crate::proxy::TcpSession, view: &'a ProxiesView<'a>, serving: usize) -> ibex_sample::PhaseCtx<'a> {
         let proxies = view.0;
         let name = proxies[serving].name.as_str();
-        SampleContext {
+        ibex_sample::PhaseCtx {
             proxies: Some(view),
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
@@ -13368,7 +13424,7 @@ impl EngineDispatcher<'_> {
         let Some(cond) = cond else { return true };
         let view = ProxiesView(proxies);
         let ctx = Self::stats_ctx(sess, &view, serving);
-        eval_condition(cond, &ctx, &proxies[serving].acls, registry)
+        eval_condition(cond, &ctx.as_ctx(), &proxies[serving].acls, registry)
     }
 
     /// `stats http-request` (and the rule `stats auth` became): the first rule whose condition
@@ -13404,8 +13460,8 @@ impl EngineDispatcher<'_> {
                         // `%s` is `<STATS>` for a stream the stats applet serves.
                         let view = ProxiesView(proxies);
                         let ctx = Self::stats_ctx(sess, &view, serving);
-                        let data = crate::logfmt::LogData { server: Some("<STATS>"), ..crate::logfmt::LogData::of_context(&ctx) };
-                        build_templated_error_response(status, content_type, reply, Some(&data), &ctx, registry)
+                        let data = crate::logfmt::LogData { server: Some("<STATS>"), ..crate::logfmt::LogData::of_context(&ctx.as_ctx()) };
+                        build_templated_error_response(status, content_type, reply, Some(&data), &ctx.as_ctx(), registry)
                     }
                 }
             };
@@ -13814,7 +13870,7 @@ impl EngineDispatcher<'_> {
                     let stick = StickView::new(proxies, &entry.sess.tracked_sc);
                     let ctx = Self::request_ctx(&entry.sess, proxy, &view, &stick);
                     let registry = sample_registry();
-                    mon.fail.iter().any(|c| crate::proxy::eval_acl_condition(c, &proxy.acls, registry, &ctx))
+                    mon.fail.iter().any(|c| crate::proxy::eval_acl_condition(c, &proxy.acls, registry, &ctx.as_ctx()))
                 };
                 if failed {
                     reply_error(entry, proxies, 503);
@@ -13839,7 +13895,7 @@ impl EngineDispatcher<'_> {
             if cfg!(debug_assertions) {
                 ibex_sample::work::note(ibex_sample::work::Op::TrackCtx, 1);
             }
-            Some(SampleContext {
+            Some(SampleContext { phase: &ibex_sample::PhaseCtx {
             proxies: Some(&track_view),
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
@@ -13870,7 +13926,7 @@ impl EngineDispatcher<'_> {
             captures_req_hdr: Some(&entry.sess.strm.log.req_captures),
             captures_res_hdr: Some(&entry.sess.strm.log.res_captures),
             ..Default::default()
-            })
+            }, live: None })
         } else {
             None
         };
@@ -13938,48 +13994,36 @@ impl EngineDispatcher<'_> {
         // The stream a `do-resolve` wakes (T489).
         let my_task = entry.task;
         let eval_http_rules_held = |rules: &[ibex_config::HttpReqRule], compiled: &[crate::rule_compiled::Rule], acls: &ibex_sample::Acls, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize, be_stage: bool, start: usize| -> Result<RuleFlow, u16> {
+            // CP4a-2: what does not change while the rules run, once for the phase; each rule's
+            // context is this and the live session, read at the fetch (`LiveReq`).
+            let phase = ibex_sample::PhaseCtx {
+                proxies: Some(&ProxiesView(proxies)),
+                fc_src: sess.fc_src(),
+                so_id: sess.so_id,
+                fc_dst: sess.fc_dst(),
+                is_first_req: sess.is_first_req,
+                quic_acks: sess.quic_facts(),
+                fc_http_major: sess.fc_http_major(),
+                bc_http_major: sess.bc_http_major(),
+                req_version: sess.client_version(),
+                // `ssl_bc` stays `None`: the parser refuses every `ssl_bc*` fetch in a request
+                // rule, as HAProxy does (`rule_exprs.rs`, "server-side connection"; T341).
+                htx: None,
+                fe_name,
+                be_name,
+                fe_id: fe_name.and_then(|n| proxies.iter().find(|p| p.has_frontend && p.name == n)).map(|p| p.ids.iid),
+                be_id: be_name.and_then(|n| proxies.iter().find(|p| p.has_backend && p.name == n)).map(|p| p.ids.iid),
+                accept_date: Some(sess.strm.log.date()),
+                request_date: Some(request_date(&sess.strm.log)),
+                be_max_retries: Some(be_retries),
+                acls: Some(acls),
+                act_conn,
+                stick: Some(&stick),
+                ..Default::default()
+            };
             macro_rules! make_ctx {
                 ($s:expr) => {
-                    SampleContext {
-                        proxies: Some(&ProxiesView(proxies)),
-                        client_addr: $s.client_addr,
-                        server_addr: $s.server_addr,
-                        fc_src: $s.fc_src(),
-                        so_name: $s.so_name.as_deref(),
-                        so_id: $s.so_id,
-                        fc_dst: $s.fc_dst(),
-                        is_first_req: $s.is_first_req,
-                        proxy_tlvs: $s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
-                        ssl_fc: crate::proxy::ssl_fc(&$s.cli_xprt, $s.h2_role.as_deref()),
-                        quic_acks: $s.quic_facts(),
-                        fc_http_major: $s.fc_http_major(),
-                        bc_http_major: $s.bc_http_major(),
-                        req_version: $s.client_version(),
-                        ssl_bc: $s.srv_xprt.ssl_facts(),
-                        htx: None,
-                        htx_slice: $s.htx_slice(),
-                        req_uri: $s.req_uri.as_deref(),
-                        req_method: $s.req_method.as_deref(),
-                        req_headers: $s.req_headers.as_deref(),
-                        req_body: txn_req_body(&$s),
-                        fe_name,
-                        be_name,
-                        fe_id: fe_name.and_then(|n| proxies.iter().find(|p| p.has_frontend && p.name == n)).map(|p| p.ids.iid),
-                        be_id: be_name.and_then(|n| proxies.iter().find(|p| p.has_backend && p.name == n)).map(|p| p.ids.iid),
-                        captures_req_hdr: Some(&$s.strm.log.req_captures),
-                        unique_id: $s.strm.log.unique_id.as_deref(),
-                        accept_date: Some($s.strm.log.date()),
-                        request_date: Some(request_date(&$s.strm.log)),
-                        last_rule: last_rule_at($s.strm.log.last_rule),
-                        prio: ($s.strm.log.prio_class, $s.strm.log.prio_offset),
-                        be_max_retries: Some(be_retries),
-                        term_state: Some(sess_term_state(&$s)),
-                        cur_max_retries: Some($s.max_retries),
-                        acls: Some(acls),
-                        act_conn,
-                        stick: Some(&stick),
-                        ..Default::default()
-                    }
+                    SampleContext::live(&phase, &*$s)
                 };
             }
 
@@ -14896,7 +14940,7 @@ impl EngineDispatcher<'_> {
         // at the end of the last `Forwarded` header.
         if let Some(fwd) = proxies[be_idx].stats_config.forwarded.clone() {
             let stick = StickView::new(proxies, &entry.sess.tracked_sc);
-            let element = forwarded_element(&fwd, &entry.sess, &stream_sample_ctx(&entry.sess, &proxies[proxy_idx], &proxies[be_idx], &ProxiesView(proxies), &stick));
+            let element = forwarded_element(&fwd, &entry.sess, &stream_sample_ctx(&entry.sess, &proxies[proxy_idx], &proxies[be_idx], &ProxiesView(proxies), &stick).as_ctx());
             if !append_forwarded_element(&mut entry.sess, &element) {
                 return Self::request_no_room(entry, proxies);
             }
@@ -15913,10 +15957,10 @@ pub(crate) fn push_alias(out: &mut String, name: &str, ctx: &SampleContext, push
         }
     };
     match name {
-        "ci" => addr(out, ctx.client_addr),
-        "cp" => port(out, ctx.client_addr),
-        "fi" => addr(out, ctx.server_addr),
-        "fp" => port(out, ctx.server_addr),
+        "ci" => addr(out, ctx.client_addr()),
+        "cp" => port(out, ctx.client_addr()),
+        "fi" => addr(out, ctx.server_addr()),
+        "fp" => port(out, ctx.server_addr()),
         "si" => addr(out, ctx.bc_dst),
         "sp" => port(out, ctx.bc_dst),
         "f" => push(out, ctx.fe_name.unwrap_or_default()),
@@ -17224,7 +17268,7 @@ pub fn response_head_writes() -> u64 {
 
 /// X3b: the response head the rules edit, as HTX header blocks over the response buffer (or,
 /// for a reply the proxy made, over memory of its own): what the `res.*` fetches read through
-/// [`SampleContext::res_htx`] and the actions edit, with no copy of it per rule. Nothing may
+/// [`ibex_sample::PhaseCtx::res_htx`] and the actions edit, with no copy of it per rule. Nothing may
 /// evaluate a fetch while an action holds it borrowed: a rule's format and condition are
 /// evaluated before.
 struct RepHead<'b> {
@@ -17787,7 +17831,7 @@ fn run_res_rules<'a, 'c>(
     rules: impl Iterator<Item = (ResRule<'a>, Option<&'a crate::rule_compiled::Cond>, u32)>,
     acls: &'c ibex_sample::Acls,
     head: (&mut u16, &mut crate::reuse::Word),
-    ctx: &mut SampleContext<'c>,
+    ctx: &mut ibex_sample::PhaseCtx<'c>,
     rh: &RepHead<'_>,
     caps: ResCaps<'_>,
     registry: &Registry,
@@ -17796,7 +17840,7 @@ fn run_res_rules<'a, 'c>(
 ) -> Result<Option<usize>, ResStop> {
     // In place, not a copy of the context per rule (S7).
     let prev = ctx.acls.replace(acls);
-    let flow = run_res_rules_in(rules, acls, head, ctx, rh, caps, registry, vars, wait);
+    let flow = run_res_rules_in(rules, acls, head, &ctx.as_ctx(), rh, caps, registry, vars, wait);
     ctx.acls = prev;
     flow
 }
@@ -17821,10 +17865,12 @@ fn run_res_rules_in<'a>(
     for (idx, (op, cond, line)) in rules.enumerate().skip(start) {
         // The slots as the earlier rules left them, for `capture.res.hdr`: a copy of the
         // context per rule, for the lists that capture.
+        let with_caps_phase;
         let with_caps;
         let ctx = match caps.as_ref() {
             Some((slots, _)) => {
-                with_caps = SampleContext { captures_res_hdr: Some(slots.as_slice()), ..outer.clone() };
+                with_caps_phase = ibex_sample::PhaseCtx { captures_res_hdr: Some(slots.as_slice()), ..outer.phase.clone() };
+                with_caps = with_caps_phase.as_ctx();
                 &with_caps
             }
             None => outer,
@@ -17901,7 +17947,7 @@ fn eval_after_res_rules<'c>(
     fe_idx: usize,
     be_idx: usize,
     head: (&mut u16, &mut crate::reuse::Word),
-    ctx: &mut SampleContext<'c>,
+    ctx: &mut ibex_sample::PhaseCtx<'c>,
     rh: &RepHead<'_>,
     mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
@@ -18285,7 +18331,7 @@ fn after_res_on_reply<'r>(
         // The reply is the proxy's own, and the rules read the same state they read on a server's.
         let view = ProxiesView(proxies);
         let stick = StickView::new(proxies, &sess.tracked_sc);
-        let mut ctx = SampleContext {
+        let mut ctx = ibex_sample::PhaseCtx {
             proxies: Some(&view),
             stick: Some(&stick),
             prio: (sess.strm.log.prio_class, sess.strm.log.prio_offset),
@@ -18360,7 +18406,7 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Pr
         match proxy.error_replies.get(&status) {
             Some(ibex_config::ErrorPageSource::Raw(bytes)) => return Some(copy_page(bytes)),
             Some(ibex_config::ErrorPageSource::Custom { content_type, .. }) => {
-                let ctx = SampleContext {
+                let ctx = SampleContext { phase: &ibex_sample::PhaseCtx {
                     proxies: Some(&ProxiesView(proxies)),
                     client_addr: sess.client_addr,
                     fc_src: sess.fc_src(),
@@ -18384,7 +18430,7 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &[Pr
                     be_name: Some(be.name.as_str()),
                     be_id: Some(be.ids.iid),
                     ..Default::default()
-                };
+                }, live: None };
                 return Some(build_templated_error_response(
                     status,
                     content_type.as_deref(),

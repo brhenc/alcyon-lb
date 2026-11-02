@@ -14,7 +14,7 @@ use std::cell::Cell;
 pub enum Op {
     /// The request head written out of its HTX into the request buffer again.
     ReqRebuild = 0,
-    /// A [`crate::registry::SampleContext`] copied.
+    /// A [`crate::registry::PhaseCtx`] copied (the per-rule [`crate::registry::SampleContext`] is two references, `Copy`, and not counted).
     CtxClone = 1,
     /// An expression looked up by its text ([`crate::expr::Expr::cached`]).
     ExprLookup = 2,
@@ -74,7 +74,7 @@ pub fn on_this_thread() -> [u64; OPS] {
     COUNTS.with(|c| std::array::from_fn(|i| c[i].get()))
 }
 
-/// A field of [`crate::registry::SampleContext`] that counts the context's copies: its
+/// A field of [`crate::registry::PhaseCtx`] that counts the context's copies: its
 /// `Clone` is the context's.
 #[derive(Debug, Default)]
 pub struct CloneCount;

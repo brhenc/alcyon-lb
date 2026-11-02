@@ -866,7 +866,7 @@ mod tests {
         htx.push(HtxBlock::Eoh);
         htx.push(HtxBlock::Eom);
 
-        let ctx = SampleContext {
+        let ctx = SampleContext { phase: &crate::PhaseCtx {
             client_addr: Some(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
                 54321,
@@ -875,7 +875,7 @@ mod tests {
             htx: Some(&htx),
             act_conn: 1,
             ..Default::default()
-        };
+        }, live: None };
 
         // Expression 1: req.hdr(Host),lower -m str example.com
         let expr1 = Expr::parse("req.hdr(Host),lower -m str example.com").unwrap();
@@ -902,8 +902,9 @@ mod tests {
         assert!(expr_path_beg.eval(&registry, &ctx));
 
         // Rate limit expressions, on a stream that tracks an entry in slot 0 only.
-        let mut ctx_rates = ctx.clone();
-        ctx_rates.stick = Some(&Slot0);
+        let mut rates = ctx.phase.clone();
+        rates.stick = Some(&Slot0);
+        let ctx_rates = SampleContext::new(&rates);
 
         let expr_rate1 = Expr::parse("{ sc_conn_rate(0) gt 100 }").unwrap();
         assert!(expr_rate1.eval(&registry, &ctx_rates));
@@ -1067,7 +1068,7 @@ mod tests {
         }));
         htx.push(HtxBlock::Eoh);
         htx.push(HtxBlock::Eom);
-        let ctx = SampleContext { htx: Some(&htx), ..Default::default() };
+        let ctx = SampleContext { phase: &crate::PhaseCtx { htx: Some(&htx), ..Default::default() }, live: None };
         assert!(first.eval(&registry, &ctx));
         assert!(!Expr::parse("path /a").unwrap().eval(&registry, &ctx));
     }

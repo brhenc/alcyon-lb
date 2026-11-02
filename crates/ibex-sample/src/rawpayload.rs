@@ -823,7 +823,7 @@ mod tests {
         use crate::registry::SampleContext;
         let reg = crate::registry::sample_registry();
         let hello = raw_hello(0, &[0, 2, 0x13, 2, 1, 0, 0, 0]);
-        let ctx = SampleContext { raw_res: Some(&hello), ..Default::default() };
+        let ctx = SampleContext { phase: &crate::PhaseCtx { raw_res: Some(&hello), ..Default::default() }, live: None };
         let get = |name: &str| (reg.get_fetch(name).expect(name).func)(&ctx, &[]);
         assert_eq!(get("res.ssl_hello_type"), Some(crate::sample::Sample::Sint(1)));
         assert_eq!(get("rep_ssl_hello_type"), Some(crate::sample::Sample::Sint(1)));

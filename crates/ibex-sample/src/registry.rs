@@ -108,7 +108,7 @@ pub fn take_debug_destinations() -> Vec<String> {
 
 
 /// X3b: the response head the rules edit, as HTX blocks, read by the `res.*` header fetches
-/// ([`SampleContext::res_htx`]). The engine's is a `RefCell` over the response buffer's HTX:
+/// ([`PhaseCtx::res_htx`]). The engine's is a `RefCell` over the response buffer's HTX:
 /// a fetch reads the blocks as they are when it runs, and an action edits them between fetches.
 pub trait ResHead {
     /// `f` over the blocks as they are now.
@@ -134,7 +134,7 @@ pub fn htx_value_text(v: &[u8], latin1: bool) -> Cow<'_, str> {
 }
 
 /// The response headers as `(name, value)` text pairs: `ctx.res_headers`, else the blocks of
-/// [`SampleContext::res_htx`] (a copy, for the fetches that read the whole list).
+/// [`PhaseCtx::res_htx`] (a copy, for the fetches that read the whole list).
 fn res_pairs(ctx: &SampleContext) -> Vec<(String, String)> {
     if let Some(h) = ctx.res_headers {
         return h.to_vec();
@@ -258,9 +258,13 @@ pub struct QuicAckFacts {
     pub excess: Option<u64>,
 }
 
-/// Runtime context passed into sample fetch functions during evaluation.
-#[derive(Debug, Clone, Default)]
-pub struct SampleContext<'a> {
+/// The facts a sample fetch reads, as one phase of the stream knows them (CP4a-2): built once
+/// for a rule phase and held across its rules, read through [`SampleContext::phase`]. The facts
+/// [`LiveReq`] gives are read from the live request instead where a context has one
+/// ([`SampleContext::live`]); read them with the context's accessor of the same name, never
+/// the field here.
+#[derive(Debug, Clone)]
+pub struct PhaseCtx<'a> {
     /// The client connection's error, when it failed before a session (`error-log-format`).
     pub conn_err: Option<ConnErr<'a>>,
     /// Evaluated for the access log, after the request buffer is gone: `method` reads
@@ -372,6 +376,339 @@ pub struct SampleContext<'a> {
     pub clones: crate::work::CloneCount,
 }
 
+
+impl PhaseCtx<'_> {
+    /// A phase that knows nothing: what [`Default`] gives, as a constant so an empty
+    /// [`SampleContext`] can borrow it for `'static`.
+    pub const EMPTY: PhaseCtx<'static> = PhaseCtx {
+        conn_err: None,
+        at_log: false,
+        client_addr: None,
+        server_addr: None,
+        fc_src: None,
+        fc_dst: None,
+        proxy_tlvs: None,
+        htx: None,
+        htx_slice: None,
+        req_uri: None,
+        req_method: None,
+        req_headers: None,
+        req_version: None,
+        req_body: None,
+        raw_req: None,
+        raw_res: None,
+        res_version: None,
+        res_headers: None,
+        res_htx: None,
+        res_status: None,
+        res_body: None,
+        fe_id: None,
+        fe_name: None,
+        be_id: None,
+        be_name: None,
+        srv_id: None,
+        srv_name: None,
+        so_id: None,
+        so_name: None,
+        fc_rtt: None,
+        fc_rttvar: None,
+        bc_rtt: None,
+        bc_rttvar: None,
+        bc_err: None,
+        bc_reused: None,
+        term_state: None,
+        bc_dst: None,
+        bc_src: None,
+        captures_req_hdr: None,
+        captures_res_hdr: None,
+        unique_id: None,
+        last_rule: None,
+        prio: (0, 0),
+        accept_date: None,
+        request_date: None,
+        stream: None,
+        acls: None,
+        is_first_req: false,
+        vars: None,
+        timeouts: None,
+        be_max_retries: None,
+        cur_max_retries: None,
+        act_conn: 0,
+        fc_http_major: None,
+        bc_http_major: None,
+        ssl_fc: SslFacts::NONE,
+        ssl_bc: None,
+        quic_acks: None,
+        proxies: None,
+        stick: None,
+        clones: crate::work::CloneCount,
+    };
+}
+
+impl PhaseCtx<'_> {
+    /// A context reading this phase only (no live request).
+    #[inline]
+    #[must_use]
+    pub fn as_ctx(&self) -> SampleContext<'_> {
+        SampleContext::new(self)
+    }
+}
+
+impl Default for PhaseCtx<'_> {
+    #[inline]
+    fn default() -> Self {
+        PhaseCtx::EMPTY
+    }
+}
+
+/// The facts of a request that its rules can change, or that borrow the stream (CP4a-2): what
+/// a request rule's context reads from the live session ([`SampleContext::live`]) at the fetch,
+/// so the rule assembles no copy of them. Each method gives what the [`PhaseCtx`] field of the
+/// same name would hold.
+pub trait LiveReq {
+    /// The client address as the request rules leave it (`set-src`).
+    fn client_addr(&self) -> Option<SocketAddr>;
+    /// The frontend address as the request rules leave it (`set-dst`).
+    fn server_addr(&self) -> Option<SocketAddr>;
+    /// The listener's name (`so_name`).
+    fn so_name(&self) -> Option<&str>;
+    /// The PROXY protocol TLVs the connection came with.
+    fn proxy_tlvs(&self) -> Option<&[u8]>;
+    /// The client connection's TLS session.
+    fn ssl_fc(&self) -> SslFacts<'_>;
+    /// The request head as HTX, as the rules before have edited it.
+    fn htx_slice(&self) -> Option<HtxSliceRef<'_>>;
+    /// The request URI kept apart from the HTX.
+    fn req_uri(&self) -> Option<&str>;
+    /// The request method kept apart from the HTX.
+    fn req_method(&self) -> Option<&str>;
+    /// The request headers kept apart from the HTX.
+    fn req_headers(&self) -> Option<&[(String, String)]>;
+    /// The request body buffered so far.
+    fn req_body(&self) -> Option<&[u8]>;
+    /// The request header capture slots.
+    fn captures_req_hdr(&self) -> Option<&[Option<Vec<u8>>]>;
+    /// The stream's unique ID.
+    fn unique_id(&self) -> Option<&str>;
+    /// The file and line of the last rule that ended a rule set.
+    fn last_rule(&self) -> Option<(&str, u32)>;
+    /// The stream's priority class and offset (`set-priority-*`).
+    fn prio(&self) -> (i32, i32);
+    /// The stream's termination state as it stands.
+    fn term_state(&self) -> Option<[u8; 2]>;
+    /// The stream's retry budget (`set-retries`).
+    fn cur_max_retries(&self) -> Option<u16>;
+}
+
+/// Runtime context passed into sample fetch functions during evaluation (CP4a-2): the phase's
+/// facts by reference, and the live request where there is one. A rule puts together only these
+/// two words (`size_of` is pinned by `rules_path_work.rs`); a field of [`PhaseCtx`] reads through
+/// [`Deref`](std::ops::Deref), a [`LiveReq`] fact through the accessor of its name.
+#[derive(Clone, Copy)]
+pub struct SampleContext<'a> {
+    /// The facts the phase worked out once.
+    pub phase: &'a PhaseCtx<'a>,
+    /// The request the rules run on, read at the fetch; `None` reads the phase's fields.
+    pub live: Option<&'a dyn LiveReq>,
+}
+
+impl<'a> SampleContext<'a> {
+    /// A context reading `phase` only.
+    #[inline]
+    #[must_use]
+    pub const fn new(phase: &'a PhaseCtx<'a>) -> Self {
+        Self { phase, live: None }
+    }
+
+    /// A request rule's context: `phase`, and `live`'s facts read at the fetch.
+    #[inline]
+    #[must_use]
+    pub fn live(phase: &'a PhaseCtx<'a>, live: &'a dyn LiveReq) -> Self {
+        Self { phase, live: Some(live) }
+    }
+
+    /// [`LiveReq::client_addr`] from the live request, else [`PhaseCtx::client_addr`].
+    #[inline]
+    #[must_use]
+    pub fn client_addr(&self) -> Option<SocketAddr> {
+        match self.live {
+            Some(l) => l.client_addr(),
+            None => self.phase.client_addr,
+        }
+    }
+
+    /// [`LiveReq::server_addr`] from the live request, else [`PhaseCtx::server_addr`].
+    #[inline]
+    #[must_use]
+    pub fn server_addr(&self) -> Option<SocketAddr> {
+        match self.live {
+            Some(l) => l.server_addr(),
+            None => self.phase.server_addr,
+        }
+    }
+
+    /// [`LiveReq::so_name`] from the live request, else [`PhaseCtx::so_name`].
+    #[inline]
+    #[must_use]
+    pub fn so_name(&self) -> Option<&'a str> {
+        match self.live {
+            Some(l) => l.so_name(),
+            None => self.phase.so_name,
+        }
+    }
+
+    /// [`LiveReq::proxy_tlvs`] from the live request, else [`PhaseCtx::proxy_tlvs`].
+    #[inline]
+    #[must_use]
+    pub fn proxy_tlvs(&self) -> Option<&'a [u8]> {
+        match self.live {
+            Some(l) => l.proxy_tlvs(),
+            None => self.phase.proxy_tlvs,
+        }
+    }
+
+    /// [`LiveReq::ssl_fc`] from the live request, else [`PhaseCtx::ssl_fc`].
+    #[inline]
+    #[must_use]
+    pub fn ssl_fc(&self) -> SslFacts<'a> {
+        match self.live {
+            Some(l) => l.ssl_fc(),
+            None => self.phase.ssl_fc,
+        }
+    }
+
+    /// [`LiveReq::htx_slice`] from the live request, else [`PhaseCtx::htx_slice`].
+    #[inline]
+    #[must_use]
+    pub fn htx_slice(&self) -> Option<HtxSliceRef<'a>> {
+        match self.live {
+            Some(l) => l.htx_slice(),
+            None => self.phase.htx_slice,
+        }
+    }
+
+    /// [`LiveReq::req_uri`] from the live request, else [`PhaseCtx::req_uri`].
+    #[inline]
+    #[must_use]
+    pub fn req_uri(&self) -> Option<&'a str> {
+        match self.live {
+            Some(l) => l.req_uri(),
+            None => self.phase.req_uri,
+        }
+    }
+
+    /// [`LiveReq::req_method`] from the live request, else [`PhaseCtx::req_method`].
+    #[inline]
+    #[must_use]
+    pub fn req_method(&self) -> Option<&'a str> {
+        match self.live {
+            Some(l) => l.req_method(),
+            None => self.phase.req_method,
+        }
+    }
+
+    /// [`LiveReq::req_headers`] from the live request, else [`PhaseCtx::req_headers`].
+    #[inline]
+    #[must_use]
+    pub fn req_headers(&self) -> Option<&'a [(String, String)]> {
+        match self.live {
+            Some(l) => l.req_headers(),
+            None => self.phase.req_headers,
+        }
+    }
+
+    /// [`LiveReq::req_body`] from the live request, else [`PhaseCtx::req_body`].
+    #[inline]
+    #[must_use]
+    pub fn req_body(&self) -> Option<&'a [u8]> {
+        match self.live {
+            Some(l) => l.req_body(),
+            None => self.phase.req_body,
+        }
+    }
+
+    /// [`LiveReq::captures_req_hdr`] from the live request, else [`PhaseCtx::captures_req_hdr`].
+    #[inline]
+    #[must_use]
+    pub fn captures_req_hdr(&self) -> Option<&'a [Option<Vec<u8>>]> {
+        match self.live {
+            Some(l) => l.captures_req_hdr(),
+            None => self.phase.captures_req_hdr,
+        }
+    }
+
+    /// [`LiveReq::unique_id`] from the live request, else [`PhaseCtx::unique_id`].
+    #[inline]
+    #[must_use]
+    pub fn unique_id(&self) -> Option<&'a str> {
+        match self.live {
+            Some(l) => l.unique_id(),
+            None => self.phase.unique_id,
+        }
+    }
+
+    /// [`LiveReq::last_rule`] from the live request, else [`PhaseCtx::last_rule`].
+    #[inline]
+    #[must_use]
+    pub fn last_rule(&self) -> Option<(&'a str, u32)> {
+        match self.live {
+            Some(l) => l.last_rule(),
+            None => self.phase.last_rule,
+        }
+    }
+
+    /// [`LiveReq::prio`] from the live request, else [`PhaseCtx::prio`].
+    #[inline]
+    #[must_use]
+    pub fn prio(&self) -> (i32, i32) {
+        match self.live {
+            Some(l) => l.prio(),
+            None => self.phase.prio,
+        }
+    }
+
+    /// [`LiveReq::term_state`] from the live request, else [`PhaseCtx::term_state`].
+    #[inline]
+    #[must_use]
+    pub fn term_state(&self) -> Option<[u8; 2]> {
+        match self.live {
+            Some(l) => l.term_state(),
+            None => self.phase.term_state,
+        }
+    }
+
+    /// [`LiveReq::cur_max_retries`] from the live request, else [`PhaseCtx::cur_max_retries`].
+    #[inline]
+    #[must_use]
+    pub fn cur_max_retries(&self) -> Option<u16> {
+        match self.live {
+            Some(l) => l.cur_max_retries(),
+            None => self.phase.cur_max_retries,
+        }
+    }
+}
+
+impl Default for SampleContext<'_> {
+    #[inline]
+    fn default() -> Self {
+        SampleContext::new(&PhaseCtx::EMPTY)
+    }
+}
+
+impl<'a> std::ops::Deref for SampleContext<'a> {
+    type Target = PhaseCtx<'a>;
+    #[inline]
+    fn deref(&self) -> &PhaseCtx<'a> {
+        self.phase
+    }
+}
+
+impl std::fmt::Debug for SampleContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SampleContext").field("phase", self.phase).field("live", &self.live.is_some()).finish()
+    }
+}
+
 /// What a TLS session tells the `ssl_*` fetches, as the transport knows it once the
 /// handshake is done (`TlsInfo`).
 #[derive(Debug, Clone, Copy, Default)]
@@ -395,6 +732,12 @@ pub struct SslFacts<'a> {
     /// The client's `ClientHello` as `tune.ssl.capture-buffer-size` kept it; `None` when the
     /// size is 0 (`ssl_fc_cipherlist_bin`, `ssl_fc_protocol_hello_id`: no sample).
     pub capture: Option<&'a ibex_tls::SslCapture>,
+}
+
+impl SslFacts<'_> {
+    /// A plaintext connection's: what [`Default`] gives.
+    pub const NONE: SslFacts<'static> =
+        SslFacts { used: false, sni: None, cipher: None, protocol: None, alpn: None, has_crt: false, local_crt: None, resumed: false, capture: None };
 }
 
 /// One server's live state, as the server fetches read it.
@@ -490,7 +833,7 @@ pub enum StickOp {
 }
 
 /// The stick-table entries a stream tracks, which the `sc_*`, `sc[0-9]_*` and `src_*`
-/// fetches read, provided through [`SampleContext::stick`].
+/// fetches read, provided through [`PhaseCtx::stick`].
 ///
 /// Both answer as `HAProxy` does: `None` where there is no sample (nothing is tracked in
 /// the slot; the entry is there and its table does not store `data`; a table argument whose
@@ -517,7 +860,7 @@ pub trait StickState: std::fmt::Debug {
 }
 
 /// The live state of the configured proxies, which the runtime provides through
-/// [`SampleContext::proxies`].
+/// [`PhaseCtx::proxies`].
 ///
 /// Backend and server names are resolved against the configuration when it loads, so a
 /// `None` from these at run time means the name was not checked (a converter's input is
@@ -563,7 +906,7 @@ pub type FetchFn = fn(&SampleContext, &[String]) -> Option<Sample>;
 /// A sample converter implementation.
 pub type ConvFn = fn(Sample, &[String]) -> Option<Sample>;
 
-/// A converter that reads the runtime state ([`SampleContext::proxies`]) as well as its
+/// A converter that reads the runtime state ([`PhaseCtx::proxies`]) as well as its
 /// input: `nbsrv`, `srv_is_up`, `fe_exists`, `in_table`.
 pub type CtxConvFn = fn(&SampleContext, Sample, &[String]) -> Option<Sample>;
 
@@ -627,7 +970,7 @@ fn server_arg<'a>(ctx: &'a SampleContext, arg: &'a str) -> Option<(&'a str, &'a 
 /// A server fetch: the named server's [`ServerState`] through `f`.
 /// The certificate this side presented, as DER and parsed (`ssl_f_*`).
 fn local_cert<'a>(ctx: &SampleContext<'a>) -> Option<(&'a [u8], ibex_tls::x509::Cert<'a>)> {
-    let der = ctx.ssl_fc.local_crt?;
+    let der = ctx.ssl_fc().local_crt?;
     Some((der, ibex_tls::x509::Cert::parse(der)?))
 }
 
@@ -688,8 +1031,8 @@ fn stick_act(ctx: &SampleContext, target: Target, act: Act) -> Option<Sample> {
     match (target, act) {
         (Target::Slot(slot, table), Act::Read(d)) => stick.tracked(slot, table, d),
         (Target::Slot(slot, table), Act::Write(op)) => stick.write_tracked(slot, table, op),
-        (Target::Source(tables), Act::Read(d)) => stick.source(ctx.client_addr?.ip(), tables, d),
-        (Target::Source(tables), Act::Write(op)) => stick.write_source(ctx.client_addr?.ip(), tables, op),
+        (Target::Source(tables), Act::Read(d)) => stick.source(ctx.client_addr()?.ip(), tables, d),
+        (Target::Source(tables), Act::Write(op)) => stick.write_source(ctx.client_addr()?.ip(), tables, op),
     }
     .map(Sample::Sint)
 }
@@ -1649,11 +1992,11 @@ impl Registry {
     #[allow(clippy::too_many_lines)]
     fn register_builtin_fetches(&mut self) {
         // --- 1. Client & Destination Network Fetches ---
-        let src_fetch: FetchFn = |ctx, _args| match ctx.client_addr?.ip() {
+        let src_fetch: FetchFn = |ctx, _args| match ctx.client_addr()?.ip() {
             IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
             IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
         };
-        let fc_src_fetch: FetchFn = |ctx, _args| match ctx.fc_src.or(ctx.client_addr)?.ip() {
+        let fc_src_fetch: FetchFn = |ctx, _args| match ctx.fc_src.or(ctx.client_addr())?.ip() {
             IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
             IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
         };
@@ -1670,7 +2013,7 @@ impl Registry {
         // T331: `smp_fetch_fc_rcvd_proxy`: `CO_FL_RCVD_PROXY`, set once a PROXY header
         // (v1, v1 UNKNOWN, v2 PROXY or LOCAL) has been parsed. `proxy_tlvs` is `Some` exactly
         // then: `apply_proxy_header` stores every parsed header in `proxy_info`.
-        let fc_rcvd_proxy_fetch: FetchFn = |ctx, _args| Some(Sample::Bool(ctx.proxy_tlvs.is_some()));
+        let fc_rcvd_proxy_fetch: FetchFn = |ctx, _args| Some(Sample::Bool(ctx.proxy_tlvs().is_some()));
         self.register_fetch(FetchDesc {
             name: "fc_rcvd_proxy",
             out_type: SampleType::Bool,
@@ -1686,9 +2029,9 @@ impl Registry {
         });
 
         let src_port_fetch: FetchFn =
-            |ctx, _args| ctx.client_addr.map(|sa| Sample::Sint(i64::from(sa.port())));
+            |ctx, _args| ctx.client_addr().map(|sa| Sample::Sint(i64::from(sa.port())));
         let fc_src_port_fetch: FetchFn =
-            |ctx, _args| ctx.fc_src.or(ctx.client_addr).map(|sa| Sample::Sint(i64::from(sa.port())));
+            |ctx, _args| ctx.fc_src.or(ctx.client_addr()).map(|sa| Sample::Sint(i64::from(sa.port())));
         self.register_fetch(FetchDesc {
             name: "src_port",
             out_type: SampleType::Sint,
@@ -1702,10 +2045,10 @@ impl Registry {
 
         // T329: src_is_local, fc_src_is_local
         let src_is_local_fetch: FetchFn = |ctx, _args| {
-            is_local_sample(ctx.client_addr)
+            is_local_sample(ctx.client_addr())
         };
         let fc_src_is_local_fetch: FetchFn = |ctx, _args| {
-            is_local_sample(ctx.fc_src.or(ctx.client_addr))
+            is_local_sample(ctx.fc_src.or(ctx.client_addr()))
         };
         self.register_fetch(FetchDesc {
             name: "src_is_local",
@@ -1718,11 +2061,11 @@ impl Registry {
             func: fc_src_is_local_fetch,
         });
 
-        let dst_fetch: FetchFn = |ctx, _args| match ctx.server_addr?.ip() {
+        let dst_fetch: FetchFn = |ctx, _args| match ctx.server_addr()?.ip() {
             IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
             IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
         };
-        let fc_dst_fetch: FetchFn = |ctx, _args| match ctx.fc_dst.or(ctx.server_addr)?.ip() {
+        let fc_dst_fetch: FetchFn = |ctx, _args| match ctx.fc_dst.or(ctx.server_addr())?.ip() {
             IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
             IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
         };
@@ -1740,11 +2083,11 @@ impl Registry {
         // `smp_fetch_dport` (src/tcp_sample.c) fails on port 0: `set-dst-port` can put it
         // there, and HAProxy then prints nothing for `%[dst_port]`.
         let dst_port_fetch: FetchFn = |ctx, _args| {
-            ctx.server_addr.filter(|sa| sa.port() != 0).map(|sa| Sample::Sint(i64::from(sa.port())))
+            ctx.server_addr().filter(|sa| sa.port() != 0).map(|sa| Sample::Sint(i64::from(sa.port())))
         };
         let fc_dst_port_fetch: FetchFn = |ctx, _args| {
             ctx.fc_dst
-                .or(ctx.server_addr)
+                .or(ctx.server_addr())
                 .filter(|sa| sa.port() != 0)
                 .map(|sa| Sample::Sint(i64::from(sa.port())))
         };
@@ -1761,10 +2104,10 @@ impl Registry {
 
         // T329: dst_is_local, fc_dst_is_local
         let dst_is_local_fetch: FetchFn = |ctx, _args| {
-            is_local_sample(ctx.server_addr)
+            is_local_sample(ctx.server_addr())
         };
         let fc_dst_is_local_fetch: FetchFn = |ctx, _args| {
-            is_local_sample(ctx.fc_dst.or(ctx.server_addr))
+            is_local_sample(ctx.fc_dst.or(ctx.server_addr()))
         };
         self.register_fetch(FetchDesc {
             name: "dst_is_local",
@@ -1970,7 +2313,7 @@ impl Registry {
         });
 
         let status_fetch: FetchFn = |ctx, _args| {
-            if let Some(h) = ctx.htx_slice {
+            if let Some(h) = ctx.htx_slice() {
                 if let Some(res) = h.res_line() {
                     return Some(Sample::Sint(i64::from(res.status)));
                 }
@@ -2017,7 +2360,7 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "txn.sess_term_state",
             out_type: SampleType::Str,
-            func: |ctx, _args| ctx.term_state.map(|t| Sample::Str(t.iter().map(|&b| char::from(b)).collect())),
+            func: |ctx, _args| ctx.term_state().map(|t| Sample::Str(t.iter().map(|&b| char::from(b)).collect())),
         });
         // `txn.status`: the status the log reports, `status` where a response is read.
         self.register_fetch(FetchDesc {
@@ -2053,7 +2396,7 @@ impl Registry {
         // `smp_fetch_proto_http` (`src/http_fetch.c`), registered as `req.proto_http` and, T326,
         // as its alias `req_proto_http`.
         let proto_http_fetch: FetchFn = |ctx, _args| {
-            Some(Sample::Bool(ctx.htx_slice.is_some() || ctx.htx.is_some() || ctx.req_uri.is_some()))
+            Some(Sample::Bool(ctx.htx_slice().is_some() || ctx.htx.is_some() || ctx.req_uri().is_some()))
         };
         self.register_fetch(FetchDesc { name: "req.proto_http", out_type: SampleType::Bool, func: proto_http_fetch });
         self.register_fetch(FetchDesc { name: "req_proto_http", out_type: SampleType::Bool, func: proto_http_fetch });
@@ -2062,7 +2405,7 @@ impl Registry {
             out_type: SampleType::Bool,
             func: |ctx, _args| {
                 Some(Sample::Bool(
-                    ctx.htx_slice.is_some()
+                    ctx.htx_slice().is_some()
                         || ctx.htx.is_some()
                         || ctx.res_status.is_some()
                         || CURRENT_RES_STATUS.get() > 0,
@@ -2090,7 +2433,7 @@ impl Registry {
                 let h = base32_hash(ctx)?;
                 let mut out = Vec::with_capacity(20);
                 out.extend_from_slice(&h.to_be_bytes());
-                if let Some(sa) = ctx.client_addr {
+                if let Some(sa) = ctx.client_addr() {
                     match sa.ip() {
                         IpAddr::V4(v4) => out.extend_from_slice(&v4.octets()),
                         IpAddr::V6(v6) => out.extend_from_slice(&v6.octets()),
@@ -2118,7 +2461,7 @@ impl Registry {
                 let h = url32_hash(ctx);
                 let mut out = Vec::with_capacity(20);
                 out.extend_from_slice(&h.to_be_bytes());
-                if let Some(sa) = ctx.client_addr {
+                if let Some(sa) = ctx.client_addr() {
                     match sa.ip() {
                         IpAddr::V4(v4) => out.extend_from_slice(&v4.octets()),
                         IpAddr::V6(v6) => out.extend_from_slice(&v6.octets()),
@@ -2225,13 +2568,13 @@ impl Registry {
         // T329: req.hdrs_bin (`smp_fetch_hdrs_bin`, src/http_fetch.c). No request headers at
         // all, no sample, as HAProxy without an HTX message.
         let req_hdrs_bin_fetch: FetchFn = |ctx, _args| {
-            if let Some(htx) = ctx.htx_slice {
+            if let Some(htx) = ctx.htx_slice() {
                 return Some(hdrs_bin(htx.headers(), true));
             }
             if let Some(htx) = ctx.htx {
                 return Some(hdrs_bin(htx.headers().map(|hf| (hf.name.as_str(), hf.value.as_str())), true));
             }
-            ctx.req_headers.map(|h| hdrs_bin(h.iter().map(|(k, v)| (k.as_str(), v.as_str())), true))
+            ctx.req_headers().map(|h| hdrs_bin(h.iter().map(|(k, v)| (k.as_str(), v.as_str())), true))
         };
         self.register_fetch(FetchDesc {
             name: "req.hdrs_bin",
@@ -2470,10 +2813,10 @@ impl Registry {
             name: "req.body",
             out_type: SampleType::Bin,
             func: |ctx, _args| {
-                if let Some(b) = ctx.req_body {
+                if let Some(b) = ctx.req_body() {
                     return Some(Sample::Bin(b.to_vec()));
                 }
-                ctx.htx_slice.map(|h| Sample::Bin(h.body_bytes()))
+                ctx.htx_slice().map(|h| Sample::Bin(h.body_bytes()))
             },
         });
 
@@ -2484,7 +2827,7 @@ impl Registry {
             out_type: SampleType::Bin,
             func: |ctx, args| {
                 let owned;
-                let body: &[u8] = match (ctx.req_body, ctx.htx_slice) {
+                let body: &[u8] = match (ctx.req_body(), ctx.htx_slice()) {
                     (Some(b), _) => b,
                     (_, Some(h)) => {
                         owned = h.body_bytes();
@@ -2507,18 +2850,18 @@ impl Registry {
                 if let Some(b) = ctx.res_body {
                     return Some(Sample::Bin(b.to_vec()));
                 }
-                ctx.htx_slice.map(|h| Sample::Bin(h.body_bytes()))
+                ctx.htx_slice().map(|h| Sample::Bin(h.body_bytes()))
             },
         });
 
         let request_body_len_fetch: FetchFn = |ctx, _args| {
-            if let Some(h) = ctx.htx_slice {
+            if let Some(h) = ctx.htx_slice() {
                 let bl = h.body_len();
                 if bl > 0 {
                     return Some(Sample::Sint(len_to_sint(bl)));
                 }
             }
-            if let Some(b) = ctx.req_body {
+            if let Some(b) = ctx.req_body() {
                 return Some(Sample::Sint(len_to_sint(b.len())));
             }
             if let Some(cl) = get_req_header(ctx, "content-length") {
@@ -2548,7 +2891,7 @@ impl Registry {
         });
 
         let response_body_len_fetch: FetchFn = |ctx, _args| {
-            if let Some(h) = ctx.htx_slice {
+            if let Some(h) = ctx.htx_slice() {
                 let bl = h.body_len();
                 if bl > 0 {
                     return Some(Sample::Sint(len_to_sint(bl)));
@@ -2584,7 +2927,7 @@ impl Registry {
             let offset = args.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
             let len = args.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
 
-            if let Some(body) = ctx.req_body {
+            if let Some(body) = ctx.req_body() {
                 if offset >= body.len() {
                     return None;
                 }
@@ -2596,7 +2939,7 @@ impl Registry {
                 return Some(Sample::Bin(slice.to_vec()));
             }
 
-            if let Some(h) = ctx.htx_slice {
+            if let Some(h) = ctx.htx_slice() {
                 let body = h.body_bytes();
                 if offset >= body.len() {
                     return None;
@@ -2661,7 +3004,7 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "unique-id",
             out_type: SampleType::Str,
-            func: |ctx, _args| ctx.unique_id.map(|u| Sample::Str(u.to_string())),
+            func: |ctx, _args| ctx.unique_id().map(|u| Sample::Str(u.to_string())),
         });
         // `smp_fetch_wait_end` (src/payload.c): true once the rules may no longer wait. The
         // tcp-request and tcp-response content rules hold a condition on it while they can
@@ -2676,22 +3019,22 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "last_rule_file",
             out_type: SampleType::Str,
-            func: |ctx, _args| ctx.last_rule.map(|(file, _)| Sample::Str(file.to_string())),
+            func: |ctx, _args| ctx.last_rule().map(|(file, _)| Sample::Str(file.to_string())),
         });
         self.register_fetch(FetchDesc {
             name: "prio_class",
             out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.prio.0))),
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.prio().0))),
         });
         self.register_fetch(FetchDesc {
             name: "prio_offset",
             out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.prio.1))),
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.prio().1))),
         });
         self.register_fetch(FetchDesc {
             name: "last_rule_line",
             out_type: SampleType::Sint,
-            func: |ctx, _args| ctx.last_rule.map(|(_, line)| Sample::Sint(i64::from(line))),
+            func: |ctx, _args| ctx.last_rule().map(|(_, line)| Sample::Sint(i64::from(line))),
         });
 
         // --- 7. Captures ---
@@ -2705,7 +3048,7 @@ impl Registry {
                 if let Some(v) = crate::capture_write::pending(false, idx) {
                     return Some(capture_sample(v));
                 }
-                let caps = ctx.captures_req_hdr?;
+                let caps = ctx.captures_req_hdr()?;
                 caps.get(idx)?.clone().map(capture_sample)
             },
         });
@@ -2917,7 +3260,7 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "so_name",
             out_type: SampleType::Str,
-            func: |ctx, _args| ctx.so_name.map(|n| Sample::Str(n.to_string())),
+            func: |ctx, _args| ctx.so_name().map(|n| Sample::Str(n.to_string())),
         });
 
         // --- 9. Connection & Rate Fetches ---
@@ -2989,7 +3332,7 @@ impl Registry {
                 self.register_fetch(FetchDesc {
                     name: concat!("src_", $suffix),
                     out_type: SampleType::Sint,
-                    func: |ctx, args| ctx.stick?.source(ctx.client_addr?.ip(), &source_tables(ctx, args), $data).map(Sample::Sint),
+                    func: |ctx, args| ctx.stick?.source(ctx.client_addr()?.ip(), &source_tables(ctx, args), $data).map(Sample::Sint),
                 });
             };
         }
@@ -3171,7 +3514,7 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "src_updt_conn_cnt",
             out_type: SampleType::Sint,
-            func: |ctx, args| ctx.stick?.write_source(ctx.client_addr?.ip(), &source_tables(ctx, args), StickOp::UpdtConnCnt).map(Sample::Sint),
+            func: |ctx, args| ctx.stick?.write_source(ctx.client_addr()?.ip(), &source_tables(ctx, args), StickOp::UpdtConnCnt).map(Sample::Sint),
         });
         // `smp_fetch_table_cnt` and `smp_fetch_table_avl`.
         self.register_fetch(FetchDesc {
@@ -3234,7 +3577,7 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "cur_max_retries",
             out_type: SampleType::Sint,
-            func: |ctx, _args| ctx.cur_max_retries.map(|v| Sample::Sint(i64::from(v))),
+            func: |ctx, _args| ctx.cur_max_retries().map(|v| Sample::Sint(i64::from(v))),
         });
 
         // --- 12. SSL Fetches ---
@@ -3244,12 +3587,12 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "ssl_fc",
             out_type: SampleType::Bool,
-            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_fc.used)),
+            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_fc().used)),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_sni",
             out_type: SampleType::Str,
-            func: |ctx, _args| ctx.ssl_fc.sni.map(|v| Sample::Str(v.to_string())),
+            func: |ctx, _args| ctx.ssl_fc().sni.map(|v| Sample::Str(v.to_string())),
         });
         // The ClientHello capture (`tune.ssl.capture-buffer-size`, `smp_fetch_ssl_fc_*_bin` and
         // friends, src/ssl_sample.c): no sample without one. The `(1)` argument runs the list
@@ -3294,7 +3637,7 @@ impl Registry {
             name: "ssl_fc_ja4",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                let parts = ctx.ssl_fc.capture?.ja4.as_ref()?;
+                let parts = ctx.ssl_fc().capture?.ja4.as_ref()?;
                 Some(Sample::Str(crate::ja4::ja4(parts)))
             },
         });
@@ -3302,12 +3645,12 @@ impl Registry {
             name: "ssl_fc_cipherlist_xxh",
             out_type: SampleType::Sint,
             // `smp->data.u.sint = capture->xxh64`: the unsigned 64-bit hash as a signed value.
-            func: |ctx, _args| ctx.ssl_fc.capture.map(|c| Sample::Sint(c.xxh64.cast_signed())),
+            func: |ctx, _args| ctx.ssl_fc().capture.map(|c| Sample::Sint(c.xxh64.cast_signed())),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_protocol_hello_id",
             out_type: SampleType::Sint,
-            func: |ctx, _args| ctx.ssl_fc.capture.map(|c| Sample::Sint(i64::from(c.protocol_version))),
+            func: |ctx, _args| ctx.ssl_fc().capture.map(|c| Sample::Sint(i64::from(c.protocol_version))),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_extlist_bin",
@@ -3322,7 +3665,7 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "ssl_fc_ecformats_bin",
             out_type: SampleType::Bin,
-            func: |ctx, _args| ctx.ssl_fc.capture.map(|c| Sample::Bin(c.ec_formats().to_vec())),
+            func: |ctx, _args| ctx.ssl_fc().capture.map(|c| Sample::Bin(c.ec_formats().to_vec())),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_supported_versions_bin",
@@ -3337,17 +3680,17 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "ssl_fc_alpn",
             out_type: SampleType::Str,
-            func: |ctx, _args| ctx.ssl_fc.alpn.map(|v| Sample::Str(String::from_utf8_lossy(v).into_owned())),
+            func: |ctx, _args| ctx.ssl_fc().alpn.map(|v| Sample::Str(String::from_utf8_lossy(v).into_owned())),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_cipher",
             out_type: SampleType::Str,
-            func: |ctx, _args| ctx.ssl_fc.cipher.map(|v| Sample::Str(v.to_string())),
+            func: |ctx, _args| ctx.ssl_fc().cipher.map(|v| Sample::Str(v.to_string())),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_protocol",
             out_type: SampleType::Str,
-            func: |ctx, _args| ctx.ssl_fc.protocol.map(|v| Sample::Str(v.to_string())),
+            func: |ctx, _args| ctx.ssl_fc().protocol.map(|v| Sample::Str(v.to_string())),
         });
         // The error fetches the `option httpslog` line reads. `fc_err` is 0 here: Ibex does not
         // keep the error code of a connection that failed. The `ssl_*` ones have a value on a
@@ -3377,25 +3720,25 @@ impl Registry {
             out_type: SampleType::Sint,
             func: |ctx, _args| match ctx.conn_err {
                 Some(e) if e.tls => Some(Sample::Sint(e.ssl_code)),
-                _ => ctx.ssl_fc.used.then_some(Sample::Sint(0)),
+                _ => ctx.ssl_fc().used.then_some(Sample::Sint(0)),
             },
         });
         for name in ["ssl_c_err", "ssl_c_ca_err"] {
             self.register_fetch(FetchDesc {
                 name,
                 out_type: SampleType::Sint,
-                func: |ctx, _args| ctx.ssl_fc.used.then_some(Sample::Sint(0)),
+                func: |ctx, _args| ctx.ssl_fc().used.then_some(Sample::Sint(0)),
             });
         }
         self.register_fetch(FetchDesc {
             name: "ssl_fc_is_resumed",
             out_type: SampleType::Bool,
-            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_fc.used && ctx.ssl_fc.resumed)),
+            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_fc().used && ctx.ssl_fc().resumed)),
         });
         self.register_fetch(FetchDesc {
             name: "ssl_c_used",
             out_type: SampleType::Bool,
-            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_fc.has_crt)),
+            func: |ctx, _args| Some(Sample::Bool(ctx.ssl_fc().has_crt)),
         });
         // T398: `ssl_f_*`, the certificate the frontend presented (`SSL_get_certificate`):
         // `SslFacts::local_crt`, set from the resolver's answer to the ClientHello. No sample on a
@@ -3601,7 +3944,7 @@ impl Registry {
             name: "fc_pp_unique_id",
             out_type: SampleType::Str,
             func: |ctx, _args| {
-                let mut t = ctx.proxy_tlvs?;
+                let mut t = ctx.proxy_tlvs()?;
                 while t.len() >= 3 {
                     let len = usize::from(u16::from_be_bytes([t[1], t[2]]));
                     let value = t.get(3..3 + len)?;
@@ -3623,7 +3966,7 @@ impl Registry {
                 } else {
                     target_type_str.parse::<u8>().ok()?
                 };
-                let tlvs_data = ctx.proxy_tlvs?;
+                let tlvs_data = ctx.proxy_tlvs()?;
                 let mut matches = Vec::new();
                 let mut idx = 0;
                 while idx + 3 <= tlvs_data.len() {
@@ -3666,7 +4009,7 @@ impl Registry {
             }) else {
                 return Vec::new();
             };
-            let Some(tlvs_data) = ctx.proxy_tlvs else {
+            let Some(tlvs_data) = ctx.proxy_tlvs() else {
                 return Vec::new();
             };
             let mut matches = Vec::new();
@@ -6668,25 +7011,25 @@ impl Registry {
 }
 
 fn get_context_uri<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
-    ctx.htx_slice
+    ctx.htx_slice()
         .and_then(|h| h.req_line().map(|r| r.uri))
-        .or(ctx.req_uri)
+        .or(ctx.req_uri())
         .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))
 }
 
 /// R2: [`get_context_uri`] as bytes, read from the HTX start line with no UTF-8 check.
 fn get_context_uri_b<'a>(ctx: &'a SampleContext) -> Option<&'a [u8]> {
-    ctx.htx_slice
+    ctx.htx_slice()
         .and_then(|h| h.req_line_bytes().map(|r| r.uri))
-        .or(ctx.req_uri.map(str::as_bytes))
+        .or(ctx.req_uri().map(str::as_bytes))
         .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_bytes())))
 }
 
 /// R2: [`get_context_method`] as bytes.
 fn get_context_method_b<'a>(ctx: &'a SampleContext) -> Option<&'a [u8]> {
-    ctx.htx_slice
+    ctx.htx_slice()
         .and_then(|h| h.req_line_bytes().map(|r| r.method))
-        .or(ctx.req_method.map(str::as_bytes))
+        .or(ctx.req_method().map(str::as_bytes))
         .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.method.as_str().as_bytes())))
 }
 
@@ -6704,7 +7047,7 @@ fn pathq_b<'c>(ctx: &'c SampleContext<'_>, _args: &[String]) -> Option<Smp<'c>> 
 
 fn pathq_bytes<'c>(ctx: &'c SampleContext<'_>) -> Option<&'c [u8]> {
     // The HTX start line read once for the target and the method.
-    if let Some(line) = ctx.htx_slice.and_then(|h| h.req_line_bytes()) {
+    if let Some(line) = ctx.htx_slice().and_then(|h| h.req_line_bytes()) {
         return http_parse_path_b(line.uri, line.method == b"OPTIONS");
     }
     http_parse_path_b(get_context_uri_b(ctx)?, get_context_method_b(ctx) == Some(b"OPTIONS"))
@@ -6731,9 +7074,9 @@ fn query_b<'c>(ctx: &'c SampleContext<'_>, _args: &[String]) -> Option<Smp<'c>> 
 }
 
 fn get_context_method<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
-    ctx.htx_slice
+    ctx.htx_slice()
         .and_then(|h| h.req_line().map(|r| r.method))
-        .or(ctx.req_method)
+        .or(ctx.req_method())
         .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.method.as_str())))
 }
 
@@ -6741,12 +7084,12 @@ fn get_context_req_version<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
     // `req_version` first: the client's own version, which the HTX start line no longer has
     // for an h2 or h3 request (rewritten to HTTP/1.1 for the server leg).
     ctx.req_version
-        .or_else(|| ctx.htx_slice.and_then(|h| h.req_line().map(|r| r.version)))
+        .or_else(|| ctx.htx_slice().and_then(|h| h.req_line().map(|r| r.version)))
         .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.version.as_str())))
 }
 
 fn get_context_res_version<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
-    ctx.htx_slice
+    ctx.htx_slice()
         .and_then(|h| h.res_line().map(|r| r.version))
         .or(ctx.res_version)
         .or_else(|| ctx.htx.and_then(|h| h.res_line().map(|r| r.version.as_str())))
@@ -7094,7 +7437,7 @@ pub(crate) fn request_header(ctx: &SampleContext, name: &str) -> Option<String> 
 }
 
 fn get_req_header(ctx: &SampleContext, name: &str) -> Option<String> {
-    if let Some(htx) = ctx.htx_slice {
+    if let Some(htx) = ctx.htx_slice() {
         if let Some(v) = htx.get_header(name) {
             return Some(v.to_string());
         }
@@ -7104,7 +7447,7 @@ fn get_req_header(ctx: &SampleContext, name: &str) -> Option<String> {
             return Some(v.to_string());
         }
     }
-    if let Some(headers) = ctx.req_headers {
+    if let Some(headers) = ctx.req_headers() {
         for (k, v) in headers {
             if k.eq_ignore_ascii_case(name) {
                 return Some(v.clone());
@@ -7263,7 +7606,7 @@ fn visit_header_lines_b<'c>(ctx: &'c SampleContext<'_>, name: &str, res: bool, f
         }
         return;
     }
-    if let Some(htx) = ctx.htx_slice {
+    if let Some(htx) = ctx.htx_slice() {
         for (k, v, latin1) in htx.header_bytes() {
             if k.eq_ignore_ascii_case(name.as_bytes()) {
                 any = true;
@@ -7283,7 +7626,7 @@ fn visit_header_lines_b<'c>(ctx: &'c SampleContext<'_>, name: &str, res: bool, f
             f(ibex_regex::bytetext::text_to_bytes(&hf.value));
         }
     }
-    for (k, v) in ctx.req_headers.into_iter().flatten() {
+    for (k, v) in ctx.req_headers().into_iter().flatten() {
         if k.eq_ignore_ascii_case(name) {
             f(ibex_regex::bytetext::text_to_bytes(v));
         }
@@ -7451,7 +7794,7 @@ fn strl2ic_sample(v: String) -> Sample {
 
 fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
     let mut matches = Vec::new();
-    if let Some(htx) = ctx.htx_slice {
+    if let Some(htx) = ctx.htx_slice() {
         for (hn, hv) in htx.headers() {
             if hn.eq_ignore_ascii_case(name) {
                 matches.push(hv.to_string());
@@ -7468,7 +7811,7 @@ fn get_all_req_headers(ctx: &SampleContext, name: &str) -> Vec<String> {
             }
         }
     }
-    if let Some(headers) = ctx.req_headers {
+    if let Some(headers) = ctx.req_headers() {
         for (k, v) in headers {
             if k.eq_ignore_ascii_case(name) {
                 matches.push(v.clone());
@@ -7494,13 +7837,13 @@ fn names_delim(args: &[String]) -> String {
 /// has any, without those `HAProxy`'s H1 parser leaves out of HTX ([`crate::h1_clean`]).
 fn req_header_names(ctx: &SampleContext) -> Vec<String> {
     let mut hdrs: Vec<(&str, &str)> = Vec::new();
-    if let Some(htx) = ctx.htx_slice {
+    if let Some(htx) = ctx.htx_slice() {
         hdrs.extend(htx.headers());
     }
     if let (true, Some(htx)) = (hdrs.is_empty(), ctx.htx) {
         hdrs.extend(htx.headers().map(|hf| (hf.name.as_str(), hf.value.as_str())));
     }
-    if let (true, Some(headers)) = (hdrs.is_empty(), ctx.req_headers) {
+    if let (true, Some(headers)) = (hdrs.is_empty(), ctx.req_headers()) {
         hdrs.extend(headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     }
     let kept = crate::h1_clean::kept_headers(&hdrs, true);
@@ -7513,12 +7856,12 @@ fn req_header_names(ctx: &SampleContext) -> Vec<String> {
 /// when there is no request.
 fn req_header_block(ctx: &SampleContext) -> Option<String> {
     use crate::h1_clean::{h1_clean_headers, header_block};
-    let hdrs = if let Some(htx) = ctx.htx_slice {
+    let hdrs = if let Some(htx) = ctx.htx_slice() {
         h1_clean_headers(htx.headers(), true)
     } else if let Some(htx) = ctx.htx {
         h1_clean_headers(htx.headers().map(|hf| (hf.name.as_str(), hf.value.as_str())), true)
     } else {
-        h1_clean_headers(ctx.req_headers?.iter().map(|(k, v)| (k.as_str(), v.as_str())), true)
+        h1_clean_headers(ctx.req_headers()?.iter().map(|(k, v)| (k.as_str(), v.as_str())), true)
     };
     Some(header_block(&hdrs))
 }
@@ -7527,14 +7870,14 @@ fn req_header_block(ctx: &SampleContext) -> Option<String> {
 /// `get_all_req_headers`, as the oracle's H1 parser leaves them (`cleaned_for`).
 fn get_all_req_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
     let mut all = Vec::new();
-    if let Some(htx) = ctx.htx_slice {
+    if let Some(htx) = ctx.htx_slice() {
         all.extend(htx.headers().map(|(n, v)| (n.to_string(), v.to_string())));
     }
     if all.is_empty() {
         if let Some(htx) = ctx.htx {
             all.extend(htx.headers().map(|hf| (hf.name.clone(), hf.value.clone())));
         }
-        if let Some(headers) = ctx.req_headers {
+        if let Some(headers) = ctx.req_headers() {
             all.extend(headers.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
     }
@@ -7599,7 +7942,7 @@ fn get_all_res_header_names(ctx: &SampleContext) -> Vec<String> {
     };
     let pairs = match ctx.res_headers.filter(|h| !h.is_empty()) {
         Some(h) => h.to_vec(),
-        None => res_pairs(&SampleContext { res_headers: None, ..ctx.clone() }),
+        None => res_pairs(&SampleContext { phase: &PhaseCtx { res_headers: None, ..ctx.phase.clone() }, ..*ctx }),
     };
     names(&pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>())
 }
@@ -7610,7 +7953,7 @@ fn get_all_res_header_names(ctx: &SampleContext) -> Vec<String> {
 fn get_all_res_headers_all(ctx: &SampleContext) -> Vec<(String, String)> {
     let mut all: Vec<(String, String)> = ctx.res_headers.map(<[_]>::to_vec).unwrap_or_default();
     if all.is_empty() {
-        all = res_pairs(&SampleContext { res_headers: None, ..ctx.clone() });
+        all = res_pairs(&SampleContext { phase: &PhaseCtx { res_headers: None, ..ctx.phase.clone() }, ..*ctx });
     }
     cleaned_for(&all, false)
 }
@@ -8080,7 +8423,7 @@ fn format_time_ns(epoch: i64, nanos: u32, format: &str, local: bool) -> String {
 /// One captured list for the `ssl_fc_*list_bin` fetches: the bytes as captured, or with
 /// `GREASE` removed when the integer argument is not 0; no sample without a capture.
 fn capture_bytes(ctx: &SampleContext, args: &[String], list: fn(&ibex_tls::SslCapture) -> &[u8]) -> Option<Vec<u8>> {
-    let c = ctx.ssl_fc.capture?;
+    let c = ctx.ssl_fc().capture?;
     let bytes = list(c);
     let filter = args.first().and_then(|a| a.parse::<i64>().ok()).unwrap_or(0) != 0;
     Some(if filter { ibex_tls::exclude_tls_grease(bytes, 16384) } else { bytes.to_vec() })
@@ -9163,11 +9506,11 @@ mod tests {
     #[test]
     fn test_basic_eval() {
         let reg = Registry::new();
-        let ctx = SampleContext {
+        let ctx = SampleContext { phase: &PhaseCtx {
             req_uri: Some("/api/v1/users?id=123&name=alice"),
             client_addr: Some("192.168.1.50:8080".parse().unwrap()),
             ..Default::default()
-        };
+        }, live: None };
 
         let res = reg.eval("path", &[], &[("upper", vec![])], &ctx);
         assert_eq!(res, Some(Sample::Str("/API/V1/USERS".to_string())));

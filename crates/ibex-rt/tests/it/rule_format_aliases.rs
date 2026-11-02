@@ -109,3 +109,23 @@ fn the_frontend_alias_renders_and_an_unknown_one_is_refused_at_load() {
     let r = exchange(&format!("{DEFAULTS}listen ret\n  bind ADDR accept-proxy\n  http-request return status 200 content-type text/plain lf-string \"ft=%ft ci=%ci\"\n"), GET);
     assert!(r.ends_with("\r\n\r\nft=ret ci=192.0.2.7"), "{r}");
 }
+
+/// CP4a-2: a request rule reads the stream's priority, the frontend address and the last rule
+/// from the live session at the fetch (`LiveReq`), as the earlier rules leave them. Measured on
+/// `HAProxy` 3.5-dev8 (without the PROXY line, `fi`/`fp` the bind's):
+/// `pc=3 po=-20 fi=127.0.0.1 fp=18431 lr= end`.
+#[test]
+fn a_request_rule_reads_what_the_earlier_rules_set() {
+    let r = exchange(
+        &format!(
+            "{DEFAULTS}frontend fe\n  bind ADDR accept-proxy\n  http-request set-priority-class int(3)\n  \
+             http-request set-priority-offset int(-20)\n  http-request set-var(txn.pc) prio_class\n  \
+             http-request set-var(txn.po) prio_offset\n  \
+             http-request set-var-fmt(txn.f) \"fi=%fi fp=%fp lr=%[last_rule_line]\"\n  \
+             http-request return status 200 content-type text/plain lf-string \"pc=%[var(txn.pc)] po=%[var(txn.po)] %[var(txn.f)] end\"\n"
+        ),
+        GET,
+    );
+    assert!(r.starts_with("HTTP/1.1 200 OK\r\n"), "{r}");
+    assert!(r.ends_with("\r\n\r\npc=3 po=-20 fi=198.51.100.9 fp=8443 lr= end"), "{r}");
+}

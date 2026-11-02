@@ -33,7 +33,7 @@ pub(crate) fn with_request_line<R>(wire: &[u8], f: impl FnOnce(&SampleContext) -
     let mut buf = [0u8; 4096];
     let mut htx = ibex_proto::htx::HtxSlice::new(&mut buf);
     parser.parse(wire, &mut htx).expect("parse");
-    let ctx = SampleContext { htx_slice: Some(htx.as_ref()), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { htx_slice: Some(htx.as_ref()), ..Default::default() }, live: None };
     f(&ctx)
 }
 

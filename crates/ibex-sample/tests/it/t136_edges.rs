@@ -23,7 +23,7 @@ fn field_and_word_far_before_the_start_are_no_sample() {
 #[test]
 fn unknown_units_give_no_sample() {
     let reg = Registry::new();
-    let ctx = SampleContext { accept_date: Some((1, 2)), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { accept_date: Some((1, 2)), ..Default::default() }, live: None };
     assert_eq!(reg.eval("date", &s(&["0", "bogus"]), &[], &ctx), None);
     assert_eq!(reg.eval("accept_date", &s(&["bogus"]), &[], &ctx), None);
     assert_eq!(reg.eval("accept_date", &s(&["us"]), &[], &ctx), Some(Sample::Sint(1_002_000)));

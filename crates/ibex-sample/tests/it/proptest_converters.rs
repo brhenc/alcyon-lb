@@ -14,16 +14,16 @@ proptest! {
     fn prop_conv_lower_idempotent(s in "\\PC*") {
         let reg = Registry::new();
         let convs = vec![("lower", vec![])];
-        let ctx = SampleContext {
+        let ctx = SampleContext { phase: &ibex_sample::PhaseCtx {
             req_uri: Some(&s),
             ..Default::default()
-        };
+        }, live: None };
         let first = reg.eval("url", &[], &convs, &ctx).expect("first lower");
         if let Sample::Str(res1) = first {
-            let ctx2 = SampleContext {
+            let ctx2 = SampleContext { phase: &ibex_sample::PhaseCtx {
                 req_uri: Some(&res1),
                 ..Default::default()
-            };
+            }, live: None };
             let second = reg.eval("url", &[], &convs, &ctx2).expect("second lower");
             prop_assert_eq!(second, Sample::Str(res1));
         } else {
@@ -36,16 +36,16 @@ proptest! {
     fn prop_conv_upper_idempotent(s in "\\PC*") {
         let reg = Registry::new();
         let convs = vec![("upper", vec![])];
-        let ctx = SampleContext {
+        let ctx = SampleContext { phase: &ibex_sample::PhaseCtx {
             req_uri: Some(&s),
             ..Default::default()
-        };
+        }, live: None };
         let first = reg.eval("url", &[], &convs, &ctx).expect("first upper");
         if let Sample::Str(res1) = first {
-            let ctx2 = SampleContext {
+            let ctx2 = SampleContext { phase: &ibex_sample::PhaseCtx {
                 req_uri: Some(&res1),
                 ..Default::default()
-            };
+            }, live: None };
             let second = reg.eval("url", &[], &convs, &ctx2).expect("second upper");
             prop_assert_eq!(second, Sample::Str(res1));
         } else {
@@ -58,10 +58,10 @@ proptest! {
     fn prop_conv_len(s in "\\PC*") {
         let reg = Registry::new();
         let convs = vec![("len", vec![])];
-        let ctx = SampleContext {
+        let ctx = SampleContext { phase: &ibex_sample::PhaseCtx {
             req_uri: Some(&s),
             ..Default::default()
-        };
+        }, live: None };
         let result = reg.eval("url", &[], &convs, &ctx).expect("eval len");
         let expected_len = i64::try_from(s.len()).unwrap_or(i64::MAX);
         prop_assert_eq!(result, Sample::Sint(expected_len));

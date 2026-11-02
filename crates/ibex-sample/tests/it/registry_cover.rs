@@ -96,11 +96,11 @@ fn request_headers_from_every_source_of_the_context() {
     for (hdrs, want) in request_cases() {
         // `htx`: an owned HTX message
         let htx = htx_of(&hdrs);
-        let ctx = SampleContext { htx: Some(&htx), ..Default::default() };
+        let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { htx: Some(&htx), ..Default::default() }, live: None };
         assert_eq!(req_fetches(&reg, &ctx), want, "htx: {hdrs:?}");
 
         // `req_headers`: the headers an h2 request was turned into
-        let ctx = SampleContext { req_headers: Some(&hdrs), ..Default::default() };
+        let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { req_headers: Some(&hdrs), ..Default::default() }, live: None };
         assert_eq!(req_fetches(&reg, &ctx), want, "req_headers: {hdrs:?}");
 
         // `htx_slice`: the proxy's own buffer
@@ -112,7 +112,7 @@ fn request_headers_from_every_source_of_the_context() {
         }
         slice.push_eoh().unwrap();
         slice.push_eom().unwrap();
-        let ctx = SampleContext { htx_slice: Some(slice.as_ref()), ..Default::default() };
+        let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { htx_slice: Some(slice.as_ref()), ..Default::default() }, live: None };
         assert_eq!(req_fetches(&reg, &ctx), want, "htx_slice: {hdrs:?}");
     }
 }
@@ -129,7 +129,7 @@ fn response_headers_from_the_context() {
         ("X-A", "1"),
         ("Content-Length", "0"),
     ]);
-    let ctx = SampleContext { res_headers: Some(&hdrs), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { res_headers: Some(&hdrs), ..Default::default() }, live: None };
     assert_eq!(
         res_fetches(&reg, &ctx),
         "0A636F6E6E656374696F6E0822715C22782C792207757067726164650622755C22762203782D6101310E636F6E74656E742D6C656E67746801300000\
@@ -151,7 +151,7 @@ fn req_body_param_from_the_htx_buffer() {
     slice.push_eoh().unwrap();
     slice.push_data(b"a=1&b=2").unwrap();
     slice.push_eom().unwrap();
-    let ctx = SampleContext { htx_slice: Some(slice.as_ref()), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { htx_slice: Some(slice.as_ref()), ..Default::default() }, live: None };
     assert_eq!(reg.eval("req.body_param", &["b".to_string()], &[], &ctx), Some(Sample::Bin(b"2".to_vec())));
     // No message at all (a rule evaluated before any request exists): no sample. HAProxy cannot
     // be asked this from a configuration; the fetch needs the request buffer.
@@ -199,12 +199,12 @@ fn jwt_verify_direct_sample_types() {
 fn absolute_uri_without_a_path_from_a_hand_made_context() {
     let reg = Registry::new();
     let hdrs = pairs(&[("Host", "a")]);
-    let ctx = SampleContext {
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx {
         req_uri: Some("http://a"),
         req_method: Some("GET"),
         req_headers: Some(&hdrs),
         ..Default::default()
-    };
+    }, live: None };
     for (fetch, want) in [("path", "/"), ("pathq", "/"), ("base", "a/"), ("baseq", "a/")] {
         assert_eq!(reg.eval(fetch, &[], &[], &ctx), Some(Sample::Str(want.to_string())), "{fetch}");
     }
@@ -229,7 +229,7 @@ fn ocsp_check_err_str_on_another_sample_type() {
 fn base32_src_without_a_client_address() {
     let reg = Registry::new();
     let hdrs = pairs(&[("Host", "a")]);
-    let ctx = SampleContext { req_uri: Some("/"), req_method: Some("GET"), req_headers: Some(&hdrs), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { req_uri: Some("/"), req_method: Some("GET"), req_headers: Some(&hdrs), ..Default::default() }, live: None };
     assert_eq!(reg.eval("base32", &[], &[], &ctx), Some(Sample::Sint(877_786_378)));
     match reg.eval("base32+src", &[], &[], &ctx) {
         None => {}
@@ -278,8 +278,8 @@ fn header_occurrences_from_every_source_of_the_context() {
     };
 
     let htx = htx_of(&hdrs);
-    check(&SampleContext { htx: Some(&htx), ..Default::default() }, "req.", "htx");
-    check(&SampleContext { req_headers: Some(&hdrs), ..Default::default() }, "req.", "req_headers");
+    check(&SampleContext { phase: &ibex_sample::PhaseCtx { htx: Some(&htx), ..Default::default() }, live: None }, "req.", "htx");
+    check(&SampleContext { phase: &ibex_sample::PhaseCtx { req_headers: Some(&hdrs), ..Default::default() }, live: None }, "req.", "req_headers");
     let mut buf = vec![0u8; 4096];
     let mut slice = HtxSlice::new(&mut buf);
     slice.push_req_line("GET", "/", "HTTP/1.1").unwrap();
@@ -288,9 +288,9 @@ fn header_occurrences_from_every_source_of_the_context() {
     }
     slice.push_eoh().unwrap();
     slice.push_eom().unwrap();
-    check(&SampleContext { htx_slice: Some(slice.as_ref()), ..Default::default() }, "req.", "htx_slice");
+    check(&SampleContext { phase: &ibex_sample::PhaseCtx { htx_slice: Some(slice.as_ref()), ..Default::default() }, live: None }, "req.", "htx_slice");
 
-    check(&SampleContext { res_headers: Some(&hdrs), ..Default::default() }, "res.", "res_headers");
+    check(&SampleContext { phase: &ibex_sample::PhaseCtx { res_headers: Some(&hdrs), ..Default::default() }, live: None }, "res.", "res_headers");
     // X3b: the response being processed is the HTX blocks its rules edit.
     struct Head<'h>(ibex_proto::htx::HtxSliceRef<'h>);
     impl ibex_sample::registry::ResHead for Head<'_> {
@@ -299,7 +299,7 @@ fn header_occurrences_from_every_source_of_the_context() {
         }
     }
     let head = Head(slice.as_ref());
-    let ctx = SampleContext { res_htx: Some(&head), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { res_htx: Some(&head), ..Default::default() }, live: None };
     check(&ctx, "res.", "the response being processed");
     assert!(format!("{ctx:?}").contains(&format!("ResHead({} headers)", hdrs.len())), "a context shows its response head");
 }
@@ -313,7 +313,7 @@ fn header_occurrences_from_every_source_of_the_context() {
 fn a_converter_failing_on_one_occurrence_is_skipped_outside_an_acl_and_ends_an_acl() {
     let reg = Registry::new();
     let hdrs = pairs(&[("Host", "h"), ("X", "a:1"), ("X", "b"), ("X", "c:3")]);
-    let ctx = SampleContext { req_headers: Some(&hdrs), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { req_headers: Some(&hdrs), ..Default::default() }, live: None };
     let conv = [("field", vec!["2".to_string(), ":".to_string()])];
     let args = ["x".to_string()];
     assert_eq!(reg.eval_all("req.hdr", &args, &conv, &ctx), [Sample::Str("1".into()), Sample::Str("3".into())]);

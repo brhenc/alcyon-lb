@@ -98,8 +98,8 @@ impl<'a> LogData<'a> {
     pub fn of_context(ctx: &SampleContext<'a>) -> Self {
         let timers = ctx.stream.and_then(|f| f.timers);
         LogData {
-            client: ctx.client_addr,
-            frontend_addr: ctx.server_addr,
+            client: ctx.client_addr(),
+            frontend_addr: ctx.server_addr(),
             server_addr: ctx.bc_dst,
             backend_addr: ctx.bc_src,
             frontend: ctx.fe_name.unwrap_or_default(),
@@ -112,10 +112,10 @@ impl<'a> LogData<'a> {
             t_connect: timers.map_or(-1, |t| t[3]),
             t_data: timers.map_or(-1, |t| t[4]),
             status: ctx.res_status.map_or(-1, i64::from),
-            term_state: ctx.term_state.unwrap_or(*b"--"),
-            req_captures: ctx.captures_req_hdr,
+            term_state: ctx.term_state().unwrap_or(*b"--"),
+            req_captures: ctx.captures_req_hdr(),
             res_captures: ctx.captures_res_hdr,
-            unique_id: ctx.unique_id,
+            unique_id: ctx.unique_id(),
             ..LogData::default()
         }
     }
