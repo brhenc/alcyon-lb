@@ -1849,26 +1849,6 @@ impl HeadFacts {
         Some(scan.finish())
     }
 
-    /// The facts of a response head [`ibex_proto::response_head::check_response_head`] has
-    /// indexed (E2): its field lines are read from the index, not looked for again. The
-    /// index is of `head`, made from it with nothing edited since. (The engine reads them in
-    /// the check's own pass, [`ResponseFacts`]; this is the reading it is held to.)
-    #[must_use]
-    pub fn of_response(head: &[u8], index: &ibex_proto::response_head::RspHead) -> Option<Self> {
-        debug_assert_eq!(index.len as usize, head.len(), "an index of another head");
-        let mut scan = FactsScan::start(head, index.start as usize - 1, false)?;
-        for f in index.fields() {
-            scan.field(f.at as usize, f.end as usize, f.name(head), ascii_trim(f.value(head)));
-        }
-        let facts = scan.finish();
-        #[cfg(debug_assertions)]
-        {
-            debug_assert_eq!(Some(facts), Self::scan_plain(head, false), "indexed facts of {:?}", String::from_utf8_lossy(head));
-            facts.check(head, false);
-        }
-        Some(facts)
-    }
-
     /// The facts against the readings they stand for, each of which reads the head again.
     #[cfg(debug_assertions)]
     fn check(&self, head: &[u8], request: bool) {

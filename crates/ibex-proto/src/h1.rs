@@ -111,21 +111,9 @@ impl FieldBytes for String {
     }
 }
 
-impl FieldBytes for Vec<u8> {
-    fn field_bytes(&self) -> &[u8] {
-        self
-    }
-}
-
 impl FieldBytes for std::borrow::Cow<'_, str> {
     fn field_bytes(&self) -> &[u8] {
         self.as_bytes()
-    }
-}
-
-impl FieldBytes for std::borrow::Cow<'_, [u8]> {
-    fn field_bytes(&self) -> &[u8] {
-        self
     }
 }
 

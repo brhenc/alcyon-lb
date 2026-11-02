@@ -12015,8 +12015,7 @@ impl EngineDispatcher<'_> {
         // read from is read the old way, a pass for each.
         let rsp_facts = match (&index, checked_facts) {
             (Some(_), Some(f)) => Some(f),
-            (Some(ix), None) => crate::txn::HeadFacts::of_response(&entry.sess.rep.readable()[..total_hdr_len], ix),
-            (None, _) => crate::txn::HeadFacts::scan(&entry.sess.rep.readable()[..total_hdr_len], false),
+            _ => crate::txn::HeadFacts::scan(&entry.sess.rep.readable()[..total_hdr_len], false),
         };
         let (status, framing, srv_has_close, srv_http11) = {
             let raw = &entry.sess.rep.readable()[..total_hdr_len];
@@ -12495,14 +12494,15 @@ impl EngineDispatcher<'_> {
         let mut held: Option<crate::txn::RspWait> = None;
         let mut timed_out = false;
         let mut malformed = false;
-        // The headers, out of the fetches' sight while the `tcp-response` rules run.
-        let mut hidden: Option<Vec<(String, String)>>;
         let failed: Option<ResStop> = 'rules: {
             // 0. Apply be.tcp_res_content_rules. They run before the response is analysed
             // as HTTP (`AN_RES_INSPECT` ahead of `AN_RES_WAIT_HTTP`), so its status and
             // headers are not there to fetch until they are done.
             CURRENT_RES_STATUS.set(0);
-            hidden = Some(with_res_hdrs(std::mem::take));
+            // The headers, out of the fetches' sight while the `tcp-response` rules run, and
+            // back whatever ends them.
+            let hidden = with_res_hdrs(std::mem::take);
+            let tcp_stop = 'tcp: {
             // Copied only for a backend that has the rules (S7: a copy per response).
             let tcp_ctx = (resume.is_none() && !proxies[be_idx].tcp_res_content_rules.is_empty()).then(|| SampleContext { res_version: None, ..ctx.clone() });
             // `tcp-response inspect-delay` runs from the first pass over the head; with none,
@@ -12529,7 +12529,7 @@ impl EngineDispatcher<'_> {
                         if res == crate::proxy::AclEvalResult::MissingData {
                             // Held until the delay is over: the rules start again then.
                             held = Some(crate::txn::RspWait { list: 0, rule: 0, deadline: inspect_exp.unwrap_or(Tick::ETERNITY), inspect: true });
-                            break 'rules None;
+                            break 'tcp true;
                         }
                         res == crate::proxy::AclEvalResult::Matched
                     }
@@ -12545,7 +12545,7 @@ impl EngineDispatcher<'_> {
                     ibex_config::TcpResAction::Reject | ibex_config::TcpResAction::SilentDrop => {
                         entry.sess.log.last_rule = Some(rule.line);
                         rejected = true;
-                        break 'rules None;
+                        break 'tcp true;
                     }
                     ibex_config::TcpResAction::SetVar { var_name, expr: _ } => {
                         set_var_from(&mut entry.sess.vars, var_name, rc.expr.as_ref(), tcp_ctx, registry);
@@ -12559,10 +12559,13 @@ impl EngineDispatcher<'_> {
                     }
                 }
             }
-            CURRENT_RES_STATUS.set(status);
-            if let Some(h) = hidden.take() {
-                with_res_hdrs(|hdrs| *hdrs = h);
+            false
+            };
+            with_res_hdrs(|hdrs| *hdrs = hidden);
+            if tcp_stop {
+                break 'rules None;
             }
+            CURRENT_RES_STATUS.set(status);
 
             // 1. The backend's `http-response` rules, then the frontend's when it is another
             // proxy; an `allow` ends only its own list.
@@ -12701,9 +12704,6 @@ impl EngineDispatcher<'_> {
             }
             None
         };
-        if let Some(h) = hidden.take() {
-            with_res_hdrs(|hdrs| *hdrs = h);
-        }
         if rejected {
             entry.sess.rep.clear();
             if let Some(txn) = entry.sess.txn.as_mut() {
