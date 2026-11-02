@@ -115,19 +115,25 @@ pub struct HotRow {
     pub rate_max: AtomicU32,
 }
 
+/// The [`HotRow::hrsp`] class of a response status: 1xx to 5xx, then anything else.
+#[inline]
+#[must_use]
+pub fn status_class(status: i64) -> usize {
+    match status {
+        100..=199 => 0,
+        200..=299 => 1,
+        300..=399 => 2,
+        400..=499 => 3,
+        500..=599 => 4,
+        _ => 5,
+    }
+}
+
 impl HotRow {
     /// Counts a response status in its class.
     #[inline]
     pub fn count_status<W: Write>(&self, w: W, status: i64) {
-        let class = match status {
-            100..=199 => 0,
-            200..=299 => 1,
-            300..=399 => 2,
-            400..=499 => 3,
-            500..=599 => 4,
-            _ => 5,
-        };
-        w.add(&self.hrsp[class], 1);
+        w.add(&self.hrsp[status_class(status)], 1);
     }
 
     /// Zeroes everything but the session rate (`clear counters all`), as the shared set is.
@@ -199,6 +205,19 @@ pub trait Rows<'a>: Copy {
     fn w(self) -> Self::W;
     /// Row `k` of proxy `p`: [`FE`], [`BE`], or `SRV + i` for server `i`.
     fn row(self, p: &'a crate::engine::Proxy, k: usize) -> Option<&'a HotRow>;
+    /// [`Rows::row`] and the object's shared part (its maxima).
+    fn obj(self, p: &'a crate::engine::Proxy, k: usize) -> Option<(&'a HotRow, &'a TxnCounters)>;
+}
+
+/// The shared part of object `k` of `p`.
+#[inline]
+fn cold(p: &crate::engine::Proxy, k: usize) -> Option<&TxnCounters> {
+    let c = p.txn_counters();
+    match k {
+        FE => Some(&c.fe),
+        BE => Some(&c.be),
+        i => c.srv.get(i - SRV),
+    }
 }
 
 /// Row [`Rows::row`] of a proxy as a frontend, as a backend, and of its first server.
@@ -219,20 +238,20 @@ impl<'a> Rows<'a> for SharedRows {
     }
     #[inline]
     fn row(self, p: &'a crate::engine::Proxy, k: usize) -> Option<&'a HotRow> {
-        let c = p.txn_counters();
-        match k {
-            FE => Some(&c.fe.hot),
-            BE => Some(&c.be.hot),
-            i => c.srv.get(i - SRV).map(|s| &s.hot),
-        }
+        cold(p, k).map(|c| &c.hot)
+    }
+    #[inline]
+    fn obj(self, p: &'a crate::engine::Proxy, k: usize) -> Option<(&'a HotRow, &'a TxnCounters)> {
+        cold(p, k).map(|c| (&c.hot, c))
     }
 }
 
 /// This thread's slab of a [`CounterTable`].
 #[derive(Clone, Copy, Debug)]
 pub struct OwnRows<'a> {
-    table: &'a CounterTable,
-    slab: &'a Slab,
+    /// The table's [`CounterTable::spans`] and the slab's rows, loaded once per stream.
+    spans: &'a [(u32, u32)],
+    rows: &'a [HotRow],
 }
 
 impl<'a> Rows<'a> for OwnRows<'a> {
@@ -243,7 +262,16 @@ impl<'a> Rows<'a> for OwnRows<'a> {
     }
     #[inline]
     fn row(self, p: &'a crate::engine::Proxy, k: usize) -> Option<&'a HotRow> {
-        self.slab.rows_of(self.table, p.id as usize).get(k)
+        // `k` is in the proxy's span: its servers are the ones the table was made for (the
+        // shared sets answer `None` past them, which the callers never ask). Out of the slab,
+        // `None`; never another thread's memory.
+        let &(base, len) = self.spans.get(p.id as usize)?;
+        debug_assert!(k < len as usize, "row {k} of a proxy of {len}");
+        self.rows.get(base as usize + k)
+    }
+    #[inline]
+    fn obj(self, p: &'a crate::engine::Proxy, k: usize) -> Option<(&'a HotRow, &'a TxnCounters)> {
+        Some((self.row(p, k)?, cold(p, k)?))
     }
 }
 
@@ -294,16 +322,28 @@ impl<'a> Rows<'a> for AnyRows<'a> {
             AnyRows::Own(o) => o.row(p, k),
         }
     }
+    #[inline]
+    fn obj(self, p: &'a crate::engine::Proxy, k: usize) -> Option<(&'a HotRow, &'a TxnCounters)> {
+        match self {
+            AnyRows::Shared => SharedRows.obj(p, k),
+            AnyRows::Own(o) => o.obj(p, k),
+        }
+    }
 }
 
 /// The rows this thread writes for the proxies of `any` (any proxy of the list: they share
-/// one table): its slab under `per-thread`, else the shared sets.
+/// one table): its slab under `per-thread`, else the shared sets. Its rows of a proxy that
+/// `clear counters` cleared since are zeroed first (one shared load when none was).
 #[inline]
 #[must_use]
 pub fn own_rows(any: &crate::engine::Proxy) -> Option<OwnRows<'_>> {
     let table = any.ids.rows.as_deref()?;
     let slab = table.slabs.get(crate::engine::worker_id())?.get()?;
-    Some(OwnRows { table, slab })
+    let cleared = table.cleared.load(Ordering::Acquire);
+    if cleared != slab.cleared_seen.load(Ordering::Relaxed) {
+        slab.catch_up(table, cleared);
+    }
+    Some(OwnRows { spans: &table.spans, rows: &slab.rows })
 }
 
 /// [`own_rows`] or the shared sets, as an [`AnyRows`].
@@ -454,13 +494,15 @@ pub fn counters_pool_stats() -> Option<ibex_alloc::PoolHead> {
 /// ([`CounterTable::start_worker`]), so the request path never allocates.
 #[derive(Debug)]
 pub struct CounterTable {
-    /// Where proxy `p`'s rows start in a slab (after the guard row), and one past the last.
-    bases: Box<[u32]>,
+    /// Where proxy `p`'s rows start in a slab (after the guard row), and how many it has.
+    spans: Box<[(u32, u32)]>,
     /// Per proxy, bumped by `clear counters`: the clears of everything in the high half, the
     /// clears of the maxima in the low one. A slab whose rows of the proxy are from an older
     /// value reads as zero (or as no maxima), and its owner zeroes them before it next
     /// writes: no thread writes another's slab.
     epochs: Box<[AtomicU64]>,
+    /// Bumped after any of [`Self::epochs`]: an owner looks at the proxies' only when it moved.
+    cleared: AtomicU64,
     slabs: Box<[std::sync::OnceLock<Slab>]>,
 }
 
@@ -471,16 +513,17 @@ impl CounterTable {
     /// The table of `proxies` (`2 + servers` rows each) for `threads` workers.
     #[must_use]
     pub fn new(proxies: &[crate::engine::Proxy], threads: usize) -> Self {
-        let mut bases = Vec::with_capacity(proxies.len() + 1);
+        let mut spans = Vec::with_capacity(proxies.len());
         let mut at = 1u32;
         for p in proxies {
-            bases.push(at);
-            at += u32::try_from(SRV + p.servers.len()).unwrap_or(u32::MAX);
+            let n = u32::try_from(SRV + p.servers.len()).unwrap_or(u32::MAX);
+            spans.push((at, n));
+            at = at.saturating_add(n);
         }
-        bases.push(at);
         CounterTable {
-            bases: bases.into_boxed_slice(),
+            spans: spans.into_boxed_slice(),
             epochs: proxies.iter().map(|_| AtomicU64::new(0)).collect(),
+            cleared: AtomicU64::new(0),
             slabs: (0..threads.max(1)).map(|_| std::sync::OnceLock::new()).collect(),
         }
     }
@@ -488,7 +531,7 @@ impl CounterTable {
     /// Rows a slab holds, the two guard rows included.
     #[must_use]
     pub fn slab_rows(&self) -> usize {
-        self.bases.last().map_or(2, |&e| e as usize + 1)
+        self.spans.last().map_or(2, |&(b, n)| (b + n) as usize + 1)
     }
 
     /// Bytes of every worker's slab: what the startup notice prints.
@@ -524,8 +567,9 @@ impl CounterTable {
             )));
         }
         rows.extend((0..n).map(|_| HotRow::default()));
+        let cleared = AtomicU64::new(self.cleared.load(Ordering::Acquire));
         seen.extend(self.epochs.iter().map(|e| AtomicU64::new(e.load(Ordering::Relaxed))));
-        let mut slab = Slab { rows: rows.into_boxed_slice(), seen: seen.into_boxed_slice(), published: ibex_alloc::arena::Published::default() };
+        let mut slab = Slab { rows: rows.into_boxed_slice(), seen: seen.into_boxed_slice(), cleared_seen: cleared, published: ibex_alloc::arena::Published::default() };
         let mut last = slab.published;
         COUNTERS_POOL.publish_arena::<HotRow>(&mut last, &slab);
         slab.published = last;
@@ -538,6 +582,7 @@ impl CounterTable {
     pub fn clear(&self, p: usize, all: bool) {
         if let Some(e) = self.epochs.get(p) {
             e.fetch_add(if all { CLEAR_ALL } else { 1 }, Ordering::Relaxed);
+            self.cleared.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -545,11 +590,11 @@ impl CounterTable {
     /// slab's maxima of the proxy are current; a slab whose totals were cleared since it last
     /// wrote them is left out. The session rate is not cleared: it is in `rate` of every slab.
     fn each(&self, p: usize, k: usize, mut f: impl FnMut(&HotRow, bool, bool)) {
-        let (Some(&base), Some(&end), Some(epoch)) = (self.bases.get(p), self.bases.get(p + 1), self.epochs.get(p)) else { return };
-        let at = base as usize + k;
-        if at >= end as usize {
+        let (Some(&(base, n)), Some(epoch)) = (self.spans.get(p), self.epochs.get(p)) else { return };
+        if k >= n as usize {
             return;
         }
+        let at = base as usize + k;
         let want = epoch.load(Ordering::Relaxed);
         for slab in self.slabs.iter().filter_map(std::sync::OnceLock::get) {
             let seen = slab.seen[p].load(Ordering::Relaxed);
@@ -566,37 +611,33 @@ pub struct Slab {
     rows: Box<[HotRow]>,
     /// Per proxy, the [`CounterTable::epochs`] value its rows here belong to.
     seen: Box<[AtomicU64]>,
+    /// The [`CounterTable::cleared`] the slab caught up with.
+    cleared_seen: AtomicU64,
     published: ibex_alloc::arena::Published,
 }
 
 impl Slab {
-    /// The rows of proxy `p` (frontend, backend, servers), zeroed first when a `clear
-    /// counters` came since this thread last wrote them. The owner's call only.
-    #[inline]
-    fn rows_of(&self, table: &CounterTable, p: usize) -> &[HotRow] {
-        let (Some(&base), Some(&end), Some(epoch), Some(seen)) = (table.bases.get(p), table.bases.get(p + 1), table.epochs.get(p), self.seen.get(p)) else {
-            return &[];
-        };
-        let rows = self.rows.get(base as usize..end as usize).unwrap_or(&[]);
-        let want = epoch.load(Ordering::Relaxed);
-        let had = seen.load(Ordering::Relaxed);
-        if want != had {
-            catch_up(rows, had, want);
+    /// Zeroes this thread's rows of every proxy `clear counters` cleared since it last looked
+    /// (`cleared` being [`CounterTable::cleared`] as just read). The owner's call only.
+    #[cold]
+    #[inline(never)]
+    fn catch_up(&self, table: &CounterTable, cleared: u64) {
+        for ((epoch, seen), &(base, n)) in table.epochs.iter().zip(&self.seen).zip(&table.spans) {
+            let want = epoch.load(Ordering::Relaxed);
+            let had = seen.load(Ordering::Relaxed);
+            if want == had {
+                continue;
+            }
+            for r in self.rows.get(base as usize..(base + n) as usize).unwrap_or(&[]) {
+                if had >> 32 == want >> 32 {
+                    r.rate_max.store(0, Ordering::Relaxed);
+                } else {
+                    r.clear();
+                }
+            }
             seen.store(want, Ordering::Relaxed);
         }
-        rows
-    }
-}
-
-#[cold]
-#[inline(never)]
-fn catch_up(rows: &[HotRow], had: u64, want: u64) {
-    for r in rows {
-        if had >> 32 == want >> 32 {
-            r.rate_max.store(0, Ordering::Relaxed);
-        } else {
-            r.clear();
-        }
+        self.cleared_seen.store(cleared, Ordering::Relaxed);
     }
 }
 

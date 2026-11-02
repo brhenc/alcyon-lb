@@ -3585,6 +3585,7 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
 /// Under `tune.ibex.counters per-thread` the rows are this thread's own and are written with
 /// a plain load and store ([`crate::statcnt::Owned`]); otherwise the shared sets, with locked
 /// adds. One copy of the accounting per mode, chosen here once.
+#[inline]
 fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
     if entry.stats_done {
         return;
@@ -3599,6 +3600,9 @@ fn account_stream(entry: &mut SessionEntry, proxies: &[Proxy]) {
 // The one accounting of a stream's end, per mode: split, its closure would take the
 // stream's figures as a dozen arguments.
 #[allow(clippy::too_many_lines)]
+// Out of line: two copies inlined into `account_stream` grow its callers past LLVM's inlining
+// threshold, which cost more instructions than the call (T582: release-perf `insreq`).
+#[inline(never)]
 fn account_rows<'a, R: crate::statcnt::Rows<'a>>(entry: &SessionEntry, proxies: &'a [Proxy], rows: R) {
     use crate::statcnt::Write as _;
     let w = rows.w();
@@ -3616,6 +3620,8 @@ fn account_rows<'a, R: crate::statcnt::Rows<'a>>(entry: &SessionEntry, proxies: 
     let term = term_state(entry);
     let routed = !http || (l.request.is_some() && !matches!(&term, b"PR" | b"LR"));
     let status = stream_status(s);
+    // Classified once for the frontend, backend and server rows.
+    let class = crate::statcnt::status_class(status);
     // A request lost on a kept server connection has status 0 in `HAProxy`, which counts
     // no response for it, and no backend request (`stream.c`, at the stream's end).
     let keepalive_lost = s.txn.as_ref().is_some_and(|t| t.keepalive_lost);
@@ -3636,7 +3642,7 @@ fn account_rows<'a, R: crate::statcnt::Rows<'a>>(entry: &SessionEntry, proxies: 
         if http {
             w.add(&fe.req_tot, 1);
             if !keepalive_lost {
-                fe.count_status(w, status);
+                w.add(&fe.hrsp[class], 1);
             }
             if entry.sess.log.request.is_none() {
                 w.add(&fe.ereq, 1);
@@ -3670,7 +3676,7 @@ fn account_rows<'a, R: crate::statcnt::Rows<'a>>(entry: &SessionEntry, proxies: 
         }
         if http && (!server || answered) && !keepalive_lost {
             w.add(&c.req_tot, 1);
-            c.count_status(w, status);
+            w.add(&c.hrsp[class], 1);
         }
         // Which side's fault, as `HAProxy`'s termination code counts it (measured on
         // 3.5-dev8-885761-29: `SH` adds two to `eresp`, `sH` one, `SD` one to `eresp` and
@@ -3709,11 +3715,14 @@ fn account_rows<'a, R: crate::statcnt::Rows<'a>>(entry: &SessionEntry, proxies: 
             let ms = |v: i64| u64::try_from(v).unwrap_or(0);
             // The window is the row's own count (`HAProxy`'s per-tgroup rule, design Q2).
             let counted = if http { c.req_tot.load(Ordering::Relaxed) } else { c.lbtot.load(Ordering::Relaxed) };
-            let samples = [ms(tw), ms(tc), if http { ms(tr) } else { 0 }, ms(ta)];
-            for ((sum, max), v) in c.tsum.iter().zip(&cold.tmax).zip(samples) {
-                crate::statcnt::swrate_add(sum, v, counted);
-                crate::statcnt::max(max, u32::try_from(v).unwrap_or(u32::MAX));
-            }
+            let time = |k: usize, v: u64| {
+                crate::statcnt::swrate_add(&c.tsum[k], v, counted);
+                crate::statcnt::max(&cold.tmax[k], u32::try_from(v).unwrap_or(u32::MAX));
+            };
+            time(crate::statcnt::QTIME, ms(tw));
+            time(crate::statcnt::CTIME, ms(tc));
+            time(crate::statcnt::RTIME, if http { ms(tr) } else { 0 });
+            time(crate::statcnt::TTIME, ms(ta));
         }
         c.last_sess.store(now_ms, Ordering::Relaxed);
         c.sess_rate.tick_at(now);
@@ -3722,15 +3731,15 @@ fn account_rows<'a, R: crate::statcnt::Rows<'a>>(entry: &SessionEntry, proxies: 
     };
     let be = &proxies[be_idx];
     let picked = srv_idx.is_some() && entry.sess.lb_picked;
-    if let Some(c) = rows.row(be, crate::statcnt::BE) {
+    if let Some((c, cold)) = rows.obj(be, crate::statcnt::BE) {
         if picked {
             w.add(&c.lbtot, 1);
         }
-        one(c, &be.txn_counters().be, false);
+        one(c, cold, false);
     }
     let sbe = &proxies[srv_be];
-    let srv = srv_idx.and_then(|i| Some((i, rows.row(sbe, crate::statcnt::SRV + i)?, sbe.txn_counters().srv.get(i)?)));
-    if let Some((i, c, cold)) = srv {
+    let srv = srv_idx.and_then(|i| Some((i, rows.obj(sbe, crate::statcnt::SRV + i)?)));
+    if let Some((i, (c, cold))) = srv {
         if picked {
             w.add(&c.lbtot, 1);
         }
@@ -9589,10 +9598,18 @@ fn leave_backend(entry: &SessionEntry, proxies: &[Proxy]) {
 /// `connect_server`: an attempt to reach the server counts in `reuse` on the server and the
 /// backend when the stream uses a connection that exists already, in `connect` when it makes
 /// one (failed attempts included).
+#[inline]
 fn count_connect(proxies: &[Proxy], be_idx: usize, srv_idx: Option<usize>, reused: bool) {
-    use crate::statcnt::{Rows as _, Write as _};
     let Some(px) = proxies.get(be_idx) else { return };
-    let rows = crate::statcnt::rows_here(px);
+    match crate::statcnt::own_rows(px) {
+        Some(rows) => count_connect_on(rows, px, srv_idx, reused),
+        None => count_connect_on(crate::statcnt::SharedRows, px, srv_idx, reused),
+    }
+}
+
+#[inline(never)]
+fn count_connect_on<'a, R: crate::statcnt::Rows<'a>>(rows: R, px: &'a Proxy, srv_idx: Option<usize>, reused: bool) {
+    use crate::statcnt::Write as _;
     let pick = |c: &crate::statcnt::HotRow| rows.w().add(if reused { &c.reuse } else { &c.connect }, 1);
     rows.row(px, crate::statcnt::BE).into_iter().chain(srv_idx.and_then(|i| rows.row(px, crate::statcnt::SRV + i))).for_each(pick);
 }
