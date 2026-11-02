@@ -245,6 +245,7 @@ mod http_rule_keywords;
 mod http_server_close;
 mod http_txn;
 mod htx_byte_counts;
+mod htx_primary_body;
 mod htx_primary_response;
 mod idle_conn_events;
 mod idle_pool_fd_ratio;
