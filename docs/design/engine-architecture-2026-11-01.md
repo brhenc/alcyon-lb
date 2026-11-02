@@ -968,3 +968,33 @@ Not done / caveats: no BOLT; no vtest full reg-test run (the Python runner subse
 h2s1/keepalive/rules training for q10 variants covers dev10's code but the q10 binaries were measured
 only on h3fit; HAProxy's build ran through ccache (`/usr/lib64/ccache/gcc`, a cache hit is the same object);
 the version string of the copies reads `3.5-dev8-88576119c` (no `.git` in `git archive`, harmless).
+
+### 6.8 ibex-rc6, measured (2026-11-02 23:45, 694eabcc)
+
+After the CP/X/O waves (§6.7's main 06bdbce0 plus T617, T618, T614/T614b), the red-ibex fixes
+RV-A..RV-D, the ring-ibex zeroize review and Miri (T623). Same method as §6.6/6.7, slot A, governor
+performance, no `wwm.exe`; release-perf from `tools/measure/perfbase.sh`, PGO from `tools/pgo-build.sh`,
+h3fit median of 3 at 1.97 dg/req. HAProxy columns = §6.7 (dev8, dev10 for h3fit). Board:
+`~/ibex-worktrees/boards/pgo-rc6-694eabcc/`, `boards/insreq-694eabcc4d1c.json`.
+
+| scenario | rc5 rp | **rc6 rp** | rp / HA lto | rc5 PGO | **rc6 PGO** | **PGO / HA pgo-lto** |
+|---|---:|---:|---:|---:|---:|---:|
+| keepalive ab1 | 36.0k | **36,585** (65,721) | 1.02x | 30.9k | **31,217** (65,696) | **0.97x** |
+| rules ab1 | 56.8k | **52,740** (65,864) | 1.22x | 48.0k | **44,715** (65,789) | **1.15x** |
+| h2s1 | 58.6k | **51,217** (66,425) | 0.97x | 51.1k | **44,802** (66,264) | **0.92x** |
+| h3fit | 86.7k | **82,817** | 1.32x | 74.5k | **71,493** | **1.25x** |
+
+User ins/req, kernel in brackets. Above 1 = Ibex does more work.
+
+- **The measuring gate on main failed** (23:18, ref 8d456329 = rc5): keepalive ab1 36,540 against
+  35,990, **+1.5%** (limit +1%); every other row passed (rules -7.2%, allocations 0, 50-conn CPU/req
+  +3.1% under its limit, binary +0.7%). The tag stands with this recorded. Cause: drift of the
+  wave merges after rc5, each inside its own budget: T582 +0.52% (budget waived by the user, C582),
+  X7 +0.45%, O1b +0.27%, CP3 +0.23%, R4 +0.09%, X3b-1 +0.08%, CP4a-2 +29 ins, against X8 -0.16%
+  and O1a -0.35%. §6.7 already measured 36,717 at 06bdbce0, before any of tonight's merges, so
+  tonight's merges did not cause it. This is the case T604 (a ratchet a measured speed-up can clear)
+  is for. The next measuring gate's ref is 694eabcc.
+- rc5 -> rc6: rules -7 %, h2s1 -13 %, h3fit -4.5 % (rp); PGO rules -7 %, h2s1 -12 %, h3fit -4 %.
+  keepalive +1.6 % rp, +1.0 % PGO.
+- Like-for-like (best builds both sides): Ibex is ahead on keepalive and h2s1, 15 % behind on rules and
+  25 % behind on h3fit. Those two are where the work is.
