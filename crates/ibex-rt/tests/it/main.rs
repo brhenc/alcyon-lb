@@ -445,6 +445,7 @@ mod stick_rules;
 mod stick_table;
 mod stick_table_bounds;
 mod stick_untrack;
+mod track_rule_order;
 mod str_to_int_cast;
 mod stream_timeouts;
 mod strftime_specifiers;
