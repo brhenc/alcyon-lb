@@ -99,3 +99,33 @@ fn a_rule_run_validates_no_utf8() {
     let (_, utf8, _) = rules_scenario_costs();
     assert_eq!(utf8, 0, "{utf8} UTF-8 checks of the request's bytes for 2 ACLs and a path sample");
 }
+
+/// R2: the by-name path (an expression with a converter Ibex does not know is not compiled;
+/// the configuration refuses one, the CLI and tests can still evaluate it) reads the same
+/// samples in their bytes form: a header iterated, a multi fetch, a single fetch, each ending
+/// at the unknown converter; `eval_all` of a fetch with a bytes form and of one without.
+#[test]
+fn the_by_name_path_reads_the_bytes_forms_too() {
+    let reg = Registry::new();
+    crate::bytes_samples::with_request_line(b"GET /p HTTP/1.1\r\nHost: localhost\r\n\r\n", |ctx| {
+        for text in ["req.hdr(host),t574_no_such_conv -m found", "req.ssl_alpn,t574_no_such_conv -m found", "str(a),t574_no_such_conv -m found"] {
+            let e = Expr::parse(text).unwrap();
+            assert!(!format!("{e:?}").contains("Compiled"), "{text} was compiled");
+            assert!(!e.eval(&reg, ctx), "{text}");
+        }
+        assert_eq!(reg.eval_all("path", &[], &[], ctx), vec![Sample::Str("/p".into())]);
+        assert_eq!(reg.eval_all("str", &["x".to_string()], &[("upper", vec![])], ctx), vec![Sample::Str("X".into())]);
+    });
+}
+
+/// An ACL with no match method takes a boolean or an integer for its truth (`pat_match_nothing`).
+#[test]
+fn an_acl_without_a_method_reads_a_boolean_or_an_integer() {
+    let reg = Registry::new();
+    let ctx = SampleContext::default();
+    for (text, want) in [("bool(1)", true), ("bool(0)", false), ("int(2)", true), ("int(0)", false), ("str(x)", true)] {
+        let e = Expr::parse(text).unwrap();
+        assert!(e.matcher.is_none(), "{text} has a method");
+        assert_eq!(e.eval(&reg, &ctx), want, "{text}");
+    }
+}

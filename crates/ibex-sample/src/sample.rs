@@ -78,29 +78,6 @@ impl<'a> Smp<'a> {
         }
     }
 
-    /// The bytes of a text or binary sample.
-    #[must_use]
-    pub fn bytes(&self) -> Option<&[u8]> {
-        match self {
-            Smp::Str(b) | Smp::Bin(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    /// The same sample, owning its bytes.
-    #[must_use]
-    pub fn into_owned(self) -> Smp<'static> {
-        match self {
-            Smp::Bool(b) => Smp::Bool(b),
-            Smp::Sint(i) => Smp::Sint(i),
-            Smp::Ipv4(a) => Smp::Ipv4(a),
-            Smp::Ipv6(a) => Smp::Ipv6(a),
-            Smp::Str(b) => Smp::Str(Cow::Owned(b.into_owned())),
-            Smp::Bin(b) => Smp::Bin(Cow::Owned(b.into_owned())),
-            Smp::Meth(m) => Smp::Meth(m),
-        }
-    }
-
     /// The text form ([`Sample`]): a text sample's bytes as [`ibex_regex::bytetext`] text in a
     /// [`crate::spare`] string.
     #[must_use]

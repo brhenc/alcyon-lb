@@ -368,33 +368,19 @@ impl Matcher {
             Matcher::IntRange(range) => {
                 matches!(cast_smp_ref(sample, SampleType::Sint).as_deref(), Some(&Smp::Sint(v)) if range.contains(v))
             }
-            Matcher::Str { target, case_insensitive } => match cast_smp_ref(sample, SampleType::Str).as_deref() {
-                Some(Smp::Str(s)) => if *case_insensitive { s.eq_ignore_ascii_case(target) } else { **s == **target },
-                _ => false,
-            },
-            Matcher::Beg { prefix, case_insensitive } => match cast_smp_ref(sample, SampleType::Str).as_deref() {
-                Some(Smp::Str(s)) => s.get(..prefix.len()).is_some_and(|h| if *case_insensitive { h.eq_ignore_ascii_case(prefix) } else { h == &prefix[..] }),
-                _ => false,
-            },
-            Matcher::End { suffix, case_insensitive } => match cast_smp_ref(sample, SampleType::Str).as_deref() {
-                Some(Smp::Str(s)) => s.len().checked_sub(suffix.len()).is_some_and(|at| {
-                    let t = &s[at..];
-                    if *case_insensitive { t.eq_ignore_ascii_case(suffix) } else { t == &suffix[..] }
-                }),
-                _ => false,
-            },
-            Matcher::Sub { sub, case_insensitive } => match cast_smp_ref(sample, SampleType::Str).as_deref() {
-                Some(Smp::Str(s)) => if *case_insensitive { contains_icase(s, sub) } else { memchr::memmem::find(s, sub).is_some() },
-                _ => false,
-            },
-            Matcher::Reg(regex) => match cast_smp_ref(sample, SampleType::Str).as_deref() {
-                Some(Smp::Str(s)) => regex.is_match_bytes(s),
-                _ => false,
-            },
-            Matcher::Len(range) => match cast_smp_ref(sample, SampleType::Str).as_deref() {
-                Some(Smp::Str(s)) => i64::try_from(s.len()).is_ok_and(|n| range.contains(n)),
-                _ => false,
-            },
+            Matcher::Str { target, case_insensitive } => {
+                str_of(sample).is_some_and(|s| if *case_insensitive { s.eq_ignore_ascii_case(target) } else { *s == **target })
+            }
+            Matcher::Beg { prefix, case_insensitive } => str_of(sample)
+                .is_some_and(|s| s.get(..prefix.len()).is_some_and(|h| if *case_insensitive { h.eq_ignore_ascii_case(prefix) } else { h == &prefix[..] })),
+            Matcher::End { suffix, case_insensitive } => str_of(sample).is_some_and(|s| {
+                s.len().checked_sub(suffix.len()).is_some_and(|at| if *case_insensitive { s[at..].eq_ignore_ascii_case(suffix) } else { s[at..] == suffix[..] })
+            }),
+            Matcher::Sub { sub, case_insensitive } => {
+                str_of(sample).is_some_and(|s| if *case_insensitive { contains_icase(&s, sub) } else { memchr::memmem::find(&s, sub).is_some() })
+            }
+            Matcher::Reg(regex) => str_of(sample).is_some_and(|s| regex.is_match_bytes(&s)),
+            Matcher::Len(range) => str_of(sample).is_some_and(|s| i64::try_from(s.len()).is_ok_and(|n| range.contains(n))),
             Matcher::Bin(target) => {
                 // Every type casts to binary (`c_*2bin`), so this is the only comparison.
                 matches!(cast_smp_ref(sample, SampleType::Bin).as_deref(), Some(Smp::Bin(b)) if **b == **target)
@@ -445,6 +431,15 @@ impl Matcher {
             }
         }
     }
+}
+
+/// The bytes of `sample` as a text sample (every type casts to `str`), borrowed when it is one.
+fn str_of<'s>(sample: &'s Smp<'_>) -> Option<std::borrow::Cow<'s, [u8]>> {
+    if let Smp::Str(b) = sample {
+        return Some(std::borrow::Cow::Borrowed(b));
+    }
+    let Smp::Str(b) = crate::cast::cast_smp(sample.clone(), SampleType::Str)? else { return None };
+    Some(std::borrow::Cow::Owned(b.into_owned()))
 }
 
 /// `sample` cast to `t` (`cast`), borrowed when it is of that type already: matching a sample

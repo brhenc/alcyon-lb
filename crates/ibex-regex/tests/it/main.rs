@@ -12,4 +12,5 @@
 
 mod budget;
 mod bytewise;
+mod bytes_api;
 mod group_refs;

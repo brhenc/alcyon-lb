@@ -694,17 +694,14 @@ pub struct ConvDesc {
 }
 
 pub type MultiFetchFn = fn(&SampleContext, &[String]) -> Vec<Sample>;
-/// A [`MultiFetchFn`] that hands each sample to its caller as it is found, with no list: the
-/// caller returns false to stop (T437). Registered next to the list form for the fetches an
-/// ACL iterates on most (the headers).
-pub type VisitFetchFn = fn(&SampleContext, &[String], &mut dyn FnMut(Sample) -> bool);
-
 /// R2: a fetch that gives its sample as bytes ([`Smp`]), borrowed from the context where the
 /// value is there as it is (a header, the path): no copy, no UTF-8 check. Registered beside the
 /// text form ([`FetchFn`]) of the same fetch, which the compiled path no longer calls.
 pub type ViewFetchFn = for<'c> fn(&'c SampleContext<'_>, &[String]) -> Option<Smp<'c>>;
 
-/// R2: [`VisitFetchFn`] of a [`ViewFetchFn`]: each sample handed over as borrowed bytes.
+/// A [`MultiFetchFn`] that hands each sample to its caller as it is found, with no list: the
+/// caller returns false to stop (T437), each one as borrowed bytes (R2). Registered next to
+/// the list form for the fetches an ACL iterates on most (the headers, the cookies).
 pub type ViewVisitFn = for<'c> fn(&'c SampleContext<'_>, &[String], &mut dyn FnMut(Smp<'c>) -> bool);
 
 /// R2: a converter on bytes: a borrowed input that it does not change goes out borrowed.
@@ -744,7 +741,6 @@ enum ConvRef {
 pub struct Compiled {
     single: Option<FetchFn>,
     multi: Option<MultiFetchFn>,
-    visit: Option<VisitFetchFn>,
     /// The fetch on bytes, when it has that form (R2): used instead of `single`.
     view: Option<ViewFetchFn>,
     /// The iteration on bytes, when the fetch has it: used instead of `visit`.
@@ -785,7 +781,6 @@ pub struct Registry {
     converters: HashMap<&'static str, ConvDesc>,
     ctx_converters: HashMap<&'static str, CtxConvDesc>,
     multi_fetches: HashMap<&'static str, MultiFetchFn>,
-    multi_visits: HashMap<&'static str, VisitFetchFn>,
     /// R2: the fetches, iterations and converters that have a form on bytes.
     views: HashMap<&'static str, ViewFetchFn>,
     visit_views: HashMap<&'static str, ViewVisitFn>,
@@ -1319,7 +1314,6 @@ impl Registry {
             converters: HashMap::new(),
             ctx_converters: HashMap::new(),
             multi_fetches: HashMap::new(),
-            multi_visits: HashMap::new(),
             views: HashMap::new(),
             visit_views: HashMap::new(),
             conv_views: HashMap::new(),
@@ -3920,14 +3914,12 @@ impl Registry {
             },
         });
         // `sample_conv_str2lower`: ASCII only, in place (owned bytes are lowered where they are).
-        self.register_conv_view("lower", |smp, _args| match smp {
-            Smp::Str(mut b) => {
-                if b.iter().any(u8::is_ascii_uppercase) {
-                    b.to_mut().make_ascii_lowercase();
-                }
-                Some(Smp::Str(b))
+        self.register_conv_view("lower", |smp, _args| {
+            let Smp::Str(mut b) = smp else { return None };
+            if b.iter().any(u8::is_ascii_uppercase) {
+                b.to_mut().make_ascii_lowercase();
             }
-            _ => None,
+            Some(Smp::Str(b))
         });
 
         self.register_converter(ConvDesc {
@@ -3940,14 +3932,12 @@ impl Registry {
                 _ => None,
             },
         });
-        self.register_conv_view("upper", |smp, _args| match smp {
-            Smp::Str(mut b) => {
-                if b.iter().any(u8::is_ascii_lowercase) {
-                    b.to_mut().make_ascii_uppercase();
-                }
-                Some(Smp::Str(b))
+        self.register_conv_view("upper", |smp, _args| {
+            let Smp::Str(mut b) = smp else { return None };
+            if b.iter().any(u8::is_ascii_lowercase) {
+                b.to_mut().make_ascii_uppercase();
             }
-            _ => None,
+            Some(Smp::Str(b))
         });
 
         // A sample longer than i64::MAX bytes cannot exist, so the conversion never
@@ -6459,14 +6449,6 @@ impl Registry {
                 }
                 None => false,
             });
-        } else if let Some(visit) = self.multi_visits.get(fetch_name) {
-            visit(ctx, fetch_args, &mut |smp| match self.apply_converters_g(ctx, Smp::from_sample(smp), converters) {
-                Some(res) => {
-                    see(res);
-                    true
-                }
-                None => false,
-            });
         } else if self.multi_fetches.contains_key(fetch_name) {
             for smp in self.fetch_all(fetch_name, fetch_args, ctx).unwrap_or_default() {
                 match self.apply_converters_g(ctx, smp, converters) {
@@ -6559,7 +6541,6 @@ impl Registry {
     pub(crate) fn compile<S: AsRef<str>>(&self, fetch_name: &str, converters: &[(S, Vec<String>)]) -> Option<Compiled> {
         let single = self.get_fetch(fetch_name).map(|d| d.func);
         let multi = self.multi_fetches.get(fetch_name).copied();
-        let visit = self.multi_visits.get(fetch_name).copied();
         let view = self.views.get(fetch_name).copied();
         let visit_view = self.visit_views.get(fetch_name).copied();
         if single.is_none() && multi.is_none() {
@@ -6569,7 +6550,7 @@ impl Registry {
         for (name, _) in converters {
             convs.push(self.conv_ref(name.as_ref())?);
         }
-        Some(Compiled { single, multi, visit, view, visit_view, convs, var: None })
+        Some(Compiled { single, multi, view, visit_view, convs, var: None })
     }
 
     fn apply_c<'a, S>(c: &Compiled, ctx: &SampleContext, mut smp: Smp<'a>, converters: &[(S, Vec<String>)]) -> Option<Smp<'a>> {
@@ -6615,14 +6596,6 @@ impl Registry {
         };
         if let Some(visit) = c.visit_view {
             visit(ctx, fetch_args, &mut |smp| match Self::apply_c(c, ctx, smp, converters) {
-                Some(res) => {
-                    see(res);
-                    true
-                }
-                None => false,
-            });
-        } else if let Some(visit) = c.visit {
-            visit(ctx, fetch_args, &mut |smp| match Self::apply_c(c, ctx, Smp::from_sample(smp), converters) {
                 Some(res) => {
                     see(res);
                     true
@@ -8954,6 +8927,22 @@ mod tests {
         assert!(!reg.any_acl("no.such.fetch", &[], none, &super::SampleContext::default(), |_| true));
     }
 
+    /// `any_acl` by name hands a known fetch's samples to the matcher, in their bytes form (R2):
+    /// a single fetch and a list one. `Expr` comes here only for an expression it could not
+    /// compile, which has an unknown fetch or converter, so only a direct call reaches a match.
+    #[test]
+    fn a_known_fetch_by_name_reaches_the_matcher() {
+        let reg = super::Registry::new();
+        let none: &[(&str, Vec<String>)] = &[];
+        let ctx = super::SampleContext::default();
+        let mut seen = Vec::new();
+        assert!(reg.any_acl("str", &["x".to_string()], none, &ctx, |s| {
+            seen.push(s.clone().into_sample());
+            true
+        }));
+        assert_eq!(seen, vec![super::Sample::Str("x".into())]);
+    }
+
     /// `dump_var_value` escapes NUL as `\0` (as `chunk_escape_string` does). A NUL cannot be put in a
     /// string variable from a configuration: HAProxy 3.5-dev8 drops the `url_dec` of `%00` altogether, and
     /// dumps a `bin` variable as hex, so no oracle column exists; this pins the code's own rule. Also the
@@ -10111,6 +10100,8 @@ mod compiled_multi_only {
         let ctx = SampleContext::default();
         assert_eq!(Registry::eval_c(&c, &[], none, &ctx), Some(Sample::Sint(7)));
         assert_eq!(Registry::eval_all_c(&c, &[], none, &ctx), vec![Sample::Sint(7), Sample::Sint(8)]);
+        // And by name (R2: `eval_smp_g` falls back to the list for its first sample).
+        assert_eq!(r.eval("t574_multi_only", &[], none, &ctx), Some(Sample::Sint(7)));
     }
 }
 

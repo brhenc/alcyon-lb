@@ -361,16 +361,6 @@ impl Expr {
         }
     }
 
-    /// [`Expr::eval_sample`] in the bytes form (R2): a header or the path borrowed from the
-    /// request when no converter made new bytes.
-    #[must_use]
-    pub fn eval_smp<'c>(&self, registry: &Registry, ctx: &'c SampleContext<'_>) -> Option<Smp<'c>> {
-        match self.compiled(registry) {
-            Some(c) => Registry::eval_smp_c(c, &self.fetch_args, &self.converters, ctx),
-            None => registry.eval_smp_g(&self.fetch_name, &self.fetch_args, &self.converters, ctx),
-        }
-    }
-
     /// Evaluates the expression against the sample context to produce all sample values.
     #[must_use]
     pub fn eval_all_samples(&self, registry: &Registry, ctx: &SampleContext) -> Vec<Sample> {

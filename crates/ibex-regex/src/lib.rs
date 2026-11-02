@@ -761,11 +761,6 @@ fn bytewise_bytes(b: &[u8]) -> Cow<'_, str> {
     }
 }
 
-/// What [`bytewise_bytes`] made of bytes, as those bytes.
-fn unbytewise_bytes(text: &str) -> Vec<u8> {
-    text.chars().map(|c| bytetext::unescape_char(c).unwrap_or_else(|| u8::try_from(u32::from(c)).unwrap_or(b'?'))).collect()
-}
-
 /// `pattern` (configuration text, [`bytetext`]) as `regex::bytes` reads it with Unicode off
 /// (R2): each byte of 0x80 or more written `\xHH`, so a literal `é` is its two UTF-8 bytes
 /// and a Latin-1 `\xe9` from the configuration is that one byte, as PCRE2 without UTF reads
@@ -928,23 +923,6 @@ impl UserRegex {
         }
     }
 
-    /// [`UserRegex::replace`] (`all` false) or [`UserRegex::replace_all`] of bytes, the
-    /// replacement bytes too: `subject` itself when nothing matched.
-    #[must_use]
-    pub fn replace_bytes<'h>(&self, subject: &'h [u8], replacement: &[u8], all: bool) -> Cow<'h, [u8]> {
-        let limit = if all { usize::MAX } else { 1 };
-        match self {
-            UserRegex::Linear(r) => r.replacen(subject, limit, replacement),
-            UserRegex::Backtracking(..) => {
-                let text = bytewise_bytes(subject);
-                match self.replacen_backtracking(&text, &bytewise_bytes(replacement), limit) {
-                    Cow::Borrowed(_) => Cow::Borrowed(subject),
-                    Cow::Owned(s) => Cow::Owned(unbytewise_bytes(&s)),
-                }
-            }
-        }
-    }
-
     /// The groups of the first match in `text`. A match that exceeds [`BACKTRACK_LIMIT`]
     /// is none.
     #[must_use]
@@ -985,68 +963,66 @@ impl UserRegex {
     }
 
     fn replacen<'h>(&self, text: &'h str, replacement: &str, limit: usize) -> Cow<'h, str> {
-        if let UserRegex::Linear(r) = self {
-            let subject = bytetext::text_to_bytes(text);
-            return match r.replacen(&subject, limit, &*bytetext::text_to_bytes(replacement)) {
-                Cow::Borrowed(_) => Cow::Borrowed(text),
-                Cow::Owned(b) => Cow::Owned(bytetext::bytes_to_text(&b)),
-            };
-        }
+        let ladder = match self {
+            UserRegex::Linear(r) => {
+                let subject = bytetext::text_to_bytes(text);
+                return match r.replacen(&subject, limit, &*bytetext::text_to_bytes(replacement)) {
+                    Cow::Borrowed(_) => Cow::Borrowed(text),
+                    Cow::Owned(b) => Cow::Owned(bytetext::bytes_to_text(&b)),
+                };
+            }
+            UserRegex::Backtracking(_, ladder) => ladder,
+        };
         if !text.is_ascii() {
             let mapped = bytewise(text);
-            let done = self.replacen_backtracking(mapped.as_ref(), &bytewise(replacement), limit);
+            let done = Self::replacen_backtracking(ladder, mapped.as_ref(), &bytewise(replacement), limit);
             return match done {
                 Cow::Borrowed(_) => Cow::Borrowed(text),
                 Cow::Owned(s) => Cow::Owned(unbytewise(&s)),
             };
         }
-        self.replacen_backtracking(text, replacement, limit)
+        Self::replacen_backtracking(ladder, text, replacement, limit)
     }
 
-    /// The replacement loop of a [`UserRegex::Backtracking`] pattern over a [`bytewise`] text
-    /// (each step under the [`LOOP_BUDGET`]); a [`UserRegex::Linear`] one never comes here.
-    fn replacen_backtracking<'h>(&self, text: &'h str, replacement: &str, limit: usize) -> Cow<'h, str> {
-        match self {
-            UserRegex::Linear(_) => Cow::Borrowed(text),
-            UserRegex::Backtracking(_, ladder) => {
-                let mut budget = LOOP_BUDGET;
-                let mut out = String::new();
-                let mut last = 0;
-                let mut pos = 0;
-                let mut n = 0;
-                while n < limit && pos <= text.len() {
-                    let caps = match ladder.captures_from_pos(text, pos, &mut budget) {
-                        Ok(Some(caps)) => caps,
-                        Ok(None) => break,
-                        // Out of budget: a non-match, whatever was replaced so far is dropped.
-                        Err(()) => return Cow::Borrowed(text),
-                    };
-                    let Some(m) = caps.get(0) else { break };
-                    out.push_str(&text[last..m.start()]);
-                    caps.expand(replacement, &mut out);
-                    last = m.end();
-                    n += 1;
-                    pos = if m.end() == m.start() {
-                        // An empty match: copy one character and go on after it.
-                        match text[m.end()..].chars().next() {
-                            Some(c) => {
-                                out.push(c);
-                                last = m.end() + c.len_utf8();
-                                last
-                            }
-                            None => break,
-                        }
-                    } else {
-                        m.end()
-                    };
+    /// The replacement loop of a [`UserRegex::Backtracking`] pattern (its `ladder`) over a
+    /// [`bytewise`] text, each step under the [`LOOP_BUDGET`].
+    fn replacen_backtracking<'h>(ladder: &Ladder, text: &'h str, replacement: &str, limit: usize) -> Cow<'h, str> {
+        let mut budget = LOOP_BUDGET;
+        let mut out = String::new();
+        let mut last = 0;
+        let mut pos = 0;
+        let mut n = 0;
+        while n < limit && pos <= text.len() {
+            let caps = match ladder.captures_from_pos(text, pos, &mut budget) {
+                Ok(Some(caps)) => caps,
+                Ok(None) => break,
+                // Out of budget: a non-match, whatever was replaced so far is dropped.
+                Err(()) => return Cow::Borrowed(text),
+            };
+            let Some(m) = caps.get(0) else { break };
+            out.push_str(&text[last..m.start()]);
+            caps.expand(replacement, &mut out);
+            last = m.end();
+            n += 1;
+            pos = if m.end() == m.start() {
+                // An empty match: copy one character and go on after it.
+                match text[m.end()..].chars().next() {
+                    Some(c) => {
+                        out.push(c);
+                        last = m.end() + c.len_utf8();
+                        last
+                    }
+                    None => break,
                 }
-                if n == 0 {
-                    return Cow::Borrowed(text);
-                }
-                out.push_str(&text[last.min(text.len())..]);
-                Cow::Owned(out)
-            }
+            } else {
+                m.end()
+            };
         }
+        if n == 0 {
+            return Cow::Borrowed(text);
+        }
+        out.push_str(&text[last.min(text.len())..]);
+        Cow::Owned(out)
     }
 
     /// `text` with every character that is special in a pattern escaped.

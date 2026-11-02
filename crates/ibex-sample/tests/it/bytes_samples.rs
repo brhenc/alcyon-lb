@@ -45,6 +45,8 @@ fn rendered(smp: Option<Sample>) -> Vec<u8> {
         Some(Sample::Bin(b)) => b,
         Some(Sample::Sint(i)) => i.to_string().into_bytes(),
         Some(Sample::Bool(b)) => if b { b"1".to_vec() } else { b"0".to_vec() },
+        Some(Sample::Ipv4(a)) => a.to_string().into_bytes(),
+        Some(Sample::Ipv6(a)) => a.to_string().into_bytes(),
         Some(other) => format!("{other:?}").into_bytes(),
     }
 }
@@ -75,6 +77,92 @@ fn a_non_utf8_header_matches_and_converts_as_bytes() {
         }
     }
     assert!(wrong.is_empty(), "{} of {} rows differ from HAProxy:\n{}", wrong.len(), ORACLE.len(), wrong.join("\n"));
+}
+
+/// More rows, each with the request it was measured on (HAProxy 3.5-dev8-885761-29, the
+/// same set-var probe): `json`'s UTF-8 modes on a surrogate, a character past 0xFFFF and an
+/// overlong form; a Latin-1 cookie; `path` of `OPTIONS *` and of absolute targets; a binary
+/// sample matched as text (cut at its NUL, `c_bin2str`); a method and a string through
+/// converters that take another type (`lower` on a method, `ipmask` on a string).
+const MORE: &[(&[u8], &[u8], &[u8])] = &[
+    (b"GET / HTTP/1.1\r\nX: \xed\xa0\x80x\r\n\r\n", b"req.hdr(x),json(utf8)", b""),
+    (b"GET / HTTP/1.1\r\nX: \xed\xa0\x80x\r\n\r\n", b"req.hdr(x),json(utf8s)", b"x"),
+    (b"GET / HTTP/1.1\r\nX: \xed\xa0\x80x\r\n\r\n", b"req.hdr(x),json(utf8p)", b""),
+    (b"GET / HTTP/1.1\r\nX: \xed\xa0\x80x\r\n\r\n", b"req.hdr(x),json(utf8ps)", b"x"),
+    (b"GET / HTTP/1.1\r\nX: \xf0\x9f\x98\x80x\r\n\r\n", b"req.hdr(x),json(utf8)", b""),
+    (b"GET / HTTP/1.1\r\nX: \xf0\x9f\x98\x80x\r\n\r\n", b"req.hdr(x),json(utf8s)", b"x"),
+    (b"GET / HTTP/1.1\r\nX: \xf0\x9f\x98\x80x\r\n\r\n", b"req.hdr(x),json(utf8p)", b""),
+    (b"GET / HTTP/1.1\r\nX: \xf0\x9f\x98\x80x\r\n\r\n", b"req.hdr(x),json(utf8ps)", b"x"),
+    (b"GET / HTTP/1.1\r\nX: caf\xe9\r\n\r\n", b"req.hdr(x),json(utf8ps)", b"caf"),
+    (b"GET / HTTP/1.1\r\nX: \xc0\xafx\r\n\r\n", b"req.hdr(x),json(utf8)", b""),
+    (b"GET / HTTP/1.1\r\nX: \xc0\xafx\r\n\r\n", b"req.hdr(x),json(utf8s)", b"x"),
+    (b"GET / HTTP/1.1\r\nX: \xc0\xafx\r\n\r\n", b"req.hdr(x),json(utf8ps)", b"\\/x"),
+    (b"GET / HTTP/1.1\r\nCookie: a=caf\xe9\r\n\r\n", b"req.cook(a)", b"caf\xe9"),
+    (b"GET / HTTP/1.1\r\nCookie: a=caf\xe9\r\n\r\n", b"req.cook(a) -m end \xe9", b"1"),
+    (b"GET / HTTP/1.1\r\nCookie: a=1; a=2\r\n\r\n", b"req.cook(a) -m str 1", b"1"),
+    // A converter that gives no sample ends the ACL line: the later values are not tried.
+    (b"GET / HTTP/1.1\r\nCookie: a=x; a=1.2.3.4; b=1.2.3.4; b=x\r\n\r\n", b"req.cook(a),ipmask(8) -m found", b""),
+    (b"GET / HTTP/1.1\r\nCookie: a=x; a=1.2.3.4; b=1.2.3.4; b=x\r\n\r\n", b"req.cook(b),ipmask(8) -m found", b"1"),
+    (b"OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n", b"path", b""),
+    (b"OPTIONS http://h HTTP/1.1\r\nHost: h\r\n\r\n", b"path", b""),
+    (b"GET http://h HTTP/1.1\r\nHost: h\r\n\r\n", b"path", b"/"),
+    (b"GET / HTTP/1.1\r\n\r\n", b"bin(610062) -m str a", b"1"),
+    (b"GET / HTTP/1.1\r\n\r\n", b"bin(610062) -m len 1", b"1"),
+    (b"GET / HTTP/1.1\r\n\r\n", b"method,lower", b"get"),
+    (b"GET / HTTP/1.1\r\n\r\n", b"str(10.1.2.3),ipmask(8)", b"10.0.0.0"),
+    (b"GET / HTTP/1.1\r\n\r\n", b"str(2001:db8::1),ipmask(8,32)", b"2001:db8::"),
+];
+
+#[test]
+fn more_bytes_rows_match_haproxy() {
+    let reg = Registry::new();
+    let mut wrong = Vec::new();
+    for &(wire, expr, want) in MORE {
+        let e = Expr::parse(&bytes_to_text(expr)).unwrap_or_else(|err| panic!("{}: {err}", expr.escape_ascii()));
+        let got = with_request_line(wire, |ctx| {
+            if e.matcher.is_some() {
+                if e.eval(&reg, ctx) { b"1".to_vec() } else { Vec::new() }
+            } else {
+                rendered(e.eval_sample(&reg, ctx))
+            }
+        });
+        if got != want {
+            wrong.push(format!("{} | {} -> got {} want {}", wire.escape_ascii(), expr.escape_ascii(), got.escape_ascii(), want.escape_ascii()));
+        }
+    }
+    assert!(wrong.is_empty(), "differ from HAProxy:\n{}", wrong.join("\n"));
+}
+
+/// The text form's matcher entry point reads a binary sample in place (cut at its NUL as
+/// `bin(610062) -m str a` above), and a method as its name (`method -m str GET`).
+#[test]
+fn the_text_form_matches_bytes_and_methods() {
+    let m = ibex_sample::Matcher::compile("str", "a").unwrap();
+    assert!(m.matches(&Sample::Bin(b"a\0b".to_vec())));
+    assert!(!m.matches(&Sample::Bin(b"ab".to_vec())));
+    let get = ibex_sample::Matcher::compile("str", "GET").unwrap();
+    assert!(get.matches(&Sample::Meth(ibex_proto::htx::HttpMethod::Get)));
+}
+
+/// The two forms convert into each other without loss, every variant.
+#[test]
+fn the_two_forms_round_trip() {
+    use ibex_sample::Smp;
+    for smp in [
+        Sample::Bool(true),
+        Sample::Sint(-3),
+        Sample::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+        Sample::Ipv6(std::net::Ipv6Addr::LOCALHOST),
+        Sample::Str(bytes_to_text(b"caf\xe9")),
+        Sample::Str("plain".into()),
+        Sample::Bin(vec![0, 0xff]),
+        Sample::Meth(ibex_proto::htx::HttpMethod::Post),
+    ] {
+        assert_eq!(Smp::from_sample(smp.clone()).into_sample(), smp);
+        assert_eq!(Smp::of_sample(&smp).into_sample(), smp);
+    }
+    // Borrowed bytes that are not UTF-8 come back as their escape characters.
+    assert_eq!(Smp::str(b"caf\xe9").into_sample(), Sample::Str(bytes_to_text(b"caf\xe9")));
 }
 
 const ORACLE: &[(&[u8], &[u8], &[u8])] = &[

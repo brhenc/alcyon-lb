@@ -31,3 +31,4 @@ mod proxy_protocol_tests;
 mod qpack_field_cap;
 mod qpack_static;
 mod smuggling_cl_te;
+mod htx_rule_headers;

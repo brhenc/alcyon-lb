@@ -31,12 +31,10 @@ pub fn cast(smp: Sample, target_type: SampleType) -> Option<Sample> {
 
 /// [`cast`] of a sample in its bytes form (R2): between text and binary the bytes are moved
 /// (borrowed ones stay borrowed); `bin` to `str` stops at the first NUL as `c_bin2str` does.
-/// Every other cast is [`cast`]'s, through the text form.
+/// Every other cast is [`cast`]'s, through the text form (the callers cast only to another
+/// type).
 #[must_use]
 pub fn cast_smp(smp: Smp<'_>, target_type: SampleType) -> Option<Smp<'_>> {
-    if smp.sample_type() == target_type {
-        return Some(smp);
-    }
     match (smp, target_type) {
         (Smp::Str(b), SampleType::Bin) => Some(Smp::Bin(b)),
         (Smp::Bin(b), SampleType::Str) => Some(Smp::Str(match b.iter().position(|&c| c == 0) {
@@ -49,7 +47,6 @@ pub fn cast_smp(smp: Smp<'_>, target_type: SampleType) -> Option<Smp<'_>> {
             },
             None => b,
         })),
-        (Smp::Str(b) | Smp::Bin(b), SampleType::Meth) => Some(Smp::Meth(HttpMethod::from_bytes(&b))),
         (smp, t) => cast(smp.into_sample(), t).map(Smp::from_sample),
     }
 }
