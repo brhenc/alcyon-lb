@@ -195,6 +195,11 @@ impl ibex_alloc::Poolable for H2SrvCodec {
     }
 }
 
+/// The most a response header block may grow to over HEADERS and CONTINUATION frames before the
+/// connection fails (HAProxy: the block has to fit its `tune.bufsize` buffer; `mux_h2` bounds
+/// the client side at the same 64 KiB).
+const MAX_HEADER_BLOCK: usize = 65_536;
+
 /// The largest response text kept before frames stop being read: a stream window (16384)
 /// and its framing.
 const RSP_ROOM: usize = 32 * 1024;
@@ -940,6 +945,9 @@ impl H2SrvCodec {
             FrameType::Continuation => {
                 if self.hb_stream == 0 {
                     return Err(self.conn_fail(0x1));
+                }
+                if self.hblock.len() + p.len() > MAX_HEADER_BLOCK {
+                    return Err(self.conn_fail(0x6));
                 }
                 self.hblock.extend_from_slice(p);
                 if h.flags & frame_flags::END_HEADERS == 0 {
