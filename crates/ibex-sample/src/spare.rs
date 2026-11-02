@@ -94,7 +94,8 @@ thread_local! {
 
 /// How many spare strings ([`string`]) this thread has taken (debug builds only; always 0 in
 /// release): a test reads it around an evaluation to show that a sample borrowed from the
-/// request takes none (R2).
+/// request takes none (R2), and that the response rules take
+/// none per request (X7).
 #[must_use]
 pub fn strings_taken_on_this_thread() -> u64 {
     #[cfg(debug_assertions)]

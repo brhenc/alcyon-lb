@@ -247,10 +247,17 @@ fn normalisation_cases() -> Vec<Case> {
         let want: &'static [u8] = Box::leak(format!("POST /caf\u{e9} HTTP/1.1\r\nhost: x\r\nx-case: {id}\r\ncontent-length: 5\r\n\r\nhello").into_bytes().into_boxed_slice());
         add(id, f, Want::Forwards(want));
     }
-    // In `:path` HAProxy forwards it too (`GET /a\xe9b`); Ibex keeps the request line as
-    // UTF-8 text and resets the stream (tradeoff.md 6.24).
+    // In `:path` HAProxy forwards it too, measured on 3.5-dev8 (X7): `GET /a\xe9b HTTP/1.1`, the
+    // log line `GET http://x/a#E9b HTTP/2.0 U=49`.
     let id = "path-e9".to_string();
-    add(id.clone(), one(&id, b"GET", b"http", b"/a\xe9b", b"x", &[]), Want::Rst);
+    add(id.clone(), one(&id, b"GET", b"http", b"/a\xe9b", b"x", &[]), Want::Forwards(b"GET /a\xe9b HTTP/1.1\r\nhost: x\r\nx-case: path-e9\r\n\r\n"));
+    // Two `:path`: a malformed request (X7: the path is read as bytes in the loop).
+    let mut two = lit(b":method", b"GET");
+    two.extend(lit(b":scheme", b"http"));
+    two.extend(lit(b":path", b"/a"));
+    two.extend(lit(b":path", b"/b"));
+    two.extend(lit(b":authority", b"x"));
+    add("path-twice".to_string(), frame(1, 5, 1, &two), Want::Rst);
     out
 }
 

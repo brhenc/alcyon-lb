@@ -12450,13 +12450,13 @@ impl EngineDispatcher<'_> {
             None => return,
         };
         let hdr_bytes = &entry.sess.rep.readable()[..total_hdr_len];
-        // The head as text, the status line's parts and the header list are per-thread strings
-        // given back at the end (T437).
-        let mut hdr_str = crate::reuse::PString::new();
-        match std::str::from_utf8(hdr_bytes) {
-            Ok(t) if !ibex_regex::bytetext::has_escapes(t) => hdr_str.push_str(t),
-            _ => hdr_str.push_str(&ibex_regex::bytetext::bytes_to_text(hdr_bytes)),
-        }
+        // The head as text, read where it is when it is plain UTF-8 (every head on the fast path);
+        // the status line's words are constants when they are the usual ones (X7): no spare
+        // string for the head or its words.
+        let hdr_str: std::borrow::Cow<'_, str> = match std::str::from_utf8(hdr_bytes) {
+            Ok(t) if !ibex_regex::bytetext::has_escapes(t) => std::borrow::Cow::Borrowed(t),
+            _ => std::borrow::Cow::Owned(ibex_regex::bytetext::bytes_to_text(hdr_bytes)),
+        };
 
         // Bare-LF line ends are a head too (`find_eoh` accepts them, as HAProxy's parser
         // does); split only on CRLF, such a head skipped every rule.
@@ -12466,22 +12466,25 @@ impl EngineDispatcher<'_> {
         };
 
         let mut status: u16 = 200;
-        let mut proto_version = crate::reuse::PString::of("HTTP/1.1");
-        let mut status_msg = crate::reuse::PString::of("OK");
+        let mut proto_version = crate::reuse::Word::usual("HTTP/1.1");
+        let mut status_msg = crate::reuse::Word::usual("OK");
         let mut parts = first_line.split_whitespace();
         if let (Some(p0), Some(p1)) = (parts.next(), parts.next()) {
-            proto_version.clear();
-            proto_version.push_str(p0);
+            if p0 == "HTTP/1.1" {
+                proto_version.set_usual("HTTP/1.1");
+            } else {
+                proto_version.set_words(std::iter::once(p0));
+            }
             if let Ok(st) = p1.parse::<u16>() {
                 status = st;
             }
             // The reason's words, one space between each.
-            if let Some(w) = parts.next() {
-                status_msg.clear();
-                status_msg.push_str(w);
-                for w in parts {
-                    status_msg.push(' ');
-                    status_msg.push_str(w);
+            if parts.clone().next().is_some() {
+                let usual = status_reason(status);
+                if usual.split(' ').eq(parts.clone()) {
+                    status_msg.set_usual(usual);
+                } else {
+                    status_msg.set_words(parts);
                 }
             }
         }
@@ -12489,16 +12492,20 @@ impl EngineDispatcher<'_> {
         // The headers the rules edit are the list the response fetches read (X3): built once
         // where they read it, edited there, and written out from it, with no copy of it per
         // rule or per list.
+        // The previous response's strings are written over in place (X7): a spare string is
+        // taken only for a header more than that response had.
         with_res_hdrs(|hdrs| {
-            crate::reuse::clear_pairs(hdrs);
+            let mut n = 0;
             for line in rest_headers.lines() {
                 if line.is_empty() {
                     break;
                 }
                 if let Some((k, v)) = line.split_once(':') {
-                    hdrs.push((crate::reuse::string_from(k.trim()), crate::reuse::string_from(v.trim())));
+                    crate::reuse::set_pair(hdrs, n, k.trim(), v.trim());
+                    n += 1;
                 }
             }
+            crate::reuse::truncate_pairs(hdrs, n);
         });
         // T439: the rules do not see the server's `close` and `keep-alive` (`HAProxy` takes
         // them out as it parses the head), and what framed the response is kept for after
@@ -12982,24 +12989,25 @@ impl EngineDispatcher<'_> {
             }
         }
         // The same `Connection` handling as without rules, on the headers the rules left.
-        // The head written again into the string it was read from, from the list the
-        // fetches read (left there for the ones after, the log's).
-        let mut new_hdr = hdr_str;
-        new_hdr.clear();
-        new_hdr.push_str(&proto_version);
-        new_hdr.push(' ');
-        push_status(&mut new_hdr, status);
-        new_hdr.push(' ');
-        new_hdr.push_str(&status_msg);
-        new_hdr.push_str("\r\n");
-        with_res_hdrs(|hdrs| {
-            crate::txn::apply_response_connection(hdrs, srv_http11, client_close, req_http11, tunnel || status < 100);
-            push_header_lines(&mut new_hdr, hdrs);
-        });
-        new_hdr.push_str("\r\n");
-
+        // The head written again, from the list the fetches read (left there for the ones
+        // after, the log's), straight into the buffer (X7: no string of it).
+        with_res_hdrs(|hdrs| crate::txn::apply_response_connection(hdrs, srv_http11, client_close, req_http11, tunnel || status < 100));
         note_response_head_write();
-        entry.sess.rep.replace_prefix(total_hdr_len, &ibex_regex::bytetext::text_to_bytes(&new_hdr));
+        let old = total_hdr_len;
+        let written = with_res_hdrs(|hdrs| entry.sess.rep.replace_head_with(old, |out| write_response_head(out, &proto_version, status, &status_msg, hdrs)));
+        if !written {
+            // Larger than the buffer's free memory: through a `Vec`, which the buffer grows for.
+            // Sized once: no piece is shorter as bytes than as the text that stands for them.
+            let mut v = Vec::new();
+            with_res_hdrs(|hdrs| {
+                let size = proto_version.len() + status_msg.len() + 16 + hdrs.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>();
+                v.resize(size, 0);
+                let n = write_response_head(&mut v, &proto_version, status, &status_msg, hdrs);
+                debug_assert!(n.is_some(), "the head fits the room it was sized for");
+                v.truncate(n.unwrap_or(0));
+            });
+            entry.sess.rep.replace_prefix(old, &v);
+        }
         set_rsp(entry);
     }
 
@@ -16896,6 +16904,47 @@ fn with_res_hdrs<R>(f: impl FnOnce(&mut Vec<(String, String)>) -> R) -> R {
     CURRENT_RES_HEADERS.with(|h| f(&mut h.borrow_mut()))
 }
 
+/// The head `proto status reason`, the headers and the blank line, as bytes into `out`
+/// (the text of the strings standing for their bytes, [`ibex_regex::bytetext`]); `None` when
+/// `out` is too small.
+fn write_response_head(out: &mut [u8], proto: &str, status: u16, reason: &str, hdrs: &[(String, String)]) -> Option<usize> {
+    let mut at = 0;
+    let mut put = |piece: &str| -> Option<()> {
+        // ASCII is itself; only a piece with bytes beyond it is looked at for the characters
+        // that stand for a byte.
+        let bytes = if piece.is_ascii() { std::borrow::Cow::Borrowed(piece.as_bytes()) } else { ibex_regex::bytetext::text_to_bytes(piece) };
+        out.get_mut(at..at + bytes.len())?.copy_from_slice(&bytes);
+        at += bytes.len();
+        Some(())
+    };
+    let mut digits = [0u8; 5];
+    let mut i = digits.len();
+    let mut n = status;
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    put(proto)?;
+    put(" ")?;
+    // ASCII digits.
+    put(std::str::from_utf8(&digits[i..]).unwrap_or_default())?;
+    put(" ")?;
+    put(reason)?;
+    put("\r\n")?;
+    for (k, v) in hdrs {
+        put(k)?;
+        put(": ")?;
+        put(v)?;
+        put("\r\n")?;
+    }
+    put("\r\n")?;
+    Some(at)
+}
+
 /// `name: value\r\n` for each header, without the formatting machinery.
 fn push_header_lines(out: &mut String, hdrs: &[(String, String)]) {
     for (k, v) in hdrs {
@@ -17103,7 +17152,7 @@ fn replace_each_value(v: &str, re: &ibex_regex::UserRegex, repl: &str) -> Option
 fn res_action(
     op: ResOp<'_>,
     status: &mut u16,
-    status_msg: &mut String,
+    status_msg: &mut crate::reuse::Word,
     ctx: &SampleContext,
     registry: &Registry,
     vars: &mut VarStore,
@@ -17147,7 +17196,10 @@ fn res_action(
                 return failed();
             }
             *status = st;
-            *status_msg = reason.to_string();
+            match custom {
+                Some(c) => status_msg.set_words(std::iter::once(c)),
+                None => status_msg.set_usual(status_reason(st)),
+            }
             CURRENT_RES_STATUS.set(st);
             return Ok(true);
         }
@@ -17299,7 +17351,7 @@ type ResCaps<'x> = Option<(&'x mut Vec<Option<Vec<u8>>>, &'x [(String, usize)])>
 fn run_res_rules<'a, 'c>(
     rules: impl Iterator<Item = (ResRule<'a>, Option<&'a crate::rule_compiled::Cond>, u32)>,
     acls: &'c ibex_sample::Acls,
-    head: (&mut u16, &mut String),
+    head: (&mut u16, &mut crate::reuse::Word),
     ctx: &mut SampleContext<'c>,
     caps: ResCaps<'_>,
     registry: &Registry,
@@ -17317,7 +17369,7 @@ fn run_res_rules<'a, 'c>(
 fn run_res_rules_in<'a>(
     rules: impl Iterator<Item = (ResRule<'a>, Option<&'a crate::rule_compiled::Cond>, u32)>,
     acls: &ibex_sample::Acls,
-    head: (&mut u16, &mut String),
+    head: (&mut u16, &mut crate::reuse::Word),
     ctx: &SampleContext,
     mut caps: ResCaps<'_>,
     registry: &Registry,
@@ -17411,7 +17463,7 @@ fn eval_after_res_rules<'c>(
     proxies: &'c [Proxy],
     fe_idx: usize,
     be_idx: usize,
-    head: (&mut u16, &mut String),
+    head: (&mut u16, &mut crate::reuse::Word),
     ctx: &mut SampleContext<'c>,
     mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
@@ -17766,16 +17818,18 @@ fn after_res_on_reply<'r>(
             .collect();
         Some((hdr_end, eoh_len, version, status, reason, hdrs))
     });
-    let Some((hdr_end, eoh_len, version, mut status, mut reason, hdrs)) = parsed else {
+    let Some((hdr_end, eoh_len, version, mut status, reason_text, hdrs)) = parsed else {
         return Ok(Cow::Borrowed(raw));
     };
+    let mut reason = crate::reuse::Word::usual("");
+    reason.set_words(std::iter::once(reason_text.as_str()));
 
     CURRENT_RES_STATUS.set(status);
     // A reply Ibex built has no server status and no Tr (HAProxy: 0 and -1), whatever response
     // this thread handled before.
     CURRENT_SRV_STATUS.set(0);
     CURRENT_RES_TR.set(-1);
-    res_htx_init(sess.bufsize, None, &version, &reason, &hdrs, raw.len() - hdr_end - eoh_len);
+    res_htx_init(sess.bufsize, None, &version, &reason_text, &hdrs, raw.len() - hdr_end - eoh_len);
     // The rules edit the list the fetches read (X3).
     with_res_hdrs(|h| *h = hdrs);
     // The variables are the session's own, in `CURRENT_VARS` for the run that makes the

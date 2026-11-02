@@ -379,9 +379,23 @@ fn a_value_with_a_byte_that_is_not_utf8_is_forwarded_byte_for_byte() {
 }
 
 crate::h3_both_paths! {
-/// Row 4: `HAProxy` forwards it; Ibex refuses the stream (`tradeoff.md` 6.24).
+/// Row 4: `HAProxy` forwards it, and so does the mux since X7; the relay path refuses the
+/// stream (`tradeoff.md` 6.24). Measured 2026-11-02 on haproxy-quic 3.5-dev10 (aioquic, `:path`
+/// `/r4\xe9`): `200`, no reset; the server saw `GET /r4\xe9 HTTP/1.1\r\nhost: localhost\r\n\r\n`;
+/// the log line was `GET https://localhost/r4#E9 HTTP/3.0 U=66 ST=200`.
 fn a_path_with_a_byte_that_is_not_utf8_resets_the_stream_only() {
-    refused_then_served(&request(&[b'/', b'r', b'4', E9], None), b"/r4");
+    let req = request(&[b'/', b'r', b'4', E9], None);
+    if !crate::common::h3_mux() {
+        refused_then_served(&req, b"/r4");
+        return;
+    }
+    let (be, heads) = backend();
+    let ibex = ibex(be);
+    let mut cl = Client::connect(ibex.quic);
+    let id = cl.open(&req);
+    assert_eq!(cl.outcome(id).status, Some(200));
+    let h = heads.lock().unwrap();
+    assert!(h[0].starts_with(b"GET /r4\xe9 HTTP/1.1\r\n"), "{:?}", String::from_utf8_lossy(&h[0]));
 }
 }
 
