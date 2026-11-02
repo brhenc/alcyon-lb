@@ -344,15 +344,18 @@ fn an_h2_server_response_is_not_parsed_again() {
 fn a_head_held_back_for_an_h2_server_is_written_when_the_text_goes() {
     use crate::server_h2::{scripted, Script};
     let h2 = scripted(Script::Ok { goaway_after: 0 });
-    let h1 = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let h1_addr = h1.local_addr().expect("addr");
-    let running = Arc::new(AtomicBool::new(true));
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let be = backend(h1, Arc::clone(&running), Arc::clone(&seen));
-    for (retry, servers) in [("", format!("  server a {} proto h2\n  server b {h1_addr}\n", h2.addr)), ("  retry-on 503\n", format!("  server a {} proto h2\n", h2.addr))] {
+    // Both settings: the names are lowered when the head is written only under `on`.
+    for (lowercase, retry, with_h1) in [("off", "", true), ("on", "", true), ("on", "  retry-on 503\n", false)] {
+        // Each round has its own h1 server and its own record of what it saw.
+        let h1 = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let h1_addr = h1.local_addr().expect("addr");
+        let running = Arc::new(AtomicBool::new(true));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let be = backend(h1, Arc::clone(&running), Arc::clone(&seen));
+        let servers = if with_h1 { format!("  server a {} proto h2\n  server b {h1_addr}\n", h2.addr) } else { format!("  server a {} proto h2\n", h2.addr) };
         let fe = common::reserve_addr();
         let cfg = format!(
-            "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+            "global\n  tune.ibex.h1-lowercase-headers {lowercase}\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
              frontend fe\n  bind {fe}\n  http-request set-header X-Edited yes\n  default_backend be\n\
              backend be\n  balance roundrobin\n{retry}{servers}"
         );
@@ -363,19 +366,22 @@ fn a_head_held_back_for_an_h2_server_is_written_when_the_text_goes() {
         for i in 0..4 {
             let w0 = ibex_proto::h1_encode::head_writes();
             let rsp = rig.request(&mut c, req);
-            assert!(rsp.starts_with("HTTP/1.1 200"), "{retry:?} {i}: {rsp:?}");
+            assert!(rsp.starts_with("HTTP/1.1 200"), "{lowercase} {retry:?} {i}: {rsp:?}");
             // Once per request: before the pick on the first (no h2 connection yet), at the send
             // for the h1 server or the copy kept for a retry, never for blocks alone.
             let wrote = ibex_proto::h1_encode::head_writes() - w0;
             assert!(wrote <= 1, "{retry:?} {i}: {wrote} head writes");
             if retry.is_empty() && i % 2 == 1 {
                 let head = String::from_utf8_lossy(&rig.last_seen()).into_owned();
-                assert!(head.contains("x-edited: yes\r\n") && head.contains("x-case: 1\r\n"), "{i}: {head:?}");
+                assert!(head.to_ascii_lowercase().contains("x-edited: yes\r\n"), "{i}: {head:?}");
+                // The client's `X-Case` is lowered only under `on`.
+                assert_eq!(head.contains("x-case: 1\r\n"), lowercase == "on", "{lowercase} {i}: {head:?}");
+                assert_eq!(head.contains("X-Case: 1\r\n"), lowercase == "off", "{lowercase} {i}: {head:?}");
             } else if !retry.is_empty() {
                 assert_eq!(wrote, 1, "{i}: the head kept for a retry is text");
             }
         }
+        running.store(false, Ordering::Relaxed);
+        let _ = be.join();
     }
-    running.store(false, Ordering::Relaxed);
-    let _ = be.join();
 }

@@ -3818,8 +3818,11 @@ impl TcpSession {
         }
 
         // A head the h2 server was to take as blocks goes as text after all when the connection
-        // is not h2 (another server, a new connection) or the request is kept for a retry.
-        if self.req_head_deferred.is_some() && (self.srv_xprt.h2().is_none() || self.strm.txn.as_ref().is_some_and(|t| matches!(t.l7, txn::L7Retry::Armed))) {
+        // is not h2 (another server, a new connection), the request is kept for a retry, or the
+        // h2 layer cannot take a send now: nothing goes then, and the text is what the layer takes
+        // when it can (the layer's block can outlast its stream), so that no send is ever made
+        // with the head not yet written.
+        if self.req_head_deferred.is_some() && (self.srv_xprt.h2().is_none() || self.srv_xprt.send_blocked() || self.strm.txn.as_ref().is_some_and(|t| matches!(t.l7, txn::L7Retry::Armed))) {
             self.write_deferred_head();
         }
         let window = self.req_window();
@@ -3847,11 +3850,10 @@ impl TcpSession {
                 None => {}
             }
         }
-        if self.req_head_deferred.is_some() && window > 0 && self.srv_state.can_write() {
-            // The text goes (the blocks did not): written out of the HTX now.
-            self.write_deferred_head();
-            window = self.req_window();
-        }
+        // A head still held back was not sent as blocks: `send_h2_head` answers `None` only for a
+        // session without HTX, a head not whole in the window or no h2 layer, none of which a
+        // deferred head on a writable h2 layer (not blocked, else written above) can be.
+        debug_assert!(self.req_head_deferred.is_none() || window == 0 || !self.srv_state.can_write(), "a deferred head the h2 layer did not take");
         if self.srv_state.can_write() && ((window > 0 && !self.srv_xprt.send_blocked()) || self.srv_xprt.wants_write()) {
             let r = {
                 let sfd = self
