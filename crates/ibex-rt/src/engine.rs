@@ -9457,15 +9457,7 @@ fn h2_child_start(
     move_server(owner, child, fdtab);
     // It is not this stream's until a request takes it (`bc_idle`, T491).
     child.sess.bc_idle = child.sess.srv.is_some();
-    // A head kept as its fields gives its memory back to the connection (an h2 head written as
-    // blocks is the child's `htx_buf` now, CP2a).
-    if let Some(head) = crate::h2_bridge::start_request(&mut child.sess, d) {
-        if let Some(h2) = owner.sess.h2_ctx.as_deref_mut() {
-            h2.give_back_head(head);
-        } else if let Some(h3) = owner.sess.h3_owner_mut() {
-            ibex_proto::htx_mux::HtxMux::give_back_head(&mut *h3.mux, head);
-        }
-    }
+    crate::h2_bridge::start_request(&mut child.sess, d);
     // The stream's own `timeout client` starts with it (T300).
     child.sess.arm_client(now);
     if let Some(o) = owner.sess.h2_owner_mut() {
@@ -19303,19 +19295,29 @@ mod add_req_connection_tests {
 mod pending_req_head_tests {
     use super::*;
     use crate::proxy::{H2ActiveStream, H2ReqBody};
-    use ibex_proto::mux_h2::{H2MuxContext, H2ReqHead};
+    use ibex_proto::mux_h2::H2MuxContext;
 
-    /// A stream's session with `head` started on it (`h2_bridge::start_request`), its head in
+    /// A stream's session with the head `method uri` and `fields` written as blocks (as the mux
+    /// writes it) started on it (`h2_bridge::start_request`), its head in
     /// its HTX alone (X4).
-    fn started(head: H2ReqHead, chunked: bool) -> (TcpSession, TcpSession, std::os::unix::net::UnixStream) {
+    fn started(method: &str, fields: &[(&str, &str)], chunked: bool) -> (TcpSession, TcpSession, std::os::unix::net::UnixStream) {
         let (a, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
         let mut owner = TcpSession::new(OwnedFd::from(a), Default::default(), 0, Tick(1000));
         owner.h2_ctx = Some(Box::new(H2MuxContext::new(ibex_proto::ConnId(0), true)));
         let stream = H2ActiveStream { id: 1, body: H2ReqBody { chunked, ..H2ReqBody::default() }, chunk_out: chunked };
         let mut s = TcpSession::h2_child_of(&mut owner, (0, TaskRef::NONE), stream);
+        let mut enc = ibex_proto::hpack::HpackEncoder::new();
+        let mut block = Vec::new();
+        for (n, v) in [(":method", method), (":scheme", "https"), (":path", "/")].into_iter().chain(fields.iter().copied()) {
+            enc.encode_field_bytes(n.as_bytes(), v.as_bytes(), &mut block);
+        }
+        let mut df = ibex_proto::hpack::DecodedFields::default();
+        ibex_proto::hpack::HpackDecoder::new().decode_into(&block, &mut df).expect("decodes");
+        let mut rx = ibex_proto::htx::RxHead::from_box(vec![0; 16384].into_boxed_slice());
+        let facts = ibex_proto::h2::write_request_htx(&df, &mut ibex_proto::htx::HtxSlice::over(&mut rx), false).expect("written");
         let d = crate::h2_bridge::H2Dispatch {
             stream: H2ActiveStream { id: 1, body: H2ReqBody { chunked, ..H2ReqBody::default() }, chunk_out: chunked },
-            head: crate::h2_bridge::DispatchHead::Fields(Box::new(head)),
+            head: crate::h2_bridge::DispatchHead::Htx { rx, facts, abs_len: 0, version: "HTTP/2.0" },
             req_htx: 0,
             request_line: None,
             bad_request: false,
@@ -19332,7 +19334,7 @@ mod pending_req_head_tests {
     #[test]
     fn a_head_larger_than_the_room_behind_the_body_goes_in_front_of_it() {
         let big = "v".repeat(6000);
-        let (mut s, _o, _p) = started(H2ReqHead::of("POST", "/", &[("host", "x"), ("x-big", &big), ("content-length", "3")]), false);
+        let (mut s, _o, _p) = started("POST", &[("host", "x"), ("x-big", &big), ("content-length", "3")], false);
         let free = s.req.writable().len();
         s.req.writable()[..free].fill(b'b');
         s.req.commit(free);
@@ -19354,7 +19356,7 @@ mod pending_req_head_tests {
         for (chunked, extra, fill) in [(false, None, false), (true, None, false), (false, Some(big.as_str()), true)] {
             let mut fields = vec![("host", "x")];
             fields.extend(extra.map(|v| ("x-big", v)));
-            let (mut s, _o, _p) = started(H2ReqHead::of("POST", "/", &fields), chunked);
+            let (mut s, _o, _p) = started("POST", &fields, chunked);
             s.with_htx_mut(|h| {
                 let _ = h.add_header("content-length", "x");
             });

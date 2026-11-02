@@ -1647,9 +1647,9 @@ pub enum HeadError {
     Refused(&'static str),
     /// The head the fields make is one the HTTP/1 parser refuses (an invalid request line, too
     /// many header lines, a `Host` against the authority, a length the parser reads otherwise):
-    /// what `put_request_head` returned `InvalidData` for. What was written is partial.
+    /// what the HTTP/1 parser returns `InvalidData` for. What was written is partial.
     Invalid,
-    /// The blocks do not fit the memory (`OutOfMemory` in `put_request_head`). What was
+    /// The blocks do not fit the memory (`OutOfMemory`). What was
     /// written is partial.
     NoRoom,
 }
@@ -1686,9 +1686,21 @@ pub struct HeadFacts {
     /// Of [`Self::field_bytes`], those of the `content-length` fields as the client sent them
     /// (the HTX holds one canonical value in their place).
     pub cl_bytes: usize,
+    /// A `sec-websocket-key` was written after the fields ([`write_request_htx_with`]); the
+    /// fields and bytes above do not count it.
+    pub key_written: bool,
 }
 
 impl HeadFacts {
+    /// What `%U` counts of the head (`HAProxy`'s HTX: 20 bytes for the start line, its three
+    /// strings -- the target is `scheme://authority` and the path when the request had both, so
+    /// `abs_len` more -- and the version, then each header's name and value, then the end of the
+    /// headers).
+    #[must_use]
+    pub fn log_size(&self, abs_len: usize, version: &str) -> u64 {
+        (20 + self.method_len + abs_len + self.uri_len + version.len() + 1 + self.field_bytes) as u64
+    }
+
     /// The length of the head as HTTP/1.1 text: the line, each field, the blank line.
     #[must_use]
     pub fn wire_len(&self) -> usize {
@@ -1708,19 +1720,22 @@ fn trim_blanks(v: &[u8]) -> &[u8] {
     &v[start..end]
 }
 
-/// Writes the request head of the decoded `fields` as the HTX blocks the data path starts a
-/// stream with: `ReqLine`, a `Header` per field, `Eoh`, then the end-of-head checks and edits
-/// of the HTTP/1 parser, so that the blocks (and which heads are refused) are those of
-/// `H2ReqHead::write` followed by `HtxSlice::put_request_head` (the differential row in
-/// `tests/it/htx_differential.rs`). One scan of the fields checks them and counts what the
-/// limits count, then the blocks are written from the fields where they lie: no text of the
-/// head and no list of its fields in between.
-///
-/// `relaxed` is `option accept-unsafe-violations-in-http-request`.
-///
-/// # Errors
-/// [`HeadError`]; `out` is then to be discarded.
-pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<'_>, relaxed: bool) -> Result<HeadFacts, HeadError> {
+/// What the scan of a request head's fields found: the pseudo-headers that are text, the length the
+/// `content-length` fields agree on, and the `host` an `:authority` makes ([`write_request_htx`],
+/// [`write_request_text`]).
+struct Scan<'a> {
+    bad_request: bool,
+    method: &'a str,
+    path: Option<&'a [u8]>,
+    authority: Option<&'a str>,
+    protocol: Option<&'a str>,
+    made_host: Option<&'a str>,
+    length: Option<u64>,
+    has_abs: bool,
+}
+
+/// Checks the fields as `h2_make_htx_request` does and reads what both writers need of them.
+fn scan_request(fields: &DecodedFields, relaxed: bool) -> Result<Scan<'_>, HeadError> {
     // Every field is checked before any block is written from it (T449).
     let bad_request = check_request_fields(fields.iter(), relaxed).map_err(|_| HeadError::Refused("malformed field"))?;
     let (mut method, mut path, mut authority, mut host, mut scheme, mut protocol) = (None, None, None, None, None, None);
@@ -1811,6 +1826,34 @@ pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<
         }
         _ => false,
     };
+    Ok(Scan { bad_request, method, path, authority, protocol, made_host, length, has_abs })
+}
+
+/// Writes the request head of the decoded `fields` as the HTX blocks the data path starts a
+/// stream with: `ReqLine`, a `Header` per field, `Eoh`, then the end-of-head checks and edits
+/// of the HTTP/1 parser, so that the blocks (and which heads are refused) are those of
+/// the former `H2ReqHead::write` followed by `HtxSlice::put_request_head` made (the golden file
+/// in `tests/it/htx_differential.rs`). One scan of the fields checks them and counts what the
+/// limits count, then the blocks are written from the fields where they lie: no text of the
+/// head and no list of its fields in between.
+///
+/// `relaxed` is `option accept-unsafe-violations-in-http-request`.
+///
+/// # Errors
+/// [`HeadError`]; `out` is then to be discarded.
+pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<'_>, relaxed: bool) -> Result<HeadFacts, HeadError> {
+    write_request_htx_with(fields, out, relaxed, None)
+}
+
+/// [`write_request_htx`] with one more header after the others and before the end of the head
+/// (`extra`: the `sec-websocket-key` of an extended CONNECT to a websocket, which an HTTP/2
+/// client does not send). The HTTP/1 checks see it; the facts do not count it
+/// ([`HeadFacts::key_written`] says it is there).
+///
+/// # Errors
+/// As [`write_request_htx`].
+pub fn write_request_htx_with(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<'_>, relaxed: bool, extra: Option<(&str, &str)>) -> Result<HeadFacts, HeadError> {
+    let Scan { bad_request, method, path, authority, protocol, made_host, length, has_abs } = scan_request(fields, relaxed)?;
     let ext_connect = protocol.is_some();
     let method = if ext_connect { "GET" } else { method };
     // The path as text; one that is not UTF-8 is held as `bytetext` stands for its bytes.
@@ -1875,8 +1918,12 @@ pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<
         count += 1;
         field_bytes += "cookie".len() + cookies.fold(first.len(), |t, v| t + 2 + v.len());
     }
+    if let Some((n, v)) = extra {
+        scan.add(out.num_blocks(), n.as_bytes(), v.as_bytes());
+        out.push_header(n, v).map_err(oom)?;
+    }
     out.push_eoh().map_err(oom)?;
-    crate::htx::count_head_bytes(method.len() + uri.len() + field_bytes);
+    crate::htx::count_head_bytes(method.len() + uri.len() + field_bytes + extra.map_or(0, |(n, v)| n.len() + v.len()));
     crate::h1::finish_request_head(out, method, &uri, Some(&scan)).map_err(|e| if e.kind() == io::ErrorKind::OutOfMemory { HeadError::NoRoom } else { HeadError::Invalid })?;
     Ok(HeadFacts {
         tail: out.tail_addr(),
@@ -1891,7 +1938,161 @@ pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<
         fields: count,
         field_bytes,
         cl_bytes,
+        key_written: extra.is_some(),
     })
+}
+
+/// A request head the HTTP/1 checks refuse (a path that is not UTF-8, a blank in it, a method
+/// that is not a token, too many header lines) or the HTX cannot hold, as the HTTP/1.1 text the
+/// data path forwards (`HAProxy` forwards what it cannot parse as the bytes it made).
+#[derive(Debug, Clone)]
+pub struct TextHead {
+    /// The head up to and with its blank line, the client's `content-length` fields as it sent
+    /// them (see [`Self::add_len`]).
+    pub wire: Vec<u8>,
+    /// What the head is made of (method and path lengths, field counts).
+    pub facts: HeadFacts,
+    /// `scheme://authority`, when the request had both.
+    pub abs: String,
+    /// The path, as the text that stands for its bytes ([`ibex_regex::bytetext`]).
+    pub uri: String,
+    /// The length the head goes with in place of its `content-length` fields when they are not
+    /// one field of its digits (`005`, `5, 5`, two fields): `HAProxy` forwards the digits.
+    pub add_len: Option<u64>,
+}
+
+/// The head of `fields` as text, for one [`write_request_htx_with`] found `Invalid` (with the
+/// same `key` as its `sec-websocket-key`).
+///
+/// # Errors
+/// [`HeadError::Refused`] as [`write_request_htx`].
+pub fn write_request_text(fields: &DecodedFields, relaxed: bool, key: Option<&str>) -> Result<TextHead, HeadError> {
+    let Scan { bad_request, method, path, authority, protocol, made_host, length, has_abs } = scan_request(fields, relaxed)?;
+    let method = if protocol.is_some() { "GET" } else { method };
+    let uri: &[u8] = match path {
+        Some(b"*") if authority.is_some() && method != "OPTIONS" => b"/",
+        Some(p) => p,
+        None => b"/",
+    };
+    let mut wire = Vec::with_capacity(fields.byte_len() + 5 * fields.len() + 64);
+    wire.extend_from_slice(method.as_bytes());
+    wire.push(b' ');
+    wire.extend_from_slice(uri);
+    wire.extend_from_slice(b" HTTP/1.1\r\n");
+    let (mut count, mut field_bytes, mut cl_bytes) = (0usize, 0usize, 0usize);
+    let mut lens: Vec<&[u8]> = Vec::new();
+    let mut put = |wire: &mut Vec<u8>, n: &[u8], v: &[u8]| {
+        wire.extend_from_slice(n);
+        wire.extend_from_slice(b": ");
+        wire.extend_from_slice(v);
+        wire.extend_from_slice(b"\r\n");
+        count += 1;
+        field_bytes += n.len() + v.len();
+    };
+    if let Some(a) = made_host {
+        put(&mut wire, b"host", a.as_bytes());
+    }
+    let mut host_seen = false;
+    for (n, v) in fields.iter().filter(|(n, _)| !n.starts_with(b":")) {
+        if n.eq_ignore_ascii_case(b"host") {
+            if host_seen {
+                continue;
+            }
+            host_seen = true;
+        } else if n == b"cookie" {
+            continue;
+        }
+        let v = trim_blanks(v);
+        put(&mut wire, n, v);
+        if n == b"content-length" {
+            cl_bytes += n.len() + v.len();
+            lens.push(v);
+        }
+    }
+    if let Some(p) = protocol {
+        put(&mut wire, b"upgrade", p.as_bytes());
+        put(&mut wire, b"connection", b"upgrade");
+    }
+    let mut cookie = Vec::new();
+    for (i, v) in fields.iter().filter(|(n, _)| *n == b"cookie").map(|(_, v)| v).enumerate() {
+        if i > 0 {
+            cookie.extend_from_slice(b"; ");
+        }
+        cookie.extend_from_slice(v);
+    }
+    if !cookie.is_empty() || fields.iter().any(|(n, _)| n == b"cookie") {
+        put(&mut wire, b"cookie", &cookie);
+    }
+    if let Some(k) = key {
+        // After the fields, uncounted (as [`write_request_htx_with`]'s `extra`).
+        wire.extend_from_slice(b"sec-websocket-key: ");
+        wire.extend_from_slice(k.as_bytes());
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"\r\n");
+    // Every `content-length` the scan took is one length; the digits go in place of the client's
+    // unless it wrote them once, as they print.
+    let canonical = match (length, lens.as_slice()) {
+        (Some(n), [v]) => {
+            let v = std::str::from_utf8(v).unwrap_or("");
+            (v.parse::<u64>().ok() == Some(n) && !v.starts_with('0')) || v == "0"
+        }
+        (None, []) => true,
+        _ => false,
+    };
+    let abs = match (has_abs, fields.iter().find(|(n, _)| *n == b":scheme"), authority) {
+        (true, Some((_, sc)), Some(a)) => format!("{}://{a}", String::from_utf8_lossy(sc)),
+        _ => String::new(),
+    };
+    Ok(TextHead {
+        wire,
+        facts: HeadFacts {
+            bad_request,
+            ext_connect: protocol.is_some(),
+            content_length: length.and_then(|l| usize::try_from(l).ok()),
+            method_len: method.len(),
+            uri_len: uri.len(),
+            path_raw: std::str::from_utf8(uri).is_err(),
+            has_abs,
+            fields: count,
+            field_bytes,
+            cl_bytes,
+            key_written: key.is_some(),
+            ..HeadFacts::default()
+        },
+        abs,
+        uri: ibex_regex::bytetext::bytes_to_text(uri),
+        add_len: if canonical { None } else { length },
+    })
+}
+
+impl TextHead {
+    /// The method.
+    #[must_use]
+    pub fn method(&self) -> &str {
+        std::str::from_utf8(&self.wire[..self.facts.method_len]).unwrap_or("")
+    }
+
+    /// The path, as the text that stands for its bytes ([`ibex_regex::bytetext`]).
+    #[must_use]
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    /// The headers in order, as name and value in bytes.
+    pub fn headers(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
+        let head = &self.wire[self.facts.method_len + 1 + self.facts.uri_len + " HTTP/1.1\r\n".len()..];
+        head.split(|&b| b == b'\n').filter_map(|l| {
+            let l = l.strip_suffix(b"\r")?;
+            let at = l.windows(2).position(|w| w == b": ")?;
+            Some((&l[..at], &l[at + 2..]))
+        })
+    }
+
+    /// The headers whose name and value are text (the rules' list).
+    pub fn text_headers(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.headers().filter_map(|(n, v)| Some((std::str::from_utf8(n).ok()?, std::str::from_utf8(v).ok()?)))
+    }
 }
 
 #[cfg(test)]

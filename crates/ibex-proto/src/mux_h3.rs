@@ -282,7 +282,8 @@ use crate::h2::{check_request_fields, check_trailer_fields, HeadFacts};
 use crate::hpack::DecodedFields;
 use crate::htx::{HeaderField, Htx, HtxBlock, RxHead};
 use crate::htx_mux::{HtxMux, HtxStream, MuxReset};
-use crate::mux_h2::{status_text, H2ReqHead, StreamMap};
+use crate::h2::TextHead;
+use crate::mux_h2::{status_text, StreamMap};
 use crate::qpack::{decode_decoder_stream, decode_encoder_stream, decode_qpack_static_into};
 use ibex_alloc::{PoolBox, Poolable};
 use std::collections::VecDeque;
@@ -305,8 +306,6 @@ pub const RX_DATA_ROOM: usize = 16384 - 40 - 8;
 pub const TX_ROOM: usize = 65536;
 /// `tune.quic.fe.stream.max-concurrent`: the children an owner runs at once.
 pub const MAX_CONCURRENT: u32 = 100;
-/// The spare request heads a connection keeps (as h2's `SPARE_STREAMS`).
-const SPARE_HEADS: usize = 4;
 
 const FRAME_CANCEL_PUSH: u64 = 0x03;
 const FRAME_PUSH_PROMISE: u64 = 0x05;
@@ -391,20 +390,19 @@ pub struct H3StreamCtx {
     pub interim_sent: bool,
     /// A request `HAProxy` takes and answers 400 ([`check_request_fields`]).
     pub bad_request: bool,
-    /// The head as its checked fields, as h2's (T437, E1), until the data path takes it: only
-    /// for a head [`Self::rx_head`] does not hold (one the HTTP/1 checks refuse, no memory).
-    pub req_head: Option<Box<H2ReqHead>>,
+    /// The head the HTTP/1 checks refuse, as the text it goes out as, until the data path takes
+    /// it: only for a head [`Self::rx_head`] does not hold.
+    pub text_head: Option<Box<TextHead>>,
     /// CP2b: the request head as the HTX blocks the mux wrote ([`crate::h2::write_request_htx`])
     /// into the memory the stream's buffer adopts, once from the decoded fields; `None` until
     /// the head comes, once the data path has taken it, and for a head kept in
-    /// [`Self::req_head`].
+    /// [`Self::text_head`].
     pub rx_head: Option<RxHead>,
     /// What [`Self::rx_head`]'s writer said of the head.
     pub head_facts: HeadFacts,
     /// The bytes of `scheme://authority` after the head's payload in [`Self::rx_head`].
     pub abs_len: usize,
-    /// No memory could be had for the head's blocks ([`H3MuxContext::take_rx_head`]): kept as
-    /// its fields, and the stream answered 500 by the data path (S5).
+    /// No memory could be had for the head's blocks ([`H3MuxContext::take_rx_head`]): the stream is answered 500 by the data path (S5).
     pub no_memory: bool,
     pub content_length: Option<u64>,
     /// The body's length when the whole request came with its head (FIN in that read):
@@ -440,26 +438,24 @@ impl H3StreamCtx {
 
 impl Poolable for H3StreamCtx {
     fn footprint(&self) -> usize {
-        std::mem::size_of::<Self>() + self.rx.capacity() + self.tx.capacity() + self.req_head.as_ref().map_or(0, |h| h.capacity()) + self.rx_head.as_ref().map_or(0, RxHead::len)
+        std::mem::size_of::<Self>() + self.rx.capacity() + self.tx.capacity() + self.text_head.as_ref().map_or(0, |h| h.wire.capacity()) + self.rx_head.as_ref().map_or(0, RxHead::len)
     }
 
     fn reset(&mut self, wipe: bool) {
         let (mut rx, mut tx, mut htx, mut head) =
-            (std::mem::take(&mut self.rx), std::mem::take(&mut self.tx), std::mem::take(&mut self.rx_htx), self.req_head.take());
+            (std::mem::take(&mut self.rx), std::mem::take(&mut self.tx), std::mem::take(&mut self.rx_htx), self.text_head.take());
         if wipe {
             ibex_alloc::wipe_bytes(&mut rx);
             ibex_alloc::wipe_bytes(&mut tx);
             if let Some(h) = head.as_mut() {
-                h.wipe();
+                ibex_alloc::wipe_bytes(&mut h.wire);
             }
         }
         rx.clear();
         tx.clear();
         htx.clear();
-        if let Some(h) = head.as_mut() {
-            h.clear();
-        }
-        *self = Self { rx, tx, rx_htx: htx, req_head: head, ..Self::default() };
+        drop(head);
+        *self = Self { rx, tx, rx_htx: htx, ..Self::default() };
     }
 
     fn try_new() -> Option<Self> {
@@ -503,9 +499,6 @@ pub struct H3MuxContext {
     pub relaxed_path: bool,
     signals: VecDeque<H3Signal>,
     decoded: DecodedFields,
-    // Boxed: the bridge takes a head as the `Box` h2's `H2Dispatch` carries, and gives it back.
-    #[allow(clippy::vec_box)]
-    spare_heads: Vec<Box<H2ReqHead>>,
     /// Where a request head is written (CP2b, [`H3StreamCtx::rx_head`]): memory for a head of
     /// an estimated `need` bytes of HTX, `None` when there is none. The data path's pool
     /// (`Buf::take_rx_head`); without one, the heap.
@@ -568,7 +561,6 @@ impl H3MuxContext {
             relaxed_path: false,
             signals: VecDeque::new(),
             decoded: DecodedFields::default(),
-            spare_heads: Vec::new(),
             take_rx_head: crate::mux_h2::heap_rx_head,
             scratch: Vec::new(),
             lower: Vec::new(),
@@ -663,9 +655,9 @@ impl H3MuxContext {
 
     /// Frames what stream `id` holds.
     fn demux_req(&mut self, id: u64) -> Result<(), H3Error> {
-        let Self { streams, decoded, spare_heads, relaxed_path, take_rx_head, .. } = self;
+        let Self { streams, decoded, relaxed_path, take_rx_head, .. } = self;
         let Some(st) = streams.get_mut(&id) else { return Ok(()) };
-        let mut shared = Shared { decoded, spare_heads, take_rx: *take_rx_head, relaxed: *relaxed_path };
+        let mut shared = Shared { decoded, take_rx: *take_rx_head, relaxed: *relaxed_path };
         if let Some(code) = demux(st, &mut shared)? {
             if code != REQUEST_REJECTED {
                 self.glitch_count += 1;
@@ -920,8 +912,6 @@ impl H3MuxContext {
 /// What the demux of a stream borrows from its connection.
 struct Shared<'a> {
     decoded: &'a mut DecodedFields,
-    #[allow(clippy::vec_box)]
-    spare_heads: &'a mut Vec<Box<H2ReqHead>>,
     take_rx: fn(usize) -> Option<RxHead>,
     relaxed: bool,
 }
@@ -1085,7 +1075,7 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
     // error over h3: measured on 3.5-dev7 (T509). A `:path` with a blank under
     // `option accept-unsafe-violations-in-http-request` keeps h2's 400 (not measured).
     let bad;
-    match crate::mux_h2::write_head(f, sh.take_rx, sh.relaxed) {
+    match crate::mux_h2::write_head(f, crate::mux_h2::HeadHooks { take_rx: sh.take_rx, ws_key: crate::mux_h2::heap_ws_key }, sh.relaxed) {
         crate::mux_h2::HeadOut::Refused => return Ok(Some(MESSAGE_ERROR)),
         crate::mux_h2::HeadOut::Blocks { rx, facts, abs_len } => {
             debug_assert!(!facts.ext_connect);
@@ -1094,19 +1084,18 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
             st.abs_len = abs_len;
             st.rx_head = Some(rx);
         }
-        crate::mux_h2::HeadOut::Fields { no_memory } => {
-            st.no_memory = no_memory;
+        crate::mux_h2::HeadOut::Text(t) => {
+            bad = t.facts.bad_request;
+            st.text_head = Some(t);
+        }
+        crate::mux_h2::HeadOut::NoMemory => {
+            st.no_memory = true;
             // The writer took the fields (`Refused` is the other verdict on a malformed one).
             bad = check_request_fields(f.iter(), sh.relaxed) == Ok(true);
-            let mut head = st.req_head.take().or_else(|| sh.spare_heads.pop()).unwrap_or_default();
-            // The writer took these fields, so `write` does (the differential's rows).
-            let written = head.write(f);
-            debug_assert!(written.is_ok(), "the writer took the fields: {written:?}");
-            st.req_head = Some(head);
         }
     }
     if bad && !sh.relaxed {
-        // The head's memory goes back with `st.rx_head`/`st.req_head` when the stream does.
+        // The head's memory goes back with `st.rx_head`/`st.text_head` when the stream does.
         return Ok(Some(MESSAGE_ERROR));
     }
     st.bad_request = bad;
@@ -1246,11 +1235,8 @@ impl HtxStream for H3StreamCtx {
     fn is_reset(&self) -> bool {
         !self.is_live()
     }
-    fn req_head(&self) -> Option<&H2ReqHead> {
-        self.req_head.as_deref()
-    }
-    fn take_req_fields(&mut self) -> Option<Box<H2ReqHead>> {
-        self.req_head.take()
+    fn take_text_head(&mut self) -> Option<Box<TextHead>> {
+        self.text_head.take()
     }
     fn take_rx_head(&mut self) -> Option<(RxHead, HeadFacts, usize)> {
         self.rx_head.take().map(|rx| (rx, self.head_facts, self.abs_len))
@@ -1289,13 +1275,6 @@ impl HtxMux for H3MuxContext {
             return None;
         }
         self.streams.values().find(|st| !st.dispatched && st.is_live() && st.phase != ReqPhase::Before).map(|st| st.id)
-    }
-
-    fn give_back_head(&mut self, mut head: Box<H2ReqHead>) {
-        if self.spare_heads.len() < SPARE_HEADS {
-            head.clear();
-            self.spare_heads.push(head);
-        }
     }
 
     fn send_head(&mut self, id: u64, head: &[u8], end_stream: bool) -> bool {
@@ -1417,16 +1396,14 @@ mod tests {
     #[test]
     fn a_stream_given_back_wiped_keeps_its_memory_and_nothing_else() {
         let mut st = H3StreamCtx { id: 8, rx: b"secret".to_vec(), tx: b"reply".to_vec(), dispatched: true, ..H3StreamCtx::default() };
-        let mut head = Box::<H2ReqHead>::default();
-        *head = H2ReqHead::of("GET", "/secret", &[("x-secret", "1")]);
-        st.req_head = Some(head);
+        st.text_head = Some(Box::new(TextHead { wire: b"GET /secret HTTP/1.1\r\nx-secret: 1\r\n\r\n".to_vec(), facts: crate::h2::HeadFacts::default(), abs: String::new(), uri: "/secret".into(), add_len: None }));
         st.rx_htx.push(HtxBlock::Eoh);
         let cap = st.rx.capacity();
         Poolable::reset(&mut st, true);
         assert_eq!((st.id, st.dispatched, st.rx.len(), st.tx.len()), (0, false, 0, 0));
         assert_eq!(st.rx.capacity(), cap, "the buffer is kept for the next stream");
         assert_eq!(st.rx_htx.blocks(), &[] as &[HtxBlock]);
-        assert!(st.req_head.as_ref().is_some_and(|h| h.line.is_empty() && h.bytes.is_empty()));
+        assert!(st.text_head.is_none());
         Poolable::reset(&mut st, false);
         assert!(st.footprint() >= std::mem::size_of::<H3StreamCtx>());
     }

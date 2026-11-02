@@ -1,0 +1,20 @@
+no path	false	CONNECT / HTTP/1.1\r\nhost: a.test:443\r\n\r\n	7	1	14
+no path	true	CONNECT / HTTP/1.1\r\nhost: a.test:443\r\n\r\n	7	1	14
+extended connect	false	GET /chat HTTP/1.1\r\nhost: a.test\r\nsec-websocket-version: 13\r\nupgrade: websocket\r\nconnection: upgrade\r\n\r\n	3	5	66
+extended connect	true	GET /chat HTTP/1.1\r\nhost: a.test\r\nsec-websocket-version: 13\r\nupgrade: websocket\r\nconnection: upgrade\r\n\r\n	3	5	66
+connect	false	CONNECT / HTTP/1.1\r\nhost: a.test:443\r\n\r\n	7	1	14
+connect	true	CONNECT / HTTP/1.1\r\nhost: a.test:443\r\n\r\n	7	1	14
+method with a blank	false	GE T / HTTP/1.1\r\n\r\n	4	1	0
+method with a blank	true	GE T / HTTP/1.1\r\n\r\n	4	1	0
+empty method	false	 / HTTP/1.1\r\n\r\n	0	1	0
+empty method	true	 / HTTP/1.1\r\n\r\n	0	1	0
+path with a blank	true	GET /a b HTTP/1.1\r\n\r\n	3	4	0
+path with a hash	true	GET /a#b HTTP/1.1\r\n\r\n	3	4	0
+path with DEL	false	GET /a\x7fb HTTP/1.1\r\n\r\n	3	4	0
+path with DEL	true	GET /a\x7fb HTTP/1.1\r\n\r\n	3	4	0
+latin-1 path	false	GET /caf\xe9 HTTP/1.1\r\nhost: a\r\n\r\n	3	5	5
+latin-1 path	true	GET /caf\xe9 HTTP/1.1\r\nhost: a\r\n\r\n	3	5	5
+escape character in a path	false	GET /\xef\x9e\x80 HTTP/1.1\r\n\r\n	3	4	0
+escape character in a path	true	GET /\xef\x9e\x80 HTTP/1.1\r\n\r\n	3	4	0
+100 fields, extended connect	false	GET / HTTP/1.1\r\nhost: a\r\nx-0: v\r\nx-1: v\r\nx-2: v\r\nx-3: v\r\nx-4: v\r\nx-5: v\r\nx-6: v\r\nx-7: v\r\nx-8: v\r\nx-9: v\r\nx-10: v\r\nx-11: v\r\nx-12: v\r\nx-13: v\r\nx-14: v\r\nx-15: v\r\nx-16: v\r\nx-17: v\r\nx-18: v\r\nx-19: v\r\nx-20: v\r\nx-21: v\r\nx-22: v\r\nx-23: v\r\nx-24: v\r\nx-25: v\r\nx-26: v\r\nx-27: v\r\nx-28: v\r\nx-29: v\r\nx-30: v\r\nx-31: v\r\nx-32: v\r\nx-33: v\r\nx-34: v\r\nx-35: v\r\nx-36: v\r\nx-37: v\r\nx-38: v\r\nx-39: v\r\nx-40: v\r\nx-41: v\r\nx-42: v\r\nx-43: v\r\nx-44: v\r\nx-45: v\r\nx-46: v\r\nx-47: v\r\nx-48: v\r\nx-49: v\r\nx-50: v\r\nx-51: v\r\nx-52: v\r\nx-53: v\r\nx-54: v\r\nx-55: v\r\nx-56: v\r\nx-57: v\r\nx-58: v\r\nx-59: v\r\nx-60: v\r\nx-61: v\r\nx-62: v\r\nx-63: v\r\nx-64: v\r\nx-65: v\r\nx-66: v\r\nx-67: v\r\nx-68: v\r\nx-69: v\r\nx-70: v\r\nx-71: v\r\nx-72: v\r\nx-73: v\r\nx-74: v\r\nx-75: v\r\nx-76: v\r\nx-77: v\r\nx-78: v\r\nx-79: v\r\nx-80: v\r\nx-81: v\r\nx-82: v\r\nx-83: v\r\nx-84: v\r\nx-85: v\r\nx-86: v\r\nx-87: v\r\nx-88: v\r\nx-89: v\r\nx-90: v\r\nx-91: v\r\nx-92: v\r\nx-93: v\r\nx-94: v\r\nx-95: v\r\nx-96: v\r\nx-97: v\r\nupgrade: websocket\r\nconnection: upgrade\r\n\r\n	3	1	518
+100 fields, extended connect	true	GET / HTTP/1.1\r\nhost: a\r\nx-0: v\r\nx-1: v\r\nx-2: v\r\nx-3: v\r\nx-4: v\r\nx-5: v\r\nx-6: v\r\nx-7: v\r\nx-8: v\r\nx-9: v\r\nx-10: v\r\nx-11: v\r\nx-12: v\r\nx-13: v\r\nx-14: v\r\nx-15: v\r\nx-16: v\r\nx-17: v\r\nx-18: v\r\nx-19: v\r\nx-20: v\r\nx-21: v\r\nx-22: v\r\nx-23: v\r\nx-24: v\r\nx-25: v\r\nx-26: v\r\nx-27: v\r\nx-28: v\r\nx-29: v\r\nx-30: v\r\nx-31: v\r\nx-32: v\r\nx-33: v\r\nx-34: v\r\nx-35: v\r\nx-36: v\r\nx-37: v\r\nx-38: v\r\nx-39: v\r\nx-40: v\r\nx-41: v\r\nx-42: v\r\nx-43: v\r\nx-44: v\r\nx-45: v\r\nx-46: v\r\nx-47: v\r\nx-48: v\r\nx-49: v\r\nx-50: v\r\nx-51: v\r\nx-52: v\r\nx-53: v\r\nx-54: v\r\nx-55: v\r\nx-56: v\r\nx-57: v\r\nx-58: v\r\nx-59: v\r\nx-60: v\r\nx-61: v\r\nx-62: v\r\nx-63: v\r\nx-64: v\r\nx-65: v\r\nx-66: v\r\nx-67: v\r\nx-68: v\r\nx-69: v\r\nx-70: v\r\nx-71: v\r\nx-72: v\r\nx-73: v\r\nx-74: v\r\nx-75: v\r\nx-76: v\r\nx-77: v\r\nx-78: v\r\nx-79: v\r\nx-80: v\r\nx-81: v\r\nx-82: v\r\nx-83: v\r\nx-84: v\r\nx-85: v\r\nx-86: v\r\nx-87: v\r\nx-88: v\r\nx-89: v\r\nx-90: v\r\nx-91: v\r\nx-92: v\r\nx-93: v\r\nx-94: v\r\nx-95: v\r\nx-96: v\r\nx-97: v\r\nupgrade: websocket\r\nconnection: upgrade\r\n\r\n	3	1	518

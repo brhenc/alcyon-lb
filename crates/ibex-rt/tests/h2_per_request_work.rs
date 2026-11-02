@@ -455,7 +455,7 @@ fn an_h2_request_head_is_parsed_once() {
 
 /// CP2 (`docs/design/copies-2026-11-02.md` section 3.1, row S2): an h2 request head is
 /// written into memory once, by the mux, as the HTX blocks of the buffer the stream then owns
-/// (`Buf::adopt`). Before CP2 the mux wrote it into an `H2ReqHead` and the bridge wrote it
+/// (`Buf::adopt`). Before CP2 the mux wrote it into its own fields and the bridge wrote it
 /// again as blocks: twice the head's bytes per request (`ibex_proto::htx::head_bytes_written`,
 /// debug builds). The head here: `GET`, `/`, `host: localhost`, 17 bytes.
 #[test]

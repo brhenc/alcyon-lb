@@ -244,7 +244,7 @@ fn an_h3_post_through_the_mux_allocates_at_most_the_pinned_count() {
 
 /// CP2b (`docs/design/copies-2026-11-02.md` section 3.1, row S2): an h3 request head is written
 /// into memory once, by the mux, as the HTX blocks of the buffer the stream then owns. Before
-/// CP2b the mux wrote it into an `H2ReqHead` and the bridge wrote it again as blocks: twice the
+/// CP2b the mux wrote it into its own fields and the bridge wrote it again as blocks: twice the
 /// head's bytes per request (`ibex_proto::htx::head_bytes_written`, debug builds). The head
 /// here: `GET`, `/`, `host: localhost`, 17 bytes.
 #[test]

@@ -57,15 +57,21 @@ impl ReqWs {
         let handshake = upgrade && websocket;
         let mut ws = ReqWs { upgrade, key: key.filter(|_| handshake).unwrap_or([0; 24]), sent_key: None };
         let written = (handshake && !any_key && write_key).then(|| {
-            let mut raw = [0u8; 16];
-            raw[..8].copy_from_slice(&crate::lb::next_random_u64().to_le_bytes());
-            raw[8..].copy_from_slice(&crate::lb::next_random_u64().to_le_bytes());
-            let k = base64(&raw);
+            let k = fresh_key();
             ws.sent_key = <[u8; 24]>::try_from(k.as_bytes()).ok();
             k
         });
         (ws, written)
     }
+}
+
+/// A fresh `Sec-WebSocket-Key`: sixteen random bytes in base64.
+#[must_use]
+pub fn fresh_key() -> String {
+    let mut raw = [0u8; 16];
+    raw[..8].copy_from_slice(&crate::lb::next_random_u64().to_le_bytes());
+    raw[8..].copy_from_slice(&crate::lb::next_random_u64().to_le_bytes());
+    base64(&raw)
 }
 
 /// The `Sec-WebSocket-Accept` that answers `key`.

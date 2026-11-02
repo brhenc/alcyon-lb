@@ -3197,6 +3197,8 @@ impl TcpSession {
                 h2.relaxed_path = self.accept_unsafe_request;
                 // The request heads go into the buffers their streams adopt (CP2a).
                 h2.take_rx_head = Buf::take_rx_head;
+                // An extended CONNECT to a websocket gets the key an HTTP/2 client does not send.
+                h2.ws_key = crate::websocket::fresh_key;
                 if let Some(m) = self.h2_flood_config.max_concurrent_streams {
                     h2.max_concurrent_streams = m;
                 }
