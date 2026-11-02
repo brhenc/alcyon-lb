@@ -410,3 +410,66 @@ fn clear_counters_zeroes_the_per_thread_rate_maxima_and_keeps_the_totals() {
     idle(&per);
     assert_ne!(col(&per, "b", "BACKEND", "rate_max"), "0", "a peak after the clear");
 }
+
+/// One proxy's counters cleared and not another's (the stats page's `clear_counters` of a
+/// backend, `Engine::clear_counters(Some(..))`) under `per-thread`: the cleared backend's rows
+/// read 0, and when the thread counts again it zeroes only those; the other backend keeps its
+/// totals and its peak.
+#[test]
+fn clearing_one_backend_leaves_the_other_backends_per_thread_rows() {
+    use ibex_rt::statcnt::{snapshot, BE};
+    let live = backend();
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "global\n  tune.ibex.counters per-thread\n\
+         defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend f\n  bind {fe}\n  use_backend ba if {{ path /a }}\n  default_backend bb\n\
+         backend ba\n  server s 127.0.0.1:{live}\n\
+         backend bb\n  server s 127.0.0.1:{live}\n"
+    );
+    let mut engine = ibex_rt::engine::Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_nonblocking(true).expect("nonblocking");
+    let mut get = |engine: &mut ibex_rt::engine::Engine, path: &str| {
+        write!(c, "GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").expect("write");
+        let mut got = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !got.ends_with(b"ok") && Instant::now() < deadline {
+            let _ = engine.run_once();
+            let mut b = [0u8; 512];
+            if let Ok(n) = c.read(&mut b) {
+                got.extend_from_slice(&b[..n]);
+            }
+        }
+        assert!(got.ends_with(b"ok"), "{:?}", String::from_utf8_lossy(&got));
+        // The stream's accounting may run a pass later.
+        for _ in 0..3 {
+            let _ = engine.run_once();
+        }
+    };
+    for path in ["/a", "/b", "/a", "/b", "/b"] {
+        get(&mut engine, path);
+    }
+    let idx = |engine: &ibex_rt::engine::Engine, name: &str| engine.proxies.iter().position(|p| p.name == name).expect("proxy");
+    let (ba, bb) = (idx(&engine, "ba"), idx(&engine, "bb"));
+    let stot = |engine: &ibex_rt::engine::Engine, i: usize| snapshot(&engine.proxies[i], BE).stot;
+    let peak = |engine: &ibex_rt::engine::Engine, i: usize| snapshot(&engine.proxies[i], BE).rate_max;
+    assert_eq!((stot(&engine, ba), stot(&engine, bb)), (2, 3));
+    let bb_peak = peak(&engine, bb);
+    assert!(bb_peak > 0, "bb made a peak");
+
+    assert!(engine.clear_counters(Some("ba")));
+    assert_eq!((stot(&engine, ba), peak(&engine, ba)), (0, 0), "ba reads cleared at once");
+    assert_eq!(stot(&engine, bb), 3, "bb keeps its totals");
+
+    // The thread counts again, once the session rate has fallen (two seconds: its window and
+    // the one before), so a peak zeroed by mistake would show: it zeroes its rows of `ba` and
+    // leaves those of `bb`, peak included.
+    thread::sleep(Duration::from_millis(2100));
+    get(&mut engine, "/b");
+    assert_eq!(stot(&engine, ba), 0);
+    assert_eq!(stot(&engine, bb), 4, "bb counted on");
+    assert_eq!(peak(&engine, bb), bb_peak, "bb keeps its peak");
+    get(&mut engine, "/a");
+    assert_eq!(stot(&engine, ba), 1, "ba counts from 0");
+}

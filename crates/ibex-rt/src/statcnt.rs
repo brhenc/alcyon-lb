@@ -516,18 +516,21 @@ impl CounterTable {
 
     /// `clear counters all` (`all`) or `clear counters` of proxy `p`: each owner zeroes its
     /// own rows when it next counts on them, the readers count them as zero meanwhile.
+    /// `p` is a proxy's id: the table was made from the whole proxy list, which never changes
+    /// after (`Proxies` is shared and frozen), so every id has its epoch and span.
     pub fn clear(&self, p: usize, all: bool) {
-        if let Some(e) = self.epochs.get(p) {
-            e.fetch_add(if all { CLEAR_ALL } else { 1 }, Ordering::Relaxed);
-            self.cleared.fetch_add(1, Ordering::Release);
-        }
+        debug_assert!(p < self.epochs.len(), "proxy {p} of a table of {}", self.epochs.len());
+        self.epochs[p].fetch_add(if all { CLEAR_ALL } else { 1 }, Ordering::Relaxed);
+        self.cleared.fetch_add(1, Ordering::Release);
     }
 
     /// The rows of object `k` of proxy `p` in every slab that has them, with whether the
     /// slab's maxima of the proxy are current; a slab whose totals were cleared since it last
     /// wrote them is left out. The session rate is not cleared: it is in `rate` of every slab.
     fn each(&self, p: usize, k: usize, mut f: impl FnMut(&HotRow, bool, bool)) {
-        let (Some(&(base, n)), Some(epoch)) = (self.spans.get(p), self.epochs.get(p)) else { return };
+        // `p` is in range as in [`Self::clear`].
+        debug_assert!(p < self.spans.len(), "proxy {p} of a table of {}", self.spans.len());
+        let ((base, n), epoch) = (self.spans[p], &self.epochs[p]);
         if k >= n as usize {
             return;
         }
