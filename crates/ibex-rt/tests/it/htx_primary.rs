@@ -227,3 +227,44 @@ fn rules_with_a_full_reserve_still_forward() {
     }
     assert!(seen.contains(&"p".repeat(13_000)), "the client's header went");
 }
+
+/// X7: a log line's `%U` does not serialise the head. A head nothing edits is never written
+/// out of its HTX (the size is the received one's); a head the parser changed (bare `LF` line
+/// ends) is written once, for the buffer, and `%U` is read from that write, not from two more.
+#[test]
+fn a_log_line_does_not_serialise_the_head() {
+    let collector = std::net::UdpSocket::bind("127.0.0.1:0").expect("collector");
+    collector.set_nonblocking(true).expect("nonblocking");
+    let global = format!("  log {} local0\n", collector.local_addr().expect("addr"));
+    let mut rig = Rig::new(&global, "  log global\n  log-format \"U=%U\"\n");
+    let mut c = rig.connect();
+    let mut plain = b"GET /x HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+    for i in 0..40 {
+        plain.extend_from_slice(format!("X-Pad-{i:02}: {}\r\n", "p".repeat(20)).as_bytes());
+    }
+    plain.extend_from_slice(b"\r\n");
+    assert!(plain.len() > 1024, "a head over 1 KiB");
+    let lf: Vec<u8> = plain.iter().copied().filter(|&b| b != b'\r').collect();
+    let mut logged = Vec::new();
+    let mut writes = Vec::new();
+    for req in [&plain, &lf] {
+        let _ = rig.request(&mut c, req);
+        let w0 = ibex_proto::h1_encode::head_writes();
+        let rsp = rig.request(&mut c, req);
+        assert!(rsp.starts_with("HTTP/1.1 200"), "response: {rsp:?}");
+        writes.push(ibex_proto::h1_encode::head_writes() - w0);
+        let mut line = String::new();
+        let mut buf = [0u8; 512];
+        for _ in 0..20 {
+            let _ = rig.engine.run_once();
+            while let Ok(n) = collector.recv(&mut buf) {
+                line = String::from_utf8_lossy(&buf[..n]).into_owned();
+            }
+        }
+        logged.push(line.trim_end().rsplit("U=").next().unwrap_or("").to_string());
+    }
+    assert_eq!(logged[0], logged[1], "%U of the same head with LF ends: {logged:?}");
+    assert!(logged[0].parse::<u64>().is_ok_and(|n| n > 1000), "logged: {logged:?}");
+    assert_eq!(writes[0], 0, "head writes for a head nothing edits");
+    assert_eq!(writes[1], 1, "head writes for a head the parser changed: one, for the buffer");
+}

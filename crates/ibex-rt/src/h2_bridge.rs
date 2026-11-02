@@ -810,7 +810,7 @@ pub fn abort_on_client_left(sess: &mut TcpSession) -> bool {
 /// request had both -- and each header's name and value, then the end of the headers).
 fn h2_head_size(head: &H2ReqHead) -> u64 {
     // Every head dispatched has a start line: one without `:method` is reset (T437).
-    20 + (head.method().len() + head.abs_prefix().map_or(0, str::len) + head.uri().len() + "HTTP/2.0".len()) as u64 + 1 + head.field_bytes as u64
+    20 + (head.method().len() + head.abs_prefix().map_or(0, str::len) + head.uri_len() + "HTTP/2.0".len()) as u64 + 1 + head.field_bytes as u64
 }
 
 /// Writes what has come of an HTTP/2 request's body into `req`, as much as there is room

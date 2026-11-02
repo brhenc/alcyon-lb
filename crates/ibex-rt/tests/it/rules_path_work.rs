@@ -69,6 +69,11 @@ fn backend(listener: TcpListener, running: Arc<AtomicBool>) -> thread::JoinHandl
     })
 }
 
+thread_local! {
+    /// Spare strings taken during the measured rounds of the last [`work_with`] on this thread.
+    static TAKES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// One request on `client`, the engine run until its whole response is back; the response.
 fn request(client: &mut TcpStream, engine: &mut Engine) -> String {
     client.write_all(b"GET /api/test HTTP/1.1\r\nHost: localhost\r\nX-Junk: 1\r\n\r\n").expect("write");
@@ -114,6 +119,7 @@ fn work_with(rules: &str, clients: usize, rounds: usize) -> ([u64; 4], String, S
         last = request(c, &mut engine);
     }
     let before = ibex_sample::work::on_this_thread();
+    let takes_before = ibex_sample::spare::strings_taken_on_this_thread();
     let utf8_before = ibex_proto::htx::utf8_checks_on_this_thread();
     for _ in 0..rounds {
         for c in &mut conns {
@@ -121,6 +127,7 @@ fn work_with(rules: &str, clients: usize, rounds: usize) -> ([u64; 4], String, S
         }
     }
     let after = ibex_sample::work::on_this_thread();
+    TAKES.set(ibex_sample::spare::strings_taken_on_this_thread() - takes_before);
     let utf8 = ibex_proto::htx::utf8_checks_on_this_thread() - utf8_before;
     drop(conns);
     for _ in 0..5 {
@@ -164,4 +171,132 @@ fn rule_expressions_are_not_looked_up_per_request() {
     assert!(rsp.contains("x-b: /api/test-x\r\n") && rsp.contains("x-c: s200,200\r\n"), "response: {rsp:?}");
     assert!(seen.to_ascii_lowercase().contains("x-a: localhost\r\n"), "request the server saw: {seen:?}");
     assert_eq!(counts[Op::ExprLookup as usize], 0, "expressions looked up by text");
+}
+
+/// X7: the response rules hold the head's strings in place. R2 counted 12 spare-string takes per
+/// request on this scenario (debug build): 1 for the request's `set-var` and 2 more on the
+/// request side, 11 for the response head held as `(String, String)` pairs. What is left of
+/// those is the pair `set-header` adds and the one a header more than the last response had
+/// makes: 4.
+#[test]
+fn the_response_rules_take_few_spare_strings() {
+    const N: u64 = 50;
+    let (_, rsp, _) = work(1, 50);
+    assert!(rsp.contains("x-served: ibex"), "response: {rsp:?}");
+    let per = TAKES.get() / N;
+    println!("[MEASUREMENT X7] spare strings taken per request: {per}");
+    assert!(per <= 7, "spare strings taken per request: {per} (3 on the request side, 4 on the response's)");
+}
+
+/// A server that answers the request heads with `responses`, whole, in turn.
+fn serve(responses: &'static [&'static [u8]]) -> (std::net::SocketAddr, Arc<AtomicBool>) {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    l.set_nonblocking(true).expect("nonblocking");
+    let addr = l.local_addr().expect("addr");
+    let running = Arc::new(AtomicBool::new(true));
+    let run = Arc::clone(&running);
+    thread::spawn(move || {
+        let mut conns: Vec<TcpStream> = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut turn = 0;
+        while run.load(Ordering::Relaxed) {
+            if let Ok((s, _)) = l.accept() {
+                s.set_nonblocking(true).expect("nonblocking");
+                conns.push(s);
+            }
+            conns.retain_mut(|s| match s.read(&mut buf) {
+                Ok(0) => false,
+                Ok(n) => {
+                    if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                        let _ = s.write_all(responses[turn % responses.len()]);
+                        turn += 1;
+                    }
+                    true
+                }
+                Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+            });
+            thread::sleep(Duration::from_micros(200));
+        }
+    });
+    (addr, running)
+}
+
+/// `rounds` requests on one connection through `rules` to a server answering `response`;
+/// the responses.
+fn answers(rules: &str, responses: &'static [&'static [u8]], rounds: usize) -> Vec<String> {
+    let (srv, running) = serve(responses);
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend fe\n  bind {fe}\n{rules}  default_backend be\nbackend be\n  server s1 {srv}\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_nonblocking(true).expect("nonblocking");
+    let mut out = Vec::new();
+    for _ in 0..rounds {
+        c.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("write");
+        let start = Instant::now();
+        let mut rsp = vec![0u8; 32768];
+        let mut len = 0;
+        while start.elapsed() < Duration::from_secs(3) && !rsp[..len].ends_with(b"ok") {
+            let _ = engine.run_once();
+            if let Ok(n) = c.read(&mut rsp[len..]) {
+                len += n;
+            }
+        }
+        out.push(String::from_utf8_lossy(&rsp[..len]).into_owned());
+    }
+    running.store(false, Ordering::Relaxed);
+    out
+}
+
+/// The words of the status line are the server's when the rules rewrite the head: a version that
+/// is not 1.1, a reason that is not the usual one (several words, one space between).
+#[test]
+fn the_status_line_words_survive_the_rules() {
+    let rsp = answers("  http-response set-header X-A 1\n", &[b"HTTP/1.0 200 Fine   and dandy\r\nContent-Length: 2\r\n\r\nok"], 2);
+    for r in &rsp {
+        assert!(r.starts_with("HTTP/1.0 200 Fine and dandy\r\n") && r.to_ascii_lowercase().contains("x-a: 1\r\n"), "response: {r:?}");
+    }
+}
+
+/// `set-status` with a reason: set in the string the first request made, written over by the next.
+#[test]
+fn set_status_with_a_reason_is_written_over_per_request() {
+    let rsp = answers("  http-response set-status 201 reason Made\n", &[b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"], 3);
+    for r in &rsp {
+        assert!(r.starts_with("HTTP/1.1 201 Made\r\n"), "response: {r:?}");
+    }
+}
+
+/// A head that the rules leave larger than the room beside the body that came with it is
+/// written through a `Vec`.
+#[test]
+fn a_rewritten_response_head_larger_than_the_free_room_is_written_whole() {
+    static BIG: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+    let big = BIG.get_or_init(|| {
+        let mut v = b"HTTP/1.1 200 OK\r\nX-Pad: ".to_vec();
+        v.extend(std::iter::repeat_n(b'p', 8000));
+        v.extend_from_slice(b"\r\nContent-Length: 6002\r\n\r\n");
+        v.extend(std::iter::repeat_n(b'b', 6000));
+        v.extend_from_slice(b"ok");
+        Box::leak(v.into_boxed_slice())
+    });
+    let rsp = answers("  http-response set-header X-A 1\n", std::slice::from_ref(big), 1);
+    assert!(rsp[0].len() > 14_000 && rsp[0].contains(&"p".repeat(8000)) && rsp[0].to_ascii_lowercase().contains("x-a: 1\r\n"), "response of {} bytes", rsp[0].len());
+}
+
+/// A response with fewer headers than the one before it: the strings of the others are given back.
+#[test]
+fn a_response_with_fewer_headers_than_the_last_is_forwarded_whole() {
+    let rsp = answers(
+        "  http-response set-header X-A 1\n",
+        &[b"HTTP/1.1 200 OK\r\nX-1: a\r\nX-2: b\r\nX-3: c\r\nContent-Length: 2\r\n\r\nok", b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"],
+        4,
+    );
+    for (i, r) in rsp.iter().enumerate() {
+        let l = r.to_ascii_lowercase();
+        assert!(l.contains("x-a: 1\r\n") && l.contains("x-1: a\r\n") == (i % 2 == 0), "response {i}: {r:?}");
+    }
 }

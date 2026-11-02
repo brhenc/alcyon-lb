@@ -105,6 +105,29 @@ pub fn copy_pairs(dst: &mut Vec<(String, String)>, src: &[(String, String)]) {
     }
 }
 
+/// `hdrs[at]` is `(name, value)`, written over the strings it has; a pair more than the list
+/// has is one with spare strings (`at` is at most `hdrs.len()`).
+pub fn set_pair(hdrs: &mut Vec<(String, String)>, at: usize, name: &str, value: &str) {
+    if let Some((k, v)) = hdrs.get_mut(at) {
+        k.clear();
+        k.push_str(name);
+        v.clear();
+        v.push_str(value);
+    } else {
+        hdrs.push((string_from(name), string_from(value)));
+    }
+}
+
+/// `hdrs` cut to its first `len` pairs, the strings of the others given back.
+pub fn truncate_pairs(hdrs: &mut Vec<(String, String)>, len: usize) {
+    while hdrs.len() > len {
+        if let Some((k, v)) = hdrs.pop() {
+            give(k);
+            give(v);
+        }
+    }
+}
+
 /// A [`string`] that is given back when it is dropped.
 #[derive(Debug, Default)]
 pub struct PString(String);
@@ -145,6 +168,61 @@ impl std::fmt::Display for PString {
 impl Drop for PString {
     fn drop(&mut self) {
         give(std::mem::take(&mut self.0));
+    }
+}
+
+/// A short word of a head's first line (the version, the reason): a constant when it is the
+/// usual one, else in a spare string, so that the usual response takes no string (X7).
+#[derive(Debug)]
+pub struct Word {
+    usual: Option<&'static str>,
+    text: String,
+}
+
+impl Word {
+    /// The usual word `usual`.
+    #[must_use]
+    pub const fn usual(usual: &'static str) -> Self {
+        Word { usual: Some(usual), text: String::new() }
+    }
+
+    /// Now the usual word `usual`.
+    pub fn set_usual(&mut self, usual: &'static str) {
+        self.usual = Some(usual);
+    }
+
+    /// Now `words` with one space between each, in the spare string it has or takes.
+    pub fn set_words<'a>(&mut self, words: impl Iterator<Item = &'a str>) {
+        self.usual = None;
+        if self.text.capacity() == 0 {
+            self.text = string();
+        }
+        self.text.clear();
+        for (i, w) in words.enumerate() {
+            if i > 0 {
+                self.text.push(' ');
+            }
+            self.text.push_str(w);
+        }
+    }
+}
+
+impl std::ops::Deref for Word {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.usual.unwrap_or(&self.text)
+    }
+}
+
+impl std::fmt::Display for Word {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self)
+    }
+}
+
+impl Drop for Word {
+    fn drop(&mut self) {
+        give(std::mem::take(&mut self.text));
     }
 }
 

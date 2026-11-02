@@ -2607,7 +2607,7 @@ impl TcpSession {
     /// A framing violation: a malformed `Content-Length` / `Transfer-Encoding`, a bare CR as a line terminator, an invalid header name, or a
     /// malformed chunk size. Each of these is a way for two intermediaries to read the
     /// same bytes as different requests.
-    fn validate_request_head(&mut self, head_len: usize) -> io::Result<(bool, txn::LenHdrs, Option<Option<u64>>)> {
+    fn validate_request_head(&mut self, head_len: usize) -> io::Result<(bool, txn::LenHdrs, Option<u64>)> {
         // The built-in parser is a value on this frame: a `Box<dyn HttpStream>` per request
         // head was an allocation per request (Z2, 56 bytes). Nothing sets `parser_kind` to
         // another parser (the other kinds are not built into this crate: `build` refuses them,
@@ -2680,7 +2680,8 @@ impl TcpSession {
         // What `%U` counts of a head the parser changed (an `Upgrade` cleaned, an authority
         // and `Host` normalised, a repeated `Host` dropped): the message as HAProxy's parser
         // leaves it, which is the HTX here, before the key below (T522).
-        let parsed_size = (head_rewritten || conflict).then(|| txn::htx_head_size(&slice.as_ref().write_h1_wire_vec(), true));
+        // Read from the one write of the head that follows (X7), less the key put in below.
+        let sized_from_write = head_rewritten || conflict;
         // The websocket handshake, for the response (T281): a key written when the request
         // has none and the frontend accepts that (`h1_process_mux`).
         // Without an `Upgrade` line the request asks for nothing (T436: not looked for).
@@ -2692,7 +2693,8 @@ impl TcpSession {
         } else {
             (crate::websocket::ReqWs::default(), None)
         };
-        let key_written = written.is_some_and(|k| slice.add_header("sec-websocket-key", &k).is_ok());
+        let key_written = written.as_ref().is_some_and(|k| slice.add_header("sec-websocket-key", k).is_ok());
+        let key_size = written.as_ref().filter(|_| key_written).map_or(0, |k| "sec-websocket-key".len() + k.len()) as u64;
         self.req_ws = (ws != crate::websocket::ReqWs::default()).then(|| Box::new(ws));
         self.htx_tail = slice.tail_addr();
         self.htx_blocks = slice.num_blocks();
@@ -2703,7 +2705,7 @@ impl TcpSession {
         self.htx_modified = conflict || key_written || head_rewritten;
         // What frames the request as parsed (`H1_MF_CLEN`, `H1_MF_CHNK`), for after its rules (T439).
         let len_hdrs = txn::LenHdrs { clen: h1_parser.content_length.is_some() && !h1_parser.is_chunked, chnk: h1_parser.is_chunked };
-        Ok((close, len_hdrs, parsed_size))
+        Ok((close, len_hdrs, sized_from_write.then_some(key_size)))
     }
 
     #[must_use]
@@ -3122,7 +3124,7 @@ impl TcpSession {
                 // stream needs no state across calls. One allocation per request head
                 // for the trait object; it buys the framing rules and the seam that lets
                 // the parser be swapped.
-                let (mut close, len_hdrs, parsed_size) = match self.validate_request_head(total_hdr_len) {
+                let (mut close, len_hdrs, size_less) = match self.validate_request_head(total_hdr_len) {
                     Ok(v) => v,
                     Err(e) if crate::buf::is_oom(&e) => {
                         self.fail_alloc();
@@ -3141,6 +3143,7 @@ impl TcpSession {
                 };
                 // Where the head's `Connection` headers are, while the facts still say (T439).
                 let mut conn_scan = None;
+                let mut parsed_size: Option<Option<u64>> = None;
                 if self.has_htx {
                     let (conn_close, wire_replacement) = {
                         let htx = ibex_proto::htx::HtxSliceRef::new(
@@ -3183,6 +3186,13 @@ impl TcpSession {
                         (conn_close, wire_replacement)
                     };
                     close |= conn_close;
+                    // What `%U` counts of a head the parser changed (an `Upgrade` cleaned, an
+                    // authority and `Host` normalised, a repeated `Host` dropped): the message
+                    // as HAProxy's parser leaves it, which is the HTX here, before the key
+                    // (T522). Read from the text just written: no second write to measure it.
+                    parsed_size = size_less
+                        .zip(wire_replacement.as_deref())
+                        .map(|(key, wire)| txn::htx_head_size(wire, true).map(|n| n.saturating_sub(key)));
                     // Only regenerate wire buffer if HTX was actually modified
                     let regenerated = wire_replacement.is_some();
                     if let Some(wire) = wire_replacement {

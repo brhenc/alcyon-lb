@@ -82,7 +82,24 @@ fn new_string() -> Option<String> {
 #[must_use]
 #[inline(never)]
 pub fn string() -> String {
+    #[cfg(debug_assertions)]
+    STRINGS_TAKEN.with(|c| c.set(c.get() + 1));
     SPARE_STR.take_raw(new_string).unwrap_or_default()
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static STRINGS_TAKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Spare strings taken ([`string`], so [`string_from`]) on this thread (debug builds; 0 in
+/// release): X7 pins that the response rules take none per request.
+#[must_use]
+pub fn strings_taken_on_this_thread() -> u64 {
+    #[cfg(debug_assertions)]
+    return STRINGS_TAKEN.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
 }
 
 /// `src` in a [`string`].

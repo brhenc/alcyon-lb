@@ -119,6 +119,9 @@ pub struct H2ReqHead {
     /// The request is an extended CONNECT (RFC 8441), written as the `GET` with
     /// `upgrade: <protocol>` and `connection: upgrade` of an HTTP/1.1 upgrade.
     pub ext_connect: bool,
+    /// The path was not UTF-8: `uri()` is the text standing for its bytes
+    /// ([`ibex_regex::bytetext`]), [`Self::uri_len`] their number (X7).
+    pub path_raw: bool,
 }
 
 /// A pseudo-header's value as text: one that is not UTF-8 is refused (`tradeoff.md` 6.24).
@@ -143,7 +146,7 @@ impl H2ReqHead {
         self.line.clear();
         self.bytes.clear();
         self.fields.clear();
-        (self.method_len, self.uri, self.abs, self.field_bytes, self.has_line, self.ext_connect) = (0, (0, 0), (0, 0), 0, false, false);
+        (self.method_len, self.uri, self.abs, self.field_bytes, self.has_line, self.ext_connect, self.path_raw) = (0, (0, 0), (0, 0), 0, false, false, false);
     }
 
     /// The memory the head holds, for a pool's accounting.
@@ -181,7 +184,11 @@ impl H2ReqHead {
         if self.has_line {
             w.extend_from_slice(self.method().as_bytes());
             w.push(b' ');
-            w.extend_from_slice(self.uri().as_bytes());
+            if self.path_raw {
+                w.extend_from_slice(&ibex_regex::bytetext::text_to_bytes(self.uri()));
+            } else {
+                w.extend_from_slice(self.uri().as_bytes());
+            }
             w.extend_from_slice(b" HTTP/1.1\r\n");
         }
         for (n, v) in self.headers() {
@@ -197,7 +204,7 @@ impl H2ReqHead {
     /// The length of [`Self::to_wire`].
     #[must_use]
     pub fn wire_len(&self) -> usize {
-        let line = if self.has_line { self.method_len + 1 + (self.uri.1 - self.uri.0) + 11 } else { 0 };
+        let line = if self.has_line { self.method_len + 1 + self.uri_len() + 11 } else { 0 };
         line + self.field_bytes + 4 * self.fields.len() + 2
     }
 
@@ -209,6 +216,16 @@ impl H2ReqHead {
     #[must_use]
     pub fn uri(&self) -> &str {
         &self.line[self.uri.0..self.uri.1]
+    }
+
+    /// The number of bytes of the path as the client sent it.
+    #[must_use]
+    pub fn uri_len(&self) -> usize {
+        if self.path_raw {
+            ibex_regex::bytetext::text_len(self.uri())
+        } else {
+            self.uri.1 - self.uri.0
+        }
     }
 
     /// `scheme://authority`, when the request had both.
@@ -286,10 +303,16 @@ impl H2ReqHead {
                 let slot = match n {
                     b":method" => &mut method,
                     b":path" => {
-                        if path.is_none() && v.is_empty() {
+                        if path.is_some() {
+                            return Err("duplicate pseudo-header");
+                        }
+                        if v.is_empty() {
                             return Err("empty :path");
                         }
-                        &mut path
+                        // The octets the client sent: forwarded as `HAProxy` forwards them
+                        // (X7), not refused when they are not UTF-8.
+                        path = Some(v);
+                        continue;
                     }
                     b":authority" => &mut authority,
                     b":protocol" => &mut protocol,
@@ -319,6 +342,19 @@ impl H2ReqHead {
             }
         }
         let method = method.ok_or("no :method")?;
+        // The path as text; one that is not UTF-8 is held as `ibex_regex::bytetext` stands for
+        // its bytes, and `path_raw` says so (the text of `uri()`, `%r`, the fetches; the octets
+        // go out in `to_wire`).
+        let path_text: Option<std::borrow::Cow<'_, str>> = path.map(|p| {
+            std::str::from_utf8(p).map_or_else(
+                |_| {
+                    self.path_raw = true;
+                    std::borrow::Cow::Owned(ibex_regex::bytetext::bytes_to_text(p))
+                },
+                std::borrow::Cow::Borrowed,
+            )
+        });
+        let path = path_text.as_deref();
         // `:protocol` is an extended CONNECT's (RFC 8441), which goes to the server as the
         // `GET` of an HTTP/1.1 upgrade to that protocol (`h2_prepare_htx_reqline`,
         // `h2_make_htx_request`): with `:scheme`, `:path` and `:authority`, and not to h2.
