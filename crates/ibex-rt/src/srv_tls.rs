@@ -108,7 +108,8 @@ impl Configs {
     }
 
     /// Opens the TLS transport over the connected `fd`: `sni` is sent and checked when
-    /// given, else `verifyhost` is checked without being sent, else no name is checked.
+    /// given (a name that is no DNS name fails the certificate check), else `verifyhost` is
+    /// checked without being sent, else no name is checked.
     /// The connection is keyed by `sni` whether or not it could be sent ([`ServerXprt::sni`]).
     fn connect(&self, fd: &impl AsRawFd, sni: Option<&str>, server_ip: IpAddr) -> ServerXprt {
         let mut x = self.connect_named(fd, sni, server_ip);
@@ -119,8 +120,17 @@ impl Configs {
     fn connect_named(&self, fd: &impl AsRawFd, sni: Option<&str>, server_ip: IpAddr) -> ServerXprt {
         let b = self.builds.current();
         let dns = |name: &str| ServerName::try_from(name.to_string()).ok().filter(|n| matches!(n, ServerName::DnsName(_)));
-        if let Some(name) = sni.filter(|s| !s.is_empty()).and_then(dns) {
-            return xprt::connect_tls_on(fd, Arc::clone(&b.with_sni), name, b.provider);
+        if let Some(sni) = sni.filter(|s| !s.is_empty()) {
+            if let Some(name) = dns(sni) {
+                return xprt::connect_tls_on(fd, Arc::clone(&b.with_sni), name, b.provider);
+            }
+            // An SNI that is no DNS name (an address, an underscore, a bracketed address) is
+            // still the name the certificate must carry, and takes precedence over
+            // `verifyhost` (`ssl_sock_srv_verifycbk`; measured on 3.5-dev8: 503 for
+            // `Host: 10.9.9.9` and `Host: a_b`, `verifyhost` or not). rustls cannot be opened
+            // with it, so it is a name no certificate carries, and nothing goes on the wire.
+            let unmatchable = ServerName::try_from("name-not-in-any-certificate.invalid".to_string()).expect("a DNS name");
+            return xprt::connect_tls_on(fd, Arc::clone(&b.without_sni), unmatchable, b.provider);
         }
         if let Some(name) = self.verifyhost.as_deref().and_then(dns) {
             return xprt::connect_tls_on(fd, Arc::clone(&b.without_sni), name, b.provider);

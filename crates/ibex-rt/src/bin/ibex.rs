@@ -62,7 +62,6 @@ struct CliOptions {
     disable_epoll: bool,
     disable_poll: bool,
     dump_libs: bool,
-    overrides: Vec<String>,
 }
 
 fn print_help(program: &str) {
@@ -89,7 +88,6 @@ fn print_help(program: &str) {
     println!("        -dL dumps loaded object files after config checks");
     println!("        -sf/-st [pid ]* finishes/terminates old pids.");
     println!("        -S <bind>[,<bind options>...] master CLI / stats socket");
-    println!("        -e <setting> override configuration directives");
     println!("        -h, --help show this help message");
 }
 
@@ -426,12 +424,6 @@ fn parse_cli_args(args: &[String]) -> (String, CliOptions) {
             }
             "-dL" => {
                 opts.dump_libs = true;
-            }
-            "-e" => {
-                i += 1;
-                if i < args.len() {
-                    opts.overrides.push(args[i].clone());
-                }
             }
             other if other.starts_with("-f") => {
                 opts.config_paths.push(PathBuf::from(&other[2..]));
@@ -774,6 +766,21 @@ fn main() {
     // serving cleartext to clients that believe they negotiated TLS -- it is just
     // enforced where the certificates actually are, in `bind_tls`, and again per
     // connection in the accept path, which drops rather than downgrades.
+
+    // 6a. `-N <maxpconn>`: the maxconn of every proxy that sets none (`cfg_maxpconn`, the
+    // initial `p->maxconn` of `init_new_proxy` in `src/proxy.c`).
+    if let Some(n) = opts.maxpconn {
+        for listen in &mut config.listens {
+            if listen.maxconn == 0 {
+                listen.maxconn = n;
+            }
+        }
+        for frontend in &mut config.frontends {
+            if frontend.maxconn == 0 {
+                frontend.maxconn = n;
+            }
+        }
+    }
 
     // 6. Apply command-line maxconn override (-n <maxconn>)
     if let Some(mc) = opts.maxconn {

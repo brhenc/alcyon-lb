@@ -145,7 +145,8 @@ pub(crate) fn match_word(smp: &[u8], pattern: &[u8], delimiters: &[u8], icase: b
         }
         p = rest;
     }
-    if p.len() > smp.len() {
+    // Nothing left of the pattern: HAProxy never matches it (oracle, T612a).
+    if p.is_empty() || p.len() > smp.len() {
         return false;
     }
     let same = |a: &[u8], b: &[u8]| if icase { a.eq_ignore_ascii_case(b) } else { a == b };
@@ -503,6 +504,19 @@ mod tests {
         assert!(!dir("a", "/xa/"));
         assert!(Matcher::compile_with_flags("dom", "A.B", true).unwrap().matches(&Sample::Str("x.a.b:80".into())));
         assert!(!Matcher::compile_with_flags("dom", "A.B", false).unwrap().matches(&Sample::Str("x.a.b".into())));
+    }
+
+    /// A pattern made only of delimiters is empty once stripped: `path -m dir /` and
+    /// `hdr(host) -m dom .` never matched on HAProxy 3.5-dev8 (oracle run, T612a), and must not
+    /// index past the sample.
+    #[test]
+    fn an_empty_stripped_word_matches_nothing() {
+        let dir = |p: &str, s: &str| Matcher::compile("dir", p).unwrap().matches(&Sample::Str(s.into()));
+        for smp in ["/", "/a/b", "a", ""] {
+            assert!(!dir("/", smp), "{smp:?}");
+            assert!(!dir("//", smp), "{smp:?}");
+        }
+        assert!(!Matcher::compile("dom", ".").unwrap().matches(&Sample::Str("a.b".into())));
     }
 
     #[test]

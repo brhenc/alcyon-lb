@@ -278,7 +278,7 @@ impl TlsCtx {
 
     /// `n` bytes of [`Self::pending_tx`] went out.
     pub fn tx_done(&mut self, n: usize) {
-        self.tx_sent = (self.tx_sent + n).min(self.tx.len());
+        self.tx_sent = self.tx_sent.saturating_add(n).min(self.tx.len());
         if self.tx_sent == self.tx.len() {
             self.tx_release();
         }
