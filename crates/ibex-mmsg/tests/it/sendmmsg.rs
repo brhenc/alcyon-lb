@@ -6,6 +6,7 @@ use std::os::fd::AsFd;
 use ibex_mmsg::{sendmmsg, SendMsg, recvmmsg, RecvMsg};
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn test_sendmmsg_basic() {
     let server4 = UdpSocket::bind("127.0.0.1:0").unwrap();
     let server6 = UdpSocket::bind("[::1]:0").unwrap();
@@ -34,6 +35,7 @@ fn test_sendmmsg_basic() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn test_sendmmsg_connected() {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -45,6 +47,7 @@ fn test_sendmmsg_connected() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn test_eagain_returns_ok_zero() {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     sock.set_nonblocking(true).unwrap();
@@ -58,6 +61,7 @@ fn test_eagain_returns_ok_zero() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn test_zero_length_datagram() {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -79,6 +83,7 @@ fn test_zero_length_datagram() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn test_batch_larger_than_max() {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -96,6 +101,7 @@ fn test_batch_larger_than_max() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn test_empty_slices() {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -120,6 +126,7 @@ fn test_empty_slices() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn test_src_addr_correctness_two_senders() {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     let client1 = UdpSocket::bind("127.0.0.1:0").unwrap();

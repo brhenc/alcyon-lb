@@ -29,6 +29,7 @@ fn recv_one(server: &UdpSocket) -> (usize, Option<IpAddr>) {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn ipv4_reports_the_destination_the_client_aimed_at() {
     let server = UdpSocket::bind("127.0.0.1:0").expect("bind v4");
     set_ip_pktinfo(server.as_fd(), true).expect("IP_PKTINFO");
@@ -45,6 +46,7 @@ fn ipv4_reports_the_destination_the_client_aimed_at() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn ipv6_reports_the_destination_the_client_aimed_at() {
     let Ok(server) = UdpSocket::bind("[::1]:0") else {
         eprintln!("no IPv6 loopback on this host; skipping");
@@ -73,6 +75,7 @@ fn ipv6_reports_the_destination_the_client_aimed_at() {
 /// reader must not take the missing bytes as an address. The 8 bytes past the slice are 0xAA
 /// so that reading them shows.
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn a_truncated_pktinfo_control_message_gives_no_destination() {
     #[repr(align(8))]
     struct Aligned([u8; 40]);

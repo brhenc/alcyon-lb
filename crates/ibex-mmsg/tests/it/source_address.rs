@@ -22,6 +22,7 @@ fn source_seen(sender: &UdpSocket, to: &UdpSocket, src: Option<IpAddr>) -> std::
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn wildcard_v4_sends_from_the_given_source() {
     let sender = UdpSocket::bind("0.0.0.0:0").unwrap();
     let to = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -34,6 +35,7 @@ fn wildcard_v4_sends_from_the_given_source() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn a_batch_carries_one_source_per_datagram() {
     let sender = UdpSocket::bind("0.0.0.0:0").unwrap();
     let to = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -58,6 +60,7 @@ fn a_batch_carries_one_source_per_datagram() {
 /// The host has `::1` only, so the IPv6 cmsg is checked with the one address it has: it must be
 /// accepted by the kernel (a malformed `IPV6_PKTINFO` is `EINVAL`) and honoured.
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn wildcard_v6_accepts_a_source() {
     let Ok(sender) = UdpSocket::bind("[::]:0") else { return };
     let Ok(to) = UdpSocket::bind("[::1]:0") else { return };
@@ -68,6 +71,7 @@ fn wildcard_v6_accepts_a_source() {
 /// A dual-stack IPv6 socket reaching an IPv4 client through its mapped address: an IPv4 source
 /// goes as its mapped form, which the kernel takes as the IPv4 source.
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn mapped_destination_takes_an_ipv4_source() {
     let Ok(sender) = UdpSocket::bind("[::]:0") else { return };
     let to = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -83,6 +87,7 @@ fn mapped_destination_takes_an_ipv4_source() {
 /// An IPv4 destination with a mapped IPv6 source sends it as IPv4; a source that has no IPv4
 /// form is left to the kernel rather than sent as a control message the kernel refuses.
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn ipv4_destination_with_an_ipv6_source() {
     let sender = UdpSocket::bind("0.0.0.0:0").unwrap();
     let to = UdpSocket::bind("127.0.0.1:0").unwrap();

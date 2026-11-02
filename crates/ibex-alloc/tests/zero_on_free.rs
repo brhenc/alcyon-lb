@@ -237,6 +237,7 @@ fn the_setting_names_and_the_failed_allocation_retry() {
 /// allocator): it applies the setting on its frees and reallocations, and a refused allocation
 /// empties the quarantine and is tried once more.
 #[test]
+#[cfg_attr(miri, ignore = "1<<62 alloc: Miri aborts with resource exhaustion instead of returning null")]
 fn the_process_allocator_applies_the_setting_and_retries_after_emptying_the_quarantine() {
     use std::alloc::{GlobalAlloc, Layout};
     let _t = turn(ZeroOnFree::Hard);

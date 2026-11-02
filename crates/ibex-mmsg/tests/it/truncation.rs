@@ -13,6 +13,7 @@ use std::net::UdpSocket;
 use std::os::fd::AsFd;
 
 #[test]
+#[cfg_attr(miri, ignore = "UDP socket and sendmmsg/recvmmsg syscalls")]
 fn a_datagram_larger_than_the_buffer_is_reported_as_truncated() {
     let server = UdpSocket::bind("127.0.0.1:0").expect("bind server");
     let client = UdpSocket::bind("127.0.0.1:0").expect("bind client");
