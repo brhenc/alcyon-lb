@@ -1165,23 +1165,20 @@ impl H1Parser {
                 };
                 return Ok((cursor, false));
             }
+            // Only CRLF ends chunk data: HAProxy 3.5 answers 400 to a bare CR or a bare LF
+            // here, and a hop that takes either as the end disagrees about the chunk's end.
             if input[cursor..].starts_with(b"\r\n") {
                 cursor += 2;
                 waiting_crlf = false;
-            } else if input[cursor..].starts_with(b"\n") {
-                cursor += 1;
-                waiting_crlf = false;
-            } else if input[cursor..].starts_with(b"\r") {
-                if input.len() - cursor == 1 && !self.saw_bare_cr {
-                    self.phase = H1Phase::BodyChunked {
-                        chunk_rem,
-                        waiting_crlf,
-                    };
-                    return Ok((cursor, false));
-                }
-                cursor += 1;
-                waiting_crlf = false;
+            } else if &input[cursor..] == b"\r" {
+                // The LF may come with the next read.
+                self.phase = H1Phase::BodyChunked {
+                    chunk_rem,
+                    waiting_crlf,
+                };
+                return Ok((cursor, false));
             } else {
+                self.phase = H1Phase::Error;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Malformed chunk boundary",
@@ -1197,6 +1194,14 @@ impl H1Parser {
                 };
                 return Ok((cursor, false));
             };
+            if delim_len != 2 {
+                // A chunk-size line ends in CRLF (HAProxy 3.5: 400 for a bare CR or LF).
+                self.phase = H1Phase::Error;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunk size line not ended by CRLF",
+                ));
+            }
             let len_str = std::str::from_utf8(&input[cursor..cursor + line_end])
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid chunk len"))?;
             // No trimming: RFC 9112 7.1 allows no whitespace around a chunk size, and

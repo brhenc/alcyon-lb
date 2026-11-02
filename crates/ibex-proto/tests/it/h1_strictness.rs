@@ -286,3 +286,51 @@ fn conflicting_comma_content_length_is_rejected() {
         b"POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5, 6\r\n\r\nhello"
     ));
 }
+
+// ---- chunk framing: only CRLF ends a chunk-size line or chunk data (T611 / #3) ----------
+//
+// Measured on HAProxy 3.5-dev8 (2026-11-02): each of these answers 400, as does LF alone.
+// The header parser already refuses a bare CR; the chunk framing must too, or a hop that
+// reads CR as a line end disagrees with this one about where the chunk stops.
+
+fn chunked(body: &[u8]) -> Vec<u8> {
+    let mut v = b"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    v.extend_from_slice(body);
+    v
+}
+
+#[test]
+fn bare_cr_after_chunk_data_is_rejected() {
+    assert!(rejects(&chunked(b"5\r\nhello\rX0\r\n\r\n")));
+    assert!(rejects(&chunked(b"5\r\nhello\r0\r\n\r\n")));
+}
+
+#[test]
+fn bare_cr_ending_a_chunk_size_line_is_rejected() {
+    assert!(rejects(&chunked(b"5\rhello\r\n0\r\n\r\n")));
+    assert!(rejects(&chunked(b"5\r\nhello\r\n0\r\r\n\r\n")));
+}
+
+#[test]
+fn bare_lf_in_chunk_framing_is_rejected() {
+    assert!(rejects(&chunked(b"5\r\nhello\n0\r\n\r\n")));
+    assert!(rejects(&chunked(b"5\nhello\r\n0\r\n\r\n")));
+    assert!(rejects(&chunked(b"5\r\nhello\r\n0\n\n")));
+}
+
+#[test]
+fn chunk_framing_split_across_reads_still_works() {
+    // Every cut of a well-formed chunked body parses: a lone CR at the end of a read waits
+    // for the LF that follows it.
+    let all = chunked(b"5\r\nhello\r\n0\r\n\r\n");
+    for cut in 1..all.len() {
+        let mut p = H1Parser::new(false);
+        let mut buf = [0u8; 4096];
+        let mut h = HtxSlice::new(&mut buf);
+        let mut pending = all[..cut].to_vec();
+        let n = p.parse(&pending, &mut h).unwrap_or_else(|e| panic!("cut {cut}: {e}"));
+        pending.drain(..n);
+        pending.extend_from_slice(&all[cut..]);
+        p.parse(&pending, &mut h).unwrap_or_else(|e| panic!("cut {cut} second read: {e}"));
+    }
+}
