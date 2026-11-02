@@ -712,6 +712,7 @@ dependencies = [
  "ibex-proto",
  "ibex-regex",
  "ibex-tls",
+ "memchr",
  "proptest",
  "serde",
  "serde_json",

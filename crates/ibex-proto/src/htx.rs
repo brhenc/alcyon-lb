@@ -1118,6 +1118,17 @@ impl<'a> HtxSliceRef<'a> {
         })
     }
 
+    /// The headers as their bytes, none read as UTF-8 (R2): name, value, and whether the
+    /// value is held as Latin-1 text ([`HTX_BLK_FL_LATIN1`]), whose bytes are then
+    /// `ibex_regex::bytetext::text_to_bytes` of it.
+    pub fn header_bytes(self) -> impl Iterator<Item = (&'a [u8], &'a [u8], bool)> + 'a {
+        (0..self.num_blocks).filter_map(move |i| {
+            let desc = self.read_desc(i);
+            (desc.blk_type == HtxBlockType::Header)
+                .then(|| (&self.buf[desc.name_range()], &self.buf[desc.value_range()], desc.flags & HTX_BLK_FL_LATIN1 != 0))
+        })
+    }
+
     /// [`Self::header_blocks`] of the headers whose name `keep` keeps, the name read as bytes:
     /// what `header_blocks().filter(..)` on the name gives, without reading as UTF-8 the
     /// names and values of the headers it does not keep.
@@ -1968,7 +1979,9 @@ impl<'a> HtxSlice<'a> {
 
 
     pub fn insert_header(&mut self, index: usize, name: &str, value: &str) -> Result<(), HtxError> {
-        insert_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, index, name, value)
+        insert_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, index, name, value)?;
+        self.flag_escaped(index.min(self.num_blocks - 1), value);
+        Ok(())
     }
 
     pub fn add_header(&mut self, name: &str, value: &str) -> Result<(), HtxError> {
@@ -1983,7 +1996,22 @@ impl<'a> HtxSlice<'a> {
             insert_idx,
             name,
             value,
-        )
+        )?;
+        self.flag_escaped(insert_idx, value);
+        Ok(())
+    }
+
+    /// A header value a rule wrote that holds an escaped byte (a sample of a Latin-1 header,
+    /// T286) is flagged as such, so that the wire gets the byte and a fetch reads it (R2), as
+    /// [`replace_block_value_raw`] does for a value it replaces.
+    fn flag_escaped(&mut self, index: usize, value: &str) {
+        if !value.is_ascii() && ibex_regex::bytetext::has_escapes(value) {
+            let mut desc = read_desc_at(self.buf, self.num_blocks, index);
+            if desc.blk_type == HtxBlockType::Header {
+                desc.flags |= HTX_BLK_FL_LATIN1;
+                write_desc_at(self.buf, self.num_blocks, index, &desc);
+            }
+        }
     }
 
     pub fn set_header(&mut self, name: &str, value: &str) -> Result<(), HtxError> {

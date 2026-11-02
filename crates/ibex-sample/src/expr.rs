@@ -8,7 +8,7 @@
 
 use crate::matcher::Matcher;
 use crate::registry::{Compiled, Registry, SampleContext};
-use crate::sample::Sample;
+use crate::sample::{Sample, Smp};
 
 /// A parsed and compiled sample expression with optional matcher.
 #[derive(Debug, Clone)]
@@ -361,6 +361,16 @@ impl Expr {
         }
     }
 
+    /// [`Expr::eval_sample`] in the bytes form (R2): a header or the path borrowed from the
+    /// request when no converter made new bytes.
+    #[must_use]
+    pub fn eval_smp<'c>(&self, registry: &Registry, ctx: &'c SampleContext<'_>) -> Option<Smp<'c>> {
+        match self.compiled(registry) {
+            Some(c) => Registry::eval_smp_c(c, &self.fetch_args, &self.converters, ctx),
+            None => registry.eval_smp_g(&self.fetch_name, &self.fetch_args, &self.converters, ctx),
+        }
+    }
+
     /// Evaluates the expression against the sample context to produce all sample values.
     #[must_use]
     pub fn eval_all_samples(&self, registry: &Registry, ctx: &SampleContext) -> Vec<Sample> {
@@ -380,11 +390,11 @@ impl Expr {
     fn eval_line(&self, registry: &Registry, ctx: &SampleContext) -> bool {
         // No list of the samples and no copy of the converters: each sample is matched as it
         // comes (T437).
-        let test = |smp: &Sample| match self.matcher {
-            Some(ref matcher) => matcher.matches(smp),
+        let test = |smp: &Smp| match self.matcher {
+            Some(ref matcher) => matcher.matches_smp(smp),
             None => match smp {
-                Sample::Bool(b) => *b,
-                Sample::Sint(i) => *i != 0,
+                Smp::Bool(b) => *b,
+                Smp::Sint(i) => *i != 0,
                 _ => true,
             },
         };

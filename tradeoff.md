@@ -435,7 +435,27 @@ Status: **resolved and measured** — cached lookups verified in `crates/ibex-sa
 
 
 
-### 6.12 `str` samples and variables stay UTF-8 (`String`), not arbitrary bytes — **decided 2026-10-10: leave unimplemented**
+### 6.12 `str` samples and variables stay UTF-8 (`String`), not arbitrary bytes — **decided 2026-10-10: leave unimplemented**; **sample half replaced 2026-11-02 (R2): samples are bytes on the data path**
+
+> **R2 (2026-11-02, user decision 2026-11-01, D-18: bytes like HAProxy, no UTF-8 validation or
+> re-encoding).** The "`str` samples stay UTF-8" half below is retired for the data path. A
+> sample there is `Smp<'a>` (`crates/ibex-sample/src/sample.rs`): `Str`/`Bin` are `Cow<'a, [u8]>`,
+> borrowed from the HTX blocks for `req.hdr`/`hdr`/`req.fhdr`/`res.hdr`/`res.fhdr`, `path`,
+> `pathq`, `url`/`req.uri`, `query`, `req.cook`/`res.cook` (no spare string, no UTF-8 check:
+> `compiled_expr.rs` `a_header_acl_takes_no_spare_string`, `a_rule_run_validates_no_utf8`),
+> owned once a converter makes new bytes. The matchers (`-m str/beg/end/sub/reg/len/dir/dom`,
+> `-i` folding ASCII only) and the converters `lower`, `upper`, `field`, `word`, `url_enc`,
+> `json` work on the bytes; `UserRegex::Linear` is `regex::bytes::Regex` with Unicode off (a
+> byte is a character, as PCRE2 without UTF: `\xe9` and `[\x80-\xff]` are bytes), `Backtracking`
+> stays `fancy-regex` over the bytes read one character each. Measured against HAProxy
+> 3.5-dev8-885761-29: `crates/ibex-sample/tests/it/bytes_samples.rs` (552 rows, 31 differed
+> before, 0 now), `crates/ibex-rt/tests/it/bytes_samples_oracle.rs` (ACLs, converters,
+> `set-header`, log line). **What is left as `String`** (bytetext, lossless): the text form
+> `Sample` that the by-name entry points (CLI, tests, `get_fetch(..).func`) and the converters
+> not yet ported take; variables (R4); log-format and rule-format rendering (R4); a converter
+> without a bytes form converts its input to text and back. Why two forms: the specification
+> test `tests/sample_semantics.rs` (`tools/checkin.sha256`) reads `get_fetch("uuid").func` as a
+> `Sample::Str(String)`, so the text form keeps the name `Sample`.
 
 > **Revisited 2026-10-17 (T363a, T364).** Bytes are now kept losslessly (bytetext; before T363a a binary sample stored in
 > a variable lost every byte >= 0x80 to U+FFFD, which broke `secure_memcmp` against a decoded hash). What remains is
@@ -620,7 +640,7 @@ fix/t444 did) a new connection's method and URI (`ReqText`) come from the spares
 | **Cost** | A client that sends Latin-1 (or other non-UTF-8) bytes in an HTTP/2 or HTTP/3 `:path` (or `:method`, `:scheme`) gets its stream reset where HAProxy forwards it (answers 400). HTTP/1 is not affected. |
 | **Why that is acceptable** | RFC 9110 section 5.5 makes such bytes obs-text, which a recipient may refuse; clients that send them are rare. Carrying fields as bytes would change every type from the decoder to the rules. |
 | **Status** | Open. |
-| **Revisit** | When the request line is carried as bytes (`ReqText`, `%r`). |
+| **Revisit** | When the request line is carried as bytes (`ReqText`, `%r`). R2 (2026-11-02, 6.12): the samples read the HTX blocks as bytes, so a Latin-1 value forwarded here is matched and converted byte for byte; the `:path` reset is unchanged. |
 
 ### 6.25 `-m <megs>` sizes `maxconn` and sets `RLIMIT_DATA` (T453, T465b) — **closed 2026-10-25: as HAProxy does**
 

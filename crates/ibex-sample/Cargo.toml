@@ -13,6 +13,7 @@ ibex-proto = { path = "../ibex-proto" }
 ibex-tls = { path = "../ibex-tls" }
 getrandom = "0.2"
 ibex-regex = { workspace = true }
+memchr = { workspace = true }
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 ctr = "0.9"

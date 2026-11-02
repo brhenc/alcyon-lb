@@ -82,7 +82,25 @@ fn new_string() -> Option<String> {
 #[must_use]
 #[inline(never)]
 pub fn string() -> String {
+    #[cfg(debug_assertions)]
+    TAKES.with(|n| n.set(n.get() + 1));
     SPARE_STR.take_raw(new_string).unwrap_or_default()
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static TAKES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many spare strings ([`string`]) this thread has taken (debug builds only; always 0 in
+/// release): a test reads it around an evaluation to show that a sample borrowed from the
+/// request takes none (R2).
+#[must_use]
+pub fn strings_taken_on_this_thread() -> u64 {
+    #[cfg(debug_assertions)]
+    return TAKES.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
 }
 
 /// `src` in a [`string`].

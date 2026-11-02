@@ -107,9 +107,15 @@ fn next_name(v: &[u8], from: usize, is_req: bool) -> Option<(usize, usize, usize
 /// next search starts after a value found, so `a=1; a=2` gives both). Values keep their
 /// quotes, end at a `;` or `,` outside them, and are trimmed of blanks.
 pub fn values<'a>(elem: &'a str, name: &str, list: bool) -> Vec<&'a str> {
-    let (v, name) = (elem.as_bytes(), name.as_bytes());
-    let end = v.len();
     let mut out = Vec::new();
+    // The bounds border ASCII delimiters or the ends: char boundaries.
+    value_ranges(elem.as_bytes(), name.as_bytes(), list, &mut |r| out.push(elem.get(r).unwrap_or("")));
+    out
+}
+
+/// [`values`] on bytes (R2): calls `f` with the place of each value in `v`.
+pub fn value_ranges(v: &[u8], name: &[u8], list: bool, f: &mut dyn FnMut(std::ops::Range<usize>)) {
+    let end = v.len();
     let mut att_beg = 0;
     while att_beg + name.len() + 1 < end {
         while att_beg < end && is_spht(v[att_beg]) {
@@ -142,15 +148,13 @@ pub fn values<'a>(elem: &'a str, name: &str, list: bool) -> Vec<&'a str> {
         };
         if v.get(att_beg) != Some(&b'$') && equal != next {
             if name.is_empty() || v.get(att_beg..att_end) == Some(name) {
-                // The bounds border ASCII delimiters or the ends: char boundaries.
-                out.push(elem.get(val_beg..val_end).unwrap_or(""));
+                f(val_beg..val_end);
             } else if !list {
                 break;
             }
         }
         att_beg = next + 1;
     }
-    out
 }
 
 /// Appends the names of one `value` to `out` the way `smp_fetch_cookie_names` does: `delim`

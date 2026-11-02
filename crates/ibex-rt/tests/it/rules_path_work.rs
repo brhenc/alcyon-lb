@@ -146,7 +146,9 @@ fn the_rules_scenario_costs_what_is_pinned() {
     assert_eq!(counts[Op::CtxClone as usize], 0, "sample context copies");
     assert_eq!(counts[Op::ExprLookup as usize], 0, "expressions looked up by text");
     // X2: 24 before (the copying parse and `req_htx_init` reading every header as text).
-    assert_eq!(counts[UTF8], 14 * N, "HTX blocks read as UTF-8");
+    // R2: 14 before, the 2 ACLs' and `set-var(txn.p) path`'s samples reading the request line
+    // and the headers as text (they are bytes now).
+    assert_eq!(counts[UTF8], 4 * N, "HTX blocks read as UTF-8");
 }
 
 /// Anonymous ACLs, `%[...]` in request and response formats, response `set-var` and

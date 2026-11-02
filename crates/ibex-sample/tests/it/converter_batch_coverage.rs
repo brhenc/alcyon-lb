@@ -61,12 +61,14 @@ fn json_converters_utf8() {
     let reg = Registry::new();
     let ctx = SampleContext::default();
 
+    // U+FFFD is a valid character (EF BF BD), written as any other past 0xFF; HAProxy
+    // 3.5-dev8-885761-29 answers `bad\ufffdchar` in both modes (R2: the input is bytes).
     let bad_utf8 = "bad\u{FFFD}char";
     let res = reg.eval("str", &[bad_utf8.to_string()], &[("json", vec!["utf8".to_string()])], &ctx);
-    assert_eq!(res, Some(Sample::Str("".to_string())));
+    assert_eq!(res, Some(Sample::Str("bad\\ufffdchar".to_string())));
 
     let res2 = reg.eval("str", &[bad_utf8.to_string()], &[("json", vec!["utf8s".to_string()])], &ctx);
-    assert_eq!(res2, Some(Sample::Str("badchar".to_string())));
+    assert_eq!(res2, Some(Sample::Str("bad\\ufffdchar".to_string())));
 }
 
 #[test]
@@ -131,14 +133,14 @@ fn bin_fetch_of_text_is_its_bytes() {
     assert_eq!(reg.eval("bin", &[stray], &[], &ctx), Some(Sample::Bin(b"z\xe9".to_vec())));
 }
 
-/// `json(utf8)` of a stray byte is empty and `json(utf8s)` drops it (T286: the byte is held
-/// as an escape character, no longer as U+FFFD).
+/// `json(utf8)` of a stray byte gives no sample (`sample_conv_json` returns 0; HAProxy
+/// 3.5-dev8-885761-29 sets no variable from it) and `json(utf8s)` drops it.
 #[test]
 fn json_utf8_modes_see_a_stray_byte_as_invalid() {
     let reg = Registry::new();
     let ctx = SampleContext::default();
     let stray = ibex_regex::bytetext::bytes_to_text(b"-\xe0-");
     let run = |mode: &str| reg.eval("str", &[stray.clone()], &[("json", vec![mode.to_string()])], &ctx);
-    assert_eq!(run("utf8"), Some(Sample::Str(String::new())));
+    assert_eq!(run("utf8"), None);
     assert_eq!(run("utf8s"), Some(Sample::Str("--".to_string())));
 }

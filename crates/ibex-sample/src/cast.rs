@@ -8,7 +8,8 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::sample::{Sample, SampleType, SAMPLE_TYPES_COUNT};
+use crate::sample::{Sample, SampleType, Smp, SAMPLE_TYPES_COUNT};
+use std::borrow::Cow;
 use ibex_proto::htx::HttpMethod;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -26,6 +27,31 @@ pub fn cast(smp: Sample, target_type: SampleType) -> Option<Sample> {
 
     let f = CAST_MATRIX[src_idx][dst_idx]?;
     f(smp)
+}
+
+/// [`cast`] of a sample in its bytes form (R2): between text and binary the bytes are moved
+/// (borrowed ones stay borrowed); `bin` to `str` stops at the first NUL as `c_bin2str` does.
+/// Every other cast is [`cast`]'s, through the text form.
+#[must_use]
+pub fn cast_smp(smp: Smp<'_>, target_type: SampleType) -> Option<Smp<'_>> {
+    if smp.sample_type() == target_type {
+        return Some(smp);
+    }
+    match (smp, target_type) {
+        (Smp::Str(b), SampleType::Bin) => Some(Smp::Bin(b)),
+        (Smp::Bin(b), SampleType::Str) => Some(Smp::Str(match b.iter().position(|&c| c == 0) {
+            Some(nul) => match b {
+                Cow::Borrowed(b) => Cow::Borrowed(&b[..nul]),
+                Cow::Owned(mut v) => {
+                    v.truncate(nul);
+                    Cow::Owned(v)
+                }
+            },
+            None => b,
+        })),
+        (Smp::Str(b) | Smp::Bin(b), SampleType::Meth) => Some(Smp::Meth(HttpMethod::from_bytes(&b))),
+        (smp, t) => cast(smp.into_sample(), t).map(Smp::from_sample),
+    }
 }
 
 /// Checks whether an implicit cast from `src` to `dst` is available.

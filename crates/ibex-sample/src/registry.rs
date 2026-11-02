@@ -7,13 +7,13 @@
 
 #![forbid(unsafe_code)]
 
-use crate::cast::cast;
 use crate::hash::{
     full_hash, hash_crc32, hash_crc32c, hash_djb2, hash_sdbm, hash_wt6, hash_xxh3, hash_xxh32,
     hash_xxh64, md5_digest, sha1_digest, sha224_digest, sha256_digest, sha384_digest,
     sha512_digest,
 };
-use crate::sample::{Sample, SampleType, TypeSpec};
+use crate::sample::{Sample, SampleType, Smp, TypeSpec};
+use std::borrow::Cow;
 use ibex_proto::htx::{Htx, HtxSliceRef};
 
 use std::cell::{Cell, RefCell};
@@ -699,6 +699,17 @@ pub type MultiFetchFn = fn(&SampleContext, &[String]) -> Vec<Sample>;
 /// ACL iterates on most (the headers).
 pub type VisitFetchFn = fn(&SampleContext, &[String], &mut dyn FnMut(Sample) -> bool);
 
+/// R2: a fetch that gives its sample as bytes ([`Smp`]), borrowed from the context where the
+/// value is there as it is (a header, the path): no copy, no UTF-8 check. Registered beside the
+/// text form ([`FetchFn`]) of the same fetch, which the compiled path no longer calls.
+pub type ViewFetchFn = for<'c> fn(&'c SampleContext<'_>, &[String]) -> Option<Smp<'c>>;
+
+/// R2: [`VisitFetchFn`] of a [`ViewFetchFn`]: each sample handed over as borrowed bytes.
+pub type ViewVisitFn = for<'c> fn(&'c SampleContext<'_>, &[String], &mut dyn FnMut(Smp<'c>) -> bool);
+
+/// R2: a converter on bytes: a borrowed input that it does not change goes out borrowed.
+pub type ViewConvFn = for<'a> fn(Smp<'a>, &[String]) -> Option<Smp<'a>>;
+
 thread_local! {
     static LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -722,6 +733,8 @@ pub fn name_lookups_on_this_thread() -> u64 {
 enum ConvRef {
     Plain(ConvFn),
     WithCtx(CtxConvFn),
+    /// On bytes (R2).
+    View(ViewConvFn),
 }
 
 /// The fetch and converters of an expression resolved once to function pointers, so the
@@ -732,6 +745,10 @@ pub struct Compiled {
     single: Option<FetchFn>,
     multi: Option<MultiFetchFn>,
     visit: Option<VisitFetchFn>,
+    /// The fetch on bytes, when it has that form (R2): used instead of `single`.
+    view: Option<ViewFetchFn>,
+    /// The iteration on bytes, when the fetch has it: used instead of `visit`.
+    visit_view: Option<ViewVisitFn>,
     convs: Vec<(TypeSpec, ConvRef)>,
     /// `var(<name>)`: the variable resolved at load (T595), read by number.
     var: Option<crate::vars::VarRef>,
@@ -744,12 +761,15 @@ impl Compiled {
     }
 
     /// The single fetch's sample: `var()` by the number it was given at load.
-    fn fetch_single(&self, ctx: &SampleContext, args: &[String]) -> Option<Sample> {
+    fn fetch_single<'c>(&self, ctx: &'c SampleContext<'_>, args: &[String]) -> Option<Smp<'c>> {
         if let Some(v) = &self.var {
             // `smp_fetch_var`: the variable, else the default (a string).
-            return v.get(ctx.vars).or_else(|| args.get(1).cloned().map(Sample::Str));
+            return v.get(ctx.vars).or_else(|| args.get(1).cloned().map(Sample::Str)).map(Smp::from_sample);
         }
-        self.single.and_then(|f| f(ctx, args))
+        if let Some(f) = self.view {
+            return f(ctx, args);
+        }
+        self.single.and_then(|f| f(ctx, args)).map(Smp::from_sample)
     }
 }
 
@@ -766,6 +786,10 @@ pub struct Registry {
     ctx_converters: HashMap<&'static str, CtxConvDesc>,
     multi_fetches: HashMap<&'static str, MultiFetchFn>,
     multi_visits: HashMap<&'static str, VisitFetchFn>,
+    /// R2: the fetches, iterations and converters that have a form on bytes.
+    views: HashMap<&'static str, ViewFetchFn>,
+    visit_views: HashMap<&'static str, ViewVisitFn>,
+    conv_views: HashMap<&'static str, ViewConvFn>,
 }
 
 fn resolve_int_arg(arg: &str) -> Option<i64> {
@@ -1296,10 +1320,31 @@ impl Registry {
             ctx_converters: HashMap::new(),
             multi_fetches: HashMap::new(),
             multi_visits: HashMap::new(),
+            views: HashMap::new(),
+            visit_views: HashMap::new(),
+            conv_views: HashMap::new(),
         };
         r.register_builtin_fetches();
         r.register_builtin_converters();
         r
+    }
+
+    /// R2: gives the fetches `names` (registered in their text form) their form on bytes,
+    /// `one` and, for those an ACL iterates on, `visit`.
+    fn register_views(&mut self, names: &[&'static str], one: ViewFetchFn, visit: Option<ViewVisitFn>) {
+        for &name in names {
+            debug_assert!(self.fetches.contains_key(name), "view of unregistered fetch {name}");
+            self.views.insert(name, one);
+            if let Some(v) = visit {
+                self.visit_views.insert(name, v);
+            }
+        }
+    }
+
+    /// R2: gives the converter `name` (registered in its text form) its form on bytes.
+    fn register_conv_view(&mut self, name: &'static str, f: ViewConvFn) {
+        debug_assert!(self.converters.contains_key(name), "view of unregistered converter {name}");
+        self.conv_views.insert(name, f);
     }
 
     pub fn register_multi_fetch(&mut self, name: &'static str, func: MultiFetchFn) {
@@ -1735,27 +1780,18 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "path",
             out_type: SampleType::Str,
-            func: |ctx, _args| {
-                // `http_parse_path`: a target that is neither an absolute path nor an
-                // absolute URI (`*`, `host:port`, what `replace-path a Y` leaves) has none.
-                let path = http_parse_path(get_context_uri(ctx)?, get_context_method(ctx) == Some("OPTIONS"))?;
-                Some(Sample::Str(crate::spare::string_from(path.split('?').next().unwrap_or_default())))
-            },
+            func: |ctx, args| path_b(ctx, args).map(Smp::into_sample),
         });
+        self.register_views(&["path"], path_b, None);
 
         self.register_fetch(FetchDesc {
             name: "pathq",
             out_type: SampleType::Str,
-            func: |ctx, _args| {
-                let path = http_parse_path(get_context_uri(ctx)?, get_context_method(ctx) == Some("OPTIONS"))?;
-                Some(Sample::Str(crate::spare::string_from(path)))
-            },
+            func: |ctx, args| pathq_b(ctx, args).map(Smp::into_sample),
         });
+        self.register_views(&["pathq"], pathq_b, None);
 
-        let url_fetch: FetchFn = |ctx, _args| {
-            let uri = get_context_uri(ctx)?;
-            Some(Sample::Str(crate::spare::string_from(uri)))
-        };
+        let url_fetch: FetchFn = |ctx, args| url_b(ctx, args).map(Smp::into_sample);
         self.register_fetch(FetchDesc {
             name: "url",
             out_type: SampleType::Str,
@@ -1766,6 +1802,7 @@ impl Registry {
             out_type: SampleType::Str,
             func: url_fetch,
         });
+        self.register_views(&["url", "req.uri"], url_b, None);
 
         self.register_fetch(FetchDesc {
             name: "url_ip",
@@ -1787,12 +1824,9 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "query",
             out_type: SampleType::Str,
-            func: |ctx, _args| {
-                let uri = get_context_uri(ctx)?;
-                let (_, _, query) = split_uri(uri);
-                Some(Sample::Str(query.to_string()))
-            },
+            func: |ctx, args| query_b(ctx, args).map(Smp::into_sample),
         });
+        self.register_views(&["query"], query_b, None);
 
         // T337: `url_param`/`urlp` give the first parameter as a sample; an ACL tries each one.
         self.register_iterating(
@@ -2082,10 +2116,9 @@ impl Registry {
             |ctx, args| header_one(ctx, args, false, true).map(Sample::Str),
             |ctx, args| header_all(ctx, args, false, true).into_iter().map(Sample::Str).collect(),
         );
-        for name in ["req.hdr", "hdr"] {
-            self.multi_visits.insert(name, |ctx, args, f| header_visit(ctx, args, false, false, f));
-        }
-        self.multi_visits.insert("req.fhdr", |ctx, args, f| header_visit(ctx, args, false, true, f));
+        // R2: the values as the bytes of the header blocks, borrowed.
+        self.register_views(&["req.hdr", "hdr"], |ctx, args| header_one_b(ctx, args, false, false).map(Smp::Str), Some(|ctx, args, f| header_visit_b(ctx, args, false, false, f)));
+        self.register_views(&["req.fhdr"], |ctx, args| header_one_b(ctx, args, false, true).map(Smp::Str), Some(|ctx, args, f| header_visit_b(ctx, args, false, true, f)));
 
         // `http_auth_bearer([<header>])` (`smp_fetch_http_auth_bearer`): the token of a
         // `Bearer` credential in the first `<header>` (default `Authorization`). The scheme is
@@ -2120,10 +2153,8 @@ impl Registry {
             |ctx, args| header_one(ctx, args, true, true).map(Sample::Str),
             |ctx, args| header_all(ctx, args, true, true).into_iter().map(Sample::Str).collect(),
         );
-        for name in ["res.hdr", "shdr"] {
-            self.multi_visits.insert(name, |ctx, args, f| header_visit(ctx, args, true, false, f));
-        }
-        self.multi_visits.insert("res.fhdr", |ctx, args, f| header_visit(ctx, args, true, true, f));
+        self.register_views(&["res.hdr", "shdr"], |ctx, args| header_one_b(ctx, args, true, false).map(Smp::Str), Some(|ctx, args, f| header_visit_b(ctx, args, true, false, f)));
+        self.register_views(&["res.fhdr"], |ctx, args| header_one_b(ctx, args, true, true).map(Smp::Str), Some(|ctx, args, f| header_visit_b(ctx, args, true, true, f)));
 
         // T327: req.fhdr_cnt counts lines and req.hdr_cnt values, with or without a name, on
         // the headers as the oracle's H1 parser leaves them (`cleaned_for`).
@@ -2308,15 +2339,18 @@ impl Registry {
         self.register_iterating(
             &["req.cook", "cook", "cookie"],
             SampleType::Str,
-            |ctx, args| cookie_fetch(ctx, args, false, false).pop().map(Sample::Str),
+            |ctx, args| cookie_one_b(ctx, args, false).map(Smp::into_sample),
             |ctx, args| cookie_fetch(ctx, args, false, true).into_iter().map(Sample::Str).collect(),
         );
+        // R2: as the bytes of the `Cookie` header, borrowed.
+        self.register_views(&["req.cook", "cook", "cookie"], |ctx, args| cookie_one_b(ctx, args, false), Some(|ctx, args, f| cookie_visit_b(ctx, args, false, f)));
         self.register_iterating(
             &["res.cook", "scook"],
             SampleType::Str,
-            |ctx, args| cookie_fetch(ctx, args, true, false).pop().map(Sample::Str),
+            |ctx, args| cookie_one_b(ctx, args, true).map(Smp::into_sample),
             |ctx, args| cookie_fetch(ctx, args, true, true).into_iter().map(Sample::Str).collect(),
         );
+        self.register_views(&["res.cook", "scook"], |ctx, args| cookie_one_b(ctx, args, true), Some(|ctx, args, f| cookie_visit_b(ctx, args, true, f)));
 
         // T337: `smp_fetch_cookie_cnt` on a request: every cookie `smp_fetch_cookie` would try.
         let cook_cnt_fetch: FetchFn = |ctx, args| Some(Sample::Sint(len_to_sint(cookie_fetch(ctx, args, false, true).len())));
@@ -3465,6 +3499,11 @@ impl Registry {
                             continue;
                         }
                     }
+                    // A byte of the configuration that is not UTF-8 is that byte (bytetext).
+                    if let Some(b) = ibex_regex::bytetext::unescape_char(c) {
+                        bytes.push(b);
+                        continue;
+                    }
                     let mut buf = [0; 4];
                     bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
                 }
@@ -3880,6 +3919,16 @@ impl Registry {
                 _ => None,
             },
         });
+        // `sample_conv_str2lower`: ASCII only, in place (owned bytes are lowered where they are).
+        self.register_conv_view("lower", |smp, _args| match smp {
+            Smp::Str(mut b) => {
+                if b.iter().any(u8::is_ascii_uppercase) {
+                    b.to_mut().make_ascii_lowercase();
+                }
+                Some(Smp::Str(b))
+            }
+            _ => None,
+        });
 
         self.register_converter(ConvDesc {
             name: "upper",
@@ -3890,6 +3939,15 @@ impl Registry {
                 Sample::Str(s) => Some(Sample::Str(s.to_ascii_uppercase())),
                 _ => None,
             },
+        });
+        self.register_conv_view("upper", |smp, _args| match smp {
+            Smp::Str(mut b) => {
+                if b.iter().any(u8::is_ascii_lowercase) {
+                    b.to_mut().make_ascii_uppercase();
+                }
+                Some(Smp::Str(b))
+            }
+            _ => None,
         });
 
         // A sample longer than i64::MAX bytes cannot exist, so the conversion never
@@ -3984,176 +4042,17 @@ impl Registry {
             name: "field",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, args| {
-                // T359
-                let idx_str = args.first()?;
-                let seps_str = args.get(1).map_or(" ", |s| s.as_str());
-                let idx: i64 = idx_str.parse().ok()?;
-                if idx == 0 {
-                    return None;
-                }
-                let count = args.get(2).map_or(1i32, |c| parse_count(c));
-                let Sample::Str(mut s) = smp else { return None };
-                let bytes = s.as_bytes();
-                let len = bytes.len();
-                let seps = seps_str.as_bytes();
-                // The field is cut out of the input's own string, which allocates nothing.
-                let (start, end) = if idx < 0 {
-                    let mut field = -1i64;
-                    let mut start = len;
-                    let mut end = len;
-                    let mut cnt = count;
-                    let mut found = false;
-                    while start > 0 {
-                        let pos = start - 1;
-                        let Some(&b) = bytes.get(pos) else { break };
-                        if seps.contains(&b) {
-                            if field == idx {
-                                if cnt == 1 {
-                                    found = true;
-                                    break;
-                                } else if cnt > 1 {
-                                    cnt -= 1;
-                                }
-                            } else {
-                                end = pos;
-                                field -= 1;
-                            }
-                        }
-                        start -= 1;
-                    }
-                    if !found && field != idx {
-                        return None;
-                    }
-                    (start, end)
-                } else {
-                    let mut field = 1i64;
-                    let mut start = 0usize;
-                    let mut end = 0usize;
-                    let mut cnt = count;
-                    let mut found = false;
-                    while end < len {
-                        let Some(&b) = bytes.get(end) else { break };
-                        if seps.contains(&b) {
-                            if field == idx {
-                                if cnt == 1 {
-                                    found = true;
-                                    break;
-                                } else if cnt > 1 {
-                                    cnt -= 1;
-                                }
-                            } else {
-                                start = end + 1;
-                                field += 1;
-                            }
-                        }
-                        end += 1;
-                    }
-                    if !found && field != idx {
-                        return None;
-                    }
-                    (start, end)
-                };
-                s.get(start..end)?;
-                s.truncate(end);
-                s.replace_range(..start, "");
-                Some(Sample::Str(s))
-            },
+            func: |smp, args| field_b(Smp::from_sample(smp), args).map(Smp::into_sample),
         });
+        self.register_conv_view("field", field_b);
 
         self.register_converter(ConvDesc {
             name: "word",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, args| {
-                // T359
-                let idx_str = args.first()?;
-                let seps_str = args.get(1).map_or(" ", |s| s.as_str());
-                let idx: i64 = idx_str.parse().ok()?;
-                if idx == 0 {
-                    return None;
-                }
-                let count = args.get(2).map_or(1i32, |c| parse_count(c));
-                let Sample::Str(s) = smp else { return None };
-                let bytes = s.as_bytes();
-                let len = bytes.len();
-                let seps = seps_str.as_bytes();
-                if idx < 0 {
-                    let mut word_num = 0i64;
-                    let mut in_word = false;
-                    let mut start = len;
-                    let mut end = len;
-                    let mut cnt = count;
-                    let mut found = false;
-                    while start > 0 {
-                        let pos = start - 1;
-                        let Some(&b) = bytes.get(pos) else { break };
-                        let is_sep = seps.contains(&b);
-                        if !in_word {
-                            if !is_sep {
-                                if word_num != idx {
-                                    word_num -= 1;
-                                    end = start;
-                                }
-                                in_word = true;
-                            }
-                        } else if is_sep {
-                            if word_num == idx {
-                                if cnt == 1 {
-                                    found = true;
-                                    break;
-                                } else if cnt > 1 {
-                                    cnt -= 1;
-                                }
-                            }
-                            in_word = false;
-                        }
-                        start -= 1;
-                    }
-                    if !found && word_num != idx {
-                        return None;
-                    }
-                    let slice = s.get(start..end)?;
-                    Some(Sample::Str(slice.to_string()))
-                } else {
-                    let mut word_num = 0i64;
-                    let mut in_word = false;
-                    let mut start = 0usize;
-                    let mut end = 0usize;
-                    let mut cnt = count;
-                    let mut found = false;
-                    while end < len {
-                        let Some(&b) = bytes.get(end) else { break };
-                        let is_sep = seps.contains(&b);
-                        if !in_word {
-                            if !is_sep {
-                                if word_num != idx {
-                                    word_num += 1;
-                                    start = end;
-                                }
-                                in_word = true;
-                            }
-                        } else if is_sep {
-                            if word_num == idx {
-                                if cnt == 1 {
-                                    found = true;
-                                    break;
-                                } else if cnt > 1 {
-                                    cnt -= 1;
-                                }
-                            }
-                            in_word = false;
-                        }
-                        end += 1;
-                    }
-                    if !found && word_num != idx {
-                        return None;
-                    }
-                    let slice = s.get(start..end)?;
-                    Some(Sample::Str(slice.to_string()))
-                }
-            },
+            func: |smp, args| word_b(Smp::from_sample(smp), args).map(Smp::into_sample),
         });
+        self.register_conv_view("word", word_b);
 
         self.register_converter(ConvDesc {
             name: "param",
@@ -4354,11 +4253,9 @@ impl Registry {
             name: "url_enc",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, _args| match smp {
-                Sample::Str(s) => Some(Sample::Str(url_encode(&s))),
-                _ => None,
-            },
+            func: |smp, args| url_enc_b(Smp::from_sample(smp), args).map(Smp::into_sample),
         });
+        self.register_conv_view("url_enc", url_enc_b);
 
         // --- 2. Arithmetic & Bitwise Logic ---
 
@@ -5277,74 +5174,13 @@ impl Registry {
         reg_map!("map_ip", MapMatchType::Ip, TypeSpec::Addr);
 
         // --- 6. JSON Converters ---
-        fn json_escape(s: &str) -> String {
-            let mut out = String::with_capacity(s.len());
-            for c in s.chars() {
-                match c {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '/' => out.push_str("\\/"),
-                    '\x08' => out.push_str("\\b"),
-                    '\x0c' => out.push_str("\\f"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    _ if c.is_control() => {
-                        use std::fmt::Write;
-                        let _ = write!(out, "\\u{:04x}", c as u32);
-                    }
-                    _ => out.push(c),
-                }
-            }
-            out
-        }
-
         self.register_converter(ConvDesc {
             name: "json",
             in_type: TypeSpec::Exact(SampleType::Str),
             out_type: TypeSpec::Exact(SampleType::Str),
-            func: |smp, args| match smp {
-                Sample::Str(s) => {
-                    let mode = args.first().map(|x| x.as_str()).unwrap_or("");
-                    // A byte that is not UTF-8 is held as an escape character (T286), and
-                    // U+FFFD is the replacement character itself.
-                    let invalid = |c: char| c == '\u{FFFD}' || ibex_regex::bytetext::unescape_char(c).is_some();
-                    if mode == "utf8" && s.chars().any(invalid) {
-                        return Some(Sample::Str(String::new()));
-                    }
-                    if mode != "utf8" && mode != "utf8s" {
-                        // IT_ASCII (default): every byte on its own; a byte that is not
-                        // printable ASCII (control, 0x7f, >= 0x80) becomes \u00XX.
-                        let mut out = String::new();
-                        for b in ibex_regex::bytetext::text_to_bytes(&s).iter() {
-                            match *b {
-                                b'"' => out.push_str("\\\""),
-                                b'\\' => out.push_str("\\\\"),
-                                b'/' => out.push_str("\\/"),
-                                8 => out.push_str("\\b"),
-                                12 => out.push_str("\\f"),
-                                b'\r' => out.push_str("\\r"),
-                                b'\n' => out.push_str("\\n"),
-                                b'\t' => out.push_str("\\t"),
-                                0x20..=0x7e => out.push(char::from(*b)),
-                                _ => {
-                                    use std::fmt::Write;
-                                    let _ = write!(out, "\\u{:04x}", *b);
-                                }
-                            }
-                        }
-                        return Some(Sample::Str(out));
-                    }
-                    let s = if mode == "utf8s" {
-                        s.chars().filter(|c| !invalid(*c)).collect()
-                    } else {
-                        s
-                    };
-                    Some(Sample::Str(json_escape(&s)))
-                }
-                _ => None,
-            },
+            func: |smp, args| json_b(Smp::from_sample(smp), args).map(Smp::into_sample),
         });
+        self.register_conv_view("json", json_b);
         
         /// C's `printf("%g")`: six significant digits, trailing zeros dropped, an exponent
         /// below -4 or from 6 up.
@@ -6495,24 +6331,48 @@ impl Registry {
     /// Applies a chain of converters to a sample value, with the runtime state the context
     /// converters read. The converters' names are of any string type (an
     /// [`crate::expr::Expr`]'s own are passed with no copy of them).
-    pub(crate) fn apply_converters_g<S: AsRef<str>>(
+    pub(crate) fn apply_converters_g<'a, S: AsRef<str>>(
         &self,
         ctx: &SampleContext,
-        mut smp: Sample,
+        mut smp: Smp<'a>,
         converters: &[(S, Vec<String>)],
-    ) -> Option<Sample> {
+    ) -> Option<Smp<'a>> {
         for (c_name, c_args) in converters {
             let c_name = c_name.as_ref();
-            let (in_type, func) = if let Some(d) = self.get_converter(c_name) {
-                (d.in_type, ConvRef::Plain(d.func))
-            } else {
-                let d = self.get_ctx_converter(c_name)?;
-                (d.in_type, ConvRef::WithCtx(d.func))
-            };
+            let (in_type, func) = self.conv_ref(c_name)?;
             smp = run_conv(ctx, smp, in_type, func, c_args)?;
         }
-
         Some(smp)
+    }
+
+    /// The converter `name` resolved: its form on bytes when it has one.
+    fn conv_ref(&self, name: &str) -> Option<(TypeSpec, ConvRef)> {
+        if let Some(d) = self.get_converter(name) {
+            return Some((d.in_type, self.conv_views.get(name).map_or(ConvRef::Plain(d.func), |v| ConvRef::View(*v))));
+        }
+        let d = self.get_ctx_converter(name)?;
+        Some((d.in_type, ConvRef::WithCtx(d.func)))
+    }
+
+    /// The samples of fetch `name` before any converter, in their bytes form.
+    fn fetch_all<'c>(&self, fetch_name: &str, fetch_args: &[String], ctx: &'c SampleContext<'_>) -> Option<Vec<Smp<'c>>> {
+        if let Some(mf) = self.multi_fetches.get(fetch_name) {
+            return Some(mf(ctx, fetch_args).into_iter().map(Smp::from_sample).collect());
+        }
+        let f_desc = self.get_fetch(fetch_name)?;
+        Some(match self.views.get(fetch_name) {
+            Some(v) => v(ctx, fetch_args).into_iter().collect(),
+            None => (f_desc.func)(ctx, fetch_args).into_iter().map(Smp::from_sample).collect(),
+        })
+    }
+
+    /// The single sample of fetch `name` before any converter, in its bytes form.
+    fn fetch_one<'c>(&self, fetch_name: &str, fetch_args: &[String], ctx: &'c SampleContext<'_>) -> Option<Option<Smp<'c>>> {
+        let f_desc = self.get_fetch(fetch_name)?;
+        Some(match self.views.get(fetch_name) {
+            Some(v) => v(ctx, fetch_args),
+            None => (f_desc.func)(ctx, fetch_args).map(Smp::from_sample),
+        })
     }
 
     /// Evaluates a fetch and a chain of converters against the given context, returning all matching sample values.
@@ -6561,18 +6421,11 @@ impl Registry {
         stop_at_failure: bool,
     ) -> Vec<Sample> {
         note_lookup();
-        let initial_samples = if let Some(mf) = self.multi_fetches.get(fetch_name) {
-            mf(ctx, fetch_args)
-        } else if let Some(f_desc) = self.get_fetch(fetch_name) {
-            (f_desc.func)(ctx, fetch_args).into_iter().collect()
-        } else {
-            return Vec::new();
-        };
-
+        let Some(initial_samples) = self.fetch_all(fetch_name, fetch_args, ctx) else { return Vec::new() };
         let mut out = Vec::with_capacity(initial_samples.len());
         for smp in initial_samples {
             match self.apply_converters_g(ctx, smp, converters) {
-                Some(res) => out.push(res),
+                Some(res) => out.push(res.into_sample()),
                 None if stop_at_failure => break,
                 None => {}
             }
@@ -6582,7 +6435,7 @@ impl Registry {
 
     /// [`Self::eval_all_acl`] with each sample handed to `f` instead of collected, and true
     /// when `f` was true for one: every sample is still produced (a converter may store a
-    /// variable), but a fetch of one sample needs no list, and a text sample's string is
+    /// variable), but a fetch of one sample needs no list, and a sample's owned bytes are
     /// given back for reuse ([`crate::spare`]) once `f` has seen it (T437).
     pub(crate) fn any_acl<S: AsRef<str>>(
         &self,
@@ -6590,15 +6443,15 @@ impl Registry {
         fetch_args: &[String],
         converters: &[(S, Vec<String>)],
         ctx: &SampleContext,
-        mut f: impl FnMut(&Sample) -> bool,
+        mut f: impl FnMut(&Smp) -> bool,
     ) -> bool {
         let mut any = false;
-        let mut see = |smp: Sample| {
+        let mut see = |smp: Smp| {
             any |= f(&smp);
-            crate::spare::give_sample(smp);
+            give_smp(smp);
         };
         note_lookup();
-        if let Some(visit) = self.multi_visits.get(fetch_name) {
+        if let Some(visit) = self.visit_views.get(fetch_name) {
             visit(ctx, fetch_args, &mut |smp| match self.apply_converters_g(ctx, smp, converters) {
                 Some(res) => {
                     see(res);
@@ -6606,17 +6459,23 @@ impl Registry {
                 }
                 None => false,
             });
-        } else if let Some(mf) = self.multi_fetches.get(fetch_name) {
-            for smp in mf(ctx, fetch_args) {
+        } else if let Some(visit) = self.multi_visits.get(fetch_name) {
+            visit(ctx, fetch_args, &mut |smp| match self.apply_converters_g(ctx, Smp::from_sample(smp), converters) {
+                Some(res) => {
+                    see(res);
+                    true
+                }
+                None => false,
+            });
+        } else if self.multi_fetches.contains_key(fetch_name) {
+            for smp in self.fetch_all(fetch_name, fetch_args, ctx).unwrap_or_default() {
                 match self.apply_converters_g(ctx, smp, converters) {
                     Some(res) => see(res),
                     None => break,
                 }
             }
-        } else if let Some(f_desc) = self.get_fetch(fetch_name) {
-            if let Some(res) = (f_desc.func)(ctx, fetch_args).and_then(|smp| self.apply_converters_g(ctx, smp, converters)) {
-                see(res);
-            }
+        } else if let Some(res) = self.fetch_one(fetch_name, fetch_args, ctx).flatten().and_then(|smp| self.apply_converters_g(ctx, smp, converters)) {
+            see(res);
         }
         any
     }
@@ -6641,34 +6500,55 @@ impl Registry {
         converters: &[(S, Vec<String>)],
         ctx: &SampleContext,
     ) -> Option<Sample> {
+        self.eval_smp_g(fetch_name, fetch_args, converters, ctx).map(Smp::into_sample)
+    }
+
+    /// [`Self::eval_g`] in the bytes form (R2).
+    pub(crate) fn eval_smp_g<'c, S: AsRef<str>>(
+        &self,
+        fetch_name: &str,
+        fetch_args: &[String],
+        converters: &[(S, Vec<String>)],
+        ctx: &'c SampleContext<'_>,
+    ) -> Option<Smp<'c>> {
         // T337: a fetch that iterates in an ACL gives its own single sample here (the last
         // header value, the last cookie), not the first of the ACL's list.
-        if let Some(f_desc) = self.get_fetch(fetch_name) {
-            let smp = (f_desc.func)(ctx, fetch_args)?;
-            return self.apply_converters_g(ctx, smp, converters);
+        if let Some(smp) = self.fetch_one(fetch_name, fetch_args, ctx) {
+            return self.apply_converters_g(ctx, smp?, converters);
         }
-        self.eval_all_g(fetch_name, fetch_args, converters, ctx).into_iter().next()
+        let first = self.fetch_all(fetch_name, fetch_args, ctx)?.into_iter().find_map(|smp| self.apply_converters_g(ctx, smp, converters));
+        first
     }
 }
 
 /// One converter step: the implicit cast of the input to the converter's input type, then the
-/// converter.
-fn run_conv(ctx: &SampleContext, mut smp: Sample, in_type: TypeSpec, func: ConvRef, c_args: &[String]) -> Option<Sample> {
+/// converter. A converter with no form on bytes takes and gives the text form.
+fn run_conv<'a>(ctx: &SampleContext, mut smp: Smp<'a>, in_type: TypeSpec, func: ConvRef, c_args: &[String]) -> Option<Smp<'a>> {
     if !in_type.matches(smp.sample_type()) {
         if let TypeSpec::Exact(target_ty) = in_type {
-            smp = cast(smp, target_ty)?;
+            smp = crate::cast::cast_smp(smp, target_ty)?;
         } else {
             // Only `Exact` and `Addr` can refuse a type (`TypeSpec::matches`).
             debug_assert_eq!(in_type, TypeSpec::Addr);
-            smp = match cast(smp.clone(), SampleType::Ipv4) {
+            smp = match crate::cast::cast_smp(smp.clone(), SampleType::Ipv4) {
                 Some(v4) => v4,
-                None => cast(smp, SampleType::Ipv6)?,
+                None => crate::cast::cast_smp(smp, SampleType::Ipv6)?,
             };
         }
     }
     match func {
-        ConvRef::Plain(f) => f(smp, c_args),
-        ConvRef::WithCtx(f) => f(ctx, smp, c_args),
+        ConvRef::View(f) => f(smp, c_args),
+        ConvRef::Plain(f) => f(smp.into_sample(), c_args).map(Smp::from_sample),
+        ConvRef::WithCtx(f) => f(ctx, smp.into_sample(), c_args).map(Smp::from_sample),
+    }
+}
+
+/// Gives back a text sample's bytes for reuse when they were a [`crate::spare`] string.
+fn give_smp(smp: Smp<'_>) {
+    if let Smp::Str(Cow::Owned(v)) = smp {
+        if let Ok(s) = String::from_utf8(v) {
+            crate::spare::give(s);
+        }
     }
 }
 
@@ -6680,23 +6560,19 @@ impl Registry {
         let single = self.get_fetch(fetch_name).map(|d| d.func);
         let multi = self.multi_fetches.get(fetch_name).copied();
         let visit = self.multi_visits.get(fetch_name).copied();
+        let view = self.views.get(fetch_name).copied();
+        let visit_view = self.visit_views.get(fetch_name).copied();
         if single.is_none() && multi.is_none() {
             return None;
         }
         let mut convs = Vec::with_capacity(converters.len());
         for (name, _) in converters {
-            let name = name.as_ref();
-            if let Some(d) = self.get_converter(name) {
-                convs.push((d.in_type, ConvRef::Plain(d.func)));
-            } else {
-                let d = self.get_ctx_converter(name)?;
-                convs.push((d.in_type, ConvRef::WithCtx(d.func)));
-            }
+            convs.push(self.conv_ref(name.as_ref())?);
         }
-        Some(Compiled { single, multi, visit, convs, var: None })
+        Some(Compiled { single, multi, visit, view, visit_view, convs, var: None })
     }
 
-    fn apply_c<S>(c: &Compiled, ctx: &SampleContext, mut smp: Sample, converters: &[(S, Vec<String>)]) -> Option<Sample> {
+    fn apply_c<'a, S>(c: &Compiled, ctx: &SampleContext, mut smp: Smp<'a>, converters: &[(S, Vec<String>)]) -> Option<Smp<'a>> {
         for ((in_type, func), (_, args)) in c.convs.iter().zip(converters) {
             smp = run_conv(ctx, smp, *in_type, *func, args)?;
         }
@@ -6705,9 +6581,14 @@ impl Registry {
 
     /// [`Self::eval_all_g`] through a compiled expression: no name is looked up.
     pub(crate) fn eval_all_c<S>(c: &Compiled, fetch_args: &[String], converters: &[(S, Vec<String>)], ctx: &SampleContext) -> Vec<Sample> {
+        Self::eval_all_smp_c(c, fetch_args, converters, ctx).into_iter().map(Smp::into_sample).collect()
+    }
+
+    /// [`Self::eval_all_c`] in the bytes form.
+    pub(crate) fn eval_all_smp_c<'c, S>(c: &Compiled, fetch_args: &[String], converters: &[(S, Vec<String>)], ctx: &'c SampleContext<'_>) -> Vec<Smp<'c>> {
         // `compile` gives a multi or a single fetch, never neither.
-        let initial: Vec<Sample> = match c.multi {
-            Some(mf) => mf(ctx, fetch_args),
+        let initial: Vec<Smp<'c>> = match c.multi {
+            Some(mf) => mf(ctx, fetch_args).into_iter().map(Smp::from_sample).collect(),
             None => c.fetch_single(ctx, fetch_args).into_iter().collect(),
         };
         let mut out = Vec::with_capacity(initial.len());
@@ -6725,15 +6606,23 @@ impl Registry {
         fetch_args: &[String],
         converters: &[(S, Vec<String>)],
         ctx: &SampleContext,
-        mut f: impl FnMut(&Sample) -> bool,
+        mut f: impl FnMut(&Smp) -> bool,
     ) -> bool {
         let mut any = false;
-        let mut see = |smp: Sample| {
+        let mut see = |smp: Smp| {
             any |= f(&smp);
-            crate::spare::give_sample(smp);
+            give_smp(smp);
         };
-        if let Some(visit) = c.visit {
+        if let Some(visit) = c.visit_view {
             visit(ctx, fetch_args, &mut |smp| match Self::apply_c(c, ctx, smp, converters) {
+                Some(res) => {
+                    see(res);
+                    true
+                }
+                None => false,
+            });
+        } else if let Some(visit) = c.visit {
+            visit(ctx, fetch_args, &mut |smp| match Self::apply_c(c, ctx, Smp::from_sample(smp), converters) {
                 Some(res) => {
                     see(res);
                     true
@@ -6742,7 +6631,7 @@ impl Registry {
             });
         } else if let Some(mf) = c.multi {
             for smp in mf(ctx, fetch_args) {
-                match Self::apply_c(c, ctx, smp, converters) {
+                match Self::apply_c(c, ctx, Smp::from_sample(smp), converters) {
                     Some(res) => see(res),
                     None => break,
                 }
@@ -6755,9 +6644,14 @@ impl Registry {
 
     /// [`Self::eval_g`] through a compiled expression: no name is looked up.
     pub(crate) fn eval_c<S>(c: &Compiled, fetch_args: &[String], converters: &[(S, Vec<String>)], ctx: &SampleContext) -> Option<Sample> {
+        Self::eval_smp_c(c, fetch_args, converters, ctx).map(Smp::into_sample)
+    }
+
+    /// [`Self::eval_c`] in the bytes form.
+    pub(crate) fn eval_smp_c<'c, S>(c: &Compiled, fetch_args: &[String], converters: &[(S, Vec<String>)], ctx: &'c SampleContext<'_>) -> Option<Smp<'c>> {
         match c.single {
             Some(_) => Self::apply_c(c, ctx, c.fetch_single(ctx, fetch_args)?, converters),
-            None => Self::eval_all_c(c, fetch_args, converters, ctx).into_iter().next(),
+            None => Self::eval_all_smp_c(c, fetch_args, converters, ctx).into_iter().next(),
         }
     }
 }
@@ -6767,6 +6661,62 @@ fn get_context_uri<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
         .and_then(|h| h.req_line().map(|r| r.uri))
         .or(ctx.req_uri)
         .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_str())))
+}
+
+/// R2: [`get_context_uri`] as bytes, read from the HTX start line with no UTF-8 check.
+fn get_context_uri_b<'a>(ctx: &'a SampleContext) -> Option<&'a [u8]> {
+    ctx.htx_slice
+        .and_then(|h| h.req_line_bytes().map(|r| r.uri))
+        .or(ctx.req_uri.map(str::as_bytes))
+        .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.uri.as_bytes())))
+}
+
+/// R2: [`get_context_method`] as bytes.
+fn get_context_method_b<'a>(ctx: &'a SampleContext) -> Option<&'a [u8]> {
+    ctx.htx_slice
+        .and_then(|h| h.req_line_bytes().map(|r| r.method))
+        .or(ctx.req_method.map(str::as_bytes))
+        .or_else(|| ctx.htx.and_then(|h| h.req_line().map(|r| r.method.as_str().as_bytes())))
+}
+
+/// `path`: [`http_parse_path`] of the target up to `?`. A target that is neither an absolute
+/// path nor an absolute URI (`*`, `host:port`, what `replace-path a Y` leaves) has none.
+fn path_b<'c>(ctx: &'c SampleContext<'_>, _args: &[String]) -> Option<Smp<'c>> {
+    let path = pathq_bytes(ctx)?;
+    Some(Smp::str(&path[..path.iter().position(|&c| c == b'?').unwrap_or(path.len())]))
+}
+
+/// `pathq`: the path with its query.
+fn pathq_b<'c>(ctx: &'c SampleContext<'_>, _args: &[String]) -> Option<Smp<'c>> {
+    pathq_bytes(ctx).map(Smp::str)
+}
+
+fn pathq_bytes<'c>(ctx: &'c SampleContext<'_>) -> Option<&'c [u8]> {
+    // The HTX start line read once for the target and the method.
+    if let Some(line) = ctx.htx_slice.and_then(|h| h.req_line_bytes()) {
+        return http_parse_path_b(line.uri, line.method == b"OPTIONS");
+    }
+    http_parse_path_b(get_context_uri_b(ctx)?, get_context_method_b(ctx) == Some(b"OPTIONS"))
+}
+
+/// `url`, `req.uri`: the request target as it is.
+fn url_b<'c>(ctx: &'c SampleContext<'_>, _args: &[String]) -> Option<Smp<'c>> {
+    get_context_uri_b(ctx).map(Smp::str)
+}
+
+/// `query`: what follows the first `?` of the target ([`split_uri`]), empty without one.
+fn query_b<'c>(ctx: &'c SampleContext<'_>, _args: &[String]) -> Option<Smp<'c>> {
+    let uri = get_context_uri_b(ctx)?;
+    // [`split_uri`]: an `http://` or `https://` target's query is in what follows its first
+    // `/` after the scheme, none when there is no such `/`.
+    let rest = match uri.strip_prefix(b"http://").or_else(|| uri.strip_prefix(b"https://")) {
+        Some(after) => match after.iter().position(|&c| c == b'/') {
+            Some(i) => &after[i..],
+            None => &b""[..],
+        },
+        None => uri,
+    };
+    Some(Smp::str(rest.iter().position(|&c| c == b'?').map_or(&b""[..], |q| &rest[q + 1..])))
 }
 
 fn get_context_method<'a>(ctx: &'a SampleContext) -> Option<&'a str> {
@@ -6824,6 +6774,23 @@ fn fetch_base_path(ctx: &SampleContext, with_query: bool) -> Option<Sample> {
 /// An absolute URI that ends with its authority reads `/` (T326: the oracle's
 /// `http_scheme_based_normalize`, `src/http_htx.c`, adds it on the way in), except for an
 /// OPTIONS request (`options`), where it has no path.
+fn http_parse_path_b(uri: &[u8], options: bool) -> Option<&[u8]> {
+    match uri.first()? {
+        b'*' => return None,
+        b'/' => return Some(uri),
+        c if !c.is_ascii_alphabetic() => return None,
+        _ => {}
+    }
+    let scheme = 1 + uri[1..].iter().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.')).count();
+    let rest = uri[scheme..].strip_prefix(b"://")?;
+    match rest.iter().position(|c| matches!(c, b'/' | b'?' | b'#')) {
+        Some(i) => Some(&rest[i..]),
+        None if options => None,
+        None => Some(b"/"),
+    }
+}
+
+/// [`http_parse_path_b`] of a text target.
 fn http_parse_path(uri: &str, options: bool) -> Option<&str> {
     let b = uri.as_bytes();
     match b.first()? {
@@ -7179,80 +7146,17 @@ fn hdr_values(v: &str) -> Vec<&str> {
 /// T337: `MAX_HDR_HISTORY`, how far back from the last one a negative occurrence reaches.
 const MAX_HDR_HISTORY: u64 = 10;
 
-/// T337: calls `f` with each line of header `name`, in order, from the sources
-/// [`get_all_req_headers`] / (with `res`) [`get_all_res_headers`] read, without copying them.
-fn visit_header_lines(ctx: &SampleContext, name: &str, res: bool, f: &mut dyn FnMut(&str)) {
-    let mut any = false;
-    if res {
-        for (k, v) in ctx.res_headers.into_iter().flatten() {
-            if k.eq_ignore_ascii_case(name) {
-                any = true;
-                f(v);
-            }
-        }
-        if !any {
-            CURRENT_RES_HEADERS.with(|hdrs| {
-                for (k, v) in hdrs.borrow().iter() {
-                    if k.eq_ignore_ascii_case(name) {
-                        f(v);
-                    }
-                }
-            });
-        }
-        return;
-    }
-    if let Some(htx) = ctx.htx_slice {
-        for (k, v) in htx.headers() {
-            if k.eq_ignore_ascii_case(name) {
-                any = true;
-                f(v);
-            }
-        }
-    }
-    if any {
-        return;
-    }
-    for hf in ctx.htx.into_iter().flat_map(Htx::headers) {
-        if hf.name.eq_ignore_ascii_case(name) {
-            f(&hf.value);
-        }
-    }
-    for (k, v) in ctx.req_headers.into_iter().flatten() {
-        if k.eq_ignore_ascii_case(name) {
-            f(v);
-        }
-    }
-}
-
-/// T337: calls `f` with each value of header `name` as `smp_fetch_hdr` (comma values) or,
-/// with `full`, `smp_fetch_fhdr` (lines) sees them.
-fn visit_header_values(ctx: &SampleContext, name: &str, res: bool, full: bool, f: &mut dyn FnMut(&str)) {
-    visit_header_lines(ctx, name, res, &mut |line| {
-        if full {
-            // `__http_find_header` skips LWS on both sides even for a full line (`set-header`
-            // can store them; the wire keeps them).
-            f(line.trim_matches([' ', '\t']));
-            return;
-        }
-        let b = line.as_bytes();
-        let mut s = 0;
-        loop {
-            let n = hdr_value_end(b, s);
-            f(line[s..n].trim_matches([' ', '\t']));
-            if n >= b.len() {
-                return;
-            }
-            s = n + 1;
-        }
-    });
-}
-
 /// T337: the value of header `name` (`args[0]`) `smp_fetch_hdr` (comma values) or, with
 /// `full`, `smp_fetch_fhdr` (lines) gives as a sample: the `<occ>`th one (`args[1]`), counted
 /// from the end when negative, no further back than [`MAX_HDR_HISTORY`]
 /// (`http_get_htx_hdr`), and the last one when `<occ>` is absent or 0. Only the value given
 /// is copied: a negative occurrence counts the values first, then picks one.
 fn header_one(ctx: &SampleContext, args: &[String], res: bool, full: bool) -> Option<String> {
+    header_one_b(ctx, args, res, full).map(|v| crate::sample::text_of(&v))
+}
+
+/// [`header_one`] as the bytes of the header, borrowed from the context (R2).
+fn header_one_b<'c>(ctx: &'c SampleContext<'_>, args: &[String], res: bool, full: bool) -> Option<Cow<'c, [u8]>> {
     let name = args.first()?;
     let occ: i64 = args.get(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let target = if occ > 0 {
@@ -7263,13 +7167,13 @@ fn header_one(ctx: &SampleContext, args: &[String], res: bool, full: bool) -> Op
             return None;
         }
         let mut n: u64 = 0;
-        visit_header_values(ctx, name, res, full, &mut |_| n += 1);
+        visit_header_values_b(ctx, name, res, full, &mut |_| n += 1);
         n.checked_sub(back)?
     };
-    let (mut i, mut out): (u64, Option<String>) = (0, None);
-    visit_header_values(ctx, name, res, full, &mut |v| {
+    let (mut i, mut out): (u64, Option<Cow<'c, [u8]>>) = (0, None);
+    visit_header_values_b(ctx, name, res, full, &mut |v| {
         if i == target {
-            out = Some(crate::spare::string_from(v));
+            out = Some(v);
         }
         i += 1;
     });
@@ -7277,32 +7181,150 @@ fn header_one(ctx: &SampleContext, args: &[String], res: bool, full: bool) -> Op
 }
 
 /// T337: the values of header `name` an ACL tries (`SMP_OPT_ITERATE`): every one, or only
-/// [`header_one`]'s when an `<occ>` other than 0 is given.
-/// [`header_all`], each value handed to `f` as it is found (in a [`crate::spare`] string)
-/// until `f` returns false.
-fn header_visit(ctx: &SampleContext, args: &[String], res: bool, full: bool, f: &mut dyn FnMut(Sample) -> bool) {
+/// [`header_one_b`]'s when an `<occ>` other than 0 is given, each handed to `f` as it is
+/// found, as the bytes of the header (R2), until `f` returns false.
+fn header_visit_b<'c>(ctx: &'c SampleContext<'_>, args: &[String], res: bool, full: bool, f: &mut dyn FnMut(Smp<'c>) -> bool) {
     let Some(name) = args.first() else { return };
     if args.get(1).and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0) != 0 {
-        if let Some(v) = header_one(ctx, args, res, full) {
-            f(Sample::Str(v));
+        if let Some(v) = header_one_b(ctx, args, res, full) {
+            f(Smp::Str(v));
         }
         return;
     }
     let mut go = true;
-    visit_header_values(ctx, name, res, full, &mut |v| {
+    visit_header_values_b(ctx, name, res, full, &mut |v| {
         if go {
-            go = f(Sample::Str(crate::spare::string_from(v)));
+            go = f(Smp::Str(v));
         }
     });
 }
 
 fn header_all(ctx: &SampleContext, args: &[String], res: bool, full: bool) -> Vec<String> {
-    let Some(name) = args.first() else { return Vec::new() };
-    if args.get(1).and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0) != 0 {
-        return header_one(ctx, args, res, full).into_iter().collect();
-    }
     let mut out = Vec::new();
-    visit_header_values(ctx, name, res, full, &mut |v| out.push(v.to_string()));
+    header_visit_b(ctx, args, res, full, &mut |v| {
+        if let Smp::Str(b) = v {
+            out.push(ibex_regex::bytetext::bytes_to_text(&b));
+        }
+        true
+    });
+    out
+}
+
+/// `b` without the blanks at either end (`__http_find_header`'s LWS).
+fn trim_lws(b: &[u8]) -> &[u8] {
+    let start = b.iter().position(|c| !matches!(c, b' ' | b'\t')).unwrap_or(b.len());
+    let end = b.iter().rposition(|c| !matches!(c, b' ' | b'\t')).map_or(start, |e| e + 1);
+    &b[start..end.max(start)]
+}
+
+/// `b[range]` trimmed, borrowed when `b` is.
+fn sub_trimmed<'c>(b: &Cow<'c, [u8]>, range: std::ops::Range<usize>) -> Cow<'c, [u8]> {
+    match b {
+        Cow::Borrowed(b) => Cow::Borrowed(trim_lws(&b[range])),
+        Cow::Owned(v) => Cow::Owned(trim_lws(&v[range]).to_vec()),
+    }
+}
+
+/// T337: calls `f` with each line of header `name`, in order, from the sources
+/// [`get_all_req_headers`] / (with `res`) [`get_all_res_headers`] read, without copying them:
+/// R2: as the bytes of each line, borrowed from the HTX blocks (a Latin-1 block's bytes are
+/// made from its text), with no UTF-8 check.
+fn visit_header_lines_b<'c>(ctx: &'c SampleContext<'_>, name: &str, res: bool, f: &mut dyn FnMut(Cow<'c, [u8]>)) {
+    let mut any = false;
+    if res {
+        for (k, v) in ctx.res_headers.into_iter().flatten() {
+            if k.eq_ignore_ascii_case(name) {
+                any = true;
+                f(ibex_regex::bytetext::text_to_bytes(v));
+            }
+        }
+        if !any {
+            CURRENT_RES_HEADERS.with(|hdrs| {
+                for (k, v) in hdrs.borrow().iter() {
+                    if k.eq_ignore_ascii_case(name) {
+                        f(Cow::Owned(ibex_regex::bytetext::text_to_bytes(v).into_owned()));
+                    }
+                }
+            });
+        }
+        return;
+    }
+    if let Some(htx) = ctx.htx_slice {
+        for (k, v, latin1) in htx.header_bytes() {
+            if k.eq_ignore_ascii_case(name.as_bytes()) {
+                any = true;
+                if latin1 {
+                    f(Cow::Owned(ibex_regex::bytetext::text_to_bytes(std::str::from_utf8(v).unwrap_or_default()).into_owned()));
+                } else {
+                    f(Cow::Borrowed(v));
+                }
+            }
+        }
+    }
+    if any {
+        return;
+    }
+    for hf in ctx.htx.into_iter().flat_map(Htx::headers) {
+        if hf.name.eq_ignore_ascii_case(name) {
+            f(ibex_regex::bytetext::text_to_bytes(&hf.value));
+        }
+    }
+    for (k, v) in ctx.req_headers.into_iter().flatten() {
+        if k.eq_ignore_ascii_case(name) {
+            f(ibex_regex::bytetext::text_to_bytes(v));
+        }
+    }
+}
+
+/// T337: calls `f` with each value of header `name` as `smp_fetch_hdr` (comma values) or,
+/// with `full`, `smp_fetch_fhdr` (lines) sees them, as bytes (R2).
+fn visit_header_values_b<'c>(ctx: &'c SampleContext<'_>, name: &str, res: bool, full: bool, f: &mut dyn FnMut(Cow<'c, [u8]>)) {
+    visit_header_lines_b(ctx, name, res, &mut |line| {
+        if full {
+            f(sub_trimmed(&line, 0..line.len()));
+            return;
+        }
+        let mut s = 0;
+        loop {
+            let n = hdr_value_end(&line, s);
+            f(sub_trimmed(&line, s..n));
+            if n >= line.len() {
+                return;
+            }
+            s = n + 1;
+        }
+    });
+}
+
+/// R2: [`cookie_fetch`] on bytes: each cookie value of `args[0]` handed to `f` until it
+/// returns false, borrowed from the header.
+fn cookie_visit_b<'c>(ctx: &'c SampleContext<'_>, args: &[String], res: bool, f: &mut dyn FnMut(Smp<'c>) -> bool) {
+    let name = ibex_regex::bytetext::text_to_bytes(args.first().map_or("", String::as_str));
+    let mut go = true;
+    visit_header_values_b(ctx, if res { "set-cookie" } else { "cookie" }, res, false, &mut |elem| {
+        if !go || elem.len() <= name.len() {
+            return;
+        }
+        crate::cookie_names::value_ranges(&elem, &name, !res, &mut |r| {
+            if go {
+                go = f(Smp::Str(match &elem {
+                    Cow::Borrowed(b) => Cow::Borrowed(&b[r]),
+                    Cow::Owned(v) => Cow::Owned(v[r].to_vec()),
+                }));
+            }
+        });
+    });
+}
+
+/// R2: the sample of [`cookie_fetch`] (not iterating) on bytes: the last value, or the first
+/// one when no name is given.
+fn cookie_one_b<'c>(ctx: &'c SampleContext<'_>, args: &[String], res: bool) -> Option<Smp<'c>> {
+    let first = args.first().is_none_or(String::is_empty);
+    let mut out = None;
+    cookie_visit_b(ctx, args, res, &mut |v| {
+        out = Some(v);
+        !first
+    });
     out
 }
 
@@ -8601,18 +8623,289 @@ pub fn check_converter_args(name: &str, args: &[String]) -> Option<String> {
     }
 }
 
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
-            out.push(b as char);
+/// `sample_conv_url_enc` (`query` class): each byte other than an unreserved one as `%XX`.
+fn url_enc_b<'a>(smp: Smp<'a>, _args: &[String]) -> Option<Smp<'a>> {
+    let Smp::Str(b) = smp else { return None };
+    let mut out = Vec::with_capacity(b.len() * 3);
+    for &c in b.iter() {
+        if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'~') {
+            out.push(c);
         } else {
-            use std::fmt::Write;
-            let _ = write!(out, "%{b:02X}");
+            out.extend_from_slice(format!("%{c:02X}").as_bytes());
         }
     }
-    out
+    Some(Smp::Str(Cow::Owned(out)))
 }
+
+/// `utf8_next` (src/tools.c): the character at the start of `b`, the bytes it takes, and
+/// its `UTF8_CODE_*` (0 OK, 0x10 overlong, 0x20 invalid range, 0x40 bad sequence).
+fn utf8_next(b: &[u8]) -> (u32, usize, u8) {
+    const OVERLONG: u8 = 0x10;
+    const INVRANGE: u8 = 0x20;
+    const BADSEQ: u8 = 0x40;
+    let Some(&first) = b.first() else { return (0, 0, 0) };
+    let (mut c, dec) = match first {
+        0x00..=0x7f => return (u32::from(first), 1, 0),
+        0xc0..=0xdf => (u32::from(first & 0x1f), 1),
+        0xe0..=0xef => (u32::from(first & 0x0f), 2),
+        0xf0..=0xf7 => (u32::from(first & 0x07), 3),
+        0xf8..=0xfb => (u32::from(first & 0x03), 4),
+        0xfc..=0xfd => (u32::from(first & 0x01), 5),
+        _ => return (u32::from(first), 1, BADSEQ),
+    };
+    if b.len() < dec + 1 {
+        return (u32::from(first), 1, BADSEQ);
+    }
+    let mut n = 1;
+    for &cont in &b[1..=dec] {
+        if cont & 0xc0 != 0x80 {
+            return (c, n, BADSEQ);
+        }
+        c = (c << 6) | u32::from(cont & 0x3f);
+        n += 1;
+    }
+    let mut code = 0;
+    if (c <= 0x7f && n > 1) || ((0x80..=0x7ff).contains(&c) && n > 2) || ((0x800..=0xffff).contains(&c) && n > 3) || ((0x10000..=0x1f_ffff).contains(&c) && n > 4) {
+        code |= OVERLONG;
+    }
+    if (0xd800..=0xdfff).contains(&c) || (0xfffe..=0xffff).contains(&c) {
+        code |= INVRANGE;
+    }
+    (c, n, code)
+}
+
+/// `sample_conv_json` on bytes: `ascii` (the default) reads each byte as a character; `utf8`
+/// (no sample on a bad sequence), `utf8s` (skip it), `utf8p` and `utf8ps` (the same, but only
+/// for an invalid range or a bad sequence, an overlong form passes) decode UTF-8 with
+/// `utf8_next`. A character over 0xFFFF fails `utf8`/`utf8p` and is skipped by the others;
+/// one that is not printable ASCII is written `\u00XX`.
+fn json_b<'a>(smp: Smp<'a>, args: &[String]) -> Option<Smp<'a>> {
+    let Smp::Str(b) = smp else { return None };
+    let mode = args.first().map_or("", String::as_str);
+    let (utf8, strict, any_code) = match mode {
+        "utf8" => (true, true, true),
+        "utf8s" => (true, false, true),
+        "utf8p" => (true, true, false),
+        "utf8ps" => (true, false, false),
+        _ => (false, false, false),
+    };
+    let mut out = Vec::with_capacity(b.len());
+    let mut p = 0;
+    while p < b.len() {
+        let c = if utf8 {
+            let (c, n, code) = utf8_next(&b[p..]);
+            p += n.max(1);
+            let bad = if any_code { code != 0 } else { code & 0x60 != 0 };
+            if bad {
+                if strict {
+                    return None;
+                }
+                continue;
+            }
+            if c > 0xffff {
+                if strict {
+                    return None;
+                }
+                continue;
+            }
+            c
+        } else {
+            p += 1;
+            u32::from(b[p - 1])
+        };
+        match c {
+            0x22 => out.extend_from_slice(b"\\\""),
+            0x5c => out.extend_from_slice(b"\\\\"),
+            0x2f => out.extend_from_slice(b"\\/"),
+            8 => out.extend_from_slice(b"\\b"),
+            12 => out.extend_from_slice(b"\\f"),
+            0x0d => out.extend_from_slice(b"\\r"),
+            0x0a => out.extend_from_slice(b"\\n"),
+            9 => out.extend_from_slice(b"\\t"),
+            0x20..=0x7e => out.push(u8::try_from(c).unwrap_or(b'?')),
+            _ => out.extend_from_slice(format!("\\u{c:04x}").as_bytes()),
+        }
+    }
+    Some(Smp::Str(Cow::Owned(out)))
+}
+
+/// `b[range]`, borrowed when `b` is; `None` when the range is not in it.
+fn sub_cow(b: Cow<'_, [u8]>, range: std::ops::Range<usize>) -> Option<Cow<'_, [u8]>> {
+    b.get(range.clone())?;
+    Some(match b {
+        Cow::Borrowed(b) => Cow::Borrowed(&b[range]),
+        Cow::Owned(mut v) => {
+            v.truncate(range.end);
+            v.drain(..range.start);
+            Cow::Owned(v)
+        }
+    })
+}
+
+/// `field` (T359) on bytes (R2): the separators are bytes, the result a slice of the input.
+fn field_b<'a>(smp: Smp<'a>, args: &[String]) -> Option<Smp<'a>> {
+        // T359
+        let idx_str = args.first()?;
+        let seps_str = args.get(1).map_or(" ", |s| s.as_str());
+        let idx: i64 = idx_str.parse().ok()?;
+        if idx == 0 {
+            return None;
+        }
+        let count = args.get(2).map_or(1i32, |c| parse_count(c));
+        let Smp::Str(s) = smp else { return None };
+        let bytes: &[u8] = &s;
+        let len = bytes.len();
+        let seps_b = ibex_regex::bytetext::text_to_bytes(seps_str);
+        let seps: &[u8] = &seps_b;
+        // The field is cut out of the input's own string, which allocates nothing.
+        let (start, end) = if idx < 0 {
+            let mut field = -1i64;
+            let mut start = len;
+            let mut end = len;
+            let mut cnt = count;
+            let mut found = false;
+            while start > 0 {
+                let pos = start - 1;
+                let Some(&b) = bytes.get(pos) else { break };
+                if seps.contains(&b) {
+                    if field == idx {
+                        if cnt == 1 {
+                            found = true;
+                            break;
+                        } else if cnt > 1 {
+                            cnt -= 1;
+                        }
+                    } else {
+                        end = pos;
+                        field -= 1;
+                    }
+                }
+                start -= 1;
+            }
+            if !found && field != idx {
+                return None;
+            }
+            (start, end)
+        } else {
+            let mut field = 1i64;
+            let mut start = 0usize;
+            let mut end = 0usize;
+            let mut cnt = count;
+            let mut found = false;
+            while end < len {
+                let Some(&b) = bytes.get(end) else { break };
+                if seps.contains(&b) {
+                    if field == idx {
+                        if cnt == 1 {
+                            found = true;
+                            break;
+                        } else if cnt > 1 {
+                            cnt -= 1;
+                        }
+                    } else {
+                        start = end + 1;
+                        field += 1;
+                    }
+                }
+                end += 1;
+            }
+            if !found && field != idx {
+                return None;
+            }
+            (start, end)
+        };
+        Some(Smp::Str(sub_cow(s, start..end)?))
+}
+
+/// `word` (T359) on bytes (R2): the separators are bytes, the result a slice of the input.
+fn word_b<'a>(smp: Smp<'a>, args: &[String]) -> Option<Smp<'a>> {
+        // T359
+        let idx_str = args.first()?;
+        let seps_str = args.get(1).map_or(" ", |s| s.as_str());
+        let idx: i64 = idx_str.parse().ok()?;
+        if idx == 0 {
+            return None;
+        }
+        let count = args.get(2).map_or(1i32, |c| parse_count(c));
+        let Smp::Str(s) = smp else { return None };
+        let bytes: &[u8] = &s;
+        let len = bytes.len();
+        let seps_b = ibex_regex::bytetext::text_to_bytes(seps_str);
+        let seps: &[u8] = &seps_b;
+        if idx < 0 {
+            let mut word_num = 0i64;
+            let mut in_word = false;
+            let mut start = len;
+            let mut end = len;
+            let mut cnt = count;
+            let mut found = false;
+            while start > 0 {
+                let pos = start - 1;
+                let Some(&b) = bytes.get(pos) else { break };
+                let is_sep = seps.contains(&b);
+                if !in_word {
+                    if !is_sep {
+                        if word_num != idx {
+                            word_num -= 1;
+                            end = start;
+                        }
+                        in_word = true;
+                    }
+                } else if is_sep {
+                    if word_num == idx {
+                        if cnt == 1 {
+                            found = true;
+                            break;
+                        } else if cnt > 1 {
+                            cnt -= 1;
+                        }
+                    }
+                    in_word = false;
+                }
+                start -= 1;
+            }
+            if !found && word_num != idx {
+                return None;
+            }
+            Some(Smp::Str(sub_cow(s, start..end)?))
+        } else {
+            let mut word_num = 0i64;
+            let mut in_word = false;
+            let mut start = 0usize;
+            let mut end = 0usize;
+            let mut cnt = count;
+            let mut found = false;
+            while end < len {
+                let Some(&b) = bytes.get(end) else { break };
+                let is_sep = seps.contains(&b);
+                if !in_word {
+                    if !is_sep {
+                        if word_num != idx {
+                            word_num += 1;
+                            start = end;
+                        }
+                        in_word = true;
+                    }
+                } else if is_sep {
+                    if word_num == idx {
+                        if cnt == 1 {
+                            found = true;
+                            break;
+                        } else if cnt > 1 {
+                            cnt -= 1;
+                        }
+                    }
+                    in_word = false;
+                }
+                end += 1;
+            }
+            if !found && word_num != idx {
+                return None;
+            }
+            Some(Smp::Str(sub_cow(s, start..end)?))
+        }
+}
+
 
 /// T330: the length of an Ethernet header up to and including the `EtherType`, skipping every
 /// 802.1Q tag, or None when the frame ends first (the loop in `net_helper.c`'s `sample_conv_eth_*`).

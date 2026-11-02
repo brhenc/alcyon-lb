@@ -41,3 +41,4 @@ mod t364d4_json_ascii;
 mod t364d5_case_ascii;
 mod t364d6_strcmp;
 mod compiled_expr;
+mod bytes_samples;

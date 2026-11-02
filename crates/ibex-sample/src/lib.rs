@@ -60,4 +60,4 @@ pub use registry::{name_lookups_on_this_thread, set_debug_sink, take_debug_desti
 };
 pub use rawpayload::{check_args as check_raw_fetch_args, raw_may_change};
 pub use vars::{Scope as VarScope, VarStore};
-pub use sample::{Sample, SampleType, TypeSpec, SAMPLE_TYPES_COUNT};
+pub use sample::{Sample, SampleType, Smp, TypeSpec, SAMPLE_TYPES_COUNT};

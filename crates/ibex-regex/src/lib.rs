@@ -594,8 +594,9 @@ thread_local! {
 /// A regular expression from the configuration.
 #[derive(Clone)]
 pub enum UserRegex {
-    /// Compiled by `regex`: matches in time linear in the input.
-    Linear(regex::Regex),
+    /// Compiled by `regex` over bytes, Unicode off: matches in time linear in the input, a
+    /// byte as one character, as PCRE2 without `PCRE2_UTF` (R2).
+    Linear(regex::bytes::Regex),
     /// Compiled by `fancy-regex`: the pattern uses a PCRE-only feature, and a match is
     /// bounded by [`BACKTRACK_LIMIT`].
     Backtracking(fancy_regex::Regex, std::sync::Arc<Ladder>),
@@ -655,7 +656,8 @@ impl Error {
 
 /// The groups of one match.
 pub enum Captures<'h> {
-    Linear(regex::Captures<'h>),
+    /// A match of a [`UserRegex::Linear`] over an ASCII text: every group is ASCII.
+    Linear(regex::bytes::Captures<'h>),
     Backtracking(fancy_regex::Captures<'h, str>),
     /// The match was made over the bytes of a non-ASCII text (see [`bytewise`]): the groups
     /// are held here as text again, with the names of the groups that have one.
@@ -667,7 +669,7 @@ impl Captures<'_> {
     #[must_use]
     pub fn get(&self, i: usize) -> Option<&str> {
         match self {
-            Captures::Linear(c) => c.get(i).map(|m| m.as_str()),
+            Captures::Linear(c) => c.get(i).and_then(|m| std::str::from_utf8(m.as_bytes()).ok()),
             Captures::Backtracking(c) => c.get(i).map(|m| m.as_str()),
             Captures::Bytes { groups, .. } => groups.get(i).and_then(|g| g.as_deref()),
         }
@@ -692,7 +694,11 @@ impl Captures<'_> {
     /// Appends `replacement` to `dst` with `$1`, `${1}` and `$name` expanded.
     pub fn expand(&self, replacement: &str, dst: &mut String) {
         match self {
-            Captures::Linear(c) => c.expand(replacement, dst),
+            Captures::Linear(c) => {
+                let mut out = Vec::new();
+                c.expand(&bytetext::text_to_bytes(replacement), &mut out);
+                dst.push_str(&bytetext::bytes_to_text(&out));
+            }
             Captures::Backtracking(c) => c.expand(replacement, dst),
             Captures::Bytes { groups, names } => expand_groups(groups, names, replacement, dst),
         }
@@ -747,6 +753,45 @@ fn unbytewise(text: &str) -> String {
     bytetext::bytes_to_text(&bytetext::text_to_bytes(text))
 }
 
+/// [`bytewise`] of the bytes `b`: the text `fancy-regex` matches, one character a byte.
+fn bytewise_bytes(b: &[u8]) -> Cow<'_, str> {
+    match std::str::from_utf8(b) {
+        Ok(ascii) if ascii.is_ascii() => Cow::Borrowed(ascii),
+        _ => Cow::Owned(b.iter().map(|&c| if c < 0x80 { char::from(c) } else { bytetext::escape_byte(c) }).collect()),
+    }
+}
+
+/// What [`bytewise_bytes`] made of bytes, as those bytes.
+fn unbytewise_bytes(text: &str) -> Vec<u8> {
+    text.chars().map(|c| bytetext::unescape_char(c).unwrap_or_else(|| u8::try_from(u32::from(c)).unwrap_or(b'?'))).collect()
+}
+
+/// `pattern` (configuration text, [`bytetext`]) as `regex::bytes` reads it with Unicode off
+/// (R2): each byte of 0x80 or more written `\xHH`, so a literal `é` is its two UTF-8 bytes
+/// and a Latin-1 `\xe9` from the configuration is that one byte, as PCRE2 without UTF reads
+/// them. A backslash before such a byte escapes the byte itself (`\é` is the bytes of `é`).
+fn byte_syntax(pattern: &str) -> Cow<'_, str> {
+    if pattern.is_ascii() {
+        return Cow::Borrowed(pattern);
+    }
+    let bytes = bytetext::text_to_bytes(pattern);
+    let mut out = String::with_capacity(bytes.len() * 2);
+    let mut escaped = false;
+    for &b in bytes.iter() {
+        if b >= 0x80 {
+            if escaped {
+                out.pop();
+            }
+            out.push_str(&format!("\\x{b:02X}"));
+            escaped = false;
+        } else {
+            out.push(char::from(b));
+            escaped = b == b'\\' && !escaped;
+        }
+    }
+    Cow::Owned(out)
+}
+
 impl UserRegex {
     /// Compiles `pattern`: with `regex`, and with `fancy-regex` only if `regex` refuses it.
     ///
@@ -795,16 +840,16 @@ impl UserRegex {
         if let Some(what) = scan.unsupported {
             return Err(Error(format!("PCRE feature not supported by Ibex: {what} (see docs/differences.md)"), None));
         }
-        // The pattern is read byte by byte, as the text is (T296).
-        let mapped = bytewise(pattern);
-        let pattern = mapped.as_ref();
         // `regex` reads `a++` as `(a+)+` and `(?R)` as a flag, and so would accept what it
         // does not mean: a pattern with such a token goes to `fancy-regex` directly.
         if !scan.pcre_only {
-            if let Ok(re) = regex::RegexBuilder::new(pattern).case_insensitive(case_insensitive).build() {
+            if let Ok(re) = regex::bytes::RegexBuilder::new(&byte_syntax(pattern)).unicode(false).case_insensitive(case_insensitive).build() {
                 return Ok(UserRegex::Linear(re));
             }
         }
+        // The pattern is read byte by byte, as the text is (T296).
+        let mapped = bytewise(pattern);
+        let pattern = mapped.as_ref();
         let re = fancy_regex::RegexBuilder::new(pattern)
             .case_insensitive(case_insensitive)
             .backtrack_limit(BACKTRACK_LIMIT)
@@ -866,11 +911,37 @@ impl UserRegex {
     /// Whether `text` matches. A match that exceeds [`BACKTRACK_LIMIT`] does not.
     #[must_use]
     pub fn is_match(&self, text: &str) -> bool {
-        let text = bytewise(text);
-        let text = text.as_ref();
         match self {
-            UserRegex::Linear(r) => r.is_match(text),
-            UserRegex::Backtracking(r, _) => r.is_match(text).unwrap_or(false),
+            UserRegex::Linear(r) => r.is_match(&bytetext::text_to_bytes(text)),
+            UserRegex::Backtracking(r, _) => r.is_match(bytewise(text).as_ref()).unwrap_or(false),
+        }
+    }
+
+    /// Whether the bytes `subject` match (R2: a sample is bytes). `fancy-regex` matches only
+    /// text: for a [`UserRegex::Backtracking`] pattern each byte of 0x80 or more is read as
+    /// one character ([`bytewise`]), the text made only then.
+    #[must_use]
+    pub fn is_match_bytes(&self, subject: &[u8]) -> bool {
+        match self {
+            UserRegex::Linear(r) => r.is_match(subject),
+            UserRegex::Backtracking(r, _) => r.is_match(bytewise_bytes(subject).as_ref()).unwrap_or(false),
+        }
+    }
+
+    /// [`UserRegex::replace`] (`all` false) or [`UserRegex::replace_all`] of bytes, the
+    /// replacement bytes too: `subject` itself when nothing matched.
+    #[must_use]
+    pub fn replace_bytes<'h>(&self, subject: &'h [u8], replacement: &[u8], all: bool) -> Cow<'h, [u8]> {
+        let limit = if all { usize::MAX } else { 1 };
+        match self {
+            UserRegex::Linear(r) => r.replacen(subject, limit, replacement),
+            UserRegex::Backtracking(..) => {
+                let text = bytewise_bytes(subject);
+                match self.replacen_backtracking(&text, &bytewise_bytes(replacement), limit) {
+                    Cow::Borrowed(_) => Cow::Borrowed(subject),
+                    Cow::Owned(s) => Cow::Owned(unbytewise_bytes(&s)),
+                }
+            }
         }
     }
 
@@ -879,14 +950,15 @@ impl UserRegex {
     #[must_use]
     pub fn captures<'h>(&self, text: &'h str) -> Option<Captures<'h>> {
         if !text.is_ascii() {
-            let mapped = bytewise(text);
-            let mapped = mapped.as_ref();
             let (groups, names): (Vec<Option<String>>, Vec<Option<String>>) = match self {
                 UserRegex::Linear(r) => {
-                    let c = r.captures(mapped)?;
-                    ((0..c.len()).map(|i| c.get(i).map(|m| unbytewise(m.as_str()))).collect(), r.capture_names().map(|n| n.map(str::to_owned)).collect())
+                    let bytes = bytetext::text_to_bytes(text);
+                    let c = r.captures(&bytes)?;
+                    ((0..c.len()).map(|i| c.get(i).map(|m| bytetext::bytes_to_text(m.as_bytes()))).collect(), r.capture_names().map(|n| n.map(str::to_owned)).collect())
                 }
                 UserRegex::Backtracking(r, _) => {
+                    let mapped = bytewise(text);
+                    let mapped = mapped.as_ref();
                     let c = r.captures(mapped).ok().flatten()?;
                     ((0..c.len()).map(|i| c.get(i).map(|m| unbytewise(m.as_str()))).collect(), r.capture_names().map(|n| n.map(str::to_owned)).collect())
                 }
@@ -894,7 +966,7 @@ impl UserRegex {
             return Some(Captures::Bytes { groups, names });
         }
         match self {
-            UserRegex::Linear(r) => r.captures(text).map(Captures::Linear),
+            UserRegex::Linear(r) => r.captures(text.as_bytes()).map(Captures::Linear),
             UserRegex::Backtracking(r, _) => r.captures(text).ok().flatten().map(Captures::Backtracking),
         }
     }
@@ -913,26 +985,29 @@ impl UserRegex {
     }
 
     fn replacen<'h>(&self, text: &'h str, replacement: &str, limit: usize) -> Cow<'h, str> {
+        if let UserRegex::Linear(r) = self {
+            let subject = bytetext::text_to_bytes(text);
+            return match r.replacen(&subject, limit, &*bytetext::text_to_bytes(replacement)) {
+                Cow::Borrowed(_) => Cow::Borrowed(text),
+                Cow::Owned(b) => Cow::Owned(bytetext::bytes_to_text(&b)),
+            };
+        }
         if !text.is_ascii() {
             let mapped = bytewise(text);
-            let done = self.replacen_ascii_or_bytes(mapped.as_ref(), &bytewise(replacement), limit);
+            let done = self.replacen_backtracking(mapped.as_ref(), &bytewise(replacement), limit);
             return match done {
                 Cow::Borrowed(_) => Cow::Borrowed(text),
                 Cow::Owned(s) => Cow::Owned(unbytewise(&s)),
             };
         }
-        self.replacen_ascii_or_bytes(text, replacement, limit)
+        self.replacen_backtracking(text, replacement, limit)
     }
 
-    fn replacen_ascii_or_bytes<'h>(&self, text: &'h str, replacement: &str, limit: usize) -> Cow<'h, str> {
+    /// The replacement loop of a [`UserRegex::Backtracking`] pattern over a [`bytewise`] text
+    /// (each step under the [`LOOP_BUDGET`]); a [`UserRegex::Linear`] one never comes here.
+    fn replacen_backtracking<'h>(&self, text: &'h str, replacement: &str, limit: usize) -> Cow<'h, str> {
         match self {
-            UserRegex::Linear(r) => {
-                if limit == 1 {
-                    r.replace(text, replacement)
-                } else {
-                    r.replace_all(text, replacement)
-                }
-            }
+            UserRegex::Linear(_) => Cow::Borrowed(text),
             UserRegex::Backtracking(_, ladder) => {
                 let mut budget = LOOP_BUDGET;
                 let mut out = String::new();
