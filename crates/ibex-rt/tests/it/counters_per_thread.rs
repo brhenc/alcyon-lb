@@ -333,6 +333,11 @@ fn show_stat_show_info_and_prometheus_read_the_same_with_per_thread_rows() {
         let counted = req_tot(&shared);
         assert!(counted.as_deref().is_some_and(|n| n.parse::<u64>().is_ok_and(|n| n >= 60)), "the frontend counted the traffic: {counted:?}");
         assert_eq!(req_tot(&per), counted);
+        // The retries reached the paths they are there for: a redispatch, an attempt that failed.
+        let st = stat(&per);
+        let at = |px: &str, sv: &str, c: &str| st.get(&(px.into(), sv.into(), c.into())).cloned().unwrap_or_default();
+        assert_ne!(at("br", "BACKEND", "wredis"), "0", "a redispatch");
+        assert_ne!(at("br", "x", "stot"), "0", "a failed attempt counted on the dead server");
 
         for d in [&shared, &per] {
             assert_eq!(cli(d, "clear counters all"), "\n");
