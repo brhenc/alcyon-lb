@@ -505,3 +505,82 @@ fn an_h3_owner_and_its_stream_wake_each_other_in_the_same_pass() {
     let _ = be.join();
     assert!(per <= 4.6, "{per:.2} passes an HTTP/3 request: the owner and its stream wake each other a pass late");
 }
+
+/// (stream runs, `op`) counted over `n` requests after a warm-up, with `get` one request.
+fn runs_and_ops(op: Op, n: u64, mut get: impl FnMut()) -> (u64, u64) {
+    for _ in 0..20 {
+        get();
+    }
+    let c0 = on_this_thread();
+    for _ in 0..n {
+        get();
+    }
+    let c1 = on_this_thread();
+    (c1[Op::StreamRun as usize] - c0[Op::StreamRun as usize], c1[op as usize] - c0[op as usize])
+}
+
+/// T599: a run derives what the sockets its entry polls want, not a side it has no socket
+/// for: a stream of an HTTP/2 connection polls its server only (its client side is the
+/// owner's to write: `has_pending_output`, the response window, every run), the owner the
+/// client and the server connection it keeps between requests. Here about as many owner
+/// runs as stream runs: 1.5 a run at most. Two a run before, every run.
+#[test]
+#[cfg(debug_assertions)]
+fn an_h2_entry_derives_only_the_side_it_polls() {
+    const N: u64 = 100;
+    let (mut engine, fe, running, be) = setup_h2();
+    let mut c = H2Client::connect(&mut engine, fe);
+    let (runs, wants) = runs_and_ops(Op::WantDerive, N, || c.get(&mut engine));
+    println!("{N} h2 requests: {runs} stream runs, {wants} sides derived");
+    assert!(runs > 0, "no stream run counted");
+    assert!(wants * 2 <= runs * 3, "{wants} sides derived in {runs} runs: a run derives the side it does not poll");
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}
+
+/// T599: the rare checks of a stream run (the connect log, `rate_max`, the deferred
+/// `tcp-request session` rules, the content inspection, a TCP stream's connect and stick
+/// stores, a server TLS failure) are looked at only in a run with one armed: none is on a
+/// keep-alive HTTP request or an HTTP/2 one past its first. Every run looked at all before.
+#[test]
+#[cfg(debug_assertions)]
+fn a_stream_run_looks_at_no_rare_check_when_none_is_armed() {
+    const N: u64 = 100;
+    let (mut engine, fe, running, be) = setup();
+    let mut c = Client::connect(fe);
+    let (runs, rare) = runs_and_ops(Op::RareCheck, N, || c.get(&mut engine));
+    println!("{N} keep-alive requests: {runs} stream runs, {rare} with the rare checks looked at");
+    assert!(runs > 0, "no stream run counted");
+    assert_eq!(rare, 0, "{rare} of {runs} keep-alive runs looked at the rare checks with none armed");
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+
+    let (mut engine, fe, running, be) = setup_h2();
+    let mut c = H2Client::connect(&mut engine, fe);
+    let (runs, rare) = runs_and_ops(Op::RareCheck, N, || c.get(&mut engine));
+    println!("{N} h2 requests: {runs} stream runs, {rare} with the rare checks looked at");
+    assert_eq!(rare, 0, "{rare} of {runs} h2 runs looked at the rare checks with none armed");
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}
+
+/// T599: an HTTP/2 GET is three runs of its stream (its request, the server's response, its
+/// end) and four of the owner (the client's HEADERS, then after each of its stream's runs):
+/// the owner is not run again in a pass for a stream its run already queued for spawning,
+/// nor woken by the spawn before the stream has run. Nine before.
+#[test]
+#[cfg(debug_assertions)]
+fn an_h2_request_runs_its_owner_only_when_there_is_something_to_move() {
+    const N: u64 = 100;
+    let (mut engine, fe, running, be) = setup_h2();
+    let mut c = H2Client::connect(&mut engine, fe);
+    let (runs, _) = runs_and_ops(Op::Pass, N, || c.get(&mut engine));
+    println!("{N} h2 requests: {runs} stream runs");
+    assert!(runs <= 7 * N, "{runs} stream runs for {N} HTTP/2 requests");
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}

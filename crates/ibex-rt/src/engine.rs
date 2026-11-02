@@ -6642,8 +6642,16 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             if let Some(o) = owner.sess.h2_owner_mut() {
                 o.children.push(crate::proxy::H2ChildLink { idx: child_idx, task, stream_id });
             }
+            // What the owner's next run would move first (the request's body so far, its end)
+            // moves now, so the stream's first run has it (T599). That run wakes the owner in
+            // the next pass (`owner_wake`), which moves the rest: woken here too, the owner
+            // ran before its stream had, to do just this.
+            if owner.sess.h2_ctx.is_some() {
+                let _ = h2_bridge_moves(owner, child, now);
+            } else {
+                wake_queue.push(owner_task);
+            }
             wake_queue.push(task);
-            wake_queue.push(owner_task);
         }
     }
 
@@ -8706,6 +8714,7 @@ fn init_client_session(
     // With a PROXY header to come, the rules wait for it (`run_deferred_session_rules`).
     let session_rules = if sess.accept_proxy {
         sess.session_rules_pending = true;
+        sess.rare_armed = true;
         SessionEvalOutcome::Accept
     } else {
         stream_timeouts_enter(proxies, proxy_idx, proxy_idx, &sess);
@@ -8747,6 +8756,7 @@ fn init_client_session(
     let has_inspect = proxy.tcp_req_inspect_delay.is_some() || !proxy.tcp_req_content_rules.is_empty();
     if has_inspect {
         sess.tcp_inspect_done = false;
+        sess.rare_armed = true;
         if let Some(delay) = proxy.tcp_req_inspect_delay {
             let ms = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
             sess.inspect_exp = Some(now.add(ms));
@@ -9829,32 +9839,49 @@ fn check_srv_connect(
     }
 }
 
+/// Whether one of the checks behind [`TcpSession::rare_armed`] is armed (T599).
+fn rare_check_armed(entry: &SessionEntry) -> bool {
+    let s = &entry.sess;
+    entry.connect_log_due || entry.rate_max_due || s.session_rules_pending || !s.tcp_inspect_done || s.res_inspect_pending
+}
+
 fn update_interests(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &mut Poller) {
-    let (mut cli_want, mut srv_want) = entry.sess.interests();
+    // Each side's wants are derived only for a side with a socket to poll (T599): a stream
+    // of an HTTP/2 or HTTP/3 connection polls no client socket (its owner does, T280), an
+    // owner no server one, and a server socket still connecting is `check_srv_connect`'s.
     // Waiting for a buffer to read into (S6): that side is not polled for reading until the
     // stream is woken, or its unread bytes would wake it on every loop.
-    if entry.buf_wait.queued() {
-        cli_want.read &= !entry.buf_wait.mutes_cli();
-        srv_want.read &= !entry.buf_wait.mutes_srv();
-    }
-    let new_cli_interest = Interest {
-        readable: cli_want.read,
-        writable: cli_want.write,
-    };
-    // A stream of an HTTP/2 connection polls no client socket: its owner does (T280).
-    if let Some(cfd) = entry.sess.cli_fd().filter(|_| new_cli_interest != entry.cli_interest) {
-        let _ = poller.modify(
-            cfd,
-            raw_fd_to_u64(entry.cli_raw_fd),
-            new_cli_interest.readable,
-            new_cli_interest.writable,
-        );
-        fdtab.set_interest(entry.cli_raw_fd, new_cli_interest);
-        entry.cli_interest = new_cli_interest;
+    if let Some(cfd) = entry.sess.cli_fd() {
+        #[cfg(debug_assertions)]
+        ibex_sample::work::note(ibex_sample::work::Op::WantDerive, 1);
+        let mut cli_want = entry.sess.cli_want();
+        if entry.buf_wait.queued() {
+            cli_want.read &= !entry.buf_wait.mutes_cli();
+        }
+        let new_cli_interest = Interest {
+            readable: cli_want.read,
+            writable: cli_want.write,
+        };
+        if new_cli_interest != entry.cli_interest {
+            let _ = poller.modify(
+                cfd,
+                raw_fd_to_u64(entry.cli_raw_fd),
+                new_cli_interest.readable,
+                new_cli_interest.writable,
+            );
+            fdtab.set_interest(entry.cli_raw_fd, new_cli_interest);
+            entry.cli_interest = new_cli_interest;
+        }
     }
 
     if let (Some(srv_fd), Some(sfd)) = (entry.sess.srv.as_ref(), entry.srv_raw_fd) {
         if entry.sess.srv_state != ScState::Connecting {
+            #[cfg(debug_assertions)]
+            ibex_sample::work::note(ibex_sample::work::Op::WantDerive, 1);
+            let mut srv_want = entry.sess.srv_want();
+            if entry.buf_wait.queued() {
+                srv_want.read &= !entry.buf_wait.mutes_srv();
+            }
             let new_srv_interest = Interest {
                 readable: srv_want.read,
                 writable: srv_want.write,
@@ -10955,6 +10982,7 @@ impl EngineDispatcher<'_> {
         let proxy = &proxies[entry.proxy_idx];
         if !proxy.tcp_req_content_rules.is_empty() {
             entry.sess.tcp_inspect_done = false;
+            entry.sess.rare_armed = true;
             entry.sess.inspect_exp = proxy
                 .tcp_req_inspect_delay
                 .map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
@@ -11297,12 +11325,20 @@ impl EngineDispatcher<'_> {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
                 return Outcome::Done;
             };
-
+            #[cfg(debug_assertions)]
+            ibex_sample::work::note(ibex_sample::work::Op::StreamRun, 1);
+            // A source that armed a rare check and not `rare_armed` would have it skipped:
+            // every test run in debug says so here (T599).
+            debug_assert!(entry.sess.rare_armed || !rare_check_armed(entry), "a rare check armed without `rare_armed`");
             // A frontend that logs and has no `log-format` (no `option httplog`, `tcplog`) says
             // only that it took the connection, once, and nothing when the request or the
             // connection ends (`frontend_accept`, `frontend.c`): after the PROXY header and
             // the TLS handshake, which a connection that fails never gets past.
-            if entry.connect_log_due && (!entry.sess.accept_proxy || entry.sess.proxy_handshake_done) && entry.sess.cli_xprt.is_ready() {
+            #[cfg(debug_assertions)]
+            if entry.sess.rare_armed {
+                ibex_sample::work::note(ibex_sample::work::Op::RareCheck, 1);
+            }
+            if entry.sess.rare_armed && entry.connect_log_due && (!entry.sess.accept_proxy || entry.sess.proxy_handshake_done) && entry.sess.cli_xprt.is_ready() {
                 entry.connect_log_due = false;
                 let fe = &self.proxies[entry.proxy_idx];
                 let unknown = SocketAddr::from(([0, 0, 0, 0], 0));
@@ -11319,7 +11355,7 @@ impl EngineDispatcher<'_> {
                 connect_line = Some((entry.proxy_idx, line));
             }
 
-            if entry.rate_max_due && entry.sess.cli_xprt.is_ready() {
+            if entry.sess.rare_armed && entry.rate_max_due && entry.sess.cli_xprt.is_ready() {
                 entry.rate_max_due = false;
                 let rate = self.proxies[entry.proxy_idx].counters().fe_sess_rate.rate();
                 self.proxies[entry.proxy_idx].txn_counters().fe.rate_max.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), Ordering::Relaxed);
@@ -11401,8 +11437,8 @@ impl EngineDispatcher<'_> {
             // A TCP stream stores what its `stick` rules took once the server has accepted
             // the connection (`AN_RES_STORE_RULES` runs on the first event of the response
             // side); a server that refused stores nothing.
-            if !entry.sess.stick_stores.is_empty()
-                && entry.sess.mode == Mode::Tcp
+            if entry.sess.mode == Mode::Tcp
+                && !entry.sess.stick_stores.is_empty()
                 && entry.sess.log.connect.is_some()
             {
                 let stores = std::mem::take(&mut entry.sess.stick_stores);
@@ -11413,7 +11449,7 @@ impl EngineDispatcher<'_> {
             // a peer not speaking TLS) is a connect failure: `HAProxy` retries it and,
             // out of retries, answers 503 `SC` (measured: `ssl verify required` against
             // a certificate the SNI does not match, "0/0/-1/-1/1 503 ... SC-- ... /3").
-            if entry.sess.srv_xprt.handshake_failed() && entry.sess.srv_state == ScState::Error {
+            if entry.sess.srv_state == ScState::Error && entry.sess.srv_xprt.handshake_failed() {
                 if let (Some(fd), Some(sfd)) = (entry.sess.srv.as_ref(), entry.srv_raw_fd.take()) {
                     let _ = self.poller.delete(fd.as_fd());
                     self.fdtab.remove(sfd);
@@ -11426,90 +11462,96 @@ impl EngineDispatcher<'_> {
                 server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, true);
             }
 
-            // Step 3.3: `tcp-request session` rules that waited for the PROXY header.
-            run_deferred_session_rules(entry.proxy_idx, self.proxies, &mut entry.sess);
+            // Steps 3.3 to 3.45, the rare checks of the request's start, behind one bit (T599).
+            if entry.sess.rare_armed {
+                // Step 3.3: `tcp-request session` rules that waited for the PROXY header.
+                run_deferred_session_rules(entry.proxy_idx, self.proxies, &mut entry.sess);
 
-            // Step 3.4: Content inspection for TCP rules (or before HTTP request parsing)
-            if !entry.sess.tcp_inspect_done && !entry.sess.is_done() {
-                let proxy_idx = entry.proxy_idx;
-                // The request's capture slots exist from the first rule that can fill one:
-                // `begin_http_stream` keeps what these rules wrote in the slots no header fills.
-                if self.proxies[proxy_idx].tcp_req_content_rules.iter().any(|r| matches!(r.action, ibex_config::TcpReqContentAction::Capture { .. })) {
-                    entry.sess.log.req_captures.clear();
-                    entry.sess.log.req_captures.resize(self.proxies[proxy_idx].req_capture_slots.len(), None);
+                // Step 3.4: Content inspection for TCP rules (or before HTTP request parsing)
+                if !entry.sess.tcp_inspect_done && !entry.sess.is_done() {
+                    let proxy_idx = entry.proxy_idx;
+                    // The request's capture slots exist from the first rule that can fill one:
+                    // `begin_http_stream` keeps what these rules wrote in the slots no header fills.
+                    if self.proxies[proxy_idx].tcp_req_content_rules.iter().any(|r| matches!(r.action, ibex_config::TcpReqContentAction::Capture { .. })) {
+                        entry.sess.log.req_captures.clear();
+                        entry.sess.log.req_captures.resize(self.proxies[proxy_idx].req_capture_slots.len(), None);
+                    }
+                    crate::resolvers::dr_set_task(entry.task);
+                    match eval_tcp_req_content_rules(
+                        &self.proxies[proxy_idx],
+                        proxy_idx,
+                        self.proxies,
+                        sample_registry(),
+                        &mut entry.sess,
+                        now,
+                        0,
+                    ) {
+                        ContentEvalResult::Done => {
+                            entry.sess.tcp_inspect_done = true;
+                            entry.sess.inspect_exp = None;
+                            // `switch-mode http` made the first request's head a thing to wait
+                            // for: `timeout http-request` starts now, not at the next event.
+                            entry.sess.arm_request(now);
+                        }
+                        ContentEvalResult::Reject => {
+                            entry.sess.abort_client();
+                            self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
+                            entry.sess.cli_state = ScState::Closed;
+                            entry.sess.srv_state = ScState::Closed;
+                            entry.sess.tcp_inspect_done = true;
+                        }
+                        ContentEvalResult::SilentDrop(ttl) => {
+                            let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
+                            entry.sess.silent_drop_client(is_ipv6, ttl);
+                            self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
+                            entry.sess.cli_state = ScState::Closed;
+                            entry.sess.srv_state = ScState::Closed;
+                            entry.sess.tcp_inspect_done = true;
+                        }
+                        ContentEvalResult::Waiting => {}
+                    }
                 }
-                crate::resolvers::dr_set_task(entry.task);
-                match eval_tcp_req_content_rules(
-                    &self.proxies[proxy_idx],
-                    proxy_idx,
-                    self.proxies,
-                    sample_registry(),
-                    &mut entry.sess,
-                    now,
-                    0,
-                ) {
-                    ContentEvalResult::Done => {
-                        entry.sess.tcp_inspect_done = true;
-                        entry.sess.inspect_exp = None;
-                        // `switch-mode http` made the first request's head a thing to wait
-                        // for: `timeout http-request` starts now, not at the next event.
-                        entry.sess.arm_request(now);
-                    }
-                    ContentEvalResult::Reject => {
-                        entry.sess.abort_client();
-                        self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
-                        entry.sess.cli_state = ScState::Closed;
-                        entry.sess.srv_state = ScState::Closed;
-                        entry.sess.tcp_inspect_done = true;
-                    }
-                    ContentEvalResult::SilentDrop(ttl) => {
-                        let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                        entry.sess.silent_drop_client(is_ipv6, ttl);
-                        self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
-                        entry.sess.cli_state = ScState::Closed;
-                        entry.sess.srv_state = ScState::Closed;
-                        entry.sess.tcp_inspect_done = true;
-                    }
-                    ContentEvalResult::Waiting => {}
-                }
-            }
 
-            // Step 3.45: TCP mode, `tcp-response content` rules over the response so far.
-            if entry.sess.res_inspect_pending && !entry.sess.is_done() {
-                let be_idx = entry.backend_idx;
-                let res = eval_tcp_res_content_rules(&self.proxies[be_idx], &self.proxies, sample_registry(), &mut entry.sess, now);
-                if res != ContentEvalResult::Waiting {
-                    entry.sess.res_inspect_pending = false;
-                    entry.sess.res_inspect_exp = None;
+                // Step 3.45: TCP mode, `tcp-response content` rules over the response so far.
+                if entry.sess.res_inspect_pending && !entry.sess.is_done() {
+                    let be_idx = entry.backend_idx;
+                    let res = eval_tcp_res_content_rules(&self.proxies[be_idx], &self.proxies, sample_registry(), &mut entry.sess, now);
+                    if res != ContentEvalResult::Waiting {
+                        entry.sess.res_inspect_pending = false;
+                        entry.sess.res_inspect_exp = None;
+                    }
+                    match res {
+                        ContentEvalResult::Waiting => {}
+                        // Released: forward what was held.
+                        ContentEvalResult::Done => {
+                            entry.sess.advance(now);
+                        }
+                        // `reject` (src/tcp_rules.c): the server connection is killed, the
+                        // client's closed with nothing forwarded.
+                        ContentEvalResult::Reject => {
+                            if let Some(srv_fd) = entry.sess.srv.as_ref() {
+                                raw::abort_with_rst(srv_fd.as_fd());
+                            }
+                            entry.sess.rep.clear();
+                            self.proxies[be_idx].counters().denied_resp.fetch_add(1, Ordering::Relaxed);
+                            entry.sess.cli_state = ScState::Closed;
+                            entry.sess.srv_state = ScState::Closed;
+                        }
+                        ContentEvalResult::SilentDrop(ttl) => {
+                            let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
+                            entry.sess.silent_drop_client(is_ipv6, ttl);
+                            if let Some(srv_fd) = entry.sess.srv.as_ref() {
+                                raw::abort_with_rst(srv_fd.as_fd());
+                            }
+                            entry.sess.rep.clear();
+                            self.proxies[be_idx].counters().denied_resp.fetch_add(1, Ordering::Relaxed);
+                            entry.sess.cli_state = ScState::Closed;
+                            entry.sess.srv_state = ScState::Closed;
+                        }
+                    }
                 }
-                match res {
-                    ContentEvalResult::Waiting => {}
-                    // Released: forward what was held.
-                    ContentEvalResult::Done => {
-                        entry.sess.advance(now);
-                    }
-                    // `reject` (src/tcp_rules.c): the server connection is killed, the
-                    // client's closed with nothing forwarded.
-                    ContentEvalResult::Reject => {
-                        if let Some(srv_fd) = entry.sess.srv.as_ref() {
-                            raw::abort_with_rst(srv_fd.as_fd());
-                        }
-                        entry.sess.rep.clear();
-                        self.proxies[be_idx].counters().denied_resp.fetch_add(1, Ordering::Relaxed);
-                        entry.sess.cli_state = ScState::Closed;
-                        entry.sess.srv_state = ScState::Closed;
-                    }
-                    ContentEvalResult::SilentDrop(ttl) => {
-                        let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
-                        entry.sess.silent_drop_client(is_ipv6, ttl);
-                        if let Some(srv_fd) = entry.sess.srv.as_ref() {
-                            raw::abort_with_rst(srv_fd.as_fd());
-                        }
-                        entry.sess.rep.clear();
-                        self.proxies[be_idx].counters().denied_resp.fetch_add(1, Ordering::Relaxed);
-                        entry.sess.cli_state = ScState::Closed;
-                        entry.sess.srv_state = ScState::Closed;
-                    }
+                if !rare_check_armed(entry) {
+                    entry.sess.rare_armed = false;
                 }
             }
 
@@ -11603,7 +11645,11 @@ impl EngineDispatcher<'_> {
             // a pass, the scrape counted its own response buffers in the pool figures.
             if entry.sess.wants_rerun() && !entry.sess.is_done() {
                 if entry.sess.has_undispatched_h2_streams() {
-                    self.wake_now.push(entry.task);
+                    // Its streams are spawned after the pass, which `h2_owner_pass` queued in
+                    // this run: a second run now would only queue it again (T599).
+                    if self.h2_spawn.last() != Some(&(session_idx, entry.task)) {
+                        self.wake_now.push(entry.task);
+                    }
                 } else {
                     self.wake_queue.push(entry.task);
                 }
