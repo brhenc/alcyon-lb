@@ -418,6 +418,10 @@ pub struct H2Owner {
     pub next_child: usize,
     /// The memory a stream that is over held for its request, for the next (T437).
     pub spare: H2ChildSpare,
+    /// The sessions of streams that are over, kept for the next ones (O1b): parked entries
+    /// of the worker's session arena, at most [`TcpSession::h2_max_children`] with the
+    /// children, freed with the connection.
+    pub parked: Vec<u32>,
     /// The owner of an HTTP/3 connection: its mux and connection (T509). Kept here, in the
     /// boxed role, not on the session: every client connection pays for a session's
     /// fields (`struct_sizes::session_entry_stays_small`, T511).
@@ -1237,14 +1241,6 @@ impl TcpSession {
     /// starts (T300). [`Self::h2_child_done`] gives back what the stream changed.
     #[must_use]
     pub fn h2_child_of(owner: &mut TcpSession, owner_ref: (u32, ibex_sched::TaskRef), stream: H2ActiveStream) -> TcpSession {
-        let tls = owner.h2_owner_mut().and_then(|o| o.tls.clone());
-        let tls = tls.or_else(|| {
-            let info = Arc::new(owner.cli_xprt.tls_info()?.clone());
-            if let Some(o) = owner.h2_owner_mut() {
-                o.tls = Some(Arc::clone(&info));
-            }
-            Some(info)
-        });
         let mut c = TcpSession::new_with_mode(ClientSide::H2Child, owner.mode, Vec::new(), Vec::new(), owner.timeouts, owner.max_retries, Tick::ETERNITY);
         c.cli_exp = Tick::ETERNITY;
         c.parser_kind = owner.parser_kind;
@@ -1253,9 +1249,41 @@ impl TcpSession {
         c.so_id = owner.so_id;
         c.http_request_ms = owner.http_request_ms;
         c.keep_alive_ms = owner.keep_alive_ms;
+        c.drop_rsp_trailers = owner.drop_rsp_trailers;
+        c.accept_proxy = owner.accept_proxy;
+        c.accept_proxy_v2 = owner.accept_proxy_v2;
+        c.proxy_handshake_done = owner.proxy_handshake_done;
+        c.proxy_info.clone_from(&owner.proxy_info);
+        c.server_addr = owner.server_addr;
+        c.fc_src = owner.fc_src;
+        c.fc_dst = owner.fc_dst;
+        c.bufsize = owner.bufsize;
+        c.maxrewrite = owner.maxrewrite;
+        c.h2_flood_config = owner.h2_flood_config;
+        c.reset_with_request = owner.reset_with_request;
+        c.keep_request_line = owner.keep_request_line;
+        c.accept_unsafe_request = owner.accept_unsafe_request;
+        c.h2_child_init(owner, owner_ref, stream);
+        c
+    }
+
+    /// [`Self::h2_child_of`] in place (O1b): the session of a stream of `owner` that is over
+    /// ([`Self::park_h2_child`]) serves its stream `stream` next, with no session built. What
+    /// it has of its connection that does not change from one stream to the next (addresses,
+    /// listener, PROXY header, the frontend's settings) it keeps, as it keeps its role and
+    /// strings.
+    pub fn h2_child_again(&mut self, owner: &mut TcpSession, owner_ref: (u32, ibex_sched::TaskRef), stream: H2ActiveStream) {
+        self.timeouts = owner.timeouts;
+        self.conn_retries = owner.max_retries;
+        self.max_retries = owner.max_retries;
+        self.h2_child_init(owner, owner_ref, stream);
+    }
+
+    /// What a stream's session takes of its connection `owner` when its stream starts.
+    fn h2_child_init(&mut self, owner: &mut TcpSession, owner_ref: (u32, ibex_sched::TaskRef), stream: H2ActiveStream) {
+        let c = self;
         c.close_client = owner.close_client;
         c.stopping = owner.stopping;
-        c.drop_rsp_trailers = owner.drop_rsp_trailers;
         c.bytes_in = owner.bytes_in;
         c.bytes_out = owner.bytes_out;
         // The bytes not credited yet are the stream's to credit (with its request): the
@@ -1264,16 +1292,7 @@ impl TcpSession {
         c.stick_acct_in = owner.stick_acct_in;
         c.stick_out_pending = std::mem::take(&mut owner.stick_out_pending);
         owner.stick_acct_in = owner.stick_acct_in.max(owner.strm.log.bytes_in_at_start);
-        c.accept_proxy = owner.accept_proxy;
-        c.accept_proxy_v2 = owner.accept_proxy_v2;
-        c.proxy_handshake_done = owner.proxy_handshake_done;
-        c.proxy_info.clone_from(&owner.proxy_info);
-        c.server_addr = owner.server_addr;
-        c.fc_src = owner.fc_src;
-        c.fc_dst = owner.fc_dst;
         c.created_at = crate::txnlog::loop_now();
-        c.bufsize = owner.bufsize;
-        c.maxrewrite = owner.maxrewrite;
         // The `tcp-request content` rules the owner armed for the next request run on this
         // one (`end_txn` armed them for the next request of the connection).
         c.tcp_inspect_done = std::mem::replace(&mut owner.tcp_inspect_done, true);
@@ -1282,7 +1301,34 @@ impl TcpSession {
         c.rare_armed = !c.tcp_inspect_done;
         c.inspect_exp = owner.inspect_exp.take();
         c.strm.vars.copy_scope_from(&owner.strm.vars, ibex_sample::VarScope::Sess);
-        c.strm.log = owner.strm.log.clone();
+        // The log the connection started for its next stream; a session that served a
+        // stream before keeps its request line's memory.
+        let mut line = std::mem::take(&mut c.strm.log.request_line);
+        line.reset();
+        c.strm.log.clone_from(&owner.strm.log);
+        c.strm.log.request_line = line;
+        c.tracked_sc.clone_from(&owner.tracked_sc);
+        c.is_first_req = owner.is_first_req;
+        // A session that served a stream before has its role and its strings still.
+        if let Some(H2Role::Child(ch)) = c.h2_role.as_deref_mut() {
+            let H2Child { owner: o, stream: st, late_trailers, rsp_head, reset, finished, conn_end, owner_tx_pending, rst, goaway, tls: _, quic_ack, sess_vars_at_start } = ch;
+            *o = Some(owner_ref);
+            *st = stream;
+            *late_trailers = None;
+            *rsp_head = None;
+            (*reset, *finished, *owner_tx_pending) = (false, false, false);
+            (*conn_end, *rst, *goaway, *quic_ack) = (None, None, None, None);
+            sess_vars_at_start.copy_scope_from(&owner.strm.vars, ibex_sample::VarScope::Sess);
+            return;
+        }
+        let tls = owner.h2_owner_mut().and_then(|o| o.tls.clone());
+        let tls = tls.or_else(|| {
+            let info = Arc::new(owner.cli_xprt.tls_info()?.clone());
+            if let Some(o) = owner.h2_owner_mut() {
+                o.tls = Some(Arc::clone(&info));
+            }
+            Some(info)
+        });
         // The memory the connection's last stream held for its request (T437).
         let mut spare_role = None;
         if let Some(o) = owner.h2_owner_mut() {
@@ -1295,12 +1341,6 @@ impl TcpSession {
             c.req_headers = sp.req_headers.take();
             spare_role = sp.role.take();
         }
-        c.tracked_sc.clone_from(&owner.tracked_sc);
-        c.h2_flood_config = owner.h2_flood_config;
-        c.is_first_req = owner.is_first_req;
-        c.reset_with_request = owner.reset_with_request;
-        c.keep_request_line = owner.keep_request_line;
-        c.accept_unsafe_request = owner.accept_unsafe_request;
         let role = H2Role::Child(H2Child {
             owner: Some(owner_ref),
             stream,
@@ -1327,18 +1367,212 @@ impl TcpSession {
             }
             None => Box::new(role),
         });
-        c
+    }
+
+    /// The session of an HTTP/2 stream that is over, made as [`Self::h2_child_of`] made it
+    /// before its stream, in place (O1b): its connection keeps it for its next stream
+    /// ([`Self::h2_child_again`]), as an HTTP/1 session is kept for its next request. What
+    /// the stream gave back to its connection ([`Self::h2_child_done`]: its server
+    /// connection, its strings, its role) is gone already. Every field is named, with no
+    /// `..`: a field added to the session does not compile until its reset is written here,
+    /// so nothing a stream set is seen by the next (`HAProxy` frees and allocates the
+    /// `h2s` and `struct stream` instead).
+    #[allow(clippy::too_many_lines)] // one line per field, by design
+    pub fn park_h2_child(&mut self) {
+        let TcpSession {
+            // The connection's, the same for each of its streams (`h2_child_init` copies
+            // the ones a stream may change).
+            cli: _,
+            parser_kind: _,
+            cli_xprt: _,
+            mode: _,
+            client_addr: _,
+            so_name: _,
+            so_id: _,
+            proxy_hdr_err,
+            cliexp,
+            srvexp,
+            srv,
+            srv_xprt,
+            req_uri,
+            req_method,
+            req_body_htx,
+            // Reused in place by the next stream's `start_request`, as the spare list is.
+            req_headers: _,
+            htx_buf,
+            htx_tail,
+            htx_blocks,
+            htx_head,
+            has_htx,
+            htx_modified,
+            req_head_pending,
+            req_ws,
+            cli_state,
+            srv_state,
+            req,
+            rep,
+            // From the connection when the next stream starts (`h2_child_again`).
+            timeouts: _,
+            be_tunnel_ms,
+            be_queue_ms,
+            queue,
+            conn_retries: _,
+            max_retries: _,
+            cli_exp,
+            http_request_ms: _,
+            keep_alive_ms: _,
+            close_client: _,
+            stopping: _,
+            drop_req_trailers,
+            drop_rsp_trailers: _,
+            req_idle,
+            req_exp,
+            srv_exp,
+            conn_exp,
+            retry_after,
+            srv_park_exp,
+            srv_kept,
+            retry_conn,
+            redispatched,
+            target_addr,
+            bc_src,
+            bc_idle,
+            bc_err,
+            lb_picked,
+            bytes_in: _,
+            bytes_out: _,
+            stick_acct_in: _,
+            glitches_credited,
+            stick_out_pending,
+            ending,
+            accept_proxy: _,
+            accept_proxy_v2: _,
+            proxy_handshake_done: _,
+            session_rules_pending,
+            rare_armed: _,
+            proxy_info: _,
+            server_addr: _,
+            send_proxy_prepended,
+            send_proxy_header,
+            srv_cant_recv,
+            cli_cant_recv,
+            passes_ran_out,
+            cli_failed,
+            created_at: _,
+            pending_resp,
+            fc_src: _,
+            fc_dst: _,
+            tcp_inspect_done: _,
+            inspect_exp: _,
+            dr_wait,
+            be_inspect,
+            res_inspect_pending,
+            res_inspect_exp,
+            res_inspect_armed,
+            strm,
+            tracked_sc,
+            bufsize: _,
+            maxrewrite: _,
+            h2_ctx: _,
+            h2_idle_goaway,
+            cli_linger,
+            proto_h2,
+            h2_idle_start,
+            h2_out_waited,
+            h2_head_partial,
+            // Its fields are the next stream's, set when it starts (`h2_child_init`).
+            h2_role: _,
+            h2_flood_config: _,
+            is_first_req: _,
+            reset_with_request: _,
+            keep_request_line: _,
+            accept_unsafe_request: _,
+            h3,
+        } = self;
+        *proxy_hdr_err = None;
+        cliexp.clear();
+        srvexp.clear();
+        debug_assert!(srv.is_none(), "a parked stream holds no server connection");
+        *srv = None;
+        *srv_xprt = ServerXprt::Plain;
+        req_uri.reset();
+        req_method.reset();
+        req_body_htx.set(None);
+        *htx_buf = Buf::unallocated(crate::buf::BufClass::Standard);
+        *htx_tail = 0;
+        *htx_blocks = 0;
+        *htx_head = 0;
+        *has_htx = false;
+        *htx_modified = false;
+        *req_head_pending = false;
+        *req_ws = None;
+        *cli_state = ScState::Ready;
+        *srv_state = ScState::Init;
+        *req = Buf::unallocated(crate::buf::BufClass::Standard);
+        *rep = Buf::unallocated(crate::buf::BufClass::Standard);
+        *be_tunnel_ms = 0;
+        *be_queue_ms = 0;
+        *queue = QueueSlot::default();
+        *cli_exp = Tick::ETERNITY;
+        *drop_req_trailers = false;
+        *req_idle = false;
+        *req_exp = Tick::ETERNITY;
+        *srv_exp = Tick::ETERNITY;
+        *conn_exp = Tick::ETERNITY;
+        *retry_after = Tick::ETERNITY;
+        *srv_park_exp = Tick::ETERNITY;
+        *srv_kept = false;
+        *retry_conn = true;
+        *redispatched = false;
+        *target_addr = None;
+        *bc_src = None;
+        *bc_idle = false;
+        *bc_err = None;
+        *lb_picked = false;
+        *glitches_credited = 0;
+        *stick_out_pending = 0;
+        *ending = None;
+        *session_rules_pending = false;
+        *send_proxy_prepended = false;
+        send_proxy_header.clear();
+        *srv_cant_recv = false;
+        *cli_cant_recv = false;
+        *passes_ran_out = false;
+        *cli_failed = false;
+        *pending_resp = None;
+        *dr_wait = 0;
+        *be_inspect = false;
+        *res_inspect_pending = false;
+        *res_inspect_exp = None;
+        *res_inspect_armed = None;
+        // `Stream::reset` but the log, which is the connection's next one, copied when the
+        // next stream starts (`h2_child_init`), and the timeouts, the connection's then.
+        let crate::stream::Stream { txn, log: _, vars, stick_stores, timeouts_set } = strm;
+        *txn = None;
+        vars.clear_txn();
+        vars.clear_scope(ibex_sample::VarScope::Sess);
+        stick_stores.clear();
+        *timeouts_set = None;
+        *tracked_sc = [None, None, None];
+        *h2_idle_goaway = false;
+        *cli_linger = false;
+        *proto_h2 = false;
+        *h2_idle_start = Tick::ETERNITY;
+        *h2_out_waited = false;
+        *h2_head_partial = false;
+        *h3 = false;
     }
 
     /// The stream `child` is over: what it changed of the connection's state comes back to
     /// the owner, which then waits for its next stream as the session did after `end_txn`
     /// (`reset_for_next_request`). `inspect`: the frontend's `tcp-request content` rules
     /// are armed again for the next request, with this deadline.
-    pub fn h2_child_done(&mut self, child: &mut TcpSession, inspect: Option<Option<Tick>>) {
+    pub fn h2_child_done(&mut self, child: &mut TcpSession, inspect: Option<Option<Tick>>, keep: bool) {
         // Other streams may be served beside this one: what it changed is merged in, the
         // rest of the connection's state is left as they made it.
-        let at_start = child.h2_child_mut().map(|c| std::mem::take(&mut c.sess_vars_at_start)).unwrap_or_default();
-        self.strm.vars.merge_sess_from(&child.strm.vars, &at_start);
+        if let Some(H2Role::Child(ch)) = child.h2_role.as_deref() {
+            self.strm.vars.merge_sess_from(&child.strm.vars, &ch.sess_vars_at_start);
+        }
         child.strm.vars.clear_scope(ibex_sample::VarScope::Sess);
         for (mine, theirs) in self.tracked_sc.iter_mut().zip(&mut child.tracked_sc) {
             if mine.is_none() {
@@ -1348,8 +1582,9 @@ impl TcpSession {
         self.stick_acct_in = self.stick_acct_in.max(child.stick_acct_in);
         self.stick_out_pending += child.stick_out_pending + child.strm.log.bytes_from_server;
         self.strm.log.reset(self.bytes_in, self.bytes_out);
-        // The memory the stream held for its request is the next stream's (T437).
-        if let Some(o) = self.h2_owner_mut() {
+        // The memory the stream held for its request is the next stream's (T437): kept by
+        // its session when the connection keeps that for its next stream (`keep`, O1b).
+        if let Some(o) = self.h2_owner_mut().filter(|_| !keep) {
             let sp = &mut o.spare;
             sp.req_uri = std::mem::take(&mut child.req_uri);
             sp.req_uri.reset();
@@ -1456,6 +1691,7 @@ impl TcpSession {
         retries: u16,
         now: Tick,
     ) -> Self {
+        crate::probe::session_new();
         let cli_state = if mode == Mode::Http {
             ScState::Ready
         } else {

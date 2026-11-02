@@ -398,3 +398,163 @@ fn set_var_takes_no_spare() {
     drop(client);
     let _ = be.join();
 }
+
+fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(payload.len()).expect("len").to_be_bytes();
+    let mut f = vec![len[1], len[2], len[3], kind, flags];
+    f.extend_from_slice(&stream.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// Whether `rx` holds a frame with `END_STREAM` on stream `id` (HEADERS or DATA).
+fn h2_ended(rx: &[u8], id: u32) -> bool {
+    let mut at = 0;
+    while rx.len() >= at + 9 {
+        let len = (usize::from(rx[at]) << 16) | (usize::from(rx[at + 1]) << 8) | usize::from(rx[at + 2]);
+        let (kind, flags) = (rx[at + 3], rx[at + 4]);
+        let sid = u32::from_be_bytes([rx[at + 5], rx[at + 6], rx[at + 7], rx[at + 8]]) & 0x7fff_ffff;
+        if sid == id && (kind == 0 || kind == 1) && flags & 1 != 0 {
+            return true;
+        }
+        at += 9 + len;
+    }
+    false
+}
+
+/// One GET on stream `id` of the h2c connection `client`, the engine run until its end.
+fn h2_get(engine: &mut Engine, client: &mut TcpStream, rx: &mut Vec<u8>, id: u32) {
+    let mut block = vec![0x82, 0x86, 0x84, 0x01, 9];
+    block.extend_from_slice(b"localhost");
+    h2_send(engine, client, rx, id, &block);
+}
+
+/// `:path` `path`, `:authority` `h`, and `extra` (literal fields), as an HPACK block.
+fn h2_block(path: &[u8], extra: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut b = vec![0x82, 0x86, 0x04, u8::try_from(path.len()).expect("short")];
+    b.extend_from_slice(path);
+    b.extend_from_slice(&[0x01, 1, b'h']);
+    for (n, v) in extra {
+        b.push(0);
+        b.push(u8::try_from(n.len()).expect("short"));
+        b.extend_from_slice(n);
+        b.push(u8::try_from(v.len()).expect("short"));
+        b.extend_from_slice(v);
+    }
+    b
+}
+
+/// HEADERS `block` with `END_STREAM` on stream `id`, the engine run until the response ends.
+fn h2_send(engine: &mut Engine, client: &mut TcpStream, rx: &mut Vec<u8>, id: u32, block: &[u8]) {
+    client.write_all(&h2_frame(0x1, 0x5, id, block)).expect("HEADERS");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut buf = [0u8; 4096];
+    while !h2_ended(rx, id) {
+        assert!(Instant::now() < deadline, "no response on stream {id}");
+        let _ = engine.run_once();
+        match client.read(&mut buf) {
+            Ok(0) => panic!("the proxy closed the connection"),
+            Ok(n) => rx.extend_from_slice(&buf[..n]),
+            Err(_) => {}
+        }
+    }
+}
+
+/// O1b: an HTTP/2 stream is a `Stream` its connection holds, not a session of its own: a
+/// request on a connection that served one before builds no `TcpSession` (on 2c69433e, one
+/// per stream: `h2_child_of` -> `new_with_mode`, 2.0k ins a request).
+#[test]
+fn an_h2_stream_is_not_a_session() {
+    const N: u64 = 20;
+    let srv = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let srv_addr = srv.local_addr().expect("addr");
+    let running = Arc::new(AtomicBool::new(true));
+    let be = keepalive_backend(srv, Arc::clone(&running));
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind {fe} proto h2\n  http-request set-var(txn.x) str(a)\n  default_backend be\n\
+         backend be\n  server s {srv_addr}\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = TcpStream::connect(fe).expect("connect");
+    client.set_nonblocking(true).expect("nonblocking");
+    let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    hello.extend(h2_frame(0x4, 0, 0, &[]));
+    client.write_all(&hello).expect("preface");
+    let mut rx = Vec::new();
+    let mut id = 1;
+    for _ in 0..4 {
+        h2_get(&mut engine, &mut client, &mut rx, id);
+        id += 2;
+    }
+    let s0 = ibex_rt::probe::session_news();
+    for _ in 0..N {
+        h2_get(&mut engine, &mut client, &mut rx, id);
+        id += 2;
+    }
+    let made = ibex_rt::probe::session_news() - s0;
+    println!("{N} h2 requests on one connection: {made} TcpSession constructions");
+    assert_eq!(made, 0, "an h2 stream is reset in place, not built as a session");
+    running.store(false, Ordering::Relaxed);
+    drop(client);
+    let _ = be.join();
+}
+
+/// What the first stream of an HTTP/2 connection set (a `txn.` variable, header captures of
+/// both kinds, the priority class, a stream timeout) is gone for the second, served by the
+/// same session reset in place (O1b): each line as `HAProxy` 3.5-dev8-885761-29 logged it
+/// for the same two streams on one h2c connection, measured 2026-11-02:
+/// `"GET http://h/one HTTP/2.0" 200 one - s1 {c1|d1} {r1} 5 1000 56` and
+/// `"GET http://h/two HTTP/2.0" 200 - - - {|} {} 0 5000 51`.
+#[test]
+fn a_field_set_in_stream_one_is_absent_in_stream_two() {
+    let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
+    collector.set_nonblocking(true).expect("nonblocking");
+    let srv = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let srv_addr = srv.local_addr().expect("addr");
+    let running = Arc::new(AtomicBool::new(true));
+    let be = keepalive_backend(srv, Arc::clone(&running));
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n  log {} local0\n\
+           log-format \"%{{+Q}}r %ST %[var(txn.x)] %[var(req.r)] %[var(res.s)] %hr %hs %[prio_class] %[cur_server_timeout] %B\"\n\
+         frontend fe\n  bind {fe} proto h2\n  capture request header X-Cap len 10\n  capture response header X-R len 10\n\
+           http-request capture req.hdr(x-c2) len 10\n  http-request set-var(txn.x) str(one) if {{ path /one }}\n\
+           http-request set-var(req.r) str(r1) if {{ path /one }}\n  http-request set-priority-class int(5) if {{ path /one }}\n\
+           http-response set-var(res.s) str(s1) if {{ var(txn.x) -m found }}\n  default_backend be\n\
+         backend be\n  http-request set-timeout server 1s if {{ path /one }}\n  server s {srv_addr}\n",
+        collector.local_addr().expect("addr")
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = TcpStream::connect(fe).expect("connect");
+    client.set_nonblocking(true).expect("nonblocking");
+    let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    hello.extend(h2_frame(0x4, 0, 0, &[]));
+    client.write_all(&hello).expect("preface");
+    let mut rx = Vec::new();
+    let s0 = ibex_rt::probe::session_news();
+    h2_send(&mut engine, &mut client, &mut rx, 1, &h2_block(b"/one", &[(b"x-cap", b"c1"), (b"x-c2", b"d1")]));
+    h2_send(&mut engine, &mut client, &mut rx, 3, &h2_block(b"/two", &[]));
+    assert_eq!(ibex_rt::probe::session_news() - s0, 2, "the connection's session and its first stream's, which serves the second");
+    let mut lines = Vec::new();
+    let mut buf = [0u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while lines.len() < 2 && Instant::now() < deadline {
+        let _ = engine.run_once();
+        if let Ok(n) = collector.recv(&mut buf) {
+            let l = String::from_utf8_lossy(&buf[..n]).into_owned();
+            lines.push(l.split_once("]: ").map_or(l.clone(), |(_, b)| b.trim_end().to_string()));
+        }
+    }
+    assert_eq!(
+        lines,
+        [
+            "\"GET http://h/one HTTP/2.0\" 200 one - s1 {c1|d1} {r1} 5 1000 56",
+            "\"GET http://h/two HTTP/2.0\" 200 - - - {|} {} 0 5000 51"
+        ]
+    );
+    running.store(false, Ordering::Relaxed);
+    drop(client);
+    let _ = be.join();
+}

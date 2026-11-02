@@ -2413,6 +2413,9 @@ pub struct SessionEntry {
     pub log_sd: u32,
     /// Its place in the buffer wait queue (S6, [`crate::buf_wait`]).
     pub buf_wait: crate::buf_wait::WaitState,
+    /// The session of an HTTP/2 stream that is over, kept by its connection for its next
+    /// stream (O1b, [`SessionArena::park`]): no task, and nothing but its owner finds it.
+    pub parked: bool,
 }
 
 /// Whether the soft stop has asked for its `pool_gc` (one request for every worker).
@@ -2446,6 +2449,8 @@ pub struct SessionArena {
     entries: Vec<Option<SessionEntry>>,
     free: Vec<u32>,
     live: usize,
+    /// Slots held by parked entries (O1b, [`Self::park`]): in use, not live.
+    parked: usize,
     /// The capacity it was created with (`maxconn`'s pre-size): never given back, since
     /// untouched capacity costs no resident memory and growing it again is a `realloc` on
     /// the request path.
@@ -2480,6 +2485,7 @@ impl SessionArena {
             entries,
             free,
             live: 0,
+            parked: 0,
             floor: cap,
             peak: 0,
             presized: false,
@@ -2546,11 +2552,41 @@ impl SessionArena {
 
     #[must_use]
     pub fn get(&self, idx: u32) -> Option<&SessionEntry> {
-        self.entries.get(idx as usize)?.as_ref()
+        self.entries.get(idx as usize)?.as_ref().filter(|e| !e.parked)
     }
 
+    /// (A parked entry is none: a run that ended its stream looks its slot up again after,
+    /// `step_stream`, and must find nothing there.)
     pub fn get_mut(&mut self, idx: u32) -> Option<&mut SessionEntry> {
-        self.entries.get_mut(idx as usize)?.as_mut()
+        self.entries.get_mut(idx as usize)?.as_mut().filter(|e| !e.parked)
+    }
+
+    /// Puts back `entry`, just taken out of slot `idx` by [`Self::free`], as a parked one
+    /// (O1b): the session of an HTTP/2 stream that is over, which its connection keeps for
+    /// its next stream ([`Self::unpark`]). Not seen by `get`, `iter` or `live`.
+    pub fn park(&mut self, idx: u32, mut entry: SessionEntry) {
+        debug_assert_eq!(self.free.last(), Some(&idx), "parked straight after its free");
+        debug_assert!(self.entries[idx as usize].is_none());
+        self.free.pop();
+        entry.parked = true;
+        self.entries[idx as usize] = Some(entry);
+        self.parked += 1;
+    }
+
+    /// Frees the parked entry `idx`; nothing if `idx` is not parked.
+    pub fn free_parked(&mut self, idx: u32) {
+        if self.entries.get(idx as usize).and_then(Option::as_ref).is_some_and(|e| e.parked) {
+            drop(self.free(idx));
+        }
+    }
+
+    /// The parked entry `idx` serves again (its connection's next stream).
+    pub fn unpark(&mut self, idx: u32) -> Option<&mut SessionEntry> {
+        let e = self.entries.get_mut(idx as usize)?.as_mut().filter(|e| e.parked)?;
+        e.parked = false;
+        self.live += 1;
+        self.parked -= 1;
+        Some(e)
     }
 
     /// Two distinct entries at once: an HTTP/2 connection's owner and one of its streams,
@@ -2572,7 +2608,12 @@ impl SessionArena {
             // A scrape or stats page cut short (the client left, its HTTP/2 stream was reset)
             // gives its box back to the pool, which does not count it while it is out (T580).
             e.sess.end_dump();
-            self.live -= 1;
+            // A parked entry is not counted live.
+            if e.parked {
+                self.parked -= 1;
+            } else {
+                self.live -= 1;
+            }
             self.free.push(idx);
         }
         entry
@@ -2589,7 +2630,7 @@ impl SessionArena {
             .enumerate()
             .filter_map(|(idx, opt)| {
                 let id = u32::try_from(idx).ok()?;
-                opt.as_mut().map(|entry| (id, entry))
+                opt.as_mut().filter(|e| !e.parked).map(|entry| (id, entry))
             })
     }
 
@@ -2599,7 +2640,7 @@ impl SessionArena {
             .enumerate()
             .filter_map(|(idx, opt)| {
                 let id = u32::try_from(idx).ok()?;
-                opt.as_ref().map(|entry| (id, entry))
+                opt.as_ref().filter(|e| !e.parked).map(|entry| (id, entry))
             })
     }
 }
@@ -2622,8 +2663,9 @@ impl ibex_alloc::Arena<SessionEntry> for SessionArena {
         self.entries.len()
     }
 
+    // The slots in use, parked ones too (`show pools`).
     fn live(&self) -> usize {
-        self.live
+        self.live + self.parked
     }
 
     fn compact(&mut self) -> usize {
@@ -2631,7 +2673,7 @@ impl ibex_alloc::Arena<SessionEntry> for SessionArena {
         if self.presized {
             return 0;
         }
-        ibex_alloc::arena::compact_slots(&mut self.entries, &mut self.free, self.live, self.floor, &mut self.peak, &SESSION_POOL)
+        ibex_alloc::arena::compact_slots(&mut self.entries, &mut self.free, self.live + self.parked, self.floor, &mut self.peak, &SESSION_POOL)
     }
 }
 
@@ -6169,6 +6211,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     log_err: false,
                     log_sd: 0,
                     buf_wait: crate::buf_wait::WaitState::default(),
+                    parked: false,
                 };
                 let Some(idx) = self.sessions.alloc(entry) else {
                     self.quic_listeners[q_idx].owner_close(conn);
@@ -6692,22 +6735,19 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             };
             let Some(d) = d else { return };
             let stream_id = d.stream.id;
+            // The session of a stream that is over serves this one, in place (O1b).
+            if let Some(idx) = owner.sess.h2_owner_mut().and_then(|o| o.parked.pop()) {
+                let Some(task) = self.scheduler.create(WorkKind::new(Kind::Stream, idx)) else { self.sessions.free_parked(idx); return };
+                self.sessions.unpark(idx);
+                let Some((owner, child)) = self.sessions.get2_mut(owner_idx, idx) else { return };
+                child.sess.h2_child_again(&mut owner.sess, (owner_idx, owner_task), d.stream);
+                h3_child_facts(&mut child.sess, &owner.sess, &self.quic_listeners);
+                child.task = task;
+                h2_child_start(owner, child, &mut self.fdtab, now, (owner_task, idx, task, stream_id), d, wake_queue);
+                continue;
+            }
             let mut sess = TcpSession::h2_child_of(&mut owner.sess, (owner_idx, owner_task), d.stream);
-            sess.h3 = owner.sess.h3;
-            // T569: the connection's acknowledgement counts as this request found them.
-            if let Some(h3) = owner.sess.h3_owner() {
-                let facts = self.quic_listeners.get(h3.listener as usize).and_then(|ql| ql.ack_facts(h3.conn));
-                if let Some(c) = sess.h2_child_mut() {
-                    c.quic_ack = Some(crate::proxy::QuicAckSrc { listener: h3.listener, conn: h3.conn, facts });
-                }
-            }
-            // An HTTP/2 owner stamps the first byte of each stream as it reads it; an HTTP/3
-            // one reads no bytes of its own. The stream's request head is in, which is where
-            // its idle time (`Ti`, since the connection's previous stream ended) stops and
-            // its own `TR` and `Ta` start (T529). Left unset, `TR` and `Ta` held the idle gap.
-            if owner.sess.h3 {
-                sess.strm.log.first_byte_now();
-            }
+            h3_child_facts(&mut sess, &owner.sess, &self.quic_listeners);
             let entry = SessionEntry {
                 sess,
                 task: TaskRef::NONE,
@@ -6730,38 +6770,14 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 log_err: false,
                 log_sd: 0,
                 buf_wait: crate::buf_wait::WaitState::default(),
+                parked: false,
             };
             // Neither fails before the `u32` indices run out.
             let Some(child_idx) = self.sessions.alloc(entry) else { return };
             let Some(task) = self.scheduler.create(WorkKind::new(Kind::Stream, child_idx)) else { self.sessions.free(child_idx); return };
             let Some((owner, child)) = self.sessions.get2_mut(owner_idx, child_idx) else { return };
             child.task = task;
-            // A server connection the last stream kept goes to this one, as the session
-            // kept it for its next request.
-            move_server(owner, child, &mut self.fdtab);
-            // It is not this stream's until a request takes it (`bc_idle`, T491).
-            child.sess.bc_idle = child.sess.srv.is_some();
-            let head = crate::h2_bridge::start_request(&mut child.sess, d);
-            if let Some(h2) = owner.sess.h2_ctx.as_deref_mut() {
-                h2.give_back_head(head);
-            } else if let Some(h3) = owner.sess.h3_owner_mut() {
-                ibex_proto::htx_mux::HtxMux::give_back_head(&mut *h3.mux, head);
-            }
-            // The stream's own `timeout client` starts with it (T300).
-            child.sess.arm_client(now);
-            if let Some(o) = owner.sess.h2_owner_mut() {
-                o.children.push(crate::proxy::H2ChildLink { idx: child_idx, task, stream_id });
-            }
-            // What the owner's next run would move first (the request's body so far, its end)
-            // moves now, so the stream's first run has it (T599). That run wakes the owner in
-            // the next pass (`owner_wake`), which moves the rest: woken here too, the owner
-            // ran before its stream had, to do just this.
-            if owner.sess.h2_ctx.is_some() {
-                let _ = h2_bridge_moves(owner, child, now);
-            } else {
-                wake_queue.push(owner_task);
-            }
-            wake_queue.push(task);
+            h2_child_start(owner, child, &mut self.fdtab, now, (owner_task, child_idx, task, stream_id), d, wake_queue);
         }
     }
 
@@ -8564,6 +8580,7 @@ fn register_new_session(
         log_err: false,
         log_sd: 0,
         buf_wait: crate::buf_wait::WaitState::default(),
+        parked: false,
     })) else {
         if let Some(idx) = target_server_idx {
             if idx < proxy.server_actconn.len() {
@@ -9367,6 +9384,67 @@ fn move_server(from: &mut SessionEntry, to: &mut SessionEntry, fdtab: &mut FdTab
     if let Some(sfd) = to.srv_raw_fd {
         fdtab.set_task(sfd, to.task);
     }
+}
+
+/// What the session of a stream of an HTTP/3 connection `owner` takes of it as the stream
+/// starts; nothing for an HTTP/2 one.
+fn h3_child_facts(sess: &mut TcpSession, owner: &TcpSession, quic_listeners: &[crate::quic_listener::QuicListener]) {
+    sess.h3 = owner.h3;
+    // T569: the connection's acknowledgement counts as this request found them.
+    if let Some(h3) = owner.h3_owner() {
+        let facts = quic_listeners.get(h3.listener as usize).and_then(|ql| ql.ack_facts(h3.conn));
+        if let Some(c) = sess.h2_child_mut() {
+            c.quic_ack = Some(crate::proxy::QuicAckSrc { listener: h3.listener, conn: h3.conn, facts });
+        }
+    }
+    // An HTTP/2 owner stamps the first byte of each stream as it reads it; an HTTP/3
+    // one reads no bytes of its own. The stream's request head is in, which is where
+    // its idle time (`Ti`, since the connection's previous stream ended) stops and
+    // its own `TR` and `Ta` start (T529). Left unset, `TR` and `Ta` held the idle gap.
+    if owner.h3 {
+        sess.strm.log.first_byte_now();
+    }
+}
+
+/// The stream `child` of `owner` starts (T280): the server connection the connection kept,
+/// the request head into the child, its client timer, its link, and what the owner would
+/// move first. `ids`: the owner's task, the child's entry, task and stream id.
+fn h2_child_start(
+    owner: &mut SessionEntry,
+    child: &mut SessionEntry,
+    fdtab: &mut FdTab,
+    now: Tick,
+    ids: (TaskRef, u32, TaskRef, u32),
+    d: crate::h2_bridge::H2Dispatch,
+    wake_queue: &mut Vec<TaskRef>,
+) {
+    let (owner_task, child_idx, task, stream_id) = ids;
+    // A server connection the last stream kept goes to this one, as the session
+    // kept it for its next request.
+    move_server(owner, child, fdtab);
+    // It is not this stream's until a request takes it (`bc_idle`, T491).
+    child.sess.bc_idle = child.sess.srv.is_some();
+    let head = crate::h2_bridge::start_request(&mut child.sess, d);
+    if let Some(h2) = owner.sess.h2_ctx.as_deref_mut() {
+        h2.give_back_head(head);
+    } else if let Some(h3) = owner.sess.h3_owner_mut() {
+        ibex_proto::htx_mux::HtxMux::give_back_head(&mut *h3.mux, head);
+    }
+    // The stream's own `timeout client` starts with it (T300).
+    child.sess.arm_client(now);
+    if let Some(o) = owner.sess.h2_owner_mut() {
+        o.children.push(crate::proxy::H2ChildLink { idx: child_idx, task, stream_id });
+    }
+    // What the owner's next run would move first (the request's body so far, its end)
+    // moves now, so the stream's first run has it (T599). That run wakes the owner in
+    // the next pass (`owner_wake`), which moves the rest: woken here too, the owner
+    // ran before its stream had, to do just this.
+    if owner.sess.h2_ctx.is_some() {
+        let _ = h2_bridge_moves(owner, child, now);
+    } else {
+        wake_queue.push(owner_task);
+    }
+    wake_queue.push(task);
 }
 
 /// The bytes an HTTP/2 connection's owner moves for one of its streams (T280): the DATA
@@ -11313,7 +11391,7 @@ impl EngineDispatcher<'_> {
     /// stream changed of the connection (and a server connection it kept, as the session
     /// kept it between requests), and goes on to its next stream; or, when the stream ended
     /// the connection as the session's transaction would have, closes it (T280).
-    fn h2_child_released(&mut self, child: &mut SessionEntry, now: Tick) {
+    fn h2_child_released(&mut self, child: &mut SessionEntry, now: Tick, keep: bool) {
         // The bytes before the stream that were its to credit at its http rules (the
         // connection's accounting moved past them when it started): a stream that ended
         // before its rules ran (refused, reset) credits them now, or nothing would (T300).
@@ -11381,7 +11459,7 @@ impl EngineDispatcher<'_> {
             move_server(child, owner, self.fdtab);
             let fe = &self.proxies[owner.proxy_idx];
             let inspect = (!fe.tcp_req_content_rules.is_empty()).then(|| fe.tcp_req_inspect_delay.map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX))));
-            owner.sess.h2_child_done(&mut child.sess, inspect);
+            owner.sess.h2_child_done(&mut child.sess, inspect, keep);
             owner.sess.arm_request(now);
             // The connection's own timer runs again once no stream is attached (T300).
             if owner.sess.h2_owner().is_some_and(|o| o.children.is_empty()) && matches!(owner.sess.cli_state, ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW) {
@@ -11910,13 +11988,36 @@ impl EngineDispatcher<'_> {
             if entry.buf_wait.queued() {
                 crate::buf_wait::leave(session_idx);
             }
+            let mut park_in = None;
             if entry.sess.is_h2_child() {
+                // A stream over as its transaction ended (not reset, not ending its
+                // connection, not a panic's) leaves its session to its connection's next
+                // stream (O1b), while the connection serves and keeps fewer than it may
+                // serve at once (this one is among its children still).
+                park_in = entry
+                    .sess
+                    .h2_child()
+                    .filter(|c| close_notify && c.finished && c.conn_end.is_none())
+                    .and_then(|c| c.owner)
+                    .filter(|&(idx, task)| {
+                        self.sessions.get(idx).filter(|o| o.task == task).is_some_and(|o| {
+                            let max = o.sess.h2_max_children();
+                            let serving = !o.sess.is_done() && matches!(o.sess.cli_state, ScState::Ready | ScState::Established);
+                            serving && o.sess.h2_owner().is_some_and(|h| h.parked.len() + h.children.len() <= max)
+                        })
+                    });
                 // The stream is freed in its own run: its variables are in the run's map
                 // until they go back to it here, for its connection's.
                 stream_vars_leave(Some(&mut entry.sess));
-                self.h2_child_released(&mut entry, now);
-            } else if entry.sess.h2_owner().is_some_and(|o| !o.children.is_empty()) {
-                self.h2_owner_released(&mut entry);
+                self.h2_child_released(&mut entry, now, park_in.is_some());
+            } else {
+                if entry.sess.h2_owner().is_some_and(|o| !o.children.is_empty()) {
+                    self.h2_owner_released(&mut entry);
+                }
+                // The sessions it kept for its next streams go with it.
+                for idx in entry.sess.h2_owner_mut().map(|o| std::mem::take(&mut o.parked)).unwrap_or_default() {
+                    self.sessions.free_parked(idx);
+                }
             }
             if close_notify {
                 entry.sess.close_notify_both();
@@ -11929,7 +12030,58 @@ impl EngineDispatcher<'_> {
                 self.listeners,
             );
             crate::proxy::give_relay_role(&mut entry.sess);
+            if let Some((owner_idx, owner_task)) = park_in {
+                self.park_h2_child(owner_idx, owner_task, session_idx, entry);
+            }
         }
+    }
+
+    /// The session `entry` of a stream of `owner_idx` that is over, slot `idx` (just freed),
+    /// is kept by its connection for its next stream (O1b), made as a new stream's session
+    /// is.
+    fn park_h2_child(&mut self, owner_idx: u32, owner_task: TaskRef, idx: u32, mut entry: SessionEntry) {
+        // (Its owner was found serving before the stream was released, which it survives.)
+        let Some(h) = self.sessions.get_mut(owner_idx).filter(|o| o.task == owner_task).and_then(|o| o.sess.h2_owner_mut()) else { return };
+        h.parked.push(idx);
+        entry.sess.park_h2_child();
+        let SessionEntry {
+            sess: _,
+            task,
+            proxy_idx,
+            backend_idx,
+            srv_backend_idx,
+            target_server_idx,
+            cli_raw_fd: _,
+            srv_raw_fd,
+            cli_interest,
+            srv_interest,
+            actconn_reclaimed,
+            stats_done,
+            be_counted,
+            connect_log_due,
+            rate_max_due,
+            srv_served,
+            log_line,
+            log_err,
+            log_sd,
+            buf_wait,
+            parked: _,
+        } = &mut entry;
+        *task = TaskRef::NONE;
+        (*backend_idx, *srv_backend_idx) = (*proxy_idx, *proxy_idx);
+        *target_server_idx = None;
+        debug_assert!(srv_raw_fd.is_none(), "a parked stream holds no server connection");
+        *srv_raw_fd = None;
+        (*cli_interest, *srv_interest) = (Interest::NONE, Interest::NONE);
+        *actconn_reclaimed = false;
+        *stats_done = false;
+        be_counted.set(NO_BACKEND);
+        (*connect_log_due, *rate_max_due) = (false, false);
+        *srv_served = 0;
+        *log_line = None;
+        (*log_err, *log_sd) = (false, 0);
+        *buf_wait = crate::buf_wait::WaitState::default();
+        self.sessions.park(idx, entry);
     }
 
     /// A stream's run panicked ([`crate::crash::contain`], T447): the stream is closed as one
