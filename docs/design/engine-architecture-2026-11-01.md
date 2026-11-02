@@ -803,3 +803,32 @@ HAProxy = §2.1's dev8 (dev10 for h3fit), non-PGO. Board: `~/ibex-worktrees/boar
   measured -2.7k rules on its own branch; T584 -0.3k; T595 targets the var lookup ~0.4k).
 - **h3fit 1.18x with PGO**: O1c and T586 item 3 (h3 same-pass wake) are the h3 slices.
 - PGO gains here: keepalive -12 %, rules -13 %, h2s1 -11 %, h3fit -14 % over release-perf.
+
+### 6.6 ibex-rc5, measured (2026-11-02 03:55, 8d456329)
+
+After wave 1 plus T584-T598, X1, X2, X3, X5 (T599 merged after the tag). Same method as §6.5:
+`tools/measure/perfbase.sh` (release-perf: fat LTO, 1 codegen unit) and the same scenarios on a
+`tools/pgo-build.sh` binary, counts slot, min of 5 (h3fit: median of 3 fits at 1.97 dg/req). User
+ins/req. Ratio = Ibex ÷ HAProxy, **above 1 = Ibex does more work**. HAProxy = §2.1 (dev8, dev10 for
+h3fit), gcc 16.2.1 `-O2 -g -fwrapv`, **no LTO, no PGO**. Board:
+`~/ibex-worktrees/boards/pgo-rc5-8d456329/`.
+
+| scenario | wave 1 PGO (§6.5) | rc5 release-perf | ratio | **rc5 PGO** | **PGO ratio** | HAProxy | PGO gain |
+|---|---|---|---|---|---|---|---|
+| keepalive ab1 | 34.7k | 36.0k | 1.00x | **30.9k** | **0.85x** | 36.2k | -14 % |
+| rules ab1 | 59.6k | 56.8k | 1.30x | **48.0k** | **1.10x** | 43.8k | -15 % |
+| h2s1 | 54.1k | 58.6k | 1.10x | **51.1k** | **0.96x** | 53.2k | -13 % |
+| h3fit (1.97 dg/req) | 75.7k | 86.7k | 1.35x | **74.5k** | **1.16x** | 64.0k | -14 % |
+
+Kernel per request (release-perf) 65.7k keepalive, 65.7k rules, 66.6k h2s1 (HAProxy 69.7k
+keepalive, 76.3k h2s1, §2.1): the kernel is the larger half of every request on both.
+
+- **The fair comparison is not either column yet.** release-perf has fat LTO and HAProxy has none;
+  PGO-Ibex against non-PGO HAProxy flatters Ibex by roughly the PGO gain (10-15 % on both, as a
+  rule). T603 builds HAProxy o2/lto/pgo/pgo-lto. Until then, read release-perf vs HAProxy -O2 as
+  the nearest like-for-like (Ibex has LTO, HAProxy doesn't).
+- **rules is still the gap** (1.30x release-perf): R2 (samples as bytes) and R4 are in waves A-B.
+- **h3fit** (1.35x): O1c and X8 (wave C). T599 (after the tag) cut h3fit by -2.5k and h2s1 by -4.0k
+  on release-perf: not in this table.
+- Instructions only. Cycles, IPC, cache and branch misses on both proxies (`perf stat`) come with
+  T603, so a gap can be split into work, memory and kernel. T582's waived +0.5% (C582) lands after.
