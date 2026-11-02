@@ -87,7 +87,7 @@ pub struct H2StreamCtx {
     /// The request is an extended CONNECT (RFC 8441, [`H2ReqHead::ext_connect`]): the
     /// server's `101` is a `200` to the client, and what follows a tunnel.
     pub ext_connect: bool,
-    /// CP2a: the request head of a stream of a server connection as the HTX blocks
+    /// CP2: the request head of a stream of a server connection as the HTX blocks
     /// ([`crate::h2::write_request_htx`]) of the memory the stream's buffer adopts, written
     /// once from the decoded fields; `rx_htx` then holds the end of the head and what follows.
     /// `None` until the head comes, once the data path has taken it, and for a head kept as
@@ -441,7 +441,7 @@ impl H2ReqHead {
     }
 }
 
-/// The request head of a server connection's stream from its decoded `fields` (CP2a): the HTX
+/// The request head of a server connection's stream from its decoded `fields` (CP2): the HTX
 /// blocks [`crate::h2::write_request_htx`] writes into memory from `take_rx` (the buffer the
 /// stream's transaction adopts, `H2StreamCtx::rx_head`), then `scheme://authority` after
 /// them for the log line. The checks, the limits (`tune.http.maxhdr`, the head's room: T242)
@@ -817,7 +817,7 @@ pub struct H2MuxContext {
     /// The memory of the HTX of streams that are over, for the next (at most
     /// [`SPARE_STREAMS`]).
     pub spare_htx: Vec<Htx>,
-    /// Where a server connection's request heads are written (CP2a, [`H2StreamCtx::rx_head`]):
+    /// Where a server connection's request heads are written (CP2, [`H2StreamCtx::rx_head`]):
     /// memory for a head of an estimated `need` bytes of HTX, `None` when there is none (the
     /// stream is refused, `REFUSED_STREAM`). The data path's pool (`Buf::take_rx_head`);
     /// without one, the heap.
@@ -3227,7 +3227,7 @@ mod tests {
         None
     }
 
-    /// CP2a: a request head is written as HTX blocks into the memory the data path hands the
+    /// CP2: a request head is written as HTX blocks into the memory the data path hands the
     /// mux (`take_rx_head`), with `scheme://authority` after them; none to be had refuses the
     /// stream (`REFUSED_STREAM`), memory too small is asked for again, larger, and a head
     /// that fits neither is kept as its fields.

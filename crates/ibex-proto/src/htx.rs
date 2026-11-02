@@ -1399,7 +1399,7 @@ pub struct HtxRegion {
 /// small-buffer pool (`Buf::take_rx_head`, `Buf`'s drop), so it is counted there and the box
 /// never changes pool on the way.
 ///
-/// CP2a: dropped without being adopted (a stream reset before it is served, a connection
+/// CP2: dropped without being adopted (a stream reset before it is served, a connection
 /// closed with streams not served yet), the memory goes back to the pool it came from
 /// ([`Self::pooled`]), so the pool's count stays right whoever drops it.
 #[derive(Debug)]

@@ -625,7 +625,7 @@ impl Buf {
     /// estimated fits it, as a head's own HTX takes one (T312), else a standard one. `None`
     /// when the pool refuses (memory short, `tune.fail-alloc`): the caller refuses the stream,
     /// never mallocs. Dropped without being adopted, the memory goes back to its pool, zeroed
-    /// under `tune.ibex.zero-buffers` (CP2a: the mux's `H2MuxContext::take_rx_head`).
+    /// under `tune.ibex.zero-buffers` (CP2: the mux's `H2MuxContext::take_rx_head`).
     #[must_use]
     pub fn take_rx_head(need: usize) -> Option<ibex_proto::htx::RxHead> {
         let mem = if need.saturating_mul(2) <= get_bufsize_small() { alloc_small() } else { alloc_standard() };

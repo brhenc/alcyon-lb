@@ -887,7 +887,7 @@ mod in_place {
 /// followed by `HtxSlice::put_request_head` do today. The reference here is today's code: a
 /// server `H2MuxContext` fed the same HEADERS frame says whether the stream is taken (its
 /// checks, limits and `bad_request` included), then `H2ReqHead::write` + `put_request_head`
-/// write the blocks (CP2a: the mux itself writes with `write_request_htx` now); the expected values behind it are pinned by T437/T449/T451/E1
+/// write the blocks (CP2: the mux itself writes with `write_request_htx` now); the expected values behind it are pinned by T437/T449/T451/E1
 /// (`h2_field_validity.rs`) and were measured on ``HAProxy`` 3.5-dev8 then, so no row here
 /// doubts them.
 mod request_head_writer {

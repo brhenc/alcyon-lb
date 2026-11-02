@@ -688,10 +688,18 @@ impl ReqText {
     /// session gave back when it ended, rather than allocating. `false`, and no text, when the
     /// memory cannot be had (S5: T446's run under `RLIMIT_DATA` aborted here, `reserve_exact`).
     pub fn set(&mut self, s: &str) -> bool {
-        self.set_parts(&[s])
+        if self.buf.capacity() == 0 {
+            self.buf = crate::reuse::string();
+        }
+        self.buf.clear();
+        self.set = self.buf.try_reserve_exact(s.len()).is_ok();
+        if self.set {
+            self.buf.push_str(s);
+        }
+        self.set
     }
 
-    /// [`Self::set`] of the `parts` one after the other, with no joined copy (CP2a: the line
+    /// [`Self::set`] of the `parts` one after the other, with no joined copy (CP2: the line
     /// `%r` prints of an h2 request, from its blocks).
     pub fn set_parts(&mut self, parts: &[&str]) -> bool {
         if self.buf.capacity() == 0 {
@@ -700,7 +708,9 @@ impl ReqText {
         self.buf.clear();
         self.set = self.buf.try_reserve_exact(parts.iter().map(|p| p.len()).sum()).is_ok();
         if self.set {
-            parts.iter().for_each(|p| self.buf.push_str(p));
+            for p in parts {
+                self.buf.push_str(p);
+            }
         }
         self.set
     }

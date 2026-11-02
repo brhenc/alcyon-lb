@@ -43,7 +43,7 @@ pub struct H2Dispatch {
 
 /// The request head of a stream taken to be served.
 pub enum DispatchHead {
-    /// CP2a: the HTX blocks the h2 mux wrote from the decoded fields
+    /// CP2: the HTX blocks the h2 mux wrote from the decoded fields
     /// ([`ibex_proto::h2::write_request_htx`]), in the memory that becomes the stream's
     /// `htx_buf` ([`Buf::adopt`]), what the writer said of them, and the length of the
     /// `scheme://authority` written after them (the log line's).
@@ -184,7 +184,7 @@ pub fn chunked_head(head: &[u8], at: usize) -> Vec<u8> {
 /// connection's owner (T280): its head written as HTX from the fields the mux kept (E1: no
 /// HTTP/1.1 text is written and parsed again), the head in `req` written once from the HTX,
 /// the request's log fields, and the transaction. The head's memory is given back, for the
-/// connection's next streams ([`H2MuxContext::give_back_head`]); CP2a: a head the h2 mux
+/// connection's next streams ([`H2MuxContext::give_back_head`]); CP2: a head the h2 mux
 /// wrote as blocks is adopted as the stream's `htx_buf` instead, and there is none to give.
 pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Option<Box<H2ReqHead>> {
     let chunked = d.stream.chunk_out;
@@ -228,7 +228,7 @@ fn digits(n: u64) -> usize {
     n.max(1).ilog10() as usize + 1
 }
 
-/// [`start_request`] of a head the h2 mux wrote as HTX blocks into `rx` (CP2a): the memory
+/// [`start_request`] of a head the h2 mux wrote as HTX blocks into `rx` (CP2): the memory
 /// becomes the stream's `htx_buf` as it is, and the log fields are read from its start line
 /// (and the `scheme://authority` after its payload, `abs_len` bytes) before it does.
 fn start_adopted(sess: &mut TcpSession, rx: RxHead, facts: HeadFacts, abs_len: usize, chunked: bool) {
@@ -1114,7 +1114,7 @@ mod tests {
     }
 
     /// The HTX blocks `write_request_htx` writes of `fields` into 1 KB, as the h2 mux does
-    /// (CP2a), with `https://x` after them.
+    /// (CP2), with `https://x` after them.
     fn written(fields: &[(&[u8], &[u8])]) -> (RxHead, HeadFacts, usize) {
         let mut enc = ibex_proto::hpack::HpackEncoder::new();
         let mut block = Vec::new();
@@ -1129,7 +1129,7 @@ mod tests {
         (rx, facts, 9)
     }
 
-    /// CP2a: a head the h2 mux wrote as blocks is the stream's `htx_buf`, the memory moved,
+    /// CP2: a head the h2 mux wrote as blocks is the stream's `htx_buf`, the memory moved,
     /// not copied: its log line and method from its start line, framed and counted (`%U`) by
     /// the one canonical `content-length` the blocks hold in place of the client's `005`.
     #[test]
