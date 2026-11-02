@@ -10,5 +10,6 @@
 //! own `[[test]]` in Cargo.toml and says why in its header. `harness/test_layout.py` fails on
 //! a test file no target compiles.
 
+mod do_resolve_cache;
 mod hostile_responses;
 mod resolver_behavior;
