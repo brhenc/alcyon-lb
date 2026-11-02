@@ -14666,7 +14666,7 @@ impl EngineDispatcher<'_> {
                 }
             }
             // No `track-sc` rule of a slot ran (its condition did not hold): it keeps its entry, which counts the request.
-            if !be_stage {
+            if !be_stage && deferred != [false; 3] {
                 let c = counted.get();
                 for (slot, tracked) in sess.tracked_sc.iter().enumerate() {
                     let Some((t_idx, key)) = tracked.as_ref().filter(|_| deferred[slot] && !c[slot]) else { continue };
