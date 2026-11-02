@@ -558,3 +558,60 @@ fn a_field_set_in_stream_one_is_absent_in_stream_two() {
     drop(client);
     let _ = be.join();
 }
+
+/// The sessions an h2 connection parks are a cache (AGENTS §8): after a burst of concurrent
+/// streams the idle connection keeps one (for its next stream), not one per stream of the
+/// burst, and a `pool_gc` frees even that one (O1b; on 493404f1 the burst left 10 parked
+/// and `pool_gc` freed none).
+#[test]
+fn parked_h2_sessions_fall_back_when_idle_and_go_with_pool_gc() {
+    const N: u32 = 10;
+    let srv = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let srv_addr = srv.local_addr().expect("addr");
+    let running = Arc::new(AtomicBool::new(true));
+    let be = keepalive_backend(srv, Arc::clone(&running));
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind {fe} proto h2\n  default_backend be\n\
+         backend be\n  server s {srv_addr}\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = TcpStream::connect(fe).expect("connect");
+    client.set_nonblocking(true).expect("nonblocking");
+    let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    hello.extend(h2_frame(0x4, 0, 0, &[]));
+    for i in 0..N {
+        hello.extend(h2_frame(0x1, 0x5, 1 + 2 * i, &h2_block(b"/", &[])));
+    }
+    client.write_all(&hello).expect("preface and heads");
+    let mut rx = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !(0..N).all(|i| h2_ended(&rx, 1 + 2 * i)) {
+        assert!(Instant::now() < deadline, "not every stream ended");
+        let _ = engine.run_once();
+        if let Ok(n) = client.read(&mut buf) {
+            rx.extend_from_slice(&buf[..n]);
+        }
+    }
+    for _ in 0..5 {
+        let _ = engine.run_once();
+    }
+    // What one parked session holds: its arena slot and its role box (plus its strings'
+    // and variables' capacity, a few hundred bytes for this request).
+    println!(
+        "parked session: entry {} B + role box {} B",
+        std::mem::size_of::<ibex_rt::engine::SessionEntry>(),
+        std::mem::size_of::<ibex_rt::proxy::H2Role>()
+    );
+    assert!(engine.sessions.parked() <= 1, "{} sessions parked by an idle connection", engine.sessions.parked());
+    ibex_rt::pool_gc::request();
+    let _ = engine.run_once();
+    assert_eq!(engine.sessions.parked(), 0, "pool_gc frees the parked sessions");
+    // The connection still serves.
+    h2_get(&mut engine, &mut client, &mut rx, 1 + 2 * N);
+    running.store(false, Ordering::Relaxed);
+    drop(client);
+    let _ = be.join();
+}

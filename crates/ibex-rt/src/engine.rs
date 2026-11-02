@@ -2573,11 +2573,26 @@ impl SessionArena {
         self.parked += 1;
     }
 
-    /// Frees the parked entry `idx`; nothing if `idx` is not parked.
-    pub fn free_parked(&mut self, idx: u32) {
-        if self.entries.get(idx as usize).and_then(Option::as_ref).is_some_and(|e| e.parked) {
-            drop(self.free(idx));
+    /// Slots held by parked entries.
+    #[must_use]
+    pub const fn parked(&self) -> usize {
+        self.parked
+    }
+
+    /// `pool_gc`: every connection's parked sessions are freed (a cache, AGENTS §8). How many.
+    pub fn drain_parked(&mut self) -> usize {
+        let mut idxs = Vec::new();
+        self.iter_mut().filter_map(|(_, e)| e.sess.h2_owner_mut()).for_each(|o| idxs.append(&mut o.parked));
+        for &i in &idxs {
+            self.free_parked(i);
         }
+        idxs.len()
+    }
+
+    /// Frees the parked entry `idx` (its connection's list names only parked ones).
+    pub fn free_parked(&mut self, idx: u32) {
+        debug_assert!(self.entries.get(idx as usize).and_then(Option::as_ref).is_some_and(|e| e.parked), "not a parked entry");
+        drop(self.free(idx));
     }
 
     /// The parked entry `idx` serves again (its connection's next stream).
@@ -6465,6 +6480,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // A `pool_gc` was asked for (a signal, the stop path, a failed allocation on any
         // thread): this thread empties its caches, and the engine its own scratch lists.
         if crate::pool_gc::poll() {
+            self.sessions.drain_parked();
             self.compact_arenas();
             self.wake_now_scratch = Vec::new();
             if self.wake_scratch.is_empty() {
@@ -12041,7 +12057,13 @@ impl EngineDispatcher<'_> {
     /// is.
     fn park_h2_child(&mut self, owner_idx: u32, owner_task: TaskRef, idx: u32, mut entry: SessionEntry) {
         // (Its owner was found serving before the stream was released, which it survives.)
-        let Some(h) = self.sessions.get_mut(owner_idx).filter(|o| o.task == owner_task).and_then(|o| o.sess.h2_owner_mut()) else { return };
+        let h = self.sessions.get_mut(owner_idx).filter(|o| o.task == owner_task).and_then(|o| o.sess.h2_owner_mut());
+        debug_assert!(h.is_some(), "the owner outlives the release of its stream");
+        let Some(h) = h else { return };
+        // A connection left with no stream keeps one session for its next, not one per
+        // stream of a burst it served (a cache, AGENTS §8): the others go now.
+        let idle = h.children.is_empty();
+        let extra = if idle { std::mem::take(&mut h.parked) } else { Vec::new() };
         h.parked.push(idx);
         entry.sess.park_h2_child();
         let SessionEntry {
@@ -12082,6 +12104,9 @@ impl EngineDispatcher<'_> {
         (*log_err, *log_sd) = (false, 0);
         *buf_wait = crate::buf_wait::WaitState::default();
         self.sessions.park(idx, entry);
+        for i in extra {
+            self.sessions.free_parked(i);
+        }
     }
 
     /// A stream's run panicked ([`crate::crash::contain`], T447): the stream is closed as one
