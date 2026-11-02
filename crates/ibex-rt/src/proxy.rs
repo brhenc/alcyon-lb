@@ -688,13 +688,19 @@ impl ReqText {
     /// session gave back when it ended, rather than allocating. `false`, and no text, when the
     /// memory cannot be had (S5: T446's run under `RLIMIT_DATA` aborted here, `reserve_exact`).
     pub fn set(&mut self, s: &str) -> bool {
+        self.set_parts(&[s])
+    }
+
+    /// [`Self::set`] of the `parts` one after the other, with no joined copy (CP2a: the line
+    /// `%r` prints of an h2 request, from its blocks).
+    pub fn set_parts(&mut self, parts: &[&str]) -> bool {
         if self.buf.capacity() == 0 {
             self.buf = crate::reuse::string();
         }
         self.buf.clear();
-        self.set = self.buf.try_reserve_exact(s.len()).is_ok();
+        self.set = self.buf.try_reserve_exact(parts.iter().map(|p| p.len()).sum()).is_ok();
         if self.set {
-            self.buf.push_str(s);
+            parts.iter().for_each(|p| self.buf.push_str(p));
         }
         self.set
     }
@@ -3179,6 +3185,8 @@ impl TcpSession {
                 let mut h2 = H2MuxContext::new(ibex_proto::conn::ConnId(0), true);
                 h2.flood_config = self.h2_flood_config;
                 h2.relaxed_path = self.accept_unsafe_request;
+                // The request heads go into the buffers their streams adopt (CP2a).
+                h2.take_rx_head = Buf::take_rx_head;
                 if let Some(m) = self.h2_flood_config.max_concurrent_streams {
                     h2.max_concurrent_streams = m;
                 }

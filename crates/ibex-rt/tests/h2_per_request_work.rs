@@ -453,6 +453,33 @@ fn an_h2_request_head_is_parsed_once() {
     let _ = be.join();
 }
 
+/// CP2a (`docs/design/copies-2026-11-02.md` section 3.1, row S2): an h2 request head is
+/// written into memory once, by the mux, as the HTX blocks of the buffer the stream then owns
+/// (`Buf::adopt`). Before CP2a the mux wrote it into an `H2ReqHead` and the bridge wrote it
+/// again as blocks: twice the head's bytes per request (`ibex_proto::htx::head_bytes_written`,
+/// debug builds). The head here: `GET`, `/`, `host: localhost`, 17 bytes.
+#[test]
+fn an_h2_request_head_is_copied_once() {
+    const N: u64 = 20;
+    const HEAD: u64 = 3 + 1 + 4 + 9;
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut engine, fe, running, be) = setup();
+    let mut c = Client::connect(&mut engine, fe);
+    c.get(&mut engine);
+    let b0 = ibex_proto::htx::head_bytes_written();
+    for _ in 0..N {
+        c.get(&mut engine);
+    }
+    let bytes = ibex_proto::htx::head_bytes_written() - b0;
+    println!("{N} h2 requests: {bytes} head bytes written ({HEAD} a head)");
+    if cfg!(debug_assertions) {
+        assert_eq!(bytes, N * HEAD, "{N} h2 requests of a {HEAD}-byte head wrote {bytes} head bytes");
+    }
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}
+
 /// X4 (`docs/design/htx-engine-2026-11-01.md` section 3): an h2 request head is written as
 /// HTTP/1 text once, at the server send, out of the blocks the bridge wrote into the stream's
 /// layout. Before X4 the bridge wrote the text at once and the send wrote it again when a rule

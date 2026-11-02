@@ -884,9 +884,10 @@ mod in_place {
 
 /// CP1 (`docs/design/copies-2026-11-02.md` section 6, row S1): `write_request_htx` over the
 /// decoded fields writes the blocks, and refuses the heads, that the h2 mux's `H2ReqHead::write`
-/// followed by `HtxSlice::put_request_head` do today. The reference here is today's code, run
-/// live through a server `H2MuxContext` fed the same HEADERS frame (its checks, limits and
-/// `bad_request` included); the expected values behind it are pinned by T437/T449/T451/E1
+/// followed by `HtxSlice::put_request_head` do today. The reference here is today's code: a
+/// server `H2MuxContext` fed the same HEADERS frame says whether the stream is taken (its
+/// checks, limits and `bad_request` included), then `H2ReqHead::write` + `put_request_head`
+/// write the blocks (CP2a: the mux itself writes with `write_request_htx` now); the expected values behind it are pinned by T437/T449/T451/E1
 /// (`h2_field_validity.rs`) and were measured on ``HAProxy`` 3.5-dev8 then, so no row here
 /// doubts them.
 mod request_head_writer {
@@ -965,7 +966,15 @@ mod request_head_writer {
             field_bytes: 0,
             wire_len: 0,
         };
-        if let Some(head) = ctx.streams.get_mut(&1).and_then(|s| s.req_head.take()) {
+        // CP2a: the mux writes the head it takes with `write_request_htx` (or keeps it as its
+        // fields); the reference blocks are `H2ReqHead::write`'s, of a head the mux took.
+        let taken = ctx.streams.get(&1).is_some_and(|s| s.rx_head.is_some() || s.req_head.is_some());
+        let reference = taken.then(|| {
+            let mut head = ibex_proto::mux_h2::H2ReqHead::default();
+            head.write(&decoded(fields)).expect("a head the mux took is one `H2ReqHead::write` takes");
+            head
+        });
+        if let Some(head) = reference {
             let mut slice = HtxSlice::new(&mut buf);
             out.verdict = match slice.put_request_head(&head, None, |_, _| {}) {
                 Ok(()) => Ok(()),

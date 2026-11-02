@@ -26,7 +26,7 @@ use crate::h2::{
     MAX_MAX_FRAME_SIZE, MAX_WINDOW_SIZE, MIN_MAX_FRAME_SIZE,
 };
 use crate::hpack::{DecodedFields, HpackDecoder, HpackEncoder};
-use crate::htx::{HeaderField, HttpVersion, Htx, HtxBlock};
+use crate::htx::{HeaderField, HttpVersion, Htx, HtxBlock, RxHead};
 use crate::mux::{mux_flags, Mux, MuxFlags, MuxOps, ShutMode};
 use std::io;
 
@@ -50,7 +50,7 @@ static H2_OPS: MuxOps = MuxOps {
 };
 
 /// Per-stream multiplexer context tracking flow control and HTX representation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct H2StreamCtx {
     pub id: u32,
     pub state: H2StreamState,
@@ -87,6 +87,17 @@ pub struct H2StreamCtx {
     /// The request is an extended CONNECT (RFC 8441, [`H2ReqHead::ext_connect`]): the
     /// server's `101` is a `200` to the client, and what follows a tunnel.
     pub ext_connect: bool,
+    /// CP2a: the request head of a stream of a server connection as the HTX blocks
+    /// ([`crate::h2::write_request_htx`]) of the memory the stream's buffer adopts, written
+    /// once from the decoded fields; `rx_htx` then holds the end of the head and what follows.
+    /// `None` until the head comes, once the data path has taken it, and for a head kept as
+    /// its fields in [`Self::req_head`] (one the HTTP/1 checks refuse, an extended CONNECT).
+    pub rx_head: Option<RxHead>,
+    /// What [`Self::rx_head`]'s writer said of the head.
+    pub head_facts: crate::h2::HeadFacts,
+    /// The bytes of `scheme://authority` (the start of the line `HAProxy` logs) after the
+    /// head's payload in [`Self::rx_head`], 0 for a request without both.
+    pub abs_len: usize,
 }
 
 /// A request head as the fields of its HEADERS, checked and in the order the HTTP/1.1 head
@@ -291,7 +302,10 @@ impl H2ReqHead {
     /// an extended CONNECT. A `host` after the first is dropped, as `HAProxy` drops it. A
     /// pseudo-header that is not UTF-8 is refused (`tradeoff.md` 6.24); a regular value is
     /// kept as the bytes it is. Every request of a server connection is kept this way.
-    pub(crate) fn write(&mut self, fields: &DecodedFields) -> Result<(), &'static str> {
+    ///
+    /// # Errors
+    /// The refusal, as text. (Public as the reference of `htx_differential.rs` until CP2b.)
+    pub fn write(&mut self, fields: &DecodedFields) -> Result<(), &'static str> {
         self.clear();
         let (mut method, mut path, mut authority, mut host, mut scheme, mut protocol) = (None, None, None, None, false, None);
         let mut seen_regular = false;
@@ -422,28 +436,132 @@ impl H2ReqHead {
         // "; " and their blanks kept, after the other fields (`h2_make_htx_request`;
         // measured, T506).
         self.push_cookies(fields.iter().filter(|(n, _)| *n == b"cookie").map(|(_, v)| v));
+        crate::htx::count_head_bytes(self.method_len + (self.uri.1 - self.uri.0) + self.field_bytes);
         Ok(())
     }
 }
 
+/// The request head of a server connection's stream from its decoded `fields` (CP2a): the HTX
+/// blocks [`crate::h2::write_request_htx`] writes into memory from `take_rx` (the buffer the
+/// stream's transaction adopts, `H2StreamCtx::rx_head`), then `scheme://authority` after
+/// them for the log line. The checks, the limits (`tune.http.maxhdr`, the head's room: T242)
+/// and the refusals are the writer's, those of `h2_make_htx_request` (T437, T449, E1). The
+/// error is the stream's reset: `PROTOCOL_ERROR` for a refused head, `REFUSED_STREAM` when
+/// no memory can be had. A head the HTTP/1 checks refuse, and an extended CONNECT (its
+/// websocket key is the bridge's), are kept as their fields ([`H2ReqHead`], [`keep_fields`]).
+fn request_head(stream: &mut H2StreamCtx, fields: &DecodedFields, take_rx: fn(usize) -> Option<RxHead>, relaxed: bool, spare_heads: &mut Vec<Box<H2ReqHead>>) -> Result<(), H2Error> {
+    let mut need = rx_head_need(fields);
+    for _ in 0..2 {
+        let mut rx = take_rx(need).ok_or(H2Error::RefusedStream)?;
+        match crate::h2::write_request_htx(fields, &mut crate::htx::HtxSlice::over(&mut rx), relaxed) {
+            Err(crate::h2::HeadError::Refused(_)) => return Err(H2Error::ProtocolError),
+            Ok(facts) if !facts.ext_connect => {
+                if let Some(abs_len) = put_abs(&mut rx, &facts, fields) {
+                    stream.bad_request = facts.bad_request;
+                    stream.req_content_length = facts.content_length;
+                    stream.ext_connect = false;
+                    stream.head_facts = facts;
+                    stream.abs_len = abs_len;
+                    stream.rx_head = Some(rx);
+                    stream.rx_htx.push(HtxBlock::Eoh);
+                    return Ok(());
+                }
+            }
+            Err(crate::h2::HeadError::NoRoom) => {}
+            // `Invalid`, an extended CONNECT.
+            _ => break,
+        }
+        // Larger than its estimate: once more in more memory.
+        need = rx.len() + 1;
+    }
+    keep_fields(stream, fields, relaxed, spare_heads)
+}
+
+/// `scheme://authority` of a request that had both, written after the head's payload in
+/// `rx` (where its free memory starts; what the head's buffer writes next goes over it once
+/// the log line has it): its length, 0 for a request without both, `None` when it does not
+/// fit.
+fn put_abs(rx: &mut RxHead, facts: &crate::h2::HeadFacts, fields: &DecodedFields) -> Option<usize> {
+    if !facts.has_abs {
+        return Some(0);
+    }
+    // Both are there, once each, and text (the writer checked them), among the
+    // pseudo-headers, which come first.
+    let (mut scheme, mut authority): (&[u8], &[u8]) = (b"", b"");
+    for (n, v) in fields.iter().take_while(|(n, _)| n.starts_with(b":")) {
+        match n {
+            b":scheme" => scheme = v,
+            b":authority" => authority = v,
+            _ => {}
+        }
+    }
+    let len = scheme.len() + 3 + authority.len();
+    if facts.tail + len > rx.len() - facts.blocks * crate::htx::HTX_DESC_SIZE {
+        return None;
+    }
+    let out = &mut rx.bytes_mut()[facts.tail..facts.tail + len];
+    out[..scheme.len()].copy_from_slice(scheme);
+    out[scheme.len()..scheme.len() + 3].copy_from_slice(b"://");
+    out[scheme.len() + 3..].copy_from_slice(authority);
+    Some(len)
+}
+
+/// The request head of a server connection's stream as its fields ([`H2ReqHead`], T437), for
+/// the heads [`request_head`] does not write as blocks, which the writer has checked and
+/// not refused: the bridge writes them as HTTP/1.1 text (one the HTTP/1 parser refuses) or
+/// as blocks with the websocket key (an extended CONNECT).
+#[cold]
+#[inline(never)]
+fn keep_fields(stream: &mut H2StreamCtx, fields: &DecodedFields, relaxed: bool, spare_heads: &mut Vec<Box<H2ReqHead>>) -> Result<(), H2Error> {
+    stream.bad_request = crate::h2::check_request_fields(fields.iter(), relaxed) == Ok(true);
+    let mut head = stream.req_head.take().or_else(|| spare_heads.pop()).unwrap_or_default();
+    // Every `content-length` one length, as `h2_parse_cont_len_header` reads them
+    // (measured on 3.5-dev8, E1): the writer refused any other.
+    let cl = fields.iter().filter(|(n, _)| *n == b"content-length").find_map(|(_, v)| std::str::from_utf8(v).ok().and_then(crate::h2::content_length_value));
+    // The writer took these fields, so `write` does (the differential row): this error is
+    // never seen, and would refuse the stream.
+    head.write(fields).map_err(|_| H2Error::ProtocolError)?;
+    stream.req_content_length = cl.and_then(|c| usize::try_from(c).ok());
+    stream.ext_connect = head.ext_connect;
+    stream.req_head = Some(head);
+    stream.rx_htx.push(HtxBlock::Eoh);
+    Ok(())
+}
+
 impl H2StreamCtx {
+    /// The request head as the HTX blocks the mux wrote ([`Self::rx_head`]), until the data
+    /// path takes it.
+    #[must_use]
+    pub fn request_htx(&self) -> Option<crate::htx::HtxSliceRef<'_>> {
+        self.rx_head.as_ref().map(|rx| crate::htx::HtxSliceRef::new(rx.bytes(), self.head_facts.blocks))
+    }
+
     /// The request's method, until the data path takes the head.
     #[must_use]
     pub fn request_method(&self) -> Option<&str> {
-        self.req_head.as_ref().map(|h| h.method())
+        match self.request_htx() {
+            Some(h) => h.req_line().map(|l| l.method),
+            None => self.req_head.as_ref().map(|h| h.method()),
+        }
     }
 
     /// The request's path, until the data path takes the head.
     #[must_use]
     pub fn request_uri(&self) -> Option<&str> {
-        self.req_head.as_ref().map(|h| h.uri())
+        match self.request_htx() {
+            Some(h) => h.req_line().map(|l| l.uri),
+            None => self.req_head.as_ref().map(|h| h.uri()),
+        }
     }
 
     /// The first value of the request's header `name`, until the data path takes the head
     /// (`None` too for a value that is not UTF-8).
     #[must_use]
     pub fn request_header(&self, name: &str) -> Option<&str> {
-        self.req_head.as_ref().and_then(|h| h.get_header(name)).and_then(|v| std::str::from_utf8(v).ok())
+        match self.request_htx() {
+            Some(h) => h.get_header_bytes(name.as_bytes()).and_then(|v| std::str::from_utf8(v).ok()),
+            None => self.req_head.as_ref().and_then(|h| h.get_header(name)).and_then(|v| std::str::from_utf8(v).ok()),
+        }
     }
 
     /// The request's `content-length`, as a number, even once the data path has taken the
@@ -614,6 +732,9 @@ impl H2StreamCtx {
             req_head: None,
             req_content_length: None,
             ext_connect: false,
+            rx_head: None,
+            head_facts: crate::h2::HeadFacts::default(),
+            abs_len: 0,
         }
     }
 }
@@ -696,6 +817,24 @@ pub struct H2MuxContext {
     /// The memory of the HTX of streams that are over, for the next (at most
     /// [`SPARE_STREAMS`]).
     pub spare_htx: Vec<Htx>,
+    /// Where a server connection's request heads are written (CP2a, [`H2StreamCtx::rx_head`]):
+    /// memory for a head of an estimated `need` bytes of HTX, `None` when there is none (the
+    /// stream is refused, `REFUSED_STREAM`). The data path's pool (`Buf::take_rx_head`);
+    /// without one, the heap.
+    pub take_rx_head: fn(usize) -> Option<RxHead>,
+}
+
+/// [`H2MuxContext::take_rx_head`] of a context the data path gave none: twice the need, at
+/// least 1 KB, from the heap.
+fn heap_rx_head(need: usize) -> Option<RxHead> {
+    Some(RxHead::from_box(vec![0u8; need.saturating_mul(2).max(1024)].into_boxed_slice()))
+}
+
+/// The estimate of a request head's HTX that [`H2MuxContext::take_rx_head`] is asked for:
+/// the decoded bytes, a descriptor and the line's words per field, the start line and the
+/// blocks a head always has.
+fn rx_head_need(decoded: &DecodedFields) -> usize {
+    decoded.byte_len() + (crate::htx::HTX_DESC_SIZE + 4) * decoded.len() + 64 + 3 * crate::htx::HTX_DESC_SIZE
 }
 
 /// How many spare heads and HTX a connection keeps while it serves streams; an idle one
@@ -774,6 +913,7 @@ impl H2MuxContext {
             block_scratch: Vec::new(),
             spare_heads: Vec::new(),
             spare_htx: Vec::new(),
+            take_rx_head: heap_rx_head,
         }
     }
 
@@ -1296,14 +1436,6 @@ impl crate::htx_mux::HtxMux for H2MuxContext {
     }
 }
 
-/// Bytes of decoded header names and values a request may carry: `tune.bufsize` (16384)
-/// less `tune.maxrewrite` (1024), the room HAProxy's request buffer gives a head.
-const MAX_REQUEST_HEAD_BYTES: usize = 16384 - 1024;
-
-/// Header fields a request may carry once converted (HAProxy's `tune.http.maxhdr` 101,
-/// less one: measured, host + 99 headers pass and host + 100 are refused).
-const MAX_REQUEST_HEADERS: usize = 100;
-
 /// Trailer fields a request may carry: HAProxy's `tune.http.maxhdr` (101). Measured: 101
 /// fields pass, 102 are RST_STREAM PROTOCOL_ERROR.
 const MAX_REQUEST_TRAILERS: usize = 101;
@@ -1495,6 +1627,14 @@ impl Mux for MuxH2 {
         if let Some(h) = &stream.req_head {
             let head = h.to_wire();
             wire.splice(..0, head[..head.len() - 2].iter().copied());
+        } else if let Some(h) = stream.request_htx() {
+            // A head written as blocks (CP2a): its line and fields as text.
+            let mut head = Vec::new();
+            head.extend(h.req_line().into_iter().flat_map(|l| format!("{} {} HTTP/1.1\r\n", l.method, l.uri).into_bytes()));
+            for (_, n, v) in h.header_blocks_where(|_| true) {
+                head.extend_from_slice(format!("{n}: {v}\r\n").as_bytes());
+            }
+            wire.splice(..0, head);
         }
         if wire.is_empty() {
             return Ok(0);
@@ -1726,35 +1866,11 @@ impl MuxH2 {
             return Ok(());
         }
 
-        // HAProxy keeps at most tune.http.maxhdr - 1 (100) header fields in a request,
-        // counting the host made from :authority; more is a stream error PROTOCOL_ERROR.
-        let regular = decoded.iter().filter(|(n, _)| !n.starts_with(b":")).count();
-        let host_from_authority = decoded.iter().any(|(n, _)| n == b":authority")
-            && !decoded.iter().any(|(n, _)| n == b"host");
-        let too_many = ctx.is_server && regular + usize::from(host_from_authority) > MAX_REQUEST_HEADERS;
-        // The decoded request must fit HAProxy's request buffer less its rewrite reserve
-        // (tune.bufsize 16384 - tune.maxrewrite 1024): one-byte HPACK references to a large
-        // table entry otherwise decode to megabytes per request (T242, fuzz h2_mux).
-        // Measured: four 3800-byte fields pass, four 3850-byte fields are RST_STREAM
-        // PROTOCOL_ERROR.
-        let too_big = ctx.is_server
-            && decoded.iter().map(|(n, v)| n.len() + v.len()).sum::<usize>() > MAX_REQUEST_HEAD_BYTES;
-
-        // Each field is checked before any head is written from it (T449): a CR LF in a
-        // value, a name or a pseudo-header written into the HTTP/1 head is a header, or a
-        // request, the server trusts. Malformed is a stream error; a method or URI HAProxy
-        // takes and then refuses is a 400.
         // A client connection's response gets the name and value checks of
         // `h2_make_htx_response` (no runtime path speaks h2 to a server yet: `proto h2` on
         // a server is refused by the parser).
-        let checked = if ctx.is_server {
-            crate::h2::check_request_fields(decoded.iter(), ctx.relaxed_path)
-        } else {
-            crate::h2::check_response_fields(decoded.iter_text()).map(|()| false)
-        };
-        // A server connection's request head is kept as its fields, in memory a stream before
-        // it used (T437, E1); what that form does not take keeps the HTX blocks.
-        let as_text = ctx.is_server && !too_many && !too_big;
+        let checked = if ctx.is_server { Ok(()) } else { crate::h2::check_response_fields(decoded.iter_text()) };
+        let (take_rx, relaxed) = (ctx.take_rx_head, ctx.relaxed_path);
         let spare_htx = ctx.spare_htx.pop();
         let stream = ctx.streams.entry(stream_id).or_insert_with(|| {
             let mut s = H2StreamCtx::new(
@@ -1771,38 +1887,18 @@ impl MuxH2 {
         stream.state = H2StreamState::Open;
         ctx.highest_opened = ctx.highest_opened.max(stream_id);
 
-        // Extract pseudo-headers and construct HTX blocks
-        stream.bad_request = checked == Ok(true);
-        let converted = if too_many || too_big || checked.is_err() {
-            Err(())
-        } else if as_text {
-            let mut head = stream.req_head.take().or_else(|| ctx.spare_heads.pop()).unwrap_or_default();
-            // Every `content-length` one length, as `h2_parse_cont_len_header` reads them
-            // (measured on 3.5-dev8, E1: `abc`, `5\xe9`, and `5` then `6` are RST_STREAM
-            // PROTOCOL_ERROR): a head the server would frame otherwise is not forwarded.
-            let mut cl = Ok(None);
-            for (_, v) in decoded.iter().filter(|(n, _)| *n == b"content-length") {
-                cl = match (cl, std::str::from_utf8(v).ok().and_then(crate::h2::content_length_value)) {
-                    (Ok(c), Some(x)) if c.is_none_or(|c| c == x) => Ok(Some(x)),
-                    _ => Err(()),
-                };
-            }
-            if let (Ok(cl), Ok(())) = (cl, head.write(decoded)) {
-                stream.req_content_length = cl.and_then(|c| usize::try_from(c).ok());
-                stream.ext_connect = head.ext_connect;
-                stream.req_head = Some(head);
-                stream.rx_htx.push(HtxBlock::Eoh);
-                Ok(())
-            } else {
-                ctx.spare_heads.push(head);
-                Err(())
-            }
+        let converted = if ctx.is_server {
+            // A server connection's request head: written once, as the HTX blocks of the
+            // memory the stream's buffer adopts (CP2a), checked and limited as it is written.
+            request_head(stream, decoded, take_rx, relaxed, &mut ctx.spare_heads)
+        } else if checked.is_err() {
+            Err(H2Error::ProtocolError)
         } else {
             // A response head (a client connection), as HTX blocks.
-            crate::htx::pseudo_headers_to_htx(decoded.to_fields(), HttpVersion::Http20).map(|blocks| blocks.into_iter().for_each(|b| stream.rx_htx.push(b))).map_err(|_| ())
+            crate::htx::pseudo_headers_to_htx(decoded.to_fields(), HttpVersion::Http20).map(|blocks| blocks.into_iter().for_each(|b| stream.rx_htx.push(b))).map_err(|_| H2Error::ProtocolError)
         };
-        if converted.is_err() {
-            ctx.send_rst_stream(stream_id, H2Error::ProtocolError);
+        if let Err(code) = converted {
+            ctx.send_rst_stream(stream_id, code);
             return Ok(());
         }
 
@@ -2954,8 +3050,10 @@ mod tests {
                 _ => 0,
             })
             .sum::<usize>()
-            // A head kept as text (T437) holds its fields there.
-            + ctx.streams.values().map(|s| s.req_head.as_ref().map_or(0, |h| h.field_bytes)).sum::<usize>();
+            // A head kept as text (T437) holds its fields there, one written as blocks (CP2a)
+            // in its `rx_head`.
+            + ctx.streams.values().map(|s| s.req_head.as_ref().map_or(0, |h| h.field_bytes)).sum::<usize>()
+            + ctx.streams.values().filter(|s| s.rx_head.is_some()).map(|s| s.head_facts.field_bytes).sum::<usize>();
         assert!(held >= 8000, "the control request is held: {held}");
         assert!(held <= 2 << 20, "{} streams hold {held} bytes of headers from {} bytes", ctx.streams.len(), wire.len());
     }
@@ -3110,6 +3208,68 @@ mod tests {
         }
     }
 
+    std::thread_local! {
+        /// The size of the memory [`given`] and [`grows`] hand the mux.
+        static GIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn given(_: usize) -> Option<RxHead> {
+        Some(RxHead::from_box(vec![0; GIVE.with(std::cell::Cell::get)].into_boxed_slice()))
+    }
+
+    /// [`given`], then 4 KB when asked for more than it gave.
+    fn grows(need: usize) -> Option<RxHead> {
+        let n = GIVE.with(std::cell::Cell::get);
+        Some(RxHead::from_box(vec![0; if need == n + 1 { 4096 } else { n }].into_boxed_slice()))
+    }
+
+    fn no_memory(_: usize) -> Option<RxHead> {
+        None
+    }
+
+    /// CP2a: a request head is written as HTX blocks into the memory the data path hands the
+    /// mux (`take_rx_head`), with `scheme://authority` after them; none to be had refuses the
+    /// stream (`REFUSED_STREAM`), memory too small is asked for again, larger, and a head
+    /// that fits neither is kept as its fields.
+    #[test]
+    fn a_request_head_is_written_into_the_memory_the_data_path_gives() {
+        let block = [&[0x82u8, 0x86, 0x84][..], &lit(b":authority", b"a")].concat();
+        let run = |take: fn(usize) -> Option<RxHead>| {
+            let (mux, mut ctx) = open_conn();
+            ctx.take_rx_head = take;
+            let from = ctx.tx_buf.len();
+            let _ = mux.parse(&mut ctx, &headers(frame_flags::END_HEADERS | frame_flags::END_STREAM, 1, block.clone()));
+            let s = sent(&ctx, from);
+            (ctx, s)
+        };
+        let (ctx, s) = run(no_memory);
+        assert!(s.contains(&(3, 1, 7)), "REFUSED_STREAM: {s:?}");
+        assert!(ctx.streams.get(&1).is_none_or(|st| st.rx_head.is_none() && st.req_head.is_none()));
+
+        let (ctx, s) = run(heap_rx_head);
+        assert_eq!(s, vec![]);
+        let st = ctx.streams.get(&1).expect("the stream");
+        let rx = st.rx_head.as_ref().expect("the head as blocks");
+        assert_eq!(&rx.bytes()[st.head_facts.tail..][..st.abs_len], b"http://a");
+        assert_eq!((st.request_method(), st.request_uri(), st.request_header("host")), (Some("GET"), Some("/"), Some("a")));
+        let exact = st.head_facts.tail + st.head_facts.blocks * crate::htx::HTX_DESC_SIZE;
+
+        GIVE.with(|g| g.set(40));
+        let (ctx, _) = run(grows);
+        let st = ctx.streams.get(&1).expect("the stream");
+        assert_eq!(st.rx_head.as_ref().map(RxHead::len), Some(4096), "asked again, for more");
+
+        // Room for the head and not the prefix, then too little for the head: kept as fields.
+        for size in [exact + "http://a".len() - 1, 40] {
+            GIVE.with(|g| g.set(size));
+            let (ctx, s) = run(given);
+            assert_eq!(s, vec![], "{size}");
+            let st = ctx.streams.get(&1).expect("the stream");
+            assert!(st.rx_head.is_none() && st.req_head.is_some(), "{size}: kept as fields");
+            assert_eq!((st.request_method(), st.request_uri()), (Some("GET"), Some("/")));
+        }
+    }
+
     /// T437: a request with two `host` headers is taken, with the first (HAProxy 3.5-dev8,
     /// measured: the server receives `GET / HTTP/1.1` and `host: a` alone).
     #[test]
@@ -3120,8 +3280,11 @@ mod tests {
         ] {
             let (ctx, s) = answer(&headers(frame_flags::END_HEADERS | frame_flags::END_STREAM, 1, block));
             assert_eq!(s, vec![], "the request was refused");
-            let head = ctx.streams.get(&1).and_then(|st| st.req_head.as_ref()).expect("a head");
-            assert_eq!(head.to_wire(), b"GET / HTTP/1.1\r\nhost: a\r\n\r\n");
+            // CP2a: written as the blocks of `GET / HTTP/1.1` and `host: a`.
+            let head = ctx.streams.get(&1).and_then(H2StreamCtx::request_htx).expect("a head");
+            assert_eq!(head.req_line().map(|l| (l.method, l.uri)), Some(("GET", "/")));
+            let fields: Vec<(String, String)> = head.header_blocks_where(|_| true).map(|(_, n, v)| (n.to_string(), v.to_string())).collect();
+            assert_eq!(fields, [("host".to_string(), "a".to_string())]);
         }
     }
 

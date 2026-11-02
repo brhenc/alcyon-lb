@@ -1683,6 +1683,9 @@ pub struct HeadFacts {
     pub fields: usize,
     /// Their names and values, in bytes (`%U` counts them).
     pub field_bytes: usize,
+    /// Of [`Self::field_bytes`], those of the `content-length` fields as the client sent them
+    /// (the HTX holds one canonical value in their place).
+    pub cl_bytes: usize,
 }
 
 impl HeadFacts {
@@ -1824,7 +1827,7 @@ pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<
     let oom = |_| HeadError::NoRoom;
     crate::h1::check_request_line(method, &uri).map_err(|_| HeadError::Invalid)?;
     out.push_req_line(method, &uri, "HTTP/1.1").map_err(oom)?;
-    let (mut count, mut field_bytes) = (0usize, 0usize);
+    let (mut count, mut field_bytes, mut cl_bytes) = (0usize, 0usize, 0usize);
     if let Some(a) = made_host {
         out.push_header_bytes(b"host", a.as_bytes()).map_err(oom)?;
         count += 1;
@@ -1846,6 +1849,9 @@ pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<
         out.push_header_bytes(n, v).map_err(oom)?;
         count += 1;
         field_bytes += n.len() + v.len();
+        if n == b"content-length" {
+            cl_bytes += n.len() + v.len();
+        }
     }
     if let Some(p) = protocol {
         out.push_header_bytes(b"upgrade", p.as_bytes()).map_err(oom)?;
@@ -1862,6 +1868,7 @@ pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<
         field_bytes += "cookie".len() + cookies.fold(first.len(), |t, v| t + 2 + v.len());
     }
     out.push_eoh().map_err(oom)?;
+    crate::htx::count_head_bytes(method.len() + uri.len() + field_bytes);
     crate::h1::finish_request_head(out, method, &uri).map_err(|e| if e.kind() == io::ErrorKind::OutOfMemory { HeadError::NoRoom } else { HeadError::Invalid })?;
     Ok(HeadFacts {
         tail: out.tail_addr(),
@@ -1875,6 +1882,7 @@ pub fn write_request_htx(fields: &DecodedFields, out: &mut crate::htx::HtxSlice<
         has_abs,
         fields: count,
         field_bytes,
+        cl_bytes,
     })
 }
 

@@ -1398,20 +1398,42 @@ pub struct HtxRegion {
 /// `htx_buf`, no copy. It is not a pool of its own: the box comes from, and goes back to, the
 /// small-buffer pool (`Buf::take_rx_head`, `Buf`'s drop), so it is counted there and the box
 /// never changes pool on the way.
+///
+/// CP2a: dropped without being adopted (a stream reset before it is served, a connection
+/// closed with streams not served yet), the memory goes back to the pool it came from
+/// ([`Self::pooled`]), so the pool's count stays right whoever drops it.
 #[derive(Debug)]
-pub struct RxHead(Box<[u8]>);
+pub struct RxHead(Box<[u8]>, fn(Box<[u8]>));
 
 impl RxHead {
-    /// Takes the memory of a buffer.
+    /// Takes the memory of a buffer; dropped, it is freed.
     #[must_use]
     pub fn from_box(mem: Box<[u8]>) -> Self {
-        Self(mem)
+        Self(mem, drop)
+    }
+
+    /// Takes the memory of a pool's buffer; dropped without [`Self::into_box`], it is given
+    /// to `give` (its pool).
+    #[must_use]
+    pub fn pooled(mem: Box<[u8]>, give: fn(Box<[u8]>)) -> Self {
+        Self(mem, give)
     }
 
     /// The memory, to become a buffer's.
     #[must_use]
-    pub fn into_box(self) -> Box<[u8]> {
-        self.0
+    pub fn into_box(mut self) -> Box<[u8]> {
+        std::mem::take(&mut self.0)
+    }
+
+    /// The memory.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The memory, to be written.
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.0
     }
 
     /// The size of the memory.
@@ -1425,6 +1447,41 @@ impl RxHead {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+impl Drop for RxHead {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            (self.1)(std::mem::take(&mut self.0));
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static HEAD_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `n` bytes of a request head (method, path, names and values) written into memory
+/// by one of the writers of an HTTP/2 or HTTP/3 head (debug builds).
+#[inline]
+pub(crate) fn count_head_bytes(n: usize) {
+    #[cfg(debug_assertions)]
+    HEAD_BYTES.with(|c| c.set(c.get() + n as u64));
+    #[cfg(not(debug_assertions))]
+    let _ = n;
+}
+
+/// Bytes of HTTP/2 and HTTP/3 request heads written into memory on this thread, a head's
+/// method, path, names and values each time one of its writers copies them (debug builds; 0
+/// in release): CP2 pins that an h2 head is written once, where it was three times (the
+/// mux's `H2ReqHead`, the bridge's blocks).
+#[must_use]
+pub fn head_bytes_written() -> u64 {
+    #[cfg(debug_assertions)]
+    return HEAD_BYTES.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
 }
 
 /// Zero-allocation HTX representation over a contiguous pre-allocated byte slice.
@@ -1740,6 +1797,7 @@ impl<'a> HtxSlice<'a> {
             self.push_header(n, v).map_err(oom)?;
         }
         self.push_eoh().map_err(oom)?;
+        count_head_bytes(method.len() + uri.len() + head.field_bytes + extra.map_or(0, |(n, v)| n.len() + v.len()));
         crate::h1::finish_request_head(self, method, uri)
     }
 
