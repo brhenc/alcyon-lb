@@ -6,6 +6,7 @@
 
 use crate::check::{ServerCheckState, ServerStatus};
 use crate::engine::Proxy;
+use ibex_stick_table::StickKey;
 use std::fmt::Write;
 
 /// Formats a byte count into a human-readable string (B, KB, MB, GB).
@@ -36,6 +37,23 @@ pub fn format_bytes(bytes: u64) -> String {
 #[must_use]
 pub fn render_stats_html(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) -> String {
     render_stats_html_for(proxies, checks, pid, &ibex_config::StatsConfig::default())
+}
+
+/// `text` as HTML text and attribute content: a stick-table key is whatever a client sent
+/// (IBEX-STATS-HTML-XSS-001).
+fn html_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// A proxy's `description` for the page, unescaped as HAProxy prints it (`px->desc`).
@@ -864,10 +882,19 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                     for (k, d) in entries {
                         let conn_rate = d.conn_rate.map_or(0, |r| r.rate());
                         let http_rate = d.http_req_rate.map_or(0, |r| r.rate());
+                        let key = html_text(&match k {
+                            StickKey::Ip(ip) => ip.to_string(),
+                            StickKey::Integer(i) => i.to_string(),
+                            StickKey::String(s) => s,
+                            StickKey::Binary(b) => b.iter().fold(String::new(), |mut s, byte| {
+                                let _ = write!(s, "{byte:02x}");
+                                s
+                            }),
+                        });
                         let _ = write!(
                             out,
                             r#"          <tr>
-            <td class="mono">{k:?}</td>
+            <td class="mono">{key}</td>
             <td class="mono">{conn_rate}</td>
             <td class="mono">{http_rate}</td>
             <td class="mono">{req_cnt}</td>
