@@ -33,3 +33,4 @@ mod qpack_static;
 mod smuggling_cl_te;
 mod t612a_mux_h1_sniff;
 mod htx_rule_headers;
+mod h2_head_scan;

@@ -1798,7 +1798,7 @@ impl<'a> HtxSlice<'a> {
         }
         self.push_eoh().map_err(oom)?;
         count_head_bytes(method.len() + uri.len() + head.field_bytes + extra.map_or(0, |(n, v)| n.len() + v.len()));
-        crate::h1::finish_request_head(self, method, uri)
+        crate::h1::finish_request_head(self, method, uri, None)
     }
 
     /// Pushes a header whose value is text a peer sent. A character the byte mapping uses
