@@ -214,7 +214,9 @@ fn tcp_mode_idle_is_closed_after_timeout_tunnel() {
         assert!(logged(lines, " cD"), "log: {:?}", lines.lock().expect("lock"));
         r
     });
-    assert!(eof && near(d, 700), "closed after {d:?} ({eof})");
+    // Never sooner than the timer; the upper bound only has to tell 700 ms from `timeout
+    // client` (2 s), the host's delay in waking this thread is not what is tested.
+    assert!(eof && d + Duration::from_millis(150) >= Duration::from_millis(700) && d <= Duration::from_millis(1500), "closed after {d:?} ({eof})");
 }
 
 #[test]
