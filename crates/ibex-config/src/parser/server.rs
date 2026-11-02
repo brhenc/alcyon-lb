@@ -100,11 +100,11 @@ pub(crate) fn parse_server(
                 i += 1;
             }
             "fall" => {
-                fall = Some(parse_u32(server_kw_arg(tokens, i, who, "expects an integer argument.")?, "fall")?);
+                fall = Some(parse_check_count(server_kw_arg(tokens, i, who, "expects an integer argument.")?, "fall")?);
                 i += 1;
             }
             "rise" => {
-                let value = parse_u32(server_kw_arg(tokens, i, who, "expects an integer argument.")?, "rise")?;
+                let value = parse_check_count(server_kw_arg(tokens, i, who, "expects an integer argument.")?, "rise")?;
                 rise = Some(value);
                 health = value;
                 i += 1;
@@ -828,11 +828,11 @@ pub(crate) fn parse_default_server(
                 i += 1;
             }
             "fall" => {
-                cfg.fall = Some(parse_u32(server_kw_arg(tokens, i, None, "expects an integer argument.")?, "fall")?);
+                cfg.fall = Some(parse_check_count(server_kw_arg(tokens, i, None, "expects an integer argument.")?, "fall")?);
                 i += 1;
             }
             "rise" => {
-                cfg.rise = Some(parse_u32(server_kw_arg(tokens, i, None, "expects an integer argument.")?, "rise")?);
+                cfg.rise = Some(parse_check_count(server_kw_arg(tokens, i, None, "expects an integer argument.")?, "rise")?);
                 i += 1;
             }
             "send-proxy" => cfg.send_proxy = true,
@@ -1094,4 +1094,14 @@ fn parse_proxy_v2_options(arg: Option<&Token>, kw: &Token) -> Result<bool, Confi
         }
     }
     Ok(unique_id)
+}
+
+/// `fall`/`rise` are `int`s in HAProxy: one past `i32::MAX` reads negative and is refused
+/// ("'rise' has to be > 0"; measured on 3.5-dev8: 2147483647 accepted, 2147483648 refused).
+fn parse_check_count(token: &Token, keyword: &str) -> Result<u32, ConfigError> {
+    let v = parse_u32(token, keyword)?;
+    if v > i32::MAX as u32 {
+        return Err(ConfigError::new(token.line, token.col, format!("'{keyword}' has to be > 0.")));
+    }
+    Ok(v)
 }

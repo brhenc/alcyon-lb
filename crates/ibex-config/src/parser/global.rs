@@ -737,7 +737,20 @@ pub(crate) fn parse_global_directive(
                 let bad = if digits < t.len() && rest.len() > 1 && matches!(rest.as_bytes()[0] | 0x20, b'k' | b'm' | b'g') { &rest[1..] } else { rest };
                 return Err(ConfigError::new(arg.line, arg.col, format!("'tune.h2.fe.rxbuf': unexpected character '{}' in size argument '{t}'.", bad.chars().next().unwrap_or('\0'))));
             }
-            global.h2_fe_rxbuf = Some(super::scalars::parse_size(arg).unwrap_or(0));
+            // `parse_size_err` holds the size in 32 bits: the first character that overflows
+            // it (a digit, or the k/m/g multiplier) is the one named.
+            let mut value: u32 = 0;
+            for (n, d) in t.bytes().take(digits).enumerate() {
+                value = match value.checked_mul(10).and_then(|v| v.checked_add(u32::from(d - b'0'))) {
+                    Some(v) => v,
+                    None => return Err(ConfigError::new(arg.line, arg.col, format!("'tune.h2.fe.rxbuf': unexpected character '{}' in size argument '{t}'.", t.as_bytes()[n] as char))),
+                };
+            }
+            let shift = match rest.to_ascii_lowercase().as_str() { "k" => 10, "m" => 20, "g" => 30, _ => 0 };
+            if u64::from(value) << shift > u64::from(u32::MAX) {
+                return Err(ConfigError::new(arg.line, arg.col, format!("'tune.h2.fe.rxbuf': unexpected character '{}' in size argument '{t}'.", rest.chars().next().unwrap_or('\0'))));
+            }
+            global.h2_fe_rxbuf = Some((u64::from(value) << shift) as usize);
             Ok(())
         }
         // HAProxy accepts it; Ibex opens no HTTP/2 connection to a server (`server ... proto h2`

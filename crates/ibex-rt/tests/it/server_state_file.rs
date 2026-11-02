@@ -723,3 +723,17 @@ fn the_check_port_is_shown_and_restored() {
         ]
     );
 }
+
+/// IBEX-SRVSTATE-OVERFLOW-001: `rise + fall - 1` was plain `u32` arithmetic and `rise 4294967295` panicked (debug) while the file was applied; the config now refuses past `i32::MAX` as HAProxy does (rv_d_scanner), this is the largest accepted pair.
+/// panicked in a debug build (and wrapped in a release one) while the file was applied.
+#[test]
+fn a_huge_rise_does_not_overflow_the_health_counter() {
+    let cfg = base(&global_file("st"), LOAD_GLOBAL, "", "")
+        .replace("server s2 127.0.0.1:{live}", "server s2 127.0.0.1:{live} check inter 1h rise 2147483647 fall 2147483647");
+    let file = state(&[
+        "3 b 1 s1 127.0.0.1 2 0 3 5 100 1 0 0 0 0 0 0 - {live} - 0 0 - - 0",
+        "3 b 2 s2 127.0.0.1 2 0 3 1 100 1 0 0 0 0 0 0 - {live} - 0 0 - - 0",
+    ]);
+    let run = Run::start(&cfg, &[("st", &file)]);
+    assert_eq!(run.rows().len(), 3, "ibex is still serving its socket");
+}
