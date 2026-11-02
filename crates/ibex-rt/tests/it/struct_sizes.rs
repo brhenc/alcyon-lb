@@ -57,8 +57,11 @@ fn server_check_state_stays_small() {
 /// T540 added 8: `ServerXprt::H2` (HTTP/2 to servers), a third variant that costs the enum a
 /// tag, two boxes leaving no niche; boxing the transport itself would be an allocation per
 /// server connection.
+/// T599 added 8: `rare_armed`, the one bit that keeps the rare per-run checks (timeouts, drain,
+/// soft stop) off a pass; the bools before it filled their word. A box would be 8 and an
+/// allocation.
 #[test]
 fn session_entry_stays_small() {
     let n = size_of::<ibex_rt::engine::SessionEntry>();
-    assert!(n <= 1656, "SessionEntry grew to {n} bytes (bound 1656): one is held per client connection, box the new field");
+    assert!(n <= 1664, "SessionEntry grew to {n} bytes (bound 1664): one is held per client connection, box the new field");
 }
