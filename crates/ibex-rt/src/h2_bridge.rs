@@ -196,13 +196,9 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     let mut no_mem = raw.is_empty();
     let mut slice = ibex_proto::htx::HtxSlice::new(raw);
     let extra = key.as_deref().map(|k| ("sec-websocket-key", k));
-    // The list the samples read once the HTX is let go, in the memory of the session's
-    // (or, for a new stream, its connection's) previous list: the head's fields, copied as
-    // they are written into the HTX (T437).
-    let hdrs = sess.req_headers.get_or_insert_with(Vec::new);
-    let mut n = 0;
-    let parsed = slice.put_request_head(&d.head, extra, |k, v| copy_header(hdrs, &mut n, k, v)).is_ok();
-    hdrs.truncate(n);
+    // The blocks are the request's only copy (X4): no field list beside them (the samples and
+    // the send read the HTX, as for an HTTP/1 head), and no text until the server send.
+    let parsed = slice.put_request_head(&d.head, extra, |_, _| {}).is_ok();
     let (tail, blocks) = (slice.tail_addr(), slice.num_blocks());
     let line = d.head.has_line;
     sess.req_method.set_opt(line.then(|| d.head.method()));
@@ -211,10 +207,21 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
     // client's (`005`, `5, 5`, a repeat: `HAProxy` 3.5-dev8 forwards and counts `5`).
     let mut req_htx = d.req_htx;
     let has_len = d.head.get_header("content-length").is_some();
+    let mut framing = if chunked { txn::Framing::Chunked } else { txn::Framing::None };
     if parsed {
+        // A stream's previous list (the connection's spare, T437) is no list of this head's.
+        sess.req_headers = None;
         if has_len {
             let client: usize = d.head.headers().filter(|(n, _)| n.eq_ignore_ascii_case(b"content-length")).map(|(n, v)| n.len() + v.len()).sum();
-            let kept: usize = slice.as_ref().header_blocks_where(|n| n.eq_ignore_ascii_case(b"content-length")).map(|(_, n, v)| n.len() + v.len()).sum();
+            let mut kept = 0;
+            for (_, n, v) in slice.as_ref().header_blocks_where(|n| n.eq_ignore_ascii_case(b"content-length")) {
+                kept += n.len() + v.len();
+                // Framed by the one canonical length the HTX holds, as the text it is written
+                // as is read (`txn::request_framing`): `0` is no body.
+                if let Some(len) = v.parse::<u64>().ok().filter(|&l| l > 0 && !chunked) {
+                    framing = txn::Framing::Length(len);
+                }
+            }
             req_htx = (req_htx + kept as u64).saturating_sub(client as u64);
         }
     } else {
@@ -235,32 +242,12 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
         sess.req = Buf::unallocated(crate::buf::BufClass::Small);
     }
     no_mem |= !sess.req.alloc_if_needed();
-    if parsed {
-        // The head written once, from the HTX, by the h1 encoder (X5): a request without a
-        // length goes chunked, `transfer-encoding: chunked` after the other headers, which
-        // no rule sees (`h1_make_eoh`). The names are the client's, in lower case (HTTP/2,
-        // HTTP/3), so `tune.ibex.h1-lowercase-headers` has nothing to change here; the mode
-        // is keep-alive, as the server side starts (the `connection` header is the
-        // engine's, `rewrite_request_connection`).
-        use ibex_proto::h1_encode::{h1_encode_head, H1Dir, H1EncodeOpts, SlFlags};
-        let sl = SlFlags::XFER_LEN
-            | if chunked {
-                SlFlags::NONE
-            } else if has_len {
-                SlFlags::CLEN
-            } else {
-                SlFlags::BODYLESS
-            };
-        let w = sess.req.writable();
-        // The buffer is sized for the head (`out_len`); one it does not fit fails the stream
-        // as a buffer that cannot be had does, rather than going out cut short.
-        let n = h1_encode_head(slice.as_ref(), &H1EncodeOpts::new(H1Dir::Request, sl, false), w).map_or(0, |e| e.len);
-        no_mem |= n == 0;
-        sess.req.commit(n);
-    } else {
+    if !parsed {
         let wire = text_wire(&d.head, key.as_deref(), chunked, d.add_len);
         let n = copy_into(sess.req.writable(), &wire);
         sess.req.commit(n);
+        let wire_req = sess.req.readable();
+        framing = find_eoh(wire_req).map_or(txn::Framing::None, |(h, e)| txn::request_framing(&wire_req[..h + e]));
     }
     // What a refused head wrote is zeroed on release like the rest (`tune.ibex.zero-buffers`).
     sess.htx_buf.note_htx(tail, blocks * ibex_proto::htx::HTX_DESC_SIZE);
@@ -268,10 +255,14 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
         sess.htx_tail = tail;
         sess.htx_blocks = blocks;
         sess.has_htx = true;
-        sess.htx_modified = false;
+        // The head is the HTX's alone until the send writes it (X4, `write_pending_head`):
+        // the rules edit the blocks only, as for an edited HTTP/1 head (X2).
+        sess.htx_modified = true;
+        sess.req_head_pending = true;
+        if let Some(c) = sess.h2_child_mut() {
+            c.stream.body.head_room = out_len;
+        }
     }
-    let wire_req = sess.req.readable();
-    let framing = find_eoh(wire_req).map_or(txn::Framing::None, |(h, e)| txn::request_framing(&wire_req[..h + e]));
     let mut txn = HttpTxn::new(framing, false);
     txn.req_htx = Some(req_htx);
     // The client's own method, as the HTTP/1 parser takes it: a reply the proxy makes to a
@@ -290,6 +281,68 @@ pub fn start_request(sess: &mut TcpSession, d: H2Dispatch) -> Box<H2ReqHead> {
         sess.fail_alloc();
     }
     d.head
+}
+
+/// The head of an HTTP/2 or HTTP/3 request, held in its HTX since [`start_request`]
+/// (`TcpSession::req_head_pending`), written as HTTP/1.1 at the front of `req`, ahead of the
+/// body already moved there: once, at the server send, after the rules (X4), or first by
+/// whatever reads `req` as text before it (a reply of the proxy's own). By the h1 encoder
+/// (X5): a request without a length goes chunked, `transfer-encoding: chunked` after the other
+/// headers, which no rule sees (`h1_make_eoh`, the encoder's flag); one with a length is
+/// framed by it. The names are the client's, in lower case (HTTP/2, HTTP/3); the mode is
+/// keep-alive, as the server side starts (the `connection` header is the engine's,
+/// `rewrite_request_connection`). `lower` and `case_map` are the backend's
+/// `tune.ibex.h1-lowercase-headers` and `h1-case-adjust` map, applied as the names are
+/// written (no pass over the text after). False, nothing written, for an HTX the encoder
+/// refuses (a `content-length` a rule made invalid) and no HTX at all.
+pub fn write_pending_head(sess: &mut TcpSession, lower: bool, case_map: Option<&std::collections::HashMap<String, String>>) -> bool {
+    use ibex_proto::h1_encode::{h1_encode_head, H1Dir, H1EncodeOpts, SlFlags};
+    if !std::mem::take(&mut sess.req_head_pending) || !sess.has_htx {
+        return false;
+    }
+    sess.htx_modified = false;
+    if let Some(c) = sess.h2_child_mut() {
+        c.stream.body.head_room = 0;
+    }
+    let htx = ibex_proto::htx::HtxSliceRef::new(sess.htx_buf.raw_slice(), sess.htx_blocks);
+    let chunked = sess.h2_active().is_some_and(|a| a.chunk_out);
+    let sl = SlFlags::XFER_LEN
+        | if chunked {
+            SlFlags::NONE
+        } else if htx.header_blocks_where(|n| n.eq_ignore_ascii_case(b"content-length")).next().is_some() {
+            SlFlags::CLEN
+        } else {
+            SlFlags::BODYLESS
+        };
+    let mut opts = H1EncodeOpts::new(H1Dir::Request, sl, lower);
+    opts.case_map = case_map;
+    let mut refused = false;
+    if sess.req.replace_head_with(0, |out| match h1_encode_head(htx, &opts, out) {
+        Ok(e) => Some(e.len),
+        Err(e) => {
+            refused = e != ibex_proto::htx::HtxError::BufferTooSmall;
+            None
+        }
+    }) {
+        return true;
+    }
+    if refused {
+        return false;
+    }
+    // Larger than the buffer's free memory: into a `Vec` grown until it fits, which the
+    // buffer then grows for.
+    let mut wire = vec![0u8; 4096];
+    loop {
+        match h1_encode_head(htx, &opts, &mut wire) {
+            Ok(e) => {
+                wire.truncate(e.len);
+                sess.req.replace_prefix(0, &wire);
+                return true;
+            }
+            Err(ibex_proto::htx::HtxError::BufferTooSmall) => wire.resize(wire.len() * 2, 0),
+            Err(_) => return false,
+        }
+    }
 }
 
 /// `src` into `dst`, as much as fits: the bytes copied.
@@ -769,9 +822,20 @@ pub(crate) fn pump_h2_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, r
     pump_htx_body(msg, st, req, drop)
 }
 
+/// `req`'s free memory less the last `keep` bytes.
+fn writable_less(req: &mut Buf, keep: usize) -> &mut [u8] {
+    let w = req.writable();
+    let n = w.len().saturating_sub(keep);
+    &mut w[..n]
+}
+
 /// [`pump_h2_body`], a block written out whole given to `release` (T512: h3's pool).
 fn pump_htx_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut Buf, mut release: impl FnMut(Vec<u8>)) -> bool {
     let blocks = msg.blocks_mut();
+    // The room the head takes once it is written (X4: it is in its HTX until the send), as
+    // the head takes room in `HAProxy`'s channel buffer: a DATA frame that did not fit beside
+    // it does not fit now either (T322's receive slots).
+    let keep = st.head_room;
     let mut wrote = false;
     while !st.done && st.cursor < blocks.len() {
         match &blocks[st.cursor] {
@@ -788,7 +852,7 @@ fn pump_htx_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut B
                 // it goes to the server a kilobyte at a time (4 uploads of 256 KB: 256
                 // writes each, ~35 ms a round where `HAProxy` takes 7).
                 req.promote_to_standard();
-                let room = req.writable();
+                let room = writable_less(req, keep);
                 if room.len() <= framing {
                     break;
                 }
@@ -827,7 +891,7 @@ fn pump_htx_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut B
                     line.extend_from_slice(b": ");
                     line.extend_from_slice(h.value.as_bytes());
                     line.extend_from_slice(b"\r\n");
-                    let room = req.writable();
+                    let room = writable_less(req, keep);
                     if room.len() < line.len() {
                         break;
                     }
@@ -842,7 +906,7 @@ fn pump_htx_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut B
             }
             HtxBlock::Eot => {
                 if st.chunked && st.trailing {
-                    let room = req.writable();
+                    let room = writable_less(req, keep);
                     if room.len() < 2 {
                         break;
                     }
@@ -855,7 +919,7 @@ fn pump_htx_body(msg: &mut ibex_proto::htx::Htx, st: &mut H2ReqBody, req: &mut B
             }
             HtxBlock::Eom => {
                 if st.chunked && !st.trailing {
-                    let room = req.writable();
+                    let room = writable_less(req, keep);
                     if room.len() < 5 {
                         break;
                     }
@@ -926,7 +990,11 @@ mod tests {
         let (mut s, _owner, _peer) = child();
         start_request(&mut s, dispatch(H2ReqHead::of("GET", "/", &[("host", "x")])));
         assert!(s.has_htx, "a valid head is parsed");
+        // X4: in its HTX alone until the send writes it, once.
+        assert!(s.req.readable().is_empty() && s.req_head_pending, "no text before the send");
+        assert!(write_pending_head(&mut s, false, None));
         assert_eq!(s.req.readable(), b"GET / HTTP/1.1\r\nhost: x\r\n\r\n");
+        assert!(!s.req_head_pending && !write_pending_head(&mut s, false, None), "written once");
     }
 
     /// E1: the HTX `put_request_head` writes from a head's fields is the one the HTTP/1

@@ -952,6 +952,7 @@ impl<'a> HtxSliceRef<'a> {
     }
 
     pub fn write_h1_wire(&self, out: &mut [u8]) -> Result<usize, HtxError> {
+        crate::h1_encode::note_head_write();
         let mut cursor = 0;
 
         if let Some(req) = self.req_line() {

@@ -175,6 +175,11 @@ fn setup_after(delay: Duration) -> (Engine, SocketAddr, Arc<AtomicBool>, thread:
 }
 
 fn setup_with(delay: Duration, response: &'static [u8]) -> (Engine, SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
+    setup_rules(delay, response, "")
+}
+
+/// [`setup_with`], the frontend with the lines `fe_extra` (each ending in a newline).
+fn setup_rules(delay: Duration, response: &'static [u8], fe_extra: &str) -> (Engine, SocketAddr, Arc<AtomicBool>, thread::JoinHandle<()>) {
     let srv = TcpListener::bind("127.0.0.1:0").expect("bind backend");
     let srv_addr = srv.local_addr().expect("addr");
     let fe = common::reserve_addr();
@@ -182,7 +187,7 @@ fn setup_with(delay: Duration, response: &'static [u8]) -> (Engine, SocketAddr, 
     let be = backend_with(srv, Arc::clone(&running), delay, response);
     let cfg = format!(
         "defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\n\
-         frontend fe\n  bind {fe} proto h2\n  default_backend be\n\
+         frontend fe\n  bind {fe} proto h2\n{fe_extra}  default_backend be\n\
          backend be\n  server s1 {srv_addr}\n"
     );
     let engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
@@ -446,6 +451,34 @@ fn an_h2_request_head_is_parsed_once() {
     drop(c);
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
+}
+
+/// X4 (`docs/design/htx-engine-2026-11-01.md` section 3): an h2 request head is written as
+/// HTTP/1 text once, at the server send, out of the blocks the bridge wrote into the stream's
+/// layout. Before X4 the bridge wrote the text at once and the send wrote it again when a rule
+/// had edited the blocks since: two writes per request with a `set-header`
+/// (`ibex_proto::h1_encode::head_writes`, debug builds).
+#[test]
+fn an_h2_request_head_is_written_once() {
+    const N: u64 = 20;
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (what, extra) in [("no rule", ""), ("a set-header", "  http-request set-header x-a 1\n")] {
+        let (mut engine, fe, running, be) = setup_rules(Duration::ZERO, RESPONSE, extra);
+        let mut c = Client::connect(&mut engine, fe);
+        c.get(&mut engine);
+        let w0 = ibex_proto::h1_encode::head_writes();
+        for _ in 0..N {
+            c.get(&mut engine);
+        }
+        let writes = ibex_proto::h1_encode::head_writes() - w0;
+        println!("{what}: {N} h2 requests, {writes} request heads written as HTTP/1 text");
+        if cfg!(debug_assertions) {
+            assert_eq!(writes, N, "{what}: {N} h2 requests wrote {writes} heads");
+        }
+        drop(c);
+        running.store(false, Ordering::Relaxed);
+        let _ = be.join();
+    }
 }
 
 /// E2 (`docs/design/quic-transport-2026-11-01.md` section 3): a response head is walked once.

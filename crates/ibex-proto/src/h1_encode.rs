@@ -348,6 +348,29 @@ fn version(v: &[u8]) -> (&[u8], bool) {
     }
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static HEAD_WRITES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Message heads written out of an HTX as HTTP/1 text on this thread, by [`h1_encode_head`] or
+/// [`HtxSliceRef::write_h1_wire`] (debug builds; 0 in release): X4 pins that an HTTP/2 or
+/// HTTP/3 request head is written once, at the server send.
+#[must_use]
+pub fn head_writes() -> u64 {
+    #[cfg(debug_assertions)]
+    return HEAD_WRITES.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
+/// Counts one [`head_writes`].
+#[inline]
+pub(crate) fn note_head_write() {
+    #[cfg(debug_assertions)]
+    HEAD_WRITES.with(|c| c.set(c.get() + 1));
+}
+
 /// The head of `htx` as HTTP/1.1 into `out` (`h1_make_reqline`/`h1_make_stline`,
 /// `h1_make_headers`, `h1_make_eoh`): its start line, its headers up to the EOH block in
 /// order, the framing and `connection` headers the stream needs, the blank line, and for a
@@ -360,6 +383,7 @@ fn version(v: &[u8]) -> (&[u8], bool) {
 /// (`h1_make_headers`' processing error).
 #[allow(clippy::too_many_lines)]
 pub fn h1_encode_head(htx: HtxSliceRef<'_>, o: &H1EncodeOpts<'_>, out: &mut [u8]) -> Result<H1Encoded, HtxError> {
+    note_head_write();
     let buf = htx.buf();
     let mut w = Out { out, at: 0 };
     let mut m: u32 = 0;

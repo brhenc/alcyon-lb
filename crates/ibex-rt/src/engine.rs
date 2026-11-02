@@ -7769,7 +7769,8 @@ fn eval_tcp_req_content_rules(
     }
 
     let req_bytes = sess.req.readable();
-    let has_content = !req_bytes.is_empty();
+    // An HTTP/2 or HTTP/3 head in its HTX alone is content (X4).
+    let has_content = !req_bytes.is_empty() || sess.req_head_pending;
     // A kept-alive connection closed by the client with no next request has no stream to
     // inspect: HAProxy runs nothing for it.
     if sess.mode == Mode::Http
@@ -13145,6 +13146,10 @@ impl EngineDispatcher<'_> {
         serving: usize,
     ) -> Option<crate::stats_html::AdminAction> {
         entry.sess.log.applet = true;
+        // The applet reads the request's body behind its head in the buffer (X4).
+        if entry.sess.req_head_pending {
+            crate::h2_bridge::write_pending_head(&mut entry.sess, false, None);
+        }
         if Self::stats_rules_reply(entry, proxies, serving) {
             return None;
         }
@@ -14511,14 +14516,15 @@ impl EngineDispatcher<'_> {
         // `stick match` after those (`SF_ASSIGNED`); the keys to store are queued either way.
         let assigned = cookie_server.is_some();
         let cookie_server = cookie_server.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned));
-        // The head is final: written out of its HTX if anything edited it (X2), once.
-        encode_if_modified(&mut entry.sess);
         // Its header names go to the server in lower case, as `HAProxy` writes them (HTX). The
         // request line and the values are the client's.
         let srv_table = (proxies[be_idx].h1_adjust & ibex_config::H1_ADJ_SERVER != 0).then(|| &*proxies[be_idx].h1_case);
         // In the case they came in when `tune.ibex.h1-lowercase-headers` is off (D-E, X5).
         let lower = proxies[be_idx].h1_lower;
-        if lower || srv_table.is_some() {
+        // The head is final: written out of its HTX if anything edited it (X2), once; an
+        // HTTP/2 or HTTP/3 one always, its names written as they go (X4).
+        let names_done = encode_if_modified(&mut entry.sess, lower, srv_table);
+        if !names_done && (lower || srv_table.is_some()) {
             entry.sess.req.edit_keeping_lines(|head, eoh| rewrite_header_names_before(head, eoh, srv_table, lower));
         }
         Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, cookie_server)
@@ -16082,7 +16088,7 @@ fn wait_for_request_body(
         }
     };
     let data = sess.req.readable();
-    let head = crate::proxy::find_eoh(data).map_or(data.len(), |(h, e)| h + e);
+    let head = req_head_len(sess);
     // A `Content-Length` body is read where it is: its length so far, no copy (the pass runs
     // again at every read while it is incomplete). Other framings are un-framed into `body`.
     let limit = sess.bufsize.saturating_sub(sess.maxrewrite);
@@ -16142,9 +16148,21 @@ fn txn_req_body(sess: &TcpSession) -> Option<&[u8]> {
         crate::txn::ReqBody::Owned(b) => Some(b),
         crate::txn::ReqBody::InPlace(len) => {
             let data = sess.req.readable();
-            let head = crate::proxy::find_eoh(data).map_or(data.len(), |(h, e)| h + e);
+            let head = req_head_len(sess);
             Some(&data[head..(head + len).min(data.len())])
         }
+    }
+}
+
+/// The length of the request head in the request buffer: none of an HTTP/2 or HTTP/3 head
+/// still in its HTX alone (X4, `TcpSession::req_head_pending`), all of the buffer for one
+/// not yet whole.
+fn req_head_len(sess: &TcpSession) -> usize {
+    let data = sess.req.readable();
+    if sess.req_head_pending {
+        0
+    } else {
+        crate::proxy::find_eoh(data).map_or(data.len(), |(h, e)| h + e)
     }
 }
 
@@ -16190,8 +16208,9 @@ fn req_htx_init(sess: &TcpSession) {
         (hdrs, h.req_line_bytes().map_or(3 + 1, |r| r.method.len() + r.uri.len()))
     });
     let data = sess.req.readable();
-    // The head as it is in the buffer (an edited one is written at the send): what follows it is the body.
-    let head_len = sess.req.eoh().map_or(data.len(), |(h, e)| h + e);
+    // The head as it is in the buffer (an edited one is written at the send, an HTTP/2 one is
+    // not there yet): what follows it is the body.
+    let head_len = if sess.req_head_pending { 0 } else { sess.req.eoh().map_or(data.len(), |(h, e)| h + e) };
     let body = data.len().saturating_sub(head_len);
     let line = 8 + 20 + line + 8;
     let head = line + hdrs + 9;
@@ -16507,11 +16526,37 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
 /// here, when something did: the rules, `option forwardfor`, the `Connection` the server side
 /// calls for, the cookies. Called once, just before the server is picked; nothing edits the
 /// head after it.
-fn encode_if_modified(sess: &mut TcpSession) {
+/// An HTTP/2 or HTTP/3 head is written here whatever edited it (X4: `req` holds none of it
+/// until now), its names as `lower` and `table` say; true when they are.
+fn encode_if_modified(sess: &mut TcpSession, lower: bool, table: Option<&std::collections::HashMap<String, String>>) -> bool {
+    if sess.req_head_pending {
+        return write_pending_req_head(sess, lower, table);
+    }
     if sess.htx_modified {
         write_req_head(sess);
         sess.htx_modified = false;
     }
+    false
+}
+
+/// An HTTP/2 or HTTP/3 head, in its HTX alone since the bridge wrote it (X4): written once,
+/// in front of the body, its names as the backend writes them (`lower`, `table`). True when
+/// they are: the text needs no pass after.
+fn write_pending_req_head(sess: &mut TcpSession, lower: bool, table: Option<&std::collections::HashMap<String, String>>) -> bool {
+    ibex_sample::work::note(ibex_sample::work::Op::ReqRebuild, 1);
+    let chunked = sess.h2_active().is_some_and(|a| a.chunk_out);
+    if crate::h2_bridge::write_pending_head(sess, lower, table) {
+        return true;
+    }
+    // One the encoder refuses (a `content-length` a rule made invalid) goes as its blocks
+    // are, as an edited head did before X4.
+    let htx = ibex_proto::htx::HtxSliceRef::new(sess.htx_buf.raw_slice(), sess.htx_blocks);
+    let mut wire = htx.write_h1_wire_vec();
+    if let Some((h, _)) = crate::proxy::find_eoh(&wire).filter(|_| chunked) {
+        wire = crate::h2_bridge::chunked_head(&wire, h);
+    }
+    sess.req.replace_prefix(0, &wire);
+    false
 }
 
 fn write_req_head(sess: &mut TcpSession) {
@@ -16523,17 +16568,7 @@ fn write_req_head(sess: &mut TcpSession) {
     if sess.has_htx {
         // The HTX is in its own buffer: the request buffer is written while it is read.
         let htx = ibex_proto::htx::HtxSliceRef::new(sess.htx_buf.raw_slice(), sess.htx_blocks);
-        if sess.h2_active().is_some_and(|a| a.chunk_out) {
-            let mut wire = htx.write_h1_wire_vec();
-            // An HTTP/2 request without a length goes out chunked: the header is written with
-            // the head, after the rules, which never saw it.
-            if !wire.is_empty() {
-                if let Some((h, _)) = crate::proxy::find_eoh(&wire) {
-                    wire = crate::h2_bridge::chunked_head(&wire, h);
-                }
-            }
-            sess.req.replace_prefix(old, &wire);
-        } else if !sess.req.replace_head_with(old, |out| htx.write_h1_wire(out).ok()) {
+        if !sess.req.replace_head_with(old, |out| htx.write_h1_wire(out).ok()) {
             // Larger than the buffer's free memory: through a `Vec` (`write_h1_wire_vec`
             // grows until it fits), which the buffer then grows for.
             sess.req.replace_prefix(old, &htx.write_h1_wire_vec());
@@ -18626,7 +18661,7 @@ mod add_req_connection_tests {
         add_req_connection(&mut s, "keep-alive");
         assert_eq!(s.req_headers.as_ref().map(Vec::len), Some(2));
         assert_eq!(s.req.readable(), b"GET / HTTP/1.0\r\nHost: a\r\n\r\n", "not written before the send");
-        encode_if_modified(&mut s);
+        encode_if_modified(&mut s, false, None);
         assert_eq!(s.req.readable(), b"GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\n\r\n");
     }
 
@@ -18640,8 +18675,79 @@ mod add_req_connection_tests {
         s.req_headers = Some(vec![("Host".to_string(), "a".to_string()), ("X-A".to_string(), "1".to_string())]);
         set_req_header(&mut s, "x-a", "2");
         del_req_header(&mut s, "host");
-        encode_if_modified(&mut s);
+        encode_if_modified(&mut s, false, None);
         assert_eq!(s.req.readable(), b"GET / HTTP/1.1\r\nx-a: 2\r\n\r\n");
+    }
+}
+
+#[cfg(test)]
+mod pending_req_head_tests {
+    use super::*;
+    use crate::proxy::{H2ActiveStream, H2ReqBody};
+    use ibex_proto::mux_h2::{H2MuxContext, H2ReqHead};
+
+    /// A stream's session with `head` started on it (`h2_bridge::start_request`), its head in
+    /// its HTX alone (X4).
+    fn started(head: H2ReqHead, chunked: bool) -> (TcpSession, TcpSession, std::os::unix::net::UnixStream) {
+        let (a, peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut owner = TcpSession::new(OwnedFd::from(a), Default::default(), 0, Tick(1000));
+        owner.h2_ctx = Some(Box::new(H2MuxContext::new(ibex_proto::ConnId(0), true)));
+        let stream = H2ActiveStream { id: 1, body: H2ReqBody { chunked, ..H2ReqBody::default() }, chunk_out: chunked };
+        let mut s = TcpSession::h2_child_of(&mut owner, (0, TaskRef::NONE), stream);
+        let d = crate::h2_bridge::H2Dispatch {
+            stream: H2ActiveStream { id: 1, body: H2ReqBody { chunked, ..H2ReqBody::default() }, chunk_out: chunked },
+            head: Box::new(head),
+            req_htx: 0,
+            request_line: None,
+            bad_request: false,
+            add_len: None,
+        };
+        crate::h2_bridge::start_request(&mut s, d);
+        assert!(s.req_head_pending && s.req.readable().is_empty());
+        (s, owner, peer)
+    }
+
+    /// A head larger than the free memory behind the body already in `req` is written through
+    /// a `Vec` grown until it fits, the body kept behind it.
+    #[test]
+    fn a_head_larger_than_the_room_behind_the_body_goes_in_front_of_it() {
+        let big = "v".repeat(6000);
+        let (mut s, _o, _p) = started(H2ReqHead::of("POST", "/", &[("host", "x"), ("x-big", &big), ("content-length", "3")]), false);
+        let free = s.req.writable().len();
+        s.req.writable()[..free].fill(b'b');
+        s.req.commit(free);
+        assert!(encode_if_modified(&mut s, false, None), "written by the encoder");
+        let want = format!("POST / HTTP/1.1\r\nhost: x\r\nx-big: {big}\r\ncontent-length: 3\r\n\r\n");
+        let data = s.req.readable();
+        assert_eq!(&data[..want.len()], want.as_bytes());
+        assert_eq!(data.len(), want.len() + free, "the body is kept behind the head");
+        assert!(!s.req_head_pending);
+    }
+
+    /// The engine never sends a head the encoder refuses (a rule's non-numeric
+    /// `content-length` is refused or dropped by `reread_request_framing` first); one that
+    /// gets here anyway goes as its blocks are, as an edited head did before X4, chunked when
+    /// the stream is. In free memory and through the grown `Vec` alike.
+    #[test]
+    fn a_head_the_encoder_refuses_goes_as_its_blocks_are() {
+        let big = "v".repeat(6000);
+        for (chunked, extra, fill) in [(false, None, false), (true, None, false), (false, Some(big.as_str()), true)] {
+            let mut fields = vec![("host", "x")];
+            fields.extend(extra.map(|v| ("x-big", v)));
+            let (mut s, _o, _p) = started(H2ReqHead::of("POST", "/", &fields), chunked);
+            s.with_htx_mut(|h| {
+                let _ = h.add_header("content-length", "x");
+            });
+            if fill {
+                let free = s.req.writable().len();
+                s.req.commit(free);
+            }
+            assert!(!encode_if_modified(&mut s, false, None), "{chunked} {fill}: refused by the encoder");
+            let head = String::from_utf8_lossy(s.req.readable()).into_owned();
+            assert!(head.starts_with("POST / HTTP/1.1\r\nhost: x\r\n"), "{head:.80}");
+            assert!(head.contains("content-length: x\r\n"), "{chunked} {fill}");
+            assert_eq!(head.contains("transfer-encoding: chunked\r\n"), chunked, "{chunked} {fill}");
+        }
     }
 }
 
