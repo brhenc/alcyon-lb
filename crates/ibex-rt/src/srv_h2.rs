@@ -108,10 +108,10 @@ impl H2Layer {
     /// # Errors
     /// The transport's.
     pub fn send_head(&mut self, fd: BorrowedFd<'_>, htx: ibex_proto::htx::HtxSliceRef<'_>, chunked: bool) -> io::Result<Io> {
-        if self.err.is_none() {
-            if let Err(e) = self.codec.send_head(htx, chunked) {
-                self.fail(e);
-            }
+        // On a layer that failed before, the codec's own refusal (or a stream opened on a
+        // connection about to close) changes nothing: the verdict is `Closed` either way.
+        if let Err(e) = self.codec.send_head(htx, chunked) {
+            self.fail(e);
         }
         let _ = self.flush(fd)?;
         Ok(if self.err.is_some() { Io::Closed } else { Io::Done(1) })
