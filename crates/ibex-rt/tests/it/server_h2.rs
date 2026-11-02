@@ -273,6 +273,8 @@ pub(crate) enum Script {
     ResetAfterResponse,
     /// RST_STREAM INTERNAL_ERROR on the request's HEADERS, its body not waited for.
     ResetOnHeaders,
+    /// A head of 34 fields: more than the codec's index holds (T618).
+    ManyFields,
 }
 
 pub(crate) struct Scripted {
@@ -390,6 +392,16 @@ fn serve_h2c(mut s: TcpStream, script: Script, st: &Mutex<Vec<u32>>, idx: usize)
                     return;
                 }
                 Script::ResetOnHeaders => {}
+                Script::ManyFields => {
+                    let mut b = vec![0x88, 0x0f, 0x0d, 0x01, b'2'];
+                    for i in 0..33 {
+                        b.extend_from_slice(&[0x00, 4]);
+                        b.extend_from_slice(format!("x-{:02}", i).as_bytes());
+                        b.extend_from_slice(&[1, b'v']);
+                    }
+                    frame(&mut out, 1, 4, id, &b);
+                    frame(&mut out, 0, 1, id, b"ok");
+                }
                 Script::Reset => frame(&mut out, 3, 0, id, &2u32.to_be_bytes()),
                 Script::Refuse => frame(&mut out, 3, 0, id, &7u32.to_be_bytes()),
                 Script::NoLength => {
@@ -718,7 +730,9 @@ fn a_refused_stream_is_retried_under_retry_on_empty_response() {
 /// server: 49 bytes with `content-length: 2`, 34 without.
 #[test]
 fn the_bytes_logged_for_an_h2_response_are_haproxys() {
-    for (script, want) in [(Script::Ok { goaway_after: 0 }, " 200 49 "), (Script::NoLength, " 200 34 ")] {
+    // ManyFields: 33 fields of `x-NN`: `v` (5 bytes of HTX each) more than Ok's 49, and a head
+    // too long for the codec's index, so the engine scans its text (T618).
+    for (script, want) in [(Script::Ok { goaway_after: 0 }, " 200 49 "), (Script::NoLength, " 200 34 "), (Script::ManyFields, " 200 214 ")] {
         let srv = scripted(script);
         let p = proxy(&format!("  server s {} proto h2", srv.addr));
         assert_eq!(get(p.fe, "/x").0, 200);

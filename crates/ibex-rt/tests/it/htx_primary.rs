@@ -304,6 +304,35 @@ fn an_h2_server_request_is_not_text() {
     rig.running.store(false, Ordering::Relaxed);
 }
 
+/// T618: the bytes `%B` leaves out of an h2 server's response (the reason phrase, the
+/// `transfer-encoding` the codec adds) are read from the codec's index of the head, not scanned
+/// out of its text; a head too long for the index (34 fields) is scanned. Debug builds count.
+#[test]
+fn an_h2_server_response_is_not_scanned_for_its_htx_size() {
+    use crate::server_h2::{scripted, Script};
+    for (script, scans) in [(Script::Ok { goaway_after: 0 }, 0), (Script::ManyFields, 1)] {
+        let srv = scripted(script);
+        let fe = common::reserve_addr();
+        let cfg = format!(
+            "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+             frontend fe\n  bind {fe}\n  default_backend be\nbackend be\n  server s1 {} proto h2\n",
+            srv.addr
+        );
+        let engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+        let mut rig = Rig { engine, fe, running: Arc::new(AtomicBool::new(true)), seen: Arc::new(Mutex::new(Vec::new())), be: None };
+        let mut c = rig.connect();
+        let _ = rig.request(&mut c, b"GET /plain HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let s0 = ibex_rt::engine::h2_overcount_scans();
+        let rsp = rig.request(&mut c, b"GET /plain HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        assert!(rsp.starts_with("HTTP/1.1 200"), "{rsp:?}");
+        let n = ibex_rt::engine::h2_overcount_scans() - s0;
+        if cfg!(debug_assertions) {
+            assert_eq!(n, scans, "scans of the response head's text per request");
+        }
+        rig.running.store(false, Ordering::Relaxed);
+    }
+}
+
 /// X3b-2: an h2 server's response head reaches the client with no HTTP/1 parse of it
 /// (`ibex_proto::response_head::response_parses`): the codec indexes the head it writes, and
 /// the engine reads that index. A rules-edited request and a body changes nothing of it.
