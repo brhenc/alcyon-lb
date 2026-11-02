@@ -356,15 +356,21 @@ pub fn static_ref(name: &str, value: &str) -> StaticRef {
 /// [`static_ref`] of a value that is octets (a response field as the server sent it, E2).
 #[must_use]
 pub fn static_ref_octets(name: &str, value: &[u8]) -> StaticRef {
+    static_ref_bytes(name.as_bytes(), value)
+}
+
+/// [`static_ref_octets`] of a name that is bytes (a token: what a response head holds, T581).
+#[must_use]
+pub fn static_ref_bytes(name: &[u8], value: &[u8]) -> StaticRef {
     // `SORTED` is in (name, value, index) order, and `str`'s `Ord` is the byte order
     // `str_cmp` sorted it by: one binary search on the name (memcmp, not the const byte
     // loop), then a walk of that name's few entries. The first with the value is the lowest
     // index of the pair; the lowest index of the run is the name-only reference (T539:
     // two searches of `str_cmp` were ~1.7 % of an HTTP/3 request).
-    let first = SORTED.partition_point(|&(n, _, _)| n < name);
+    let first = SORTED.partition_point(|&(n, _, _)| n.as_bytes() < name);
     let mut lowest = None;
     for &(n, v, i) in &SORTED[first..] {
-        if n != name {
+        if n.as_bytes() != name {
             break;
         }
         if v.as_bytes() == value {

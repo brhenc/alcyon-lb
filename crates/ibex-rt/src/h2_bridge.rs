@@ -434,7 +434,7 @@ fn trailer_fields<'a>(section: &'a [u8], out: &mut [(&'a str, &'a str); MAX_TRAI
 
 /// The fields of a response head the engine indexed and kept up to date (E2), for the
 /// client's HEADERS: what the mux read of the head as text, without reading it.
-fn indexed_fields<'h>(head: &'h [u8], ix: &'h ibex_proto::response_head::RspHead) -> impl Iterator<Item = (&'h str, &'h [u8])> {
+fn indexed_fields<'h>(head: &'h [u8], ix: &'h ibex_proto::response_head::RspHead) -> impl Iterator<Item = (&'h [u8], &'h [u8])> {
     #[cfg(debug_assertions)]
     {
         // What the mux's own reading of the head gives (`send_h1_head`), names lowered.
@@ -442,15 +442,13 @@ fn indexed_fields<'h>(head: &'h [u8], ix: &'h ibex_proto::response_head::RspHead
         let mut new = ix.fields().iter().map(|f| (f.name(head), f.value(head).trim_ascii()));
         let same = ibex_proto::response_head::mux_head_lines_uncounted(head).is_some_and(|(status, mut lines)| {
             status == ix.status
-                && lines.all(|(n, v)| new.next().is_some_and(|(nn, nv)| n.as_bytes().eq_ignore_ascii_case(nn) && !nn.iter().any(u8::is_ascii_uppercase) && v == nv))
+                && lines.all(|(n, v)| new.next().is_some_and(|(nn, nv)| n.eq_ignore_ascii_case(nn) && !nn.iter().any(u8::is_ascii_uppercase) && v == nv))
                 && new.next().is_none()
         });
         debug_assert!(same, "stale response head index of {:?}", String::from_utf8_lossy(head));
     }
-    ix.fields().iter().filter_map(move |f| {
-        // A name is a token: ASCII.
-        Some((std::str::from_utf8(f.name(head)).ok()?, f.value(head).trim_ascii()))
-    })
+    // A name is a token: its bytes go as they are (T581).
+    ix.fields().iter().map(move |f| (f.name(head), f.value(head).trim_ascii()))
 }
 
 /// [`forward_response`] for any mux the bridge drives (T509), the DATA staged in `scratch`.

@@ -226,3 +226,23 @@ fn an_http10_keep_alive_request_edited_by_a_rule_gets_the_token_last() {
     let _ = rig.send(&mut c, "GET /r HTTP/1.0\r\nHost: a\r\nConnection: Keep-Alive\r\n\r\n");
     assert_eq!(rig.last_head(), "GET /r HTTP/1.0\r\nhost: a\r\nx-a: 1\r\nconnection: keep-alive\r\n\r\n");
 }
+
+/// T581 / X3: the server's response head is read as bytes too: its `Content-Length`, its
+/// `Connection` and its status are not read as UTF-8 (`HAProxy` keeps the message as bytes).
+#[test]
+fn the_parse_of_an_ascii_response_reads_no_utf8() {
+    const N: usize = 20;
+    let mut rig = Rig::new("", "");
+    let mut c = rig.client();
+    let req = "GET /r HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let _ = rig.send(&mut c, req);
+    let before = ibex_proto::utf8_parse_calls_on_this_thread();
+    for _ in 0..N {
+        let rsp = rig.send(&mut c, req);
+        assert!(rsp.starts_with(b"HTTP/1.1 200 OK\r\n"), "{rsp:?}");
+    }
+    let reads = ibex_proto::utf8_parse_calls_on_this_thread() - before;
+    if cfg!(debug_assertions) {
+        assert_eq!(reads, 0, "UTF-8 reads in {N} responses");
+    }
+}

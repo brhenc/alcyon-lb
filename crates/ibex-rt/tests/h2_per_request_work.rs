@@ -474,6 +474,29 @@ fn a_response_head_is_scanned_once() {
     let _ = be.join();
 }
 
+/// T581 / X3: an h2 client's HEADERS are written from the response head's bytes: no field
+/// name, status or framing value is read as UTF-8 (`HAProxy` keeps the message as bytes).
+#[test]
+fn an_h2_response_head_reads_no_utf8() {
+    const N: u64 = 20;
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut engine, fe, running, be) = setup();
+    let mut c = Client::connect(&mut engine, fe);
+    c.get(&mut engine);
+    let u0 = ibex_proto::utf8_parse_calls_on_this_thread();
+    for _ in 0..N {
+        c.get(&mut engine);
+    }
+    let reads = ibex_proto::utf8_parse_calls_on_this_thread() - u0;
+    println!("{N} h2 responses: {reads} UTF-8 reads");
+    if cfg!(debug_assertions) {
+        assert_eq!(reads, 0, "{N} h2 responses read {reads} strings as UTF-8");
+    }
+    drop(c);
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+}
+
 /// The fields of the HEADERS of three responses to an h2 client, and the passes over their
 /// heads.
 type Fields = Vec<(Vec<u8>, Vec<u8>)>;

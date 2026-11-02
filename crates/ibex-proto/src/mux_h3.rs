@@ -156,15 +156,15 @@ fn encode_string(out: &mut Vec<u8>, s: &[u8], prefix_bits: u8, mask: u8) {
 pub fn encode_field_section(headers: &[(String, String)]) -> Vec<u8> {
     let mut out = vec![0x00, 0x00];
     for (name, value) in headers {
-        put_field(&mut out, &name.to_ascii_lowercase(), value.as_bytes());
+        put_field(&mut out, name.to_ascii_lowercase().as_bytes(), value.as_bytes());
     }
     out
 }
 
 /// Appends one field line (`name` lowercase): a static reference with one search of the
 /// table ([`crate::qpack::static_ref`]), else literals. Allocates nothing.
-fn put_field(out: &mut Vec<u8>, name: &str, value: &[u8]) {
-    match crate::qpack::static_ref_octets(name, value) {
+fn put_field(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
+    match crate::qpack::static_ref_bytes(name, value) {
         // Indexed field line, static table: 1 1 index(6+)
         StaticRef::Full(idx) => encode_prefixed_int(out, 6, 0xc0, idx),
         StaticRef::Name(idx) => {
@@ -174,7 +174,7 @@ fn put_field(out: &mut Vec<u8>, name: &str, value: &[u8]) {
         }
         StaticRef::None => {
             // Literal with literal name: 0 0 1 N=0 H=0 len(3+)
-            encode_string(out, name.as_bytes(), 3, 0x20);
+            encode_string(out, name, 3, 0x20);
             encode_string(out, value, 7, 0x00);
         }
     }
@@ -317,7 +317,7 @@ const REQUEST_REJECTED: u64 = H3Error::RequestRejected as u64;
 
 /// Connection-specific fields: never in an HTTP/3 message (RFC 9114 section 4.2), dropped
 /// from a response head.
-const HOP_BY_HOP: [&str; 5] = ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"];
+const HOP_BY_HOP: [&[u8]; 5] = [b"connection", b"keep-alive", b"proxy-connection", b"transfer-encoding", b"upgrade"];
 
 ibex_alloc::declare_pool!(
     /// `show pools` `qcs`: request streams (HAProxy's `qcs` + `h3s`), with their buffers.
@@ -489,7 +489,7 @@ pub struct H3MuxContext {
     /// A field section being encoded, kept for the next.
     scratch: Vec<u8>,
     /// A header name lowercased, kept for the next.
-    lower: String,
+    lower: Vec<u8>,
     /// The stream [`Self::next_tx`] gave last (round robin).
     tx_last: Option<u64>,
 }
@@ -546,7 +546,7 @@ impl H3MuxContext {
             decoded: DecodedFields::default(),
             spare_heads: Vec::new(),
             scratch: Vec::new(),
-            lower: String::new(),
+            lower: Vec::new(),
             tx_last: None,
         }
     }
@@ -853,30 +853,31 @@ impl H3MuxContext {
     }
 
     /// The response head (`status`, `headers`) of stream `id` as a HEADERS frame.
-    fn put_head<'h>(&mut self, id: u64, status: Option<u16>, headers: impl Iterator<Item = (&'h str, &'h [u8])>) {
+    fn put_head<'h, N: AsRef<[u8]>>(&mut self, id: u64, status: Option<u16>, headers: impl Iterator<Item = (N, &'h [u8])>) {
         self.put_head_of(id, status, headers, false);
     }
 
     /// [`Self::put_head`]; `lowered`: the names are in lower case already (E2).
-    fn put_head_of<'h>(&mut self, id: u64, status: Option<u16>, headers: impl Iterator<Item = (&'h str, &'h [u8])>, lowered: bool) {
+    fn put_head_of<'h, N: AsRef<[u8]>>(&mut self, id: u64, status: Option<u16>, headers: impl Iterator<Item = (N, &'h [u8])>, lowered: bool) {
         let Self { streams, scratch, lower, .. } = self;
         let Some(st) = streams.get_mut(&id) else { return };
         scratch.clear();
         scratch.extend_from_slice(&[0x00, 0x00]);
         if let Some(status) = status {
             let mut digits = [0u8; 5];
-            put_field(scratch, ":status", status_text(status, &mut digits).as_bytes());
+            put_field(scratch, b":status", status_text(status, &mut digits).as_bytes());
         }
         for (name, value) in headers {
+            let name = name.as_ref();
             let name = if lowered {
                 name
             } else {
                 lower.clear();
-                lower.push_str(name);
+                lower.extend_from_slice(name);
                 lower.make_ascii_lowercase();
-                lower.as_str()
+                lower.as_slice()
             };
-            if HOP_BY_HOP.contains(&name) || name.starts_with(':') {
+            if HOP_BY_HOP.contains(&name) || name.starts_with(b":") {
                 continue;
             }
             put_field(scratch, name, value);
@@ -1262,7 +1263,7 @@ impl HtxMux for H3MuxContext {
         true
     }
 
-    fn send_head_fields<'h>(&mut self, id: u64, status: u16, fields: impl Iterator<Item = (&'h str, &'h [u8])>, end_stream: bool) -> bool {
+    fn send_head_fields<'h, N: AsRef<[u8]>>(&mut self, id: u64, status: u16, fields: impl Iterator<Item = (N, &'h [u8])>, end_stream: bool) -> bool {
         if !self.live(id) {
             return true;
         }

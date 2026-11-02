@@ -132,11 +132,11 @@ impl RspHead {
 
 /// An HTTP/1 response head (status line and fields, the blank line or not) as the h2 and
 /// h3 muxes write it to their clients: the status (the second word of the first line), and
-/// each line with a colon as its name (UTF-8, blanks trimmed) and its value as octets
-/// (blanks trimmed), as `HAProxy` sends a value whatever bytes it holds (E2: Ibex read the
-/// head as lossy text, and a byte that is not UTF-8 went as U+FFFD). `None`: no status.
+/// each line with a colon as its name and its value as octets (blanks trimmed), as `HAProxy`
+/// sends a field whatever bytes it holds (E2: Ibex read the head as lossy text, and a byte
+/// that is not UTF-8 went as U+FFFD; T581: nothing of it is read as UTF-8). `None`: no status.
 #[must_use]
-pub fn mux_head_lines(head: &[u8]) -> Option<(u16, impl Iterator<Item = (&str, &[u8])>)> {
+pub fn mux_head_lines(head: &[u8]) -> Option<(u16, impl Iterator<Item = (&[u8], &[u8])>)> {
     count_head_scan();
     mux_head_lines_uncounted(head)
 }
@@ -144,17 +144,26 @@ pub fn mux_head_lines(head: &[u8]) -> Option<(u16, impl Iterator<Item = (&str, &
 /// [`mux_head_lines`], not counted as a pass over the head (what a debug build checks an
 /// index against).
 #[must_use]
-pub fn mux_head_lines_uncounted(head: &[u8]) -> Option<(u16, impl Iterator<Item = (&str, &[u8])>)> {
+pub fn mux_head_lines_uncounted(head: &[u8]) -> Option<(u16, impl Iterator<Item = (&[u8], &[u8])>)> {
     let mut lines = head.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
     let code = lines.next()?.split(u8::is_ascii_whitespace).filter(|w| !w.is_empty()).nth(1)?;
-    let status = std::str::from_utf8(code).ok()?.parse::<u16>().ok()?;
+    let status = status_of_word(code)?;
     Some((
         status,
         lines.filter_map(|l| {
             let colon = l.iter().position(|&b| b == b':')?;
-            Some((std::str::from_utf8(l[..colon].trim_ascii()).ok()?, l[colon + 1..].trim_ascii()))
+            Some((l[..colon].trim_ascii(), l[colon + 1..].trim_ascii()))
         }),
     ))
+}
+
+/// `str::parse::<u16>` of a word, on its bytes: an optional `+`, then decimal digits that fit.
+fn status_of_word(w: &[u8]) -> Option<u16> {
+    let d = w.strip_prefix(b"+").unwrap_or(w);
+    if d.is_empty() || !d.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    d.iter().try_fold(0u16, |n, &c| n.checked_mul(10)?.checked_add(u16::from(c - b'0')))
 }
 
 #[cfg(debug_assertions)]
@@ -502,7 +511,7 @@ pub fn is_http11(head: &[u8]) -> bool {
 /// `Some(Valid { rewrite: None, .. })` only when `check_response_head`'s full pass would say
 /// the same; `None` for anything else (refused, rewritten, or in doubt), which the full pass
 /// then decides. Everything that sets `dirty` there, or refuses, makes this give up.
-fn fast_check(head: &[u8], accept_unsafe: bool) -> Option<ResponseHead> {
+fn fast_check(head: &[u8], accept_unsafe: bool, mut field: impl FnMut(usize, usize, usize)) -> Option<ResponseHead> {
     let (mut xfer_enc, mut te_chunked, mut chnk, mut te_other) = (false, false, false, false);
     let mut cl: Option<u64> = None;
     let (mut conn_upg, mut upg_ws, mut ws_accept) = (false, false, false);
@@ -522,6 +531,7 @@ fn fast_check(head: &[u8], accept_unsafe: bool) -> Option<ResponseHead> {
         if indexed {
             let n = usize::from(ix.n);
             if n < RSP_FIELDS {
+                field(h.at, h.colon, h.end);
                 // In range: the head's length fits `u32`.
                 #[allow(clippy::cast_possible_truncation)]
                 let f = RspField { at: h.at as u32, colon: h.colon as u32, end: h.end as u32 };
@@ -591,8 +601,16 @@ fn fast_check(head: &[u8], accept_unsafe: bool) -> Option<ResponseHead> {
 /// Parses a response head (the bytes up to and including the empty line that ends it).
 #[must_use]
 pub fn check_response_head(head: &[u8], accept_unsafe: bool) -> ResponseHead {
+    check_response_head_with(head, accept_unsafe, |_, _, _| {})
+}
+
+/// [`check_response_head`], `field(at, colon, end)` called in its pass for each field line
+/// of the index it makes, in order (X3: what the caller reads of the fields is read then,
+/// not in a second walk). The calls stand only when the result has an index: a head that
+/// is not indexed may have had some of its lines given before the check gave up on it.
+pub fn check_response_head_with(head: &[u8], accept_unsafe: bool, field: impl FnMut(usize, usize, usize)) -> ResponseHead {
     count_head_scan();
-    fast_check(head, accept_unsafe).unwrap_or_else(|| full_check(head, accept_unsafe))
+    fast_check(head, accept_unsafe, field).unwrap_or_else(|| full_check(head, accept_unsafe))
 }
 
 /// `check_response_head` the long way, building the head written again when there is one.
@@ -828,7 +846,7 @@ mod tests {
                 b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n",
             ] {
                 assert_eq!(valid(head, accept), None, "{} accept={accept}", head.escape_ascii());
-                assert!(fast_check(head, accept).is_none_or(|r| r == ResponseHead::Invalid));
+                assert!(fast_check(head, accept, |_, _, _| {}).is_none_or(|r| r == ResponseHead::Invalid));
             }
         }
     }
@@ -937,7 +955,7 @@ mod tests {
         ];
         for &head in heads {
             for accept in [false, true] {
-                if let Some(mut fast) = fast_check(head, accept) {
+                if let Some(mut fast) = fast_check(head, accept, |_, _, _| {}) {
                     if let ResponseHead::Valid { index, .. } = &mut fast {
                         *index = None;
                     }
