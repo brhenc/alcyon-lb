@@ -929,6 +929,11 @@ impl ServerXprt {
         matches!(self, ServerXprt::H2(_))
     }
 
+    /// [`Self::h2`], mutable.
+    pub fn h2_mut(&mut self) -> Option<&mut crate::srv_h2::H2Layer> {
+        if let ServerXprt::H2(h) = self { Some(h) } else { None }
+    }
+
     /// The h2 layer, when the connection speaks HTTP/2.
     #[must_use]
     pub fn h2(&self) -> Option<&crate::srv_h2::H2Layer> {

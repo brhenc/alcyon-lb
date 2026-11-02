@@ -31,6 +31,7 @@
 //! its buffers and HPACK table and allocates nothing per request.
 
 use crate::h2::{frame_flags, FrameHeader, FrameType, Frame, H2_CONN_PREFACE, DEFAULT_MAX_FRAME_SIZE, FRAME_HEADER_LEN, MAX_WINDOW_SIZE};
+use crate::htx::HtxSliceRef;
 use crate::hpack::{encode_field_stateless, DecodedFields, HpackDecoder, DEFAULT_DYNAMIC_TABLE_MAX_SIZE};
 
 ibex_alloc::declare_pool!(
@@ -199,6 +200,22 @@ const OUR_INITIAL_WINDOW: u32 = 16_384;
 /// `H2_INITIAL_WINDOW_INCREMENT`: the connection window's opening, added to the first
 /// connection WINDOW_UPDATE.
 const CONN_WINDOW_OPENING: u32 = MAX_WINDOW_SIZE as u32 - 65_535;
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static TEXT_HEADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Request heads this thread's codecs read as HTTP/1.1 text ([`H2SrvCodec::send_request`])
+/// instead of taking them as HTX blocks ([`H2SrvCodec::send_head`]); debug builds, 0 in
+/// release. X8 pins that a head the engine holds as blocks is not parsed again.
+#[must_use]
+pub fn text_heads() -> u64 {
+    #[cfg(debug_assertions)]
+    return TEXT_HEADS.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
+}
 
 fn push_frame_header(out: &mut Vec<u8>, len: usize, typ: FrameType, flags: u8, sid: u32) {
     let h = FrameHeader { length: len as u32, frame_type: typ, flags, stream_id: sid };
@@ -463,12 +480,7 @@ impl H2SrvCodec {
             if src.is_empty() {
                 return Ok(0);
             }
-            if let Some(e) = self.stream_error.take() {
-                return Err(e);
-            }
-            if !self.reusable() {
-                return Err(SrvH2Error::Refused);
-            }
+            self.can_open()?;
             used = self.start_request(src)?;
             if used == 0 {
                 return Ok(0);
@@ -478,9 +490,41 @@ impl H2SrvCodec {
         Ok(used)
     }
 
+    /// What stops a new stream: a stream error from before, a connection that cannot carry one.
+    fn can_open(&mut self) -> Result<(), SrvH2Error> {
+        if let Some(e) = self.stream_error.take() {
+            return Err(e);
+        }
+        if !self.reusable() {
+            return Err(SrvH2Error::Refused);
+        }
+        Ok(())
+    }
+
+    /// The head of the next request as the blocks of its HTX (X8): HEADERS (and
+    /// CONTINUATION) written from the request line and the header blocks, nothing parsed.
+    /// `chunked`: the body that follows is chunked though no `transfer-encoding` block says
+    /// so (an HTTP/2 or HTTP/3 client's, which the engine frames as chunks). The body goes
+    /// through [`Self::send_request`] after it, as the bytes that follow the head.
+    ///
+    /// # Errors
+    /// As [`Self::send_request`], and [`SrvH2Error::Unsupported`] for a head with no request
+    /// line.
+    pub fn send_head(&mut self, htx: HtxSliceRef<'_>, chunked: bool) -> Result<(), SrvH2Error> {
+        if let Some(code) = self.conn_error {
+            return Err(SrvH2Error::Connection(code));
+        }
+        debug_assert!(self.req == ReqBody::Idle, "a head while a request is in progress");
+        self.can_open()?;
+        let Some(rl) = htx.req_line_bytes() else { return Err(SrvH2Error::Unsupported("request line")) };
+        self.open_stream(rl.method, rl.uri, chunked, htx.header_bytes().map(|(n, v, latin1)| Ok((n, v, latin1))))
+    }
+
     /// The head: HEADERS (and CONTINUATION). Returns the bytes used, 0 when not whole.
     fn start_request(&mut self, src: &[u8]) -> Result<usize, SrvH2Error> {
         let Some(end) = memchr::memmem::find(src, b"\r\n\r\n") else { return Ok(0) };
+        #[cfg(debug_assertions)]
+        TEXT_HEADS.with(|c| c.set(c.get() + 1));
         let head = &src[..end + 2];
         let Some(rl_end) = crlf_at(head) else { return Err(SrvH2Error::Unsupported("request line")) };
         let rl = &head[..rl_end];
@@ -488,7 +532,36 @@ impl H2SrvCodec {
         let (Some(method), Some(target), Some(ver)) = (parts.next(), parts.next(), parts.next()) else {
             return Err(SrvH2Error::Unsupported("request line"));
         };
-        if method.is_empty() || target.is_empty() || !ver.starts_with(b"HTTP/1.") {
+        if !ver.starts_with(b"HTTP/1.") {
+            return Err(SrvH2Error::Unsupported("request line"));
+        }
+        let mut rest = &head[rl_end + 2..];
+        let lines = std::iter::from_fn(|| {
+            let e = crlf_at(rest)?;
+            let line = &rest[..e];
+            rest = &rest[e + 2..];
+            let Some(colon) = line.iter().position(|&b| b == b':') else {
+                return Some(Err(SrvH2Error::Unsupported("header line without a colon")));
+            };
+            Some(Ok((trim(&line[..colon]), trim(&line[colon + 1..]), false)))
+        });
+        self.open_stream(method, target, false, lines)?;
+        Ok(end + 4)
+    }
+
+    /// The stream a request opens, from its method, target and header fields (name, value,
+    /// whether the value is held as Latin-1 text, [`ibex_regex::bytetext`]), as
+    /// `h2s_snd_bhdrs` writes it: scheme and authority from an absolute target, userinfo
+    /// dropped, `*` or `/` for an empty path, CONNECT refused, the connection-specific
+    /// fields dropped. `chunked`: the body is chunked whatever the fields say.
+    fn open_stream<'a>(
+        &mut self,
+        method: &[u8],
+        target: &[u8],
+        chunked: bool,
+        fields: impl Iterator<Item = Result<(&'a [u8], &'a [u8], bool), SrvH2Error>>,
+    ) -> Result<(), SrvH2Error> {
+        if method.is_empty() || target.is_empty() {
             return Err(SrvH2Error::Unsupported("request line"));
         }
         if method == b"CONNECT" {
@@ -517,7 +590,7 @@ impl H2SrvCodec {
             path = if method == b"OPTIONS" { b"*" } else { b"/" };
         }
 
-        let mut body = ReqBody::Done;
+        let mut body = if chunked { ReqBody::ChunkSize } else { ReqBody::Done };
         let mut blk = std::mem::take(&mut self.scratch);
         blk.clear();
         match method {
@@ -538,16 +611,20 @@ impl H2SrvCodec {
             b"/index.html" => blk.push(0x85),
             p => encode_field_stateless(b":path", p, &mut blk),
         }
-        let mut rest = &head[rl_end + 2..];
-        while let Some(e) = crlf_at(rest) {
-            let line = &rest[..e];
-            rest = &rest[e + 2..];
-            let Some(colon) = line.iter().position(|&b| b == b':') else {
-                self.scratch = blk;
-                return Err(SrvH2Error::Unsupported("header line without a colon"));
+        for field in fields {
+            let (name, value, latin1) = match field {
+                Ok(f) => f,
+                Err(e) => {
+                    self.scratch = blk;
+                    return Err(e);
+                }
             };
-            let name = trim(&line[..colon]);
-            let value = trim(&line[colon + 1..]);
+            // The bytes a Latin-1 value stands for; borrowed unless one is escaped.
+            let value = match std::str::from_utf8(value) {
+                Ok(text) if latin1 => ibex_regex::bytetext::text_to_bytes(text),
+                _ => std::borrow::Cow::Borrowed(value),
+            };
+            let value = &*value;
             let is = |n: &[u8]| name.eq_ignore_ascii_case(n);
             if is(b"connection") || is(b"proxy-connection") || is(b"keep-alive") || is(b"upgrade") {
                 continue;
@@ -594,7 +671,7 @@ impl H2SrvCodec {
         let es = if body == ReqBody::Done { frame_flags::END_STREAM } else { 0 };
         self.put_header_block(&blk, es);
         self.scratch = blk;
-        Ok(end + 4)
+        Ok(())
     }
 
     /// One header block as HEADERS and CONTINUATION frames of at most the server's

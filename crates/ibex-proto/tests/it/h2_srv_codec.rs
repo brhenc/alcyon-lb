@@ -612,6 +612,7 @@ fn request_heads_it_cannot_write() {
         (&b"GET /\r\n\r\n"[..], "no version"),
         (b"GET / HTTP/2.0\r\nHost: x\r\n\r\n", "not HTTP/1.x"),
         (b" / HTTP/1.1\r\nHost: x\r\n\r\n", "no method"),
+        (b"GET  HTTP/1.1\r\nHost: x\r\n\r\n", "no target"),
         (b"GET / HTTP/1.1\r\nHost x\r\n\r\n", "a line without a colon"),
         (b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1a\r\n\r\n", "content-length"),
     ] {
@@ -766,4 +767,123 @@ fn a_target_with_a_colon_but_no_authority_is_a_path_and_other_streams_windows_ar
     let w = request(&mut c, b"GET urn:x HTTP/1.1\r\nHost: h\r\n\r\n");
     assert_eq!(&w[9..], &[0x82, 0x87, 0x44, 5, b'u', b'r', b'n', b':', b'x', 0x66, 1, b'h']);
     assert_eq!(c.receive(&fr(8, 0, 7, &[0, 0, 0, 1])), Ok(()));
+}
+
+// ----------------------------------------------------------------------------------------
+// X8: the head as HTX blocks (`send_head`) writes the frames the same head as text does.
+// ----------------------------------------------------------------------------------------
+
+/// The HTX the engine holds for the head of `text` (request line, header lines).
+fn htx_of(text: &str) -> ibex_proto::htx::HtxBuffer {
+    let mut b = ibex_proto::htx::HtxBuffer::new();
+    let mut lines = text.split("\r\n");
+    let mut rl = lines.next().unwrap().splitn(3, ' ');
+    b.push_req_line(rl.next().unwrap(), rl.next().unwrap(), rl.next().unwrap()).unwrap();
+    for l in lines.take_while(|l| !l.is_empty()) {
+        let (n, v) = l.split_once(':').unwrap();
+        b.push_header(n.trim(), v.trim()).unwrap();
+    }
+    b.push_eoh().unwrap();
+    b
+}
+
+#[test]
+fn a_head_as_blocks_writes_the_frames_of_the_same_head_as_text() {
+    for head in [
+        "GET /sc/cl HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: u\r\n\r\n",
+        "GET /index.html HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET http://h.example:81/sc/a/?q HTTP/1.1\r\nHost: h.example:81\r\nAccept: */*\r\n\r\n",
+        "GET https://h.example/x HTTP/1.1\r\nHost: h.example\r\nX-Big: VALUE\r\nUser-Agent: u\r\n\r\n",
+        "GET http://user:pw@h.example/x HTTP/1.1\r\nHost: h.example\r\n\r\n",
+        "GET http://h.example HTTP/1.1\r\nHost: h.example\r\n\r\n",
+        "OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n",
+        "OPTIONS http://h.example HTTP/1.1\r\nHost: x\r\n\r\n",
+        "PUT /m HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET h:8080/x HTTP/1.1\r\n\r\n",
+        "GET x HTTP/1.1\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\nProxy-Connection: x\r\nKeep-Alive: 5\r\nUpgrade: y\r\nX-A: 1\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nX-A: 1\r\n\r\n",
+        "GET / HTTP/1.1\r\nHost: x\r\nTE: gzip\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+    ] {
+        let (mut t, mut b) = (ready(), ready());
+        let as_text = request(&mut t, head.as_bytes());
+        let htx = htx_of(head);
+        b.send_head(htx.as_slice(), false).unwrap();
+        assert_eq!(take_out(&mut b), as_text, "{head:?}");
+        // The body is read the same way after either: a chunked body is cut into DATA, a
+        // length one is counted.
+        let body: &[u8] = if head.contains("chunked") { b"5\r\nhello\r\n0\r\n\r\n" } else { b"hello" };
+        if !head.contains("Content-Length: 0") && (head.starts_with("POST") || head.contains("chunked")) {
+            assert_eq!(t.send_request(body), b.send_request(body), "{head:?}: body");
+            assert_eq!(take_out(&mut t), take_out(&mut b), "{head:?}: body frames");
+        }
+    }
+}
+
+#[test]
+fn a_head_as_blocks_the_codec_cannot_write_is_refused_with_nothing_written() {
+    for (head, what) in [
+        ("CONNECT h.example:443 HTTP/1.1\r\nHost: h.example:443\r\n\r\n", "CONNECT"),
+        ("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1a\r\n\r\n", "content-length"),
+    ] {
+        let mut c = ready();
+        assert!(matches!(c.send_head(htx_of(head).as_slice(), false), Err(SrvH2Error::Unsupported(_))), "{what}");
+        assert_eq!(c.output(), b"", "{what}: nothing written");
+        assert!(c.is_idle() && c.reusable(), "{what}");
+    }
+    // Blocks with no request line.
+    let mut b = ibex_proto::htx::HtxBuffer::new();
+    b.push_header("host", "x").unwrap();
+    b.push_eoh().unwrap();
+    let mut c = ready();
+    assert!(matches!(c.send_head(b.as_slice(), false), Err(SrvH2Error::Unsupported("request line"))));
+    assert_eq!(c.output(), b"");
+}
+
+#[test]
+fn a_chunked_body_the_blocks_do_not_say_is_chunked_when_the_caller_says_so() {
+    // An HTTP/2 or HTTP/3 client's request without a length: the engine frames its body as
+    // chunks and the head has no `transfer-encoding` block.
+    let mut c = ready();
+    let mut b = ibex_proto::htx::HtxBuffer::new();
+    b.push_req_line("POST", "/", "HTTP/1.1").unwrap();
+    b.push_header("host", "x").unwrap();
+    b.push_eoh().unwrap();
+    c.send_head(b.as_slice(), true).unwrap();
+    let head = take_out(&mut c);
+    assert_eq!(head[4] & 1, 0, "no END_STREAM on the HEADERS: a body follows");
+    let body = b"5\r\nhello\r\n0\r\n\r\n";
+    assert_eq!(c.send_request(body), Ok(body.len()));
+    let w = take_out(&mut c);
+    assert_eq!(&w[9..14], b"hello", "DATA");
+}
+
+#[test]
+fn a_latin1_header_value_goes_as_the_bytes_it_stands_for() {
+    let mut b = ibex_proto::htx::HtxBuffer::new();
+    b.push_req_line("GET", "/", "HTTP/1.1").unwrap();
+    b.with_slice_mut(|s| s.push_header_latin1("x-l", b"a\xe9b")).unwrap();
+    b.push_eoh().unwrap();
+    let mut c = ready();
+    c.send_head(b.as_slice(), false).unwrap();
+    let w = take_out(&mut c);
+    assert!(w.windows(3).any(|x| x == b"a\xe9b"), "frames: {w:02x?}");
+}
+
+#[test]
+fn no_head_as_blocks_after_goaway_or_on_a_connection_that_failed() {
+    let htx = htx_of("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut c = ready();
+    c.receive(&fr(7, 0, 0, &[0; 8])).unwrap();
+    assert_eq!(c.send_head(htx.as_slice(), false), Err(SrvH2Error::Refused), "GOAWAY read while idle");
+    let mut c = ready();
+    let _ = request(&mut c, b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert_eq!(c.receive(&fr(5, 4, 1, &[0, 0, 0, 2, 0x88])), Err(SrvH2Error::Connection(1)), "PUSH_PROMISE with push disabled");
+    assert_eq!(c.send_head(htx.as_slice(), false), Err(SrvH2Error::Connection(1)));
 }

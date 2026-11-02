@@ -4,9 +4,11 @@
 //! HTTP/2 to a server, one stream at a time (T540, slice B-H2 of T535): the transport layer
 //! that puts [`H2SrvCodec`] between the session's HTTP/1.1 text and the connection.
 //!
-//! The session goes on writing an HTTP/1.1 request and reading an HTTP/1.1 response, as it
-//! does to every server: [`H2Layer::send`] gives the request text to
-//! [`H2SrvCodec::send_request`] and writes the frames it made; [`H2Layer::recv`] reads frames
+//! The request head is given as the blocks of the session's HTX ([`H2Layer::send_head`], X8:
+//! nothing written as text or read back); its body, and the response, go as HTTP/1.1 text, as
+//! they do to every server. A request with no blocks (a health check) and the first request of
+//! a connection whose h2 layer is installed inside that send are text throughout:
+//! [`H2Layer::send`] gives the request text to [`H2SrvCodec::send_request`] and writes the frames it made; [`H2Layer::recv`] reads frames
 //! into the caller's buffer, gives them to [`H2SrvCodec::receive`] and hands back the
 //! response text in their place. Below it is the connection's own transport, cleartext
 //! (`proto h2`) or TLS (`alpn h2` selected, or `proto h2` with `ssl`).
@@ -97,6 +99,22 @@ impl H2Layer {
             }
         }
         Ok(true)
+    }
+
+    /// Takes the request head as the blocks of its HTX (X8), nothing read as text: `Done(1)`
+    /// when the codec wrote its HEADERS, `Closed` after an error (as [`Self::send`]). The
+    /// body follows through [`Self::send`]. `chunked`: see [`H2SrvCodec::send_head`].
+    ///
+    /// # Errors
+    /// The transport's.
+    pub fn send_head(&mut self, fd: BorrowedFd<'_>, htx: ibex_proto::htx::HtxSliceRef<'_>, chunked: bool) -> io::Result<Io> {
+        if self.err.is_none() {
+            if let Err(e) = self.codec.send_head(htx, chunked) {
+                self.fail(e);
+            }
+        }
+        let _ = self.flush(fd)?;
+        Ok(if self.err.is_some() { Io::Closed } else { Io::Done(1) })
     }
 
     /// Takes request text, as [`crate::raw::send`] takes bytes: `Done(n)` for the `n` bytes

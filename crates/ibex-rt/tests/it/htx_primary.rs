@@ -268,3 +268,36 @@ fn a_log_line_does_not_serialise_the_head() {
     assert_eq!(writes[0], 0, "head writes for a head nothing edits");
     assert_eq!(writes[1], 1, "head writes for a head the parser changed: one, for the buffer");
 }
+
+/// X8: a request head the engine holds as blocks reaches an h2 server as blocks: the codec reads
+/// no HTTP/1.1 text for it (`ibex_proto::h2_srv::text_heads`), and a head nothing edited is not
+/// written out of its HTX either (`head_writes`). Debug builds count; release builds count 0.
+#[test]
+fn an_h2_server_request_is_not_text() {
+    use crate::server_h2::{scripted, Script};
+    let srv = scripted(Script::Ok { goaway_after: 0 });
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend fe\n  bind {fe}\n  http-request set-header X-Edited %[rand] if {{ path /edited }}\n  default_backend be\n\
+         backend be\n  server s1 {} proto h2\n",
+        srv.addr
+    );
+    let engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut rig = Rig { engine, fe, running: Arc::new(AtomicBool::new(true)), seen: Arc::new(Mutex::new(Vec::new())), be: None };
+    let mut c = rig.connect();
+    let plain = b"GET /plain HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let edited = b"GET /edited HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let post = b"POST /post HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
+    let chunked = b"POST /chunked HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    let _ = rig.request(&mut c, plain);
+    for (name, req, writes) in [("plain", &plain[..], 0), ("edited", &edited[..], 1), ("content-length", &post[..], 0), ("chunked", &chunked[..], 0)] {
+        let (t0, w0) = (ibex_proto::h2_srv::text_heads(), ibex_proto::h1_encode::head_writes());
+        let rsp = rig.request(&mut c, req);
+        assert!(rsp.starts_with("HTTP/1.1 200"), "{name}: {rsp:?}");
+        let (texts, wrote) = (ibex_proto::h2_srv::text_heads() - t0, ibex_proto::h1_encode::head_writes() - w0);
+        assert_eq!(texts, 0, "{name}: heads the h2 codec read as text");
+        assert_eq!(wrote, writes, "{name}: heads written out of the HTX");
+    }
+    rig.running.store(false, Ordering::Relaxed);
+}

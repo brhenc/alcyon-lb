@@ -3488,6 +3488,31 @@ impl TcpSession {
         t.l7 = if after.is_done() && window <= self.bufsize { txn::L7Retry::save(data, t.req) } else { txn::L7Retry::Dead };
     }
 
+    /// The request head to an h2 server connection as its HTX blocks (X8), taken off `req`
+    /// when the codec has it: `None` when the head is not the next thing to send, or the
+    /// session holds no HTX for it (the text goes through [`ServerXprt::send`]); else the
+    /// codec's verdict, `Closed` after an error.
+    fn send_h2_head(&mut self, window: usize) -> io::Result<Option<Io>> {
+        if self.srv_xprt.h2().is_none() || !self.strm.txn.as_ref().is_some_and(|t| matches!(t.req, txn::MsgState::Head { .. })) {
+            return Ok(None);
+        }
+        let Some((h, e)) = self.req.eoh().filter(|&(h, e)| self.mode == Mode::Http && self.has_htx && h + e <= window) else { return Ok(None) };
+        let chunked = self.h2_active().is_some_and(|a| a.chunk_out);
+        let sfd = self.srv.as_ref().map(AsFd::as_fd).ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+        let htx = ibex_proto::htx::HtxSliceRef::new(self.htx_buf.raw_slice(), self.htx_blocks);
+        let r = self.srv_xprt.h2_mut().expect("an h2 layer, checked above").send_head(sfd, htx, chunked)?;
+        if matches!(r, Io::Done(_)) {
+            let n = h + e;
+            if let Some(t) = self.strm.txn.as_mut() {
+                t.request_consumed(self.req.readable(), n);
+            }
+            self.req.consume(n);
+            self.release_forwarded_head();
+            self.drain_request();
+        }
+        Ok(Some(r))
+    }
+
     fn process_srv_active(&mut self) -> io::Result<bool> {
         let changed_io = self.process_srv_io()?;
 
@@ -3530,6 +3555,22 @@ impl TcpSession {
             }
         }
         let mut head_gone = false;
+        let mut window = window;
+        // An h2 server takes the head as the HTX blocks it is held as (X8), the body after it.
+        if window > 0 && self.srv_state.can_write() && !self.srv_xprt.send_blocked() {
+            match self.send_h2_head(window)? {
+                Some(Io::Closed) => {
+                    self.srv_state = ScState::Closed;
+                    self.ending.get_or_insert(Ending::ServerAbort);
+                    changed = true;
+                }
+                Some(_) => {
+                    window = self.req_window();
+                    changed = true;
+                }
+                None => {}
+            }
+        }
         if self.srv_state.can_write() && ((window > 0 && !self.srv_xprt.send_blocked()) || self.srv_xprt.wants_write()) {
             let r = {
                 let sfd = self

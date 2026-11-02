@@ -249,7 +249,7 @@ fn get_keepalive(fe: SocketAddr, n: usize) -> Vec<u16> {
 // ----------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-enum Script {
+pub(crate) enum Script {
     /// `:status 200`, body `ok`; GOAWAY and close after `n` streams (0: never).
     Ok { goaway_after: u32 },
     /// `:status 200` and `ok` with no content-length.
@@ -275,8 +275,8 @@ enum Script {
     ResetOnHeaders,
 }
 
-struct Scripted {
-    addr: SocketAddr,
+pub(crate) struct Scripted {
+    pub(crate) addr: SocketAddr,
     /// Streams answered on each connection, in the order the connections came.
     streams: Arc<Mutex<Vec<u32>>>,
 }
@@ -289,7 +289,7 @@ fn frame(out: &mut Vec<u8>, typ: u8, flags: u8, id: u32, payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
-fn scripted(script: Script) -> Scripted {
+pub(crate) fn scripted(script: Script) -> Scripted {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = l.local_addr().unwrap();
     let streams = Arc::new(Mutex::new(Vec::new()));
