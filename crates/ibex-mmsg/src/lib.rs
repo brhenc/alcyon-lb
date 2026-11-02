@@ -151,11 +151,20 @@ fn extract_dst_addr(hdr: &libc::msghdr) -> Option<IpAddr> {
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(hdr);
         while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::IPPROTO_IP && (*cmsg).cmsg_type == libc::IP_PKTINFO {
+            // A message the kernel cut short (MSG_CTRUNC, a control buffer too small) has a
+            // `cmsg_len` below the size of its data: reading the whole struct would read past it.
+            let len = (*cmsg).cmsg_len as usize;
+            if (*cmsg).cmsg_level == libc::IPPROTO_IP
+                && (*cmsg).cmsg_type == libc::IP_PKTINFO
+                && len >= libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize
+            {
                 let pktinfo = libc::CMSG_DATA(cmsg).cast::<libc::in_pktinfo>();
                 let ip = Ipv4Addr::from(u32::from_be((*pktinfo).ipi_addr.s_addr));
                 return Some(IpAddr::V4(ip));
-            } else if (*cmsg).cmsg_level == libc::IPPROTO_IPV6 && (*cmsg).cmsg_type == libc::IPV6_PKTINFO {
+            } else if (*cmsg).cmsg_level == libc::IPPROTO_IPV6
+                && (*cmsg).cmsg_type == libc::IPV6_PKTINFO
+                && len >= libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize
+            {
                 let pktinfo = libc::CMSG_DATA(cmsg).cast::<libc::in6_pktinfo>();
                 let ip = Ipv6Addr::from((*pktinfo).ipi6_addr.s6_addr);
                 return Some(IpAddr::V6(ip));
