@@ -784,6 +784,11 @@ pub struct TcpSession {
     /// body the bridge moved), and the server send writes it at the front, once (X4,
     /// [`crate::h2_bridge::write_pending_head`]). Whatever reads `req` as text first writes it.
     pub req_head_pending: bool,
+    /// X3b-2: an edited head (`htx_modified`) not written out of its HTX before the server was
+    /// picked, because the session's server connection speaks h2, which takes the blocks:
+    /// written at the send only if the text goes ([`Self::write_deferred_head`]), its names in
+    /// lower case when this holds `Some(true)`. A retry or another server writes it then.
+    pub req_head_deferred: Option<bool>,
     /// What the request in flight asked for of a websocket upgrade, for its response
     /// (`crate::websocket`); `None` for one that asked for no upgrade.
     pub req_ws: Option<Box<crate::websocket::ReqWs>>,
@@ -1411,6 +1416,7 @@ impl TcpSession {
             has_htx,
             htx_modified,
             req_head_pending,
+            req_head_deferred,
             req_ws,
             cli_state,
             srv_state,
@@ -1510,6 +1516,7 @@ impl TcpSession {
         *has_htx = false;
         *htx_modified = false;
         *req_head_pending = false;
+        *req_head_deferred = None;
         *req_ws = None;
         *cli_state = ScState::Ready;
         *srv_state = ScState::Init;
@@ -1726,6 +1733,7 @@ impl TcpSession {
             has_htx: false,
             htx_modified: false,
             req_head_pending: false,
+            req_head_deferred: None,
             req_ws: None,
             cli_state,
             srv_state: ScState::Init,
@@ -3505,6 +3513,7 @@ impl TcpSession {
                 // the parse changed it, and every edit since made to both): the send passes it
                 // as it is unless the rules edit it (X2, `engine::encode_if_modified`).
                 self.htx_modified = false;
+                self.req_head_deferred = None;
                 let line = self.req.readable().split(|&b| b == b'\n').next().map_or(&[][..], <[u8]>::trim_ascii_end);
                 let ver = &line[line.len().saturating_sub(8)..];
                 // A chunked HTTP/1.0 request closes the connection after its response, whatever
@@ -3745,6 +3754,10 @@ impl TcpSession {
         let htx = ibex_proto::htx::HtxSliceRef::new(self.htx_buf.raw_slice(), self.htx_blocks);
         let r = self.srv_xprt.h2_mut().expect("an h2 layer, checked above").send_head(sfd, htx, chunked)?;
         if matches!(r, Io::Done(_)) {
+            // The blocks went: a head the send was to write as text is not (X3b-2).
+            if self.req_head_deferred.take().is_some() {
+                self.htx_modified = false;
+            }
             let n = h + e;
             if let Some(t) = self.strm.txn.as_mut() {
                 t.request_consumed(self.req.readable(), n);
@@ -3754,6 +3767,23 @@ impl TcpSession {
             self.drain_request();
         }
         Ok(Some(r))
+    }
+
+    /// The head [`Self::req_head_deferred`] holds back, written out of its HTX into `req`.
+    fn write_deferred_head(&mut self) {
+        let Some(lower) = self.req_head_deferred.take() else { return };
+        crate::engine::write_req_head(self);
+        self.htx_modified = false;
+        // Nothing of the head went (the text is written before it goes): its length is read
+        // again from the head written, not the one it replaces.
+        if let Some(t) = self.strm.txn.as_mut() {
+            if let txn::MsgState::Head { body, .. } = t.req {
+                t.req = txn::MsgState::head(body);
+            }
+        }
+        if lower {
+            self.req.edit_keeping_lines(|head, eoh| crate::engine::rewrite_header_names_before(head, eoh, None, true));
+        }
     }
 
     fn process_srv_active(&mut self) -> io::Result<bool> {
@@ -3789,6 +3819,11 @@ impl TcpSession {
             }
         }
 
+        // A head the h2 server was to take as blocks goes as text after all when the connection
+        // is not h2 (another server, a new connection) or the request is kept for a retry.
+        if self.req_head_deferred.is_some() && (self.srv_xprt.h2().is_none() || self.strm.txn.as_ref().is_some_and(|t| matches!(t.l7, txn::L7Retry::Armed))) {
+            self.write_deferred_head();
+        }
         let window = self.req_window();
         // `retry-on <status>`: the request is copied the first time it is sent, whole, so
         // that it can be sent again when the answer is one to retry on.
@@ -3813,6 +3848,11 @@ impl TcpSession {
                 }
                 None => {}
             }
+        }
+        if self.req_head_deferred.is_some() && window > 0 && self.srv_state.can_write() {
+            // The text goes (the blocks did not): written out of the HTX now.
+            self.write_deferred_head();
+            window = self.req_window();
         }
         if self.srv_state.can_write() && ((window > 0 && !self.srv_xprt.send_blocked()) || self.srv_xprt.wants_write()) {
             let r = {

@@ -80,6 +80,12 @@ impl H2Layer {
         self.err == Some(SrvH2Error::BadResponse)
     }
 
+    /// X3b-2: the index the codec made of the final response head it wrote, once
+    /// ([`H2SrvCodec::take_head_index`]): the engine reads it instead of parsing the head.
+    pub fn take_head_index(&mut self) -> Option<ibex_proto::response_head::RspHead> {
+        self.codec.take_head_index()
+    }
+
     /// The trailer section that followed the last response's content-length body (T559).
     pub fn take_late_trailers(&mut self) -> Option<ibex_alloc::PoolBox<Vec<u8>>> {
         self.codec.take_late_trailers()

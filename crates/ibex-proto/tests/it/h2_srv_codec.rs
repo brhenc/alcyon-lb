@@ -887,3 +887,60 @@ fn no_head_as_blocks_after_goaway_or_on_a_connection_that_failed() {
     assert_eq!(c.receive(&fr(5, 4, 1, &[0, 0, 0, 2, 0x88])), Err(SrvH2Error::Connection(1)), "PUSH_PROMISE with push disabled");
     assert_eq!(c.send_head(htx.as_slice(), false), Err(SrvH2Error::Connection(1)));
 }
+
+/// X3b-2: the index the codec makes of the response head it writes
+/// (`H2SrvCodec::take_head_index`) is the one `check_response_head` makes of those bytes, so
+/// the engine reads it instead of parsing the head; a head the check would not index as it is
+/// (written again, or past the index's size) has none, and the engine parses that one.
+#[test]
+fn the_response_head_index_is_the_checks_of_the_bytes_written() {
+    use ibex_proto::response_head::{check_response_head, ResponseHead};
+    let many: Vec<(String, String)> = (0..33).map(|i| (format!("x-f{i}"), "v".to_string())).collect();
+    let mut cases: Vec<(&str, Vec<(String, String)>, bool)> = vec![
+        ("200", vec![("content-length".into(), "2".into())], true),
+        ("200", vec![], true),
+        ("200", vec![("x-a".into(), String::new()), ("x-b".into(), "a\tb c".into())], true),
+        ("304", vec![("etag".into(), "\"x\"".into())], true),
+        ("200", vec![("content-length".into(), "2".into()), ("content-length".into(), "2".into())], false),
+        ("200", vec![("content-length".into(), "02".into())], false),
+        ("204", vec![("content-length".into(), "0".into())], false),
+        ("200", vec![("x-a".into(), "caf\u{e9}".into())], false),
+        ("299", vec![], true),
+        ("200", many, false),
+    ];
+    cases.push(("200", (0..31).map(|i| (format!("x-f{i}"), "v".to_string())).collect(), true));
+    for (status, fields, indexed) in cases {
+        let mut c = ready();
+        let _ = request(&mut c, b"GET / HTTP/1.1\r\nhost: x\r\n\r\n");
+        let mut block = vec![lit(":status", status)];
+        block.extend(fields.iter().map(|(n, v)| {
+            let mut b = vec![0, n.len() as u8];
+            b.extend_from_slice(n.as_bytes());
+            b.push(v.len() as u8);
+            b.extend_from_slice(v.as_bytes());
+            b
+        }));
+        c.receive(&hdrs(1, &block, false)).unwrap();
+        let rsp = take_rsp(&mut c);
+        let end = rsp.windows(4).position(|w| w == b"\r\n\r\n").expect("a head") + 4;
+        let head = &rsp[..end];
+        let ix = c.take_head_index();
+        assert_eq!(ix.is_some(), indexed, "{status} {fields:?}: {:?}", String::from_utf8_lossy(head));
+        if let Some(ix) = ix {
+            assert_eq!(check_response_head(head, false), ResponseHead::Valid { status: ix.status, rewrite: None, close_server: false, index: Some(ix) }, "{status} {fields:?}");
+        }
+        assert_eq!(c.take_head_index(), None, "taken once");
+    }
+}
+
+/// X3b-2: an interim head has no index (the engine reads the final head's), and the final
+/// head after it has its own.
+#[test]
+fn an_interim_head_is_not_indexed_the_final_one_is() {
+    let mut c = ready();
+    let _ = request(&mut c, b"GET / HTTP/1.1\r\nhost: x\r\n\r\n");
+    c.receive(&hdrs(1, &[lit(":status", "103"), lit("link", "</a>")], false)).unwrap();
+    assert_eq!(c.take_head_index(), None);
+    c.receive(&hdrs(1, &[lit(":status", "200"), lit("content-length", "0")], true)).unwrap();
+    assert_eq!(c.take_head_index().map(|i| (i.status, i.fields().len())), Some((200, 1)));
+}

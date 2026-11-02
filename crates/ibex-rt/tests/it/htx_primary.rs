@@ -291,7 +291,9 @@ fn an_h2_server_request_is_not_text() {
     let post = b"POST /post HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
     let chunked = b"POST /chunked HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     let _ = rig.request(&mut c, plain);
-    for (name, req, writes) in [("plain", &plain[..], 0), ("edited", &edited[..], 1), ("content-length", &post[..], 0), ("chunked", &chunked[..], 0)] {
+    // X3b-2: an edited head is written at the send, for the server it goes to: as blocks to
+    // this h2 server, so not as HTTP/1.1 text (it was, before the server was picked).
+    for (name, req, writes) in [("plain", &plain[..], 0), ("edited", &edited[..], 0), ("content-length", &post[..], 0), ("chunked", &chunked[..], 0)] {
         let (t0, w0) = (ibex_proto::h2_srv::text_heads(), ibex_proto::h1_encode::head_writes());
         let rsp = rig.request(&mut c, req);
         assert!(rsp.starts_with("HTTP/1.1 200"), "{name}: {rsp:?}");
@@ -300,4 +302,80 @@ fn an_h2_server_request_is_not_text() {
         assert_eq!(wrote, writes, "{name}: heads written out of the HTX");
     }
     rig.running.store(false, Ordering::Relaxed);
+}
+
+/// X3b-2: an h2 server's response head reaches the client with no HTTP/1 parse of it
+/// (`ibex_proto::response_head::response_parses`): the codec indexes the head it writes, and
+/// the engine reads that index. A rules-edited request and a body changes nothing of it.
+/// Debug builds count; release builds count 0.
+#[test]
+fn an_h2_server_response_is_not_parsed_again() {
+    use crate::server_h2::{scripted, Script};
+    {
+        let srv = scripted(Script::Ok { goaway_after: 0 });
+        let fe = common::reserve_addr();
+        let cfg = format!(
+            "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+             frontend fe\n  bind {fe}\n  http-request set-header X-Edited %[rand] if {{ path /edited }}\n  default_backend be\n\
+             backend be\n  http-response set-header X-Rsp 1 if {{ path /rules }}\n  server s1 {} proto h2\n",
+            srv.addr
+        );
+        let engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+        let mut rig = Rig { engine, fe, running: Arc::new(AtomicBool::new(true)), seen: Arc::new(Mutex::new(Vec::new())), be: None };
+        let mut c = rig.connect();
+        let _ = rig.request(&mut c, b"GET /plain HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        for path in ["/plain", "/edited", "/rules"] {
+            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let p0 = ibex_proto::response_head::response_parses();
+            let rsp = rig.request(&mut c, req.as_bytes());
+            assert!(rsp.starts_with("HTTP/1.1 200"), "{path}: {rsp:?}");
+            assert_eq!(rsp.to_ascii_lowercase().contains("x-rsp: 1"), path == "/rules", "{path}: {rsp:?}");
+            assert_eq!(ibex_proto::response_head::response_parses() - p0, 0, "{path}: h1 parses of the h2 server's response head");
+        }
+        rig.running.store(false, Ordering::Relaxed);
+    }
+}
+
+/// X3b-2: an edited head held back for the session's h2 server connection is written at the
+/// send when the text goes after all: to an h1 server the round robin picks next (its names in
+/// lower case under `tune.ibex.h1-lowercase-headers on`), and to the h2 server when the request
+/// is kept for `retry-on` (the copy is of the text). The edit reaches both servers.
+#[test]
+fn a_head_held_back_for_an_h2_server_is_written_when_the_text_goes() {
+    use crate::server_h2::{scripted, Script};
+    let h2 = scripted(Script::Ok { goaway_after: 0 });
+    let h1 = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let h1_addr = h1.local_addr().expect("addr");
+    let running = Arc::new(AtomicBool::new(true));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let be = backend(h1, Arc::clone(&running), Arc::clone(&seen));
+    for (retry, servers) in [("", format!("  server a {} proto h2\n  server b {h1_addr}\n", h2.addr)), ("  retry-on 503\n", format!("  server a {} proto h2\n", h2.addr))] {
+        let fe = common::reserve_addr();
+        let cfg = format!(
+            "global\n  tune.ibex.h1-lowercase-headers on\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+             frontend fe\n  bind {fe}\n  http-request set-header X-Edited yes\n  default_backend be\n\
+             backend be\n  balance roundrobin\n{retry}{servers}"
+        );
+        let engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+        let mut rig = Rig { engine, fe, running: Arc::clone(&running), seen: Arc::clone(&seen), be: None };
+        let mut c = rig.connect();
+        let req = b"GET /x HTTP/1.1\r\nHost: localhost\r\nX-Case: 1\r\n\r\n";
+        for i in 0..4 {
+            let w0 = ibex_proto::h1_encode::head_writes();
+            let rsp = rig.request(&mut c, req);
+            assert!(rsp.starts_with("HTTP/1.1 200"), "{retry:?} {i}: {rsp:?}");
+            // Once per request: before the pick on the first (no h2 connection yet), at the send
+            // for the h1 server or the copy kept for a retry, never for blocks alone.
+            let wrote = ibex_proto::h1_encode::head_writes() - w0;
+            assert!(wrote <= 1, "{retry:?} {i}: {wrote} head writes");
+            if retry.is_empty() && i % 2 == 1 {
+                let head = String::from_utf8_lossy(&rig.last_seen()).into_owned();
+                assert!(head.contains("x-edited: yes\r\n") && head.contains("x-case: 1\r\n"), "{i}: {head:?}");
+            } else if !retry.is_empty() {
+                assert_eq!(wrote, 1, "{i}: the head kept for a retry is text");
+            }
+        }
+    }
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
 }

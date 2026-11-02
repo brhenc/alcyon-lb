@@ -221,6 +221,13 @@ pub fn format_log_format_string(
     out
 }
 
+/// A status of 100..=999 as its three digits (`HTTP/1.1 ` writes them so).
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub const fn status_digits(status: u16) -> [u8; 3] {
+    [b'0' + (status / 100 % 10) as u8, b'0' + (status / 10 % 10) as u8, b'0' + (status % 10) as u8]
+}
+
 /// Returns the standard RFC HTTP reason phrase for a given status code.
 #[must_use]
 pub const fn status_reason_phrase(status: u16) -> &'static str {

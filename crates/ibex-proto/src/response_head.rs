@@ -88,6 +88,25 @@ impl RspHead {
         Self { status: 0, http11: false, upgrade: false, start: 0, len: 0, n: 0, fields: [RspField::default(); RSP_FIELDS] }
     }
 
+    /// The index of a head the h2 server codec writes as it writes it (X3b-2): `HTTP/1.1`,
+    /// `status`, a start line of `start` bytes; the fields follow ([`Self::push_written`]),
+    /// then [`Self::len`].
+    pub(crate) fn written(status: u16, start: u32) -> Self {
+        Self { status, http11: true, start, ..Self::new() }
+    }
+
+    /// A canonical field line `name: value\r\n` written at `at..end`, its colon at `colon`.
+    /// False when the index is full ([`RSP_FIELDS`]): the head is then not indexed.
+    pub(crate) fn push_written(&mut self, at: u32, colon: u32, end: u32) -> bool {
+        let n = usize::from(self.n);
+        if n == RSP_FIELDS {
+            return false;
+        }
+        self.fields[n] = RspField { at, colon, end };
+        self.n += 1;
+        true
+    }
+
     /// The field lines, in order.
     #[must_use]
     pub fn fields(&self) -> &[RspField] {
@@ -188,6 +207,22 @@ pub fn head_scans() -> u64 {
     0
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static PARSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The response heads [`check_response_head_with`] parsed as HTTP/1 on this thread (debug
+/// builds; 0 in release): a test pins that an h2 server's response head, which the codec
+/// indexes as it writes it, is not parsed again (X3b-2).
+#[must_use]
+pub fn response_parses() -> u64 {
+    #[cfg(debug_assertions)]
+    return PARSES.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
+}
+
 /// A head written again.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Rewrite {
@@ -199,7 +234,7 @@ pub struct Rewrite {
 }
 
 /// `HTTP_IS_TOKEN`: RFC 7230 tchar.
-const fn is_token(c: u8) -> bool {
+pub(crate) const fn is_token(c: u8) -> bool {
     matches!(c, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~')
         || c.is_ascii_alphanumeric()
 }
@@ -610,7 +645,16 @@ pub fn check_response_head(head: &[u8], accept_unsafe: bool) -> ResponseHead {
 /// is not indexed may have had some of its lines given before the check gave up on it.
 pub fn check_response_head_with(head: &[u8], accept_unsafe: bool, field: impl FnMut(usize, usize, usize)) -> ResponseHead {
     count_head_scan();
+    #[cfg(debug_assertions)]
+    PARSES.with(|c| c.set(c.get() + 1));
     fast_check(head, accept_unsafe, field).unwrap_or_else(|| full_check(head, accept_unsafe))
+}
+
+/// [`check_response_head`], not counted (what a debug build checks an index the h2 server
+/// codec made against, X3b-2).
+#[must_use]
+pub fn check_response_head_uncounted(head: &[u8], accept_unsafe: bool) -> ResponseHead {
+    fast_check(head, accept_unsafe, |_, _, _| {}).unwrap_or_else(|| full_check(head, accept_unsafe))
 }
 
 /// `check_response_head` the long way, building the head written again when there is one.

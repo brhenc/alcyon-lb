@@ -12369,9 +12369,25 @@ impl EngineDispatcher<'_> {
         let mut checked_facts = None;
         if entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp_wait.is_none()) {
             let accept = proxies[be_idx].stats_config.accept_unsafe_response;
+            // An h2 server's head was indexed by the codec that wrote it (X3b-2): read, not
+            // parsed. The index is of the head at the front of `rep` when its length and its
+            // status are this head's (an interim head ahead of it has another status).
+            let given = entry.sess.srv_xprt.h2_mut().and_then(crate::srv_h2::H2Layer::take_head_index);
             let head = &entry.sess.rep.readable()[..total_hdr_len];
+            let given = given.filter(|ix| ix.len as usize == total_hdr_len && head.get(9..12) == Some(&ibex_proto::actions::status_digits(ix.status)[..]));
             let mut facts = crate::txn::ResponseFacts::default();
-            let checked = ibex_proto::response_head::check_response_head_with(head, accept, |at, colon, end| facts.field(head, at, colon, end));
+            let checked = match given {
+                Some(ix) => {
+                    for f in ix.fields() {
+                        facts.field(head, f.at as usize, f.colon as usize, f.end as usize);
+                    }
+                    let given = ibex_proto::response_head::ResponseHead::Valid { status: ix.status, rewrite: None, close_server: false, index: Some(ix) };
+                    #[cfg(debug_assertions)]
+                    debug_assert_eq!(given, ibex_proto::response_head::check_response_head_uncounted(head, accept), "{:?}", String::from_utf8_lossy(head));
+                    given
+                }
+                None => ibex_proto::response_head::check_response_head_with(head, accept, |at, colon, end| facts.field(head, at, colon, end)),
+            };
             if let ibex_proto::response_head::ResponseHead::Valid { rewrite: None, index: Some(ix), .. } = &checked {
                 checked_facts = facts.finish(head, ix.start as usize);
             }
@@ -14919,7 +14935,15 @@ impl EngineDispatcher<'_> {
         let lower = proxies[be_idx].h1_lower;
         // The head is final: written out of its HTX if anything edited it (X2), once; an
         // HTTP/2 or HTTP/3 one always, its names written as they go (X4).
-        let names_done = encode_if_modified(&mut entry.sess, lower, srv_table);
+        // X3b-2: not before the pick when the session's server connection speaks h2, which takes
+        // the blocks: written at the send if the text goes after all (another server, a retry).
+        let s = &mut entry.sess;
+        let names_done = if s.htx_modified && s.has_htx && !s.req_head_pending && srv_table.is_none() && s.srv_xprt.h2().is_some() {
+            s.req_head_deferred = Some(lower);
+            true
+        } else {
+            encode_if_modified(s, lower, srv_table)
+        };
         if !names_done && (lower || srv_table.is_some()) {
             entry.sess.req.edit_keeping_lines(|head, eoh| rewrite_header_names_before(head, eoh, srv_table, lower));
         }
@@ -16988,7 +17012,7 @@ fn write_pending_req_head(sess: &mut TcpSession, lower: bool, table: Option<&std
     false
 }
 
-fn write_req_head(sess: &mut TcpSession) {
+pub(crate) fn write_req_head(sess: &mut TcpSession) {
     let Some((hdr_len, eoh_len)) = sess.req.eoh() else {
         return;
     };
@@ -18117,7 +18141,7 @@ fn rewrite_header_names(buf: &mut [u8], table: Option<&std::collections::HashMap
 /// case of name bytes changes: no line end moves. Without `lower`
 /// (`tune.ibex.h1-lowercase-headers off`) only the names `table` holds are written, the
 /// others left in the case they came in.
-fn rewrite_header_names_before(buf: &mut [u8], eoh: Option<(usize, usize)>, table: Option<&std::collections::HashMap<String, String>>, lower: bool) {
+pub(crate) fn rewrite_header_names_before(buf: &mut [u8], eoh: Option<(usize, usize)>, table: Option<&std::collections::HashMap<String, String>>, lower: bool) {
     let head = eoh.map_or(0, |(h, _)| h);
     let mut at = memchr::memchr(b'\n', &buf[..head]).map_or(head, |i| i + 1);
     while at < head {

@@ -155,6 +155,12 @@ pub struct H2SrvCodec {
     late: Vec<u8>,
     /// No new stream on this connection.
     no_reuse: bool,
+    /// X3b-2: the index of the last final response head written into [`Self::rsp`], as
+    /// [`crate::response_head::check_response_head`] would make it of those bytes, for the
+    /// engine to read instead of parsing them ([`Self::take_head_index`]). `None` for a head
+    /// that index would not hold (more fields than it takes, a byte that is not visible ASCII,
+    /// a field the check would write again): the engine parses that one.
+    head_ix: Option<crate::response_head::RspHead>,
 }
 
 impl Default for H2SrvCodec {
@@ -282,6 +288,7 @@ impl H2SrvCodec {
             failed: false,
             held: None,
             late: Vec::new(),
+            head_ix: None,
             no_reuse: false,
         };
         c.restart();
@@ -304,6 +311,7 @@ impl H2SrvCodec {
         self.rsp_off = 0;
         self.held = None;
         self.late.clear();
+        self.head_ix = None;
         self.hblock.clear();
         self.hb_stream = 0;
         self.hb_flags = 0;
@@ -561,6 +569,7 @@ impl H2SrvCodec {
         chunked: bool,
         fields: impl Iterator<Item = Result<(&'a [u8], &'a [u8], bool), SrvH2Error>>,
     ) -> Result<(), SrvH2Error> {
+        self.head_ix = None;
         if method.is_empty() || target.is_empty() {
             return Err(SrvH2Error::Unsupported("request line"));
         }
@@ -1126,19 +1135,54 @@ impl H2SrvCodec {
         let bodyless = self.head_req || status == 204 || status == 304;
         let chunked = !interim && !bodyless && cl.is_none();
         let r = &mut self.rsp;
+        let base = r.len();
         r.extend_from_slice(b"HTTP/1.1 ");
-        let d = [b'0' + (status / 100) as u8, b'0' + (status / 10 % 10) as u8, b'0' + (status % 10) as u8];
-        r.extend_from_slice(&d);
+        r.extend_from_slice(&crate::actions::status_digits(status));
         r.push(b' ');
-        r.extend_from_slice(crate::actions::status_reason_phrase(status).as_bytes());
+        let reason = crate::actions::status_reason_phrase(status);
+        r.extend_from_slice(reason.as_bytes());
         r.extend_from_slice(b"\r\n");
+        // The index of the head as it is written (X3b-2): what `check_response_head` makes of
+        // a canonical head, so the engine does not parse it. An interim head is not indexed
+        // (the engine reads the final one), nor one with a duplicate `content-length` (the
+        // check drops it) or a `content-length` on a 204.
+        let mut ix = (!interim && !(cl.is_some() && status == 204))
+            .then(|| crate::response_head::RspHead::written(status, 15 + reason.len() as u32));
+        // (Every reason phrase is a non-empty ASCII word: the start line is canonical.)
+        debug_assert!(15 + reason.len() == r.len() - base && !reason.is_empty() && reason.is_ascii());
+        let mut cls = 0;
         for (n, v) in self.fields.iter_text().filter(|(n, _)| !n.starts_with(':')) {
+            let at = r.len() - base;
             push_field(r, n, v);
+            if n == "content-length" {
+                cls += 1;
+                let b = v.as_bytes();
+                if cls > 1 || b.len() > 1 && b[0] == b'0' {
+                    ix = None;
+                }
+            }
+            ix = ix.filter(|ix| written_field_canonical(n, v) && u32::try_from(r.len() - base).is_ok());
+            if let Some(i) = ix.as_mut() {
+                #[allow(clippy::cast_possible_truncation)]
+                let ok = i.push_written(at as u32, (at + n.len()) as u32, (r.len() - base) as u32);
+                if !ok {
+                    ix = None;
+                }
+            }
         }
         if chunked {
+            let at = r.len() - base;
             r.extend_from_slice(b"transfer-encoding: chunked\r\n");
+            #[allow(clippy::cast_possible_truncation)]
+            if ix.as_mut().is_some_and(|i| !i.push_written(at as u32, (at + 17) as u32, (r.len() - base) as u32)) {
+                ix = None;
+            }
         }
         r.extend_from_slice(b"\r\n");
+        self.head_ix = ix.and_then(|mut i| {
+            i.len = u32::try_from(r.len() - base).ok()?;
+            Some(i)
+        });
         if interim {
             return Ok(());
         }
@@ -1197,6 +1241,12 @@ impl H2SrvCodec {
         }
     }
 
+    /// X3b-2: the index of the final response head last written into the response bytes,
+    /// once (see [`Self::head_ix`]); `None` for a head the caller must parse.
+    pub fn take_head_index(&mut self) -> Option<crate::response_head::RspHead> {
+        self.head_ix.take()
+    }
+
     /// The trailer section that followed the content-length body of the last response, as
     /// text for `h2_bridge` (T559), once; empty for none.
     pub fn take_late_trailers(&mut self) -> Option<ibex_alloc::PoolBox<Vec<u8>>> {
@@ -1228,6 +1278,17 @@ impl H2SrvCodec {
         self.cur = 0;
         self.rx_strm = 0;
     }
+}
+
+/// A field line [`push_field`] writes is one `check_response_head` indexes as it is: a token
+/// name, a value of visible ASCII and blanks with none at either end.
+fn written_field_canonical(n: &str, v: &str) -> bool {
+    let v = v.as_bytes();
+    !n.is_empty()
+        && n.bytes().all(crate::response_head::is_token)
+        && v.iter().all(|&c| c == b'\t' || (b' '..=b'~').contains(&c))
+        && v.first().is_none_or(|&c| c != b' ' && c != b'\t')
+        && v.last().is_none_or(|&c| c != b' ' && c != b'\t')
 }
 
 fn push_field(out: &mut Vec<u8>, n: &str, v: &str) {
