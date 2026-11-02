@@ -16913,7 +16913,9 @@ fn with_res_hdrs<R>(f: impl FnOnce(&mut Vec<(String, String)>) -> R) -> R {
 fn write_response_head(out: &mut [u8], proto: &str, status: u16, reason: &str, hdrs: &[(String, String)]) -> Option<usize> {
     let mut at = 0;
     let mut put = |piece: &str| -> Option<()> {
-        let bytes = ibex_regex::bytetext::text_to_bytes(piece);
+        // ASCII is itself; only a piece with bytes beyond it is looked at for the characters
+        // that stand for a byte.
+        let bytes = if piece.is_ascii() { std::borrow::Cow::Borrowed(piece.as_bytes()) } else { ibex_regex::bytetext::text_to_bytes(piece) };
         out.get_mut(at..at + bytes.len())?.copy_from_slice(&bytes);
         at += bytes.len();
         Some(())

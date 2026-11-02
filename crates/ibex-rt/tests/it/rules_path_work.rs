@@ -300,3 +300,13 @@ fn a_response_with_fewer_headers_than_the_last_is_forwarded_whole() {
         assert!(l.contains("x-a: 1\r\n") && l.contains("x-1: a\r\n") == (i % 2 == 0), "response {i}: {r:?}");
     }
 }
+
+/// A header value that is not ASCII (a Latin-1 byte, UTF-8) goes through the response rules as
+/// the bytes it was.
+#[test]
+fn bytes_beyond_ascii_in_a_response_head_survive_the_rules() {
+    let rsp = answers("  http-response set-header X-A 1\n", &[b"HTTP/1.1 200 OK\r\nX-L: caf\xe9\r\nX-U: caf\xc3\xa9\r\nContent-Length: 2\r\n\r\nok"], 1);
+    let l = &rsp[0];
+    assert!(l.contains("X-L: caf\u{fffd}\r\n") || l.contains("x-l: caf\u{fffd}\r\n"), "response: {l:?}");
+    assert!(l.contains("caf\u{e9}\r\n"), "response: {l:?}");
+}
