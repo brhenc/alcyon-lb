@@ -1303,10 +1303,7 @@ impl TcpSession {
         c.strm.vars.copy_scope_from(&owner.strm.vars, ibex_sample::VarScope::Sess);
         // The log the connection started for its next stream; a session that served a
         // stream before keeps its request line's memory.
-        let mut line = std::mem::take(&mut c.strm.log.request_line);
-        line.reset();
         c.strm.log.clone_from(&owner.strm.log);
-        c.strm.log.request_line = line;
         c.tracked_sc.clone_from(&owner.tracked_sc);
         c.is_first_req = owner.is_first_req;
         // A session that served a stream before has its role and its strings still.

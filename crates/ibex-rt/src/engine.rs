@@ -2561,15 +2561,11 @@ impl SessionArena {
         self.entries.get_mut(idx as usize)?.as_mut().filter(|e| !e.parked)
     }
 
-    /// Puts back `entry`, just taken out of slot `idx` by [`Self::free`], as a parked one
-    /// (O1b): the session of an HTTP/2 stream that is over, which its connection keeps for
+    /// The entry that [`EngineDispatcher::reset_parked`] marked parked, in its slot (O1b, CP3), is
+    /// counted so: the session of an HTTP/2 stream that is over, which its connection keeps for
     /// its next stream ([`Self::unpark`]). Not seen by `get`, `iter` or `live`.
-    pub fn park(&mut self, idx: u32, mut entry: SessionEntry) {
-        debug_assert_eq!(self.free.last(), Some(&idx), "parked straight after its free");
-        debug_assert!(self.entries[idx as usize].is_none());
-        self.free.pop();
-        entry.parked = true;
-        self.entries[idx as usize] = Some(entry);
+    pub fn count_parked(&mut self) {
+        self.live -= 1;
         self.parked += 1;
     }
 
@@ -2620,6 +2616,7 @@ impl SessionArena {
     pub fn free(&mut self, idx: u32) -> Option<SessionEntry> {
         let mut entry = self.entries.get_mut(idx as usize)?.take();
         if let Some(e) = entry.as_mut() {
+            crate::probe::entry_move();
             // A scrape or stats page cut short (the client left, its HTTP/2 stream was reset)
             // gives its box back to the pool, which does not count it while it is out (T580).
             e.sess.end_dump();
@@ -2776,6 +2773,8 @@ pub struct Engine {
     wake_scratch: Vec<TaskRef>,
     /// The dispatcher's `wake_now` between passes (L2), empty.
     wake_now_scratch: Vec<TaskRef>,
+    /// The dispatcher's `links` between passes (CP3), empty.
+    links_scratch: Vec<crate::proxy::H2ChildLink>,
     h2_spawn_scratch: Vec<(u32, TaskRef)>,
     /// Every syslog target the config declared, global and per-proxy. Proxies reference
     /// these by index through `Proxy::log_target_idx`.
@@ -5632,6 +5631,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             timer_updates: Vec::with_capacity(capacity * 2),
             wake_scratch: Vec::new(),
             wake_now_scratch: Vec::new(),
+            links_scratch: Vec::new(),
             h2_spawn_scratch: Vec::new(),
             log_targets,
             log_tag: syslog_tag(config.global.as_ref().and_then(|g| g.log_tag.as_deref()).unwrap_or("haproxy")).to_string(),
@@ -6483,6 +6483,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             self.sessions.drain_parked();
             self.compact_arenas();
             self.wake_now_scratch = Vec::new();
+            self.links_scratch = Vec::new();
             if self.wake_scratch.is_empty() {
                 self.wake_scratch = Vec::new();
             }
@@ -6671,11 +6672,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             quic_listeners: &mut self.quic_listeners,
             hk_due: 0,
             wake_now: std::mem::take(&mut self.wake_now_scratch),
+            links: std::mem::take(&mut self.links_scratch),
         };
 
         let tasks_run = self.scheduler.process_runnable_tasks(&mut dispatcher);
         let hk_due = dispatcher.hk_due;
         self.wake_now_scratch = std::mem::take(&mut dispatcher.wake_now);
+        self.links_scratch = std::mem::take(&mut dispatcher.links);
         // What the other workers changed on the servers whose checks run here (T593).
         crate::track::adopt_pending(dispatcher.proxies, dispatcher.checks);
         // The server state changes the pass made (a check, the CLI, the stats page).
@@ -9177,6 +9180,8 @@ struct EngineDispatcher<'a> {
     /// its streams, a stream that wants another run. The scheduler takes them after the run
     /// (`Dispatch::pop_wake_now`); `wake_queue` is for what waits for the next pass.
     wake_now: Vec<TaskRef>,
+    /// The links of the HTTP/3 owner being run (CP3), in memory kept between passes.
+    links: Vec<crate::proxy::H2ChildLink>,
     /// Streams whose server connection is in its TLS handshake after this pass: marked
     /// heavy after it, one per pass from then on, as the client side is at admission
     /// (T283; `ssl_sock_init` sets `TASK_HEAVY` for a server connection too). T295.
@@ -9192,6 +9197,16 @@ struct EngineDispatcher<'a> {
     worker_id: usize,
     /// The QUIC listeners, which the owners of HTTP/3 connections read and write (T509).
     quic_listeners: &'a mut [crate::quic_listener::QuicListener],
+}
+
+/// What a stream's release changes beside the entries of the stream and its connection: the
+/// dispatcher's fields it reaches, borrowed apart from its arena so both entries can be held (CP3).
+struct ReleaseEnv<'a> {
+    proxies: &'a mut Proxies,
+    fdtab: &'a mut FdTab,
+    poller: &'a mut Poller,
+    idle_pool: &'a mut IdlePool,
+    wake_now: &'a mut Vec<TaskRef>,
 }
 
 /// Answers the current request with the page for `status`, chosen as HAProxy's
@@ -11285,6 +11300,18 @@ impl EngineDispatcher<'_> {
     /// connection to the children, and the streams with their heads in dispatched after the
     /// pass (`h2_spawn`). The connection gone, the owner ends and its children with it.
     fn step_h3_owner(&mut self, owner_idx: u32, now: Tick) -> Outcome {
+        // The pass's list of links, in memory kept from one pass to the next (a pass that
+        // returns early gives it back too).
+        let mut links = std::mem::take(&mut self.links);
+        links.clear();
+        let out = self.step_h3_owner_links(owner_idx, now, &mut links);
+        self.links = links;
+        out
+    }
+
+    /// [`Self::step_h3_owner`], the owner's children copied into `links` once, for both loops
+    /// over them (nothing in the pass adds or removes one): each child is then one `get2_mut`.
+    fn step_h3_owner_links(&mut self, owner_idx: u32, now: Tick, links: &mut Vec<crate::proxy::H2ChildLink>) -> Outcome {
         let Some(e) = self.sessions.get_mut(owner_idx) else { return Outcome::Done };
         let task = e.task;
         let Some(h3) = e.sess.h3_owner_mut() else { return Outcome::Done };
@@ -11296,10 +11323,10 @@ impl EngineDispatcher<'_> {
             e.sess.ending.get_or_insert(crate::proxy::Ending::ClientAbort);
             return Outcome::Done;
         }
-        let children = e.sess.h2_owner().map_or(0, |o| o.children.len());
+        links.extend(e.sess.h2_owner().into_iter().flat_map(|o| o.children.iter().copied()));
+        let children = links.len();
         let mut moved = false;
-        for i in 0..children {
-            let Some(link) = self.sessions.get(owner_idx).and_then(|e| e.sess.h2_owner()).and_then(|o| o.children.get(i).copied()) else { break };
+        for &link in links.iter() {
             let Some((o, c)) = self.sessions.get2_mut(owner_idx, link.idx).filter(|(_, c)| c.task == link.task) else { continue };
             if h3_bridge_moves(o, c, now) {
                 moved = true;
@@ -11342,8 +11369,7 @@ impl EngineDispatcher<'_> {
         // Read only in a stop: `head_partial` walks the streams, every pass of every request.
         let in_flight = stopping && (ibex_proto::htx_mux::HtxMux::next_dispatch(&*h3.mux).is_some() || h3.mux.head_partial().is_some());
         let failed = h3.mux.error.is_some();
-        for i in 0..children {
-            let Some(link) = self.sessions.get(owner_idx).and_then(|e| e.sess.h2_owner()).and_then(|o| o.children.get(i).copied()) else { break };
+        for &link in links.iter() {
             let Some((o, c)) = self.sessions.get2_mut(owner_idx, link.idx).filter(|(_, c)| c.task == link.task) else { continue };
             if h3_bridge_state(o, c, failed) {
                 self.wake_now.push(link.task);
@@ -11407,14 +11433,13 @@ impl EngineDispatcher<'_> {
     /// stream changed of the connection (and a server connection it kept, as the session
     /// kept it between requests), and goes on to its next stream; or, when the stream ended
     /// the connection as the session's transaction would have, closes it (T280).
-    fn h2_child_released(&mut self, child: &mut SessionEntry, now: Tick, keep: bool) {
+    fn h2_child_released(env: ReleaseEnv<'_>, child: &mut SessionEntry, owner: Option<&mut SessionEntry>, now: Tick, keep: bool) {
         // The bytes before the stream that were its to credit at its http rules (the
         // connection's accounting moved past them when it started): a stream that ended
         // before its rules ran (refused, reset) credits them now, or nothing would (T300).
         let due = child.sess.strm.log.bytes_in_at_start.saturating_sub(child.sess.stick_acct_in);
         child.sess.stick_acct_in += due;
         let (finished, conn_end) = child.sess.h2_child().map_or((false, None), |c| (c.finished, c.conn_end));
-        let owner = child.sess.h2_child().and_then(|c| c.owner).and_then(|(idx, task)| self.sessions.get_mut(idx).filter(|o| o.task == task));
         // Its server's bytes go to its connection, which credits them with its next request
         // or at its end; a stream that outlives its connection (freed first, its final
         // count done), or ends it, credits them itself (T300: under load, the second of two
@@ -11422,7 +11447,7 @@ impl EngineDispatcher<'_> {
         let kept = finished && conn_end.is_none() && owner.is_some();
         let out = if kept { 0 } else { std::mem::take(&mut child.sess.stick_out_pending) + child.sess.strm.log.bytes_from_server };
         if due > 0 || out > 0 {
-            for_tracked(self.proxies, &child.sess, |data| data.add_bytes(due, out));
+            for_tracked(&*env.proxies, &child.sess, |data| data.add_bytes(due, out));
         }
         let Some(owner) = owner else { return };
         let owner_task = owner.task;
@@ -11470,10 +11495,10 @@ impl EngineDispatcher<'_> {
                 // Another stream already gave one back: this one goes to the pool, as
                 // `HAProxy`'s streams each release theirs. The owner of an HTTP/3
                 // connection keeps none: it polls no server socket (T509).
-                release_server(child, self.proxies, self.fdtab, self.poller, self.idle_backend_pool, true);
+                release_server(child, env.proxies, env.fdtab, env.poller, env.idle_pool, true);
             }
-            move_server(child, owner, self.fdtab);
-            let fe = &self.proxies[owner.proxy_idx];
+            move_server(child, owner, env.fdtab);
+            let fe = &env.proxies[owner.proxy_idx];
             let inspect = (!fe.tcp_req_content_rules.is_empty()).then(|| fe.tcp_req_inspect_delay.map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX))));
             owner.sess.h2_child_done(&mut child.sess, inspect, keep);
             owner.sess.arm_request(now);
@@ -11499,13 +11524,13 @@ impl EngineDispatcher<'_> {
                 None => {}
             }
             if owner.sess.srv.is_some() {
-                release_server(owner, self.proxies, self.fdtab, self.poller, self.idle_backend_pool, false);
+                release_server(owner, env.proxies, env.fdtab, env.poller, env.idle_pool, false);
             }
             owner.sess.cli_state = ScState::Closed;
             owner.sess.srv_state = ScState::Closed;
             owner.sess.ending.get_or_insert(child.sess.ending.unwrap_or(crate::proxy::Ending::Complete));
         }
-        self.wake_now.push(owner_task);
+        env.wake_now.push(owner_task);
     }
 
     /// An HTTP/2 connection is freed with streams still served: each forgets it (its index
@@ -12000,32 +12025,24 @@ impl EngineDispatcher<'_> {
             self.send_stream_log(fe, err, &line, sd);
             crate::logfmt::recycle_line(line);
         }
+        // A stream over as its transaction ended (not reset, not ending its connection, not a
+        // panic's) leaves its session where it is, parked by its connection for its next
+        // stream (O1b, CP3), while the connection serves and keeps fewer than it may serve at
+        // once (this one is among its children still).
+        if close_notify && self.park_in_place(session_idx, now) {
+            return;
+        }
         let Some(mut entry) = self.sessions.free(session_idx) else { return };
         if entry.buf_wait.queued() {
             crate::buf_wait::leave(session_idx);
         }
-        let mut park_in = None;
         if entry.sess.is_h2_child() {
-            // A stream over as its transaction ended (not reset, not ending its
-            // connection, not a panic's) leaves its session to its connection's next
-            // stream (O1b), while the connection serves and keeps fewer than it may
-            // serve at once (this one is among its children still).
-            park_in = entry
-                .sess
-                .h2_child()
-                .filter(|c| close_notify && c.finished && c.conn_end.is_none())
-                .and_then(|c| c.owner)
-                .filter(|&(idx, task)| {
-                    self.sessions.get(idx).filter(|o| o.task == task).is_some_and(|o| {
-                        let max = o.sess.h2_max_children();
-                        let serving = !o.sess.is_done() && matches!(o.sess.cli_state, ScState::Ready | ScState::Established);
-                        serving && o.sess.h2_owner().is_some_and(|h| h.parked.len() + h.children.len() <= max)
-                    })
-                });
             // The stream is freed in its own run: its variables are in the run's map
             // until they go back to it here, for its connection's.
             stream_vars_leave(Some(&mut entry.sess));
-            self.h2_child_released(&mut entry, now, park_in.is_some());
+            let owner = entry.sess.h2_child().and_then(|c| c.owner).and_then(|(idx, task)| self.sessions.get_mut(idx).filter(|o| o.task == task));
+            let env = ReleaseEnv { proxies: &mut *self.proxies, fdtab: &mut *self.fdtab, poller: &mut *self.poller, idle_pool: &mut *self.idle_backend_pool, wake_now: &mut self.wake_now };
+            Self::h2_child_released(env, &mut entry, owner, now, false);
         } else {
             if entry.sess.h2_owner().is_some_and(|o| !o.children.is_empty()) {
                 self.h2_owner_released(&mut entry);
@@ -12047,23 +12064,51 @@ impl EngineDispatcher<'_> {
         );
         crate::proxy::give_relay_role(&mut entry.sess);
         // (Nothing follows: a stream not kept for its connection is done here.)
-        let Some((owner_idx, owner_task)) = park_in else { return };
-        self.park_h2_child(owner_idx, owner_task, session_idx, entry);
     }
 
-    /// The session `entry` of a stream of `owner_idx` that is over, slot `idx` (just freed),
-    /// is kept by its connection for its next stream (O1b), made as a new stream's session
-    /// is.
-    fn park_h2_child(&mut self, owner_idx: u32, owner_task: TaskRef, idx: u32, mut entry: SessionEntry) {
-        // (Its owner was found serving before the stream was released, which it survives.)
-        let h = self.sessions.get_mut(owner_idx).filter(|o| o.task == owner_task).and_then(|o| o.sess.h2_owner_mut());
-        debug_assert!(h.is_some(), "the owner outlives the release of its stream");
-        let Some(h) = h else { return };
+    /// The session of the stream `idx`, over as its transaction ended, is kept by its connection
+    /// for its next stream (O1b) if the connection serves and keeps fewer than it may serve at
+    /// once: released and reset where it stands in the arena, not moved out and back (CP3).
+    /// Whether it was kept; if not, the caller frees it.
+    fn park_in_place(&mut self, idx: u32, now: Tick) -> bool {
+        let Some(owner_ref) = self.sessions.get(idx).and_then(|e| e.sess.h2_child()).filter(|c| c.finished && c.conn_end.is_none()).and_then(|c| c.owner) else { return false };
+        let Some((o, e)) = self.sessions.get2_mut(owner_ref.0, idx).filter(|(o, _)| o.task == owner_ref.1 && Self::keeps_streams(o)) else { return false };
+        e.sess.end_dump();
+        // (A transaction that ended has had its buffers: it waits for none.)
+        debug_assert!(!e.buf_wait.queued(), "a finished stream waits for no buffer");
+        stream_vars_leave(Some(&mut e.sess));
+        let env = ReleaseEnv { proxies: &mut *self.proxies, fdtab: &mut *self.fdtab, poller: &mut *self.poller, idle_pool: &mut *self.idle_backend_pool, wake_now: &mut self.wake_now };
+        Self::h2_child_released(env, e, Some(&mut *o), now, true);
+        e.sess.close_notify_both();
+        cleanup_done(e, self.proxies, self.fdtab, self.poller, self.listeners);
+        crate::proxy::give_relay_role(&mut e.sess);
         // A connection left with no stream keeps one session for its next, not one per
         // stream of a burst it served (a cache, AGENTS §8): the others go now.
         // (Freed one by one, the list keeping its memory: no allocation a request.)
+        let h = o.sess.h2_owner_mut();
+        debug_assert!(h.is_some(), "the owner outlives the release of its stream");
+        let Some(h) = h else { return true };
         let extra = if h.children.is_empty() { h.parked.len() } else { 0 };
         h.parked.push(idx);
+        Self::reset_parked(e);
+        self.sessions.count_parked();
+        for _ in 0..extra {
+            // The oldest first: this one, last, stays.
+            let i = self.sessions.get_mut(owner_ref.0).and_then(|o| o.sess.h2_owner_mut()).map(|h| h.parked.remove(0));
+            debug_assert!(i.is_some(), "the owner was found above");
+            i.into_iter().for_each(|i| self.sessions.free_parked(i));
+        }
+        true
+    }
+
+    /// The connection `o` serves and keeps fewer sessions than it may serve streams at once.
+    fn keeps_streams(o: &SessionEntry) -> bool {
+        let serving = !o.sess.is_done() && matches!(o.sess.cli_state, ScState::Ready | ScState::Established);
+        serving && o.sess.h2_owner().is_some_and(|h| h.parked.len() + h.children.len() <= o.sess.h2_max_children())
+    }
+
+    /// The entry of a stream that is over, made as a new stream's session is (O1b).
+    fn reset_parked(entry: &mut SessionEntry) {
         entry.sess.park_h2_child();
         let SessionEntry {
             sess: _,
@@ -12086,8 +12131,8 @@ impl EngineDispatcher<'_> {
             log_err,
             log_sd,
             buf_wait,
-            parked: _,
-        } = &mut entry;
+            parked,
+        } = entry;
         *task = TaskRef::NONE;
         (*backend_idx, *srv_backend_idx) = (*proxy_idx, *proxy_idx);
         *target_server_idx = None;
@@ -12102,13 +12147,7 @@ impl EngineDispatcher<'_> {
         *log_line = None;
         (*log_err, *log_sd) = (false, 0);
         *buf_wait = crate::buf_wait::WaitState::default();
-        self.sessions.park(idx, entry);
-        for _ in 0..extra {
-            // The oldest first: this one, last, stays.
-            let i = self.sessions.get_mut(owner_idx).and_then(|o| o.sess.h2_owner_mut()).map(|h| h.parked.remove(0));
-            debug_assert!(i.is_some(), "the owner was found above");
-            i.into_iter().for_each(|i| self.sessions.free_parked(i));
-        }
+        *parked = true;
     }
 
     /// A stream's run panicked ([`crate::crash::contain`], T447): the stream is closed as one

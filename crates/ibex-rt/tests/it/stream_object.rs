@@ -501,6 +501,77 @@ fn an_h2_stream_is_not_a_session() {
     let _ = be.join();
 }
 
+/// CP3: `StreamLog::clone_from` makes a log a copy of another, whatever the target held: captures
+/// (values and empty slots), the request line, the unique id and the plain fields, in the memory
+/// the target has (a target with more slots than the source ends with the source's).
+#[test]
+fn a_stream_log_copied_from_another_is_equal_to_it() {
+    use ibex_rt::txnlog::{set_capture, StreamLog};
+    let mut from = StreamLog::start(7, 9);
+    from.req_captures = vec![None, None, None];
+    set_capture(&mut from.req_captures[1], b"one");
+    from.res_captures = vec![None];
+    set_capture(&mut from.res_captures[0], b"two");
+    from.request_line.set("GET / HTTP/1.1");
+    from.unique_id = Some("id".into());
+    from.status = Some(400);
+    from.prio_class = -3;
+    let mut to = StreamLog::start(0, 0);
+    to.req_captures = vec![None; 5];
+    set_capture(&mut to.req_captures[4], b"stale");
+    to.request_line.set("stale line");
+    to.unique_id = Some("stale".into());
+    to.clone_from(&from);
+    assert_eq!(to.req_captures, from.req_captures);
+    assert_eq!(to.res_captures, from.res_captures);
+    assert_eq!(to.request_line.as_deref(), Some("GET / HTTP/1.1"));
+    assert_eq!((to.unique_id.as_deref(), to.status, to.prio_class), (Some("id"), Some(400), -3));
+    assert_eq!((to.bytes_in_at_start, to.bytes_out_at_start, to.uniq_id), (7, 9, from.uniq_id));
+    to.clone_from(&StreamLog::start(1, 2));
+    assert!(to.req_captures.is_empty() && to.request_line.as_deref().is_none() && to.unique_id.is_none());
+}
+
+/// CP3: the session of an HTTP/2 stream that ends is parked where it stands: its entry is not
+/// moved out of the arena (`SessionArena::free`) and back (`SessionArena::park`), 1.6 KB each
+/// way, for each stream.
+#[test]
+fn an_h2_stream_end_moves_no_entry() {
+    const N: u64 = 20;
+    let srv = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let srv_addr = srv.local_addr().expect("addr");
+    let running = Arc::new(AtomicBool::new(true));
+    let be = keepalive_backend(srv, Arc::clone(&running));
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind {fe} proto h2\n  default_backend be\n\
+         backend be\n  server s {srv_addr}\n"
+    );
+    let mut engine = Engine::new(&ibex_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = TcpStream::connect(fe).expect("connect");
+    client.set_nonblocking(true).expect("nonblocking");
+    let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    hello.extend(h2_frame(0x4, 0, 0, &[]));
+    client.write_all(&hello).expect("preface");
+    let mut rx = Vec::new();
+    let mut id = 1;
+    for _ in 0..4 {
+        h2_get(&mut engine, &mut client, &mut rx, id);
+        id += 2;
+    }
+    let m0 = ibex_rt::probe::entry_moves();
+    for _ in 0..N {
+        h2_get(&mut engine, &mut client, &mut rx, id);
+        id += 2;
+    }
+    let moved = ibex_rt::probe::entry_moves() - m0;
+    println!("{N} h2 requests on one connection: {moved} entry moves");
+    assert_eq!(moved, 0, "a stream's end parks its session where it is");
+    running.store(false, Ordering::Relaxed);
+    drop(client);
+    let _ = be.join();
+}
+
 /// What the first stream of an HTTP/2 connection set (a `txn.` variable, header captures of
 /// both kinds, the priority class, a stream timeout) is gone for the second, served by the
 /// same session reset in place (O1b): each line as `HAProxy` 3.5-dev8-885761-29 logged it
