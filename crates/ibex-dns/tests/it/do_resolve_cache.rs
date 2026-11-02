@@ -50,3 +50,11 @@ fn distinct_do_resolve_names_do_not_grow_the_cache_without_bound() {
     r.query(t0 + Duration::from_secs(2), "late.test", Question::v4(), Requester::DoResolve).unwrap();
     assert!(r.poll_transmit(t0 + Duration::from_secs(2)).is_none());
 }
+
+#[test]
+fn hold_valid_zero_keeps_nothing() {
+    let ns: SocketAddr = NS1.parse().unwrap();
+    let mut r = Resolver::new(ResolverConfig { nameservers: vec![ns], hold_valid: Duration::ZERO, ..ResolverConfig::default() });
+    resolve(&mut r, Instant::now(), "z.test");
+    assert_eq!(r.cached_names(), 0);
+}

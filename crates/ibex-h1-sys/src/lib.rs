@@ -122,7 +122,7 @@ pub fn parse_h1<'a>(
     is_response: bool,
 ) -> ParseResult<'a> {
     let mut h1m = h1m {
-        state: 0,
+        state: if is_response { 8 } else { 0 }, // H1_MSG_RPBEFORE / H1_MSG_RQBEFORE (h1m_init_res / h1m_init_req)
         flags: if is_response { 0x00000004 } else { 0 }, // H1_MF_RESP
         curr_len: 0,
         body_len: 0,
