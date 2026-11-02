@@ -12862,8 +12862,14 @@ impl EngineDispatcher<'_> {
 
         // The response capture slots the `http-response capture` rules write, and that the
         // context reads (as they were when the response came in).
-        let mut res_caps = entry.sess.strm.log.res_captures.clone();
-        let res_caps_in = res_caps.clone();
+        // Nothing to clone (and nothing to snapshot) for a frontend with no response capture slot.
+        let (mut res_caps, res_caps_in) = if entry.sess.strm.log.res_captures.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            note_res_caps_clone();
+            note_res_caps_clone();
+            (entry.sess.strm.log.res_captures.clone(), entry.sess.strm.log.res_captures.clone())
+        };
 
         let htx_slice = if entry.sess.has_htx {
             Some(ibex_proto::htx::HtxSliceRef::new(
@@ -13134,7 +13140,10 @@ impl EngineDispatcher<'_> {
             }
             // What the rules captured is what the log line shows, and what the rules after
             // them (`http-after-response`) read.
-            entry.sess.strm.log.res_captures.clone_from(&res_caps);
+            if !res_caps.is_empty() || !entry.sess.strm.log.res_captures.is_empty() {
+                note_res_caps_clone();
+                entry.sess.strm.log.res_captures.clone_from(&res_caps);
+            }
             if stopped.is_some() {
                 break 'rules stopped;
             }
@@ -13192,7 +13201,10 @@ impl EngineDispatcher<'_> {
                 registry,
                 &mut entry.sess.strm.vars,
             );
-            entry.sess.strm.log.res_captures.clone_from(&res_caps);
+            if !res_caps.is_empty() || !entry.sess.strm.log.res_captures.is_empty() {
+                note_res_caps_clone();
+                entry.sess.strm.log.res_captures.clone_from(&res_caps);
+            }
             if let Err(stop) = after {
                 break 'rules Some(stop);
             }
@@ -13228,7 +13240,10 @@ impl EngineDispatcher<'_> {
             note_response_head_write();
             let (out, end) = write_res_head(rh.htx.into_inner(), &proto_version, status, &status_msg);
             out.put(&mut entry.sess.rep, total_hdr_len, end);
-            entry.sess.strm.log.res_captures.clone_from(&res_caps);
+            if !res_caps.is_empty() || !entry.sess.strm.log.res_captures.is_empty() {
+                note_res_caps_clone();
+                entry.sess.strm.log.res_captures.clone_from(&res_caps);
+            }
             if let Some(txn) = entry.sess.strm.txn.as_mut() {
                 txn.rsp_wait = Some(wait);
             }
@@ -17219,6 +17234,28 @@ impl<'a> ResOp<'a> {
             ibex_config::HttpAfterResAction::DelHeader { name } => Self::Del(name),
         })
     }
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static RES_CAPS_CLONES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The response rules cloned the response captures (debug builds).
+#[inline]
+fn note_res_caps_clone() {
+    #[cfg(debug_assertions)]
+    RES_CAPS_CLONES.with(|c| c.set(c.get() + 1));
+}
+
+/// The clones [`note_res_caps_clone`] counted on this thread (0 in release builds): a test
+/// pins none for a frontend with no response capture slot (T617).
+#[must_use]
+pub fn res_caps_clones() -> u64 {
+    #[cfg(debug_assertions)]
+    return RES_CAPS_CLONES.with(std::cell::Cell::get);
+    #[cfg(not(debug_assertions))]
+    0
 }
 
 #[cfg(debug_assertions)]
