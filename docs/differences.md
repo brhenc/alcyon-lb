@@ -519,6 +519,27 @@ not left in memory. Default **off**: the wipe costs ~1k instructions per request
 benchmark, and HAProxy wipes nothing either. HAProxy refuses the keyword as unknown. It takes
 exactly `on` or `off`; anything else, or a missing argument, is a configuration error.
 
+## `tune.ibex.counters shared|per-thread`: an Ibex-only global keyword (T582)
+
+Who writes the counters a stream adds to when it ends (`hrsp_*`, `req_tot`, `stot`, `lbtot`,
+`connect`, `reuse`, `bin`, `bout`, the aborts and errors, the timing sums, `lastsess`, the
+session rate), for every frontend, backend and server. `shared` (default) is one set of relaxed
+atomics written by every thread, as HAProxy's with one thread group. `per-thread` gives each
+thread its own row per object, written without a locked instruction, and `show stat`, `show
+info`, the stats page and the Prometheus exporter sum the rows: the totals read the same as
+with `shared`. Two figures are not computed the same way when several threads serve one
+object: `rate_max` of a backend or server is the sum of the threads' peaks (an upper bound
+when the peaks were not simultaneous, exact with one thread, as `MaxConnRate`), and
+`qtime`/`ctime`/`rtime`/`ttime` are the mean of the threads' running averages (each over the
+thread's own requests, HAProxy's per-thread-group rule; exact with one thread). The rows are
+made when each thread starts, (2 x proxies + servers + 2) x 208 bytes per thread (10,000
+servers at 64 threads: ~128 MB); the start prints the size (`[NOTICE] tune.ibex.counters
+per-thread: ...`), `show pools` lists them as pool `counters`, and a thread that cannot have
+them stops the start. `clear counters` works as with `shared`. `per-tgroup` is refused: Ibex
+runs one thread group, so it would be `shared` under another name. Read at start: a reload
+applies a change. HAProxy refuses the keyword as unknown. Design:
+`docs/design/per-thread-counters-2026-11-02.md`.
+
 ## `tune.ibex.zero-on-free off|soft|hard`: an Ibex-only global keyword (T459)
 
 What the process's allocator does with every heap block that is freed (rustls and ring state,
