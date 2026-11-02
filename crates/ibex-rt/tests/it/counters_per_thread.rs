@@ -178,6 +178,9 @@ fn traffic(d: &Daemon) {
         }
         write!(w, "GET /return HTTP/1.1\r\nHost: x\r\n\r\n").expect("write");
         assert_eq!(response(&mut r).0, "404");
+        drop((w, r));
+        // One connection at a time, so `smax` does not depend on when the last one closed.
+        idle(d);
     }
     for path in ["/deny", "/deny", "/dead", "/dead", "/dead"] {
         let mut c = TcpStream::connect(("127.0.0.1", d.http)).expect("connect");
@@ -187,6 +190,8 @@ fn traffic(d: &Daemon) {
         let _ = c.read_to_end(&mut out);
         let status = String::from_utf8_lossy(&out).split(' ').nth(1).unwrap_or("").to_string();
         assert_eq!(status, if path == "/deny" { "403" } else { "503" }, "{path}");
+        drop(c);
+        idle(d);
     }
     let mut c = TcpStream::connect(("127.0.0.1", d.http)).expect("connect");
     c.set_read_timeout(Some(Duration::from_secs(10))).ok();
@@ -194,6 +199,8 @@ fn traffic(d: &Daemon) {
     let mut out = Vec::new();
     let _ = c.read_to_end(&mut out);
     assert!(out.starts_with(b"HTTP/1.1 400"), "{:?}", String::from_utf8_lossy(&out));
+    drop(c);
+    idle(d);
     for _ in 0..4 {
         let mut c = TcpStream::connect(("127.0.0.1", d.tcp)).expect("connect");
         c.set_read_timeout(Some(Duration::from_secs(10))).ok();
@@ -209,7 +216,6 @@ fn traffic(d: &Daemon) {
         }
         assert!(out.ends_with(b"ok"), "{:?}", String::from_utf8_lossy(&out));
         drop(c);
-        // One session at a time, so `smax` does not depend on when the last one closed.
         idle(d);
     }
 }

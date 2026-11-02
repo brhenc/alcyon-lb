@@ -101,8 +101,9 @@ fn accounting_a_request_does_at_most_n_atomic_rmws() {
     // reuse; server: the same and smax; timings add no maximum RMW when the sample does not
     // beat it (the backend's smax is counted where a stream joins it, T583). `CumStreams` is
     // counted per thread in every mode (T582 Q5); `reuse` (or `connect`) was an uncounted
-    // `fetch_add` before T582.
-    assert!(per <= 20.0, "{per} atomic RMWs per request");
+    // `fetch_add` before T582: 20, and one for a maximum beaten under load (21 before T582,
+    // pinned at 20 with `reuse` unseen).
+    assert!(per <= 21.0, "{per} atomic RMWs per request");
 }
 
 #[test]
