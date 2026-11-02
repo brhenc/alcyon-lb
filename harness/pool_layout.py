@@ -35,7 +35,6 @@ NOT_CACHES: dict[tuple[str, str], str] = {
     ("crates/ibex-rt/src/proxy.rs", "QUEUED"): "the requests waiting on this thread, oldest first (live queue state)",
     ("crates/ibex-config/src/ast/userlist.rs", "USERLISTS"): "the userlist sections of the parse in progress, handed to the config by `take_userlists` (configuration, built once at start-up; no spare memory is kept for a later owner)",
     ("crates/ibex-sample/src/registry.rs", "DEBUG_DESTS"): "the `debug()` destinations named while a config was checked, handed to the runtime once by `take_debug_destinations` (configuration)",
-    ("crates/ibex-sample/src/registry.rs", "CURRENT_RES_HEADERS"): "the response headers a fetch reads during one run (its strings are spare_str)",
 }
 
 SKIP_CRATES = {"ibex-alloc"}
