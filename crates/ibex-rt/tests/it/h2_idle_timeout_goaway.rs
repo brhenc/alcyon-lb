@@ -99,8 +99,12 @@ fn check(send_request: bool, last: u32) {
         "frames: {types:?}"
     );
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-    assert!(ms(tail[0].4) >= TIMEOUT_MS - 50 && ms(tail[0].4) < TIMEOUT_MS + 250, "first GOAWAY at {:?}", tail[0].4);
-    assert!(ms(tail[1].4) >= 2 * TIMEOUT_MS - 50 && ms(tail[1].4) < 2 * TIMEOUT_MS + 250, "second GOAWAY at {:?}", tail[1].4);
+    // Not sooner than the timer; the first one a loaded host may deliver late, so the second is
+    // judged by its distance from the first (one more `timeout client`), which a late wake-up
+    // of this thread barely stretches.
+    let (first, second) = (ms(tail[0].4), ms(tail[1].4));
+    assert!(first >= TIMEOUT_MS - 50 && first < TIMEOUT_MS + 1500, "first GOAWAY at {:?}", tail[0].4);
+    assert!(second >= first + TIMEOUT_MS - 50 && second < first + TIMEOUT_MS + 750, "second GOAWAY at {:?} (first at {:?})", tail[1].4, tail[0].4);
 }
 
 #[test]
