@@ -832,3 +832,139 @@ keepalive, 76.3k h2s1, §2.1): the kernel is the larger half of every request on
   on release-perf: not in this table.
 - Instructions only. Cycles, IPC, cache and branch misses on both proxies (`perf stat`) come with
   T603, so a gap can be split into work, memory and kernel. T582's waived +0.5% (C582) lands after.
+
+### 6.7 HAProxy built the same four ways as Ibex (T603, 2026-11-02, Ibex main 06bdbce0)
+
+§6.5/6.6 set PGO-Ibex against a `-O2` HAProxy with no LTO and no PGO. T603 builds HAProxy from
+copies of the oracle sources (`git archive HEAD` of `~/reference/haproxy` = 3.5-dev8 for h1/h2 and
+`~/reference/haproxy-quic` = 3.5-dev10 for h3fit; the oracle trees and binaries were not touched) in
+`~/ibex-targets/t603/<d8|q10>/<variant>/`, same `USE_*` as the oracles' `-vv`
+(d8: `USE_OPENSSL=1 USE_ZLIB=1 USE_PCRE2=1`; q10: `USE_THREAD=1 USE_OPENSSL=1 USE_ZLIB=1 USE_QUIC=1
+USE_PROMEX=1 USE_PCRE2=1`), `make TARGET=linux-glibc`, gcc 16.2.1. Script:
+`tools/measure/haproxy-variants.sh build <d8|q10>`; measurement: `tools/measure/variants-matrix.sh`
+(insreq.sh, `hwcounters.sh`). Raw data, logs, `-vv` of every build: `~/ibex-worktrees/boards/t603-06bdbce0/`.
+
+| variant | OPT_CFLAGS | LDFLAGS | `-vv` CFLAGS (after the base `-g -fwrapv -fvect-cost-model=very-cheap`) |
+|---|---|---|---|
+| o2 | `-O2` | (none) | `-O2` (the oracle's own line; instruction counts reproduce the oracle, below) |
+| lto | `-O2 -flto=auto` | `-O2 -flto=auto` | `-O2 -flto=auto` |
+| pgo (gen) | `-O2 -fprofile-generate -fprofile-update=atomic` | `-fprofile-generate -fprofile-update=atomic` | n/a, trained, then objects deleted |
+| pgo (use) | `-O2 -fprofile-use -fprofile-partial-training -Wno-missing-profile` | `-O2` | as given |
+| pgo-lto | the pgo use flags `-flto=auto` | `-O2 -flto=auto` | the same profile (a copy of the trained tree), `-flto=auto` |
+
+Training (`haproxy-variants.sh`, `train()`): the request sequence of `tools/pgo-build.sh train()`, in
+the same order, against `tools/pgo/train.cfg` (nbthread 1; h1 keep-alive/close, rules, errors, TLS h1,
+TLS h2, h2c; q10 also the h3 part: h3bench best/worst GET/POST and h2load `--alpn-list=h3`; d8 has no QUIC, so no `fe_h3`).
+One difference: HAProxy jails itself in an empty chroot, where gcov cannot write at exit, so the
+training config gets `chroot /` (not in the measured configs). 190 `.gcda` files (d8), 234 (q10);
+the profile is written when SIGUSR1 stops the process. Ibex PGO: `tools/pgo-build.sh --target-dir
+~/ibex-targets/t603-ibex` (952 s: 533 s build, 51 s training, 368 s final build), the binary copied to
+`~/ibex-targets/t603-ibex/ibex-pgo`. Ibex release-perf: `perfbase/06bdbce07c6d/release-perf/ibex`.
+
+**Checks.** (a) `-vv` CFLAGS as in the table, `.gcda` present (above). (b) The o2 rebuild reproduces the
+oracle: user ins/req keepalive 36,236 (§2.1: 36,230), rules 43,830 (43,830), h2s1 53,298 (53,171),
+h3fit 63,977 (64,037), kernel 69,626 / 69,698 / 76,091. (c) Reg-tests, `harness/vtc_runner.py --binary
+<variant> --no-triage` over `http-rules http-messaging http-cookies converter sample_fetches
+http-capture` (118 files; q10 adds `quic`, 161), the same set the oracle binary is run on (the runner
+fails 21 of 118 on the oracle itself: h2/h3/websocket tests it cannot drive): d8 oracle, o2, lto, pgo-lto
+give the **same 96 pass / 21 fail**; d8 pgo failed 2 more in its first run (`http_fail_cnt_body`,
+`ssl_client_hello_alpn`) and passed both 12/12 and 2/2 on the rerun, as the oracle does: the runner's
+timing, not behaviour. q10: the runner declines 28 tests that need both QUIC roles when the target
+is not the reference itself (OUT_OF_SCOPE, o2 included), so q10 variants are compared with q10 o2:
+lto and pgo identical (107 pass / 26 fail), pgo-lto differs in two tests (`h1_big_chunk_size_line`
+10/10 pass on rerun; `ssl_client_hello_ext` fail to pass), both flakes. So **no PGO build changed
+behaviour in this subset**; a full vtest run was not done (no vtest binary here).
+
+**Which comparison is like-for-like.** Ibex release-perf is fat LTO, no PGO: its peer is HAProxy
+**lto**. Ibex PGO is the best Ibex build: its peer is HAProxy **pgo-lto**. HAProxy o2 is what §2.1, §6.5
+and §6.6 used (the oracle's own build); against it Ibex release-perf already had LTO that HAProxy lacked,
+and Ibex PGO had PGO. Both Ibex and HAProxy PGO are trained on the same mix, with the Ibex profile from
+LLVM (instrumentation) and the HAProxy one from gcc `-fprofile-generate` (not the same counters, and
+HAProxy's training has no `fe_h3` for d8). The post-wave baseline HAProxy figure is **pgo-lto**.
+
+**Instructions per request** (user; kernel in brackets), slot A (`flock -x /tmp/ibex-load.lock`, CPUs
+4-6, governor performance, no `wwm.exe`), `insreq.sh`: keepalive and rules `ab -k -c 1` 5 x 20,000, min
+total round; h2s1 5 x 10,000; h3fit median of 3 at 1.97 dg/req, 5,000. Ibex rp was re-measured on slot A (the board
+`insreq-06bdbce07c6d.json` came from another slot and agrees within 3 ins/req).
+
+| scenario | Ibex rp | Ibex PGO | HA o2 | HA lto | HA pgo | HA pgo-lto |
+|---|---:|---:|---:|---:|---:|---:|
+| keepalive ab1 | 36,717 (65,947) | **31,240** (65,869) | 36,236 (69,626) | 35,700 (69,655) | 33,454 (69,602) | **32,114** (69,564) |
+| rules ab1 | 52,867 (66,032) | **44,707** (65,972) | 43,830 (69,698) | 43,276 (69,753) | 40,422 (69,618) | **38,915** (69,649) |
+| h2s1 | 51,259 (66,660) | **44,726** (66,465) | 53,298 (76,091) | 52,667 (76,151) | 50,244 (76,056) | **48,896** (76,047) |
+| h3fit | 83,447 | **72,053** | 63,977 | 62,679 | 59,294 | **57,011** |
+
+Ratios, Ibex / HAProxy, user instructions (above 1 = Ibex does more work):
+
+| scenario | rp / lto (like-for-like, no PGO) | **PGO / pgo-lto (like-for-like, best)** | rp / o2 (§6.6 convention) | PGO / o2 (§6.6 "PGO ratio") |
+|---|---:|---:|---:|---:|
+| keepalive | 1.03x | **0.97x** | 1.01x | 0.86x |
+| rules | 1.22x | **1.15x** | 1.21x | 1.02x |
+| h2s1 | 0.97x | **0.91x** | 0.96x | 0.84x |
+| h3fit | 1.33x | **1.26x** | 1.30x | 1.13x |
+
+What each build is worth on HAProxy (user ins, from o2): lto -1.5 % keepalive, -1.3 % rules, -1.2 %
+h2s1, -2.0 % h3fit; pgo -7.7 / -7.8 / -5.7 / -7.3 %; pgo-lto -11.4 / -11.2 / -8.3 / -10.9 %. Ibex PGO
+over release-perf: -14.9 / -15.4 / -12.7 / -13.7 %. So the PGO gain flattered Ibex by about 3-5 points,
+not by 10-15: HAProxy gains 8-11 % from the same treatment. Kernel instructions do not move with the
+build (Ibex 66k, HAProxy 69.6k / 76.1k): Ibex is 3.7k (keepalive, rules) and 9.6k (h2s1) below.
+
+**Cycles, IPC and misses per request** (`hwcounters.sh`: `perf stat -p <proxy>`, 5 rounds of 20,000
+(h2s1 10,000), median per event; two event groups of four so the PMU never multiplexes, "min run 100 %").
+`LLC-load-misses` is `<not supported>` on this CPU (AMD), so the nearest is
+`l2_cache_req_stat.ic_dc_miss_in_l2`; the cache and branch miss events have no `:u`/`:k` split
+(user + kernel together).
+
+| scenario | metric | Ibex rp | Ibex PGO | HA o2 | HA lto | HA pgo | HA pgo-lto |
+|---|---|---:|---:|---:|---:|---:|---:|
+| keepalive | cycles user | 30,674 | 21,107 | 40,446 | 40,428 | 24,928 | 23,257 |
+| keepalive | cycles kernel | 109,498 | 103,987 | 118,082 | 119,712 | 112,241 | 111,371 |
+| keepalive | IPC user / kernel | 1.20 / 0.61 | 1.48 / 0.64 | 0.90 / 0.59 | 0.88 / 0.59 | 1.34 / 0.62 | 1.38 / 0.63 |
+| keepalive | L1d / L1i miss | 2,489 / 1,151 | 2,443 / 1,011 | 2,430 / 1,411 | 2,415 / 1,479 | 2,353 / 1,182 | 2,337 / 1,137 |
+| keepalive | branch miss / L2 miss | 1,728 / 5,310 | 1,623 / 2,989 | 2,053 / 6,180 | 2,057 / 6,794 | 1,800 / 3,104 | 1,826 / 3,561 |
+| rules | cycles user | 46,234 | 31,293 | 48,020 | 44,735 | 31,331 | 29,055 |
+| rules | cycles kernel | 112,379 | 108,376 | 121,134 | 117,576 | 114,441 | 111,808 |
+| rules | IPC user / kernel | 1.15 / 0.59 | 1.43 / 0.61 | 0.91 / 0.58 | 0.97 / 0.60 | 1.29 / 0.61 | 1.34 / 0.63 |
+| rules | L1d / L1i miss | 2,779 / 1,326 | 2,661 / 1,145 | 2,628 / 1,499 | 2,631 / 1,548 | 2,509 / 1,249 | 2,581 / 1,251 |
+| rules | branch miss / L2 miss | 1,935 / 9,332 | 1,724 / 4,876 | 2,169 / 8,052 | 2,149 / 8,084 | 1,866 / 4,714 | 1,870 / 4,733 |
+| h2s1 | cycles user | 52,601 | 30,222 | 74,948 | 75,323 | 47,575 | 48,736 |
+| h2s1 | cycles kernel | 117,312 | 106,999 | 137,423 | 138,961 | 127,454 | 128,487 |
+| h2s1 | IPC user / kernel | 0.97 / 0.57 | 1.48 / 0.63 | 0.71 / 0.56 | 0.70 / 0.55 | 1.06 / 0.60 | 1.00 / 0.59 |
+| h2s1 | L1d / L1i miss | 3,521 / 1,480 | 3,437 / 1,118 | 3,049 / 2,084 | 3,074 / 2,153 | 2,930 / 1,656 | 2,905 / 1,627 |
+| h2s1 | branch miss / L2 miss | 2,018 / 10,097 | 1,690 / 5,692 | 2,726 / 13,246 | 2,758 / 13,586 | 2,212 / 7,771 | 2,265 / 8,349 |
+
+Total cycles a request (user + kernel), Ibex PGO against HAProxy pgo-lto: keepalive 125.1k vs 134.6k
+(0.93x), rules 139.7k vs 140.9k (0.99x), h2s1 137.2k vs 177.2k (0.77x); release-perf against lto:
+140.2k vs 160.1k (0.88x), 158.6k vs 162.3k (0.98x), 169.9k vs 214.3k (0.79x).
+
+Reading it:
+- **Work (instructions).** On the like-for-like pair Ibex does 3 % fewer user instructions on
+  keepalive, 9 % fewer on h2s1, **15 % more on rules** and **26 % more on h3fit**. The rules and h3 gaps
+  are what the waves are for; keepalive and h2s1 are at or past parity.
+- **Memory and branches.** Ibex does not lose on misses: with PGO, L1i misses are 1.0-1.1k against
+  1.1-1.6k, L2 (ic+dc) misses 3.0-5.7k against 3.6-8.3k and branch misses are lower on all three.
+  The gap on rules is instructions, not memory.
+- **IPC.** Ibex PGO runs user code at IPC 1.43-1.48 against HAProxy pgo-lto 1.00-1.38; on h2s1 that is
+  why 9 % fewer instructions become 38 % fewer user cycles (30.2k vs 48.7k). Without PGO Ibex's IPC is
+  1.0-1.2, HAProxy's 0.7-0.97. On rules Ibex's higher IPC (1.34 vs 1.43) is not enough to cover +15 % instructions:
+  user cycles are 31.3k vs 29.1k (+8 %).
+- **Kernel.** 70-80 % of cycles of a request are kernel on both proxies (IPC about 0.6). Ibex's kernel
+  cycles are 7-10 % lower at the same syscalls count order (Ibex does fewer kernel instructions and
+  its cycles per kernel instruction are equal): the kernel part is not where the user-space PGO gap is.
+- h2s1 note: Ibex is not at parity in the pass count (§2.1); the cycle figure above says the extra
+  passes are cheap in cycles (hot caches) on this host, not that they are free.
+
+**Throughput** (`hwcounters.sh tp1/tp50`: `ab -k -c 1` 5 x 50,000, and `measure-bench fixed` with 50
+connections 5 x 200,000, wall time, median; client on CPU 5): Ibex rp 17,823 / 35,694 req/s, Ibex PGO
+18,823 / 39,970, HAProxy o2 16,825 / 32,853, lto 16,915 / 32,246, pgo 18,286 / 33,818, pgo-lto 18,265 /
+34,192 (1-conn / 50-conn). **These are not clean timing claims**: the host was not quiet, load average at
+the start of each run 6.0 to 14.1 (other sessions' builds and a gate on other cores; load by variant is
+in `t603-tp.log`; the Ibex PGO runs happened at load 12-14, the spread between the 5 rounds is
+2-6 %, and the 50-conn client is one measure-bench process on one CPU). The ranking agrees with the cycle counts
+(Ibex PGO > HAProxy PGO builds > o2/lto) but differences below ~5 % should not be read. Instruction and cycle counts
+above are per request and do not depend on host load; no `wwm.exe` was seen before or after any run.
+
+Not done / caveats: no BOLT; no vtest full reg-test run (the Python runner subset above); the
+h2s1/keepalive/rules training for q10 variants covers dev10's code but the q10 binaries were measured
+only on h3fit; HAProxy's build ran through ccache (`/usr/lib64/ccache/gcc`, a cache hit is the same object);
+the version string of the copies reads `3.5-dev8-88576119c` (no `.git` in `git archive`, harmless).
