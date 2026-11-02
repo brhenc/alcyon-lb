@@ -6381,7 +6381,7 @@ impl Registry {
                     let ver = b.first()? >> 4;
                     match ver {
                         4 => {
-                            if b.len() < 6 {
+                            if b.len() < 7 {
                                 return None;
                             }
                             let df = i64::from((b[6] & 0x40) != 0);
@@ -9451,6 +9451,23 @@ mod tests {
         // 0x60 0xa0 -> version 6, traffic class 0x0a
         let v6 = vec![0x60, 0xa0, 0x00, 0x00];
         assert_eq!((conv.func)(Sample::Bin(v6), &[]), Some(Sample::Sint(0x0a)));
+    }
+
+    /// A 6-byte IPv4 header has no byte 6: no sample, not a panic (IBEX-SAMPLE-IPDF-001).
+    #[test]
+    fn ip_df_on_a_truncated_header_is_no_sample() {
+        let reg = Registry::new();
+        let conv = reg.get_converter("ip.df").expect("ip.df is registered");
+        assert_eq!((conv.func)(Sample::Bin(vec![0x45, 0, 0, 0, 0, 0]), &[]), None);
+    }
+
+    /// `%` then a non-ASCII char is a bad escape: `url_dec` fails as HAProxy's `url_decode`
+    /// does, and never reaches the slice (IBEX-SAMPLE-URLDEC-001).
+    #[test]
+    fn url_dec_with_a_non_ascii_escape_is_no_sample() {
+        let reg = Registry::new();
+        let conv = reg.get_converter("url_dec").expect("url_dec is registered");
+        assert_eq!((conv.func)(Sample::Str("%a\u{e9}".into()), &[]), None);
     }
 
     #[test]
