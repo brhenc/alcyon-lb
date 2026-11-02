@@ -622,13 +622,15 @@ impl Buf {
 
     /// The memory of a buffer for a request head to be written into before the stream that
     /// owns it exists (CP1, [`ibex_proto::htx::RxHead`]): a small one when twice the `need`
-    /// estimated fits it, as a head's own HTX takes one (T312), else a standard one. `None`
-    /// when the pool refuses (memory short, `tune.fail-alloc`): the caller refuses the stream,
-    /// never mallocs. Dropped without being adopted, the memory goes back to its pool, zeroed
-    /// under `tune.ibex.zero-buffers` (CP2: the mux's `H2MuxContext::take_rx_head`).
+    /// estimated fits it, as a head's own HTX takes one (T312), else a standard one; a small one
+    /// refused, a standard one (T615: so that `None` means no buffer at all, which the buffer
+    /// wait queue is woken for). `None` when the pool refuses (memory short, `tune.fail-alloc`):
+    /// the caller waits or refuses the stream, never mallocs. Dropped without being adopted, the
+    /// memory goes back to its pool, zeroed under `tune.ibex.zero-buffers` (CP2: the mux's
+    /// `H2MuxContext::take_rx_head`).
     #[must_use]
     pub fn take_rx_head(need: usize) -> Option<ibex_proto::htx::RxHead> {
-        let mem = if need.saturating_mul(2) <= get_bufsize_small() { alloc_small() } else { alloc_standard() };
+        let mem = if need.saturating_mul(2) <= get_bufsize_small() { alloc_small().or_else(alloc_standard) } else { alloc_standard() };
         mem.map(|m| ibex_proto::htx::RxHead::pooled(m, give_rx_head))
     }
 

@@ -1088,7 +1088,7 @@ fn on_headers(st: &mut H3StreamCtx, payload: &[u8], rest: &[u8], last: bool, sh:
             bad = t.facts.bad_request;
             st.text_head = Some(t);
         }
-        crate::mux_h2::HeadOut::NoMemory => {
+        crate::mux_h2::HeadOut::NoMemory | crate::mux_h2::HeadOut::TooLarge => {
             st.no_memory = true;
             // The writer took the fields (`Refused` is the other verdict on a malformed one).
             bad = check_request_fields(f.iter(), sh.relaxed) == Ok(true);

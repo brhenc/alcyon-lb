@@ -3114,6 +3114,12 @@ impl TcpSession {
         // reach, and it changed nothing a client could see (T217).
         let is_h2 = self.h2_ctx.is_some();
         if is_h2 {
+            // A head that waited for memory is written again first (T615), in a run after the
+            // one it was refused in: the connection is woken for a buffer given back.
+            if let Some(h2) = self.h2_ctx.as_mut().filter(|h| h.head_waiting()) {
+                h2.retry_head();
+                changed |= !h2.head_waiting();
+            }
             // Not while the demux is held (`H2MuxContext::wants_input`): what the client
             // sends then waits in the socket, as with `HAProxy` (T235).
             if self.cli_state.can_read() && !self.cli_cant_recv && self.h2_ctx.as_ref().is_some_and(|h| h.wants_input()) {
@@ -3260,6 +3266,12 @@ impl TcpSession {
         // The streams are dispatched to their own entries, and their bytes moved, by the
         // engine (`h2_owner_pass`, T280): the owner only reads and writes the socket.
         if let Some(ref mut h2) = self.h2_ctx {
+            // A request head with no memory to be had (T615, `H2_CF_DEM_SALLOC`): the demux
+            // waits, the connection queued for a receive buffer (`h2_get_buf`'s `DB_MUX_RX`),
+            // the client not read meanwhile. Its other streams' responses still go out.
+            if h2.head_waiting() {
+                crate::buf_wait::want(crate::buf_wait::Class::MuxRx);
+            }
             // Flush pending frames to client socket
             let pending = h2.tx_buf.len() - h2.tx_consumed;
             if pending > 0 {

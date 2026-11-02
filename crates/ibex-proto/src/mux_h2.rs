@@ -99,8 +99,9 @@ pub struct H2StreamCtx {
     /// The bytes of `scheme://authority` (the start of the line `HAProxy` logs) after the
     /// head's payload in [`Self::rx_head`], 0 for a request without both.
     pub abs_len: usize,
-    /// No memory could be had for the head's blocks ([`H2MuxContext::take_rx_head`]): kept as
-    /// its fields, and the stream answered 500 by the data path (S5).
+    /// The head does not fit the largest memory [`H2MuxContext::take_rx_head`] gives, with its
+    /// `scheme://authority` ([`HeadOut::TooLarge`]): the stream is answered 500 by the data path
+    /// (S5). No memory to be had at all makes the demux wait instead (T615).
     pub no_memory: bool,
 }
 
@@ -110,10 +111,11 @@ pub struct H2StreamCtx {
 /// them for the log line. The checks, the limits (`tune.http.maxhdr`, the head's room: T242)
 /// and the refusals are the writer's, those of `h2_make_htx_request` (T437, T449, E1). The
 /// error is the stream's reset (`PROTOCOL_ERROR`, a refused head). A head the HTTP/1 checks
-/// refuse is kept as the text it goes out as ([`TextHead`]); one with no memory to be had
-/// flags the stream (`no_memory`), which the data path answers 500.
-fn request_head(stream: &mut H2StreamCtx, fields: &DecodedFields, hooks: HeadHooks, relaxed: bool) -> Result<(), H2Error> {
-    match write_head(fields, hooks, relaxed) {
+/// refuse is kept as the text it goes out as ([`TextHead`]); one too large for the memory
+/// flags the stream (`no_memory`), which the data path answers 500. `head` is what
+/// [`write_head`] made of it, other than [`HeadOut::NoMemory`] (the demux waits for that one).
+fn request_head(stream: &mut H2StreamCtx, fields: &DecodedFields, head: HeadOut, relaxed: bool) -> Result<(), H2Error> {
+    match head {
         HeadOut::Refused => Err(H2Error::ProtocolError),
         HeadOut::Blocks { rx, facts, abs_len } => {
             stream.bad_request = facts.bad_request;
@@ -133,7 +135,8 @@ fn request_head(stream: &mut H2StreamCtx, fields: &DecodedFields, hooks: HeadHoo
             stream.rx_htx.push(HtxBlock::Eoh);
             Ok(())
         }
-        HeadOut::NoMemory => {
+        HeadOut::TooLarge | HeadOut::NoMemory => {
+            debug_assert!(matches!(head, HeadOut::TooLarge));
             stream.no_memory = true;
             stream.bad_request = crate::h2::check_request_fields(fields.iter(), relaxed) == Ok(true);
             stream.rx_htx.push(HtxBlock::Eoh);
@@ -158,9 +161,12 @@ pub(crate) enum HeadOut {
     Refused,
     /// A head the HTTP/1 checks refuse: its text.
     Text(Box<TextHead>),
-    /// No memory to be had for the blocks, or a head that does not fit the largest memory
-    /// with its `scheme://authority`: the stream is answered 500 (S5).
+    /// No memory to be had for the blocks: an h2 connection's demux waits for a buffer (T615,
+    /// `H2_CF_DEM_SALLOC`), an h3 stream is answered 500 (S5).
     NoMemory,
+    /// A head that does not fit the largest memory with its `scheme://authority`: the stream is
+    /// answered 500 (S5).
+    TooLarge,
 }
 
 /// The head of `fields` written as blocks into memory from `hooks.take_rx` (CP2, CP2b: h2 and h3
@@ -189,7 +195,7 @@ pub(crate) fn write_head(fields: &DecodedFields, hooks: HeadHooks, relaxed: bool
         }
         need = rx.len() + 1;
     }
-    HeadOut::NoMemory
+    HeadOut::TooLarge
 }
 
 /// The head the HTTP/1 checks refuse as text ([`TextHead`]), with the websocket `key` if any.
@@ -516,6 +522,11 @@ pub struct H2MuxContext {
     decoded: DecodedFields,
     /// A HEADERS frame's block, copied out of `rx_buf` to be decoded.
     block_scratch: Vec<u8>,
+    /// The stream id and flags of a request head decoded into [`Self::decoded`] for which no
+    /// memory could be had (T615, `HAProxy`'s `H2_CF_DEM_SALLOC`): the demux waits, no frame
+    /// after it is handled and the client is not read, until [`Self::retry_head`] writes it.
+    /// The block is decoded once (the HPACK table has moved with it); its fields wait here.
+    head_wait: Option<(u32, u8)>,
     /// The memory of the HTX of streams that are over, for the next (at most
     /// [`SPARE_STREAMS`]).
     pub spare_htx: Vec<Htx>,
@@ -621,6 +632,7 @@ impl H2MuxContext {
             body_scratch: Vec::new(),
             decoded: DecodedFields::default(),
             block_scratch: Vec::new(),
+            head_wait: None,
             spare_htx: Vec::new(),
             take_rx_head: heap_rx_head,
             ws_key: heap_ws_key,
@@ -809,13 +821,36 @@ impl H2MuxContext {
     /// as HAProxy stops reading while its demux is blocked. The client is held by TCP.
     #[must_use]
     pub fn wants_input(&self) -> bool {
-        self.rx_buf.len() < FRAME_HEADER_LEN + DEFAULT_MAX_FRAME_SIZE as usize
+        self.head_wait.is_none() && self.rx_buf.len() < FRAME_HEADER_LEN + DEFAULT_MAX_FRAME_SIZE as usize
     }
 
     /// Demuxes what waits in `rx_buf` after what held it has drained.
     pub fn resume(&mut self) {
         if !self.rx_buf.is_empty() && self.conn_state != H2ConnState::GoAwaySent {
             let _ = MuxH2.parse(self, &[]).map_err(|_| self.ensure_goaway());
+        }
+    }
+
+    /// Whether the demux waits for memory for a request head (T615, `H2_CF_DEM_SALLOC`): the
+    /// data path queues the connection for a buffer and calls [`Self::retry_head`] when woken.
+    #[must_use]
+    #[inline]
+    pub fn head_waiting(&self) -> bool {
+        self.head_wait.is_some()
+    }
+
+    /// The request head the demux waits for memory for, written again from its fields (not
+    /// decoded again: `h2_buf_available` then the same HEADERS); written, the demux goes on with
+    /// what waits in `rx_buf`. Still no memory: it waits on.
+    #[cold]
+    #[inline(never)]
+    pub fn retry_head(&mut self) {
+        let Some((stream_id, flags)) = self.head_wait.take() else { return };
+        let decoded = std::mem::take(&mut self.decoded);
+        MuxH2::decoded_head(self, stream_id, flags, &decoded);
+        self.decoded = decoded;
+        if self.head_wait.is_none() {
+            self.resume();
         }
     }
 
@@ -1235,7 +1270,8 @@ impl Mux for MuxH2 {
 
         // Step 2: Demultiplex incoming frames
         while ctx.rx_buf.len() >= consumed + FRAME_HEADER_LEN {
-            if ctx.conn_state == H2ConnState::GoAwaySent {
+            // Closed, or waiting for a head's memory (T615): nothing more is demuxed.
+            if ctx.conn_state == H2ConnState::GoAwaySent || ctx.head_wait.is_some() {
                 break;
             }
             if ctx.tx_buf.len() - ctx.tx_consumed > TX_ROOM {
@@ -1517,7 +1553,14 @@ impl MuxH2 {
             ctx.send_goaway(stream_id, e, b"HPACK compression error");
             return Err(io::Error::new(io::ErrorKind::InvalidData, "HPACK compression error"));
         }
+        Self::decoded_head(ctx, stream_id, flags, decoded);
+        Ok(())
+    }
 
+    /// A header block of `stream_id` decoded into `decoded`: a stream opened, its trailers, or
+    /// (no memory for a request head) the demux set waiting ([`H2MuxContext::retry_head`] is
+    /// here again with the same fields).
+    fn decoded_head(ctx: &mut H2MuxContext, stream_id: u32, flags: u8, decoded: &DecodedFields) {
         if !ctx.streams.contains_key(&stream_id) {
             let active = ctx
                 .streams
@@ -1526,7 +1569,7 @@ impl MuxH2 {
                 .count();
             if active >= ctx.max_concurrent_streams as usize {
                 ctx.send_rst_stream(stream_id, H2Error::RefusedStream);
-                return Ok(());
+                return;
             }
         }
 
@@ -1539,7 +1582,7 @@ impl MuxH2 {
             let ended = ctx.streams.get(&stream_id).is_some_and(|s| s.rx_htx.is_eom());
             if ended {
                 ctx.send_rst_stream(stream_id, H2Error::StreamClosed);
-                return Ok(());
+                return;
             }
             // Trailers get the room HAProxy's rx buffer gives them (T271): past it, a stream
             // error, so a client cannot park decoded trailers of any size in each stream.
@@ -1552,7 +1595,7 @@ impl MuxH2 {
             let malformed = crate::h2::check_trailer_fields(decoded.iter_text()).is_err();
             if (flags & frame_flags::END_STREAM) == 0 || too_big || malformed || decoded.iter().any(|(n, _)| n.starts_with(b":")) {
                 ctx.send_rst_stream(stream_id, H2Error::ProtocolError);
-                return Ok(());
+                return;
             }
             ctx.streams.entry(stream_id).and_modify(|stream| {
                 for (name, value) in decoded.iter_text() {
@@ -1562,7 +1605,7 @@ impl MuxH2 {
                 stream.rx_htx.push(HtxBlock::Eom);
                 stream.state = H2StreamState::HalfClosedRemote;
             });
-            return Ok(());
+            return;
         }
 
         // A client connection's response gets the name and value checks of
@@ -1570,6 +1613,19 @@ impl MuxH2 {
         // a server is refused by the parser).
         let checked = if ctx.is_server { Ok(()) } else { crate::h2::check_response_fields(decoded.iter_text()) };
         let (take_rx, ws_key, relaxed) = (ctx.take_rx_head, ctx.ws_key, ctx.relaxed_path);
+        // A server connection's request head: written once, as the HTX blocks of the memory
+        // the stream's buffer adopts (CP2a), checked and limited as it is written; asked for
+        // before the stream is made, so that with no memory to be had nothing is (T615).
+        let head = if ctx.is_server {
+            let head = write_head(decoded, HeadHooks { take_rx, ws_key }, relaxed);
+            if matches!(head, HeadOut::NoMemory) {
+                ctx.head_wait = Some((stream_id, flags));
+                return;
+            }
+            Some(head)
+        } else {
+            None
+        };
         let spare_htx = ctx.spare_htx.pop();
         let stream = ctx.streams.entry(stream_id).or_insert_with(|| {
             let mut s = H2StreamCtx::new(
@@ -1586,10 +1642,8 @@ impl MuxH2 {
         stream.state = H2StreamState::Open;
         ctx.highest_opened = ctx.highest_opened.max(stream_id);
 
-        let converted = if ctx.is_server {
-            // A server connection's request head: written once, as the HTX blocks of the
-            // memory the stream's buffer adopts (CP2a), checked and limited as it is written.
-            request_head(stream, decoded, HeadHooks { take_rx, ws_key }, relaxed)
+        let converted = if let Some(head) = head {
+            request_head(stream, decoded, head, relaxed)
         } else if checked.is_err() {
             Err(H2Error::ProtocolError)
         } else {
@@ -1598,15 +1652,13 @@ impl MuxH2 {
         };
         if let Err(code) = converted {
             ctx.send_rst_stream(stream_id, code);
-            return Ok(());
+            return;
         }
 
         if (flags & frame_flags::END_STREAM) != 0 {
             stream.rx_htx.push(HtxBlock::Eom);
             stream.state = H2StreamState::HalfClosedRemote;
         }
-
-        Ok(())
     }
 
     /// A HEADERS frame (`header_block` without its padding and priority fields).
@@ -2927,9 +2979,10 @@ mod tests {
     }
 
     /// CP2: a request head is written as HTX blocks into the memory the data path hands the
-    /// mux (`take_rx_head`), with `scheme://authority` after them; none to be had flags the
-    /// stream (the data path answers 500, S5), memory too small is asked for again, larger, and
-    /// a head that fits neither flags it too (CP2b-2: no head is kept as fields any more).
+    /// mux (`take_rx_head`), with `scheme://authority` after them; none to be had makes the
+    /// demux wait (T615, below), memory too small is asked for again, larger, and a head that
+    /// fits neither flags the stream (the data path answers 500, S5; CP2b-2: no head is kept as
+    /// fields any more).
     #[test]
     fn a_request_head_is_written_into_the_memory_the_data_path_gives() {
         let block = [&[0x82u8, 0x86, 0x84][..], &lit(b":authority", b"a")].concat();
@@ -2942,8 +2995,8 @@ mod tests {
             (ctx, s)
         };
         let (ctx, s) = run(no_memory);
-        assert_eq!(s, vec![], "no reset: the data path answers");
-        assert!(ctx.streams.get(&1).is_some_and(|st| st.rx_head.is_none() && st.text_head.is_none() && st.no_memory));
+        assert_eq!(s, vec![], "no reset: the demux waits");
+        assert!(ctx.head_waiting() && ctx.streams.get(&1).is_none());
 
         let (ctx, s) = run(heap_rx_head);
         assert_eq!(s, vec![]);
@@ -2967,6 +3020,36 @@ mod tests {
             assert!(st.rx_head.is_none() && st.text_head.is_none() && st.no_memory, "{size}: no memory");
             assert_eq!(st.request_method(), None);
         }
+    }
+
+    /// T615 (`H2_CF_DEM_SALLOC`): no memory for a request head and the demux waits: the block is
+    /// decoded once (the HPACK table moved), no frame after it is handled and no input wanted;
+    /// written again from its fields when memory comes, the stream opens and the frames that
+    /// waited behind it are handled, the next block decoding with the table as the client has it.
+    #[test]
+    fn a_head_with_no_memory_holds_the_demux_until_it_is_written_again() {
+        let (mux, mut ctx) = open_conn();
+        ctx.take_rx_head = no_memory;
+        let from = ctx.tx_buf.len();
+        // `:authority a` added to the table; a PING behind it.
+        let block = [&[0x82u8, 0x86, 0x84][..], &[0x41, 0x01, b'a']].concat();
+        let mut input = headers(frame_flags::END_HEADERS | frame_flags::END_STREAM, 1, block);
+        input.extend_from_slice(&[0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let _ = mux.parse(&mut ctx, &input);
+        assert!(ctx.head_waiting() && !ctx.wants_input() && ctx.streams.get(&1).is_none());
+        assert_eq!(sent(&ctx, from), vec![], "the PING waits behind the head");
+        ctx.retry_head();
+        assert!(ctx.head_waiting(), "still no memory");
+        ctx.resume();
+        assert_eq!(sent(&ctx, from), vec![], "resumed, the demux still waits");
+        ctx.take_rx_head = heap_rx_head;
+        ctx.retry_head();
+        assert!(!ctx.head_waiting() && ctx.wants_input());
+        assert_eq!(ctx.streams.get(&1).and_then(|st| st.request_header("host")), Some("a"));
+        assert_eq!(sent(&ctx, from).iter().map(|f| f.0).collect::<Vec<_>>(), vec![6], "the PING answered");
+        ctx.retry_head();
+        let _ = mux.parse(&mut ctx, &headers(frame_flags::END_HEADERS | frame_flags::END_STREAM, 3, vec![0x82, 0x86, 0x84, 0xbe]));
+        assert_eq!(ctx.streams.get(&3).and_then(|st| st.request_header("host")), Some("a"), "the table as the client has it");
     }
 
     /// CP2b-2: an extended CONNECT to a websocket is written as blocks with the

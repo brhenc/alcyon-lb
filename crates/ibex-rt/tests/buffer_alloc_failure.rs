@@ -473,31 +473,151 @@ fn h2_get(id: u8) -> [u8; 15] {
     [0, 0, 6, 1, 5, 0, 0, 0, id, 0x82, 0x86, 0x84, 0x41, 0x01, b'x']
 }
 
-/// An HTTP/2 stream whose buffer cannot be had is answered `500` on that stream, and the
-/// connection goes on: the next stream on it is served (T464). `HAProxy` 3.5-dev8 under `-dMfail`
-/// with `tune.fail-alloc 3`, `nghttp` sending four `GET`s on one connection (measured): the failed
-/// stream gets HEADERS `:status 500` (`content-length: 97`, the error page as DATA) or, when its
-/// mux stream cannot be made, `RST_STREAM` `REFUSED_STREAM`; the other streams complete (`200`)
-/// and the connection ends with an idle `GOAWAY NO_ERROR`, never because of the failure.
-#[test]
-fn an_h2_stream_whose_buffer_cannot_be_had_is_answered_500_and_its_connection_goes_on() {
-    const SMALL: usize = 1536;
-    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    for skip in 0..2 {
-        let (mut engine, addr) = engine_with(
-            &format!("global\n  tune.bufsize.small {SMALL}\n"),
-            "  http-request return status 200 content-type text/plain string ok\n",
-        );
-        let mut sock = h2_connect(addr);
-        refuse_allocs_of(SMALL, skip, 2);
-        sock.write_all(&h2_get(1)).expect("HEADERS 1");
-        let failed = h2_status(&mut engine, &mut sock, 1);
-        assert_eq!(refusals_left(), 0, "skip {skip}: the stream's buffer was asked for");
-        refuse_allocs_of(SMALL, 0, 0);
-        assert_eq!(failed, Some(0x8e), "skip {skip}: the failed stream gets :status 500");
-        sock.write_all(&h2_get(3)).expect("HEADERS 3");
-        assert_eq!(h2_status(&mut engine, &mut sock, 3), Some(0x88), "skip {skip}: the next stream, same connection");
+/// Reads HTTP/2 frames off `sock` while running the engine, for `dur` or until the connection
+/// closes: each frame's type and stream id, whether it closed, and how many engine passes ran.
+fn h2_frames(engine: &mut Engine, sock: &mut TcpStream, dur: Duration) -> (Vec<(u8, u32)>, bool, usize) {
+    let (mut rx, mut frames, mut passes) = (Vec::new(), Vec::new(), 0);
+    let mut buf = [0u8; 4096];
+    let start = Instant::now();
+    while start.elapsed() < dur {
+        let _ = engine.run_once();
+        passes += 1;
+        match sock.read(&mut buf) {
+            Ok(0) => return (frames, true, passes),
+            Ok(n) => rx.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return (frames, true, passes),
+        }
+        while rx.len() >= 9 {
+            let len = (usize::from(rx[0]) << 16) | (usize::from(rx[1]) << 8) | usize::from(rx[2]);
+            if rx.len() < 9 + len {
+                break;
+            }
+            let sid = u32::from_be_bytes([rx[5], rx[6], rx[7], rx[8]]) & 0x7fff_ffff;
+            if rx[3] == 0x4 && rx[4] & 1 == 0 {
+                sock.write_all(b"\x00\x00\x00\x04\x01\x00\x00\x00\x00").expect("SETTINGS ACK");
+            }
+            frames.push((rx[3], sid));
+            rx.drain(..9 + len);
+        }
     }
+    (frames, false, passes)
+}
+
+/// `GET`, `http`, `/` on stream `id`, its `:authority` the dynamic table's first entry (index
+/// 62: the `x` that [`h2_get`] added); `END_STREAM` and `END_HEADERS`.
+fn h2_get_indexed(id: u8) -> [u8; 13] {
+    [0, 0, 4, 1, 5, 0, 0, 0, id, 0x82, 0x86, 0x84, 0xbe]
+}
+
+/// Every standard buffer the engine's thread can have, held, the pool put at a
+/// `tune.buffers.limit` (1: the buffers the earlier tests' threads keep are counted too); dropped,
+/// the limit is lifted, then the buffers given back.
+struct Held {
+    _bufs: Vec<Buf>,
+}
+
+fn hold_all() -> Held {
+    ibex_rt::buf::set_buffers_limit(1);
+    let mut v = Vec::new();
+    loop {
+        let b = Buf::standard();
+        if !b.is_allocated() {
+            break;
+        }
+        v.push(b);
+    }
+    assert!(ibex_rt::buf::standard_at_limit(), "held to the limit");
+    Held { _bufs: v }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        ibex_rt::buf::set_buffers_limit(0);
+    }
+}
+
+/// The small buffers' size in the HTTP/2 tests.
+const SMALL: usize = 1536;
+
+/// An engine answering `200` with `lines` before its rule, the small buffers [`SMALL`], an
+/// HTTP/2 connection to it settled (its preface read, SETTINGS exchanged).
+fn h2_settled(lines: &str) -> (Engine, TcpStream) {
+    let (mut engine, addr) = engine_with(
+        &format!("global\n  tune.bufsize.small {SMALL}\n  tune.buffers.reserve 0\n"),
+        &format!("{lines}  http-request return status 200 content-type text/plain string ok\n"),
+    );
+    let mut sock = h2_connect(addr);
+    let (frames, closed, _) = h2_frames(&mut engine, &mut sock, Duration::from_millis(100));
+    assert!(!closed && frames.iter().any(|&(t, _)| t == 0x4), "settled: {frames:?}");
+    (engine, sock)
+}
+
+/// T615 (D-5 (b), user 11-02): an HTTP/2 stream whose head buffer cannot be had makes its
+/// connection's demux wait for one, as `HAProxy`'s `H2_CF_DEM_SALLOC` (`h2c_dec_hdrs`,
+/// `src/mux_h2.c:6286`: `h2_get_buf` fails, the connection is queued on the buffer wait queue
+/// `DB_MUX_RX`, the frame stays; `h2_buf_available` wakes it). No `500`, no `RST_STREAM`: the
+/// stream is served once a buffer is given back, and the HPACK table is the one the client's
+/// encoder has (the next stream's `:authority` from it decodes). It was answered `500` (S5).
+#[test]
+fn an_h2_stream_whose_buffer_cannot_be_had_waits_for_one_and_its_connection_goes_on() {
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut engine, mut sock) = h2_settled("");
+    let held = hold_all();
+    refuse_allocs_of(SMALL, 0, usize::MAX);
+    sock.write_all(&h2_get(1)).expect("HEADERS 1");
+    let (frames, closed, _) = h2_frames(&mut engine, &mut sock, Duration::from_millis(300));
+    let asked = refusals_left() < usize::MAX;
+    refuse_allocs_of(SMALL, 0, 0);
+    assert!(asked, "the stream's buffer was asked for");
+    assert!(!closed && !frames.iter().any(|&(t, s)| s == 1 && (t == 0x1 || t == 0x3)), "stream 1 waits, not answered: {frames:?}");
+    drop(held);
+    assert_eq!(h2_status(&mut engine, &mut sock, 1), Some(0x88), "served once buffers are given back");
+    sock.write_all(&h2_get_indexed(3)).expect("HEADERS 3");
+    assert_eq!(h2_status(&mut engine, &mut sock, 3), Some(0x88), "the next stream, its field from the HPACK table");
+}
+
+/// T615: a connection whose stream never gets its head buffer ends at its `timeout client`, as
+/// `HAProxy`'s (the waiting stream does not exist yet: `h2_timeout_task` with no stream), and
+/// while it waits the engine is not run for it: the thread sleeps in the poller.
+#[test]
+fn an_h2_connection_waiting_for_a_buffer_forever_ends_at_its_client_timeout_without_spinning() {
+    /// The CPU time this thread has run, from `/proc/thread-self/schedstat` (nanoseconds).
+    fn cpu() -> Duration {
+        let s = std::fs::read_to_string("/proc/thread-self/schedstat").expect("schedstat");
+        Duration::from_nanos(s.split_whitespace().next().and_then(|n| n.parse().ok()).expect("on-CPU ns"))
+    }
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mut engine, mut sock) = h2_settled("  timeout client 1s\n");
+    let held = hold_all();
+    refuse_allocs_of(SMALL, 0, usize::MAX);
+    sock.write_all(&h2_get(1)).expect("HEADERS 1");
+    let (t0, c0) = (Instant::now(), cpu());
+    let (frames, closed, passes) = h2_frames(&mut engine, &mut sock, Duration::from_secs(4));
+    let (wall, used) = (t0.elapsed(), cpu().saturating_sub(c0));
+    refuse_allocs_of(SMALL, 0, 0);
+    drop(held);
+    assert!(closed, "the connection ends: {frames:?}");
+    assert!(!frames.iter().any(|&(t, s)| s == 1 && (t == 0x1 || t == 0x3)), "stream 1 is never answered: {frames:?}");
+    assert!(wall >= Duration::from_millis(900) && wall < Duration::from_secs(3), "at the client timeout: {wall:?}");
+    assert!(used < wall / 4 && passes < 200, "no busy loop: {used:?} on CPU in {wall:?}, {passes} passes");
+}
+
+/// T615: a head whose small buffer cannot be had is written into a standard one, so that a
+/// stream waits only when no buffer at all can be had (the wait queue is woken by standard
+/// buffers given back, and a waiter refused with one in the cache would be woken at once).
+#[test]
+fn an_h2_head_whose_small_buffer_cannot_be_had_is_written_into_a_standard_one() {
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (engine, _) = engine_with(&format!("global\n  tune.bufsize.small {SMALL}\n"), "");
+    // The take and the take again after the pool's collection (S5).
+    refuse_allocs_of(SMALL, 0, 2);
+    let head = Buf::take_rx_head(100);
+    let left = refusals_left();
+    refuse_allocs_of(SMALL, 0, 0);
+    assert_eq!(left, 0, "the small buffer was asked for");
+    assert_eq!(head.as_ref().map(ibex_proto::htx::RxHead::len), Some(BUFSIZE), "a standard one instead");
+    drop((head, engine));
 }
 
 /// Set by [`split_backend`] once the response head is sent; the body follows 200 ms later.
