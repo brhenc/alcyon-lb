@@ -12997,17 +12997,14 @@ impl EngineDispatcher<'_> {
         let written = with_res_hdrs(|hdrs| entry.sess.rep.replace_head_with(old, |out| write_response_head(out, &proto_version, status, &status_msg, hdrs)));
         if !written {
             // Larger than the buffer's free memory: through a `Vec`, which the buffer grows for.
+            // Sized once: no piece is shorter as bytes than as the text that stands for them.
             let mut v = Vec::new();
             with_res_hdrs(|hdrs| {
-                let mut size = 4096;
-                loop {
-                    v.resize(size, 0);
-                    if let Some(n) = write_response_head(&mut v, &proto_version, status, &status_msg, hdrs) {
-                        v.truncate(n);
-                        break;
-                    }
-                    size *= 2;
-                }
+                let size = proto_version.len() + status_msg.len() + 16 + hdrs.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>();
+                v.resize(size, 0);
+                let n = write_response_head(&mut v, &proto_version, status, &status_msg, hdrs);
+                debug_assert!(n.is_some(), "the head fits the room it was sized for");
+                v.truncate(n.unwrap_or(0));
             });
             entry.sess.rep.replace_prefix(old, &v);
         }
