@@ -67,6 +67,15 @@ pub struct EcdsaKeyPair {
 
 derive_debug_via_field!(EcdsaKeyPair, stringify!(EcdsaKeyPair), public_key);
 
+/// ring-ibex: `d` and `nonce_key` are `Copy` values, wiped here and nowhere else.
+#[cfg(feature = "zeroize")]
+impl Drop for EcdsaKeyPair {
+    fn drop(&mut self) {
+        self.d.wipe();
+        self.nonce_key.0.wipe();
+    }
+}
+
 impl EcdsaKeyPair {
     /// Generates a new key pair and returns the key pair serialized as a
     /// PKCS#8 document.
@@ -157,8 +166,11 @@ impl EcdsaKeyPair {
 
         let (seed, public_key) = key_pair.split();
         let n = &alg.private_scalar_ops.scalar_ops.scalar_modulus(cpu);
-        let d = private_key::private_key_as_scalar(n, &seed);
-        let d = alg.private_scalar_ops.to_mont(&d, cpu);
+        #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
+        let mut d_unmont = private_key::private_key_as_scalar(n, &seed);
+        let d = alg.private_scalar_ops.to_mont(&d_unmont, cpu);
+        #[cfg(feature = "zeroize")]
+        d_unmont.wipe();
 
         let nonce_key = NonceRandomKey::new(alg, &seed, rng)?;
         Ok(Self {
@@ -246,11 +258,23 @@ impl EcdsaKeyPair {
         let q = &cops.elem_modulus(cpu);
         let n = &scalar_ops.scalar_modulus(cpu);
 
+        // ring-ibex: the per-signature nonce `k` and what is derived from it give `d` away.
+        #[cfg(feature = "zeroize")]
+        macro_rules! wipe {
+            ($($v:ident),*) => { $( $v.wipe(); )* };
+        }
+        #[cfg(not(feature = "zeroize"))]
+        macro_rules! wipe {
+            ($($v:ident),*) => {};
+        }
+
         for _ in 0..100 {
             // XXX: iteration conut?
             // Step 1.
-            let k = private_key::random_scalar(self.alg.private_key_ops, n, rng)?;
-            let k_inv = ops.scalar_inv_to_mont(&k, cpu);
+            #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
+            let mut k = private_key::random_scalar(self.alg.private_key_ops, n, rng)?;
+            #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
+            let mut k_inv = ops.scalar_inv_to_mont(&k, cpu);
 
             // Step 2.
             let r = private_key_ops.point_mul_base(&k, cpu);
@@ -262,6 +286,7 @@ impl EcdsaKeyPair {
                 n.elem_reduced_to_scalar(&x)
             };
             if n.is_zero(&r) {
+                wipe!(k, k_inv);
                 continue;
             }
 
@@ -274,8 +299,11 @@ impl EcdsaKeyPair {
             let s = {
                 let mut e_plus_dr = scalar_ops.scalar_product(&self.d, &r, cpu);
                 n.add_assign(&mut e_plus_dr, &e);
-                scalar_ops.scalar_product(&k_inv, &e_plus_dr, cpu)
+                let s = scalar_ops.scalar_product(&k_inv, &e_plus_dr, cpu);
+                wipe!(e_plus_dr);
+                s
             };
+            wipe!(k, k_inv);
             if n.is_zero(&s) {
                 continue;
             }
@@ -334,11 +362,14 @@ impl rand::sealed::SecureRandom for NonceRandom<'_> {
 
         ctx.update(self.message_digest.as_ref());
 
-        let nonce = ctx.finish();
+        #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
+        let mut nonce = ctx.finish();
 
         // `copy_from_slice()` panics if the lengths differ, so we don't have
         // to separately assert that the lengths are the same.
         dest.copy_from_slice(nonce.as_ref());
+        #[cfg(feature = "zeroize")]
+        nonce.wipe();
 
         Ok(())
     }
@@ -366,6 +397,8 @@ impl NonceRandomKey {
         let mut ctx = digest::Context::new(alg.digest_alg);
         ctx.update(rand);
         ctx.update(seed.bytes_less_safe());
+        #[cfg(feature = "zeroize")]
+        zeroize::Zeroize::zeroize(&mut rand[..]);
         Ok(Self(ctx.finish()))
     }
 }
@@ -614,5 +647,50 @@ mod tests {
                 Ok(())
             },
         );
+    }
+}
+
+// ring-ibex (zrev): the key pair's long-term scalar `d` and the key-derived `nonce_key` are
+// `Copy` values inside the struct, so only `Drop for EcdsaKeyPair` can wipe them.
+#[cfg(all(test, feature = "zeroize"))]
+mod zeroize_tests {
+    extern crate std;
+    use super::*;
+    use crate::{rand, signature};
+    use crate::zeroize_testutil::assert_needle_wiped;
+
+    fn key_pair(alg: &'static EcdsaSigningAlgorithm) -> EcdsaKeyPair {
+        let rng = rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(alg, &rng).unwrap();
+        EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng).unwrap()
+    }
+
+    fn limb_bytes(kp: &EcdsaKeyPair) -> std::vec::Vec<u8> {
+        // The first 16 bytes of `d` (Montgomery form) are enough to find it.
+        let d = &kp.d;
+        // SAFETY: reads the bytes of a live `Elem`: an array of plain integers.
+        let all = unsafe { core::slice::from_raw_parts((d as *const Scalar<R>).cast::<u8>(), core::mem::size_of::<Scalar<R>>()) };
+        all[..16].to_vec()
+    }
+
+    #[test]
+    fn ecdsa_p256_private_scalar_is_wiped() {
+        let kp = key_pair(&signature::ECDSA_P256_SHA256_FIXED_SIGNING);
+        let needle = limb_bytes(&kp);
+        assert_needle_wiped(kp, &needle, "EcdsaKeyPair P-256 d");
+    }
+
+    #[test]
+    fn ecdsa_p384_private_scalar_is_wiped() {
+        let kp = key_pair(&signature::ECDSA_P384_SHA384_FIXED_SIGNING);
+        let needle = limb_bytes(&kp);
+        assert_needle_wiped(kp, &needle, "EcdsaKeyPair P-384 d");
+    }
+
+    #[test]
+    fn ecdsa_nonce_key_is_wiped() {
+        let kp = key_pair(&signature::ECDSA_P256_SHA256_FIXED_SIGNING);
+        let needle = kp.nonce_key.0.as_ref().to_vec();
+        assert_needle_wiped(kp, &needle, "EcdsaKeyPair nonce_key");
     }
 }

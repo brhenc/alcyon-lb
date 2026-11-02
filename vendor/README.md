@@ -13,9 +13,9 @@ key material when it is freed (feature `zeroize`, which `rustls-ringibex` turns 
 rustls 0.24 provider, a fork of `rustls-ring` 0.24.0-dev.2. What it wipes and what it cannot:
 `ringibex/ZEROIZE.md`. Why vanilla ring stays the default: `tradeoff.md` 6.27.
 
-- **Source:** `~/ring-ibex`, branch `zeroize`, commit `741d7a834f828984bd2185bb6897366b1c1232cd`
-  (741d7a8, T462: vector registers cleared after AEAD, key agreement, signing and HMAC; was
-  237a254 at T460), `git archive` of the tracked files: no `.git`, no `target/`, no `.cargo-ok`.
+- **Source:** `~/ring-ibex`, branch `zeroize`, commit `b023c4ec9baf5fc6ca8ba14609b1c0e6eb7693fe`
+  (branch `zrev-fix` on 741d7a8: the zrev review wipes, see `ringibex/ZEROIZE.md`; 741d7a8 was T462, vector
+  registers cleared after AEAD, key agreement, signing and HMAC; 237a254 at T460), `git archive` of the tracked files: no `.git`, no `target/`, no `.cargo-ok`.
   `rustls-ringibex/` there is `vendor/rustls-ringibex/` here.
 - **Left out:** ring's `tests/` (1.9 MB of test vectors; Ibex does not run ring's suite), and the
   two crates' `Cargo.lock`. `ringibex/Cargo.toml` still lists the `[[test]]` targets: they are

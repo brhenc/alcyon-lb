@@ -208,8 +208,9 @@ fn fill_okm(
         }
         ctx.update(&[n]);
 
-        let t = ctx.sign();
-        let t = t.as_ref();
+        #[cfg_attr(not(feature = "zeroize"), allow(unused_mut))]
+        let mut t_tag = ctx.sign();
+        let t = t_tag.as_ref();
 
         // Append `t` to the output.
         out = if out.len() < digest_alg.output_len() {
@@ -223,11 +224,16 @@ fn fill_okm(
         };
 
         if out.is_empty() {
+            // ring-ibex: `t_tag` is output keying material.
+            #[cfg(feature = "zeroize")]
+            t_tag.wipe();
             return Ok(());
         }
 
         ctx = hmac::Context::with_key(&prk.0);
         ctx.update(t);
+        #[cfg(feature = "zeroize")]
+        t_tag.wipe();
         n = n.checked_add(1).unwrap();
     }
 }

@@ -42,8 +42,23 @@ struct poly1305_state_st {
     key: [u8; 16],
 }
 
+// ring-ibex: r, s and the `s` half of the one-time key.
+#[cfg(feature = "zeroize")]
+impl Drop for State {
+    fn drop(&mut self) {
+        // SAFETY: `poly1305_state_st` is plain integers; wiping its bytes is valid.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                (&mut self.state as *mut poly1305_state_st).cast::<u8>(),
+                core::mem::size_of::<poly1305_state_st>(),
+            )
+        };
+        zeroize::Zeroize::zeroize(bytes);
+    }
+}
+
 impl State {
-    pub(super) fn new_context(Key { key_and_nonce }: Key) -> super::Context {
+    pub(super) fn new_context(key: Key) -> super::Context {
         prefixed_extern! {
             fn CRYPTO_poly1305_init(state: &mut poly1305_state_st, key: &[u8; KEY_LEN]);
         }
@@ -66,7 +81,8 @@ impl State {
                 key: [0u8; 16],
             },
         };
-        unsafe { CRYPTO_poly1305_init(&mut r.state, &key_and_nonce) }
+        // `key` wipes itself when it drops (feature `zeroize`); no copy of it is made here.
+        unsafe { CRYPTO_poly1305_init(&mut r.state, &key.key_and_nonce) }
         super::Context::Fallback(r)
     }
 
@@ -92,5 +108,22 @@ impl State {
         let mut tag = Tag([0u8; TAG_LEN]);
         unsafe { CRYPTO_poly1305_finish(&mut self.state, &mut tag.0) }
         tag
+    }
+}
+
+// ring-ibex (zrev): the state holds the clamped r, s and the raw `s` half of the one-time key.
+#[cfg(all(test, feature = "zeroize"))]
+mod zeroize_tests {
+    use super::*;
+
+    #[test]
+    fn poly1305_state_is_wiped() {
+        let mut key = [0u8; KEY_LEN];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = 0x31 + i as u8;
+        }
+        let needle = key[16..].to_vec();
+        let ctx = State::new_context(Key::new(key));
+        crate::zeroize_testutil::assert_needle_wiped(ctx, &needle, "poly1305 State");
     }
 }

@@ -242,6 +242,9 @@ pub fn elem_reduced<Larger, Smaller>(
     tmp.copy_from_slice(&a.limbs);
 
     limbs_from_mont_in_place(&mut r.limbs, tmp, m.limbs(), m.n0());
+    // ring-ibex (zrev): for the RSA key load `a` is the other prime.
+    #[cfg(feature = "zeroize")]
+    zeroize::Zeroize::zeroize(&mut tmp[..]);
     Elem {
         limbs: r.limbs,
         encoding: PhantomData,

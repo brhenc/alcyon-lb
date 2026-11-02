@@ -34,6 +34,15 @@ const _LIMB_SIZE_DIVIDES_ALIGNMENT: () =
 
 pub const LIMBS_PER_CHUNK: usize = 512 / LIMB_BITS;
 
+// ring-ibex (zrev): the window table of a constant-time exponentiation holds powers of the base
+// modulo a secret prime; for an RSA signature the base mod p reveals p.
+#[cfg(feature = "zeroize")]
+impl<const N: usize> Drop for AlignedStorage<N> {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0[..]);
+    }
+}
+
 impl<const N: usize> AlignedStorage<N> {
     pub fn zeroed() -> Self {
         assert_eq!(N % LIMBS_PER_CHUNK, 0); // TODO: const.
@@ -56,5 +65,17 @@ impl<const N: usize> AlignedStorage<N> {
             (chunks, []) => Ok(chunks),
             (_, r) => Err(LenMismatchError::new(r.len())),
         }
+    }
+}
+
+#[cfg(all(test, feature = "zeroize"))]
+mod zeroize_tests {
+    use super::*;
+
+    #[test]
+    fn exponentiation_window_table_is_wiped() {
+        let mut s = AlignedStorage::<{ LIMBS_PER_CHUNK * 4 }>::zeroed();
+        s.0[3] = 0x1234_5678_9abc_def0u64 as Limb;
+        crate::zeroize_testutil::assert_all_zero_after(s, "AlignedStorage");
     }
 }

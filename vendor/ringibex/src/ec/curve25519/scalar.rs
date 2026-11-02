@@ -62,7 +62,19 @@ impl Scalar {
         let mut unreduced = [0u8; digest::SHA512_OUTPUT_LEN];
         unreduced.copy_from_slice(digest.as_ref());
         unsafe { x25519_sc_reduce(&mut unreduced) };
-        Self((&unreduced[..SCALAR_LEN]).try_into().unwrap())
+        let r = Self((&unreduced[..SCALAR_LEN]).try_into().unwrap());
+        // ring-ibex: for the per-signature nonce this is the secret nonce.
+        #[cfg(feature = "zeroize")]
+        zeroize::Zeroize::zeroize(&mut unreduced);
+        r
+    }
+}
+
+// ring-ibex: every `Scalar` is secret (the private scalar, the per-signature nonce).
+#[cfg(feature = "zeroize")]
+impl Drop for Scalar {
+    fn drop(&mut self) {
+        self.wipe();
     }
 }
 
@@ -96,3 +108,16 @@ impl From<MaskedScalar> for Scalar {
 
 type UnreducedScalar = [u8; UNREDUCED_SCALAR_LEN];
 const UNREDUCED_SCALAR_LEN: usize = SCALAR_LEN * 2;
+
+#[cfg(all(test, feature = "zeroize"))]
+mod zeroize_tests {
+    use super::*;
+
+    /// The per-signature nonce is a `Scalar` that goes out of scope in `Ed25519KeyPair::sign`.
+    #[test]
+    fn scalar_is_wiped_on_drop() {
+        let bytes: [u8; SCALAR_LEN] = core::array::from_fn(|i| if i == SCALAR_LEN - 1 { 0 } else { 1 + i as u8 });
+        let s = Scalar::from_bytes_checked(bytes).unwrap();
+        crate::zeroize_testutil::assert_needle_wiped(s, &bytes, "curve25519 Scalar");
+    }
+}

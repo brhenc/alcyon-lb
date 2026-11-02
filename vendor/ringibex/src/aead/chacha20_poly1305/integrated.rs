@@ -135,7 +135,9 @@ pub(super) fn seal(
         }
     }
 
-    Ok(Tag(*tag))
+    let tag = Tag(*tag);
+    wipe_in_out(&mut data);
+    Ok(tag)
 }
 
 pub(super) fn open(
@@ -204,7 +206,9 @@ pub(super) fn open(
             }
         }
 
-        Ok(Tag(*tag))
+        let tag = Tag(*tag);
+        wipe_in_out(&mut data);
+        Ok(tag)
     })
 }
 
@@ -227,4 +231,20 @@ where
 #[repr(align(16), C)]
 pub(super) struct Out {
     pub(super) tag: [u8; TAG_LEN],
+}
+
+// ring-ibex (zrev): `data` holds a copy of the 256-bit session key for the assembly; wipe it once
+// the tag is copied out. A no-op without the feature.
+#[inline]
+fn wipe_in_out<T>(data: &mut T) {
+    #[cfg(feature = "zeroize")]
+    {
+        // SAFETY: the unions are plain integers and pointers; any bytes are valid.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut((data as *mut T).cast::<u8>(), core::mem::size_of::<T>())
+        };
+        zeroize::Zeroize::zeroize(bytes);
+    }
+    #[cfg(not(feature = "zeroize"))]
+    let _ = data;
 }

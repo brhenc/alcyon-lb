@@ -143,6 +143,14 @@ pub static HMAC_SHA512: Algorithm = Algorithm(&digest::SHA512);
 #[derive(Clone, Copy, Debug)]
 pub struct Tag(Digest);
 
+impl Tag {
+    /// ring-ibex: overwrite a tag that is key material (an HKDF-Expand block).
+    #[cfg(feature = "zeroize")]
+    pub(crate) fn wipe(&mut self) {
+        self.0.wipe();
+    }
+}
+
 impl AsRef<[u8]> for Tag {
     #[inline]
     fn as_ref(&self) -> &[u8] {
@@ -233,6 +241,8 @@ impl Key {
         key_value: &[u8],
         cpu_features: cpu::Features,
     ) -> Result<Self, InputTooLongError> {
+        // ring-ibex (zrev): the padded key blocks went through the SHA assembly's registers.
+        let _clear = crate::vregs::ClearOnDrop(cpu_features);
         let digest_alg = algorithm.0;
         let mut key = Self {
             inner: digest::BlockContext::new(digest_alg),
@@ -241,12 +251,13 @@ impl Key {
 
         let block_len = digest_alg.block_len();
 
-        let key_hash;
+        let mut key_hash = None;
         let key_value = if key_value.len() <= block_len {
             key_value
         } else {
-            key_hash = Digest::compute_from(digest_alg, key_value, cpu_features)?;
-            key_hash.as_ref()
+            let hash: &Digest =
+                key_hash.insert(Digest::compute_from(digest_alg, key_value, cpu_features)?);
+            hash.as_ref()
         };
 
         const IPAD: u8 = 0x36;
@@ -271,7 +282,13 @@ impl Key {
         debug_assert_eq!(leftover.len(), 0);
 
         #[cfg(feature = "zeroize")]
-        zeroize::Zeroize::zeroize(padded_key);
+        {
+            zeroize::Zeroize::zeroize(padded_key);
+            // The hash of an over-long key is the key.
+            if let Some(key_hash) = key_hash.as_mut() {
+                key_hash.wipe();
+            }
+        }
 
         Ok(key)
     }
