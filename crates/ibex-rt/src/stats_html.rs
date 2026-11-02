@@ -72,9 +72,8 @@ fn on_node(serving: &ibex_config::StatsConfig) -> String {
 
 /// The check of server `s` of proxy `p`, by bisection: the checks are made in (proxy,
 /// server) order (`Engine::new_worker`), so a page of many servers is not quadratic.
-pub(crate) fn check_of(checks: &[ServerCheckState], p: usize, s: usize) -> Option<&ServerCheckState> {
-    let i = checks.partition_point(|c| (c.proxy(), c.server()) < (p, s));
-    checks.get(i).filter(|c| c.proxy() == p && c.server() == s)
+pub(crate) fn check_of<'a>(proxy: &Proxy, checks: &'a [ServerCheckState], p: usize, s: usize) -> Option<crate::check::CheckView<'a>> {
+    crate::track::check_view(proxy, checks, p, s)
 }
 
 const H_CSS: u8 = 0;
@@ -670,9 +669,9 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                     let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);
                     let actconn = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
 
-                    let check_state = check_of(checks, p_idx, s_idx);
+                    let check_state = check_of(proxy, checks, p_idx, s_idx);
 
-                    let (check_info, health_toggle) = if let Some(c) = check_state {
+                    let (check_info, health_toggle) = if let Some(c) = &check_state {
                         let info = if !c.enabled {
                             "PAUSED".to_string()
                         } else if c.status == ServerStatus::Up {
@@ -1237,8 +1236,8 @@ impl JsonCursor {
                 let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
                 let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);
                 let actconn = proxy.server_actconn.get(s_idx).map_or(0, |a| a.load(Relaxed));
-                let check_state = check_of(checks, p_idx, s_idx);
-                let check_info = if let Some(c) = check_state {
+                let check_state = check_of(proxy, checks, p_idx, s_idx);
+                let check_info = if let Some(c) = &check_state {
                     if !c.enabled {
                         "PAUSED".to_string()
                     } else if c.status == ServerStatus::Up {
@@ -1249,7 +1248,7 @@ impl JsonCursor {
                 } else {
                     "no check".to_string()
                 };
-                let check_enabled = check_state.is_some_and(|c| c.enabled);
+                let check_enabled = check_state.as_ref().is_some_and(|c| c.enabled);
                 let _ = write!(
                     out,
                     r#"{{"name":"{}","status":"{}","weight":{},"maxconn":{},"act_conn":{},"check_info":"{}","check_enabled":{}}}"#,

@@ -1,0 +1,127 @@
+show tls-keys [id|*]                    : show tls keys references or dump tls ticket keys when id specified
+set ssl tls-key [id|file] <key>         : set the next TLS key for the <id> or <file> listener to <key>
+show ssl providers                      : show loaded SSL providers
+show ssl sni [-f <frontend>] [-A]       : display the list of SNI and their corresponding filename
+new ssl cert <certfile>                 : create a new certificate file to be used in a crt-list or a directory
+set ssl cert <certfile> <payload>       : replace a certificate file
+commit ssl cert <certfile>              : commit a certificate file
+abort ssl cert <certfile>               : abort a transaction for a certificate file
+del ssl cert <certfile>                 : delete an unused certificate file
+show ssl cert [<certfile>]              : display the SSL certificates used in memory, or the details of a file
+dump ssl cert <certfile>                : dump the SSL certificates in PEM format
+add ssl jwt <certfile>                  : add certificate to list of certificates used for JWT validation
+del ssl jwt <certfile>                  : remove certificate from list of certificates used for JWT validation
+show ssl jwt                            : show list of certificates used for JWT validation
+new ssl ca-file <cafile>                : create a new CA file to be used in a crt-list
+add ssl ca-file <cafile> <payload>      : add a certificate into the CA file
+set ssl ca-file <cafile> <payload>      : replace a CA file
+commit ssl ca-file <cafile>             : commit a CA file
+abort ssl ca-file <cafile>              : abort a transaction for a CA file
+del ssl ca-file <cafile>                : delete an unused CA file
+show ssl ca-file [<cafile>[:<index>]]   : display the SSL CA files used in memory, or the details of a <cafile>, or a single certificate of index <index> of a CA file <cafile>
+new ssl crl-file <crlfile>               : create a new CRL file to be used in a crt-list
+set ssl crl-file <crlfile> <payload>    : replace a CRL file
+commit ssl crl-file <crlfile>           : commit a CRL file
+abort ssl crl-file <crlfile>            : abort a transaction for a CRL file
+del ssl crl-file <crlfile>              : delete an unused CRL file
+show ssl crl-file [<crlfile[:<index>>]] : display the SSL CRL files used in memory, or the details of a <crlfile>, or a single CRL of index <index> of CRL file <crlfile>
+set ssl ocsp-response <resp|payload>       : update a certificate's OCSP Response from a base64-encode DER
+show ssl ocsp-response [[text|base64] id]  : display the IDs of the OCSP responses used in memory, or the details of a single OCSP response (in text or base64 format)
+show ssl ocsp-updates                      : display information about the next 'nb' ocsp responses that will be updated automatically
+update ssl ocsp-response <certfile>     : send ocsp request and update stored ocsp response
+add ssl crt-list <list> <cert> [opts]*  : add to crt-list file <list> a line <cert> or a payload
+del ssl crt-list <list> <cert[:line]>   : delete a line <cert> from crt-list file <list>
+show ssl crt-list [-n] [<list>]         : show the list of crt-lists or the content of a crt-list file <list>
+acme renew <certfile>                   : renew a certificate using the ACME protocol
+acme status                             : show status of certificates configured with ACME
+acme challenge_ready <certfile> domain <domain> : notify HAProxy that the ACME challenge is ready
+disable agent                           : disable agent checks
+disable health                          : disable health checks
+disable server (DEPRECATED)             : disable a server for maintenance (use 'set server' instead)
+enable agent                            : enable agent checks
+enable health                           : enable health checks
+enable server  (DEPRECATED)             : enable a disabled server (use 'set server' instead)
+set maxconn server <bk>/<srv>           : change a server's maxconn setting
+set server <bk>/<srv> [opts]            : change a server's state, weight, address, name or ssl
+get weight <bk>/<srv>                   : report a server's current weight
+set weight <bk>/<srv>  (DEPRECATED)     : change a server's weight (use 'set server' instead)
+add server <bk>/<srv>                   : create a new server
+del server <bk>/<srv>                   : remove a server
+show sess [help|<id>|all] [opts...]     : report the list of current streams or dump this exact stream
+shutdown session [id]                   : kill a specific session
+shutdown sessions server <bk>/<srv>     : kill sessions on a server
+clear table <table> [<filter>]*         : remove an entry from a table (filter: data/key)
+set table <table> key <k> [data.* <v>]* : update or create a table entry's data
+show table [<table> [<filter>]*]        : report table usage stats or dump this table's contents (filter: data/key)
+set profiling <what> {auto|on|off}      : enable/disable resource profiling (tasks,memory)
+show activity [-1|0|thread_num]         : show per-thread activity stats (for support/developers)
+show profiling [<what>|<#lines>|<opts>]*: show profiling state (all,status,tasks,memory)
+show tasks                              : show running tasks
+show peers [dict|-] [section]           : dump some information about all the peers or this peers section
+echo <text>                             : print text to the output
+set anon on [value]                     : activate the anonymized mode
+set anon off                            : deactivate the anonymized mode
+set anon global-key <value>             : change the global anonymizing key
+set maxconn global <value>              : change the per-process maxconn setting
+set rate-limit <setting> <value>        : change a rate limiting value
+set severity-output [none|number|string]: set presence of severity level in feedback information
+set timeout [cli] <delay>               : change a timeout setting
+show anon                               : display the current state of anonymized mode
+show env [var]                          : dump environment variables known to the process
+show cli sockets                        : dump list of cli sockets
+show cli level                          : display the level of the current CLI session
+show fd [-!plcfbs]* [num]               : dump list of file descriptors in use or a specific one
+show version                            : show version of the current process
+operator                                : lower the level of the current CLI session to operator
+user                                    : lower the level of the current CLI session to user
+wait {-h|<delay_ms>} cond [args...]     : wait the specified delay or condition (-h to see list)
+show resolvers [id]                     : dumps counters from all resolvers section and associated name servers
+add backend <backend>                   : add a new backend
+del backend <backend>                   : delete a backend
+disable frontend <frontend>             : temporarily disable specific frontend
+enable frontend <frontend>              : re-enable specific frontend
+publish backend <backend>               : mark backend as ready for traffic
+set maxconn frontend <frontend> <value> : change a frontend's maxconn setting
+show default-server [<backend>]         : list default-server instances in all or a single backend
+show defaults                           : list all proxies defaults sections
+show servers conn [<backend>]           : dump server connections status (all or for a single backend)
+show servers state [<backend>]          : dump volatile server information (all or for a single backend)
+show backend                            : list backends in the current running config
+shutdown frontend <frontend>            : stop a specific frontend
+set dynamic-cookie-key backend <bk> <k> : change a backend secret key for dynamic cookies
+unpublish backend <backend>             : remove backend for traffic processing
+enable dynamic-cookie backend <bk>      : enable dynamic cookies on a specific backend
+disable dynamic-cookie backend <bk>     : disable dynamic cookies on a specific backend
+show errors [<px>] [request|response]   : report last request and/or response errors for each proxy
+show cache                              : show cache status
+debug counters [?|all|bug|cnt|chk|glt]* : dump/reset rare event counters
+debug dev hash   [msg]                  : return msg hashed if anon is set
+show dev                                : show debug info for developers
+show libs                               : show loaded object files and libraries
+show threads                            : show some threads debugging information
+get var <name>                          : retrieve contents of a process-wide variable
+show pools [by*] [match <pfx>] [nb]     : report information about the memory pools usage
+clear counters [all|server <bk>/<srv> [force]] : clear max statistics counters (or all, or one server's)
+show info [desc|json|typed|float]*      : report information about the running process
+show stat [desc|json|no-maint|typed|up]*: report counters for each proxy and server
+show schema json                        : report schema used for stats
+dump stats-file                         : dump stats for restore
+show events [-0hnrsw]* [<sink>]         : show event sink state
+add acl [@<ver>] <acl> <pattern>        : add an acl entry
+clear acl [@<ver>] <acl>                : clear the contents of this acl
+commit acl @<ver> <acl>                 : commit the ACL at this version
+del acl <acl> [<key>|#<ref>]            : delete acl entries matching <key>
+get acl <acl> <value>                   : report the patterns matching a sample for an ACL
+prepare acl <acl>                       : prepare a new version for atomic ACL replacement
+show acl [@<ver>] <acl>                 : report available acls or dump an acl's contents
+add map [@<ver>] <map> <key> <val>      : add a map entry (payload supported instead of key/val)
+clear map [@<ver>] <map>                : clear the contents of this map
+commit map @<ver> <map>                 : commit the map at this version
+del map <map> [<key>|#<ref>]            : delete map entries matching <key>
+get map <map> <value>                   : report the keys and values matching a sample for a map
+prepare map <map>                       : prepare a new version for atomic map replacement
+set map <map> [<key>|#<ref>] <value>    : modify a map entry
+show map [@<ver>] [map]                 : report available maps or dump a map's contents
+show startup-logs                       : report logs emitted during HAProxy startup
+trace [<module>|0] [cmd [args...]]      : manage live tracing (empty to list, 0 to stop all)
+show trace [<module>]                   : show live tracing state

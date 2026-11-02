@@ -605,17 +605,36 @@ impl ServerCheckState {
     /// likewise, `DOWN`, or `DOWN n/rise` while a down server climbs.
     #[must_use]
     pub fn status_word(&self) -> String {
-        StatusWord(self).to_string()
+        StatusWord(&self.view()).to_string()
     }
 
     /// True for the statuses from L57DATA on, the ones that have a `code` (log line and
     /// `show stat` `check_code`).
     #[must_use]
     pub fn carries_code(&self) -> bool {
-        matches!(
-            self.last_status_code,
-            "L57DATA" | "L7OK" | "L7OKD" | "L7OKC" | "L7OKCD" | "L7STS" | "PROCERR" | "PROCTOUT" | "PROCOK"
-        )
+        code_carries(self.last_status_code)
+    }
+
+    /// What the stats pages read of this check ([`CheckView`]).
+    #[must_use]
+    pub fn view(&self) -> CheckView<'_> {
+        CheckView {
+            status: self.status,
+            enabled: self.enabled,
+            rise_count: self.rise_count,
+            fall_count: self.fall_count,
+            health: self.health,
+            in_progress: self.in_progress,
+            last_status_code: self.last_status_code,
+            last_status_desc: self.last_status_desc,
+            http_code: self.http_code,
+            last_status_info: self.last_status_info.as_deref().map(std::borrow::Cow::Borrowed),
+            check_duration_ms: self.check_duration_ms,
+            failed_checks: self.failed_checks,
+            down_transitions: self.down_transitions,
+            rise: self.config.rise,
+            fall: self.config.fall,
+        }
     }
 
     /// Formats the check result as `HAProxy` does.
@@ -4080,13 +4099,67 @@ mod tests {
     }
 }
 
+/// What the stats pages read of a server's check: its own state on the worker that runs the
+/// checks (worker 0), or the copy it publishes for the others (`crate::track::publish_view`,
+/// T597), so that every worker answers with the same check columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckView<'a> {
+    pub status: ServerStatus,
+    pub enabled: bool,
+    pub rise_count: u32,
+    pub fall_count: u32,
+    pub health: u32,
+    pub in_progress: bool,
+    pub last_status_code: &'static str,
+    pub last_status_desc: &'static str,
+    pub http_code: Option<u16>,
+    pub last_status_info: Option<std::borrow::Cow<'a, str>>,
+    pub check_duration_ms: u32,
+    pub failed_checks: u64,
+    pub down_transitions: u64,
+    pub rise: u32,
+    pub fall: u32,
+}
+
+/// [`ServerCheckState::carries_code`] for a status code.
+fn code_carries(code: &str) -> bool {
+    matches!(code, "L57DATA" | "L7OK" | "L7OKD" | "L7OKC" | "L7OKCD" | "L7STS" | "PROCERR" | "PROCTOUT" | "PROCOK")
+}
+
+impl CheckView<'_> {
+    /// See [`ServerCheckState::carries_code`].
+    #[must_use]
+    pub fn carries_code(&self) -> bool {
+        code_carries(self.last_status_code)
+    }
+
+    /// Takes the state of `c`, copying its info text only when it changed.
+    pub fn refresh(&mut self, c: &ServerCheckState) {
+        let info = self.last_status_info.take();
+        *self = CheckView { last_status_info: info, ..c.view().into_owned() };
+        if self.last_status_info.as_deref() != c.last_status_info.as_deref() {
+            self.last_status_info = c.last_status_info.as_deref().map(|s| std::borrow::Cow::Owned(s.to_string()));
+        }
+    }
+
+    /// The same view with its text owned. (Only the scalar fields are meant to be used before
+    /// [`Self::refresh`] sets the text.)
+    pub fn into_owned(self) -> CheckView<'static> {
+        CheckView { last_status_info: None, status: self.status, enabled: self.enabled, rise_count: self.rise_count, fall_count: self.fall_count, health: self.health, in_progress: self.in_progress, last_status_code: self.last_status_code, last_status_desc: self.last_status_desc, http_code: self.http_code, check_duration_ms: self.check_duration_ms, failed_checks: self.failed_checks, down_transitions: self.down_transitions, rise: self.rise, fall: self.fall }
+    }
+
+    fn full_health(&self) -> u32 {
+        self.rise + self.fall - 1
+    }
+}
+
 /// [`ServerCheckState::status_word`] written without building a `String`.
-pub struct StatusWord<'a>(pub &'a ServerCheckState);
+pub struct StatusWord<'a>(pub &'a CheckView<'a>);
 
 impl std::fmt::Display for StatusWord<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = self.0;
-        let (health, rise, fall) = (i64::from(s.health), i64::from(s.config.rise), i64::from(s.config.fall));
+        let (health, rise, fall) = (i64::from(s.health), i64::from(s.rise), i64::from(s.fall));
         let full = s.health >= s.full_health();
         match s.status {
             ServerStatus::Maint => f.write_str("MAINT"),

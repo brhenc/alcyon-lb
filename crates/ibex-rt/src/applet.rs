@@ -842,9 +842,8 @@ impl CliApplet {
                 self.run_patref(cmd, None);
             }
         } else {
-            self.out_buf.extend_from_slice(
-                b"Unknown command. Please enter 'help' for a list of valid commands.\n",
-            );
+            let msg = crate::cli_unknown::answer(&cli_words(cmd));
+            self.out_buf.extend_from_slice(msg.as_bytes());
             if self.interactive {
                 self.out_buf.extend_from_slice(b"\n> ");
             } else {

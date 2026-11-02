@@ -12746,7 +12746,11 @@ impl EngineDispatcher<'_> {
                     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
                     let raw: Vec<u8> = match resolve_error_body(&proxies[be_idx], &proxies[entry.proxy_idx], status, error_page.as_ref(), content_type.as_ref(), reply.as_deref(), page.as_deref()) {
                         ResolvedErrorBody::Raw(bytes) => bytes.to_vec(),
-                        ResolvedErrorBody::Custom { content_type, reply } => build_templated_error_response(status, content_type, reply, None, &res_ctx, registry),
+                        ResolvedErrorBody::Custom { content_type, reply } => {
+                            let mut r = build_templated_error_response(status, content_type, reply, None, &res_ctx, registry);
+                            fit_or_500(&entry.sess, proxies, entry.proxy_idx, be_idx, &mut r);
+                            r
+                        }
                     };
                     // The proxy's own answer, not a refusal: `LH`.
                     entry.sess.log.term = Some(*b"LH");
@@ -13580,6 +13584,7 @@ impl EngineDispatcher<'_> {
                                     let line = reply.is_some_and(crate::rule_compiled::Reply::uses_request_line).then(|| request_line_of(&ctx));
                                     let data = reply.filter(|r| r.needs_stream()).and_then(|_| stream_data(sess, proxies, &ctx, line.as_deref()));
                                     build_templated_error_response_into(full_resp, *status, content_type, reply, data.as_ref(), &ctx, registry);
+                                    fit_or_500(sess, proxies, proxy_idx, pages_idx, full_resp);
                                     send_proxy_reply(sess, &proxies[..], proxy_idx, pages_idx, full_resp);
                                 }
                             }
@@ -13618,7 +13623,9 @@ impl EngineDispatcher<'_> {
                                 let ctx = make_ctx!(sess);
                                 let line = reply.is_some_and(crate::rule_compiled::Reply::uses_request_line).then(|| request_line_of(&ctx));
                                 let data = reply.filter(|r| r.needs_stream()).and_then(|_| stream_data(sess, proxies, &ctx, line.as_deref()));
-                                build_templated_error_response(status_code, content_type, reply, data.as_ref(), &ctx, registry)
+                                let mut r = build_templated_error_response(status_code, content_type, reply, data.as_ref(), &ctx, registry);
+                                fit_or_500(sess, proxies, proxy_idx, pages_idx, &mut r);
+                                r
                             }
                         };
                         // `dreq` of the proxy whose rule denied (`http_req_get_intercept_rule`).
@@ -13659,7 +13666,9 @@ impl EngineDispatcher<'_> {
                                 let ctx = make_ctx!(sess);
                                 let line = reply.is_some_and(crate::rule_compiled::Reply::uses_request_line).then(|| request_line_of(&ctx));
                                 let data = reply.filter(|r| r.needs_stream()).and_then(|_| stream_data(sess, proxies, &ctx, line.as_deref()));
-                                build_templated_error_response(status_code, content_type, reply, data.as_ref(), &ctx, registry)
+                                let mut r = build_templated_error_response(status_code, content_type, reply, data.as_ref(), &ctx, registry);
+                                fit_or_500(sess, proxies, proxy_idx, pages_idx, &mut r);
+                                r
                             }
                         };
                         for_tracked(proxies, sess, |data| data.count_err());
@@ -17773,6 +17782,32 @@ fn resolve_error_body<'a>(
             }
             ResolvedErrorBody::Custom { content_type: None, reply: None }
         }
+    }
+}
+
+/// Whether a `string`/`lf-string` reply fits the HTX message `HAProxy` builds it in (T597): that
+/// holds `tune.bufsize` rounded up to 16, and the reply takes `96 + len(reason)` for its status
+/// line and end of headers, `name + value + 8` per header and its payload (bisected on
+/// `HAProxy` 3.5-dev8-885761-29: at bufsize 16384, `status 200 content-type text/plain` fits
+/// 16229 bytes). What does not fit is a 500 there ([`fit_or_500`]).
+fn templated_reply_fits(raw: &[u8], bufsize: usize) -> bool {
+    let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { return true };
+    let (head, body) = (&raw[..end], raw.len() - end - 4);
+    let mut lines = head.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let reason = lines.next().map_or(0, |l| l.splitn(3, |&b| b == b' ').nth(2).map_or(0, <[u8]>::len));
+    let mut need = 96 + reason + body;
+    for l in lines {
+        let Some(colon) = l.iter().position(|&b| b == b':') else { continue };
+        need += colon + l[colon + 1..].trim_ascii().len() + 8;
+    }
+    need <= (bufsize + 15) & !15
+}
+
+/// Replaces `resp`, a reply built from a `string`/`lf-string`, by the proxy's 500 when it does
+/// not fit the buffer ([`templated_reply_fits`]).
+fn fit_or_500(sess: &TcpSession, proxies: &[Proxy], fe_idx: usize, be_idx: usize, resp: &mut Vec<u8>) {
+    if !templated_reply_fits(resp, sess.bufsize) {
+        *resp = proxy_error_response(sess, &proxies[be_idx], &proxies[fe_idx], proxies, 500);
     }
 }
 

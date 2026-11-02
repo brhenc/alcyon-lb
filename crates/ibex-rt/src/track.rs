@@ -234,6 +234,7 @@ pub fn set_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState
     adopt(&mut ops, p, checks);
     if let Some(c) = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s) {
         c.set_admin_status(to);
+        publish_view(px, c);
         set_raw(proxies, p, s, c.published(), Kind::Admin, cause);
     } else if let Some(cur) = px.server_statuses.get(s) {
         queue(&mut ops, px, s, CheckOp::Admin(to));
@@ -260,6 +261,42 @@ pub enum CheckOp {
 /// the proxy: whoever changes their state, the owner included, holds it.
 #[derive(Debug, Default)]
 pub struct CheckOps(std::sync::Mutex<Vec<(u32, CheckOp)>>);
+
+/// The check state of each checked server of one proxy, as the owner of the checks (worker 0)
+/// last published it, for the stats pages the other workers serve (T597). A slot is `None`
+/// until its check has stepped once. Its lock is taken for a read per server row of a page and
+/// for a write per check step, never on the request path.
+#[derive(Debug, Default)]
+pub struct CheckViews(std::sync::Mutex<Vec<Option<crate::check::CheckView<'static>>>>);
+
+/// The check of server `s` of `px` for a stats page: its own state when this worker holds the
+/// checks, else the copy worker 0 published.
+pub fn check_view<'a>(px: &Proxy, checks: &'a [crate::check::ServerCheckState], p: usize, s: usize) -> Option<crate::check::CheckView<'a>> {
+    if !checks.is_empty() {
+        let i = checks.partition_point(|c| (c.proxy(), c.server()) < (p, s));
+        return checks.get(i).filter(|c| c.proxy() == p && c.server() == s).map(crate::check::ServerCheckState::view);
+    }
+    px.server_check_configs.get(s).filter(|c| c.is_some())?;
+    let views = px.txn_counters().check_views.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    views.get(s).and_then(Clone::clone)
+}
+
+/// Publishes the state of `check` for [`check_view`]; after every change of it.
+pub fn publish_view(px: &Proxy, check: &crate::check::ServerCheckState) {
+    let s = check.server();
+    let mut views = px.txn_counters().check_views.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if views.len() <= s {
+        views.resize(px.server_check_configs.len().max(s + 1), None);
+    }
+    match &mut views[s] {
+        Some(v) => v.refresh(check),
+        slot @ None => {
+            let mut v = check.view().into_owned();
+            v.refresh(check);
+            *slot = Some(v);
+        }
+    }
+}
 
 /// How many [`CheckOp`]s wait in all proxies.
 static OPS_PENDING: AtomicUsize = AtomicUsize::new(0);
@@ -319,7 +356,13 @@ pub fn adopt_pending(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckS
     for (p, px) in proxies.iter().enumerate() {
         if px.ids.tc.get().is_some() {
             let mut ops = lock_ops(px);
+            let had = !ops.is_empty();
             adopt(&mut ops, p, checks);
+            if had {
+                for c in checks.iter().filter(|c| c.proxy() == p) {
+                    publish_view(px, c);
+                }
+            }
             // Every check is here: what is left has none (a server added since), nothing
             // will take it, and it must not make every loop pass take the locks.
             OPS_PENDING.fetch_sub(ops.len(), Ordering::Release);
@@ -339,6 +382,7 @@ pub fn set_check_enabled(proxies: &[Proxy], checks: &mut [crate::check::ServerCh
         if enabled {
             c.next_check = now;
         }
+        publish_view(px, c);
         true
     } else if px.server_check_configs.get(s).is_some_and(Option::is_some) {
         queue(&mut ops, px, s, CheckOp::Enabled(enabled));
@@ -357,6 +401,7 @@ pub fn publish_check(proxies: &[Proxy], check: &mut crate::check::ServerCheckSta
     // after this publication, on top of it (T593).
     let mut ops = lock_ops(px);
     adopt(&mut ops, p, std::slice::from_mut(check));
+    publish_view(px, check);
     if check.enabled && s < px.server_statuses.len() {
         set_raw(proxies, p, s, check.published(), Kind::Op, Cause::Check(check));
     }
@@ -375,6 +420,7 @@ pub fn apply_health(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckSt
     adopt(&mut ops, p, checks);
     if let Some(c) = checks.iter_mut().find(|c| c.proxy() == p && c.server() == s) {
         c.set_health(up);
+        publish_view(px, c);
         set_raw(proxies, p, s, c.published(), Kind::Op, cause);
     } else if let Some(cur) = px.server_statuses.get(s) {
         queue(&mut ops, px, s, CheckOp::Health(up));
