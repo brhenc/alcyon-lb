@@ -308,7 +308,7 @@ class TestCovercheckNeedsSuite(StateCase):
         self.assertEqual(sel, ["lint"])
 
 
-class TestCheckinDriver(unittest.TestCase):
+class DriverCase(unittest.TestCase):
     """tools/checkin.sh itself, in a throwaway repository, with every stage replaced by a
     script in $IBEX_CHECKIN_FAKE (`<stage>`; missing means pass). Each run appends the stages
     it ran to $IBEX_CHECKIN_FAKE/ran."""
@@ -353,6 +353,8 @@ class TestCheckinDriver(unittest.TestCase):
                            env=self.env, capture_output=True, text=True, check=True)
         return [line.split()[0] for line in p.stdout.splitlines() if line.strip()]
 
+
+class TestCheckinDriver(DriverCase):
     def test_list_names_the_stages(self):
         ids = self.all_stages()
         for s in ("tripwire", "harness-tests", "findings", "oracles", "suite", "covercheck",
@@ -427,6 +429,118 @@ class TestCheckinDriver(unittest.TestCase):
         rc, out, ran = self.run_gate("--only", "measure")
         self.assertEqual(ran, ["measure"])
         self.assertIn(f"R=unset L=unset I=unset T={self.env['CARGO_TARGET_DIR']}\n", out)
+
+
+class TestCarryFromParent(DriverCase):
+    """T608: a child whose diff from the parent is only crates/*/tests/** carries the stages
+    that read no test file (smoke, diff-fuzz, surface) from the parent's full gate."""
+
+    CARRIED = ["smoke", "diff-fuzz", "surface"]
+
+    def setUp(self) -> None:
+        super().setUp()
+        # A base that does not move with HEAD, as on a branch (the key holds it).
+        self.env["IBEX_COVERCHECK_BASE"] = git(self.r.path, "rev-parse", "HEAD")
+        rc, out, _ran = self.run_gate()
+        self.assertEqual(rc, 0, out)
+
+    def rest(self):
+        return [s for s in self.all_stages() if s not in self.CARRIED]
+
+    def test_a_tests_only_child_carries_the_listed_stages(self):
+        self.r.write("crates/x/tests/it/a.rs", "// more coverage\n")
+        self.r.commit("test-only fix")
+        rc, out, ran = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(ran, self.rest(), out)
+        for s in self.CARRIED:
+            self.assertRegex(out, rf"{s}\s+PASS \(carried from [0-9a-f]+\)")
+        self.assertIn("checkin: PASS", out.splitlines()[-1])
+
+    def test_never_carried(self):
+        self.r.write("crates/x/tests/it/a.rs", "// t\n")
+        self.r.commit("test-only fix")
+        _rc, out, ran = self.run_gate()
+        for s in ("tripwire", "suite", "covercheck", "lint", "findings", "harness-tests",
+                  "oracles", "haproxy", "measure", "stray"):
+            self.assertIn(s, ran, out)
+
+    def test_a_src_change_carries_nothing(self):
+        self.r.write("crates/x/tests/it/a.rs", "// t\n")
+        self.r.write("crates/x/src/lib.rs", "fn a() {}\nfn b() {}\n")
+        self.r.commit("src + test")
+        _rc, out, ran = self.run_gate()
+        self.assertEqual(ran, self.all_stages(), out)
+        self.assertNotIn("carried", out)
+
+    def test_a_non_test_path_that_looks_like_one_carries_nothing(self):
+        for rel in ("crates/x/src/tests/a.rs", "tools/tests/a.rs", "crates/x/tests.rs",
+                    "harness/tests/a.py", "crates/x/Cargo.toml"):
+            self.r.write(rel, "x\n")
+            self.r.commit("touch " + rel)
+            _rc, out, ran = self.run_gate()
+            self.assertEqual(ran, self.all_stages(), rel + out)
+            git(self.r.path, "reset", "-q", "--hard", "HEAD^")
+
+    def test_a_parent_not_gated_in_full_carries_nothing(self):
+        self.r.write("crates/x/src/lib.rs", "fn a() {}\nfn b() {}\n")
+        self.r.commit("src, gated with --only lint")
+        self.run_gate("--only", "lint")
+        self.r.write("crates/x/tests/it/a.rs", "// t\n")
+        self.r.commit("test-only fix")
+        _rc, out, ran = self.run_gate()
+        self.assertEqual(ran, self.all_stages(), out)
+        self.assertNotIn("carried", out)
+
+    def test_a_parent_with_a_failed_stage_carries_nothing(self):
+        self.r.write("crates/x/src/lib.rs", "fn a() {}\nfn b() {}\n")
+        self.r.commit("src")
+        self.stage("suite", "exit 1\n")
+        self.run_gate()
+        os.unlink(os.path.join(self.fake, "suite"))
+        self.r.write("crates/x/tests/it/a.rs", "// t\n")
+        self.r.commit("test-only fix")
+        _rc, out, ran = self.run_gate()
+        self.assertEqual(ran, self.all_stages(), out)
+
+    def test_a_failure_in_a_rerun_stage_still_fails_the_verdict(self):
+        self.r.write("crates/x/tests/it/a.rs", "// t\n")
+        self.r.commit("test-only fix")
+        self.stage("covercheck", "exit 1\n")
+        rc, out, _ran = self.run_gate()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("checkin: FAIL", out)
+
+    def test_rerun_failed_keeps_the_carry(self):
+        self.r.write("crates/x/tests/it/a.rs", "// t\n")
+        self.r.commit("test-only fix")
+        self.stage("suite", 'mkdir -p "$IBEX_INSTRUMENTED"; echo "{}" > "$IBEX_INSTRUMENTED/suite-run.json"\n')
+        self.stage("covercheck", "exit 1\n")
+        self.run_gate()
+        os.unlink(os.path.join(self.fake, "covercheck"))
+        rc, out, ran = self.run_gate("--rerun-failed")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(ran, ["covercheck"], out)
+        self.assertIn("carried from", out)
+
+    def test_only_does_not_carry(self):
+        self.r.write("crates/x/tests/it/a.rs", "// t\n")
+        self.r.commit("test-only fix")
+        _rc, out, ran = self.run_gate("--only", "smoke")
+        self.assertEqual(ran, ["smoke"], out)
+        self.assertNotIn("carried", out)
+
+    def test_the_parent_key_follows_the_default_base(self):
+        # No base override: on main the base is HEAD^, which differs between parent and child.
+        self.env["IBEX_COVERCHECK_BASE"] = ""
+        self.r.write("crates/x/src/lib.rs", "fn a() {}\nfn b() {}\n")
+        self.r.commit("src")
+        rc, out, _ran = self.run_gate()
+        self.assertEqual(rc, 0, out)
+        self.r.write("crates/x/tests/it/a.rs", "// t\n")
+        self.r.commit("test-only fix")
+        _rc, out, ran = self.run_gate()
+        self.assertEqual(ran, self.rest(), out)
 
 
 if __name__ == "__main__":

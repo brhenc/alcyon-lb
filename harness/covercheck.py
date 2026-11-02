@@ -59,8 +59,10 @@ def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
 
 
-def default_base(repo: str = REPO, env: dict | None = None) -> str:
-    """The commit a change is judged against, as a full sha. See the module docstring."""
+def default_base(repo: str = REPO, env: dict | None = None, rev: str = "HEAD") -> str:
+    """The commit a change is judged against, as a full sha. See the module docstring.
+
+    `rev` is the commit judged, HEAD unless the gate asks what the base was at another (T608)."""
     env = os.environ if env is None else env
     override = env.get("IBEX_COVERCHECK_BASE") or env.get("COVERCHECK_BASE")
     if override:
@@ -68,18 +70,18 @@ def default_base(repo: str = REPO, env: dict | None = None) -> str:
         if r.returncode != 0:
             raise SystemExit(f"covercheck: base {override!r} is not a commit")
         return r.stdout.strip()
-    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    head = _git(repo, "rev-parse", rev).stdout.strip()
     main = _git(repo, "rev-parse", "--verify", "-q", "main").stdout.strip() or head
-    fork = _git(repo, "merge-base", "HEAD", main).stdout.strip() or head
+    fork = _git(repo, "merge-base", rev, main).stdout.strip() or head
     if fork != head:
         return fork  # a branch with commits of its own: everything it would bring in
     # On main, or a branch with nothing of its own yet: the uncommitted change if there is
     # one, else what the last commit changed. Never "nothing changed, pass".
-    dirty = (_git(repo, "diff", "--quiet", "HEAD", "--", "crates").returncode != 0
-             or bool(_untracked_sources(repo)))
+    dirty = rev == "HEAD" and (_git(repo, "diff", "--quiet", "HEAD", "--", "crates").returncode != 0
+                               or bool(_untracked_sources(repo)))
     if dirty:
         return head
-    parent = _git(repo, "rev-parse", "--verify", "-q", "HEAD^").stdout.strip()
+    parent = _git(repo, "rev-parse", "--verify", "-q", f"{rev}^").stdout.strip()
     return parent or head
 
 
