@@ -60,9 +60,10 @@ fn the_h2_mux_serves_a_stream_through_the_trait() {
     assert!(st.rx_htx_mut().is_eoh());
     st.set_dispatched();
     assert!(st.dispatched());
-    let head = st.take_req_fields().expect("head");
+    // CP2a: the head is the blocks the mux wrote, no fields.
     assert!(st.req_head().is_none());
-    m.give_back_head(head);
+    let rx = st.rx_head.take().expect("head");
+    assert!(st.head_facts.blocks > 0 && rx.len() >= st.head_facts.tail);
     assert_eq!(m.next_dispatch(), Some(3), "the next stream with a head");
     assert!(m.stream(5).is_none() && m.stream(1 << 40).is_none());
 
@@ -123,8 +124,11 @@ impl RxTaken for H2MuxContext {
 
 /// What the bridge will do, generic over the mux: every call goes through the trait.
 fn respond<M: HtxMux>(m: &mut M, id: u64) {
-    let head = m.stream_mut(id).and_then(HtxStream::take_req_fields).expect("head");
-    m.give_back_head(head);
+    // An h3 head is its fields; an h2 one the blocks the mux wrote (CP2a), which the stream
+    // drops with it.
+    if let Some(head) = m.stream_mut(id).and_then(HtxStream::take_req_fields) {
+        m.give_back_head(head);
+    }
     assert!(m.send_interim(id, b"HTTP/1.1 100 Continue"));
     assert!(m.send_head(id, b"HTTP/1.1 200 OK", false));
     let n = m.data_budget(id).min(2);

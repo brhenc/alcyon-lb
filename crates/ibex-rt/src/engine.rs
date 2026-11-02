@@ -9455,11 +9455,14 @@ fn h2_child_start(
     move_server(owner, child, fdtab);
     // It is not this stream's until a request takes it (`bc_idle`, T491).
     child.sess.bc_idle = child.sess.srv.is_some();
-    let head = crate::h2_bridge::start_request(&mut child.sess, d);
-    if let Some(h2) = owner.sess.h2_ctx.as_deref_mut() {
-        h2.give_back_head(head);
-    } else if let Some(h3) = owner.sess.h3_owner_mut() {
-        ibex_proto::htx_mux::HtxMux::give_back_head(&mut *h3.mux, head);
+    // A head kept as its fields gives its memory back to the connection (an h2 head written as
+    // blocks is the child's `htx_buf` now, CP2a).
+    if let Some(head) = crate::h2_bridge::start_request(&mut child.sess, d) {
+        if let Some(h2) = owner.sess.h2_ctx.as_deref_mut() {
+            h2.give_back_head(head);
+        } else if let Some(h3) = owner.sess.h3_owner_mut() {
+            ibex_proto::htx_mux::HtxMux::give_back_head(&mut *h3.mux, head);
+        }
     }
     // The stream's own `timeout client` starts with it (T300).
     child.sess.arm_client(now);
@@ -19286,10 +19289,11 @@ mod pending_req_head_tests {
         let mut s = TcpSession::h2_child_of(&mut owner, (0, TaskRef::NONE), stream);
         let d = crate::h2_bridge::H2Dispatch {
             stream: H2ActiveStream { id: 1, body: H2ReqBody { chunked, ..H2ReqBody::default() }, chunk_out: chunked },
-            head: Box::new(head),
+            head: crate::h2_bridge::DispatchHead::Fields(Box::new(head)),
             req_htx: 0,
             request_line: None,
             bad_request: false,
+            no_memory: false,
             add_len: None,
         };
         crate::h2_bridge::start_request(&mut s, d);

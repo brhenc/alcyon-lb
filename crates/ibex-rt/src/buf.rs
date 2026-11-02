@@ -409,6 +409,14 @@ fn alloc_small() -> Option<Box<[u8]>> {
     take_mem(&BUF_SMALL)
 }
 
+/// The memory of an [`ibex_proto::htx::RxHead`] no buffer adopted (a stream reset before it
+/// was served): back to the pool of its size, all of it zeroed first under
+/// `tune.ibex.zero-buffers` (what the head wrote is not known here).
+fn give_rx_head(mem: Box<[u8]>) {
+    let n = mem.len();
+    drop(Buf::adopt(ibex_proto::htx::RxHead::from_box(mem), n, 0));
+}
+
 fn alloc_large() -> Option<Box<[u8]>> {
     ensure_registered();
     take_mem(&BUF_LARGE)
@@ -612,12 +620,16 @@ impl Buf {
         self.data = new;
     }
 
-    /// The memory of a small buffer for a request head to be written into before the stream
-    /// that owns it exists (CP1, [`ibex_proto::htx::RxHead`]); `None` when the pool refuses
-    /// (memory short, `tune.fail-alloc`): the caller refuses the stream, never mallocs.
+    /// The memory of a buffer for a request head to be written into before the stream that
+    /// owns it exists (CP1, [`ibex_proto::htx::RxHead`]): a small one when twice the `need`
+    /// estimated fits it, as a head's own HTX takes one (T312), else a standard one. `None`
+    /// when the pool refuses (memory short, `tune.fail-alloc`): the caller refuses the stream,
+    /// never mallocs. Dropped without being adopted, the memory goes back to its pool, zeroed
+    /// under `tune.ibex.zero-buffers` (CP2: the mux's `H2MuxContext::take_rx_head`).
     #[must_use]
-    pub fn take_rx_head() -> Option<ibex_proto::htx::RxHead> {
-        alloc_small().map(ibex_proto::htx::RxHead::from_box)
+    pub fn take_rx_head(need: usize) -> Option<ibex_proto::htx::RxHead> {
+        let mem = if need.saturating_mul(2) <= get_bufsize_small() { alloc_small() } else { alloc_standard() };
+        mem.map(|m| ibex_proto::htx::RxHead::pooled(m, give_rx_head))
     }
 
     /// The buffer that owns `head`'s memory, the HTX of `blocks` blocks and `tail` bytes of
@@ -627,7 +639,11 @@ impl Buf {
     #[must_use]
     pub fn adopt(head: ibex_proto::htx::RxHead, tail: usize, blocks: usize) -> Self {
         let data = head.into_box();
-        let class = if data.len() == get_bufsize_small() { BufClass::Small } else { BufClass::Custom };
+        let class = match data.len() {
+            n if n == get_bufsize_small() => BufClass::Small,
+            n if n == get_bufsize() => BufClass::Standard,
+            _ => BufClass::Custom,
+        };
         let mut b = Buf { data, head: 0, len: 0, hwm: 0, lo: NO_LO, class, eoh: Cell::new(EOH_UNKNOWN) };
         b.note_htx(tail, blocks * ibex_proto::htx::HTX_DESC_SIZE);
         b
@@ -1147,7 +1163,7 @@ mod tests {
     #[test]
     fn an_adopted_head_is_the_buffers_htx_and_its_memory_goes_back_to_the_small_pool() {
         use ibex_proto::htx::HtxSlice;
-        let mut rx = Buf::take_rx_head().expect("the pool has memory");
+        let mut rx = Buf::take_rx_head(100).expect("the pool has memory");
         let at = rx.len();
         assert_eq!(at, super::get_bufsize_small());
         let (tail, blocks) = {
@@ -1165,10 +1181,22 @@ mod tests {
             assert_eq!(s.as_ref().get_header_bytes(b"host"), Some(&b"h"[..]));
         }
         drop(b);
-        let again = Buf::take_rx_head().expect("the pool has it back");
+        let again = Buf::take_rx_head(100).expect("the pool has it back");
         assert_eq!(again.len(), at);
         let b = Buf::adopt(again, 0, 0);
         assert_eq!(b.raw_slice().as_ptr(), ptr, "the box the head went in is the one that came back");
+        drop(b);
+        // CP2a: one no buffer adopts goes back by itself; a head too large for a small
+        // buffer gets a standard one, which goes back to its own pool.
+        drop(Buf::take_rx_head(100).expect("the pool has memory"));
+        let b = Buf::adopt(Buf::take_rx_head(100).expect("the pool has it back"), 0, 0);
+        assert_eq!(b.raw_slice().as_ptr(), ptr, "a head dropped unadopted gave its box back");
+        let big = Buf::take_rx_head(super::get_bufsize_small()).expect("the pool has memory");
+        assert_eq!(big.len(), super::get_bufsize());
+        let big_ptr = big.bytes().as_ptr();
+        drop(big);
+        let b = Buf::adopt(Buf::take_rx_head(super::get_bufsize_small()).expect("the pool has it back"), 0, 0);
+        assert_eq!((b.class(), b.raw_slice().as_ptr()), (super::BufClass::Standard, big_ptr));
         // A memory of another size than the class's is of no pool.
         let odd = Buf::adopt(ibex_proto::htx::RxHead::from_box(vec![0u8; 100].into_boxed_slice()), 0, 0);
         assert_eq!(odd.class(), super::BufClass::Custom);

@@ -928,6 +928,12 @@ impl DecodedFields {
         self.spans.len()
     }
 
+    /// The bytes of the names and values.
+    #[must_use]
+    pub(crate) fn byte_len(&self) -> usize {
+        self.text.len()
+    }
+
     /// The fields in order, as name and value, in bytes.
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &[u8])> + Clone + '_ {
         self.spans.iter().map(|&(n, v, e)| (&self.text[n as usize..v as usize], &self.text[v as usize..e as usize]))
