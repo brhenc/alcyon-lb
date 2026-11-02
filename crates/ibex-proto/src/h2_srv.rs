@@ -1161,7 +1161,7 @@ impl H2SrvCodec {
                     ix = None;
                 }
             }
-            ix = ix.filter(|ix| written_field_canonical(n, v) && u32::try_from(r.len() - base).is_ok());
+            ix = ix.filter(|_| written_field_canonical(n, v) && u32::try_from(r.len() - base).is_ok());
             if let Some(i) = ix.as_mut() {
                 #[allow(clippy::cast_possible_truncation)]
                 let ok = i.push_written(at as u32, (at + n.len()) as u32, (r.len() - base) as u32);
