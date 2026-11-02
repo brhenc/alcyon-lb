@@ -86,6 +86,8 @@ pub struct H1MuxContext {
     pub tx_buf: Vec<u8>,
     pub tx_consumed: usize,
     pub tx_chunked: bool,
+    /// The head of the message being written has been seen: the rest is body.
+    pub tx_head_done: bool,
     pub streams_used: u32,
     pub streams_total: u64,
     pub is_shut: bool,
@@ -114,6 +116,7 @@ impl H1MuxContext {
             tx_buf: Vec::with_capacity(4096),
             tx_consumed: 0,
             tx_chunked: false,
+            tx_head_done: false,
             streams_used: 0,
             streams_total: 0,
             is_shut: false,
@@ -140,6 +143,7 @@ impl H1MuxContext {
         self.rx_wire_buf.clear();
         self.rx_wire_consumed = 0;
         self.tx_chunked = false;
+        self.tx_head_done = false;
         self.is_upgrade = false;
         self.stream_state = H1StreamState::Idle;
     }
@@ -427,40 +431,57 @@ impl Mux for MuxH1 {
             return Ok(input.len());
         }
 
-        // Inspect start line and headers for protocol upgrade or connection directives
-        let input_str = std::str::from_utf8(input).unwrap_or("");
-        if input_str.starts_with("HTTP/1.1 101") || input_str.starts_with("HTTP/1.0 101") {
+        // Once the head has been written, what follows is body: it is forwarded as it is and
+        // never inspected (IBEX-H1MUX-SNDBUF-SNIFF-001).
+        if ctx.tx_head_done {
+            ctx.tx_buf.extend_from_slice(input);
+            return Ok(input.len());
+        }
+
+        // Inspect start line and headers (only those) for protocol upgrade or connection
+        // directives; a slice that ends inside the head is inspected again with the next one.
+        let (head, body) = match input.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(end) => {
+                ctx.tx_head_done = true;
+                input.split_at(end + 4)
+            }
+            None => (input, &input[input.len()..]),
+        };
+        let head_str = std::str::from_utf8(head).unwrap_or("");
+        let head_lower = head_str.to_ascii_lowercase();
+        // A header line is what starts a line: the same words inside a value are not it.
+        let has_line = |line: &str| head_lower.split("\r\n").skip(1).any(|l| l.starts_with(line));
+        if head_str.starts_with("HTTP/1.1 101") || head_str.starts_with("HTTP/1.0 101") {
             ctx.enter_tunnel();
-        } else if (input_str.starts_with("HTTP/1.1 200") || input_str.starts_with("HTTP/1.0 200"))
-            && ctx.is_upgrade
-        {
+        } else if (head_str.starts_with("HTTP/1.1 200") || head_str.starts_with("HTTP/1.0 200")) && ctx.is_upgrade {
             ctx.enter_tunnel();
         }
 
-        if input_str
-            .to_ascii_lowercase()
-            .contains("transfer-encoding: chunked")
-        {
+        if has_line("transfer-encoding: chunked") {
             ctx.tx_chunked = true;
         }
 
-        let to_strip = !ctx.is_server && !ctx.conn_close && input_str.to_ascii_lowercase().contains("connection: close");
-        if to_strip {
-            let stripped = strip_connection_close_header(input);
-            ctx.tx_buf.extend_from_slice(&stripped);
+        let close = has_line("connection: close");
+        if !ctx.is_server && !ctx.conn_close && close {
+            ctx.tx_buf.extend_from_slice(&strip_connection_close_header(head));
         } else {
-            if input_str.to_ascii_lowercase().contains("connection: close") {
+            if close {
                 ctx.conn_close = true;
             }
-            ctx.tx_buf.extend_from_slice(input);
+            ctx.tx_buf.extend_from_slice(head);
+        }
+        if !body.is_empty() {
+            if ctx.tx_chunked {
+                ctx.send_chunk(body);
+            } else {
+                ctx.tx_buf.extend_from_slice(body);
+            }
         }
 
         // If complete bodyless response was buffered and not upgrading, mark stream done
-        if !ctx.is_tunnel && !ctx.tx_chunked && input_str.contains("\r\n\r\n") {
-            let cl_zero = input_str.to_ascii_lowercase().contains("content-length: 0");
-            let is_head = input_str.starts_with("HTTP/1.1 204")
-                || input_str.starts_with("HTTP/1.1 304")
-                || cl_zero;
+        if !ctx.is_tunnel && !ctx.tx_chunked && ctx.tx_head_done {
+            let cl_zero = has_line("content-length: 0");
+            let is_head = head_str.starts_with("HTTP/1.1 204") || head_str.starts_with("HTTP/1.1 304") || cl_zero;
             if is_head {
                 ctx.finish_stream();
             }
