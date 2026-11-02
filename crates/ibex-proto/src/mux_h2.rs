@@ -3052,6 +3052,16 @@ mod tests {
         assert_eq!(ctx.streams.get(&3).and_then(|st| st.request_header("host")), Some("a"), "the table as the client has it");
     }
 
+    /// HEADERS again on a stream whose request has ended (its head with `END_STREAM`, the
+    /// stream not yet closed by the response) are a stream error `STREAM_CLOSED`.
+    #[test]
+    fn headers_on_a_stream_whose_request_ended_reset_it_stream_closed() {
+        let block = [&[0x82u8, 0x86, 0x84][..], &lit(b":authority", b"a")].concat();
+        let f = headers(frame_flags::END_HEADERS | frame_flags::END_STREAM, 1, block);
+        let (_, s) = answer(&[f.clone(), f].concat());
+        assert_eq!(s, vec![(3, 1, 5)]);
+    }
+
     /// CP2b-2: an extended CONNECT to a websocket is written as blocks with the
     /// `sec-websocket-key` the data path's hook makes, after the other headers; the client's own
     /// key is kept and none made.
