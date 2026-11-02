@@ -40,9 +40,20 @@ pub enum Op {
     /// The sample context the `track-sc` rules of `http-request` read, built for a request:
     /// counted in debug builds only (T584). A proxy without such a rule builds none.
     TrackCtx = 10,
+    /// A run of a stream (`step_stream_run`, an HTTP/3 owner's excepted): counted in debug
+    /// builds only (T599).
+    StreamRun = 11,
+    /// What one side of a stream wants from the poller derived (`update_interests`): counted
+    /// in debug builds only (T599). A side with no socket of its own derives nothing.
+    WantDerive = 12,
+    /// The rare checks of a stream run (connect log, rate max, deferred session rules, TCP
+    /// inspection, ...) looked at: counted in debug builds only (T599). Not when none is armed.
+    RareCheck = 13,
+    /// The engine's dispatcher built: counted in debug builds only (T599). Once an engine.
+    DispatcherBuild = 14,
 }
 
-const OPS: usize = 11;
+const OPS: usize = 15;
 
 thread_local! {
     static COUNTS: [Cell<u64>; OPS] = const { [const { Cell::new(0) }; OPS] };

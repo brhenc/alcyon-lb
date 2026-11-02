@@ -877,6 +877,11 @@ pub struct TcpSession {
     /// them in `conn_complete_session`, after the handshake, so `src` and `fc_pp_tlv`
     /// read the header.
     pub session_rules_pending: bool,
+    /// One of the rare checks of a stream run may be armed (T599): the connect log line and
+    /// `rate_max` (the entry's), the deferred `tcp-request session` rules, the content
+    /// inspection, the `tcp-response content` rules. Set where each is armed (and at
+    /// creation), cleared by the run that finds none: a run with it clear looks at none.
+    pub rare_armed: bool,
     pub proxy_info: Option<Box<ibex_proto::ProxyInfo>>,
     pub server_addr: Option<SocketAddr>,
     pub send_proxy_prepended: bool,
@@ -1275,6 +1280,9 @@ impl TcpSession {
         // The `tcp-request content` rules the owner armed for the next request run on this
         // one (`end_txn` armed them for the next request of the connection).
         c.tcp_inspect_done = std::mem::replace(&mut owner.tcp_inspect_done, true);
+        // A stream's entry has no connect log or `rate_max` of its own, nor deferred session
+        // rules: the content inspection it takes over is its only rare check (T599).
+        c.rare_armed = !c.tcp_inspect_done;
         c.inspect_exp = owner.inspect_exp.take();
         c.vars.copy_scope_from(&owner.vars, ibex_sample::VarScope::Sess);
         c.log = owner.log.clone();
@@ -1360,6 +1368,7 @@ impl TcpSession {
         self.ending = None;
         if let Some(exp) = inspect {
             self.tcp_inspect_done = false;
+            self.rare_armed = true;
             self.inspect_exp = exp;
         }
         // The streams that are over are let go, as `HAProxy` frees a stream when it closes
@@ -1521,6 +1530,7 @@ impl TcpSession {
             accept_proxy_v2: false,
             proxy_handshake_done: false,
             session_rules_pending: false,
+            rare_armed: true,
             proxy_info: None,
             server_addr: None,
             send_proxy_prepended: false,
@@ -1922,6 +1932,7 @@ impl TcpSession {
         // `AN_RES_INSPECT` runs from here, before any of the response has arrived.
         if let Some(delay) = self.res_inspect_armed.take() {
             self.res_inspect_pending = true;
+            self.rare_armed = true;
             self.res_inspect_exp = delay.map(|ms| now.add(ms));
         }
     }
@@ -3917,13 +3928,21 @@ impl TcpSession {
         exp
     }
 
-    /// What each side needs from the poller.
+    /// What each side needs from the poller ([`Self::cli_want`], [`Self::srv_want`]).
     ///
     /// Derived from buffer occupancy, which is what makes backpressure work: a full
     /// request buffer stops us asking for client readability, the client's socket
     /// buffer fills, and TCP slows the sender.
     #[must_use]
     pub fn interests(&self) -> (Want, Want) {
+        (self.cli_want(), self.srv_want())
+    }
+
+    /// What the client side needs from the poller. Derived only for a stream with a client
+    /// socket: an HTTP/2 or HTTP/3 stream's is its owner's (T599).
+    #[must_use]
+    #[inline]
+    pub fn cli_want(&self) -> Want {
         // An HTTP/2 client is written only what is framed in `tx_buf`: the response in
         // `rep` goes there as the flow-control windows allow (`h2_forward_response`), and
         // what they hold back cannot be written. Counting it asked the level-triggered
@@ -3939,14 +3958,20 @@ impl TcpSession {
         // talking, and the condition below it -- "we have a response queued" -- is false
         // throughout one, so without this the connection is never polled for writability
         // and the handshake never finishes. It is always false for a plaintext session.
-        let cli = Want {
+        Want {
             // An HTTP/2 demux that is held reads nothing (`H2MuxContext::wants_input`): asked
             // for readability then, the level-triggered poller woke the session for the
             // bytes left in the socket over and over, a core spinning (T235).
             read: self.cli_state.can_read() && !self.req.is_full() && self.h2_ctx.as_ref().is_none_or(|h| h.wants_input()),
             write: self.cli_state.can_write() && (has_pending || self.cli_xprt.wants_write()),
-        };
-        let srv = match self.srv_state {
+        }
+    }
+
+    /// What the server side needs from the poller.
+    #[must_use]
+    #[inline]
+    pub fn srv_want(&self) -> Want {
+        match self.srv_state {
             ScState::Connecting => Want {
                 read: false,
                 write: true,
@@ -3956,8 +3981,7 @@ impl TcpSession {
                 write: self.srv_state.can_write() && ((self.req_window() > 0 && !self.srv_xprt.send_blocked()) || self.srv_xprt.wants_write()),
             },
             _ => Want::default(),
-        };
-        (cli, srv)
+        }
     }
 }
 
