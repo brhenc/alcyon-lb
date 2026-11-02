@@ -99,6 +99,7 @@ mod cli_limits;
 mod cli_map_payload_cap;
 mod cli_one_command_per_connection;
 mod cli_options;
+mod t612a_cli;
 mod cli_set_server;
 mod cli_set_server_health;
 mod cli_show_events;
