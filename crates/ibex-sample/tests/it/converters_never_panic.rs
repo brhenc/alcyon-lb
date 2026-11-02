@@ -127,13 +127,13 @@ fn fetches_never_panic(use_htx: bool) {
             htx.push(HtxBlock::Eoh);
             htx.push(HtxBlock::Data(body.to_vec()));
             htx.push(HtxBlock::Eom);
-            let ctx = SampleContext {
+            let ctx = SampleContext { phase: &ibex_sample::PhaseCtx {
                 htx: use_htx.then_some(&htx),
                 req_uri: Some(uri), req_method: Some("GET"), req_version: Some("HTTP/1.1"),
                 req_headers: Some(&hdrs), res_headers: Some(&hdrs), res_status: Some(200), res_version: Some("HTTP/1.1"),
                 req_body: Some(body), res_body: Some(body), raw_req: Some(body), raw_res: Some(body),
                 proxy_tlvs: Some(body), ..Default::default()
-            };
+            }, live: None };
             for a in &args {
                 let r = catch_unwind(AssertUnwindSafe(|| { let _ = (d.func)(&ctx, a); }));
                 if r.is_err() { bad.push(format!("{name}: uri {uri:?} body#{bi} args {a:?}")); break 'o; }
@@ -180,7 +180,7 @@ fn client_hello() -> Vec<u8> {
 fn raw_fetches_never_panic_on_a_mangled_buffer() {
     let reg = Registry::new();
     let base = client_hello();
-    let sni = (reg.get_fetch("req.ssl_sni").expect("fetch").func)(&SampleContext { raw_req: Some(&base), ..Default::default() }, &[]);
+    let sni = (reg.get_fetch("req.ssl_sni").expect("fetch").func)(&SampleContext { phase: &ibex_sample::PhaseCtx { raw_req: Some(&base), ..Default::default() }, live: None }, &[]);
     assert_eq!(sni, Some(Sample::Str("a.b".into())), "the unmangled hello must parse, or the test proves nothing");
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
     let mut rnd = move || {
@@ -214,7 +214,7 @@ fn raw_fetches_never_panic_on_a_mangled_buffer() {
     for name in reg.fetch_names() {
         let Some(d) = reg.get_fetch(name) else { continue };
         'o: for b in &bufs {
-            let ctx = SampleContext { raw_req: Some(b), raw_res: Some(b), ..Default::default() };
+            let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { raw_req: Some(b), raw_res: Some(b), ..Default::default() }, live: None };
             for a in &arglists {
                 if catch_unwind(AssertUnwindSafe(|| { let _ = (d.func)(&ctx, a); })).is_err() {
                     bad.push(format!("{name}: buffer {b:02x?} args {a:?}"));

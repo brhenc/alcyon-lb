@@ -29,11 +29,11 @@ fn a_pattern_keeps_its_spaces_and_escaped_bytes() {
     ] {
         let e = Expr::parse(&expr).unwrap_or_else(|err| panic!("{expr:?}: {err:?}"));
         for p in payloads {
-            let ctx = SampleContext { req_body: Some(p), ..Default::default() };
+            let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { req_body: Some(p), ..Default::default() }, live: None };
             assert!(e.eval(reg, &ctx), "{expr:?} should match {p:?}");
         }
         for p in [&b"a b"[..], b"a b\\r\\n$4", b"a", b"A\\\\"] {
-            let ctx = SampleContext { req_body: Some(p), ..Default::default() };
+            let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { req_body: Some(p), ..Default::default() }, live: None };
             assert!(!e.eval(reg, &ctx), "{expr:?} should not match {p:?}");
         }
     }

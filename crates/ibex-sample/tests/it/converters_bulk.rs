@@ -1198,7 +1198,7 @@ fn test_conv_when() {
     use ibex_sample::registry::{SampleContext, StreamFacts};
     let reg = Registry::new();
     let when = |facts: Option<StreamFacts>, args: &[&str]| {
-        let ctx = SampleContext { stream: facts, ..Default::default() };
+        let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { stream: facts, ..Default::default() }, live: None };
         let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
         reg.eval("str", &["v".to_string()], &[("when", args)], &ctx)
     };

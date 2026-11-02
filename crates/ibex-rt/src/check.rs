@@ -787,7 +787,7 @@ fn with_check_ctx<R>(
     let reg = crate::engine::sample_registry();
     let srv = px.server_ids.get(check.server()).map(String::as_str);
     let view = ProxiesView(proxies);
-    let mut ctx = ibex_sample::SampleContext {
+    let mut ctx = ibex_sample::PhaseCtx {
         fe_name: Some(&px.name),
         fe_id: Some(px.ids.iid),
         be_name: Some(&px.name),
@@ -813,10 +813,10 @@ fn with_check_ctx<R>(
         pid: std::process::id(),
         ..LogData::default()
     };
-    let unique_id = px.unique_id_format.as_ref().map(|f| f.render(&data, reg, &ctx));
+    let unique_id = px.unique_id_format.as_ref().map(|f| f.render(&data, reg, &ctx.as_ctx()));
     ctx.unique_id = unique_id.as_deref();
     data.unique_id = unique_id.as_deref();
-    f(&data, &ctx)
+    f(&data, &ctx.as_ctx())
 }
 
 /// Runs the `set-var` / `unset-var` rules among `rules` in order on `vars`; a `set-var`

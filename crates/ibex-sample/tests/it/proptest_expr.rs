@@ -30,10 +30,10 @@ proptest! {
     ) {
         let registry = Registry::new();
         let uri = format!("/{prefix}/{middle}/{suffix}");
-        let ctx = SampleContext {
+        let ctx = SampleContext { phase: &ibex_sample::PhaseCtx {
             req_uri: Some(&uri),
             ..Default::default()
-        };
+        }, live: None };
 
         let expr_beg = Expr::parse(&format!("path -m beg /{prefix}")).unwrap();
         prop_assert!(expr_beg.eval(&registry, &ctx));
@@ -49,10 +49,10 @@ proptest! {
     #[test]
     fn prop_expr_port_integer_matcher(port in 1024u16..=65535) {
         let registry = Registry::new();
-        let ctx = SampleContext {
+        let ctx = SampleContext { phase: &ibex_sample::PhaseCtx {
             client_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)),
             ..Default::default()
-        };
+        }, live: None };
 
         let expr_eq = Expr::parse(&format!("src_port -m eq {port}")).unwrap();
         prop_assert!(expr_eq.eval(&registry, &ctx));
@@ -74,10 +74,10 @@ proptest! {
     #[test]
     fn prop_expr_converter_chain(uri in "[a-zA-Z0-9/]{1,32}", delta in 0i64..100) {
         let registry = Registry::new();
-        let ctx = SampleContext {
+        let ctx = SampleContext { phase: &ibex_sample::PhaseCtx {
             req_uri: Some(&uri),
             ..Default::default()
-        };
+        }, live: None };
 
         let uri_len = i64::try_from(uri.len()).unwrap_or(i64::MAX);
         let expected = uri_len + delta;
@@ -109,23 +109,23 @@ proptest! {
         let mut htx = ibex_proto::htx::HtxSlice::new(&mut buf);
         parser.parse(wire.as_bytes(), &mut htx).unwrap();
 
-        let ctx_htx = SampleContext {
+        let ctx_htx = SampleContext { phase: &ibex_sample::PhaseCtx {
             htx_slice: Some(htx.as_ref()),
             ..Default::default()
-        };
+        }, live: None };
 
         let headers = vec![
             ("host".to_string(), host_val.clone()),
             ("content-length".to_string(), body_content.len().to_string()),
         ];
-        let ctx_current = SampleContext {
+        let ctx_current = SampleContext { phase: &ibex_sample::PhaseCtx {
             req_uri: Some(&uri),
             req_method: Some(&method),
             req_headers: Some(&headers),
             req_version: Some("HTTP/1.1"),
             req_body: if body_content.is_empty() { None } else { Some(body_content.as_bytes()) },
             ..Default::default()
-        };
+        }, live: None };
 
         let expressions = [
             "path",
@@ -298,13 +298,13 @@ fn test_fc_src_and_fc_dst_fetches() {
     let fc_dst_fetch = reg.get_fetch("fc_dst").expect("fc_dst registered");
 
     // Case 1: Specific client/server and explicit fc_src/fc_dst in SampleContext
-    let ctx_explicit = SampleContext {
+    let ctx_explicit = SampleContext { phase: &ibex_sample::PhaseCtx {
         client_addr: Some(client_sock),
         server_addr: Some(server_sock),
         fc_src: Some(fc_src_sock),
         fc_dst: Some(fc_dst_sock),
         ..Default::default()
-    };
+    }, live: None };
 
     let src_res = (fc_src_fetch.func)(&ctx_explicit, &[]);
     assert_eq!(
@@ -321,13 +321,13 @@ fn test_fc_src_and_fc_dst_fetches() {
     );
 
     // Case 2: Fallback when fc_src/fc_dst are None -> client_addr/server_addr
-    let ctx_fallback = SampleContext {
+    let ctx_fallback = SampleContext { phase: &ibex_sample::PhaseCtx {
         client_addr: Some(client_sock),
         server_addr: Some(server_sock),
         fc_src: None,
         fc_dst: None,
         ..Default::default()
-    };
+    }, live: None };
 
     let src_fallback = (fc_src_fetch.func)(&ctx_fallback, &[]);
     assert_eq!(
@@ -346,11 +346,11 @@ fn test_fc_src_and_fc_dst_fetches() {
     // Case 3: IPv6 addresses
     let v6_src: SocketAddr = "[2001:db8:cafe::42]:50000".parse().unwrap();
     let v6_dst: SocketAddr = "[2001:db8:beef::99]:8443".parse().unwrap();
-    let ctx_v6 = SampleContext {
+    let ctx_v6 = SampleContext { phase: &ibex_sample::PhaseCtx {
         fc_src: Some(v6_src),
         fc_dst: Some(v6_dst),
         ..Default::default()
-    };
+    }, live: None };
 
     assert_eq!(
         (fc_src_fetch.func)(&ctx_v6, &[]),
@@ -457,10 +457,10 @@ fn test_req_payload_and_req_len_fetches() {
     let len_fetch = reg.get_fetch("req.len").expect("req.len registered");
 
     let body = b"HTTP request body content 12345";
-    let ctx_with_body = SampleContext {
+    let ctx_with_body = SampleContext { phase: &ibex_sample::PhaseCtx {
         req_body: Some(body),
         ..Default::default()
-    };
+    }, live: None };
 
     // req.len with req_body
     assert_eq!(
@@ -470,11 +470,11 @@ fn test_req_payload_and_req_len_fetches() {
 
     // req.len fallback to content-length header
     let hdrs = vec![("content-length".to_string(), "99".to_string())];
-    let ctx_with_hdr = SampleContext {
+    let ctx_with_hdr = SampleContext { phase: &ibex_sample::PhaseCtx {
         req_body: None,
         req_headers: Some(&hdrs),
         ..Default::default()
-    };
+    }, live: None };
     assert_eq!(
         (len_fetch.func)(&ctx_with_hdr, &[]),
         Some(Sample::Sint(99))
@@ -568,10 +568,10 @@ fn test_expr_eval_all_samples() {
     tlv_bytes.extend_from_slice(&[0x01, 0x00, 0x06]);
     tlv_bytes.extend_from_slice(b"value2");
 
-    let ctx = SampleContext {
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx {
         proxy_tlvs: Some(&tlv_bytes),
         ..Default::default()
-    };
+    }, live: None };
 
     let expr = Expr::parse("fc_pp_tlv(0x01)").unwrap();
     let samples = expr.eval_all_samples(reg, &ctx);
@@ -647,9 +647,9 @@ fn fc_pp_unique_id_is_the_first_unique_id_tlv() {
     tlvs.extend_from_slice(b"one");
     tlvs.extend_from_slice(&[0x05, 0x00, 0x03]);
     tlvs.extend_from_slice(b"two");
-    let ctx = SampleContext { proxy_tlvs: Some(&tlvs), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { proxy_tlvs: Some(&tlvs), ..Default::default() }, live: None };
     let expr = Expr::parse("fc_pp_unique_id").unwrap();
     assert_eq!(expr.eval_all_samples(reg, &ctx), [Sample::Str("one".into())]);
-    let none = SampleContext { proxy_tlvs: Some(&[0x01, 0x00, 0x00]), ..Default::default() };
+    let none = SampleContext { phase: &ibex_sample::PhaseCtx { proxy_tlvs: Some(&[0x01, 0x00, 0x00]), ..Default::default() }, live: None };
     assert!(expr.eval_all_samples(reg, &none).is_empty());
 }

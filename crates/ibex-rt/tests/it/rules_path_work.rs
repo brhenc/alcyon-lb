@@ -326,3 +326,14 @@ fn the_response_fetches_read_the_head_blocks() {
     assert!(rsp.contains("\r\nx-names: x-empty,set-cookie,content-length\r\n"), "res.hdr_names: {rsp:?}");
     assert!(rsp.contains("\r\nx-cook: \u{fffd}t\u{fffd}\r\n"), "res.cook of a Latin-1 value: {rsp:?}");
 }
+
+/// CP4a-2: what a rule assembles to evaluate a sample is the small per-rule part of the context,
+/// not the whole of it. Before CP4a-2 (main f4ba1fc5) a `SampleContext` was 1,184 bytes, put
+/// together for every rule that read a sample (4 a request here, ~375 instructions each); now
+/// it is a reference to the phase's facts ([`ibex_sample::PhaseCtx`], built once a rule phase)
+/// and a reference to the live request, and the per-rule assembly is those few words.
+#[test]
+fn a_rule_assembles_only_the_small_part_of_the_context() {
+    let per_rule = std::mem::size_of::<ibex_sample::SampleContext<'static>>();
+    assert!(per_rule <= 64, "the per-rule SampleContext is {per_rule} bytes, more than 64");
+}

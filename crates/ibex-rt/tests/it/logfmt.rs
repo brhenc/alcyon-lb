@@ -52,7 +52,7 @@ fn base<'a>(req_caps: &'a [Option<Vec<u8>>], res_caps: &'a [Option<Vec<u8>>]) ->
 
 fn render(fmt: &str, d: &LogData) -> String {
     let reg = sample_registry();
-    let ctx = SampleContext { client_addr: d.client, ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { client_addr: d.client, ..Default::default() }, live: None };
     LogFormat::compile(fmt, reg).expect("compiles").render(d, reg, &ctx)
 }
 
@@ -294,7 +294,7 @@ fn flags_without_a_sign_or_unknown_are_ignored_and_absent_values_quote_as_empty(
     // `a=GET /y HTTP/1.1|b="GET /y HTTP/1.1"` for `a=%{-E}r|b=%{+Q,-json}r` (2026-10-03).
     assert_eq!(render("a=%{-E}r|b=%{+Q,-json}r", &d), "a=GET /a/b?q HTTP/1.1|b=\"GET /a/b?q HTTP/1.1\"");
     let reg = sample_registry();
-    let ctx = SampleContext { req_method: Some("GET"), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { req_method: Some("GET"), ..Default::default() }, live: None };
     let nosrv = LogData { server: None, server_addr: None, ..d };
     assert_eq!(
         LogFormat::compile("m=%[method]|Qm=%{+Q}[method]|si=%si|sp=%sp|Xsp=%{+X}sp|Xsi=%{+X}si", reg)

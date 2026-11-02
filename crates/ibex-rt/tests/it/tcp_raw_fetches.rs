@@ -376,7 +376,7 @@ fn payload_fetches_follow_the_direction_of_their_rule_set() {
     use ibex_sample::{sample_registry, Expr, Sample, SampleContext};
     let reg = sample_registry();
     let res = b"\x00\x00\x00\x06onionsQQ";
-    let ctx = SampleContext { raw_res: Some(res), res_body: Some(res), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { raw_res: Some(res), res_body: Some(res), ..Default::default() }, live: None };
     let sample = |e: &str, c: &SampleContext| Expr::parse(e).expect("parse").eval_sample(reg, c);
     assert_eq!(sample("payload(4,6)", &ctx), Some(Sample::Bin(b"onions".to_vec())));
     assert_eq!(sample("payload(0,3)", &ctx), Some(Sample::Bin(vec![0, 0, 0])));
@@ -384,13 +384,13 @@ fn payload_fetches_follow_the_direction_of_their_rule_set() {
     assert_eq!(sample("payload_lv(0,4)", &ctx), Some(Sample::Bin(b"onions".to_vec())));
     assert_eq!(sample("payload(40,6)", &ctx), None);
     let req = b"\x00\x00\x00\x05hello";
-    let ctx = SampleContext { raw_req: Some(req), req_body: Some(req), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { raw_req: Some(req), req_body: Some(req), ..Default::default() }, live: None };
     assert_eq!(sample("req_len", &ctx), Some(Sample::Sint(9)));
     assert_eq!(sample("payload(4,5)", &ctx), Some(Sample::Bin(b"hello".to_vec())), "a request rule set");
     assert_eq!(sample("payload_lv(0,4)", &ctx), Some(Sample::Bin(b"hello".to_vec())));
     // The ACL forms of `req.ssl_ver`: dotted, ranged, with operators.
     let hello = client_hello();
-    let ctx = SampleContext { raw_req: Some(&hello), req_body: Some(&hello), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { raw_req: Some(&hello), req_body: Some(&hello), ..Default::default() }, live: None };
     for (expr, want) in [
         ("req.ssl_ver 3.3", true),
         ("req.ssl_ver 3.0", false),
@@ -425,7 +425,7 @@ fn payload_fetches_follow_the_direction_of_their_rule_set() {
         rec.extend(hs);
         rec
     };
-    let ctx = SampleContext { raw_req: Some(&h), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { raw_req: Some(&h), ..Default::default() }, live: None };
     let single = (reg.get_fetch("req.ssl_alpn").expect("registered").func)(&ctx, &[]);
     assert_eq!(single, Some(Sample::Str("h2".into())));
 }

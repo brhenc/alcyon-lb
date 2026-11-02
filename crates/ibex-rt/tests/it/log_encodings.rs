@@ -14,7 +14,7 @@ use ibex_sample::{sample_registry, SampleContext};
 fn render_with(fmt: &str, d: &LogData, caps: &[Option<Vec<u8>>]) -> Vec<u8> {
     let reg = sample_registry();
     let client: SocketAddr = "127.0.0.1:40000".parse().expect("addr");
-    let ctx = SampleContext { client_addr: Some(client), captures_req_hdr: Some(caps), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { client_addr: Some(client), captures_req_hdr: Some(caps), ..Default::default() }, live: None };
     LogFormat::compile(fmt, reg).expect("compiles").render_bytes(d, reg, &ctx)
 }
 
@@ -153,7 +153,7 @@ fn booleans_and_the_types_that_will_not_convert() {
 fn an_ipv6_peer_and_a_method_are_strings_on_an_encoded_line() {
     let reg = sample_registry();
     let client: SocketAddr = "[::1]:40000".parse().expect("addr");
-    let ctx = SampleContext { client_addr: Some(client), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { client_addr: Some(client), ..Default::default() }, live: None };
     let got = LogFormat::compile("%{+json}o %(a)[src]", reg).expect("compiles").render_bytes(&data(), reg, &ctx);
     assert_eq!(String::from_utf8_lossy(&got), r#"{"a": "::1"}"#);
 }
@@ -181,7 +181,7 @@ fn what_follows_a_name_is_an_alias_an_expression_text_or_an_error() {
 #[test]
 fn a_method_and_a_boolean_on_an_encoded_line() {
     let reg = sample_registry();
-    let ctx = SampleContext { req_method: Some("GET"), ..Default::default() };
+    let ctx = SampleContext { phase: &ibex_sample::PhaseCtx { req_method: Some("GET"), ..Default::default() }, live: None };
     let got = LogFormat::compile("%{+json}o %(m)[method] %(b:sint)[bool(1)]", reg).expect("compiles").render_bytes(&data(), reg, &ctx);
     assert_eq!(String::from_utf8_lossy(&got), r#"{"m": "GET", "b": 1}"#);
 }

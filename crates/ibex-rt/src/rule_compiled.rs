@@ -680,7 +680,7 @@ mod tests {
     fn formats_render_as_their_text_does() {
         let registry = crate::engine::sample_registry();
         let ctx = SampleContext::default();
-        let formats = ["", "plain", "%[str(a)]", "a%[str(x)]b%[str(y)]c", "%[str(a),concat([x])]", "%%", "%ci:%cp-%[str(b)]", "\u{e9}%[str(\u{fc} x)]"];
+        let formats = ["", "plain", "%[str(a)]", "a%[str(x)]b%[str(y)]c", "%[str(a),concat([x])]", "%%", "%ci:%cp-%[str(b)]", "%fi:%fp", "\u{e9}%[str(\u{fc} x)]"];
         for http in [false, true] {
             for fmt in formats {
                 let mut text = String::new();
