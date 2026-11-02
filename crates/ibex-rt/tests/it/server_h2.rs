@@ -732,6 +732,7 @@ fn a_refused_stream_is_retried_under_retry_on_empty_response() {
 fn the_bytes_logged_for_an_h2_response_are_haproxys() {
     // ManyFields: 33 fields of `x-NN`: `v` (5 bytes of HTX each) more than Ok's 49, and a head
     // too long for the codec's index, so the engine scans its text (T618).
+    // 214 is HAProxy's too: 3.5-dev8 logged `%B` 49, 34 and 214 for these three scripts (T619).
     for (script, want) in [(Script::Ok { goaway_after: 0 }, " 200 49 "), (Script::NoLength, " 200 34 "), (Script::ManyFields, " 200 214 ")] {
         let srv = scripted(script);
         let p = proxy(&format!("  server s {} proto h2", srv.addr));
