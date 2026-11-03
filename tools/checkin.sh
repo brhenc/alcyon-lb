@@ -91,6 +91,46 @@ section_hint() {
         printf "usually ~%ds; stuck after %dm%02ds", v[int((NR + 1) / 2)], stuck / 60, stuck % 60
       }'
 }
+
+# The whole gate's time depends on its kind and on what else the machine does (measured 11-02/03:
+# a branch gate 8-12 min alone, 22-30 min beside two other gates and agents' builds; the
+# exclusive measuring gate ~29 min). Each run is recorded with its kind (measured / nomeasure) and
+# the load per CPU when it started (1-min loadavg / CPUs, before the gate's own work). The hint is
+# the median of the last runs of the same kind and load band; with fewer than 3, the quiet median
+# times the band's factor; with no history, the defaults below.
+GATE_NCPU=$(nproc 2>/dev/null || echo 1)
+gate_load_pct() { awk -v n="$GATE_NCPU" '{ printf "%d", 100 * $1 / n }' /proc/loadavg 2>/dev/null || echo 0; }
+gate_load_band() { if [ "$1" -lt 15 ]; then echo quiet; elif [ "$1" -lt 40 ]; then echo busy; else echo heavy; fi; }
+gate_kind() { if [ "${IBEX_GATE_SKIP_MEASURE:-}" = 1 ]; then echo nomeasure; else echo measured; fi; }
+# whole_hint KIND BAND LOADPCT -> two lines: the estimate for BAND, and the table of all three bands
+whole_hint() {
+  awk -F'\t' -v k="$1" -v b="$2" -v lp="$3" -v ncpu="$GATE_NCPU" '
+    function med(a, n,   i, j, t, c, lo) {   # median of the last 7 of a[1..n]
+      lo = n > 7 ? n - 6 : 1; c = 0
+      for (i = lo; i <= n; i++) w[++c] = a[i]
+      for (i = 1; i <= c; i++) for (j = i + 1; j <= c; j++) if (w[j] < w[i]) { t = w[i]; w[i] = w[j]; w[j] = t }
+      return w[int((c + 1) / 2)]
+    }
+    function mmss(x) { return sprintf("%dm%02ds", x / 60, x % 60) }
+    BEGIN { base["nomeasure"] = 660; base["measured"] = 1750; f["quiet"] = 1; f["busy"] = 1.6; f["heavy"] = 2.6
+            split("quiet busy heavy", bands, " ") }
+    $1 == "(whole gate)" {
+      kind = (NF >= 3 ? $3 : "measured"); if (kind != k || NF < 5) next   # rows before 11-03 have no band
+      x[$5, ++n[$5]] = $2
+    }
+    function est(band,   i, a, src) {
+      if (n[band] >= 3) { for (i = 1; i <= n[band]; i++) a[i] = x[band, i]; E = med(a, n[band]); S = sprintf("median of the last %d %s runs", n[band] > 7 ? 7 : n[band], band); return }
+      if (n["quiet"] >= 3) { for (i = 1; i <= n["quiet"]; i++) a[i] = x["quiet", i]; E = int(med(a, n["quiet"]) * f[band]); S = sprintf("quiet median x %.1f", f[band]); return }
+      E = int(base[k] * f[band]); S = "default, no history yet"
+    }
+    END {
+      est(b); stuck = int(2.5 * E); if (stuck < 60) stuck = 60
+      printf "the whole gate (%s), load %d%% of %d CPUs (%s): usually ~%s (%s); stuck after %s\n", k, lp, ncpu, b, mmss(E), S, mmss(stuck)
+      line = "by load:"
+      for (i = 1; i <= 3; i++) { est(bands[i]); line = line sprintf(" %s %s ~%s%s", bands[i], (i == 1 ? "<15%" : i == 2 ? "15-40%" : ">40%"), mmss(E), i < 3 ? " |" : "") }
+      print line
+    }' "$GATE_HISTORY" 2>/dev/null
+}
 if [ "$MODE" = list ]; then
   for id in "${STAGES[@]}"; do
     h=$(section_hint "${TITLE[$id]}")
@@ -388,8 +428,8 @@ fake_stage() {
 }
 
 # --- run -------------------------------------------------------------------------------
-hint=$(section_hint "(whole gate)")
-[ "$MODE" != all ] || [ -z "$hint" ] || echo "checkin: the whole gate: $hint"
+GATE_KIND=$(gate_kind); GATE_LOAD0=$(gate_load_pct); GATE_BAND=$(gate_load_band "$GATE_LOAD0")
+[ "$MODE" != all ] || whole_hint "$GATE_KIND" "$GATE_BAND" "$GATE_LOAD0" | sed 's/^/checkin: /'
 RAN=()
 for id in "${SELECTED[@]}"; do
   now=$((SECONDS - GATE_T0))
@@ -428,9 +468,11 @@ done
 
 echo
 echo "=== verdict === [+$((SECONDS - GATE_T0))s]"
-# A gate without its measurement is shorter; its time would drag the "usually" hint down.
-if [ "$MODE" = all ] && [ -z "${SKIPPED_MEASURE:-}" ]; then
-  printf '%s\t%s\n' "(whole gate)" $((SECONDS - GATE_T0)) >> "$GATE_HISTORY" 2>/dev/null || true
+# Recorded with its kind and load band, so a gate without its measurement, or one beside other
+# gates, does not set the hint of the others (whole_hint).
+if [ "$MODE" = all ]; then
+  k=measured; [ -z "${SKIPPED_MEASURE:-}" ] || k=nomeasure
+  printf '%s\t%s\t%s\t%s\t%s\n' "(whole gate)" $((SECONDS - GATE_T0)) "$k" "$GATE_LOAD0" "$GATE_BAND" >> "$GATE_HISTORY" 2>/dev/null || true
 fi
 [ -z "${SKIPPED_MEASURE:-}" ] || echo "checkin: measurement skipped: not final until the gate on main has measured"
 [ "$KEY" != dirty ] || echo "checkin: this tree's results are not kept (logs in $RUN_DIR)"
