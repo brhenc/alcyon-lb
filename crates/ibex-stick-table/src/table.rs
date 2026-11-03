@@ -472,6 +472,20 @@ impl StickTable {
         }
     }
 
+    /// Removes the entry `key` unless a session tracks it (`clear table`): `Some(true)` when
+    /// removed, `Some(false)` when it is in use, `None` when there is no such entry.
+    pub fn remove_unused(&self, key: &StickKey) -> Option<bool> {
+        let mut inner = self.inner.write().ok()?;
+        let enc_key = self.cut(key).encode_bytes();
+        let node_idx = inner.tree.lookup_node(&enc_key)?;
+        let slot_idx = inner.tree.data_of(node_idx);
+        if inner.slots[slot_idx as usize].as_ref().is_some_and(|s| s.data.trackers > 0) {
+            return Some(false);
+        }
+        inner.evict_slot(slot_idx);
+        Some(true)
+    }
+
     /// Returns the number of entries currently stored.
     #[must_use]
     pub fn len(&self) -> usize {
