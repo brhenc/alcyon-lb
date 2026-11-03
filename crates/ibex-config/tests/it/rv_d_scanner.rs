@@ -51,3 +51,17 @@ fn rise_and_fall_past_i32_max_are_refused() {
         assert!(e.contains(&format!("'{kw}' has to be > 0")), "{e}");
     }
 }
+
+/// VV-33: `rise 0` / `fall 0` are refused, on a server and on `default-server`, as HAProxy
+/// 3.5-dev8 refuses them ("'rise' has to be > 0.").
+#[test]
+fn rise_and_fall_zero_are_refused() {
+    for line in ["server s 127.0.0.1:1 check", "default-server"] {
+        for kw in ["rise", "fall"] {
+            let cfg = format!("listen l\n\tmode tcp\n\tbind 127.0.0.1:8080\n\t{line} {kw} 0\n\tserver t 127.0.0.1:2\n");
+            let e = parse_str(&cfg).expect_err(kw).message;
+            assert!(e.contains(&format!("'{kw}' has to be > 0")), "{line} {kw}: {e}");
+            assert!(parse_str(&cfg.replace(&format!("{kw} 0"), &format!("{kw} 1"))).is_ok(), "{line} {kw} 1");
+        }
+    }
+}

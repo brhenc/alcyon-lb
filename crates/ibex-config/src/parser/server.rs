@@ -1100,7 +1100,7 @@ fn parse_proxy_v2_options(arg: Option<&Token>, kw: &Token) -> Result<bool, Confi
 /// ("'rise' has to be > 0"; measured on 3.5-dev8: 2147483647 accepted, 2147483648 refused).
 fn parse_check_count(token: &Token, keyword: &str) -> Result<u32, ConfigError> {
     let v = parse_u32(token, keyword)?;
-    if v > i32::MAX as u32 {
+    if v == 0 || v > i32::MAX as u32 {
         return Err(ConfigError::new(token.line, token.col, format!("'{keyword}' has to be > 0.")));
     }
     Ok(v)
