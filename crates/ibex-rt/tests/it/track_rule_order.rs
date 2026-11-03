@@ -175,8 +175,8 @@ fn track_rules_run_in_rule_order() {
         assert!(Instant::now() < deadline, "no stats socket");
         std::thread::sleep(Duration::from_millis(20));
     }
-    // `wait_listening` itself connects: start from empty tables. (Ibex has no `clear table`
-    // yet, T625: the tables count requests, which the probe connection does not make.)
+    // `wait_listening` itself connects: start from empty tables (the probe makes no request;
+    // an entry its connection still tracks is kept by `clear table`, as HAProxy keeps it).
     for n in names.iter().chain(&["cdup2"]) {
         cli(&sock, &format!("clear table ts_{n}"));
     }
