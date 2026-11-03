@@ -41,6 +41,24 @@ frontend f
   bind {f}
   http-request track-sc0 req.hdr(x-k) table t1
   http-request return status 200
+backend t6
+  stick-table type ipv6 size 10 expire 1m store http_req_cnt
+backend ti
+  stick-table type integer size 10 expire 1m store http_req_cnt
+backend tb
+  stick-table type binary len 8 size 10 expire 1m store http_req_cnt
+backend tbig
+  stick-table type string len 16 size 400 expire 1m store http_req_cnt
+frontend h
+  bind {h}
+  http-request track-sc0 req.hdr(x6) table t6 if { req.hdr(x6) -m found }
+  http-request track-sc1 req.hdr(xi) table ti if { req.hdr(xi) -m found }
+  http-request track-sc2 req.hdr(xb) table tb if { req.hdr(xb) -m found }
+  http-request return status 200
+frontend k
+  bind {k}
+  http-request track-sc0 req.hdr(x-k) table tbig
+  http-request return status 200
 frontend g
   bind {g}
   tcp-request connection track-sc0 src table t2
@@ -65,6 +83,14 @@ fn get(addr: SocketAddr, k: &str) {
 }
 
 /// `key=count` of each entry of `table`, sorted.
+fn get_hdr(addr: SocketAddr, hdr: &str) {
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    s.write_all(format!("GET / HTTP/1.1\r\nHost: x\r\n{hdr}\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+}
+
 fn keys(sock: &str, table: &str) -> String {
     let mut v: Vec<String> = cli(sock, &format!("show table {table}"))
         .lines()
@@ -79,11 +105,13 @@ fn keys(sock: &str, table: &str) -> String {
 fn clear_table() {
     let f = common::reserve_addr();
     let g = common::reserve_addr();
+    let h = common::reserve_addr();
+    let kb = common::reserve_addr();
     let dir = std::env::temp_dir().join(format!("cct-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let sock = dir.join("cli.sock").display().to_string();
-    let cfg = CFG.replace("{sock}", &sock).replace("{f}", &f.to_string()).replace("{g}", &g.to_string());
+    let cfg = CFG.replace("{sock}", &sock).replace("{f}", &f.to_string()).replace("{g}", &g.to_string()).replace("{h}", &h.to_string()).replace("{k}", &kb.to_string());
     let path = dir.join("c.cfg");
     std::fs::write(&path, cfg).unwrap();
     let bin = std::env::var("CCT_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ibex").to_string());
@@ -91,6 +119,8 @@ fn clear_table() {
     let _p = Proc(child, dir);
     assert!(common::wait_listening(f), "no listener");
     assert!(common::wait_listening(g), "no listener");
+    assert!(common::wait_listening(h), "no listener");
+    assert!(common::wait_listening(kb), "no listener");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !std::path::Path::new(&sock).exists() {
         assert!(Instant::now() < deadline, "no stats socket");
@@ -143,6 +173,28 @@ fn clear_table() {
     check("no key", cli(&sock, "clear table t1 key"), "Key value expected\n\n");
     check("bad ip key", cli(&sock, "clear table t2 key notip"), "Invalid key\n\n");
     check("errors keep b", keys(&sock, "t1"), "key=b:http_req_cnt=2");
+
+    // Keys of the other types, as the CLI spells them.
+    for hd in ["x6: ::1", "x6: 2001:db8::7", "xi: 7", "xi: 42", "xb: ab", "xb: cd"] {
+        get_hdr(h, hd);
+    }
+    check("ipv6 key", cli(&sock, "clear table t6 key 2001:db8::7"), "\n");
+    check("after ipv6", keys(&sock, "t6"), "key=::1:http_req_cnt=1");
+    check("bad ipv6", cli(&sock, "clear table t6 key nope"), "Invalid key\n\n");
+    check("int key", cli(&sock, "clear table ti key 42"), "\n");
+    check("after int", keys(&sock, "ti"), "key=7:http_req_cnt=1");
+    check("bad int", cli(&sock, "clear table ti key x1"), "\n");
+    check("bin key", cli(&sock, "clear table tb key 6364"), "Removing keys from tables of type other than ip, ipv6, string and integer is not supported\n\n");
+    // Both kept (HAProxy shows binary keys zero-padded to `len`, Ibex unpadded: a `show table` difference, tasks/T625).
+    check("after bin", keys(&sock, "tb").split(',').count().to_string(), "2");
+    check("bad bin", cli(&sock, "clear table tb key 6"), "Removing keys from tables of type other than ip, ipv6, string and integer is not supported\n\n");
+    // More entries than one walk batch (256).
+    for i in 0..300 {
+        get_hdr(kb, &format!("x-k: k{i}"));
+    }
+    check("big count", keys(&sock, "tbig").split(',').filter(|e| !e.is_empty()).count().to_string(), "300");
+    check("big whole", cli(&sock, "clear table tbig"), "\n");
+    check("big gone", keys(&sock, "tbig"), "");
 
     // An entry a connection tracks is kept.
     let mut held = TcpStream::connect(g).unwrap();

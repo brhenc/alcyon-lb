@@ -1109,15 +1109,10 @@ impl CliApplet {
                 let key = match table.config().key_type {
                     KeyType::Ip => k.parse::<std::net::Ipv4Addr>().ok().map(|a| StickKey::Ip(a.into())),
                     KeyType::Ipv6 => k.parse::<std::net::Ipv6Addr>().ok().map(|a| StickKey::Ip(a.into())),
-                    KeyType::Integer => k.parse::<u64>().ok().map(StickKey::Integer),
+                    // `atoi`, as HAProxy reads it: the leading digits, 0 without any.
+                    KeyType::Integer => Some(StickKey::Integer(k.bytes().take_while(u8::is_ascii_digit).fold(0u64, |n, d| n.wrapping_mul(10).wrapping_add(u64::from(d - b'0'))))),
                     KeyType::String => Some(StickKey::String(k.to_string())),
-                    KeyType::Binary => {
-                        let h = k.strip_prefix("0x").unwrap_or(k);
-                        (h.len() % 2 == 0 && h.is_ascii())
-                            .then(|| (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok()).collect::<Option<Vec<u8>>>())
-                            .flatten()
-                            .map(StickKey::Binary)
-                    }
+                    KeyType::Binary => return "Removing keys from tables of type other than ip, ipv6, string and integer is not supported".to_string(),
                 };
                 let Some(key) = key else { return "Invalid key".to_string() };
                 match table.remove_unused(&key) {
