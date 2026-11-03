@@ -6230,45 +6230,46 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let ql = &mut self.quic_listeners[q_idx];
                 let (peer, local) = (ql.peer_of(conn), ql.addr());
                 let mut tracked: [Option<(usize, StickKey)>; 3] = [None, None, None];
-                let (client_addr, server_addr, fc_src, fc_dst) =
-                    match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, Some(&mut tracked)) {
-                        ConnEvalOutcome::Accept(c, s, fs, fd, _) => (c, s, fs, fd),
-                        ConnEvalOutcome::Reject | ConnEvalOutcome::SilentDrop(_) => {
-                            self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
-                            untrack_slots(&self.proxies, &tracked);
-                            ql.owner_close(conn);
-                            continue;
-                        }
-                    };
-                let Some(mut mux) = ibex_proto::mux_h3::H3MuxContext::take() else {
-                    untrack_slots(&self.proxies, &tracked);
-                    ql.owner_close(conn);
-                    continue;
+                let admitted = match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, Some(&mut tracked)) {
+                    ConnEvalOutcome::Accept(c, s, fs, fd, _) => Some((c, s, fs, fd)),
+                    ConnEvalOutcome::Reject | ConnEvalOutcome::SilentDrop(_) => {
+                        self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
                 };
-                mux.relaxed_path = self.proxies[proxy_idx].stats_config.accept_unsafe_request;
-                // The request heads go into the buffers their streams adopt (CP2b).
-                mux.take_rx_head = crate::buf::Buf::take_rx_head;
                 let raw_fd = ql.raw_fd();
-                let Some((mut sess, _, _)) = init_client_session(
-                    &self.proxies,
-                    proxy_idx,
-                    crate::proxy::ClientSide::Quic,
-                    self.now,
-                    peer,
-                    client_addr,
-                    server_addr,
-                    fc_src,
-                    fc_dst,
-                    None,
-                    0,
-                    false,
-                    tracked.clone(),
-                    self.global_bufsize,
-                    self.global_maxrewrite,
-                    self.global_h2_flood_config,
-                    false,
-                    (false, false),
-                ) else {
+                let (proxies, now) = (&self.proxies, self.now);
+                let (bufsize, maxrewrite, flood) = (self.global_bufsize, self.global_maxrewrite, self.global_h2_flood_config);
+                // Refused by a rule, no mux context, or no session: one way out, which gives the
+                // tracked slots back and closes the connection.
+                let admitted = admitted.and_then(|(client_addr, server_addr, fc_src, fc_dst)| {
+                    let mut mux = ibex_proto::mux_h3::H3MuxContext::take()?;
+                    mux.relaxed_path = proxies[proxy_idx].stats_config.accept_unsafe_request;
+                    // The request heads go into the buffers their streams adopt (CP2b).
+                    mux.take_rx_head = crate::buf::Buf::take_rx_head;
+                    let (sess, _, _) = init_client_session(
+                        proxies,
+                        proxy_idx,
+                        crate::proxy::ClientSide::Quic,
+                        now,
+                        peer,
+                        client_addr,
+                        server_addr,
+                        fc_src,
+                        fc_dst,
+                        None,
+                        0,
+                        false,
+                        tracked.clone(),
+                        bufsize,
+                        maxrewrite,
+                        flood,
+                        false,
+                        (false, false),
+                    )?;
+                    Some((sess, mux))
+                });
+                let Some((mut sess, mut mux)) = admitted else {
                     untrack_slots(&self.proxies, &tracked);
                     self.quic_listeners[q_idx].owner_close(conn);
                     continue;
