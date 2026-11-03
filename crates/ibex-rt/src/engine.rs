@@ -6247,7 +6247,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     mux.relaxed_path = proxies[proxy_idx].stats_config.accept_unsafe_request;
                     // The request heads go into the buffers their streams adopt (CP2b).
                     mux.take_rx_head = crate::buf::Buf::take_rx_head;
-                    let (sess, _, _) = init_client_session(
+                    init_client_session(
                         proxies,
                         proxy_idx,
                         crate::proxy::ClientSide::Quic,
@@ -6266,8 +6266,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         flood,
                         false,
                         (false, false),
-                    )?;
-                    Some((sess, mux))
+                    )
+                    .map(|(sess, _, _)| (sess, mux))
                 });
                 let Some((mut sess, mut mux)) = admitted else {
                     untrack_slots(&self.proxies, &tracked);
@@ -18024,9 +18024,8 @@ fn eval_after_res_rules<'c>(
 /// The entries the slots of a connection that did not start track are given back (T624).
 fn untrack_slots(proxies: &[Proxy], tracked: &[Option<(usize, StickKey)>; 3]) {
     for (t_idx, key) in tracked.iter().flatten() {
-        if let Some(t) = proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()) {
-            let _ = t.update_entry(key, |data| data.untrack());
-        }
+        let Some(t) = proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()) else { continue };
+        let _ = t.update_entry(key, |data| data.untrack());
     }
 }
 
