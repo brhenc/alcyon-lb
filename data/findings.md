@@ -40,7 +40,7 @@ method               hours  last finding     runs
 vv-battery             0.0  2026-11-01 02:27 0
 vv-soak                7.9  2026-11-01 00:18 1
 vv-probe               0.0  2026-11-03 09:50 0
-vv-recheck             1.2  never            8
+vv-recheck             1.3  never            9
 redteam                5.6  2026-10-12 12:31 37
 fuzz-libfuzzer         3.0  2026-10-10 22:18 4
 fuzz-differential      0.0  2026-10-11 11:30 0
