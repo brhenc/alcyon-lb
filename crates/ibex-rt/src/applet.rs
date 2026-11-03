@@ -743,6 +743,9 @@ impl CliApplet {
             self.handle_show_stat(cmd, ctx);
         } else if cmd == "show table" || cmd.starts_with("show table ") {
             self.handle_show_table(cmd, ctx);
+        } else if cmd == "clear table" || cmd.starts_with("clear table ") {
+            let msg = Self::clear_table(cmd, ctx);
+            self.finish_msg(&msg);
         } else if let Some(rest) = cmd.strip_prefix("set ssl crypto-provider").filter(|r| r.is_empty() || r.starts_with(' ')) {
             // T460 (Ibex-only, admin): the provider of the handshakes from now on.
             let msg = crate::crypto_provider::set(rest);
@@ -1081,6 +1084,108 @@ impl CliApplet {
             self.end_stat_answer();
         } else {
             self.stat_dump = Some(d);
+        }
+    }
+
+    /// `clear table <table> [key <k> | ptr <p> | data.<type> <op> <v> ...]` (`table_process_entry_per_key`
+    /// and `cli_parse_clear_table`): the answer, empty on success. Entries a session tracks stay.
+    fn clear_table(cmd: &str, ctx: &AppletContext) -> String {
+        use ibex_stick_table::entry::{StickEntryData, StickKey};
+        use ibex_stick_table::table::KeyType;
+        const REQ: &str = "Required arguments: <table> \"data.<store_data_type>\" <operator> <value> or <table> key <key> or <table> ptr <ptr>";
+        const TYPES: [&str; 25] = [
+            "server_id", "gpc0", "gpc0_rate", "gpc1", "gpc1_rate", "conn_cnt", "conn_rate", "conn_cur", "sess_cnt", "sess_rate", "http_req_cnt",
+            "http_req_rate", "http_err_cnt", "http_err_rate", "bytes_in_cnt", "bytes_in_rate", "bytes_out_cnt", "bytes_out_rate", "gpt0", "gpt",
+            "gpc", "gpc_rate", "glitch_cnt", "glitch_rate", "server_key",
+        ];
+        let w: Vec<&str> = cmd.split_whitespace().skip(2).collect();
+        let Some(&name) = w.first() else { return REQ.to_string() };
+        let Some(table) = ctx.proxies.iter().find_map(|p| p.stick_table.as_ref().filter(|t| t.config().name == name || p.name == name)) else {
+            return "No such table".to_string();
+        };
+        match w.get(1).copied() {
+            Some("key") => {
+                let Some(&k) = w.get(2) else { return "Key value expected".to_string() };
+                let key = match table.config().key_type {
+                    KeyType::Ip => k.parse::<std::net::Ipv4Addr>().ok().map(|a| StickKey::Ip(a.into())),
+                    KeyType::Ipv6 => k.parse::<std::net::Ipv6Addr>().ok().map(|a| StickKey::Ip(a.into())),
+                    KeyType::Integer => k.parse::<u64>().ok().map(StickKey::Integer),
+                    KeyType::String => Some(StickKey::String(k.to_string())),
+                    KeyType::Binary => {
+                        let h = k.strip_prefix("0x").unwrap_or(k);
+                        (h.len() % 2 == 0 && h.is_ascii())
+                            .then(|| (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok()).collect::<Option<Vec<u8>>>())
+                            .flatten()
+                            .map(StickKey::Binary)
+                    }
+                };
+                let Some(key) = key else { return "Invalid key".to_string() };
+                match table.remove_unused(&key) {
+                    Some(false) => "Entry currently in use, cannot remove".to_string(),
+                    _ => String::new(),
+                }
+            }
+            Some("ptr") => "No entry can be found matching ptr.".to_string(),
+            Some(f) if f.starts_with("data.") => {
+                let stored: Vec<String> = table.data_fields(&StickEntryData::default()).into_iter().map(|(n, _, _)| n).collect();
+                let mut filters: Vec<(String, &str, u64)> = Vec::new();
+                let mut i = 1;
+                while i < w.len() {
+                    let n = filters.len() + 1;
+                    let Some(ty) = w[i].strip_prefix("data.").filter(|t| TYPES.contains(t)) else {
+                        return format!("Filter entry #{n}: Unknown data type");
+                    };
+                    if !stored.iter().any(|s| s == ty) {
+                        return format!("Filter entry #{n}: Data type not stored in this table");
+                    }
+                    let op = w.get(i + 1).copied().unwrap_or("");
+                    if !["eq", "ne", "le", "ge", "lt", "gt"].contains(&op) {
+                        return format!("Filter entry #{n}: Require and operator among \"eq\", \"ne\", \"le\", \"ge\", \"lt\", \"gt\"");
+                    }
+                    let Some(v) = w.get(i + 2).and_then(|v| v.parse::<u64>().ok()) else {
+                        return format!("Filter entry #{n}: Require a valid integer value to compare against");
+                    };
+                    filters.push((ty.to_string(), op, v));
+                    i += 3;
+                }
+                Self::clear_matching(table, &filters);
+                String::new()
+            }
+            Some(_) => REQ.to_string(),
+            None => {
+                Self::clear_matching(table, &[]);
+                String::new()
+            }
+        }
+    }
+
+    /// Removes the unused entries of `table` that satisfy every filter; the lock is taken per
+    /// batch, never across the whole table.
+    fn clear_matching(table: &ibex_stick_table::table::StickTable, filters: &[(String, &str, u64)]) {
+        let mut slot = 0;
+        loop {
+            let (entries, next) = table.dump_from(slot, 256);
+            for (k, v) in entries {
+                let fields = table.data_fields(&v);
+                let keep = filters.iter().all(|(ty, op, val)| {
+                    let x = fields.iter().find(|(n, _, _)| n == ty).map_or(0, |(_, _, x)| *x);
+                    match *op {
+                        "eq" => x == *val,
+                        "ne" => x != *val,
+                        "le" => x <= *val,
+                        "ge" => x >= *val,
+                        "lt" => x < *val,
+                        _ => x > *val,
+                    }
+                });
+                if keep {
+                    let _ = table.remove_unused(&k);
+                }
+            }
+            match next {
+                Some(n) => slot = n,
+                None => return,
+            }
         }
     }
 
