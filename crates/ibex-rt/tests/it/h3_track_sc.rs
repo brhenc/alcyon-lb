@@ -36,6 +36,11 @@ type Seen = ((String, String), (String, String));
 
 /// The two tables while the connection is open and after it closed.
 fn run() -> Seen {
+    run_with("")
+}
+
+/// [`run`] with `extra` (config lines) after the `tcp-request connection track-sc0` rule.
+fn run_with(extra: &str) -> Seen {
     let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
     let quic = common::reserve_addr();
     let dir = std::env::temp_dir().join(format!("h3track-{}-{}", std::process::id(), quic.port()));
@@ -48,7 +53,7 @@ fn run() -> Seen {
          backend t\n  stick-table type ip size 10 expire 1m store conn_cnt,conn_cur,http_req_cnt\n\
          backend t2\n  stick-table type ip size 10 expire 1m store conn_cnt,conn_cur,http_req_cnt\n\
          frontend fe\n  bind quic4@{quic} ssl crt {crt} alpn h3\n\
-         \x20 tcp-request connection track-sc0 src table t\n\
+         \x20 tcp-request connection track-sc0 src table t\n{extra}\
          \x20 http-request track-sc1 src table t2\n\
          \x20 http-request return status 200 content-type text/plain string \"ok\"\n"
     );
@@ -102,9 +107,19 @@ fn the_connection_rule_tracks_a_quic_connection_and_gives_it_back_at_close() {
 /// connection's slot (`h2_child_done` hands it to the owner): `conn_cnt=1`, `conn_cur=1` until
 /// the connection closes.
 #[test]
-#[ignore = "T624 step 2b: per-stream http-request track slots on a QUIC connection"]
 fn the_request_rule_tracks_each_stream_and_gives_it_back_at_its_end() {
     let (open, closed) = run();
     assert_eq!(open.1, "conn_cnt=3 conn_cur=0 http_req_cnt=3");
     assert_eq!(closed.1, "conn_cnt=3 conn_cur=0 http_req_cnt=3");
+}
+
+/// A connection a `tcp-request connection reject` ends after `track-sc0` has counted it gives
+/// its slot back at once (the `untrack_slots` path of `adopt_quic_owners`): the client gets no
+/// answer (`ok=0`), the entry exists with its one connection and none open. No request ran.
+#[test]
+fn a_rejected_quic_connection_gives_its_tracked_slot_back() {
+    let (open, closed) = run_with("  tcp-request connection reject if { src 127.0.0.1 }\n");
+    assert_eq!(open.0, "conn_cnt=1 conn_cur=0 http_req_cnt=0", "while the probe waits");
+    assert_eq!(closed.0, "conn_cnt=1 conn_cur=0 http_req_cnt=0", "after it closed");
+    assert_eq!(closed.1, "none", "no stream ran");
 }

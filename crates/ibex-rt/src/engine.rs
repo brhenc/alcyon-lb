@@ -11507,6 +11507,17 @@ impl EngineDispatcher<'_> {
             for_tracked(&*env.proxies, &child.sess, |data| data.add_bytes(due, out));
         }
         let Some(owner) = owner else { return };
+        // A stream of a QUIC connection is a session of its own for `HAProxy`: the slots its
+        // `http-request track-sc*` rules took are counted for it and given back here, not
+        // handed to the connection (T624). The connection's own slots stay shared. (A stream
+        // freed after its connection cannot tell its own slots from the shared ones: skipped.)
+        if owner.sess.h3_owner().is_some() {
+            for (mine, theirs) in child.sess.tracked_sc.iter_mut().zip(&owner.sess.tracked_sc) {
+                if mine.is_some() && mine != theirs {
+                    untrack_slots(env.proxies, &[mine.take(), None, None]);
+                }
+            }
+        }
         let owner_task = owner.task;
         // An HTTP/3 owner runs in this pass too (L2): its own closes (a GOAWAY framed, then
         // `closing`) still wait for the next pass (`step_h3_owner`, T558), so a second run
