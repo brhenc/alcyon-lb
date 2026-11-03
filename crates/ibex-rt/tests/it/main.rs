@@ -196,6 +196,7 @@ mod duress_target;
 mod h3_backend_reuse;
 mod h3_bench_client;
 mod h3_connection_session;
+mod h3_track_sc;
 mod h3_end_to_end;
 mod h3_field_validity;
 mod quic_retry;

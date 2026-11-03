@@ -6229,17 +6229,19 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             for conn in self.quic_listeners[q_idx].take_new_owned() {
                 let ql = &mut self.quic_listeners[q_idx];
                 let (peer, local) = (ql.peer_of(conn), ql.addr());
-                let tracked: [Option<(usize, StickKey)>; 3] = [None, None, None];
+                let mut tracked: [Option<(usize, StickKey)>; 3] = [None, None, None];
                 let (client_addr, server_addr, fc_src, fc_dst) =
-                    match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, None) {
+                    match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, Some(&mut tracked)) {
                         ConnEvalOutcome::Accept(c, s, fs, fd, _) => (c, s, fs, fd),
                         ConnEvalOutcome::Reject | ConnEvalOutcome::SilentDrop(_) => {
                             self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
+                            untrack_slots(&self.proxies, &tracked);
                             ql.owner_close(conn);
                             continue;
                         }
                     };
                 let Some(mut mux) = ibex_proto::mux_h3::H3MuxContext::take() else {
+                    untrack_slots(&self.proxies, &tracked);
                     ql.owner_close(conn);
                     continue;
                 };
@@ -6260,13 +6262,14 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     None,
                     0,
                     false,
-                    tracked,
+                    tracked.clone(),
                     self.global_bufsize,
                     self.global_maxrewrite,
                     self.global_h2_flood_config,
                     false,
                     (false, false),
                 ) else {
+                    untrack_slots(&self.proxies, &tracked);
                     self.quic_listeners[q_idx].owner_close(conn);
                     continue;
                 };
@@ -10225,6 +10228,15 @@ fn cleanup_done(
     // in `maxconn` and its tracked counters are its owner's, which settles them when it
     // ends. Only its server connection is its own (T280).
     let Some(cfd) = entry.sess.cli_fd() else {
+        // A QUIC connection has no socket of its own here; its tracked entries are settled
+        // like those of a TCP connection (T624).
+        if entry.sess.h3_owner().is_some() {
+            let (din, dout) = stick_bytes_due(&entry.sess, true);
+            for_tracked(proxies, &entry.sess, |data| {
+                data.add_bytes(din, dout);
+                data.untrack();
+            });
+        }
         if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.actconn_reclaimed && !entry.sess.srv_uncounted()) {
             let be_idx = entry.srv_backend_idx;
             if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
@@ -17997,6 +18009,15 @@ fn eval_after_res_rules<'c>(
 /// tracks something alone; Ibex moves it to a different key, releasing the old entry -- it tracks
 /// a connection with the peer's address when it accepts it, before a PROXY header gives the
 /// source (T139: `canonical_haproxy_35_e2e` relies on the move).
+/// The entries the slots of a connection that did not start track are given back (T624).
+fn untrack_slots(proxies: &[Proxy], tracked: &[Option<(usize, StickKey)>; 3]) {
+    for (t_idx, key) in tracked.iter().flatten() {
+        if let Some(t) = proxies.get(*t_idx).and_then(|p| p.stick_table.as_ref()) {
+            let _ = t.update_entry(key, |data| data.untrack());
+        }
+    }
+}
+
 fn track_http_slot(proxies: &[Proxy], tracked: &mut [Option<(usize, StickKey)>; 3], slot: usize, t_idx: usize, key: StickKey) {
     if tracked[slot].as_ref().is_some_and(|(old_idx, old_key)| *old_idx == t_idx && *old_key == key) {
         return;
