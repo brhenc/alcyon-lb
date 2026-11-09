@@ -44,14 +44,14 @@ fn status_via(global_line: &str, bind_opts: &str, client_ip: &str) -> (String, O
     );
     let mut f = tempfile::NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .env_remove("ALCYON_H3_PATH")
         .arg("-f")
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn alcyon");
+        .expect("spawn alcyon"));
     assert!(common::wait_listening(tcp), "alcyon never started listening on {tcp}");
     let out = Command::new("curl")
         .args(["-sS", "--http3-only", "-k", "--max-time", "4", "-o", "/dev/null", "-w", "%{http_code}", "--resolve"])

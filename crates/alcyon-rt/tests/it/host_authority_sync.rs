@@ -30,7 +30,7 @@ fn upstream_head_in(tag: &str, global: &str, rule: &str, req: &str) -> String {
         "global\n  tune.alcyon.h1-lowercase-headers on\n{global}defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {bind}\n  {rule}\n  default_backend be\nbackend be\n  server s1 127.0.0.1:{sp}\n"
     );
     std::fs::write(&path, cfg).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     assert!(common::wait_listening(bind), "alcyon did not listen");
     let h = std::thread::spawn(move || {
         let (mut c, _) = srv.accept().unwrap();
@@ -118,7 +118,7 @@ fn status_in(tag: &str, global: &str, rule: &str, req: &str) -> String {
         "global\n  tune.alcyon.h1-lowercase-headers on\n{global}defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind {bind}\n  {rule}\n  default_backend be\nbackend be\n  server s1 127.0.0.1:9\n"
     );
     std::fs::write(&path, cfg).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     assert!(common::wait_listening(bind), "alcyon did not listen");
     let mut c = TcpStream::connect(bind).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(4))).unwrap();

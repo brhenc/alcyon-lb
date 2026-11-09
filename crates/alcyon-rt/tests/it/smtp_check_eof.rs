@@ -96,7 +96,7 @@ fn smtpchk_short_greeting_at_close_is_judged_and_does_not_spin() {
     );
     let path = dir.join("c.cfg");
     std::fs::write(&path, cfg).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     assert!(common::wait_listening(front), "alcyon did not listen");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !std::path::Path::new(&sock).exists() {

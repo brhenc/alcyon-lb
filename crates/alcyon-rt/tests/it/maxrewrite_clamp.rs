@@ -48,7 +48,7 @@ fn status_with(global: &str, extra: &str, n: usize) -> String {
         server()
     )
     .expect("cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn"));
     assert!(common::wait_listening(fe));
     let mut s = TcpStream::connect(fe).expect("connect");
     s.set_read_timeout(Some(std::time::Duration::from_secs(5))).expect("timeout");

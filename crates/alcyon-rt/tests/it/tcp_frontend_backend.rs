@@ -118,14 +118,14 @@ fn a_server_reset_behind_a_full_buffer_delivers_what_the_proxy_holds() {
     )
     .expect("write config");
     let bin = std::env::var("T280_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string());
-    let mut child = std::process::Command::new(bin)
+    let mut child = common::Alcyon(std::process::Command::new(bin)
         .arg("-f")
         .arg(&cfg)
         .arg("-db")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     let mut err = child.stderr.take().expect("stderr");
     let log = thread::spawn(move || {
         let mut out = String::new();
@@ -208,14 +208,14 @@ fn a_client_that_half_closes_at_once_still_reaches_a_server_that_speaks_first() 
         )
         .expect("write config");
         let bin = std::env::var("T280_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string());
-        let mut child = std::process::Command::new(bin)
+        let mut child = common::Alcyon(std::process::Command::new(bin)
             .arg("-f")
             .arg(&cfg)
             .arg("-db")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("spawn");
+            .expect("spawn"));
         let mut c = (0..250)
             .find_map(|_| TcpStream::connect(fe).ok().or_else(|| {
                 thread::sleep(Duration::from_millis(20));

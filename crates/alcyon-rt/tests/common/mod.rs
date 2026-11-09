@@ -62,21 +62,33 @@ pub fn reserve_addr() -> SocketAddr {
     panic!("no free test port in {FIRST}..{}", FIRST + COUNT);
 }
 
-/// Whether `addr` can be bound, checked the way alcyon binds (`SO_REUSEADDR`) and without
-/// listening.
+/// Whether `addr` can be bound: for TCP the way alcyon binds (`SO_REUSEADDR`) and without
+/// listening, and for UDP by anyone.
 ///
 /// `TcpListener::bind` listens. A test that spawns a process at that moment forks a child
 /// holding a copy of every open descriptor until it execs, so the probe could outlive its
 /// drop by a few hundred microseconds, still listening, and alcyon's bind then failed with
 /// `EADDRINUSE` (traced in `tcp_proxy` under concurrent runs). A socket that is only bound
 /// does not conflict with a later `SO_REUSEADDR` bind, wherever copies of it live.
-fn bindable(addr: SocketAddr) -> bool {
+pub fn bindable(addr: SocketAddr) -> bool {
     use rustix::net::{AddressFamily, SocketFlags, SocketType};
     let Ok(fd) = rustix::net::socket_with(AddressFamily::INET, SocketType::STREAM, SocketFlags::CLOEXEC, None)
     else {
         return false;
     };
-    rustix::net::sockopt::set_socket_reuseaddr(&fd, true).is_ok() && rustix::net::bind(&fd, &addr).is_ok()
+    if !(rustix::net::sockopt::set_socket_reuseaddr(&fd, true).is_ok() && rustix::net::bind(&fd, &addr).is_ok()) {
+        return false;
+    }
+    // The same port for UDP, with no reuse option, so the bind fails if anything holds it. A
+    // QUIC listener holds only UDP, with `SO_REUSEPORT`: an alcyon a failed test left running
+    // kept its port, the TCP probe alone handed it out again, and the next QUIC test's alcyon
+    // joined the orphan's reuseport group and lost datagrams to it (2026-11-09,
+    // tests/it/common_helpers.rs).
+    let Ok(udp) = rustix::net::socket_with(AddressFamily::INET, SocketType::DGRAM, SocketFlags::CLOEXEC, None)
+    else {
+        return false;
+    };
+    rustix::net::bind(&udp, &addr).is_ok()
 }
 
 /// The port of [`reserve_addr`].

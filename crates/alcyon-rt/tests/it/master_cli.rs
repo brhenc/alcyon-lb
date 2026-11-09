@@ -514,7 +514,7 @@ fn the_master_cli_needs_master_worker_mode() {
     // `-s <path>` (Alcyon's command-line stats socket, not the master CLI) is an admin stats
     // socket in a single process.
     let stats = dir.join("s.sock");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .arg("-f")
         .arg(&cfg)
         .arg("-s")
@@ -522,7 +522,7 @@ fn the_master_cli_needs_master_worker_mode() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     wait_for_socket(&stats);
     assert_eq!(master(&stats, "show cli level"), "admin\n\n");
     common::stop(&mut child);

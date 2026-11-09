@@ -47,7 +47,7 @@ fn exchange(req: &[u8], resp: &'static [u8]) -> (String, String) {
         ),
     )
     .expect("write config");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn");
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn"));
     let out = child.stdout.take().expect("stdout");
     let (tx, logs) = mpsc::channel();
     thread::spawn(move || {

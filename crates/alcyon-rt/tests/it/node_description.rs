@@ -163,7 +163,7 @@ fn a_reload_with_sf_shows_the_node_and_description_of_the_new_configuration() {
     let cfg = std::fs::read_to_string(dir.join("cfg")).expect("cfg");
     std::fs::write(dir.join("cfg"), cfg.replace("node first", "node second").replace("description one", "description two")).expect("rewrite");
     assert_eq!(lines_with(&cli(&old.sock, "show info"), &["node:", "description:"]), ["node: first", "description: one"]);
-    let mut new = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let mut new = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .arg("-f")
         .arg(dir.join("cfg"))
         .arg("-sf")
@@ -171,7 +171,7 @@ fn a_reload_with_sf_shows_the_node_and_description_of_the_new_configuration() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     let _ = old.child.wait();
     let end = std::time::Instant::now() + Duration::from_secs(10);
     let info = loop {

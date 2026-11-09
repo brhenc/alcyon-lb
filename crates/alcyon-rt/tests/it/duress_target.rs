@@ -35,13 +35,13 @@ fn duress_target_proxies_an_h3_request_to_its_backend() {
     });
 
     let port = common::reserve_addr().port();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_duress_target"))
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_duress_target"))
         .arg(port.to_string())
         .arg(backend.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn duress_target");
+        .expect("spawn duress_target"));
     // It prints the port once the engine is built.
     let mut out = child.stdout.take().expect("stdout");
     let mut line = [0u8; 16];

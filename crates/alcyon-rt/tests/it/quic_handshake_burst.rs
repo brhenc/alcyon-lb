@@ -51,7 +51,7 @@ const CLIENTS: usize = 300;
 type Client = (UdpSocket, Vec<u8>, Endpoint, alcyon_quic::quinn_proto::Connection);
 
 /// Alcyon at `nbthread 1`, and its QUIC address.
-fn spawn() -> (std::process::Child, std::net::SocketAddr, tempfile::NamedTempFile) {
+fn spawn() -> (common::Alcyon, std::net::SocketAddr, tempfile::NamedTempFile) {
     let tcp = common::reserve_addr();
     let quic = common::reserve_addr();
     let crt = format!("{}/../../examples/certs/localhost.pem", env!("CARGO_MANIFEST_DIR"));
@@ -67,7 +67,7 @@ fn spawn() -> (std::process::Child, std::net::SocketAddr, tempfile::NamedTempFil
         .arg(cfg.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Alcyon)
         .expect("spawn alcyon");
     assert!(common::wait_listening(tcp), "alcyon never listened");
     (child, quic, cfg)

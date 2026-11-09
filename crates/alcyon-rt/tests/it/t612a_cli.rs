@@ -51,14 +51,14 @@ fn run_slim(tag: &str, args: &[&str], fe_maxconn: &str) -> String {
     std::fs::create_dir_all(&dir).unwrap();
     let addr = common::reserve_addr();
     let path = cfg(&dir, addr, fe_maxconn);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .args(args)
         .arg("-f")
         .arg(&path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap();
+        .unwrap());
     assert!(common::wait_listening(addr));
     let sock = dir.join("cli.sock").display().to_string();
     let deadline = Instant::now() + Duration::from_secs(5);

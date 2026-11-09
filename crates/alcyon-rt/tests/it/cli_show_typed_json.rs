@@ -33,7 +33,7 @@ fn answers_with(proxies: &str, cmds: &[&str]) -> Vec<String> {
         ),
     )
     .expect("write cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn"));
     assert!(common::wait_listening(fe), "alcyon never listened");
     let mut res = Vec::new();
     for cmd in cmds {

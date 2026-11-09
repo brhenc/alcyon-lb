@@ -58,7 +58,7 @@ fn the_log_counts_the_upgrade_heads_and_the_tunnel_bytes() {
         ),
     )
     .expect("write config");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn");
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().expect("spawn"));
     let out = child.stdout.take().expect("stdout");
     let (tx, logs) = mpsc::channel();
     thread::spawn(move || {

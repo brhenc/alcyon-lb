@@ -50,13 +50,13 @@ fn check_columns_are_the_same_on_every_worker() {
     );
     let path = dir.path().join("alcyon.cfg");
     std::fs::write(&path, &cfg).expect("write cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .arg("-f")
         .arg(&path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn alcyon");
+        .expect("spawn alcyon"));
     let start = Instant::now();
     while !sock.exists() && start.elapsed() < Duration::from_secs(5) {
         thread::sleep(Duration::from_millis(20));

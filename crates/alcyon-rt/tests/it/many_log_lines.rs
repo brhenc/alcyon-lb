@@ -50,7 +50,7 @@ fn run(build: impl Fn(&str) -> String, cs: &[UdpSocket]) -> Vec<bool> {
     let mut f = NamedTempFile::new().expect("cfg");
     f.write_all(cfg.as_bytes()).expect("write");
     let bin = std::env::var("T306C_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string());
-    let mut child = Command::new(bin).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let mut child = common::Alcyon(Command::new(bin).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn"));
     assert!(common::wait_listening(fe), "never listened:\n{cfg}");
     let mut c = TcpStream::connect(fe).expect("connect");
     c.write_all(b"GET /MARK HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("send");

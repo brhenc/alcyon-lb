@@ -125,7 +125,7 @@ fn strace_setsockopt(cfg: &str, probe: SocketAddr) -> String {
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("cfg");
     let log = NamedTempFile::new().expect("tmp");
-    let mut child = Command::new("strace")
+    let mut child = common::Alcyon(Command::new("strace")
         .args(["-f", "-e", "trace=setsockopt,connect", "-o"])
         .arg(log.path())
         .arg(env!("CARGO_BIN_EXE_alcyon"))
@@ -134,7 +134,7 @@ fn strace_setsockopt(cfg: &str, probe: SocketAddr) -> String {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn strace");
+        .expect("spawn strace"));
     assert!(common::wait_listening(probe));
     if let Ok(mut c) = std::net::TcpStream::connect(probe) {
         let _ = c.write_all(b"x");

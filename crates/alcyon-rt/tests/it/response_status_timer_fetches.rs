@@ -50,7 +50,7 @@ fn server_status_comp_and_header_timer() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     assert!(common::wait_listening(a), "alcyon did not listen");
     let mut s = TcpStream::connect(a).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -86,7 +86,7 @@ fn local_reply_does_not_inherit_previous_response() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     assert!(common::wait_listening(a), "alcyon did not listen");
     let mut got = Vec::new();
     for p in ["/", "/deny", "/ret", "/"] {
@@ -147,7 +147,7 @@ fn h2_streams_keep_their_own_status_and_timer() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     assert!(common::wait_listening(a), "alcyon did not listen");
     let url = |p: &str| format!("http://{a}/{p}");
     let st = Command::new("curl")
@@ -232,7 +232,7 @@ fn h2_denied_stream_ending_after_a_server_answer_logs_no_server_status() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     assert!(common::wait_listening(a), "alcyon did not listen");
     let mut c = std::net::TcpStream::connect(a).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

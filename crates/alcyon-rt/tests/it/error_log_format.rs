@@ -48,7 +48,7 @@ fn session(template: &str, probes: &[(usize, &[u8], bool)]) -> Result<Vec<Vec<St
         .replace("@CERT@", cert());
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write");
-    let mut child = Command::new(binary()).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().expect("spawn");
+    let mut child = common::Alcyon(Command::new(binary()).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().expect("spawn"));
     if !common::wait_listening(binds[0]) {
         common::stop(&mut child);
         let mut stderr = String::new();

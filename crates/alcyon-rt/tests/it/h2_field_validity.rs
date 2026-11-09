@@ -341,7 +341,7 @@ fn server() -> (std::net::SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
 }
 
 /// An alcyon with an h2 frontend (`fe_extra` added to it) in front of `be`, and its port.
-fn proxy(be: std::net::SocketAddr, fe_extra: &str) -> (std::process::Child, u16, std::path::PathBuf) {
+fn proxy(be: std::net::SocketAddr, fe_extra: &str) -> (common::Alcyon, u16, std::path::PathBuf) {
     let port = common::reserve_port();
     let cfg = std::env::temp_dir().join(format!("alcyon_h2field_{}_{port}.cfg", std::process::id()));
     std::fs::write(
@@ -353,7 +353,7 @@ fn proxy(be: std::net::SocketAddr, fe_extra: &str) -> (std::process::Child, u16,
         ),
     )
     .expect("write config");
-    let child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Alcyon).expect("spawn");
     assert!(common::wait_listening(([127, 0, 0, 1], port).into()), "never listened");
     (child, port, cfg)
 }

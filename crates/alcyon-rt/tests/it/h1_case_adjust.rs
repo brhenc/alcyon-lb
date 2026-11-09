@@ -43,7 +43,7 @@ fn exchange(global: &str, fe: &str, be: &str) -> (String, String) {
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn alcyon");
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn alcyon"));
     assert!(common::wait_listening(fa), "alcyon never listened on {fa}");
     let mut c = TcpStream::connect(fa).expect("connect");
     c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -152,7 +152,7 @@ fn a_return_with_a_content_type_writes_content_length_first() {
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn alcyon");
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn alcyon"));
     assert!(common::wait_listening(fa), "alcyon never listened on {fa}");
     let mut c = TcpStream::connect(fa).expect("connect");
     c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();

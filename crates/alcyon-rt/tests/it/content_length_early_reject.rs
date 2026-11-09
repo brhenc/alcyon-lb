@@ -58,7 +58,7 @@ fn run(cases: &[(&[u8], Option<&str>)]) {
     )
     .expect("write cfg");
     let bin = std::env::var("T315_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string());
-    let mut child = Command::new(bin).arg("-f").arg(cfg.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let mut child = common::Alcyon(Command::new(bin).arg("-f").arg(cfg.path()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn"));
     assert!(common::wait_listening(addr), "proxy never listened");
     let mut bad = Vec::new();
     for &(tail, want) in cases {

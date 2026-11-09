@@ -18,6 +18,7 @@
 mod common;
 
 mod aborted_client_waiting_for_server;
+mod common_helpers;
 mod abortonclose;
 mod h1_lowercase_headers;
 mod smax_beconn;

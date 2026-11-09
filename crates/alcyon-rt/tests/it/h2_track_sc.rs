@@ -52,7 +52,7 @@ fn run(client: &[&str]) -> (String, String) {
     let path = dir.join("c.cfg");
     std::fs::write(&path, cfg).expect("cfg");
     let bin = std::env::var("H2TRACK_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string());
-    let mut child = Command::new(bin).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let mut child = common::Alcyon(Command::new(bin).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn"));
     let deadline = Instant::now() + Duration::from_secs(5);
     while !std::path::Path::new(&sock).exists() {
         assert!(Instant::now() < deadline, "no stats socket");

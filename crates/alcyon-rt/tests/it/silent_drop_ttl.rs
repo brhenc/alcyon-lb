@@ -36,7 +36,7 @@ fn ttls_on(rule: &str, v6: bool) -> (Vec<String>, bool) {
     .expect("write cfg");
     let trace = NamedTempFile::new().expect("trace");
     let bin = std::env::var("T306C_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string());
-    let mut child = Command::new("strace")
+    let mut child = common::Alcyon(Command::new("strace")
         .args(["-f", "-o"])
         .arg(trace.path())
         .args(["-e", "trace=setsockopt", &bin, "-f"])
@@ -44,7 +44,7 @@ fn ttls_on(rule: &str, v6: bool) -> (Vec<String>, bool) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("strace must be installed");
+        .expect("strace must be installed"));
     assert!(common::wait_listening(fe), "never listened:\n{rule}");
     let mut c = TcpStream::connect(fe).expect("connect");
     let _ = c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");

@@ -97,7 +97,7 @@ fn forms_alcyon_does_not_implement_say_so() {
     }
 }
 
-fn start(lines: &str, extra: &[String]) -> (Child, NamedTempFile) {
+fn start(lines: &str, extra: &[String]) -> (common::Alcyon, NamedTempFile) {
     let f = cfg(lines);
     let child = Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .arg("-f")
@@ -105,7 +105,7 @@ fn start(lines: &str, extra: &[String]) -> (Child, NamedTempFile) {
         .args(extra)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .spawn().map(common::Alcyon)
         .expect("spawn");
     (child, f)
 }
@@ -200,14 +200,14 @@ fn a_tcp_stats_socket_survives_an_sf_reload() {
     let info = ask(tcp(a), "show info");
     assert!(info.contains(&format!("Pid: {}", old.id())), "{info}");
 
-    let mut new = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let mut new = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .arg("-f")
         .arg(f.path())
         .args(["-sf".to_string(), old.id().to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     let end = Instant::now() + Duration::from_secs(10);
     let st = loop {
         if let Some(st) = old.try_wait().expect("wait") {
@@ -285,14 +285,14 @@ fn x_hands_the_tcp_stats_socket_over() {
     let (mut old, f) = start(&lines, &[]);
     let _ = tcp(a);
     let _ = wait("unix CLI", || UnixStream::connect(&sock).ok());
-    let mut new = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let mut new = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .arg("-f")
         .arg(f.path())
         .args(["-x".to_string(), sock.display().to_string(), "-sf".to_string(), old.id().to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     let end = Instant::now() + Duration::from_secs(10);
     while old.try_wait().expect("wait").is_none() {
         assert!(Instant::now() < end, "the old process never exited");
@@ -352,7 +352,7 @@ fn an_abns_stats_socket_survives_a_sf_reload() {
     let first = pid_of(wait("abns@", || abstract_stream(&abns, true)));
     assert_eq!(first, format!("Pid: {}", old.id()));
 
-    let mut new = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let mut new = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .arg("-f")
         .arg(f.path())
         .arg("-sf")
@@ -360,7 +360,7 @@ fn an_abns_stats_socket_survives_a_sf_reload() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut old_gone = false;
     while Instant::now() < deadline && !old_gone {
@@ -411,7 +411,7 @@ fn a_failed_sf_successor_gives_the_abns_name_back() {
 /// tries to bind it back exactly once, at once, as HAProxy's `protocol_resume_all` does, and
 /// prints `bound` or `busy`. It needs no retry if the successor has closed its socket before
 /// it signals.
-fn old_process_stand_in(name: &str) -> Child {
+fn old_process_stand_in(name: &str) -> common::Alcyon {
     const SCRIPT: &str = r#"
 import os, signal, socket, sys
 addr = b"\0" + sys.argv[1].encode().ljust(107, b"\0")
@@ -436,7 +436,7 @@ while True:
         .args(["-I", "-c", SCRIPT, name])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .spawn()
+        .spawn().map(common::Alcyon)
         .expect("python3")
 }
 
@@ -483,13 +483,13 @@ fn an_abns_name_still_held_when_sigttin_arrives_is_reported_and_taken_back_on_th
     let abns = format!("alcyon-t370-held-{}", std::process::id());
     let f = cfg(&format!("\tstats socket abns@{abns} level admin"));
     let err = tempfile::NamedTempFile::new().expect("stderr file");
-    let mut p = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let mut p = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .arg("-f")
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(err.reopen().expect("reopen"))
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     drop(wait("abns@", || abstract_stream(&abns, true)));
     let sig = |s: &str| {
         let _ = Command::new("kill").arg(format!("-{s}")).arg(p.id().to_string()).status();

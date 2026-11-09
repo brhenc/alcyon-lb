@@ -43,7 +43,7 @@ fn res_fhdr_trims_lws_but_wire_keeps_it() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     assert!(common::wait_listening(a));
     let mut s = TcpStream::connect(a).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();

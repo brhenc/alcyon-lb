@@ -189,13 +189,13 @@ fn occurrence_as_sample_and_every_value_in_acls() {
     let (fq, fr, be) = (common::reserve_addr(), common::reserve_addr(), backend());
     let mut f = tempfile::NamedTempFile::new().expect("tmp");
     f.write_all(config(fq, fr, be).as_bytes()).expect("write cfg");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .arg("-f")
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn alcyon");
+        .expect("spawn alcyon"));
     assert!(common::wait_listening(fq) && common::wait_listening(fr), "alcyon did not listen");
 
     let mut bad = Vec::new();

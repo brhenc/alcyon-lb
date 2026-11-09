@@ -76,13 +76,13 @@ fn run(extra: &str) -> Run {
         collector.local_addr().expect("addr")
     )
     .expect("write");
-    let mut child = Command::new(std::env::var("T262_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string()))
+    let mut child = common::Alcyon(Command::new(std::env::var("T262_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string()))
         .arg("-f")
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     assert!(common::wait_listening(fe), "alcyon never listened");
     let probe = |send: &[u8], half_close: bool| -> Vec<u8> {
         let mut c = TcpStream::connect(fe).expect("connect");
@@ -229,13 +229,13 @@ fn session_quiet(mode: &str, bind_opts: &str, extra: &str, inputs: &[(&[u8], boo
         collector.local_addr().expect("addr")
     )
     .expect("write");
-    let mut child = Command::new(std::env::var("T262_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string()))
+    let mut child = common::Alcyon(Command::new(std::env::var("T262_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string()))
         .arg("-f")
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn");
+        .expect("spawn"));
     if !common::wait_listening(fe) {
         common::stop(&mut child);
         let mut stderr = String::new();

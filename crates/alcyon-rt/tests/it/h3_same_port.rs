@@ -60,13 +60,13 @@ fn run(quic_first: bool) {
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("write cfg");
-    let mut child = common::alcyon_command(env!("CARGO_BIN_EXE_alcyon"))
+    let mut child = common::Alcyon(common::alcyon_command(env!("CARGO_BIN_EXE_alcyon"))
         .arg("-f")
         .arg(f.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn alcyon");
+        .expect("spawn alcyon"));
     assert!(common::wait_listening(addr), "alcyon never listened on {addr}");
     let h3 = curl_version(addr.port(), "--http3-only");
     let h2 = curl_version(addr.port(), "--http2");

@@ -41,7 +41,7 @@ fn stats_refresh_sends_the_refresh_header_in_seconds() {
             ),
         )
         .unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
         assert!(common::wait_listening(addr));
         let page = get(addr, "/st");
         let norefresh = get(addr, "/st;norefresh");

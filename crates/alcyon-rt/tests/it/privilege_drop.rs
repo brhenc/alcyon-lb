@@ -64,7 +64,7 @@ fn write_cfg(global: &str, port: u16, body: &str) -> PathBuf {
 
 /// Alcyon with its stderr in a file next to `cfg` (a pipe would keep a test waiting on any
 /// process that inherited it) and its pidfile there too, for [`reap`].
-fn spawn(args: &[&str], cfg: &Path) -> Child {
+fn spawn(args: &[&str], cfg: &Path) -> common::Alcyon {
     let dir = cfg.parent().expect("dir");
     let err = std::fs::File::create(dir.join("stderr")).expect("stderr file");
     Command::new(BIN)
@@ -76,7 +76,7 @@ fn spawn(args: &[&str], cfg: &Path) -> Child {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(err)
-        .spawn()
+        .spawn().map(common::Alcyon)
         .expect("spawn alcyon")
 }
 

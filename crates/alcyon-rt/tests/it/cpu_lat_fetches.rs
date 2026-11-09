@@ -37,13 +37,13 @@ fn cpu_and_latency_fetches_have_values() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .arg("-f")
         .arg(&path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap();
+        .unwrap());
     let ok = common::wait_listening(a);
     let resp = if ok { body(a) } else { String::new() };
     common::stop(&mut child);
@@ -80,14 +80,14 @@ fn haproxy_localpeer_is_exported() {
         ),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon"))
         .arg("-f")
         .arg(&path)
         .env("HAPROXY_LOCALPEER", "stale")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap();
+        .unwrap());
     let ok = common::wait_listening(a);
     let resp = if ok { body(a) } else { String::new() };
     common::stop(&mut child);

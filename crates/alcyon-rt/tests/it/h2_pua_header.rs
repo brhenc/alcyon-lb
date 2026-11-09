@@ -77,7 +77,7 @@ fn an_h2_value_in_the_private_use_range_is_not_a_stray_byte() {
         ),
     )
     .expect("write config");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn"));
     assert!(common::wait_listening(([127, 0, 0, 1], port).into()), "never listened");
     let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     c.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").unwrap();
