@@ -61,6 +61,18 @@ class OneProcessPerTest(unittest.TestCase):
                          "/t/llvm-cov-target/alcyon-%16m.profraw")
         self.assertEqual(suite.pooled_profile("/t/x-%p.profraw"), "/t/x-%16m.profraw")
 
+    def test_an_instrumented_run_builds_a_plain_alcyon_beside_it(self):
+        # memmax measures alcyon's own memory under `-m 8`; the coverage counters of the
+        # instrumented binary take ~3.8 MB of that budget (11-09), so those tests run the plain
+        # one, built in the target directory `cargo llvm-cov` nests its own in.
+        env = {"RUSTFLAGS": "-C instrument-coverage", "LLVM_PROFILE_FILE": "/t/llvm-cov-target/a-%p.profraw",
+               "ALCYON_INSTRUMENTED": "/t/llvm-cov-target", "CARGO_TARGET_DIR": "/t/llvm-cov-target",
+               "CARGO_LLVM_COV": "1", "PATH": "/usr/bin"}
+        cmd, plain, binary = suite.plain_build(env)
+        self.assertEqual(cmd, ["cargo", "build", "-q", "-p", "alcyon-rt", "--bin", "alcyon"])
+        self.assertEqual(plain, {"CARGO_TARGET_DIR": "/t", "PATH": "/usr/bin"})
+        self.assertEqual(binary, "/t/debug/alcyon")
+
     def test_serial_entries_are_tests_or_prefixes(self):
         self.assertTrue(suite.is_serial("alcyon-rt/it::fd_hygiene::an_idle_server_connection"))
         self.assertTrue(suite.is_serial("alcyon-rt/request_allocations::sixty_thousand"))

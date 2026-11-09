@@ -457,6 +457,34 @@ def instrument() -> str | None:
     return tdir
 
 
+PLAIN_BIN_KEY = "ALCYON_PLAIN_BIN"
+
+
+def plain_build(env: dict) -> tuple[list[str], dict, str]:
+    """The build of a plain (not instrumented) alcyon beside an instrumented run: the command,
+    its environment and the binary it leaves. Tests that measure alcyon's own memory (memmax,
+    `-m 8`) run it through `ALCYON_PLAIN_BIN`: the instrumented binary's coverage counters take
+    ~3.8 MB of an 8 MB budget (11-09: 8.07 MB of data before serving, the plain one 4.2 MB).
+    It builds in the target directory `cargo llvm-cov` nests its own in, as checkin's plain
+    builds do."""
+    plain = {k: v for k, v in env.items()
+             if k not in ("RUSTFLAGS", "RUSTDOCFLAGS", "LLVM_PROFILE_FILE", INSTRUMENTED_KEY)
+             and not k.startswith(("CARGO_LLVM_COV", "__CARGO_LLVM_COV"))}
+    plain["CARGO_TARGET_DIR"] = os.path.dirname(env["CARGO_TARGET_DIR"].rstrip("/"))
+    return (["cargo", "build", "-q", "-p", "alcyon-rt", "--bin", "alcyon"], plain,
+            os.path.join(plain["CARGO_TARGET_DIR"], "debug", "alcyon"))
+
+
+def build_plain_alcyon() -> None:
+    """Builds the plain alcyon of `plain_build` and names it to the tests (PLAIN_BIN_KEY)."""
+    cmd, env, binary = plain_build(dict(os.environ))
+    p = subprocess.run(cmd, cwd=REPO, env=env, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise SystemExit(f"suite: the plain alcyon did not build: {p.stderr[-2000:]}")
+    os.environ[PLAIN_BIN_KEY] = binary
+    say(f"suite: plain alcyon for the memory tests: {binary}")
+
+
 def record_run(tdir: str, failed_tests: dict[str, set[str]], passed: int, failed_n: int) -> None:
     """Tells covercheck which executables wrote the profiles in `tdir` (covercheck.SUITE_RUN)."""
     rec = {"executables": sorted(built_executables), "passed": passed, "failed_n": failed_n,
@@ -536,6 +564,8 @@ def main() -> int:
                   REPO, None, None) for pkg, t in targets]
     else:
         tdir = instrument()
+        if tdir:
+            build_plain_alcyon()
         say(f"suite: running every test in the workspace in a process of its own, {JOBS} at a time, "
             f"{TARGET_TIMEOUT}s each at most, "
             + ("instrumented (the profiles are covercheck's)" if tdir else "not instrumented (COVERCHECK=0)"))

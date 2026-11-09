@@ -63,8 +63,20 @@ fn config_threads(name: &str, port: u16, tls: bool, global_extra: &str, nbthread
     (cfg, sock)
 }
 
+/// The alcyon a budget of `megs` is measured on. Under the gate's coverage build the binary's
+/// counters take ~3.8 MB of data (11-09: 8.07 MB before serving against 8.19 MB at `-m 8`, the
+/// plain binary 4.2 MB), so a small budget would measure the instrumentation: below 16 MB the
+/// plain alcyon the suite builds beside it (`harness/suite.py`, `ALCYON_PLAIN_BIN`) runs.
+fn binary_for(megs: &str) -> String {
+    let instrumented = env!("CARGO_BIN_EXE_alcyon").to_string();
+    match std::env::var("ALCYON_PLAIN_BIN") {
+        Ok(plain) if megs.parse::<u32>().is_ok_and(|m| m < 16) => plain,
+        _ => instrumented,
+    }
+}
+
 fn spawn(megs: &str, cfg: &str, sock: String, port: u16) -> Run {
-    let child = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let child = Command::new(binary_for(megs))
         .args(["-m", megs, "-f", cfg])
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
