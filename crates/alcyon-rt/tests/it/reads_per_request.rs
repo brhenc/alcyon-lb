@@ -8,7 +8,7 @@
 //! not read again until epoll reports it (`fd_cant_recv`, `src/raw_sock.c`). Measured
 //! 2026-10-02 with `strace -c`, one keep-alive connection: `HAProxy` 3.5 made 2.00
 //! receives per request (one each side) and Alcyon 10.99, 9 of them `EAGAIN`
-//! (`performance.md`).
+//! (`docs/history/performance-2026-10-02.md`).
 
 use crate::common;
 

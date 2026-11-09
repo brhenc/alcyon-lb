@@ -914,7 +914,7 @@ pub struct TcpSession {
     /// TLS may hold decrypted bytes the socket no longer shows.
     pub srv_cant_recv: bool,
     /// The same for the client socket. Without it every pass over the session read the
-    /// client again, eight `EAGAIN` reads per keep-alive request (`performance.md`).
+    /// client again, eight `EAGAIN` reads per keep-alive request (`docs/history/performance-2026-10-02.md`).
     pub cli_cant_recv: bool,
     /// The last [`Self::advance`] stopped at its bound with its passes still making
     /// progress: there is more to do, and maybe no socket event to say so.

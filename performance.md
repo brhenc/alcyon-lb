@@ -1,123 +1,111 @@
+<!--
+SPDX-License-Identifier: GPL-2.0-or-later
+Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+-->
 # Performance: Alcyon against HAProxy
 
-Measured 2026-10-02 on main `b61b340` (design 010 steps 1-4 merged) against the reference
-HAProxy (`3.5-dev7-e6f616-55`, `/home/bhenc/reference/haproxy/haproxy`). The open question
-this records: **where does Alcyon spend the CPU HAProxy does not?** The syscall profile
-below found an architecture difference -- Alcyon read a socket on every pass over a session
-where HAProxy reads it only when epoll says it is readable -- and it was fixed the same day,
-ahead of the `patches/` integration, because every later change would have been built and
-measured on top of it. See **Fixed: read only when readable** at the end; the tables before
-it are the "before".
+Measured 2026-11-09 on Alcyon `3ea291cb` against HAProxy 3.5-dev8 (HTTP/1, HTTP/2, TLS) and
+3.5-dev10 (HTTP/3), on one quiet host. Every figure below comes from the same harness, client
+and backend for both proxies. The previous version of this file (2026-10-02, when Alcyon used
+16-18% more CPU per request than HAProxy) is in `docs/history/performance-2026-10-02.md`.
 
-`data/perf_parity.md` (T39) is older and measured differently (unpinned, before the HTTP
-transaction); prefer the numbers here.
+These figures are for one small, synthetic workload: an empty `GET /`, a 200 response, one
+core. They say where the per-request cost stands. They do not say how either proxy behaves
+under real traffic, with many cores, or with large bodies.
 
-## How it was measured
+## Setup
 
-Same harness for both, one process per role, each pinned to its own core in one L3 group of
-the 32-core EPYC 7542 (`taskset -c 4` proxy, `5` client, `6` backend), `nbthread 1`, the
-`measure-bench` backend and client (`tools/measure/bench`), plain HTTP/1.1 keep-alive,
-`GET /`, empty 200 response. CPU is the proxy's own time from
-`/proc/<pid>/task/*/schedstat` over a fixed number of requests (`measure-bench fixed`).
-Unpinned, one build's samples split into two clusters ~25% apart, depending on whether the
-scheduler put the three processes in one L3.
+- **Host:** AMD EPYC 7542 (32 cores), Linux 7.2.15, governor `performance`. Nothing else ran
+  (checked before and after, `/tmp/alcyon-load.lock` held).
+- **Pinning:** proxy on CPU 4, client on 5, backend on 6 (one L3 group), `nbthread 1`.
+- **Alcyon:** `cargo build --profile release-perf` (fat LTO, `codegen-units = 1`), rustc 1.99.1;
+  TLS is rustls 0.24 with ring.
+- **HAProxy:** built from source with its defaults: `CFLAGS = -O2 -g -fwrapv`, OpenSSL 3.5.8
+  (3.5.9 for the QUIC build), PCRE2 without JIT.
+- **Configurations:** `tools/measure/scenarios/*.body`. The same file runs on both proxies.
+  `keepalive` is a plain proxy; `rules` adds a typical set of `http-request` /
+  `http-response` rules; `tls` terminates TLS; `h3` binds QUIC.
 
-The gate's A/B (`tools/measure/measure.py`, `measure_ab`) uses the same setup. Between two
-identical builds it agrees to 0.3% on CPU per request at 50 connections.
+Instructions per request (`tools/measure/insreq.sh`, `perf stat -e instructions:u` on the proxy
+process, minimum of 5 rounds) are the figure the project budgets on. They vary by under 0.3%
+between runs, where wall time varies by a few percent. They are user-space only, because this
+host does not allow counting kernel instructions. Fewer instructions is not the same as less
+time: the CPU-time figures are below.
 
-## Results
+## Instructions per request
 
-| | HAProxy | Alcyon |
-|---|---|---|
-| CPU per request, 50 connections | **17.8 µs** | **20.6-21.0 µs** (+16-18%) |
-| Requests/s, 50 connections (client-bound) | ~31.6k | ~31.9k |
-| CPU per request, 1 connection | 33.5 µs | 41-44 µs |
-| Requests/s, 1 connection | 16-17k | 14-19k |
-| Syscalls per request, 1 connection | 10.2 | 17.0 |
-| Syscalls per request, 50 connections | **4.2** | **13.1** |
+| Workload | Client | HAProxy | Alcyon | Alcyon vs HAProxy |
+|---|---|---:|---:|---:|
+| HTTP/1.1 keep-alive | 1 connection (`ab -k -c 1`) | 36,100 | 35,104 | -2.8% |
+| HTTP/1.1 keep-alive | 50 connections (`measure-bench`) | 32,637 | 28,098 | -13.9% |
+| HTTP/1.1 with rules | 1 connection | 43,711 | 50,492 | **+15.5%** |
+| HTTP/1.1 with rules | 50 connections | 41,438 | 42,373 | +2.3% |
+| HTTPS keep-alive | 1 connection (`ab1s`) | 49,354 | 41,211 | -16.5% |
+| HTTPS, one handshake per request | 1 connection (`hs1`) | 2,997,694 | 1,441,002 | -51.9% |
+| HTTP/2 over TLS | 1 connection, 1 stream (`h2load`) | 53,161 | 50,660 | -4.7% |
+| HTTP/3 | 1 connection (`h3fit`, at 1.97 client datagrams/request) | 63,783 | 82,705 | **+29.7%** |
 
-At 1 connection both proxies sleep in `epoll_wait` between requests, and CPU per request
-there also measures how often a process sleeps and wakes. c0e2ca6 (Alcyon's timer disarm)
-moved Alcyon's 1-connection CPU by +29% while gaining 21% requests/s, by sleeping a quarter as
-often, and left the 50-connection figure unchanged. **Compare the two at 50 connections.**
+Notes:
 
-For history: Alcyon before the HTTP transaction (`cd435a8`) cost 18.4 µs at 50 connections,
-and the transaction added 11.4% (part of which is request rules now running on every
-request rather than only the first).
+- **TLS handshakes** compare two cryptography libraries (ring under rustls against OpenSSL 3.5)
+  as much as two proxies. The figure counts only the proxy's user-space instructions, so the
+  handshake's kernel work is not in it.
+- **HTTP/3** is measured with Alcyon's own client (`tools/measure/h3bench`, T555), because
+  `h2load`'s acknowledgement pattern varies too much between rounds. The client's datagram
+  rate is fixed by fitting two runs, as `insreq.sh` describes. Alcyon's QUIC is quinn-proto
+  (vendored); HAProxy's is its own.
+- **Rules at one connection** is the largest HTTP/1 gap. At 50 connections it shrinks to 2.3%,
+  so most of it is a fixed cost paid on every wakeup rather than work done per rule.
 
-## Syscalls per request (strace -c, 1 connection, 20,000 requests)
+## CPU time and throughput, one core
 
-| HAProxy | per request | Alcyon | per request |
-|---|---|---|---|
-| `recvmsg` | 2.00 | `read` | **10.99** (9.0 of them `EAGAIN`) |
-| `sendmsg` | 2.00 | `write` | 2.00 |
-| `epoll_wait` | 2.00 | `epoll_wait` | 2.00 |
-| `clock_gettime` | 4.00 | `getpid` | 2.00 |
+From `measure_ab` (`tools/measure/measure.py`), the gate's own A/B, with HAProxy as the second
+binary. It runs 6 rounds in alternating order, with a fresh proxy for each sample, on the
+`keepalive` configuration.
 
-At 50 connections: HAProxy `recvmsg` 2.00, `sendmsg` 2.00, `epoll_wait` 0.04 (66 `EAGAIN` in
-200,214 receives); Alcyon `read` 10.99 (**8.98 `EAGAIN` per request**), `write` 2.00,
-`epoll_wait` 0.04.
+| | HAProxy | Alcyon | |
+|---|---:|---:|---:|
+| CPU per request, 50 connections | 16.35 µs | 15.67 µs | -4.2% |
+| Requests/s, 1 connection | 18,495 | 19,774 | +6.9% |
 
-## The lead
+- **CPU per request at 50 connections** is the proxy's own CPU time (from `/proc/<pid>/schedstat`)
+  over a fixed number of requests. It is the figure to compare: the proxy is busy and rarely
+  sleeps.
+- **Requests/s at 1 connection** also measures how quickly each proxy goes to sleep and wakes
+  up again between requests.
+- **Samples:** HAProxy 16,539 / 16,456 / 16,367 / 16,323 / 16,326 / 16,288 ns; Alcyon 15,604 /
+  15,722 / 15,707 / 15,719 / 15,624 / 15,605 ns.
 
-**Alcyon attempts nine reads per request that the kernel answers with `EAGAIN`; HAProxy
-attempts almost none.** HAProxy tracks readiness per file descriptor: after a short read it
-marks the fd unable to receive (`fd_cant_recv`) and does not try again until epoll reports
-it readable. Alcyon has that for the server side only (`srv_cant_recv`, HTTP only) and
-otherwise retries the read on every pass over the session -- the client socket on every
-step, whether or not anything arrived. Nine extra syscalls per request at ~0.3-0.5 µs each
-is a plausible share of the 3 µs gap, and the passes that issue them are themselves work.
+## Memory and allocations
 
-Also seen, smaller:
-* `getpid` twice per request at 1 connection (once per `epoll_wait`): something asks for
-  the pid on every poll.
-* `CURRENT_TIMEOUTS`, a `HashMap` rebuilt per request in `connect_http_backend` (18 SipHash
-  inserts); `RandomState::hash_one` and `HashMap::insert` are ~8% of user samples.
-* About 40,000 user-space instructions per request (`perf stat`), equal in Alcyon before and
-  after c0e2ca6.
+- **Allocations per request:** 0 (0 bytes) for proxied HTTP/1 keep-alive, measured by
+  `tools/allocprofile` in the same run. The tests in `crates/alcyon-rt/tests/request_allocations*.rs`
+  pin the same for h2c, TLS, HTTP/2 to servers, rules, `return`, logging and HTTP/3
+  (RUST-FOOTGUNS.md section 2).
+- **60,000 backends** (`measure_60k_backends_memory`): 18.59 MB resident after loading, against
+  15.84 MB when last measured on 2026-09-24, before the memory pools (2026-10-24). This is
+  Alcyon only: HAProxy was not measured in this run.
 
-## Fixed: read only when readable (2026-10-02, uncommitted on `b61b340`)
+## How to reproduce
 
-* `cli_cant_recv` beside `srv_cant_recv` (`crates/alcyon-rt/src/proxy.rs`), and both are
-  now set the way `raw_sock_to_buf` sets `fd_cant_recv`: on `EAGAIN` **or on a read shorter
-  than the buffer**. The short read is what removes the `EAGAIN` entirely; marking on
-  `EAGAIN` alone still costs one wasted read per wakeup. Cleared in `step_stream` when the
-  poller reports the fd readable; a hang-up or error event now also counts as readable
-  (`fdtab.set_ready`), so the read that finds the EOF is never skipped. HTTP over plain
-  sockets only, as before: `mode tcp` sessions can be driven without a poller (tests do),
-  and TLS can hold decrypted bytes the socket no longer shows.
-* The engine reads its pid once at construction instead of `std::process::id()` (a
-  `getpid` syscall) on every step.
-* Pinned by `crates/alcyon-rt/tests/reads_per_request.rs`, which counts read syscalls in
-  process (`raw::read_counters`): 200 keep-alive requests made 2000 reads, 1600 of them
-  `EAGAIN`, before the fix, and 400 reads, 0 `EAGAIN`, after.
+```
+export ALCYON_REFERENCE=<directory with haproxy/ and haproxy-quic/>
+cargo build --profile release-perf --bin alcyon
+flock -x /tmp/alcyon-load.lock tools/measure/insreq.sh <label> <proxy-binary> \
+    tools/measure/scenarios/keepalive.body ab1 20000 5 /tmp/<label>
+```
 
-| | HAProxy | Alcyon before | Alcyon after |
-|---|---|---|---|
-| CPU per request, 50 connections | 17.4-17.6 µs | 20.6-21.0 µs | **15.8-15.9 µs** |
-| Requests/s, 50 connections | ~32.2k | ~31.9k | **36-38k** |
-| Syscalls per request, 1 connection | 10.2 | 17.0 | **6.0** |
-| Syscalls per request, 50 connections | 4.2 | 13.1 | **4.05** |
+The other rows use the same command with the scenario and client from the first table
+(`tls.body` with `ab1s`, `hs1` and `h2s1`, at 5,000 requests; `h3.body` with `h3fit`). The CPU
+table calls `measure.measure_ab(alcyon, haproxy, target_dir, rounds=6)`. The check-in gate runs
+the keep-alive and rules A/B on every main commit, against the previous one
+(`data/measurements.jsonl`).
 
-Alcyon after, by syscall (strace -c): 1 connection, 20,000 requests -- `read` 40,011 (1
-`EAGAIN`), `write` 40,000, `epoll_wait` 40,012, `getpid` 2; 50 connections, 200,000
-requests -- `read` 400,162 (5 `EAGAIN`), `write` 400,098, `epoll_wait` 8,026. HAProxy and
-Alcyon after were measured alternately, three rounds each, pinned as above; the gate's A/B
-against `b61b340` measured 20,661 -> 15,635 ns (-24.3%) at 50 connections and +13.7%
-requests/s at 1 connection.
+## Open
 
-Alcyon now does less per request than HAProxy, which is not the same as being cheaper for
-the same work: HAProxy reads the clock four times per request (`clock_gettime`, the
-remaining syscall difference) and keeps per-request statistics Alcyon may not yet. The
-requests/s at 50 connections rose because the proxy, not only the client, had been a
-bottleneck.
-
-## Next steps
-
-1. Replace `CURRENT_TIMEOUTS` with something that is not rebuilt per request.
-2. `mode tcp` and TLS still read speculatively; the TCP side needs the sessions that run
-   without a poller (tests) given readiness, or the flag made conditional on the engine.
-3. Kernel-side profile (`perf` with kernel symbols needs `perf_event_paranoid` lowered).
-
-Each change goes through the A/B (`tools/measure/run.sh --fast`, or `ALCYON_MEASURE_REF=<sha>`
-to compare against a chosen commit).
+- **HTTP/3 (+30%)** and **rules at one connection (+15%)** are the two gaps worth work. Profile them
+  with `tools/measure/insprof.sh` before choosing a change.
+- **Syscalls per request** were not counted in this run. The 2026-10-02 profile found 9 `EAGAIN`
+  reads per request, and that was fixed the same day (`docs/history/performance-2026-10-02.md`,
+  `crates/alcyon-rt/tests/it/reads_per_request.rs`).
+- **Multi-core scaling** and **large bodies** are not measured here.
