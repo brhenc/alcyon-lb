@@ -5,7 +5,7 @@
 //! loops opening one QUIC connection per request, and one slow request at a time that keeps
 //! each old process draining for a second while the new one serves.
 //!
-//! V&V (100 reloads 1.5 s apart, main 50c0a325): Alcyon lost 36 of 1962 short requests, all
+//! V&V (100 reloads 1.5 s apart, main 4808be65): Alcyon lost 36 of 1962 short requests, all
 //! closed by the old process with `H3_NO_ERROR` and no GOAWAY; `HAProxy` 3.5-dev10 lost
 //! about one per 33 reloads (a connection accepted by the old worker as it stopped, then
 //! never answered). The target is none lost.

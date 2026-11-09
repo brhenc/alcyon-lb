@@ -5,7 +5,7 @@ Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 # T364 plan: typed variables (design and slices), 2026-10-18
 
 Design task. Nothing is implemented. Measured on HAProxy 3.5-dev8-885761-29
-(`/home/bhenc/reference/haproxy/haproxy`) against Alcyon main `1a86b96b` (T363a merged), built at
+(`/home/bhenc/reference/haproxy/haproxy`) against Alcyon main `f1f6e951` (T363a merged), built at
 `/home/bhenc/ibex-targets/t364/release/alcyon` from the scratch worktree `~/ibex-worktrees/t364`
 (branch `design/t364`, no commits). Probe scripts and raw results: `~/ibex-worktrees/review/t364-probes/`
 (`matrix.py` + `hi.json` is the matrix; `e2.py`..`e8.py` are the smaller probes; `hmal.py` is the

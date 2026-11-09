@@ -1,6 +1,6 @@
 # Roadmap: after HTX
 
-Written 2026-09-23 against `b632cd2`. Scoping, not a task list — the nudges stay the unit
+Written 2026-09-23 against `b03a956`. Scoping, not a task list — the nudges stay the unit
 of work. This exists to answer two questions: what comes after HTX, and whether HTTP/3
 should be scoped now.
 

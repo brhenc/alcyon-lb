@@ -6,7 +6,7 @@ How it was run:
   `performance`.
 - Each line is the output of `tools/measure/insreq.sh <label> <bin> <scenario> <client> 30000 5`:
   instructions:u per request, 5 rounds, sorted with the min first.
-- `base` is main 0b57eabf (S1-S4), a release build. `main` is ac694b18 (S5, S7, T459 and T465 on
+- `base` is main 39eaa6ff (S1-S4), a release build. `main` is ac694b18 (S5, S7, T459 and T465 on
   top), also a release build. They were interleaved, two rounds each.
 
 ```
@@ -27,6 +27,6 @@ end 04:42:44 load=1.52 2.73 7.09
 ```
 
 The same method was used earlier that night, with the results in the merge messages:
-- **S1:** 05ddac2e, against d48d6037, with `tune.alcyon.zero-buffers off` on both sides.
-- **S2+S3:** fcab8c91, against 05ddac2e.
-- **S4:** 0b57eabf, against S3 4ed7312a.
+- **S1:** 0805a946, against ea04167c, with `tune.alcyon.zero-buffers off` on both sides.
+- **S2+S3:** 406ad144, against 0805a946.
+- **S4:** 39eaa6ff, against S3 a4702aac.

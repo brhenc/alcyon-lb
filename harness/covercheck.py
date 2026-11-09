@@ -31,7 +31,7 @@ clean (what the last commit changed; for a merge, everything the merge brought i
 It used to be `origin/main`. This repository is pushed rarely, so on a local main 18 commits
 ahead of origin that judged every change since the last push, reviewed and merged work
 included. To audit a range of merges, set the base explicitly:
-    ALCYON_COVERCHECK_BASE=03f2b75 python3 harness/covercheck.py
+    ALCYON_COVERCHECK_BASE=ef0bd7d python3 harness/covercheck.py
 """
 from __future__ import annotations
 

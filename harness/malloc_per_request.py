@@ -40,7 +40,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BACKEND_PORT, FRONT_PORT, LOG_PORT = 47440, 47441, 47442
 
-# (config, shape) -> (keep-alive pin, new-connection pin). Measured 2026-10-18 on 1a86b96b
+# (config, shape) -> (keep-alive pin, new-connection pin). Measured 2026-10-18 on f1f6e951
 # (the plan-2100 table, §2.1, reproduced). The ratchet: counts may go down, never up.
 PINS = {
     ("bare", "min"): (2, 2),    # GET / HTTP/1.1 + Host

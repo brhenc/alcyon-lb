@@ -15,7 +15,7 @@
 //!
 //! Not a pool object (the plan's §4.3 row said one): measured (ab1 keepalive, release-perf,
 //! user ins/req), a `Box<Stream>` taken from a `stream` pool cost +0.33k a request over the
-//! stream held in the session (36,243 and 36,207 against 35,912; base b1a99005 36,046): every
+//! stream held in the session (36,243 and 36,207 against 35,912; base bd5f534e 36,046): every
 //! `sess.strm.*` access loads the box's pointer first. On HTTP/1 the stream lives exactly as
 //! long as its session, whose entry is already the per-connection object; O1b decides where
 //! the multiplexed streams' memory comes from.

@@ -64,7 +64,7 @@ class Unreached(unittest.TestCase):
         self.assertEqual(bad, [], "test files no test target compiles (declare them in tests/it/main.rs)")
 
 
-# data/suite_baseline.json on main before T260 (94cc644), and what each entry is now. The
+# data/suite_baseline.json on main before T260 (07b7634), and what each entry is now. The
 # table is the migration: every old entry is here, and every entry here is in the baseline.
 OLD_TO_NEW = {
     "alcyon-dns/resolver_behavior::test_retry_and_failover":

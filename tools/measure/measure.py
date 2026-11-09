@@ -622,7 +622,7 @@ def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
       * 1-connection requests/s: latency-bound, a request at a time;
       * alcyon CPU time per request under `load_conns` connections. Busy, alcyon rarely sleeps,
         so this is what a request costs. At one connection the CPU figure also moves with
-        how often alcyon sleeps: 964e201 raised it 30% there by sleeping a quarter as often
+        how often alcyon sleeps: c0e2ca6 raised it 30% there by sleeping a quarter as often
         (and gained 21% requests/s), while at 50 connections the two builds cost the same.
 
     Machine load drifts over seconds; alternating puts both builds under the same drift, and

@@ -5,8 +5,8 @@ are user-space instructions (`instructions:u`). There are no wall-time claims: e
 measuring slot B (`flock -x /tmp/ibex-load-n1.lock`, `ALCYON_MEASURE_CPUS=12,13,14`, perf and the
 client on 13), governor `performance`, no `wwm.exe`, 21:55-22:16 CET.
 
-**Build measured**: branch `fix/t544` = main d581eae9 (T539: HandleMap hasher, qpack
-`static_ref`) + fix/t542 f9ac59ef (vendored quinn-proto 0.11.18 + PADDING-run patch).
+**Build measured**: branch `fix/t544` = main 5d7fea46 (T539: HandleMap hasher, qpack
+`static_ref`) + fix/t542 029512f9 (vendored quinn-proto 0.11.18 + PADDING-run patch).
 `cargo build --profile release-perf --bin alcyon` (`~/ibex-targets/t544/release-perf/alcyon`). The
 profiles come from the same tree built with `RUSTFLAGS="-C force-frame-pointers=yes"`
 (`~/ibex-targets/t544/fp/release-perf/alcyon`, +5.2 % on h3, +1.5 % on h2), and their shares are
@@ -187,7 +187,7 @@ the idle pool. h2 does not make this call.
 | 19 | h3 framing + QPACK cost more than h2 + HPACK | **confirmed** | 10.1k + 4.8k shared = 14.9k against h2's 7.5k + 2.2k = 9.7k (+5.2k). Largest: `H3MuxContext::put_head` 2.55k (response QPACK encode), `on_headers` 1.06k, `parse_head` 0.85k, `static_ref` binary search 0.74k, Huffman decode 1.72k, `check_request_fields` 1.16k (against h2's 2.2k for the whole shared codec: unknown why h3 pays twice the shared codec) |
 | 20 | The gap to HAProxy is mostly QUIC | **refuted** | 32.3k of the 47.3k is the common stream engine (Alcyon h2 pays it too: 63.6k against HAProxy's 26.9k). QUIC + glue + h3 is +15.0k net over HAProxy, but +41.4k over Alcyon h2 |
 
-## 5. If T543's plans land (from `tasks/T543-progress.md` on fix/t543, 1d2f9114)
+## 5. If T543's plans land (from `tasks/T543-progress.md` on fix/t543, d025fc2b)
 
 T543 part A (done: 0 allocations per h3 request, quinn free lists per connection) is not in
 this build. It removes at most the 0.67k of malloc/free here, plus the boxing/unboxing code

@@ -41,9 +41,9 @@ Oracle: `~/reference/haproxy` (`include/haproxy/htx-t.h`, `src/htx.c`, `src/http
 
 | scenario | Alcyon (release-perf) | HAProxy | ratio | record |
 |---|---:|---:|---:|---|
-| rules ab1 | 75,630 | ~42,000 | 1.80x | `data/measurements.jsonl` last row (main 59c2f3bb, 2026-11-01 07:50); HAProxy from `memory-2026-10-24.md` §1.3 (42.0k) |
+| rules ab1 | 75,630 | ~42,000 | 1.80x | `data/measurements.jsonl` last row (main 5ed713eb, 2026-11-01 07:50); HAProxy from `memory-2026-10-24.md` §1.3 (42.0k) |
 | keepalive ab1 | 45,879 | 33,300 | 1.38x | same row; HAProxy §1.3 (33.3k) |
-| h2s1 | ~70k (79.6k at T544, then E1 -1.9 %, E2 -2.7 %, T560/T563 small) | 53.4k | ~1.31x | E1/E2 merge messages (f18dd295, 53902978); `quic-profile-2026-11-01.md` §2 |
+| h2s1 | ~70k (79.6k at T544, then E1 -1.9 %, E2 -2.7 %, T560/T563 small) | 53.4k | ~1.31x | E1/E2 merge messages (0fd04c38, 3ba030bb); `quic-profile-2026-11-01.md` §2 |
 | h3fit (1.97 dg/req) | 98.4k | 73.7k (dev10) | 1.34x | the brief for this task; `quic-transport-2026-11-01.md` §0 |
 
 The only per-function profiles in the tree are **pre-E1/E2**: `memory-2026-10-24.md` §1.3 (rules,
@@ -76,7 +76,7 @@ the task file. Nothing else in this plan depends on X0 for its design, only for 
 
 ### 1.3 X0 results
 
-Measured on main e83cd302 (2026-11-01), release-perf, IBS with inlines expanded, shares scaled to
+Measured on main b9b1b231 (2026-11-01), release-perf, IBS with inlines expanded, shares scaled to
 `insreq.sh` user totals (45,900 keepalive / 75,719 rules / 71,593 h2s1), +-15 %, as in
 `engine-architecture-2026-11-01.md` §2.1 (method, totals, raw data in
 `~/ibex-worktrees/review/x0-2026-11-01/`). Inclusive instructions a request; the buckets overlap by

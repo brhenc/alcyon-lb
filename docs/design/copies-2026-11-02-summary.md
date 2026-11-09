@@ -1,6 +1,6 @@
 # Summary for the user: T610 (Fable), "why Alcyon copies" — 2026-11-02
 
-Full design: `docs/design/copies-2026-11-02.md` (409 lines, merged 91e96523). Decisions: all six
+Full design: `docs/design/copies-2026-11-02.md` (409 lines, merged 568a6857). Decisions: all six
 §8 answers approved by the user 11-02 ~08:20 (`tasks/DECISIONS-pending.md`).
 
 ## The finding in one paragraph

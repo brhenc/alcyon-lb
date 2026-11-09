@@ -208,7 +208,7 @@ fn a_steady_state_http_request_allocates_no_more_than_n_times() {
     // (allocprofile: 5 allocs, 124 bytes). Zero allocs in HtxBuffer::with_capacity and to_h1_wire.
     // Bound lowered from 25 to <= 10, bytes from 2000 to <= 500.
     // 2026-10-17: 6 allocs, 202 bytes, one of them a 32-byte `Box<SocketAddr>` for `bc_dst`
-    // made on every server connect (853f2b94; measuring gate 4 -> 5 allocs/req). `bc_dst`
+    // made on every server connect (60dc5ada; measuring gate 4 -> 5 allocs/req). `bc_dst`
     // is derived from the stream's target now: 5 allocs, 170 bytes. Pinned there.
     // 2026-10-18 (Z2): the `Box<H1Parser>` made per request head (56 bytes) is a value on the
     // stack now: 4 allocs, 114 bytes.
@@ -289,7 +289,7 @@ fn a_request_with_retry_on_a_status_copies_it_into_a_pooled_buffer() {
 
 /// The request-line version check runs on every HTTP/1 request (proxy.rs, before the
 /// head is parsed): it must not allocate. T286 added it with a `Vec` of the line's
-/// tokens, 64 bytes per request (measuring gate on 18bddeb: Bytes / req 151 -> 191).
+/// tokens, 64 bytes per request (measuring gate on b77b9dc: Bytes / req 151 -> 191).
 #[test]
 fn the_request_version_check_allocates_nothing() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -370,7 +370,7 @@ fn a_steady_state_tcp_connection_allocates_no_more_than_n_times() {
     // 2026-09-23 (Nudge 6): Measured 0 allocs, 0 bytes. Buffer reuse and poller event buffer reuse.
     // Bound lowered from 30 to <= 5.
     // 2026-10-17: 2 allocs, 40 bytes, one of them the 32-byte `Box<SocketAddr>` the TCP-mode
-    // connect made for `bc_dst` (853f2b94). Without it: 1 alloc, 8 bytes. Pinned there.
+    // connect made for `bc_dst` (60dc5ada). Without it: 1 alloc, 8 bytes. Pinned there.
     let max_allowed_allocs: usize = 1;
     assert!(
         diff.alloc_count <= max_allowed_allocs,
@@ -1035,7 +1035,7 @@ fn logged_proxied_allocations(n: usize, fe_lines: &str) -> (usize, usize) {
 }
 
 /// T437 part 1: a request logged with `option httplog` allocates nothing. Measured before
-/// (2026-10-19, uprobe on malloc, main 5bcdce4b): 3 per request, the request line kept for `%r`
+/// (2026-10-19, uprobe on malloc, main 70c38bd3): 3 per request, the request line kept for `%r`
 /// (`keep_request_line`), the rendered line (`render_bytes`) and `logfmt::alias`.
 #[test]
 fn a_request_logged_with_httplog_allocates_nothing() {
@@ -1048,7 +1048,7 @@ fn a_request_logged_with_httplog_allocates_nothing() {
 }
 
 /// T437 part 1: a custom `log-format` with `%{+Q}r`, `%HU`.. and header captures allocates
-/// nothing. Measured before (2026-10-19, this test on main 5bcdce4b): 18 per request (the
+/// nothing. Measured before (2026-10-19, this test on main 70c38bd3): 18 per request (the
 /// request line, the line, `%ft`, `%HM`.. each a `String`, and the captures: the headers
 /// collected, the values, the slots, request and response).
 #[test]
@@ -1068,7 +1068,7 @@ fn a_request_logged_with_a_capture_allocates_nothing() {
 /// What is left is the sample engine's, not the log's: the rule's fetch and its value as a
 /// `String` (`sample_to_string`), and the log expression's fetch (T437 part 2, rules and
 /// samples into a reused scratch). Measured 2026-10-19 (this test): 10 per request on main
-/// 5bcdce4b, 3 after part 1. The bound holds part 1's result; part 2 brings it to 0.
+/// 70c38bd3, 3 after part 1. The bound holds part 1's result; part 2 brings it to 0.
 #[test]
 fn a_request_logged_with_a_capture_rule_allocates_only_in_the_samples() {
     let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1213,7 +1213,7 @@ fn h2c_allocations_with(fe_lines: &str, n: usize) -> usize {
 }
 
 /// T437 part 4: a steady-state h2c request proxied to an HTTP/1.1 server allocates nothing.
-/// Measured before (2026-10-19, main 5bcdce4b): 49.7 per request (uprobe on malloc under
+/// Measured before (2026-10-19, main 70c38bd3): 49.7 per request (uprobe on malloc under
 /// h2load), 53 in this test: HPACK decode (a `String` per name and value), the HTX of owned
 /// blocks, the bridge's owned copies of the head, the response encoded into new `Vec`s, the
 /// stream's session and the engine's per-pass queues.
@@ -1230,7 +1230,7 @@ fn an_h2c_request_allocates_nothing() {
 
 /// CP3: starting a stream of an h2 connection allocates nothing with header captures configured:
 /// the stream's log takes the connection's by `clone_from`, into the capture lists and strings it
-/// kept, not by a clone that builds them anew. Measured before (2026-11-02, main 6b86eb3a, debug):
+/// kept, not by a clone that builds them anew. Measured before (2026-11-02, main 36465f80, debug):
 /// see the commit message.
 #[test]
 fn a_stream_start_allocates_nothing() {

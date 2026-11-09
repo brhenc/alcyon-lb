@@ -171,7 +171,7 @@ fn ip_fp_arguments_and_converter_input_types_are_checked_at_load() {
 /// and at the end of a rule's expression; in a `%[...]` the `]` is left, and the converter
 /// after a trailing comma is the empty name. Measured with `haproxy -c` on
 /// 3.5-dev8-885761-29, 2026-10-17: Alcyon refused `str(a),,lower` everywhere ("Invalid
-/// converter name ''") once expressions were parsed at load (2ea14cbe).
+/// converter name ''") once expressions were parsed at load (b3a9bd7f).
 #[test]
 fn repeated_commas_between_converters_are_skipped() {
     for expr in ["str(a),,lower", "str(a),,,lower", "str(a),lower,,upper", "str(a),", "str(a),lower,"] {

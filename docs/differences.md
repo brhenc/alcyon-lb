@@ -332,7 +332,7 @@ Which chunks HAProxy merges depends on how the bytes arrive, and the payload is 
 
 ## Slow clients (slowloris) and timeouts (T349)
 
-Measured live on 2026-10-17 (main 603c48a2 vs HAProxy 3.5-dev8, timeouts of 1-3 s, raw-socket
+Measured live on 2026-10-17 (main e517536b vs HAProxy 3.5-dev8, timeouts of 1-3 s, raw-socket
 clients; scripts in T349). Open items are tracked in `tasks/T349-slow-client-defences.md`.
 
 **The same on both:**

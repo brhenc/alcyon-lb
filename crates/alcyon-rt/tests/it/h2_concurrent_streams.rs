@@ -5,7 +5,7 @@
 //!
 //! The red team's probe (`tools/battery/repro/h2concurrency.py`, branch `myth/battery-spam`):
 //! ten GETs on one h2c connection to a backend that sends its response head at once and then
-//! drips the body. Measured 2026-10-11 against `haproxy` 3.5-dev8 and Alcyon (b11c30f), same
+//! drips the body. Measured 2026-10-11 against `haproxy` 3.5-dev8 and Alcyon (d9e2ee8), same
 //! config (`bind ... proto h2`, one server):
 //!
 //! ```text

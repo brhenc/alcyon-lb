@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! HAProxy 3.5-dev8-885761-29   480/480 responses carry their own x-id, every log line its own
-//! Alcyon c5dc274                   2/480; the log lines 0/221 (all showed another client's id)
+//! Alcyon 589ae64                   2/480; the log lines 0/221 (all showed another client's id)
 //! ```
 //!
 //! The same load, `log-format "%HP st=%[status]"` and no `http-response` rule: HAProxy logs

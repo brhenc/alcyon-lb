@@ -102,7 +102,7 @@ Alcyon clearly worse (reproducers in `repro/`):
 - h2_rapid_reset: peak RSS 173 MB (HAProxy 32 MB), 10 legit connection errors and 2/6 mid-attack probes failed (HAProxy none).
 Alcyon better or equal: everything else; h2_flood costs Alcyon 5% CPU against 266% (it presumably drops the connection early; not checked). No crashes or panics in either.
 
-## Results, Alcyon main 94cc644 vs HAProxy 3.5-dev8 (2026-10-10 night, 60 s)
+## Results, Alcyon main 07b7634 vs HAProxy 3.5-dev8 (2026-10-10 night, 60 s)
 | scenario | haproxy | alcyon |
 |---|---|---|
 | slowloris | RSS 56M->56M, cpu 5%/17%, fds 1823->20, p99 1.7ms, ok 3040 bad 0 err 0, mid 6/6, recovered y (0.0s) | RSS 44M->44M, cpu 4%/9%, fds 1828->24, p99 1.0ms, ok 3053 bad 0 err 0, mid 6/6, recovered y (0.0s) |
@@ -119,13 +119,13 @@ Alcyon better or equal: everything else; h2_flood costs Alcyon 5% CPU against 26
 
 Against 36c022b: h2_rapid_reset fixed (RSS 173M -> 13M, no legit errors, mid 6/6). Still worse than HAProxy: h2_window0 (cpu 148%/403% vs 13%/70%, not recovered within 45 s; T269) and hdr_storm (average cpu now equal, 57% vs 55%, but peak 401% vs 128% and 56 fds left vs recovered at 4.1 s; T270). Everything else equal or better; no crash or panic.
 
-## Results, integration branch batch/1011 a65fedf (main + T269 + T270 + the night batch) vs HAProxy 3.5-dev8 (2026-10-11, 60 s)
+## Results, integration branch batch/1011 f506c32 (main + T269 + T270 + the night batch) vs HAProxy 3.5-dev8 (2026-10-11, 60 s)
 | scenario | haproxy | alcyon |
 |---|---|---|
 | h2_window0 | RSS 148M->120M, cpu 12%/59%, fds 2723->21, p99 11.5ms, ok 3037 bad 0 err 0, mid 6/6, recovered y (27.7s) | RSS 22M->22M, cpu 3%/10%, fds 228->27, p99 0.8ms, ok 3051 bad 0 err 0, mid 6/6, recovered y (0.0s) |
 | hdr_storm | RSS 56M->56M, cpu 40%/60%, fds 1656->31, p99 0.8ms, ok 3047 bad 0 err 0, mid 6/6, recovered y (4.1s) | RSS 26M->26M, cpu 56%/100%, fds 92->28, p99 3.4ms, ok 3026 bad 0 err 0, mid 6/6, recovered y (0.0s) |
 
-Both now recover: h2_window0 cpu 3%/10% (was 148%/403% on 94cc644), fds released at once (HAProxy 27.7 s); hdr_storm no more 4-core spin (peak 100% vs HAProxy 60%, average 56% vs 40%: roughly comparable), fds back to baseline at once (HAProxy 4.1 s). T269 (h2 FIN with window 0, epoll removal of idle fds) and T270 (server-wide idle-connection purge).
+Both now recover: h2_window0 cpu 3%/10% (was 148%/403% on 07b7634), fds released at once (HAProxy 27.7 s); hdr_storm no more 4-core spin (peak 100% vs HAProxy 60%, average 56% vs 40%: roughly comparable), fds back to baseline at once (HAProxy 4.1 s). T269 (h2 FIN with window 0, epoll removal of idle fds) and T270 (server-wide idle-connection purge).
 
 ## Host noise (user rule, 2026-10-11)
 

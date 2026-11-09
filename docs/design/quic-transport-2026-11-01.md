@@ -10,7 +10,7 @@ the two tables cover every number below, and slot B was left to the coding tasks
 | build | h3 ins/req at 1.30 client dg/req | at 1.50 | at 1.97 (HAProxy's count, fit) | h2s1 |
 |---|---:|---:|---:|---:|
 | T544's build (pre-T543) | 120.8k | 122.0k | 125.1k | 79.6k |
-| main after T543 (T5 30609647) | 109.8k | 111.3k | ~114.8k (slope 7.4k/dg) | 79.7k |
+| main after T543 (T5 1f6d62b0) | 109.8k | 111.3k | ~114.8k (slope 7.4k/dg) | 79.7k |
 | HAProxy 3.5-dev10 | | | 73.7k | 53.4k |
 | H4 rule: h2 + 15 % / 1.5x HAProxy | 91.6k / 110.5k | | | |
 

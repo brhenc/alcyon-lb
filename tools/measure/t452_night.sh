@@ -31,7 +31,7 @@ SUFFIX=${T452_TAG_SUFFIX:-}
 BUSY_MAX=${T452_BUSY_MAX:-2.0}       # busy CPUs (of 64) allowed before a batch, besides us
 DEADLINE=$(( $(date +%s) + ${T452_MAX_MINUTES:-150} * 60 ))
 MUSE=$HOME/ibex-worktrees/qwen/muse-pause
-REF=95f4f5cc RC2REF=5bcdce4b
+REF=608656b6 RC2REF=70c38bd3
 mkdir -p /tmp/t452
 exec > >(tee -a "$LOG") 2>&1
 

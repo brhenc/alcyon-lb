@@ -1,6 +1,6 @@
 # Performance: Alcyon against HAProxy
 
-Measured 2026-10-02 on main `e1fc5d9` (design 010 steps 1-4 merged) against the reference
+Measured 2026-10-02 on main `b61b340` (design 010 steps 1-4 merged) against the reference
 HAProxy (`3.5-dev7-e6f616-55`, `/home/bhenc/reference/haproxy/haproxy`). The open question
 this records: **where does Alcyon spend the CPU HAProxy does not?** The syscall profile
 below found an architecture difference -- Alcyon read a socket on every pass over a session
@@ -37,11 +37,11 @@ identical builds it agrees to 0.3% on CPU per request at 50 connections.
 | Syscalls per request, 50 connections | **4.2** | **13.1** |
 
 At 1 connection both proxies sleep in `epoll_wait` between requests, and CPU per request
-there also measures how often a process sleeps and wakes. 964e201 (Alcyon's timer disarm)
+there also measures how often a process sleeps and wakes. c0e2ca6 (Alcyon's timer disarm)
 moved Alcyon's 1-connection CPU by +29% while gaining 21% requests/s, by sleeping a quarter as
 often, and left the 50-connection figure unchanged. **Compare the two at 50 connections.**
 
-For history: Alcyon before the HTTP transaction (`31d391c`) cost 18.4 µs at 50 connections,
+For history: Alcyon before the HTTP transaction (`cd435a8`) cost 18.4 µs at 50 connections,
 and the transaction added 11.4% (part of which is request rules now running on every
 request rather than only the first).
 
@@ -74,9 +74,9 @@ Also seen, smaller:
 * `CURRENT_TIMEOUTS`, a `HashMap` rebuilt per request in `connect_http_backend` (18 SipHash
   inserts); `RandomState::hash_one` and `HashMap::insert` are ~8% of user samples.
 * About 40,000 user-space instructions per request (`perf stat`), equal in Alcyon before and
-  after 964e201.
+  after c0e2ca6.
 
-## Fixed: read only when readable (2026-10-02, uncommitted on `e1fc5d9`)
+## Fixed: read only when readable (2026-10-02, uncommitted on `b61b340`)
 
 * `cli_cant_recv` beside `srv_cant_recv` (`crates/alcyon-rt/src/proxy.rs`), and both are
   now set the way `raw_sock_to_buf` sets `fd_cant_recv`: on `EAGAIN` **or on a read shorter
@@ -103,7 +103,7 @@ Alcyon after, by syscall (strace -c): 1 connection, 20,000 requests -- `read` 40
 `EAGAIN`), `write` 40,000, `epoll_wait` 40,012, `getpid` 2; 50 connections, 200,000
 requests -- `read` 400,162 (5 `EAGAIN`), `write` 400,098, `epoll_wait` 8,026. HAProxy and
 Alcyon after were measured alternately, three rounds each, pinned as above; the gate's A/B
-against `e1fc5d9` measured 20,661 -> 15,635 ns (-24.3%) at 50 connections and +13.7%
+against `b61b340` measured 20,661 -> 15,635 ns (-24.3%) at 50 connections and +13.7%
 requests/s at 1 connection.
 
 Alcyon now does less per request than HAProxy, which is not the same as being cheaper for

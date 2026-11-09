@@ -12,7 +12,7 @@
 //! of its HTX again, how often a sample context is copied, how often an expression is looked up by
 //! its text, and how often the HTX reads a block as UTF-8.
 //!
-//! Before S7 (main fcab8c91), per request: 4 rebuilds (set-header is a delete and an add, then
+//! Before S7 (main 406ad144), per request: 4 rebuilds (set-header is a delete and an add, then
 //! the del-header and the add-header), 3 context copies, 2 expression lookups (`rand`, `path`),
 //! 37 UTF-8 reads of HTX blocks (in a debug build).
 

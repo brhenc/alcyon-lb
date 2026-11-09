@@ -1,6 +1,6 @@
 # Allocation census, Alcyon release binary, 2026-10-18
 
-Tree: ~/ibex-worktrees/alloc-review, detached at batch 36ef460f. Binary: `cargo build --release -p alcyon-rt --bin alcyon`
+Tree: ~/ibex-worktrees/alloc-review, detached at batch 26e3a3cf. Binary: `cargo build --release -p alcyon-rt --bin alcyon`
 with `CARGO_PROFILE_RELEASE_DEBUG=true`, run `nbthread 1` under an LD_PRELOAD counter. Counts = malloc+calloc+realloc
 calls (aligned: 0); bytes = requested bytes. Each cell = min of 3 after 3 warm-up operations, one operation at a time,
 measured under `flock -s /tmp/ibex-load.lock`. No timing was taken. Counts are deterministic; the idle process

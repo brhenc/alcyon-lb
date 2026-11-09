@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| Found by | V&V, 2026-10-31 (ledger row on `vv/ledger-1101` 0444e120), A1 dry run on main 61bb0771 |
+| Found by | V&V, 2026-10-31 (ledger row on `vv/ledger-1101` a1017370), A1 dry run on main 61bb0771 |
 | Severity | medium: a difference from HAProxy; no crash, no leak; connections fail |
-| Affects | every Alcyon with QUIC since the listener was written; not a regression of tonight's quinn work (b7e5bfc1, before T542, fails the same way) |
+| Affects | every Alcyon with QUIC since the listener was written; not a regression of tonight's quinn work (2f807eef, before T542, fails the same way) |
 | Fix | T552 (`tasks/T552-quic-wildcard-source-address.md`) |
 
 ## What goes wrong

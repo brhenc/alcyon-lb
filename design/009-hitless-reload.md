@@ -62,7 +62,7 @@ Alcyon is a single-process Rust binary with an async scheduler. It does not carr
 
 This reaches HAProxy's exact behavioral guarantees without imitating its structural legacy.
 
-## Part 4 — As implemented (`eaddcd6`, `ed51cb9`, and the SIGUSR2 commit after them)
+## Part 4 — As implemented (`28624cc`, `c30c9af`, and the SIGUSR2 commit after them)
 
 Parts 1 and 2 above were implemented as written. Part 3's workflow was not, because it
 cannot work under systemd:

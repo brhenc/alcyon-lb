@@ -149,7 +149,7 @@ better; slice. Sources: **[I]** Alcyon h2 IBS (79.6k build; E1/E2/Q2/Q3/Q8 have 
 
 ### 2.1 Measured (X0, 2026-11-01)
 
-Main e83cd302, release-perf (plain build for the totals, `-C force-frame-pointers=yes` build for
+Main b9b1b231, release-perf (plain build for the totals, `-C force-frame-pointers=yes` build for
 the profiles), quiet CPUs (4-6 and 12-14 idle, governor `performance`, no `wwm.exe`; other
 sessions were compiling on other cores, load 7-21). HAProxy dev8 (dev10 for h3). Raw data,
 folded stacks, scripts: `~/ibex-worktrees/review/x0-2026-11-01/` (`insreq/`, `calls/`, `calls2/`,
@@ -784,12 +784,12 @@ moment." §4.6's week table is replaced by this; §4's slice rows and budgets st
   and what remains can't reasonably be optimised further. Whatever ends up out of scope is
   recorded in `challenges/` (one file each, `C<task>-challenge-<slug>.md`, as C541).
 
-### 6.5 Wave-1 landing, measured (2026-11-01 23:05, main 85edb342)
+### 6.5 Wave-1 landing, measured (2026-11-01 23:05, main 458a3e1f)
 
 After T574 (R1), T575 (K1 + parse bytes), T577 (L1-L3), T578 (O2), T579 (C1+C2), T583 (smax O(1)),
 plus correctness merges. `tools/measure/perfbase.sh` (release-perf) and the same scenarios on a
 `tools/pgo-build.sh` binary, counts slot, min of 5 (h3fit: median of 3 fits). User ins/req;
-HAProxy = §2.1's dev8 (dev10 for h3fit), non-PGO. Board: `~/ibex-worktrees/boards/pgo-wave1-85edb342/`.
+HAProxy = §2.1's dev8 (dev10 for h3fit), non-PGO. Board: `~/ibex-worktrees/boards/pgo-wave1-458a3e1f/`.
 
 | scenario | start (rc4) | release-perf | ratio | **PGO** | **PGO ratio** | HAProxy | kernel (rp) |
 |---|---|---|---|---|---|---|---|
@@ -969,13 +969,13 @@ h2s1/keepalive/rules training for q10 variants covers dev10's code but the q10 b
 only on h3fit; HAProxy's build ran through ccache (`/usr/lib64/ccache/gcc`, a cache hit is the same object);
 the version string of the copies reads `3.5-dev8-88576119c` (no `.git` in `git archive`, harmless).
 
-### 6.8 alcyon-rc6, measured (2026-11-02 23:45, 694eabcc)
+### 6.8 alcyon-rc6, measured (2026-11-02 23:45, fa7a546d)
 
 After the CP/X/O waves (§6.7's main 06bdbce0 plus T617, T618, T614/T614b), the red-ibex fixes
 RV-A..RV-D, the ring-alcyon zeroize review and Miri (T623). Same method as §6.6/6.7, slot A, governor
 performance, no `wwm.exe`; release-perf from `tools/measure/perfbase.sh`, PGO from `tools/pgo-build.sh`,
 h3fit median of 3 at 1.97 dg/req. HAProxy columns = §6.7 (dev8, dev10 for h3fit). Board:
-`~/ibex-worktrees/boards/pgo-rc6-694eabcc/`, `boards/insreq-694eabcc4d1c.json`.
+`~/ibex-worktrees/boards/pgo-rc6-fa7a546d/`, `boards/insreq-fa7a546d6770.json`.
 
 | scenario | rc5 rp | **rc6 rp** | rp / HA lto | rc5 PGO | **rc6 PGO** | **PGO / HA pgo-lto** |
 |---|---:|---:|---:|---:|---:|---:|
@@ -993,7 +993,7 @@ User ins/req, kernel in brackets. Above 1 = Alcyon does more work.
   X7 +0.45%, O1b +0.27%, CP3 +0.23%, R4 +0.09%, X3b-1 +0.08%, CP4a-2 +29 ins, against X8 -0.16%
   and O1a -0.35%. §6.7 already measured 36,717 at 06bdbce0, before any of tonight's merges, so
   tonight's merges did not cause it. This is the case T604 (a ratchet a measured speed-up can clear)
-  is for. The next measuring gate's ref is 694eabcc.
+  is for. The next measuring gate's ref is fa7a546d.
 - rc5 -> rc6: rules -7 %, h2s1 -13 %, h3fit -4.5 % (rp); PGO rules -7 %, h2s1 -12 %, h3fit -4 %.
   keepalive +1.6 % rp, +1.0 % PGO.
 - Like-for-like (best builds both sides): Alcyon is ahead on keepalive and h2s1, 15 % behind on rules and

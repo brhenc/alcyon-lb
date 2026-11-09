@@ -3,7 +3,7 @@
 (`docs/tradeoff.md` does not exist, so the table is here; `docs/milestones.md` "Resource
 parameters" is the source of the targets.)
 
-- Date: 2026-10-12, 08:14-10:00. Commit: 29cdff64 (Alcyon built with
+- Date: 2026-10-12, 08:14-10:00. Commit: ae4fc11f (Alcyon built with
   `CARGO_TARGET_DIR=/home/bhenc/ibex-targets/T294 CARGO_INCREMENTAL=0 cargo build --release --bin alcyon`).
 - HAProxy: `/home/bhenc/reference/haproxy/haproxy` 3.5-dev8-885761-29, also the origin server
   (4 threads, `http-request return`).
@@ -101,14 +101,14 @@ Notes (carried over)
 
 Raw `RESULT` lines of the runs are printed by each script; re-run any row with its command.
 
-## Previous run (2026-10-05, 4d2cc6f, loaded host)
+## Previous run (2026-10-05, 9329fa6, loaded host)
 
 (Original title: M1 resource measurements (T180).)
 
 (`docs/tradeoff.md` does not exist, so the table is here; `docs/milestones.md` "Resource
 parameters" is the source of the targets.)
 
-- Date: 2026-10-05. Commit: 4d2cc6f (no `crates/` change; Alcyon built with
+- Date: 2026-10-05. Commit: 9329fa6 (no `crates/` change; Alcyon built with
   `CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t180 CARGO_INCREMENTAL=0 cargo build --release --bin alcyon`).
 - HAProxy: `/home/bhenc/reference/haproxy/haproxy` 3.5-dev8-885761-29, also used as the origin
   server (4 threads, `http-request return`).
@@ -162,9 +162,9 @@ Notes on individual rows
 
 Raw `RESULT` lines of the runs are printed by each script; re-run any row with its command.
 
-## Previous run: reload and uneven load (T214, 2026-10-05, 863f5a8)
+## Previous run: reload and uneven load (T214, 2026-10-05, 4e802f6)
 
-- Date: 2026-10-05. Commit: 863f5a8 (no `crates/` change; Alcyon built with
+- Date: 2026-10-05. Commit: 4e802f6 (no `crates/` change; Alcyon built with
   `CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t214 CARGO_INCREMENTAL=0 cargo build --release --bin alcyon`).
   Load average (1/5/15) at the start: reload single 6.2/23.2/36.0, reload soak 6.1/13.8/28.6,
   uneven 26.1/23.0/25.2. HAProxy 3.5-dev8-885761-29 as oracle and as origin.

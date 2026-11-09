@@ -80,7 +80,7 @@ impl Cfg {
         }
         let mode = if self.tcp { "tcp" } else { "http" };
         if self.tcp {
-            // A `listen` section, not `frontend` + `default_backend`: at 9512e76 a TCP-mode
+            // A `listen` section, not `frontend` + `default_backend`: at 140980e a TCP-mode
             // frontend never connects to its default backend (the client is closed at
             // once), a defect outside T96 that `tests/tcp_frontend_backend.rs` in the main
             // checkout already covers. The listen section is still named `fe`.
