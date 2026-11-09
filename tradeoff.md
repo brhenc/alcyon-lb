@@ -34,7 +34,7 @@ one expensive computation is one unit of its budget.
 | | |
 |---|---|
 | **Gained** | Zero locks on the data path, as a consequence rather than an optimisation. Connection state is legitimately `!Send`, so the compiler enforces the invariant |
-| **Gave up** | No automatic rebalancing. **One pathological connection degrades its core with no safety net** — a work-stealing runtime would paper over this and we will not. Idle backend connection reuse across threads needs `takeover()`, which is real work and is deferred |
+| **Gave up** | No automatic rebalancing. **One pathological connection degrades its core with no safety net** — a work-stealing runtime would paper over this and we will not. Idle server connections are the one exception: a worker with none for a server takes another worker's under that worker's slot lock (§6.3) |
 | **Status** | **reasoned** — the lock-free property follows structurally; the imbalance risk is untested under real load |
 | **Revisit if** | Load testing shows meaningful core imbalance that admission-time placement cannot fix |
 
@@ -141,9 +141,9 @@ one expensive computation is one unit of its budget.
 | | |
 |---|---|
 | **Gained** | `alcyon_rt::pool_gc` runs where `HAProxy`'s does: SIGQUIT (the process goes on), SIGTTOU, SIGUSR1, the stop path after a stick-table purge, and a refused allocation. No thread is stopped: each worker empties its own `thread_local!` caches at its next loop pass (at most 100 ms later), where `HAProxy`'s `thread_isolate` stops them all. Alcyon empties its caches completely: after a burst of 500 connections on 4 threads, SIGQUIT takes `show pools` `buffer` from 256 allocated (all cached) to 0, RSS 26.4 to 24.4 MB. `HAProxy`'s `pool_gc` frees only the shared free lists, not its per-thread caches: its counts stay at 112 allocated (~93 cached) and RSS goes 93.7 to 91.1 MB, the `malloc_trim` alone |
-| **Gave up** | **Retry after collection exists only where the failure is seen.** Rust's global allocator aborts the process when an allocation fails; nothing in rustls, ring, the H2 or HTX code, or `Vec::push` returns the failure. The one recoverable site is a variable's memory (`alcyon_sample::vars::reserve_more`, `try_reserve`): it collects and retries once, as `ssl_sock.c:6074` retries `SSL_new`. `HAProxy` retries `SSL_new`/`BIO_new` and its pools count `failures`; Alcyon has neither, and its `failures` column stays 0. **`-m` is not an rlimit**: `HAProxy` sets `RLIMIT_DATA`/`RLIMIT_AS` so its allocations really fail and `pool_gc` can save one; Alcyon's `-m` only sizes `maxconn` (`engine::apply_memmax`), so a burst past it is refused at accept, never at allocation, and an operator's `ulimit -v` makes Alcyon abort where `HAProxy` would collect and go on |
+| **Gave up** | **Retry after collection exists only where the failure is seen.** Rust's global allocator aborts the process when an infallible allocation fails; nothing in rustls, ring, the h2 decoder or std returns the failure. The sites Alcyon made fallible collect and retry once, as `ssl_sock.c:6074` retries `SSL_new`: a variable's memory (`alcyon_sample::vars::reserve_more`), and since S5/T465/T465b the buffers, session slots, arena growth, the request target copy, the timer tree, the idle server lists and the error page copy (6.23); a refusal there fails one stream and counts in `show pools` `failures`. Everything else still aborts. `-m` sets `RLIMIT_DATA` as `HAProxy`'s does (6.25, since T465b), so under `-m` or an operator's `ulimit` those sites fail and collect; an allocation outside them aborts where `HAProxy` would collect and go on |
 | **Status** | **measured** — `show pools` and RSS before and after each signal on both (`tests/it/pool_gc_signals.rs` header) |
-| **Revisit if** | Fallible allocation on the request path (T448: buffers that can fail and a wait queue): every new fallible site calls `pool_gc()` once before it gives up |
+| **Revisit if** | A new fallible site: it calls `pool_gc()` once before it gives up. Rust gains a recoverable OOM (6.23) |
 
 ---
 
@@ -154,18 +154,27 @@ one expensive computation is one unit of its budget.
 | | |
 |---|---|
 | **Gained** | A finishable milestone that exercises every layer — protocol, transport, mux, sedesc, stconn, stream, session, scheduler, poller — with **zero HTTP parsing**. And 1.0.2 is 3047 lines, small enough to build and run as a live differential oracle |
-| **Gave up** | Nothing shippable to a real site until HTTP lands. A TCP-only proxy is a demo, not a product |
+| **Gave up** | Nothing shippable to a real site until HTTP landed (it has: HTTP/1.1, HTTP/2 and HTTP/3 to clients, HTTP/1.1 and HTTP/2 to servers). A TCP-only proxy is a demo, not a product |
 | **Status** | **measured** — 1.0.2 compiles (one fix: glibc 2.38 now defines `strlcpy`) and proxies traffic end to end |
 | **Revisit if** | Never; this is sequencing, not exclusion |
 
-### 4.2 No Lua, filters, SPOE, QUIC/H3, FCGI, cache
+### 4.2 No Lua, filters, SPOE, FCGI, cache, `peers` (QUIC/H3 was on this list until M2)
 
 | | |
 |---|---|
-| **Gained** | A tractable, focused codebase. `src/hlua.c` alone is ~14k lines. For QUIC/H3, the architectural objection is structural: **Alcyon has no datagram I/O at all** (UDP surface is three lines in `syslog.rs`). QUIC demuxes by CID from datagrams on a shared socket rather than 1 fd per connection; throughput requires `recvmmsg`/`sendmmsg`/GSO/GRO; TLS moves inside the packet layer; and loss recovery/congestion control are an entire stateful subsystem on a scheduler built for stream epoll. Connections are not file descriptors |
-| **Gave up** | Every reg-test needing them is permanently `OUT_OF_SCOPE`, capping the scoreboard below 312 |
+| **Gained** | A tractable, focused codebase. `src/hlua.c` alone is ~14k lines. Each of these is refused by name at load (`crates/alcyon-config/src/parser/scope.rs`: `lua-load`, `filter`, `compression`, `use-service`, `use-fcgi-app`, `fcgi-app`, `cache`, `peers`), never accepted and dropped (AGENTS.md 5) |
+| **Gave up** | Every reg-test needing them is `OUT_OF_SCOPE`, capping the scoreboard below 312 |
 | **Status** | **measured** — triage in `data/regtests.json` |
-| **Revisit if** | For Lua/filters: the core is finished and complete. For QUIC/H3: h2 is reachable and measured, a datagram I/O path exists for other reasons, and a concrete user requires it |
+| **Revisit if** | The core is finished and a concrete user requires one of them |
+
+**QUIC/H3 is no longer excluded.** It was, on the grounds that Alcyon had no datagram I/O and
+QUIC breaks the one-fd-per-connection model (the reasoning is kept in 6.9). M2 built it:
+`alcyon-mmsg` (batched `recvmmsg`/`sendmmsg`), `alcyon-quic` on a vendored quinn-proto (6.30),
+QUIC sessions demultiplexed by connection ID from the bind's socket, and HTTP/3 through the
+same stream engine as h1 and h2 (the mux path, default since T536; the older relay path stays
+selectable until slice H5, 6.31 #1). `quic4@`, `quic6@` and `quic+` binds parse and reach the
+data path. What it costs is in 6.30, 6.31 and `performance.md` (HTTP/3 at 29-43% more
+instructions per request than HAProxy 3.5-dev10).
 
 ### 4.3 Not "99% HAProxy compatibility"
 
@@ -189,7 +198,11 @@ one expensive computation is one unit of its budget.
 | **Status** | **measured** — read from the upstream headers |
 | **Revisit if** | Impossible without a clean-room reimplementation |
 
-### 5.2 Three-tier delegation: flash worker, pro reviewer, Opus supervisor
+### 5.2 Three-tier delegation: flash worker, pro reviewer, Opus supervisor — **history (September 2026)**
+
+How the specification tables were extracted at the start. It is not how the work is done now:
+since October, task agents work on their own branches in separate worktrees, and every merge
+passes `tools/gate.sh` (`tools/checkin.sh` and the measuring stages). The lesson below still holds.
 
 | | |
 |---|---|
@@ -227,9 +240,17 @@ HAProxy walks with `eb32_next()`. O(depth) per task instead of O(1) amortised, c
 because correctness under concurrent deletion was not worth reasoning about yet. At 280
 tasks per pass and depth ≤ 32 this is ~9k steps; whether that matters is unmeasured.
 
-### 6.3 `takeover()` not implemented — **decided 2026-10-04: per-thread pools first, a shared pool second**
+### 6.3 Idle server connections shared across workers — **decided 2026-10-04: per-thread pools first, a shared pool second; both built (B: T159 part B, 868eb1e5)**
 
-Idle backend connections can only be reused by their owning thread, costing some reuse
+**Now:** `IdlePools` (`crates/alcyon-rt/src/engine.rs`) keeps one slot per worker behind a
+`Mutex`. A worker releases into and purges its own slot; one whose slot holds nothing for a
+server takes another worker's connection, starting from a rotating slot as HAProxy's
+`next_takeover`, and moves the socket from that worker's epoll set to its own under the slot's
+lock. `tune.idle-pool.shared off` keeps each worker to its own (`full` and `on` are the
+default). **Cost:** a lock on every reuse and release (uncontended on the worker's own slot);
+the lock-free option C below was not taken. The history of the decision:
+
+Idle backend connections could only be reused by their owning thread, costing some reuse
 ratio under uneven load. HAProxy needs three cooperating layers and ~60 lines for this,
 and it can fail at each.
 
@@ -379,15 +400,18 @@ Trajectory: **14.00 MB bare, 29.75 MB with TCP-connect checks, 47.09 MB with HTT
 
 ### 6.6 Map converters in-memory caching — **resolved**
 
-`match_map` in `crates/alcyon-sample/src/registry.rs` previously called `std::fs::read_to_string` and
-scanned the file linearly for each sample evaluation. That is now resolved: `registry.rs` has
-`MAP_CACHE` (`CachedMapTable`) with a read-lock fast path and the disk read and regex/prefix parsing
-happening once upon initial load.
+`match_map` in `crates/alcyon-sample/src/registry.rs` once called `std::fs::read_to_string` and
+scanned the file linearly for each sample evaluation. Since T251 a map file is a pattern
+reference (`crates/alcyon-sample/src/patref.rs`, HAProxy's `pat_ref`): read and indexed once
+for each match method (`PatTable`), held in the process-wide `MAP_REFS` registry by path, and
+changed in place, one entry at a time, by the CLI (`add/set/del/clear map`).
 
-Gained: eliminate per-request filesystem I/O (`read(2)`) and heap re-parsing on the hot data path.
-Gave up: an `RwLock` read acquisition per sample evaluation, which is lock contention across threads
-on the data path (though avoiding any syscall).
-Status: **resolved and measured** — cached lookups verified in `crates/alcyon-sample/tests/sample_semantics.rs`.
+Gained: no per-request filesystem I/O or re-parsing; a CLI change is what every worker matches
+on its next request, as in HAProxy.
+Gave up: two `RwLock` read acquisitions per lookup (`MAP_REFS`, then the reference's own), shared
+cache lines written by every reader across threads on the data path.
+Status: **resolved** — lookups in `crates/alcyon-sample/tests/sample_semantics.rs`, CLI answers in
+`tests/ops_patref_cli.rs`. The lock cost on many threads is not measured.
 
 ### 6.7 Request and response header size limit -- **resolved 2026-10-10 (T265): Alcyon matches HAProxy**
 
@@ -406,7 +430,12 @@ Status: **resolved and measured** — cached lookups verified in `crates/alcyon-
 | **Status** | **measured and verified** — verified in `crates/alcyon-rt/tests/h2_flood_knobs.rs` (all 3 tests pass: unconfigured flood survival, `max-total-streams` cap enforcement, and graceful 75% `GOAWAY` preceding hard close) and `crates/alcyon-rt/tests/h2_multiplexing.rs`. |
 | **Revisit if** | Once compatibility is established. HAProxy's defaults here are compatibility decisions, not security ones. Shipping a flood mitigation off by default means an unconfigured Alcyon has none, and "HAProxy does it too" is a reason, not a justification. Revisit once compatibility is established: a proxy whose stated purpose is surviving hostile traffic has a weak argument for inheriting a permissive default it did not choose. |
 
-### 6.9 QUIC stays declined — the architectural constraint is fd-per-session, not HTX
+### 6.9 QUIC stays declined — the architectural constraint is fd-per-session, not HTX — **superseded: QUIC/H3 built in M2 (4.2)**
+
+> **History.** This was the case for declining QUIC, as of early October 2026. M2 reversed it:
+> the "revisit if" below came true (a datagram path, `alcyon-mmsg`, and QUIC sessions that are
+> not file descriptors, `alcyon-quic`). The `quic+`/`quic4@`/`quic6@` prefixes are no longer
+> refused. The HTX analysis stays valid, and HTTP/3 does go through HTX as HAProxy's `h3.c` does.
 
 | | |
 |---|---|
@@ -419,9 +448,9 @@ Status: **resolved and measured** — cached lookups verified in `crates/alcyon-
 
 | | |
 |---|---|
-| **Gained** | `HtxSlice<'a>` operates directly over caller-provided byte slices backed by pooled `Buf` (`alcyon-rt/src/buf.rs`). `HtxBuffer::with_capacity` (16,384 B) and `HtxBuffer::to_h1_wire` (8,192 B) eliminated completely from the data path. Total steady-state request allocations dropped from 16 allocs / 25,038 bytes to 5 allocs / 124 bytes (`allocprofile`). |
+| **Gained** | `HtxSlice<'a>` operates directly over caller-provided byte slices backed by pooled `Buf` (`alcyon-rt/src/buf.rs`). `HtxBuffer::with_capacity` (16,384 B) and `HtxBuffer::to_h1_wire` (8,192 B) eliminated completely from the data path. Total steady-state request allocations dropped from 16 allocs / 25,038 bytes to 5 allocs / 124 bytes (`allocprofile`), and to 0 since the pool series (6.13). |
 | **Gave up** | Borrow checker lifetimes require scoped borrows around `HtxSlice::new(raw_slice_mut)` in `TcpSession` and separate scratch buffers for downstream rule modifications. `HtxBuffer` becomes an ownership convenience for unit/differential tests rather than a data-path type. |
-| **Status** | **measured** — 0 allocations for `HtxBuffer::with_capacity` and `to_h1_wire`, 5 allocs / 124 bytes measured per request in `tools/allocprofile`, pinned in `crates/alcyon-rt/tests/request_allocations.rs`. |
+| **Status** | **measured** — 0 allocations for `HtxBuffer::with_capacity` and `to_h1_wire`; 0 per keep-alive request now, pinned in `crates/alcyon-rt/tests/request_allocations.rs` (5 allocs / 124 bytes when this entry was written). |
 | **Revisit if** | Dynamic reallocation of HTX buffers becomes necessary for requests exceeding standard buffer size classes. |
 
 ### 6.11 HAProxy C FFI Differential Oracle (`alcyon-h1-sys` & `ParserKind::HaproxyFfi`)
@@ -465,6 +494,9 @@ Status: **resolved and measured** — cached lookups verified in `crates/alcyon-
 > **T364 S2 (2026-10-18): the type half is done.** A variable holds a `Sample` (`crates/alcyon-sample/src/vars.rs`),
 > so `var()` gives back what was stored and casts start from that type, as in HAProxy. What stays decided as above is
 > the other half only: `Sample::Str` is a `String` (bytetext), not bytes.
+>
+> **The table below is the 2026-10-10 decision as written.** Since R2 its "Gained" holds only for what is still
+> `String` (the text-form `Sample`, variables, log-format rendering; R2 note above); data-path samples are bytes.
 
 | | |
 |---|---|
@@ -496,7 +528,7 @@ Status: **resolved and measured** — cached lookups verified in `crates/alcyon-
 
 **What stays on the heap, and why.**
 
-- **rustls 0.23 on QUIC (quinn), the log forwarder and `ring.rs`, and the test clients**: not ported to 0.24's caller-owned buffers (6.22). The TCP TLS path is on 0.24 and makes 0 allocations per steady-state keep-alive request; a TLS **handshake** still allocates inside rustls/ring (not pooled, not counted as zero).
+- **TLS handshakes**: every TLS of the binary (TCP, QUIC, the log forwarder) is on rustls 0.24 since T461 (6.22, 6.27); rustls 0.23 is left only in the test clients. A steady-state keep-alive request makes 0 allocations (TCP TLS and HTTP/3); a TLS **handshake** still allocates inside rustls/ring (not pooled, not counted as zero).
 - **h2/HPACK/QPACK decoder and std internals**: infallible; a failure there aborts (6.23 status). Not pooled.
 - **Configuration**: the parsed config, the regex and `Expr` caches built at load, userlists and debug destinations (`harness/pool_layout.py` `NOT_CACHES`, with a reason each). Built before traffic; they do not grow per request.
 - **Per-thread state that is not a cache** (S3 progress, `tasks/S3-progress.md`): crash and watchdog state, `pool_gc`'s seen-set, the promex trash held across fills, engine flags, counters, thread ids, `capture_write`'s state, the load-balancer avoid list, check last-run state.
@@ -519,9 +551,9 @@ Status: **resolved and measured** — cached lookups verified in `crates/alcyon-
 | | |
 |---|---|
 | **Gained** | AGENTS.md rule 5: an operator never gets a keyword that parses and does nothing. Each one below used to load and be ignored (or, for `fc_rtt`, always return 0). |
-| **Gave up** | `fc_rtt`, `fc_rttvar`, `bc_rtt`, `bc_rttvar`: reading `TCP_INFO` needs `getsockopt` with a C struct, which neither `nix` nor `rustix` exposes and `alcyon-rt` forbids `unsafe`; the reg-test `sample_fetches/tcpinfo_rtt.vtc` now fails at load. `resolvers` sections and `resolvers` in `defaults`: Alcyon does no DNS resolution at run time (M1 scope; `init-addr`, `resolve-net`, `resolve-opts`, `resolve-prefer` are still accepted and ignored, T351 follow-up). `-dM` in every form except `-dMfail` and `-dMno-fail` (S5; the poison, tag and use-after-free forms need HAProxy's per-object pools; `docs/differences.md`). `no <keyword>` other than `no option` and `no log` (HAProxy refuses those too, with the same message). |
-| **Status** | **measured** 2026-10-17 against HAProxy 3.5-dev8 `-c` (exit code and message), except the `resolvers` refusal text, which is Alcyon's own. |
-| **Revisit if** | A blog configuration needs RTT in its logs (then a small audited `unsafe` wrapper for `TCP_INFO` in `alcyon-mmsg` or `alcyon-alloc`'s style), or servers named by DNS that change at run time (then `resolvers`). |
+| **Gave up** | `fc_rtt`, `fc_rttvar`, `bc_rtt`, `bc_rttvar`: reading `TCP_INFO` needs `getsockopt` with a C struct, which neither `nix` nor `rustix` exposes and `alcyon-rt` forbids `unsafe`; the reg-test `sample_fetches/tcpinfo_rtt.vtc` now fails at load. (`resolvers` sections were on this list until M2: since T484/T489 they are parsed (`crates/alcyon-config/src/parser/resolvers.rs`) and resolve at run time (`alcyon-dns`, `crates/alcyon-rt/src/resolvers.rs`: servers that name one, `do-resolve`, `parse-resolv-conf`; 6.31 #4 and #12). `resolve-prefer` and `resolve-net` reach the resolver; whether `init-addr` and `resolve-opts` reach the data path was not re-checked on 2026-11-09.) `-dM` in every form except `-dMfail` and `-dMno-fail` (S5; the poison, tag and use-after-free forms need HAProxy's per-object pools; `docs/differences.md`). `no <keyword>` other than `no option` and `no log` (HAProxy refuses those too, with the same message). |
+| **Status** | **measured** 2026-10-17 against HAProxy 3.5-dev8 `-c` (exit code and message). |
+| **Revisit if** | A blog configuration needs RTT in its logs (then a small audited `unsafe` wrapper for `TCP_INFO` in `alcyon-mmsg` or `alcyon-alloc`'s style). `resolvers`: done. |
 
 ### 6.16 `Tw` 1 ms on a cold first request where HAProxy logs 0 (T367) — **resolved (T375): stamped from the loop's per-iteration clock**
 
@@ -549,7 +581,7 @@ Status: **resolved and measured** — cached lookups verified in `crates/alcyon-
 | **What HAProxy does** | With OpenSSL, a `bind ... ciphers "DHE-RSA-AES256-GCM-SHA384" ssl-max-ver TLSv1.2` offers TLS 1.2 finite-field Diffie-Hellman, with parameters from `ssl-dh-param-file`, from a DH block appended to the `crt` PEM (also via `set ssl cert`), or generated to the size of `tune.ssl.default-dh-param` (capped by the key size). `reg-tests/ssl/ssl_dh.vtc` checks it with `openssl s_client` ("Server Temp Key: DH, 2048 bits"). |
 | **Why Alcyon has none** | rustls 0.23 (0.23.45 in the tree) parses DHE in its TLS 1.2 handshake and has a `SupportedKxGroup::ffdhe_group` hook, but neither of its crypto providers ships a DHE cipher suite or an FFDHE key-exchange group. Alcyon uses the `ring` provider (crates/alcyon-tls/Cargo.toml), whose groups are X25519, P-256 and P-384. Offering DHE would mean Alcyon writing its own provider: TLS 1.2 DHE suite definitions plus a constant-time modular exponentiation over 2048-4096-bit numbers. That is new crypto code of our own, which is exactly what the memory-safety rule for dependencies (pure-Rust, no home-made crypto) and the sealed TLS trait (§3.3) are there to avoid. |
 | **Why that is acceptable** | rustls leaves FFDHE out by design. ECDHE gives the same forward secrecy, faster, with standard curves. DHE carries a history of weak or custom primes (Logjam, 2015), servers that reuse the key, and the Raccoon timing attack on TLS 1.2 DHE (2020). Browsers no longer offer DHE suites (Chrome since 2016, Firefox since 2020), so a client that can only do DHE is a very old or embedded one. |
-| **What Alcyon does** | TLS 1.2 and 1.3 with ECDHE (X25519, P-256, P-384). `tune.ssl.default-dh-param` is accepted and has no effect (parser/mod.rs inert list): there is no DHE for it to size, so a config written for HAProxy keeps loading. A DHE cipher name and `ssl-dh-param-file` must be refused at load with a message naming this section (T399), and a DH block in a `crt` PEM ignored with a warning (T399). |
+| **What Alcyon does** | TLS 1.2 and 1.3 with ECDHE (X25519, P-256, P-384). `tune.ssl.default-dh-param` is accepted and has no effect (parser/mod.rs inert list): there is no DHE for it to size, so a config written for HAProxy keeps loading. `ssl-dh-param-file` is refused at load, but only as an unknown keyword (`unknown keyword 'ssl-dh-param-file' in 'global' section`, checked 2026-11-09): the message naming this section that T399 planned was not built, and how a DHE cipher name on `ciphers` and a DH block in a `crt` PEM are handled was not re-checked. |
 | **Board** | `ssl/ssl_dh.vtc` cannot pass; T399 marks it OUT_OF_SCOPE in the runner. |
 | **Status** | **decided** (user, 2026-10-18). |
 | **Revisit if** | rustls or a provider we already depend on ships FFDHE, or a user brings a client that cannot do ECDHE. |
@@ -565,7 +597,7 @@ signature or key algorithm as `UNDEF`. DN values are copied as raw bytes (no cha
 of BMPString/UniversalString) in the one-line form; `rfc2253` dumps non-text types as `#<hex>`.
 The `ssl_c_*` fetches (the peer's certificate) are not implemented here.
 
-### 6.20 rustls allocates 3 times per TLS request — **known M1 difference; fix is the rustls 0.24 port (T437 5a), waiting for 0.24.0**
+### 6.20 rustls allocated 3 times per TLS request — **closed by T440 (6.22): TCP TLS on rustls 0.24.0-dev.2, 0 per request; history below**
 
 | | |
 |---|---|
@@ -609,10 +641,10 @@ fix/t444 did) a new connection's method and URI (`ReqText`) come from the spares
 | | |
 |---|---|
 | **What changed** | The TCP TLS path (`alcyon_tls::tcp`, `alcyon_tls::conn`, `alcyon-rt/src/xprt.rs`, `srv_tls.rs`) uses rustls `=0.24.0-dev.2` with its `rustls-ring` provider, because 0.24 has caller-owned buffers: a steady-state keep-alive request over TLS makes 0 allocations (`tls_request_allocations`: TLS to plain 3 to 0 per request, TLS to TLS 13 to 0). 0.23 cannot do this. |
-| **Cost** | A pre-release pin: the API may change before 0.24.0, and a fix may land on 0.23.x first and reach 0.24 later. We pin exactly (`=`) so a build never moves under us; every bump is a manual port. Two rustls versions are in the tree: QUIC (quinn), the log forwarder, `ring.rs`, and the test clients stay on 0.23 (`rustls`), the TCP path is `rustls24`. Binary size (release, same tree otherwise): stripped 10 920 512 to 12 204 696 bytes (+1.2 MB, +11.8%); with `debug = true` as `[profile.release]` ships it, 183 079 104 to 206 240 360 bytes. |
+| **Cost** | A pre-release pin: the API may change before 0.24.0, and a fix may land on 0.23.x first and reach 0.24 later. We pin exactly (`=`) so a build never moves under us; every bump is a manual port. Two rustls versions are in the tree, but only one in the binary: since T461 every TLS the binary does (TCP, QUIC, the log forwarder) is `rustls24`; 0.23 (`rustls`, 0.23.45) is a dev-dependency of the TLS and HTTP/3 test clients (quinn's own client needs it; 0.24.0-dev.2 has no QUIC client), in `alcyon-rt`, `alcyon-proto`, `alcyon-quic` and `alcyon-tls`. Binary size (release, same tree otherwise): stripped 10 920 512 to 12 204 696 bytes (+1.2 MB, +11.8%); with `debug = true` as `[profile.release]` ships it, 183 079 104 to 206 240 360 bytes. |
 | **Why that is acceptable** | The zero-allocation request path is an M1 requirement; the dev pin is merged once gated green (user decision 2026-10-19). `ring` stays the crypto, so the memory-safety rule for dependencies holds. |
 | **Status** | Open. |
-| **Revisit** | Move to `0.24.0` when it is released (expected around Q1 2027; low confidence) and drop the duplicate rustls where QUIC can follow. |
+| **Revisit** | Move to `0.24.0` when it is released (expected around Q1 2027; low confidence) and drop rustls 0.23 once the test clients can move (a 0.24 QUIC client). |
 
 ### 6.23 A failed allocation aborts the whole process; HAProxy fails one stream (T446) — **measured 2026-10-24; open, waiting on Rust and on our own `try_*` work**
 
@@ -677,8 +709,8 @@ without an answer, logged with termination state `I` and its phase, and counted 
 | **Cost** | A memory disclosure (a core dump, a swapped page, a later read of freed memory by another bug) can expose keys that OpenSSL would have wiped. Rust's memory safety makes the "later read" path much less likely than in C, but core dumps and swap remain. |
 | **Mitigations today** | Disable core dumps for the service (`LimitCORE=0`), no swap or encrypted swap. These are ops settings, not Alcyon code. |
 | **Plan** | Patch ring (or the rustls provider) to zeroize key material on drop: the ECDH/X25519 private and shared values, the AEAD key schedules, the RSA/ECDSA private keys. Ask upstream first whether such a patch would be taken; otherwise carry it as a vendored patch, or evaluate another memory-safe provider that wipes. aws-lc-rs stays excluded (C, see the memory-safety rule). |
-| **Status** | A choice since T460: `tune.alcyon.crypto-provider ring-alcyon` runs TLS over TCP on the vendored fork (`vendor/ringalcyon`, feature `zeroize`; ring-alcyon 237a254, 741d7a8 since T462). It wipes the ephemeral and shared ECDH/X25519 secrets, the AES/ChaCha/GHASH/Poly1305 key schedules, the HMAC/HKDF and digest states, the Ed25519 key pair, the ECDSA seed and the RSA private primes and exponents (inventory: `vendor/ringalcyon/ZEROIZE.md`). Not wiped even there: stack copies left by moves, registers, asm temporaries (since T462: the stack below the TLS layer and, on `ring-alcyon`, the vector registers are; next row), the ECDSA per-signature nonce, the affine coordinates of the ECDH point (TODO in ZEROIZE.md). `ring` (vanilla upstream) wipes none of it and stays the **default**: operators are right to be wary of a forked crypto library, and an upstream ring fix reaches Alcyon by a `cargo update`, a fork fix only by our re-vendoring. HTTP/3 is covered since T461: QUIC runs on rustls 0.24 and the chosen provider, quinn-proto's stateless-reset, token and Retry crypto included (`alcyon-quic/src/crypto.rs`); so do the log-forward TLS binds and the ring TLS servers (`alcyon-tls/src/blocking.rs`). No TLS of the binary is left on rustls 0.23. The stack scrub (T462) runs in `TlsCtx::handshake`; QUIC handshakes are not scrubbed yet (T462 follow-up). |
-| **Stack and registers (T462)** | **Wiped now:** the heap (T459's wipe-on-free allocator), key structs on drop (ring-alcyon), and since T462 **the stack below the TLS layer** and **the vector registers**. After every `TlsCtx::handshake` call until the handshake is done (and after `TlsCtx::connect`), front and back, `alcyon_alloc::scrub_stack` zeroes 48 KiB below `TlsCtx`'s frame (128 KiB in debug builds): the moved-from `Seed`/key copies, the `Copy` `digest::Output`/`hmac::Tag` values (the HKDF-extract result among them), the ECDH point's coordinates and assembly spills that rustls and ring leave there, on either provider. The deepest handshake step measured 23,864 B below that frame in a release build (RSA-4096, TLS 1.3; test `alcyon-tls` `stack_scrub`, which without the scrub finds the TLS 1.3 traffic secrets and the TLS 1.2 master secret in that region). Under `tune.alcyon.ssl-zero-buffers` (default on); not per record. With `ring-alcyon`, ring's assembly no longer leaves key material in xmm/ymm registers: one `vzeroall` (or 16 `pxor`) after each AEAD key setup, seal and open, key agreement, signature and HMAC (`vendor/ringalcyon/ZEROIZE.md` 2; it found two GHASH key-table entries in xmm6-7 after a seal). **Not wiped:** general-purpose registers (overwritten at once by the caller's code), the kernel's saved register state on a context switch, swap; QUIC handshakes until T461 (QUIC on rustls 0.24) is merged; vanilla `ring`'s registers (the default provider). Mitigations unchanged: `LimitCORE=0`, no swap or encrypted swap. |
+| **Status** | A choice since T460: `tune.alcyon.crypto-provider ring-alcyon` runs TLS over TCP on the vendored fork (`vendor/ringalcyon`, feature `zeroize`; ring-alcyon 237a254, 741d7a8 since T462). It wipes the ephemeral and shared ECDH/X25519 secrets, the AES/ChaCha/GHASH/Poly1305 key schedules, the HMAC/HKDF and digest states, the Ed25519 key pair, the ECDSA seed and the RSA private primes and exponents (inventory: `vendor/ringalcyon/ZEROIZE.md`). Not wiped even there: stack copies left by moves, registers, asm temporaries (since T462: the stack below the TLS layer and, on `ring-alcyon`, the vector registers are; next row), the ECDSA per-signature nonce, the affine coordinates of the ECDH point (TODO in ZEROIZE.md). `ring` (vanilla upstream) wipes none of it and stays the **default**: operators are right to be wary of a forked crypto library, and an upstream ring fix reaches Alcyon by a `cargo update`, a fork fix only by our re-vendoring. HTTP/3 is covered since T461: QUIC runs on rustls 0.24 and the chosen provider, quinn-proto's stateless-reset, token and Retry crypto included (`alcyon-quic/src/crypto.rs`); so do the log-forward TLS binds and the ring TLS servers (`alcyon-tls/src/blocking.rs`). No TLS of the binary is left on rustls 0.23. The stack scrub (T462) runs in `TlsCtx::handshake`, and for QUIC after each pop of rustls's handshake events (`alcyon-quic/src/crypto.rs` `take_handshake_scrubbed`, client and server, T534; 6.31 #15). |
+| **Stack and registers (T462)** | **Wiped now:** the heap (T459's wipe-on-free allocator), key structs on drop (ring-alcyon), and since T462 **the stack below the TLS layer** and **the vector registers**. After every `TlsCtx::handshake` call until the handshake is done (and after `TlsCtx::connect`), front and back, `alcyon_alloc::scrub_stack` zeroes 48 KiB below `TlsCtx`'s frame (128 KiB in debug builds): the moved-from `Seed`/key copies, the `Copy` `digest::Output`/`hmac::Tag` values (the HKDF-extract result among them), the ECDH point's coordinates and assembly spills that rustls and ring leave there, on either provider. The deepest handshake step measured 23,864 B below that frame in a release build (RSA-4096, TLS 1.3; test `alcyon-tls` `stack_scrub`, which without the scrub finds the TLS 1.3 traffic secrets and the TLS 1.2 master secret in that region). Under `tune.alcyon.ssl-zero-buffers` (default on); not per record. With `ring-alcyon`, ring's assembly no longer leaves key material in xmm/ymm registers: one `vzeroall` (or 16 `pxor`) after each AEAD key setup, seal and open, key agreement, signature and HMAC (`vendor/ringalcyon/ZEROIZE.md` 2; it found two GHASH key-table entries in xmm6-7 after a seal). **Not wiped:** general-purpose registers (overwritten at once by the caller's code), the kernel's saved register state on a context switch, swap; vanilla `ring`'s registers (the default provider). Mitigations unchanged: `LimitCORE=0`, no swap or encrypted swap. |
 | **Cost (T462)** | Measured 2026-10-25, `tools/measure/insreq.sh`, base 2b2bc82e against T462, min of 5 rounds, proxy instructions:u, load lock held, governor `performance` (**wwm.exe was running throughout**: the instruction counts hold, the timing does not). **Handshake** (`hs1`, one TLS 1.3 handshake per request, P-256 certificate, `tls.body`): 1,509,953 -> 1,514,905 instructions per handshake (+4,952, **+0.33%**) on `ring`; 1,519,295 -> 1,524,112 (+4,817, +0.32%) on `ring-alcyon`: the stack scrub (a 48 KiB `memset` plus the stack probes of its frame, once per handshake step). Handshakes per second were not measurable (the game's load moved the base runs from 494 to 742/s); to be re-measured on a quiet host. **TLS keep-alive** (`ab1s`): `ring-alcyon` 55,461 -> 55,399 min, 55,467 -> 55,470 median (the register clear: about 5 instructions per seal or open, inside the +-40 round-to-round spread); `ring` 55,444 -> 55,380 (unchanged path). Plain HTTP `ab1` (path not touched): keepalive 49,226 -> 49,271 (+0.09%), rules 80,620 -> 80,504 (-0.14%). The scrub has no keyword of its own: it is `tune.alcyon.ssl-zero-buffers` (off: no scrub, and no TLS buffer wiping). |
 
 ### 6.28 One pool type, `alcyon_alloc::Pool` (S1-S5, S7 of `docs/design/memory-2026-10-24.md`) — **measured 2026-10-24/25**
