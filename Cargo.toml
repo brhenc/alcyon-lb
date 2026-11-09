@@ -32,55 +32,33 @@ repository = "https://github.com/brhenc/alcyon-lb"
 rust-version = "1.80.0"
 
 [workspace.dependencies]
-# Internal workspace crates
+# What member crates take with `workspace = true`. Workspace crates that are named by path in
+# each member's own manifest are not listed here.
 alcyon-alloc = { path = "crates/alcyon-alloc" }
-alcyon-core = { path = "crates/alcyon-core" }
-ebtree = { path = "crates/ebtree" }
-alcyon-stick-table = { path = "crates/alcyon-stick-table" }
-alcyon-peers = { path = "crates/alcyon-peers" }
-alcyon-parser = { path = "crates/alcyon-parser" }
+alcyon-regex = { path = "crates/alcyon-regex" }
 alcyon-tls = { path = "crates/alcyon-tls" }
-alcyon-config = { path = "crates/alcyon-config" }
-alcyon-vtest = { path = "crates/alcyon-vtest" }
-alcyon-runtime = { path = "crates/alcyon-runtime" }
+ebtree = { path = "crates/ebtree" }
 
-# Async & Networking
-tokio = { version = "1.40", features = ["full"] }
-async-trait = "0.1"
 bytes = "1.7"
 memchr = "2.7"
-arc-swap = "1.7"
-crossbeam-epoch = "0.9"
-crossbeam-utils = "0.8"
-
-# Parsing & Serialization
-nom = "7.1"
-thiserror = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 regex = "1.10"
 fancy-regex = "0.19"
-alcyon-regex = { path = "crates/alcyon-regex" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
 
-
-# TLS & Cryptography
+# TLS. QUIC (quinn-proto 0.11) and the test clients use rustls 0.23.
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
-tokio-rustls = "0.26"
 # T440: the TCP TLS path (alcyon-tls transport, alcyon-rt xprt) on the 0.24 pre-release, whose
-# connections decrypt and encrypt in buffers the caller owns. QUIC (quinn-proto 0.11) and the test
-# clients stay on 0.23 above. Pinned exactly: a pre-release (tradeoff.md 6.21).
+# connections decrypt and encrypt in buffers the caller owns. Pinned exactly: a pre-release
+# (tradeoff.md 6.21).
 rustls24 = { package = "rustls", version = "=0.24.0-dev.2", default-features = false, features = ["webpki"] }
 rustls24-ring = { package = "rustls-ring", version = "=0.24.0-dev.2" }
 # T460: `tune.alcyon.crypto-provider ring-alcyon`: the zeroizing ring fork (vendor/README.md). Its own
 # `links` value and C symbol prefix, so it links next to upstream ring.
 rustls24-ringalcyon = { package = "rustls-ringalcyon", path = "vendor/rustls-ringalcyon" }
 
-# CLI & Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4.5", features = ["derive"] }
-
-# Testing & Verification
 proptest = "1.5"
 
 [workspace.lints.rust]
@@ -91,7 +69,7 @@ dead_code = "allow"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-# Soft-realtime & NASA safety rules
+# Panics and unfinished code (todo!, unimplemented!) are warned about.
 panic = "warn"
 todo = "warn"
 unimplemented = "warn"

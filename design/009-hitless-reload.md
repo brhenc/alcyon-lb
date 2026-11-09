@@ -73,8 +73,9 @@ cannot work under systemd:
 under `Type=notify`, when the main PID exits with no successor named, systemd treats the
 service as failed. That is the exact failure the "haproxy-systemd-wrapper" history in
 `doc/internals/mworker.md` describes. HAProxy solves it with a master whose PID never
-changes. Alcyon has no master and cannot re-exec in place without discarding every
-in-flight session, so the serving PID *must* change on reload. What makes that safe:
+changes. Alcyon had no master then and cannot re-exec in place without discarding every
+in-flight session, so in this mode the serving PID *must* change on reload. What makes that
+safe:
 
 - **The running process starts its successor**, on `SIGUSR2` (`-W` / `-Ws`), with the same
   arguments plus `-x <private socket> -sf <own pid>`. The unit file is HAProxy's:
@@ -96,17 +97,43 @@ in-flight session, so the serving PID *must* change on reload. What makes that s
 `-x` against an operator-managed stats socket with `expose-fd listeners` also works, for
 reloads done by hand as `alcyon -f cfg -x <sock> -sf <pid>`.
 
-### Not done
+### Since: master process, QUIC, HTTP/2, pause and resume
 
-- **QUIC.** Listeners are not handed over and QUIC connections are not drained: a QUIC
-  connection lives on the listening UDP socket, so sharing it between two processes would
-  deliver each one's datagrams to the other. HTTP/3 connections are cut at reload.
-- **HTTP/2 soft stop** does not send GOAWAY; H2 sessions drain until `hard-stop-after`.
-- **`SIGTTOU`/`SIGTTIN`** (pause/resume listeners) are not handled.
+The first implementation left four things out. All four are in the code now.
+
+- **A master process** (T200, `crates/alcyon-rt/src/bin/alcyon/master.rs`). Part 3 argued
+  against copying HAProxy's master; it was added anyway, for HAProxy's master CLI (`-S`) and
+  for `user` / `group` / `chroot`: a plain `-W` process that has given up root or entered a
+  chroot can no longer start the binary again, so the master keeps its privileges while its
+  workers drop theirs, as HAProxy's does. With `-W -S`, or `-W` with any of those, the master
+  runs no proxy, starts the
+  binary again as a worker, and on reload starts another worker, which takes the listeners
+  over from the serving one (`-x`) and soft-stops it (`-sf`). A worker whose configuration
+  does not load exits, and the serving one is never told. Plain `-W` without them still
+  reloads as described above, by the serving process starting its successor.
+- **QUIC** (T558, `crates/alcyon-rt/src/handover.rs`). The QUIC listeners' UDP sockets, one per
+  worker thread, are handed over with the TCP and log-forward ones, as HAProxy 3.5-dev10
+  does. Bound anew, the new process's sockets joined the old one's `SO_REUSEPORT` group, and
+  while the old process drained, the kernel sent about half of the new connections' Initials
+  to it, which refused them. Shared, the old process stops reading them at its soft stop and
+  serves the connections it already has on the connected sockets it pins then
+  (`QuicListener::begin_soft_stop`); its HTTP/3 requests in flight finish before it exits
+  (T108, `tests/it/soft_stop_h3.rs`).
+- **HTTP/2 soft stop** sends a graceful GOAWAY (`Engine::begin_soft_stop`): an idle HTTP/2
+  connection is told first and closed once the frame is out, and one with streams in flight
+  finishes them (`tests/it/soft_stop_h2.rs`). A keep-alive HTTP/1 request read after the stop
+  is answered with `Connection: close`.
+- **`SIGTTOU` / `SIGTTIN`** (T456, `crates/alcyon-rt/src/lifecycle.rs`): HAProxy's pause and
+  resume. A new process whose bind finds an address in use sends `SIGTTOU` to the processes it
+  replaces, which pause every listener (QUIC ones excepted), and `SIGTTIN` if it then fails to
+  start, which resumes them; a resume that fails is tried again on the next signal
+  (`tests/it/pause_resume_signals.rs`, against HAProxy 3.5-dev8 with `nbthread 4`).
 
 ### Evidence
 
-`crates/alcyon-rt/tests/it/soft_stop.rs` and `tests/reload.rs` drive the real binary.
+`crates/alcyon-rt/tests/it/soft_stop.rs` and `tests/reload.rs` drive the real binary;
+`tests/it/h3_reload.rs` reloads under HTTP/3 load every 400 ms and requires no request lost and
+the same QUIC sockets before and after.
 `harness/systemd_reload.sh` drives `admin/systemd/alcyon.service` through `systemctl --user`
 under continuous load: three reloads, a reload onto a broken config (refused, `MainPID`
 unchanged, `Reload failed!`), a recovering reload, and a stop. Four runs, 27,002 requests,
