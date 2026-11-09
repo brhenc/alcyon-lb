@@ -11,8 +11,8 @@
 # Override any variable below from the environment, e.g.  SIZE_MB=10 ./run.sh
 
 # ---- settings you may want to change ---------------------------------------
-ALCYON_BIN=${ALCYON_BIN:-/home/bhenc/ibex-targets/t167/release/alcyon}
-HAPROXY_BIN=${HAPROXY_BIN:-/home/bhenc/reference/haproxy/haproxy}
+ALCYON_BIN=${ALCYON_BIN:-${ALCYON_TARGETS:-${XDG_CACHE_HOME:-$HOME/.cache}/alcyon/targets}/t167/release/alcyon}
+HAPROXY_BIN=${HAPROXY_BIN:-${ALCYON_REFERENCE:?set ALCYON_REFERENCE (README, "Running the oracle tests") or HAPROXY_BIN}/haproxy/haproxy}
 PROXY_PORT=${PROXY_PORT:-18080}     # where the proxy listens (clients connect here)
 APP_PORT=${APP_PORT:-13000}         # where the node.js app listens
 SIZE_MB=${SIZE_MB:-100}             # size of the upload and download cases

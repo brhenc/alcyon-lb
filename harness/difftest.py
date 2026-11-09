@@ -1462,8 +1462,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Differential Proxy Test Harness (HAProxy 3.5 vs Alcyon)")
     parser.add_argument(
         "--reference",
-        default="/home/bhenc/reference/haproxy/haproxy",
-        help="Path to reference proxy binary (defaults to /home/bhenc/reference/haproxy/haproxy)"
+        default=None,
+        help="Path to reference proxy binary (defaults to $ALCYON_REFERENCE/haproxy/haproxy)"
     )
     parser.add_argument("--candidate", default=None, help="Path to candidate proxy binary (optional)")
     parser.add_argument("--scenario", default="all", help="Scenario to run ('all' or specific name)")
@@ -1472,6 +1472,10 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    if args.reference is None:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import reference  # noqa: E402
+        args.reference = reference.require(reference.HAPROXY, who="difftest")
     ref_path = os.path.abspath(args.reference)
     if not os.path.isfile(ref_path) or not os.access(ref_path, os.X_OK):
         print(f"Error: Reference binary '{ref_path}' not found or not executable.", file=sys.stderr)

@@ -10,7 +10,7 @@ import os, subprocess, sys
 B = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path[:0] = [B, B + "/repro"]
 import labproxy
-HA = "/home/bhenc/reference/haproxy/haproxy"
+HA = os.path.join(os.environ["ALCYON_REFERENCE"], "haproxy/haproxy")
 TCFG = """global
     nbthread 2
 defaults

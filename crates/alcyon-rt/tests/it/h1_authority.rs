@@ -12,7 +12,7 @@
 //! `Host` is rewritten to match, and an empty path becomes `/`.
 //!
 //! Every expected value below was measured, not derived: `HAProxy` 3.5-dev8-885761-29
-//! (2026/10/02, `/home/bhenc/reference/haproxy/haproxy`), on 2026-10-03, with
+//! (2026/10/02, `$ALCYON_REFERENCE/haproxy/haproxy`), on 2026-10-03, with
 //! `defaults mode http` / `frontend fe` / `default_backend be` / `backend be` / `server s1`,
 //! sending each request on its own connection and recording the status the client got and
 //! the request line and `Host` lines the server received. The `c*` names are the clients

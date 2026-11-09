@@ -23,8 +23,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 PARITY_DIR = REPO_ROOT / "tools" / "parity-bench"
 BENCH_BIN = Path("/tmp/t39-target/release/parity-bench")
 ALCYON_BIN = Path("/tmp/t39-target/release/alcyon")
-HAPROXY_BIN = Path("/home/bhenc/reference/haproxy-quic/haproxy")
-PERF_SCRIPT_DIR = Path("/home/bhenc/.cargo/bin")
+HAPROXY_BIN = Path(os.environ.get("ALCYON_REFERENCE", "$ALCYON_REFERENCE")) / "haproxy-quic" / "haproxy"
+# inferno (flamegraphs) is installed with `cargo install`.
+PERF_SCRIPT_DIR = Path(os.environ.get("CARGO_HOME") or Path.home() / ".cargo") / "bin"
 
 # Add cargo bin to PATH for inferno tools
 os.environ["PATH"] = f"{PERF_SCRIPT_DIR}:{os.environ.get('PATH', '')}"

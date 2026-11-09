@@ -6,7 +6,7 @@ stats http-request, stats in a backend.  stats_acl.py ALCYON [HAPROXY]
 Each case: one config, a list of requests (path, credentials, extra header); prints status and
 WWW-Authenticate per request for both proxies, SAME/DIFF per case.  Port 19970, backend 19971."""
 import base64, os, socket, subprocess, sys, tempfile, time
-IB = sys.argv[1]; HA = sys.argv[2] if len(sys.argv) > 2 else "/home/bhenc/reference/haproxy/haproxy"
+IB = sys.argv[1]; HA = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.environ["ALCYON_REFERENCE"], "haproxy/haproxy")
 P = 19970
 HEAD = """global
     nbthread 1

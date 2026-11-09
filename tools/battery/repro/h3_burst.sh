@@ -26,7 +26,7 @@ ALCYON=${1:?usage: h3_burst.sh <alcyon-binary> [runs] [nbthread ...]}
 RUNS=${2:-3}
 shift; shift 2>/dev/null
 NTS=${*:-1 16}
-HAP=${HAPROXY_QUIC:-$HOME/reference/haproxy-quic/haproxy}
+HAP=${HAPROXY_QUIC:-${ALCYON_REFERENCE:?set ALCYON_REFERENCE or HAPROXY_QUIC}/haproxy-quic/haproxy}
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 1
 CRT=$HERE/../../../examples/certs/localhost.pem
 D=/tmp/h3_burst.$$

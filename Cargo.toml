@@ -16,6 +16,23 @@ members = [
 ]
 # T460: the vendored ring fork and its rustls provider are dependencies, not members: `cargo test
 # --workspace` and clippy do not run ring's suite or lint upstream code (vendor/README.md).
+# T630: alcyon-h1-sys compiles HAProxy's C (alcyon-proto's opt-in `haproxy-ffi`) and needs its
+# source tree ($ALCYON_REFERENCE/haproxy), so it is not a default member: `cargo build` and
+# `cargo test` work on a fresh clone; `--workspace` (the gate) includes it.
+default-members = [
+    "crates/ebtree",
+    "crates/alcyon-sched",
+    "crates/alcyon-proto",
+    "crates/alcyon-rt",
+    "crates/alcyon-config",
+    "crates/alcyon-sample",
+    "crates/alcyon-regex",
+    "crates/alcyon-crypt",
+    "crates/alcyon-stick-table",
+    "crates/alcyon-tls",
+    "crates/alcyon-alloc",
+    "crates/slz", "crates/alcyon-mmsg", "crates/alcyon-dns", "crates/alcyon-quic",
+]
 exclude = ["vendor/ringalcyon", "vendor/rustls-ringalcyon", "vendor/quinn-proto"]
 
 # T542: quinn-proto vendored and patched here (vendor/README.md); every user in the graph takes it.

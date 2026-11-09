@@ -4,7 +4,7 @@
 //! X5: the h1 encoder (`h1_make_reqline`/`h1_make_stline`/`h1_make_headers`/`h1_make_eoh`,
 //! src/mux_h1.c). Each row is an HTX head as HAProxy's HTX holds it after its parse (names in
 //! the case they arrived), the state the stream is in, and the bytes HAProxy 3.5-dev8
-//! (`/home/bhenc/reference/haproxy/haproxy`) put on the wire for it, measured on 2026-11-01:
+//! (`$ALCYON_REFERENCE/haproxy/haproxy`) put on the wire for it, measured on 2026-11-01:
 //! a listener per mode (`option http-server-close`, `option httpclose`, keep-alive, `proto h2`,
 //! `http-request del-header content-length`) in front of a server that recorded what it got
 //! and answered the row's response. `on` is HAProxy's output byte for byte

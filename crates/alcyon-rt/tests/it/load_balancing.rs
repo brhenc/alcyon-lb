@@ -138,7 +138,7 @@ backend test_be
     assert!(active_servers > 1, "balance uri sent all requests to a single server!");
 }
 
-/// Verified against the reference binary (`/home/bhenc/reference/haproxy/haproxy` 3.5-dev7):
+/// Verified against the reference binary (`$ALCYON_REFERENCE/haproxy/haproxy` 3.5-dev7):
 /// three real HTTP servers behind `balance first`, 20 requests through the real engine,
 /// landed on the first server 20/20 times ({'18091': 20}). `first` is not a random or
 /// rotating choice -- it always prefers the earliest server in declaration order that has

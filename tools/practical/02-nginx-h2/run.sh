@@ -13,8 +13,8 @@
 # script and killed by PID at the end. The certificate is generated into the work dir.
 
 # ---- settings you may want to change ---------------------------------------
-ALCYON_BIN=${ALCYON_BIN:-/home/bhenc/ibex-targets/t193/release/alcyon}
-HAPROXY_BIN=${HAPROXY_BIN:-/home/bhenc/reference/haproxy/haproxy}
+ALCYON_BIN=${ALCYON_BIN:-${ALCYON_TARGETS:-${XDG_CACHE_HOME:-$HOME/.cache}/alcyon/targets}/t193/release/alcyon}
+HAPROXY_BIN=${HAPROXY_BIN:-${ALCYON_REFERENCE:?set ALCYON_REFERENCE (README, "Running the oracle tests") or HAPROXY_BIN}/haproxy/haproxy}
 NGINX_BIN=${NGINX_BIN:-/usr/sbin/nginx}
 H2LOAD_BIN=${H2LOAD_BIN:-/usr/bin/h2load}
 PROXY_PORT=${PROXY_PORT:-24080}         # proxy, TLS (clients connect here)

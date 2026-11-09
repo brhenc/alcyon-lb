@@ -102,7 +102,7 @@ def one(label, pid):
     print(f"          per second (rss MB, cpu %, open, stalled): {rows}")
     print(f"          after close (rss MB, cpu %): {after}", flush=True)
 
-ht = subprocess.Popen(["taskset", "-c", "16-31", "/root/ibex-test/haterm", "-L", "127.0.0.1:8888", "-G", "nbthread 8"],
+ht = subprocess.Popen(["taskset", "-c", "16-31", os.environ.get("ALCYON_LAB_DIR", "/root/alcyon-test") + "/haterm", "-L", "127.0.0.1:8888", "-G", "nbthread 8"],
                       stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 try:
     if not wait_port(8888): print("haterm did not listen"); sys.exit(1)

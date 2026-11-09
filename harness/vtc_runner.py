@@ -1861,7 +1861,10 @@ def install_exit_handlers() -> None:
 
 _QUIC_CLIENT_LINE = re.compile(r"(?:\bquic[46]?[@+]|\bproto\s+qmux\b|\balpn\s+h3\b)")
 _QUIC_SERVER_LINE = re.compile(r"(?:\bquic[46]?\+|\bquic[46]?@|\bproto\s+qmux\b|\balpn\s+h3\b)")
-DEFAULT_QUIC_CLIENT_BINARY = os.path.expanduser("~/reference/haproxy-quic/haproxy")
+# $ALCYON_REFERENCE/haproxy-quic/haproxy (T630); "" when the variable is unset, which the run
+# refuses by name like a missing binary.
+DEFAULT_QUIC_CLIENT_BINARY = os.path.join(os.environ["ALCYON_REFERENCE"], "haproxy-quic/haproxy") \
+    if os.environ.get("ALCYON_REFERENCE") else ""
 
 
 def quic_roles(conf: str, env: Optional[Dict[str, str]] = None) -> Tuple[bool, bool]:

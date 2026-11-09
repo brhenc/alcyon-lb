@@ -4,7 +4,8 @@
 syslog sink for the proxy's httplog lines, /proc readers.  Lab only."""
 import os, re, socket, subprocess, sys, threading, time
 
-HATERM = "/root/ibex-test/haterm"
+LAB = os.environ.get("ALCYON_LAB_DIR", "/root/alcyon-test")  # the lab VM's tools: haterm, haload, lab.pem
+HATERM = f"{LAB}/haterm"
 TICK = os.sysconf("SC_CLK_TCK")
 
 def wait_port(port, secs=5):

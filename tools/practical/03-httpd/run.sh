@@ -11,8 +11,8 @@
 # Everything is started by this script and killed by PID at the end.
 
 # ---- settings you may want to change ---------------------------------------
-ALCYON_BIN=${ALCYON_BIN:-/home/bhenc/ibex-targets/t201/release/alcyon}
-HAPROXY_BIN=${HAPROXY_BIN:-/home/bhenc/reference/haproxy/haproxy}
+ALCYON_BIN=${ALCYON_BIN:-${ALCYON_TARGETS:-${XDG_CACHE_HOME:-$HOME/.cache}/alcyon/targets}/t201/release/alcyon}
+HAPROXY_BIN=${HAPROXY_BIN:-${ALCYON_REFERENCE:?set ALCYON_REFERENCE (README, "Running the oracle tests") or HAPROXY_BIN}/haproxy/haproxy}
 HTTPD_BIN=${HTTPD_BIN:-/usr/sbin/httpd}
 HTTPD_MODS=${HTTPD_MODS:-/usr/lib64/httpd/modules}
 WRK2=${WRK2:-$HOME/.local/bin/wrk2}

@@ -989,15 +989,10 @@ fn a_request_is_reset(payload: &[u8], tag: &str) {
 /// Compares received backend headers between HAProxy oracle and Alcyon for an identical HTTP/2 request.
 #[test]
 fn h2_backend_headers_match_haproxy_reference_oracle() {
-    let oracle_bin = std::path::PathBuf::from("/home/bhenc/reference/haproxy-quic/haproxy");
-    let haproxy_bin = if oracle_bin.exists() {
-        oracle_bin
-    } else {
-        std::path::PathBuf::from("/home/bhenc/reference/haproxy/haproxy")
-    };
-    if !haproxy_bin.exists() {
+    let Some(haproxy_bin) = common::reference("haproxy-quic/haproxy").or_else(|| common::reference("haproxy/haproxy"))
+    else {
         return;
-    }
+    };
 
     // 1. Run HAProxy
     let (haproxy_be_port, haproxy_seen) = spawn_backend_full();

@@ -25,19 +25,24 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import reference  # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(REPO, "data", "txn_oracle_baseline.json")
-DEFAULT_HAPROXY = "/home/bhenc/reference/haproxy/haproxy"
 RESULT_RE = re.compile(r"^test (\S+) \.\.\. (ok|FAILED)\s*$", re.M)
 
 
 def main() -> int:
-    haproxy = DEFAULT_HAPROXY
+    # A gate stage: without its oracle it fails, naming $ALCYON_REFERENCE (T630); it used to
+    # print "not run" and pass.
     if "--haproxy" in sys.argv:
         haproxy = sys.argv[sys.argv.index("--haproxy") + 1]
+    else:
+        haproxy = reference.require(reference.HAPROXY, who="txn oracle")
     if not os.access(haproxy, os.X_OK):
-        print(f"txn oracle: no HAProxy at {haproxy}; not run")
-        return 0
+        print(f"txn oracle: no HAProxy at {haproxy}")
+        return 1
     version = subprocess.run([haproxy, "-v"], capture_output=True, text=True).stdout.splitlines()[0]
     base = json.load(open(BASELINE))
     print(f"txn oracle: {version}")

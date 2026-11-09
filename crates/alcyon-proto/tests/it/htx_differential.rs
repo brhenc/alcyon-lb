@@ -329,7 +329,7 @@ fn test_measure_htx_block_desc_and_allocations() {
 
     // Build a realistic request in Htx: 1 start line + 10 headers
     let headers_data = [
-        ("Host", "api.project-ibex.internal"),
+        ("Host", "api.alcyon-lb.internal"),
         ("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/128.0"),
         ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
         ("Accept-Language", "en-US,en;q=0.5"),

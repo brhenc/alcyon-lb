@@ -100,7 +100,7 @@ def rss_kb(binary, backends, nbthread, extra):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--alcyon", default=default_alcyon())
-    ap.add_argument("--haproxy", default="/home/bhenc/reference/haproxy/haproxy")
+    ap.add_argument("--haproxy", default=os.path.join(os.environ.get("ALCYON_REFERENCE", "$ALCYON_REFERENCE"), "haproxy/haproxy"))
     ap.add_argument("--backends", default="10,1000,10000")
     ap.add_argument("--nbthread", default="1,16")
     ap.add_argument("--no-haproxy", action="store_true")

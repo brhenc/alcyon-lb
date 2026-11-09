@@ -3,7 +3,7 @@
 """Shared helpers for the tools/measure/m1_*.py scripts (T180).
 
 Binaries come from the environment: ALCYON (default $CARGO_TARGET_DIR/release/alcyon),
-HAPROXY (default /home/bhenc/reference/haproxy/haproxy). Every script runs both proxies
+HAPROXY (default $ALCYON_REFERENCE/haproxy/haproxy). Every script runs both proxies
 on the same generated config, with one HAProxy as the shared origin server.
 """
 import json
@@ -19,11 +19,14 @@ import multiprocessing as mp
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ALCYON = os.environ.get("ALCYON", os.path.join(os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target")), "release", "alcyon"))
-HAPROXY = os.environ.get("HAPROXY", "/home/bhenc/reference/haproxy/haproxy")
+HAPROXY = os.environ.get("HAPROXY") or os.path.join(os.environ["ALCYON_REFERENCE"], "haproxy/haproxy")  # T630
 ORIGIN_HAPROXY = os.environ.get("ORIGIN_HAPROXY", HAPROXY)
 RUNS = int(os.environ.get("RUNS", "3"))
 TICK = os.sysconf("SC_CLK_TCK")
-TMP = os.environ.get("M1_TMP", os.path.expanduser("~/ibex-targets/t180/tmp"))  # never /tmp (RAM)
+# Under ALCYON_TARGETS, else ${XDG_CACHE_HOME:-~/.cache}/alcyon/targets (T630).
+TARGETS = os.environ.get("ALCYON_TARGETS") or os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "alcyon", "targets")
+TMP = os.environ.get("M1_TMP") or os.path.join(TARGETS, "t180", "tmp")  # never /tmp (RAM)
 os.makedirs(TMP, exist_ok=True)
 
 

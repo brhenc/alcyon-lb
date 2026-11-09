@@ -16,23 +16,21 @@ use alcyon_config::{
     AclCondition, AclTerm, TcpReqConnAction, TcpReqContentAction, TcpReqSessionAction,
 };
 
-const ORACLE_BIN: &str = "/home/bhenc/reference/haproxy/haproxy";
-
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
     Accept,
     Reject,
 }
 
-fn run_oracle(config_path: &Path) -> (Verdict, String) {
-    let output = match Command::new(ORACLE_BIN)
+fn run_oracle(oracle: &Path, config_path: &Path) -> (Verdict, String) {
+    let output = match Command::new(oracle)
         .arg("-c")
         .arg("-f")
         .arg(config_path)
         .output()
     {
         Ok(out) => out,
-        Err(e) => panic!("Failed to execute oracle binary at {ORACLE_BIN}: {e}"),
+        Err(e) => panic!("Failed to execute oracle binary at {}: {e}", oracle.display()),
     };
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if output.status.success() {
@@ -44,6 +42,9 @@ fn run_oracle(config_path: &Path) -> (Verdict, String) {
 
 #[test]
 fn test_corpus_differential() {
+    // The oracle is HAProxy 3.5 (`$ALCYON_REFERENCE/haproxy/haproxy`); without it there is
+    // nothing to compare against.
+    let Some(oracle) = crate::reference::reference("haproxy/haproxy") else { return };
     let corpus_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
     let mut entries: Vec<_> = fs::read_dir(&corpus_dir)
         .expect("Read corpus dir")
@@ -71,7 +72,7 @@ fn test_corpus_differential() {
 
     for path in &entries {
         let filename = path.file_name().unwrap().to_str().unwrap();
-        let (oracle_verdict, oracle_msg) = run_oracle(path);
+        let (oracle_verdict, oracle_msg) = run_oracle(&oracle, path);
         let alcyon_result = alcyon_config::parse_file(path);
         let alcyon_verdict = if alcyon_result.is_ok() {
             Verdict::Accept

@@ -3,7 +3,7 @@
 
 //! `http-check` / `tcp-check` rules, black-box against the binary and a fake server each
 //! (T134). Every expectation here was measured on `HAProxy` 3.5-dev8-885761-29: set
-//! `CHECK_BIN=/home/bhenc/reference/haproxy/haproxy` to run the same file against it.
+//! `CHECK_BIN=$ALCYON_REFERENCE/haproxy/haproxy` to run the same file against it.
 
 use crate::common;
 

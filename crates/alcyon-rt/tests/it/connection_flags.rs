@@ -5,7 +5,7 @@
 //! request (`ab -k`) reaches the server without its head being written out of the HTX again
 //! ([`alcyon_sample::work::Op::ReqRebuild`]), and what the server reads is what `HAProxy` sends.
 //!
-//! `CASES` are the heads a server read from `/home/bhenc/reference/haproxy/haproxy`
+//! `CASES` are the heads a server read from `$ALCYON_REFERENCE/haproxy/haproxy`
 //! (3.5-dev8-885761-29) for the request in the first column, in the five modes of `MODES`,
 //! captured with a backend that records the request it got.
 

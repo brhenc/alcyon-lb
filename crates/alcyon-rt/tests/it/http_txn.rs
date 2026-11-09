@@ -7,7 +7,7 @@
 //! re-measure, point the suite at the oracle:
 //!
 //! ```text
-//! ALCYON_TXN_BIN=/home/bhenc/reference/haproxy/haproxy cargo test -p alcyon-rt --test http_txn
+//! ALCYON_TXN_BIN=$ALCYON_REFERENCE/haproxy/haproxy cargo test -p alcyon-rt --test http_txn
 //! ```
 //!
 //! A binary whose name contains `haproxy` is started with `-db`.
@@ -1496,7 +1496,7 @@ fn timeout_client_does_not_cut_off_a_slow_server() {
 /// `Transfer-Encoding: chunked` gets no `Connection` token to the server (`keep-alive` would
 /// be wrong: its message ends with the connection) and its client connection closes whatever
 /// the client asked for (`option httpclose` in the frontend alone leaves the server side as the
-/// default mode has it). Measured on HAProxy 3.5-dev8 (`/home/bhenc/reference/haproxy`),
+/// default mode has it). Measured on HAProxy 3.5-dev8 (`$ALCYON_REFERENCE/haproxy`),
 /// 2026-10-18; run with `ALCYON_TXN_BIN` set to it to re-measure.
 #[test]
 fn http10_connection_header_by_framing_and_mode() {
@@ -1565,7 +1565,7 @@ fn http10_connection_header_by_framing_and_mode() {
 /// `HAProxy` sends the page for a request it cannot parse as it is and closes: the built-in
 /// 400 and 408 pages carry `Connection: close` themselves, the 413, 414, 422 and 431 ones do
 /// not, and nothing is added (not even to an `errorfile` without it). Measured on 3.5-dev8
-/// (`/home/bhenc/reference/haproxy`), 2026-10-18; every one of them closes the connection.
+/// (`$ALCYON_REFERENCE/haproxy`), 2026-10-18; every one of them closes the connection.
 #[test]
 fn a_parse_error_reply_has_no_connection_header_but_the_pages() {
     let long_uri = format!("GET /{} HTTP/1.1\r\nHost: x\r\n\r\n", "a".repeat(20000));

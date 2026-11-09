@@ -2,7 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! Alcyon HTTP/1 Parser Differential Fuzzing Harness.
 //!
-//! Compares Alcyon's HTTP/1 parser (`crates/alcyon-proto`) against HAProxy 3.5 (`/home/bhenc/reference/haproxy/haproxy`)
+//! Compares Alcyon's HTTP/1 parser (`crates/alcyon-proto`) against HAProxy 3.5 (`$ALCYON_REFERENCE/haproxy/haproxy`)
 //! and against itself across equivalent streaming inputs.
 
 #![forbid(unsafe_code)]
@@ -35,7 +35,11 @@ struct Config {
 
 fn parse_args() -> Config {
     let args: Vec<String> = env::args().collect();
-    let mut haproxy_bin = PathBuf::from("/home/bhenc/reference/haproxy/haproxy");
+    // T630: no default under anyone's home; empty (refused in `main`) when neither is given.
+    let mut haproxy_bin = env::var_os("ALCYON_REFERENCE")
+        .filter(|r| !r.is_empty())
+        .map(|r| PathBuf::from(r).join("haproxy/haproxy"))
+        .unwrap_or_default();
     let mut corpus_dir = PathBuf::from("fuzz/corpus");
     let mut findings_file = PathBuf::from("fuzz/FINDINGS.md");
     let mut mutated_count = 250;
@@ -93,7 +97,7 @@ fn parse_args() -> Config {
             "--help" | "-h" => {
                 println!("Usage: alcyon-fuzz [OPTIONS]");
                 println!("Options:");
-                println!("  --haproxy <PATH>        Path to HAProxy binary (default: /home/bhenc/reference/haproxy/haproxy)");
+                println!("  --haproxy <PATH>        Path to HAProxy binary (default: $ALCYON_REFERENCE/haproxy/haproxy)");
                 println!("  --corpus-dir <PATH>     Directory to save discrepancy inputs (default: fuzz/corpus)");
                 println!("  --findings-file <PATH>  Output markdown report (default: fuzz/FINDINGS.md)");
                 println!("  --iters <N>             Number of mutated cases to generate (default: 250)");
@@ -175,6 +179,11 @@ fn main() {
         }
         println!("emitted {} cases to {}", cases.len(), dir.display());
         return;
+    }
+
+    if config.haproxy_bin.as_os_str().is_empty() {
+        eprintln!("[-] [FATAL] no HAProxy oracle: set ALCYON_REFERENCE (README, \"Running the oracle tests\") or pass --haproxy");
+        std::process::exit(1);
     }
 
     // 1. Initialize HAProxy Oracle on dynamic ephemeral ports

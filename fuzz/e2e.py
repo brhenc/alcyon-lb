@@ -12,7 +12,7 @@ The harness itself compares parsers, not proxies; confirm a finding here before 
 """
 import os
 import socket,threading,subprocess,sys,time,glob,re
-HA='/home/bhenc/reference/haproxy/haproxy'
+HA=os.path.join(os.environ['ALCYON_REFERENCE'],'haproxy/haproxy')  # T630: KeyError names the variable
 IB=sys.argv[2] if len(sys.argv)>2 else os.path.join(os.environ.get('CARGO_TARGET_DIR','target'),'release','alcyon')
 TMP=__import__('tempfile').mkdtemp(prefix='alcyon-fuzz-e2e-')
 def free():

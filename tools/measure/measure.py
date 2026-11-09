@@ -36,8 +36,8 @@ from typing import Any, Dict, List, Optional, Tuple
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = REPO_ROOT / "data"
 MEASUREMENTS_JSONL = DATA_DIR / "measurements.jsonl"
-HAPROXY_BIN = Path("/home/bhenc/reference/haproxy/haproxy")
-VTC_TESTS_DIR = Path("/home/bhenc/reference/haproxy/reg-tests")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "harness"))
+import reference  # noqa: E402  -- the oracle and its reg-tests are under $ALCYON_REFERENCE (T630)
 VTC_RUNNER = REPO_ROOT / "harness" / "vtc_runner.py"
 
 # Ensure ~/.cargo/bin is in PATH for inferno tools
@@ -334,9 +334,8 @@ backend be
                 alcyon_bin = ensure_alcyon_binary(target_dir, profile="release-perf")
             proxy_proc = subprocess.Popen([str(alcyon_bin), "-f", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif proxy_type == "haproxy":
-            if not HAPROXY_BIN.exists():
-                raise FileNotFoundError(f"HAProxy oracle binary not found at {HAPROXY_BIN}")
-            proxy_proc = subprocess.Popen([str(HAPROXY_BIN), "-f", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            haproxy_bin = reference.require(reference.HAPROXY, who="measure")
+            proxy_proc = subprocess.Popen([haproxy_bin, "-f", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             raise ValueError(f"Unknown proxy type: {proxy_type}")
 
@@ -458,13 +457,13 @@ def ensure_reference_binary(sha: str, target_dir: Path) -> Path:
                        capture_output=True)
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(cache / "target")
-    # A reference from before the rename (2026-11-08) builds the binary under its old name.
-    name = "ibex" if (src / "crates" / "ibex-rt").is_dir() else "alcyon"
-    res = subprocess.run(["cargo", "build", "--profile", "release-perf", "--bin", name], cwd=src, env=env,
+    # A reference from before the rename (2026-11-08) has no `alcyon` binary and does not build:
+    # measure against f01d5ecb (11-09) or later.
+    res = subprocess.run(["cargo", "build", "--profile", "release-perf", "--bin", "alcyon"], cwd=src, env=env,
                          capture_output=True, text=True)
     if res.returncode != 0:
         raise RuntimeError(f"Failed to build reference alcyon at {sha[:12]}: {res.stderr[-2000:]}")
-    shutil.copy2(cache / "target" / "release-perf" / name, bin_path)
+    shutil.copy2(cache / "target" / "release-perf" / "alcyon", bin_path)
     # Keep the newest few reference binaries.
     for old in sorted(cache.glob("alcyon-*"), key=lambda q: q.stat().st_mtime)[:-4]:
         old.unlink()
@@ -764,14 +763,13 @@ def measure_vtc_board(target_dir: Path) -> Dict[str, int]:
     """Run HAProxy VTC regression test runner and return scoreboard metrics."""
     if not VTC_RUNNER.exists():
         raise FileNotFoundError(f"VTC runner not found at {VTC_RUNNER}")
-    if not VTC_TESTS_DIR.exists():
-        raise FileNotFoundError(f"VTC tests directory not found at {VTC_TESTS_DIR}")
+    vtc_tests_dir = reference.require(reference.REGTESTS, who="measure")
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
         json_tmp = tf.name
 
     alcyon_bin = ensure_alcyon_binary(target_dir, profile="release")
-    cmd = [sys.executable, str(VTC_RUNNER), str(VTC_TESTS_DIR), "--binary", str(alcyon_bin), "--json", json_tmp]
+    cmd = [sys.executable, str(VTC_RUNNER), vtc_tests_dir, "--binary", str(alcyon_bin), "--json", json_tmp]
 
     try:
         subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)

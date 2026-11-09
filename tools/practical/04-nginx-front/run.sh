@@ -18,8 +18,8 @@
 # that "the real client" differs from nginx's own address (127.0.0.1).
 
 # ---- settings you may want to change ---------------------------------------
-ALCYON_BIN=${ALCYON_BIN:-/home/bhenc/ibex-targets/t193/release/alcyon}
-HAPROXY_BIN=${HAPROXY_BIN:-/home/bhenc/reference/haproxy/haproxy}
+ALCYON_BIN=${ALCYON_BIN:-${ALCYON_TARGETS:-${XDG_CACHE_HOME:-$HOME/.cache}/alcyon/targets}/t193/release/alcyon}
+HAPROXY_BIN=${HAPROXY_BIN:-${ALCYON_REFERENCE:?set ALCYON_REFERENCE (README, "Running the oracle tests") or HAPROXY_BIN}/haproxy/haproxy}
 NGINX_BIN=${NGINX_BIN:-/usr/sbin/nginx}
 STREAM_MODULE=${STREAM_MODULE:-/usr/lib64/nginx/modules/ngx_stream_module.so}
 NGX_PORT=${NGX_PORT:-24040}         # nginx (clients connect here)

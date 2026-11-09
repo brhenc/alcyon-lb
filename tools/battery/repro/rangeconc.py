@@ -95,7 +95,7 @@ def wait_port(port):
     return False
 
 
-ht = subprocess.Popen(["taskset", "-c", "16-31", "/root/ibex-test/haterm", "-L", "127.0.0.1:8888", "-G", "nbthread 8",
+ht = subprocess.Popen(["taskset", "-c", "16-31", os.environ.get("ALCYON_LAB_DIR", "/root/alcyon-test") + "/haterm", "-L", "127.0.0.1:8888", "-G", "nbthread 8",
                        "-G", "stats socket /tmp/rangeconc-haterm.sock mode 666"], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 try:
     wait_port(8888); time.sleep(0.5)

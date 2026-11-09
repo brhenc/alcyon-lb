@@ -35,7 +35,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import measure as m  # noqa: E402
 
-TARGET = Path(os.environ.get("T452_TARGET", "/home/bhenc/ibex-targets/t452"))
+TARGET = Path(os.environ.get("T452_TARGET")
+              or Path(os.environ.get("ALCYON_TARGETS")
+                      or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "alcyon" / "targets") / "t452")
 EXTRA_BINS = Path(os.environ.get("T452_BINS", "/tmp/t452/bins"))
 CCX = [4, 5, 6, 7, 36, 37, 38, 39]
 PERF_LAUNCH_CPUS = "16-31"  # perf/sudo themselves run away from node0

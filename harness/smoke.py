@@ -44,9 +44,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vtc_runner as _vtc  # noqa: E402  -- reuse its preprocessing rather than rewriting it
+import reference  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-REGTESTS = "/home/bhenc/reference/haproxy/reg-tests/"
+# $ALCYON_REFERENCE/haproxy/reg-tests/ (T630), set by main(): unset, the stage fails naming it.
+REGTESTS = ""
 BASELINE = os.path.join(REPO, "data", "board_baseline.json")
 # The binary `tools/checkin.sh` just built: it builds into CARGO_TARGET_DIR, and a fixed
 # `target/` here checked whatever stale binary happened to be there (or none, in a worktree).
@@ -153,6 +155,8 @@ def pass_gate(expected: list[str]) -> tuple[list[str], list[str]]:
 
 
 def main() -> int:
+    global REGTESTS
+    REGTESTS = reference.require(reference.REGTESTS, who="smoke") + "/"
     ap = argparse.ArgumentParser()
     ap.add_argument("--accept", action="store_true",
                     help="record the current state as the baseline")

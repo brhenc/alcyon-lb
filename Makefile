@@ -20,11 +20,15 @@ CANONICAL_CONFIG ?= examples/canonical_haproxy_35.cfg
 STATS_CONFIG     ?= examples/stats_dashboard.cfg
 RUN_FLAGS        ?=
 
-# Test reference oracles and suites
-DIFFTEST_REF     ?= /home/bhenc/reference/haproxy-1.0.2/haproxy102
+# Test reference oracles and suites: under $(ALCYON_REFERENCE) (README, "Running the oracle
+# tests"). Without it, `test` and `lint` leave out alcyon-h1-sys (it compiles HAProxy's C) and
+# the oracle targets stop, naming the variable.
+WORKSPACE        := $(if $(ALCYON_REFERENCE),--workspace,)
+NEED_REFERENCE    = @test -n "$(ALCYON_REFERENCE)" || { echo "set ALCYON_REFERENCE to the directory of the reference HAProxy builds (README, 'Running the oracle tests')" >&2; exit 1; }
+DIFFTEST_REF     ?= $(ALCYON_REFERENCE)/haproxy-1.0.2/haproxy102
 DIFFTEST_EXTRA   ?=
-VTC_TEST         ?= /home/bhenc/reference/haproxy/reg-tests/balance/balance-rr.vtc
-VTC_ALL_TESTS    ?= /home/bhenc/reference/haproxy/reg-tests/balance/balance-rr.vtc
+VTC_TEST         ?= $(ALCYON_REFERENCE)/haproxy/reg-tests/balance/balance-rr.vtc
+VTC_ALL_TESTS    ?= $(ALCYON_REFERENCE)/haproxy/reg-tests/balance/balance-rr.vtc
 VTC_EXTRA        ?=
 
 # Installation commands
@@ -62,31 +66,35 @@ $(TARGET_DEBUG): FORCE
 
 ##@ Testing & Verification
 
-test: ## Run all workspace tests ($(CARGO) test --workspace)
+test: ## Run all workspace tests ($(CARGO) test, --workspace when ALCYON_REFERENCE is set)
 	@echo -e "$(GREEN)Running full workspace test suite...$(RESET)"
-	$(CARGO) test --workspace
+	$(CARGO) test $(WORKSPACE)
 
 difftest: ## Run differential test harness against reference HAProxy
 	@echo -e "$(GREEN)Running differential testing harness against reference HAProxy...$(RESET)"
+	$(NEED_REFERENCE)
 	$(PYTHON) harness/difftest.py --reference $(DIFFTEST_REF) $(DIFFTEST_EXTRA)
 
 difftest-candidate: build ## Run differential test harness comparing reference vs candidate (alcyon)
 	@echo -e "$(GREEN)Running differential test comparison (reference vs candidate)...$(RESET)"
+	$(NEED_REFERENCE)
 	$(PYTHON) harness/difftest.py --reference $(DIFFTEST_REF) --candidate $(TARGET_RELEASE) $(DIFFTEST_EXTRA)
 
 vtc: debug ## Run VTC runner on HAProxy regression tests (balance-rr.vtc)
 	@echo -e "$(GREEN)Running VTC regression test runner...$(RESET)"
+	$(NEED_REFERENCE)
 	$(PYTHON) harness/vtc_runner.py $(VTC_TEST) $(VTC_EXTRA)
 
 vtc-all: debug ## Run VTC runner on all compatible regression tests
 	@echo -e "$(GREEN)Running all compatible VTC regression tests...$(RESET)"
+	$(NEED_REFERENCE)
 	$(PYTHON) harness/vtc_runner.py $(VTC_ALL_TESTS) $(VTC_EXTRA)
 
 ##@ Code Quality & Formatting
 
-lint: ## Run strict linter ($(CARGO) clippy --workspace --all-targets -- -D warnings)
+lint: ## Run strict linter ($(CARGO) clippy --all-targets -- -D warnings; --workspace with ALCYON_REFERENCE)
 	@echo -e "$(YELLOW)Running Clippy strict linter across all workspace crates...$(RESET)"
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy $(WORKSPACE) --all-targets -- -D warnings
 
 check: lint ## Run strict linter (alias for lint)
 

@@ -7,15 +7,15 @@
 #   tools/measure/perfbase.sh [--no-measure] <main-sha>
 #
 # Builds `--profile release-perf --bin alcyon` of <main-sha> once into
-# ~/ibex-targets/perfbase/<sha>/ (from a `git archive` under perfbase/src-<sha>, not the caller's
+# $ALCYON_PERFBASE_DIR/<sha>/ (from a `git archive` under perfbase/src-<sha>, not the caller's
 # tree), under flock -x perfbase/<sha>.lock so concurrent callers wait for the one build and reuse
 # it. Then (unless --no-measure) runs insreq.sh ab1 keepalive, ab1 rules and h2s1 (min of 5; user
 # and kernel) on the first free counts slot (tools/measure/slot.sh) and writes
-# ~/ibex-worktrees/boards/insreq-<sha>.json. Prints the binary path and the table. A second call
+# $ALCYON_PERFBASE_BOARDS/insreq-<sha>.json. Prints the binary path and the table. A second call
 # for the same sha prints both at once. Keeps the 5 newest shas' builds, deletes older ones
 # (only under perfbase/). Counts only, never a timing claim.
 #
-# Env: ALCYON_PERFBASE_DIR (~/ibex-targets/perfbase), ALCYON_PERFBASE_BOARDS (~/ibex-worktrees/boards),
+# Env: ALCYON_PERFBASE_DIR (~/.cache/alcyon/targets/perfbase), ALCYON_PERFBASE_BOARDS (~/.cache/alcyon/boards),
 # ALCYON_PERFBASE_KEEP (5), ALCYON_PERFBASE_BUILD_CMD (run in the source dir with CARGO_TARGET_DIR set;
 # default cargo build --profile release-perf --bin alcyon --offline), ALCYON_PERFBASE_MEASURE_CMD
 # (stub: called as `cmd <bin> <sha> <json-out>`), ALCYON_PERFBASE_N (requests per round, 20000).
@@ -26,8 +26,8 @@ NOM=0
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 SHA=$(git -C "$REPO" rev-parse --verify --short=12 "$1^{commit}") || { echo "perfbase: no such commit $1" >&2; exit 2; }
-BASE=${ALCYON_PERFBASE_DIR:-$HOME/ibex-targets/perfbase}
-BOARDS=${ALCYON_PERFBASE_BOARDS:-$HOME/ibex-worktrees/boards}
+BASE=${ALCYON_PERFBASE_DIR:-${ALCYON_TARGETS:-${XDG_CACHE_HOME:-$HOME/.cache}/alcyon/targets}/perfbase}
+BOARDS=${ALCYON_PERFBASE_BOARDS:-${XDG_CACHE_HOME:-$HOME/.cache}/alcyon/boards}
 mkdir -p "$BASE" "$BOARDS" || exit 1
 T=$BASE/$SHA
 BIN=$T/release-perf/alcyon
@@ -35,8 +35,6 @@ JSON=$BOARDS/insreq-$SHA.json
 
 (
   flock -x 8
-  # A commit from before the rename (2026-11-08) builds and caches the binary as `ibex`.
-  [ -x "$T/release-perf/ibex" ] && [ ! -e "$BIN" ] && ln -s ibex "$BIN"
   if [ ! -x "$BIN" ]; then
     SRC=$BASE/src-$SHA
     rm -rf "$SRC"; mkdir -p "$SRC" || exit 1
@@ -45,9 +43,8 @@ JSON=$BOARDS/insreq-$SHA.json
     if [ -n "${ALCYON_PERFBASE_BUILD_CMD:-}" ]; then
       (cd "$SRC" && CARGO_TARGET_DIR=$T bash -c "$ALCYON_PERFBASE_BUILD_CMD") || { rm -rf "$SRC"; exit 1; }
     else
-      NAME=alcyon; [ -d "$SRC/crates/ibex-rt" ] && NAME=ibex
-      (cd "$SRC" && CARGO_TARGET_DIR=$T cargo build --profile release-perf --bin $NAME --offline) || { rm -rf "$SRC"; exit 1; }
-      [ "$NAME" = ibex ] && ln -sf ibex "$BIN"
+      # A commit from before the rename (2026-11-08) has no `alcyon` binary: use f01d5ecb or later.
+      (cd "$SRC" && CARGO_TARGET_DIR=$T cargo build --profile release-perf --bin alcyon --offline) || { rm -rf "$SRC"; exit 1; }
     fi
     rm -rf "$SRC"
     [ -x "$BIN" ] || { echo "perfbase: build left no $BIN" >&2; exit 1; }

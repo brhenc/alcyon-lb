@@ -102,7 +102,7 @@ pub fn generate_findings_markdown(
     md.push_str("## Executive Summary\n\n");
     md.push_str(&format!(
         "This report documents differential testing between the **Alcyon HTTP/1 parser** (`crates/alcyon-proto`) \
-         and the reference **{}** oracle (`/home/bhenc/reference/haproxy/haproxy`); Alcyon at commit `{}`.\n\n\
+         and the reference **{}** oracle (`$ALCYON_REFERENCE/haproxy/haproxy`); Alcyon at commit `{}`.\n\n\
          - **Total Inputs Evaluated:** {}\n\
          - **Accepted by Both Parsers:** {}\n\
          - **Rejected by Both Parsers:** {}\n\

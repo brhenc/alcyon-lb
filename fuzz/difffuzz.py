@@ -25,8 +25,9 @@ not fail the gate). Processes are killed by PID on every exit path. Ports: --bas
 import argparse, atexit, base64, concurrent.futures as cf, glob, hashlib, json, os, re
 import signal, socket, subprocess, sys, tempfile, threading, time
 
-HA_DEFAULT = '/home/bhenc/reference/haproxy/haproxy'
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), 'harness'))
+import reference  # noqa: E402  -- $ALCYON_REFERENCE (T630)
 PIDS = set()
 
 
@@ -427,7 +428,7 @@ def main():
     tgt = os.environ.get('CARGO_TARGET_DIR', 'target')
     ap.add_argument('--alcyon', default=os.path.join(tgt, 'debug', 'alcyon'))
     ap.add_argument('--gen', default=os.path.join(tgt, 'debug', 'alcyon-fuzz'))
-    ap.add_argument('--haproxy', default=HA_DEFAULT)
+    ap.add_argument('--haproxy', default=None, help='default $ALCYON_REFERENCE/haproxy/haproxy')
     ap.add_argument('--baseline', default=os.path.join(HERE, 'known_diffs.json'))
     ap.add_argument('--corpus', default=os.path.join(HERE, 'corpus'))
     ap.add_argument('--budget', type=float, default=30.0)
@@ -444,6 +445,8 @@ def main():
     ap.add_argument('--task', default='T291')
     ap.add_argument('--write', action='store_true')
     a = ap.parse_args()
+    if a.haproxy is None:
+        a.haproxy = reference.require(reference.HAPROXY, who='diff-fuzz')
     return {'gate': cmd_gate, 'soak': cmd_soak, 'record': cmd_record}[a.mode](a)
 
 

@@ -495,7 +495,6 @@ mod pools {
     use std::sync::Arc;
     use std::time::Duration;
 
-    const ORACLE: &str = "/home/bhenc/reference/haproxy/haproxy";
     const ERR: &str = "Expects either 'byname', 'bysize', 'byusage', 'match <pfx>', 'detailed', or a max number of output lines.\n\n";
 
     struct Proxy {
@@ -506,7 +505,7 @@ mod pools {
     }
 
     impl Proxy {
-        fn start(alcyon: bool, dir: &str, backend_port: u16) -> Proxy {
+        fn start(bin: &std::path::Path, alcyon: bool, dir: &str, backend_port: u16) -> Proxy {
             let port = crate::common::reserve_port();
             let name = if alcyon { "alcyon" } else { "oracle" };
             std::fs::create_dir_all(dir).unwrap();
@@ -520,7 +519,6 @@ mod pools {
             );
             let path = format!("{dir}/{name}.cfg");
             std::fs::write(&path, cfg).unwrap();
-            let bin = if alcyon { env!("CARGO_BIN_EXE_alcyon") } else { ORACLE };
             let child = std::process::Command::new(bin)
                 .args(["-f", &path])
                 .stdout(std::process::Stdio::null())
@@ -735,20 +733,22 @@ mod pools {
         }
     }
 
-    /// Both proxies and a backend, each on a port reserved with `common::reserve_port`.
-    fn pair(test: &str) -> (Backend, Proxy, Proxy) {
+    /// Both proxies and a backend, each on a port reserved with `common::reserve_port`; `None`
+    /// (the test skips) without the oracle, `$ALCYON_REFERENCE/haproxy/haproxy`.
+    fn pair(test: &str) -> Option<(Backend, Proxy, Proxy)> {
+        let oracle = crate::common::reference("haproxy/haproxy")?;
         let dir = format!("/tmp/mem-show-pools/{test}-{}", std::process::id());
         let be = Backend::start();
-        let o = Proxy::start(false, &dir, be.2);
-        let i = Proxy::start(true, &dir, be.2);
-        (be, o, i)
+        let o = Proxy::start(&oracle, false, &dir, be.2);
+        let i = Proxy::start(std::path::Path::new(env!("CARGO_BIN_EXE_alcyon")), true, &dir, be.2);
+        Some((be, o, i))
     }
 
     /// In the interactive mode (`prompt`) the dump and the error end with the empty line and
     /// then the prompt, no more: HAProxy's `Total:` line is followed by `\n\n> `.
     #[test]
     fn show_pools_in_prompt_mode_ends_with_the_prompt() {
-        let (_be, o, i) = pair("prompt");
+        let Some((_be, o, i)) = pair("prompt") else { return };
         for p in [&o, &i] {
             let mut s = UnixStream::connect(&p.sock).expect("cli connect");
             s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -775,7 +775,7 @@ mod pools {
 
     #[test]
     fn show_pools_rejects_what_it_does_not_know() {
-        let (_be, o, i) = pair("bogus");
+        let Some((_be, o, i)) = pair("bogus") else { return };
         for bad in ["bogus", "byname bogus", "match", "-1"] {
             let cmd = format!("show pools {bad}");
             assert_eq!(o.cli(&cmd), ERR, "oracle {bad}");
@@ -785,7 +785,7 @@ mod pools {
 
     #[test]
     fn show_pools_limit_and_sort_orders() {
-        let (_be, o, i) = pair("sorts");
+        let Some((_be, o, i)) = pair("sorts") else { return };
         for p in [&o, &i] {
             let r = p.pools("byname 2");
             assert_eq!(r.header, "Dumping pools usage (limited to the first 2 entries). Use SIGQUIT to flush them.");
@@ -808,7 +808,7 @@ mod pools {
 
     #[test]
     fn show_pools_match_prefix_and_totals() {
-        let (_be, o, i) = pair("match");
+        let Some((_be, o, i)) = pair("match") else { return };
         for p in [&o, &i] {
             let r = p.pools("match buf");
             assert!(!r.lines.is_empty(), "{}", r.raw);
@@ -826,7 +826,7 @@ mod pools {
 
     #[test]
     fn show_pools_line_shape_and_totals() {
-        let (_be, o, i) = pair("shape");
+        let Some((_be, o, i)) = pair("shape") else { return };
         let _c = i.keepalive();
         let _d = o.keepalive();
         for p in [&o, &i] {
@@ -864,7 +864,10 @@ mod pools {
 
     #[test]
     fn show_pools_counters_follow_traffic() {
-        let (_be, _o, i) = pair("counters");
+        // Alcyon alone: this one needs no oracle.
+        let dir = format!("/tmp/mem-show-pools/counters-{}", std::process::id());
+        let be = Backend::start();
+        let i = Proxy::start(std::path::Path::new(env!("CARGO_BIN_EXE_alcyon")), true, &dir, be.2);
         // The probes that waited for the listeners are closed but may not be reaped yet.
         let mut rest = i.pools("");
         for _ in 0..100 {

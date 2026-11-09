@@ -6,7 +6,7 @@
 
 Automates:
 1. Spawning robust HTTP/1.1 backend.
-2. Spawning HAProxy 3.5 (+QUIC) via /home/bhenc/reference/haproxy-quic/haproxy.
+2. Spawning HAProxy 3.5 (+QUIC) via $ALCYON_REFERENCE/haproxy-quic/haproxy.
 3. Probing Alcyon (+QUIC) status (noting T26 dependency on T25 landing end-to-end HTTP/3).
 4. Running complete test suite:
    - Conformance harness (tools/quic-differential/conformance.py)
@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 REPO_DIR = Path(__file__).resolve().parent.parent.parent
-HQ_BIN = Path("/home/bhenc/reference/haproxy-quic/haproxy")
+HQ_BIN = Path(os.environ.get("ALCYON_REFERENCE", "$ALCYON_REFERENCE")) / "haproxy-quic" / "haproxy"
 CERT_PEM = REPO_DIR / "examples" / "certs" / "localhost.pem"
 DATA_MD = REPO_DIR / "data" / "quic_parity.md"
 
@@ -224,7 +224,7 @@ def generate_markdown_report(
 
     md_content = f"""# QUIC and HTTP/3 Parity & Duress Scoreboard
 
-Generated 2026-09-23 against HAProxy 3.5-dev7 (`/home/bhenc/reference/haproxy-quic/haproxy`) and Alcyon QUIC transport (`quinn-proto` 0.11 / `alcyon-quic`).
+Generated 2026-09-23 against HAProxy 3.5-dev7 (`$ALCYON_REFERENCE/haproxy-quic/haproxy`) and Alcyon QUIC transport (`quinn-proto` 0.11 / `alcyon-quic`).
 
 Test Harness: `tools/quic-differential/` (`conformance.py`, `amplification.py`, `initial_flood.py`, `stream_flood.py`, `cid_exhaustion.py`, `bench_throughput_latency.py`, `knobs_catalog.py`).
 

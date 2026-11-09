@@ -305,11 +305,8 @@ fn an_inherited_high_descriptor_does_not_raise_the_ceiling() {
 /// The oracle, started the same way: what the test above asserts of Alcyon.
 #[test]
 fn oracle_with_an_inherited_high_descriptor_keeps_its_ceiling() {
-    let haproxy = "/home/bhenc/reference/haproxy/haproxy";
-    if !std::path::Path::new(haproxy).exists() {
-        return;
-    }
-    let ((maxsock, ulimit), open, servers, saw_503) = inherited_run(haproxy);
+    let Some(haproxy) = crate::common::reference("haproxy/haproxy") else { return };
+    let ((maxsock, ulimit), open, servers, saw_503) = inherited_run(haproxy.to_str().unwrap());
     assert_eq!((maxsock.as_str(), ulimit.as_str()), ("46", "46"), "Maxsock / Ulimit-n");
     assert!(open <= MAXSOCK, "{open} descriptors open besides the inherited one");
     assert!(servers < MAXSOCK && saw_503, "{servers} server connections (503 seen: {saw_503})");

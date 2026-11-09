@@ -4,7 +4,7 @@
 //! The `ssl_f_*` fetches describe the certificate the frontend presented (T398).
 //!
 //! Alcyon refused them at load ("unknown fetch method 'ssl_f_der'"). Expected values were
-//! measured on `/home/bhenc/reference/haproxy/haproxy` (3.5-dev8) with the same two
+//! measured on `$ALCYON_REFERENCE/haproxy/haproxy` (3.5-dev8) with the same two
 //! certificates (`data/ssl_f_common.pem`: RSA, `data/ssl_f_ecdsa.pem`: ECDSA, listed in that
 //! order on one bind), one SNI at a time:
 //!

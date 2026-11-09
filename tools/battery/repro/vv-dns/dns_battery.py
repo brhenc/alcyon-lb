@@ -35,7 +35,7 @@ if "-p" in args:
 if out is None:
     out = "/tmp/vv-dns" if off == 0 else "/tmp/vv-dns-p%d" % off
 IB = args[0]
-HA = args[1] if len(args) > 1 else "/home/bhenc/reference/haproxy/haproxy"
+HA = args[1] if len(args) > 1 else os.path.join(os.environ["ALCYON_REFERENCE"], "haproxy/haproxy")
 P, NS1, NS2, DEAD, BE = (x + off for x in (19970, 19953, 19954, 19959, 19971))
 SOCK = os.path.join(out, "cli.sock")
 for b in (IB, HA):
@@ -242,7 +242,7 @@ def run_one(binary, name, conf, zone0, timeline, secs, flags):
           for port, zf, lf in ((NS1, z1, l1), (NS2, z2, l2))]
     bes = []
     if "http" in flags:
-        bes = [subprocess.Popen(["python3", "-I", "/home/bhenc/ibex-worktrees/review/night-1025/t481-oracle/be.py", ip, str(BE)],
+        bes = [subprocess.Popen(["python3", "-I", os.path.join(HERE, "be.py"), ip, str(BE)],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for ip in ("127.0.0.1", "127.0.0.2")]
     time.sleep(0.3)
     logp = os.path.join(d, tag + ".log")

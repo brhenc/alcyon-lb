@@ -7,7 +7,7 @@ query-string and JSON admin calls.  stats_admin.py ALCYON [HAPROXY]
 Each request runs against a fresh process; prints status, Location, banner and s1's status
 from ;csv afterwards, for both proxies, SAME/DIFF per case.  Port 19970, s1 at 19971 (no listener)."""
 import base64, os, re, socket, subprocess, sys, tempfile, time
-IB = sys.argv[1]; HA = sys.argv[2] if len(sys.argv) > 2 else "/home/bhenc/reference/haproxy/haproxy"
+IB = sys.argv[1]; HA = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.environ["ALCYON_REFERENCE"], "haproxy/haproxy")
 P = 19970
 HEAD = """global
     nbthread 1

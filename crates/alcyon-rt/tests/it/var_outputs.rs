@@ -2,7 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! T364 S4: what the variable outputs print for each stored type. Every expected string was measured on
-//! `HAProxy` 3.5-dev8 (`/home/bhenc/reference/haproxy/haproxy`):
+//! `HAProxy` 3.5-dev8 (`$ALCYON_REFERENCE/haproxy/haproxy`):
 //! - CLI `get var proc.v` prints `proc.v: type=<bool|sint|str|bin|ipv4|ipv6|meth> value=<...>`, the value cast to
 //!   a string (`bin` stops at its first NUL byte), every byte that is not printable ASCII shown as `.`.
 //! - `dump_all_vars(<scope>)` prints a string quoted and escaped, a `bin` as upper-case hex, an integer bare,

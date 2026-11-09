@@ -12,7 +12,7 @@ the reload 'Server b/s1 is DOWN, changed from server-state after a reload.', eac
 log. Port 19990, socket and files in a temporary directory."""
 import os, socket, subprocess, sys, tempfile, time
 
-IB = sys.argv[1]; HA = sys.argv[2] if len(sys.argv) > 2 else "/home/bhenc/reference/haproxy/haproxy"
+IB = sys.argv[1]; HA = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.environ["ALCYON_REFERENCE"], "haproxy/haproxy")
 D = tempfile.mkdtemp(prefix="vv24-"); S = D + "/cli.sock"
 
 def cfg(extra_global="", extra_be=""):

@@ -838,8 +838,8 @@ fn test_conv_sdbm() {
     assert_ne!(non_av, av);
     // 4. Deterministic across multiple calls
     assert_eq!(
-        eval_conv("sdbm", Sample::Bin(b"project-ibex".to_vec()), &[]),
-        eval_conv("sdbm", Sample::Bin(b"project-ibex".to_vec()), &[])
+        eval_conv("sdbm", Sample::Bin(b"alcyon-lb".to_vec()), &[]),
+        eval_conv("sdbm", Sample::Bin(b"alcyon-lb".to_vec()), &[])
     );
     // 5. Refused types
     assert_eq!(eval_conv("sdbm", Sample::Sint(123), &[]), None);

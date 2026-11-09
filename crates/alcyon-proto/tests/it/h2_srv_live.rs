@@ -19,8 +19,6 @@ use std::time::{Duration, Instant};
 
 use alcyon_proto::h2_srv::{H2SrvCodec, SrvH2Error};
 
-const ORACLE: &str = "/home/bhenc/reference/haproxy/haproxy";
-
 struct Server {
     child: Child,
     port: u16,
@@ -82,10 +80,7 @@ fn nghttpd(tag: &str, args: &[&str]) -> Option<(Server, std::path::PathBuf)> {
 /// HAProxy as an h2c server: at most 3 streams a connection, `/rej` rejected (RST_STREAM),
 /// any other path answered `ver=<version> path=<path>`.
 fn haproxy_server(tag: &str) -> Option<Server> {
-    if !std::path::Path::new(ORACLE).exists() {
-        eprintln!("{ORACLE} not on this host; skipping");
-        return None;
-    }
+    let oracle = crate::reference::reference("haproxy/haproxy")?;
     let d = dir(tag);
     let port = free_port();
     let cfg = format!(
@@ -94,7 +89,7 @@ fn haproxy_server(tag: &str) -> Option<Server> {
          \x20   http-request return status 200 content-type text/plain lf-string \"ver=%[req.ver] path=%[path]\"\n"
     );
     std::fs::write(d.join("s.cfg"), cfg).unwrap();
-    let child = Command::new(ORACLE).arg("-f").arg(d.join("s.cfg")).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let child = Command::new(oracle).arg("-f").arg(d.join("s.cfg")).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     wait_listening(port);
     Some(Server { child, port })
 }

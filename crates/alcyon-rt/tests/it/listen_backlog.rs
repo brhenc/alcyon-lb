@@ -5,7 +5,7 @@
 //! `maxconn` when the proxy sets none), capped by `net.core.somaxconn`; a socket handed
 //! over by `-x` keeps the backlog it had.
 //!
-//! Expected values measured on /home/bhenc/reference/haproxy/haproxy (3.5-dev8-885761-29):
+//! Expected values measured on `$ALCYON_REFERENCE/haproxy/haproxy` (3.5-dev8-885761-29):
 //! the Send-Q of the LISTEN sockets in `ss -ltn`, which this test reads. Task file: tasks/T360-listen-backlog-default.md.
 
 use crate::common;

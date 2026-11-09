@@ -340,7 +340,6 @@ fn ja4_gives_no_sample_without_a_capture() {
 /// accepts it. Skipped when the reference binary is not installed.
 #[test]
 fn haproxy_refuses_ja4() {
-    let haproxy = std::path::Path::new("/home/bhenc/reference/haproxy/haproxy");
     let mut f = NamedTempFile::new().unwrap();
     f.write_all(
         b"frontend t\n  mode http\n  bind 127.0.0.1:1\n  http-request return status 200 hdr x \"%[ssl_fc_ja4]\"\n",
@@ -348,7 +347,7 @@ fn haproxy_refuses_ja4() {
     .unwrap();
     let alcyon = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-c").arg("-f").arg(f.path()).output().unwrap();
     assert!(alcyon.status.success(), "{}", String::from_utf8_lossy(&alcyon.stderr));
-    if haproxy.exists() {
+    if let Some(haproxy) = crate::common::reference("haproxy/haproxy") {
         let out = Command::new(haproxy).arg("-c").arg("-f").arg(f.path()).output().unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success() && err.contains("unknown fetch method 'ssl_fc_ja4'"), "{err}");

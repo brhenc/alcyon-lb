@@ -30,6 +30,7 @@ mod parser_seam;
 mod proxy_protocol_tests;
 mod qpack_field_cap;
 mod qpack_static;
+mod reference;
 mod smuggling_cl_te;
 mod t612a_mux_h1_sniff;
 mod htx_rule_headers;

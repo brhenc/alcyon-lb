@@ -8,11 +8,11 @@
 # reference HAProxy, end to end (fuzz/difffuzz.py soak). Runs under the shared load lock
 # (a red-team measurement holds it exclusive and we wait) at nice 19 on cores 48-55.
 # New DIFFs (not in fuzz/known_diffs.json, or a known input whose shape changed) go to
-#   ~/ibex-worktrees/review/difffuzz/<date>-<sha>.md      (outside the repository)
+#   $DIFFFUZZ_OUT/<date>-<sha>.md      (outside the repository; default ~/.cache/alcyon/reports/difffuzz)
 # One summary line goes to stdout. Exit 0: nothing new; 1: new DIFFs; 2: could not run.
 #
 # Env: ALCYON_BIN (default: a release build of this checkout in $DIFFFUZZ_TARGET),
-#      DIFFFUZZ_TARGET (default ~/ibex-targets/difffuzz), DIFFFUZZ_SEED (default: day number,
+#      DIFFFUZZ_TARGET (default ~/.cache/alcyon/targets/difffuzz), DIFFFUZZ_SEED (default: day number,
 #      so each night explores other seeds), DIFFFUZZ_OUT (report dir), DIFFFUZZ_CORES (48-55).
 # A clean run appends its row to data/verification_runs.csv (T292's ledger, columns
 #   start,method,commit,duration_min,new_findings,note), e.g.
@@ -23,8 +23,8 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 2
 MIN=${1:-60}
 case "$MIN" in ''|*[!0-9.]*) echo "usage: $0 [MINUTES]" >&2; exit 2 ;; esac
-T=${DIFFFUZZ_TARGET:-$HOME/ibex-targets/difffuzz}
-OUTDIR=${DIFFFUZZ_OUT:-$HOME/ibex-worktrees/review/difffuzz}
+T=${DIFFFUZZ_TARGET:-${ALCYON_TARGETS:-${XDG_CACHE_HOME:-$HOME/.cache}/alcyon/targets}/difffuzz}
+OUTDIR=${DIFFFUZZ_OUT:-${XDG_CACHE_HOME:-$HOME/.cache}/alcyon/reports/difffuzz}
 CORES=${DIFFFUZZ_CORES:-48-55}
 SEED=${DIFFFUZZ_SEED:-$(( $(date +%s) / 86400 * 1000 ))}
 SHA=$(git rev-parse --short HEAD)

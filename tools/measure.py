@@ -28,7 +28,8 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(REPO_ROOT, "data")
 DEFAULT_JSON_OUT = os.path.join(DATA_DIR, "continuous_metrics.json")
 DEFAULT_MD_OUT = os.path.join(DATA_DIR, "continuous_metrics.md")
-DEFAULT_VTC_DIR = "/home/bhenc/reference/haproxy/reg-tests/"
+# $ALCYON_REFERENCE/haproxy/reg-tests/ (T630); --vtc-dir overrides.
+DEFAULT_VTC_DIR = os.path.join(os.environ.get("ALCYON_REFERENCE", "$ALCYON_REFERENCE"), "haproxy/reg-tests/")
 DEFAULT_VTC_JSON = "/tmp/rt_snapshot.json"
 
 # Targets and baselines for comparison

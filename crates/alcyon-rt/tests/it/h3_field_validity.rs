@@ -6,7 +6,7 @@
 //! `h2_field_validity`).
 //!
 //! Every expected value was measured on `HAProxy` 3.5-dev7 built with QUIC
-//! (`/home/bhenc/reference/haproxy-quic/haproxy`; the usual oracle has no QUIC), with a raw
+//! (`$ALCYON_REFERENCE/haproxy-quic/haproxy`; the usual oracle has no QUIC), with a raw
 //! HTTP/3 client (aioquic 1.3.0, hand-built QPACK blocks, one fresh QUIC connection):
 //!
 //! | input | `HAProxy` |

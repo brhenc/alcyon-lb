@@ -4,7 +4,7 @@
 """cfgcmp.py ALCYON CASES.py: `-c` each config case on Alcyon and HAProxy; print rc and core ALERT."""
 import os, re, subprocess, sys, tempfile
 IB, CASES = sys.argv[1], sys.argv[2]
-HA = "/home/bhenc/reference/haproxy/haproxy"
+HA = os.path.join(os.environ["ALCYON_REFERENCE"], "haproxy/haproxy")
 ns = {}; exec(open(CASES).read(), ns)
 TPL = """global
     nbthread 1

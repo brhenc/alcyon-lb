@@ -10,8 +10,10 @@ Description=Alcyon vs HAProxy differential fuzz soak (T293)
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/project-ibex
-ExecStart=%h/project-ibex/tools/difffuzz_soak.sh 60
+# Edit both paths to your checkout (%h is your home directory), and set ALCYON_REFERENCE
+# (README, "Running the oracle tests") in an Environment= line or a drop-in.
+WorkingDirectory=%h/alcyon-lb
+ExecStart=%h/alcyon-lb/tools/difffuzz_soak.sh 60
 # exit 1 means "new DIFFs found" (see the report), not a unit failure worth restarting
 SuccessExitStatus=0 1
 Nice=19

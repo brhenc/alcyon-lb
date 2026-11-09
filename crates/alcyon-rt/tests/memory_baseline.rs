@@ -30,7 +30,7 @@
 //! The h2 phase uses a small in-process h2c client (HEADERS with END_STREAM, sequential
 //! streams on 20 connections), not `curl`.
 //!
-//! The oracle (`/home/bhenc/reference/haproxy/haproxy`, 3.5-dev8) ran the same phases
+//! The oracle (`$ALCYON_REFERENCE/haproxy/haproxy`, 3.5-dev8) ran the same phases
 //! (`cargo test -p alcyon-rt --test memory_baseline oracle -- --ignored --nocapture`); its
 //! per-phase deltas against its own baseline are the bar, not compared value for value
 //! (2026-10-17, same 9 phases, 250 TLS handshakes, 50-request warm-up; baseline VmRSS 97508 kB,
@@ -100,7 +100,6 @@ fn udp() -> u16 {
 fn dir() -> String {
     format!("/tmp/mem-baseline-{}", std::process::id())
 }
-const ORACLE: &str = "/home/bhenc/reference/haproxy/haproxy";
 const IDLE: Duration = Duration::from_millis(1500);
 const RSS_SLACK_KB: i64 = 2048;
 
@@ -601,8 +600,9 @@ fn mixed_traffic_no_growth_after_the_first_burst() {
 #[test]
 #[ignore = "records the oracle's per-phase deltas; needs the reference haproxy"]
 fn oracle_phases() {
+    let Some(oracle) = common::reference("haproxy/haproxy") else { return };
     backend();
     let _logged = log_sink();
-    let p = Proc::start("haproxy", ORACLE);
+    let p = Proc::start("haproxy", oracle.to_str().unwrap());
     let _ = run(&p, false);
 }

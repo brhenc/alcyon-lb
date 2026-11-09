@@ -8,9 +8,9 @@ The server 10.9.9.9 is unreachable (connects time out). One GET per case; prints
 took, and the log line. HAProxy waits for the connect retries and answers 503 `sC--`. Alcyon answers
 400 `cH--` at `timeout client` whenever timeout connect x (retries + 1) > timeout client.
 Port 19970, slow backend (2 s) on 127.0.0.1:19972."""
-import socket, subprocess, sys, tempfile, threading, time
+import os, socket, subprocess, sys, tempfile, threading, time
 
-IB = sys.argv[1]; HA = sys.argv[2] if len(sys.argv) > 2 else "/home/bhenc/reference/haproxy/haproxy"
+IB = sys.argv[1]; HA = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.environ["ALCYON_REFERENCE"], "haproxy/haproxy")
 P = 19970
 
 def slow_backend(port, delay):

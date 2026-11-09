@@ -20,7 +20,7 @@
 #                                           `flock -o /tmp/alcyon-gate.lock ...` waiters and
 #                                           this script exclude each other)
 #   slot K:  /tmp/alcyon-gate.slot<K>.lock
-#   target:  ~/ibex-targets/gate-slot<K>
+#   target:  $ALCYON_GATE_TARGET_BASE/gate-slot<K>  (default ~/.cache/alcyon/targets)
 # Inside the slot the worktree's *.rs and *.toml are touched, so the slot's target never
 # trusts mtimes another worktree left in it -- unless the last gate in the slot was this
 # worktree's and nothing has built in the target since (<target>/.gate-last-tree, written
@@ -52,7 +52,7 @@
 #
 # Overrides used by tools/test_gate.sh only (not for normal use):
 #   ALCYON_GATE_LOCK_PREFIX  (default /tmp/alcyon-gate)  slot1 = <prefix>.lock, slotK = <prefix>.slot<K>.lock
-#   ALCYON_GATE_TARGET_BASE  (default ~/ibex-targets)  slot K target = <base>/gate-slot<K>
+#   ALCYON_GATE_TARGET_BASE  (default $ALCYON_TARGETS, else ${XDG_CACHE_HOME:-~/.cache}/alcyon/targets)  slot K target = <base>/gate-slot<K>
 #   ALCYON_GATE_CMD          a bash command run instead of ./tools/checkin.sh
 #   ALCYON_GATE_POLL_SECS    (default 5) how often a waiting gate retries the slots
 set -uo pipefail
@@ -93,7 +93,7 @@ REPO=$(pwd)
 SLOTS=${ALCYON_GATE_SLOTS:-1}
 case "$SLOTS" in ''|*[!0-9]*|0) echo "gate: ALCYON_GATE_SLOTS must be a positive integer" >&2; exit 2 ;; esac
 PREFIX=${ALCYON_GATE_LOCK_PREFIX:-/tmp/alcyon-gate}
-TARGET_BASE=${ALCYON_GATE_TARGET_BASE:-$HOME/ibex-targets}
+TARGET_BASE=${ALCYON_GATE_TARGET_BASE:-${ALCYON_TARGETS:-${XDG_CACHE_HOME:-$HOME/.cache}/alcyon/targets}}
 MIN_FREE_GB=${ALCYON_GATE_MIN_FREE_GB:-40}
 REPORT_SECS=${ALCYON_GATE_REPORT_SECS:-300}
 POLL_SECS=${ALCYON_GATE_POLL_SECS:-5}
@@ -224,8 +224,8 @@ echo "gate: CARGO_TARGET_DIR=$CARGO_TARGET_DIR ALCYON_GATE_SKIP_MEASURE=${ALCYON
 
 # A measuring gate pauses the local-model queue (cores 32-47 and the GPU) at its next safe
 # point and resumes it on exit; without the harness on this machine this does nothing.
-# ALCYON_MUSE_PAUSE names the command, empty to skip.
-MUSE_PAUSE=${ALCYON_MUSE_PAUSE-$HOME/ibex-worktrees/qwen/muse-pause}
+# ALCYON_MUSE_PAUSE names the command; unset or empty skips it (the author's machine sets it).
+MUSE_PAUSE=${ALCYON_MUSE_PAUSE:-}
 if [ $EXCLUSIVE = 1 ] && [ -z "${ALCYON_GATE_SKIP_MEASURE:-}" ] && [ -n "$MUSE_PAUSE" ] && [ -x "$MUSE_PAUSE" ]; then
   if MUSE_ID=$("$MUSE_PAUSE" on --reason "gate measure $REPO" --max-minutes 120); then
     trap '"$MUSE_PAUSE" off --id "$MUSE_ID" >/dev/null' EXIT

@@ -163,7 +163,7 @@ def parse_table(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--haproxy", default=os.path.expanduser("~/reference/haproxy/haproxy"))
+    ap.add_argument("--haproxy", default=os.path.join(os.environ.get("ALCYON_REFERENCE", "$ALCYON_REFERENCE"), "haproxy/haproxy"))
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--ja4", action="store_true")
     ap.add_argument("--check-ja4", metavar="TABLE")

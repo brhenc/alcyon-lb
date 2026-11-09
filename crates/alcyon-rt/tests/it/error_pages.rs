@@ -151,7 +151,7 @@ fn return_with_an_errorfile_keeps_the_connection() {
 
 // ---- which proxy's page, and which declaration wins ---------------------------------
 //
-// Every expectation below is what `HAProxy` 3.5 (`/home/bhenc/reference/haproxy/haproxy`)
+// Every expectation below is what `HAProxy` 3.5 (`$ALCYON_REFERENCE/haproxy/haproxy`)
 // sent for the same configuration. Its header names are lower case (HTX); Alcyon keeps the
 // case it was given, so responses are compared lower-cased.
 

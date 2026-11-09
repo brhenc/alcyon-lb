@@ -103,12 +103,57 @@ make test           # the workspace tests
 make lint           # clippy with warnings as errors
 make fmt-check      # formatting check
 make vtc            # one HAProxy .vtc case through harness/vtc_runner.py (vtc-all: the compatible ones)
-make difftest       # differential tests; DIFFTEST_REF must point at a reference haproxy binary
+make difftest       # differential tests against HAProxy 1.0.2 (needs ALCYON_REFERENCE, below)
 sudo make install   # installs the binary (PREFIX, DESTDIR as usual)
 ```
 
 The binary takes HAProxy's command line: `alcyon -f haproxy.cfg`, `alcyon -c -f haproxy.cfg` to
 check a configuration. [docs/operating.md](docs/operating.md) covers running it as a service.
+
+`cargo build` and `cargo test` need no HAProxy. They leave out `alcyon-h1-sys`, which compiles
+HAProxy's own HTTP/1 parser for the `haproxy-ffi` oracle; `--workspace` includes it.
+
+## Running the oracle tests
+
+HAProxy is the oracle: many tests run the same configuration or bytes through a reference
+HAProxy and through Alcyon and compare the answers. They find the reference builds through one
+variable, `ALCYON_REFERENCE`, a directory laid out like this:
+
+```
+$ALCYON_REFERENCE/
+  haproxy/                   HAProxy 3.5-dev8 (885761, 2026/10/02), a git checkout built in place:
+    haproxy                    the binary: USE_OPENSSL=1 USE_ZLIB=1 USE_PCRE2=1
+    src/ include/              alcyon-h1-sys compiles src/h1.c and src/http.c
+    reg-tests/                 HAProxy's regression tests (the smoke board, harness/vtc_runner.py)
+  haproxy-quic/haproxy       HAProxy 3.5-dev10 (38e65c, 2026/10/30) with QUIC
+  haproxy-1.0.2/haproxy102   HAProxy 1.0.2 (curl_parity, make difftest)
+```
+
+To build them (OpenSSL 3.5 or later, whose QUIC API needs no quictls):
+
+```bash
+export ALCYON_REFERENCE=$HOME/reference        # anywhere; put it in your shell profile
+git clone https://github.com/haproxy/haproxy.git "$ALCYON_REFERENCE/haproxy"
+cd "$ALCYON_REFERENCE/haproxy" && git checkout 88576119c   # 3.5-dev8-885761-29
+make -j"$(nproc)" TARGET=linux-glibc USE_OPENSSL=1 USE_ZLIB=1 USE_PCRE2=1
+git clone https://github.com/haproxy/haproxy.git "$ALCYON_REFERENCE/haproxy-quic"
+cd "$ALCYON_REFERENCE/haproxy-quic" && git checkout 38e65c812   # 3.5-dev10-38e65c-10
+make -j"$(nproc)" TARGET=linux-glibc USE_THREAD=1 USE_OPENSSL=1 USE_ZLIB=1 USE_QUIC=1 USE_PROMEX=1 USE_PCRE2=1
+# HAProxy 1.0.2: the release tarball from https://www.haproxy.org/download/1.0/src/, built with
+# its own Makefile into $ALCYON_REFERENCE/haproxy-1.0.2, binary renamed haproxy102.
+```
+
+With the variable unset, a test that needs an oracle prints `skipped: ALCYON_REFERENCE is not
+set` and passes; the check-in gate (`tools/checkin.sh`) instead fails the stage and names the
+variable (`harness/reference.py --require`), so a gate cannot pass by skipping its oracles.
+Variables that name one binary still win where they exist: `HAPROXY_REF` (the source tree for
+`alcyon-h1-sys`), `CHECK_BIN`, `ALCYON_TXN_BIN`, `HAPROXY` (tools/measure), `HQ`,
+`VTC_QUIC_CLIENT_BINARY`, `--haproxy` on the fuzz scripts.
+
+Build and report directories default to `${XDG_CACHE_HOME:-~/.cache}/alcyon/` (`targets/`,
+`boards/`, `reports/`), each with its own variable: `ALCYON_TARGETS` (all target directories),
+`ALCYON_GATE_TARGET_BASE`, `ALCYON_PERFBASE_DIR`, `ALCYON_PERFBASE_BOARDS`, `DIFFFUZZ_TARGET`,
+`DIFFFUZZ_OUT`, `ALCYON_WORKTREES`.
 
 ## Licence
 

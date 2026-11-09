@@ -12,8 +12,8 @@
 # script and killed by PID at the end. Override any variable from the environment.
 
 # ---- settings you may want to change ---------------------------------------
-ALCYON_BIN=${ALCYON_BIN:-/home/bhenc/ibex-targets/t181/release/alcyon}
-HAPROXY_BIN=${HAPROXY_BIN:-/home/bhenc/reference/haproxy/haproxy}
+ALCYON_BIN=${ALCYON_BIN:-${ALCYON_TARGETS:-${XDG_CACHE_HOME:-$HOME/.cache}/alcyon/targets}/t181/release/alcyon}
+HAPROXY_BIN=${HAPROXY_BIN:-${ALCYON_REFERENCE:?set ALCYON_REFERENCE (README, "Running the oracle tests") or HAPROXY_BIN}/haproxy/haproxy}
 PROXY_PORT=${PROXY_PORT:-23080}     # plain (round-robin) frontend
 STICKY_PORT=${STICKY_PORT:-23081}   # cookie persistence frontend
 APP_PORT1=${APP_PORT1:-23001}       # the three node.js instances

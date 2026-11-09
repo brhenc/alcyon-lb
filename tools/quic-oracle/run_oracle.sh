@@ -4,16 +4,16 @@
 # Start HAProxy 3.5-dev with QUIC in front of a trivial HTTP/1 backend, and prove
 # curl --http3 reaches it. Prints the QUIC port and leaves the daemon running.
 #
-# The stock /home/bhenc/reference/haproxy/haproxy is built -QUIC and cannot serve
-# HTTP/3. This uses the separate tree at /home/bhenc/reference/haproxy-quic, built with
+# The stock $ALCYON_REFERENCE/haproxy/haproxy is built -QUIC and cannot serve
+# HTTP/3. This uses the separate tree at $ALCYON_REFERENCE/haproxy-quic, built with
 #
 #   make -j64 TARGET=linux-glibc USE_OPENSSL=1 USE_QUIC=1 USE_ZLIB=1 USE_PCRE2=1 USE_THREAD=1
 #
 # against the system OpenSSL 3.5.8, whose native QUIC API needs neither quictls nor
 # USE_QUIC_OPENSSL_COMPAT. Verified: +QUIC -QUIC_OPENSSL_COMPAT.
 set -euo pipefail
-HQ=${HQ:-/home/bhenc/reference/haproxy-quic/haproxy}
-CRT=${CRT:-/home/bhenc/project-ibex/examples/certs/localhost.pem}
+HQ=${HQ:-${ALCYON_REFERENCE:?set ALCYON_REFERENCE (README, "Running the oracle tests") or HQ}/haproxy-quic/haproxy}
+CRT=${CRT:-$(cd "$(dirname "$0")/../.." && pwd)/examples/certs/localhost.pem}
 D=$(mktemp -d /tmp/quic-oracle.XXXXXX)
 
 python3 "$(dirname "$0")/echo_backend.py" > "$D/be.port" 2> "$D/be.err" &

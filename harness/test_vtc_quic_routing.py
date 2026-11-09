@@ -9,7 +9,7 @@ Run:  python3 -m unittest harness/test_vtc_quic_routing.py
 vtest does not speak h3, so a QUIC reg-test chains a second `haproxy` block as the QUIC client
 (`server ... quic4@...`, `ssl alpn h3`, `proto qmux`). Alcyon refuses QUIC towards servers (out of
 M2 scope), so that block runs on the QUIC-enabled reference binary
-(`VTC_QUIC_CLIENT_BINARY`, default ~/reference/haproxy-quic/haproxy); the others on Alcyon.
+(`VTC_QUIC_CLIENT_BINARY`, default $ALCYON_REFERENCE/haproxy-quic/haproxy); the others on Alcyon.
 """
 import asyncio
 import os

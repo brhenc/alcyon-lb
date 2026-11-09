@@ -39,7 +39,7 @@ listen l
 """
 open(f"{d}/hap.cfg", "w").write(cfg)
 if case.get("check"):
-    r = subprocess.run([case.get("bin", "/home/bhenc/reference/haproxy/haproxy"), "-c", "-f", f"{d}/hap.cfg"], capture_output=True, text=True)
+    r = subprocess.run([(case.get("bin") or os.path.join(os.environ["ALCYON_REFERENCE"], "haproxy/haproxy")), "-c", "-f", f"{d}/hap.cfg"], capture_output=True, text=True)
     print("rc", r.returncode); print(r.stdout); print(r.stderr)
     dns.kill(); sys.exit(0)
 def get(path):
@@ -55,7 +55,7 @@ def get(path):
     except Exception as e:
         return "error %s" % e
 t0 = time.time()
-p = subprocess.Popen([case.get("bin", "/home/bhenc/reference/haproxy/haproxy"), "-f", f"{d}/hap.cfg"], stdout=open(f"{d}/out.log", "w"), stderr=open(f"{d}/err.log", "w"))
+p = subprocess.Popen([(case.get("bin") or os.path.join(os.environ["ALCYON_REFERENCE"], "haproxy/haproxy")), "-f", f"{d}/hap.cfg"], stdout=open(f"{d}/out.log", "w"), stderr=open(f"{d}/err.log", "w"))
 def cli(c):
     try:
         s = socket.socket(socket.AF_UNIX); s.connect(sock); s.sendall((c + "\n").encode())

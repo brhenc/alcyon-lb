@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 passes = ["", "a", "secret", "pass word", "0123456789abcdef", "0123456789abcdefg", "x" * 31, "y" * 64, "z" * 72, "w" * 73, "é€ü", "pa$$:w\\rd"]
 settings = [
     "$1$", "$1$salt", "$1$salt$", "$1$abcdefghijkl$", "$1$s$x",
@@ -36,7 +37,7 @@ for (p, s), o in zip(direct, run(direct)):
 for s in ["ab", "a.", "KX9oOBGuoeCIs", "_J9..salt", "_J9..sal", "$sha1$1$abc", "$md5$abc", "$3$abc", "$y$j9T$1nZAl.AiE9fK3YIKl7dej.$fm26plQOfV3uymBaBxn65uVem0IUdbHYe6PLwrZdu30", "$2x$05$fDT1s53J9hc2GdGrAK.LQOtqRsu5pcbLSuKdbfWmKNcCLmW5Y6rgu"]:
     o = run([("secret", s)])[0]
     rows.append((s, "secret", "load:" + ("NULL" if o == "NULL" else "ok") + ",match:" + ("yes" if o == s else "no")))
-with open("/home/bhenc/project-ibex/.claude/worktrees/agent-a19aa4612676c1f17/crates/alcyon-crypt/tests/vectors.txt", "w") as f:
+with open(Path(__file__).parent / "vectors.txt", "w") as f:
     f.write("# stored<TAB>password<TAB>verdict, from glibc crypt() on 2026-10-04 (see tests/vectors.py in the task)\n")
     for r in rows:
         f.write("\t".join(r) + "\n")

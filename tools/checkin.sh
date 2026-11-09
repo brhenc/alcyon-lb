@@ -144,7 +144,7 @@ fi
 # other's test binaries, and each run then tests the other's code. Refuse instead.
 if [ -z "${CARGO_TARGET_DIR:-}" ] && [ "$(git rev-parse --git-dir)" != "$(git rev-parse --git-common-dir)" ]; then
   echo "checkin: this is a linked worktree; set CARGO_TARGET_DIR to a directory of its own" >&2
-  echo "         (for example CARGO_TARGET_DIR=/home/bhenc/ibex-targets/<task> ./tools/checkin.sh)" >&2
+  echo "         (for example CARGO_TARGET_DIR=${XDG_CACHE_HOME:-~/.cache}/alcyon/targets/<task> ./tools/checkin.sh)" >&2
   exit 2
 fi
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/alcyon-checkin-target}
@@ -295,6 +295,9 @@ stage_suite() {
   # Failing targets are re-run alone before they count: tcp_proxy passes 17/17 by itself and
   # fails in the parallel run on port contention, and fc_src_is_the_real_peer_after_set_src
   # does the same. Known failures live in data/suite_baseline.json with a reason each.
+  # T630: the suite's oracle tests skip without $ALCYON_REFERENCE, and alcyon-h1-sys does not
+  # build without it; the gate fails instead, naming the variable, so it cannot pass by skipping.
+  python3 harness/reference.py --require --who suite || { check 1 "workspace suite: ALCYON_REFERENCE"; return; }
   python3 harness/suite.py 2>&1 | grep -vE "^$"
   check "${PIPESTATUS[0]}" "workspace suite"
 }
@@ -367,6 +370,8 @@ stage_haproxy() {
 }
 
 stage_lint() {
+  # --workspace builds alcyon-h1-sys, which compiles $ALCYON_REFERENCE/haproxy/src (T630).
+  python3 harness/reference.py --require --who lint haproxy/src/h1.c || { check 1 "clippy: ALCYON_REFERENCE"; return; }
   cargo clippy -q --workspace --all-targets 2>&1 | grep -E "^(warning|error)" | grep -v generated | sort | uniq -c
   local CLIPPY_RC=${PIPESTATUS[0]}
   echo "clippy exit: $CLIPPY_RC"

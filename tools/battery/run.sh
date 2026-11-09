@@ -20,7 +20,7 @@ $SSH "$HOST" "rm -rf $REMOTE/out; mkdir -p $REMOTE"
 $SCP -q "$HERE/battery.py" "$HERE/clients.py" "$HOST:$REMOTE/"
 $SCP -q "$ALCYON" "$HOST:$REMOTE/alcyon"
 for P in alcyon haproxy; do
-  BIN=$REMOTE/alcyon; [ $P = haproxy ] && BIN=${HAPROXY_REMOTE:-/root/ibex-test/haproxy}
+  BIN=$REMOTE/alcyon; [ $P = haproxy ] && BIN=${HAPROXY_REMOTE:-${ALCYON_LAB_DIR:-/root/alcyon-test}/haproxy}
   $SSH "$HOST" "${BATTERY_ENV:-} python3 $REMOTE/battery.py run $BIN $P $REMOTE/out $SECS $*" | tee -a "$OUT/raw.jsonl"
 done
 $SCP -q "$HOST:$REMOTE/out/*.json" "$OUT/"

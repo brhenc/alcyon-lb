@@ -13,8 +13,8 @@
 # the system trust store is never touched. Everything is killed by PID and the work dir removed.
 
 # ---- settings you may want to change ---------------------------------------
-ALCYON_BIN=${ALCYON_BIN:-/home/bhenc/ibex-targets/t212/release/alcyon}
-HAPROXY_BIN=${HAPROXY_BIN:-/home/bhenc/reference/haproxy/haproxy}
+ALCYON_BIN=${ALCYON_BIN:-${ALCYON_TARGETS:-${XDG_CACHE_HOME:-$HOME/.cache}/alcyon/targets}/t212/release/alcyon}
+HAPROXY_BIN=${HAPROXY_BIN:-${ALCYON_REFERENCE:?set ALCYON_REFERENCE (README, "Running the oracle tests") or HAPROXY_BIN}/haproxy/haproxy}
 APP_PORT=${APP_PORT:-26001}
 PROXY_PORT=${PROXY_PORT:-26080}
 CHROME_DEBUG_PORT=${CHROME_DEBUG_PORT:-26010}

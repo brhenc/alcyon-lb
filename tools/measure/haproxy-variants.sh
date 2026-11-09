@@ -4,24 +4,25 @@
 #
 # T603: build HAProxy the ways Alcyon is built (o2, lto, pgo, pgo-lto) from COPIES of the oracle
 # sources, train the pgo builds with the same request mix as tools/pgo-build.sh, and measure.
-# The oracle trees and binaries under ~/reference are never touched (git archive reads them).
+# The oracle trees and binaries under $ALCYON_REFERENCE are never touched (git archive reads them).
 #
 #   tools/measure/haproxy-variants.sh build  <d8|q10> [variant...]   o2 lto pgo pgo-lto (default all)
 #   tools/measure/haproxy-variants.sh check  <d8|q10>                -vv CFLAGS line, .gcda count
 #
-#   d8  = ~/reference/haproxy      (3.5-dev8, h1/h2: USE_OPENSSL USE_ZLIB USE_PCRE2, as its -vv)
-#   q10 = ~/reference/haproxy-quic (3.5-dev10, h3fit: + USE_THREAD USE_QUIC USE_PROMEX)
+#   d8  = $ALCYON_REFERENCE/haproxy      (3.5-dev8, h1/h2: USE_OPENSSL USE_ZLIB USE_PCRE2, as its -vv)
+#   q10 = $ALCYON_REFERENCE/haproxy-quic (3.5-dev10, h3fit: + USE_THREAD USE_QUIC USE_PROMEX)
 #
-# Root: $HAPV_ROOT (default ~/ibex-targets/t603): src/<set>, <set>/<variant>/haproxy.
+# Root: $HAPV_ROOT (default $ALCYON_TARGETS/t603; ALCYON_TARGETS defaults to ~/.cache/alcyon/targets): src/<set>, <set>/<variant>/haproxy.
 # Training: the mix of tools/pgo-build.sh train(), the same requests in the same order; q10 gets
 # the HTTP/3 part and the fe_h3 frontend of tools/pgo/train.cfg, d8 (no QUIC) does not.
 # Needs the same tools as pgo-build.sh (h2load, socat, openssl, curl, nc) and its measure-bench/h3bench
-# (HAPV_BENCH_DIR, default ~/ibex-targets/t603-alcyon/pgo-bench/release). Training runs under
+# (HAPV_BENCH_DIR, default $ALCYON_TARGETS/t603-alcyon/pgo-bench/release). Training runs under
 # flock -x /tmp/alcyon-load.lock (a synthetic load), builds run niced on CPUs 16-47.
 set -u
-ROOT=${HAPV_ROOT:-$HOME/ibex-targets/t603}
+TARGETS=${ALCYON_TARGETS:-${XDG_CACHE_HOME:-$HOME/.cache}/alcyon/targets}
+ROOT=${HAPV_ROOT:-$TARGETS/t603}
 HERE=$(cd "$(dirname "$0")/../.." && pwd) || exit 1
-BENCHD=${HAPV_BENCH_DIR:-$HOME/ibex-targets/t603-alcyon/pgo-bench/release}
+BENCHD=${HAPV_BENCH_DIR:-$TARGETS/t603-alcyon/pgo-bench/release}
 BUILDCPUS=${HAPV_BUILD_CPUS:-16-47}
 log() { echo "haproxy-variants [$(date +%H:%M:%S)]: $*" >&2; }
 die() { echo "haproxy-variants: $*" >&2; exit 1; }
@@ -109,7 +110,7 @@ cmd_build() {
   local SET=$1; shift
   local V=${*:-o2 lto pgo pgo-lto} v
   local SRC=$ROOT/src/$SET
-  [ -d "$SRC" ] || { mkdir -p "$SRC"; git -C "$HOME/reference/$([ "$SET" = d8 ] && echo haproxy || echo haproxy-quic)" archive HEAD | tar -x -C "$SRC"; }
+  [ -d "$SRC" ] || { mkdir -p "$SRC"; git -C "${ALCYON_REFERENCE:?set ALCYON_REFERENCE}/$([ "$SET" = d8 ] && echo haproxy || echo haproxy-quic)" archive HEAD | tar -x -C "$SRC"; }
   local O2="-O2" LT="-O2 -flto=auto"
   for v in $V; do
     local D=$ROOT/$SET/$v

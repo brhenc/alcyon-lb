@@ -13,9 +13,10 @@ recovery polling.  One JSON file per (label, scenario) in <outdir>.
 import glob, json, os, re, signal, subprocess, sys, threading, time, urllib.request
 
 D = os.path.dirname(os.path.abspath(__file__))
-HATERM, HALOAD = "/root/ibex-test/haterm", "/root/ibex-test/haload"
+LAB = os.environ.get("ALCYON_LAB_DIR", "/root/alcyon-test")  # the lab VM's tools: haterm, haload, lab.pem
+HATERM, HALOAD = f"{LAB}/haterm", f"{LAB}/haload"
 H1, H2, TLS = 10080, 10081, 10443
-CRT = os.environ.get("BATTERY_CRT", "/root/ibex-test/lab.pem")  # TLS bind only if this exists
+CRT = os.environ.get("BATTERY_CRT", f"{LAB}/lab.pem")  # TLS bind only if this exists
 # name: (attack processes, legit protocol).  An attack process is either
 #   (client scenario, port, workers)            -> clients.py attack ... (one Python process)
 #   ("haload", port, scheme, [haload args])     -> haload as a rate-capped flood engine (-R)

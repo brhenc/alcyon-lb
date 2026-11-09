@@ -87,11 +87,7 @@ fn start_http_backend() -> (SocketAddr, Arc<AtomicBool>, std::thread::JoinHandle
 }
 
 /// Spawns `HAProxy` 1.0.2 pointing to backend.
-fn spawn_haproxy102(backend_addr: SocketAddr) -> Option<(SocketAddr, std::process::Child, String)> {
-    let haproxy_bin = "/home/bhenc/reference/haproxy-1.0.2/haproxy102";
-    if !std::path::Path::new(haproxy_bin).exists() {
-        return None;
-    }
+fn spawn_haproxy102(haproxy_bin: &std::path::Path, backend_addr: SocketAddr) -> (SocketAddr, std::process::Child, String) {
 
     let front_port = common::reserve_port();
 
@@ -126,7 +122,7 @@ fn spawn_haproxy102(backend_addr: SocketAddr) -> Option<(SocketAddr, std::proces
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    Some((front_addr, child, cfg_path))
+    (front_addr, child, cfg_path)
 }
 
 /// Runs the Alcyon proxy event loop in a background thread.
@@ -285,14 +281,16 @@ impl Drop for TestContext {
     }
 }
 
-fn setup_test_proxies() -> TestContext {
+/// `None` (the test skips) without `$ALCYON_REFERENCE/haproxy-1.0.2/haproxy102`.
+fn setup_test_proxies() -> Option<TestContext> {
+    let haproxy_bin = common::reference("haproxy-1.0.2/haproxy102")?;
     let (backend_addr, b_run, b_handle) = start_http_backend();
     let (alcyon_addr, i_run, i_handle) = spawn_alcyon_proxy(backend_addr);
 
     let (haproxy_addr, haproxy_child, cfg_path) =
-        spawn_haproxy102(backend_addr).expect("HAProxy 1.0.2 binary must exist and run");
+        spawn_haproxy102(&haproxy_bin, backend_addr);
 
-    TestContext {
+    Some(TestContext {
         haproxy_addr,
         alcyon_addr,
         haproxy_child,
@@ -301,12 +299,12 @@ fn setup_test_proxies() -> TestContext {
         i_run,
         b_handle: Some(b_handle),
         i_handle: Some(i_handle),
-    }
+    })
 }
 
 #[test]
 fn curl_parity_get_and_post() {
-    let ctx = setup_test_proxies();
+    let Some(ctx) = setup_test_proxies() else { return };
 
     // 1. GET request via curl
     let get_path = "/test/get/path";
@@ -363,7 +361,7 @@ fn curl_parity_get_and_post() {
 
 #[test]
 fn curl_parity_headers_and_large_payload() {
-    let ctx = setup_test_proxies();
+    let Some(ctx) = setup_test_proxies() else { return };
 
     // 1. Custom Headers via curl
     let h_hdr = Command::new("curl")

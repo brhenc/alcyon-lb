@@ -30,7 +30,8 @@ ONLY=${T452_ONLY:-}
 SUFFIX=${T452_TAG_SUFFIX:-}
 BUSY_MAX=${T452_BUSY_MAX:-2.0}       # busy CPUs (of 64) allowed before a batch, besides us
 DEADLINE=$(( $(date +%s) + ${T452_MAX_MINUTES:-150} * 60 ))
-MUSE=$HOME/ibex-worktrees/qwen/muse-pause
+# The author's local-model queue pauser (tools/gate.sh's ALCYON_MUSE_PAUSE); unset, nothing is paused.
+MUSE=${ALCYON_MUSE_PAUSE:-}
 REF=608656b6 RC2REF=70c38bd3
 mkdir -p /tmp/t452
 exec > >(tee -a "$LOG") 2>&1
@@ -105,7 +106,7 @@ batch() {
             log "SKIP $tag: /tmp/alcyon-load.lock busy for 20 min"; batch_record "$tag" skip "lock busy" '{}'; exit 0
         fi
         local pause=""
-        [ -x "$MUSE" ] && pause=$("$MUSE" on --reason "T452 $tag" --max-minutes 20 --wait-seconds 120 2>/dev/null)
+        [ -n "$MUSE" ] && [ -x "$MUSE" ] && pause=$("$MUSE" on --reason "T452 $tag" --max-minutes 20 --wait-seconds 120 2>/dev/null)
         local st
         if ! st=$(host_state); then
             log "SKIP $tag: $(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["reason"])' "$st")"

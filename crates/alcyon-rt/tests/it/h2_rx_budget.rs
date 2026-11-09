@@ -300,8 +300,8 @@ fn rounds(bin: &str, streams: u32) -> Vec<Duration> {
 /// here on the reference binary when it is there (`T280_ORACLE` unset), else a floor.
 #[test]
 fn four_concurrent_uploads_do_not_stall() {
-    let oracle = std::path::Path::new("/home/bhenc/reference/haproxy/haproxy");
-    let reference = if std::env::var_os("T280_ORACLE").is_none() && oracle.exists() {
+    let oracle = if std::env::var_os("T280_ORACLE").is_none() { crate::common::reference("haproxy/haproxy") } else { None };
+    let reference = if let Some(oracle) = oracle {
         let mut r = rounds(oracle.to_str().unwrap(), 4);
         r.sort();
         r[r.len() / 2]

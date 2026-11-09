@@ -9,13 +9,14 @@ argument mask (ARGn(min, T1, ...), include/haproxy/arg.h), a val_args function, 
 the fetch an ACL keyword stands for. This reads them all, so that Alcyon checks each argument
 against the type HAProxy declares for it, rather than against a hand-copied table.
 
-    python3 tools/gen_sample_argspecs.py /home/bhenc/reference/haproxy > crates/alcyon-sample/src/argspec_table.rs
+    python3 tools/gen_sample_argspecs.py "$ALCYON_REFERENCE/haproxy" > crates/alcyon-sample/src/argspec_table.rs
 """
 import glob
+import os
 import re
 import sys
 
-SRC = sys.argv[1] if len(sys.argv) > 1 else "/home/bhenc/reference/haproxy"
+SRC = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["ALCYON_REFERENCE"], "haproxy")
 KW = re.compile(
     r'\{\s*"([^"]+)"\s*,\s*([A-Za-z_0-9]+)\s*,\s*(0|ARG\d+\([^)]*\))\s*,\s*([A-Za-z_0-9]+)\s*,'
     r'\s*(SMP_T_[A-Z0-9]+)\s*,\s*([A-Z0-9_|\s]+?)\s*[,}]'
