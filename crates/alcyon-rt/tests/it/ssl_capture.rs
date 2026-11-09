@@ -298,14 +298,15 @@ fn argument_errors() {
 /// (`ssl_capture_table.rs`, N = 1024: `x-cl1`, `x-ext1`, `x-sa1`, `x-sv1`) and the ALPN each
 /// client offers (`http/1.1` for 1, 2 and 4, curl `h2,http/1.1`, none for the others). The rule
 /// itself is checked against FoxIO's published vectors in `alcyon-sample`'s `ja4` tests.
+/// `tools/ssl-capture-oracle/record.py --ja4` prints them from a fresh recording.
 const JA4: &[(u8, &str)] = &[
-    (1, "t13d0212h1_88d8eb61a8ee_f7b8ee8a4e9e"),
+    (1, "t13d0211h1_88d8eb61a8ee_3000aeec7d7e"),
     (2, "t12d0209h1_d23a474016f0_7a0c0693ab17"),
     (3, "t13d351200_bfa337485184_a141b6f9fa1c"),
-    (4, "t13i0211h1_88d8eb61a8ee_f7b8ee8a4e9e"),
+    (4, "t13i0210h1_88d8eb61a8ee_3000aeec7d7e"),
     (5, "t13d351200_bfa337485184_a141b6f9fa1c"),
-    (6, "t13i0411h2_9caa18292e23_e6e6d98f61e7"),
-    (7, "t13d011100_0f2cb44170f4_c657c3cd4f7d"),
+    (6, "t13i0410h2_9caa18292e23_c139bde80fb4"),
+    (7, "t13d011000_0f2cb44170f4_5f8b4fb81445"),
     (8, "t13d821200_ce333ca46318_a141b6f9fa1c"),
 ];
 
@@ -361,9 +362,9 @@ fn haproxy_refuses_ja4() {
 #[test]
 fn ja4_compat_picks_the_alpn_rule() {
     for (extra, want) in [
-        ("", "t13d0212/x_88d8eb61a8ee_f7b8ee8a4e9e"),
-        ("  alcyon.ja4-compat foxio\n", "t13d0212/x_88d8eb61a8ee_f7b8ee8a4e9e"),
-        ("  alcyon.ja4-compat spec\n", "t13d021228_88d8eb61a8ee_f7b8ee8a4e9e"),
+        ("", "t13d0211/x_88d8eb61a8ee_3000aeec7d7e"),
+        ("  alcyon.ja4-compat foxio\n", "t13d0211/x_88d8eb61a8ee_3000aeec7d7e"),
+        ("  alcyon.ja4-compat spec\n", "t13d021128_88d8eb61a8ee_3000aeec7d7e"),
     ] {
         let (_alcyon, addr) = start_cfg(Some(1024), &[("x-ja4", "%[ssl_fc_ja4]")], extra);
         let r = get(addr, 9);
