@@ -89,13 +89,15 @@ Each of these is a panic, so (section 1) it aborts the whole proxy:
 | `RefCell::borrow_mut()` | already borrowed (re-entrancy) |
 | `Instant + Duration`, `Duration * n` | the result overflows (a huge timeout from config or the CLI) |
 | `Duration::from_secs_f64(x)` | `x` is negative, NaN or too big |
-| `println!`, `eprintln!` | the write fails, for example with EAGAIN on a full non-blocking stderr pipe. **This happened** (T342b: `log stderr` plus a stalled reader aborted Alcyon); `eprintln!` and `eprint!` are now disallowed by `clippy.toml` outside tests (a clippy warning; use `stderr_line!`). |
+| `println!`, `eprintln!` | the write fails, for example with EAGAIN on a full non-blocking stderr pipe. **This happened** (T342b: `log stderr` plus a stalled reader aborted Alcyon); `eprintln!` and `eprint!` are now disallowed by `clippy.toml` outside tests (use `stderr_line!`): denied in alcyon-rt, alcyon-config and alcyon-tls, so the gate fails on one there, and only a warning in the other crates (T629). |
 | `unreachable!()`, `panic!()`, `assert!()` | the "impossible" happens |
 
 Today:
-- `clippy::panic`, `todo` and `unimplemented` are warned workspace-wide. Warnings fail
-  `make lint` (`-D warnings`) but not the check-in gate, whose lint stage fails only on clippy
-  errors.
+- `clippy::panic`, `todo` and `unimplemented` are set to warn in the root `Cargo.toml`'s
+  `[workspace.lints]`, but only alcyon-mmsg and alcyon-quic inherit that section; the other
+  crates have lint sections of their own without them, so in most of the code they are off.
+  Warnings fail `make lint` (`-D warnings`) but not the check-in gate, whose lint stage fails only
+  on clippy errors; clippy reports about 2,040 warnings today (T629).
 - `unwrap_used`, `expect_used`, `indexing_slicing` and `arithmetic_side_effects` are **not**
   enabled.
 - `src/` has about 437 `.unwrap()` and 675 `.expect(` sites (2026-11-09, unit tests included).
